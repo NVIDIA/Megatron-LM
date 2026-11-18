@@ -302,11 +302,12 @@ def test_config_includes_mtp_ratio_and_derives_dimensions():
 
 
 def test_config_requires_contiguous_context_parallelism(monkeypatch):
-    """Static CP needs contiguous layout, but THD metadata may be supplied directly."""
+    """Without the dp_balanced packing path static CP needs the contiguous layout (THD metadata
+    may then be supplied directly); the default zigzag layout is tied to that data path."""
     monkeypatch.setattr(
         "megatron.core.transformer.transformer_config.is_te_min_version", lambda *_a, **_k: True
     )
-    with pytest.raises(ValueError, match="cp_partition_mode='contiguous'"):
+    with pytest.raises(ValueError, match="requires sequence_packing_scheduler='dp_balanced'"):
         _make_config(context_parallel_size=2)
     config = _make_config(context_parallel_size=2, attention_cp_layout="contiguous")
     assert config.sequence_packing_scheduler is None
@@ -323,6 +324,105 @@ def test_config_requires_contiguous_context_parallelism(monkeypatch):
         max_seqlen_per_dp_cp_rank=128,
     )
     assert config.context_parallel_size == 2
+
+
+@pytest.mark.parametrize(
+    "model_layout,floor,tag,match",
+    [
+        # validated for the zigzag layout (non-zero padding floor): only zigzag batches
+        ("zigzag", 512, "contiguous", "does not match the model's attention_cp_layout='zigzag'"),
+        # contiguous model: the contiguous-only rule and its message are unchanged
+        ("contiguous", 0, "zigzag", "DSv4 THD CP requires a contiguous CP partition"),
+        # a config that never passed the zigzag validation (context_parallel_size == 1 keeps
+        # the default layout name and a zero floor) driven with a real CP group: unchanged too
+        ("zigzag", 0, "zigzag", "DSv4 THD CP requires a contiguous CP partition"),
+    ],
+    ids=["zigzag_model_contiguous_batch", "contiguous_model_zigzag_batch", "unvalidated_model"],
+)
+def test_forward_rejects_a_packed_layout_tag_that_differs_from_the_model(
+    model_layout, floor, tag, match
+):
+    """The per-sequence zigzag path is selected by the validated model configuration, never by
+    the per-microbatch layout tag alone; a batch with the other tag fails before any
+    layout-specific work, and models outside that configuration keep the contiguous-only rule."""
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.transformer.experimental_attention_variant import (
+        deepseek_v4_hybrid_attention as dsv4_attention,
+    )
+
+    cp_group = SimpleNamespace(rank=lambda: 0, size=lambda: 2)
+    layer = SimpleNamespace(
+        config=SimpleNamespace(
+            attention_cp_layout=model_layout,
+            cp_partition_mode=model_layout,
+            dsv4_zigzag_min_padded_seq_len=floor,
+        ),
+        pg_collection=SimpleNamespace(cp=cp_group),
+    )
+    packed = PackedSeqParams(qkv_format="thd", cp_partition_mode=tag)
+    with pytest.raises(ValueError, match=match):
+        dsv4_attention.DSv4HybridSelfAttention.forward(
+            layer, torch.zeros(4, 1, 4), None, packed_seq_params=packed
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_seq_zigzag_geometry_follows_a_refreshed_cu_seqlens_buffer(dtype):
+    """The per-sequence zigzag geometry is derived from the current contents of the caller's
+    cu_seqlens buffer on every call: refreshing the buffer in place (as a static CUDA-graph input
+    is, without a version bump) must not return the previous pack's block tables."""
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.transformer.experimental_attention_variant import (
+        deepseek_v4_hybrid_attention as dsv4_attention,
+    )
+
+    layer = SimpleNamespace(
+        config=SimpleNamespace(csa_window_size=4),
+        _dsv4_compress_ratio=0,
+        pg_collection=SimpleNamespace(cp=SimpleNamespace(size=lambda: 2, rank=lambda: 0)),
+    )
+    first = torch.tensor([0, 32, 96], dtype=dtype)
+    packed = PackedSeqParams(
+        qkv_format="thd",
+        cp_partition_mode="zigzag",
+        cu_seqlens_q=first.clone(),
+        cu_seqlens_q_padded=first.clone(),
+    )
+    hidden = torch.zeros(48, 1, 4)
+    geometry = dsv4_attention.DSv4HybridAttention._seq_zigzag_geometry
+    assert geometry(layer, hidden, packed).chunk_rows.tolist() == [8, 16]
+    packed.cu_seqlens_q_padded.data.copy_(torch.tensor([0, 64, 96], dtype=dtype))
+    assert geometry(layer, hidden, packed).chunk_rows.tolist() == [16, 8]
+
+
+@pytest.mark.parametrize(
+    "boundaries", [[0, 8, 96], [0, 10, 96]], ids=["below_the_floor", "not_a_multiple_of_2cp"]
+)
+def test_seq_zigzag_geometry_checks_the_layout_preconditions(boundaries):
+    """Every layer queues the layout's device-side assertion when it builds its geometry (on CPU
+    the assertion raises at once): a sequence whose half-chunk is shorter than the boundary
+    window, or whose length is not a multiple of 2 * cp_size, does not get a geometry."""
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.transformer.experimental_attention_variant import (
+        deepseek_v4_hybrid_attention as dsv4_attention,
+    )
+
+    layer = SimpleNamespace(
+        config=SimpleNamespace(csa_window_size=4),
+        _dsv4_compress_ratio=0,
+        pg_collection=SimpleNamespace(cp=SimpleNamespace(size=lambda: 2, rank=lambda: 0)),
+    )
+    cu = torch.tensor(boundaries, dtype=torch.int32)
+    packed = PackedSeqParams(
+        qkv_format="thd",
+        cp_partition_mode="zigzag",
+        cu_seqlens_q=cu.clone(),
+        cu_seqlens_q_padded=cu.clone(),
+    )
+    with pytest.raises(RuntimeError, match="DSv4 per-sequence zigzag CP: every packed sequence"):
+        dsv4_attention.DSv4HybridAttention._seq_zigzag_geometry(
+            layer, torch.zeros(48, 1, 4), packed
+        )
 
 
 def test_config_accepts_cudnn_backend_for_fused_sbhd(cudnn_config_capability):

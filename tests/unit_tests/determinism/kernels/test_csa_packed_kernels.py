@@ -44,6 +44,39 @@ def test_cp_compressor_layout_replays():
     assert_replays_bit_exact(indices, (layout[-2], layout[-1]), backward=False, contention=True)
 
 
+def test_explicit_row_rope_positions_replay():
+    """The per-sequence zigzag CP layout hands the RoPE helpers one explicit pack row per local
+    row instead of a consecutive interval: the row -> position map replays bit-exact, equals
+    the interval map on a consecutive interval and resolves rows of other sequences, of an
+    empty sequence's neighbours, beyond the pack end and before its start (position 0)."""
+    seeded()
+    cu = torch.tensor([0, 37, 37, 215, 512], device="cuda", dtype=torch.int32)
+    rows = torch.cat(
+        (torch.arange(200, 232), torch.arange(8, 40), torch.arange(480, 520), torch.arange(-8, 0))
+    ).to(device="cuda", dtype=torch.int32)
+
+    def positions(global_rows):
+        return cp_utils.thd_cp_position_ids_from_rows(cu, global_rows)
+
+    reference, _ = assert_replays_bit_exact(
+        positions, (rows,), backward=False, contention=True, what="explicit-row RoPE positions"
+    )
+    expected = torch.cat(
+        (
+            torch.arange(200, 215) - 37,
+            torch.arange(215, 232) - 215,
+            torch.arange(8, 37),
+            torch.arange(37, 40) - 37,
+            torch.arange(480, 512) - 215,
+            torch.zeros(16, dtype=torch.int64),
+        )
+    ).to(device="cuda", dtype=torch.int32)
+    assert torch.equal(positions(rows), expected)
+    assert all(torch.equal(value, expected) for value in reference.values())
+    interval = torch.arange(100, 420, device="cuda", dtype=torch.int32)
+    assert torch.equal(positions(interval), cp_utils.thd_cp_position_ids(cu, 100, 320))
+
+
 def test_packed_indexer_metadata_and_loss_replay():
     seeded()
     cu_q = torch.tensor([0, 65, 65, 256], device="cuda", dtype=torch.int32)

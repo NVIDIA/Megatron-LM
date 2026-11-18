@@ -85,6 +85,40 @@ _DSV4_CP_BALANCED_REPLAY_SEG_LENS = (512, 512, 1024, 2048)
 _DSV4_CP_BALANCED_THIRD_SEG_LENS = (384, 640, 1024, 2048)
 
 _DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS = ("dsa_cp_graph_layout_buffer", "dsa_cp_graph_route_buffer")
+# Per-sequence zigzag (attention_cp_layout='zigzag'): the same 4096-row capacity, but every
+# physical sequence must be divisible by 2*CP and at least 2*CP*max(window, d_comp) rows long
+# (1024 at CP4 with window 128 / ratio 128) so each zigzag half-chunk covers the boundary
+# window. The first and last sequences carry real padding; the middle one is full.
+_DSV4_CP_ZIGZAG_SEG_LENS = (1000, 2048, 1001)
+_DSV4_CP_ZIGZAG_PADDED_SEG_LENS = (1024, 2048, 1024)
+# The same capacity with zero-length entries in leading, middle and trailing positions (the
+# unused slots of a static thd_max_packed_sequences buffer) and half-chunks of 129 / 255 / 128
+# rows at CP4 (258 / 510 / 256 at CP2): in the first two sequences they are multiples of neither
+# compression ratio, so compressed groups straddle chunk boundaries and take their leading
+# tokens from the halo.
+_DSV4_CP_ZIGZAG_STRADDLE_SEG_LENS = (0, 1001, 0, 2040, 1000, 0)
+_DSV4_CP_ZIGZAG_STRADDLE_PADDED_SEG_LENS = (0, 1032, 0, 2040, 1024, 0)
+# (logical, padded) packs of one static six-slot cu_seqlens buffer: a graph captured with the
+# first must replay correctly with the others (other per-sequence chunk sizes; fewer real
+# sequences; real sequences in other slots with straddling groups). Halo tails, compressor
+# ownership and indexer segments all change between them.
+_DSV4_CP_ZIGZAG_GRAPH_PACKS = (
+    ((1000, 2048, 1001, 0, 0, 0), (1024, 2048, 1024, 0, 0, 0)),
+    ((2000, 1000, 1001, 0, 0, 0), (2048, 1024, 1024, 0, 0, 0)),
+    ((2000, 2040, 0, 0, 0, 0), (2048, 2048, 0, 0, 0, 0)),
+    (_DSV4_CP_ZIGZAG_STRADDLE_SEG_LENS, _DSV4_CP_ZIGZAG_STRADDLE_PADDED_SEG_LENS),
+)
+# Row-wise gates of the zigzag parity tests (row error norm / mean reference row norm). The
+# failure modes of the layout are row local (the first rows of a block read the halo, the last
+# ones feed it) and the global similarity gates dilute them: one wrong row in 1024 passes
+# 1e-3. Measured on the compositions above: output rows are bitwise equal for the window-only
+# layer, bitwise equal or within 3e-3 for the ratio-128 layer (the compressor's RMSNorm rounds a
+# rare row differently when it is handed another number of rows than the reference) and within
+# 6e-3 for the ratio-4 layer (up to 1.5e-2 on packs whose mean row norm is small);
+# hidden-gradient rows within 3.7e-2 (bf16 accumulation order). A wrong row is an error of
+# order 1.
+_DSV4_CP_ZIGZAG_OUTPUT_ROW_EPS = 3e-2
+_DSV4_CP_ZIGZAG_HIDDEN_GRAD_ROW_EPS = 1.5e-1
 
 # Probe the logical route schema, not its packed TE owner mapping. The packed
 # owner mapping intentionally has only two entries and is not a logical-field
@@ -201,7 +235,9 @@ class _ReferenceCPGroup:
         return 1
 
 
-def _make_thd_packed_seq_params(seg_lens, padded_seg_lens=None, device='cuda'):
+def _make_thd_packed_seq_params(
+    seg_lens, padded_seg_lens=None, device='cuda', cp_partition_mode='contiguous'
+):
     """Build THD PackedSeqParams from raw and padded segment lengths."""
     if padded_seg_lens is None:
         padded_seg_lens = seg_lens
@@ -222,7 +258,7 @@ def _make_thd_packed_seq_params(seg_lens, padded_seg_lens=None, device='cuda'):
         max_seqlen_q=max_len,
         max_seqlen_kv=max_len,
         qkv_format='thd',
-        cp_partition_mode='contiguous',
+        cp_partition_mode=cp_partition_mode,
     )
 
 
@@ -267,6 +303,21 @@ def _assert_cp_tensor_match(actual: torch.Tensor, expected: torch.Tensor, label:
         f"cosine_sim={cosine_sim:.10f}, max_abs={max_abs:.6e}, "
         f"actual_norm={actual_norm:.6e}, expected_norm={expected_norm:.6e}, "
         f"eps={_DSV4_CP_PARITY_EPS}"
+    )
+
+
+def _assert_cp_rows_match(actual: torch.Tensor, expected: torch.Tensor, label: str, eps: float):
+    """Assert the largest row error, relative to the mean reference row norm, is within eps."""
+    assert (
+        actual.shape == expected.shape
+    ), f"{label}: shape {tuple(actual.shape)} != {tuple(expected.shape)}"
+    a = actual.float().reshape(actual.shape[0], -1)
+    e = expected.float().reshape(expected.shape[0], -1)
+    row_error = (a - e).norm(dim=1) / e.norm(dim=1).mean().clamp_min(1e-30)
+    worst = int(row_error.argmax())
+    assert row_error[worst].item() <= eps, (
+        f"{label}: row {worst} of {a.shape[0]} has relative error "
+        f"{row_error[worst].item():.4e} > {eps} ({int((row_error > eps).sum())} rows above)"
     )
 
 
@@ -435,6 +486,30 @@ def _make_ragged_cp_case(cp_size, cp_rank):
     local_rows = padded_total_tokens // cp_size
     local_indices = torch.arange(cp_rank * local_rows, (cp_rank + 1) * local_rows, device='cuda')
     return packed, padded_total_tokens, local_indices
+
+
+def _zigzag_local_indices(padded_seg_lens, cp_size, cp_rank, device='cuda'):
+    """Local rows of CP rank ``cp_rank`` under the per-sequence zigzag split
+    (TE ``thd_get_partitioned_indices``): chunks r and 2*cp-1-r of every sequence, in order."""
+    idx, start = [], 0
+    for length in padded_seg_lens:
+        assert length % (2 * cp_size) == 0
+        c = length // (2 * cp_size)
+        for k in (cp_rank, 2 * cp_size - 1 - cp_rank):
+            idx.extend(range(start + k * c, start + (k + 1) * c))
+        start += length
+    return torch.tensor(idx, device=device)
+
+
+def _make_zigzag_cp_case(
+    cp_size,
+    cp_rank,
+    seg_lens=_DSV4_CP_ZIGZAG_SEG_LENS,
+    padded_seg_lens=_DSV4_CP_ZIGZAG_PADDED_SEG_LENS,
+):
+    """Packed params and local rows of one CP rank for the per-sequence zigzag layout."""
+    packed = _make_thd_packed_seq_params(seg_lens, padded_seg_lens, cp_partition_mode='zigzag')
+    return packed, sum(padded_seg_lens), _zigzag_local_indices(padded_seg_lens, cp_size, cp_rank)
 
 
 def _make_hidden_and_grad(padded_total_tokens, hidden_size):
@@ -954,6 +1029,493 @@ class TestDSv4HybridAttentionTHDCP:
 
         del cp_attn, ref_attn, full_hidden, local_hidden, ref_hidden, local_out, ref_out, grad
         _clear_cuda_test_state()
+
+    def _check_zigzag_parity(self, layer_number, apply_rope_fusion, seg_lens, padded_seg_lens):
+        """One pack composition under the per-sequence zigzag CP layout against the
+        full-sequence THD reference: local output, hidden grad and reduced parameter grads on
+        the zigzag-sliced reference tensors."""
+        packed, padded_tokens, local_idx = _make_zigzag_cp_case(
+            self.cp_size, self.cp_rank, seg_lens, padded_seg_lens
+        )
+
+        torch.manual_seed(_SEED + 100 + layer_number)
+        model_parallel_cuda_manual_seed(_SEED + 100 + layer_number)
+        config_cp = _make_dsv4_cp_config(
+            context_parallel_size=self.cp_size,
+            dsa_indexer_loss_coeff=1.0,
+            dsa_indexer_use_sparse_loss=True,
+            use_fused_kernels=True,
+            apply_rope_fusion=apply_rope_fusion,
+            cp_partition_mode="zigzag",
+        )
+        assert config_cp.attention_cp_layout == "zigzag"
+        assert config_cp.dsv4_zigzag_min_padded_seq_len == 2 * self.cp_size * 128
+        assert min(l for l in padded_seg_lens if l) >= config_cp.dsv4_zigzag_min_padded_seq_len
+        config_ref = _make_dsv4_cp_config(
+            context_parallel_size=1,
+            dsa_indexer_loss_coeff=1.0,
+            dsa_indexer_use_sparse_loss=True,
+            use_fused_kernels=True,
+            apply_rope_fusion=apply_rope_fusion,
+        )
+        cp_attn = _build_attention(
+            config_cp, layer_number=layer_number, pg_collection=self.pg
+        ).cuda()
+        ref_attn = _build_attention(
+            config_ref, layer_number=layer_number, pg_collection=self.ref_pg
+        ).cuda()
+        _copy_module_parameters(cp_attn, ref_attn)
+
+        full_hidden = torch.randn(
+            padded_tokens, 1, config_cp.hidden_size, dtype=torch.bfloat16, device='cuda'
+        )
+        local_hidden = full_hidden.index_select(0, local_idx).detach().clone().requires_grad_(True)
+        ref_hidden = full_hidden.detach().clone().requires_grad_(True)
+        ref_packed = _make_thd_packed_seq_params(
+            seg_lens, padded_seg_lens, cp_partition_mode='zigzag'
+        )
+
+        local_out, _ = cp_attn(
+            hidden_states=local_hidden, attention_mask=None, packed_seq_params=packed
+        )
+        ref_out, _ = ref_attn(
+            hidden_states=ref_hidden, attention_mask=None, packed_seq_params=ref_packed
+        )
+        grad = torch.randn_like(ref_out)
+        local_out.backward(grad.index_select(0, local_idx))
+        ref_out.backward(grad)
+        # Every rank finishes its collectives (halo exchange, gradient reduction) before any
+        # comparison can fail: a rank that stopped early would leave its peers blocked.
+        reduced_grads = {}
+        for name, param in cp_attn.named_parameters():
+            has_grad = param.grad is not None
+            grad_sum = param.grad.detach().clone() if has_grad else torch.zeros_like(param)
+            dist.all_reduce(grad_sum, group=self.pg.cp)
+            reduced_grads[name] = (grad_sum, has_grad)
+
+        tag = f"zigzag:layer={layer_number}:rope={apply_rope_fusion}"
+        failures = []
+
+        def check(assertion, *args):
+            try:
+                assertion(*args)
+            except AssertionError as exc:
+                failures.append(str(exc))
+
+        ref_local_out = ref_out.detach().index_select(0, local_idx)
+        ref_local_grad = ref_hidden.grad.index_select(0, local_idx)
+        check(_assert_cp_tensor_match, local_out.detach(), ref_local_out, f"{tag}:output")
+        check(
+            _assert_cp_rows_match,
+            local_out.detach(),
+            ref_local_out,
+            f"{tag}:output",
+            _DSV4_CP_ZIGZAG_OUTPUT_ROW_EPS,
+        )
+        check(
+            _assert_cp_tensor_match,
+            local_hidden.grad.detach(),
+            ref_local_grad,
+            f"{tag}:hidden_grad",
+        )
+        check(
+            _assert_cp_rows_match,
+            local_hidden.grad.detach(),
+            ref_local_grad,
+            f"{tag}:hidden_grad",
+            _DSV4_CP_ZIGZAG_HIDDEN_GRAD_ROW_EPS,
+        )
+        ref_params = dict(ref_attn.named_parameters())
+        for name, (grad_sum, has_grad) in reduced_grads.items():
+            ref_grad = ref_params[name].grad
+            if not has_grad or ref_grad is None:
+                failures.append(f"{tag}: missing CP or reference grad for {name}")
+                continue
+            check(_assert_cp_tensor_match, grad_sum, ref_grad, f"{tag}:param_grad:{name}")
+        any_rank_failed = _max_int_across_world(int(bool(failures)))
+
+        del cp_attn, ref_attn, full_hidden, local_hidden, ref_hidden, local_out, ref_out, grad
+        _clear_cuda_test_state()
+        assert not failures, "\n".join(failures[:6])
+        assert any_rank_failed == 0, "another rank failed"
+
+    @pytest.mark.parametrize(
+        "layer_number",
+        [1, 2, 3],
+        ids=["ratio_0_window_only", "ratio_4_indexer_sparse", "ratio_128_compressor"],
+    )
+    @pytest.mark.parametrize("apply_rope_fusion", [True, False], ids=["fused_rope", "unfused_rope"])
+    def test_thd_cp_zigzag_matches_full_reference_forward_backward(
+        self, layer_number, apply_rope_fusion
+    ):
+        """Per-sequence zigzag CP layout (attention_cp_layout='zigzag') matches the
+        full-sequence THD reference: local output, hidden grad and reduced parameter grads
+        against the zigzag-sliced reference tensors."""
+        if not self.fused_kernels_available:
+            pytest.skip("per-sequence zigzag CP requires the fused DSA kernels")
+        self._check_zigzag_parity(
+            layer_number,
+            apply_rope_fusion,
+            _DSV4_CP_ZIGZAG_SEG_LENS,
+            _DSV4_CP_ZIGZAG_PADDED_SEG_LENS,
+        )
+
+    @pytest.mark.parametrize(
+        "layer_number",
+        [1, 2, 3],
+        ids=["ratio_0_window_only", "ratio_4_indexer_sparse", "ratio_128_compressor"],
+    )
+    def test_thd_cp_zigzag_straddling_groups_and_empty_slots_match_full_reference(
+        self, layer_number
+    ):
+        """The same parity on a pack with zero-length entries in leading, middle and trailing
+        positions and two sequences whose half-chunks are multiples of neither compression
+        ratio: compressed groups straddle chunk boundaries (their leading tokens come from the
+        halo slots) and the slots of the empty sequences must stay inert."""
+        if not self.fused_kernels_available:
+            pytest.skip("per-sequence zigzag CP requires the fused DSA kernels")
+        self._check_zigzag_parity(
+            layer_number,
+            True,
+            _DSV4_CP_ZIGZAG_STRADDLE_SEG_LENS,
+            _DSV4_CP_ZIGZAG_STRADDLE_PADDED_SEG_LENS,
+        )
+
+    @pytest.mark.parametrize(
+        "layer_number", [2, 3], ids=["ratio_4_indexer_sparse", "ratio_128_compressor"]
+    )
+    def test_thd_cp_zigzag_single_projection_compressor_matches_full_reference(
+        self, layer_number, monkeypatch
+    ):
+        """The compressors' single-projection input (delay_wgrad_compute, FSDP sharded
+        weights): hidden rows and halo tails are gathered into compaction order before one
+        projection, instead of being projected in place and compacted afterwards. Same parity
+        as above on the pack with straddling groups and empty slots."""
+        if not self.fused_kernels_available:
+            pytest.skip("per-sequence zigzag CP requires the fused DSA kernels")
+        from megatron.core.transformer.experimental_attention_variant import csa
+
+        monkeypatch.setattr(
+            csa.Compressor, "_cp_requires_single_projection", lambda _compressor: True
+        )
+        self._check_zigzag_parity(
+            layer_number,
+            True,
+            _DSV4_CP_ZIGZAG_STRADDLE_SEG_LENS,
+            _DSV4_CP_ZIGZAG_STRADDLE_PADDED_SEG_LENS,
+        )
+
+    @pytest.mark.parametrize(
+        "layer_number",
+        [1, 2, 3],
+        ids=["ratio_0_window_only", "ratio_4_indexer_sparse", "ratio_128_compressor"],
+    )
+    def test_thd_cp_zigzag_cuda_graph_replay_accepts_changed_boundaries(self, layer_number):
+        """Per-sequence zigzag CP under CUDA graphs: capture with one pack in a static six-slot
+        cu_seqlens buffer, then replay the capture pack and three others written into the same
+        metadata tensors (other per-sequence chunk sizes, fewer real sequences, real sequences
+        in other slots with straddling compressed groups). Every replay must match eager
+        execution: the geometry, halo tails, compressor ownership and indexer segments are
+        rebuilt on device from the static cu_seqlens buffers at every replay. The replayed
+        output is also compared row by row with the full-sequence CP=1 reference, the only
+        check that sees a defect shared by graph and eager execution in this configuration
+        (static slots, max_seqlen = pack capacity)."""
+        if not self.fused_kernels_available:
+            pytest.skip(_DSV4_CP_FUSED_KERNELS_UNAVAILABLE_REASON)
+        padded_tokens = sum(_DSV4_CP_ZIGZAG_GRAPH_PACKS[0][1])
+        packs = []
+        for seg_lens, padded_seg_lens in _DSV4_CP_ZIGZAG_GRAPH_PACKS:
+            assert sum(padded_seg_lens) == padded_tokens
+            packed = _make_thd_packed_seq_params(
+                seg_lens, padded_seg_lens, cp_partition_mode='zigzag'
+            )
+            # As under TE CUDA graphs: the static maximum is the pack capacity for every pack.
+            packed.max_seqlen_q = packed.max_seqlen_kv = padded_tokens
+            packs.append(
+                (packed, _zigzag_local_indices(padded_seg_lens, self.cp_size, self.cp_rank))
+            )
+        capture_packed = packs[0][0]
+        for packed, _ in packs[1:]:
+            assert packed.cu_seqlens_q_padded.shape == capture_packed.cu_seqlens_q_padded.shape
+            assert not torch.equal(packed.cu_seqlens_q_padded, capture_packed.cu_seqlens_q_padded)
+
+        torch.manual_seed(_SEED + 1300 + layer_number)
+        model_parallel_cuda_manual_seed(_SEED + 1300 + layer_number)
+        config = _make_dsv4_cp_config(
+            context_parallel_size=self.cp_size,
+            dsa_indexer_loss_coeff=1.0,
+            dsa_indexer_use_sparse_loss=True,
+            use_fused_kernels=True,
+            apply_rope_fusion=True,
+            cuda_graph_impl="local",
+            cp_partition_mode="zigzag",
+        )
+        for _, padded_seg_lens in _DSV4_CP_ZIGZAG_GRAPH_PACKS:
+            assert min(l for l in padded_seg_lens if l) >= config.dsv4_zigzag_min_padded_seq_len
+        graph_attn = _build_attention(
+            config, layer_number=layer_number, pg_collection=self.pg
+        ).cuda()
+        eager_attn = _build_attention(
+            config, layer_number=layer_number, pg_collection=self.pg
+        ).cuda()
+        graph_attn.train()
+        eager_attn.train()
+        _copy_module_parameters(graph_attn, eager_attn)
+
+        ref_attn = _build_attention(
+            _make_dsv4_cp_config(
+                context_parallel_size=1,
+                dsa_indexer_loss_coeff=1.0,
+                dsa_indexer_use_sparse_loss=True,
+                use_fused_kernels=True,
+                apply_rope_fusion=True,
+            ),
+            layer_number=layer_number,
+            pg_collection=self.ref_pg,
+        ).cuda()
+        ref_attn.train()
+        _copy_module_parameters(graph_attn, ref_attn)
+
+        full_hiddens, hiddens, grads = [], [], []
+        for _, local_idx in packs:
+            full_hidden = torch.randn(
+                padded_tokens, 1, config.hidden_size, dtype=torch.bfloat16, device='cuda'
+            )
+            full_hiddens.append(full_hidden)
+            hiddens.append(full_hidden.index_select(0, local_idx).detach().clone())
+            grads.append(torch.randn_like(hiddens[-1]))
+        static_hidden = hiddens[0].detach().clone().requires_grad_(True)
+        static_grad = grads[0].detach().clone()
+
+        graph, graph_output = _capture_dsv4_attention_forward_backward(
+            graph_attn, static_hidden, static_grad, capture_packed
+        )
+
+        def _replay_and_compare(hidden, grad, packed, tag):
+            with torch.no_grad():
+                static_hidden.copy_(hidden)
+                static_grad.copy_(grad)
+                if static_hidden.grad is not None:
+                    static_hidden.grad.zero_()
+                for param in graph_attn.parameters():
+                    if param.grad is not None:
+                        param.grad.zero_()
+            graph.replay()
+            torch.cuda.synchronize()
+            graph_out = graph_output.detach().clone()
+            graph_hidden_grad = static_hidden.grad.detach().clone()
+            graph_param_grads = {
+                name: param.grad.detach().clone()
+                for name, param in graph_attn.named_parameters()
+                if param.grad is not None
+            }
+            eager_hidden = hidden.detach().clone().requires_grad_(True)
+            eager_out, eager_hidden_grad, eager_param_grads = _run_dsv4_attention_forward_backward(
+                eager_attn, eager_hidden, grad, packed
+            )
+            torch.cuda.synchronize()
+            assert graph_param_grads.keys() == eager_param_grads.keys()
+            # Verdicts are collected: a rank that stopped here would leave its peers blocked
+            # in the collectives of the next replay.
+            comparisons = [
+                (_assert_cp_graph_bitwise_match, (graph_out, eager_out, f"{tag}:output")),
+                (
+                    _assert_cp_graph_fused_grad_match,
+                    (graph_hidden_grad, eager_hidden_grad, f"{tag}:hidden_grad"),
+                ),
+            ]
+            for name, graph_grad in graph_param_grads.items():
+                comparisons.append(
+                    (
+                        _assert_cp_graph_fused_grad_match,
+                        (graph_grad, eager_param_grads[name], f"{tag}:param_grad:{name}"),
+                    )
+                )
+            for assertion, args in comparisons:
+                try:
+                    assertion(*args)
+                except AssertionError as exc:
+                    replay_failures.append(str(exc))
+            return graph_out
+
+        replay_failures = []
+        reference_failures = []
+        for index, (packed, local_idx) in enumerate(packs):
+            if index:
+                with torch.no_grad():
+                    capture_packed.cu_seqlens_q.copy_(packed.cu_seqlens_q)
+                    capture_packed.cu_seqlens_kv.copy_(packed.cu_seqlens_kv)
+                    capture_packed.cu_seqlens_q_padded.copy_(packed.cu_seqlens_q_padded)
+                    capture_packed.cu_seqlens_kv_padded.copy_(packed.cu_seqlens_kv_padded)
+            tag = f"zigzag:layer={layer_number}:pack{index}"
+            graph_out = _replay_and_compare(hiddens[index], grads[index], packed, tag)
+            # The reference forward is rank local; its verdict is collected so that every rank
+            # still enters the next replay's collectives.
+            seg_lens, padded_seg_lens = _DSV4_CP_ZIGZAG_GRAPH_PACKS[index]
+            ref_packed = _make_thd_packed_seq_params(
+                seg_lens, padded_seg_lens, cp_partition_mode='zigzag'
+            )
+            ref_packed.max_seqlen_q = ref_packed.max_seqlen_kv = padded_tokens
+            # Autograd stays enabled: under no_grad the reference would take the inference
+            # indexer branch, whose rows between a sequence's logical and padded length differ
+            # from the training branch the graph was captured with.
+            ref_out, _ = ref_attn(
+                hidden_states=full_hiddens[index], attention_mask=None, packed_seq_params=ref_packed
+            )
+            ref_out = ref_out.detach()
+            try:
+                _assert_cp_rows_match(
+                    graph_out,
+                    ref_out.index_select(0, local_idx),
+                    f"{tag}:output-vs-reference",
+                    _DSV4_CP_ZIGZAG_OUTPUT_ROW_EPS,
+                )
+            except AssertionError as exc:
+                reference_failures.append(str(exc))
+        failures = replay_failures + reference_failures
+        any_rank_failed = _max_int_across_world(int(bool(failures)))
+
+        graph.reset()
+        del graph, graph_output, graph_attn, eager_attn, ref_attn, full_hiddens, hiddens, grads
+        del static_hidden, static_grad
+        _clear_cuda_test_state()
+        assert not failures, "\n".join(failures[:6])
+        assert any_rank_failed == 0, "another rank failed"
+
+    @pytest.mark.parametrize(
+        "layer_number",
+        [1, 2, 3],
+        ids=["ratio_0_window_only", "ratio_4_indexer", "ratio_128_compressor"],
+    )
+    def test_thd_cp_zigzag_mla_up_proj_recompute_matches_eager(self, layer_number):
+        """Selective MLA up-projection recompute under the per-sequence zigzag layout matches the
+        same layer without recompute (the recompute closure must reuse the zigzag geometry and the
+        backward's KV reconstruction keeps the layout's cat order)."""
+        if not self.fused_kernels_available:
+            pytest.skip(_DSV4_CP_FUSED_KERNELS_UNAVAILABLE_REASON)
+        packed, padded_tokens, local_idx = _make_zigzag_cp_case(self.cp_size, self.cp_rank)
+
+        torch.manual_seed(_SEED + 1500 + layer_number)
+        model_parallel_cuda_manual_seed(_SEED + 1500 + layer_number)
+        eager_config = _make_dsv4_cp_config(
+            context_parallel_size=self.cp_size,
+            dsa_indexer_loss_coeff=1.0,
+            dsa_indexer_use_sparse_loss=True,
+            use_fused_kernels=True,
+            apply_rope_fusion=True,
+            cp_partition_mode="zigzag",
+        )
+        recompute_config = _make_dsv4_cp_config(
+            context_parallel_size=self.cp_size,
+            dsa_indexer_loss_coeff=1.0,
+            dsa_indexer_use_sparse_loss=True,
+            use_fused_kernels=True,
+            apply_rope_fusion=True,
+            cp_partition_mode="zigzag",
+        )
+        recompute_config.recompute_granularity = "selective"
+        recompute_config.recompute_modules = ["mla_up_proj"]
+
+        eager_attn = _build_attention(
+            eager_config, layer_number=layer_number, pg_collection=self.pg
+        ).cuda()
+        recompute_attn = _build_attention(
+            recompute_config, layer_number=layer_number, pg_collection=self.pg
+        ).cuda()
+        eager_attn.train()
+        recompute_attn.train()
+        # the comparison below is only meaningful if the second module really recomputes
+        assert recompute_attn.recompute_up_proj and not eager_attn.recompute_up_proj
+        _copy_module_parameters(eager_attn, recompute_attn)
+
+        full_hidden, full_grad = _make_hidden_and_grad(padded_tokens, eager_config.hidden_size)
+        hidden = full_hidden.index_select(0, local_idx)
+        grad = full_grad.index_select(0, local_idx)
+        eager_result = _run_dsv4_attention_forward_backward(
+            eager_attn, hidden.detach().clone().requires_grad_(True), grad, packed
+        )
+        recompute_result = _run_dsv4_attention_forward_backward(
+            recompute_attn, hidden.detach().clone().requires_grad_(True), grad, packed
+        )
+        mode = f"zigzag:layer={layer_number}:mla_up_proj_recompute"
+        _assert_cp_tensor_match(recompute_result[0], eager_result[0], f"{mode}:output")
+        _assert_cp_tensor_match(recompute_result[1], eager_result[1], f"{mode}:hidden_grad")
+        assert recompute_result[2].keys() == eager_result[2].keys()
+        for name, recompute_grad in recompute_result[2].items():
+            _assert_cp_tensor_match(
+                recompute_grad, eager_result[2][name], f"{mode}:param_grad:{name}"
+            )
+        del eager_attn, recompute_attn, full_hidden, full_grad, hidden, grad
+        _clear_cuda_test_state()
+
+    def test_thd_cp_zigzag_ratio4_eval_matches_full_reference(self):
+        """Inference under the per-sequence zigzag layout (eval, no grad): the ratio-4 layer
+        lowers the indexer's top-k ids through the block-mode index kernel without the loss path
+        (every validation step runs this branch). The pack's longest sequence has 510 compressed
+        rows against top-k 512, so the indexer returns every visible group and the comparison
+        with the reference is free of near-tie selection differences."""
+        if not self.fused_kernels_available:
+            pytest.skip("per-sequence zigzag CP requires the fused DSA kernels")
+        layer_number = 2
+        seg_lens = _DSV4_CP_ZIGZAG_STRADDLE_SEG_LENS
+        padded_seg_lens = _DSV4_CP_ZIGZAG_STRADDLE_PADDED_SEG_LENS
+        packed, padded_tokens, local_idx = _make_zigzag_cp_case(
+            self.cp_size, self.cp_rank, seg_lens, padded_seg_lens
+        )
+
+        torch.manual_seed(_SEED + 1600 + layer_number)
+        model_parallel_cuda_manual_seed(_SEED + 1600 + layer_number)
+        common = dict(
+            dsa_indexer_loss_coeff=1.0,
+            dsa_indexer_use_sparse_loss=True,
+            use_fused_kernels=True,
+            apply_rope_fusion=True,
+        )
+        config_cp = _make_dsv4_cp_config(
+            context_parallel_size=self.cp_size, cp_partition_mode="zigzag", **common
+        )
+        config_ref = _make_dsv4_cp_config(context_parallel_size=1, **common)
+        cp_attn = _build_attention(config_cp, layer_number=layer_number, pg_collection=self.pg)
+        ref_attn = _build_attention(
+            config_ref, layer_number=layer_number, pg_collection=self.ref_pg
+        )
+        cp_attn, ref_attn = cp_attn.cuda().eval(), ref_attn.cuda().eval()
+        _copy_module_parameters(cp_attn, ref_attn)
+
+        full_hidden = torch.randn(
+            padded_tokens, 1, config_cp.hidden_size, dtype=torch.bfloat16, device='cuda'
+        )
+        local_hidden = full_hidden.index_select(0, local_idx)
+        ref_packed = _make_thd_packed_seq_params(
+            seg_lens, padded_seg_lens, cp_partition_mode='zigzag'
+        )
+        with torch.no_grad():
+            local_out, _ = cp_attn(
+                hidden_states=local_hidden, attention_mask=None, packed_seq_params=packed
+            )
+            ref_out, _ = ref_attn(
+                hidden_states=full_hidden, attention_mask=None, packed_seq_params=ref_packed
+            )
+        tag = f"zigzag:layer={layer_number}:eval:output"
+        ref_local_out = ref_out.index_select(0, local_idx)
+        failures = []
+        for assertion, args in (
+            (_assert_cp_tensor_match, (local_out, ref_local_out, tag)),
+            (
+                _assert_cp_rows_match,
+                (local_out, ref_local_out, tag, _DSV4_CP_ZIGZAG_OUTPUT_ROW_EPS),
+            ),
+        ):
+            try:
+                assertion(*args)
+            except AssertionError as exc:
+                failures.append(str(exc))
+        any_rank_failed = _max_int_across_world(int(bool(failures)))
+
+        del cp_attn, ref_attn, full_hidden, local_hidden, local_out, ref_out
+        _clear_cuda_test_state()
+        assert not failures, "\n".join(failures)
+        assert any_rank_failed == 0, "another rank failed"
 
     @pytest.mark.parametrize("balanced", [False, True], ids=["contiguous", "balanced"])
     def test_thd_cp_mxfp8_matches_full_reference_forward_backward(self, balanced, monkeypatch):

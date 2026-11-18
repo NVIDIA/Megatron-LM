@@ -109,6 +109,11 @@ def cp_config(request):
             id="gdn2-contiguous",
         ),
         pytest.param(
+            # DSv4 runs the zigzag layout only with static CP and the settings its
+            # per-sequence zigzag validation accepts (tests/unit_tests/transformer/
+            # test_cp_seq_zigzag.py). Neither holds here (dynamic CP; a pack capacity
+            # below the layout's padding floor), and every such rejection names the
+            # contiguous layout as the alternative.
             dict(cp_partition_mode="zigzag", experimental_attention_variant="dsv4_hybrid"),
             "requires cp_partition_mode='contiguous'",
             id="dsv4-zigzag",

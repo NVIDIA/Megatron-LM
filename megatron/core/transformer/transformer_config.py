@@ -58,6 +58,10 @@ from ..utils import (
 
 logger = logging.getLogger(__name__)
 
+# (thd_max_packed_sequences, halo rows, max_seqlen_per_dp_cp_rank) combinations the DSv4
+# zigzag halo-size warning has already reported in this process.
+_DSV4_ZIGZAG_HALO_WARNED: set = set()
+
 try:
     from packaging.version import Version as PkgVersion
 
@@ -1595,7 +1599,10 @@ class TransformerConfig(ModelParallelConfig):
     roughly ceil(max_seqlen_per_dp_cp_rank * cp_size / min_seq_len_after_filter).
     Setting it too small results in more microbatches with smaller packs (wasted
     token budget); setting it too large just allocates a slightly larger cu_seqlens
-    buffer."""
+    buffer. Exception: under DSv4 ``attention_cp_layout='zigzag'`` every slot also
+    costs ``2 * max(csa_window_size, d_comp)`` halo rows per rank in every layer
+    (boundary exchange, KV projection, RoPE), so keep it close to the real
+    packed-sequence count there."""
 
     cuda_graph_dynamic_microbatches: bool = False
     """Allow CUDA graph replay when runtime microbatch count varies across iterations.
@@ -2119,6 +2126,133 @@ class TransformerConfig(ModelParallelConfig):
                     setattr(self, canonical, canonical_value)
                 setattr(self, legacy, canonical_value)
 
+    @property
+    def dsv4_zigzag_min_padded_seq_len(self) -> int:
+        """Per-sequence padded-length floor of the THD data pipeline under DSv4
+        ``attention_cp_layout='zigzag'`` with CP > 1 (0 otherwise).
+
+        Every non-empty packed sequence is padded to at least
+        ``2 * cp_size * max(csa_window_size, d_comp)`` rows so that each zigzag half-chunk covers
+        the boundary window of every attention layer (``csa_utils/cp_seq_zigzag.py``); a
+        post-pack padding tail shorter than this extends the last non-empty sequence instead of
+        becoming a dummy sequence."""
+        if (
+            self.experimental_attention_variant != "dsv4_hybrid"
+            or self.context_parallel_size <= 1
+            or self.attention_cp_layout != "zigzag"
+        ):
+            return 0
+        from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_seq_zigzag
+
+        return cp_seq_zigzag.dsv4_zigzag_min_padded_seq_len(
+            self.context_parallel_size, self.csa_window_size, self.csa_compress_ratios or []
+        )
+
+    def _validate_dsv4_seq_zigzag_cp(self) -> None:
+        """Per-sequence zigzag CP (``attention_cp_layout='zigzag'``) for the DSv4 attention stack.
+
+        The data split is Megatron's THD zigzag (``tex.thd_get_partitioned_indices``); inside
+        CSA every CP mechanism runs on the rank's ``2 * n_seq`` row blocks through the
+        block-table layout kernels (``csa_utils/cp_seq_zigzag.py``). The full-iteration CUDA
+        graph rejection sits further down in ``__post_init__``, after the deprecated CUDA
+        graph spellings are folded into ``cuda_graph_impl``.
+        """
+        from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_seq_zigzag
+        from megatron.core.transformer.experimental_attention_variant.dsa_fused_safety import (
+            FUSED_INDEXER_MAX_SAFE_ROWS,
+        )
+        from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+            use_fused_dsa_kernels,
+        )
+
+        fallback = (
+            "; with these settings DSv4 context parallelism requires "
+            "cp_partition_mode='contiguous' (attention_cp_layout='contiguous')."
+        )
+        if self.dsa_cp_balance_indexer:
+            raise ValueError(
+                "dsa_cp_balance_indexer routes the contiguous layout; attention_cp_layout="
+                "'zigzag' balances the indexer through the layout itself, disable the flag"
+                + fallback
+            )
+        if self.sequence_packing_scheduler != "dp_balanced":
+            # Only that data path pads every packed sequence to the per-sequence floor
+            # (dsv4_zigzag_min_padded_seq_len), accounts for the floor when packing and hands
+            # the attention stack the logical sequence boundaries. The other THD frontends
+            # (SFT / inter-document masking without a scheduler, RL packing) do none of this,
+            # and default_dynamic_cp sizes its packs for candidate CP groups rather than for
+            # the static one that pads and slices them.
+            raise ValueError(
+                "DSv4 attention_cp_layout='zigzag' requires sequence_packing_scheduler="
+                f"'dp_balanced' (got {self.sequence_packing_scheduler!r}): only that data path "
+                "applies the per-sequence padding floor of the layout" + fallback
+            )
+        if not use_fused_dsa_kernels(self):
+            raise ValueError(
+                "DSv4 attention_cp_layout='zigzag' requires the fused DSA kernel backend" + fallback
+            )
+        uses_ratio4_indexer = (
+            bool(self.csa_compress_ratios)
+            and 4 in self.csa_compress_ratios
+            and not self.csa_dense_mode
+        )
+        if uses_ratio4_indexer and not self.dsa_indexer_use_sparse_loss:
+            raise ValueError(
+                "DSv4 attention_cp_layout='zigzag' currently supports the sparse indexer loss "
+                "only (set dsa_indexer_use_sparse_loss=True)" + fallback
+            )
+        if self.dsv4_zigzag_min_padded_seq_len == 0:
+            # csa_window_size == 0 with window-only layers: no boundary window, so no halo
+            # and no padding floor, which is what selects this layout at run time.
+            raise ValueError(
+                "DSv4 attention_cp_layout='zigzag' needs a boundary window (csa_window_size "
+                ">= 1 or a compressing layer)" + fallback
+            )
+        # Post-pack padding, which applies the per-sequence floor, is a data-path setting:
+        # wrap_data_iterator rejects a DSv4 zigzag configuration that leaves it disabled.
+        if self.max_seqlen_per_dp_cp_rank is not None:
+            if uses_ratio4_indexer and self.max_seqlen_per_dp_cp_rank > FUSED_INDEXER_MAX_SAFE_ROWS:
+                raise ValueError(
+                    "DSv4 attention_cp_layout='zigzag' scores all per-rank rows in one fused "
+                    f"indexer call: max_seqlen_per_dp_cp_rank={self.max_seqlen_per_dp_cp_rank} "
+                    f"exceeds the verified-safe limit of {FUSED_INDEXER_MAX_SAFE_ROWS}. Increase "
+                    "CP or reduce max_seqlen_per_dp_cp_rank" + fallback
+                )
+            floor = self.dsv4_zigzag_min_padded_seq_len
+            if floor > self.max_seqlen_per_dp_cp_rank * self.context_parallel_size:
+                raise ValueError(
+                    "DSv4 attention_cp_layout='zigzag' needs a per-sequence padded length of at "
+                    f"least {floor} rows, above the pack capacity "
+                    f"{self.max_seqlen_per_dp_cp_rank * self.context_parallel_size}" + fallback
+                )
+            if self.thd_max_packed_sequences is not None:
+                # Static halo slot region: one d_window-row slot per (sequence, chunk) block
+                # of the static sequence capacity, exchanged, projected and RoPE'd by every
+                # layer whether or not the slots belong to real sequences (correct for any
+                # size, so only its cost is flagged).
+                d_window = cp_seq_zigzag.max_boundary_window(
+                    self.csa_window_size, self.csa_compress_ratios or []
+                )
+                halo_rows = 2 * self.thd_max_packed_sequences * d_window
+                # The training entry points rebuild the config for every microbatch: report
+                # each (slots, halo rows, capacity) combination once per process.
+                warned = (self.thd_max_packed_sequences, halo_rows, self.max_seqlen_per_dp_cp_rank)
+                if (
+                    4 * halo_rows > self.max_seqlen_per_dp_cp_rank
+                    and warned not in _DSV4_ZIGZAG_HALO_WARNED
+                ):
+                    _DSV4_ZIGZAG_HALO_WARNED.add(warned)
+                    share = halo_rows / self.max_seqlen_per_dp_cp_rank
+                    log_single_rank(
+                        logger,
+                        logging.WARNING,
+                        "DSv4 attention_cp_layout='zigzag' keeps one boundary window per "
+                        f"(sequence, chunk) block: thd_max_packed_sequences="
+                        f"{self.thd_max_packed_sequences} adds {halo_rows} halo rows per rank "
+                        f"({share:.0%} of max_seqlen_per_dp_cp_rank) to every layer's KV "
+                        "projection and RoPE; lower it to the real packed-sequence count.",
+                    )
+
     def _validate_dsv4_execution_scope(self) -> None:
         """Validate dev indexer choices before the shared layout/backend checks."""
         if self.experimental_attention_variant != "dsv4_hybrid":
@@ -2475,7 +2609,13 @@ class TransformerConfig(ModelParallelConfig):
                         "experimental_attention_variant='gdn2', which supports only headwise CP."
                     )
             elif self.cp_partition_mode == "zigzag":
-                if self.experimental_attention_variant == "dsv4_hybrid":
+                # Static context parallelism runs the zigzag split through the per-sequence
+                # zigzag CSA layout (_validate_dsv4_seq_zigzag_cp below); dynamic context
+                # parallelism keeps requiring the contiguous layout.
+                if (
+                    self.experimental_attention_variant == "dsv4_hybrid"
+                    and self.dynamic_context_parallel
+                ):
                     raise ValueError(
                         "DSv4 Hybrid with context parallelism requires "
                         "cp_partition_mode='contiguous'."
@@ -2517,6 +2657,16 @@ class TransformerConfig(ModelParallelConfig):
                     f"release; use dsa_kernel_backend={legacy_backend!r} instead.",
                 )
                 self.dsa_kernel_backend = legacy_backend
+
+        if (
+            has_context_parallelism
+            and self.cp_partition_mode == "zigzag"
+            and self.experimental_attention_variant == "dsv4_hybrid"
+        ):
+            # dsv4_hybrid runs the standard zigzag split through the per-sequence zigzag CSA
+            # layout (csa_utils/cp_seq_zigzag.py). Checked after the apply_dsa_kernel_fusion
+            # fold: the fused-backend predicate must see the final dsa_kernel_backend.
+            self._validate_dsv4_seq_zigzag_cp()
 
         if self.dsa_indexer_weights_proj_output_dtype not in ("bf16", "fp32"):
             raise ValueError(
@@ -2755,10 +2905,6 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.tensor_model_parallel_size == 1
             ), "DSv4 Hybrid Attention only supports TP size 1."
-            if self.context_parallel_size > 1 and self.attention_cp_layout != "contiguous":
-                raise ValueError(
-                    "DSv4 context parallelism requires attention_cp_layout='contiguous'."
-                )
             if self.dynamic_context_parallel and not self.dsa_cp_balance_indexer:
                 # NOTE(nightly-sync 26_10_2026): main rejects DSv4 + dynamic CP outright
                 # ("not supported yet"), but dev has since implemented it for the balanced
@@ -5040,6 +5186,32 @@ class TransformerConfig(ModelParallelConfig):
                     )
 
         graph_captures_attention = cuda_graph_captures_attention(self)
+
+        if self.dsv4_zigzag_min_padded_seq_len:
+            # Checked here rather than in _validate_dsv4_seq_zigzag_cp: both gates read
+            # cuda_graph_impl, into which the deprecated cuda_graph_modules / cuda_graph_scope
+            # spellings are folded above.
+            fallback = (
+                "; with these settings DSv4 context parallelism requires "
+                "cp_partition_mode='contiguous' (attention_cp_layout='contiguous')."
+            )
+            if self.cuda_graph_impl == "full_iteration":
+                raise ValueError(
+                    "DSv4 attention_cp_layout='zigzag' is incompatible with full-iteration CUDA "
+                    "graphs" + fallback
+                )
+            if (
+                self.max_seqlen_per_dp_cp_rank is not None
+                and self.max_seqlen_per_dp_cp_rank % 2 != 0
+                and (self.pad_packed_seq_alignment == "max" or self.cuda_graph_impl != "none")
+            ):
+                # Every sequence is a multiple of 2 * cp_size rows, so a rank never holds an
+                # odd number of rows; a pack padded to an odd capacity cannot exist (and the
+                # CUDA-graph capture sample would trip the layout's device-side assertion).
+                raise ValueError(
+                    "DSv4 attention_cp_layout='zigzag' with fixed-capacity packing needs an even "
+                    f"max_seqlen_per_dp_cp_rank, got {self.max_seqlen_per_dp_cp_rank}" + fallback
+                )
 
         if self.dsa_cp_balance_indexer_graph_dynamic_packs:
             if self.dynamic_context_parallel or self.context_parallel_size <= 1:

@@ -200,6 +200,123 @@ def test_static_cp_capacity_counts_per_sequence_padding(pad_sequences):
     assert [sid for group in groups for sid in group[0]] == list(range(12))
 
 
+def test_static_cp_scheduler_applies_per_sequence_floor():
+    # DSv4 zigzag floor at CP16 / window 128: every 1000-token document counts 4096 rows, so a
+    # pack of capacity 2048 * 16 = 32768 rows holds eight of them (24 without the floor).
+    scheduler = DpBalancedScheduler(2048, 16, 1, None, pad_sequences=True, min_seq_len=4096)
+    groups = scheduler.get_groups_and_subsamples(list(enumerate([1000] * 24)))
+    assert len(groups) == 3
+    assert [sid for group in groups for sid in group[0]] == list(range(24))
+    assert all(len(group[0]) <= 8 for group in groups)
+    scheduler = DpBalancedScheduler(2048, 16, 1, None, pad_sequences=True)
+    assert len(scheduler.get_groups_and_subsamples(list(enumerate([1000] * 24)))) == 1
+
+
+def _wrap_config(**overrides):
+    config = dict(
+        sequence_packing_scheduler='dp_balanced',
+        min_dynamic_context_parallel_size=1,
+        dynamic_context_parallel=False,
+        max_seqlen_per_dp_cp_rank=2048,
+        pad_packed_seq_alignment=32,
+        virtual_pipeline_model_parallel_size=None,
+    )
+    config.update(overrides)
+    return SimpleNamespace(**config)
+
+
+def _wrap(config):
+    return data_schedule.wrap_data_iterator(
+        None,
+        config,
+        1,
+        pg_collection=ProcessGroupCollection(
+            dp_cp=_group(16), dp=_group(1), tp=_group(1), pp=_group(1)
+        ),
+    )
+
+
+def test_wrap_iterator_passes_the_dsv4_zigzag_floor(monkeypatch, no_global_process_groups):
+    seen = []
+
+    def run(scheduler, *args):
+        assert scheduler.pad_sequences and scheduler.cp_size == 16
+        seen.append(scheduler.min_seq_len)
+        return None, 0, 0, 0
+
+    def init_without_floor(self, *args, **kwargs):
+        assert 'min_seq_len' not in kwargs  # other configurations: scheduler arguments unchanged
+        seen.append('unchanged')
+
+    monkeypatch.setattr(DpBalancedScheduler, 'run', run)
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: torch.device('cpu'))
+    _wrap(_wrap_config(dsv4_zigzag_min_padded_seq_len=4096))
+    assert seen == [4096]
+    for scheduler_class, name in (
+        (DpBalancedScheduler, 'dp_balanced'),
+        (DefaultDynamicCPScheduler, 'default_dynamic_cp'),
+    ):
+        monkeypatch.setattr(scheduler_class, '__init__', init_without_floor)
+        monkeypatch.setattr(scheduler_class, 'run', lambda self, *args: (None, 0, 0, 0))
+        for config in (
+            _wrap_config(sequence_packing_scheduler=name),
+            _wrap_config(sequence_packing_scheduler=name, dsv4_zigzag_min_padded_seq_len=0),
+        ):
+            _wrap(config)
+    assert seen == [4096] + ['unchanged'] * 4
+
+
+@pytest.mark.parametrize(
+    'overrides,match',
+    [
+        ({'pad_packed_seq_alignment': None}, "needs post-pack padding"),
+        (
+            {'sequence_packing_scheduler': 'default_dynamic_cp'},
+            "requires sequence_packing_scheduler='dp_balanced'",
+        ),
+    ],
+    ids=['padding_disabled', 'default_dynamic_cp_static'],
+)
+def test_wrap_iterator_rejects_dsv4_zigzag_without_its_packing_path(
+    monkeypatch, no_global_process_groups, overrides, match
+):
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: torch.device('cpu'))
+    with pytest.raises(ValueError, match=match):
+        _wrap(_wrap_config(dsv4_zigzag_min_padded_seq_len=4096, **overrides))
+
+
+@pytest.mark.parametrize(
+    'floor,cp_size,expected',
+    [(512, 2, [0, 10]), (0, 2, [0, 16]), (0, 1, [0, 16])],
+    ids=['dsv4_zigzag_cp2', 'other_cp2', 'cp1'],
+)
+def test_sequence_packing_batch_carries_logical_boundaries_only_for_dsv4_zigzag(
+    cpu_batch_communication, floor, cp_size, expected
+):
+    # The DSv4 zigzag layout (non-zero floor: dsv4_hybrid + attention_cp_layout='zigzag' + CP > 1)
+    # needs the logical cu_seqlens_q next to the padded ones; every other configuration, DSv4
+    # at CP = 1 included, keeps the standard zigzag metadata (physical boundaries only).
+    batch = _batch([16])
+    batch['cu_seqlens'] = torch.tensor([0, 10], dtype=torch.int32)  # 10 valid of 16 rows
+    cp = _group(cp_size)
+    result = data_schedule.get_batch_on_this_rank_for_sequence_packing(
+        iter([batch]),
+        dynamic_cp=False,
+        pg_collection=ProcessGroupCollection(tp=_group(1), pp=_group(1), cp=cp, tp_cp=cp),
+        config=SimpleNamespace(
+            sequence_parallel=False,
+            linear_cp_layout='zigzag',
+            attention_cp_layout='zigzag',
+            experimental_attention_variant='dsv4_hybrid',
+            dsv4_zigzag_min_padded_seq_len=floor,
+        ),
+        return_context_parallel_batch=True,
+    )
+    params = result.get_packed_seq_params('zigzag')
+    assert params.cu_seqlens_q.tolist() == expected
+    assert params.cu_seqlens_q_padded.tolist() == [0, 16]
+
+
 def test_static_cp_splits_a_single_packed_group_across_dp_ranks():
     scheduler = DpBalancedScheduler(1024, 1, 4, None)
     groups = scheduler.get_groups_and_subsamples(list(enumerate([100] * 8)))

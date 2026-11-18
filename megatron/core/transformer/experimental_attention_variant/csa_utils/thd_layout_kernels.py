@@ -355,6 +355,256 @@ if _CUTE_AVAILABLE:
             stream=stream,
         )
 
+    # Block-table variants (per-sequence zigzag CP, csa_utils/cp_seq_zigzag.py): the rank's rows
+    # are n_blocks contiguous row blocks, each inside one sequence, described by device tables
+    # (rows, local offset, global start, sequence id). Each block is one compaction segment and
+    # owns the groups whose last token lies in its chunk plus the groups starting within the
+    # d_comp rows before it (the contiguous ownership rule evaluated per block). The conceptual
+    # source buffer is ``[halo slot tails (n_blocks * d_comp rows) | local rows]``.
+    @cute.kernel
+    def _compressor_row_maps_blocks_kernel(
+        cu_seqlens: cute.Tensor,
+        block_rows: cute.Tensor,
+        block_loff: cute.Tensor,
+        block_gstart: cute.Tensor,
+        block_seq: cute.Tensor,
+        compact_to_source: cute.Tensor,
+        source_to_compact: cute.Tensor,
+        comp_ids: cute.Tensor,
+        position_ids: cute.Tensor,
+        local_cu: cute.Tensor,
+        local_cuc: cute.Tensor,
+        global_cuc: cute.Tensor,
+        n_seq: cutlass.Int32,
+        n_blocks: cutlass.Int32,
+        l_local: cutlass.Int32,
+        ratio: cutlass.Constexpr,
+        d_comp: cutlass.Constexpr,
+        compact_len: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        row = bidx * 128 + tidx
+        halo_rows = n_blocks * d_comp
+        source_row = cutlass.Int32(-1)
+        compact_row = cutlass.Int32(-1)
+        group_id = cutlass.Int32(-1)
+        running_tokens = 0
+        # Source row ``row`` (inverse map): its block and global pack row.
+        src_block = cutlass.Int32(-1)
+        src_global = cutlass.Int32(-1)
+        if row < halo_rows:
+            src_block = row // d_comp
+            src_global = block_gstart[src_block] - d_comp + (row - src_block * d_comp)
+        else:
+            if row < halo_rows + l_local:
+                j = row - halo_rows
+                for b in range(n_blocks):
+                    if j >= block_loff[b] and block_rows[b] > 0:
+                        src_block = b
+                if src_block >= 0:
+                    src_global = block_gstart[src_block] + (j - block_loff[src_block])
+        if row == 0:
+            local_cu[0] = 0
+            local_cuc[0] = 0
+            global_cuc[0] = 0
+            global_groups = 0
+            for seq in range(n_seq):
+                global_groups = global_groups + (cu_seqlens[seq + 1] - cu_seqlens[seq]) // ratio
+                global_cuc[seq + 1] = global_groups
+        for b in range(n_blocks):
+            rows_b = block_rows[b]
+            g0 = block_gstart[b]
+            seq_start = cu_seqlens[block_seq[b]]
+            chunk_start = g0 - seq_start
+            first_numer = chunk_start - d_comp
+            if first_numer < 0:
+                first_numer = 0
+            first = cute.ceil_div(first_numer, ratio)
+            stop = (chunk_start + rows_b) // ratio
+            count = cutlass.Int32(0)
+            if rows_b > 0:
+                count = stop - first
+                if count < 0:
+                    count = 0
+            tokens = count * ratio
+            if row >= running_tokens and row < running_tokens + tokens:
+                offset = row - running_tokens
+                group_id = first + offset // ratio
+                g_row = seq_start + group_id * ratio + (offset - (offset // ratio) * ratio)
+                if g_row < g0:
+                    source_row = b * d_comp + (g_row - (g0 - d_comp))
+                else:
+                    source_row = halo_rows + block_loff[b] + (g_row - g0)
+            if src_block == b and src_global >= seq_start and rows_b > 0:
+                g = (src_global - seq_start) // ratio
+                if g >= first and g < stop:
+                    compact_row = (
+                        running_tokens + (g - first) * ratio + (src_global - seq_start - g * ratio)
+                    )
+            running_tokens = running_tokens + tokens
+            if row == 0:
+                local_cu[b + 1] = running_tokens
+                local_cuc[b + 1] = running_tokens // ratio
+        if row < compact_len:
+            compact_to_source[row] = source_row
+            if row % ratio == 0:
+                comp_ids[row // ratio] = group_id
+                position_id = cutlass.Int32(0)
+                if group_id >= 0:
+                    position_id = group_id * ratio
+                position_ids[row // ratio] = position_id
+        if row < halo_rows + l_local:
+            source_to_compact[row] = compact_row
+
+    @cute.jit
+    def _compressor_row_maps_blocks_launch(
+        cu_seqlens: cute.Tensor,
+        block_rows: cute.Tensor,
+        block_loff: cute.Tensor,
+        block_gstart: cute.Tensor,
+        block_seq: cute.Tensor,
+        compact_to_source: cute.Tensor,
+        source_to_compact: cute.Tensor,
+        comp_ids: cute.Tensor,
+        position_ids: cute.Tensor,
+        local_cu: cute.Tensor,
+        local_cuc: cute.Tensor,
+        global_cuc: cute.Tensor,
+        n_seq: cutlass.Int32,
+        n_blocks: cutlass.Int32,
+        l_local: cutlass.Int32,
+        ratio: cutlass.Constexpr,
+        d_comp: cutlass.Constexpr,
+        compact_len: cutlass.Int32,
+        rows: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        _launch_named(
+            _compressor_row_maps_blocks_kernel,
+            "dsv4_cp_compressor_row_maps_blocks",
+            (
+                cu_seqlens,
+                block_rows,
+                block_loff,
+                block_gstart,
+                block_seq,
+                compact_to_source,
+                source_to_compact,
+                comp_ids,
+                position_ids,
+                local_cu,
+                local_cuc,
+                global_cuc,
+                n_seq,
+                n_blocks,
+                l_local,
+                ratio,
+                d_comp,
+                compact_len,
+            ),
+            grid=(cute.ceil_div(rows, 128), 1, 1),
+            block=(128, 1, 1),
+            stream=stream,
+        )
+
+    # Sequence-major -> rank-major compressed row map for the block layout: the owner of a group
+    # is the chunk holding its last token (rank owner_rank_of_chunk, half chunk >= cp_size);
+    # its slot is the owner's group count over its earlier blocks plus the offset inside the
+    # owning block's [first, stop) range.
+    @cute.kernel
+    def _compressor_rank_row_blocks_kernel(
+        cu_seqlens_comp: cute.Tensor,
+        chunk_rows: cute.Tensor,
+        seq_to_rank_row: cute.Tensor,
+        n_seq: cutlass.Int32,
+        cp_size: cutlass.Int32,
+        ratio: cutlass.Constexpr,
+        d_comp: cutlass.Constexpr,
+        c_cap: cutlass.Int32,
+        seq_major_rows: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        logical_row = bidx * 128 + tidx
+
+        if logical_row < seq_major_rows:
+            physical_row = cutlass.Int32(-1)
+            if logical_row < cu_seqlens_comp[n_seq]:
+                seq_id = cutlass.Int32(0)
+                for seq in range(n_seq):
+                    if logical_row >= cu_seqlens_comp[seq + 1]:
+                        seq_id = seq + 1
+                comp_id = logical_row - cu_seqlens_comp[seq_id]
+                c = chunk_rows[seq_id]
+                owner_chunk = ((comp_id + 1) * ratio - 1) // c
+                if owner_chunk > 2 * cp_size - 1:
+                    owner_chunk = 2 * cp_size - 1
+                owner_rank = owner_chunk
+                owner_half = cutlass.Int32(0)
+                if owner_chunk >= cp_size:
+                    owner_rank = 2 * cp_size - 1 - owner_chunk
+                    owner_half = 1
+                prefix = cutlass.Int32(0)
+                for seq in range(n_seq):
+                    if seq <= seq_id:
+                        cs = chunk_rows[seq]
+                        for half in range(2):
+                            k = owner_rank
+                            if half == 1:
+                                k = 2 * cp_size - 1 - owner_rank
+                            before = cutlass.Int32(0)
+                            if seq < seq_id:
+                                before = 1
+                            if seq == seq_id and half < owner_half:
+                                before = 1
+                            if before == 1 and cs > 0:
+                                numer = k * cs - d_comp
+                                if numer < 0:
+                                    numer = 0
+                                f = cute.ceil_div(numer, ratio)
+                                st = ((k + 1) * cs) // ratio
+                                if st > f:
+                                    prefix = prefix + (st - f)
+                numer_t = owner_chunk * c - d_comp
+                if numer_t < 0:
+                    numer_t = 0
+                first_t = cute.ceil_div(numer_t, ratio)
+                physical_row = owner_rank * c_cap + prefix + (comp_id - first_t)
+            seq_to_rank_row[logical_row] = physical_row
+
+    @cute.jit
+    def _compressor_rank_row_blocks_launch(
+        cu_seqlens_comp: cute.Tensor,
+        chunk_rows: cute.Tensor,
+        seq_to_rank_row: cute.Tensor,
+        n_seq: cutlass.Int32,
+        cp_size: cutlass.Int32,
+        ratio: cutlass.Constexpr,
+        d_comp: cutlass.Constexpr,
+        c_cap: cutlass.Int32,
+        seq_major_rows: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        _launch_named(
+            _compressor_rank_row_blocks_kernel,
+            "dsv4_cp_compressor_rank_row_blocks",
+            (
+                cu_seqlens_comp,
+                chunk_rows,
+                seq_to_rank_row,
+                n_seq,
+                cp_size,
+                ratio,
+                d_comp,
+                c_cap,
+                seq_major_rows,
+            ),
+            grid=(cute.ceil_div(seq_major_rows, 128), 1, 1),
+            block=(128, 1, 1),
+            stream=stream,
+        )
+
     # Kernel contract:
     #   grad_hidden_compact: gradient of compact rows, shape (compact_len, row_width).
     #   grad_hidden_local: output gradient, shape (l_local, row_width).
@@ -1012,6 +1262,290 @@ if _CUTE_AVAILABLE:
             stream=stream,
         )
 
+    @cute.kernel
+    def _build_attention_indices_blocks_kernel(
+        cu_seqlens: cute.Tensor,
+        cu_seqlens_unpadded: cute.Tensor,
+        cu_seqlens_compressed: cute.Tensor,
+        indexer_topk: cute.Tensor,
+        seq_to_rank_row: cute.Tensor,
+        topk_idxs: cute.Tensor,
+        topk_length: cute.Tensor,
+        indexer_physical_rows: cute.Tensor,
+        q_padding_mask: cute.Tensor,
+        block_local_offset: cute.Tensor,
+        block_global_start: cute.Tensor,
+        block_rows: cute.Tensor,
+        n_seq: cutlass.Int32,
+        l_local: cutlass.Int32,
+        d_window: cutlass.Int32,
+        window_size: cutlass.Int32,
+        ratio: cutlass.Int32,
+        compressed_width: cutlass.Int32,
+        seq_major_rows: cutlass.Int32,
+        compressed_rows: cutlass.Int32,
+        compressed_base: cutlass.Int32,
+        total_width: cutlass.Int32,
+        n_blocks: cutlass.Int32,
+        index_mode: cutlass.Constexpr,
+        compressed_is_sequence_major: cutlass.Constexpr,
+        has_unpadded_seqlens: cutlass.Constexpr,
+    ):
+        # Block variant of _build_attention_indices_kernel for the per-sequence zigzag CP
+        # layout: the rank's rows are n_blocks contiguous blocks given by device tables instead
+        # of one interval. Halo slot b occupies rows [b * d_window, (b + 1) * d_window) of
+        # kv_full_thd and the local rows follow all slots, so the window indices are
+        # halo_base + (pos - (row_global_start - d_window)) / local_base + (pos - row_global_start)
+        # with per-row bases; everything else follows the interval kernel line by line.
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        linear = bidx * 128 + tidx
+
+        # 0: selected top-k, 1: all visible compressed rows, 2: indexer loss.
+        if cutlass.const_expr(index_mode == 0):
+            row = linear
+        else:
+            row = bidx
+
+        if row < l_local:
+            blk = cutlass.Int32(0)
+            for b in range(n_blocks):
+                if row >= block_local_offset[b] and block_rows[b] > 0:
+                    blk = b
+            row_global_start = block_global_start[blk]
+            halo_base = blk * d_window
+            local_base = n_blocks * d_window + block_local_offset[blk]
+            global_q = row_global_start + (row - block_local_offset[blk])
+            seq_start_found = cutlass.Int32(-1)
+            seq_comp_start = cutlass.Int32(0)
+            seq_comp_len = cutlass.Int32(0)
+            seq_real_len = cutlass.Int32(0)
+            if cutlass.const_expr(index_mode == 0):
+                for seq in range(n_seq):
+                    seq_start = cu_seqlens[seq]
+                    seq_end = cu_seqlens[seq + 1]
+                    if global_q >= seq_start and global_q < seq_end:
+                        seq_start_found = seq_start
+                        if cutlass.const_expr(has_unpadded_seqlens):
+                            seq_real_len = cu_seqlens_unpadded[seq + 1] - cu_seqlens_unpadded[seq]
+                        if ratio > 1 and compressed_width > 0:
+                            seq_comp_start = cu_seqlens_compressed[seq]
+                            seq_comp_len = cu_seqlens_compressed[seq + 1] - seq_comp_start
+            else:
+                shared = utils.SmemAllocator().allocate_tensor(cutlass.Int32, cute.make_layout(4))
+                if tidx == 0:
+                    for seq in range(n_seq):
+                        seq_start = cu_seqlens[seq]
+                        seq_end = cu_seqlens[seq + 1]
+                        if global_q >= seq_start and global_q < seq_end:
+                            seq_start_found = seq_start
+                            if cutlass.const_expr(has_unpadded_seqlens):
+                                seq_real_len = (
+                                    cu_seqlens_unpadded[seq + 1] - cu_seqlens_unpadded[seq]
+                                )
+                            if ratio > 1 and compressed_width > 0:
+                                seq_comp_start = cu_seqlens_compressed[seq]
+                                seq_comp_len = cu_seqlens_compressed[seq + 1] - seq_comp_start
+                    shared[0] = seq_start_found
+                    shared[1] = seq_comp_start
+                    shared[2] = seq_comp_len
+                    shared[3] = seq_real_len
+                cute.arch.sync_threads()
+                seq_start_found = shared[0]
+                seq_comp_start = shared[1]
+                seq_comp_len = shared[2]
+                seq_real_len = shared[3]
+
+            is_padding = cutlass.Int32(0)
+            if cutlass.const_expr(has_unpadded_seqlens):
+                if cutlass.const_expr(index_mode == 0):
+                    if seq_start_found < 0:
+                        is_padding = 1
+                    elif global_q - seq_start_found >= seq_real_len:
+                        is_padding = 1
+                    q_padding_mask[row] = is_padding.to(q_padding_mask.element_type)
+                elif tidx == 0:
+                    if seq_start_found < 0:
+                        is_padding = 1
+                    elif global_q - seq_start_found >= seq_real_len:
+                        is_padding = 1
+                    q_padding_mask[row] = is_padding.to(q_padding_mask.element_type)
+
+            if cutlass.const_expr(index_mode != 0):
+                col = tidx
+                while col < total_width:
+                    topk_value = cutlass.Int32(-1)
+                    physical_value = cutlass.Int32(-1)
+                    length = cutlass.Int32(0)
+                    if seq_start_found >= 0:
+                        window_start = global_q - window_size + 1
+                        if window_start < seq_start_found:
+                            window_start = seq_start_found
+                        window_count = global_q - window_start + 1
+                        if cutlass.const_expr(index_mode == 2):
+                            if col < compressed_width:
+                                comp_id = indexer_topk[row, col]
+                                if comp_id >= 0 and comp_id < seq_comp_len:
+                                    seq_major_id = seq_comp_start + comp_id
+                                    if seq_major_id < seq_major_rows:
+                                        if cutlass.const_expr(compressed_is_sequence_major):
+                                            physical_value = seq_major_id
+                                        else:
+                                            physical_value = seq_to_rank_row[seq_major_id]
+                                        if physical_value >= 0 and physical_value < compressed_rows:
+                                            topk_value = compressed_base + physical_value
+                                        else:
+                                            physical_value = cutlass.Int32(-1)
+                            else:
+                                window_col = col - compressed_width
+                                if window_col < window_count:
+                                    pos = window_start + window_col
+                                    if pos < row_global_start:
+                                        topk_value = halo_base + pos - (row_global_start - d_window)
+                                    else:
+                                        topk_value = local_base + pos - row_global_start
+                        else:
+                            comp_count = cutlass.Int32(0)
+                            if ratio > 1 and compressed_width > 0:
+                                comp_count = (global_q - seq_start_found + 1) // ratio
+                                if comp_count > compressed_width:
+                                    comp_count = compressed_width
+                                if comp_count > seq_comp_len:
+                                    comp_count = seq_comp_len
+                            length = window_count + comp_count
+                            if col < window_count:
+                                pos = window_start + col
+                                if pos < row_global_start:
+                                    topk_value = halo_base + pos - (row_global_start - d_window)
+                                else:
+                                    topk_value = local_base + pos - row_global_start
+                            elif col < length:
+                                seq_major_id = seq_comp_start + col - window_count
+                                if seq_major_id < seq_major_rows:
+                                    if cutlass.const_expr(compressed_is_sequence_major):
+                                        physical_id = seq_major_id
+                                    else:
+                                        physical_id = seq_to_rank_row[seq_major_id]
+                                    if physical_id >= 0 and physical_id < compressed_rows:
+                                        topk_value = compressed_base + physical_id
+                    elif total_width > 0 and cutlass.const_expr(index_mode != 2):
+                        length = 1
+                        if col == 0:
+                            topk_value = 0
+                    topk_idxs[row, col] = topk_value
+                    if cutlass.const_expr(index_mode == 2):
+                        if col < compressed_width:
+                            indexer_physical_rows[row, col] = physical_value
+                    elif col == 0:
+                        topk_length[row] = length
+                    col = col + 128
+            else:
+                for out_col in range(total_width):
+                    topk_idxs[row, out_col] = -1
+                topk_length[row] = 0
+
+                if seq_start_found >= 0:
+                    write_col = cutlass.Int32(0)
+                    window_start = global_q - window_size + 1
+                    if window_start < seq_start_found:
+                        window_start = seq_start_found
+                    window_count = global_q - window_start + 1
+                    for window_col in range(window_size):
+                        if window_col < window_count:
+                            pos = window_start + window_col
+                            if pos < row_global_start:
+                                topk_idxs[row, write_col] = (
+                                    halo_base + pos - (row_global_start - d_window)
+                                )
+                            else:
+                                topk_idxs[row, write_col] = local_base + pos - row_global_start
+                            write_col = write_col + 1
+
+                    if ratio > 1 and compressed_width > 0:
+                        for compressed_col in range(compressed_width):
+                            comp_id = indexer_topk[row, compressed_col]
+                            if comp_id >= 0 and comp_id < seq_comp_len:
+                                seq_major_id = seq_comp_start + comp_id
+                                if seq_major_id < seq_major_rows:
+                                    if cutlass.const_expr(compressed_is_sequence_major):
+                                        physical_id = seq_major_id
+                                    else:
+                                        physical_id = seq_to_rank_row[seq_major_id]
+                                    if physical_id >= 0 and physical_id < compressed_rows:
+                                        topk_idxs[row, write_col] = compressed_base + physical_id
+                                        write_col = write_col + 1
+                    topk_length[row] = write_col
+                elif total_width > 0:
+                    topk_idxs[row, 0] = 0
+                    topk_length[row] = 1
+
+    @cute.jit
+    def _build_attention_indices_blocks_launch(
+        cu_seqlens: cute.Tensor,
+        cu_seqlens_unpadded: cute.Tensor,
+        cu_seqlens_compressed: cute.Tensor,
+        indexer_topk: cute.Tensor,
+        seq_to_rank_row: cute.Tensor,
+        topk_idxs: cute.Tensor,
+        topk_length: cute.Tensor,
+        indexer_physical_rows: cute.Tensor,
+        q_padding_mask: cute.Tensor,
+        block_local_offset: cute.Tensor,
+        block_global_start: cute.Tensor,
+        block_rows: cute.Tensor,
+        n_seq: cutlass.Int32,
+        l_local: cutlass.Int32,
+        d_window: cutlass.Int32,
+        window_size: cutlass.Int32,
+        ratio: cutlass.Int32,
+        compressed_width: cutlass.Int32,
+        seq_major_rows: cutlass.Int32,
+        compressed_rows: cutlass.Int32,
+        compressed_base: cutlass.Int32,
+        total_width: cutlass.Int32,
+        n_blocks: cutlass.Int32,
+        index_mode: cutlass.Constexpr,
+        compressed_is_sequence_major: cutlass.Constexpr,
+        has_unpadded_seqlens: cutlass.Constexpr,
+        launch_work: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        _launch_named(
+            _build_attention_indices_blocks_kernel,
+            "dsv4_thd_build_attention_indices_blocks",
+            (
+                cu_seqlens,
+                cu_seqlens_unpadded,
+                cu_seqlens_compressed,
+                indexer_topk,
+                seq_to_rank_row,
+                topk_idxs,
+                topk_length,
+                indexer_physical_rows,
+                q_padding_mask,
+                block_local_offset,
+                block_global_start,
+                block_rows,
+                n_seq,
+                l_local,
+                d_window,
+                window_size,
+                ratio,
+                compressed_width,
+                seq_major_rows,
+                compressed_rows,
+                compressed_base,
+                total_width,
+                n_blocks,
+                index_mode,
+                compressed_is_sequence_major,
+                has_unpadded_seqlens,
+            ),
+            grid=(cute.ceil_div(launch_work, 128), 1, 1),
+            block=(128, 1, 1),
+            stream=stream,
+        )
+
 
 # =============================================================================
 # Torch Wrapper Functions
@@ -1096,6 +1630,8 @@ class CPCompressorLayout(NamedTuple):
 
     Source rows address the conceptual ``[boundary[-d_comp:], local]`` buffer;
     neither the hidden states nor their concatenation is stored in this layout.
+    The block layout (per-sequence zigzag CP) addresses ``[halo slot tails, local]``
+    instead and is marked by ``global_start == -1``.
     The inverse map is injective, so backward needs no atomics or reductions.
     All tensor values are rebuilt on device for each pack, including graph replay.
     """
@@ -1176,6 +1712,114 @@ def build_cp_compressor_layout(
         seq_to_rank_row,
         d_comp,
         int(global_start),
+        int(cp_size),
+    )
+
+
+def build_cp_compressor_layout_blocks(
+    cu_seqlens: torch.Tensor,
+    block_rows: torch.Tensor,
+    block_local_offset: torch.Tensor,
+    block_global_start: torch.Tensor,
+    block_seq: torch.Tensor,
+    chunk_rows: torch.Tensor,
+    l_local: int,
+    cp_size: int,
+    ratio: int,
+    c_cap: int,
+) -> CPCompressorLayout:
+    """Block-table ``CPCompressorLayout`` (per-sequence zigzag CP, ``csa_utils/cp_seq_zigzag.py``).
+
+    One compaction segment per row block (``local_cu_seqlens`` has ``n_blocks + 1`` entries);
+    source rows address ``[halo slot tails (n_blocks * d_comp) | local]`` so
+    ``boundary_rows == n_blocks * d_comp``; ``global_start`` is ``-1`` (the single-projection
+    fallback must compact through the maps instead). ``c_cap`` is the caller's static capacity
+    (``cp_seq_zigzag.compact_group_capacity_blocks``); ``chunk_rows`` (``c_i`` per sequence)
+    gives the chunk ownership for the rank-major row map (the owner chunk of every group is
+    recomputed in-kernel from it and ``cp_size``).
+    """
+    ratio = int(ratio)
+    if ratio < 1 or l_local < 1 or cp_size < 1 or c_cap < 1:
+        raise ValueError("ratio, l_local, cp_size and c_cap must all be positive.")
+    _require_cute(
+        "DSv4 CP compressor layout requires CUDA tensors and CuTeDSL.",
+        cu_seqlens,
+        block_rows,
+        block_local_offset,
+        block_global_start,
+        block_seq,
+        chunk_rows,
+    )
+    d_comp = 8 if ratio == 4 else ratio
+    n_blocks = int(block_rows.shape[0])
+    n_seq = cu_seqlens.shape[0] - 1
+    if n_blocks != 2 * n_seq:
+        raise ValueError("block layout expects two blocks per packed sequence.")
+    compact_len = int(c_cap) * ratio
+    halo_rows = n_blocks * d_comp
+
+    def empty(rows):
+        return torch.empty(rows, dtype=torch.int32, device=cu_seqlens.device)
+
+    compact_to_source = empty(compact_len)
+    source_to_compact = empty(halo_rows + int(l_local))
+    group_ids, position_ids = empty(int(c_cap)), empty(int(c_cap))
+    local_cu, local_cuc = empty(n_blocks + 1), empty(n_blocks + 1)
+    global_cuc = empty(cu_seqlens.shape[0])
+    _run_compiled_launch(
+        _compressor_row_maps_blocks_launch,
+        (
+            cu_seqlens,
+            block_rows,
+            block_local_offset,
+            block_global_start,
+            block_seq,
+            compact_to_source,
+            source_to_compact,
+            group_ids,
+            position_ids,
+            local_cu,
+            local_cuc,
+            global_cuc,
+        ),
+        (
+            n_seq,
+            n_blocks,
+            int(l_local),
+            ratio,
+            d_comp,
+            compact_len,
+            max(compact_len, halo_rows + int(l_local)),
+        ),
+        static_arg_indices=(3, 4),
+    )
+    # The static capacity bounds the owned groups; a violation would make the fused compressor
+    # read past the compact buffer, so fail on device (CUDA-graph safe) instead.
+    torch._assert_async(
+        local_cu[-1] <= compact_len,
+        "DSv4 per-sequence zigzag CP: the compressed groups owned by this rank exceed the "
+        "static compaction capacity (cp_seq_zigzag.compact_group_capacity_blocks).",
+    )
+    seq_major_rows = int(l_local) * int(cp_size) // ratio
+    seq_to_rank_row = empty(seq_major_rows)
+    if seq_major_rows:
+        _run_compiled_launch(
+            _compressor_rank_row_blocks_launch,
+            (global_cuc, chunk_rows, seq_to_rank_row),
+            (n_seq, int(cp_size), ratio, d_comp, int(c_cap), seq_major_rows),
+            static_arg_indices=(2, 3),
+        )
+    return CPCompressorLayout(
+        compact_to_source,
+        source_to_compact,
+        group_ids,
+        position_ids,
+        local_cu,
+        local_cuc,
+        global_cuc,
+        seq_to_rank_row,
+        halo_rows,
+        -1,
         int(cp_size),
     )
 
@@ -1452,8 +2096,15 @@ def build_attention_indices(
     compressed_is_sequence_major: bool = False,
     cu_seqlens_unpadded: Optional[torch.Tensor] = None,
     output_alignment: int = 1,
+    block_tables: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Build final sparse-attention and optional indexer-loss indices.
+
+    ``block_tables = (block_local_offset, block_global_start, block_rows)`` (int32 device
+    tensors, per-sequence zigzag CP) replaces the single ``[global_start, global_start +
+    l_local)`` interval by ``n_blocks`` row blocks whose halo slots of ``d_window`` rows precede
+    the local rows in ``kv_full_thd`` (``compressed_base`` must then be given); ``global_start``
+    is ignored and the block variant of the kernel is launched.
 
     Inputs:
         cu_seqlens: int32 CUDA tensor, shape ``(n_seq + 1,)``.
@@ -1551,38 +2202,86 @@ def build_attention_indices(
     else:
         q_padding_mask_kernel = torch.empty((l_local,), dtype=torch.uint8, device=cu_seqlens.device)
     launch_work = l_local * 128 if index_mode else l_local
-    _run_compiled_launch(
-        _build_attention_indices_launch,
-        (
-            cu_seqlens,
-            cu_seqlens_unpadded,
-            cu_seqlens_compressed,
-            compressed_topk,
-            seq_to_rank_row,
-            topk_idxs,
-            topk_length_kernel,
-            indexer_physical_rows,
-            q_padding_mask_kernel,
-        ),
-        (
-            cu_seqlens.shape[0] - 1,
-            global_start,
-            l_local,
-            d_window,
-            window_size,
-            ratio,
-            compressed_width,
-            seq_major_rows,
-            compressed_rows,
-            compressed_base,
-            total_width,
-            index_mode,
-            compressed_is_sequence_major,
-            has_unpadded_seqlens,
-            launch_work,
-        ),
-        static_arg_indices=(11, 12, 13),
-    )
+    if block_tables is not None:
+        block_local_offset, block_global_start, block_rows = block_tables
+        for name, t in (
+            ("block_local_offset", block_local_offset),
+            ("block_global_start", block_global_start),
+            ("block_rows", block_rows),
+        ):
+            if t.dtype != torch.int32 or not t.is_cuda or t.ndim != 1 or not t.is_contiguous():
+                raise ValueError(f"{name}: block tables must be contiguous 1-D int32 CUDA tensors")
+        n_blocks = block_local_offset.shape[0]
+        if compressed_base != n_blocks * int(d_window) + l_local:
+            raise ValueError("block mode: compressed_base must equal n_blocks*d_window + l_local")
+        _run_compiled_launch(
+            _build_attention_indices_blocks_launch,
+            (
+                cu_seqlens,
+                cu_seqlens_unpadded,
+                cu_seqlens_compressed,
+                compressed_topk,
+                seq_to_rank_row,
+                topk_idxs,
+                topk_length_kernel,
+                indexer_physical_rows,
+                q_padding_mask_kernel,
+                block_local_offset,
+                block_global_start,
+                block_rows,
+            ),
+            (
+                cu_seqlens.shape[0] - 1,
+                l_local,
+                d_window,
+                window_size,
+                ratio,
+                compressed_width,
+                seq_major_rows,
+                compressed_rows,
+                compressed_base,
+                total_width,
+                n_blocks,
+                index_mode,
+                compressed_is_sequence_major,
+                has_unpadded_seqlens,
+                launch_work,
+            ),
+            static_arg_indices=(11, 12, 13),
+        )
+    else:
+        _run_compiled_launch(
+            _build_attention_indices_launch,
+            (
+                cu_seqlens,
+                cu_seqlens_unpadded,
+                cu_seqlens_compressed,
+                compressed_topk,
+                seq_to_rank_row,
+                topk_idxs,
+                topk_length_kernel,
+                indexer_physical_rows,
+                q_padding_mask_kernel,
+            ),
+            (
+                cu_seqlens.shape[0] - 1,
+                global_start,
+                l_local,
+                d_window,
+                window_size,
+                ratio,
+                compressed_width,
+                seq_major_rows,
+                compressed_rows,
+                compressed_base,
+                total_width,
+                index_mode,
+                compressed_is_sequence_major,
+                has_unpadded_seqlens,
+                launch_work,
+            ),
+            static_arg_indices=(11, 12, 13),
+        )
     q_padding_mask = q_padding_mask_kernel.view(torch.bool) if has_unpadded_seqlens else None
     if for_indexer_loss:
         return topk_idxs, None, indexer_physical_rows, q_padding_mask

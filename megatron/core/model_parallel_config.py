@@ -214,6 +214,11 @@ class ModelParallelConfig:
       global metadata before CP slicing.
     - None (default): treated as append_dummy_seq.
 
+    Under DSv4 ``attention_cp_layout='zigzag'`` a tail shorter than the
+    per-sequence padding floor (``dsv4_zigzag_min_padded_seq_len``) extends the
+    last non-empty sequence under either policy: a dummy sequence below the
+    floor cannot be split by that layout.
+
     When thd_max_packed_sequences is set, cu_seqlens tensors are padded to
     that value + 1 entries in both eager and CUDA Graph modes.
     """

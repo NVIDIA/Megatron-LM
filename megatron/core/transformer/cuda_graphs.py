@@ -3348,6 +3348,12 @@ class TECudaGraphHelper:
             if self.thd_sequence_length_upper_bound is not None
             else self.seq_length
         )
+        # DSv4 attention_cp_layout='zigzag' pads every packed sequence to at least its
+        # per-sequence floor (0 for every other configuration), so a pack never holds more
+        # sequences than capacity // floor even when all samples are shorter than the floor.
+        max_sequence_length = max(
+            max_sequence_length, int(getattr(self.config, 'dsv4_zigzag_min_padded_seq_len', 0) or 0)
+        )
 
         max_num_seqs = getattr(self.config, 'thd_max_packed_sequences', None)
         if max_num_seqs is not None:

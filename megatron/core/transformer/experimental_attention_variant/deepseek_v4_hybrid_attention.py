@@ -22,7 +22,10 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.attention import Attention, QKVLayout
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa import _build_csa_submodule
-from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
+from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+    cp_seq_zigzag,
+    cp_utils,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -143,6 +146,16 @@ class DSv4HybridAttention(Attention):
             compress_ratio = self.config.csa_compress_ratios[_ratio_idx]
         # compress_ratio == 0 is a sliding-window-only layer (the 'W' symbol): no compressor /
         # no top-k indexer (see CompressedSparseAttention) AND standard (non-YARN) rope.
+        zigzag_floor = getattr(self.config, "dsv4_zigzag_min_padded_seq_len", 0)
+        if zigzag_floor:
+            # Per-sequence zigzag CP (the floor is 0 for every other configuration): this
+            # layer's boundary window must fit the padding floor of the data pipeline.
+            cp_seq_zigzag.validate_layer_padding_floor(
+                zigzag_floor,
+                self.config.context_parallel_size,
+                self.config.csa_window_size,
+                compress_ratio,
+            )
         use_compressed_yarn = compress_ratio > 1
         self._dsv4_compress_ratio = compress_ratio
         self._dsv4_uses_yarn_rope = use_compressed_yarn
@@ -246,6 +259,33 @@ class DSv4HybridAttention(Attention):
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
 
+    def _seq_zigzag_geometry(self, hidden_states, packed_seq_params):
+        """This rank's per-sequence zigzag geometry for the current microbatch.
+
+        Derived on device from the padded ``cu_seqlens`` (no host synchronisation, so it is
+        also valid inside a captured CUDA graph, where ``cu_seqlens`` is a static input buffer
+        refreshed before replay). Every layer builds its own: the geometry is a handful of
+        small device ops and no cache key can prove that a caller-owned ``cu_seqlens`` buffer
+        still holds the values the tables were derived from. The row tables are memoized on
+        the geometry for the several consumers inside the layer.
+        """
+        cu = (
+            packed_seq_params.cu_seqlens_q_padded
+            if packed_seq_params.cu_seqlens_q_padded is not None
+            else packed_seq_params.cu_seqlens_q
+        )
+        d_window = cp_seq_zigzag.boundary_window(
+            self.config.csa_window_size, self._dsv4_compress_ratio
+        )
+        geom = cp_seq_zigzag.make_geometry(
+            self.pg_collection.cp, cu, int(hidden_states.shape[0]), d_window
+        )
+        # Layout preconditions (lengths divisible by 2*cp_size, the data pipeline's
+        # per-sequence floor, a pack that starts at row 0 and has cp_size * local rows);
+        # checked on device so capture and replay stay sync-free.
+        cp_seq_zigzag.validate_geometry(geom, host_check=False)
+        return geom
+
     def forward(
         self,
         hidden_states,
@@ -291,18 +331,45 @@ class DSv4HybridAttention(Attention):
         if cp_size > 1 and qkv_format != 'thd':
             raise ValueError("DSv4 Hybrid with CP requires qkv_format='thd'.")
         use_thd_cp = cp_size > 1 and qkv_format == 'thd'
-        if use_thd_cp and packed_seq_params.cp_partition_mode != "contiguous":
+        # Per-sequence zigzag CP is a static model property: it runs only for a configuration
+        # that TransformerConfig validated for attention_cp_layout='zigzag' with context
+        # parallelism (the layout's padding floor is non-zero exactly then). Every other
+        # model keeps the contiguous-only rule below.
+        use_seq_zigzag = use_thd_cp and bool(
+            getattr(self.config, "dsv4_zigzag_min_padded_seq_len", 0)
+        )
+        if use_seq_zigzag:
+            if packed_seq_params.cp_partition_mode != "zigzag":
+                raise ValueError(
+                    "DSv4 THD CP: PackedSeqParams.cp_partition_mode="
+                    f"{packed_seq_params.cp_partition_mode!r} does not match the model's "
+                    "attention_cp_layout='zigzag'."
+                )
+        elif use_thd_cp and packed_seq_params.cp_partition_mode != "contiguous":
             raise ValueError("DSv4 THD CP requires a contiguous CP partition.")
         self.pg_collection.cp = cp_group
 
         boundary_hidden = None
+        sz_geom = None
         if use_thd_cp:
-            boundary_hidden = cp_utils.exchange_cp_boundary_hidden(
-                hidden_states,
-                self._dsv4_compress_ratio,
-                self.config.csa_window_size,
-                self.pg_collection.cp,
-            )
+            if use_seq_zigzag:
+                # Per-sequence zigzag CP (attention_cp_layout='zigzag'): the data pipeline's THD
+                # zigzag split, one boundary window per (sequence, chunk) block.
+                sz_geom = self._seq_zigzag_geometry(hidden_states, packed_seq_params)
+                boundary_hidden = cp_seq_zigzag.exchange_cp_boundary_hidden_seq_zigzag(
+                    hidden_states, sz_geom, self.pg_collection.cp
+                )
+            else:
+                boundary_hidden = cp_utils.exchange_cp_boundary_hidden(
+                    hidden_states,
+                    self._dsv4_compress_ratio,
+                    self.config.csa_window_size,
+                    self.pg_collection.cp,
+                )
+
+        # Passed only under the per-sequence zigzag layout; the calls of the contiguous layout
+        # and of CP=1 take no extra argument.
+        seq_zigzag_kwargs = {} if sz_geom is None else {"seq_zigzag_geom": sz_geom}
 
         # =====================
         # Query, Key, and Value
@@ -316,6 +383,7 @@ class DSv4HybridAttention(Attention):
             packed_seq_params,
             inference_context=inference_context,
             boundary_hidden=boundary_hidden,
+            **seq_zigzag_kwargs,
         )
         if use_thd_cp:
             query, key, value, q_compressed, kv_compressed, boundary_kv = qkv
@@ -346,6 +414,7 @@ class DSv4HybridAttention(Attention):
                 qr=q_compressed,
                 boundary_hidden=boundary_hidden,
                 boundary_kv=boundary_kv,
+                **seq_zigzag_kwargs,
             )
         forced_released_tensors = [query, key, value]
         if boundary_kv is not None:
@@ -511,6 +580,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         *,
         inference_params=None,
         boundary_hidden=None,
+        seq_zigzag_geom=None,
     ):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
@@ -647,6 +717,17 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
             cp_size = cp_group.size()
+            # Per-sequence zigzag CP: the rank's rows are not one interval, so the RoPE helpers
+            # get an explicit pack row per query row and per (halo, local) KV row.
+            zigzag_q_rows = zigzag_kv_rows = None
+            if seq_zigzag_geom is not None:
+                zigzag_q_rows = seq_zigzag_geom.global_rows(q.device, cu_seqlens_q.dtype)
+                zigzag_kv_rows = zigzag_q_rows
+                if boundary_kv_compressed is not None:
+                    zigzag_halo_rows = seq_zigzag_geom.halo_global_rows(
+                        q.device, cu_seqlens_q.dtype
+                    )
+                    zigzag_kv_rows = torch.cat((zigzag_halo_rows, zigzag_q_rows))
             if self.config.apply_rope_fusion:
                 if cp_size > 1 and packed_seq:
                     cp_rank = cp_group.rank()
@@ -660,6 +741,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         self.config.qk_pos_emb_head_dim,
                         cu_seqlens_q,
                         global_start,
+                        global_rows=zigzag_q_rows,
                     )
                     kv = kv.unsqueeze(-2)
                     kv = cp_utils.apply_thd_cp_local_rope_fused(
@@ -670,6 +752,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         self.config.qk_pos_emb_head_dim,
                         cu_seqlens_q,
                         global_start - boundary_rows,
+                        global_rows=zigzag_kv_rows,
                     )
                     if boundary_kv_compressed is not None:
                         boundary_kv = kv[:boundary_rows]
@@ -712,6 +795,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         cu_seqlens_q,
                         global_start,
                         self.config,
+                        global_rows=zigzag_q_rows,
                     )
                     kv = cp_utils.apply_thd_cp_local_rope_unfused(
                         kv.unsqueeze(-2),
@@ -721,6 +805,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         cu_seqlens_kv,
                         global_start - boundary_rows,
                         self.config,
+                        global_rows=zigzag_kv_rows,
                     )
                     if boundary_kv_compressed is not None:
                         boundary_kv = kv[:boundary_rows]

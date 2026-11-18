@@ -270,6 +270,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         )
 
         parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
+        if getattr(self.config, "dsv4_zigzag_min_padded_seq_len", 0):
+            # DSv4 attention_cp_layout='zigzag' with context parallelism (the floor is 0 for
+            # every other configuration): only DSv4 attention, MLP and MoE layers run on it.
+            from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+                cp_seq_zigzag,
+            )
+
+            cp_seq_zigzag.validate_hybrid_layer_pattern(parsed.main_pattern, parsed.mtp_pattern)
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
         hash_moe_layer_threshold = _get_hash_moe_layer_threshold(

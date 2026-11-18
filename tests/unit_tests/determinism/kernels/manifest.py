@@ -122,8 +122,22 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_dsv4_dev_replay.py",),
         kind="triton",
         notes="Real CuTe compaction forward/unique-store backward and Triton/compiled integer "
-        "routing metadata replay. External sparse-attention backward is not certified here; "
+        "routing metadata replay, including the block-table layout kernels of the per-sequence "
+        "zigzag CP layout. External sparse-attention backward is not certified here; "
         "numerical CP/indexer parity remains in the dev CSA tests.",
+    ),
+    KernelEntry(
+        name="dsv4_seq_zigzag_halo_exchange",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/cp_seq_zigzag.py",
+        ),
+        tests=(K + "test_dsv4_dev_replay.py",),
+        kind="torch-op",
+        notes="Per-sequence zigzag CP halo exchange: index_select gather forward, index_add_ "
+        "scatter backward. The gradient of empty-sequence slots is masked, so every destination "
+        "row receives at most one non-zero contribution and the scatter is order independent. "
+        "Replayed on a single-rank group (self-served halo) with an empty sequence in the pack; "
+        "multi-rank parity is in test_dsv4_hybrid_attention_cp.py.",
     ),
     KernelEntry(
         name="dev_csa_fused_compressor_dispatch",

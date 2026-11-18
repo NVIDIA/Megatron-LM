@@ -178,6 +178,16 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  # The multi-rank DSv4 THD-CP parity / graph-replay suite (contiguous, balanced and per-sequence
+  # zigzag layouts) takes about a third of this directory's runtime; the directory bucket no
+  # longer runs this file. Tagged like the other single-file buckets of the directory.
+  - test_case: [tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_attention_cp.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
 
   - test_case: [tests/unit_tests/transformer/experimental_attention_variant/**/*.py]
     products:

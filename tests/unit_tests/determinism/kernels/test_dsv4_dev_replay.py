@@ -6,6 +6,8 @@ The external compressor dAPE backward uses atomics and is not claimed bit-exact;
 the existing strict-determinism dispatch guard is checked explicitly instead.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -115,3 +117,97 @@ def test_dev_fused_compressor_forward_and_determinism_guard():
         )
     finally:
         torch.use_deterministic_algorithms(prior, warn_only=prior_warn)
+
+
+def test_dev_seq_zigzag_halo_exchange_replays():
+    """Per-sequence zigzag CP halo: gather forward and the masked index_add_ scatter backward.
+
+    A single-rank group serves its own halo (block (i, 1) reads the tail of block (i, 0)), which
+    runs the same gather and scatter as the multi-rank exchange without point-to-point messages.
+    Three of the five sequences are empty: their tail indices repeat row 0 (clamped) and rows
+    56..63 of the first real sequence, so index_add_ runs with duplicate destinations, and the
+    gradient arriving in their slots must not reach those rows.
+    """
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_seq_zigzag
+
+    seeded()
+    group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
+    cu = torch.tensor([0, 0, 64, 64, 64, 160], dtype=torch.int32, device="cuda")
+    d_window = 8
+    geom = cp_seq_zigzag.make_geometry(group, cu, 160, d_window)
+    cp_seq_zigzag.validate_geometry(geom, host_check=True)
+    tail_rows = geom.tail_indices(0, d_window).tolist()
+    assert len(set(tail_rows)) < len(tail_rows)  # the scatter really sees duplicate rows
+    hidden = torch.randn(160, 1, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    slot_grad = torch.randn(geom.halo_rows, 1, 32, device="cuda", dtype=torch.bfloat16)
+    _, grads = assert_replays_bit_exact(
+        lambda x: cp_seq_zigzag.exchange_cp_boundary_hidden_seq_zigzag(x, geom, group),
+        (hidden,),
+        grad_outputs={"out": slot_grad},
+        contention=True,
+        what="DSv4 per-sequence zigzag halo exchange",
+    )
+    (hidden_grad,) = grads.values()
+    slots = slot_grad.view(geom.n_blocks, d_window, 1, 32)
+    expected = torch.zeros_like(hidden_grad)
+    expected[24:32] = slots[3]  # block (1, 1) reads the tail of block (1, 0): rows 24..31
+    expected[104:112] = slots[9]  # block (4, 1) reads the tail of block (4, 0): rows 104..111
+    assert torch.equal(hidden_grad, expected)
+
+
+def test_dev_seq_zigzag_block_layout_kernels_replay():
+    """Replay the block-table compressor layout and attention-index kernels (integer routing)."""
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+        cp_seq_zigzag,
+        thd_layout_kernels,
+    )
+
+    if not thd_layout_kernels._CUTE_AVAILABLE:
+        pytest.skip("CuTe DSL is unavailable")
+    cp_size, d_window, ratio, total = 4, 16, 4, 640
+    l_local = total // cp_size
+    cu = torch.tensor([0, 256, 256, total], dtype=torch.int32, device="cuda")
+
+    def run(cu_seqlens):
+        outputs = []
+        for rank in (0, cp_size - 1):
+            group = SimpleNamespace(size=lambda: cp_size, rank=lambda rank=rank: rank)
+            geom = cp_seq_zigzag.make_geometry(group, cu_seqlens, l_local, d_window)
+            c_cap = cp_seq_zigzag.compact_group_capacity_blocks(l_local, geom.n_seq, ratio)
+            layout = cp_seq_zigzag.build_cp_compressor_layout_seq_zigzag(
+                cu_seqlens, geom, ratio, c_cap
+            )
+            indices = cp_seq_zigzag.build_attention_indices_seq_zigzag(
+                cu_seqlens,
+                geom,
+                d_window,
+                ratio,
+                total // ratio,
+                None,
+                cu_seqlens_compressed=layout.cu_seqlens_compressed,
+                seq_to_rank_row=layout.seq_to_rank_row,
+                compressed_rows=c_cap * cp_size,
+                output_alignment=1,
+            )
+            outputs.append(
+                (
+                    layout.compact_to_source,
+                    layout.source_to_compact,
+                    layout.group_ids,
+                    layout.position_ids,
+                    layout.local_cu_seqlens,
+                    layout.local_cu_seqlens_compressed,
+                    layout.seq_to_rank_row,
+                    indices[0],
+                    indices[1],
+                )
+            )
+        return outputs
+
+    assert_replays_bit_exact(
+        run,
+        (cu,),
+        backward=False,
+        contention=True,
+        what="DSv4 per-sequence zigzag block layout kernels",
+    )

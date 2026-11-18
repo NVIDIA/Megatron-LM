@@ -127,11 +127,22 @@ def get_packed_sequence_alignment(config, tp_size: int) -> tuple[int, bool]:
 
 
 def get_packed_sequence_length(
-    seq_len: _SequenceLength, cp_size: int, pad_sequences: bool
+    seq_len: _SequenceLength, cp_size: int, pad_sequences: bool, min_len: int = 0
 ) -> _SequenceLength:
-    """Return the physical length used by eager per-sequence zigzag padding."""
+    """Return the physical length used by eager per-sequence zigzag padding.
+
+    ``min_len`` (a multiple of ``2 * cp_size``) raises every non-empty padded length to at
+    least that floor; DSv4's zigzag CP layout needs each zigzag half-chunk to cover its
+    attention boundary window (``TransformerConfig.dsv4_zigzag_min_padded_seq_len``).
+    """
     alignment = 2 * cp_size if pad_sequences and cp_size > 1 else 1
-    return seq_len + (-seq_len % alignment)
+    padded = seq_len + (-seq_len % alignment)
+    if min_len and pad_sequences and cp_size > 1:
+        if isinstance(padded, torch.Tensor):
+            padded = torch.where(padded > 0, padded.clamp_min(int(min_len)), padded)
+        elif padded > 0:
+            padded = max(padded, int(min_len))
+    return padded
 
 
 def pad_packed_batch_before_cp_slice(batch: Dict, config, cp_size: int, tp_size: int) -> None:
@@ -143,6 +154,10 @@ def pad_packed_batch_before_cp_slice(batch: Dict, config, cp_size: int, tp_size:
     ``append_dummy_seq`` (default) appends a masked dummy sequence with equal
     logical and physical lengths, and ``extend_last`` keeps the logical
     boundaries and extends the final physical sequence.
+    ``config.dsv4_zigzag_min_padded_seq_len`` (DSv4 ``attention_cp_layout='zigzag'``)
+    additionally raises every non-empty physical sequence to that floor; a tail
+    shorter than the floor is absorbed under either policy, and an absorbed tail
+    extends the last non-empty sequence (an empty final sequence stays empty).
 
     CUDA graphs replay captured shapes, so with ``cuda_graph_impl`` set every pack
     is padded to ``max_seqlen_per_dp_cp_rank``. ``thd_max_packed_sequences`` pads
@@ -156,7 +171,10 @@ def pad_packed_batch_before_cp_slice(batch: Dict, config, cp_size: int, tp_size:
     logical = batch['cu_seqlens']
     physical = batch['cu_seqlens_padded']
     lengths = physical.diff()
-    padded_lengths = get_packed_sequence_length(lengths, cp_size, pad_sequences=True)
+    min_len = int(getattr(config, 'dsv4_zigzag_min_padded_seq_len', 0) or 0)
+    padded_lengths = get_packed_sequence_length(
+        lengths, cp_size, pad_sequences=True, min_len=min_len
+    )
     global_length = int(padded_lengths.sum().item())
     local_length = (global_length + cp_size - 1) // cp_size
     limit = getattr(config, 'max_seqlen_per_dp_cp_rank', None)
@@ -192,10 +210,23 @@ def pad_packed_batch_before_cp_slice(batch: Dict, config, cp_size: int, tp_size:
         padded = tensor.index_select(0, source_indices).masked_fill(~within_source, fill)
         batch[key] = torch.cat((padded, tensor.new_full((tail,), fill))) if tail else padded
 
-    if tail and resolve_thd_tail_padding_policy(config) == 'extend_last':
-        # Keep the logical boundaries; the final physical sequence absorbs the tail.
+    extend_last = bool(tail) and resolve_thd_tail_padding_policy(config) == 'extend_last'
+    if tail and not extend_last and min_len and tail < min_len:
+        # A dummy tail sequence shorter than the per-sequence floor cannot be split by the
+        # zigzag DSv4 layout; let the last real sequence absorb this short tail instead.
+        extend_last = True
+    if tail and extend_last:
+        # Keep the logical boundaries; the final physical sequence absorbs the tail (under the
+        # DSv4 zigzag floor: the last non-empty one).
         padded_boundaries = padded_boundaries.clone()
-        padded_boundaries[-1] += tail
+        nonempty = padded_lengths.nonzero() if min_len else None
+        if nonempty is not None and nonempty.numel():
+            # Under the DSv4 zigzag floor an empty final sequence must stay empty (as a
+            # tail-sized sequence it could fall below the floor): the last non-empty sequence
+            # absorbs the tail and the empty ones after it move with its end.
+            padded_boundaries[int(nonempty[-1]) + 1 :] += tail
+        else:
+            padded_boundaries[-1] += tail
     elif tail:
         logical = torch.cat((logical, logical[-1:] + tail))
         padded_boundaries = torch.cat((padded_boundaries, padded_boundaries[-1:] + tail))

@@ -91,6 +91,7 @@ class BasePackingScheduler:
         microbatch_group_size_per_vp_stage: Optional[int],
         pad_sequences: bool = False,
         max_num_seqs: Optional[int] = None,
+        min_seq_len: int = 0,
     ):
         """
         Args:
@@ -103,6 +104,8 @@ class BasePackingScheduler:
             max_num_seqs: Optional cap on the number of real packed sequences
             per microbatch. This excludes any dummy sequence later appended for
             THD padding.
+            min_seq_len: Per-sequence padded-length floor applied together with
+            ``pad_sequences`` (``TransformerConfig.dsv4_zigzag_min_padded_seq_len``).
         """
         self.max_seqlen_per_dp_cp_rank = max_seqlen_per_dp_cp_rank
         self.cp_size = cp_size
@@ -110,6 +113,7 @@ class BasePackingScheduler:
         self.microbatch_group_size_per_vp_stage = microbatch_group_size_per_vp_stage
         self.pad_sequences = pad_sequences
         self.max_num_seqs = max_num_seqs
+        self.min_seq_len = int(min_seq_len or 0)
 
     def get_required_sample_keys(self):
         """Return the required key of each batch."""
@@ -182,7 +186,7 @@ class DpBalancedScheduler(BasePackingScheduler):
 
         for i in range(len(sample_id_seqlens)):
             seq_len = get_packed_sequence_length(
-                sample_id_seqlens[i][1], self.cp_size, self.pad_sequences
+                sample_id_seqlens[i][1], self.cp_size, self.pad_sequences, self.min_seq_len
             )
             if seq_len > self.max_seq_len_all_ranks:
                 raise ValueError("A padded sequence exceeds the static CP packing capacity")
@@ -574,6 +578,25 @@ def wrap_data_iterator(
     capacity = config.max_seqlen_per_dp_cp_rank
     alignment, pad_enabled = get_packed_sequence_alignment(config, tp_group.size())
     scheduler_kwargs['pad_sequences'] = pad_enabled
+    min_seq_len = int(getattr(config, 'dsv4_zigzag_min_padded_seq_len', 0) or 0)
+    if min_seq_len:
+        # DSv4 attention_cp_layout='zigzag' (0 for every other configuration, which keeps the
+        # scheduler arguments unchanged). Only dp_balanced sizes its packs with the floor for
+        # the static CP group that pads and slices them, and the floor itself is applied by
+        # pad_packed_batch_before_cp_slice, which only runs with post-pack padding enabled.
+        if scheduler_type != PackingSchedulerEnum.DP_BALANCED:
+            raise ValueError(
+                "DSv4 attention_cp_layout='zigzag' requires "
+                "sequence_packing_scheduler='dp_balanced'."
+            )
+        if not pad_enabled:
+            raise ValueError(
+                "DSv4 attention_cp_layout='zigzag' pads every packed sequence to at least "
+                f"{min_seq_len} rows (dsv4_zigzag_min_padded_seq_len), which needs post-pack "
+                "padding on the sequence-packing path: set pad_packed_seq_alignment (or the "
+                "mxfp8 recipe)."
+            )
+        scheduler_kwargs['min_seq_len'] = min_seq_len
     if pad_enabled:
         capacity -= capacity % alignment
         if capacity < alignment:
@@ -914,6 +937,10 @@ def get_batch_on_this_rank_for_sequence_packing(
                 tp_cp_group,
             ),
             tokens_per_sample=None,
+            # DSv4's zigzag attention layout (CP > 1) derives its padding masks from logical vs
+            # physical cu_seqlens; the standard zigzag view would otherwise carry only the
+            # physical ones. Every other configuration keeps the standard metadata.
+            use_logical_qkv_seqlens=bool(getattr(config, 'dsv4_zigzag_min_padded_seq_len', 0)),
         )
 
     # Extract the data from batch after broadcasting.

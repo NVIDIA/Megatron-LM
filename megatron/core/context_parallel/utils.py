@@ -215,6 +215,7 @@ def get_batches_on_this_cp_rank(
     tp_group: torch.distributed.ProcessGroup | None = None,
     tp_cp_group: torch.distributed.ProcessGroup | None = None,
     tokens_per_sample: int | None = None,
+    use_logical_qkv_seqlens: bool = False,
 ) -> ContextParallelBatch:
     """Partition a batch and prepare metadata for the requested CP layouts.
 
@@ -229,6 +230,10 @@ def get_batches_on_this_cp_rank(
     activation-conversion plan. All other cases use the standard batch sharder.
 
     A ``None`` CP group represents a size-one CP domain and leaves sequence tensors unchanged.
+    ``use_logical_qkv_seqlens`` makes the ``PackedSeqParams`` built by the standard batch sharder
+    carry the logical (valid-token) ``cu_seqlens_q/kv`` next to the physical padded ones for
+    every layout, as the contiguous layout does for ``cp_size > 1``; DSv4's zigzag attention
+    layout derives its padding masks from that pair.
     """
     from megatron.core.utils import _resolve_dynamic_cp_group_for_batch, get_batch_on_this_cp_rank
 
@@ -345,7 +350,11 @@ def get_batches_on_this_cp_rank(
     # view rather than deriving one layout's metadata from the other.
     packed_seq_params_by_layout = {
         layout: _build_packed_seq_params(
-            batches_by_layout[layout], layout, cp_size, tokens_per_sample
+            batches_by_layout[layout],
+            layout,
+            cp_size,
+            tokens_per_sample,
+            use_logical_qkv_seqlens=use_logical_qkv_seqlens,
         )
         for layout in requested_layouts
     }

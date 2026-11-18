@@ -41,6 +41,7 @@ mappings:
       dgx_h100:
         - tests/unit_tests/transformer/experimental_attention_variant/test_csa_thd_layout_kernels.py
         - tests/unit_tests/transformer/experimental_attention_variant/test_csa_cp_utils.py
+        - tests/unit_tests/transformer/test_cp_seq_zigzag.py
         - tests/unit_tests/determinism/kernels/test_dsv4_dev_replay.py
       dgx_gb200:
         - tests/unit_tests/determinism/kernels/test_dsv4_dev_replay.py
