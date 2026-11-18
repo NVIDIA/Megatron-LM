@@ -17,6 +17,7 @@
 import enum
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 from weakref import WeakKeyDictionary
 
@@ -31,6 +32,14 @@ from .runtime_policy import PrefetchOrder, RuntimePolicy
 if TYPE_CHECKING:
     from .dbuffer import DBuffer
     from .parameter_group import FsdpParameterGroup
+
+
+@dataclass
+class _RsInput:
+    buffer: "DBuffer"
+    ready: torch.cuda.Event
+    write_stream: torch.cuda.Stream
+    bound_grad_dtypes: dict[int, torch.dtype | None] = field(default_factory=dict)
 
 
 class GradientFinalizationMode(enum.Enum):
@@ -130,7 +139,7 @@ class FsdpContext:
         self.retain_mask: Mapping[int, bool] = {}
         self.rs_window_budget_bytes = rs_window_budget_bytes
         self.rs_plan: Mapping[tuple[int, int], int] | None = None
-        self.rs_inputs: dict[FsdpParameterGroup, tuple[DBuffer, torch.cuda.Event]] = {}
+        self.rs_inputs: dict[FsdpParameterGroup, _RsInput] = {}
         self._execution_order_view: ExecutionOrderView | None = None
         self._prefetch_order_view: ExecutionOrderView | None = None
         self._recording_execution_order = runtime_policy.prefetch_order is PrefetchOrder.RECORDED
@@ -371,6 +380,12 @@ class FsdpContext:
             device=self.inner_reduction_stream.device,
             budget_bytes=self.rs_window_budget_bytes,
         )
+        groups = {
+            self.execution_order.seek(event_id).module.parameter_groups[index]
+            for event_id, index in self.rs_plan
+        }
+        for group in groups:
+            group.register_rs_grad_view_hooks(self)
 
     def post_microbatch(self) -> None:
         """Release deferred module weights after each microbatch backward."""

@@ -29,7 +29,7 @@ from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .context import FsdpContext, GradientFinalizationMode
+from .context import FsdpContext, GradientFinalizationMode, _RsInput
 from .countdown import Countdown
 from .execution_order import ExecutionAction, ExecutionEvent, ExecutionOrderView
 from .module_utils import get_parameter_owner, is_in_backward
@@ -517,16 +517,26 @@ class FsdpModule:
                 partial_grad = group.allocate_partial_grad_buffer(dtype=group.main_grad.dtype)
             current_stream.wait_stream(inner_stream)
         else:
-            partial_grad, ready = saved
-            current_stream.wait_event(ready)
-        group.copy_gradients_to_partial_buffer(partial_grad, accumulate=saved is not None)
+            partial_grad = saved.buffer
+            if saved.bound_grad_dtypes:
+                if current_stream != saved.write_stream:
+                    current_stream.wait_stream(saved.write_stream)
+            else:
+                current_stream.wait_event(saved.ready)
+        group.copy_gradients_to_partial_buffer(
+            partial_grad,
+            accumulate=saved is not None,
+            bound_grad_dtypes=None if saved is None else saved.bound_grad_dtypes,
+        )
         if flush:
             inner_stream.wait_stream(current_stream)
             with torch.cuda.stream(inner_stream):
                 group.reduce_inner_gradients(partial_grad.cast(group.grad_comm_dtype))
             del context.rs_inputs[group]
         else:
-            context.rs_inputs[group] = (partial_grad, current_stream.record_event())
+            context.rs_inputs[group] = _RsInput(
+                partial_grad, current_stream.record_event(), current_stream
+            )
 
     def _accumulate_local_gradients(self, group: FsdpParameterGroup) -> None:
         """Accumulate on compute without waiting for other groups' inner reductions."""

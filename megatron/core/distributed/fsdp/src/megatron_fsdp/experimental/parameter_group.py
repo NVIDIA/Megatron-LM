@@ -652,17 +652,78 @@ class FsdpParameterGroup:
                 device=grads[0].device,
             )
 
+    def register_rs_grad_view_hooks(self, context) -> None:
+        """Allow ordinary autograd leaves to reuse this group's planned RS input."""
+        group_ref, context_ref = ref(self), ref(context)
+        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+            parameter = fsdp_parameter.unsharded
+            if type(parameter) is not nn.Parameter or getattr(
+                parameter, "skip_backward_post_hook", False
+            ):
+                continue
+
+            def bind(grad, index=index):
+                group, active_context = group_ref(), context_ref()
+                if group is not None and active_context is not None:
+                    group._bind_rs_grad_view(active_context, index, grad)
+
+            parameter.register_hook(bind)
+
+    def _bind_rs_grad_view(self, context, index: int, grad: torch.Tensor) -> None:
+        saved = context.rs_inputs.get(self)
+        if saved is None or torch.is_grad_enabled():
+            return
+        if type(grad) is not torch.Tensor or grad.layout != torch.strided:
+            return
+        stream = context.current_stream()
+        if stream != saved.write_stream:
+            return
+        parameter = self.fsdp_parameters[index].unsharded
+        if parameter.grad is not None:
+            return
+        view = saved.buffer.get_tensor_view(index)
+        if (
+            view.shape != parameter.shape
+            or view.device != parameter.device
+            or view.stride() != parameter.stride()
+        ):
+            return
+        dtype = getattr(parameter, "grad_dtype", parameter.dtype)
+        if dtype is not None and dtype != view.dtype:
+            if not hasattr(torch.Tensor, "grad_dtype"):
+                return
+            # AccumulateGrad promotes the add while keeping the incoming gradient dtype.
+            parameter.grad_dtype = None
+        if not saved.bound_grad_dtypes:
+            stream.wait_event(saved.ready)
+        parameter.grad = view
+        saved.bound_grad_dtypes[index] = dtype
+
     def copy_gradients_to_partial_buffer(
-        self, partial_grad: DBuffer, *, accumulate: bool = False
+        self,
+        partial_grad: DBuffer,
+        *,
+        accumulate: bool = False,
+        bound_grad_dtypes: dict[int, torch.dtype | None] | None = None,
     ) -> None:
         """Pack full local gradients on compute into the reduce-scatter input buffer."""
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+            parameter = fsdp_parameter.unsharded
+            grad = parameter.grad
             destination = partial_grad.get_tensor_view(index)
+            if bound_grad_dtypes and index in bound_grad_dtypes:
+                if grad is None or not grad.is_set_to(destination):
+                    raise RuntimeError("Autograd replaced a bound FSDP gradient view.")
+                parameter.grad = None
+                dtype = bound_grad_dtypes[index]
+                if getattr(parameter, "grad_dtype", parameter.dtype) != dtype:
+                    parameter.grad_dtype = dtype
+                continue
             if accumulate:
-                destination.add_(fsdp_parameter.unsharded.grad)
+                destination.add_(grad)
             else:
-                destination.copy_(fsdp_parameter.unsharded.grad)
-            fsdp_parameter.unsharded.grad = None
+                destination.copy_(grad)
+            parameter.grad = None
 
     def accumulate_local_gradients(self) -> None:
         """Accumulate on compute, retaining source gradients for caller cleanup.

@@ -89,7 +89,7 @@ def test_plan_cuts_at_outer_and_four_and_leaves_unprofitable_groups_on_baseline(
         plan[(ids[0], 0)] = ids[0]
 
 
-def test_real_packing_accumulates_changed_bf16_gradients_once_before_rs():
+def test_autograd_accumulates_into_existing_rs_view_on_its_write_stream():
     class Buffer:
         def __init__(self, dtype):
             self.dtype = dtype
@@ -104,7 +104,9 @@ def test_real_packing_accumulates_changed_bf16_gradients_once_before_rs():
             result.tensor = self.tensor.to(dtype)
             return result
 
-    parameter = nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+    dtype = torch.bfloat16 if hasattr(torch.Tensor, "grad_dtype") else torch.float32
+    parameter = nn.Parameter(torch.ones(4, dtype=dtype))
+    grad_dtype = getattr(parameter, "grad_dtype", dtype)
     group = Mock(grad_comm_dtype=torch.bfloat16)
     group.main_grad.dtype = torch.float32
     group.fsdp_parameters = (SimpleNamespace(unsharded=parameter, fqns=("weight",)),)
@@ -112,24 +114,32 @@ def test_real_packing_accumulates_changed_bf16_gradients_once_before_rs():
     group.copy_gradients_to_partial_buffer = MethodType(
         FsdpParameterGroup.copy_gradients_to_partial_buffer, group
     )
+    group._bind_rs_grad_view = MethodType(FsdpParameterGroup._bind_rs_grad_view, group)
     reduced = []
     group.reduce_inner_gradients.side_effect = lambda buffer: reduced.append(buffer.tensor.clone())
-    compute, inner = Mock(), Mock()
-    context = SimpleNamespace(
-        rs_inputs={}, current_stream=lambda: compute, inner_reduction_stream=inner
-    )
+    compute, alternate, inner = Mock(), Mock(), Mock()
+    context = Mock(rs_inputs={}, inner_reduction_stream=inner)
     owner = SimpleNamespace(context=context)
+    FsdpParameterGroup.register_rs_grad_view_hooks(group, context)
     with (
         patch.object(torch.cuda, "stream", side_effect=lambda _: nullcontext()),
         patch.object(torch.cuda, "current_stream", return_value=compute),
         patch.object(torch.Tensor, "record_stream"),
     ):
-        for index, value in enumerate((1, 3, 5)):
+        for index, value in enumerate((1, 3, 5, 7)):
+            context.current_stream.return_value = compute if index < 2 else alternate
             (parameter * value).sum().backward()
-            FsdpModule._accumulate_rs_window(owner, group, flush=index == 2)
+            if index in (1, 3):
+                assert parameter.grad.is_set_to(context.rs_inputs[group].buffer.get_tensor_view(0))
+            else:
+                assert parameter.grad.dtype == dtype
+                if index:
+                    assert not context.rs_inputs[group].bound_grad_dtypes
+            FsdpModule._accumulate_rs_window(owner, group, flush=index == 3)
             assert parameter.grad is None
-            assert len(reduced) == (1 if index == 2 else 0)
+            assert getattr(parameter, "grad_dtype", dtype) == grad_dtype
+            assert len(reduced) == (1 if index == 3 else 0)
     assert len(reduced) == 1
     assert reduced[0].dtype == torch.bfloat16
-    assert torch.equal(reduced[0], torch.full((4,), 9, dtype=torch.bfloat16))
+    assert torch.equal(reduced[0], torch.full((4,), 16, dtype=torch.bfloat16))
     assert not context.rs_inputs
