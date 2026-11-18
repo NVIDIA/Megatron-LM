@@ -17,7 +17,7 @@ from megatron.post_training import model_config as mc
 from megatron.post_training import model_hooks
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
 from megatron.training.config import CheckpointConfig
-from megatron.training.models.base import ModelConfig
+from megatron.training.models.base import ModelConfig, compose_hooks
 from megatron.training.models.distillation import DistillationConfig, validate_distillation_student
 from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig, default_layer_spec
 from megatron.training.models.hybrid import (
@@ -296,7 +296,11 @@ class TestModelOptModelConfigFromArgs:
             mc.modelopt_model_config_from_args(args)
 
     @pytest.mark.parametrize("builder_cls", [GPTModelBuilder, HybridModelBuilder])
-    def test_round_trip_reconstructs_setup_in_dependency_order(self, monkeypatch, builder_cls):
+    def test_training_installs_setup_and_kd_hooks_around_config_hooks(
+        self, monkeypatch, run_config, builder_cls
+    ):
+        from megatron.training import training
+
         events = []
         for name in (
             "restore_modelopt_state_hook",
@@ -333,11 +337,33 @@ class TestModelOptModelConfigFromArgs:
             return models
 
         config.pre_wrap_hooks.append(freeze)
-        builder = builder_cls(config)
+        run_config.model = config
+        run_config.distillation = distillation
+        run_config.checkpoint = CheckpointConfig(load="/ckpt/student", ckpt_format="torch_dist")
+
+        class ReachedBuilder(Exception):
+            pass
+
+        built_configs = []
+
+        def builder_factory(model_config):
+            built_configs.append(model_config)
+            return Mock(build_distributed_models=Mock(side_effect=ReachedBuilder))
+
+        monkeypatch.setattr(config, "get_builder_cls", lambda: builder_factory)
+        training_args = Namespace(
+            skip_train=False, freeze_all_layers=False, freeze_base_model_for_mtp=False
+        )
+        monkeypatch.setattr(training, "get_args", lambda: training_args)
+        monkeypatch.setattr(training, "get_timers", Mock())
+        monkeypatch.setattr(training, "get_one_logger", lambda: None)
+        monkeypatch.setattr(training, "is_gtp_remat_active", lambda _: False)
+        monkeypatch.setattr("megatron.training.utils.start_memory_history_recording", Mock())
+
         for _ in range(2):
-            builder.pre_wrap_hook(
-                CheckpointConfig(load="/ckpt/student", ckpt_format="torch_dist"), distillation
-            )([Mock()])
+            with pytest.raises(ReachedBuilder):
+                training.setup_model_and_optimizer(Mock(), cfg_container=run_config)
+            compose_hooks(built_configs[-1].pre_wrap_hooks)([Mock()])
         expected = [
             "restore_modelopt_state_hook",
             "qad_freeze_hook",
@@ -347,7 +373,7 @@ class TestModelOptModelConfigFromArgs:
             "kd_convert_hook",
         ]
         assert events == expected * 2
-        assert config.pre_wrap_hooks == [freeze]  # no duplicate registration across builds
+        assert config.pre_wrap_hooks == [freeze]  # hooks go on a copy, not on run_config.model
 
     def test_no_runtime_hooks_stored_in_config(self):
         config = mc.modelopt_model_config_from_args(make_modelopt_test_args())
@@ -379,11 +405,13 @@ class TestModelOptModelConfigFromArgs:
                 "megatron.core.process_groups_config.ProcessGroupCollection.use_mpu_process_groups"
             ),
             patch.object(GPTModelBuilder, "build_distributed_models") as build,
+            patch.object(model_hooks, "modelopt_setup_hooks", return_value=[]) as setup_hooks,
         ):
             mc.build_inference_models(cfg, device=device)
         assert build.call_args.kwargs["device"] == device
-        assert build.call_args.kwargs["checkpoint"] is cfg.checkpoint
         assert build.call_args.kwargs["wrap_with_ddp"] is False
+        setup_hooks.assert_called_once_with(cfg.model, cfg.checkpoint)
+        assert cfg.model.pre_wrap_hooks == []  # setup hooks go on a copy
 
 
 class TestModelType:
@@ -436,7 +464,7 @@ class TestModelType:
         config = mc.modelopt_model_config_from_args(
             make_modelopt_test_args(export_default_te_spec=default_te_spec)
         )
-        config.get_builder_cls()(config).pre_wrap_hook()([Mock()])
+        compose_hooks(model_hooks.modelopt_setup_hooks(config))([Mock()])
         assert te_hook.called is not default_te_spec
 
 
@@ -463,7 +491,7 @@ class TestModelOptCheckpointSelection:
         checkpoint = CheckpointConfig(
             load=load, pretrained_checkpoint="/pretrained", ckpt_format="torch_dist"
         )
-        config.get_builder_cls()(config).pre_wrap_hook(checkpoint)([Mock()])
+        model_hooks.modelopt_setup_hooks(config, checkpoint)
         restore.assert_called_once_with(expected, checkpoint)
 
 

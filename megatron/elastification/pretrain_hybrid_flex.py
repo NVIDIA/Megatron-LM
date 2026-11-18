@@ -56,6 +56,7 @@ from megatron.training.argument_utils import (
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.providers import build_gpt_datasets
 from megatron.training.global_vars import get_run_config, set_run_config
+from megatron.training.models.base import compose_hooks
 from megatron.training.utils import is_first_or_last_pipeline_stage
 
 # modelopt distillation
@@ -68,6 +69,7 @@ try:
         apply_modelopt_model_config,
         distillation_config_from_args,
     )
+    from megatron.post_training.model_hooks import distillation_hooks, modelopt_setup_hooks
     has_nvidia_modelopt = True
 except ImportError:
     print_rank_0("ModelOpt is not installed. Please install it using `pip install nvidia-modelopt`")
@@ -97,8 +99,15 @@ def _build_modelopt_stage(args, pre_process, post_process, vp_stage, pg_collecti
     builder = model_config.get_builder_cls()(model_config)
     models = [builder.build_model(pg_collection, pre_process, post_process, vp_stage)]
     run_config = get_run_config()
-    models = builder.pre_wrap_hook(run_config.checkpoint, run_config.distillation)(models)
-    return models[0]
+    # Same order as setup_model_and_optimizer: ModelOpt setup, own hooks, KD conversion last.
+    pre_wrap_hook = compose_hooks(
+        [
+            *modelopt_setup_hooks(model_config, run_config.checkpoint),
+            *model_config.pre_wrap_hooks,
+            *distillation_hooks(model_config, run_config.distillation),
+        ]
+    )
+    return pre_wrap_hook(models)[0]
 
 
 def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] = None, config = None, pg_collection = None) -> HybridModel:

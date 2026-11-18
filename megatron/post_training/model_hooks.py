@@ -1,18 +1,16 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
-"""ModelOpt pre-wrap hooks for ``ModelConfig.pre_wrap_hooks``.
+"""ModelOpt pre-wrap hooks, installed explicitly by the training and inference entry points.
 
 Each ``*_hook`` factory returns a ``list[MegatronModule] -> list[MegatronModule]`` hook that
 runs after the stock GPT/Hybrid builder has built the model stages and before they are
-wrapped (Float16Module / DDP). ``modelopt_pre_wrap_hook`` reconstructs them from the
-serializable configuration on each build, in this order:
+wrapped (Float16Module / DDP). The builders themselves only compose ``pre_wrap_hooks``; the
+entry points (``setup_model_and_optimizer``, ``build_inference_models``) build that list as:
 
-1. ``restore_modelopt_state_hook``: must come before any hook that converts the model.
-2. ``qad_freeze_hook``
-3. ``lsq_hook``
-4. ``te_load_state_dict_hook``
-5. User ``pre_wrap_hooks`` (including training freezes)
-6. ``kd_convert_hook``
+1. ``modelopt_setup_hooks``: ``restore_modelopt_state_hook`` (before anything converts the
+   model), ``qad_freeze_hook``, ``lsq_hook``, ``te_load_state_dict_hook``
+2. The config's own ``pre_wrap_hooks`` (including training freezes)
+3. ``distillation_hooks``: ``kd_convert_hook`` (training only)
 """
 
 import dataclasses
@@ -32,7 +30,6 @@ from megatron.post_training.checkpointing import load_modelopt_state
 from megatron.post_training.optimizer import install_lsq_optimizer_overrides
 from megatron.training import print_rank_0
 from megatron.training.checkpointing import resolve_checkpoint_load_dir
-from megatron.training.models.base import compose_hooks
 
 PreWrapHook = Callable[[list[MegatronModule]], list[MegatronModule]]
 
@@ -276,32 +273,46 @@ def kd_convert_hook(student_model_config, distillation, remap_te_layernorm: bool
     return hook
 
 
-def modelopt_pre_wrap_hook(model_config, checkpoint=None, distillation=None) -> PreWrapHook:
-    """Rebuild setup hooks from configuration, keeping all student freezes before KD.
+def modelopt_setup_hooks(model_config, checkpoint=None) -> list[PreWrapHook]:
+    """Return the ModelOpt setup hooks selected by ``model_config.transformations``.
 
-    Called by the stock builders on every build, including after deserialization.
-    Runtime hooks are composed without modifying the config or duplicating registrations.
+    Entry points put these before the config's own ``pre_wrap_hooks`` (and the training freezes),
+    so that later hooks see the restored and prepared model. Empty without transformations.
+
+    Args:
+        model_config: The model's ``ModelConfig``.
+        checkpoint: The run's ``CheckpointConfig``; its load directory supplies ``modelopt_state``.
     """
-    hooks = []
     options = model_config.transformations
+    if options is None:
+        return []
     init_meta = model_config.transformer.init_model_with_meta_device
+    hooks = []
+    if checkpoint is not None:
+        load_dir, _ = resolve_checkpoint_load_dir(checkpoint)
+        if load_dir is not None:
+            hooks.append(restore_modelopt_state_hook(load_dir, checkpoint))
+    if options.qad_train_target is not None:
+        hooks.append(qad_freeze_hook(options.qad_train_target))
+    hooks.append(lsq_hook(options.lsq_scale_lr))
+    if not options.default_te_spec:
+        hooks.append(te_load_state_dict_hook())
+    return [on_model_init_device(hook, init_meta) for hook in hooks]
 
-    def register(hook):
-        hooks.append(on_model_init_device(hook, init_meta))
 
-    if options is not None:
-        if checkpoint is not None:
-            load_dir, _ = resolve_checkpoint_load_dir(checkpoint)
-            if load_dir is not None:
-                register(restore_modelopt_state_hook(load_dir, checkpoint))
-        if options.qad_train_target is not None:
-            register(qad_freeze_hook(options.qad_train_target))
-        register(lsq_hook(options.lsq_scale_lr))
-        if not options.default_te_spec:
-            register(te_load_state_dict_hook())
+def distillation_hooks(model_config, distillation=None) -> list[PreWrapHook]:
+    """Return the knowledge-distillation conversion hook for the student, if distilling.
 
-    hooks.extend(model_config.pre_wrap_hooks)
-    if distillation is not None:
-        remap_te_layernorm = options is not None and not options.default_te_spec
-        register(kd_convert_hook(model_config, distillation, remap_te_layernorm))
-    return compose_hooks(hooks)
+    Entry points put this after every other pre-wrap hook, so that the fully prepared (restored,
+    frozen) student is the one wrapped into a ``DistillationModel``. Empty without distillation.
+
+    Args:
+        model_config: The student's ``ModelConfig``.
+        distillation: The run's ``DistillationConfig``, or None.
+    """
+    if distillation is None:
+        return []
+    options = model_config.transformations
+    remap_te_layernorm = options is not None and not options.default_te_spec
+    hook = kd_convert_hook(model_config, distillation, remap_te_layernorm)
+    return [on_model_init_device(hook, model_config.transformer.init_model_with_meta_device)]

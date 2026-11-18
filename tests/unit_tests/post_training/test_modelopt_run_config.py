@@ -109,7 +109,7 @@ def test_whole_run_yaml_roundtrip(tmp_path, hybrid, training, kd):
     with patch.object(
         model_hooks, "restore_modelopt_state_hook", return_value=lambda x: x
     ) as restore:
-        restored.model.get_builder_cls()(restored.model).pre_wrap_hook(restored.checkpoint)
+        model_hooks.modelopt_setup_hooks(restored.model, restored.checkpoint)
     restore.assert_called_once_with("/replacement", restored.checkpoint)
 
 

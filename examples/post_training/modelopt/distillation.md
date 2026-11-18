@@ -104,21 +104,23 @@ student's `checkpoint`, rather than part of the student's model config.
 `DistillationConfig.teacher_model` and reads the loss settings, at CLI translation time.
 The teacher, its checkpoint path/format, and the loss are serialized with the run config;
 the ModelOpt setup options and independent MTP specification are serialized with the stock
-GPT/Hybrid model config. Rebuilding a deserialized config reconstructs setup hooks
-automatically; it does not need to reread the teacher architecture YAML or retain the
-original argparse namespace.
+GPT/Hybrid model config. Rebuilding a deserialized config through the training or
+inference entry points reconstructs the setup hooks from it; it does not need to reread the
+teacher architecture YAML or retain the original argparse namespace.
 
 `--export-kd-teacher-model-config` (argparse-name overrides of the student's
 architecture) is only read at CLI translation time, to resolve `teacher_model`. A YAML
 run config gives the teacher directly as `teacher_model`, a full `ModelConfig` of its own.
 
-Setup runs in this order: restore ModelOpt state, apply QAD freezing and LSQ
-setup, register checkpoint key remapping, run user pre-wrap hooks (including
-training freezes), then convert for KD. The training loop passes the run's
-`checkpoint` and `distillation` to `build_distributed_models(..., checkpoint=...,
-distillation=...)`; a custom runner using the builders directly must do the same. Teacher
-weights are loaded after wrapping by `load_kd_teacher_checkpoint(models, cfg.distillation)`,
-which such a runner must also call.
+The stock builders only select the ModelOpt layer spec from `model.transformations`; the
+ModelOpt pre-wrap hooks are installed by the entry points (`setup_model_and_optimizer` for
+training, `build_inference_models` for inference). They run in this order: restore ModelOpt
+state, apply QAD freezing and LSQ setup, register checkpoint key remapping
+(`modelopt_setup_hooks(model_config, cfg.checkpoint)`), run the config's own pre-wrap hooks
+(including training freezes), then convert for KD (`distillation_hooks(model_config,
+cfg.distillation)`). A custom runner using the builders directly must assemble the same
+`pre_wrap_hooks` list. Teacher weights are loaded after wrapping by
+`load_kd_teacher_checkpoint(models, cfg.distillation)`, which such a runner must also call.
 
 The run container owns the stock model config and student checkpoint.
 `model.transformations` contains only `ModelTransformConfig` options (QAD, LSQ,

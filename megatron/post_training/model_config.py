@@ -264,17 +264,26 @@ def modelopt_inference_config_from_args(args: Namespace, *, disable_moe_grouped_
 def build_inference_models(cfg, *, device: str = "cuda", mixed_precision: bool = True) -> list:
     """Build an inference container's model on the global MPU process groups, without DDP.
 
-    ``cfg.checkpoint`` is passed so the ModelOpt pre-wrap hooks restore its ModelOpt state.
+    The ModelOpt setup hooks run before the config's own hooks and restore the ModelOpt state
+    from ``cfg.checkpoint``. They go on a copy, so ``cfg.model`` keeps only its own hooks.
     """
     from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.post_training.model_hooks import modelopt_setup_hooks
 
+    model_config = cfg.model
+    builder_cls = model_config.get_builder_cls()
+    model_config = dataclasses.replace(
+        model_config,
+        pre_wrap_hooks=[
+            *modelopt_setup_hooks(model_config, cfg.checkpoint),
+            *model_config.pre_wrap_hooks,
+        ],
+    )
     kwargs = {} if mixed_precision else {"mixed_precision_wrapper": None}
-    builder = cfg.model.get_builder_cls()(cfg.model)
-    return builder.build_distributed_models(
+    return builder_cls(model_config).build_distributed_models(
         pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         wrap_with_ddp=False,
         device=device,
-        checkpoint=cfg.checkpoint,
         **kwargs,
     )
 

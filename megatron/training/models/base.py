@@ -11,7 +11,6 @@ from megatron.core.enums import ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
-from megatron.training.models.distillation import validate_distillation_student
 from megatron.training.models.transforms import ModelTransformConfig
 
 
@@ -68,7 +67,9 @@ class ModelConfig:
     ``transformations``. Remove together with its spec branches once Bridge no longer needs it."""
 
     transformations: ModelTransformConfig | None = None
-    """Declarative ModelOpt layer-spec and hook setup used by GPT/Hybrid builders."""
+    """Declarative ModelOpt options. The GPT/Hybrid builders select the ModelOpt layer spec from
+    it; the training and inference entry points install the matching pre-wrap hooks
+    (``megatron.post_training.model_hooks.modelopt_setup_hooks``)."""
 
     extra_checkpoint_metadata: dict[str, Any] | None = None
     """Store for additional model-related metadata to save in the checkpoint. This 
@@ -206,24 +207,6 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
     def __init__(self, model_config: ModelConfig):
         self._model_config = model_config
 
-    def pre_wrap_hook(self, checkpoint=None, distillation=None) -> Callable:
-        """Resolve declarative setup for each build, without mutating runtime hook lists.
-
-        ``checkpoint`` and ``distillation`` are the run container's settings, if any.
-        """
-        config = self._model_config
-        if config.transformations is not None or distillation is not None:
-            from megatron.post_training.model_hooks import modelopt_pre_wrap_hook
-
-            # Also covers callers that build without a run container.
-            config.validate()
-            if distillation is not None:
-                distillation.validate()
-                validate_distillation_student(distillation, config)
-
-            return modelopt_pre_wrap_hook(config, checkpoint, distillation)
-        return compose_hooks(config.pre_wrap_hooks)
-
     @abc.abstractmethod
     def build_model(
         self,
@@ -260,8 +243,6 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
         use_layer_wise_distributed_optimizer: bool = False,
         use_layer_wise_param_layout: bool = True,
         device: Any | None = None,
-        checkpoint: Any | None = None,
-        distillation: Any | None = None,
     ) -> list[ModelT]:
         """Build model stages and wrap for distributed training.
 
@@ -279,8 +260,6 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
             use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
                 controls whether to compute and supply a shard-aligned param layout to DDP.
             device: Explicit model placement requested by the run configuration.
-            checkpoint: Run-owned checkpoint configuration available to pre-wrap hooks.
-            distillation: Run-owned distillation configuration available to pre-wrap hooks.
 
         Returns:
             List of model stages. If the model does not support virtual pipeline parallelism,

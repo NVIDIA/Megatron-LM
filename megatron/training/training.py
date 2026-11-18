@@ -2514,7 +2514,6 @@ def setup_model_and_optimizer(
 
             model_config = cfg.model
             builder_cls = model_config.get_builder_cls()
-            builder = builder_cls(model_config)
 
             # Inject selective/all-layer freezing before wrapping so DDP/FSDP only allocates
             # gradient storage for parameters that remain trainable (matching get_model behavior).
@@ -2524,6 +2523,25 @@ def setup_model_and_optimizer(
                 freeze_base_model_for_mtp=cfg.model.transformer.freeze_base_model_for_mtp,
             )
 
+            # ModelOpt hooks surround the config's own hooks (including the freezes above):
+            # setup (state restore, QAD freeze, LSQ, TE-load) runs first, KD conversion last.
+            # They go on a copy, so cfg.model keeps only its own hooks across repeated builds.
+            if model_config.transformations is not None or cfg.distillation is not None:
+                from megatron.post_training.model_hooks import (
+                    distillation_hooks,
+                    modelopt_setup_hooks,
+                )
+
+                model_config = dataclasses.replace(
+                    model_config,
+                    pre_wrap_hooks=[
+                        *modelopt_setup_hooks(model_config, cfg.checkpoint),
+                        *model_config.pre_wrap_hooks,
+                        *distillation_hooks(model_config, cfg.distillation),
+                    ],
+                )
+
+            builder = builder_cls(model_config)
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
                 ddp_config=cfg.ddp,
@@ -2534,8 +2552,6 @@ def setup_model_and_optimizer(
                 data_parallel_random_init=cfg.rng.data_parallel_random_init,
                 use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
                 use_layer_wise_param_layout=cfg.optimizer.use_layer_wise_param_layout,
-                checkpoint=cfg.checkpoint,
-                distillation=cfg.distillation,
             )
         else:
             assert model_provider_func is not None, "Must provide a model config via config_container or a model_provider_func."
