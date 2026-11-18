@@ -22,7 +22,7 @@ from weakref import WeakKeyDictionary
 import torch
 from torch import nn
 
-from .execution_order import ExecutionEvent, ExecutionOrder
+from .execution_order import ExecutionAction, ExecutionEvent, ExecutionOrder, ExecutionOrderView
 from .phase import Phase
 from .runtime_policy import PrefetchOrder, RuntimePolicy
 
@@ -109,6 +109,8 @@ class FsdpContext:
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
         self.prefetch_order = runtime_policy.prefetch_order
         self.execution_order = ExecutionOrder()
+        self._execution_order_view: ExecutionOrderView | None = None
+        self._prefetch_order_view: ExecutionOrderView | None = None
         self._recording_execution_order = runtime_policy.prefetch_order is PrefetchOrder.RECORDED
         self._post_autograd_hook_registered = False
         self._delayed_post_backward_callbacks: list[
@@ -153,9 +155,31 @@ class FsdpContext:
         return self._is_finalized
 
     @property
+    def training(self) -> bool:
+        """Whether any FSDP root is in training mode."""
+        return any(root.training for root in self._roots)
+
+    @property
     def is_recording_execution_order(self) -> bool:
         """Whether module calls are being recorded for subsequent prefetching."""
-        return self._recording_execution_order
+        return self._recording_execution_order and self.training
+
+    @property
+    def execution_order_view(self) -> ExecutionOrderView | None:
+        """The complete recorded U/R sequence, consumed without wrapping."""
+        view = self._execution_order_view
+        if view is not None and view.source is not self.execution_order:
+            raise RuntimeError("The recorded FSDP execution order was replaced.")
+        return view
+
+    @property
+    def prefetch_order_view(self) -> ExecutionOrderView:
+        """Independent unshard hints for speculative prefetch."""
+        view = self._prefetch_order_view
+        if view is None or view.source is not self.execution_order:
+            view = self.execution_order.view(action=ExecutionAction.UNSHARD)
+            self._prefetch_order_view = view
+        return view
 
     def register_module(self, module: nn.Module) -> None:
         """Register a module after its FSDP initialization completes in this context."""
@@ -189,6 +213,11 @@ class FsdpContext:
         if not self._recording_execution_order:
             for root in reversed(list(self._roots)):
                 _collect_backward_order(root, registered_modules, self.execution_order)
+
+        if self.prefetch_order is PrefetchOrder.RECORDED and any(
+            not module._schedule_policy.register_hooks for module in self._module_names
+        ):
+            raise ValueError("Recorded FSDP execution requires ordinary module hooks.")
 
         self._registered_modules.clear()
         self.parameter_to_owner = None
@@ -224,7 +253,8 @@ class FsdpContext:
         Use SKIP_OUTER while accumulating gradients across backward calls. For the last
         backward before the optimizer step, use REDUCE_OUTER_AND_WAIT for automatic
         completion, or REDUCE_OUTER and call finish_grad_sync() after all backward work,
-        including backward_dw(). Inner reduction and weight cleanup run in every mode.
+        including backward_dw(). Inner reduction runs in every mode; post_backward()
+        closes model execution and clears remaining gathered weights independently.
 
         Outside a scope, backward uses the mode selected at context construction.
         Wrap both forward and backward. The scope itself does not launch reductions
@@ -261,7 +291,7 @@ class FsdpContext:
         )
 
     def finish_grad_sync(self) -> None:
-        """Reshard remaining weights and wait on submitted gradient reductions.
+        """Wait on submitted gradient reductions without ending model execution.
 
         Call after all backward work, including delayed weight-gradient computation,
         and before reading or modifying gradients. This enqueues a stream dependency;
@@ -270,12 +300,6 @@ class FsdpContext:
         # TODO(wujingyue): Support SKIP_OUTER even on the last microbatch by launching pending
         # outer reductions here before waiting, instead of requiring backward to launch them.
 
-        # A backward prefetch may gather a frozen module that never runs backward.
-        # Restore bindings and clear its gather state so the next iteration
-        # materializes fresh weights. All backward work, including delayed wgrad,
-        # must be complete here.
-        for module in self._module_names:
-            module.reshard()
         self.current_stream().wait_stream(self.inner_reduction_stream)
         if self.outer_reduction_stream is not self.inner_reduction_stream:
             self.current_stream().wait_stream(self.outer_reduction_stream)
@@ -290,14 +314,27 @@ class FsdpContext:
         self.inner_reduction_stream.wait_stream(self.current_stream())
 
     def _finish_execution_order(self) -> None:
-        """Finish recording or validate replay at the execution-window boundary."""
-        if not self._recording_execution_order and self.execution_order.position != 0:
-            raise RuntimeError("FSDP execution ended before the recorded order was complete.")
-        self._recording_execution_order = False
+        """Close one recording or require the complete recorded replay."""
+        if self._recording_execution_order:
+            self._recording_execution_order = False
+            self._execution_order_view = self.execution_order.view()
+            self._prefetch_order_view = self.execution_order.view(action=ExecutionAction.UNSHARD)
+        elif self.prefetch_order is PrefetchOrder.RECORDED:
+            view = self.execution_order_view
+            if view is None or view.position != len(view):
+                raise RuntimeError("FSDP execution ended before the recorded order was complete.")
+            view.reset()
+            self.prefetch_order_view.reset()
 
     def post_backward(self) -> None:
         """Complete the execution order after all backwards in this schedule."""
+        if not self.training:
+            return
         self._finish_execution_order()
+        # Speculative prefetch may gather an owner that never runs backward.
+        # Final cleanup is physical work outside the logical U/R trace.
+        for module in self._module_names:
+            module.reshard(force=True)
 
     def post_microbatch(self) -> None:
         """Release deferred module weights after each microbatch backward."""

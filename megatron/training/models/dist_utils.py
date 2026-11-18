@@ -338,7 +338,8 @@ def _ddp_wrap(
         # DistOpt-style buffer.
         tag_params_for_buffer_routing(model)
 
-    cuda_graph_impl = get_model_config(model[0]).cuda_graph_impl
+    config = get_model_config(model[0])
+    cuda_graph_impl = config.cuda_graph_impl
     current_stream = torch.cuda.current_stream()
     if cuda_graph_impl == "full_iteration":
         # DDP initialization must use the full-iteration capture stream so its retained
@@ -379,6 +380,11 @@ def _ddp_wrap(
             fully_shard_context(
                 FsdpContext(
                     runtime_policy=RuntimePolicy(
+                        prefetch_order=FullyShardedDataParallelV2.prefetch_order_for(config),
+                        autograd_completes_execution=not (
+                            config.pipeline_model_parallel_size > 1
+                            or config.virtual_pipeline_model_parallel_size is not None
+                        ),
                         use_symmetric_memory=ddp_config.nccl_ub,
                         overlap_outer_communication=ddp_config.overlap_outer_communication,
                     )

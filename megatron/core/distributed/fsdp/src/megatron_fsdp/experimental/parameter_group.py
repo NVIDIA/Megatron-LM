@@ -472,6 +472,16 @@ class FsdpParameterGroup:
             return False
         return buffer.is_rowwise_allocated
 
+    @property
+    def unsharded_storage_bytes(self) -> int:
+        """Conservative full gathered-weight capacity, excluding persistent compute shards."""
+        buffer = self._unsharded_model_weight
+        if buffer.is_alias_of(self.model_weight):
+            return 0
+        if isinstance(buffer, DBuffer):
+            return buffer.local_buffer.numel() * buffer.local_buffer.element_size()
+        return buffer.gathered_storage_bytes
+
     def unshard_parameters(self, phase: Phase | None = None) -> None:
         """Prepare this group's Parameters for the requested compute phase.
 

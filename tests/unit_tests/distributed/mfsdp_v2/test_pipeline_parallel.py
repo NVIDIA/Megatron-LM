@@ -25,6 +25,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     PrefetchOrder,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
+    ExecutionAction,
     ExecutionEvent,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard import (
@@ -34,6 +35,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
+from megatron.training.models.dist_utils import _ddp_wrap
 from megatron.training.training import wrap_model_chunks_with_ddp
 from tests.unit_tests.test_utilities import Utils
 
@@ -73,7 +75,8 @@ class TestMfsdpV2PipelineSharedContext:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 CUDA devices.")
-    def test_shared_context_across_virtual_pipeline_chunks(self, distributed_setup):
+    @pytest.mark.parametrize("wrapper", ["training", "model_builder"])
+    def test_shared_context_across_virtual_pipeline_chunks(self, distributed_setup, wrapper):
         """Shared chunks record their complete execution across separate backward calls."""
         device = distributed_setup.device
 
@@ -90,14 +93,26 @@ class TestMfsdpV2PipelineSharedContext:
             virtual_pipeline_model_parallel_size=2,
         )
 
-        wrapped_chunks = wrap_model_chunks_with_ddp(
-            chunks,
-            config,
-            _mfsdp_v2_ddp_config(),
-            DP=FullyShardedDataParallel,
-            pg_collection=self.pg_collection,
-            disable_bucketing_per_chunk=[False] * len(chunks),
-        )
+        if wrapper == "model_builder":
+            for chunk in chunks:
+                chunk.config = config
+            wrapped_chunks = _ddp_wrap(
+                chunks,
+                data_parallel_random_init=False,
+                ddp_config=_mfsdp_v2_ddp_config(),
+                overlap_param_gather_with_optimizer_step=False,
+                use_megatron_fsdp=True,
+                pg_collection=self.pg_collection,
+            )
+        else:
+            wrapped_chunks = wrap_model_chunks_with_ddp(
+                chunks,
+                config,
+                _mfsdp_v2_ddp_config(),
+                DP=FullyShardedDataParallel,
+                pg_collection=self.pg_collection,
+                disable_bucketing_per_chunk=[False] * len(chunks),
+            )
 
         # Every chunk is an MFSDP v2 wrapper whose root is an FsdpModule.
         assert len(wrapped_chunks) == len(chunks)
@@ -137,8 +152,10 @@ class TestMfsdpV2PipelineSharedContext:
                 context.post_backward()
                 context.finish_grad_sync()
                 assert not context.is_recording_execution_order
-                assert list(context.execution_order) == expected
-                assert context.execution_order.position == 0
+                assert (
+                    list(context.execution_order.view(action=ExecutionAction.UNSHARD)) == expected
+                )
+                assert context.execution_order_view.position == 0
                 # Each of two microbatches contributes two to every weight gradient.
                 for chunk in wrapped_chunks:
                     for parameter in chunk.parameters():
