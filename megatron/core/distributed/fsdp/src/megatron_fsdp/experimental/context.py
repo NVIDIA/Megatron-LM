@@ -60,6 +60,12 @@ class FsdpContext:
     outer_reduction_stream: torch.cuda.Stream
     # Active mode, controlled by finalize_gradients().
     _gradient_finalization_mode: GradientFinalizationMode
+    # Runs the post-optimizer DP-outer all-gather that refreshes model_weight.
+    # Aliases allgather_stream unless DP-outer overlap is enabled.
+    outer_allgather_stream: torch.cuda.Stream
+    # Weight-sync generation at which outer_allgather_stream last forked from
+    # allgather_stream; see FsdpModule._unshard_parameter_groups.
+    outer_allgather_fork_generation: int
     use_symmetric_memory: bool
     # Prefetch uses construction order unless execution-order recording is enabled.
     execution_order: ExecutionOrder
@@ -126,8 +132,8 @@ class FsdpContext:
         #   (False, True):  all-gather and inner reduction share; outer is separate.
         #   (True, True):   all-gather, inner reduction, and outer reduction each
         #                  have a separate stream.
-        # Outer all-gather separation is not implemented yet; the outer option
-        # currently affects only reduction.
+        # overlap_outer_communication also gives the post-optimizer DP-outer
+        # all-gather its own stream; otherwise it shares the all-gather stream.
         self.inner_reduction_stream = torch.cuda.Stream(device)
         self.allgather_stream = (
             torch.cuda.Stream(device)
@@ -139,6 +145,10 @@ class FsdpContext:
             if overlap_outer_communication
             else self.inner_reduction_stream
         )
+        self.outer_allgather_stream = (
+            torch.cuda.Stream(device) if overlap_outer_communication else self.allgather_stream
+        )
+        self.outer_allgather_fork_generation = 0
 
     @property
     def gradient_finalization_mode(self) -> GradientFinalizationMode:

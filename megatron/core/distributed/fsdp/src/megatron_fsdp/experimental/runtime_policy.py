@@ -40,7 +40,12 @@ class RuntimePolicy:
     """
 
     overlap_outer_communication: bool = False
-    """Run DP-outer reduction on a separate stream, independently of all-gather overlap."""
+    """Run DP-outer communication on separate streams, independently of all-gather overlap.
+
+    Covers the last-microbatch DP-outer reduction, and the first-microbatch DP-outer
+    all-gather that refreshes compute weights after an optimizer step, so it overlaps
+    DP-inner all-gathers.
+    """
 
     prefetch_order: PrefetchOrder = PrefetchOrder.REGISTRATION
     """``REGISTRATION`` expects a forward/backward pass matching module
