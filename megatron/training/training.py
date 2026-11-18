@@ -2243,7 +2243,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         config = cfg.model.transformer
     args.model_type = model_type
     if pg_collection is None:
-        if cfg.dist.create_all_gather_group:
+        if wrap_with_ddp and cfg.dist.create_all_gather_group:
             raise RuntimeError("Attach the returned AG handles to pg_collection before get_model")
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 

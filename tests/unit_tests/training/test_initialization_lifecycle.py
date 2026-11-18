@@ -859,6 +859,41 @@ def test_native_gtp_sequence_sharding_validates_cross_config_inputs(
         run_config.validate()
 
 
+@pytest.mark.parametrize(
+    "wrap_with_ddp, retained_collection", [(False, False), (True, False), (True, True)]
+)
+def test_get_model_requires_retained_ag_groups_only_for_wrapped_models(
+    monkeypatch, run_config, wrap_with_ddp, retained_collection
+):
+    from megatron.training import training
+
+    run_config.dist.create_all_gather_group = True
+    monkeypatch.setattr(training, "get_args", lambda: Namespace())
+    monkeypatch.setattr(training, "has_nvidia_modelopt", False)
+    groups = ProcessGroupCollection()
+    if retained_collection:
+        groups.dp_cp_ag = object()
+    monkeypatch.setattr(ProcessGroupCollection, "use_mpu_process_groups", Mock(return_value=groups))
+
+    class ReachedModelProvider(Exception):
+        pass
+
+    provider = Mock(side_effect=ReachedModelProvider)
+    missing_training_groups = wrap_with_ddp and not retained_collection
+    error = RuntimeError if missing_training_groups else ReachedModelProvider
+    match = "Attach the returned AG handles" if missing_training_groups else None
+    with pytest.raises(error, match=match):
+        training.get_model(
+            provider,
+            wrap_with_ddp=wrap_with_ddp,
+            pg_collection=groups if retained_collection else None,
+        )
+    if missing_training_groups:
+        provider.assert_not_called()
+    else:
+        assert provider.call_args.kwargs["pg_collection"] is groups
+
+
 def test_callback_upcycling_uses_temporary_dense_config(monkeypatch, run_config):
     from megatron.training import training
 
