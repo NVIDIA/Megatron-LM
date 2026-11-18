@@ -124,6 +124,17 @@ The following tables group common training arguments by category.
 | `--micro-batch-size` | Batch size per GPU |
 | `--global-batch-size` | Total batch size across all GPUs |
 | `--train-iters` | Number of training iterations |
+| `--no-check-optimizer-step-success` | Disable synchronization of optimizer-step success across model-parallel ranks before advancing the scheduler. Checking is enabled by default. |
+| `--skip-sync-grad-norm-across-mp` | Skip synchronization of the reported gradient norm across model-parallel ranks; gradient clipping is unchanged. Disabled by default. |
+| `--spiky-loss-factor` | Loss-spike threshold as a multiple of the observed maximum for GPT/hybrid training when `--check-for-spiky-loss` is enabled. Default: `10.0`. |
+| `--external-gpu-device-mapping` | Select visible CUDA device 0 when the launcher exposes one GPU per process. Disabled by default; otherwise device selection follows the local rank. |
+| `--timing-log-level` | Timer detail level, default `0`. Set `-1` to disable timer reports and optional operator timers; required measurements for progress, throughput, and checkpoint bookkeeping remain active. |
+
+`TrainingConfig.check_optimizer_step_success` defaults to `True`: the training
+loop combines optimizer-step success across model-parallel ranks before deciding
+whether to advance the learning-rate scheduler. Disable it only when the local
+optimizer results are consistent across those ranks, otherwise scheduler state
+can diverge.
 
 ### Learning Rate
 
@@ -133,6 +144,11 @@ The following tables group common training arguments by category.
 | `--min-lr` | Minimum learning rate |
 | `--lr-decay-style` | LR schedule (cosine, linear, constant) |
 | `--lr-warmup-iters` | Warmup iterations |
+| `--max-steps` | Full LR/weight-decay schedule horizon for a shortened iteration-based run. Overrides `--lr-decay-iters` without changing `--train-iters`; must be positive and at least `--train-iters`. Unset by default. |
+
+For example, `--train-iters 100 --max-steps 10000` runs 100 iterations using a
+10,000-iteration schedule. Fractional warmup follows the full LR horizon. This
+option is not supported with sample-based training.
 
 ### Mixed Precision
 
