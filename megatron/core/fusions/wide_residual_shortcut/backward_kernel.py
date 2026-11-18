@@ -21,6 +21,7 @@ from .kernel_utils import (
     _descriptor,
     _fma2,
     _mul2,
+    _widen_bf16,
     named_jit,
     qualified_device,
     reduce_jobs,
@@ -69,14 +70,17 @@ class _BackwardConfig(NamedTuple):
     EARLY_CARRY: bool = False
 
 
-def get_backward_knobs(m, h, streams, readers=1, *, grid="auto"):
+def get_backward_knobs(m, h, streams, readers=1, *, grid="auto", bf16=False):
     """Select the launch knobs for one shape; an explicit grid overrides the auto grid."""
-    production = streams == 3 and (m, h) in FLAGSHIPS
+    # Tuned at the flagship widths for training row counts (8K and up).
+    production = streams == 3 and m >= 2048 and h in {hidden for _, hidden in FLAGSHIPS}
     rows = 2 if h == 4096 and streams not in (1, 4) else 4
     vector = 4 if (h <= 3072 and not (h == 3072 and streams > 4)) or streams == 4 else 2
     if streams == 3 and not production:
         rows, vector = 8, 2 if h % 2048 else 4
-    budget = 456 if streams <= 3 else 288
+    # A BF16 one-reader seam fits four CTAs per SM in 128 registers (8K Nano/Super/Ultra sweep).
+    four = production and bf16 and readers == 1
+    budget = 608 if four else 456 if streams <= 3 else 288
     if grid == "auto":
         participants = triton.cdiv(h, 256)
         grid = min(triton.cdiv(m, 16), max(1, budget // participants)) * participants
@@ -86,7 +90,7 @@ def get_backward_knobs(m, h, streams, readers=1, *, grid="auto"):
         TARGET_CTAS=grid,
         EARLY_CARRY=production and h == 4096 and readers == 1,
         # Six streams have less shared-memory residency; allow registers to avoid spills.
-        MAXNREG=255 if streams == 6 else 168,
+        MAXNREG=255 if streams == 6 else 128 if four else 168,
     )
 
 
@@ -158,7 +162,7 @@ def backward(
         columns = tuple(old if old is not None else new for old, new in zip(columns, generated))
     if on_columns_ready is not None:
         on_columns_ready(columns)
-    knobs = get_backward_knobs(m, h, streams, n, grid=config)
+    knobs = get_backward_knobs(m, h, streams, n, grid=config, bf16=previous.dtype == torch.bfloat16)
     grid = knobs.TARGET_CTAS
     # Outputs and scratch belong to this invocation; a shortcut add's updates share one gradient.
     empty = saved.coefficients.new_empty
@@ -385,14 +389,6 @@ def _bulk_prefetch_l2(pointer, valid, BYTES: gl.constexpr, THREADS: gl.constexpr
 
 
 @g.jit
-def _widen_bf16(x):
-    # Exact widening to FP32; BF16 bits become the upper half of the FP32 word.
-    if x.dtype == gl.bfloat16:
-        return (x.to(gl.uint16, bitcast=True).to(gl.uint32) << 16).to(gl.float32, bitcast=True)
-    return x.to(gl.float32)
-
-
-@g.jit
 def _staged_dy(ds, row: gl.constexpr, WIDEN: gl.constexpr):
     if WIDEN:
         return _widen_bf16(ds.slice(row, 16).load(_GRADIENT_LAYOUT))
@@ -438,20 +434,15 @@ def _thread_pairs(value):
 
 
 @g.jit
-def _store_controller(destination, a, b, valid, PACKED: gl.constexpr):
-    """Reduce each 16x128 slice of a * b into eight fixed lane-group controller partials;
-    PACKED accumulates each thread's products as one packed FMA chain."""
-    if PACKED:
-        pa = _thread_pairs(a)
-        pb = _thread_pairs(b)
-        acc = _mul2(pa[0], pb[0])
-        for k in gl.static_range(1, 8):
-            acc = _fma2(pa[k], pb[k], acc)
-        per_thread = gl.sum(acc, 1)
-    else:
-        owned = gl.permute(gl.reshape(_mul2(a, b), (4, 4, 4, 8, 4)), (2, 1, 3, 0, 4))
-        per_thread = gl.sum(gl.reshape(owned, (128, 16)), 1)
-    total = gl.sum(gl.reshape(per_thread, (8, 16)), 1)
+def _store_controller(destination, a, b, valid):
+    """Reduce each 16x128 slice of a * b into eight fixed lane-group controller partials, each
+    thread's products accumulated as one packed FMA chain."""
+    pa = _thread_pairs(a)
+    pb = _thread_pairs(b)
+    acc = _mul2(pa[0], pb[0])
+    for k in gl.static_range(1, 8):
+        acc = _fma2(pa[k], pb[k], acc)
+    total = gl.sum(gl.reshape(gl.sum(acc, 1), (8, 16)), 1)
     gl.store(destination + gl.arange(0, 8, layout=total.type.layout), total, valid)
 
 
@@ -764,8 +755,8 @@ def _backward_body(
             mbarrier.expect(copy_barriers[1], HALF_BYTES)
 
         # Gradient phase: dx = r * (dz - z * p); per stream dR = t * dR + sum alpha * dx and du.
-        # Two readers start transfers first and reduce controllers as packed FMA chains; one
-        # reader releases each slice after its controller reductions.
+        # Two readers start transfers first; one reader releases each slice after its
+        # controller reductions.
         OUTPUT_CACHE: gl.constexpr = ".cs" if not TWO else ""
         HELD: gl.constexpr = min(2, streams)  # predecessor slices read before the first barrier
         prefetch_active = next_rp < total_tiles
@@ -831,7 +822,7 @@ def _backward_body(
 
             if not TWO:
                 for reader in gl.static_range(NREADERS):
-                    _store_controller(u_rows + reader * stride, u, dxs[reader], valid, False)
+                    _store_controller(u_rows + reader * stride, u, dxs[reader], valid)
             du = gl.full((16, 128), 0, gl.float32, L)
 
             if TWO:
@@ -866,11 +857,11 @@ def _backward_body(
                 controller = controller_row + s * stride
                 if TWO and s == 0:
                     for reader in gl.static_range(NREADERS):
-                        _store_controller(u_rows + reader * stride, u, dxs[reader], valid, True)
+                        _store_controller(u_rows + reader * stride, u, dxs[reader], valid)
                 # Raw a[r, s] = sum(Rprev_s * dx_r); the final reduction forms t * a + w * b.
                 for reader in gl.static_range(NREADERS):
                     reads = controller + (1 + retention + reader) * streams * stride
-                    _store_controller(reads, R_prev_s, dxs[reader], valid, TWO)
+                    _store_controller(reads, R_prev_s, dxs[reader], valid)
                 if not TWO and not CONFIG.EARLY_CARRY and (s + 1 < streams or prefetch_active):
                     gl.barrier()
                     fence_async_shared()
@@ -889,9 +880,7 @@ def _backward_body(
                     fence_async_shared()
                     _copy_tiles((residual_copies[s - 1],), next_rp, copy_barriers[part], part)
                 if retention:
-                    _store_controller(
-                        controller + streams * stride, incoming_dR_s, R_prev_s, valid, TWO
-                    )
+                    _store_controller(controller + streams * stride, incoming_dR_s, R_prev_s, valid)
                 if h % 256:
                     incoming_dR_s = gl.where(cols < h, incoming_dR_s, 0)
                 # Differentiate the rounded folded coefficients alpha = FP32(beta * t).
@@ -916,7 +905,7 @@ def _backward_body(
                 gl.store(dR_pointer, d_previous, mask, cache_modifier=OUTPUT_CACHE)
                 # du accumulates the carry here and the readers' q * dx after the streams.
                 du = _fma2(w, incoming_dR_s, du)
-                _store_controller(controller, incoming_dR_s, u, valid, TWO)
+                _store_controller(controller, incoming_dR_s, u, valid)
 
             for reader in gl.static_range(NREADERS):
                 du = _fma2(update_mixes[reader], dxs[reader], du)
