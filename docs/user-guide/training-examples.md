@@ -79,8 +79,9 @@ torchrun --nproc_per_node=8 pretrain_gpt.py \
 
 Dataset content limits and model execution widths have different owners:
 
-- `cfg.data.dataset.sequence_length` limits each GPT/SFT sequence's content. The CLI
-  supplies it with `--seq-length`.
+- `cfg.data.dataset.sequence_length` controls GPT row length and supplies SFT's
+  default pack width. It is not a separate real-SFT conversation truncation limit.
+  The CLI supplies it with `--seq-length`.
 - `cfg.model.transformer.max_seq_length_per_sample` bounds one physical model input
   row, or an entire packed THD row, including padding and expanded image tokens.
   This is the maximum for the training run, not the model's architectural capacity.
@@ -92,8 +93,10 @@ Dataset content limits and model execution widths have different owners:
   than the inputs used in a particular run.
 - `max_seqlen_per_dp_cp_rank` remains the separate per-rank dynamic-CP packing budget.
 
-For example, `--sft --seq-length 2048 --max-seq-length-per-sample 8192` truncates
-individual conversations at 2048 tokens and emits 8192-token padded packs. The
+For example, `--sft --seq-length 2048 --max-seq-length-per-sample 8192` emits
+8192-token padded packs. Real SFT preserves its existing behavior: append tokenized
+conversations, then truncate the combined pack, without truncating each conversation
+at 2048 tokens. Independent per-conversation truncation is outside this migration. The
 container derives `SFTDatasetConfig.packed_sequence_length` during startup;
 recipes should set the model bound rather than this derived dataset field. Existing
 `--seq-length`-only runs retain their previous widths and packing behavior.
@@ -120,7 +123,7 @@ ModelOpt callbacks reject bounds inconsistent with the rows they actually emit.
 ### Python API compatibility
 
 Python SFT callers use `SFTDatasetConfig` for a pack width distinct from the
-conversation limit. Container deserialization upgrades saved SFT sections from
+legacy `sequence_length` value. Container deserialization upgrades saved SFT sections from
 `GPTDatasetConfig` to this subclass using the saved `dataset_type`, preserving
 all fields. Unknown fields still fail strict loading. Varlen callers and CLI flag
 names are unchanged.

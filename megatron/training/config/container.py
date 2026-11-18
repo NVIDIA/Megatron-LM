@@ -665,8 +665,8 @@ class PretrainConfigContainer(ConfigContainerBase):
         ``finalize()``; the arguments and the saved file leave them at Megatron Core's defaults),
         and ``max_seq_length_per_sample`` describes this run's physical input width, not model
         capacity. Fixed GPT/FIM rows must match it; the container fills an unset value from the
-        dataset at ``finalize()``. SFT's physical pack width is derived from that maximum,
-        independently of its dataset's per-conversation truncation limit.
+        dataset at ``finalize()``. SFT's physical pack width is derived from that maximum;
+        real SFT retains pack-level truncation without a separate per-conversation limit.
         With both: SBHD validation excludes a scheduler, a packed varlen dataset needs one, and the
         sample length is a multiple of ``2 * cp`` under context parallelism. Each is the condition
         ``validate_args`` enforces on the CLI; here it holds for a Python or YAML container too.
@@ -733,8 +733,8 @@ class PretrainConfigContainer(ConfigContainerBase):
                 and execution_bound != dataset.sequence_length
             ):
                 raise ValueError(
-                    "Use SFTDatasetConfig to separate conversation truncation from the "
-                    "model execution width; GPTDatasetConfig emits sequence_length tokens."
+                    "Use SFTDatasetConfig for a model execution width distinct from "
+                    "dataset.sequence_length; GPTDatasetConfig emits sequence_length tokens."
                 )
             pack_length = (
                 (execution_bound or dataset.sequence_length)

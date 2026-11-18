@@ -1153,7 +1153,7 @@ def validate_args(args, defaults={}):
         assert args.hidden_size % args.num_attention_heads == 0
         args.kv_channels = args.hidden_size // args.num_attention_heads
 
-    # SFT pads conversations into a physical pack; its truncation limit need not align.
+    # SFT alignment applies to the physical pack, which can override --seq-length.
     input_length = args.max_seq_length_per_sample if args.sft else None
     input_length = input_length if input_length is not None else args.seq_length
     if input_length is None:

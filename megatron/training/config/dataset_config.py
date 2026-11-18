@@ -20,8 +20,9 @@ serves every GPT entry point: the args-to-config factory forwards every data arg
 follows the family flags, and the provider hands ``cfg.data.dataset`` to the builder unchanged.
 The loop reads the section through its predicates (``is_sft()``, ``has_cu_seqlens()``,
 ``use_per_sequence_balancing()``, ``yields_unpacked_samples()``) and the dataset's fields, never
-through ``args``. The dataset's ``sequence_length`` controls content truncation/chunking;
-SFT's ``packed_sequence_length`` is derived from the model's execution bound at finalization.
+through ``args``. GPT uses ``sequence_length`` for chunking. Real SFT keeps pack-level truncation:
+its ``packed_sequence_length`` is derived from the model's execution bound at finalization,
+without introducing a per-conversation truncation policy.
 Callback applications resolve their model input width before startup, including image expansion
 for VLMs. The model's positional capacity is independent of these dataset and execution lengths.
 Entry points with their own data pipeline carry a loader-only section (``dataset is None``) and

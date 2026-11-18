@@ -6,7 +6,7 @@ from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatr
 
 
 def get_dataset_input_length(dataset: BlendedMegatronDatasetConfig) -> int:
-    """Return a dataset's output row width, not an SFT conversation truncation limit."""
+    """Return a dataset's output row width, using the derived physical pack width for SFT."""
     from megatron.training.datasets.sft_dataset import SFTDatasetConfig
 
     if isinstance(dataset, SFTDatasetConfig):

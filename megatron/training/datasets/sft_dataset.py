@@ -21,12 +21,13 @@ IGNORE_INDEX = -100
 
 @dataclass
 class SFTDatasetConfig(GPTDatasetConfig):
-    """SFT conversation limits and physical pack width."""
+    """SFT dataset settings and physical pack width."""
 
     packed_sequence_length: Optional[int] = None
     """Physical output width, including alignment padding. The training container derives this
-    from the model execution bound; inherited ``sequence_length`` limits each conversation.
-    Standalone datasets default to ``sequence_length`` when this is unset."""
+    from the model execution bound, falling back to ``sequence_length`` when unset.
+    Real SFT truncates the combined pack, not each conversation independently.
+    Mock SFT also uses ``sequence_length`` to limit its generated sample."""
 
 
 class SFTLowLevelDataset:
@@ -154,11 +155,6 @@ class SFTDataset(MegatronDataset):
             tokens_list = tokens.tolist()
             targets_list = targets.tolist()
 
-            # Truncate each conversation before packing; the physical pack width
-            # and its alignment padding are independent of this content limit.
-            if self.config.sequence_length < pack_length:
-                tokens_list = tokens_list[: self.config.sequence_length]
-                targets_list = targets_list[: self.config.sequence_length]
 
             pack_tokens.extend(tokens_list)
             pack_targets.extend(targets_list)

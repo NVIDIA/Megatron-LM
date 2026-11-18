@@ -40,7 +40,7 @@ from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.training import legacy_dataset_factories as legacy
 
 
-def test_sft_truncates_conversations_before_packing():
+def test_sft_preserves_pack_level_truncation():
     tokenizer = SimpleNamespace(
         pad=0,
         eod=99,
@@ -62,9 +62,12 @@ def test_sft_truncates_conversations_before_packing():
     dataset.indices = [0]
     dataset.padding_divisor = 1
     sample = dataset[0]
-    assert sample["tokens"].tolist() == [1, 2, 3, 4, 1, 2, 3, 4, 0, 0, 0, 0]
-    assert sample["cu_seqlens"][:3].tolist() == [0, 4, 12]
-    assert sample["loss_mask"][-4:].tolist() == [0, 0, 0, 0]
+    # The first conversation exceeds sequence_length but fits in the pack. Only the
+    # combined pack is truncated; labels retain the existing one-token shift.
+    assert sample["tokens"].tolist() == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 1, 2]
+    assert sample["labels"].tolist() == [2, 3, 4, 5, 6, 7, 8, 9, 10, 1, 2, 0]
+    assert sample["cu_seqlens"][:3].tolist() == [0, 10, 12]
+    assert sample["loss_mask"].tolist() == [1] * 11 + [0]
 
 
 MODEL_ARGV = (
