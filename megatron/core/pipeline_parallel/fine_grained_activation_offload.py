@@ -547,19 +547,14 @@ class PipelineOffloadManager:
         # allocate streams and events for synchronization
         self._d2h_stream = torch.cuda.Stream()
         self._h2d_stream = torch.cuda.Stream()
-        # TE CUDA graph offload paths need a stream/event pair that lives outside
-        # individual layer objects so capture, replay, and backward hooks order
-        # the same D2H/H2D work with the same synchronization primitives.
-        self._cuda_graph_stream = torch.cuda.Stream()
-        self._cuda_graph_event = torch.cuda.Event(external=True)
         # Shared CPU tensor pool for all chunks to improve reuse efficiency
         self._cpu_tensor_pool = OffloadTensorPool(device="cpu", pin_memory=True)
         self._offload_buffer_size_gib = None
 
         # Whether the manager is in warmup phase.
         self._is_warmup = True
-        # Whether the manager is in CUDA graph replay phase.
-        self._in_replay = False
+        # Whether eligible group commits should be queued until explicitly flushed.
+        self.defer_group_commits = False
         # Cache OffloadChunkHandler objects for each virtual pipeline stage and each forward pass.
         self._cached_chunks_forward = []
         # Cache OffloadChunkHandler objects for each virtual pipeline stage and each backward pass.
@@ -595,16 +590,6 @@ class PipelineOffloadManager:
         return self._h2d_stream
 
     @property
-    def cuda_graph_stream(self):
-        """Get the CUDA graph stream."""
-        return self._cuda_graph_stream
-
-    @property
-    def cuda_graph_event(self):
-        """Get the CUDA graph event."""
-        return self._cuda_graph_event
-
-    @property
     def cpu_tensor_pool(self):
         """Get the shared CPU tensor pool."""
         return self._cpu_tensor_pool
@@ -612,7 +597,7 @@ class PipelineOffloadManager:
     def push_offload_groups(self, group_hook, name, forced_released_tensors):
         """Push the offload groups to the delayed queue."""
         debug_rank(f"pushing offload groups to the delayed queue")
-        # Store the group name because delayed CUDA graph replay flushes later,
+        # Store the group name because the delayed queue is flushed later,
         # after the original group-start site has already moved on.
         self._delayed_offload_groups.append((group_hook, name, forced_released_tensors))
 
@@ -1537,9 +1522,8 @@ class FineGrainedOffloadingGroupCommitFunction(torch.autograd.Function):
         # pylint: disable=missing-function-docstring
         debug_rank("FineGrainedOffloadingGroupCommitFunction forward")
 
-        if delay_offload and PipelineOffloadManager.get_instance()._in_replay:
-            # During TE CUDA graph replay, queue D2H work and launch it after
-            # replay returns, where CPU scheduling can overlap with graph/comm gaps.
+        if delay_offload and PipelineOffloadManager.get_instance().defer_group_commits:
+            # Queue eligible D2H work until the caller flushes the delayed groups.
             PipelineOffloadManager.get_instance().push_offload_groups(
                 cur_forward_chunk.on_group_commit_forward, name, forced_released_tensors
             )
@@ -1641,30 +1625,6 @@ def fine_grained_offloading_group_start(tensor, name=None):
     return FineGrainedOffloadingGroupStartFunction.apply(tensor, cur_forward_chunk, name)
 
 
-class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
-    """
-    Identity operation that marks the end of a layer group for offload synchronization.
-    Triggers offload during forward and synchronizes reload during backward.
-    """
-
-    @staticmethod
-    def forward(ctx, tensor) -> torch.Tensor:
-        """Forward pass for cuda graph capture."""
-        debug_rank("FineGrainedOffloadingBackwardRecordFunction forward")
-        return tensor
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Record the backward event and wait for the h2d stream on cuda graph stream."""
-        debug_rank("FineGrainedOffloadingBackwardRecordFunction backward")
-        mgr = PipelineOffloadManager.get_instance()
-        # This event connects TE's graph stream with the reload stream so
-        # backward consumers do not race H2D reloads launched outside the graph.
-        torch.cuda.current_stream().record_event(mgr.cuda_graph_event)
-        torch.cuda.current_stream().wait_stream(mgr.h2d_stream)
-        return (grad_output,)
-
-
 class FineGrainedActivationOffloadingInterface:
     """Interface for fine-grained activation offloading."""
 
@@ -1684,16 +1644,6 @@ class FineGrainedActivationOffloadingInterface:
         """Exit context manager to disable activation offloading hooks."""
         if self.offload:
             PipelineOffloadManager.get_instance().__exit__()
-
-    @staticmethod
-    def cuda_graph_stream():
-        """Get the CUDA graph stream."""
-        return PipelineOffloadManager.get_instance().cuda_graph_stream
-
-    @staticmethod
-    def cuda_graph_event():
-        """Get the CUDA graph event."""
-        return PipelineOffloadManager.get_instance().cuda_graph_event
 
     @staticmethod
     def init_chunk_handler(
@@ -1737,18 +1687,6 @@ class FineGrainedActivationOffloadingInterface:
         PipelineOffloadManager.get_instance().mark_not_offload(tensor)
 
     @staticmethod
-    def forward_record() -> None:
-        """Record the forward event for cuda graph capture."""
-        mgr = PipelineOffloadManager.get_instance()
-        torch.cuda.current_stream().record_event(mgr.cuda_graph_event)
-        torch.cuda.current_stream().wait_stream(mgr.d2h_stream)
-
-    @staticmethod
-    def backward_record(tensor) -> torch.Tensor:
-        """Record the backward event for cuda graph capture."""
-        return FineGrainedOffloadingBackwardRecordFunction.apply(tensor)
-
-    @staticmethod
     def reset(process_group: Optional[torch.distributed.ProcessGroup] = None):
         """Reset the chunk handler."""
         PipelineOffloadManager.get_instance().reset(process_group=process_group)
@@ -1772,13 +1710,3 @@ class FineGrainedActivationOffloadingInterface:
     def enable_offload():
         """Enable the offload."""
         PipelineOffloadManager.get_instance().enable_offload()
-
-    @staticmethod
-    def enter_replay():
-        """Enter CUDA graph replay mode to enable delayed offloading."""
-        PipelineOffloadManager.get_instance()._in_replay = True
-
-    @staticmethod
-    def exit_replay():
-        """Exit CUDA graph replay mode."""
-        PipelineOffloadManager.get_instance()._in_replay = False
