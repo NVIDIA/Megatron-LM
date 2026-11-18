@@ -85,9 +85,7 @@ def _collect_source_buffer_dtypes(
     """Map local send tasks for persistent buffers to their source dtype."""
     if src_module is None:
         return {}
-    source_buffers = {
-        name: buf.dtype for name, _, _, buf in named_persistent_buffers(src_module)
-    }
+    source_buffers = {name: buf.dtype for name, _, _, buf in named_persistent_buffers(src_module)}
     return {
         op.task_id: source_buffers[op.param_name]
         for op in plan.send_ops
@@ -115,19 +113,12 @@ def _collect_destination_receive_info(
         dst_tensor = dst_tensors.get(op.param_name)
         if dst_tensor is None:
             continue
-        receive_dtype = (
-            torch.bfloat16 if _requires_bf16_staging(dst_tensor) else dst_tensor.dtype
-        )
-        local_receives[op.task_id] = (
-            op.param_name in destination_buffers,
-            receive_dtype,
-        )
+        receive_dtype = torch.bfloat16 if _requires_bf16_staging(dst_tensor) else dst_tensor.dtype
+        local_receives[op.task_id] = (op.param_name in destination_buffers, receive_dtype)
     return local_receives
 
 
-def _resolve_refit_dtypes(
-    gathered,
-) -> dict[int, torch.dtype]:
+def _resolve_refit_dtypes(gathered) -> dict[int, torch.dtype]:
     """Resolve each transfer task's dtype from all ranks."""
     source_dtype_info, destination_dtype_info = zip(*gathered)
     source_buffer_dtypes: dict[int, torch.dtype] = {}
@@ -136,9 +127,7 @@ def _resolve_refit_dtypes(
             previous = source_buffer_dtypes.setdefault(task_id, dtype)
             if previous != dtype:
                 # Safeguard for improper tasks / plans.
-                raise ValueError(
-                    f"Source task {task_id} has conflicting buffer dtypes."
-                )
+                raise ValueError(f"Source task {task_id} has conflicting buffer dtypes.")
 
     task_dtypes: dict[int, torch.dtype] = {}
     for rank_receives in destination_dtype_info:
@@ -157,10 +146,7 @@ def _resolve_refit_dtypes(
     return task_dtypes
 
 
-def _apply_wire_dtypes(
-    plan: ReshardPlan,
-    task_dtypes: dict[int, torch.dtype],
-) -> None:
+def _apply_wire_dtypes(plan: ReshardPlan, task_dtypes: dict[int, torch.dtype]) -> None:
     """
     Attach each destination's resolved receive dtype to local sends.
     Used to map source and destination model dtype disparities.
@@ -170,16 +156,12 @@ def _apply_wire_dtypes(
 
 
 def _apply_buffer_dtypes(
-    plan: ReshardPlan,
-    dst_module: torch.nn.Module | None,
-    task_dtypes: dict[int, torch.dtype],
+    plan: ReshardPlan, dst_module: torch.nn.Module | None, task_dtypes: dict[int, torch.dtype]
 ) -> None:
     """Apply resolved dtypes to local destination buffers."""
     if dst_module is None:
         return
-    destination_buffers = {
-        name for name, _, _, _ in named_persistent_buffers(dst_module)
-    }
+    destination_buffers = {name for name, _, _, _ in named_persistent_buffers(dst_module)}
     buffer_dtypes: dict[str, torch.dtype] = {}
     for op in plan.recv_ops:
         if op.param_name not in destination_buffers:
@@ -190,9 +172,7 @@ def _apply_buffer_dtypes(
         previous = buffer_dtypes.setdefault(op.param_name, receive_dtype)
         if previous != receive_dtype:
             # Validate N-to-1 send/recv for this buffer.
-            raise ValueError(
-                f"Source shards disagree on buffer dtype for {op.param_name}."
-            )
+            raise ValueError(f"Source shards disagree on buffer dtype for {op.param_name}.")
 
     invalidated = False
     for full_name, sub, buf_name, dst_buf in named_persistent_buffers(dst_module):
@@ -509,9 +489,7 @@ def execute_reshard_plan(
     # Persistent buffers carry training state (e.g. MoE router expert_bias)
     # and must be refit alongside parameters.  Cached on each module so the
     # named_modules() walk happens once per model, not per refit.
-    _prepare_refit_dtypes(
-        plan, src_module, dst_module, group=group, transform=transform
-    )
+    _prepare_refit_dtypes(plan, src_module, dst_module, group=group, transform=transform)
     src_params = get_refit_tensor_dict(src_module) if src_module is not None else {}
     dst_params = get_refit_tensor_dict(dst_module) if dst_module is not None else {}
     service.set_plan(plan, transform=transform)

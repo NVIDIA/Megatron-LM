@@ -246,9 +246,7 @@ class TestExecuteReshard:
         target = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32, device="cuda"))
         target_module = torch.nn.Module()
         target_module.register_parameter("weight", target)
-        monkeypatch.setattr(
-            execution, "_requires_bf16_staging", lambda param: param is target
-        )
+        monkeypatch.setattr(execution, "_requires_bf16_staging", lambda param: param is target)
         s = _full_slice(1)
         plan = ReshardPlan(
             send_ops=[_make_transfer_op("weight", 1, True, s, s, task_id=0)],

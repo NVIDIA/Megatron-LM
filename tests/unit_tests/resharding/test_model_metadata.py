@@ -380,17 +380,8 @@ def test_buffer_dtypes_match_transfer_ids_across_different_storage_names(
     def gather(gathered, local, group=None):
         calls.append(local)
         receive_dtype = torch.bfloat16 if len(calls) == 1 else torch.float32
-        assert local == (
-            {7: torch.float32},
-            {
-                7: (True, receive_dtype),
-                9: (True, receive_dtype),
-            },
-        )
-        gathered[:] = [
-            local,
-            ({9: torch.float16 if conflicting_shard else torch.float32}, {}),
-        ]
+        assert local == ({7: torch.float32}, {7: (True, receive_dtype), 9: (True, receive_dtype)})
+        gathered[:] = [local, ({9: torch.float16 if conflicting_shard else torch.float32}, {})]
 
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
