@@ -509,23 +509,33 @@ class KimiDeltaAttention(_GDNBase):
                 self.out_norm.zero_centered_gamma,
                 gate_activation="sigmoid",
             ).reshape(-1, self.value_head_dim)
+        if self.two_stage_gates:
+            return self._apply_two_stage_gated_norm(x, gate)
         return self._apply_gated_norm_unfused(x, gate)
+
+    def _apply_two_stage_gated_norm(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """Round only after both normalization and sigmoid gating, in FLA's fused kernel.
+
+        Deliberately eager. FLA's ``rms_norm_gated`` is already one Triton kernel per pass;
+        traced by ``jit_fuser``, Inductor wraps it as a user-defined kernel whose mutation
+        analysis fails, and that forward ran about 15x slower on GB300 (2.1 ms instead of
+        0.13 ms for 1M rows of 128).
+        """
+        x = x.reshape(-1, self.value_head_dim)
+        gate = gate.reshape(-1, self.value_head_dim)
+        weight = self.out_norm.weight
+        if self.config.layernorm_zero_centered_gamma:
+            weight = weight + 1
+        return rms_norm_gated(
+            x, gate, weight, None, activation="sigmoid", eps=self.config.layernorm_epsilon
+        )
 
     @jit_fuser
     def _apply_gated_norm_unfused(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        """Apply per-head RMSNorm followed by KDA's sigmoid output gate."""
+        """Apply per-head RMSNorm followed by KDA's sigmoid output gate (direct-gate path)."""
 
         x_dtype = x.dtype
         x = x.reshape(-1, self.value_head_dim)
-        if self.two_stage_gates:
-            # Round only after both normalization and sigmoid gating.
-            gate = gate.reshape(-1, self.value_head_dim)
-            weight = self.out_norm.weight
-            if self.config.layernorm_zero_centered_gamma:
-                weight = weight + 1
-            return rms_norm_gated(
-                x, gate, weight, None, activation="sigmoid", eps=self.config.layernorm_epsilon
-            )
         # Keep the direct-gate graph order (norm, then gate reshape) so the compiled
         # rounding matches the pinned upstream primitive.
         x = self.out_norm(x)
