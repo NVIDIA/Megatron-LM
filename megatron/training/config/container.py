@@ -68,7 +68,6 @@ from megatron.training.models.base import ModelConfig
 T = TypeVar("T", bound="ConfigContainerBase")
 logger = logging.getLogger(__name__)
 
-
 @dataclass(kw_only=True)
 class ConfigContainerBase:
     """
@@ -143,9 +142,7 @@ class ConfigContainerBase:
 
         if extra_keys:
             if mode == InstantiationMode.STRICT:
-                raise ValueError(
-                    f"Dictionary contains extra keys not in {cls.__qualname__}: {extra_keys}"
-                )
+                raise ValueError(f"Dictionary contains extra keys not in {cls.__qualname__}: {extra_keys}")
             else:
                 # In lenient mode, remove extra keys
                 for key in extra_keys:
@@ -157,9 +154,7 @@ class ConfigContainerBase:
         return instance
 
     @classmethod
-    def from_yaml(
-        cls: Type[T], yaml_path: str, mode: InstantiationMode = InstantiationMode.LENIENT
-    ) -> T:
+    def from_yaml(cls: Type[T], yaml_path: str, mode: InstantiationMode = InstantiationMode.LENIENT) -> T:
         """
         Create a config container from a YAML file.
 
@@ -249,7 +244,8 @@ class ConfigContainerBase:
         """
         if not HAVE_YAML:
             raise ImportError(
-                "PyYAML is required to save a config to YAML. " "Install via `pip install pyyaml`."
+                "PyYAML is required to save a config to YAML. "
+                "Install via `pip install pyyaml`."
             )
 
         config_dict = self.to_dict(**section_overrides)
@@ -264,7 +260,8 @@ class ConfigContainerBase:
         """
         if not HAVE_YAML:
             raise ImportError(
-                "PyYAML is required to print a config as YAML. " "Install via `pip install pyyaml`."
+                "PyYAML is required to print a config as YAML. "
+                "Install via `pip install pyyaml`."
             )
 
         config_dict = self.to_dict()
@@ -426,23 +423,15 @@ class PretrainConfigContainer(ConfigContainerBase):
         if self.train.train_iters:
             if self.scheduler.lr_decay_iters is None:
                 self.scheduler.lr_decay_iters = self.train.train_iters
-            self.scheduler.lr_decay_steps = (
-                self.scheduler.lr_decay_iters * self.train.global_batch_size
-            )
+            self.scheduler.lr_decay_steps = self.scheduler.lr_decay_iters * self.train.global_batch_size
             self.scheduler.wd_incr_steps = self.train.train_iters * self.train.global_batch_size
             self.scheduler.wsd_decay_steps = None
             if self.scheduler.lr_wsd_decay_iters is not None:
-                self.scheduler.wsd_decay_steps = (
-                    self.scheduler.lr_wsd_decay_iters * self.train.global_batch_size
-                )
+                self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_iters * self.train.global_batch_size
             if self.scheduler.lr_warmup_fraction is not None:
-                self.scheduler.lr_warmup_steps = (
-                    self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
-                )
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
             else:
-                self.scheduler.lr_warmup_steps = (
-                    self.scheduler.lr_warmup_iters * self.train.global_batch_size
-                )
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_iters * self.train.global_batch_size
         # Sample-based training.
         elif self.train.train_samples:
             # We need to set training iters for later use. Technically
@@ -455,9 +444,7 @@ class PretrainConfigContainer(ConfigContainerBase):
             self.scheduler.wd_incr_steps = self.train.train_samples
             self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_samples
             if self.scheduler.lr_warmup_fraction is not None:
-                self.scheduler.lr_warmup_steps = (
-                    self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
-                )
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
             else:
                 self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_samples
 

@@ -67,7 +67,7 @@ CONTAINER_WRITTEN_FIELDS = (
 
 
 def upgrade_legacy_dataset_section(section: dict) -> dict:
-    """Load saved SFT configs with the subclass that supports a separate pack width.
+    """Upgrade saved SFT configs to SFTDatasetConfig for backward compatibility.
 
     Older SFT checkpoints used GPTDatasetConfig. Preserve every field, including
     unknown keys for strict deserialization to reject; only update the class.
