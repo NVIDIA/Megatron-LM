@@ -18,7 +18,7 @@ SHAPES = tuple(
     [(m, h) for m in range(2048, 16385, 1024) for h in WIDTHS]
     + [(m, h) for m in range(17408, 65537, 1024) for h in WIDTHS[:3]]
 )
-# Nano/Super/Ultra (rows, hidden) with tuned backward knobs.
+# Nano/Super/Ultra (rows, hidden): the shapes the tuned tables and tests anchor on.
 FLAGSHIPS = ((16384, 3072), (8192, 4096), (8192, 10240))
 
 

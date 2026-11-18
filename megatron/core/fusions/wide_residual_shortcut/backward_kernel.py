@@ -16,7 +16,6 @@ from triton.experimental.gluon.language import BlockedLayout, SliceLayout, Swizz
 from triton.experimental.gluon.language.nvidia.hopper import fence_async_shared, mbarrier, tma
 
 from .kernel_utils import (
-    FLAGSHIPS,
     _coefficient,
     _descriptor,
     _fma2,
@@ -32,6 +31,10 @@ from .kernel_utils import (
 _tma_load = tma.async_load if hasattr(tma, "async_load") else tma.async_copy_global_to_shared
 
 _GRADIENT_LAYOUT = gl.constexpr(BlockedLayout([1, 4], [4, 8], [1, 4], [1, 0]))
+_SMS, _SM_SHARED_BYTES = 152, 232_000  # the qualified GB300
+_SLICE = (16, 128)  # rows x columns of one TMA copy: a column half of a row tile
+_ROWS = gl.constexpr(SliceLayout(1, _GRADIENT_LAYOUT))  # one value per slice row
+_COLUMNS = gl.constexpr(SliceLayout(0, _GRADIENT_LAYOUT))  # one value per slice column
 
 
 class _BackwardInputs(NamedTuple):
@@ -61,37 +64,28 @@ class _Geometry(NamedTuple):
 
 
 class _BackwardConfig(NamedTuple):
-    """Projection-reduction layout, grid, register cap and Super one-reader early carry load."""
+    """Launch grid (whole width-spanning CTA groups) and register cap."""
 
-    PROJECTION_ROWS_PER_WARP: int
-    PROJECTION_VECTOR: int
     TARGET_CTAS: int
     MAXNREG: int
-    EARLY_CARRY: bool = False
 
 
-def get_backward_knobs(m, h, streams, readers=1, *, grid="auto", bf16=False):
-    """Select the launch knobs for one shape; an explicit grid overrides the auto grid."""
-    # Tuned at the flagship widths for training row counts (8K and up).
-    production = streams == 3 and m >= 2048 and h in {hidden for _, hidden in FLAGSHIPS}
-    rows = 2 if h == 4096 and streams not in (1, 4) else 4
-    vector = 4 if (h <= 3072 and not (h == 3072 and streams > 4)) or streams == 4 else 2
-    if streams == 3 and not production:
-        rows, vector = 8, 2 if h % 2048 else 4
-    # A BF16 one-reader seam fits four CTAs per SM in 128 registers (8K Nano/Super/Ultra sweep).
-    four = production and bf16 and readers == 1
-    budget = 608 if four else 456 if streams <= 3 else 288
+def get_backward_knobs(m, h, streams, readers=1, *, grid="auto", bf16=False, second=False):
+    """Select the launch knobs for one shape; an explicit grid overrides the auto grid.
+
+    Each CTA stages one row tile in shared memory (the predecessor streams, the update and,
+    below six streams, every reader gradient), and the grid keeps as many CTAs per SM as that
+    allows, at most four. Four leave 128 registers each, enough only for one reader or one
+    stream; three take 168 and fewer take them all. From an 8K-row sweep of widths 2048-10240,
+    1-6 streams, both residual dtypes and all reader variants.
+    """
+    staged = 2 * (readers + second) if streams < 6 else 0
+    shared = 4096 * ((2 if bf16 else 4) * streams + staged + 2) + 3000
+    per_sm = min(_SM_SHARED_BYTES // shared, 4 if readers == 1 or streams == 1 else 3)
     if grid == "auto":
         participants = triton.cdiv(h, 256)
-        grid = min(triton.cdiv(m, 16), max(1, budget // participants)) * participants
-    return _BackwardConfig(
-        PROJECTION_ROWS_PER_WARP=rows,
-        PROJECTION_VECTOR=vector,
-        TARGET_CTAS=grid,
-        EARLY_CARRY=production and h == 4096 and readers == 1,
-        # Six streams have less shared-memory residency; allow registers to avoid spills.
-        MAXNREG=255 if streams == 6 else 128 if four else 168,
-    )
+        grid = min(triton.cdiv(m, 16), max(1, per_sm * _SMS // participants)) * participants
+    return _BackwardConfig(grid, {4: 128, 3: 168}.get(per_sm, 255))
 
 
 @torch.no_grad()
@@ -148,8 +142,11 @@ def backward(
     nt = triton.cdiv(h, 256)
     if config != "auto" and (type(config) is not int or config <= 0 or config % nt):
         raise ValueError("shortcut grid must contain positive whole participant groups")
-    routes = save_columns
-    routes = (routes,) + (False,) * (n - 1) if isinstance(routes, bool) else tuple(routes)
+    routes = (
+        (save_columns,) + (False,) * (n - 1)
+        if isinstance(save_columns, bool)
+        else tuple(save_columns)
+    )
     columns = (None,) * n if columns is None else tuple(columns)
     if len(routes) != n or len(columns) != n:
         raise ValueError("shortcut backward requires one column route and operand per reader")
@@ -162,8 +159,10 @@ def backward(
         columns = tuple(old if old is not None else new for old, new in zip(columns, generated))
     if on_columns_ready is not None:
         on_columns_ready(columns)
-    knobs = get_backward_knobs(m, h, streams, n, grid=config, bf16=previous.dtype == torch.bfloat16)
-    grid = knobs.TARGET_CTAS
+    bf16 = previous.dtype == torch.bfloat16
+    grid, maxnreg = get_backward_knobs(
+        m, h, streams, n, grid=config, bf16=bf16, second=seconds[-1] is not None
+    )
     # Outputs and scratch belong to this invocation; a shortcut add's updates share one gradient.
     empty = saved.coefficients.new_empty
     du = empty((m, h), dtype=torch.bfloat16)
@@ -179,39 +178,35 @@ def backward(
     controllers = empty((planes + n, p))
     chunks = empty((planes + n, triton.cdiv(p, 1024)))
 
-    groups = grid // nt
-    tiles = triton.cdiv(m, 16)
-    if max(grid, tiles + 2 * groups, nt * (tiles + 1)) >= 2**31:
-        raise ValueError("arrival counter exceeds signed 32-bit capacity")
     # Per row tile: a 16-word header (arrival hint, next row tile) and one projection word per
-    # (reader, row, column tile); see the handoff protocol below.
-    block = 16 + n * 16 * nt
-    if tiles * block + 16 >= 2**31:
-        raise ValueError("handoff workspace exceeds signed 32-bit indexing")
+    # (reader, row, column tile); see the handoff protocol below. Its word count bounds every
+    # 32-bit counter of the launch (tickets, claimed tiles, arrivals).
+    tiles, block = triton.cdiv(m, 16), 16 + n * 16 * nt
+    if max(grid, tiles) * block + 16 >= 2**31:
+        raise ValueError("handoff workspace and counters exceed signed 32-bit capacity")
     epochs = empty((2,), dtype=torch.int32)
     pp = empty((tiles * block,), dtype=torch.int64)
 
-    slice_shape = (16, 128)
-    kw = dict(
-        inputs=_BackwardInputs(saved.coefficients, saved.rstd, saved.gammas, carry, dys, seconds),
-        GEOMETRY=_Geometry(m, h, streams, saved.has_retention),
-        CONFIG=_BackwardConfig(*(gl.constexpr(value) for value in knobs)),
-        outputs=_BackwardOutputs(grads[0], grads[1], controllers, pp, gp, epochs),
-        CARRY_DESC=_descriptor(carry, slice_shape),
-        R_DESC=_descriptor(previous, slice_shape),
-        DY0_DESC=_descriptor(dys[0] if streams < 6 else None, slice_shape),
-        DY1_DESC=_descriptor(dys[1] if streams < 6 and n == 2 else None, slice_shape),
-        # The last reader's second consumer gradient, staged with the others.
-        DY2_DESC=_descriptor(seconds[-1] if streams < 6 else None, slice_shape),
-        U_DESC=_descriptor(saved.update, slice_shape),
-        maxnreg=knobs.MAXNREG,
-        num_warps=4,
-        enable_fp_fusion=True,
-    )
+    staged = streams < 6  # six streams read dy from global memory
     # Reset on every invocation (also under graph replay) so every handoff word starts at tag 0.
     epochs.zero_()
     pp.zero_()
-    BACKWARD_KERNELS[n][(grid,)](**kw)
+    BACKWARD_KERNELS[n][(grid,)](
+        inputs=_BackwardInputs(saved.coefficients, saved.rstd, saved.gammas, carry, dys, seconds),
+        GEOMETRY=_Geometry(m, h, streams, saved.has_retention),
+        GRID=grid,
+        outputs=_BackwardOutputs(grads[0], grads[1], controllers, pp, gp, epochs),
+        CARRY_DESC=_descriptor(carry, _SLICE),
+        R_DESC=_descriptor(previous, _SLICE),
+        DY0_DESC=_descriptor(dys[0] if staged else None, _SLICE),
+        DY1_DESC=_descriptor(dys[-1] if staged and n == 2 else None, _SLICE),
+        # The last reader's second consumer gradient, staged with the others.
+        DY2_DESC=_descriptor(seconds[-1] if staged else None, _SLICE),
+        U_DESC=_descriptor(saved.update, _SLICE),
+        maxnreg=maxnreg,
+        num_warps=4,
+        enable_fp_fusion=True,
+    )
 
     # Reduce controller chunks, then all gamma and controller gradients.
     retention, two = saved.has_retention, n == 2
@@ -389,30 +384,18 @@ def _bulk_prefetch_l2(pointer, valid, BYTES: gl.constexpr, THREADS: gl.constexpr
 
 
 @g.jit
-def _staged_dy(ds, row: gl.constexpr, WIDEN: gl.constexpr):
-    if WIDEN:
-        return _widen_bf16(ds.slice(row, 16).load(_GRADIENT_LAYOUT))
-    return ds.slice(row, 16).load(_GRADIENT_LAYOUT).to(gl.float32)
-
-
-@g.jit
-def _load_dy(
-    inputs, ds, ds2, reader: gl.constexpr, part: gl.constexpr, offset, mask, WIDEN: gl.constexpr
-):
-    """A reader's FP32 dy slice from global memory or staged BF16 (WIDEN: by bit shift), plus
-    a second consumer's gradient when the reader has one (staged after the readers' slices).
-
-    Both conversions are exact, but they schedule (and so contract) differently.
-    """
+def _load_dy(inputs, ds, ds2, reader: gl.constexpr, part: gl.constexpr, offset, mask):
+    """A reader's FP32 dy slice from global memory or staged BF16, plus a second consumer's
+    gradient when the reader has one (staged after the readers' slices)."""
     second = inputs.second_grads[reader]
     if ds is None:
         dy = gl.load(inputs.reader_grads[reader] + offset, mask, 0).to(gl.float32)
         if second is not None:
             dy += gl.load(second + offset, mask, 0).to(gl.float32)
     else:
-        dy = _staged_dy(ds, reader * 32 + part * 16, WIDEN)
+        dy = _widen_bf16(ds.slice(reader * 32 + part * 16, 16).load(_GRADIENT_LAYOUT))
         if second is not None:
-            dy += _staged_dy(ds2, part * 16, WIDEN)
+            dy += _widen_bf16(ds2.slice(part * 16, 16).load(_GRADIENT_LAYOUT))
     return dy
 
 
@@ -420,16 +403,14 @@ def _load_dy(
 def _thread_pairs(value):
     """Eight per-thread (128, 2) column pairs of a 16x128 slice, in _store_controller order."""
     owned = gl.permute(gl.reshape(value, (4, 4, 4, 8, 4)), (2, 1, 3, 0, 4))
-    # Per-thread index a*4 + e = (a_hi, a_lo, e_hi, e_lo); e_lo pairs adjacent columns.
-    t = gl.reshape(owned, (128, 2, 2, 2, 2))
-    e_hi0, e_hi1 = gl.split(gl.permute(t, (0, 1, 2, 4, 3)))
+    # Per-thread index a*4 + e = (a_hi, a_lo, e_hi, e_lo); e_lo pairs adjacent columns. Peel
+    # e_hi, a_lo, then a_hi off the last axis.
+    halves = gl.split(gl.permute(gl.reshape(owned, (128, 2, 2, 2, 2)), (0, 4, 1, 2, 3)))
     pairs = ()
     for half in gl.static_range(2):
-        rest = e_hi0 if half == 0 else e_hi1
-        a_lo0, a_lo1 = gl.split(gl.permute(rest, (0, 1, 3, 2)))
+        quarters = gl.split(halves[half])
         for quarter in gl.static_range(2):
-            a_hi0, a_hi1 = gl.split(gl.permute(a_lo0 if quarter == 0 else a_lo1, (0, 2, 1)))
-            pairs += (a_hi0, a_hi1)
+            pairs += gl.split(quarters[quarter])
     return pairs
 
 
@@ -455,25 +436,45 @@ def _partial_offset(reader, rr, cc, NT: gl.constexpr):
 @g.jit
 def _prefetch(P, rp, cp, GEOMETRY: gl.constexpr):
     """Warm this tile's carry rows (every stream's 256 columns) in L2."""
-    m: gl.constexpr = GEOMETRY.M
     h: gl.constexpr = GEOMETRY.H
     streams: gl.constexpr = GEOMETRY.STREAMS
-    ROWS: gl.constexpr = 16
     ELEMENT: gl.constexpr = P.dtype.element_ty.primitive_bitwidth // 8
-    ROW_BYTES: gl.constexpr = 256 * ELEMENT
-    i = gl.arange(0, ROWS, layout=gl.constexpr(BlockedLayout([1], [32], [4], [0])))
-    rr = rp * 16 + i
+    rr = rp * 16 + gl.arange(0, 16, layout=gl.constexpr(BlockedLayout([1], [32], [4], [0])))
     cc = cp * 256
-    base = P + rr * (streams * h) + cc
     for stream in gl.static_range(streams):
-        valid = rr < m
-        if h % 256:
-            valid &= cc + 256 <= h
-        _bulk_prefetch_l2(base + stream * h, valid.to(gl.int32), ROW_BYTES, ROWS)
+        row = P + rr * (streams * h) + stream * h + cc
+        valid = rr < GEOMETRY.M
         if h % 256:
             # A short final tile keeps a single 128-column hint inside the stream.
-            tail = (rr < m) & (cc + 128 <= h) & (cc + 256 > h)
-            _bulk_prefetch_l2(base + stream * h, tail.to(gl.int32), 128 * ELEMENT, ROWS)
+            tail = valid & (cc + 128 <= h) & (cc + 256 > h)
+            _bulk_prefetch_l2(row, tail.to(gl.int32), 128 * ELEMENT, 16)
+            valid &= cc + 256 <= h
+        _bulk_prefetch_l2(row, valid.to(gl.int32), 256 * ELEMENT, 16)
+
+
+@g.jit
+def _in_range(rows, cols, GEOMETRY: gl.constexpr):
+    """The slice elements inside the [M, H] tensor."""
+    mask = rows < GEOMETRY.M
+    if GEOMETRY.H % 256:
+        mask &= cols < GEOMETRY.H
+    return mask
+
+
+@g.jit
+def _load_carry_zero(carry, rows, cols, GEOMETRY: gl.constexpr, MASKED: gl.constexpr):
+    """Carry stream zero of a slice, from global memory (later streams arrive by TMA)."""
+    pointer = carry + rows * (GEOMETRY.STREAMS * GEOMETRY.H) + cols
+    if MASKED:
+        return _widen_bf16(gl.load(pointer, _in_range(rows, cols, GEOMETRY), 0))
+    return _widen_bf16(gl.load(pointer))
+
+
+@g.jit
+def _sync():
+    """Order every thread's shared-memory reads before the TMA copies issued next."""
+    gl.barrier()
+    fence_async_shared()
 
 
 @g.jit
@@ -486,17 +487,9 @@ def _copy_tiles(plan, row_tile, barrier, part: gl.constexpr):
 
 
 @g.jit
-def _refill_slice(
-    s: gl.constexpr,
-    carry_copies,
-    residual_copies,
-    barriers,
-    copy_barrier,
-    row_tile,
-    next_rp,
-    part: gl.constexpr,
-):
+def _refill_slice(s: gl.constexpr, plan, next_rp, part: gl.constexpr):
     """Refill consumed predecessor slice s with carry s + 1, or the next tile's last stream."""
+    carry_copies, residual_copies, barriers, copy_barrier, row_tile = plan
     if s + 1 < len(residual_copies):
         bits: gl.constexpr = carry_copies[s][0].dtype.primitive_bitwidth
         mbarrier.expect(barriers[s], 16 * 128 * bits // 8)
@@ -518,7 +511,7 @@ def _backward_body(
     inputs,
     outputs,
     GEOMETRY: gl.constexpr,
-    CONFIG: gl.constexpr,
+    GRID: gl.constexpr,
     CARRY_DESC,
     R_DESC,
     DY0_DESC,
@@ -533,7 +526,6 @@ def _backward_body(
     h: gl.constexpr = GEOMETRY.H
     streams: gl.constexpr = GEOMETRY.STREAMS
     retention: gl.constexpr = GEOMETRY.HAS_RETENTION
-    GRID: gl.constexpr = CONFIG.TARGET_CTAS
     NREADERS: gl.constexpr = len(inputs.reader_grads)
     TWO: gl.constexpr = NREADERS == 2
     ctas_per_group: gl.constexpr = gl.cdiv(h, 256)
@@ -552,31 +544,22 @@ def _backward_body(
         ds2 = gl.allocate_shared_memory(DY2_DESC.dtype, [32, 128], DY2_DESC.layout)
     update_shared = gl.allocate_shared_memory(U_DESC.dtype, [32, 128], U_DESC.layout)
 
-    HALF_BYTES: gl.constexpr = (  # one column half of a tile's TMA copies
-        16
-        * 128
-        * (
-            R_DESC.dtype.primitive_bitwidth // 8 * streams
-            + 2 * (NREADERS + SECOND) * STAGE_DY
-            + U_DESC.dtype.primitive_bitwidth // 8
-        )
-    )
+    # One column half of a tile's TMA copies: every predecessor stream, the staged BF16 dys, U.
+    BITS: gl.constexpr = R_DESC.dtype.primitive_bitwidth * streams + U_DESC.dtype.primitive_bitwidth
+    HALF_BYTES: gl.constexpr = 16 * 128 * (BITS // 8 + 2 * (NREADERS + SECOND) * STAGE_DY)
     copy_deps = ((ds,) if STAGE_DY else ()) + ((ds2,) if SECOND else ()) + (update_shared,)
     copy_deps += residuals
-    # Carry s > 0 lands on barrier s - 1, the last two complete each half's copy phase; one
-    # allocation keeps them all reserved (a dead barrier was once reused for staged gamma).
-    barrier_storage = gl.allocate_shared_memory(
-        gl.int64, [streams + 1, 1], mbarrier.MBarrierLayout()
-    )
+    # Carry s > 0 lands on barrier s - 1; the last two complete each half's copy phase.
+    storage = gl.allocate_shared_memory(gl.int64, [streams + 1, 1], mbarrier.MBarrierLayout())
     barriers = ()
     for index in gl.static_range(streams + 1):
-        mbarrier.init(barrier_storage.index(index), count=1)
-        barriers += (barrier_storage.index(index),)
+        mbarrier.init(storage.index(index), count=1)
+        barriers += (storage.index(index),)
     gl.barrier()  # every init before any shared write
     copy_barrier = barriers[streams - 1]
     copy_barriers = (copy_barrier, barriers[streams])
     LINEAR_SHARED: gl.constexpr = SwizzledSharedLayout(1, 1, 1, [0])
-    # Shared projection storage avoids register spills on Nano/Ultra.
+    # Shared projection storage avoids register spills.
     local_projection = gl.allocate_shared_memory(gl.float32, [NREADERS, 16], LINEAR_SHARED)
 
     GROUPS: gl.constexpr = GRID // ctas_per_group
@@ -588,9 +571,8 @@ def _backward_body(
     bid = gl.atomic_add(cta_ticket_counter, 1, sem="relaxed")
     column_tile, group = bid % ctas_per_group, bid // ctas_per_group
 
-    rr0 = gl.arange(0, 16, layout=gl.constexpr(SliceLayout(1, L)))
-    cc0 = gl.arange(0, 128, layout=gl.constexpr(SliceLayout(0, L)))
-    cc = column_tile * 256 + cc0
+    rr0 = gl.arange(0, 16, layout=_ROWS)
+    cc = column_tile * 256 + gl.arange(0, 128, layout=_COLUMNS)
     residual_copies, reader_copies, carry_copies = (), (), ()
     for stream in gl.static_range(streams):
         column = stream * h + column_tile * 256
@@ -610,12 +592,11 @@ def _backward_body(
     cs = gl.allocate_shared_memory(gl.float32, [COEFFICIENTS], LINEAR_SHARED)
     ci = gl.arange(0, COEFFICIENTS, layout=gl.constexpr(BlockedLayout([1], [32], [4], [0])))
     gs = gl.allocate_shared_memory(gl.float32, [NREADERS * 256], LINEAR_SHARED)
-    gamma_cc = column_tile * 256 + gl.arange(0, 256, layout=gl.constexpr(SliceLayout(0, L)))
+    gamma_cc = column_tile * 256 + gl.arange(0, 256, layout=_COLUMNS)
     for reader in gl.static_range(NREADERS):
         saved_gamma = gl.load(inputs.gammas[reader] + gamma_cc, gamma_cc < h, 0)
         gs.slice(reader * 256, 256).store(saved_gamma.to(gl.float32))
-    coefficients = gl.load(inputs.coefficients + ci, ci < 4 * streams, 0)
-    cs.store(coefficients)
+    cs.store(gl.load(inputs.coefficients + ci, ci < 4 * streams, 0))
     row_tile = group
     iteration = 0
 
@@ -641,17 +622,12 @@ def _backward_body(
         if column_tile == 0:
             claimed = GROUPS + gl.atomic_add(row_tile_counter, 1, sem="relaxed")
             _publish_word(next_tile_word, claimed, tag, 127)
-            _bulk_prefetch_l2(
-                outputs.projection + claimed * BLOCK,
-                (claimed < total_tiles).to(gl.int32),
-                BLOCK * 8,
-                1,
-            )
+            block = outputs.projection + claimed * BLOCK
+            _bulk_prefetch_l2(block, (claimed < total_tiles).to(gl.int32), BLOCK * 8, 1)
 
         # Wait for column half zero only; half one is awaited inside the reader phase.
         mbarrier.wait(copy_barrier, iteration & 1, deps=copy_deps)
-        gl.barrier()
-        fence_async_shared()
+        _sync()
 
         # Reader phase: x = sum_s beta t R_s + q u, z = r x, p = sum(dy gamma z) / H per reader.
         rs = ()
@@ -672,9 +648,7 @@ def _backward_body(
             if part == 1:
                 mbarrier.wait(copy_barriers[1], iteration & 1, deps=copy_deps)
             cols = (cc + part * 128)[None, :]
-            mask = rr[:, None] < m
-            if h % 256:
-                mask &= cols < h
+            mask = _in_range(rr[:, None], cols, GEOMETRY)
             u = _widen_bf16(update_shared.slice(part * 16, 16).load(L))
             xs = (gl.full((16, 128), 0, gl.float32, L),) * NREADERS
             for s in gl.static_range(streams):
@@ -686,10 +660,8 @@ def _backward_body(
             new_projections = ()
             for reader in gl.static_range(NREADERS):
                 z = _fma2(mixes[reader], u, xs[reader]) * rs[reader][:, None]
-                dy = _load_dy(inputs, ds, ds2, reader, part, rr[:, None] * h + cols, mask, False)
-                gamma = gs.slice(reader * 256 + part * 128, 128).load(
-                    gl.constexpr(SliceLayout(0, L))
-                )
+                dy = _load_dy(inputs, ds, ds2, reader, part, rr[:, None] * h + cols, mask)
+                gamma = gs.slice(reader * 256 + part * 128, 128).load(_COLUMNS)
                 new_projections += (projections[reader] + (dy * gamma[None, :]) * z,)
                 # Gamma partials: sum over this tile's 16 rows of dy * z.
                 gamma_partials = outputs.gamma_partials[reader] + row_tile * h + cc + part * 128
@@ -710,22 +682,8 @@ def _backward_body(
         gl.barrier()
         _arrive_hint(arrival_hint)
         _prefetch(inputs.carry, row_tile, column_tile, GEOMETRY)
-        # Super one-reader issues carry zero while the projection is reduced.
-        if CONFIG.EARLY_CARRY:
-            early_rows = rr[:, None]
-            early_cols = cc[None, :]
-            early_mask = early_rows < m
-            if h % 256:
-                early_mask &= early_cols < h
-            early_incoming_zero = _widen_bf16(
-                gl.load(inputs.carry + early_rows * (streams * h) + early_cols, early_mask, 0)
-            )
-
         # Finish the projection: sum the width participants' partials.
-        projection_rows: gl.constexpr = CONFIG.PROJECTION_ROWS_PER_WARP
-        PL: gl.constexpr = BlockedLayout(
-            [1, CONFIG.PROJECTION_VECTOR], [projection_rows, 32 // projection_rows], [4, 1], [1, 0]
-        )
+        PL: gl.constexpr = BlockedLayout([1, 2], [4, 8], [4, 1], [1, 0])
         projection_cols: gl.constexpr = triton.next_power_of_2(ctas_per_group)
         pcc = gl.arange(0, projection_cols, layout=gl.constexpr(SliceLayout(0, PL)))
         prr = gl.arange(0, 16, layout=gl.constexpr(SliceLayout(1, PL)))
@@ -759,14 +717,14 @@ def _backward_body(
         # controller reductions.
         OUTPUT_CACHE: gl.constexpr = ".cs" if not TWO else ""
         HELD: gl.constexpr = min(2, streams)  # predecessor slices read before the first barrier
+        # Two readers skip the carry mask when every scheduled element is in range.
+        MASKED: gl.constexpr = not TWO or h % 256 != 0
         prefetch_active = next_rp < total_tiles
         stride = gl.cdiv(m, 16) * gl.cdiv(h, 128) * 8  # between controller partial planes
         for part in gl.static_range(2):
             cols = (cc + part * 128)[None, :]
             rows = rr[:, None]
-            mask = rows < m
-            if h % 256:
-                mask &= cols < h
+            mask = _in_range(rows, cols, GEOMETRY)
             offset = rows * h + cols
             controller_row = (
                 outputs.controller_partials
@@ -784,27 +742,13 @@ def _backward_body(
                 joint_coefficients += (_coefficient(cs, i),)
 
             u = _widen_bf16(update_shared.slice(part * 16, 16).load(L))
-            if CONFIG.EARLY_CARRY and part == 0:
-                incoming_zero = (
-                    early_incoming_zero  # pylint: disable=possibly-used-before-assignment
-                )
-            elif TWO and m % 16 == 0 and h % 256 == 0:
-                # Every row and column of a scheduled tile is in range.
-                incoming_zero = _widen_bf16(gl.load(inputs.carry + rows * (streams * h) + cols))
-            else:
-                incoming_zero = _widen_bf16(
-                    gl.load(inputs.carry + rows * (streams * h) + cols, mask, 0)
-                )
+            incoming_zero = _load_carry_zero(inputs.carry, rows, cols, GEOMETRY, MASKED)
             dxs = ()
             update_mixes = ()
             for reader in gl.static_range(NREADERS):
-                dy = _load_dy(inputs, ds, ds2, reader, part, offset, mask, TWO)
-                gamma = gs.slice(reader * 256 + part * 128, 128).load(
-                    gl.constexpr(SliceLayout(0, L))
-                )[None, :]
-                p = gl.gather(
-                    local_projection.index(reader).load(gl.constexpr(SliceLayout(1, L))), rr0, 0
-                )[:, None]
+                dy = _load_dy(inputs, ds, ds2, reader, part, offset, mask)
+                gamma = gs.slice(reader * 256 + part * 128, 128).load(_COLUMNS)[None, :]
+                p = gl.gather(local_projection.index(reader).load(_ROWS), rr0, 0)[:, None]
                 r = gl.gather(rs[reader], rr0, 0)[:, None]
                 # Packed multiplies round every product exactly like scalar ones.
                 dz = _mul2(dy, gamma)
@@ -831,11 +775,10 @@ def _backward_body(
                 for first in gl.static_range(HELD):
                     held += (_load_residual(residuals, cols, part, first, h),)
                 if streams > 1 or prefetch_active:
-                    gl.barrier()
-                    fence_async_shared()
+                    _sync()
                     for first in gl.static_range(HELD):
                         if first + 1 < streams or prefetch_active:
-                            _refill_slice(first, *refill, next_rp, part)
+                            _refill_slice(first, refill, next_rp, part)
                     if prefetch_active:
                         _copy_tiles(reader_copies, next_rp, copy_barriers[part], part)
 
@@ -845,13 +788,10 @@ def _backward_body(
                 else:
                     R_prev_s = _load_residual(residuals, cols, part, s, h)
                 # Stream s's own release: before its controller reductions for two readers past
-                # HELD and for EARLY_CARRY, after them otherwise.
-                if ((TWO and s >= HELD) or CONFIG.EARLY_CARRY) and (
-                    s + 1 < streams or prefetch_active
-                ):
-                    gl.barrier()
-                    fence_async_shared()
-                    _refill_slice(s, *refill, next_rp, part)
+                # HELD, after them for one reader.
+                if TWO and s >= HELD and (s + 1 < streams or prefetch_active):
+                    _sync()
+                    _refill_slice(s, refill, next_rp, part)
                 w = joint_coefficients[s]
                 t = joint_coefficients[streams + s] if retention else 1.0
                 controller = controller_row + s * stride
@@ -862,10 +802,9 @@ def _backward_body(
                 for reader in gl.static_range(NREADERS):
                     reads = controller + (1 + retention + reader) * streams * stride
                     _store_controller(reads, R_prev_s, dxs[reader], valid)
-                if not TWO and not CONFIG.EARLY_CARRY and (s + 1 < streams or prefetch_active):
-                    gl.barrier()
-                    fence_async_shared()
-                    _refill_slice(s, *refill, next_rp, part)
+                if not TWO and (s + 1 < streams or prefetch_active):
+                    _sync()
+                    _refill_slice(s, refill, next_rp, part)
 
                 wide = rows * (streams * h) + s * h + cols
                 if s == 0:
@@ -876,8 +815,7 @@ def _backward_body(
                     incoming_dR_s = _widen_bf16(tile.slice(part * 16, 16).load(L))
                 if TWO and s > 0 and prefetch_active:
                     # Release the consumed carry slice to the next tile's predecessor s - 1.
-                    gl.barrier()
-                    fence_async_shared()
+                    _sync()
                     _copy_tiles((residual_copies[s - 1],), next_rp, copy_barriers[part], part)
                 if retention:
                     _store_controller(controller + streams * stride, incoming_dR_s, R_prev_s, valid)
@@ -890,8 +828,7 @@ def _backward_body(
                     d_previous = _fma2(alpha, dxs[reader], d_previous)
 
                 if not TWO:
-                    gl.barrier()
-                    fence_async_shared()
+                    _sync()
                     # Start the next tile into the consumed column half.
                     if prefetch_active:
                         pending = reader_copies if s == 0 else (residual_copies[s - 1],)
