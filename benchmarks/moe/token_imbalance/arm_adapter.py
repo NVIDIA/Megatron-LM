@@ -56,7 +56,7 @@ class ArmAdapter:
         *,
         te_op_fuser: bool = False,
         scheduler_transport: str = "replica_nccl",
-    ):
+    ) -> None:
         geometry.validate()
         self.geometry, self.arm = geometry, arm
         self.name = arm.name
@@ -132,34 +132,42 @@ class ArmAdapter:
         """Time router, forward, backward and optional SGD; collect evidence afterwards."""
         from megatron.core.transformer.moe.router_replay import RouterReplayAction
 
-        if self.layer is None:
-            raise RuntimeError("build must precede run_workload")
-        g = self.geometry
-        if hidden.shape != (g.tokens, 1, g.hidden) or indices.shape != (g.tokens, g.topk):
-            raise ValueError("fixed hidden/route geometry violated")
-        x = hidden.detach().clone().requires_grad_()
-        replay = self.layer.router.router_replay
-        replay.clear_indices()
-        replay.set_target_indices(indices)
-        replay.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
-        for parameter in self.layer.parameters():
-            parameter.grad = None
-            parameter.main_grad.zero_()
-            parameter.grad_added_to_main_grad = False
-        begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        begin.record()
-        y, bias = self.layer(x)
-        if bias is not None:
-            raise AssertionError("unexpected expert bias")
-        y.backward(upstream)
-        if learning_rate:
-            with torch.no_grad():
-                for name, parameter in self.layer.named_parameters():
-                    grad = parameter.main_grad if name.startswith("experts.") else parameter.grad
-                    if grad is not None:
-                        parameter.add_(grad, alpha=-learning_rate)
-        end.record()
-        end.synchronize()
+        # Until the timed forward/backward finishes, peers may still be inside layer
+        # collectives. Let torchrun stop the job if this phase fails on a single rank.
+        try:
+            if self.layer is None:
+                raise RuntimeError("build must precede run_workload")
+            g = self.geometry
+            if hidden.shape != (g.tokens, 1, g.hidden) or indices.shape != (g.tokens, g.topk):
+                raise ValueError("fixed hidden/route geometry violated")
+            x = hidden.detach().clone().requires_grad_()
+            replay = self.layer.router.router_replay
+            replay.clear_indices()
+            replay.set_target_indices(indices)
+            replay.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+            for parameter in self.layer.parameters():
+                parameter.grad = None
+                parameter.main_grad.zero_()
+                parameter.grad_added_to_main_grad = False
+            begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            begin.record()
+            y, bias = self.layer(x)
+            if bias is not None:
+                raise AssertionError("unexpected expert bias")
+            y.backward(upstream)
+            if learning_rate:
+                with torch.no_grad():
+                    for name, parameter in self.layer.named_parameters():
+                        grad = (
+                            parameter.main_grad if name.startswith("experts.") else parameter.grad
+                        )
+                        if grad is not None:
+                            parameter.add_(grad, alpha=-learning_rate)
+            end.record()
+            end.synchronize()
+        except AssertionError as exc:
+            raise RuntimeError("MoE layer execution failed") from exc
+
         probs, routes = self._route
         self._route = None
         ids, gates = canonical_routes(probs, routes, g.topk)

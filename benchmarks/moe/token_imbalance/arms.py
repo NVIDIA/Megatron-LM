@@ -221,7 +221,7 @@ def run_order(arms: list[Arm], index: int, order: str = "rotate") -> list[Arm]:
         return list(arms)
     if order != "rotate":
         raise ValueError(f"unknown order {order!r}")
-    shift = index % len(arms)
+    shift = index % len(arms) if arms else 0
     return list(arms[shift:]) + list(arms[:shift])
 
 

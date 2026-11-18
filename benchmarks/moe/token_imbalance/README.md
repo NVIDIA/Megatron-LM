@@ -5,7 +5,7 @@ workloads is executed by several **arms** (ways of running the same MoE layer), 
 against exact oracles, and measured per rank, together with the **rank-level load** each
 workload puts on each EP rank.
 
-Two drivers share the workloads, metrics and output format:
+The two drivers share workload definitions and write different result formats.
 
 | Driver | What it runs |
 |---|---|
@@ -113,8 +113,9 @@ Checked per rank, outside the timed window, with exact integer comparisons, at e
 * `sum_e assignments[e] == tokens * topk`, and the group histogram equals
   `tokens * topk * world`;
 * dispatch -> identity expert -> combine restores every row exactly. The sentinel values are
-  integers on a `2**-10` grid so bf16 represents them exactly, and the row sum is exactly
-  `topk + rank`, which makes this an equality check rather than a tolerance check;
+  integers on a `2**-10` grid. Each row sums to `topk + rank` to identify its source rank.
+  The order of the values in each column pair encodes the token index, so swapping two
+  rows on the same rank also fails the check;
 * the combine scaling factor is **measured** first and asserted to equal `topk`, so a change
   in the dispatcher's contract fails the run instead of silently rescaling the comparison;
 * the dispatcher's receive splits are summed across ranks and reconciled against the global
@@ -147,7 +148,7 @@ Validation on load (`trace_v1.load_trace`) rejects:
 
 * an unsupported `schema_version`, a missing required field, or a missing tensor file;
 * a tensor whose sha256 does not match the manifest;
-* a shape/dtype mismatch against the manifest;
+* a shape or dtype that disagrees with the manifest, or a tensor dtype outside the v1 schema;
 * a row whose top-k slots repeat an expert;
 * NaN/Inf gates, negative gates, or gate rows that do not sum to 1;
 * an out-of-range expert id or source rank;
@@ -177,8 +178,15 @@ pytest tests/unit_tests/transformer/moe/test_token_imbalance_*.py
 ```
 
 Run `--help` for the full flag list. `--capability-json` writes the backend capability probe
-result so a run records what the backend actually supported. `report.py RESULTS_ROOT` turns a
-results tree into the per-experiment step-time and rank-level tables.
+result alongside the run. For `benchmark.py`, run `report.py RESULTS_ROOT` on its per-rank
+JSONL files (`workload_id`, `median_ms`) to produce the step-time and rank-load tables.
+For `compare_arms.py`, use its `summary.json` for arm comparisons. Its rank files contain
+per-step samples keyed by `workload` and separate numerical comparison records.
+
+To compare instrumentation overhead, write each `benchmark.py` job into
+`ROOT/inst-none/CONFIG/REPEAT` or `ROOT/inst-counters/CONFIG/REPEAT`. A single job can
+omit the `REPEAT` directory. Run `analyze_instrument.py ROOT` to compare the medians of
+the worst-rank times from complete jobs with matching workloads and configurations.
 
 ## Arms (`compare_arms.py`)
 

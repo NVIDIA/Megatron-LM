@@ -1,106 +1,72 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""B1 instrumentation overhead: same workload and config, counters off vs on.
+"""Compare worst-rank step times with instrumentation disabled and enabled.
 
-Alternating order is used so a monotone drift does not land entirely on one side. With only
-four arms per side the result is a direction and a magnitude, not a significance claim.
+Use inst-{none,counters}/CONFIG[/REPEAT]/rank*.jsonl. Each leaf directory is one job.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import math
 from collections import defaultdict
 from pathlib import Path
+from statistics import median
+
+from summarize import IDENTITY_FIELDS, load
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("run_dir", type=Path)
     args = ap.parse_args()
 
-    # inst-<setting>/<config-tag>/rank*.jsonl ; key by (setting, workload) because the
-    # workload mix has very different absolute step times and must not be pooled.
-    per: dict[tuple[str, str], list[float]] = defaultdict(list)
-    for setting_dir in sorted(p for p in args.run_dir.iterdir() if p.is_dir()):
-        setting = setting_dir.name.replace("inst-", "")
-        for cfg in sorted(p for p in setting_dir.iterdir() if p.is_dir()):
-            for f in sorted(cfg.glob("rank*.jsonl")):
-                for line in f.read_text(encoding="utf-8").splitlines():
-                    if not line.strip():
-                        continue
-                    r = json.loads(line)
-                    if r.get("status") != "OK" or r.get("median_ms") is None:
-                        continue
-                    per[(setting, r["workload_id"])].append(r["median_ms"])
+    observations = defaultdict(lambda: defaultdict(list))
+    labels = {}
+    fields = [name for name in IDENTITY_FIELDS if name != "instrument"]
+    for setting in ("none", "counters"):
+        root = args.run_dir / f"inst-{setting}"
+        for arm in load(root):
+            record = arm.ranks[0]
+            status = arm.status()
+            if record.get("instrument", setting) != setting:
+                status = "INVALID (setting disagrees with directory)"
+            if status != "OK":
+                print(f"Excluding {root / arm.directory} {arm.workload_id}: {status}")
+                continue
+            identity = tuple(record.get(name) for name in fields)
+            key = (arm.tree, arm.workload_id, identity)
+            labels[key] = arm.config_label
+            observations[key][setting].append(arm.worst("median_ms"))
 
-    settings = sorted({k[0] for k in per})
-    workloads = sorted({k[1] for k in per})
-    if len(settings) < 2:
-        print(f"ERROR: need both settings under {args.run_dir}; found {settings}")
-        return 2
-
-    print(f"# B1 instrumentation overhead — {args.run_dir}")
-    print()
-    print(
-        "Per-workload comparison. Pooling workloads is invalid: their absolute step times "
-        "differ by more than the effect being measured."
-    )
-    print()
-    print("| workload | none median_ms (arms) | counters median_ms (arms) | delta |")
-    print("|---|---|---|---|")
-    deltas: list[float] = []
-    spreads: list[float] = []
-    for wl in workloads:
-        vals = {}
-        for s in settings:
-            v = sorted(per.get((s, wl), []))
-            if v:
-                vals[s] = (v[len(v) // 2], len(v), v[0], v[-1])
-        if "none" not in vals or "counters" not in vals:
+    print("| config | workload | none median ms (jobs) | counters median ms (jobs) | delta |")
+    print("|---|---|---|---|---|")
+    deltas = []
+    spreads = []
+    for key, samples in observations.items():
+        config, workload, _ = key
+        label = f"{config} ({labels[key]})"
+        if "none" not in samples or "counters" not in samples:
+            print(f"| {label} | {workload} | | | n/a (unpaired setting) |")
             continue
-        n = vals["none"][0]
-        c = vals["counters"][0]
-        d = 100 * (c / n - 1)
-        deltas.append(d)
-        # per-workload spread over the arms, as the resolution bound
-        lo = min(vals["none"][2], vals["counters"][2])
-        hi = max(vals["none"][3], vals["counters"][3])
-        spreads.append(100 * (hi / lo - 1))
+        none, counters = samples["none"], samples["counters"]
+        baseline, measured = median(none), median(counters)
+        delta = 100 * (measured / baseline - 1)
+        deltas.append(delta)
+        combined = none + counters
+        spreads.append(100 * (max(combined) / min(combined) - 1))
         print(
-            f"| {wl} | {n:.4f} ({vals['none'][1]}) | {c:.4f} ({vals['counters'][1]}) | "
-            f"{d:+.3f}% |"
+            f"| {label} | {workload} | {baseline:.4f} ({len(none)}) | "
+            f"{measured:.4f} ({len(counters)}) | {delta:+.3f}% |"
         )
-    print()
-    if deltas:
 
-        def median(v: list[float]) -> float:
-            w = sorted(v)
-            return w[len(w) // 2] if len(w) % 2 else (w[len(w) // 2 - 1] + w[len(w) // 2]) / 2
-
-        med = median(deltas)
-        mad = median([abs(d - med) for d in deltas])
-        worst = max(abs(d) for d in deltas)
-        print(
-            f"median delta across {len(deltas)} workloads: **{med:+.3f}%** "
-            f"(median absolute deviation {mad:.3f}%)"
-        )
-        print(f"largest single-workload |delta|: {worst:.3f}%")
-        print(f"per-workload arm spread: median {median(spreads):.2f}%, max {max(spreads):.2f}%")
-        print()
-        print(
-            "A few workloads show large single-arm deltas. On this shared, drifting node "
-            "those are attributable to co-tenant load, not to the counters: the counters are "
-            "three dict increments per step, and the same setting appears both faster and "
-            "slower depending on the workload."
-        )
-        print()
-        print(
-            f"verdict: median overhead {med:+.3f}%, i.e. below the ~{median(spreads):.1f}% "
-            f"arm-to-arm resolution of this sample. The instrumentation is NOT measurably "
-            f"slower, and this experiment cannot bound it more tightly than that."
-        )
+    if not deltas:
+        print("No complete, matching jobs for the two instrumentation settings.")
+        return 2
+    med = median(deltas)
+    print(f"Median delta across {len(deltas)} workload/config pairs: {med:+.3f}%")
+    print(f"Median absolute deviation: {median(abs(d - med) for d in deltas):.3f}%")
+    print(f"Largest absolute delta: {max(map(abs, deltas)):.3f}%")
+    print(f"Observed job spread per pair: median {median(spreads):.2f}%, max {max(spreads):.2f}%")
     return 0
 
 

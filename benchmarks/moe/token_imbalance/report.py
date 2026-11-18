@@ -43,7 +43,8 @@ def load(root: Path) -> dict[str, dict[str, dict]]:
     """config -> workload -> {worst-rank metrics, correctness flags}"""
     out: dict[str, dict[str, dict]] = defaultdict(dict)
     for f in sorted(root.rglob("rank*.jsonl")):
-        cfg = f.parent.name
+        directory = f.parent.relative_to(root)
+        cfg = str(directory) if directory.parts else root.name
         rows = [json.loads(x) for x in f.read_text().splitlines() if x.strip()]
         for r in rows:
             wl = r["workload_id"]

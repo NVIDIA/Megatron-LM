@@ -25,15 +25,49 @@ Honesty rules applied here:
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import statistics
-from collections import defaultdict
 from pathlib import Path
 
+from summarize import Arm, load
 
-def geo(values: list[float]) -> float:
-    return math.exp(sum(math.log(v) for v in values) / len(values))
+
+def _block_effect(
+    kind: str, positions: list[tuple[int, str, list[Arm]]], workload: str, reference: str
+) -> tuple[float | str, tuple | None]:
+    ordered = sorted(positions, key=lambda pos: pos[0])
+    if [p for p, _, _ in ordered] != [0, 1, 2, 3]:
+        return "INVALID (expected positions 0–3 once each)", None
+    trees = {tree for _, tree, _ in ordered}
+    sequence = "".join("A" if tree == reference else "P" for _, tree, _ in ordered)
+    if len(trees) != 2 or sequence != kind:
+        return f"INVALID (expected {kind} tree order)", None
+
+    if all(arms for _, _, arms in ordered) and not any(
+        arm.workload_id == workload for _, _, arms in ordered for arm in arms
+    ):
+        return "n/a", None  # This complete block did not run the workload at any position.
+
+    identity = None
+    log_times = []
+    for pos, _, arms in ordered:
+        matches = [arm for arm in arms if arm.workload_id == workload]
+        if len(matches) != 1:
+            return f"INVALID (expected one {workload} job at position {pos})", None
+        arm = matches[0]
+        status = arm.status()
+        if status != "OK":
+            return f"INVALID (position {pos}: {status})", None
+        if not arm.has_comparison_identity():
+            return f"INVALID (unknown base or checksum at position {pos})", None
+        if identity is not None and arm.key != identity:
+            return "INVALID (different run identities)", None
+        identity = arm.key
+        log_times.append(math.log(arm.worst("median_ms")))
+    # Mean of log times is the log of the same-tree geometric mean.
+    patch = statistics.fmean(t for side, t in zip(kind, log_times) if side == "P")
+    base = statistics.fmean(t for side, t in zip(kind, log_times) if side == "A")
+    return patch - base, (frozenset(trees), identity)
 
 
 def main() -> int:
@@ -43,36 +77,18 @@ def main() -> int:
     ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args()
 
-    # Real layout written by run_b1_paired.sh:
-    #   <config-tag>-<APPA|PAAP>/<position>-<tree>/<config-tag-dir>/rank*.jsonl
-    # blocks[config_tag][block_kind][position] = (tree, {workload: worst_rank_median_ms})
-    blocks: dict[str, dict[str, dict[int, tuple[str, dict[str, float]]]]] = defaultdict(
-        lambda: defaultdict(dict)
-    )
+    # A position may contain a nested result directory. It still represents exactly one job.
+    blocks: dict[str, dict[str, list[tuple[int, str, list[Arm]]]]] = {}
     for cfg_dir in sorted(p for p in args.run_dir.iterdir() if p.is_dir()):
         config_tag, _, kind = cfg_dir.name.rpartition("-")
         if kind not in ("APPA", "PAAP"):
             continue
+        positions = []
         for arm_dir in sorted(p for p in cfg_dir.iterdir() if p.is_dir()):
-            pos_s, _, tree = arm_dir.name.partition("-")
-            if not pos_s.isdigit():
-                continue
-            per_wl: dict[str, float] = {}
-            bad = False
-            for f in sorted(arm_dir.rglob("rank*.jsonl")):
-                for line in f.read_text(encoding="utf-8").splitlines():
-                    if not line.strip():
-                        continue
-                    r = json.loads(line)
-                    if r.get("status") != "OK" or r.get("median_ms") is None:
-                        bad = True
-                        continue
-                    per_wl[r["workload_id"]] = max(
-                        per_wl.get(r["workload_id"], 0.0), r["median_ms"]
-                    )
-            if bad:
-                per_wl["__INVALID__"] = 1.0
-            blocks[config_tag][kind][int(pos_s)] = (tree, per_wl)
+            pos, _, tree = arm_dir.name.partition("-")
+            if pos.isdigit():
+                positions.append((int(pos), tree, load(arm_dir)))
+        blocks.setdefault(config_tag, {})[kind] = positions
 
     lines: list[str] = []
 
@@ -90,65 +106,61 @@ def main() -> int:
     )
     emit()
 
+    if not blocks:
+        emit("INVALID: no APPA or PAAP blocks found.")
+
     all_effects: list[float] = []
     for cfg in sorted(blocks):
         emit(f"## {cfg}")
         emit()
         emit("| workload | block APPA | block PAAP | mean step-time change | LOO | " "verdict |")
         emit("|---|---|---|---|---|---|")
-        kinds = sorted(blocks[cfg])
-        per_workload: dict[str, list[float]] = defaultdict(list)
-        for kind in kinds:
-            obs = blocks[cfg][kind]
-            if len(obs) != 4:
-                continue
-            order = "".join(obs[i][0] for i in range(4))
-            for wl in sorted({w for _, m in obs.values() for w in m}):
-                if wl == "__INVALID__":
-                    continue
-                vals: dict[str, list[float]] = defaultdict(list)
-                for i in range(4):
-                    tree, m = obs[i]
-                    if wl in m:
-                        vals[tree].append(m[wl])
-                if not vals.get(args.reference) or len(vals) < 2:
-                    continue
-                base = geo(vals[args.reference])
-                patch_tree = next(t for t in vals if t != args.reference)
-                patch = geo(vals[patch_tree])
-                if base <= 0 or patch <= 0:
-                    continue
-                per_workload[wl].append(math.log(patch / base))
-        for wl in sorted(per_workload):
-            effects = per_workload[wl]
-            if not effects:
-                continue
-            mean = sum(effects) / len(effects)
-            change = 100 * math.expm1(mean)
-            cells = [f"{100 * math.expm1(e):+.3f}%" for e in effects]
-            while len(cells) < 2:
-                cells.append("n/a")
-            loo = (
-                [
-                    100
-                    * math.expm1(
-                        sum(e for j, e in enumerate(effects) if j != i) / max(1, len(effects) - 1)
-                    )
-                    for i in range(len(effects))
-                ]
-                if len(effects) > 1
-                else []
-            )
-            verdict = (
-                "flat (|Δ| < 1%)"
-                if abs(change) < 1.0
-                else ("patch faster" if change < 0 else "patch slower")
-            )
-            emit(
-                f"| {wl} | {cells[0]} | {cells[1]} | {change:+.3f}% | "
-                f"{', '.join(f'{v:+.3f}' for v in loo) or 'n/a'} | {verdict} |"
-            )
-            all_effects.extend(effects)
+        positions_by_kind = blocks[cfg]
+        order = ("APPA", "PAAP")
+        workloads = sorted(
+            {
+                arm.workload_id
+                for positions in positions_by_kind.values()
+                for _, _, arms in positions
+                for arm in arms
+            }
+        )
+        if not workloads:
+            emit("INVALID: no workload records in this configuration.")
+        for wl in workloads:
+            results = {}
+            identities = {}
+            for kind, positions in positions_by_kind.items():
+                value, identity = _block_effect(kind, positions, wl, args.reference)
+                results[kind] = value
+                if identity is not None:
+                    identities[kind] = identity
+            if len(set(identities.values())) > 1:
+                results = dict.fromkeys(identities, "INVALID (different patch trees or workloads)")
+            cells = []
+            effects = []
+            for kind in order:
+                effect = results.get(kind, "n/a")
+                if isinstance(effect, float):
+                    effects.append(effect)
+                    cells.append(f"{100 * math.expm1(effect):+.3f}%")
+                else:
+                    cells.append(effect)
+            mean_cell = loo = "n/a"
+            verdict = "INVALID"
+            if effects:
+                change = 100 * math.expm1(statistics.fmean(effects))
+                mean_cell = f"{change:+.3f}%"
+                # There are at most two blocks. Omitting each one leaves the other.
+                if len(effects) == 2:
+                    loo = ", ".join(f"{100 * math.expm1(e):+.3f}" for e in reversed(effects))
+                verdict = (
+                    "flat (|Δ| < 1%)"
+                    if abs(change) < 1.0
+                    else ("patch faster" if change < 0 else "patch slower")
+                )
+                all_effects.extend(effects)
+            emit(f"| {wl} | {cells[0]} | {cells[1]} | {mean_cell} | {loo} | {verdict} |")
         emit()
 
     if all_effects:

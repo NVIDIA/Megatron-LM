@@ -17,6 +17,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "benchmarks/moe/token_imbalance"))
 import arms as A  # noqa: E402
 from arm_adapter import canonical_routes, numerical_error  # noqa: E402
+from backend_adapter import UNVERIFIED, probe_environment  # noqa: E402
 from compare_arms import parse_args, spread  # noqa: E402
 
 GEOMETRY = A.Geometry(ep=4, experts=16, topk=4, tokens=256, hidden=256, ffn=512)
@@ -132,6 +133,9 @@ def test_resolve_and_rotated_order():
     assert [o[0] for o in orders] == ["alltoall", "hybridep", "moonep"]
     assert all(sorted(o) == sorted(orders[0]) for o in orders)
     assert A.run_order(arms, 2, "fixed") == arms
+    assert A.run_order([], 0) == A.run_order([], 0, "fixed") == []
+    with pytest.raises(ValueError):
+        A.run_order([], 0, "random")
     with pytest.raises(ValueError):
         A.run_order(arms, 0, "random")
 
@@ -183,3 +187,8 @@ def test_spread_summarizes_median_and_range():
     assert s["n"] == 5 and s["median_ms"] == 3.0
     assert (s["min_ms"], s["max_ms"]) == (1.0, 5.0)
     assert s["p10_ms"] == pytest.approx(1.4) and s["p90_ms"] == pytest.approx(4.6)
+
+
+def test_fixed_workloads_leave_unexercised_capabilities_unverified():
+    capability = probe_environment()
+    assert capability.zero_token_rows == capability.variable_topk == UNVERIFIED

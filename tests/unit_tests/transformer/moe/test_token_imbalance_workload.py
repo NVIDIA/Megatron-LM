@@ -201,3 +201,54 @@ def test_retired_workload_ids_are_rejected():
     for retired in ("W2_hot_rank", "W4_source_ragged"):
         with pytest.raises(ValueError, match="unknown workload"):
             B.routing_for_step(retired, NUM_EXPERTS, 2, TOKENS, 0, 1, 2)
+
+
+@pytest.mark.parametrize(
+    "tokens,hidden_size,topk",
+    [(128, 512, 2), (2048, 2048, 2), (257, 16, 1), (128, 512, 8), (16, 512, 64)],
+)
+def test_roundtrip_sentinels_distinguish_tokens_and_source_ranks(tokens, hidden_size, topk):
+    source = list(B._roundtrip_sentinels(tokens, hidden_size, topk, rank=0))
+    other = list(B._roundtrip_sentinels(tokens, hidden_size, topk, rank=1))
+    assert torch.cat(source, dim=1).unique(dim=0).shape[0] == tokens
+    for rank, probes in enumerate((source, other)):
+        for hidden in probes:
+            grid = hidden.float() * 1024
+            assert torch.equal(grid, grid.round())
+            assert grid.abs().max() < 255
+            assert (grid.sum(dim=1) == (topk + rank) * 1024).all()
+            components = list(B._combine_probes(hidden, topk, world_size=2))
+            assert torch.equal(sum(c.float() for c in components), hidden)
+            for component in components:
+                summed = torch.zeros_like(component)
+                for _ in range(topk):
+                    summed += component
+                assert torch.equal(summed, component * topk)
+
+    for local, remote in zip(source, other):
+        assert (local != remote).any(dim=1).all()
+    wrong_order = torch.arange(tokens)
+    wrong_order[[0, tokens - 1]] = wrong_order[[tokens - 1, 0]]
+    assert any(not torch.equal(hidden[wrong_order] * topk, hidden * topk) for hidden in source)
+
+
+def test_oracle_rejects_non_power_of_two_topk():
+    with pytest.raises(ValueError, match="power-of-two"):
+        list(B._roundtrip_sentinels(128, 512, 3, rank=0))
+
+
+def _check_rank_local_failure(rank, rendezvous):
+    dist = torch.distributed
+    dist.init_process_group("gloo", rank=rank, world_size=2, init_method=rendezvous)
+    try:
+        assert not B._any_rank_failed(False, torch.device("cpu"))
+        assert B._any_rank_failed(rank == 1, torch.device("cpu"))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="requires the Gloo backend")
+def test_failure_on_one_rank_reaches_every_rank(tmp_path):
+    torch.multiprocessing.spawn(
+        _check_rank_local_failure, args=((tmp_path / "rendezvous").as_uri(),), nprocs=2
+    )

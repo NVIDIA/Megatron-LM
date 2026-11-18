@@ -32,7 +32,7 @@ Correctness oracle (exact integer metadata + exact round trip), at every step:
     * every token row has exactly K distinct experts
     * sum_e assignments[e] == T * K, and the global histogram matches T*K*world
     * dispatch -> identity expert -> combine restores every row to its origin
-      (values are exact powers of two, so the gated sum is exact in bf16/fp32)
+      (rank-specific row sums and token-specific column pairs are checked exactly)
     * dispatcher recv splits agree with the independent group-global count
     * rank_target: the realized per-rank load equals the target exactly
     * model modes: the routing map the layer actually used equals the workload exactly
@@ -49,6 +49,7 @@ import json
 import math
 import os
 import sys
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -404,9 +405,99 @@ class ArmResult:
     correctness: dict[str, Any] = field(default_factory=dict)
     status: str = "NOT_RUN"
     error: str | None = None
+    ffn_hidden_size: int | None = None
+    instrument: str = "none"
+    run_id: str = "unknown"
 
 
 # --------------------------------------------------------------------------------------
+
+
+def _roundtrip_sentinels(
+    tokens: int, hidden_size: int, topk: int, rank: int
+) -> Iterator[torch.Tensor]:
+    """Encode the rank in each row sum and token bits in the order of column pairs."""
+    target = (topk + rank) * 1024
+    pairs = hidden_size // 2
+    if not pairs or topk <= 0 or topk & (topk - 1):
+        raise ValueError("round-trip oracle needs a power-of-two topk and at least two columns")
+
+    lift, remainder = divmod(target, hidden_size)
+    row = torch.full((hidden_size,), lift, dtype=torch.int32)
+    row[:remainder] += 1
+    row[: 2 * pairs : 2] += 1
+    row[1 : 2 * pairs : 2] -= 1
+    assert int(row.sum()) == target, "integer row sum mismatch"
+    assert int(row.abs().max()) < 255, "value leaves the bf16-exact grid"
+    row = (row.float() / 1024).to(torch.bfloat16)
+
+    token_ids = torch.arange(tokens)
+    bits = max(1, (tokens - 1).bit_length())
+    # Multiple probes cover large token counts even when a narrow hidden dimension
+    # cannot encode every bit in a single row. Each swap preserves the rank's row sum.
+    for offset in range(0, bits, pairs):
+        width = min(pairs, bits - offset)
+        swap = ((token_ids[:, None] >> torch.arange(offset, offset + width)) & 1).bool()
+        hidden = row.repeat(tokens, 1)
+        left, right = row[: 2 * width : 2], row[1 : 2 * width : 2]
+        hidden[:, : 2 * width : 2] = torch.where(swap, right, left)
+        hidden[:, 1 : 2 * width : 2] = torch.where(swap, left, right)
+        yield hidden
+
+
+def _combine_probes(hidden: torch.Tensor, topk: int, world_size: int) -> Iterator[torch.Tensor]:
+    """Keep BF16 additions exact even for a large top-k and a narrow hidden size."""
+    # All ranks must take the same number of collective steps. Bound their largest
+    # coefficient in units of 2**-10, including the +1 that encodes a token bit.
+    max_rank_sum = (topk + world_size - 1) * 1024
+    max_grid_value = math.ceil(max_rank_sum / hidden.size(1)) + 1
+    if topk <= 2 or topk * max_grid_value <= 256:
+        yield hidden
+        return
+
+    # A BF16 accumulator can round an intermediate sum even when the final result is
+    # representable. Check each signed bit plane independently using the same power-of-two
+    # additions as the combine-factor probe. Together the planes encode the original rows.
+    grid = (hidden.float() * 1024).to(torch.int16)
+    for bit in range(8):
+        component = (grid.abs() & (1 << bit)) * grid.sign()
+        yield component.to(torch.bfloat16) / 1024
+
+
+def _write_trace_steps(
+    directory: Path,
+    per_step: list[tuple[torch.Tensor, torch.Tensor]],
+    *,
+    workload: str,
+    **metadata: Any,
+) -> list[str]:
+    """Persist each step's global routing and return the corresponding digests."""
+    from trace_v1 import save_trace, trace_digest
+
+    digests = []
+    for step, (ids, gates) in enumerate(per_step):
+        trace_dir = directory / workload / f"step{step:04d}"
+        save_trace(
+            trace_dir,
+            ids,
+            gates,
+            torch.zeros(ids.shape[0], dtype=torch.int32),
+            workload_id=workload,
+            step_id=step,
+            **metadata,
+        )
+        digests.append(trace_digest(trace_dir))
+    return digests
+
+
+class _WorkloadError(RuntimeError):
+    """All ranks have reached the same failure point and can start the next workload."""
+
+
+def _any_rank_failed(failed: bool, device: torch.device) -> bool:
+    flag = torch.tensor(int(failed), device=device)
+    torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+    return bool(flag.item())
 
 
 def main() -> int:
@@ -723,34 +814,28 @@ def main() -> int:
 
         # ---- optional trace-v1 persistence (rank 0 only: the workload is global) ----
         corr: dict[str, Any] = {}
-        if args.write_trace and rank == 0:
-            try:
-                from trace_v1 import save_trace, trace_digest
-
-                digests = []
-                for s, (ids_s, gates_s) in enumerate(per_step):
-                    tdir = Path(args.write_trace) / workload / f"step{s:04d}"
-                    src = torch.zeros(ids_s.shape[0], dtype=torch.int32)
-                    save_trace(
-                        tdir,
-                        ids_s,
-                        gates_s,
-                        src,
+        if args.write_trace:
+            error = None
+            if rank == 0:
+                try:
+                    corr["trace_digest_per_step"] = _write_trace_steps(
+                        Path(args.write_trace),
+                        per_step,
+                        workload=workload,
                         num_experts=args.num_experts,
                         topk=args.topk,
                         hidden_size=args.hidden_size,
                         world_size=world,
                         seed=args.seed,
-                        workload_id=workload,
                         workload_checksum=checksum,
                         producer_commit=args.base_sha,
                     )
-                    digests.append(trace_digest(tdir))
-                corr["trace_dir"] = str(Path(args.write_trace) / workload)
-                corr["trace_digest_per_step"] = digests
-                print(f"[B1] wrote {steps} trace step(s) for {workload}", flush=True)
-            except Exception as exc:
-                raise RuntimeError(f"trace persistence failed for {workload}: {exc}") from exc
+                    corr["trace_dir"] = str(Path(args.write_trace) / workload)
+                    print(f"[B1] wrote {steps} trace step(s) for {workload}", flush=True)
+                except Exception as exc:
+                    error = exc
+            if _any_rank_failed(error is not None, dev):
+                raise _WorkloadError(f"rank 0 trace persistence failed for {workload}") from error
         probs_dev = [
             probs_matrix_from_gates(ids, g, args.num_experts, torch.bfloat16).cuda()
             for ids, g in per_step
@@ -805,16 +890,10 @@ def main() -> int:
 
         # dispatch -> identity expert -> combine must restore the input exactly.
         #
-        # Construction: every element is an exact multiple of 2**-10 that a bf16 holds
-        # exactly, and every row sums to exactly `topk`. With uniform 1/topk gating,
-        # combine returns sum_k (row / topk) = row, i.e. an EXACT equality.
-        # `rank` shifts the pattern so a rank cannot pass on another rank's data.
-        # The dispatcher's combine step SUMS the top-k expert contributions; the routing
-        # probabilities are applied inside the expert module upstream, not by the dispatcher.
-        # This harness therefore feeds raw expert outputs to combine and the round trip
-        # returns a constant multiple of the input. That multiple is measured once here
-        # (on the slow path, outside the timed window) and then required to be exact.
-        assert (args.topk & (args.topk - 1)) == 0, "oracle prefers a power-of-two topk"
+        # The dispatcher sums the raw expert outputs. Measure that factor before using
+        # it to construct the exact reference for each rank- and token-specific sentinel.
+        if args.topk <= 0 or args.topk & (args.topk - 1):
+            raise _WorkloadError("round-trip oracle needs a power-of-two topk")
         ones_full = [
             probs_matrix_from_gates(
                 ids, torch.full_like(g, 1.0 / args.topk), args.num_experts, torch.bfloat16
@@ -826,42 +905,35 @@ def main() -> int:
         factor = float(token_unpermutation(ph)[0, 0].float().item()) / 0.5
         corr["combine_factor"] = factor
         corr["combine_factor_is_topk"] = abs(factor - args.topk) < 1e-9
-        assert corr["combine_factor_is_topk"], (
-            f"combine factor {factor} != topk {args.topk}: the dispatcher's scaling contract "
-            f"changed, refusing to score this arm"
-        )
+        if _any_rank_failed(not corr["combine_factor_is_topk"], dev):
+            raise _WorkloadError(
+                f"combine factor differs from topk on at least one rank (local: {factor})"
+            )
 
-        # Sentinel row on an integer grid of 2**-10: every |value| <= 255 * 2**-10 is an
-        # exact bf16 significand, the row sums to exactly `topk + rank` grid units, and the
-        # sign pattern is a rank-dependent zero-sum permutation.
-        k = args.topk + rank
-        h = args.hidden_size
-        assert h % 2 == 0, "round-trip oracle needs an even hidden size"
-        unit = 1024
-        target = k * unit  # integer row sum
-        amp = 42  # balanced +-amp sums to zero
-        signs = torch.empty(h, dtype=torch.int64)
-        signs[0::2] = amp
-        signs[1::2] = -amp
-        assert int(signs.sum().item()) == 0
-        signs = signs.roll(rank * 2)  # rank-dependent permutation
-        lift = target // h
-        assert lift * h == target, f"row sum {k} must divide evenly over {h} columns"
-        ints = signs + lift
-        assert int(ints.sum().item()) == target, "integer row sum mismatch"
-        assert int(ints.abs().max().item()) < 255, "value leaves the bf16-exact grid"
-        hidden = (ints.float() / unit).to(torch.bfloat16)
-        hidden = hidden.unsqueeze(0).repeat(args.tokens, 1).contiguous().cuda()
-        expected_roundtrip = hidden * torch.tensor(factor, device=dev, dtype=torch.bfloat16)
-
-        roundtrip_ok, recv_ok, mismatch_rows = True, True, 0
+        recv_ok, mismatch_rows = True, 0
         recv: list[int] = []
+        # Construct the rank-specific patterns before entering another dispatcher collective.
+        # Geometry that leaves the exact grid on one rank must fail every rank coherently.
+        error = None
+        try:
+            sentinels = [
+                sentinel.to(dev)
+                for sentinel in _roundtrip_sentinels(args.tokens, args.hidden_size, args.topk, rank)
+            ]
+        except (ValueError, AssertionError) as exc:
+            error = exc
+        if _any_rank_failed(error is not None, dev):
+            raise _WorkloadError(
+                "cannot construct exact round-trip sentinels on all ranks"
+            ) from error
         for s in range(steps):
-            permuted, counts, _pp = token_permutation(hidden, ones_full[s], maps[s])
-            restored = token_unpermutation(permuted)
-            if not torch.equal(restored, expected_roundtrip):
-                roundtrip_ok = False
-                mismatch_rows += int((restored != expected_roundtrip).any(dim=1).sum().item())
+            mismatched = torch.zeros(args.tokens, dtype=torch.bool, device=dev)
+            for sentinel in sentinels:
+                for hidden in _combine_probes(sentinel, args.topk, world):
+                    permuted, counts, _pp = token_permutation(hidden, ones_full[s], maps[s])
+                    restored = token_unpermutation(permuted)
+                    mismatched |= (restored != hidden * factor).any(dim=1)
+            mismatch_rows += int(mismatched.sum().item())
             if s == 0:
                 corr["counts_len_ok"] = len(counts) == num_local_experts
                 corr["local_counts_sum_ok"] = (
@@ -879,8 +951,8 @@ def main() -> int:
                 total_recv = torch.tensor(sum(recv_s), dtype=torch.int64, device=dev)
                 torch.distributed.all_reduce(total_recv)
                 recv_ok = recv_ok and int(total_recv.item()) == sum(global_counts[s])
-        corr["roundtrip_exact"] = roundtrip_ok
-        if not roundtrip_ok:
+        corr["roundtrip_exact"] = mismatch_rows == 0
+        if mismatch_rows:
             corr["roundtrip_mismatch_rows"] = mismatch_rows
         corr["recv_splits_assignments_ok"] = recv_ok if recv else None
         corr["global_tokens"] = args.tokens * world
@@ -920,7 +992,7 @@ def main() -> int:
 
         def dispatch_step(s: int) -> None:
             count("permute_calls")
-            ph, cnt, _pp = token_permutation(hidden, probs_dev[s], maps[s])
+            ph, cnt, _pp = token_permutation(sentinels[0], probs_dev[s], maps[s])
             count("expert_calls")
             eh = expert_compute(ph, cnt)
             # probs are applied INSIDE the expert module upstream
@@ -1027,6 +1099,7 @@ def main() -> int:
         rec.status = "FAILED_CORRECTNESS" if hard_fail else "OK"
 
     results = []
+    failures = 0
     for workload in workloads:
         rank_target = is_rank_target(workload)
         checksum = workload_fingerprint(
@@ -1046,6 +1119,9 @@ def main() -> int:
             mode=args.mode,
             backend="standard_alltoall",
             base_sha=args.base_sha,
+            ffn_hidden_size=args.ffn_hidden_size,
+            instrument=args.instrument,
+            run_id=args.run_id,
             ep=args.ep,
             etp=args.etp,
             tp=args.tp,
@@ -1071,18 +1147,24 @@ def main() -> int:
             import traceback
 
             traceback.print_exc()
+            if not isinstance(exc, _WorkloadError):
+                # Peers may already be in a dispatcher collective. Record the failure and
+                # let torchrun stop them; entering the next collective could deadlock.
+                emit(rec)
+                raise
         results.append(rec)
         emit(rec)
+        failures += _any_rank_failed(rec.status != "OK", dev)
 
     sync()
     if rank == 0:
-        ok = sum(1 for r in results if r.status == "OK")
+        ok = len(results) - failures
         print(
             f"[B1] run_id={args.run_id} mode={args.mode} ep={args.ep} world={world} "
             f"arms={len(results)} ok={ok} -> {out_dir}"
         )
     torch.distributed.destroy_process_group()
-    return 0
+    return int(failures > 0)
 
 
 if __name__ == "__main__":

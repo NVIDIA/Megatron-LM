@@ -81,6 +81,13 @@ def test_target_loads_reproduce_the_review_example():
     assert RL.target_rank_loads("R0_balanced", 5, 100, 2.0) == [20] * 5
 
 
+def test_fractional_mean_does_not_make_a_secondary_rank_hotter():
+    spread = RL.target_rank_loads("R1_hot_rank_spread", 4, 258, 1.0)
+    concentrated = RL.target_rank_loads("R2_hot_rank_concentrated", 4, 258, 1.0)
+    assert sum(spread) == sum(concentrated) == 258
+    assert max(spread) == max(concentrated) == spread[0] == concentrated[0] == 65
+
+
 @pytest.mark.parametrize("ep", [3, 4, 8])
 @pytest.mark.parametrize("hot_maxvio", [1.5, 2.0, 3.0])
 def test_r1_and_r2_share_maxvio_and_differ_in_concentration(ep, hot_maxvio):

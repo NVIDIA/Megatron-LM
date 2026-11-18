@@ -99,8 +99,7 @@ def probe_environment(num_experts: int = 8) -> Capability:
     cap.etp["etp=1"] = SUPPORTED
     cap.etp["etp>1"] = UNVERIFIED  # no ETP run was performed, so this is not a claim
 
-    cap.zero_token_rows = SUPPORTED  # W5 exercises it and passes
-    cap.variable_topk = SUPPORTED  # W0..W7 does not vary topk within a run
+    # W5 exercises empty destinations with nonempty sources; every workload uses fixed top-k.
     cap.recompute = UNVERIFIED  # not exercised by the benchmark
     cap.cuda_graph = UNVERIFIED  # not exercised by the benchmark
     return cap

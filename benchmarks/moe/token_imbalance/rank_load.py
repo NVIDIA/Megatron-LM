@@ -124,19 +124,18 @@ def target_rank_loads(workload: str, ep_size: int, total: int, hot_maxvio: float
     if not 1.0 <= hot_maxvio <= ep_size:
         raise ValueError(f"hot_maxvio {hot_maxvio} must lie in [1, ep_size={ep_size}]")
     mean = total / ep_size
-    hot = min(total, int(round(hot_maxvio * mean)))
+    ceiling = -(-total // ep_size)
+    hot = min(total, max(ceiling, round(hot_maxvio * mean)))
     rest = total - hot
     if workload == "R1_hot_rank_spread":
         return [hot] + _split_evenly(rest, ep_size - 1)
     if workload == "R2_hot_rank_concentrated":
-        # Fill the other ranks at the (rounded-down) mean until the remainder runs out.
-        cap = max(1, int(mean))
+        # The ceiling of the mean can accommodate the remainder without exceeding hot.
         loads = [hot]
         for _ in range(ep_size - 1):
-            take = min(cap, rest)
+            take = min(ceiling, rest)
             loads.append(take)
             rest -= take
-        loads[1] += rest  # rounding residue, if any, stays on the first non-hot rank
         return loads
     raise ValueError(f"unknown rank-target workload {workload}")
 

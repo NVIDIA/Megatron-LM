@@ -36,7 +36,13 @@ import torch
 
 SCHEMA_VERSION = 1
 PRODUCER = "b1_benchmark.py/trace-v1"
-TENSOR_FILES = ("token_ids", "gates", "source_rank", "expert_ids")
+TENSOR_DTYPES = {
+    "token_ids": torch.int64,
+    "gates": torch.float32,
+    "source_rank": torch.int32,
+    "expert_ids": torch.int64,
+}
+TENSOR_FILES = tuple(TENSOR_DTYPES)
 
 
 class TraceValidationError(Exception):
@@ -193,6 +199,8 @@ def load_trace(trace_dir: Path) -> tuple[TraceManifest, dict[str, torch.Tensor]]
             raise TraceValidationError(f"cannot load {name} safely: {exc}") from exc
         if not isinstance(t, torch.Tensor):
             raise TraceValidationError(f"{name} did not load as a plain tensor")
+        if t.dtype != TENSOR_DTYPES[name]:
+            raise TraceValidationError(f"{name} dtype {t.dtype} != schema {TENSOR_DTYPES[name]}")
         if list(t.shape) != list(meta["shape"]):
             raise TraceValidationError(f"{name} shape {list(t.shape)} != manifest {meta['shape']}")
         if str(t.dtype).replace("torch.", "") != meta["dtype"]:

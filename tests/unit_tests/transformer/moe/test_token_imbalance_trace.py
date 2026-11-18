@@ -15,6 +15,7 @@ rejected everything, so each case also asserts the reason.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import sys
@@ -299,3 +300,61 @@ def test_rejects_zero_token_trace(workdir):
     )
     with pytest.raises(TraceValidationError, match="zero logical tokens"):
         load_trace(d)
+
+
+def test_workload_persists_each_routing_step(workdir):
+    workload = "W6_rotating_hotspot"
+    steps = [
+        B.routing_for_step(workload, NUM_EXPERTS, TOPK, TOKENS, step, SEED, 2) for step in range(2)
+    ]
+    digests = B._write_trace_steps(
+        workdir,
+        steps,
+        workload=workload,
+        num_experts=NUM_EXPERTS,
+        topk=TOPK,
+        hidden_size=HIDDEN,
+        world_size=2,
+        seed=SEED,
+        workload_checksum="two-step-workload",
+        producer_commit="test",
+    )
+    assert not torch.equal(steps[0][0], steps[1][0])
+    for step, (ids, gates) in enumerate(steps):
+        directory = workdir / workload / f"step{step:04d}"
+        manifest, tensors = load_trace(directory)
+        assert manifest.step_id == step
+        assert manifest.workload_checksum == "two-step-workload"
+        assert digests[step] == trace_digest(directory)
+        assert torch.equal(tensors["expert_ids"], ids)
+        assert torch.equal(tensors["gates"], gates)
+        assert not tensors["source_rank"].any()
+
+
+@pytest.mark.parametrize(
+    "names,dtype",
+    [
+        (("token_ids", "expert_ids"), torch.float32),
+        (("expert_ids",), torch.int32),
+        (("gates",), torch.float64),
+        (("source_rank",), torch.int64),
+    ],
+)
+def test_rejects_dtype_outside_the_schema_even_when_manifest_matches(workdir, names, dtype):
+    directory = _save(workdir, "dtype")
+    manifest_path = directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    for name in names:
+        meta = manifest["tensors"][name]
+        path = directory / meta["file"]
+        tensor = torch.load(path, weights_only=True).to(dtype)
+        if name in ("token_ids", "expert_ids") and dtype == torch.float32:
+            tensor += 0.25
+        torch.save(tensor, path)
+        meta.update(
+            dtype=str(dtype).removeprefix("torch."),
+            sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(TraceValidationError, match=rf"{names[0]} dtype .* != schema"):
+        load_trace(directory)

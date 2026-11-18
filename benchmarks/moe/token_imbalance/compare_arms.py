@@ -118,6 +118,27 @@ def parse_args(argv=None):
     return args
 
 
+class _ArmValidationError(Exception):
+    """An arm failed post-step validation on at least one rank."""
+
+
+def _run_step(adapter, hidden, indices, upstream, *, learning_rate, collect, group):
+    """Finish post-step checks on every rank before gathering evidence or starting another step."""
+    error = None
+    try:
+        result = adapter.run_workload(
+            hidden, indices, upstream, learning_rate=learning_rate, collect=collect
+        )
+    except AssertionError as exc:
+        error = f"AssertionError: {exc}"
+
+    failed = torch.tensor(error is not None, device=hidden.device)
+    torch.distributed.all_reduce(failed, op=torch.distributed.ReduceOp.MAX, group=group)
+    if failed.item():
+        raise _ArmValidationError(error or "failed on another rank")
+    return result
+
+
 def main(argv=None):
     """Run every available arm on every workload and write per-rank JSONL plus a summary."""
     args = parse_args(argv)
@@ -201,7 +222,6 @@ def main(argv=None):
                         te_op_fuser=args.te_op_fuser,
                         scheduler_transport=args.scheduler_transport,
                     )
-                    error = None
                     try:
                         layer = adapter.build(pg, args.seed)
                         parameters = dict(layer.named_parameters())
@@ -241,12 +261,14 @@ def main(argv=None):
                                     x.shape, device="cuda", dtype=x.dtype, generator=rng
                                 )
                                 collect = iteration == 0
-                                result = adapter.run_workload(
+                                result = _run_step(
+                                    adapter,
                                     x,
                                     ids.cuda(),
                                     upstream,
                                     learning_rate=args.learning_rate if iteration >= 0 else 0.0,
                                     collect=collect,
+                                    group=pg.ep,
                                 )
                                 if iteration < 0:
                                     continue
@@ -289,17 +311,8 @@ def main(argv=None):
                                     row["capability"] = adapter.capability()
                                 stream.write(json.dumps(row) + "\n")
                                 stream.flush()
-                    except Exception as exc:  # recorded, and the run exits nonzero
-                        error = f"{type(exc).__name__}: {exc}"
+                    except _ArmValidationError as exc:
                         values.pop(arm.name, None)
-                        import traceback
-
-                        traceback.print_exc()
-                    finally:
-                        adapter.close()
-                    flag = torch.tensor(int(error is not None), device="cuda")
-                    torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
-                    if flag.item():
                         failed = True
                         stream.write(
                             json.dumps(
@@ -308,12 +321,13 @@ def main(argv=None):
                                     "workload": workload,
                                     "rank": rank,
                                     "status": "FAILED",
-                                    "error": error or "failed on another rank",
+                                    "error": str(exc),
                                 }
                             )
                             + "\n"
                         )
                         samples.pop((arm.name, workload), None)
+                    adapter.close()
                 # Numerics against the reference arm, from the first measured pass.
                 if reference in values:
                     for name, per_step in values.items():
@@ -368,10 +382,13 @@ def main(argv=None):
                 )
         flag = torch.tensor(int(failed), device="cuda")
         torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
-        return int(flag.item())
-    finally:
-        parallel_state.destroy_model_parallel()
-        torch.distributed.destroy_process_group()
+        exit_code = int(flag.item())
+    except Exception as exc:
+        # Peers may still be in a layer collective. Let torchrun terminate the job.
+        raise RuntimeError(f"Unrecoverable benchmark failure on rank {rank}") from exc
+    parallel_state.destroy_model_parallel()
+    torch.distributed.destroy_process_group()
+    return exit_code
 
 
 if __name__ == "__main__":
