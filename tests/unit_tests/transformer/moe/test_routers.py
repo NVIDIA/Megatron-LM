@@ -741,15 +741,27 @@ class TestTop2Router:
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("grad_enabled", [False, True])
-    def test_router_diagnostics_report_quantile_balancing_selection_bias(self, grad_enabled):
+    @pytest.mark.parametrize("estimation_scope", ["micro_batch", "global_batch"])
+    def test_router_diagnostics_report_quantile_balancing_selection_bias(
+        self, grad_enabled, estimation_scope
+    ):
         self.transformer_config.moe_router_load_balancing_type = "quantile_balancing"
+        self.transformer_config.moe_router_quantile_balancing_estimation_scope = estimation_scope
+        self.transformer_config.moe_router_score_function = "sigmoid"
         self.router = type(self.router)(
             self.transformer_config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
         ).cuda()
         beta = torch.tensor([1.0, -2.0, 0.5, 3.0], device="cuda")
-        self.router.qb_beta.copy_(beta)
+        bias_buffer = (
+            self.router.qb_beta if estimation_scope == "micro_batch" else self.router.expert_bias
+        )
+        bias_buffer.copy_(beta)
         logits = torch.arange(64, dtype=torch.float32, device="cuda").reshape(8, 2, 4) / 32
-        expected_indices = (logits.reshape(-1, 4) - beta).topk(2, dim=-1).indices
+        selection_bias = -beta if estimation_scope == "micro_batch" else beta
+        selection_scores = logits if estimation_scope == "micro_batch" else logits.sigmoid()
+        expected_indices = (
+            (selection_scores.reshape(-1, 4) + selection_bias).topk(2, dim=-1).indices
+        )
         expected_map = torch.zeros_like(logits.reshape(-1, 4), dtype=torch.bool)
         expected_map.scatter_(1, expected_indices, True)
         observed = []
@@ -760,20 +772,22 @@ class TestTop2Router:
                 lambda *args: observed.append(args), frozenset({"router_diagnostics"})
             ),
         ):
-            _, routing_map = self.router.routing(logits)
+            for _ in range(2):
+                _, routing_map = self.router.routing(logits)
 
-        assert len(observed) == 1
+        assert len(observed) == 2
+        assert torch.equal(observed[0][3].view(torch.uint8), observed[1][3].view(torch.uint8))
         torch.testing.assert_close(routing_map, expected_map)
         diagnostics = observed[0][3]
         torch.testing.assert_close(
-            diagnostics[:, RouterDiagnosticChannel.EXPERT_BIAS], -beta.expand(2, -1)
+            diagnostics[:, RouterDiagnosticChannel.EXPERT_BIAS], selection_bias.expand(2, -1)
         )
         expected_load = expected_map.reshape(8, 2, 4).float().sum(dim=0) / 16
         torch.testing.assert_close(
             diagnostics[:, RouterDiagnosticChannel.ACTUAL_LOAD], expected_load
         )
         # The reported correction belongs to this batch, not the accumulated next-batch update.
-        torch.testing.assert_close(self.router.qb_beta, beta)
+        torch.testing.assert_close(bias_buffer, beta)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

@@ -1212,10 +1212,13 @@ class TopKRouter(Router):
                     padding_mask=padding_mask,
                 )
             if observe_router_diagnostics:
-                # Report the additive selection correction: QB subtracts beta from logits,
-                # whereas ordinary bias routing adds expert_bias to the routing scores.
+                # Micro-batch QB subtracts beta from logits. Global-batch QB and
+                # ordinary bias routing add expert_bias to the routing scores.
                 selection_bias = (
-                    -self.qb_beta if self.routing_type == "quantile_balancing" else self.expert_bias
+                    -self.qb_beta
+                    if self.routing_type == "quantile_balancing"
+                    and self.qb_estimation_scope == "micro_batch"
+                    else self.expert_bias
                 )
                 actual_routing_map = routing_map
                 if actual_routing_map.dtype != torch.bool:
