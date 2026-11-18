@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -310,6 +311,18 @@ async def test_decode_health_probe_checks_engine_without_handoff(responsive):
         await generation.aclose()
     engine.client.add_request_streaming.assert_not_called()
     engine.client.add_request_with_kv_handoff_streaming.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_generate_applies_configured_streaming_interval():
+    stream = _stream({"final": {"generated_tokens": [9]}})
+    engine = MegatronLLMEngine(replace(_config(), streaming_interval=32))
+    engine.client = SimpleNamespace(add_request_streaming=MagicMock(return_value=stream))
+    request = {"token_ids": [1], "sampling_options": {}, "stop_conditions": {"max_tokens": 1}}
+
+    [chunk async for chunk in engine.generate(request, _Context())]
+
+    assert engine.client.add_request_streaming.call_args.args[1].streaming_interval == 32
 
 
 @pytest.mark.asyncio
