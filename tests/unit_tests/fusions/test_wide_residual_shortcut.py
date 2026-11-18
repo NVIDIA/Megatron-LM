@@ -1415,10 +1415,11 @@ def test_generic_norm_matches_unfused_oracle(hidden):
 @mxfp8_test
 @pytest.mark.parametrize("formats,counts", [(("both",), (2,)), (("mxfp8", "both"), (1, 1))])
 def test_reads_feed_every_declared_linear_from_one_column_take(monkeypatch, formats, counts):
-    """Declared Linears take each MXFP8 read directly (a "both" read's twin, while BF16 modules
-    read its BF16 output); per read the replay emits the columnwise operand once, every read in
-    one launch, and every consumer's forward and weight gradient match TE's own quantization of
-    the seam's FP32 values; a "both" read's gradient gathers all its consumers' input gradients."""
+    """Declared Linears take each MXFP8 read directly (a "both" read is a (BF16, MXFP8) pair: BF16
+    modules read its first half); per read the replay emits the columnwise operand once, every
+    read in one launch, and every consumer's forward and weight gradient match TE's own
+    quantization of the seam's FP32 values; a "both" read's seam backward receives the sum of its
+    two halves' gradients."""
     m, h = 2048, 2048
     raw = mx_inputs(m, h, len(formats))
     _, saved, _ = fwd(raw, outputs=formats)  # the same schedule's tape, for the FP32 oracle
@@ -1428,16 +1429,14 @@ def test_reads_feed_every_declared_linear_from_one_column_take(monkeypatch, form
         x = folded_reader(saved, raw[0], reader)
         x = (x * saved.rstd[reader][:, None]) * saved.gammas[reader].float()
         dys = [torch.randn(m, 128, device="cuda", dtype=BF16) for _ in linears]
-        outputs, weight_grads, input_grads = [], [], []
+        outputs, weight_grads = [], []
         for layer, dy in zip(linears, dys):
-            qref = mxfp8_quantizer()(x.detach()).to_dtype(BF16).requires_grad_(True)
-            y = consume(layer, qref)
+            y = consume(layer, mxfp8_quantizer()(x.detach()).to_dtype(BF16).requires_grad_(True))
             y.backward(dy)
             outputs.append(y.detach())
             weight_grads.append(layer.weight.main_grad.clone())
-            input_grads.append(qref.grad.float())
             layer.weight.main_grad.zero_()
-        reference.append((dys, outputs, weight_grads, input_grads))
+        reference.append((dys, outputs, weight_grads))
 
     kernel = replay_kernel._bwd_wr_recompute_mxfp8quant
     launches = []
@@ -1451,77 +1450,82 @@ def test_reads_feed_every_declared_linear_from_one_column_take(monkeypatch, form
         "record",
         lambda self, *a, **k: intervals.append(weakref.ref(self)) or record(self, *a, **k),
     )
+    seam_dys, backward = [], backward_kernel.backward
+    monkeypatch.setattr(
+        backward_kernel,
+        "backward",
+        lambda saved, previous, dys, *a, **k: seam_dys.append(dys)
+        or backward(saved, previous, dys, *a, **k),
+    )
     out = run(raw, 3, outputs=formats, mxfp8_consumers=tuple(consumers))
-    providers, results, extra = [], [], []
+    providers, results, extra, halves = [], [], [], []
     for reader, (fmt, linears) in enumerate(zip(formats, consumers)):
         read = out[1 + reader]
-        assert (type(read) is torch.Tensor) == (fmt == "both")
-        operand = (
-            api._TWINS[StorageWeakRef(read.untyped_storage())].quantized if fmt == "both" else read
-        )
-        # Held weakly through the consumers' forwards, as a model holds it (not at all).
-        providers.append(weakref.ref(reader_for(operand)))
-        del operand
+        assert isinstance(read, tuple) == (fmt == "both")
         if fmt == "both":
-            read.retain_grad()
-            extra.append((read, 0.5 * read.float()))  # a BF16 module reading the same values
+            plain, read = read
+            assert type(plain) is torch.Tensor and type(read) is not torch.Tensor
+            extra.append(0.5 * plain.float())  # a BF16 module reading the same values
+            halves.append((reader, [None, None]))
+            plain.register_hook(lambda g, store=halves[-1][1]: store.__setitem__(0, g))
+            read.register_hook(lambda g, store=halves[-1][1]: store.__setitem__(1, g))
+        # Held weakly through the consumers' forwards, as a model holds it (not at all).
+        providers.append(weakref.ref(reader_for(read)))
         # Megatron's [tokens, batch, hidden] layout: the consumer takes a view of the whole read.
         results.append([consume(layer, read.view(m, 1, h)).view(m, -1) for layer in linears])
+    del read
     providers = [provider() for provider in providers]  # kept by the consumers' saved slots
     assert None not in providers and len(set(map(id, providers))) == len(formats)
     assert all(p.reconstructions == 0 for p in providers) and not launches
-    outputs = [y for ys in results for y in ys] + [z for _, z in extra]
-    grads = [dy for dys, *_ in reference for dy in dys]
-    grads += [torch.randn_like(z) for _, z in extra]
+    outputs = [y for ys in results for y in ys] + extra
+    grads = [dy for dys, *_ in reference for dy in dys] + [torch.randn_like(z) for z in extra]
     torch.autograd.backward(
         (*outputs, out[0]), (*grads, torch.zeros_like(out[0])), retain_graph=False
     )
     # One replay launch emitted every read's columns; each read took them once for all consumers.
     assert len(launches) == 1
     assert [p.reconstructions for p in providers] == [1] * len(formats)
-    for linears, ys, (dys, y_ref, wg_ref, _) in zip(consumers, results, reference):
+    for linears, ys, (dys, y_ref, wg_ref) in zip(consumers, results, reference):
         for layer, y, expected_y, expected_wg in zip(linears, ys, y_ref, wg_ref):
             assert torch.equal(y, expected_y)
             assert torch.equal(layer.weight.main_grad, expected_wg)
-    for (read, _), bf16_grad in zip(extra, grads[len(grads) - len(extra) :]):
-        reader = list(formats).index("both")
-        expected = sum(reference[reader][3]) + 0.5 * bf16_grad.float()
-        torch.testing.assert_close(read.grad.float(), expected, rtol=1 / 64, atol=1e-2)
-        # Its consumers' forwards dropped the twin; TE's saved slots kept only a size.
-        assert api._TWINS[StorageWeakRef(read.untyped_storage())].quantized is None
+    # A "both" read's seam backward got exactly the sum of its two halves' gradients.
+    (dys,) = seam_dys
+    for reader, (plain_grad, quantized_grad) in halves:
+        assert plain_grad is not None and quantized_grad is not None
+        expected = (plain_grad + quantized_grad).reshape(m, h)
+        assert torch.equal(dys[reader], expected)
     assert raw[0].grad is not None and torch.isfinite(raw[0].grad).all()
     # The last unpack released the shared columns, and once the caller drops the seam's outputs
-    # nothing (no twin registry entry) keeps its replay interval alive past backward.
+    # nothing keeps its replay interval alive past backward.
     assert all(p._columns is None and p.hooked == 0 for p in providers)
-    del providers, out, results, outputs, extra, read
+    del providers, out, results, outputs, extra, halves, plain
     gc.collect()
     assert len(intervals) == 1 and intervals[0]() is None
 
 
 @mxfp8_test
-def test_recomputed_consumer_keeps_its_twin_and_retained_graph_backward():
-    """A "both" read declared recomputed keeps its twin for its consumer's re-run in backward,
-    also on a retained graph's second backward (its columns retaken bit-exactly); one not
-    declared recomputed raises on a second graph-building use instead of falling back."""
+def test_recomputed_consumer_and_retained_graph_backward():
+    """A consumer re-run in backward (reentrant checkpoint) takes the read as an ordinary input,
+    also on a retained graph's second backward (its columns retaken bit-exactly); a read consumed
+    with grad more often than declared raises instead of materializing its columns again."""
     m, h = 2048, 2048
     layer = linear(h, mcore=True)
     dy = torch.randn(m, 128, device="cuda", dtype=BF16)
     grads = []
     for retained in (False, True):
-        out = run(
-            mx_inputs(m, h, 1), 3, outputs=("both",), mxfp8_consumers=((layer,),), recomputed=(T,)
-        )
+        out = run(mx_inputs(m, h, 1), 3, outputs=("mxfp8",), mxfp8_consumers=((layer,),))
         y = torch.utils.checkpoint.checkpoint(
             lambda x: consume(layer, x), out[1], use_reentrant=True
         )
-        provider = reader_for(api._TWINS[StorageWeakRef(out[1].untyped_storage())].quantized)
+        provider = reader_for(out[1])
         for _ in range(1 + retained):
             layer.weight.main_grad.zero_()
             torch.autograd.backward((y, out[0]), (dy, torch.zeros_like(out[0])), retain_graph=T)
             grads.append(layer.weight.main_grad.clone())
         assert provider.reconstructions == 1 + retained
     assert all(torch.equal(g, grads[0]) for g in grads[1:])
-    out = run(mx_inputs(m, h, 1), 3, outputs=("both",), mxfp8_consumers=((layer,),))
+    out = run(mx_inputs(m, h, 1), 3, outputs=("mxfp8",), mxfp8_consumers=((layer,),))
     consume(layer, out[1])
     with pytest.raises(RuntimeError, match="more often than declared"):
         consume(layer, out[1])
@@ -1529,33 +1533,51 @@ def test_recomputed_consumer_keeps_its_twin_and_retained_graph_backward():
 
 @pytest.mark.parametrize("eligible", [True, False])
 def test_direct_mxfp8_consumer_selection(monkeypatch, eligible):
-    """Consumer Linears are chosen once at construction and fix each read's format: MXFP8 for
-    eligible Linears alone, both with a BF16 reader, BF16 otherwise (also a checkpointed GDP
-    projection or a GTP Linear: TE's backward is untouched)."""
+    """A fused read is linked to every consuming module once, at construction, which fixes its
+    format: MXFP8 if every consumer quantizes it (an eligible Linear whose layer and the read's
+    seam layer run in MXFP8), BF16 if none does, else both (also a checkpointed GDP projection or
+    a GTP Linear: TE's backward is untouched); an unlinked read cannot run."""
     monkeypatch.setattr(wide_residual, "mxfp8_linear_eligible", lambda *args: eligible)
-    projection, config = torch.nn.Linear(4, 4), SimpleNamespace()
-    assert wide_residual.mxfp8_consumer(None, config) is None
-    assert wide_residual.mxfp8_consumer(projection, config) is (projection if eligible else None)
-    # A chosen consumer takes a "both" read's twin through a pre-forward hook and hands its saved
-    # operand over through a forward hook, each registered once.
+    projection, router = torch.nn.Linear(4, 4), torch.nn.Linear(4, 4)
+    assert wide_residual.mxfp8_consumer(None, None) is None
+    assert wide_residual.mxfp8_consumer(projection, None) is (projection if eligible else None)
+    # A chosen consumer hands its saved operand over through one forward hook.
     for _ in range(2):
-        wide_residual.mxfp8_consumer(projection, config)
-        assert len(projection._forward_pre_hooks) == len(projection._forward_hooks) == eligible
+        wide_residual.mxfp8_consumer(projection, None)
+        assert len(projection._forward_hooks) == eligible and not projection._forward_pre_hooks
     config = SimpleNamespace(
         first_last_layers_bf16=True,
         num_layers_at_start_in_bf16=1,
         num_layers_at_end_in_bf16=1,
         num_layers=4,
     )
-    use = wide_residual.reader_use(config, (projection, None), bf16=False, layers=(2,))
-    assert use.mxfp8_linears == ((projection,) if eligible else ())
-    assert use.format == ("mxfp8" if eligible else "bf16")
-    both = wide_residual.reader_use(config, (projection,), bf16=True, layers=(2, 3)).format
-    assert both == ("both" if eligible else "bf16")
+
+    def read(seam_layer):
+        module = object.__new__(wide_residual.WriteReadNorm)
+        torch.nn.Module.__init__(module)
+        module.consumers, module.seam_layer_number, module.config = [], seam_layer, config
+        return module
+
+    unlinked = read(2)
+    with pytest.raises(RuntimeError, match="no linked consumer"):
+        unlinked.format
+    only = read(2)
+    assert only.link_consumer(projection, 2) == eligible
+    assert only.mxfp8_linears == ((projection,) if eligible else ())
+    assert only.format == ("mxfp8" if eligible else "bf16")
+    mixed = read(2)
+    monkeypatch.setattr(
+        wide_residual,
+        "mxfp8_linear_eligible",
+        lambda linear, cfg: eligible and linear is projection,
+    )
+    mixed.link_consumer(router, 3)  # e.g. the router: never quantizes
+    mixed.link_consumer(projection, 3)
+    assert mixed.format == ("both" if eligible else "bf16")
     # A read emitted or consumed in a BF16 layer (here the first or last) stays BF16.
-    for layers in [(1,), (3, 4)]:
-        bf16 = wide_residual.reader_use(config, (projection,), bf16=False, layers=layers)
-        assert bf16 == wide_residual.ReaderUse((), True)
+    for seam_layer, layer in [(1, 2), (2, 4)]:
+        bf16 = read(seam_layer)
+        assert not bf16.link_consumer(projection, layer) and bf16.format == "bf16"
 
     seen = []
     monkeypatch.setattr(wide_residual, "check_mxfp8_call", lambda tensor: None)
@@ -1564,14 +1586,9 @@ def test_direct_mxfp8_consumer_selection(monkeypatch, eligible):
         "shortcut_add_wide_residual_write_read_rmsnorm_quant",
         lambda *a, **k: seen.append((k["outputs"], k["mxfp8_consumers"])),
     )
-    read = SimpleNamespace(
-        use=use,
-        num_streams=3,
-        eps=1e-5,
-        weight=None,
-        read_map=lambda return_logits: None,
-        _replay_interval=lambda pending: None,
-    )
+    only.num_streams, only.eps, only.weight = 3, 1e-5, None
+    only.read_map = lambda return_logits: None
+    only._replay_interval = lambda pending: None
     pending = PendingWideResidualWrites(None, None, None, None, None)
-    wide_residual.WriteReadNorm.apply_write(read, pending)
-    assert seen == [((use.format,), (use.mxfp8_linears,))]
+    wide_residual.WriteReadNorm.apply_write(only, pending)
+    assert seen == [((only.format,), (only.mxfp8_linears,))]

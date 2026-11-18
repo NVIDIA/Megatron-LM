@@ -115,6 +115,11 @@ def _validate_shortcut_fusion_config(config):
         "MXFP8 with tp_comm_overlap": mxfp8 and config.tp_comm_overlap,
         # An MXFP8 read's consumer takes the whole read once (its columns are shared, not sliced).
         "MXFP8 with mlp_chunks_for_training > 1": mxfp8 and config.mlp_chunks_for_training > 1,
+        # The MoE read goes straight to the shared expert's first Linear as MXFP8: neither a gate
+        # reading it in BF16 nor fused grouped shared experts (which quantize it) can take it.
+        "MXFP8 with moe_shared_expert_gate": mxfp8 and config.moe_shared_expert_gate,
+        "MXFP8 with use_grouped_gemm_for_shared_expert": mxfp8
+        and config.use_grouped_gemm_for_shared_expert,
         # A fused block hands its unwritten MoE output to the next layer on the same stage.
         "pipeline_model_parallel_size > 1": config.pipeline_model_parallel_size != 1,
     }
