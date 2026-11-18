@@ -73,9 +73,9 @@ def _bwd_wr_recompute_mxfp8quant(
     RETENTION: gl.constexpr,
     TERMINAL: gl.constexpr,
     EMIT: gl.constexpr,
-    READER: gl.constexpr,
 ):
-    """Replay transitions on 32x32 tiles, emitting reader READER's columns where EMIT."""
+    """Replay transitions on 32x32 tiles, emitting the columns of every reader EMIT[tape] names
+    (``rstd``/``gamma``/``data``/``scales`` are per tape, per reader)."""
     BLOCK_COLS: gl.constexpr = 32
     L: gl.constexpr = gl.BlockedLayout([1, 4], [4, 8], [4, 1], [1, 0])
     rowtile = gl.program_id(0) // (gl.cdiv(H, 128) * (128 // BLOCK_COLS))
@@ -92,30 +92,31 @@ def _bwd_wr_recompute_mxfp8quant(
         )
     for j in gl.static_range(len(updates)):
         u = gl.load(updates[j] + rr[:, None] * H + cc[None, :], mask, 0).to(gl.float32)
-        if EMIT[j]:
-            x = gl.full((32, BLOCK_COLS), 0, gl.float32, L)
-            q = 0.0
-            for s in gl.static_range(S):
-                w = gl.load(cs[j] + s)
-                t = gl.load(cs[j] + S + s) if RETENTION[j] else 1.0
-                beta = gl.load(cs[j] + (2 + READER) * S + s)
-                # Explicit rn multiply prevents contraction into neighboring recurrence.
-                alpha = _mul_rn(beta, t)
-                x = gl.fma(alpha, values[s], x)
-                q = gl.fma(beta, w, q)
-            x = gl.fma(q, u, x)
-            r = gl.load(rstd[j] + rr, rr < M, 0)
-            weight = gl.load(gamma[j] + cc, cc < H, 0).to(gl.float32)
-            z = _mul_rn(x, r[:, None])
-            y = gl.where(mask, _mul_rn(z, weight[None, :]), 0.0)
-            # Columnwise blocks run down the rows; padded scales are overwritten too.
-            _emit_mxfp8(
-                y,
-                (data[j] + rr[:, None] * H + cc[None, :], mask),
-                (scales[j], None),
-                (cc, rowtile, M),
-                AXIS=0,
-            )
+        for reader in gl.static_range(len(EMIT[j])):
+            if EMIT[j][reader]:
+                x = gl.full((32, BLOCK_COLS), 0, gl.float32, L)
+                q = 0.0
+                for s in gl.static_range(S):
+                    w = gl.load(cs[j] + s)
+                    t = gl.load(cs[j] + S + s) if RETENTION[j] else 1.0
+                    beta = gl.load(cs[j] + (2 + reader) * S + s)
+                    # Explicit rn multiply prevents contraction into neighboring recurrence.
+                    alpha = _mul_rn(beta, t)
+                    x = gl.fma(alpha, values[s], x)
+                    q = gl.fma(beta, w, q)
+                x = gl.fma(q, u, x)
+                r = gl.load(rstd[j][reader] + rr, rr < M, 0)
+                weight = gl.load(gamma[j][reader] + cc, cc < H, 0).to(gl.float32)
+                z = _mul_rn(x, r[:, None])
+                y = gl.where(mask, _mul_rn(z, weight[None, :]), 0.0)
+                # Columnwise blocks run down the rows; padded scales are overwritten too.
+                _emit_mxfp8(
+                    y,
+                    (data[j][reader] + rr[:, None] * H + cc[None, :], mask),
+                    (scales[j][reader], None),
+                    (cc, rowtile, M),
+                    AXIS=0,
+                )
         if j < len(updates) - 1 or TERMINAL:
             next_values = ()
             for s in gl.static_range(S):
@@ -130,42 +131,58 @@ def _bwd_wr_recompute_mxfp8quant(
 
 
 def _column_inputs(checkpoint, tapes, requested, columns):
+    """Per tape, per reader: the columnwise operands (allocated unless supplied) and their data
+    and scale buffers (None where not requested)."""
     m, h = tapes[0].update.shape
     if columns is None:
         columns = tuple(
-            allocate_operand((m, h), checkpoint.device, columnwise=True) if need else None
-            for need in requested
-        )
-        return (columns, *operand_buffers(columns, columnwise=True))
-    columns = tuple(columns)
-    if len(columns) != len(tapes) or any(
-        (column is not None) != need for need, column in zip(requested, columns)
-    ):
-        raise ValueError("column entries must match requested transitions")
-    data, scales = operand_buffers(columns, columnwise=True)
-    for d, q, need in zip(data, scales, requested):
-        if need and (
-            d is None
-            or q is None
-            or d.shape != (m, h)
-            or q.numel() != triton.cdiv(m, 128) * triton.cdiv(h, 128) * 512
-            or any(
-                t.dtype != torch.uint8 or t.device != checkpoint.device or not t.is_contiguous()
-                for t in (d, q)
+            tuple(
+                allocate_operand((m, h), checkpoint.device, columnwise=True) if need else None
+                for need in needs
             )
+            for needs in requested
+        )
+    else:
+        columns = tuple(tuple(per_tape) for per_tape in columns)
+        if len(columns) != len(tapes) or any(
+            len(per_tape) != len(needs)
+            or any((column is not None) != need for need, column in zip(needs, per_tape))
+            for needs, per_tape in zip(requested, columns)
         ):
-            raise ValueError("invalid MXFP8 column allocation")
+            raise ValueError("column entries must match requested transitions and readers")
+    buffers = tuple(operand_buffers(per_tape, columnwise=True) for per_tape in columns)
+    data = tuple(tuple(d) for d, _ in buffers)
+    scales = tuple(tuple(q) for _, q in buffers)
+    for needs, ds, qs in zip(requested, data, scales):
+        for need, d, q in zip(needs, ds, qs):
+            if need and (
+                d is None
+                or q is None
+                or d.shape != (m, h)
+                or q.numel() != triton.cdiv(m, 128) * triton.cdiv(h, 128) * 512
+                or any(
+                    t.dtype != torch.uint8 or t.device != checkpoint.device or not t.is_contiguous()
+                    for t in (d, q)
+                )
+            ):
+                raise ValueError("invalid MXFP8 column allocation")
     return columns, data, scales
 
 
-def _launch_columns(checkpoint, tapes, outputs, data, scales, requested, terminal, reader):
+def _launch_columns(checkpoint, tapes, outputs, data, scales, requested, terminal):
     m, h = tapes[0].update.shape
     _bwd_wr_recompute_mxfp8quant[(triton.cdiv(m, 128) * 4 * triton.cdiv(h, 128) * 4,)](
         checkpoint,
         tuple(t.update for t in tapes),
         tuple(t.coefficients for t in tapes),
-        tuple(t.rstd[reader] if need else None for t, need in zip(tapes, requested)),
-        tuple(t.gammas[reader] if need else None for t, need in zip(tapes, requested)),
+        tuple(
+            tuple(t.rstd[r] if need else None for r, need in enumerate(needs))
+            for t, needs in zip(tapes, requested)
+        ),
+        tuple(
+            tuple(t.gammas[r] if need else None for r, need in enumerate(needs))
+            for t, needs in zip(tapes, requested)
+        ),
         outputs,
         data,
         scales,
@@ -176,29 +193,43 @@ def _launch_columns(checkpoint, tapes, outputs, data, scales, requested, termina
         tuple(t.has_retention for t in tapes),
         terminal is not None,
         requested,
-        reader,
         maxnreg=64,
         num_warps=4,
     )
 
 
+def column_requests(tapes, prepare_columns):
+    """Per tape, one bool per reader: ``prepare_columns`` is a bool for every tape or one entry
+    per tape, each a bool (reader zero) or one bool per reader."""
+    entries = (
+        (prepare_columns,) * len(tapes)
+        if isinstance(prepare_columns, bool)
+        else tuple(prepare_columns)
+    )
+    if len(entries) != len(tapes):
+        raise ValueError("one column request per transition is required")
+    requested = []
+    for tape, entry in zip(tapes, entries):
+        readers = len(tape.rstd)
+        needs = (entry,) + (False,) * (readers - 1) if isinstance(entry, bool) else tuple(entry)
+        if len(needs) != readers or not all(isinstance(need, bool) for need in needs):
+            raise ValueError("a transition's column request needs one bool per reader")
+        requested.append(needs)
+    return tuple(requested)
+
+
 @torch.no_grad()
 def replay_interval(
-    checkpoint,
-    tapes,
-    outputs=None,
-    columns=None,
-    *,
-    prepare_columns=False,
-    terminal_output=None,
-    reader=0,
+    checkpoint, tapes, outputs=None, columns=None, *, prepare_columns=False, terminal_output=None
 ):
-    """Replay N tapes from ``checkpoint``: return N predecessors and N ``reader`` columns.
+    """Replay N tapes from ``checkpoint``: return N predecessors and, per tape, one columnwise
+    MXFP8 operand per reader (None unless requested), all emitted by one launch.
 
     The predecessors are the checkpoint itself plus N - 1 scratch buffers (``outputs``), and
-    ``terminal_output`` optionally receives the last tape's result. ``prepare_columns`` is a
-    bool or one per tape; column entries are TE operands or None. Scratch may be reused only
-    after all readers, including deferred cross-stream weight gradients, have completed.
+    ``terminal_output`` optionally receives the last tape's result. ``prepare_columns`` is
+    ``column_requests``' argument; supplied ``columns`` follow the result's nesting. Scratch may
+    be reused only after all readers, including deferred cross-stream weight gradients, have
+    completed.
     """
     tapes = tuple(tapes)
     # Forward validated each saved write; check only how the interval fits together.
@@ -210,13 +241,7 @@ def replay_interval(
         or any(t.update.shape != (m, h) or t.num_streams != streams for t in tapes)
     ):
         raise ValueError("inconsistent replay interval geometry")
-    requested = (
-        (prepare_columns,) * len(tapes)
-        if isinstance(prepare_columns, bool)
-        else tuple(prepare_columns)
-    )
-    if len(requested) != len(tapes):
-        raise ValueError("one column request per transition is required")
+    requested = column_requests(tapes, prepare_columns)
     if outputs is None:
         outputs = tuple(torch.empty_like(checkpoint) for _ in tapes[:-1])
     outputs = tuple(outputs)
@@ -250,13 +275,11 @@ def replay_interval(
     supplied = columns is not None
     columns, data, scales = _column_inputs(checkpoint, tapes, requested, columns)
     if supplied:  # fresh allocations cannot alias
-        for tensor in (*data, *scales):
+        for tensor in (*sum(data, ()), *sum(scales, ())):
             if tensor is not None:
                 claim(tensor)
-    if any(requested):
-        _launch_columns(
-            checkpoint, tapes, outputs, data, scales, requested, terminal_output, reader
-        )
+    if any(any(needs) for needs in requested):
+        _launch_columns(checkpoint, tapes, outputs, data, scales, requested, terminal_output)
     elif transitions := (tapes if terminal_output is not None else tapes[:-1]):
         _bwd_wr_recompute[(m * triton.cdiv(h, 512),)](
             checkpoint,

@@ -34,10 +34,7 @@ from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLa
 from megatron.core.transformer.moe.experts import InferenceGroupedMLP
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.moe.router import InferenceTopKRouter
-from megatron.core.transformer.moe.shared_experts import (
-    SharedExpertMLP,
-    set_tensor_grad_fn_sequence_sr,
-)
+from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequence_sr
 from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import build_module
@@ -48,7 +45,7 @@ from megatron.core.transformer.wide_residual import (
     ShortcutAddWideResidualWriteReadNorm,
     StreamwiseSigmoidWideResidualRead,
     WriteReadNorm,
-    mxfp8_consumer,
+    moe_reader_use,
     seam_connections,
 )
 from megatron.core.typed_torch import apply_module
@@ -254,20 +251,15 @@ class ShortcutMoEBlock(MegatronModule):
                     "residual-stream width."
                 )
         if self.fuses_residual_seams:
-            # The stack has linked the layer-to-layer seams (link_residual_seams). The shared
-            # expert's first Linear may take the MoE read as MXFP8 if it alone consumes it (a
-            # custom forward or the shared-expert gate would also use it), and the two-reader
-            # shortcut seam applies the write handed to the compute read.
-            shared = getattr(moe_layer.mlp, "shared_experts", None)
-            exclusive = (
-                shared is not None
-                and type(shared).forward is SharedExpertMLP.forward
-                and not shared.use_shared_expert_gate
-            )
-            moe_layer.residual_read_mlp.consumer = mxfp8_consumer(
-                shared.linear_fc1 if exclusive else None, moe_layer.config
-            )
+            # The stack has linked the layer-to-layer seams (link_residual_seams). In a block the
+            # MoE read feeds only the shared expert; the router and the latent projection take the
+            # shortcut read, which the two-reader seam applying the compute read's write emits.
+            moe_layer.residual_read_mlp.use = moe_reader_use(moe_layer, routed=False)
             if self.fused_shortcut_read:
+                # The compute layer's seam emits it in its quantization context.
+                self.shortcut_residual_read.use = moe_reader_use(
+                    moe_layer, shared=False, seam_layer=compute_layer
+                )
                 self.shortcut_residual_read.link(seam_connections(compute_layer)[0])
 
         shortcut_norm_spec = TENorm
