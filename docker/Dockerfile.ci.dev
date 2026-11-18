@@ -228,6 +228,17 @@ PY
     trap - EXIT
 EOF
 
+# TE 2.22 must preserve the quantizer usages of FSDP's already-quantized expert
+# weights: forward gathers rowwise planes, backward gathers columnwise planes.
+RUN --mount=type=bind,source=docker/patches/te-grouped-linear-fsdp.patch,target=/opt/te-grouped-linear-fsdp.patch \
+    bash -ex <<"EOF"
+    TE_SITE_PACKAGES=$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')
+    patch --batch --forward --fuzz=0 -d "${TE_SITE_PACKAGES}" -p1 < /opt/te-grouped-linear-fsdp.patch
+    python -m py_compile "${TE_SITE_PACKAGES}/transformer_engine/pytorch/module/grouped_linear.py"
+    mkdir -p /opt/transformer-engine-build-info
+    cp /opt/te-grouped-linear-fsdp.patch /opt/transformer-engine-build-info/
+EOF
+
 # FLA 0.5.1 lists a nonexistent autotune key that Triton 3.9 rejects at import.
 # Patch after dependency installation so this compatibility fix reuses native builds.
 RUN --mount=type=bind,source=docker/patches/fla-triton-autotune.patch,target=/opt/fla-triton-autotune.patch \
