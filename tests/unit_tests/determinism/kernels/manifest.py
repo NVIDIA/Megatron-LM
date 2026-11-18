@@ -109,6 +109,13 @@ R = "tests/unit_tests/context_parallel/runtime/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
+        name="mtp_kl_loss",
+        sources=("megatron/core/ops/mtp_kl_loss.py",),
+        tests=(K + "test_mtp_kl_loss.py",),
+        kind="torch.compile",
+        notes="MTP KD local sum-exp/KL reductions and recomputed student gradient; no teacher gradient.",
+    ),
+    KernelEntry(
         name="csa_output_rope_reconstruction",
         sources=("megatron/core/ops/attention/csa/output_rope.py",),
         tests=(K + "test_csa_output_rope.py",),
@@ -171,7 +178,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_fused_activations.py",),
         kind="torch.compile",
         notes="squared_relu/quick_gelu/fast_gelu/tanh_soft_clamp/situ/situ_glu, openai/erf GELU, "
-        "L2Norm._norm (row reduction).",
+        "L2Norm._norm (row reduction), and eager unfused_fast_gelu for variable-length projections.",
     ),
     KernelEntry(
         name="attention_kernels_and_dispatch",
@@ -376,6 +383,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         name="moe_utils",
         sources=("megatron/core/transformer/moe/moe_utils.py",),
         tests=(
+            "tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",
             K + "test_moe_kernels.py",
             "tests/unit_tests/inference/test_batch_invariant_nvls.py",
         ),
@@ -426,7 +434,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/moe/moe_layer.py",
             "megatron/core/transformer/moe/training_matches_inference.py",
         ),
-        tests=(K + "test_moe_kernels.py",),
+        tests=(
+            "tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",
+            K + "test_moe_kernels.py",
+        ),
         kind="torch-op",
         notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available; "
         "virtual-expert routing metadata and probability gradients replay under stream contention; "
@@ -436,7 +447,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="moe_experts",
         sources=("megatron/core/transformer/moe/experts.py",),
-        tests=(K + "test_moe_kernels.py",),
+        tests=(
+            "tests/unit_tests/inference/test_moe_dispatching_and_routing.py",
+            K + "test_moe_kernels.py",
+        ),
         kind="te-wrapper",
         notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert.",
     ),
@@ -462,9 +476,25 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Activation page copy kernels (no arithmetic); functional round-trip coverage.",
     ),
     KernelEntry(
+        name="moe_ep_invariant_combine",
+        sources=("megatron/core/transformer/moe/ep_invariant_combine.py",),
+        tests=(
+            "tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",
+            "tests/unit_tests/inference/test_ep_invariant_ordered_rsv.py",
+            K + "test_moe_kernels.py",
+            K + "test_inference_kernels.py",
+        ),
+        kind="triton",
+        notes="Fixed expert-order leaves and pairwise FP32 tree; parity across EP sizes and "
+        "training/inference paths. Bit-exact replay of the training tree (forward, row and "
+        "probability gradients) in test_ep_invariant_tree_replays and of the dense-map and "
+        "top-k inference combines in test_ep_invariant_{dense_map,topk}_replays.",
+    ),
+    KernelEntry(
         name="moe_batch_invariant_unpermute",
         sources=("megatron/core/transformer/moe/batch_invariant.py",),
         tests=(
+            "tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",
             "tests/unit_tests/transformer/moe/test_moe_batch_invariant.py",
             "tests/unit_tests/transformer/moe/test_moe_batch_invariant_unpermute.py",
             K + "test_moe_kernels.py",
@@ -528,6 +558,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=("tests/unit_tests/ssm/ops/mamba2/test_batch_invariant_decode.py",),
         kind="triton",
         training_path=False,
+    ),
+    KernelEntry(
+        name="ssm_mamba2_replayssm_spec",
+        sources=("megatron/core/ssm/ops/mamba2/mamba_ssm_replay.py",),
+        tests=(K + "test_ssm_kernels.py",),
+        kind="triton",
+        training_path=False,
+        notes="ReplaySSM speculative decode: fused scatter + B.C precompute, verify, flush and "
+        "cursor-commit kernels. Fixed launch configs (no autotuning) and no atomics; one step "
+        "with verify, flush and padding rows is replayed and its output, SSM checkpoint, ring "
+        "caches and cursors compared.",
     ),
     KernelEntry(
         name="ssm_common_kernels",
@@ -708,11 +749,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/moe/fused_moe.py",
             "megatron/core/inference/quantization/mxfp8_quantize.py",
         ),
-        tests=(K + "test_inference_kernels.py",),
+        tests=(
+            "tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",
+            "tests/unit_tests/inference/test_ep_invariant_ordered_rsv.py",
+            "tests/unit_tests/inference/test_moe_dispatching_and_routing.py",
+            K + "test_inference_kernels.py",
+            "tests/unit_tests/transformer/moe/test_moe_batch_invariant.py",
+        ),
         kind="triton",
         training_path=False,
         notes="Batch-invariant paths replay bit-exactly; the atomic default unpermute is the negative control. "
-        "ordered_reduce_scatter_v (multi-rank) is not replayed here.",
+        "ordered_reduce_scatter_v (multi-rank) is not replayed here. The BF16 expert GEMM "
+        "(torch grouped_mm) is checked row-invariant in test_moe_batch_invariant.py.",
     ),
     KernelEntry(
         name="batch_invariant_kernels",
@@ -721,7 +769,6 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_inference_kernels.py",
             K + "test_te_wrappers.py",
             "tests/unit_tests/transformer/test_te_layers_batch_invariant.py",
-            "tests/unit_tests/inference/test_batch_invariant_deepgemm_stride.py",
         ),
         kind="triton",
     ),
@@ -792,7 +839,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Selects the pip causal_conv1d / mamba_ssm kernels (causal_conv1d_fn, "
         "mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined, causal_conv1d_update_cuda) or "
         "the Megatron forks (ops/common, ops/mamba2: varlen scan, causal_conv1d_update, "
-        "selective_state_update). Module-level replay: test_ssm_conv1d.py::TestMambaMixerDeterminism; "
+        "selective_state_update, ReplaySSM spec decode). Module-level replay: "
+        "test_ssm_conv1d.py::TestMambaMixerDeterminism; "
         "kernels replayed piecewise in test_ssm_kernels.py. Runtime helper projections, "
         "convolution and CP collectives are replayed in runtime/test_ssm_replay.py.",
     ),
@@ -991,6 +1039,22 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "test_muon_matches_reference checks weights, momentum, and forward outputs bitwise "
         "against unsharded Muon across multiple steps, including an optimizer-state reload. "
         "Tests exercise the default GEMM path with FP32 and BF16 model weights.",
+    ),
+    KernelEntry(
+        name="csa_deterministic_attention_and_indexer",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py",
+        ),
+        tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa_deterministic_indexer.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa_fused_sparse_attention.py",
+        ),
+        kind="dispatch",
+        notes="Stable TopK and fixed-order sparse indexer dK/dW, with batch-local reference/replay; "
+        "real non-CP attention replay exercises deterministic cuDNN backward independently. "
+        "Deterministic learned-indexer SBHD forwards preserve key order and output bits across "
+        "no-grad and training dispatch, including zero and positive sparse indexer loss.",
     ),
     # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
     KernelEntry(
