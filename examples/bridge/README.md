@@ -5,9 +5,10 @@ This directory provides Hugging Face import/export examples backed by
 
 ## Supported models and scope
 
-The registered families are Nemotron-H, Nemotron 3.5 Super VL, and the Qwen 3.5
-family's dense/MoE text and vision-language models, including compatible Qwen 3.8
-checkpoints. Other Bridge model families are not registered by this package.
+The registered families are Llama (including Llama 3.1 RoPE scaling), Nemotron-H,
+Nemotron 3.5 Super VL, and the Qwen 3.5 family's dense/MoE text and vision-language
+models, including compatible Qwen 3.8 checkpoints. Other Bridge model families are not
+registered by this package.
 Super VL can also import/export its text-only projection with `--text-only`;
 Qwen VL does not support that projection.
 
