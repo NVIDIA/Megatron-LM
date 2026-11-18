@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Independent AG communicators must preserve FSDP buffer shard coordinates."""
+"""Basic HSDP with separate AG groups is explicitly unsupported."""
 
 from contextlib import contextmanager
 
@@ -30,8 +30,6 @@ def buffer_mesh(ag_layout, hybrid=True):
         rank_sets = [list(range(world_size))]
     elif ag_layout == "inner":
         rank_sets = [list(range(i, i + inner_size)) for i in range(0, world_size, inner_size)]
-    elif ag_layout == "different":
-        rank_sets = [list(range(i, world_size, 2)) for i in range(2)]
     else:
         rank_sets = []
     ag_group = None
@@ -90,25 +88,16 @@ class TestSeparateAllGatherGroups:
 
     @pytest.mark.parametrize("expert", [False, True])
     @pytest.mark.parametrize("ag_layout", ["replica", "inner", "off"])
-    def test_basic_hsdp_requires_matching_ag_shards(self, expert, ag_layout):
+    def test_basic_hsdp_rejects_separate_ag_groups(self, expert, ag_layout):
         with buffer_mesh(ag_layout) as (mesh, ag_group):
-            if ag_layout == "replica":
-                domain = "expert" if expert else "dense"
-                with pytest.raises(
-                    ValueError, match=f"all-gather group for {domain}.*same ordered ranks"
-                ):
+            if ag_layout != "off":
+                with pytest.raises(ValueError, match="Separate all-gather group"):
                     build_buffer_model(mesh, ag_group, expert)
             else:
                 model = build_buffer_model(mesh, ag_group, expert)
                 for group in model.param_and_grad_buffer.parameter_groups:
                     assert group.is_expert_param == expert
                     assert group.model_weight_buffer.data_size == group.main_weight_buffer.data_size
-
-    def test_same_size_different_ag_membership_is_rejected(self):
-        with buffer_mesh("different") as (mesh, ag_group):
-            assert ag_group.size() == mesh["shard"].get_group().size()
-            with pytest.raises(ValueError, match="same ordered ranks"):
-                build_buffer_model(mesh, ag_group)
 
     def test_outer_sharding_does_not_consume_independent_ag(self):
         with buffer_mesh("replica") as (mesh, ag_group):
@@ -122,8 +111,7 @@ class TestSeparateAllGatherGroups:
             for group in model.param_and_grad_buffer.parameter_groups:
                 assert group.model_weight_buffer.data_parallel_group is ag_group
 
-    def test_unsharded_parameters_do_not_consume_independent_ag(self):
+    def test_basic_hsdp_rejects_ag_even_with_unsharded_parameters(self):
         with buffer_mesh("replica") as (mesh, ag_group):
-            model = build_buffer_model(mesh, ag_group, strategy="no_shard")
-            for group in model.param_and_grad_buffer.parameter_groups:
-                assert group.model_weight_buffer is None
+            with pytest.raises(ValueError, match="not supported with basic HSDP"):
+                build_buffer_model(mesh, ag_group, strategy="no_shard")

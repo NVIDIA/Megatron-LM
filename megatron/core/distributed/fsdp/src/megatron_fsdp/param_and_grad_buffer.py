@@ -2732,28 +2732,11 @@ class ParamAndGradBuffer:
             # This avoids head-of-line blocking between forward all-gather and backward
             # reduce-scatter on the same communicator.
             model_wbuf_dp_group = main_buf_dp_group
-            if (
-                not should_create_hfsdp_helper_buffers
-                and data_parallel_sharding_strategy != "no_shard"
-            ):
+            if not should_create_hfsdp_helper_buffers:
                 ag_group = self.dist_index.get_fsdp_group(
                     is_expert_parallel=group.is_expert_param, independent_all_gather=True
                 )
                 if ag_group is not None:
-                    # Separate communicators must preserve the buffer's shard coordinates.
-                    # Basic HSDP shards over the inner group, not the full replica set.
-                    ag_ranks = torch.distributed.get_process_group_ranks(ag_group)
-                    shard_ranks = torch.distributed.get_process_group_ranks(main_buf_dp_group)
-                    if ag_ranks != shard_ranks:
-                        parameter_type = "expert" if group.is_expert_param else "dense"
-                        raise ValueError(
-                            f"[Megatron-FSDP] Separate all-gather group for {parameter_type} "
-                            "parameters must have the same ordered ranks as the FSDP shard "
-                            f"group; got AG ranks {ag_ranks} and shard ranks {shard_ranks}. "
-                            "Disable separate all-gather groups "
-                            "(dist.create_all_gather_group=False in Megatron-LM/Bridge) "
-                            "or provide a communicator matching the FSDP shard group."
-                        )
                     model_wbuf_dp_group = ag_group
 
             gradient_scaling_factor = (

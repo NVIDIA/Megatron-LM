@@ -580,6 +580,15 @@ class FSDPDistributedIndex:
         self.use_hybrid_fsdp = dp_outer_dim is not None
         # Helper flag to denote if we are outer-sharding in hybrid FSDP.
         self.hsdp_outer_dp_shard = hsdp_outer_dp_shard
+        if (
+            self.use_hybrid_fsdp
+            and not hsdp_outer_dp_shard
+            and (fsdp_group_ag is not None or expt_fsdp_group_ag is not None)
+        ):
+            raise ValueError(
+                "[Megatron-FSDP] Separate all-gather groups are not supported with basic HSDP. "
+                "Disable separate AG groups (dist.create_all_gather_group=False)."
+            )
         self.expt_device_mesh = expt_device_mesh
 
         # Hybrid FSDP Process Groups

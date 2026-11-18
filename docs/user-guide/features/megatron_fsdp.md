@@ -202,11 +202,9 @@ The setting has moved from `DistributedDataParallelConfig` to
 `ddp.create_all_gather_group` to use `dist.create_all_gather_group`; the DDP field
 has been removed. The command-line option keeps the same spelling.
 
-For Megatron-FSDP v1, a separate AG communicator must have the same ordered rank
-membership as the FSDP shard group. Basic HSDP uses the smaller inner shard group;
-the initializer's full-replica AG communicators are rejected when they do not match.
-Leave `dist.create_all_gather_group=False` for that configuration, or supply AG
-communicators matching the inner shard groups through `ProcessGroupCollection`.
+Megatron-FSDP v1 does not support separate AG groups with basic HSDP
+(`outer_dp_sharding_strategy='no_shard'`). Keep `dist.create_all_gather_group=False`
+for that configuration; supplying custom AG groups is also rejected.
 
 ### 🤖 Megatron-Core
 
