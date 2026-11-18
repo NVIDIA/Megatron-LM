@@ -1348,11 +1348,9 @@ class TestMoEModules:
             )
         assert layer.experts._nvfp4_weights is not None
 
-    @pytest.mark.parametrize("parallel_align", [False, True])
-    @pytest.mark.parametrize("tiled_sum", [False, True])
-    def test_inference_vllm_moe_layer_replays(self, parallel_align, tiled_sum):
-        """Inference MoELayer through the vLLM BF16 experts, with each combination of the
-        opt-in parallel alignment and tiled top-k sum."""
+    def test_inference_vllm_moe_layer_replays(self):
+        """Inference MoELayer through the vLLM BF16 experts (parallel alignment and tiled
+        top-k sum included)."""
         from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
         from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
 
@@ -1378,8 +1376,6 @@ class TestMoEModules:
             transformer_impl="inference_optimized",
             inference_grouped_gemm_backend="vllm",
             inference_moe_token_dispatcher_type="nccl",
-            inference_moe_vllm_parallel_align=parallel_align,
-            inference_moe_vllm_tiled_sum=tiled_sum,
         )
         NCCLAllGatherDispatcher.allocate_buffers()
         layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
@@ -1392,10 +1388,7 @@ class TestMoEModules:
                 replays=3,
                 backward=False,
                 contention=True,
-                what=(
-                    f"MoELayer[inference, vllm, parallel_align={parallel_align}, "
-                    f"tiled_sum={tiled_sum}]"
-                ),
+                what="MoELayer[inference, vllm]",
             )
 
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")

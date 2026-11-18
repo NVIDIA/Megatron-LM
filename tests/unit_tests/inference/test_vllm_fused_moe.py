@@ -1042,8 +1042,6 @@ class TestVllmFusedMoe:
                 _vt(tokens),
                 routing_map,
                 num_tokens_hint=tokens,
-                parallel_align=True,
-                tiled_sum=True,
             )
 
         # 4096 tokens x top-5 exceeds the multi-CTA builder's pair limit; 1025-2048
@@ -1131,8 +1129,6 @@ class TestVllmFusedMoeModelShapes:
             out=out,
             num_tokens_hint=hint,
             activation_clamp_scale=clamp,
-            parallel_align=True,
-            tiled_sum=True,
         )
         if clamp is None:
             expected = _ref_sequential_moe(
@@ -1881,8 +1877,6 @@ def test_persistent_buffers_mode_switch_graph_replay(monkeypatch, initial_bi_mod
             routing,
             out=out,
             num_tokens_hint=tokens,
-            parallel_align=True,
-            tiled_sum=True,
         )
 
     for bi_mode in (initial_bi_mode, not initial_bi_mode):
@@ -1943,7 +1937,5 @@ def test_bi_keeps_original_expert_dispatch(monkeypatch, activation, hint):
             _vt(tokens),
             routing,
             num_tokens_hint=hint,
-            parallel_align=True,
-            tiled_sum=True,
         )
     assert torch.isfinite(out).all()

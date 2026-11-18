@@ -942,7 +942,6 @@ def _moe_sum(
     out: Optional[torch.Tensor] = None,
     apply_weights: bool = True,
     acc_fp64: bool = False,
-    tiled: bool = False,
 ) -> torch.Tensor:
     """Fused topk reduction: [max_tokens*topk, K] bf16 → [max_tokens, K].
 
@@ -962,13 +961,14 @@ def _moe_sum(
             (e.g. at the activation in batch-invariant mode).
         acc_fp64: accumulate the topk sum in fp64, making the reduction
             order-independent by precision.
-        tiled: use _moe_sum_tiled_kernel, which gives the same bits. Ignored
-            with acc_fp64 or in batch-invariant mode.
+
+    Outside batch-invariant mode and fp64 accumulation, _moe_sum_tiled_kernel does the
+    reduction; it gives the same bits as _moe_sum_kernel.
     """
     if out is None:
         out = VllmFusedMoeBuffers.get("moe_sum_out", (max_tokens, K), torch.float32, input.device)
-    # The original launch, also kept for BI's arithmetic, including FP64 reduction.
-    if not tiled or acc_fp64 or batch_invariant.enabled():
+    # The original launch, kept for BI's arithmetic, including FP64 reduction.
+    if acc_fp64 or batch_invariant.enabled():
         BLOCK_K = min(triton.next_power_of_2(K), 1024)
         NUM_K_BLOCKS = _ceil_div(K, BLOCK_K)
         BLOCK_M = _get_num_sms(input.device)
@@ -1033,8 +1033,6 @@ def vllm_fused_moe(
     num_tokens_hint: Optional[int] = None,
     activation_clamp_scale: Optional[float] = None,
     batch_invariant_kwargs: Optional[EPInvariantCombineArgs] = None,
-    parallel_align: bool = False,
-    tiled_sum: bool = False,
 ) -> torch.Tensor:
     """Fused MoE using the vLLM Triton grouped-GEMM kernel (BF16).
 
@@ -1065,13 +1063,11 @@ def vllm_fused_moe(
         batch_invariant_kwargs: ``moe_ep_invariant_combine`` (batch-invariant mode) only;
             when set, each token is summed over this rank's subtree of the EP-invariant
             combine tree instead of in top-k order (see ``EPInvariantCombineArgs``).
-        parallel_align: build the indirection tables with the multi-CTA kernel
-            (config.inference_moe_vllm_parallel_align) when BLOCK_SIZE_M < 128 and the
-            pair count is at most _PARALLEL_ALIGN_MAX_PAIRS. Outputs are unchanged.
-            Ignored in batch-invariant mode.
-        tiled_sum: reduce the top-k slots with the tiled kernel
-            (config.inference_moe_vllm_tiled_sum). Outputs are unchanged. Ignored in
-            batch-invariant mode.
+
+    Outside batch-invariant mode the indirection tables are built with the multi-CTA kernel
+    when BLOCK_SIZE_M < 128 and the pair count is at most _PARALLEL_ALIGN_MAX_PAIRS, and the
+    top-k slots are reduced with the tiled kernel. Both give the same bits as the original
+    kernels, which batch-invariant mode keeps.
 
     Returns:
         [max_tokens, hidden_size] output (fp32 when out=None, else out's dtype).
@@ -1119,8 +1115,7 @@ def vllm_fused_moe(
     # compiling another GEMM specialization during a warmed request. Decode
     # still uses the parallel builder, including underestimated token hints.
     if (
-        parallel_align
-        and not batch_invariant_mode
+        not batch_invariant_mode
         and block_m < 128
         and effective_tokens * topk <= _PARALLEL_ALIGN_MAX_PAIRS
     ):
@@ -1273,5 +1268,4 @@ def vllm_fused_moe(
         out=out,
         apply_weights=False,
         acc_fp64=accumulate_in_fp64,
-        tiled=tiled_sum,
     )
