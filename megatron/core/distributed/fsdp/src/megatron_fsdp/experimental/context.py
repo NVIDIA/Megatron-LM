@@ -299,7 +299,7 @@ class FsdpContext:
         """Complete the execution order after all backwards in this schedule."""
         self._finish_execution_order()
 
-    def run_delayed_post_backward_callbacks(self) -> None:
+    def post_microbatch(self) -> None:
         """Release deferred module weights after each microbatch backward."""
         # Finish children before parents to close nested backward NVTX ranges.
         while self._delayed_post_backward_callbacks:
@@ -308,7 +308,7 @@ class FsdpContext:
 
     def _post_autograd(self) -> None:
         """Run deferred cleanup and the configured automatic completion and gradient wait."""
-        self.run_delayed_post_backward_callbacks()
+        self.post_microbatch()
         self._post_autograd_hook_registered = False
         if self.autograd_completes_execution:
             self.post_backward()
