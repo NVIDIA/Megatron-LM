@@ -818,7 +818,7 @@ def model_parallel():
     Utils.destroy_model_parallel()
 
 
-def _hybrid_model(pattern, mixer="mamba", hidden=3072, optimized=False, **overrides):
+def _hybrid_model(pattern, mixer="mamba", hidden=3072, optimized=False, blocks=None, **overrides):
     """A small fused HybridModel: M Mamba (GDP with mixer="gdp"), G GDN, * attention, E MoE,
     - MLP-only."""
     config = _fused_config(
@@ -853,11 +853,10 @@ def _hybrid_model(pattern, mixer="mamba", hidden=3072, optimized=False, **overri
     model = HybridModel(
         config, spec, vocab_size=128, max_sequence_length=128, hybrid_layer_pattern=pattern
     )
+    expected = pattern.split("/")[0].count("E") if blocks is None else blocks
     blocks = [b for b in model.decoder.layers if isinstance(b, ShortcutMoEBlock)]
     fused = config.moe_shortcut_wide_residual_norm_fusion
-    assert len(blocks) == pattern.split("/")[0].count("E") and all(
-        b.fuses_residual_seams == fused for b in blocks
-    )
+    assert len(blocks) == expected and all(b.fuses_residual_seams == fused for b in blocks)
     return model.cuda()
 
 
@@ -1114,10 +1113,10 @@ def test_fused_seams_training_matches_unfused(monkeypatch, pattern, mixer, fp32_
 @pytest.mark.parametrize("recompute_shared_experts", [False, True])
 @REQUIRES_FUSED_BACKWARD
 def test_mxfp8_training_absorbs_every_read_quantization(monkeypatch, recompute_shared_experts):
-    """MXFP8 training (latent projection, shared-expert gate, checkpoint replay, optionally a
-    recomputed shared expert): every declared consumer Linear takes its read as the seam's MXFP8
-    operand on every call, so TE quantizes no seam read, while the router and gate read BF16;
-    each MXFP8 read's columnwise operand is taken from its replay once for all its consumers."""
+    """MXFP8 training (latent projection, checkpoint replay, optionally a recomputed shared
+    expert): every linked consumer Linear takes its read as the seam's MXFP8 operand on every
+    call, so TE quantizes no seam read, while the router reads BF16; each MXFP8 read's
+    columnwise operand is taken from its replay once for all its consumers."""
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
     from megatron.core.fusions.wide_residual_shortcut.residual_replay import ReplayInterval
@@ -1127,19 +1126,17 @@ def test_mxfp8_training_absorbs_every_read_quantization(monkeypatch, recompute_s
         fp8="e4m3",
         fp8_recipe="mxfp8",
         moe_latent_size=256,
-        moe_shared_expert_gate=True,
         residual_stream_recompute_num_layers=2,
         **(recompute if recompute_shared_experts else {}),
     )
     model = _hybrid_model("-*E*E-", hidden=2048, **options).train()
-    uses = [m.use for m in model.decoder.modules() if isinstance(m, WriteReadNorm)]
-    # Two attention qkv reads and the MLP read are MXFP8; each block's gated MoE read and its
-    # router/latent shortcut read are both (no read falls back to BF16).
-    assert sorted(use.format for use in uses) == ["both"] * 4 + ["mxfp8"] * 3
-    assert sum(use.recomputed for use in uses) == (2 if recompute_shared_experts else 0)
+    reads = [m for m in model.decoder.modules() if isinstance(m, WriteReadNorm)]
+    # Two attention qkv reads, the MLP read and each block's MoE read are MXFP8; each block's
+    # router/latent shortcut read is both (no read falls back to BF16).
+    assert sorted(read.format for read in reads) == ["both"] * 2 + ["mxfp8"] * 5
     received = {}
-    for use in uses:
-        for linear in use.mxfp8_linears:
+    for read in reads:
+        for linear in read.mxfp8_linears:
             linear.register_forward_pre_hook(
                 lambda m, args: received.setdefault(m, []).append(type(args[0]))
             )
@@ -1153,7 +1150,7 @@ def test_mxfp8_training_absorbs_every_read_quantization(monkeypatch, recompute_s
     ids = torch.randint(0, 128, (1, 2048), device="cuda")
     positions = torch.arange(2048, device="cuda")[None]
     model(ids, positions, None).float().square().mean().backward()
-    consumers = {linear for use in uses for linear in use.mxfp8_linears}
+    consumers = {linear for read in reads for linear in read.mxfp8_linears}
     calls = 2 if recompute_shared_experts else 1  # a recomputed shared expert runs twice
     shared = {block.moe_layer.mlp.shared_experts.linear_fc1 for block in model.decoder.layers
               if isinstance(block, ShortcutMoEBlock)}  # fmt: skip
@@ -1179,6 +1176,14 @@ def test_mxfp8_training_absorbs_every_read_quantization(monkeypatch, recompute_s
         (
             {"fp8": "e4m3", "fp8_recipe": "mxfp8", "tensor_model_parallel_size": 2},
             "MXFP8 with tensor_model_parallel_size",
+        ),
+        (
+            {"fp8": "e4m3", "fp8_recipe": "mxfp8", "moe_shared_expert_gate": True},
+            "MXFP8 with moe_shared_expert_gate",
+        ),
+        (
+            {"fp8": "e4m3", "fp8_recipe": "mxfp8", "use_grouped_gemm_for_shared_expert": True},
+            "MXFP8 with use_grouped_gemm_for_shared_expert",
         ),
         (
             {
@@ -1216,38 +1221,44 @@ def test_fusion_spec_keeps_sharded_checkpoint_keys():
 @pytest.mark.usefixtures("model_parallel")
 def test_fusion_spec_links_every_seam(monkeypatch):
     """Every write but the last defers to the next layer's fused read and every read but the first
-    is fused. Each fused read declares its consumers: a layer's input projection takes it as
-    MXFP8 (when eligible), a block's MoE read goes to the shared expert's fc1 (both formats with
-    the shared-expert gate) and its shortcut read to the router (BF16) and the latent projection
-    (MXFP8). Building rejects an unfused layer (with its reason) and a one-layer stack."""
-    ReaderUse = wide_residual.ReaderUse
+    is fused. Each fused read is linked to its consumers: a layer's input projection (MXFP8 when
+    eligible), a block's MoE read to the shared expert's fc1, its shortcut read to the router
+    (BF16) and the latent projection (MXFP8: both formats); a lone MoE layer's read to the MoE
+    layer (BF16). Building rejects an unfused layer (with its reason), a one-layer stack, and a
+    lone MoE layer with MXFP8."""
+    from megatron.core.extensions.transformer_engine import TELinear
+
     with monkeypatch.context() as patch:
-        patch.setattr(wide_residual, "mxfp8_linear_eligible", lambda *args: True)
+        # Eligible as under MXFP8 on a GB300: a TELinear (never the router).
+        patch.setattr(
+            wide_residual, "mxfp8_linear_eligible", lambda linear, *a: isinstance(linear, TELinear)
+        )
         model = _hybrid_model("M-*EME-", hidden=256)
-        latent = _hybrid_model("-*E", hidden=256, moe_latent_size=64, moe_shared_expert_gate=True)
+        latent = _hybrid_model("-*E", hidden=256, moe_latent_size=64)
+    links = lambda read: [(module, quantizes) for module, quantizes in read.consumers]
     for block in (b for b in model.decoder.layers if isinstance(b, ShortcutMoEBlock)):
         compute, moe = block.compute_layer, block.moe_layer
         branch = compute.mixer if isinstance(compute, MambaLayer) else compute.self_attention
         projection = getattr(branch, "in_proj", None) or branch.linear_qkv
-        assert seam_connections(compute)[0].use == ReaderUse((projection,), False)
+        assert links(seam_connections(compute)[0]) == [(projection, True)]
         fc1 = moe.mlp.shared_experts.linear_fc1
-        assert seam_connections(moe)[0].use == ReaderUse((fc1,), False)
-        assert block.shortcut_residual_read.use == ReaderUse((), True)  # the router alone
+        assert links(seam_connections(moe)[0]) == [(fc1, True)]
+        assert links(block.shortcut_residual_read) == [(moe.mlp.router, False)]  # the router alone
+        assert block.shortcut_residual_read.format == "bf16"
+        assert block.shortcut_residual_read.seam_layer_number == compute.layer_number
     plain = [layer for layer in model.decoder.layers if not isinstance(layer, ShortcutMoEBlock)]
     mlp_read = seam_connections(plain[1])[0]  # an MLP layer
-    assert mlp_read.use == ReaderUse((plain[1].mlp.linear_fc1,), False)
-    assert mlp_read.use.format == "mxfp8"
+    assert links(mlp_read) == [(plain[1].mlp.linear_fc1, True)] and mlp_read.format == "mxfp8"
     block = latent.decoder.layers[-1]
     mlp = block.moe_layer.mlp
-    fc1, latent_proj = mlp.shared_experts.linear_fc1, mlp.fc1_latent_proj
-    assert seam_connections(block.moe_layer)[0].use == ReaderUse((fc1,), True)  # gate reads BF16
-    assert block.shortcut_residual_read.use == ReaderUse((latent_proj,), True)
-    assert block.shortcut_residual_read.use.format == "both"
-    # A lone MoE layer's read feeds the shared expert, the router and the latent projection.
-    with monkeypatch.context() as patch:
-        patch.setattr(wide_residual, "mxfp8_linear_eligible", lambda *args: True)
-        lone = wide_residual.moe_reader_use(block.moe_layer)
-    assert lone == ReaderUse((fc1, latent_proj), True)
+    assert links(block.shortcut_residual_read) == [(mlp.router, False), (mlp.fc1_latent_proj, True)]
+    assert block.shortcut_residual_read.format == "both"
+    lone = _hybrid_model("-*EE-", hidden=256, blocks=1)
+    lone_moe = lone.decoder.layers[2]  # the second E follows a block, not a compute layer
+    assert not isinstance(lone_moe, ShortcutMoEBlock)
+    assert links(seam_connections(lone_moe)[0]) == [(lone_moe.mlp, False)]
+    with pytest.raises(ValueError, match="MoE layer outside a shortcut block"):
+        _hybrid_model("-*EE-", hidden=2048, blocks=1, fp8="e4m3", fp8_recipe="mxfp8")
     layers = []
     for layer in model.decoder.layers:
         is_block = isinstance(layer, ShortcutMoEBlock)

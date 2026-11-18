@@ -421,10 +421,6 @@ class HybridStack(MegatronModule):
                     setattr(self.hc_head_base, 'sequence_parallel', True)
                     setattr(self.hc_head_scale, 'sequence_parallel', True)
 
-        if self.config.moe_shortcut_wide_residual_norm_fusion and self.uses_wide_residual_stream:
-            # Fused residual seams (before shortcut grouping, which adds each block's own): link
-            # each deferred write to the next physical layer's fused read.
-            link_residual_seams(self.layers)
         self._execution_layer_indices = list(range(len(self.layers)))
         if self.config.moe_shortcut_connection:
             self.layers = group_layers_into_shortcut_blocks(
@@ -438,6 +434,21 @@ class HybridStack(MegatronModule):
                 )
                 for layer in self.layers
             ]
+        if self.config.moe_shortcut_wide_residual_norm_fusion and self.uses_wide_residual_stream:
+            # Fused residual seams, after grouping (whose blocks link their own MoE and shortcut
+            # reads): link each deferred write to the next physical layer's fused read and each
+            # remaining read to its consumer.
+            link_residual_seams(
+                [
+                    sublayer
+                    for layer in self.layers
+                    for sublayer in (
+                        (layer.compute_layer, layer.moe_layer)
+                        if isinstance(layer, ShortcutMoEBlock)
+                        else (layer,)
+                    )
+                ]
+            )
         self._residual_stream_atomic_layer_pairs = self._shortcut_layer_pairs()
         self._execution_layer_config_list = [
             self.layer_config_list[layer_index] for layer_index in self._execution_layer_indices
