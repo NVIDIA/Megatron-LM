@@ -124,7 +124,8 @@ def forbid_backward_state(monkeypatch):
 
 # fmt: off
 # forward: (tokens, hidden, streams, readers, updates, inference, quantized, retention, dtype,
-# epsilon, offset residual, MXFP8 reader checked against FP64)
+# epsilon, offset residual, MXFP8 readers checked against FP64); quantized is reader zero MXFP8
+# or the readers' output formats.
 FORWARD = [
     # Production and heuristic training schedules.
     pytest.param(m, h, 3, n, u, F, q, t, F32, 1e-5 if q else 1e-3, F, F, marks=QUALIFIED)
@@ -152,6 +153,11 @@ FORWARD = [
 ] + [
     pytest.param(2048, h, 3, n, u, F, q, T, BF16, 1e-5, F, T, marks=QUALIFIED if q else ())
     for h, n, u, q in sorted(forward_kernel._FORWARD_CONFIGS_BF16)
+] + [
+    # Every output-format training table entry (MXFP8 reader one, or BF16 and MXFP8 together).
+    pytest.param(2048, h, 3, len(o), u, F, o, T, BF16 if b else F32, 1e-5, F, T, marks=QUALIFIED)
+    for (h, b), entries in sorted(forward_kernel._FORMAT_CONFIGS.items())
+    for u, o in sorted(entries)
 ]
 # inference: (tokens, hidden, quantized, retention, readers, updates, dtype, TE consumer).
 # Tokens: cluster/tree schedules, the MXFP8 scale padding of the last 128-row tile (one or
@@ -179,8 +185,8 @@ INFERENCE = [
     + [(1024, 10240, 2, 2)]
 ]
 # backward: (streams, readers, hidden, rows, retention, grid, routes, updates, BF16 residual).
-# Column routes only prepend _bwd_wr_recompute_mxfp8quant launches (per reader index); explicit grids include
-# idle groups that must skip their bootstrap transfers.
+# Column routes only prepend _bwd_wr_recompute_mxfp8quant launches (per reader index); explicit
+# grids include idle groups that must skip their bootstrap transfers.
 EXPLICIT_GRIDS = [(32, 1), (96, 1), (128, 64), (288, 4), (4128, 34), (4096, 32)]
 EXPLICIT_GRIDS += [(4096, 960), (3072, 24), (10240, 80)]
 _BF16_BACKWARD = [(3, 4128, 1024, "auto"), (6, 96, 160, "auto"), (2, 3072, 1024, 24)]
@@ -245,6 +251,7 @@ def test_graph_replay_restores_poisoned_outputs(monkeypatch, kind, case):
         exact = (2e-6, 2e-6) if dtype == F32 else (1 / 128, 1e-6)
         torch.testing.assert_close(current, fp64[0], rtol=exact[0], atol=exact[1])
         for a, b in zip(operands, fp64[1:], strict=True):
+            a = a[1] if isinstance(a, tuple) else a  # the BF16 half of both formats
             if type(a) is torch.Tensor:
                 torch.testing.assert_close(a, b, rtol=1 / 128, atol=1 / 128)
         execute = lambda: written(*fwd(raw, streams, **options))
@@ -266,8 +273,11 @@ def test_graph_replay_restores_poisoned_outputs(monkeypatch, kind, case):
 
         graph_replay(lambda: (lambda outputs: (outputs, outputs))(execute()), expected, refresh)
         if quantized and dequantize:
-            relative = (operands[0].dequantize().float() - fp64[1].float()).norm()
-            assert relative / fp64[1].float().norm() < 0.04
+            for a, b in zip(operands, fp64[1:]):
+                a = a[0] if isinstance(a, tuple) else a  # the MXFP8 half of both formats
+                if type(a) is not torch.Tensor:
+                    relative = (a.dequantize().float() - b.float()).norm()
+                    assert relative / b.float().norm() < 0.04
     elif kind == "inference":
         tokens, hidden, quantized, retention, readers, updates, dtype, consumer = case
         raw = inputs(
