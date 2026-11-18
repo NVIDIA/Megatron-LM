@@ -23,6 +23,10 @@ import torch
 from torch.utils._pytree import tree_flatten as tree_flatten_pyt
 from torch.utils._pytree import tree_map as tree_map_pyt
 
+from megatron.core.extensions.te_cuda_graphs import (
+    TECudaGraphMixin,
+    iter_te_cuda_graph_decoder_layers,
+)
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -40,7 +44,7 @@ from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config 
     CSALayerConfig,
 )
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
-from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     ensure_params_ready,
@@ -56,11 +60,7 @@ try:
     import transformer_engine as te  # pylint: disable=unused-import
     from transformer_engine.pytorch.distributed import is_fp8_activation_recompute_enabled
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
-    from transformer_engine.pytorch.graph import (
-        make_graphed_callables,
-        restore_fp8_tensors,
-        save_fp8_tensors,
-    )
+    from transformer_engine.pytorch.graph import restore_fp8_tensors, save_fp8_tensors
     from transformer_engine.pytorch.graph import set_capture_end as te_set_capture_end
     from transformer_engine.pytorch.graph import set_capture_start as te_set_capture_start
     from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
@@ -2294,65 +2294,14 @@ class CudaGraphManager(torch.nn.Module):
 
 
 # The following functions are for capturing CUDA Graphs using TE make_graphed_callables().
-def _layer_is_graphable(layer, config):
-    """
-    Check if a layer is graphable.
-    """
-
-    # Only GraphableMegatronModule can be graphed.
-    if not isinstance(layer, GraphableMegatronModule):
-        return False
-
-    # If cuda_graph_modules is not set, every layer is graphed.
-    if not config.cuda_graph_modules:
-        return True
-
-    # import modules here to avoid a circular import
-    from megatron.core.ssm.mamba_layer import MambaLayer
-    from megatron.core.transformer.identity_op import IdentityOp
-    from megatron.core.transformer.mlp import MLP
-    from megatron.core.transformer.moe.moe_layer import MoELayer
-    from megatron.core.transformer.transformer_layer import TransformerLayer
-
-    if isinstance(layer, MambaLayer) and CudaGraphModule.mamba in config.cuda_graph_modules:
-        # mamba layer.
-        return True
-    if isinstance(layer, TransformerLayer):
-        if CudaGraphModule.attn in config.cuda_graph_modules and not (
-            isinstance(layer.self_attention, IdentityOp)
-            and isinstance(layer.cross_attention, IdentityOp)
-        ):
-            # attn layer.
-            return True
-        if (
-            CudaGraphModule.moe in config.cuda_graph_modules
-            or CudaGraphModule.moe_router in config.cuda_graph_modules
-            or CudaGraphModule.moe_preprocess in config.cuda_graph_modules
-        ) and isinstance(layer.mlp, MoELayer):
-            # moe layer.
-            return True
-        if CudaGraphModule.mlp in config.cuda_graph_modules and isinstance(layer.mlp, MLP):
-            # mlp layer.
-            return True
-    return False
-
-
-def _graphable_leaves(module):
-    """Yield graphable leaf layers, descending into grouped HybridStack modules.
-
-    A HybridStack is a MegatronModule rather than a GraphableMegatronModule, so iterating
-    decoder.layers directly yields the stack instead of the inner Mamba/attention/MoE layers.
-    """
-    try:
-        from megatron.core.models.hybrid.hybrid_block import HybridStack
-    except ImportError:
-        # Hybrid models are optional; with no HybridStack there is nothing to descend into.
-        HybridStack = ()
-    if isinstance(module, HybridStack):
-        for inner in module.layers:
-            yield from _graphable_leaves(inner)
-    else:
-        yield module
+def _te_cuda_graph_layer_is_graphable(layer, config):
+    """Check whether a module registered a TE graph for the requested scope."""
+    return (
+        config.cuda_graph_impl == "transformer_engine"
+        and isinstance(layer, TECudaGraphMixin)
+        and layer.config.cuda_graph_impl == "transformer_engine"
+        and layer.is_graphable_for_scope(config.cuda_graph_modules)
+    )
 
 
 class TECudaGraphHelper:
@@ -2367,10 +2316,10 @@ class TECudaGraphHelper:
     def __init__(
         self, model, config, seq_length, micro_batch_size, optimizers=[], pg_collection=None
     ):
-        assert HAVE_TE_GRAPHS, "CUDA Graphs are not supported without TE."
         assert (
             config.cuda_graph_impl == "transformer_engine"
         ), "Option cuda_graph_impl=transformer_engine not enabled."
+        assert HAVE_TE_GRAPHS, "CUDA Graphs are not supported without TE."
         assert (
             "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
             or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
@@ -2442,11 +2391,7 @@ class TECudaGraphHelper:
             else:
                 # A bracketed HybridStack group is one entry of decoder.layers; capture the
                 # physical layers inside it, in execution order.
-                decoder_layers = [
-                    leaf
-                    for layer in chunk_with_decoder.decoder.layers
-                    for leaf in _graphable_leaves(layer)
-                ]
+                decoder_layers = list(iter_te_cuda_graph_decoder_layers(chunk_with_decoder.decoder))
                 num_decoder_layers = len(decoder_layers)
                 if hasattr(chunk_with_decoder, 'mtp'):
                     num_mtp_layers = len(chunk_with_decoder.mtp.layers)
@@ -2455,13 +2400,13 @@ class TECudaGraphHelper:
                 num_graphable_layers = 0
                 callables, callables_is_mtp = [], []
                 for layer in decoder_layers:
-                    if _layer_is_graphable(layer, self.config):
+                    if _te_cuda_graph_layer_is_graphable(layer, self.config):
                         num_graphable_layers += 1
                         callables.append(layer)
                         callables_is_mtp.append(False)
                 for layer_number in range(num_mtp_layers):
                     layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
-                    if _layer_is_graphable(layer, self.config):
+                    if _te_cuda_graph_layer_is_graphable(layer, self.config):
                         num_graphable_layers += 1
                         callables.append(layer)
                         callables_is_mtp.append(True)
@@ -2543,8 +2488,8 @@ class TECudaGraphHelper:
 
         Args:
             order (List[int]): The forward/backward execution order from
-                convert_schedule_table_to_order(). Positive integers represent forward passes
-                (1-indexed chunk ID), negative integers represent backward passes.
+                convert_te_cuda_graph_schedule_table_to_order(). Positive integers represent
+                forward passes (1-indexed chunk ID), negative integers represent backward passes.
             chunk_id_list (List[Tuple[int, int]]): The list of chunk IDs and layer IDs in the
                 order. This is useful only when overlap_moe_expert_parallel_comm is enabled,
                 the order maps each layers' idx to their original chunk id.
@@ -2587,8 +2532,7 @@ class TECudaGraphHelper:
             """
             assert any(
                 layer is leaf
-                for decoder_layer in chunk_of_the_layer.decoder.layers
-                for leaf in _graphable_leaves(decoder_layer)
+                for leaf in iter_te_cuda_graph_decoder_layers(chunk_of_the_layer.decoder)
             ) or any(
                 layer is mtp_layer.mtp_model_layer for mtp_layer in chunk_of_the_layer.mtp.layers
             ), "Layer is not in the chunk"
@@ -2635,7 +2579,9 @@ class TECudaGraphHelper:
                 # te.make_graphed_callables() accepts keyword arguments since 1.10.0.
                 hidden_states = static_inputs.pop("hidden_states")
                 _sample_args = (hidden_states,)
-                if contains_self_attn:
+                # A layer may provide its own rotary input (e.g. batch-dependent mRoPE in VLMs that
+                # report "rope" for the language model); keep it instead of a static embedding.
+                if contains_self_attn and "rotary_pos_emb" not in static_inputs:
                     rotary_pos_emb = get_rotary_pos_emb(chunk_of_the_layer, hidden_states)
                     if rotary_pos_emb is not None:
                         static_inputs["rotary_pos_emb"] = rotary_pos_emb
@@ -2826,7 +2772,7 @@ class TECudaGraphHelper:
             self.num_model_chunks,
             self.config.microbatch_group_size_per_vp_stage,
         )
-        order = convert_schedule_table_to_order(
+        order = convert_te_cuda_graph_schedule_table_to_order(
             num_warmup_microbatches, self.num_model_chunks, schedule_table
         )
         log_on_each_pipeline_stage(
@@ -2844,7 +2790,7 @@ class TECudaGraphHelper:
                 and not self.config.moe_shared_expert_overlap
             )
             capture_wgrad_graph = self.config.delay_wgrad_compute and wgrad_in_graph_scope
-            order, chunk_id_list = get_overlap_moe_expert_parallel_comm_order(
+            order, chunk_id_list = get_te_cuda_graph_overlap_moe_expert_parallel_comm_order(
                 order, self.num_layers_per_chunk, capture_wgrad_graph
             )
             self.num_layers_per_chunk = [1] * sum(self.num_layers_per_chunk)
@@ -3020,6 +2966,8 @@ class TECudaGraphHelper:
         """
         Capture CUDA Graphs per TransformerLayer per microbatch.
         """
+        from transformer_engine.pytorch.graph import make_graphed_callables
+
         start_time = self._start_capturing()
 
         if not self.flattened_callables:
@@ -3050,7 +2998,7 @@ class TECudaGraphHelper:
             num_layers_accumulated = 0
             for layers in self.callables_per_chunk:
                 for layer_number, layer in enumerate(layers):
-                    layer.cuda_graphs = []
+                    layer.te_cuda_graphs = []
                     for batch_number in range(self.num_microbatches):
                         if self.config.overlap_moe_expert_parallel_comm:
                             graph_idx = (
@@ -3062,7 +3010,7 @@ class TECudaGraphHelper:
                                 + batch_number * len(layers)
                                 + layer_number
                             )
-                        layer.cuda_graphs.append(graphs[graph_idx])
+                        layer.te_cuda_graphs.append(graphs[graph_idx])
                 num_layers_accumulated += len(layers)
 
             self._graphs_created = True
@@ -3091,15 +3039,15 @@ class TECudaGraphHelper:
         graphs_reset, graphs_not_reset = 0, 0
         for layers in self.callables_per_chunk:
             for layer in layers:
-                for graph in layer.cuda_graphs:
+                for graph in layer.te_cuda_graphs:
                     if graph_resettable:
                         graph.reset()
                         release_capture_constants(graph)
                         graphs_reset += 1
                     else:
                         graphs_not_reset += 1
-                layer.cuda_graphs = []
-                layer.cuda_graph_manual_hooks = []
+                layer.te_cuda_graphs = []
+                layer.te_cuda_graph_manual_hooks = []
 
         log_on_each_pipeline_stage(
             logger=logger,
@@ -3113,7 +3061,9 @@ class TECudaGraphHelper:
         self._graphs_created = False
 
 
-def convert_schedule_table_to_order(num_warmup_microbatches, num_model_chunks, schedule_table):
+def convert_te_cuda_graph_schedule_table_to_order(
+    num_warmup_microbatches, num_model_chunks, schedule_table
+):
     """Convert a tunable schedule lookup table to the te.make_graphed_callables() accepted
     order format. For example, the tunable schedule table for PP2 N3M5 with VP2 is as below:
     virtual_microbatch_id | 0 1 2 3 4 5 6 7 8 9
@@ -3139,7 +3089,9 @@ def convert_schedule_table_to_order(num_warmup_microbatches, num_model_chunks, s
     return order
 
 
-def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capture_wgrad_graph):
+def get_te_cuda_graph_overlap_moe_expert_parallel_comm_order(
+    order, num_layers_per_chunk, capture_wgrad_graph
+):
     """
     This functions gets the order for overlap_moe_expert_parallel_comm schedule for the original
     chunk-wise order list. Each chunk is transformered to chunks with only 1 layer so that
@@ -3244,62 +3196,11 @@ def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capt
 
 
 # ---------------------------------------------------------------------------
-# set_current_microbatch: sets per-layer microbatch index for TE graph replay
-# ---------------------------------------------------------------------------
-
-
-def set_current_microbatch(model, microbatch_id):
-    """Set the current microbatch on all layers that use TE CUDA graph replay.
-
-    current_microbatch is read by _te_cuda_graph_replay to select the
-    correct graph index.  This helper is called from the pipeline-parallel
-    schedule before each forward step.
-    """
-    decoder_exists = True
-    model_with_decoder = None
-    try:
-        model_with_decoder = get_attr_wrapped_model(
-            model, "decoder", allow_none=False, return_model_obj=True
-        )
-    except RuntimeError:
-        decoder_exists = False
-    if decoder_exists and model_with_decoder is not None:
-        for layer in model_with_decoder.decoder.layers:
-            # The layers inside a bracketed HybridStack group replay their own graphs.
-            for leaf in _graphable_leaves(layer):
-                leaf.current_microbatch = microbatch_id
-        if hasattr(model_with_decoder, 'mtp'):
-            for layer in model_with_decoder.mtp.layers:
-                assert hasattr(
-                    layer, 'mtp_model_layer'
-                ), f"MTP layer {layer} must have 'mtp_model_layer' attribute"
-                layer.mtp_model_layer.current_microbatch = microbatch_id
-
-    # Also set current_microbatch on vision encoder layers so that
-    # _te_cuda_graph_replay selects the correct graph index. Without this,
-    # vision layers always use graph 0 (since current_microbatch defaults to 0),
-    # causing all microbatch forwards to overwrite the same static buffers.
-    # When backward runs for earlier microbatches, the buffers contain stale
-    # data from later forwards, producing NaN gradients.
-    try:
-        model_with_vision = get_attr_wrapped_model(
-            model, "vision_model", allow_none=True, return_model_obj=True
-        )
-    except RuntimeError:
-        model_with_vision = None
-    if model_with_vision is not None and hasattr(model_with_vision, 'vision_model'):
-        vision_model = model_with_vision.vision_model
-        if hasattr(vision_model, 'decoder') and hasattr(vision_model.decoder, 'layers'):
-            for layer in vision_model.decoder.layers:
-                layer.current_microbatch = microbatch_id
-
-
-# ---------------------------------------------------------------------------
 # Vision encoder CUDA graph helpers
 # ---------------------------------------------------------------------------
 
 
-def _wrap_graph_for_vision(graph_fn):
+def _wrap_te_cuda_graph_for_vision(graph_fn):
     """Wrap a graphed callable to filter out None outputs.
 
     During make_graphed_callables warmup, vision encoder layers go through their
@@ -3321,7 +3222,7 @@ def _wrap_graph_for_vision(graph_fn):
     return wrapped
 
 
-def get_vision_cuda_graph_seq_length(vision_config, default_seq_length: int = 4096) -> int:
+def get_vision_te_cuda_graph_seq_length(vision_config, default_seq_length: int = 4096) -> int:
     """Calculate the sequence length for vision encoder CUDA graphs.
 
     For vision encoders, the sequence length depends on:
@@ -3422,7 +3323,7 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
                 self.vision_model.decoder, 'layers'
             ):
                 for layer in self.vision_model.decoder.layers:
-                    if _layer_is_graphable(layer, self.config):
+                    if _te_cuda_graph_layer_is_graphable(layer, self.config):
                         vision_layers.append(layer)
 
         if vision_layers:
@@ -3467,13 +3368,15 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
     def _finish_capturing(self, start_time):
         """
         Before calling super()._finish_capturing, wrap the captured graphs with
-        _wrap_graph_for_vision to filter None from (output, None) tuples so that
+        _wrap_te_cuda_graph_for_vision to filter None from (output, None) tuples so that
         _te_cuda_graph_replay's len == 1 assertion passes.
         """
         # Wrap the captured graphs before finishing
         for layer in self.flattened_callables:
-            if hasattr(layer, 'cuda_graphs'):
-                layer.cuda_graphs = [_wrap_graph_for_vision(g) for g in layer.cuda_graphs]
+            if hasattr(layer, 'te_cuda_graphs'):
+                layer.te_cuda_graphs = [
+                    _wrap_te_cuda_graph_for_vision(g) for g in layer.te_cuda_graphs
+                ]
 
         super()._finish_capturing(start_time)
 

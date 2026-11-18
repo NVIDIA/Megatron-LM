@@ -17,6 +17,7 @@
 import contextlib
 import logging
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import List, NamedTuple, Optional, Tuple, Type
 
 import torch
@@ -42,11 +43,11 @@ try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp import MixedPrecisionPolicy
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
         FsdpContext,
+        GradientFinalizationMode,
         Placements,
         RuntimePolicy,
         SchedulePolicy,
         ShardLayout,
-        finalize_gradients,
         fully_shard,
         fully_shard_context,
     )
@@ -117,6 +118,18 @@ def _materialize_owned_meta_modules(module: nn.Module, device: torch.device | No
         _materialize_meta_module(submodule, device)
 
 
+def _initialize_symmetric_memory_communicators(
+    groups: tuple[dist.ProcessGroup, ...], device: torch.device
+) -> None:
+    """Initialize communicators before symmetric-memory registration.
+
+    NCCL rendezvous can fail as the first operation on a communicator:
+    https://github.com/pytorch/pytorch/issues/188567.
+    """
+    for group in groups:
+        dist.barrier(group=group, device_ids=[device.index])
+
+
 class FullyShardedDataParallelV2(_BaseDataParallel):
     """MFSDP v2 wrapper for the Megatron model.
 
@@ -154,8 +167,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             device: Device used to construct the data-parallel mesh and, when this wrapper
                 opens its own ``fully_shard_context``, that context's device. Defaults to
                 CUDA. When the caller has already opened an ambient context (multi-chunk
-                wrapping), this wrapper joins it and the ambient context's device and
-                ``use_symmetric_memory`` settings apply instead.
+                wrapping), this wrapper joins it and uses that context's device. The
+                context's symmetric-memory setting must match ``ddp_config.nccl_ub``.
             pg_collection: Explicit process groups. The ``dp_cp`` group defines the
                 data-parallel mesh.
 
@@ -164,6 +177,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             ValueError: If required process groups are missing or the configuration
                 requests a feature unsupported by MFSDP v2.
         """
+
         if not HAVE_MEGATRON_FSDP:
             raise IMPORT_MEGATRON_FSDP_ERROR
         if pg_collection is None:
@@ -175,6 +189,21 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
+
+        use_symmetric_memory = ddp_config.nccl_ub
+        if use_symmetric_memory:
+            if ddp_config.num_distributed_optimizer_instances > 1:
+                groups = (pg_collection.inter_dist_opt, pg_collection.intra_dp_cp)
+                if config.num_moe_experts is not None:
+                    groups += (pg_collection.intra_expt_dp,)
+            else:
+                groups = (pg_collection.dp_cp,)
+                if config.num_moe_experts is not None:
+                    groups += (pg_collection.expt_dp,)
+            _initialize_symmetric_memory_communicators(
+                tuple(group for group in groups if group is not None),
+                torch.cuda.current_stream(device).device,
+            )
 
         # Optimizer construction reads this attribute; retain the v1 contract for compatibility.
         self.ddp_config = ddp_config
@@ -242,7 +271,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         )
         common_fully_shard_kwargs = dict(
             mixed_precision_policy=self.mp_policy,
-            schedule_policy=schedule_policy,
             shard_layout=(
                 ShardLayout.PADDED
                 if ddp_config.megatron_fsdp_padded_shards
@@ -257,19 +285,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             construction_context = fully_shard_context(
                 FsdpContext(
                     device=device,
+                    gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER,
                     runtime_policy=RuntimePolicy(
                         use_symmetric_memory=ddp_config.nccl_ub,
-                        caller_managed_grad_sync=True,
                         overlap_outer_communication=ddp_config.overlap_outer_communication,
                     ),
                 )
             )
         else:
-            if not active_context.caller_managed_grad_sync:
-                raise ValueError(
-                    "MCore MFSDP v2 requires shared contexts to be constructed with "
-                    "RuntimePolicy(caller_managed_grad_sync=True)."
-                )
             construction_context = nullcontext(active_context)
         with construction_context:
             collector = FsdpUnitCollector(fsdp_unit_modules)
@@ -282,6 +305,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     mesh=expert_dp_mesh if is_expert else dp_mesh,
                     placements=expert_placements if is_expert else dense_placements,
                     grad_scale=expert_grad_scale if is_expert else dense_grad_scale,
+                    schedule_policy=replace(
+                        schedule_policy,
+                        unshard_all_planes_in_backward=collector.is_partially_recomputed(submodule),
+                    ),
                     **common_fully_shard_kwargs,
                 )
 
@@ -404,18 +431,19 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             )
         if (
             ddp_config.expert_outer_dp_sharding_strategy != "no_shard"
-            and ddp_config.num_distributed_optimizer_instances <= 1
+            and ddp_config.expert_num_distributed_optimizer_instances <= 1
         ):
             raise ValueError(
                 "MFSDP v2 expert_outer_dp_sharding_strategy="
                 f"{ddp_config.expert_outer_dp_sharding_strategy!r} requires "
-                "num_distributed_optimizer_instances > 1."
+                "expert_num_distributed_optimizer_instances > 1."
             )
         if config.gradient_accumulation_fusion:
             raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
         if config.calculate_per_token_loss and (
             config.pipeline_model_parallel_size != 1
             or ddp_config.num_distributed_optimizer_instances != 1
+            or ddp_config.expert_num_distributed_optimizer_instances != 1
         ):
             raise ValueError(
                 "MFSDP v2 per-token loss has not been tested with PP>1 "
@@ -438,7 +466,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if ddp_config.nccl_ub and not ddp_config.megatron_fsdp_padded_shards:
             raise ValueError(
                 "MFSDP v2 megatron_fsdp_padded_shards=False is incompatible with nccl_ub: "
-                "symmetric-memory collectives require equal shard sizes."
+                "symmetric-memory collectives require equal shard sizes for unsharding. "
+                "Remove --no-megatron-fsdp-padded-shards or disable --use-nccl-ub."
             )
         if ddp_config.fsdp_manual_registration:
             raise ValueError("MFSDP v2 does not support fsdp_manual_registration.")
@@ -465,7 +494,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         MCore's schedules wrap every microbatch but the last in ``no_sync_func``.
         """
-        with finalize_gradients(self.module.context, enabled=False):
+        with self.module.context.finalize_gradients(mode=GradientFinalizationMode.SKIP_OUTER):
             yield
 
     @torch.no_grad()
@@ -600,11 +629,11 @@ def _build_expert_mesh_and_placements(
 
     inner_strategy = get_sharding_strategy(ddp_config, is_expert_param=True)
 
-    if ddp_config.num_distributed_optimizer_instances > 1:
-        # Match v1 topology: dense and expert parameters share the outer DP axis,
-        # while experts use the existing expert-DP inner group. Only placements differ.
+    if ddp_config.expert_num_distributed_optimizer_instances > 1:
+        # Experts use the expert-DP inner and inter-instance groups. With equal instance counts
+        # this matches v1, where dense and experts share the outer axis.
         dp_mesh = _build_hybrid_dp_mesh(
-            pg_collection.inter_dist_opt, pg_collection.intra_expt_dp, device_type
+            pg_collection.inter_expt_dist_opt, pg_collection.intra_expt_dp, device_type
         )
         inner = _DATA_PARALLEL_PLACEMENTS[inner_strategy]
         outer = _DATA_PARALLEL_PLACEMENTS[ddp_config.expert_outer_dp_sharding_strategy]

@@ -6,7 +6,10 @@ import pytest
 import torch
 
 from megatron.core.context_parallel.layout import ContextParallelLayoutManager
-from megatron.core.models.common.model_chunk_schedule_plan import TransformerLayerSchedulePlan
+from megatron.core.models.common.model_chunk_schedule_plan import (
+    TransformerLayerSchedulePlan,
+    TransformerModelChunkSchedulePlan,
+)
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
@@ -123,16 +126,16 @@ def test_hybrid_ep_overlap_rejects_unsupported_features(config_overrides, messag
         HybridModel._validate_ep_overlap_support(_overlap_model_stub(**config_overrides))
 
 
-@pytest.mark.parametrize("pattern", ["[*E]", "[+E]"])
-def test_grouped_overlap_matches_eager_outputs_and_gradients(pattern):
-    """Exercise grouped attention, MLA and shared experts through real A2A nodes."""
+@pytest.mark.parametrize("pattern, num_layers", [("[M-][*E]", 4), ("[+E]", 2)])
+def test_grouped_overlap_matches_eager_outputs_and_gradients(pattern, num_layers):
+    """Compare per-token loss and gradients through the full grouped 1F1B schedule."""
     if Utils.world_size < 2:
         pytest.skip("Expert-parallel overlap requires at least two ranks")
     Utils.initialize_model_parallel(expert_model_parallel_size=2)
     try:
         model_parallel_cuda_manual_seed(123)
         config = MLATransformerConfig(
-            num_layers=2,
+            num_layers=num_layers,
             hidden_size=256,
             num_attention_heads=4,
             ffn_hidden_size=256,
@@ -157,59 +160,50 @@ def test_grouped_overlap_matches_eager_outputs_and_gradients(pattern):
             qk_pos_emb_head_dim=32,
             v_head_dim=64,
         )
-        block = HybridStack(
-            config,
-            hybrid_stack_spec.submodules,
-            layer_config_list=validate_segment_layers(pattern, config),
+        model = HybridModel(
+            config=config,
+            hybrid_layer_pattern=pattern,
+            vocab_size=128,
+            max_sequence_length=16,
             pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
-        inputs = [torch.randn(16, 1, 256, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+        positions = torch.arange(16, device="cuda").unsqueeze(0)
+        microbatches = [
+            dict(
+                input_ids=torch.randint(128, (1, 16), device="cuda"),
+                position_ids=positions,
+                attention_mask=None,
+                labels=torch.randint(128, (1, 16), device="cuda"),
+            )
+            for _ in range(3)
+        ]
         references = []
-        for hidden_states in inputs:
-            output = block(hidden_states.clone().requires_grad_(), attention_mask=None)
+        for data in microbatches:
+            output = model(**data)
             references.append(output.detach().clone())
             output.backward(torch.ones_like(output))
         reference_grads = {
             name: param.grad.detach().clone()
-            for name, param in block.named_parameters()
+            for name, param in model.named_parameters()
             if param.grad is not None
         }
-        block.zero_grad(set_to_none=True)
+        model.zero_grad(set_to_none=True)
 
         set_streams()
-        plans = []
-        for _ in inputs:
-            state = DummyState()
-            state.model = SimpleNamespace(decoder=block)
-            plans.append(
-                HybridStackSchedulePlan(
-                    block.layers[0],
-                    torch.cuda.Event(),
-                    state,
-                    get_comp_stream,
-                    get_comm_stream,
-                    extra_args={"layer_type": block.layer_type_list[0], "is_last_layer": True},
-                )
-            )
-
         outputs = []
         previous = None
-        for index, plan in enumerate(plans):
-            output, _ = TransformerLayerSchedulePlan.run(
-                plan,
-                previous,
-                f_input=inputs[index].clone().requires_grad_(),
-                b_grad=None if previous is None else torch.ones_like(outputs[-1]),
+        for data in microbatches:
+            plan = model.build_schedule_plan(**data)
+            output = TransformerModelChunkSchedulePlan.run(
+                plan, previous, b_grad=None if previous is None else torch.ones_like(outputs[-1])
             )
-            torch.cuda.synchronize()
             outputs.append(output.detach().clone())
             previous = plan
-        TransformerLayerSchedulePlan.run(None, previous, b_grad=torch.ones_like(outputs[-1]))
-        torch.cuda.synchronize()
+        TransformerModelChunkSchedulePlan.run(None, previous, b_grad=torch.ones_like(outputs[-1]))
 
         for output, reference in zip(outputs, references):
             torch.testing.assert_close(output, reference, rtol=1e-2, atol=1e-2)
-        for name, param in block.named_parameters():
+        for name, param in model.named_parameters():
             if name in reference_grads:
                 assert param.grad is not None, name
                 torch.testing.assert_close(param.grad, reference_grads[name], rtol=2e-2, atol=2e-2)

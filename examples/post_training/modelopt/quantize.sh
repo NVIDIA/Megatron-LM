@@ -48,31 +48,20 @@ if [ -n "${MLM_PROMPTS}" ]; then
 fi
 
 if [ -z ${MLM_MODEL_CKPT} ]; then
-    ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/quantize.py \
-        ${MODEL_ARGS} \
-        --tensor-model-parallel-size ${TP} \
-        --expert-tensor-parallel-size ${ETP} \
-        --expert-model-parallel-size ${EP} \
-        --pipeline-model-parallel-size ${PP} \
-        --context-parallel-size ${CP} \
-        --tokenizer-model ${TOKENIZER_MODEL} \
-        --pretrained-model-path ${HF_MODEL_CKPT} \
-        --save ${MLM_MODEL_SAVE} \
-        "${QUANT_CFG_ARGS[@]}" \
-        --references "${MLM_REF_LABEL}" \
-        "${EXTRA_ARGS[@]}"
-else
-    ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/quantize.py \
-        ${MODEL_ARGS} \
-        --tensor-model-parallel-size ${TP} \
-        --expert-tensor-parallel-size ${ETP} \
-        --expert-model-parallel-size ${EP} \
-        --pipeline-model-parallel-size ${PP} \
-        --context-parallel-size ${CP} \
-        --tokenizer-model ${TOKENIZER_MODEL} \
-        --load ${MLM_MODEL_CKPT} \
-        --save ${MLM_MODEL_SAVE} \
-        "${QUANT_CFG_ARGS[@]}" \
-        --references "${MLM_REF_LABEL}" \
-        "${EXTRA_ARGS[@]}"
+    printf "${MLM_ERROR} Variable ${PURPLE}MLM_MODEL_CKPT${WHITE} is not set! Import the Hugging Face checkpoint with Megatron-Bridge first (see README.md).\n"
+    exit 1
 fi
+
+${LAUNCH_SCRIPT} ${SCRIPT_DIR}/quantize.py \
+    ${MODEL_ARGS} \
+    --tensor-model-parallel-size ${TP} \
+    --expert-tensor-parallel-size ${ETP} \
+    --expert-model-parallel-size ${EP} \
+    --pipeline-model-parallel-size ${PP} \
+    --context-parallel-size ${CP} \
+    --tokenizer-model ${TOKENIZER_MODEL} \
+    --load ${MLM_MODEL_CKPT} \
+    --save ${MLM_MODEL_SAVE} \
+    "${QUANT_CFG_ARGS[@]}" \
+    --references "${MLM_REF_LABEL}" \
+    "${EXTRA_ARGS[@]}"
