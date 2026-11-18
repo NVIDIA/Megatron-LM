@@ -83,6 +83,13 @@ jobs:
             exit 1
           fi
 
+  bridge-changes:
+    if: github.repository == 'NVIDIA/Megatron-LM'
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/_bridge-changes.yml
+
   pre-flight:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@037094bcc9138c72bc125418e6e3653f9e1c4160 # v1.11.0
     with:
@@ -90,9 +97,10 @@ jobs:
     if: github.repository == 'NVIDIA/Megatron-LM' && github.event_name != 'workflow_dispatch'
 
   bump:
-    needs: [pre-flight, validate-inputs]
+    needs: [pre-flight, validate-inputs, bridge-changes]
     if: |
       !cancelled() && !failure()
+      && needs.bridge-changes.outputs.bridge_only != 'true'
       && github.repository == 'NVIDIA/Megatron-LM'
       && !(needs.pre-flight.outputs.docs_only == 'true'
            || needs.pre-flight.outputs.is_merge_group == 'true'
@@ -132,9 +140,10 @@ jobs:
     secrets: inherit  # pragma: allowlist secret
 
   finalize:
-    needs: [bump, build-test-publish-wheels]
+    needs: [bump, build-test-publish-wheels, bridge-changes]
     if: |
       github.repository == 'NVIDIA/Megatron-LM'
+      && needs.bridge-changes.outputs.bridge_only != 'true'
       && (success() || !failure())
       && !cancelled()
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_finalize.yml@cf5acebace78c7c339bc1f804357a991336f1c4d # v1.8.10

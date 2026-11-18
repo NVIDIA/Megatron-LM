@@ -27,14 +27,22 @@ permissions:
   pull-requests: read
 
 jobs:
+  bridge-changes:
+    if: github.repository == 'NVIDIA/Megatron-LM'
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/_bridge-changes.yml
+
   pre-flight:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@c1a0837f362a1a696e647238ab1cf916b2a7cf4a # v1.8.6
     if: github.repository == 'NVIDIA/Megatron-LM'
 
   process-group-usage-check:
-    needs: [pre-flight]
+    needs: [pre-flight, bridge-changes]
     if: |
       !(needs.pre-flight.outputs.docs_only == 'true'
+      || needs.bridge-changes.outputs.bridge_only == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
       && github.repository == 'NVIDIA/Megatron-LM'
     runs-on: ubuntu-latest

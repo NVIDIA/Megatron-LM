@@ -179,9 +179,18 @@ jobs:
             echo "is_maintainer=false" | tee -a $GITHUB_OUTPUT
           fi
 
-  pre-flight:
-    needs: [is-not-external-contributor]
+  bridge-changes:
     if: github.repository == 'NVIDIA/Megatron-LM'
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/_bridge-changes.yml
+
+  # Gate preflight so its merge-group and force-run outputs can only enable
+  # build/test jobs on runs that actually need them.
+  pre-flight:
+    needs: [is-not-external-contributor, bridge-changes]
+    if: github.repository == 'NVIDIA/Megatron-LM' && needs.bridge-changes.outputs.bridge_only != 'true'
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@037094bcc9138c72bc125418e6e3653f9e1c4160 # v1.11.0
     with:
       workflow_ref: 037094bcc9138c72bc125418e6e3653f9e1c4160 # pragma: allowlist secret
@@ -690,6 +699,9 @@ jobs:
           --config 'namespace-packages = ["megatron"]'
           --config 'lint.flake8-tidy-imports.banned-api = {"megatron.training" = {msg = "megatron.core must not depend on megatron.training."}}'
 
+      - name: Test Bridge-only change detection
+        run: .github/scripts/test_bridge_only_changes.sh
+
       - name: Test CI cache keys
         run: .github/scripts/test_cache_keys.sh
 
@@ -1153,7 +1165,7 @@ jobs:
       - cicd-container-build
       - cicd-unit-tests-latest
     if: |
-      needs.pre-flight.result != 'cancelled'
+      needs.pre-flight.result == 'success'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
@@ -1406,6 +1418,7 @@ jobs:
 
   Nemo_CICD_Test:
     needs:
+      - bridge-changes
       - pre-flight
       - configure
       - is-not-external-contributor
@@ -1436,6 +1449,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_RUN_ID: ${{ github.run_id }}
+          BRIDGE_ONLY: ${{ needs.bridge-changes.outputs.bridge_only == 'true' && needs.is-not-external-contributor.result == 'success' }}
           DOCS_ONLY: ${{ needs.pre-flight.outputs.docs_only }}
           IS_DEPLOYMENT: ${{ needs.pre-flight.outputs.is_deployment_workflow }}
           IS_MAINTAINER: ${{ needs.is-not-external-contributor.outputs.is_maintainer }}
@@ -1449,6 +1463,11 @@ jobs:
           H100_RESULT: ${{ needs.cicd-integration-tests-latest-h100.result }}
           GB200_RESULT: ${{ needs.cicd-integration-tests-latest-gb200.result }}
         run: |
+          if [ "$BRIDGE_ONLY" == "true" ]; then
+            echo "Only Bridge files changed. Build and test jobs skipped."
+            exit 0
+          fi
+
           # Docs-only and deployment workflows intentionally skip all tests
           if [ "$DOCS_ONLY" == "true" ] || [ "$IS_DEPLOYMENT" == "true" ]; then
             echo "✅ Docs-only or deployment workflow — test checks skipped"
@@ -1534,13 +1553,13 @@ jobs:
 
   Coverage_Fake:
     runs-on: ubuntu-latest
-    needs: [Nemo_CICD_Test, pre-flight]
+    needs: [Nemo_CICD_Test, pre-flight, bridge-changes]
     if: |
       (
-        needs.pre-flight.outputs.docs_only == 'true'
-        || needs.pre-flight.outputs.is_deployment_workflow == 'true'
+        (needs.bridge-changes.outputs.bridge_only == 'true' && needs.Nemo_CICD_Test.result == 'success')
+        || ((needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true')
+            && needs.pre-flight.outputs.is_ci_workload == 'false')
       )
-      && needs.pre-flight.outputs.is_ci_workload == 'false'
       && !cancelled()
       && github.repository == 'NVIDIA/Megatron-LM'
     steps:
@@ -1562,16 +1581,17 @@ jobs:
               repo: context.repo.repo,
               sha: context.sha,
               state: 'success',
-              description: 'No code changes - coverage check skipped',
+              description: 'Build and test jobs skipped for this change',
               context: 'codecov/patch'
             });
 
   Coverage:
     runs-on: ubuntu-latest
-    needs: [Nemo_CICD_Test, pre-flight, configure, cicd-parse-unit-tests, cicd-parse-unit-tests-gb200]
+    needs: [Nemo_CICD_Test, pre-flight, bridge-changes, configure, cicd-parse-unit-tests, cicd-parse-unit-tests-gb200]
     if: |
       !cancelled()
       && needs.Nemo_CICD_Test.result == 'success'
+      && needs.bridge-changes.outputs.bridge_only != 'true'
       && needs.pre-flight.outputs.docs_only != 'true'
       && needs.pre-flight.outputs.is_deployment_workflow != 'true'
       && github.repository == 'NVIDIA/Megatron-LM'
