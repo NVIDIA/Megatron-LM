@@ -120,6 +120,7 @@ class MambaLayer(TECudaGraphMambaLayerMixin, GraphableMegatronModule, TwoStageAt
                 "hybrid stack with WideResidualMambaLayer when wide_residual is configured."
             )
         assert pg_collection is not None, "pg_collection must be provided for MambaLayer"
+        self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
 
         self.config = config
