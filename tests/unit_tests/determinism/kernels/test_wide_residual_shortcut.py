@@ -147,17 +147,28 @@ FORWARD = [
     for i, (m, h) in enumerate(((32, 32), (64, 96), (96, 288), (160, 18432)))
     for s, u, inf in [((1, 2, 4, 6)[i], 1 + i % 2, i % 2 == 0), ((6, 4, 2, 1)[i], 2 - i % 2, i < 2)]
 ] + [
-    # Every tuned training table entry: FP32 streams, and BF16 streams with BF16 logits.
-    pytest.param(2048, h, 3, n, n, F, q, T, F32, 1e-5, F, T, marks=QUALIFIED if q else ())
+    # Every tuned prefill table entry: FP32 streams, and BF16 streams with BF16 logits.
+    pytest.param(2048, h, 3, n, n, T, q, T, F32, 1e-5, F, T, marks=QUALIFIED if q else ())
     for h, n, q in sorted(forward_kernel._FORWARD_CONFIGS)
 ] + [
-    pytest.param(2048, h, 3, n, u, F, q, T, BF16, 1e-5, F, T, marks=QUALIFIED if q else ())
+    pytest.param(2048, h, 3, n, u, T, q, T, BF16, 1e-5, F, T, marks=QUALIFIED if q else ())
     for h, n, u, q in sorted(forward_kernel._FORWARD_CONFIGS_BF16)
 ] + [
-    # Every output-format training table entry (MXFP8 reader one, or BF16 and MXFP8 together).
-    pytest.param(2048, h, 3, len(o), u, F, o, T, BF16 if b else F32, 1e-5, F, T, marks=QUALIFIED)
-    for (h, b), entries in sorted(forward_kernel._FORMAT_CONFIGS.items())
-    for u, o in sorted(entries)
+    # Every leaf of the training tree (residual row bytes, width, dtype, readers), with mixed
+    # reader formats: one or both of BF16 and MXFP8.
+    pytest.param(2048, h, s, len(o), u, F, o, T, d, 1e-5, F, T, marks=QUALIFIED)
+    for h, s, d, o, u in [
+        (2048, 3, BF16, ("mxfp8",), 1),  # <= 12 KB rows
+        (2048, 3, F32, ("both", "mxfp8"), 1),  # <= 24 KB
+        (4096, 3, BF16, ("both",), 1),
+        (3072, 3, BF16, ("bf16", "both"), 2),
+        (6144, 2, BF16, ("mxfp8", "bf16"), 1),
+        (3072, 3, F32, ("mxfp8", "both"), 2),  # <= 72 KB
+        (10240, 3, BF16, ("bf16", "both"), 2),
+        (6144, 2, F32, ("both",), 1),
+        (8192, 3, F32, ("mxfp8", "mxfp8"), 1),  # <= 96 KB
+        (10240, 3, F32, ("both", "bf16"), 2),  # wider
+    ]
 ]
 # inference: (tokens, hidden, quantized, retention, readers, updates, dtype, TE consumer).
 # Tokens: cluster/tree schedules, the MXFP8 scale padding of the last 128-row tile (one or
