@@ -619,6 +619,8 @@ def validate_eagle_streaming_args(args):
         raise ValueError("Streaming requires loading an offline EAGLE GPTModel checkpoint.")
     if args.offline_distillation_data is not None:
         raise ValueError("Choose one of streaming and --offline-distillation-data.")
+    if args.micro_batch_size != 1:
+        raise ValueError("EAGLE streaming requires --micro-batch-size 1.")
     if (
         not args.bf16
         or args.context_parallel_size != 1

@@ -19,7 +19,11 @@ transformers = pytest.importorskip("transformers")
 _MODEL_OPT_EXAMPLE_DIR = Path(__file__).parents[3] / "examples" / "post_training" / "modelopt"
 sys.path.insert(0, str(_MODEL_OPT_EXAMPLE_DIR))
 
-from finetune import SFTDataset, train_valid_test_sft_datasets_provider
+from finetune import (
+    SFTDataset,
+    train_valid_test_sft_datasets_provider,
+    validate_eagle_streaming_args,
+)
 from utils import get_eos_token_id
 
 from megatron.post_training.arguments import add_modelopt_args
@@ -89,6 +93,66 @@ def test_streaming_finetune_loads_explicit_splits(tmp_path, monkeypatch):
     assert train.entries[0]["conversation_id"] == "train"
     assert valid.entries[0]["conversation_id"] == "valid"
     assert test is None
+
+
+@pytest.fixture
+def streaming_args():
+    return SimpleNamespace(
+        eagle_streaming_server_urls="http://127.0.0.1:8765",
+        eagle_streaming_model="teacher",
+        eagle_streaming_train_data="train.jsonl",
+        eagle_streaming_valid_data=None,
+        eagle_streaming_test_data=None,
+        eagle_streaming_answer_only_loss=False,
+        export_offline_model=True,
+        load="checkpoint",
+        export_model_type="GPTModel",
+        offline_distillation_data=None,
+        micro_batch_size=1,
+        bf16=True,
+        context_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        dynamic_context_parallel=False,
+        dataloader_type="single",
+        full_validation=False,
+        eval_iters=0,
+    )
+
+
+def test_eagle_streaming_args_accept_validation_with_a_corpus(streaming_args):
+    streaming_args.eval_iters = 1
+    streaming_args.eagle_streaming_valid_data = "validation.jsonl"
+    validate_eagle_streaming_args(streaming_args)
+
+
+@pytest.mark.parametrize(
+    ("flag", "value", "error"),
+    [
+        ("eagle_streaming_server_urls", None, "--eagle-streaming-server-urls"),
+        ("eagle_streaming_model", None, "--eagle-streaming-model and --eagle-streaming-train-data"),
+        (
+            "eagle_streaming_train_data",
+            None,
+            "--eagle-streaming-model and --eagle-streaming-train-data",
+        ),
+        ("export_offline_model", False, "offline EAGLE GPTModel checkpoint"),
+        ("load", None, "offline EAGLE GPTModel checkpoint"),
+        ("export_model_type", "HybridModel", "offline EAGLE GPTModel checkpoint"),
+        ("offline_distillation_data", "dump", "--offline-distillation-data"),
+        ("micro_batch_size", 2, "--micro-batch-size 1"),
+        ("bf16", False, "BF16 and CP=PP=1"),
+        ("context_parallel_size", 2, "BF16 and CP=PP=1"),
+        ("pipeline_model_parallel_size", 2, "BF16 and CP=PP=1"),
+        ("dynamic_context_parallel", True, "BF16 and CP=PP=1"),
+        ("dataloader_type", "external", "built-in sampler"),
+        ("full_validation", True, "built-in sampler"),
+        ("eval_iters", 1, "--eagle-streaming-valid-data"),
+    ],
+)
+def test_eagle_streaming_args_reject_unsupported_configuration(streaming_args, flag, value, error):
+    setattr(streaming_args, flag, value)
+    with pytest.raises(ValueError, match=error):
+        validate_eagle_streaming_args(streaming_args)
 
 
 def test_materialize_data_files_resolves_local_dataset_directory(tmp_path):
