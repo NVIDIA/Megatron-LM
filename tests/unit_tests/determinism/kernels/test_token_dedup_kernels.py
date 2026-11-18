@@ -5,7 +5,7 @@
 
 Covers the Triton send/receive index builders and the five autograd functions of the
 deduplicating all-to-all dispatcher: payload pack, received-row expand, expert-output permute,
-probability-weighted reduce, and the final restore. Every backward is a bounded gather (no
+expert-output reduce, and the final restore. Every backward is a bounded gather (no
 atomics), so forward and backward must replay byte-identically, also under stream contention.
 """
 
@@ -20,8 +20,8 @@ from megatron.core.transformer.moe.token_dedup import (
     fused_index_build_available,
     pack_token_dedup_payload,
     permute_token_dedup_expert_output,
+    reduce_token_dedup_expert_output,
     restore_token_dedup_output,
-    weighted_reduce_token_dedup_expert_output,
 )
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
 
@@ -187,19 +187,17 @@ def test_permute_expert_output_replays():
     )
 
 
-def test_weighted_reduce_replays():
+def test_reduce_replays():
     seeded()
     plan = _dedup_plan()
     expert_output = torch.randn(
         plan["num_assignments"], HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True
     )
-    wire_probs = torch.rand(plan["num_recv"], TOPK, device="cuda", dtype=torch.bfloat16)
-    wire_probs = wire_probs.masked_fill(plan["wire_to_expert_rows"] < 0, 0).requires_grad_(True)
     assert_replays_bit_exact(
-        weighted_reduce_token_dedup_expert_output,
-        (expert_output, plan["wire_to_expert_rows"], wire_probs),
+        reduce_token_dedup_expert_output,
+        (expert_output, plan["expert_wire_rows"], plan["wire_to_expert_rows"]),
         contention=True,
-        what="weighted reduce",
+        what="reduce",
     )
 
 

@@ -346,7 +346,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/transformer/moe/token_dedup.py",),
         tests=(K + "test_token_dedup_kernels.py",),
         kind="triton",
-        notes="--moe-token-dedup payload pack / expand / weighted-reduce / restore kernels and the "
+        notes="--moe-token-dedup payload pack / expand / reduce / restore kernels and the "
         "send/receive index builders; every backward is a bounded gather (no atomics). The MoELayer "
         "replay through the deduplicating alltoall dispatcher lives in test_moe_kernels under "
         "moe_token_dispatchers.",

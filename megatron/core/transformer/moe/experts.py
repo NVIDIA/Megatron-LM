@@ -408,9 +408,7 @@ class TEGroupedMLP(MegatronModule):
         hidden_size = shape[-1]
         output_dtype = intermediate_parallel.dtype
         flat_output = intermediate_parallel.view(-1, hidden_size).float()
-        # permuted_probs is None when the dispatcher applies the routing weights itself
-        # (token-dedup weighted combine): plain bias add.
-        flat_probs = None if permuted_probs is None else permuted_probs.reshape(-1, 1).float()
+        flat_probs = permuted_probs.reshape(-1, 1).float()
 
         if tokens_per_expert.device != packed_bias.device:
             raise ValueError("Packed MoE bias and tokens_per_expert must be on the same device.")
@@ -428,8 +426,6 @@ class TEGroupedMLP(MegatronModule):
         bias_per_token = torch.repeat_interleave(
             packed_bias.float(), tokens_per_expert, dim=0, output_size=flat_output.size(0)
         )
-        if flat_probs is None:
-            return (flat_output + bias_per_token).view(shape).to(output_dtype)
         return (flat_output + bias_per_token * flat_probs).view(shape).to(output_dtype)
 
     @staticmethod
@@ -455,18 +451,6 @@ class TEGroupedMLP(MegatronModule):
 
         shape = intermediate_parallel.shape
         flat_output = intermediate_parallel.view(-1, shape[-1])
-        if permuted_probs is None:
-            # Routing weights are applied downstream (token-dedup weighted combine).
-            return (
-                torch.cat(
-                    [
-                        t + b
-                        for t, b in zip(torch.split(flat_output, tokens_per_expert), bias_parallel)
-                    ]
-                )
-                .view(shape)
-                .to(intermediate_parallel.dtype)
-            )
         return (
             torch.cat(
                 [
@@ -985,10 +969,7 @@ class TEGroupedMLP(MegatronModule):
 
         # Apply padding if needed
         unpadded_tokens_per_expert = None
-        # permuted_probs is None when the dispatcher applies the routing weights itself
-        # (token-dedup weighted combine); the experts then skip the multiply.
-        if permuted_probs is not None:
-            permuted_probs = permuted_probs.unsqueeze(-1)
+        permuted_probs = permuted_probs.unsqueeze(-1)
         # The token buffer may already contain per-expert padding when padding was performed
         # before expert compute:
         #   * router padding modified the routing map before dispatch;
@@ -1009,10 +990,9 @@ class TEGroupedMLP(MegatronModule):
             permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
                 permuted_local_hidden_states, tokens_per_expert
             )
-            if permuted_probs is not None:
-                permuted_probs, _ = self.quantization_padding(
-                    permuted_probs, unpadded_tokens_per_expert
-                )
+            permuted_probs, _ = self.quantization_padding(
+                permuted_probs, unpadded_tokens_per_expert
+            )
 
         if self._use_grouped_tensor:
             if not isinstance(tokens_per_expert, torch.Tensor):
@@ -1030,7 +1010,6 @@ class TEGroupedMLP(MegatronModule):
             assert (
                 self.config.moe_router_topk == 1
             ), "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
-            assert permuted_probs is not None, "moe_apply_probs_on_input needs the routing probs"
             original_dtype = permuted_local_hidden_states.dtype
             permuted_local_hidden_states = permuted_probs * permuted_local_hidden_states
             permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
@@ -1073,13 +1052,6 @@ class TEGroupedMLP(MegatronModule):
                     intermediate_parallel = intermediate_parallel * permuted_probs
                     intermediate_parallel = intermediate_parallel.to(original_dtype)
             elif self.config.bias_activation_fusion and not with_glu_interleaving:
-                if permuted_probs is None:
-                    # The fused kernels take the weights as an argument; the multiply is free.
-                    permuted_probs = torch.ones(
-                        (intermediate_parallel.shape[0], 1),
-                        dtype=intermediate_parallel.dtype,
-                        device=intermediate_parallel.device,
-                    )
                 if self.activation_func == F.silu and self.config.gated_linear_unit:
                     # dtype is handled inside the fused kernel
                     intermediate_parallel = weighted_bias_swiglu_impl(
@@ -1147,10 +1119,9 @@ class TEGroupedMLP(MegatronModule):
                             intermediate_parallel, tanh_clamp_scale
                         )
                     intermediate_parallel = self.activation_func(intermediate_parallel)
-                if permuted_probs is not None:
-                    original_dtype = intermediate_parallel.dtype
-                    intermediate_parallel = intermediate_parallel * permuted_probs
-                    intermediate_parallel = intermediate_parallel.to(original_dtype)
+                original_dtype = intermediate_parallel.dtype
+                intermediate_parallel = intermediate_parallel * permuted_probs
+                intermediate_parallel = intermediate_parallel.to(original_dtype)
             return intermediate_parallel
 
         # Only set up the checkpoint when a backward pass will actually follow.
@@ -1741,13 +1712,6 @@ class SequentialMLP(MegatronModule):
     ):
         """Forward step of the SequentialMLP."""
 
-        if permuted_probs is None:
-            # Routing weights are applied by the dispatcher (token-dedup weighted combine).
-            permuted_probs = torch.ones(
-                (permuted_local_hidden_states.shape[0],),
-                dtype=permuted_local_hidden_states.dtype,
-                device=permuted_local_hidden_states.device,
-            )
         if self.config.moe_apply_probs_on_input:
             assert (
                 self.config.moe_router_topk == 1

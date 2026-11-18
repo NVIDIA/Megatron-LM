@@ -197,12 +197,7 @@ class MoEModelTestContainer:
             moe_layer.token_dispatcher, hidden_states, probs, indices
         )
 
-        # permuted_probs is None when the dispatcher applies the routing weights in its combine
-        # (token-dedup weighted combine); the experts then skip the multiply, and so does this.
-        if permuted_probs is not None:
-            permuted_local_hidden_states = permuted_local_hidden_states * permuted_probs.unsqueeze(
-                -1
-            )
+        permuted_local_hidden_states = permuted_local_hidden_states * permuted_probs.unsqueeze(-1)
         permuted_local_hidden_states = permuted_local_hidden_states.to(dtype=self.test_dtype)
 
         restored_hidden_states, restored_bias = token_unpermutation(

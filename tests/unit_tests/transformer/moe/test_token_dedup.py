@@ -12,7 +12,6 @@ from megatron.core.transformer.moe.token_dedup import (
     permute_token_dedup_expert_output,
     reduce_token_dedup_expert_output,
     restore_token_dedup_output,
-    weighted_reduce_token_dedup_expert_output,
 )
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEDeduplicatingAlltoAllTokenDispatcher,
@@ -108,48 +107,6 @@ def test_received_expansion_and_wire_permutation_preserve_gradients():
     assert torch.equal(expert_output.grad[:, 0], torch.tensor([1.0, 4.0, 3.0, 2.0]))
 
 
-def test_weighted_reduce_and_restore_match_post_combine_weighting():
-    expert_output = torch.tensor(
-        [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]], requires_grad=True
-    )
-    # Wire 0 contains two experts for token 0. Wires 1 and 2 contain the two
-    # experts for token 1 on different destinations.
-    wire_to_expert_rows = torch.tensor([[0, 1], [2, -1], [-1, 3]])
-    wire_probs = torch.tensor([[0.25, 0.75], [0.4, 0.0], [0.0, 0.6]], requires_grad=True)
-    token_wire_rows = torch.tensor([[0, -1], [1, 2]])
-    wire_tokens = torch.tensor([0, 1, 1])
-
-    partials = weighted_reduce_token_dedup_expert_output(
-        expert_output, wire_to_expert_rows, wire_probs
-    )
-    output = restore_token_dedup_output(partials, token_wire_rows, wire_tokens)
-
-    expected = torch.stack(
-        (
-            expert_output[0] * wire_probs[0, 0] + expert_output[1] * wire_probs[0, 1],
-            expert_output[2] * wire_probs[1, 0] + expert_output[3] * wire_probs[2, 1],
-        )
-    )
-    assert torch.equal(output, expected)
-
-    grad = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
-    output.backward(grad)
-    expected_expert_grad = torch.stack(
-        (grad[0] * 0.25, grad[0] * 0.75, grad[1] * 0.4, grad[1] * 0.6)
-    )
-    assert torch.equal(expert_output.grad, expected_expert_grad)
-    assert torch.equal(
-        wire_probs.grad,
-        torch.tensor(
-            [
-                [(grad[0] * expert_output[0]).sum(), (grad[0] * expert_output[1]).sum()],
-                [(grad[1] * expert_output[2]).sum(), 0.0],
-                [0.0, (grad[1] * expert_output[3]).sum()],
-            ]
-        ),
-    )
-
-
 def test_reduce_and_restore_sum_expert_rows():
     expert_output = torch.arange(8, dtype=torch.float32).view(4, 2).requires_grad_()
     # Wire 0 holds two experts of token 0; wires 1 and 2 hold token 1's experts.
@@ -178,13 +135,10 @@ def test_reduce_and_restore_sum_expert_rows():
 class _DedupContainer(MoEModelTestContainer):
     """MoEModelTestContainer whose MoE layer uses the deduplicating alltoall dispatcher."""
 
-    def __init__(self, *args, weighted_combine=True, moe_router_dtype="fp32", **kwargs):
+    def __init__(self, *args, moe_router_dtype="fp32", **kwargs):
         super().__init__(*args, **kwargs)
         self.config = dataclasses.replace(
-            self.config,
-            moe_token_dedup=True,
-            moe_token_dedup_weighted_combine=weighted_combine,
-            moe_router_dtype=moe_router_dtype,
+            self.config, moe_token_dedup=True, moe_router_dtype=moe_router_dtype
         )
         self.moe_layer = self.new_moe_layer()
 
@@ -198,7 +152,7 @@ class TestTokenDedupDispatcher:
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("ep_size", [2, 8])
     def test_dropless_roundtrip(self, ep_size):
-        """Dispatch -> expand -> weighted combine -> restore must reproduce the input (and grad)."""
+        """Dispatch -> expand -> combine -> restore must reproduce the input (and grad)."""
         if Utils.world_size % ep_size != 0:
             pytest.skip(f"needs a world size divisible by EP={ep_size}")
         container = _DedupContainer(
@@ -215,12 +169,8 @@ class TestTokenDedupDispatcher:
     @pytest.mark.internal
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("ep_size,topk", [(2, 2), (8, 2), (8, 6)])
-    @pytest.mark.parametrize("weighted_combine", [False, True])
-    def test_matches_stock_dispatcher(self, ep_size, topk, weighted_combine):
+    def test_matches_stock_dispatcher(self, ep_size, topk):
         """Full MoELayer fwd+bwd: dedup and the stock alltoall dispatcher agree on identical weights.
-
-        Covers both combine modes: the weighted combine (experts handed all-ones weights) and
-        experts-side weighting with a plain-sum combine.
 
         Only the summation order of a token's expert outputs differs, so the comparison is at
         fp32 rounding level; TF32 matmuls are disabled for the comparison because their
@@ -235,19 +185,18 @@ class TestTokenDedupDispatcher:
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.set_float32_matmul_precision("highest")
         try:
-            self._matches_stock_dispatcher(ep_size, topk, weighted_combine)
+            self._matches_stock_dispatcher(ep_size, topk)
         finally:
             torch.backends.cuda.matmul.allow_tf32 = prev_tf32
             torch.set_float32_matmul_precision(prev_precision)
 
-    def _matches_stock_dispatcher(self, ep_size, topk, weighted_combine):
+    def _matches_stock_dispatcher(self, ep_size, topk):
         container = _DedupContainer(
             tp_size=1,
             ep_size=ep_size,
             pp_size=1,
             num_moe_experts=32,
             moe_router_topk=topk,
-            weighted_combine=weighted_combine,
             moe_router_dtype="fp64",
         )
         dedup_layer = container.moe_layer
