@@ -1,4 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Adapted from https://github.com/NVIDIA-NeMo/nv-mistralai-megatron/pull/797
+# Source revision: aeab73be76294f8930377aae1e853b4e930e8dd0
+# License: BSD-3-Clause; original NVIDIA notices retained (see LICENSE).
 from __future__ import annotations
 
 import functools
@@ -22,16 +25,18 @@ from megatron.core._rank_utils import warn_single_rank
 from megatron.core.activations import situ_glu, squared_relu, tanh_soft_clamp
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
-from megatron.core.enums import Fp4Recipe, Fp8Recipe
+from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import (
     HAVE_TE,
     TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
     _get_fp8_autocast_for_quant_recipe,
     _get_fp8_autocast_recipe_for_quant_params,
+    _quantization_autocast_active,
 )
 from megatron.core.extensions.transformer_engine import (
     mark_grouped_tensor as _mark_te_grouped_tensor,
 )
+from megatron.core.extensions.transformer_engine import set_save_original_input
 from megatron.core.fp8_utils import is_grouped_tensor
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
@@ -150,6 +155,12 @@ def _require_te_tanh_clamp_support(config) -> None:
 
 class GroupedLinearFc1Interface(Protocol):
     """Interface for linear_fc1 module in TEGroupedMLP."""
+
+    save_original_input: bool
+
+    def will_execute_quantized(self, *, is_context_quantized: bool) -> bool:
+        """Return whether this invocation uses quantized computation."""
+        ...
 
     def forward(
         self, permuted_local_hidden_states: torch.Tensor, tokens_per_expert: list[int], /
@@ -406,17 +417,7 @@ class TEGroupedMLP(MegatronModule):
             and "moe_act" in self.config.recompute_modules
         )
         if self.activation_recompute and (self.config.fp8 or self.config.fp4):
-            from megatron.core.extensions.transformer_engine import set_save_original_input
-
             set_save_original_input(self.linear_fc2)
-
-        # This is to avoid the CPU overhead of multiple d2h copies
-        use_mxfp8 = self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.mxfp8
-        use_nvfp4 = self.config.fp4 and self.config.fp4_recipe == Fp4Recipe.nvfp4
-        if self.offload_expert_fc1 and not (use_mxfp8 or use_nvfp4):
-            from megatron.core.extensions.transformer_engine import set_save_original_input
-
-            set_save_original_input(self.linear_fc1)
 
         # Routed expert inputs use the same alignment via get_align_size_for_quantization.
         # Probe once here to keep signature inspection out of the first forward pass.
@@ -1044,6 +1045,28 @@ class TEGroupedMLP(MegatronModule):
         x = x.view(shape)
         return x
 
+    def _forward_fc1(
+        self, hidden_states: torch.Tensor, tokens_per_expert: torch.Tensor | list[int]
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Save the complete BF16 input when this invocation can offload FC1.
+
+        MTP and first/last-layer policies can disable quantization at runtime even
+        when the global recipe is MXFP8 or NVFP4. Per-module overrides still take
+        precedence over that ambient context. Restore the module's policy after
+        the call so a later quantized invocation keeps its original save behavior.
+        """
+        if not self.offload_expert_fc1 or self.linear_fc1.will_execute_quantized(
+            is_context_quantized=_quantization_autocast_active()
+        ):
+            return apply_module(self.linear_fc1)(hidden_states, tokens_per_expert)
+
+        previous_policy = self.linear_fc1.save_original_input
+        set_save_original_input(self.linear_fc1)
+        try:
+            return apply_module(self.linear_fc1)(hidden_states, tokens_per_expert)
+        finally:
+            self.linear_fc1.save_original_input = previous_policy
+
     def _unfused_forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -1194,7 +1217,7 @@ class TEGroupedMLP(MegatronModule):
                 offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
             )
             with expert_fc1_manager as permuted_local_hidden_states:
-                fc1_output, bias_parallel = apply_module(self.linear_fc1)(
+                fc1_output, bias_parallel = self._forward_fc1(
                     permuted_local_hidden_states, tokens_per_expert
                 )
             fc1_output = expert_fc1_manager.group_offload(
