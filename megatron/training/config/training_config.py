@@ -365,11 +365,8 @@ class LoggerConfig:
     to progress.txt file in checkpoint directory.
     """
 
-    timing_log_level: Literal[-1, 0, 1, 2] = 0
+    timing_log_level: Literal[0, 1, 2] = 0
     """Granularity level to measure and report timing.
-    -1: disable timer reports and optional operator timers. Level-0 measurements remain
-        enabled for training progress, throughput, and checkpoint bookkeeping; this does
-        not eliminate their synchronization overhead or suppress ordinary progress metrics.
     0: report only iteration time and make sure timing does not introduce extra overhead.
     1: report timing for operations that are executed very limited times (basically once) during each iteration
         (such as gradient all-reduce)

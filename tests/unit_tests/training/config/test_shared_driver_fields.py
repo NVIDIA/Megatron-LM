@@ -38,7 +38,7 @@ def test_driver_settings_survive_nested_serialization():
     assert loaded.dist.external_gpu_device_mapping is True
 
 
-def test_native_cli_owns_training_flags_and_accepts_disabled_timer_reports():
+def test_native_cli_owns_training_controls():
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
     flags = parser._option_string_actions
@@ -48,8 +48,6 @@ def test_native_cli_owns_training_flags_and_accepts_disabled_timer_reports():
         [
             "--eval-iters",
             "7",
-            "--timing-log-level",
-            "-1",
             "--no-check-optimizer-step-success",
             "--skip-sync-grad-norm-across-mp",
             "--max-steps",
@@ -60,7 +58,6 @@ def test_native_cli_owns_training_flags_and_accepts_disabled_timer_reports():
         ]
     )
     assert args.eval_iters == 7
-    assert args.timing_log_level == -1
     assert not args.check_optimizer_step_success
     assert args.skip_sync_grad_norm_across_mp
     assert args.max_steps == 1000
@@ -74,4 +71,4 @@ def test_native_cli_owns_training_flags_and_accepts_disabled_timer_reports():
     assert not defaults.external_gpu_device_mapping
     assert defaults.spiky_loss_factor == 10.0
     with pytest.raises(SystemExit):
-        parser.parse_args(["--timing-log-level", "-2"])
+        parser.parse_args(["--timing-log-level", "-1"])
