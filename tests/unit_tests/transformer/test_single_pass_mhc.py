@@ -36,23 +36,29 @@ def test_previous_mix_controls_input_and_receives_gradients(dtype, fused, monkey
     output = module.fused_h_res_h_post_bda(
         residual, residual_input, post, (branch, bias), 0.0, True, False
     )
-    reference = torch.matmul(residual.transpose(-1, -2), x.float().unflatten(-1, (4, 16)))
-    reference = reference + post.unsqueeze(-1) * (branch.float() + bias).unsqueeze(-2)
-    torch.testing.assert_close(output, reference.flatten(-2).to(dtype))
-    # Direct activation-dtype stores must preserve FP32 coefficient gradients.
+    # Build an independent graph for the reference. Compiled backwards may donate
+    # their saved buffers, so each graph is differentiated exactly once.
+    ref_state = SinglePassMHCState(previous)
+    ref_branch, ref_residual, ref_post, _ = module(x, mhc_state=ref_state, return_residual=True)
+    reference = torch.matmul(ref_residual.transpose(-1, -2), x.float().unflatten(-1, (4, 16)))
+    reference = reference + ref_post.unsqueeze(-1) * (ref_branch.float() + bias).unsqueeze(-2)
+    reference = reference.flatten(-2).to(dtype)
+    torch.testing.assert_close(output, reference)
+
+    actual_end = state.contract(output, 4)
+    reference_end = ref_state.contract(reference, 4)
+    torch.testing.assert_close(actual_end, reference_end)
     leaves = (x, previous, module.mapping_proj.weight, bias)
-    upstream = torch.randn_like(output) / output.numel()
-    actual_grads = torch.autograd.grad(output, leaves, upstream, retain_graph=True)
-    reference_grads = torch.autograd.grad(
-        reference.flatten(-2).to(dtype), leaves, upstream, retain_graph=True
+    upstream = (
+        torch.randn_like(output) / output.numel(),
+        torch.randn_like(actual_end) / actual_end.numel(),
     )
+    actual_grads = torch.autograd.grad((output, actual_end), leaves, upstream)
+    reference_grads = torch.autograd.grad((reference, reference_end), leaves, upstream)
     for actual, expected in zip(actual_grads, reference_grads):
         torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-2)
     torch.testing.assert_close(actual_grads[-1], reference_grads[-1], atol=1e-6, rtol=1e-5)
-    state.contract(output, 4).square().mean().backward()
-    assert previous.grad is not None and previous.grad.abs().sum() > 0
-    assert module.mapping_proj.weight.grad is not None
-    assert torch.isfinite(x.grad).all()
+    assert actual_grads[1].abs().sum() > 0 and actual_grads[2].abs().sum() > 0
 
 
 def test_entry_selects_first_stream_and_exit_uses_last_mix():
@@ -91,43 +97,3 @@ def test_fp32_mixing_is_preserved_under_outer_autocast(backend):
             )
     assert all(output.dtype == torch.float32 for output in outputs)
     torch.testing.assert_close(outputs[1], outputs[0], rtol=1e-5, atol=1e-6)
-
-
-@pytest.mark.parametrize("fused", [False, True])
-def test_single_pass_mhc_replays_bit_exact(fused):
-    """Replay the new inter-sublayer gradient edge as well as the parameter gradients."""
-    from tests.unit_tests.determinism.kernels.harness import assert_module_replays_bit_exact
-
-    config = TransformerConfig(
-        num_layers=1,
-        hidden_size=16,
-        num_attention_heads=2,
-        enable_mhc_connections=True,
-        mhc_single_pass=True,
-        use_fused_mhc=fused,
-    )
-
-    class Projection(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.mhc = HyperConnectionModule(config, 1).cuda()
-
-        def forward(self, hidden, previous):
-            state = SinglePassMHCState(previous)
-            branch, residual_mix, post, residual = self.mhc(
-                hidden, mhc_state=state, return_residual=True
-            )
-            output = self.mhc.fused_h_res_h_post_bda(
-                residual_mix, residual, post, (branch, None), 0.0, True, False
-            )
-            return state.contract(output, config.mhc_num_residual_streams)
-
-    assert_module_replays_bit_exact(
-        Projection(),
-        (
-            torch.randn(4, 1, 64, device="cuda", requires_grad=True),
-            torch.randn(4, 1, 4, device="cuda", requires_grad=True),
-        ),
-        replays=3,
-        what="single-pass mHC",
-    )

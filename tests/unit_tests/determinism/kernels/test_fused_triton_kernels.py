@@ -35,8 +35,11 @@ from megatron.core.fusions.fused_row_copy import contiguous_rows
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa_teacher_lse import (
     fused_csa_teacher_lse,
 )
+from megatron.core.transformer.hyper_connection import HyperConnectionModule, SinglePassMHCState
 from megatron.core.transformer.moe.moe_utils import pad_routing_map
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.determinism.kernels.harness import (
+    assert_module_replays_bit_exact,
     assert_replays_bit_exact,
     bytes_equal,
     seeded,
@@ -590,6 +593,52 @@ def test_native_mhc_sinkhorn_checkpoint_replays_with_limited_compile_cache(compi
             assert bytes_equal(replay_logits.grad, logits.grad)
     finally:
         torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("backend", _MHC_BACKENDS)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_single_pass_mhc_replays_bit_exact(backend, dtype):
+    """Replay the new inter-sublayer gradient edge as well as the parameter gradients."""
+    if backend == "triton" and not fused_mhc_kernels.is_triton_available():
+        pytest.skip("Triton mHC backend unavailable")
+    seeded()
+
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=2,
+        enable_mhc_connections=True,
+        mhc_single_pass=True,
+        use_fused_mhc=True,
+        mhc_fused_backend=backend,
+    )
+
+    class Projection(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mhc = HyperConnectionModule(config, 1).cuda()
+
+        def forward(self, hidden, previous):
+            state = SinglePassMHCState(previous)
+            branch, residual_mix, post, residual = self.mhc(
+                hidden, mhc_state=state, return_residual=True
+            )
+            output = self.mhc.fused_h_res_h_post_bda(
+                residual_mix, residual, post, (branch, None), 0.0, True, False
+            )
+            assert output.dtype == hidden.dtype and residual_mix.dtype == torch.float32
+            return state.contract(output, config.mhc_num_residual_streams)
+
+    assert_module_replays_bit_exact(
+        Projection(),
+        (
+            torch.randn(4, 1, 64, device="cuda", dtype=dtype, requires_grad=True),
+            torch.randn(4, 1, 4, device="cuda", requires_grad=True),
+        ),
+        replays=3,
+        contention=True,
+        what=f"single-pass mHC[{backend}, {dtype}]",
+    )
 
 
 @pytest.mark.parametrize("backend", _MHC_BACKENDS)
