@@ -27,13 +27,14 @@ from .phase import Phase
 
 
 class ExecutionAction(enum.Enum):
-    """Weight requests and reshards.
+    """Weight requests, reshards and completed local gradient contributions.
 
     UNSHARD records a weight request, including reuse of already gathered weights.
     """
 
     UNSHARD = enum.auto()
     RESHARD = enum.auto()
+    GRAD_READY = enum.auto()
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,7 @@ class ExecutionEvent:
     rowwise_only: bool = False
     # Full-owner gathered capacity, including representations retained by a partial release.
     unsharded_bytes: int | None = field(default=None, compare=False)
+    finalizes_outer: bool = False
 
 
 class _StoredEvent(NamedTuple):
@@ -63,6 +65,7 @@ class _StoredEvent(NamedTuple):
     allocated_bytes: int | None
     rowwise_only: bool
     unsharded_bytes: int | None
+    finalizes_outer: bool
 
 
 class ExecutionOrder:
@@ -94,6 +97,10 @@ class ExecutionOrder:
             item.rowwise_only and item.action is not ExecutionAction.RESHARD
         ):
             raise ValueError("rowwise_only is a boolean flag for RESHARD events only.")
+        if type(item.finalizes_outer) is not bool or (
+            item.finalizes_outer and item.action is not ExecutionAction.GRAD_READY
+        ):
+            raise ValueError("finalizes_outer is a boolean flag for GRAD_READY events only.")
         for name in ("allocated_bytes", "unsharded_bytes"):
             value = getattr(item, name)
             if value is not None and (type(value) is not int or value < 0):
@@ -107,6 +114,7 @@ class ExecutionOrder:
                 item.allocated_bytes,
                 item.rowwise_only,
                 item.unsharded_bytes,
+                item.finalizes_outer,
             )
         )
         return event_id
@@ -141,6 +149,7 @@ class ExecutionOrder:
             event_id,
             item.rowwise_only,
             item.unsharded_bytes,
+            item.finalizes_outer,
         )
 
     def view(self, *, action: ExecutionAction | None = None) -> "ExecutionOrderView":

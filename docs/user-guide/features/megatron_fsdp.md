@@ -250,6 +250,15 @@ callers must use prefetch sizes of `None` (one successor) or `0` (disabled).
 MoE EP overlap and NCCL user buffers are currently unsupported. Gradient
 accumulation and reduction modes are unchanged.
 
+### Reduce-scatter windows in MFSDP v2
+
+Set `--megatron-fsdp-rs-window-budget-mib` to a positive budget to accumulate full
+gradients between inner reduce-scatters. The default, `0`, disables windows.
+One eager iteration records the schedule before planning or CUDA graph capture;
+full-iteration graphs require at least one warmup iteration. This option is
+independent of weight retention and requires a fixed schedule with ordinary
+module hooks. MoE EP overlap and NCCL user buffers are unsupported.
+
 ### 🔁 Checkpoint Conversion
 
 Megatron-FSDP checkpointing supports [PyTorch Distributed Checkpoint (DCP)](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html). In Megatron-LM, this is the `--ckpt-format fsdp_dtensor` checkpointing format.

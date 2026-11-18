@@ -741,6 +741,8 @@ def finalize_model_grads(
             context.post_backward()
             if was_recording and model[0].ddp_config.megatron_fsdp_weight_retention:
                 FullyShardedDataParallelV2.compile_weight_retention(model, dp_cp_group)
+            if was_recording and model[0].ddp_config.megatron_fsdp_rs_window_budget_mib > 0:
+                context.compile_rs_window(dp_cp_group)
 
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:

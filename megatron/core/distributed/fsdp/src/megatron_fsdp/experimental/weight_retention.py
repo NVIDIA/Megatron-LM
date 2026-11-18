@@ -36,7 +36,12 @@ def build_retain_mask(execution_order, agreement_group, *, device):
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("Build the weight-retention mask before CUDA graph capture.")
 
-    records = [execution_order.seek(index) for index in range(len(execution_order))]
+    records = [
+        event
+        for index in range(len(execution_order))
+        if (event := execution_order.seek(index)) is None
+        or event.action is not ExecutionAction.GRAD_READY
+    ]
     owner_indices, policies, trace = {}, {}, []
     for index, event in enumerate(records):
         if event is None:
@@ -50,7 +55,7 @@ def build_retain_mask(execution_order, agreement_group, *, device):
         )
         trace.append(
             (
-                index,
+                event.event_id,
                 owner_index,
                 event.phase,
                 event.action,

@@ -103,7 +103,9 @@ def test_record_compile_replay_and_iteration_cleanup(mode):
         for chunk, owner in zip(chunks, owners):
             chunk.module = torch.nn.Sequential(owner)
             chunk.module.context = context
-            chunk.ddp_config = SimpleNamespace(megatron_fsdp_weight_retention=True)
+            chunk.ddp_config = SimpleNamespace(
+                megatron_fsdp_weight_retention=True, megatron_fsdp_rs_window_budget_mib=0
+            )
             chunk.finish_grad_sync = Mock(side_effect=lambda **_: context.finish_grad_sync())
         config = SimpleNamespace(
             timers=None,

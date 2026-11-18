@@ -454,7 +454,7 @@ class FsdpModule:
         torch.cuda.nvtx.range_pop()
 
     def post_accumulate_grad(self) -> None:
-        """Pack completed gradients and immediately launch their reductions."""
+        """Pack completed gradients and submit reductions at the planned boundary."""
         self.context.validate_grad_sync()
         self._reduce_gradient_groups()
 
@@ -468,17 +468,32 @@ class FsdpModule:
         with self._nvtx_range("reduce_gradients"):
             context = self.context
             inner_reduction_stream = context.inner_reduction_stream
+            finalizes_outer = (
+                context.gradient_finalization_mode is not GradientFinalizationMode.SKIP_OUTER
+            )
+            event = (
+                self._execution_event(ExecutionAction.GRAD_READY, finalizes_outer=finalizes_outer)
+                if context.rs_window_budget_bytes
+                else None
+            )
+            if event is not None and context.rs_plan is None:
+                raise RuntimeError("An FSDP replay started before the RS window was compiled.")
 
-            for group in self._parameter_groups:
+            for index, group in enumerate(self._parameter_groups):
                 if not group.requires_grad:
                     continue
 
-                if group.requires_inner_reduction:
+                end = context.rs_plan.get((event.event_id, index)) if event is not None else None
+                if end is not None:
+                    self._accumulate_rs_window(group, flush=end == event.event_id)
+                    if end != event.event_id:
+                        continue
+                elif group.requires_inner_reduction:
                     self._reduce_inner_gradients(group)
                 else:
                     self._accumulate_local_gradients(group)
 
-                if context.gradient_finalization_mode is GradientFinalizationMode.SKIP_OUTER:
+                if not finalizes_outer:
                     continue
                 # Finalize the DP-outer reduction. When overlap is enabled its stream is
                 # distinct, so it overlaps the following group's DP-inner reduce; the
@@ -489,6 +504,29 @@ class FsdpModule:
                     context.outer_reduction_stream.wait_stream(inner_reduction_stream)
                 with torch.cuda.stream(context.outer_reduction_stream):
                     group.reduce_outer_gradients()
+
+    def _accumulate_rs_window(self, group: FsdpParameterGroup, *, flush: bool) -> None:
+        context = self.context
+        current_stream = context.current_stream()
+        inner_stream = context.inner_reduction_stream
+        saved = context.rs_inputs.get(group)
+        if saved is None:
+            if flush:
+                raise RuntimeError("An RS window reached its flush without a pending input.")
+            with torch.cuda.stream(inner_stream):
+                partial_grad = group.allocate_partial_grad_buffer(dtype=group.main_grad.dtype)
+            current_stream.wait_stream(inner_stream)
+        else:
+            partial_grad, ready = saved
+            current_stream.wait_event(ready)
+        group.copy_gradients_to_partial_buffer(partial_grad, accumulate=saved is not None)
+        if flush:
+            inner_stream.wait_stream(current_stream)
+            with torch.cuda.stream(inner_stream):
+                group.reduce_inner_gradients(partial_grad.cast(group.grad_comm_dtype))
+            del context.rs_inputs[group]
+        else:
+            context.rs_inputs[group] = (partial_grad, current_stream.record_event())
 
     def _accumulate_local_gradients(self, group: FsdpParameterGroup) -> None:
         """Accumulate on compute without waiting for other groups' inner reductions."""
@@ -518,7 +556,12 @@ class FsdpModule:
             group.reduce_inner_gradients(partial_grad)
 
     def _execution_event(
-        self, action: ExecutionAction, *, phase: Phase | None = None, rowwise_only: bool = False
+        self,
+        action: ExecutionAction,
+        *,
+        phase: Phase | None = None,
+        rowwise_only: bool = False,
+        finalizes_outer: bool = False,
     ) -> ExecutionEvent | None:
         """Record a request or validate replay before its physical storage operation."""
         context = self.context
@@ -530,9 +573,10 @@ class FsdpModule:
             phase if action is ExecutionAction.UNSHARD else self.phase,
             action,
             rowwise_only=rowwise_only,
+            finalizes_outer=finalizes_outer,
             unsharded_bytes=(
                 sum(group.unsharded_storage_bytes for group in self.parameter_groups)
-                if recording
+                if recording and action is not ExecutionAction.GRAD_READY
                 else None
             ),
         )

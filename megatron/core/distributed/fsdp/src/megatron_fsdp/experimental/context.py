@@ -17,14 +17,20 @@
 import enum
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from typing import TYPE_CHECKING
 from weakref import WeakKeyDictionary
 
 import torch
 from torch import nn
 
 from .execution_order import ExecutionAction, ExecutionEvent, ExecutionOrder, ExecutionOrderView
+from .gradient_window import build_rs_plan
 from .phase import Phase
 from .runtime_policy import PrefetchOrder, RuntimePolicy
+
+if TYPE_CHECKING:
+    from .dbuffer import DBuffer
+    from .parameter_group import FsdpParameterGroup
 
 
 class GradientFinalizationMode(enum.Enum):
@@ -80,6 +86,8 @@ class FsdpContext:
         gradient_finalization_mode: GradientFinalizationMode = (
             GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
         ),
+        *,
+        rs_window_budget_bytes: int = 0,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -96,6 +104,8 @@ class FsdpContext:
             gradient_finalization_mode: Initial mode restored when a gradient-finalization
                 scope exits. The default waits automatically; callers that own the wait
                 can select REDUCE_OUTER and call finish_grad_sync() after backward.
+            rs_window_budget_bytes: Buffer budget for grouping inner reduce-scatters. Zero
+                reduces each contribution as soon as it is ready.
         """
         overlap_allgather_reduction = runtime_policy.overlap_allgather_reduction
         overlap_outer_communication = runtime_policy.overlap_outer_communication
@@ -103,6 +113,14 @@ class FsdpContext:
             device = torch.device("cuda", torch.cuda.current_device())
         if device.type != "cuda":
             raise ValueError(f"FsdpContext requires a CUDA device, got {device}.")
+        if rs_window_budget_bytes < 0:
+            raise ValueError("The FSDP reduce-scatter window budget must be nonnegative.")
+        if rs_window_budget_bytes and (
+            runtime_policy.prefetch_order is not PrefetchOrder.RECORDED
+            or runtime_policy.autograd_completes_execution
+            or runtime_policy.use_symmetric_memory
+        ):
+            raise ValueError("RS windows require recorded, caller-completed, ordinary buffers.")
 
         self._gradient_finalization_mode = gradient_finalization_mode
         self.autograd_completes_execution = runtime_policy.autograd_completes_execution
@@ -110,6 +128,9 @@ class FsdpContext:
         self.prefetch_order = runtime_policy.prefetch_order
         self.execution_order = ExecutionOrder()
         self.retain_mask: Mapping[int, bool] = {}
+        self.rs_window_budget_bytes = rs_window_budget_bytes
+        self.rs_plan: Mapping[tuple[int, int], int] | None = None
+        self.rs_inputs: dict[FsdpParameterGroup, tuple[DBuffer, torch.cuda.Event]] = {}
         self._execution_order_view: ExecutionOrderView | None = None
         self._prefetch_order_view: ExecutionOrderView | None = None
         self._recording_execution_order = runtime_policy.prefetch_order is PrefetchOrder.RECORDED
@@ -331,11 +352,25 @@ class FsdpContext:
         """Complete the execution order after all backwards in this schedule."""
         if not self.training:
             return
+        if self.rs_inputs:
+            raise RuntimeError("FSDP execution ended with unreduced RS window inputs.")
         self._finish_execution_order()
         # Speculative prefetch may gather an owner that never runs backward.
         # Final cleanup is physical work outside the logical U/R trace.
         for module in self._module_names:
             module.reshard(force=True)
+
+    def compile_rs_window(self, agreement_group: torch.distributed.ProcessGroup) -> None:
+        """Plan once after the complete eager iteration and before graph capture."""
+        view = self.execution_order_view
+        if view is None or view.position or self.rs_plan is not None:
+            raise RuntimeError("Compile the RS window once, at the completed recording boundary.")
+        self.rs_plan = build_rs_plan(
+            self.execution_order,
+            agreement_group,
+            device=self.inner_reduction_stream.device,
+            budget_bytes=self.rs_window_budget_bytes,
+        )
 
     def post_microbatch(self) -> None:
         """Release deferred module weights after each microbatch backward."""

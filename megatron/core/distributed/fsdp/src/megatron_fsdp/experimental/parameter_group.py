@@ -634,7 +634,7 @@ class FsdpParameterGroup:
             for axis, placement in enumerate(self.main_grad.placements)
         )
 
-    def allocate_partial_grad_buffer(self) -> DBuffer:
+    def allocate_partial_grad_buffer(self, *, dtype: torch.dtype | None = None) -> DBuffer:
         """Allocate the unreduced reduce-scatter input buffer."""
         assert self.main_grad is not None
 
@@ -648,14 +648,20 @@ class FsdpParameterGroup:
                 mesh=self.mesh,
                 placements=[Partial("avg")] * self.mesh.ndim,
                 layout=self.main_weight.layout,
-                dtype=self.grad_comm_dtype,
+                dtype=self.grad_comm_dtype if dtype is None else dtype,
                 device=grads[0].device,
             )
 
-    def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
+    def copy_gradients_to_partial_buffer(
+        self, partial_grad: DBuffer, *, accumulate: bool = False
+    ) -> None:
         """Pack full local gradients on compute into the reduce-scatter input buffer."""
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            partial_grad.get_tensor_view(index).copy_(fsdp_parameter.unsharded.grad)
+            destination = partial_grad.get_tensor_view(index)
+            if accumulate:
+                destination.add_(fsdp_parameter.unsharded.grad)
+            else:
+                destination.copy_(fsdp_parameter.unsharded.grad)
             fsdp_parameter.unsharded.grad = None
 
     def accumulate_local_gradients(self) -> None:

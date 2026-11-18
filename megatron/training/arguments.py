@@ -2985,6 +2985,13 @@ def _add_distributed_args(parser):
     group.add_argument('--megatron-fsdp-weight-retention', action='store_true', default=False,
                        help='Reuse MFSDP v2 gathered weights within its standard double-buffer '
                             'window, planned from one complete recorded iteration.')
+    group.add_argument(
+        '--megatron-fsdp-rs-window-budget-mib',
+        type=int,
+        default=0,
+        help='Budget in MiB for MFSDP v2 unreduced-gradient windows. '
+        'Zero disables them; a positive budget requires one eager iteration.',
+    )
     group.add_argument('--overlap-outer-communication', action='store_true',
                        help="Overlap outer-DP and inner-DP gradient reductions "
                             "with Megatron-FSDP v2.")

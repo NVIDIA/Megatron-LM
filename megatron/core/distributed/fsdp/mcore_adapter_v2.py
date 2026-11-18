@@ -291,15 +291,18 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # after the schedule completes, including delayed wgrad and custom 1F1B work.
         active_context = current_fully_shard_context()
         prefetch_order = self.prefetch_order_for(config, ddp_config)
+        rs_window_budget_bytes = ddp_config.megatron_fsdp_rs_window_budget_mib * 1024**2
         if active_context is None:
             construction_context = fully_shard_context(
                 FsdpContext(
                     device=device,
                     gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER,
+                    rs_window_budget_bytes=rs_window_budget_bytes,
                     runtime_policy=RuntimePolicy(
                         prefetch_order=prefetch_order,
                         autograd_completes_execution=not (
                             ddp_config.megatron_fsdp_weight_retention
+                            or ddp_config.megatron_fsdp_rs_window_budget_mib > 0
                             or config.pipeline_model_parallel_size > 1
                             or config.virtual_pipeline_model_parallel_size is not None
                         ),
@@ -309,6 +312,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 )
             )
         else:
+            if active_context.rs_window_budget_bytes != rs_window_budget_bytes:
+                raise ValueError("MFSDP v2 RS window budget differs from the active context.")
+            if rs_window_budget_bytes and active_context.use_symmetric_memory:
+                raise ValueError("MFSDP v2 RS windows do not support NCCL user buffers.")
             if ddp_config.megatron_fsdp_weight_retention and active_context.use_symmetric_memory:
                 raise ValueError("MFSDP v2 weight retention does not support NCCL user buffers.")
             if (
@@ -348,9 +355,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
     def prefetch_order_for(
         config: TransformerConfig, ddp_config: DistributedDataParallelConfig
     ) -> "PrefetchOrder":
-        """Record ordinary pipeline schedules and weight-retention iterations."""
+        """Record pipeline schedules and iterations using weight retention or RS windows."""
         if not config.overlap_moe_expert_parallel_comm and (
             ddp_config.megatron_fsdp_weight_retention
+            or ddp_config.megatron_fsdp_rs_window_budget_mib > 0
             or config.pipeline_model_parallel_size > 1
             or config.virtual_pipeline_model_parallel_size is not None
         ):
@@ -400,6 +408,13 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 raise ValueError("MFSDP v2 weight retention requires ordinary module hooks.")
             if ddp_config.nccl_ub:
                 raise ValueError("MFSDP v2 weight retention does not support nccl_ub.")
+        if ddp_config.megatron_fsdp_rs_window_budget_mib > 0:
+            if config.overlap_moe_expert_parallel_comm:
+                raise ValueError("MFSDP v2 RS windows require ordinary module hooks.")
+            if ddp_config.nccl_ub:
+                raise ValueError("MFSDP v2 RS windows do not support nccl_ub.")
+            if config.cuda_graph_impl == "full_iteration" and config.cuda_graph_warmup_steps < 1:
+                raise ValueError("MFSDP v2 RS windows require an eager iteration before capture.")
         if config.moe_virtual_expert_load_balance:
             raise ValueError(
                 "MoonEP is not yet integrated with Megatron-FSDP v2. Supporting it requires "
