@@ -28,6 +28,10 @@ on:
     types: [checks_requested]
 
 jobs:
+  bridge-changes:
+    if: github.repository == 'NVIDIA/Megatron-LM'
+    uses: ./.github/workflows/_bridge_only.yml
+
   pre-flight:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@037094bcc9138c72bc125418e6e3653f9e1c4160 # v1.11.0
     with:
@@ -35,9 +39,10 @@ jobs:
     if: github.repository == 'NVIDIA/Megatron-LM'
 
   pip-test-pytorch:
-    needs: [pre-flight]
+    needs: [bridge-changes, pre-flight]
     if: |
-      !(needs.pre-flight.outputs.docs_only == 'true'
+      needs.bridge-changes.outputs.bridge_only != 'true'
+      && !(needs.pre-flight.outputs.docs_only == 'true'
       || needs.pre-flight.outputs.is_merge_group == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
       && github.repository == 'NVIDIA/Megatron-LM'
@@ -86,9 +91,10 @@ jobs:
           python-binary: ${{ env.UV_PROJECT_ENVIRONMENT }}/bin/python
 
   uv-test-pytorch:
-    needs: [pre-flight]
+    needs: [bridge-changes, pre-flight]
     if: |
-      !(needs.pre-flight.outputs.docs_only == 'true'
+      needs.bridge-changes.outputs.bridge_only != 'true'
+      && !(needs.pre-flight.outputs.docs_only == 'true'
       || needs.pre-flight.outputs.is_merge_group == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
       && github.repository == 'NVIDIA/Megatron-LM'
@@ -134,7 +140,7 @@ jobs:
       #     python-binary: ${{ env.UV_PROJECT_ENVIRONMENT }}/bin/python
 
   install-test-summary:
-    needs: [pre-flight, pip-test-pytorch, uv-test-pytorch]
+    needs: [bridge-changes, pre-flight, pip-test-pytorch, uv-test-pytorch]
     runs-on: ubuntu-latest
     name: Install test summary
     if: |
@@ -155,7 +161,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.run_id }}
-          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' }}
+          SKIPPING_IS_ALLOWED: ${{ needs.bridge-changes.outputs.bridge_only == 'true' || needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' }}
         run: |
           FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success")] | length') || echo 0
 

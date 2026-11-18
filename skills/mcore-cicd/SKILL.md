@@ -65,6 +65,14 @@ Images are pushed to:
 
 ---
 
+## Bridge-only changes
+
+GitHub build and test workflows skip work when the complete diff contains only
+`examples/bridge/**` and/or `megatron/bridge/**`. Required summaries and the
+coverage status still report the intentional skip. Any other changed path,
+including Bridge unit tests or packaging files, retains normal CI. Empty or
+unavailable diffs keep CI enabled. Scheduled and manual runs retain normal CI.
+
 ## CI Test Scope Labels
 
 The CI pipeline reads PR labels to decide test scope, n_repeat, and container image.

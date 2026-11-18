@@ -1,0 +1,45 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Detect Bridge-only changes
+
+on:
+  workflow_call:
+    outputs:
+      bridge_only:
+        description: All changed files are under examples/bridge or megatron/bridge
+        value: ${{ jobs.detect.outputs.bridge_only }}
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      bridge_only: ${{ steps.diff.outputs.bridge_only || 'false' }}
+    steps:
+      - name: Get PR info
+        id: pr
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/pull-request/')
+        continue-on-error: true
+        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
+
+      - name: Checkout
+        id: checkout
+        if: github.event_name == 'push' || github.event_name == 'merge_group'
+        continue-on-error: true
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify complete diff
+        id: diff
+        if: steps.checkout.outcome == 'success'
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.merge_group.base_sha || fromJSON(steps.pr.outputs.pr-info || '{}').base.sha || (!startsWith(github.ref, 'refs/heads/pull-request/') && github.event.before) || '' }}
+          HEAD_SHA: ${{ github.sha }}
+          USE_MERGE_BASE: ${{ github.event_name == 'merge_group' || startsWith(github.ref, 'refs/heads/pull-request/') }}
+        run: bash .github/scripts/bridge_only.sh

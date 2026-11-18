@@ -71,6 +71,10 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
+  bridge-changes:
+    if: github.repository == 'NVIDIA/Megatron-LM'
+    uses: ./.github/workflows/_bridge_only.yml
+
   validate-inputs:
     runs-on: ubuntu-latest
     steps:
@@ -90,9 +94,10 @@ jobs:
     if: github.repository == 'NVIDIA/Megatron-LM' && github.event_name != 'workflow_dispatch'
 
   bump:
-    needs: [pre-flight, validate-inputs]
+    needs: [bridge-changes, pre-flight, validate-inputs]
     if: |
-      !cancelled() && !failure()
+      needs.bridge-changes.outputs.bridge_only != 'true'
+      && !cancelled() && !failure()
       && github.repository == 'NVIDIA/Megatron-LM'
       && !(needs.pre-flight.outputs.docs_only == 'true'
            || needs.pre-flight.outputs.is_merge_group == 'true'
@@ -115,9 +120,10 @@ jobs:
     secrets: inherit  # pragma: allowlist secret
 
   build-test-publish-wheels:
-    needs: [pre-flight, bump]
+    needs: [bridge-changes, pre-flight, bump]
     if: |
-      !cancelled() && !failure() && needs.bump.result == 'success'
+      needs.bridge-changes.outputs.bridge_only != 'true'
+      && !cancelled() && !failure() && needs.bump.result == 'success'
       && github.repository == 'NVIDIA/Megatron-LM'
       && (
         github.event_name == 'workflow_dispatch'
