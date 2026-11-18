@@ -41,6 +41,31 @@ def test_remove_non_pickleables_preserves_torch_size():
     assert cleaned == original
 
 
+@pytest.mark.parametrize("source_is_bf16", [True, False])
+def test_weight_comparison_preserves_differences_between_fp32_and_bf16(source_is_bf16):
+    from io import StringIO
+    from types import SimpleNamespace
+
+    import torch
+    from rich.console import Console
+
+    from megatron.bridge.models.conversion.utils import weights_verification_table
+
+    bf16 = {"equal": torch.tensor([1.0], dtype=torch.bfloat16)}
+    bf16["different"] = bf16["equal"].clone()
+    fp32 = {"equal": torch.tensor([1.0]), "different": torch.tensor([1.001])}
+    # Rounding the FP32 value down to BF16 would incorrectly hide this difference.
+    source, exported = (bf16, fp32) if source_is_bf16 else (fp32, bf16)
+    bridge = SimpleNamespace(
+        hf_pretrained=SimpleNamespace(state=source),
+        export_hf_weights=lambda model, show_progress: iter(exported.items()),
+    )
+    output = StringIO()
+    Console(file=output, width=120, color_system=None).print(weights_verification_table(bridge, []))
+    assert output.getvalue().count("✅") == 1
+    assert output.getvalue().count("❌") == 1
+
+
 @pytest.mark.parametrize(
     ("window_size", "expected"), [(None, None), (2048, 2048), ((2047, 0), 2048), ([2047, 0], 2048)]
 )
