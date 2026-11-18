@@ -488,7 +488,7 @@ Currently, Megatron-FSDP supports two `DeviceMesh`(s), one for dense / non-exper
 - Dense modules typically have a `DeviceMesh` with data parallel, tensor parallel, and context parallel dimensions, where the data parallel dimension is used for FSDP. Typically, both data-parallel and context-parallel ranks are used for sharding in FSDP.
 - Mixture-of-experts modules typically have a `DeviceMesh` with data parallel, tensor parallel, and expert parallel dimensions, where the data parallel dimension is used for FSDP.
 
-For more information about Mixture-of-Experts in Megatron-Core, refer to the [Megatron-Core User Guide - MoE](https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/features/moe.html).
+For more information about Mixture-of-Experts in Megatron-Core, refer to the [Megatron-Core User Guide - MoE](moe.md).
 
 #### Non-Uniform / Un-Even Model Sharding
 

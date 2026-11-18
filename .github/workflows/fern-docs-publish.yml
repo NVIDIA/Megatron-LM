@@ -18,9 +18,9 @@
 # To publish:  git tag docs/v1.2.0 && git push origin docs/v1.2.0
 # Or use the "Run workflow" button in the Actions tab.
 #
-# This is the only workflow that holds the publish token, and it is only reachable
-# from a tag push or a manual dispatch, both of which require write access. Never
-# add a pull_request or pull_request_target trigger here.
+# Production is only reachable from a tag push or a manual dispatch. Never add
+# a pull_request or pull_request_target trigger here. Preview deployments are
+# handled separately and skip contributions from forks.
 #
 # Required configuration:
 # - Environment: fern-publish, restricted to main and docs/v* tags, with required reviewers
@@ -39,17 +39,24 @@ permissions:
 
 concurrency:
   group: fern-publish
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
+  check:
+    if: >-
+      github.repository == 'NVIDIA/Megatron-LM' &&
+      (github.ref_type == 'tag' || github.ref_name == 'main')
+    uses: ./.github/workflows/fern-docs-ci.yml
+
   publish:
+    needs: check
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     environment: fern-publish
     steps:
       - name: Checkout repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          fetch-tags: true
           persist-credentials: false
 
       - name: Set up Fern CLI
@@ -60,7 +67,8 @@ jobs:
           FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
         working-directory: ./fern
         run: |
-          set -o pipefail
+          set -euo pipefail
+          : "${FERN_TOKEN:?Set the FERN_TOKEN repository secret before publishing.}"
           fern generate --docs 2>&1 | tee /tmp/fern-output.log
           URL=$(grep -oP 'Published docs to \K.*(?= \()' /tmp/fern-output.log || true)
           if [ -n "$URL" ]; then

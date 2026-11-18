@@ -35,7 +35,7 @@ runs:
     - name: Setup Node.js
       uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
       with:
-        node-version: '20'
+        node-version: '22'
 
     - name: Install Fern CLI
       shell: bash
@@ -44,7 +44,7 @@ runs:
       run: |
         set -euo pipefail
         VERSION=$(jq -r '.version // empty' "$CONFIG_PATH")
-        if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+        if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
           echo "::error::Invalid fern-api version '${VERSION}' in ${CONFIG_PATH}"
           exit 1
         fi

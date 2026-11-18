@@ -13,17 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Validates Fern docs configuration on pull requests.
+# Validates configuration, MDX, and links, including the revision selected for publishing.
 
 name: Fern docs (check)
 
 on:
+  # Run for every PR so this job can be required without path-filtered pending checks.
   pull_request:
-    paths:
-      - 'docs/**'
-      - 'fern/**'
-      - '.github/actions/setup-fern/**'
-      - '.github/workflows/fern-docs-ci.yml'
+  merge_group:
+    types: [checks_requested]
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+  workflow_call: {}
 
 permissions:
   contents: read
@@ -31,16 +33,28 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          fetch-tags: true
           persist-credentials: false
 
       - name: Set up Fern CLI
         uses: ./.github/actions/setup-fern
 
+      - name: Test preview workflow safeguards
+        run: python3 .github/scripts/test_fern_docs_preview.py
+
+      # Keep PR validation secretless, including for contributions from forks.
       - name: Validate Fern configuration
         working-directory: ./fern
         run: fern check
+
+      - name: Validate MDX
+        working-directory: ./fern
+        run: fern docs md check
+
+      - name: Check broken links
+        working-directory: ./fern
+        run: fern docs broken-links --strict
