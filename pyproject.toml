@@ -107,6 +107,7 @@ dev = [
     "av",
     "Pillow>=13.0.0",
     "flashinfer-python>=0.7.2,<0.8.0",
+    "flash-attn-4[cu13]==4.0.0b27",
     "nvidia-cudnn-frontend[cutedsl]==1.32.0",
     "wget",
     "onnxscript",
@@ -235,7 +236,7 @@ no-build-isolation-package = [
 ]
 link-mode = "copy"
 # The Mamba revision retained from main pins an older TileLang/TVM FFI family.
-# Override those transitive constraints for cuDNN Frontend 1.29 compatibility.
+# Override those transitive constraints for cuDNN Frontend and FlashAttention-4 compatibility.
 # We don't define override-dependencies globally but rather locally where we need it.
 # For instance, when installing into a PyTorch base image, we don't want to install torch,
 # torchvision, and triton.
@@ -244,8 +245,8 @@ override-dependencies = [
     "torchvision; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
     "filelock>=4.2.1",  # CVE-2026-112940; multi-storage-client 0.51 caps filelock below 4
-    "tilelang==0.1.12",
-    "apache-tvm-ffi==0.1.11",
+    "tilelang==0.1.13",
+    "apache-tvm-ffi==0.1.12",
     # TorchX 0.7.0 caps urllib3 below 1.27; require the fix for GHSA-38jv-5279-wg99.
     "urllib3>=2.6.3",
 ]
