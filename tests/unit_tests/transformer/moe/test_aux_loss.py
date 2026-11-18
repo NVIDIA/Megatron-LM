@@ -1065,9 +1065,8 @@ class TestDeferredGlobalAuxLoss:
                 x = hidden_states.detach().clone().requires_grad_(True)
                 output, _ = moe_layer(x, padding_mask=padding_mask)
                 assert router._pending_global_aux_loss is None
-                # Deferred, the loss and its count accumulation run in backward, except for a
-                # repeated MTP layer, which waits after combine.
-                assert int(router.ga_steps) == (step if defer and not mtp_repeated else step + 1)
+                # Deferred, the loss and its count accumulation run in backward.
+                assert int(router.ga_steps) == (step if defer else step + 1)
                 output.float().pow(2).mean().backward()
                 assert int(router.ga_steps) == step + 1
                 results["outputs"].append(output.detach().clone())
@@ -1117,13 +1116,16 @@ class TestDeferredGlobalAuxLoss:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("backward_order", ["forward", "reverse", "summed"])
     @pytest.mark.parametrize("calculate_per_token_loss", [False, True])
     @pytest.mark.parametrize("tp_size,ep_size,cp_size", [(1, 1, 1), (1, 8, 1), (2, 2, 2)])
     def test_backward_wait_with_forwards_ahead(
-        self, tp_size, ep_size, cp_size, calculate_per_token_loss
+        self, tp_size, ep_size, cp_size, calculate_per_token_loss, backward_order
     ):
-        """1F1B order: every micro-batch's forward runs before the first backward. Waiting in
-        backward must still give micro-batch k the counts of micro-batches 1..k."""
+        """Every micro-batch's forward runs before the first backward (as in 1F1B), and backward
+        visits the micro-batches in forward order, in reverse, or through one summed loss (which
+        autograd runs newest first). Waiting in backward must still give micro-batch k the counts
+        of micro-batches 1..k."""
         container = MoEModelTestContainer(
             tp_size=tp_size,
             ep_size=ep_size,
@@ -1157,8 +1159,15 @@ class TestDeferredGlobalAuxLoss:
                 inputs.append(x)
                 outputs.append(output)
             assert int(router.ga_steps) == (0 if defer else len(micro_batches))
-            for output in outputs:
-                output.float().pow(2).mean().backward()
+            losses = [output.float().pow(2).mean() for output in outputs]
+            if backward_order == "forward":
+                for loss in losses:
+                    loss.backward()
+            elif backward_order == "reverse":
+                for loss in reversed(losses):
+                    loss.backward()
+            else:
+                sum(losses).backward()
             assert int(router.ga_steps) == len(micro_batches)
             return {
                 "input_grads": [x.grad.clone() for x in inputs],
@@ -1174,7 +1183,11 @@ class TestDeferredGlobalAuxLoss:
             reference = run(defer=False)
             deferred = run(defer=True)
             assert torch.equal(reference["tokens_per_expert"], deferred["tokens_per_expert"])
-            assert torch.equal(reference["loss"], deferred["loss"])
+            if backward_order == "forward":
+                assert torch.equal(reference["loss"], deferred["loss"])
+            else:
+                # The same per-micro-batch losses, logged (summed) in backward order.
+                torch.testing.assert_close(reference["loss"], deferred["loss"], rtol=1e-6, atol=0)
             assert torch.equal(reference["router_grad"], deferred["router_grad"])
             for ref, out in zip(reference["input_grads"], deferred["input_grads"]):
                 assert torch.equal(ref, out)

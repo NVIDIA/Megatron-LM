@@ -1203,10 +1203,11 @@ class TransformerConfig(ModelParallelConfig):
     flag the all-reduce is launched asynchronously in the router and waited for at the start of
     the MoE layer's backward, where the loss is computed, logged and differentiated. The loss
     changes no forward activation, so the all-reduce overlaps dispatch, expert computation,
-    combine and the remaining layers' forward. The loss value and gradients are unchanged.
-    A training forward whose backward never runs records no global aux loss, and the backward of
-    a MoE layer may run only once. Repeated MTP layers, which call one router several times per
-    micro-batch, wait after combine instead. Applies to training forwards of ``MoELayer.forward``
+    combine and the remaining layers' forward. Each micro-batch's counts are reduced together
+    with the running sum over the earlier micro-batches, so the loss value and gradients are
+    unchanged whatever order backward visits the micro-batches in. A training forward whose
+    backward never runs records no global aux loss, and the backward of a MoE layer may run only
+    once. Applies to training forwards of ``MoELayer.forward``
     that run route through combine in one call and are not being captured into a CUDA graph;
     other paths (e.g. ``overlap_moe_expert_parallel_comm``) keep the synchronous all-reduce.
     Recomputation that includes the router (full recompute, or the ``moe`` recompute module)
