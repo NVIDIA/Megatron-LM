@@ -13,9 +13,8 @@ from functools import lru_cache
 from pathlib import Path
 
 from ..runtime.planner import MAX_PRICED_GROUP_SEQUENCES
-from ..runtime.timeline import _freeze_op
+from ..runtime.timeline import layer_program
 from .base import NVLINK_DOMAIN_SIZES
-from .benchmark import BenchmarkTimeline
 from .full35b import PARAMETERS_SHA256
 from .full35b.gdn_features import features as gdn_features
 from .full35b.geometry import dot, fa_features, pack_geometry
@@ -47,9 +46,13 @@ def _duration(value, label):
 class Qwen35FullCostModel:
     """Compose all 40 decoder layers and the MTP layer in their actual order.
 
-    Frozen FA/GDN predictions cover the whole attention module, including its
+    FA/GDN predictions cover the whole attention module, including its
     projections and layout work. Required user timings exclude that module and
     include MoE/EP and other remaining work. No density regression is loaded.
+
+    One coefficient vector per direction prices a module at every CP size: the
+    CP size enters through the features (a ring set-up, one round per further
+    rank, the work of the slowest rank of each round), not through a table.
 
     The features evaluate every pack in the layout of the measured source, where the
     padding tail extends the last sequence. The tail policy the training run executes
@@ -98,27 +101,40 @@ class Qwen35FullCostModel:
         if hashlib.sha256(raw).hexdigest() != PARAMETERS_SHA256:
             raise ValueError('Frozen full Qwen3.5-35B parameter hash mismatch')
         parameters = json.loads(raw)
-        if parameters.get('schema') != 'qwen35-full35b-fixed-input-runtime/1':
+        if parameters.get('schema') != 'qwen35-full35b-module-costs/2':
             raise ValueError('Unsupported full Qwen3.5-35B parameter schema')
         manifest_raw = (root / 'manifest.json').read_bytes()
         manifest = json.loads(manifest_raw)
         for name, digest in manifest['packaged_sha256'].items():
             if hashlib.sha256((root / name).read_bytes()).hexdigest() != digest:
                 raise ValueError(f'Frozen full Qwen3.5-35B source hash mismatch: {name}')
-        self.attention = parameters['attention']
-        self.layers = parameters['layers']
-        self.cache = parameters['cache']
-        self.original_status = parameters['source_status']
+        # Coefficients by direction: one vector for every CP size (see full35b/geometry.py
+        # and full35b/gdn_features.py for the features they multiply).
+        self.full_attention = parameters['full_attention']
+        self.gdn = parameters['gdn']
+        self.accuracy = parameters['accuracy']
         self.source_execution_domain = parameters['source_execution_domain']
+        # The actual order: three GDN layers and one FA layer, ten times, then the FA MTP layer.
         expected = ('gdn', 'gdn', 'gdn', 'fa') * 10 + ('fa',)
-        if tuple(layer['kind'] for layer in self.layers) != expected:
-            raise ValueError('Full Qwen3.5-35B requires the actual 40 decoder + 1 MTP ordering')
+        names = parameters['layer_names']
+        self.layers = [
+            dict(kind=kind, name=names['decoder'].format(index=index))
+            for index, kind in enumerate(expected[:-1])
+        ]
+        self.layers.append(dict(kind='fa', name=names['mtp']))
         self.layer_types = expected
+        # With CP > 1 the first GDN layer builds the CP context in its forward pass (the
+        # cold pass of the measured source); every other GDN forward pass is hot.
+        self._cold_layer = self.layers[0]['name']
         self.source_hashes = {
             'parameters.json': PARAMETERS_SHA256,
             'manifest.json': hashlib.sha256(manifest_raw).hexdigest(),
             'source_candidate.json': manifest['source_candidate_sha256'],
             **{'source/' + name: digest for name, digest in manifest['source_sha256'].items()},
+            **{
+                'points/' + name: digest
+                for name, digest in manifest['measured_points_sha256'].items()
+            },
         }
         self.non_attention = self._non_attention_inputs(non_attention)
         self.iteration_tail_ms = self.non_attention.get('iteration_tail_ms', 0.0)
@@ -240,26 +256,20 @@ class Qwen35FullCostModel:
         self._check_cp(cp)
         point = pack_geometry(lengths, cp)
         features = fa_features(point)
-        fa = {
-            phase: dot(self.attention['models_fa_module'][str(cp)][phase]['coefficients'], features)
-            for phase in ('forward', 'backward')
-        }
+        fa = {phase: dot(self.full_attention[phase], features) for phase in ('forward', 'backward')}
+        # GDN forward is the hot pass; the backward price does not depend on the cache pass.
         gdn = {
-            phase: {
-                branch: dot(
-                    self.attention['models_gdn_module'][phase + '_cache' + str(branch)][
-                        'coefficients'
-                    ],
-                    gdn_features(point, phase),
-                )
-                for branch in (0, 1)
-            }
+            phase: dot(self.gdn[phase], gdn_features(point, phase))
             for phase in ('forward', 'backward')
         }
         return fa, gdn
 
     def attention_components(self, lengths, cp, *, cache_pass=0, scope='module'):
-        """Expose unchanged source FA/GDN module predictions for one cache branch."""
+        """Expose the FA/GDN module predictions for the cold (0) or the hot (1) GDN pass.
+
+        ``cache_pass=0`` adds the cold constant to the GDN forward price. The constant was
+        fitted at CP > 1; the planner never prices a cold pass at CP 1.
+        """
         if scope != 'module':
             raise ValueError(
                 'Full Qwen3.5-35B predicts whole attention modules, not core attention'
@@ -267,9 +277,10 @@ class Qwen35FullCostModel:
         if type(cache_pass) is not int or cache_pass not in (0, 1):
             raise ValueError('GDN cache_pass must be 0 or 1')
         fa, gdn = self._attention_costs(tuple(lengths), cp)
+        cold = self.gdn['first_layer_cold_forward_ms'] if cache_pass == 0 else 0.0
         return {
             'fa': {'module': dict(fa)},
-            'gdn': {'module': {phase: gdn[phase][cache_pass] for phase in ('forward', 'backward')}},
+            'gdn': {'module': {'forward': gdn['forward'] + cold, 'backward': gdn['backward']}},
         }
 
     @lru_cache(maxsize=65536)
@@ -279,10 +290,10 @@ class Qwen35FullCostModel:
         for layer in self.layers:
             name, kind = layer['name'], layer['kind']
             for phase in ('forward', 'backward'):
-                branch = self.cache['by_cp'][str(cp)][name][phase] if kind == 'gdn' else 0
-                result[name + ':attention:' + phase] = (
-                    gdn[phase][branch] if kind == 'gdn' else fa[phase]
-                )
+                cost = gdn[phase] if kind == 'gdn' else fa[phase]
+                if phase == 'forward' and cp > 1 and name == self._cold_layer:
+                    cost += self.gdn['first_layer_cold_forward_ms']
+                result[name + ':attention:' + phase] = cost
                 result[name + ':nonattention:' + phase] = self._fixed[phase][name]
         result['outer_microbatch'] = self.microbatch_ms
         return result
@@ -303,45 +314,26 @@ class Qwen35FullCostModel:
         return sum(values[layer['name'] + ':attention:backward'] for layer in self.layers) / 41
 
     def _execution_program(self):
-        forward, backward = [], []
-        for layer in self.layers:
-            forward.extend(
-                [
-                    dict(sync='cp', cost=layer['name'] + ':attention:forward'),
-                    dict(sync='ep', duration_ms=self._fixed['forward'][layer['name']]),
-                ]
-            )
-        for layer in reversed(self.layers):
-            backward.extend(
-                [
-                    dict(sync='ep', duration_ms=self._fixed['backward'][layer['name']]),
-                    dict(sync='cp', cost=layer['name'] + ':attention:backward'),
-                ]
-            )
-        backward.append(dict(sync='local', duration_ms=self.microbatch_ms))
-        return [dict(layer_count=41, forward=forward, backward=backward)]
+        program = layer_program(
+            [
+                (
+                    layer['name'] + ':attention:forward',
+                    self._fixed['forward'][layer['name']],
+                    layer['name'] + ':attention:backward',
+                    self._fixed['backward'][layer['name']],
+                )
+                for layer in self.layers
+            ]
+        )
+        program['backward'].append(dict(sync='local', duration_ms=self.microbatch_ms))
+        return [program]
 
     def timing(self):
         """Use the full model's ordered layer program and only user-supplied tails."""
         return dict(
             execution_program=copy.deepcopy(self.execution_program),
             iteration_tail_ms=self.iteration_tail_ms,
-        )
-
-    def build_timeline(self, geometry):
-        """Score the complete 41-layer program with the shared benchmark E2E engine."""
-        self.check_domain(geometry)
-        program = self.execution_program[0]
-        return BenchmarkTimeline(
-            world_size=geometry.world_size,
-            ep_size=geometry.ep_size,
-            layer_count=41,
-            iteration_tail_ms=self.iteration_tail_ms,
             first_forward_dp_cp_sync=self.first_forward_dp_cp_sync,
-            program=tuple(
-                tuple(_freeze_op(op) for op in program[phase]) for phase in ('forward', 'backward')
-            ),
-            execution_program=self.execution_program,
         )
 
     def clear(self):
@@ -351,12 +343,9 @@ class Qwen35FullCostModel:
 
     def metadata(self):
         """Report the model scope, the fixed inputs, the source domain and its accuracy gates."""
-        # Held-out gate results of the source fits: the facts, without its status labels.
-        accuracy = {
-            gate: passed
-            for gate, passed in self.original_status['accuracy'].items()
-            if type(passed) is bool
-        }
+        # Held-out gate results of the packaged coefficients (limits and figures: ``fit`` in
+        # full35b/parameters.json).
+        accuracy = dict(self.accuracy)
         return dict(
             name=self.name,
             model='Qwen3.5-35B-A3B',
@@ -370,7 +359,7 @@ class Qwen35FullCostModel:
             attention_prediction_scope='WHOLE_MODULE_ONLY',
             whole_attention_module_includes_projections=True,
             core_prediction_available=False,
-            gdn_feature_schema=self.attention['gdn_feature_schema'],
+            gdn_feature_schema=self.gdn['feature_schema'],
             non_attention=copy.deepcopy(self.non_attention),
             non_attention_scope='fixed user times excluding the whole FA/GDN attention module',
             non_attention_mapping_keys=[
@@ -387,8 +376,8 @@ class Qwen35FullCostModel:
             executed_tail_padding=self.executed_tail_padding,
             scientific_accuracy_passed=bool(accuracy) and all(accuracy.values()),
             accuracy=accuracy,
-            cache_observed_cp_sizes=list(self.cache['observed_cp_sizes']),
-            full_cp_cache_observation_claimed=self.cache['fullCP_observation_claimed'],
-            forward_cache_policy=self.cache['forward_policy'],
-            backward_cache_policy=self.cache['backward_policy'],
+            cache_observed_cp_sizes=list(self.gdn['cache']['observed_cp_sizes']),
+            full_cp_cache_observation_claimed=self.gdn['cache']['fullCP_observation_claimed'],
+            forward_cache_policy=self.gdn['cache']['forward_policy'],
+            backward_cache_policy=self.gdn['cache']['backward_policy'],
         )

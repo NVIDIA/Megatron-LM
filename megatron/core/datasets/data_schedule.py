@@ -563,7 +563,13 @@ def validate_dynamic_cp_runtime(config, pg_collection: ProcessGroupCollection) -
     Call it on every rank once the model configuration and its process groups exist. It
     reads the JSON file, checks it against the training configuration, creates the trace
     directory, has the DPxCP leader probe the cost model for every CP size the scheduler
-    may use, and confirms that every rank read the same file. The file is not read again:
+    may use, and confirms that every rank read the same file. With more than one pipeline
+    stage it also confirms that every rank of every stage validated the same settings,
+    within each stage and, over the pipeline group, between the stages: every stage plans
+    alone. Both comparisons are made over the groups of one tensor-parallel rank: with a
+    tensor-parallel size above 1 a difference on a single process stops the ranks of its
+    own tensor-parallel rank only, and the other ranks wait until the time-out of the
+    process groups (``check_cost_model_coverage``). The file is not read again:
     ``wrap_data_iterator`` reuses the validated result.
 
     Args:
@@ -586,7 +592,8 @@ def validate_dynamic_cp_runtime(config, pg_collection: ProcessGroupCollection) -
     if dp_cp_group is None or pp_group is None:
         raise ValueError('dynamic_cp_runtime_config needs the dp_cp and pp process groups')
     spec = _dynamic_cp_runtime_spec(config, dp_cp_group, pp_group)
-    check_cost_model_coverage(config, dp_cp_group)
+    # With more than one pipeline stage the stages are compared over the pipeline group.
+    check_cost_model_coverage(config, dp_cp_group, pp_group)
     return spec
 
 
@@ -603,7 +610,13 @@ def wrap_data_iterator(
     and return the num_micro_batches for sequence packing.
 
     Args:
-        data_iterator: The original data_iterator to wrap around
+        data_iterator: The original data_iterator to wrap around. With virtual pipeline
+            stages it is the list with one iterator per model chunk, of which the scheduler
+            reads the first one that is not None. With the runtime DCP scheduler and more
+            than one pipeline stage it must be None or, with virtual pipeline stages, that
+            list, with one entry per virtual stage (another type raises TypeError, another
+            length ValueError), and, without virtual pipeline stages, the data iterator
+            itself (a list raises TypeError).
         config: The config object containing the max_seqlen_per_dp_cp_rank
         pg_collection: Caller-owned process groups; must define dp_cp, dp, tp, and pp.
     """
@@ -703,15 +716,59 @@ def wrap_data_iterator(
                 f'{config.max_seqlen_per_dp_cp_rank}, which must be a multiple of the packed '
                 f'sequence alignment {alignment}'
             )
-        if data_iterator is not None:
-            runtime = getattr(data_iterator, '_dcp_schedule_prefetcher', None)
+        # A specification with a pipeline is one of a run with more than one pipeline stage.
+        # With virtual pipeline stages the training loop passes a list with one entry per
+        # virtual stage: the data iterator of that model chunk, or None. run() reads the
+        # first iterator of the list, so the prefetcher belongs to that one; a list without
+        # any iterator (a rank that reads no data) gets none. Without virtual pipeline stages
+        # (one virtual stage in the specification) the training loop passes the data iterator
+        # itself, or None, as with one pipeline stage; run() reads no list then. An object
+        # of the other form is refused here, on every rank alike, before a prefetcher or a
+        # CPU worker exists: run() would fail on it later and less clearly. Only the type of
+        # the argument and, with virtual stages, the length of the list are checked, not
+        # the entries of the list. With one pipeline stage the argument is taken as it is.
+        has_pipeline = spec.get('pipeline') is not None
+        source = data_iterator
+        if has_pipeline and data_iterator is not None:
+            virtual = spec['pipeline']['virtual_stages']
+            if virtual == 1:
+                if isinstance(data_iterator, list):
+                    raise TypeError(
+                        'With more than one pipeline stage and no virtual pipeline stages '
+                        'wrap_data_iterator takes as data_iterator None or the data iterator '
+                        f'itself, not a list; got a list of {len(data_iterator)} entries'
+                    )
+            else:
+                expected = (
+                    'With more than one pipeline stage wrap_data_iterator takes as '
+                    'data_iterator None or the list with one entry per virtual pipeline stage '
+                    f'({virtual} entries, each a data iterator or None)'
+                )
+                if not isinstance(data_iterator, list):
+                    raise TypeError(f'{expected}; got a {type(data_iterator).__name__}')
+                if len(data_iterator) != virtual:
+                    raise ValueError(f'{expected}; got a list of {len(data_iterator)} entries')
+                source = next(
+                    (iterator for iterator in data_iterator if iterator is not None), None
+                )
+        if source is not None:
+            runtime = getattr(source, '_dcp_schedule_prefetcher', None)
             if runtime is None:
                 # Already done when validate_dynamic_cp_runtime ran at start-up.
-                check_cost_model_coverage(config, dp_cp_group)
+                check_cost_model_coverage(config, dp_cp_group, pp_group)
+                # With more than one pipeline stage every stage plans alone, and the
+                # prefetcher compares the plans over the pipeline group on every step.
+                pipeline_kwargs = dict(pp_group=pp_group) if has_pipeline else {}
                 runtime = DcpSchedulePrefetcher(
-                    data_iterator, dp_group, dp_cp_group, spec, spec['async'], spec['trace_dir']
+                    source,
+                    dp_group,
+                    dp_cp_group,
+                    spec,
+                    spec['async'],
+                    spec['trace_dir'],
+                    **pipeline_kwargs,
                 )
-                data_iterator._dcp_schedule_prefetcher = runtime
+                source._dcp_schedule_prefetcher = runtime
             scheduler.runtime = runtime
             scheduler.prefetch_next = prefetch_next
 

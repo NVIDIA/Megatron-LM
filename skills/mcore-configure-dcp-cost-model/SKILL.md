@@ -39,12 +39,14 @@ and expert parallel sizes, precision, recomputation, `--cp-comm-type`,
 `--max-seqlen-per-dp-cp-rank`, padding and tail policy. A model name alone
 does not establish coverage. Compare it with the README:
 
-- Ordinary GQA: the coverage tables (hardware, attention geometry, DPxCP, CP
-  group sizes per `max_seqlen_per_dp_cp_rank`) and the required training
-  settings.
+- Ordinary GQA: the coverage table (hardware, attention geometry, DPxCP, CP
+  group sizes, `max_seqlen_per_dp_cp_rank`), the measured errors and known
+  limits of its attention predictor, and the required training settings.
 - Full Qwen3.5-35B-A3B and the H100 calibration: the table of required
   settings. Each admits one configuration.
 - Original DynamicUSP profile: DPxCP and the minimum CP size are 8, 16 or 32.
+  It is the only cost model that takes a pipeline-parallel size above 1,
+  under the conditions of the README section "More than one pipeline stage".
 
 Do not change a model or hardware label to make another configuration fit.
 Report a configuration that no cost model covers.
@@ -74,7 +76,10 @@ only when the user asks for it.
 Start from the file and the launch block of the cost model in the
 configuration reference. Add `max_cp_size`, `async` or `trace_dir` when
 needed; any other key is rejected with the list of keys the type accepts. The
-file must be the same on every node.
+file must be the same on every node. The pipeline step terms and the Stage 2
+switch of `dynamic_usp` are neither keys of this file nor launch arguments:
+they are in the `solver` object of the coefficient table that `calibration`
+names.
 
 ## 5. Read the start-up result
 
@@ -84,7 +89,13 @@ names the scheduler type, the cost model, the hardware with its NVLink domain
 (`hardware=h100 (NVLink domain: 8 consecutive ranks)`), the CP group sizes,
 the sequence cap, `async` and the file. Check that the cost model and the CP
 group sizes are the intended ones and that the launch places the ranks as
-the NVLink domain says.
+the NVLink domain says. For the original DynamicUSP profile the line can go on
+with notices. A `calibration` table without `solver.sample_weight`:
+DynamicUSP's published default A, B, C of the Stage 1 sample weight are in
+use. Stage 2 switched on: it is on, or idle. More than one pipeline stage: the
+stages and the pipeline step terms that are not fitted for the run. The README
+sections "Original profile", "Stage 2" and "More than one pipeline stage" say
+what each means.
 
 When it fails, the message names what must change; the table "When start-up
 rejects the configuration" in the configuration reference lists the messages.
@@ -96,7 +107,9 @@ Set `trace_dir` to see what the scheduler does. Every rank writes
 Useful checks: `lookahead` shows whether batches are planned one step ahead,
 `statistics.incumbent_rejection` whether the default layout was discarded,
 `rows` and `predicted_ms` the plan and its predicted time, and
-`model_metadata` what the cost model loaded.
+`model_metadata` what the cost model loaded. For `dynamic_usp`,
+`statistics.stage2` shows what Stage 2 did and `statistics.pipeline` the step
+terms of a run with more than one pipeline stage.
 
 A batch that cannot be scheduled stops every rank with a
 `RuntimeScheduleError` that names the sample and the limits.

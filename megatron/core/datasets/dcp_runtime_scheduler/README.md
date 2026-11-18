@@ -1,296 +1,200 @@
 # CPU runtime DCP scheduling
 
 With dynamic context parallelism the default scheduler groups the DPxCP ranks
-(data-parallel size times context-parallel size) of every global batch with a
-workload heuristic. One argument replaces it with a CPU scheduler that plans
-each global batch from a cost model:
+(data-parallel size times context-parallel size) with a workload heuristic. One
+argument replaces it with a CPU scheduler that plans each global batch from a
+cost model; `type` in its file selects the cost model and its search algorithm:
 
 ```text
 --dynamic-cp-runtime-config /path/to/runtime.json
 ```
 
-`type` in that file selects a complete scheduler, a cost model bound to a
-search algorithm:
-
 | `type` | Cost model | Search algorithm |
 | --- | --- | --- |
 | `dcp_benchmark` | Packaged attention predictions plus the user's non-attention times per layer, for [ordinary GQA](#ordinary-gqa) or [full Qwen3.5-35B-A3B](#full-qwen35-35b-a3b); the training configuration decides which | Lightweight planner |
-| `dynamic_usp` | A DynamicUSP cost profile: the [original profile](#original-profile) or, with `"hardware": "h100"`, the [calibration measured for classic P2P](#measured-h100-calibration) | DynamicUSP allocation and count search |
+| `dynamic_usp` | A DynamicUSP cost profile: the [original profile](#original-profile) or, with `"hardware": "h100"`, the [calibration measured for classic P2P](#measured-h100-calibration) | DynamicUSP allocation and count search; [Stage 2](#stage-2) is an option of the original profile |
 
-The scheduler runs in one CPU process on the DPxCP leader and has no access to
+The scheduler runs in one CPU process on each DPxCP leader, without access to
 the GPUs. It decides which samples share a CP group and which ranks form each
-group; it does not change how context parallelism is executed. Model structure
-and parallel sizes come from the training configuration.
+group, not how context parallelism is executed. A runtime file and launch
+arguments for every cost model are in the [configuration
+reference](../../../../skills/mcore-configure-dcp-cost-model/references/model-options.md).
 
-The [configuration reference](../../../../skills/mcore-configure-dcp-cost-model/references/model-options.md)
-has a runtime file and launch arguments for every cost model.
-
-## Runtime file
+## Runtime file and start-up checks
 
 | Key | `type` | Meaning |
 | --- | --- | --- |
 | `type` | both | Required. `dcp_benchmark` or `dynamic_usp`. |
 | `hardware` | `dcp_benchmark` | Required. `h100` or `gb200`: selects the attention parameters and the [NVLink topology](#nvlink-topology). |
-| `non_attention` | `dcp_benchmark` | Required. Object with exactly `forward_ms_per_layer` and `backward_ms_per_layer`, the user's [non-attention times](#non-attention-times). |
+| `non_attention` | `dcp_benchmark` | Required. Object with exactly `forward_ms_per_layer` and `backward_ms_per_layer`, the user's [non-attention times](#dcp_benchmark-cost-models). |
 | `hardware` | `dynamic_usp` | Optional. `h100` selects the measured calibration; without it the original profile is used. |
 | `calibration` | `dynamic_usp` | Optional. Coefficient file that replaces the packaged coefficients of the selected profile. A relative path is resolved beside the runtime file. |
 | `max_cp_size` | both | Largest CP group the scheduler may form; see [CP group sizes](#cp-group-sizes). |
-| `async` | both | Optional, default `true`: plan the next global batch while the current one trains; see [Lookahead](#lookahead). |
+| `async` | both | Optional, default `true`: plan the next global batch while the current one trains; see [Planning during training](#planning-during-training). |
 | `trace_dir` | both | Optional. Directory for planning records; see [Trace records](#trace-records). `~` is expanded; a relative path is relative to the working directory. |
 
-These are all the keys. Another key, a key given twice, a missing required key
-or a value of the wrong type stops training while it starts; an unknown key is
-reported with the keys the selected `type` accepts. No key describes the
-network: the NVLink topology follows from `hardware`.
+These are all the keys: another key, a key given twice, a missing required key
+or a value of the wrong type stops training while it starts. Every rank reads
+and checks the file then, and not again: the schema when the arguments are
+parsed and, once the model is built, the file against the model and parallel
+configuration (each cost model's conditions are below) and the cost model's
+parameters for every CP group size the scheduler may form. A failed check stops
+training with a message that names what must change; the [configuration
+reference](../../../../skills/mcore-configure-dcp-cost-model/references/model-options.md#when-start-up-rejects-the-configuration)
+lists the messages. When all checks pass, rank 0 prints one line that starts
+with `Runtime DCP scheduler:` and names what the file selected: the cost model
+(`dcp_benchmark` for ordinary GQA, `qwen35_full`, `usp_calib_v1` for the
+original profile or `qwen3_h100_p2p`), the NVLink domain and CP group sizes.
 
-## Start-up validation
-
-The file is read and checked while training starts, on every rank, and is not
-read again during training:
-
-1. When the arguments are parsed: the keys and value types.
-2. After the model is built and before data is loaded: the file against the
-   model and parallel configuration (the conditions of the selected cost model
-   are listed below), and that the cost model has parameters for every CP group
-   size the scheduler may form. A size without parameters is reported together
-   with the `max_cp_size` that avoids it, when one exists. `trace_dir` is
-   created and write-tested.
-
-A failed check stops training with a message that names what must change. A
-message with "does not match the training configuration" names a launch
-setting. The
-[configuration reference](../../../../skills/mcore-configure-dcp-cost-model/references/model-options.md#when-start-up-rejects-the-configuration)
-lists the messages and what to change for each.
-
-When all checks pass, rank 0 prints one line with what the file selected:
-
-```text
-Runtime DCP scheduler: type=dcp_benchmark, cost model=dcp_benchmark, hardware=h100 (NVLink domain: 8 consecutive ranks), CP group sizes=[1, 2, 4, 8, 16, 32], at most 64 sequences per CP group, async=on, runtime file=/path/to/runtime.json
-```
-
-`cost model` is `dcp_benchmark` (ordinary GQA), `qwen35_full`, `usp_calib_v1`
-(the original DynamicUSP profile) or `qwen3_h100_p2p` (the H100 calibration).
-`NVLink domain` is the number of consecutive ranks the cost model takes to
-share one [NVLink domain](#nvlink-topology).
-
-Requirements for both types:
-
-- `--dynamic-context-parallel`, which itself requires
-  `--calculate-per-token-loss`.
-- Pipeline-parallel size 1 without virtual pipeline stages; sequence
-  parallelism off or tensor-parallel size 1.
-- `--min-dynamic-context-parallel-size` is a power of two that divides DPxCP.
-- The runtime file is byte-identical on every rank. Otherwise every rank stops
-  with the number of ranks that read a different file.
-- A `calibration` file does not change during a run. Its digest is recorded at
-  start-up; a planner process that later loads other bytes stops training.
+Both types require `--dynamic-context-parallel` (hence
+`--calculate-per-token-loss`), a `--min-dynamic-context-parallel-size` that is
+a power of two dividing DPxCP, sequence parallelism off or tensor-parallel size
+1, and one pipeline stage without virtual stages or the conditions of [more
+than one pipeline stage](#more-than-one-pipeline-stage). The runtime file must
+be byte-identical on every rank; a `calibration` file may not change in a run.
 
 ## CP group sizes
 
 The scheduler forms size-aligned CP groups whose sizes are powers of two that
 divide DPxCP, from `--min-dynamic-context-parallel-size` up to the largest size
 the cost model covers: 64 for ordinary GQA, 32 for full Qwen3.5, 8 for the H100
-calibration. The original DynamicUSP profile covers the sizes 8, 16 and 32.
+calibration; the original DynamicUSP profile covers 8, 16 and 32. A sample fits
+a group of `cp` ranks when its length, rounded up to a multiple of 2 x DPxCP,
+is at most `cp * max_seqlen_per_dp_cp_rank`. A group holds at most 64
+sequences, or a smaller `--thd-max-packed-sequences`, of which a dummy sequence
+appended by the tail policy takes one entry (64 gives 63).
 
-`max_cp_size` caps the group size. It must be exactly one of the sizes the run
-can form; another value is rejected with the list of those sizes, and nothing
-is rounded. A runtime file shared by runs with different DPxCP needs a value
-that is valid for each of them.
-
-When the largest size the run can form is not the full DPxCP group (DPxCP is
-not a power of two, or is larger than the cost model covers), `max_cp_size`
-must be set: samples that the training configuration admits could then not be
-scheduled, and start-up asks for that limit to be explicit and names the value.
-
-A sample fits a CP group of `cp` ranks when its length, rounded up to a
-multiple of 2 x DPxCP, is at most `cp * max_seqlen_per_dp_cp_rank`.
+`max_cp_size` caps the group size and must be exactly one of the sizes the run
+can form. Start-up requires it and names the value when the largest such size
+is not the full DPxCP group (DPxCP is not a power of two, or is larger than the
+cost model covers), to make the limit on the sample length explicit.
 
 ## NVLink topology
 
-The NVLink topology is not configured. It follows from `hardware`, and the
-cost model reads DPxCP rank `r` as a GPU of NVLink domain `r // N`:
+The NVLink topology is not configured. It follows from `hardware`, which makes
+the cost model read DPxCP rank `r` as a GPU of NVLink domain `r // N`:
 
 | `hardware` | NVLink domain | `N` |
 | --- | --- | --- |
 | `h100` | One node: 8 consecutive ranks | 8 |
 | `gb200` | One domain of 72 GPUs: every rank of the run | 72 |
 
-The scheduler forms size-aligned groups. On `h100` a group of up to 8 ranks
-therefore lies inside one node and a larger group covers whole nodes; on
-`gb200` every group lies inside the one domain:
-
-| Cost model | `hardware` | CP sizes inside one domain | CP sizes that cross domains |
-| --- | --- | --- | --- |
-| Ordinary GQA | `h100` | 1, 2, 4, 8 | 16, 32, 64: two, four and eight nodes |
-| Ordinary GQA | `gb200` | 1 to 64 | None |
-| Full Qwen3.5 | `gb200` | 1 to 32 | None |
-| H100 calibration | `h100` | 1, 2, 4, 8 | None; larger groups are not formed |
-| Original DynamicUSP profile | Not named | 8 | 16, 32: a ring over two and four nodes |
-
-A group has the same predicted time on whichever nodes it lies. For `h100`
-the ordinary GQA parameters cover a group that lies inside one node or starts
-on a node boundary and have no value for any other group; the H100
-calibration has none for a group that leaves a node. The scheduler forms
-neither.
-
-The original DynamicUSP profile takes no `hardware` and reads no rank
-positions. Its packaged table was measured on nodes of 8 GPUs, with the
-all-to-all of every 8 ranks inside a node and the ring between nodes; the
-start-up line shows that domain. A table given with `calibration` does not
-say where it was measured, and the line shows no domain.
-
-Start-up cannot see on which node a rank runs, so the launch has to match
-the table:
-
-- `h100`: ranks `8k` to `8k+7` run on one node, which means that every node
-  of the job contributes all 8 of its GPUs.
-- `gb200`: all ranks of the run belong to one 72-GPU NVLink domain.
-- Ranks are numbered node by node. `torch.distributed.run`, started once per
-  node with `--nnodes`, `--nproc-per-node` and `--node-rank` as in the
-  [SLURM launch skill](../../../../skills/mcore-run-on-slurm/SKILL.md),
-  gives the workers of the node with `--node-rank n` the ranks from
-  `n * nproc_per_node` on; on `h100` nodes, `--nproc-per-node 8` gives the
-  placement above.
-
-The cost models that take `hardware` require tensor- and pipeline-parallel
-size 1, so that a DPxCP rank is the global rank of the launch.
-
-## Sequences per CP group
-
-A CP group holds at most 64 sequences, the range the cost models cover. A
-smaller `--thd-max-packed-sequences` applies instead. When the tail policy
-appends a dummy sequence (`append_dummy_seq` with `--pad-packed-seq-alignment`)
-one of the `--thd-max-packed-sequences` entries is reserved for it, so 64 gives
-63. Ordinary GQA on DPxCP = 64 holds at most 32 sequences in a group of 64
-ranks. The start-up line shows the cap of the run.
+Start-up cannot see on which node a rank runs, so the launch has to match the
+table: on `h100` every node of the job contributes all 8 of its GPUs. Ranks are
+numbered node by node: `torch.distributed.run`, started once per node with
+`--nnodes`, `--nproc-per-node` and `--node-rank` as in the [SLURM launch
+skill](../../../../skills/mcore-run-on-slurm/SKILL.md), gives the workers of
+the node with `--node-rank n` the ranks from `n * nproc_per_node` on.
 
 ## Planning during training
 
-### Lookahead
+With `"async": true` a training step plans the next global batch while the
+current one trains, when it is not the last step, the dataloader type is not
+`external`, and the next batch can be read ahead: `--num-workers` is above 0 or
+the varlen dataset (`--use-varlen-dataset`) is used. In every other case, and
+in evaluation, a batch is planned at the start of its step. With
+`--num-workers 0`, reading ahead makes a dataset transform that draws random
+numbers in the training process draw them before the current step trains.
 
-With `"async": true` the scheduler plans the next global batch while the
-current one trains. A training step does this when it is not the last step,
-the dataloader type is not `external`, and the next batch can be read ahead:
-`--num-workers` is above 0 or the varlen dataset (`--use-varlen-dataset`) is
-used. In every other case, with `"async": false` and in evaluation, a batch is
-planned at the start of its step. The trace field `lookahead` says which
-happened for each batch.
-
-Lookahead reads the next batch one step early. With `--num-workers 0` a
-dataset transform that draws random numbers in the training process then
-draws them before the current step trains.
-
-### Default layout
-
-The default dynamic-CP heuristic still proposes a layout for every batch. It
-is only the starting point of the search. When it violates a constraint of
-the scheduler (a group larger than `max_cp_size`, a CP size the cost model
-does not cover, too many sequences in a group) it is discarded, the reason is
-recorded in the trace, and planning continues.
-
-### Errors
+The layout of the default dynamic-CP heuristic is the starting point of every
+search; one that violates `max_cp_size`, the CP sizes of the cost model or the
+sequence cap is discarded, with the reason in the trace.
 
 When a batch cannot be scheduled, for example because a sample fits no allowed
 CP size, every DPxCP rank raises the same `RuntimeScheduleError` at that step;
 the message names the sample and the limits. Any other planner failure is
-raised on every rank as `RuntimeError: CPU DCP planner failed: ...`. A planner
-that does not answer within 600 s stops every rank in the same way.
+raised on every rank as `RuntimeError: CPU DCP planner failed: ...`, and so is
+a planner that does not answer within 300 s; `--distributed-timeout-minutes`
+(default 10) must stay above those 300 s for this error to be the one reported.
+With tensor-parallel size above 1 only the ranks of tensor-parallel rank 0
+raise, which alone read data; the others wait until that time-out.
 
 ## Trace records
 
-With `trace_dir` every rank appends one JSON object per line to
-`rank<NNNNN>.jsonl` in that directory (`NNNNN` is the global rank). The
-directory is created and write-tested on every rank while training starts.
+With `trace_dir` every rank that reads data (tensor-parallel rank 0) appends
+one JSON object per line to `rank<NNNNN>.jsonl` (`NNNNN` is the global rank) in
+that directory, which every rank creates and write-tests at start-up.
 
 | Field | Meaning |
 | --- | --- |
-| `event` | `consume`: a planned batch is handed to training. `submit`: a batch was sent to the planner one step ahead. |
-| `iterator` | Data iterator of the record, numbered in the order the iterators are first scheduled in the process: 0 is the training iterator in a normal run, evaluation iterators follow. |
-| `sequence_number` | Batch counter of that iterator. |
-| `lookahead` | Whether the batch was planned one step ahead and used as planned. |
-| `asynchronous` | The configured `async`. |
+| `event` | `consume`: a planned batch is handed to training. `submit`: a batch was sent to the planner one step ahead; such a record has `iterator` and `sequence_number` and no plan. |
+| `iterator`, `sequence_number` | Data iterator of the record (0 is the training iterator in a normal run, evaluation iterators follow) and the batch counter of that iterator. |
+| `lookahead`, `asynchronous` | Whether the batch was planned one step ahead and used as planned; the configured `async`. |
 | `global_lengths`, `padded_lengths` | Sample lengths of the global batch, as read and as stored. |
-| `rows` | The plan: per microbatch and per DPxCP rank, the sample indices of the rank's CP group. Neighbouring ranks with the same list form one group. |
-| `predicted_ms` | Predicted time of the planned global batch. |
-| `statistics` | Search statistics. `incumbent_rejection` and `incumbent_rejection_detail` say why the default layout was discarded. `model_sequence_limits` lists the CP sizes for which the cost model holds fewer sequences than the cap, for example `{"64": 32}`. |
-| `model_metadata` | What the cost model loaded: its name, inputs and file digests. `nvlink_domain_size` is the `N` of the [NVLink topology](#nvlink-topology), or null when the cost model does not know it. For `dynamic_usp`, `calibration_path` and `calibration_sha256` identify the coefficient file in use. For full Qwen3.5, `source_tail_padding` and `executed_tail_padding`. |
-
-`submit` records have `event`, `iterator` and `sequence_number` and no plan.
+| `rows`, `predicted_ms` | The plan (per microbatch and per DPxCP rank, the sample indices of the rank's CP group; neighbouring ranks with the same list form one group) and its predicted time. |
+| `statistics` | Search statistics. `incumbent_rejection` and `incumbent_rejection_detail` say why the default layout was discarded; `model_sequence_limits` lists the CP sizes for which the cost model holds fewer sequences than the cap. For `dynamic_usp`: `candidates` (every microbatch count that was tried, with its predicted time or the reason it has no layout), `selected_incumbent`, `capacity_fallback` and `incumbent_unpriced` (a plan that is not a result of the [search](#dynamic_usp-cost-profiles), and why a default layout was not scored), `stage1_weight` (the sample weight in use: the object `{"A", "B", "C", "default"}` or the string `"cost_model_sample_work"`), `algorithm` (what scores the counts) and, with more than one pipeline stage, `pipeline` (the stages, the virtual stages, the `schedule`, the count multiple and the step terms in use). |
+| `statistics.stage2` | Only with [Stage 2](#stage-2) switched on: `skipped` (why Stage 2 did no work for the plan, else null), `counts` (the outcome of every microbatch; `ADOPTED`: re-packed), `planned` (the layout that the plan is: `stage2`, `stage1` or `default`), `stage1_predicted_ms` and `stage2_predicted_ms`, `microbatches` (a record for each microbatch that was re-packed, failed or is marked `runtime_capacity`, at most 64; `microbatches_omitted` counts the rest), `first_error` and `rescore_error` (a contained error) and `guard_threshold` (the threshold of the ring placement guard). |
+| `model_metadata` | What the cost model loaded: its name, inputs and file digests; `nvlink_domain_size`, the `N` of the [NVLink topology](#nvlink-topology) or null (original profile with a `calibration` table). For `dynamic_usp`, `calibration_path`, `calibration_sha256` and `solver`, the [solver coefficients](#original-profile) in use. For full Qwen3.5, `source_tail_padding` and `executed_tail_padding`. |
+| `pipeline`, `pipeline_terms_are_default`, `pipeline_terms_fitted_at`, `pipeline_agreement_key` | Only with [more than one pipeline stage](#more-than-one-pipeline-stage): the stages, the virtual stages and the count multiple (both 1 for a run without virtual stages); the `solver.pipeline` terms left at their defaults; the `solver.pipeline.fitted_at` record with `matches_run`, `"not recorded"` or null; the key of the lengths and the plan that the stages compared at this step. |
 
 ## `dcp_benchmark` cost models
+
+The cost model predicts the attention of every CP group. The rest of each layer
+is measured by the user: `forward_ms_per_layer` and `backward_ms_per_layer` are
+the time one rank spends in that rest of one layer during the forward or the
+backward pass of one microbatch, constants between 0 and 100000 ms. Nothing is
+inferred, fitted or defaulted. With full recomputation (ordinary GQA) the cost
+model itself replays each layer's forward before its backward, so the backward
+value excludes the replay. How to measure the values is in the [configuration
+reference](../../../../skills/mcore-configure-dcp-cost-model/references/model-options.md#measuring-non-attention-times).
 
 ### Ordinary GQA
 
 Used for every model without GDN layers. The cost model predicts the core
-attention of every CP group (the attention kernel with its context-parallel
-communication, without the projections); the rest of each layer is the user's
-[non-attention time](#non-attention-times).
+attention (the attention kernel with its context-parallel communication,
+without the projections); the user's value is everything else in the layer. The
+predictor (`models/attention.py`; its docstring has the formula) is an example
+of a cost model, not a calibrated product. Start-up admits:
 
-```json
-{
-  "type": "dcp_benchmark",
-  "hardware": "h100",
-  "non_attention": {
-    "forward_ms_per_layer": null,
-    "backward_ms_per_layer": null
-  }
-}
-```
-
-Both nulls must be replaced by measured numbers; the file is rejected until
-they are.
-
-The packaged attention parameters cover:
-
-| | |
+| Setting | Covered |
 | --- | --- |
 | `hardware` | `h100` or `gb200` |
 | `num_attention_heads` / `num_query_groups` / `kv_channels` | 32/4/128, 64/4/128, 16/2/256, 32/2/256, 32/8/128 or 64/8/128 |
 | DPxCP | Up to 64 |
-
-and these CP group sizes, depending on `max_seqlen_per_dp_cp_rank`:
-
-| `max_seqlen_per_dp_cp_rank` | `h100` | `gb200` |
-| --- | --- | --- |
-| 4096 | 1 to 64 | 1 to 64 with `kv_channels` 128; 1 only with `kv_channels` 256 |
-| 8192 | 1 only | 1 only |
-| 16384 | 1 only | None |
-| Another value | None | None |
-
-Where only size 1 is covered, the file needs `"max_cp_size": 1` and every
-sample has to fit one rank. Start-up reports every size without parameters.
-
-The training configuration must have:
-
-| Setting | Required value |
-| --- | --- |
+| CP group sizes | 1 to 64 |
+| `max_seqlen_per_dp_cp_rank` | Any even number of tokens up to 1,048,576; odd: CP group size 1 only (start-up asks for `"max_cp_size": 1`) |
 | Parallelism | `tensor_model_parallel_size` 1, `pipeline_model_parallel_size` 1, no virtual pipeline stages |
 | Attention | `attention_backend` `fused`, `cp_comm_type` `p2p`; no multi-latent attention, experimental attention variant or hybrid model |
 | Precision and mode | BF16 without FP8/FP4, `cuda_graph_impl` `none` |
 | Recomputation | `recompute_granularity` unset, or `full` with `recompute_method` `uniform` |
 | Per-rank buffer | `pad_packed_seq_alignment` `max` or equal to `max_seqlen_per_dp_cp_rank`, `thd_tail_padding_policy` `extend_last` |
 
+The coefficients come from two calibrations of NVIDIA's DCP attention
+benchmark; its source marks that of the causal block as not independently
+validated. The predictor was compared with whole core-attention times of the
+packs it was developed on, not with a blind set. Mean error, then known limits:
+
+| `hardware` | Measured | Forward | Backward |
+| --- | --- | --- | --- |
+| `gb200` | CP 1: 108 packs measured twice | 3.4 % | 2.5 % |
+| `gb200` | CP 2, 3 and 4: 108 packs | 11.1 % | 6.7 % |
+| `gb200` | CP 2, 3, 5 and 8 on 8 GPUs: 8 packs | 16.4 % | 11.5 % |
+| `h100` | CP 1: 108 packs measured twice | 3.1 % | 3.4 % |
+| `h100` | CP 1, other runs: 2088 measurements of 1296 packs | 3.8 % | 5.5 % |
+| `h100` | CP 2, 4, 9 and 16: 144 packs | 8.7 % | 3.8 % |
+| `h100` | CP 2, 3 and 4 inside one node: 108 packs | 5.7 % | 2.3 % |
+| `h100` | CP 17 to 128: 251 packs on 533 placements | 16.8 % | 5.2 % |
+
+- Forward plus backward is not monotonic in the valid tokens of a pack: in 176
+  of 589 steps that only added valid tokens it fell, by up to 43 %.
+- Under-prediction grows with the CP group, favouring large ones; most at 4096
+  tokens per rank: forward 30 % low at `h100` CP 17 to 64 (forward plus
+  backward 14 %), 25 % at `gb200` CP 5 and 8 (4 packs; none measured above).
+- Measured at 4096, 8192 and 16384 tokens per rank; other buffers, over 64
+  sequences at CP 1 and exchanges outside 8 to 128 MiB are extrapolated.
+- `gb200`, 32/2/256: the backward price of the causal block jumps between the
+  measured lengths (CP 1, one sequence: 4.9 ms at 9472 tokens, 8.2 ms at 9600).
+- No pack of more than 3 sequences was measured above CP 32; up to CP 32
+  (`h100`, backward) packs of 33 to 64 sequences are 8 % to 11 % low.
+
 ### Full Qwen3.5-35B-A3B
 
 Used when the model has GDN layers (`experimental_attention_variant` `gdn`).
-The cost model covers the complete model, 40 decoder layers and one MTP layer
-in their order: 30 GDN and 11 full-attention modules. It predicts each whole
-attention module, including projections and layout conversion; the rest of
-each layer is the user's [non-attention time](#non-attention-times), one value
-for all layers or one per layer type: `gdn`, `gqa` (full attention) and
-optionally `mtp` for the MTP layer, which otherwise uses the `gqa` value.
-
-```json
-{
-  "type": "dcp_benchmark",
-  "hardware": "gb200",
-  "non_attention": {
-    "forward_ms_per_layer": {"gdn": null, "gqa": null, "mtp": null},
-    "backward_ms_per_layer": {"gdn": null, "gqa": null, "mtp": null}
-  }
-}
-```
-
+The cost model covers the whole model, 40 decoder layers and one MTP layer, and
+predicts each whole attention module (30 GDN, 11 full attention) with
+projections and layout conversion. The user's value is everything outside it:
+one value for all layers or one per layer type, `gdn`, `gqa` (full attention)
+and optionally `mtp` for the MTP layer, which otherwise uses the `gqa` value.
 Start-up admits one configuration and names the first setting that differs:
 
 | Setting | Required value |
@@ -304,88 +208,130 @@ Start-up admits one configuration and names the first setting that differs:
 | Context parallelism | `cp_comm_type` `p2p`, `cp_partition_mode` `contiguous`, `attention_backend` `auto` or `fused` |
 | Per-rank buffer | `max_seqlen_per_dp_cp_rank` 16384, `pad_packed_seq_alignment` `max` or 16384 |
 
-CP groups have the power-of-two sizes from `--min-dynamic-context-parallel-size`
-up to 32. GDN with a fixed per-rank buffer uses the `append_dummy_seq` tail
-policy, so `--thd-max-packed-sequences 64` gives at most 63 sequences per
-group.
+One coefficient vector per direction prices a module at every CP size, fitted
+on the calibration packs of one measurement on 32 GB200 ranks (full attention:
+8 packs at each CP size; GDN: 512 points per direction). Error on its held-out
+packs, six pack shapes at each CP size, then the known limits:
 
-The FA/GDN module parameters were measured on 32 GB200 ranks with the native CP
-transport, ring-routed layout conversion and `extend_last` tail padding; here
-they are applied to classic P2P with power-of-two CP sizes and the
-`append_dummy_seq` tail policy that GDN requires.
+| Module | Held out | Forward, mean / worst | Backward, mean / worst |
+| --- | --- | --- | --- |
+| Full attention | 192 packs | 0.6 % / 2.9 % | 1.4 % / 8.2 % |
+| GDN | 256 points each | 2.2 % / 11.4 % | 1.8 % / 6.7 % |
 
-In the source experiment the full-attention module predictions met the
-accuracy target; the GDN module predictions and the attention modules taken
-together did not meet it on held-out cases. These results are recorded as
-flags (`source_status.accuracy` in `models/full35b/parameters.json`); no
-accuracy figures are packaged.
-
-### Non-attention times
-
-`forward_ms_per_layer` and `backward_ms_per_layer` are measured by the user:
-the time one rank spends in one layer during the forward or the backward pass
-of one microbatch, without the part the cost model predicts. That part differs
-between the two models:
-
-| Model | Predicted by the cost model | The user's value contains |
-| --- | --- | --- |
-| Ordinary GQA | Core attention: the attention kernel with its context-parallel communication | Everything else in the layer: QKV and output projections, normalisation, MLP or MoE with expert-parallel communication |
-| Full Qwen3.5 | The whole attention module (full attention or GDN) with projections and layout conversion | Everything outside the attention module: normalisation, MoE with expert-parallel communication |
-
-A value is a constant in milliseconds per layer, per microbatch and per rank,
-between 0 and 100000. Nothing is inferred, fitted or defaulted. With full
-recomputation (ordinary GQA) the cost model itself replays each layer's forward
-before its backward, so the backward value excludes the replay. The
-[configuration reference](../../../../skills/mcore-configure-dcp-cost-model/references/model-options.md#measuring-non-attention-times)
-describes how to measure the values.
+- Measured with the native CP transport, ring-routed layout conversion and
+  `extend_last` tail padding; applied here to classic P2P with power-of-two CP
+  sizes and the `append_dummy_seq` tail policy that GDN requires.
+- The weak spot is the full-attention backward price at CP 2 to 5 (2.4 % to
+  4.3 %, about 4 % low at CP 2). The measured packs hold 1 to 32 sequences
+  (GDN: up to 64) of at least 1,024 tokens and are 25 % to 98 % full; prices
+  outside that range are extrapolated.
+- Against the limits of the source experiment (3 % weighted error, 5 % at the
+  90th percentile, 10 % for one pack) the full-attention module passes and the
+  GDN forward pass does not (`fit` in `models/full35b/parameters.json`).
 
 ## `dynamic_usp` cost profiles
 
+Both profiles are planned by a port of DynamicUSP's `solve_gbs` (commit
+`1ff97a4ae0beb5e088fadb9e112265bdd194b24d`). For one number of microbatches,
+Stage 1 chooses the CP group sizes of every microbatch and places the samples
+so that the weight per rank is balanced. The count search lays out up to four
+microbatch counts from a lower bound on and plans the one whose predicted step
+time is lowest. `ORIGIN.json` lists every ported part, the differences, what is
+not included and what was compared with upstream. In short:
+
+- A CP group holds at most 64 sequences and stores every sequence padded to a
+  multiple of 2 x DPxCP; upstream has no sequence limit and counts unpadded
+  tokens. The lower bound on the count also counts sequences, and when capacity
+  rejects every count of the window the search goes on past it, over at most 16
+  counts, where upstream raises an error (`runtime/hot_switch.py`).
+- The default layout is scored with the same step time and kept unless the
+  search result is predicted faster; when the search yields no layout and none
+  was priced, a capacity-only layout is used. The trace statistics mark both.
+- The time of one layout grows about fourfold when the number of samples
+  doubles. Measured without a default layout on one host: below 1 s at 256
+  samples, up to about 40 s at 2048 and about 100 s at 4096.
+- Plans are defined on CPython 3.12 or later, the project's interpreter. An
+  older one rounds the built-in `sum` of floats differently, and plans were
+  seen to differ there: the H100 sample weight, Stage 1 of the original profile
+  on batches of equal lengths, the Stage 2 keep rule at an exact tie.
+
 ### Original profile
 
-```json
-{
-  "type": "dynamic_usp"
-}
-```
-
-DynamicUSP's original cost profile: a fixed synthetic model of 44 layers with
-24 query heads of dimension 160, U8 all-to-all plus ring communication and an
-iteration tail. It describes that structure and does not read the training
-model configuration, so its predictions do not follow the layers, heads or
-communication of the model that is trained. It needs DPxCP and
-`--min-dynamic-context-parallel-size` to be 8, 16 or 32, the CP group sizes of
-the profile, and takes no `non_attention` input.
+`{"type": "dynamic_usp"}` selects DynamicUSP's original cost profile: a fixed
+synthetic model of 44 layers with 24 query heads of dimension 160, U8
+all-to-all plus ring communication and an iteration tail. It reads neither the
+training model configuration nor the tensor- and expert-parallel sizes, so its
+predictions do not follow the model that is trained. It needs DPxCP and
+`--min-dynamic-context-parallel-size` to be 8, 16 or 32, its CP group sizes.
+Its packaged table was measured on nodes of 8 GPUs (all-to-all inside a node,
+ring between nodes); the start-up line shows that NVLink domain, and none for a
+`calibration` table.
 
 `calibration` names a coefficient table in the format of the packaged
-`models/usp_calib_v1.json`; it replaces the coefficients, not the formulas.
-The packaged table is the upstream example table and was not fitted to a
-Megatron model. The
-[calibration skill](../../../../skills/mcore-calibrate-dcp-runtime/SKILL.md)
-describes how to measure a table.
+`models/usp_calib_v1.json`, with `"version": "v1.1"`; it replaces the
+coefficients, not the formulas. The packaged table is the upstream example
+table and was not fitted to a Megatron model; the [calibration
+skill](../../../../skills/mcore-calibrate-dcp-runtime/SKILL.md) describes how
+to measure one. A table may carry a top-level `"solver"` object with the
+coefficients of the search; the packaged table has none, so the defaults apply:
+
+| Key | Meaning | Default |
+| --- | --- | --- |
+| `solver.sample_weight` | `{"A": a, "B": b, "C": c}`. The Stage 1 weight of a sample of L tokens is `max(1, A*L^2/1e10 + B*L/1e5 + C)`. | A = 7706.03421944, B = 6528.86747592, C = 351.14154099: upstream's published measured fit of the forward cost of one sample in a group of eight ranks, not derived from the packaged table. The start-up line has a notice when it applies to a `calibration` table. |
+| `solver.tier_time_factors` | `{"8": 1.0, "16": f16, "32": f32}`: predicted time per unit of per-rank weight at each CP size, relative to the smallest CP size the run forms. With it Stage 1 balances predicted time instead of weight. Values are at least 1; keys are CP sizes of the profile as plain decimal numbers, and a key above the largest size the run forms is ignored. The factors are used as written and are not rescaled: a run at DPxCP 32 with `--min-dynamic-context-parallel-size 16` needs a table derived for the sizes 16 and 32. A table of ones is off. | Absent: weight balance |
+| `solver.pipeline` | `per_mb_overhead_ms`: overhead per microbatch, added to the predicted step time once for every microbatch. `compute_fwd_share` and `comm_fwd_share`: forward shares of the compute and of the communication time of a group, numbers from 0 to 1; with one pipeline stage they change no prediction, as upstream, and with [more than one](#more-than-one-pipeline-stage) they split every group time into its forward and its backward part. `fitted_at`: `{"pipeline_parallel": P, "virtual_stages": V, "schedule": s}` with `s` `"interleaved"` or `"non_interleaved"`, all three required: the run in which the three terms were fitted; it changes no prediction. | `per_mb_overhead_ms` 0, `compute_fwd_share` 1/3.9, `comm_fwd_share` 0.5; no `fitted_at` |
+| `solver.stage2` | `{"enabled": true}` switches [Stage 2](#stage-2) on. Optional `"keep_threshold"`, a positive number: a sample with more than that many times the mean work per rank of its microbatch is placed first, in an empty group above 8 ranks. | Off; 8.4 |
+
+### More than one pipeline stage
+
+- Only the original profile plans for a pipeline-parallel size P above 1. With
+  virtual pipeline stages `microbatch_group_size_per_vp_stage` is unset or
+  equal to P and the number of microbatches of every plan is a multiple of P,
+  so a global batch needs at least P x DPxCP / (largest CP size of the run)
+  samples. Without them any number is planned, also below P.
+- The step time replays a 1F1B order on the forward and backward time of every
+  CP group (`runtime/pipeline.py`): upstream's interleaved order with virtual
+  stages, Megatron's order of a training step without. The three
+  `solver.pipeline` terms change it; the start-up line says when they are
+  defaults or are not recorded as fitted at the pipeline sizes of the run. The
+  stages count as equal shares of the model, which start-up does not inspect.
+- Every stage plans the same batch in its own CPU process. All ranks compare
+  their settings and Python version (major.minor) at start-up and their
+  gathered lengths and plans at every step; a difference stops training.
+- Not verified: P above 1 was not run on GPUs with NCCL process groups, and no
+  step time of it was compared with a measured one.
+
+### Stage 2
+
+DynamicUSP's Stage 2 (`runtime/stage2.py`; its docstring lists the differences
+from upstream) re-packs the samples of each microbatch on its fixed CP groups
+when that makes its slowest group faster. It is off by default and offered by
+the original profile only: `solver.stage2` in a `calibration` table switches it
+on. Start-up then prints `Stage 2 on (keep_threshold=...)`, or `Stage 2
+switched on but idle: ...` when the run forms no CP group above 8 ranks.
+
+- As upstream, the layout after Stage 2 is the result of the search; the port
+  scores it again with the step time, which can rise, and compares it with the
+  default layout. An error inside Stage 2 keeps the Stage 1 layout of the
+  microbatch (`PROFILE_EXECUTION_ERROR`); rank 0 warns once per process.
+- Groups above 8 ranks are placed under upstream's ring placement guard, which
+  requires two more table fields. A re-pack needs such a group next to another
+  group in a microbatch (DPxCP 32) and in each such group a sample above the
+  guard's floor: 33368 tokens at CP 16 for the packaged table ([calibration
+  skill](../../../../skills/mcore-calibrate-dcp-runtime/SKILL.md#stage-2)).
+- With Stage 2 on, plans were compared offline with unmodified upstream and are
+  equal for lengths that the runtime does not pad and groups below its sequence
+  limit. Training speed was not measured.
 
 ### Measured H100 calibration
 
-```json
-{
-  "type": "dynamic_usp",
-  "hardware": "h100",
-  "max_cp_size": 8
-}
-```
-
-A second cost profile of this type, produced with DynamicUSP's calibration
-procedure for classic P2P context parallelism and planned by the same search.
-The original profile describes U8 all-to-all plus ring groups of 8, 16 or 32
-ranks; classic P2P forms ring groups of 1, 2, 4 or 8 ranks without all-to-all.
-The calibration therefore has its own terms for each CP size: whole
-self-attention forward and backward per layer (projections and context-parallel
-communication included), an expert remainder that grows with the valid tokens
-and is averaged over each expert-parallel block, an overhead per microbatch and
-one iteration tail. It takes no `non_attention` input.
-
-The measured recipe is the domain. Start-up names the first setting that
-differs from it:
+`{"type": "dynamic_usp", "hardware": "h100", "max_cp_size": 8}` selects a
+second cost profile, produced with DynamicUSP's calibration procedure for
+classic P2P context parallelism (ring groups of 1, 2, 4 or 8 ranks without
+all-to-all) and planned by the same search. It prices whole self-attention per
+layer at each CP size, an expert remainder that grows with the valid tokens, an
+overhead per microbatch and one iteration tail. Start-up names the first
+setting that differs from the measured recipe:
 
 | Setting | Required value |
 | --- | --- |
@@ -400,39 +346,34 @@ differs from it:
 | Context parallelism | `cp_comm_type` `p2p`, `cp_partition_mode` `zigzag`; CP groups of 1, 2, 4 or 8 ranks, so `max_cp_size` is required and is 8 or a smaller size the run can form |
 | Per-rank buffer | `max_seqlen_per_dp_cp_rank` 4096, `pad_packed_seq_alignment` `max` or 4096, `thd_tail_padding_policy` `extend_last`, `thd_max_packed_sequences` 64 |
 | Samples | At most 16384 tokens each, the measured range. A longer sample stops every rank at the step that plans it. |
-| Global batch | 256 samples, in training and in evaluation |
-
-Besides the model shape, two required values differ from the argument
-defaults and are easy to miss: `--norm-epsilon 1e-6` and
-`--moe-router-dtype fp32`.
-
-The global batch size is checked while training starts, for training
-(`--global-batch-size`, also with a batch-size schedule) and for evaluation
-(`--eval-global-batch-size`, by default the training value). Evaluation is
-checked when it is enabled; `--eval-iters 0` without `--full-validation`
-switches that check off. A batch of another size that still reaches the
-planner is rejected at its step.
+| Global batch | 256 samples, in training (`--global-batch-size`, also with a batch-size schedule) and in evaluation (`--eval-global-batch-size`, by default the training value). Both are checked while training starts; `--eval-iters 0` without `--full-validation` switches the evaluation check off. A batch of another size that still reaches the planner is rejected at its step. |
 
 The attention terms were fitted on 60 fixed-layout cases with 20 measured steps
-each (largest error 2.9 % forward, 7.7 % backward) and compared with 14 further
-cases: at most 1.8 % forward and 14.6 % backward, medians 0.7 % and 3.1 %.
-Attention plus expert remainder against the measured whole block on those 14
-cases: at most 2.7 % forward and 19.6 % backward, medians 1.3 % and 12.0 %; the
-backward block is predicted about 17 % low at CP 1 and 2, within 1 % at CP 4 and
-about 13 % high at CP 8. The overhead per microbatch and the iteration tail
-were fitted on three recorded global batches at every feasible microbatch count
-(11 rows, residual at most 0.7 %); there is no step-level comparison on other
-batches. All measurements used forced-balanced routing.
+each (largest error 2.9 % forward, 7.7 % backward). Errors, then known limits:
+
+| Compared on 14 further cases | Forward, median / largest | Backward, median / largest |
+| --- | --- | --- |
+| Attention terms | 0.7 % / 1.8 % | 3.1 % / 14.6 % |
+| Attention plus expert remainder against the measured whole block | 1.3 % / 2.7 % | 12.0 % / 19.6 % |
+
+- The backward block is predicted about 17 % low at CP 1 and 2, within 1 % at
+  CP 4 and about 13 % high at CP 8. Routing was forced-balanced throughout.
+- The overhead per microbatch and the iteration tail were fitted on three
+  recorded global batches, with no step-level comparison on other batches.
+- The Stage 1 sample weight (A, B, C) was not fitted, and the weight used
+  instead jumps where a sample needs the next CP size; the step model
+  synchronises more ranks than DynamicUSP's objective ([measurement
+  record](../../../../skills/mcore-calibrate-dcp-runtime/references/qwen3-h100-p2p.md#what-was-not-fitted)).
 
 `calibration` names a refit of the same recipe in the format of the packaged
-`models/qwen3_h100_p2p.json`. The
-[calibration skill](../../../../skills/mcore-calibrate-dcp-runtime/SKILL.md)
-describes the measurement, the file and how to add a profile for other
-hardware.
+`models/qwen3_h100_p2p.json`; another tensor- or expert-parallel size needs its
+own measured profile. The [calibration
+skill](../../../../skills/mcore-calibrate-dcp-runtime/SKILL.md) describes the
+measurement, the file and how to add a profile for other hardware.
 
 ## Provenance
 
-`ORIGIN.json`, the manifests under `models/` and the digests recorded by the
+`ORIGIN.json`, the manifest of `models/full35b` and the digests recorded by the
 cost models identify the packaged parameters and their sources. DynamicUSP
-attribution and its license are in `DYNAMIC_USP_NOTICE.txt`. Other
-architectures need their own attention predictors and layer programs.
+attribution and its license are in `DYNAMIC_USP_NOTICE.txt`. The attention
+predictor was written for this package from two time models of the benchmark.

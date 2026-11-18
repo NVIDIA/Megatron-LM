@@ -23,8 +23,7 @@ replaces it when a training run is given one more argument:
 
 `benchmark_dcp.sh` does not pass this argument, and its default mock model is
 outside the configurations the packaged cost models cover: 16 attention heads
-without grouped-query attention, 2048 tokens per rank, FlashAttention, and CP
-groups from one rank up. The
+without grouped-query attention, and FlashAttention. The
 [runtime scheduler documentation](../../megatron/core/datasets/dcp_runtime_scheduler/README.md)
 lists the configurations that are covered and links to a runtime file and
 launch arguments for each of them.

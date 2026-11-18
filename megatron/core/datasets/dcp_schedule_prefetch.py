@@ -7,6 +7,7 @@ import copy
 import hashlib
 import itertools
 import json
+import logging
 import os
 import queue
 import subprocess
@@ -32,16 +33,23 @@ from megatron.core.datasets.dcp_runtime_scheduler.runtime.planner import (
     longest_priced_sample,
 )
 from megatron.core.packed_seq_params import resolve_thd_tail_padding_policy
+from megatron.core.utils import log_single_rank
 
 if TYPE_CHECKING:
     from megatron.core.model_parallel_config import ModelParallelConfig
     from megatron.core.rerun_state_machine import RerunDataIterator
 
+logger = logging.getLogger(__name__)
+
 
 # Seconds the DPxCP leader waits for the CPU worker's reply to one batch before every rank
-# raises an error. Plans take milliseconds to seconds, loading a cost model a few seconds;
-# the limit only has to tell a busy worker from one that will never answer.
-PLANNER_REPLY_TIMEOUT_S = 600.0
+# raises an error. Plans take milliseconds to seconds; a dynamic_usp plan of thousands of
+# samples takes tens of seconds, because the time of one layout grows with samples times
+# groups and the search lays out up to 6 x candidate_count - 1 counts. Loading a cost model
+# takes a few seconds; the limit only has to tell a busy worker from one that will never
+# answer. It is below the timeout of the process groups (--distributed-timeout-minutes, 10
+# minutes by default), so that the other ranks get this error before their own timeout.
+PLANNER_REPLY_TIMEOUT_S = 300.0
 
 
 class _CpuPlanner:
@@ -205,6 +213,11 @@ class DcpSchedulePrefetcher:
     One isolated CPU worker, on the DPxCP leader only, owns the persistent planner.
     The global length collective is moved earlier, not duplicated or threaded.
 
+    With more than one pipeline stage every stage has its own DPxCP leader and CPU worker
+    and plans the same global batch alone. No plan is sent between stages: ``consume``
+    proves on every step, with one collective over the pipeline group, that all stages
+    hold the same plan, before any of them uses it.
+
     Args:
         data_iterator: Original RerunDataIterator.
         dp_group: Existing data-parallel process group.
@@ -212,13 +225,22 @@ class DcpSchedulePrefetcher:
         spec: Pickleable CPU planner specification; contains no tensors or groups.
         asynchronous: Whether to prepare and solve one batch ahead.
         trace_dir: Optional per-rank JSONL output directory.
+        pp_group: Existing pipeline-parallel process group of a run with more than one
+            pipeline stage (``spec['pipeline']``); None with one stage.
     """
 
     leader_error = None
+    # True on a DPxCP leader whose executor could not start its thread: consume() sends
+    # leader_error for it, as for a leader whose CPU worker could not be started.
+    leader_without_executor = False
+    # Set only for a run with more than one pipeline stage.
+    pp_group = None
     # Training and evaluation iterators each have a prefetcher writing to the same per-rank
     # trace file; this index, in creation order within the process, tells their records apart.
     iterator_index = 0
     _created = itertools.count()
+    # Set once this process has reported a failing Stage 2 (``_report_stage2_failure``).
+    _stage2_failure_reported = False
 
     def __init__(
         self,
@@ -228,12 +250,14 @@ class DcpSchedulePrefetcher:
         spec: dict,
         asynchronous: bool,
         trace_dir: str | None,
+        pp_group: torch.distributed.ProcessGroup | None = None,
     ) -> None:
         self.iterator = data_iterator
         self.buffer = _BufferedIterator(data_iterator.iterable)
         data_iterator.iterable = self.buffer
         self.dp_group = dp_group
         self.group = dp_cp_group
+        self.pp_group = pp_group
         self.spec = spec
         self.asynchronous = asynchronous
         self.pending = None
@@ -250,25 +274,33 @@ class DcpSchedulePrefetcher:
             directory.mkdir(parents=True, exist_ok=True)
             self.trace_path = directory / f'rank{torch.distributed.get_rank():05d}.jsonl'
         if dp_cp_group.rank() == 0:
-            # The executor marks this rank as the leader. Everything else the leader
-            # does alone must not raise here: the other ranks would wait in a collective
-            # for a leader that already failed. consume() broadcasts the error instead.
-            self.executor = _DaemonExecutor('dcp-planner-io')
+            # Nothing the leader does alone may raise here: the other ranks would wait in a
+            # collective for a leader that already failed. consume() broadcasts the error
+            # instead. The executor marks this rank as the leader; a leader whose executor
+            # cannot start its thread has none and is marked by leader_without_executor.
             try:
+                self.executor = _DaemonExecutor('dcp-planner-io')
                 from megatron.core.datasets.data_schedule import DefaultDynamicCPScheduler
 
                 geometry = spec['geometry']
+                # With more than one pipeline stage the default layout is built with a count
+                # of microbatches that is a multiple of the stages, as Megatron aligns it
+                # under virtual pipeline stages: the planner prices no other incumbent.
+                # Without virtual stages the multiple is 1 and nothing is aligned, as in
+                # Megatron. None with one stage.
+                multiple = (spec.get('pipeline') or {}).get('count_multiple')
                 self.baseline = DefaultDynamicCPScheduler(
                     geometry['tokens_per_rank'],
                     geometry['world_size'],
                     1,
-                    None,
+                    multiple,
                     max_num_seqs=geometry['max_group_seqs'],
                     min_cp_size=min(geometry['allowed_cp_sizes']),
                 ).get_groups_and_subsamples
                 self.worker = _CpuPlanner(spec)
             except Exception:
                 self.leader_error = traceback.format_exc()
+                self.leader_without_executor = self.executor is None
         atexit.register(self.close)
 
     def _submit(self, prepared, count):
@@ -314,6 +346,13 @@ class DcpSchedulePrefetcher:
     def consume(self, batch_list: list) -> tuple:
         """Consume this step's raw data and the leader's completed schedule.
 
+        With more than one pipeline stage every rank that calls this, on every stage,
+        issues exactly one collective over the pipeline group, after the schedule broadcast
+        of its DPxCP group and before it raises anything. A stage whose planner failed, or
+        whose ranks gathered different lengths, stops every stage; so do stages whose plans
+        or lengths differ. The scheduler calls this only on a step for which no stage ran
+        out of data: it reduces that flag over the pipeline group first.
+
         Args:
             batch_list: The items the scheduler read from the rerun iterator for this step.
                 Reading them there keeps the end-of-data protocol of the scheduler; with a
@@ -342,7 +381,7 @@ class DcpSchedulePrefetcher:
         self.pending = None
         payload = [None]
         waiting = time.monotonic_ns()
-        if self.executor:
+        if self.executor or self.leader_without_executor:
             try:
                 if pending['error'] is not None:
                     raise RuntimeError(pending['error'])
@@ -369,18 +408,75 @@ class DcpSchedulePrefetcher:
             device=torch.device('cuda', torch.cuda.current_device()),
         )
         consumed = {'monotonic_ns': time.monotonic_ns(), 'wall_ns': time.time_ns()}
+        if payload[0] is None and self.pp_group is not None:
+            # Only a leader whose prefetcher was closed sends nothing. The other pipeline
+            # stages wait in the collective below, so this fails the stage like a planner
+            # error, after that collective. With one stage nothing waits, and the payload
+            # raises where it is read first.
+            payload[0] = dict(error='The DPxCP leader sent no schedule: its prefetcher was closed')
+        failed = payload[0] is not None and 'error' in payload[0]
+        mismatch, stage_key, stage_failed, stages_differ = None, None, False, False
+        if self.pp_group is not None:
+            # More than one pipeline stage. Every rank of every stage issues the next two
+            # collectives here, whatever its own stage reported: a rank that raised first
+            # would leave the other stages waiting in the collective over the pipeline
+            # group. Every error is therefore raised after them, on every stage.
+            mismatch = self._lengths_differ(
+                payload[0].get('digest', pending['digest']), pending['digest']
+            )
+            stage_key = 0
+            if not failed and not mismatch:
+                # What this stage is about to use: the lengths its leader planned for and
+                # the rows of the plan. Stages that gathered other lengths differ in the
+                # key even when their rows are equal.
+                try:
+                    stage_key = _agreement_key([payload[0]['digest'], payload[0]['result']['rows']])
+                except Exception:
+                    # A reply without usable rows is the same on every rank of this stage:
+                    # it fails the stage like any planner error, after the collective.
+                    payload[0] = dict(
+                        error='The reply of the CPU planner has no rows to compare:\n'
+                        + traceback.format_exc()
+                    )
+                    failed = True
+            stage_failed, stages_differ = _compare_pipeline_stages(
+                failed or mismatch, stage_key, self.pp_group
+            )
         if payload[0].get('schedule_error') is not None:
             # Same type and text on every rank: no layout exists for this batch.
             raise RuntimeScheduleError(payload[0]['schedule_error'])
-        if 'error' in payload[0]:
+        if failed:
             raise RuntimeError(f"CPU DCP planner failed:\n{payload[0]['error']}")
-        mismatch = torch.tensor(
-            [int(payload[0]['digest'] != pending['digest'])], device='cuda', dtype=torch.int32
-        )
-        torch.distributed.all_reduce(mismatch, group=self.group)
-        if mismatch.item():
+        if mismatch is None:
+            mismatch = self._lengths_differ(payload[0]['digest'], pending['digest'])
+        if mismatch:
             raise RuntimeError('CP replicas disagree on the global logical/physical lengths')
+        if stage_failed:
+            raise RuntimeError(
+                'The CPU DCP planner of another pipeline stage failed; the ranks of that stage '
+                'report why (a planner error, a batch without a layout, or global lengths that '
+                'differ between its ranks)'
+            )
+        if stages_differ:
+            # The values of this stage, the same on all of its ranks: the logs of two stages
+            # show whether the lengths (input digest) or only the plans (key) differ.
+            raise RuntimeError(
+                'Pipeline stages disagree on the runtime DCP schedule of this step: the global '
+                'lengths they gathered or the plans they computed differ (this stage, pipeline '
+                f"rank {self.pp_group.rank()}: input digest {pending['digest']}, agreement key "
+                f'{stage_key:016x})'
+            )
         result = payload[0]['result']
+        pipeline_fields = {}
+        if self.spec.get('pipeline') is not None:
+            # More than one pipeline stage: the stages and the count multiple, what start-up
+            # disclosed about the step terms, and the key that every stage compared.
+            pipeline_fields = dict(
+                pipeline=self.spec['pipeline'],
+                pipeline_terms_are_default=self.spec.get('pipeline_terms_are_default'),
+                pipeline_terms_fitted_at=self.spec.get('pipeline_terms_fitted_at'),
+                pipeline_agreement_key=None if stage_key is None else f'{stage_key:016x}',
+            )
         self.last_telemetry = dict(
             event='consume',
             iterator=self.iterator_index,
@@ -417,13 +513,20 @@ class DcpSchedulePrefetcher:
             planner_options=result.get('planner_options', self.spec.get('solver_options', {})),
             solver_entry=result.get('solver_entry'),
             incumbent_error=pending.get('incumbent_error'),
+            **pipeline_fields,
         )
         self._trace(self.last_telemetry)
+        self._report_stage2_failure(result['statistics'])
         self.sequence_number += 1
         return pending['prepared'][:5], result['rows']
 
     def prefetch(self, count: int) -> None:
-        """Prepare one batch and submit its solve before current-step GPU training."""
+        """Prepare one batch and submit its solve before current-step GPU training.
+
+        Nothing here crosses pipeline stages. A stage that finds no next batch plans
+        nothing ahead; whether a batch was planned here or is planned in ``consume``, the
+        collective over the pipeline group is issued there.
+        """
         if not self.asynchronous or self.pending is not None:
             return
         ended = False
@@ -450,6 +553,14 @@ class DcpSchedulePrefetcher:
             )
         )
 
+    def _lengths_differ(self, leader_digest: str, own_digest: str) -> bool:
+        """Whether a rank of the DPxCP group gathered other global lengths than its leader."""
+        mismatch = torch.tensor(
+            [int(leader_digest != own_digest)], device='cuda', dtype=torch.int32
+        )
+        torch.distributed.all_reduce(mismatch, group=self.group)
+        return bool(mismatch.item())
+
     def _no_reply_error(self) -> str:
         process = getattr(self.worker, 'process', None)
         code = None if process is None else process.poll()
@@ -473,6 +584,49 @@ class DcpSchedulePrefetcher:
             with self.trace_path.open('a') as stream:
                 stream.write(json.dumps(payload) + '\n')
 
+    def _report_stage2_failure(self, statistics) -> None:
+        """Say once per process that Stage 2 of the solver failed while a plan was made.
+
+        Start-up said that Stage 2 is on. The planner contains an error of Stage 2: it keeps
+        the Stage 1 layout and records the error in ``statistics['stage2']``, as
+        ``first_error`` when a microbatch could not be re-packed and as ``rescore_error``
+        when the re-packed layout could not be scored. Without this notice only the trace
+        would show that the run trains on Stage 1 layouts. The rank that prints the start-up
+        line (rank 0) logs one warning for the first such plan it consumes and nothing for
+        later ones: the statistics of every plan keep them. The warning goes through the
+        logger of this module, which Megatron's training entry writes to standard output,
+        where the start-up line is. No collective is issued and nothing is raised; a plan
+        without such an error, and every plan of a run with Stage 2 off, is not looked at
+        further.
+        """
+        stage2 = statistics.get('stage2') if isinstance(statistics, dict) else None
+        if not isinstance(stage2, dict) or DcpSchedulePrefetcher._stage2_failure_reported:
+            return
+        kept = dict(
+            first_error='the Stage 1 layout of every microbatch that failed was kept',
+            rescore_error='the Stage 1 layout of the step was kept',
+        )
+        errors = [
+            f'{name}: {stage2[name]} ({note})'
+            for name, note in kept.items()
+            if stage2.get(name) is not None
+        ]
+        if not errors:
+            return
+        DcpSchedulePrefetcher._stage2_failure_reported = True
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            'Runtime DCP scheduler: Stage 2 of the solver failed while a plan was made '
+            '(iterator %s, batch %s): %s. Later failures of Stage 2 are not reported again in '
+            'this process: statistics["stage2"] of every plan records them (last_telemetry, '
+            'and the trace when "trace_dir" is set)',
+            self.iterator_index,
+            self.sequence_number,
+            '; '.join(errors),
+            rank=0,
+        )
+
     def close(self) -> None:
         """Finish outstanding CPU work; no worker ever accesses a process group."""
         worker, self.worker = self.worker, None
@@ -485,6 +639,31 @@ class DcpSchedulePrefetcher:
             self.executor = None
         if worker is not None:
             worker.close()
+
+
+def _agreement_key(value) -> int:
+    """62 bits of the SHA-256 of ``value`` written as JSON with sorted keys.
+
+    The key and its negative both fit a signed 64-bit tensor, so one MAX reduction of
+    ``[key, -key]`` gives the largest and the smallest key of a process group.
+    """
+    text = json.dumps(value, sort_keys=True, separators=(',', ':'))
+    return int.from_bytes(hashlib.sha256(text.encode()).digest()[:8], 'big') >> 2
+
+
+def _compare_pipeline_stages(failed, key: int, pp_group) -> tuple[bool, bool]:
+    """One collective over the pipeline group: has a stage failed, and do the keys differ.
+
+    Every rank of ``pp_group`` contributes whether its stage ``failed`` and the ``key`` of
+    what its stage holds, and gets the same answer. The reduction is MAX over
+    ``[failed, key, -key]``: a failure anywhere sets the first value on every rank, and
+    the other two are the largest and, negated, the smallest key. Nothing is raised here;
+    the callers raise once every rank has left the collective.
+    """
+    probe = torch.tensor([int(bool(failed)), key, -key], dtype=torch.int64, device='cuda')
+    torch.distributed.all_reduce(probe, op=torch.distributed.ReduceOp.MAX, group=pp_group)
+    any_failed, largest, negated_smallest = (int(value) for value in probe.tolist())
+    return bool(any_failed), largest != -negated_smallest
 
 
 _MISSING = '<unset>'
@@ -539,6 +718,107 @@ def _from_domain_check(error):
     return any(frame.name == 'check_domain' for frame in traceback.extract_tb(error.__traceback__))
 
 
+def _pipeline_schedule(pipeline: dict) -> str:
+    """Name of the pipeline schedule of a run with more than one pipeline stage.
+
+    ``pipeline`` is ``spec['pipeline']`` (``_pipeline_of_run``): Megatron runs the
+    interleaved schedule for a run with virtual pipeline stages and the non-interleaved one
+    for a run without, which the specification holds as one virtual stage. The name is the
+    one that ``solver.pipeline.fitted_at`` of a coefficient file gives the schedule, so that
+    it has one spelling: ``_pipeline_terms_fitted_at`` compares the run in which the step
+    terms were fitted with it, and ``_describe_pipeline`` names it in the start-up line.
+    """
+    from .dcp_runtime_scheduler.models.solver_section import pipeline_schedule
+
+    return pipeline_schedule(pipeline['virtual_stages'])
+
+
+def _pipeline_of_run(where, scheduler_type, hardware, model, config, pp_size, virtual):
+    """``spec['pipeline']`` of a run with more than one pipeline stage; None with one stage.
+
+    This is the one place that decides which shapes of more than one pipeline stage the
+    runtime scheduler takes. It takes the DynamicUSP solver with a cost model ``model``
+    that has a step time for several stages (``pipeline_group_times``), in two shapes.
+    With virtual pipeline stages (``virtual``, the virtual pipeline-parallel size of the
+    run, 2 or more) ``microbatch_group_size_per_vp_stage`` must be the pipeline-parallel
+    size, which is the interleaved schedule that the step time replays; every count of
+    microbatches is then a multiple of the pipeline-parallel size (``count_multiple``).
+    Without virtual stages (``virtual`` None) Megatron runs the non-interleaved schedule,
+    which takes any count: the specification has one virtual stage and the count multiple
+    1, and the group size is not read. A virtual size of 1 is not taken: Megatron's
+    training arguments turn it into None, and a 1 that reaches Megatron is read as virtual
+    stages where the schedule is chosen and as none where the data iterator is taken.
+
+    The model itself is not looked at, as in DynamicUSP: the step time takes the stages,
+    and the model chunks of their virtual stages, as equal shares of the model. A run whose
+    stages are not equal shares (an explicit pipeline layout, other layer counts in the
+    first or last stage, the embedding or the loss accounted in the split, MTP layers, a
+    hybrid model) starts like any other. Its plans are valid; only the predicted step time
+    is less accurate.
+
+    ``config`` is the recording view, so the option read here is part of the fingerprint
+    of the specification; none is read with one stage.
+    """
+    from .dcp_runtime_scheduler.runtime.config import SCHEDULERS
+
+    if pp_size == 1:
+        return None
+    if SCHEDULERS[scheduler_type]['solver'] != 'dynamic_usp' or not callable(
+        getattr(model, 'pipeline_group_times', None)
+    ):
+        raise ValueError(
+            f'{where}: the runtime DCP scheduler plans for more than one pipeline stage only '
+            'with type "dynamic_usp" without "hardware" (the original DynamicUSP profile, '
+            'whose cost model has a step time for several pipeline stages); this run has '
+            f'pipeline_model_parallel_size={pp_size} with type={scheduler_type!r}, '
+            f'hardware={hardware!r}'
+        )
+    if virtual is None:
+        # No virtual stages: Megatron runs the non-interleaved schedule, which has one model
+        # chunk per stage and takes any count of microbatches. The group size of virtual
+        # stages is not read.
+        return dict(stages=pp_size, virtual_stages=1, count_multiple=1)
+    if virtual < 2:
+        raise ValueError(
+            'With more than one pipeline stage the runtime DCP scheduler takes '
+            'virtual_pipeline_model_parallel_size unset (no virtual pipeline stages, the '
+            'non-interleaved schedule) or at least 2 (the interleaved schedule); got '
+            f'pipeline_model_parallel_size={pp_size} with '
+            f'virtual_pipeline_model_parallel_size={virtual}'
+        )
+    # Megatron sets an unset group size to the pipeline-parallel size.
+    group = getattr(config, 'microbatch_group_size_per_vp_stage', None)
+    if group is not None and group != pp_size:
+        raise ValueError(
+            'With more than one pipeline stage the runtime DCP scheduler requires '
+            'microbatch_group_size_per_vp_stage equal to pipeline_model_parallel_size '
+            f'({pp_size}): its step time replays the interleaved schedule of that group size, '
+            f'and its counts of microbatches are multiples of {pp_size}; got '
+            f'microbatch_group_size_per_vp_stage={group}'
+        )
+    return dict(stages=pp_size, virtual_stages=virtual, count_multiple=pp_size)
+
+
+def _pipeline_terms_fitted_at(terms, pipeline):
+    """What ``solver.pipeline.fitted_at`` of the coefficient file says about this run.
+
+    The record of the run in which the pipeline step terms were fitted, with ``matches_run``
+    added; ``'not recorded'`` when the file gives a term but no record; None when it gives
+    neither, so that every term is a default and there is no fit to describe.
+    """
+    record = terms.get('fitted_at')
+    if record is None:
+        defaults = terms.get('default_terms', ())
+        given = [name for name in terms if name not in ('default_terms', 'fitted_at', *defaults)]
+        return 'not recorded' if given else None
+    run = dict(
+        pipeline_parallel=pipeline['stages'],
+        virtual_stages=pipeline['virtual_stages'],
+        schedule=_pipeline_schedule(pipeline),
+    )
+    return dict(record, matches_run=all(record.get(key) == value for key, value in run.items()))
+
+
 def build_runtime_spec(
     settings: dict,
     config: 'ModelParallelConfig',
@@ -553,6 +833,19 @@ def build_runtime_spec(
     model and its paired solver are built once in this process, exactly as the CPU worker
     builds them, and the model's domain is checked against ``config``. The returned
     specification is CPU-only and serializable; ``solver_options`` is a Python-only knob.
+
+    With more than one pipeline stage (``pp_size``) the specification also has ``pipeline``
+    (the stages, the virtual stages of each and the count multiple of the microbatches; one
+    virtual stage and the multiple 1 for a run without virtual pipeline stages),
+    ``pipeline_terms_are_default`` (the pipeline step terms that the coefficient file does
+    not give), ``pipeline_terms_fitted_at`` (the run those terms were fitted in, compared
+    with this run), and two facts that the stages compare at start-up because every stage
+    plans alone: ``cost_model_table_sha256`` (the coefficient table that the cost model
+    loaded, packaged or given) and ``python_version`` (major, minor). With one stage it has
+    none of them.
+
+    ``stage2`` (``keep_threshold``, and ``idle``: None or why Stage 2 has no work in this
+    run) is present only when the coefficient file switches Stage 2 of the solver on.
     """
     from . import dcp_runtime_worker
     from .dcp_runtime_scheduler.models import measured_dynamic_usp_model, model_class
@@ -566,8 +859,16 @@ def build_runtime_spec(
         f"Runtime configuration {settings.get('config_path', '<settings>')!r} "
         f'(type {scheduler_type!r})'
     )
-    if pp_size != 1 or getattr(config, 'virtual_pipeline_model_parallel_size', None) is not None:
-        raise ValueError('The runtime DCP scheduler currently supports PP1/VPP1 only')
+    # Read and checked before anything else here: with one pipeline stage a virtual size is
+    # reported before any other fault of the run, and the fingerprint of the specification
+    # lists this field before those that the checks below read.
+    virtual = getattr(config, 'virtual_pipeline_model_parallel_size', None)
+    if pp_size == 1 and virtual is not None:
+        raise ValueError(
+            'The runtime DCP scheduler takes virtual pipeline stages only with more than '
+            f'one pipeline stage; got virtual_pipeline_model_parallel_size={virtual} with '
+            'pipeline_model_parallel_size=1'
+        )
     if (
         getattr(config, 'sequence_parallel', False)
         and getattr(config, 'tensor_model_parallel_size', 1) != 1
@@ -635,11 +936,19 @@ def build_runtime_spec(
             kv_heads=heads[1],
             head_dim=heads[2],
             layer_count=layers,
-            # The packaged GQA parameters are TE P2P fits over NCCL process groups.
-            legacy_transport_backend='nccl_p2p',
             # The layer program replays the forward pass when every layer is recomputed.
             recompute_forward=getattr(config, 'recompute_granularity', None) == 'full',
         )
+    # None with one pipeline stage, and the specification is then as it always was.
+    pipeline = _pipeline_of_run(
+        where,
+        scheduler_type,
+        settings['options'].get('hardware'),
+        model_class(model),
+        config,
+        pp_size,
+        virtual,
+    )
     if maximum is not None and maximum < minimum:
         raise ValueError(
             f'max_cp_size={maximum} must be >= min_dynamic_context_parallel_size={minimum}'
@@ -705,6 +1014,9 @@ def build_runtime_spec(
     for key in ('config_path', 'config_sha256'):
         if key in settings:
             spec[key] = settings[key]
+    if pipeline is not None:
+        # The planner below, and the one of the CPU worker, are built for these stages.
+        spec['pipeline'] = pipeline
     try:
         # The geometry comes from the training configuration alone (EP size, DPxCP, ...).
         RuntimePlanGeometry(**spec['geometry'])
@@ -728,6 +1040,36 @@ def build_runtime_spec(
     if options.get('calibration') is not None:
         # The CPU worker loads the file again when it starts; it must still be this one.
         spec['calibration_sha256'] = getattr(planner.model, 'calibration_sha256', None)
+        if getattr(planner.model, 'sample_weight_is_default', False):
+            # The user's table of the original DynamicUSP profile gives no A, B, C of the
+            # Stage 1 sample weight: the published default applies, and the start-up line
+            # says so. The packaged table always uses the default.
+            spec['sample_weight_is_default'] = True
+    if getattr(planner, 'stage2_enabled', False):
+        # The coefficient file switches Stage 2 of the DynamicUSP solver on, which changes
+        # plans: the start-up line says so. ``idle`` is the planner's reason when Stage 2
+        # has no work in any plan of this run, else None.
+        spec['stage2'] = dict(
+            keep_threshold=planner.stage2_keep_threshold, idle=getattr(planner, 'stage2_idle', None)
+        )
+    if pipeline is not None:
+        # With more than one pipeline stage three step terms of the coefficient file change
+        # every score. The start-up line and the trace name those the file does not give,
+        # for which defaults apply that are not fitted values (the packaged table gives
+        # none), and say when the terms were fitted in a run of another pipeline shape.
+        terms = planner.model.pipeline_terms
+        spec['pipeline_terms_are_default'] = list(terms.get('default_terms', ()))
+        spec['pipeline_terms_fitted_at'] = _pipeline_terms_fitted_at(terms, pipeline)
+        # Every stage plans alone, so the stages compare at start-up what a plan depends on.
+        # Beyond the files named above that is the coefficient table the cost model loaded
+        # and the Python version: the solver adds floats with the built-in sum(), whose
+        # rounding CPython 3.12 changed. The table digest tells apart stages that were given
+        # different tables, and installations whose package versions pin different packaged
+        # tables. It does not guard the bytes of the packaged table: the cost model checks
+        # those against its own pin when it is built, so a stage whose packaged table has
+        # other bytes stops alone, before the comparison.
+        spec['cost_model_table_sha256'] = getattr(planner.model, 'calibration_sha256', None)
+        spec['python_version'] = list(sys.version_info[:2])
     required_batch = getattr(planner.model, 'required_global_batch_size', None)
     if required_batch is not None:
         # A cost model whose step overhead was measured with one global batch size prices
@@ -789,12 +1131,72 @@ def describe_runtime_spec(spec: dict) -> str:
     else:
         # The original DynamicUSP profile names no hardware; its packaged table has a domain.
         hardware = f', {topology}' if topology else ''
+    weight = (
+        ", Stage 1 sample weight: DynamicUSP's published default A, B, C "
+        '(the calibration file gives no solver.sample_weight)'
+        if spec.get('sample_weight_is_default')
+        else ''
+    )
     return (
         f"Runtime DCP scheduler: type={spec['type']}, cost model={spec['model']}{hardware}, "
         f"CP group sizes={list(geometry['allowed_cp_sizes'])}, at most "
         f"{geometry['max_group_seqs']} sequences per CP group, "
         f"async={'on' if spec['async'] else 'off'}, runtime file={spec.get('config_path')}"
+        f'{weight}{_describe_stage2(spec)}{_describe_pipeline(spec)}'
     )
+
+
+def _describe_stage2(spec: dict) -> str:
+    """The part of the start-up line that a coefficient file with Stage 2 switched on adds."""
+    stage2 = spec.get('stage2')
+    if stage2 is None:
+        return ''
+    if stage2['idle'] is not None:
+        return f", Stage 2 switched on but idle: {stage2['idle']}"
+    return f", Stage 2 on (keep_threshold={stage2['keep_threshold']})"
+
+
+def _describe_pipeline(spec: dict) -> str:
+    """The part of the start-up line that a run with more than one pipeline stage adds."""
+    pipeline = spec.get('pipeline')
+    if pipeline is None:
+        return ''
+    from .dcp_runtime_scheduler.models.solver_section import PIPELINE_SCHEDULES
+
+    schedule = _pipeline_schedule(pipeline)
+    if schedule == PIPELINE_SCHEDULES[0]:
+        text = (
+            f", pipeline stages={pipeline['stages']}, virtual stages="
+            f"{pipeline['virtual_stages']}, microbatch count a multiple of "
+            f"{pipeline['count_multiple']}"
+        )
+    else:
+        # A run without virtual pipeline stages: the line names its schedule.
+        text = (
+            f", pipeline stages={pipeline['stages']}, no virtual stages ({schedule} schedule), "
+            'any microbatch count'
+        )
+    defaults = spec.get('pipeline_terms_are_default')
+    if defaults:
+        text += (
+            f", pipeline step terms at DynamicUSP's defaults, which are not fitted values: "
+            f"{', '.join(defaults)} (the coefficient file does not give them in solver.pipeline)"
+        )
+    fitted_at = spec.get('pipeline_terms_fitted_at')
+    if fitted_at == 'not recorded':
+        text += (
+            ', run in which the pipeline step terms were fitted: not recorded (the coefficient '
+            'file has no solver.pipeline.fitted_at)'
+        )
+    elif fitted_at is not None and not fitted_at['matches_run']:
+        text += (
+            ', pipeline step terms were fitted in another run than this one: '
+            f"solver.pipeline.fitted_at has pipeline_parallel={fitted_at['pipeline_parallel']}, "
+            f"virtual_stages={fitted_at['virtual_stages']}, schedule={fitted_at['schedule']}; "
+            f"this run has pipeline_parallel={pipeline['stages']}, "
+            f"virtual_stages={pipeline['virtual_stages']}, schedule={schedule}"
+        )
+    return text
 
 
 def runtime_spec(
@@ -879,13 +1281,77 @@ def _count_over_group(flag, group) -> int:
     return int(count.item())
 
 
-def check_cost_model_coverage(config: 'ModelParallelConfig', dp_cp_group) -> None:
+def _counts_over_group(flags, group) -> list[int]:
+    """``_count_over_group`` for several flags with one reduction: one count per flag."""
+    counts = torch.tensor([int(bool(flag)) for flag in flags], dtype=torch.int32, device='cuda')
+    torch.distributed.all_reduce(counts, group=group)
+    return [int(count) for count in counts.tolist()]
+
+
+def _stage_facts(spec: dict) -> dict:
+    """What every rank of every pipeline stage must hold alike, by name.
+
+    Every stage plans alone, so these are the facts that a plan depends on, and ``async``,
+    which decides the collectives of a step.
+    """
+    return {
+        'runtime file sha256': spec.get('config_sha256'),
+        'calibration file sha256': spec.get('calibration_sha256'),
+        'cost model table sha256': spec.get('cost_model_table_sha256'),
+        'Stage 2': spec.get('stage2'),
+        'pipeline': spec['pipeline'],
+        'geometry': spec['geometry'],
+        'async': spec['async'],
+        'Python version': spec.get('python_version'),
+    }
+
+
+# The facts of ``_stage_facts`` as the errors of the start-up check list them.
+_STAGE_FACTS_LISTED = (
+    'the runtime file, the calibration file, the coefficient table of the cost model, Stage 2 '
+    'of the solver, the pipeline sizes, the planner geometry, "async" and the Python version'
+)
+
+
+def check_cost_model_coverage(config: 'ModelParallelConfig', dp_cp_group, pp_group=None) -> None:
     """Probe every allowed CP width once per process; all ranks of the group raise together.
 
     Loading predictor parameters is the expensive part, so only the DPxCP leader probes
     and the outcome is broadcast, together with the digest of the runtime file the leader
-    read: every rank reads the file itself and must have read the same bytes. Call it on
-    every rank of ``dp_cp_group`` at the same point, after ``runtime_spec`` succeeded.
+    read: every rank reads the file itself and must have read the same bytes. One
+    reduction over ``dp_cp_group`` counts the ranks that read other bytes, so that every
+    rank of the group knows of them. Call it on every rank of ``dp_cp_group`` at the same
+    point, after ``runtime_spec`` succeeded.
+
+    With more than one pipeline stage every stage plans alone, so every rank of every stage
+    must hold the same facts (``_stage_facts``): the runtime file, the calibration file,
+    the coefficient table of the cost model, Stage 2 of the solver, the pipeline sizes, the
+    planner geometry, ``async`` and the Python version. They are compared in two places:
+
+    * Within a stage, each rank with the DPxCP leader of its stage. The leader sends the
+      key of its facts with the broadcast above, each rank compares it with its own, and
+      the reduction over ``dp_cp_group`` gets a second element, the count of the ranks
+      whose key is another. A stage with such a rank has failed, like a stage whose probe
+      failed or whose ranks read different runtime files.
+    * Between the stages, with one collective over ``pp_group``, the pipeline group
+      (``pg_collection.pp``): every rank contributes whether its stage has failed and
+      otherwise the key of its facts, which is then the key of all ranks of its stage.
+
+    A difference on a single rank therefore stops every rank of every stage that these two
+    groups reach: the ranks of its stage say how many of them hold other settings than
+    their leader, each with its own values; stages that differ as a whole show their own
+    values; every other stage says that another stage failed. Every rank issues the same
+    three collectives whatever it found, and raises only after the last one. With one stage
+    the collectives are the two over ``dp_cp_group`` as they always were, and no facts are
+    sent or compared.
+
+    Both groups are those of one tensor-parallel rank, so this holds for the ranks of every
+    stage within one tensor-parallel rank: all ranks of a run with tensor-parallel size 1.
+    With a larger tensor-parallel size a difference on a single process stops the ranks of
+    its own tensor-parallel rank only; the ranks of the other tensor-parallel ranks pass
+    the check and then wait in a collective until the time-out of the process groups, as
+    they do when a step fails on the ranks of tensor-parallel rank 0, which alone read
+    data and take the plan.
 
     The outcome is kept: a later call raises the same error again, without a collective,
     so a caller that caught the first error cannot go on to train.
@@ -898,10 +1364,25 @@ def check_cost_model_coverage(config: 'ModelParallelConfig', dp_cp_group) -> Non
             raise ValueError(entry['coverage_error'])
         return
     spec = entry['spec']
+    has_pipeline = spec.get('pipeline') is not None
+    if has_pipeline and pp_group is None:
+        # Every rank is called alike, so every rank raises this before any collective.
+        raise ValueError(
+            'The start-up check of the runtime DCP scheduler needs the pipeline process group '
+            'of a run with more than one pipeline stage: pass it as pp_group '
+            '(pg_collection.pp)'
+        )
+    # The facts of this rank and their key; none with one pipeline stage. Both are ready
+    # before the first collective, so nothing is computed between two collectives.
+    facts = _stage_facts(spec) if has_pipeline else {}
+    facts_key = _agreement_key(facts) if has_pipeline else 0
     # [probe outcome, what the leader read]; followers receive both.
     outcome = [None, None]
     if dp_cp_group.rank() == 0:
-        outcome[1] = dict(sha256=spec.get('config_sha256'), path=spec.get('config_path'))
+        read = dict(sha256=spec.get('config_sha256'), path=spec.get('config_path'))
+        if has_pipeline:
+            read['facts'] = facts_key
+        outcome[1] = read
         # The leader must reach the broadcast: any failure travels as its outcome.
         try:
             outcome[0] = _coverage_error(spec)
@@ -916,15 +1397,57 @@ def check_cost_model_coverage(config: 'ModelParallelConfig', dp_cp_group) -> Non
     leader = outcome[1] or {}
     # A rank that read other bytes would schedule with other settings; a different "async"
     # alone desynchronises the collectives. Count such ranks so that all of them stop.
-    differing = _count_over_group(leader.get('sha256') != spec.get('config_sha256'), dp_cp_group)
+    other_file = leader.get('sha256') != spec.get('config_sha256')
+    if has_pipeline:
+        # The same reduction with a second count: the ranks that hold other facts than the
+        # leader of their stage. Only they would see a difference in the comparison of the
+        # stages below, so their stage fails as a whole and every stage stops.
+        differing, other_facts = _counts_over_group(
+            (other_file, leader.get('facts') != facts_key), dp_cp_group
+        )
+    else:
+        differing, other_facts = _count_over_group(other_file, dp_cp_group), 0
     error = outcome[0]
+    if has_pipeline:
+        # Every rank of every stage reaches this collective, whatever its own stage found:
+        # its failure travels as a value and is raised below, after the collective.
+        failed = error is not None or bool(differing) or bool(other_facts)
+        another_failed, stages_differ = _compare_pipeline_stages(
+            failed, 0 if failed else facts_key, pp_group
+        )
+    # The last collective is done: the texts of the errors are composed from here on.
     if differing:
         error = (
             f"{differing} of {dp_cp_group.size()} DPxCP ranks read a runtime configuration "
             f"that differs from the one the DPxCP leader read ({leader.get('path')!r}). The "
             'file must be identical on every rank and must not change while training starts'
         )
-    # Both collectives are done on every rank; the outcome, good or bad, is final.
+    if has_pipeline:
+        if error is None and other_facts:
+            # The values of this rank: the logs of the ranks of this stage show which differ.
+            own = ', '.join(f'{name} {value}' for name, value in facts.items())
+            error = (
+                f'{other_facts} of {dp_cp_group.size()} DPxCP ranks of this pipeline stage '
+                'hold other settings of the runtime DCP scheduler than the DPxCP leader of '
+                f'the stage: {_STAGE_FACTS_LISTED} must be the same on every rank of every '
+                'stage, because every stage plans alone (this rank, DPxCP rank '
+                f'{dp_cp_group.rank()} of pipeline rank {pp_group.rank()}: {own})'
+            )
+        elif error is None and another_failed:
+            error = (
+                'The start-up check of the runtime DCP scheduler failed on another pipeline '
+                'stage; the ranks of that stage report why'
+            )
+        elif error is None and stages_differ:
+            # The values of this stage, the same on all of its ranks: the logs of two stages
+            # show which of them differ.
+            own = ', '.join(f'{name} {value}' for name, value in facts.items())
+            error = (
+                'Pipeline stages read different settings of the runtime DCP scheduler: '
+                f'{_STAGE_FACTS_LISTED} must be the same on every stage, because every stage '
+                f'plans alone (this stage, pipeline rank {pp_group.rank()}: {own})'
+            )
+    # Every collective is done on every rank; the outcome, good or bad, is final.
     entry['coverage_checked'], entry['coverage_error'] = True, error
     if error is not None:
         raise ValueError(error)

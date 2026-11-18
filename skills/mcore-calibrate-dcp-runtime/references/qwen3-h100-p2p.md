@@ -41,6 +41,29 @@ The measured profile therefore has its own terms, per CP size and direction:
 It is planned by the same DynamicUSP allocation and count search as the
 original profile.
 
+## What was not fitted
+
+The upstream procedure calibrates three models: the Stage 1 sample weight
+(model 1: A, B, C), the group time (model 2) and the step time (model 3).
+This record covers models 2 and 3 only.
+
+- Model 1 was not fitted. The scheduler uses a weight of its own for this
+  calibration: the CP size times the predicted time of one microbatch that
+  holds the sample alone in the smallest CP group that fits it. This
+  definition is not part of DynamicUSP, and it jumps where a sample needs the
+  next CP size: with the packaged coefficients a sample of 4096 tokens weighs
+  587 and one of 4160 tokens 1324.
+- No tier factors were derived, so Stage 1 balances weight. With a fixed
+  buffer the time of a sample per rank grows with the CP size, which is the
+  case the factors are not meant for; see
+  [Tier factors](../SKILL.md#tier-factors).
+- The step model synchronises the ranks of each expert-parallel block in
+  every layer and all ranks after the forward pass of the first microbatch.
+  DynamicUSP's objective synchronises only the ranks of one CP group.
+
+A refit may add the first two in a `solver` entry of the coefficient file;
+see [Content of the coefficient file](#content-of-the-coefficient-file).
+
 ## Recipe
 
 | Setting | Measured value |
@@ -159,6 +182,7 @@ A refit of this recipe has the structure of the packaged file:
 | `profiles.classic_p2p.microbatch_overhead_ms` | `forward` and `backward` overhead per microbatch |
 | `profiles.classic_p2p.iteration_tail_ms` | Iteration tail |
 | `profiles.classic_p2p.source`, `profiles.classic_p2p.validation` | How the coefficients were measured, and the fit and comparison errors. Both are required; they appear in `model_metadata` of the trace. |
+| `solver` | Optional; the packaged file has none. `sample_weight` with `A`, `B` and `C` makes the scheduler use the Stage 1 weight `max(1, A*L^2/1e10 + B*L/1e5 + C)` of the upstream procedure. `tier_time_factors` gives factors of at least 1 for the CP sizes `"1"`, `"2"`, `"4"` and `"8"`. `pipeline` is rejected: the overhead per microbatch is `profiles.classic_p2p.microbatch_overhead_ms`. `stage2` may only say `{"enabled": false}`: the calibration defines no Stage 2 sample loads, so `"enabled": true` and a `keep_threshold` without `enabled` are rejected. The [calibration skill](../SKILL.md#sample-weight) describes both fits. |
 
 Name the refit in the runtime file:
 

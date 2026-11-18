@@ -23,9 +23,9 @@ if TYPE_CHECKING:
 # GPUs per NVLink domain, by the ``hardware`` of the runtime file: an H100 node has eight
 # GPUs, a GB200 rack one domain of 72. A cost model takes its domain size from this table and
 # exposes it as ``nvlink_domain_size``; no option, constructor argument or runtime-file key
-# sets one. The packaged attention predictor keeps an equal table for its own use, and a test
-# compares the two. The models read DPxCP rank ``r`` as a GPU of domain ``r // size``, so the
-# launch has to place ranks consecutively, domain by domain.
+# sets one. The packaged attention predictor reads the same table. The models read DPxCP
+# rank ``r`` as a GPU of domain ``r // size``, so the launch has to place ranks
+# consecutively, domain by domain.
 NVLINK_DOMAIN_SIZES = MappingProxyType({"h100": 8, "gb200": 72})
 
 
@@ -47,40 +47,6 @@ class PackLimits:
     max_sample_length: Optional[int] = None
 
 
-def largest_priced_sequences(model, geometry: "RuntimePlanGeometry", cp: int, cap: int):
-    """Most equal sequences filling one CP-``cp`` pack that ``model`` prices, up to ``cap``.
-
-    Returns None when the model prices the largest full pack the geometry admits (it has
-    no limit of its own) and 0 when it prices none. A pack with fewer sequences is assumed
-    not to be harder to price, so the count is found by bisection.
-    """
-    ranks = list(range(cp))
-
-    def priced(count):
-        try:
-            lengths = geometry.full_pack(cp, count)
-            if getattr(model, "program_costs", None) is not None:
-                model.program_costs(lengths, cp, ranks=ranks)
-            model.forward(lengths, cp, ranks=ranks)
-            model.backward(lengths, cp, ranks=ranks)
-        except ValueError:
-            return False
-        return True
-
-    # Counts for which a full pack of aligned sequences exists at all.
-    most = min(int(cap), geometry.capacity(cp) // geometry.pack_unit(cp))
-    if most < 1 or priced(most):
-        return None
-    low, high = 0, most
-    while high - low > 1:
-        middle = (low + high) // 2
-        if priced(middle):
-            low = middle
-        else:
-            high = middle
-    return low
-
-
 @runtime_checkable
 class DcpCostModel(Protocol):
     """Callable contract consumed by ``models.cache.PackCostModel`` and the planner.
@@ -94,7 +60,60 @@ class DcpCostModel(Protocol):
     that the planner geometry admits at a CP size; the class attribute ``largest_cp_size``
     when it prices CP groups up to that size only (the scheduler then forms no larger
     one); ``required_global_batch_size`` when its step overhead describes one global
-    batch size (start-up and the CPU worker then reject any other).
+    batch size (start-up and the CPU worker then reject any other). Read by the DynamicUSP
+    solver only: ``sample_weight_coefficients``, the ``(A, B, C)`` of its Stage 1 sample
+    weight (absent or None: the weight is derived from the model's step times), and
+    ``tier_time_factors``, a ``{CP size: factor}`` table that switches Stage 1 to time
+    balance; its keys are among ``supported_cp_sizes`` when the model declares them.
+    ``sample_weight_is_default`` is True when the coefficients are the published default
+    because the coefficient file gives none; the plan statistics and, for a user's file,
+    the start-up line say so. A model that offers a step time for more than one pipeline
+    stage has ``pipeline_group_times(lengths, cp) -> (forward_ms, backward_ms)``, the
+    whole-model times of one CP group, and ``pipeline_terms``, a dictionary recorded with
+    every such plan whose ``per_mb_overhead_ms``, a finite nonnegative number, is added to
+    the step time once per microbatch; the solver rejects more than one pipeline stage for
+    a model without both.
+
+    Stage 2 of the DynamicUSP solver (``runtime.stage2``) re-packs the samples of one
+    microbatch on its CP groups. A model offers it through these members, all of them
+    optional as a set. None of the methods has a rank argument: a model whose group time
+    depends on the ranks of the group cannot offer them.
+
+    - ``stage2_enabled`` (True switches Stage 2 on; absent or False, nothing else is read)
+      and ``stage2_keep_threshold`` (a finite positive number): both from the ``solver``
+      section of the coefficient file, as ``tier_time_factors``.
+    - ``stage2_reference_cp_size``: CP groups of at most this size are the reference tier.
+      Stage 2 leaves a microbatch of such groups alone.
+    - ``stage2_global_constant_ms``: a finite nonnegative time added to the slowest group
+      of a microbatch before two layouts are compared.
+    - ``stage2_sample_loads(length, cp_sizes) -> (work, {cp: load})``: the work of one
+      sample of ``length`` logical tokens and the load it adds to a group of every size in
+      ``cp_sizes``; all finite and positive.
+    - ``stage2_empty_group_load(cp) -> float``: the load of a group before its first
+      sample; finite and nonnegative.
+    - ``stage2_group_time(lengths, cp) -> float``: the exact time in ms of one CP group for
+      one microbatch; finite and positive.
+    - Optional, the placement guard that DynamicUSP applies to groups above the reference
+      size: ``stage2_guard_threshold``, a finite number (absent or None: the model has no
+      guard, and the next member is not read), and ``stage2_guard_margin(lengths, cp)
+      -> float``, the margin of a group of ``cp`` ranks that holds the samples whose
+      logical lengths are in the tuple ``lengths``, possibly none; a finite number. A
+      sample joins such a group only if the margin with it is at least the smaller of the
+      margin without it and the threshold, and a re-packed microbatch has no such group
+      with a margin below the threshold (``runtime.stage2`` has the rules). The margin is
+      also taken for these groups of the Stage 1 layout, where it is not tested but must
+      be a finite number. The threshold is read when the planner is built, where a
+      property that raises AttributeError reads as no guard, and again for every
+      microbatch of a plan, where it is checked: a model that then gives another
+      threshold, or none, fails Stage 2 for that microbatch.
+
+    A cost model must not change what its Stage 2 members give after the planner was
+    built: the reference size, the global constant, the loads and times that the methods
+    return for the same arguments, and the guard threshold belong to the run. Only the
+    guard threshold is checked. The others are read again for every microbatch: a model
+    that, say, raises its reference size is planned with the groups up to the new size as
+    the reference tier, without a guard on them and without an error, while the plan
+    statistics name the size that was read when the planner was built.
     """
 
     name: str

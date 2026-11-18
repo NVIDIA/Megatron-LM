@@ -8,6 +8,11 @@ no all-to-all, so this calibration, measured with DynamicUSP's calibration proce
 its own terms for each CP size. Attention predictions cover the complete self-attention
 module, including its projections and exposed CP communication. Non-attention
 contributions depend on valid tokens and are averaged over each forced-balanced EP8 block.
+Two parts differ from DynamicUSP. The Stage 1 sample weight of the procedure (A, B, C) was not
+fitted: unless a coefficient file gives ``solver.sample_weight``, the scheduler derives the
+weight from the step times of this model. The step model synchronises all ranks after the
+forward pass of the first microbatch; the DynamicUSP objective synchronises only the ranks
+of one group.
 This module performs CPU arithmetic only.
 """
 
@@ -19,7 +24,9 @@ import math
 from functools import lru_cache
 from pathlib import Path
 
+from ..runtime.config import _unique_object
 from .base import NVLINK_DOMAIN_SIZES, PackLimits
+from .solver_section import parse_solver_section
 
 _MODEL_NAME = "qwen3_h100_p2p"
 _HARDWARE = "h100"
@@ -161,7 +168,8 @@ class Qwen3H100P2PCostModel:
         path = Path(__file__).with_suffix(".json") if calibration is None else Path(calibration)
         try:
             raw = path.read_bytes()
-            self.profile = json.loads(raw)
+            # A key given twice in one object is rejected, as in the runtime file.
+            self.profile = json.loads(raw, object_pairs_hook=_unique_object)
         except (OSError, ValueError, UnicodeError) as error:
             raise ValueError(f"Cannot read H100 calibration {str(path)!r}: {error}") from error
         digest = hashlib.sha256(raw).hexdigest()
@@ -282,6 +290,20 @@ class Qwen3H100P2PCostModel:
             for phase in ("forward", "backward")
         }
         self.iteration_tail_ms = _nonnegative(self.table["iteration_tail_ms"], "iteration tail")
+        # Optional Stage 1 coefficients of the solver. Without them the scheduler derives the
+        # sample weight from this model's step times and balances weight, not time. The
+        # calibration has no Stage 2 sample loads: ``solver.stage2`` can only say "off".
+        try:
+            solver = parse_solver_section(
+                data,
+                self.supported_cp_sizes,
+                pipeline_field=f"profiles.{_PROFILE}.microbatch_overhead_ms",
+                stage2_offered=False,
+            )
+        except ValueError as error:
+            raise ValueError(f"{error} (coefficient file {self.calibration_path!r})") from error
+        self.sample_weight_coefficients = solver.sample_weight
+        self.tier_time_factors = solver.tier_time_factors
 
     @property
     def required_global_batch_size(self):
@@ -500,6 +522,14 @@ class Qwen3H100P2PCostModel:
             "source": self.table["source"],
             "domain": self.domain,
             "validation": self.table["validation"],
+            "solver": {
+                "sample_weight": (
+                    None
+                    if self.sample_weight_coefficients is None
+                    else dict(zip("ABC", self.sample_weight_coefficients))
+                ),
+                "tier_time_factors": self.tier_time_factors,
+            },
             "scope": (
                 "Qwen3-30B-A3B BF16 self-attention under classic P2P context parallelism plus "
                 "valid-token EP mean contributions for forced-balanced routing, per-microbatch "

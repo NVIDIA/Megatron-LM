@@ -168,10 +168,3 @@ def build_round_geometries(
                 )
             )
     return rounds
-
-
-def critical_rank_work(rounds: Sequence[RoundGeometry]) -> dict[int, int]:
-    work: dict[int, int] = {}
-    for item in rounds:
-        work[item.rank] = work.get(item.rank, 0) + item.cp1_equivalent_sum_squared_tokens
-    return work

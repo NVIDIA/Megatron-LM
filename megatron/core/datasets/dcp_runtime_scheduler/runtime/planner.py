@@ -286,6 +286,10 @@ def dummy_tokens_per_group(
 class RuntimePlanner(ABC):
     """Common model injection, validation, pricing and rank-row contract for both solvers."""
 
+    # Every plan has a microbatch count that is a multiple of this. A planner for more than
+    # one pipeline stage sets it to the count multiple of the pipeline schedule.
+    count_multiple = 1
+
     def __init__(self, geometry, cost_model) -> None:
         geometry = replace(geometry, allowed_cp_sizes=tuple(sorted(set(geometry.allowed_cp_sizes))))
         self.geometry = geometry
@@ -345,6 +349,17 @@ class RuntimePlanner(ABC):
         """Explain which constraints left this global batch without a layout."""
         geometry = self.geometry
         longest = max(lengths, key=lengths.get)
+        if self.count_multiple > 1:
+            detail += (
+                f"; the count of microbatches is a multiple of {self.count_multiple}, the "
+                "pipeline-parallel size"
+            )
+            # A necessary condition: every microbatch holds at least DPxCP / largest CP size
+            # groups, and every group a sample. It is named only when the batch fails it.
+            groups = geometry.world_size // max(geometry.allowed_cp_sizes)
+            needed = self.count_multiple * groups
+            if len(lengths) < needed:
+                detail += f", which takes at least {needed} samples; this batch has {len(lengths)}"
         return RuntimeScheduleError(
             f"no layout gives each of the {geometry.world_size} DPxCP ranks a sample in every "
             f"microbatch: {len(lengths)} samples (longest: sample {longest}, "
@@ -366,7 +381,7 @@ class RuntimePlanner(ABC):
 
         This is a capacity-only candidate, scored by the same E2E model as any
         search result. It is bounded by the sample count, not an exhaustive
-        feasibility solver.
+        feasibility solver. Its number of rank rows is a multiple of ``count_multiple``.
         """
         geometry = self.geometry
         allowed = geometry.allowed_cp_sizes if widths is None else widths
@@ -401,7 +416,8 @@ class RuntimePlanner(ABC):
             pending = [i for i in pending if i not in selected]
             packs.append(ids)
         per_row = geometry.world_size // cp
-        needed = (-len(packs)) % per_row
+        # Whole rank rows, and a number of them that is a multiple of ``count_multiple``.
+        needed = (-len(packs)) % (per_row * self.count_multiple)
         if len(packs) + needed > len(lengths):
             return None
         for ids in tuple(packs):
@@ -488,6 +504,12 @@ class RuntimePlanner(ABC):
             incumbent = [[dict(cp=cp, sample_ids=ids) for _, cp, ids in row] for row in groups]
         plan = self.plan(logical, incumbent_rounds=incumbent)
         validate_rows(plan.rows, padded, self.geometry, min(self.geometry.allowed_cp_sizes))
+        if plan.microbatches % self.count_multiple:
+            # The pipeline schedule cannot run such a count: no plan source may return one.
+            raise RuntimeScheduleError(
+                f"the runtime schedule has {plan.microbatches} microbatches, which is not a "
+                f"multiple of {self.count_multiple}, the pipeline-parallel size"
+            )
         self.last_statistics["cost_length_source"] = (
             "after_lm_logical" if logical_lengths is not None else "dataset_padded_upper_bound"
         )

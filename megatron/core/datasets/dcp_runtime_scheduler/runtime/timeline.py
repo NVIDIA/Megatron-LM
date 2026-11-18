@@ -136,11 +136,36 @@ def _freeze_op(op):
     return (op["sync"], float(op["duration_ms"]))
 
 
+def layer_program(layers, *, recompute_forward: bool = False) -> dict:
+    """Execution program of a stack of layers on one pipeline stage.
+
+    ``layers`` lists, in model order, ``(forward_cost, forward_ms, backward_cost,
+    backward_ms)``: the names of a layer's CP-group attention costs and its fixed
+    non-attention times. A forward layer runs its attention and then the non-attention work
+    that ends at the EP rendezvous; the backward pass takes the layers in reverse order and
+    each layer in reverse. With ``recompute_forward`` every backward layer first replays
+    its forward.
+    """
+    forward, backward = [], []
+    for forward_cost, forward_ms, _, _ in layers:
+        forward += [dict(sync="cp", cost=forward_cost), dict(sync="ep", duration_ms=forward_ms)]
+    for forward_cost, forward_ms, backward_cost, backward_ms in reversed(layers):
+        if recompute_forward:
+            backward += [
+                dict(sync="cp", cost=forward_cost),
+                dict(sync="ep", duration_ms=forward_ms),
+            ]
+        backward += [dict(sync="ep", duration_ms=backward_ms), dict(sync="cp", cost=backward_cost)]
+    return dict(layer_count=len(layers), forward=forward, backward=backward)
+
+
 def build_timeline(model, geometry: "RuntimePlanGeometry") -> TimelineModel:
-    """Program-mode timeline from ``model.timing()`` or a scalar timeline when it is None."""
-    factory = getattr(model, "build_timeline", None)
-    if factory is not None:
-        return factory(geometry)
+    """Program-mode timeline from ``model.timing()`` or a scalar timeline when it is None.
+
+    A program-mode model may declare ``first_forward_dp_cp_sync`` in ``timing()``: False when
+    only the ranks of one CP group wait for each other. Without it all DPxCP ranks are
+    synchronised after the forward pass of the first microbatch.
+    """
     timing = model.timing()
     if timing is None:
         return TimelineModel(
@@ -161,6 +186,9 @@ def build_timeline(model, geometry: "RuntimePlanGeometry") -> TimelineModel:
         tuple(_freeze_op(op) for op in program["forward"]),
         tuple(_freeze_op(op) for op in program["backward"]),
     )
+    sync = timing.get("first_forward_dp_cp_sync", True)
+    if type(sync) is not bool:
+        raise ValueError("timing()['first_forward_dp_cp_sync'] must be a boolean")
     return TimelineModel(
         geometry.world_size,
         geometry.ep_size,
@@ -168,6 +196,6 @@ def build_timeline(model, geometry: "RuntimePlanGeometry") -> TimelineModel:
         0.0,
         0.0,
         float(timing.get("iteration_tail_ms", 0.0)),
-        True,
+        sync,
         ops,
     )

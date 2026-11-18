@@ -34,9 +34,29 @@ def _initialize_planner(spec):
             f"{getattr(model, 'calibration_sha256', None)} now); it must not change during a run"
         )
     options = spec.get('solver_options', {})
+    # Present only for a run with more than one pipeline stage.
+    pipeline = spec.get('pipeline')
     if schedulers[spec['type']]['solver'] == 'dynamic_usp':
+        if pipeline is not None:
+            # The planner then scores the pipeline schedule of the run: the interleaved one
+            # with virtual stages, where every count of microbatches it returns is a
+            # multiple of the stages, and the non-interleaved one without (one virtual
+            # stage in the specification), which runs any count.
+            schedule = _runtime_module('models.solver_section').pipeline_schedule(
+                pipeline['virtual_stages']
+            )
+            options = dict(
+                options,
+                pipeline=(pipeline['stages'], pipeline['virtual_stages']),
+                pipeline_schedule=schedule,
+            )
         return _runtime_module('runtime.dynamic_usp').DynamicUSPRuntimePlanner(
             geometry, model, **options
+        )
+    if pipeline is not None:
+        raise ValueError(
+            f"Scheduler type {spec['type']!r} plans for one pipeline stage; the specification "
+            f"has {pipeline['stages']}"
         )
     runtime = _runtime_module('runtime.lightweight')
     return runtime.LightweightRuntimePlanner(geometry, model, runtime.LightweightOptions(**options))
@@ -178,6 +198,14 @@ def _solve(planner, spec, lengths, padded, baseline_rows):
         dict(enumerate(padded)), logical_lengths=logical, incumbent_rows=baseline_rows
     )
     rows = plan.rows
+    multiple = (spec.get('pipeline') or {}).get('count_multiple', 1)
+    if len(rows) % multiple:
+        # Checked against the specification, whatever planner made the plan: the pipeline
+        # schedule of the run cannot execute another count, so such rows never leave here.
+        raise planner_module.RuntimeScheduleError(
+            f'the runtime schedule has {len(rows)} microbatches, which is not a multiple of '
+            f'{multiple}, the count multiple of the pipeline in the planner specification'
+        )
     statistics = {**planner.last_statistics, **incumbent_rejection}
     predicted_ms = plan.predicted_ms
     metadata = getattr(planner.model, 'metadata', None)

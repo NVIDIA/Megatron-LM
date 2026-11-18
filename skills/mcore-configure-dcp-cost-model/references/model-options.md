@@ -175,6 +175,20 @@ measured on nodes of 8 GPUs with 8 consecutive ranks per node. Optional
 `"calibration": "calibration/calib_table_v1.json"` loads a measured table; the
 [calibration skill](../../mcore-calibrate-dcp-runtime/SKILL.md) describes it.
 
+This profile is the only cost model that takes more than one pipeline stage,
+with or without virtual pipeline stages. For two pipeline stages of two
+virtual stages each, on twice the ranks, replace
+`--pipeline-model-parallel-size 1` by
+
+```bash
+--pipeline-model-parallel-size 2 --num-virtual-stages-per-pipeline-rank 2 \
+```
+
+Without virtual stages, give `--pipeline-model-parallel-size 2` alone. DPxCP
+stays 8, 16 or 32. The README section
+["More than one pipeline stage"](../../../megatron/core/datasets/dcp_runtime_scheduler/README.md#more-than-one-pipeline-stage)
+has the conditions.
+
 ## Measured H100 calibration
 
 ```json
@@ -226,10 +240,16 @@ Training stops before the first step with one of these messages:
 | Message | What to change |
 | --- | --- |
 | `Runtime configuration '<file>': ...` with an unknown or missing key, a wrong type or a value out of range | The file. An unknown key is listed with the allowed keys. |
+| `Runtime configuration '<file>' (type 'dynamic_usp'): ...` naming a DynamicUSP or H100 calibration, its `solver` section or a `solver.<key>` | The coefficient file that `calibration` names, not the runtime file: the field or key in the message. A message about the `solver` section ends with the path of that file. |
 | `... max_cp_size=<n> is not a CP group size this run can form ...` | Set `max_cp_size` to one of the sizes the message lists. |
 | `The runtime DCP scheduler forms CP groups of [...] ... Set "max_cp_size": <n> ...` | Add that value to the file, or use a power-of-two DPxCP that the cost model covers. |
-| `The '<type>' cost model cannot price CP groups of [...] ranks ...` | Set the `max_cp_size` the message names. When it names none, the cost model has no parameters for this hardware, attention geometry and `max_seqlen_per_dp_cp_rank`. |
+| `The '<type>' cost model cannot price CP groups of [...] ranks ...` | Set the `max_cp_size` the message names. When it names none, the cost model prices no CP group of this run for this hardware, attention geometry and `max_seqlen_per_dp_cp_rank`. Ordinary GQA prices groups above size 1 only with an even `max_seqlen_per_dp_cp_rank`. |
 | `... does not match the training configuration: ...` | The launch setting the message names, to the value it requires. A configuration the cost model does not cover cannot use that scheduler type. |
 | `... was measured with 256 samples per global batch ...` | `--global-batch-size` and `--eval-global-batch-size` to 256, or `--eval-iters 0`. |
 | `<k> of <N> DPxCP ranks read a runtime configuration that differs ...` | Give every node the same file. |
+| `... plans for more than one pipeline stage only with type "dynamic_usp" without "hardware" ...` | `--pipeline-model-parallel-size 1`, or the original DynamicUSP profile. |
+| `... takes virtual_pipeline_model_parallel_size unset ... or at least 2 ...` | With more than one pipeline stage a virtual size of 1 (or below) is not taken: leave the virtual pipeline stages unset, or give at least two per pipeline stage (`--num-virtual-stages-per-pipeline-rank` or `--num-layers-per-virtual-pipeline-stage`). The training arguments turn a size of 1 into unset; only a configuration built in Python can hold it. |
+| `... takes virtual pipeline stages only with more than one pipeline stage ...` | Remove the virtual pipeline stages, or use more than one pipeline stage with the original DynamicUSP profile. |
+| `... requires microbatch_group_size_per_vp_stage equal to pipeline_model_parallel_size ...` | Remove `--microbatch-group-size-per-virtual-pipeline-stage`, or set it to the pipeline-parallel size. |
+| `<k> of <N> DPxCP ranks of this pipeline stage hold other settings ...`, `Pipeline stages read different settings ...` or `The start-up check of the runtime DCP scheduler failed on another pipeline stage ...` | With more than one pipeline stage: give every rank of every stage the same runtime file, calibration file, package version and Python version (major.minor). The first two messages end with the values of the rank that prints them. |
 | `trace_dir '<path>' ... cannot be created or written on this rank` | Use a directory every rank can write. |

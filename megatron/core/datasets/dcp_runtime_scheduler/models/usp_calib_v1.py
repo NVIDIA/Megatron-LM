@@ -1,7 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Portions adapted from DynamicUSP at commit
-# 1ff97a4ae0beb5e088fadb9e112265bdd194b24d (src/hot_switch_solver/profiles/usp_calib_v1.py; the
-# table usp_calib_v1.json is profiles/calib_table_v1.json), BSD-3-Clause license.
+# 1ff97a4ae0beb5e088fadb9e112265bdd194b24d (src/hot_switch_solver: profiles/usp_calib_v1.py,
+# gbs/config.py, objectives/pipeline.py and stage2/evaluator.py; the packaged table is
+# profiles/calib_table_v1.json), BSD-3-Clause license.
 # See ../DYNAMIC_USP_NOTICE.txt for the upstream copyright and license text.
 
 """DynamicUSP U8 all-to-all + ring costs for the original synthetic shape.
@@ -11,7 +12,27 @@ Default formulas and the synthetic 44-layer shape are preserved from upstream
 Cost-model selection does not change the training communication configuration.
 An optional upstream-schema table replaces coefficients for this fixed profile;
 it does not change its shape or make it a calibration of arbitrary architectures.
-Stage 2 and upstream calibration tooling are not imported by this model.
+The optional ``solver`` section of a table (``solver_section``) holds the coefficients of
+the scheduler: the Stage 1 sample weight, the Stage 1 time-balance factors and the
+per-microbatch overhead of the step time. The step time is that of the upstream objective
+at one pipeline stage plus the global constant of the table. For more than one pipeline
+stage the model gives the forward and backward time of a group as the upstream objective
+splits it (``pipeline_group_times``); the runtime planner replays the pipeline schedule.
+The options of the upstream profile are fixed at their defaults: all 44 layers replayed, FA
+cache on, communication terms on, four backward ring chunks, no ``c_seg`` term, and a
+forward-KV exposed fraction of 0.87 for a ring of four and 0 for a ring of two.
+``ring.fwdkv_exposure_frac_by_rho`` and the other table fields that the default formulas do
+not use are not read.
+The model also gives what Stage 2 reads from the upstream profile (the ``stage2_`` members):
+the work of a sample, its load in a group of every CP size and the exact time of a group.
+For a run that switches Stage 2 on and can form a ring tier, a CP size above eight, it also
+gives the placement guard of the upstream profile for those tiers
+(``stage2_guard_threshold``, ``stage2_guard_margin``), with the guard threshold of the
+upstream profile, the constant 0.0, and its option ``guard_domain_factor`` fixed at the
+default 0.4. Only that guard reads the table fields
+``compute.in_train_overhead_factors.OF_fa_fwd`` and ``ring.in_train_bw_factor``: upstream
+requires the two in every table; here a table without them loads unless Stage 2 is on and
+a ring tier is usable.
 """
 
 import hashlib
@@ -20,12 +41,21 @@ import math
 from functools import lru_cache
 from pathlib import Path
 
+from ..runtime.config import _unique_object
+from .solver_section import DEFAULT_SAMPLE_WEIGHT, parse_solver_section
+
 # The packaged table was measured on nodes of eight GPUs, with NVLink inside a node and
 # InfiniBand between nodes (its "hardware" and "validity_domain.topology" fields): the U8
 # all-to-all stays inside a node and the ring hops between nodes. The runtime file names no
 # hardware for this profile and the formulas read no rank positions, so this number selects
 # nothing; it states which placement the packaged coefficients describe.
 _PACKAGED_TABLE_NVLINK_DOMAIN_SIZE = 8
+# Schema version of the upstream calibration table that the formulas read.
+_TABLE_VERSION = "v1.1"
+
+
+def _reject_constant(value):
+    raise ValueError(f"values must be finite numbers, got {value}")
 
 
 class USPCalibV1CostModel:
@@ -41,6 +71,12 @@ class USPCalibV1CostModel:
     supported_cp_sizes = (8, 16, 32)
     # Largest CP group this model prices; the scheduler forms no larger one.
     largest_cp_size = max(supported_cp_sizes)
+    # Stage 2: a group of at most this size is of the reference tier, where the work of a
+    # sample is priced. A larger group is a ring tier.
+    stage2_reference_cp_size = 8
+    # Forward and backward weights of the compute factors (gamma) behind the Stage 2 load of
+    # a CP size.
+    _GAMMA_BLEND_WEIGHTS = (1.0, 2.9)
 
     def __init__(self, geometry, *, allow_provisional=False, calibration=None) -> None:
         """Load bundled coefficients or an upstream-schema calibration table.
@@ -57,7 +93,12 @@ class USPCalibV1CostModel:
         path = Path(__file__).with_suffix(".json") if calibration is None else Path(calibration)
         try:
             raw = path.read_bytes()
-            table = json.loads(raw)
+            # As upstream: NaN and Infinity are rejected anywhere in the table. A key given
+            # twice in one object is rejected as well, as in the runtime file and in
+            # upstream's command-line decoder; upstream's table loader keeps the last value.
+            table = json.loads(
+                raw, object_pairs_hook=_unique_object, parse_constant=_reject_constant
+            )
         except (OSError, ValueError, UnicodeError) as error:
             raise ValueError(
                 f"Cannot read DynamicUSP calibration {str(path)!r}: {error}"
@@ -70,6 +111,36 @@ class USPCalibV1CostModel:
             raise ValueError("Frozen DynamicUSP calibration hash mismatch")
         self.table = table
         self._validate_table(self.table)
+        try:
+            self.solver = parse_solver_section(table, self.supported_cp_sizes)
+        except ValueError as error:
+            raise ValueError(f"{error} (coefficient file {str(path.resolve())!r})") from error
+        # Stage 1 weight of a sample: A, B, C of the table, else DynamicUSP's published fit.
+        self.sample_weight_is_default = self.solver.sample_weight is None
+        self.sample_weight_coefficients = (
+            DEFAULT_SAMPLE_WEIGHT if self.sample_weight_is_default else self.solver.sample_weight
+        )
+        # Stage 1 time-balance factors of the table; None keeps weight balance.
+        self.tier_time_factors = self.solver.tier_time_factors
+        # Stage 2 switch and keep threshold of the table; off without them, as in DynamicUSP.
+        self.stage2_enabled = self.solver.stage2_enabled
+        self.stage2_keep_threshold = self.solver.stage2_keep_threshold
+        # Ring tiers only (the block of that name below): the placement guard of Stage 2.
+        self._load_stage2_guard(path)
+        # Added to the slowest group of a microbatch; it only moves the Stage 2 epsilon.
+        self.stage2_global_constant_ms = float(table["global"]["C_global_clean_ms"])
+        # The step terms that score a plan for more than one pipeline stage, as the plan
+        # statistics record them. ``default_terms`` names those the table does not give:
+        # the defaults then apply, which are not fitted values (DynamicUSP fits all three
+        # in a run at the pipeline sizes of production). ``fitted_at`` is the table's
+        # record of that run, or None.
+        self.pipeline_terms = dict(
+            per_mb_overhead_ms=self.solver.per_mb_overhead_ms,
+            compute_fwd_share=self.solver.compute_fwd_share,
+            comm_fwd_share=self.solver.comm_fwd_share,
+            default_terms=list(self.solver.pipeline_default_terms),
+            fitted_at=self.solver.pipeline_fitted_at,
+        )
         # A table given with ``calibration`` has no field for the topology it was measured
         # on, so the profile does not know it.
         self.nvlink_domain_size = (
@@ -114,6 +185,11 @@ class USPCalibV1CostModel:
         def coefficient(*keys, positive=False):
             return number(field(*keys), ".".join(keys), positive=positive)
 
+        version = table.get("version") if isinstance(table, dict) else None
+        if version != _TABLE_VERSION:
+            raise ValueError(
+                f'DynamicUSP calibration requires "version": "{_TABLE_VERSION}", got {version!r}'
+            )
         for fit in ("U8_pre", "U8_post"):
             for key in ("floor_ms", "t0_ms", "bw_gbps"):
                 coefficient("a2a", "fits", fit, key, positive=key == "bw_gbps")
@@ -133,17 +209,15 @@ class USPCalibV1CostModel:
         rates = field("compute", "moe_rate_lut", "tflops")
         if not isinstance(tokens, list) or not isinstance(rates, list):
             raise ValueError("DynamicUSP calibration requires MoE tokens/tflops lists")
-        if len(tokens) < 2 or len(tokens) != len(rates):
+        if not tokens or len(tokens) != len(rates):
             raise ValueError(
-                "DynamicUSP calibration requires equal MoE LUT lengths of at least two"
+                "DynamicUSP calibration requires nonempty MoE LUT lists of equal length"
             )
         for index, (token, rate) in enumerate(zip(tokens, rates)):
             number(token, f"compute.moe_rate_lut.tokens[{index}]", positive=True)
             number(rate, f"compute.moe_rate_lut.tflops[{index}]", positive=True)
-        if tokens[-1] != 16384 or any(right <= left for left, right in zip(tokens, tokens[1:])):
-            raise ValueError(
-                "DynamicUSP calibration requires increasing MoE tokens ending at 16384"
-            )
+        if any(right <= left for left, right in zip(tokens, tokens[1:])):
+            raise ValueError("DynamicUSP calibration requires strictly increasing MoE tokens")
 
         beta = field("ring", "beta_by_chunk_bytes")
         if not isinstance(beta, dict):
@@ -151,12 +225,16 @@ class USPCalibV1CostModel:
         chunks = [key for key in beta if key.endswith("MB")]
         if not chunks:
             raise ValueError("DynamicUSP calibration requires at least one ring beta MB entry")
+        coordinates = set()
         for key in chunks:
             try:
                 chunk_bytes = float(key[:-2]) * 1e6
             except ValueError as error:
                 raise ValueError("Invalid DynamicUSP ring beta chunk: " + key) from error
             number(chunk_bytes, "ring.beta_by_chunk_bytes." + key + " bytes", positive=True)
+            if chunk_bytes in coordinates:
+                raise ValueError("DynamicUSP ring beta chunk keys must be unique: " + key)
+            coordinates.add(chunk_bytes)
             number(beta[key], "ring.beta_by_chunk_bytes." + key, positive=True)
 
     def check_domain(self, geometry, config=None):
@@ -172,11 +250,31 @@ class USPCalibV1CostModel:
     def _curve(fit, nbytes):
         return max(fit["floor_ms"], fit["t0_ms"] + nbytes / 1e6 / fit["bw_gbps"])
 
+    def _gamma(self, cp):
+        """Forward and backward compute factors of the table for groups of ``cp`` ranks."""
+        key = {8: "sp8_fa_cache", 16: "sp16_ring", 32: "sp32_ring"}[cp]
+        return self.table["global"]["gamma_comp"]["pure_compute"][key]
+
     @lru_cache(maxsize=65536)
     def components(self, lengths, cp):
         """Original full-stack group costs, plus a forward/backward decomposition."""
         if type(cp) is not int or cp not in self.geometry.allowed_cp_sizes:
             raise ValueError("CP size is outside the configured DynamicUSP tiers")
+        return self._priced(lengths, cp)
+
+    def _priced(self, lengths, cp):
+        """``_components`` with an arithmetic error of the formulas reported as ValueError."""
+        try:
+            return self._components(lengths, cp)
+        except ArithmeticError as error:
+            # Upstream's formula preflight is not run when a table is loaded: a table whose
+            # formulas divide by zero for this group is reported here.
+            raise ValueError("Invalid DynamicUSP cost prediction") from error
+
+    def _components(self, lengths, cp):
+        """Group costs at any CP size of the profile, also one this run cannot form."""
+        if type(cp) is not int or cp not in self.supported_cp_sizes:
+            raise ValueError("CP size is outside the DynamicUSP tiers")
         if not lengths or len(lengths) > 64 or any(type(n) is not int or n <= 0 for n in lengths):
             raise ValueError("One to 64 positive logical sequence lengths are required")
         total = sum(lengths)
@@ -202,8 +300,7 @@ class USPCalibV1CostModel:
         fa_flops = 44 * 4.0 * 3 * 160 * float(squares) / ring_size
         moe_flops = 44 * (float(total) / cp) * 5.306e8
         law = compute["fa_additive_law"]
-        gamma_key = {8: "sp8_fa_cache", 16: "sp16_ring", 32: "sp32_ring"}[cp]
-        gamma = self.table["global"]["gamma_comp"]["pure_compute"][gamma_key]
+        gamma = self._gamma(cp)
         compute_f = gamma["fwd"] * (fa_flops / (law["fwd"]["P_tflops"] * 1e9) + moe_flops / rate)
         compute_b = gamma["bwd"] * (
             2.5 * fa_flops / (law["bwd"]["P_tflops"] * 1e9) + 3.0 * moe_flops / rate
@@ -257,18 +354,234 @@ class USPCalibV1CostModel:
         """Return named forward/backward block costs for the timeline."""
         return dict(block_f=self.forward(lengths, cp), block_b=self.backward(lengths, cp))
 
+    def pipeline_group_times(self, lengths, cp):
+        """Whole-model ``(forward_ms, backward_ms)`` of one group for the pipeline replay.
+
+        The split of the upstream step-time objective: ``solver.pipeline.compute_fwd_share``
+        of the compute time and ``solver.pipeline.comm_fwd_share`` of the all-to-all and
+        ring time are forward time, the rest is backward time. ``forward`` and ``backward``
+        split a group by direction with the formulas of the profile instead; the timeline
+        of one pipeline stage reads those, and only their sum changes its step time.
+        """
+        parts = self.components(tuple(lengths), cp)
+        compute, communication = parts["compute_ms"], parts["a2a_ms"] + parts["ring_ms"]
+        compute_share, comm_share = self.solver.compute_fwd_share, self.solver.comm_fwd_share
+        forward = compute * compute_share + communication * comm_share
+        backward = compute * (1.0 - compute_share) + communication * (1.0 - comm_share)
+        return forward, backward
+
     def timing(self):
-        """Describe the upstream block program and global iteration-tail constant."""
+        """Describe the upstream block program and global iteration-tail constant.
+
+        As in the upstream step-time objective at one pipeline stage, only the ranks of one
+        group wait for each other: no all-rank synchronisation after the first forward pass.
+        ``solver.pipeline.per_mb_overhead_ms`` of the table is added once per microbatch on
+        every rank, so the step time grows by that overhead times the microbatch count.
+        """
+        forward = [dict(sync="cp", cost="block_f")] * self.layer_count
+        if self.solver.per_mb_overhead_ms > 0:
+            forward = [dict(sync="local", duration_ms=self.solver.per_mb_overhead_ms)] + forward
         return dict(
             iteration_tail_ms=self.table["global"]["C_global_clean_ms"],
+            first_forward_dp_cp_sync=False,
             execution_program=[
                 dict(
                     layer_count=self.layer_count,
-                    forward=[dict(sync="cp", cost="block_f")] * self.layer_count,
+                    forward=forward,
                     backward=[dict(sync="cp", cost="block_b")] * self.layer_count,
                 )
             ],
         )
+
+    def derive_tier_time_factors(self, reference_tokens, cp_sizes=None):
+        """Derive a ``solver.tier_time_factors`` table from the group times of this model.
+
+        One reference sample of ``reference_tokens`` tokens is priced alone in a group of
+        every CP size (``cp_sizes``, as upstream's ``allowed_sizes``; default: the allowed
+        sizes of the run). The factor of a size is that group time
+        (compute, all-to-all and ring, without the per-microbatch overhead) times the size,
+        relative to the smallest size. Use a long sample typical of those that open wide
+        groups, and derive the table again after every refit of the group-time coefficients.
+        """
+        sizes = tuple(sorted(self.geometry.allowed_cp_sizes if cp_sizes is None else cp_sizes))
+        if not sizes:
+            raise ValueError("cp_sizes must not be empty")
+        if type(reference_tokens) is not int or reference_tokens <= 0:
+            raise ValueError("reference_tokens must be a positive integer")
+        per_unit_weight = {}
+        for size in sizes:
+            parts = self.components((reference_tokens,), size)
+            total = parts["compute_ms"] + parts["a2a_ms"] + parts["ring_ms"]
+            per_unit_weight[size] = total * size
+        base = per_unit_weight[sizes[0]]
+        if not base > 0:
+            raise ValueError("The model gives a non-positive time for the reference sample")
+        return {size: per_unit_weight[size] / base for size in sizes}
+
+    # ---------------------------------------------------------------- Stage 2 hooks
+    def _stage2_load_factor(self, cp):
+        """Compute time per unit of work in a group of ``cp`` ranks, relative to the reference."""
+        forward, backward = self._GAMMA_BLEND_WEIGHTS
+
+        def blend(size):
+            gamma = self._gamma(size)
+            return (gamma["fwd"] * forward + gamma["bwd"] * backward) / (forward + backward)
+
+        return blend(cp) / blend(self.stage2_reference_cp_size)
+
+    def stage2_sample_loads(self, length, cp_sizes):
+        """Work of one sample and the load it adds to a group of every size in ``cp_sizes``.
+
+        The work is the reference size times the compute time, without communication, of the
+        sample alone in a reference group: it is priced there also when the run cannot form
+        such a group. The load at a size is that work per rank, times the compute factor of
+        the size relative to the reference size.
+        """
+        reference = self.stage2_reference_cp_size
+        work = reference * self._priced((length,), reference)["compute_ms"]
+        if not math.isfinite(work) or work <= 0.0:
+            raise ValueError("Invalid DynamicUSP sample work")
+        return work, {cp: self._stage2_load_factor(cp) * work / cp for cp in cp_sizes}
+
+    def stage2_empty_group_load(self, cp):
+        """Load of a group of ``cp`` ranks before its first sample."""
+        if cp not in self.supported_cp_sizes:
+            raise ValueError("CP size is outside the DynamicUSP tiers")
+        return 0.0
+
+    def stage2_group_time(self, lengths, cp):
+        """Exact time of one group for one microbatch: compute, all-to-all and ring.
+
+        For at most 64 sequences and a CP size of the run, as every group time of this model.
+        As upstream rejects such a profile result, a compute time that is not positive or a
+        negative communication time raises ValueError.
+        """
+        parts = self.components(tuple(lengths), cp)
+        compute, a2a, ring = parts["compute_ms"], parts["a2a_ms"], parts["ring_ms"]
+        if compute <= 0.0 or a2a < 0.0 or ring < 0.0:
+            raise ValueError("Invalid DynamicUSP cost prediction")
+        return compute + a2a + ring
+
+    # ------------------------------------------------------------------------------------
+    # Ring tiers only: the placement guard of Stage 2. This block, with its one call in
+    # ``__init__``, is everything the guard adds to the profile; it goes when the ring tiers
+    # (the CP sizes above ``stage2_reference_cp_size``) go.
+    #
+    # Upstream's ``guard_threshold``, a class field, and the default of its constructor
+    # option ``guard_domain_factor``: code constants, as the other options of the upstream
+    # profile, not keys of the coefficient file.
+    _GUARD_THRESHOLD = 0.0
+    _GUARD_DOMAIN_FACTOR = 0.4
+    # The two table fields that only the guard reads.
+    _GUARD_FIELDS = ("compute.in_train_overhead_factors.OF_fa_fwd", "ring.in_train_bw_factor")
+    # None: this run has no guard (Stage 2 is off, or no CP size of the run is a ring tier).
+    stage2_guard_threshold = None
+    _stage2_guard_floors = None
+
+    def _load_stage2_guard(self, path):
+        """Give the model its guard when Stage 2 is on and the run can form a ring tier.
+
+        Only then are the two guard fields of the table read and checked: a table without
+        them loads as before for every other run. The floor of a ring tier, the least mean
+        segment that passes, is ``_GUARD_DOMAIN_FACTOR`` times upstream's conservative
+        ring-overlap segment (``_ring_overlap_min_seg_tokens``): the ring size times the
+        length of a segment whose forward attention, at the in-train rate, takes as long as
+        passing its key-value bytes at the in-train ring bandwidth.
+        """
+        reference = self.stage2_reference_cp_size
+        ring = sorted(cp for cp in self.geometry.allowed_cp_sizes if cp > reference)
+        if not self.stage2_enabled or not ring:
+            return
+        absent = object()
+
+        def field(name):
+            node = self.table
+            for key in name.split("."):
+                if not isinstance(node, dict) or key not in node:
+                    return absent
+                node = node[key]
+            return node
+
+        def positive(value):
+            try:
+                return type(value) in (int, float) and math.isfinite(value) and value > 0
+            except OverflowError:  # an integer beyond the float range
+                return False
+
+        factors, bandwidth_factor = (field(name) for name in self._GUARD_FIELDS)
+        valid = (
+            isinstance(factors, list) and bool(factors) and all(map(positive, factors)),
+            positive(bandwidth_factor),
+        )
+        given = (factors is not absent, bandwidth_factor is not absent)
+        missing = [name for name, has in zip(self._GUARD_FIELDS, given) if not has]
+        invalid = [
+            name for name, has, good in zip(self._GUARD_FIELDS, given, valid) if has and not good
+        ]
+        floors = {}
+        if all(valid):
+            # Upstream's arithmetic, operation by operation. 1920 key-value bytes per token
+            # over 4 x 3 Q heads x head dimension 160 of the synthetic shape is 1.0.
+            try:
+                rate = float(field("compute.fa_additive_law.fwd.P_tflops")) * 1e12 / min(factors)
+                bandwidth = float(field("ring.fits.kv.bw_gbps")) * 1e9
+                bandwidth *= float(bandwidth_factor)
+                floors = {
+                    cp: self._GUARD_DOMAIN_FACTOR
+                    * ((cp // 8) * (1920 / (4.0 * 3 * 160)) * rate / bandwidth)
+                    for cp in self.supported_cp_sizes
+                    if cp > reference
+                }
+            except ArithmeticError:
+                floors = {}
+            if not floors or not all(math.isfinite(floor) for floor in floors.values()):
+                # Upstream's check of its formulas at load rejects such a table as well.
+                invalid = ["the guard floor that the two fields give (it is not finite)"]
+        if missing or invalid:
+            problems = []
+            if missing:
+                problems.append("missing: " + ", ".join(missing))
+            if invalid:
+                problems.append("not valid: " + ", ".join(invalid))
+            raise ValueError(
+                f"solver.stage2.enabled true with CP groups of {ring} ranks (ring tiers) reads "
+                "two more fields of the table for the placement guard of Stage 2: "
+                f"{self._GUARD_FIELDS[0]}, a non-empty list of finite positive numbers, and "
+                f"{self._GUARD_FIELDS[1]}, a finite positive number; {'; '.join(problems)} "
+                f"(coefficient file {str(path.resolve())!r})"
+            )
+        self._stage2_guard_floors = floors
+        self.stage2_guard_threshold = self._GUARD_THRESHOLD
+
+    def stage2_guard_margin(self, lengths, cp):
+        """Guard margin in tokens of a group of ``cp`` ranks that holds samples of ``lengths``.
+
+        Upstream's rule for a ring tier: the mean segment of the group, the sum of the
+        squared lengths over the sum of the lengths (0 for a group without a sample), minus
+        the floor of the size. ``lengths`` are logical lengths, as for every cost quantity of
+        Stage 2. As upstream, the margin of the reference size, which has no ring, is
+        infinite; Stage 2 never asks for it.
+        """
+        floors = self._stage2_guard_floors
+        if floors is None:
+            raise ValueError("usp_calib_v1 has no Stage 2 guard for this run")
+        if type(cp) is not int or cp not in self.supported_cp_sizes:
+            raise ValueError("CP size is outside the DynamicUSP tiers")
+        if cp not in floors:
+            return math.inf
+        total = sum(lengths)
+        try:
+            mean_segment = float(sum(n * n for n in lengths)) / float(total) if total else 0.0
+        except ArithmeticError as error:  # lengths beyond the float range
+            raise ValueError("Invalid DynamicUSP guard margin") from error
+        margin = mean_segment - floors[cp]
+        # As upstream. A length given as a float can get here: its square can be infinite, or
+        # it can be no number at all, without an arithmetic error.
+        if not math.isfinite(margin):
+            raise ValueError("Invalid DynamicUSP guard margin")
+        return margin
+
+    # ------------------------------------------------------------ end of the ring-tier block
 
     def clear(self):
         """Clear memoized upstream component costs before a new global batch."""
@@ -276,6 +589,24 @@ class USPCalibV1CostModel:
 
     def metadata(self):
         """Record the original U8 calibration and its synthetic-shape scope."""
+        solver = dict(
+            sample_weight=dict(
+                zip("ABC", self.sample_weight_coefficients), default=self.sample_weight_is_default
+            ),
+            tier_time_factors=self.tier_time_factors,
+            pipeline=dict(
+                per_mb_overhead_ms=self.solver.per_mb_overhead_ms,
+                compute_fwd_share=self.solver.compute_fwd_share,
+                comm_fwd_share=self.solver.comm_fwd_share,
+            ),
+        )
+        if self.stage2_enabled:
+            # Recorded only when the table switches Stage 2 on.
+            solver["stage2"] = dict(
+                enabled=True,
+                keep_threshold=self.stage2_keep_threshold,
+                reference_cp_size=self.stage2_reference_cp_size,
+            )
         return dict(
             name=self.name,
             nvlink_domain_size=self.nvlink_domain_size,
@@ -290,4 +621,5 @@ class USPCalibV1CostModel:
             ),
             calibration_path=self.calibration_path,
             calibration_sha256=self.calibration_sha256,
+            solver=solver,
         )
