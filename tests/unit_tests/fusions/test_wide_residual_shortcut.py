@@ -138,9 +138,19 @@ def invoke(raw, quantized=False, consumer=None):
     return run(raw, 3, mxfp8_handoff=quantized, mxfp8_consumer=consumer)
 
 
-def fwd(raw, streams=3, **options):
-    """Launch the forward kernel directly: (current, saved tape, reader operands)."""
+def formats(readers, quantized):
+    """Reader output formats: a tuple passes through; True makes reader zero MXFP8 (the rest
+    BF16), False every reader BF16."""
+    if isinstance(quantized, tuple):
+        return quantized
+    return ("mxfp8" if quantized else "bf16",) + ("bf16",) * (readers - 1)
+
+
+def fwd(raw, streams=3, *, mxfp8_handoff=False, **options):
+    """Launch the forward kernel directly: (current, saved tape, reader operands).
+    ``mxfp8_handoff`` is ``formats``' ``quantized``; ``outputs`` sets every format instead."""
     residual, updates, controllers, gammas = raw
+    options.setdefault("outputs", formats(len(gammas), mxfp8_handoff))
     return forward_kernel.forward(
         residual, updates, *controllers[:2], controllers[2:], gammas, num_streams=streams, **options
     )
@@ -154,9 +164,12 @@ def backward_args(raw, streams=3, **options):
 
 
 def buffers(outputs):
-    """Every buffer of BF16 tensors and rowwise MXFP8 operands (data, then scales)."""
+    """Every buffer of BF16 tensors and rowwise MXFP8 operands (data, then scales); a reader
+    emitting both formats is an (MXFP8, BF16) pair."""
     for tensor in outputs:
-        if type(tensor) is torch.Tensor:
+        if isinstance(tensor, tuple):
+            yield from buffers(tensor)
+        elif type(tensor) is torch.Tensor:
             yield tensor
         else:
             yield tensor._rowwise_data
@@ -547,7 +560,7 @@ def heuristic_cases(cluster):
         if quantized and tokens % 32:
             continue
         cfg = forward_kernel.choose_forward_config(
-            tokens, hidden, streams, readers, mxfp8=quantized, inference=True
+            tokens, hidden, streams, readers, outputs=formats(readers, quantized), inference=True
         )
         if (cfg.CLUSTER > 1) == cluster and cfg.LOADS_FIRST:
             shape = (quantized, streams, readers, hidden, tokens if cluster else min(tokens, 128))
@@ -637,6 +650,9 @@ def test_rejects_invalid_inputs():
     ]:
         with torch.no_grad(), pytest.raises(ValueError, match=message):
             run(raw, 3)
+    for outputs in [("fp8",), ("bf16", "bf16"), ()]:
+        with torch.no_grad(), pytest.raises(ValueError, match="output format"):
+            fwd((r, us, cs, gs), outputs=outputs)
     shapes = [(m, 96, "rows") for m in (0, 1, 31, 65)]
     shapes += [(1024, h, "width|H") for h in (0, 1, 31, 48, 1025, 2052, 16416)]
     for m, h, match in shapes:
@@ -683,27 +699,69 @@ def test_rejects_invalid_inputs():
                     all_bytes_equal(execute(values, inference), expected[inference])
 
 
+@QUALIFIED
+@pytest.mark.parametrize(
+    "dtype,readers,updates,inference",
+    [(F32, 2, 1, F), (BF16, 2, 2, F), (BF16, 1, 1, T), (F32, 1, 2, T)],
+)
+def test_reader_formats_store_one_normalization(dtype, readers, updates, inference):
+    """Under one schedule, each reader's BF16 and MXFP8 outputs are one normalized value: every
+    format combination writes the bytes of the all-"both" launch, with the residual and tape
+    unchanged, whatever the residual dtype."""
+    raw = inputs(3, readers, 3072, 256, updates=updates, residual_dtype=dtype, logit_dtype=dtype)
+    cfg = forward_kernel.choose_forward_config(
+        256, 3072, 3, readers, outputs=("both",) * readers, inference=inference, updates=updates
+    )
+    launch = lambda outputs: forced_forward(cfg, raw, 3, outputs=outputs, inference=inference)
+    current, saved, both = launch(("both",) * readers)
+    tape = written(current, saved, ())
+    for outputs in itertools.product(forward_kernel.OUTPUT_FORMATS, repeat=readers):
+        actual_current, actual_saved, operands = launch(outputs)
+        all_bytes_equal(written(actual_current, actual_saved, ()), tape)
+        for fmt, operand, (quantized, plain) in zip(outputs, operands, both, strict=True):
+            expected = {"bf16": [plain], "mxfp8": [quantized], "both": [quantized, plain]}[fmt]
+            all_bytes_equal(list(buffers([operand])), list(buffers(expected)))
+
+
 def test_config_tables():
-    """Nano/Super/Ultra and BF16-stream tables apply from 2048 rows with cached backward grids;
-    every forward/backward config is valid; training owns one CTA per row."""
+    """Nano/Super/Ultra, BF16-stream and output-format tables apply from 2048 rows with cached
+    backward grids; every forward/backward config is valid; training owns one CTA per row."""
     choose = forward_kernel.choose_forward_config
     table = forward_kernel._FORWARD_CONFIGS
     for (m, h), readers, mxfp8 in itertools.product(FLAGSHIPS, (1, 2), (F, T)):
         knobs = backward_kernel.get_backward_knobs(m, h, 3, readers)
         assert knobs.TARGET_CTAS == {3072: 456, 4096: 448, 10240: 440}[h]
         assert knobs.EARLY_CARRY == (h == 4096 and readers == 1)
+        outputs = formats(readers, mxfp8)
         for rows in (2048, m, m + 1024, 65536):
-            assert choose(rows, h, 3, readers, mxfp8=mxfp8) is table[h, readers, mxfp8]
-        assert choose(1024, h, 3, readers, mxfp8=mxfp8) is not table[h, readers, mxfp8]
-        assert choose(m, h, 2, readers, mxfp8=mxfp8) is not table[h, readers, mxfp8]
+            assert choose(rows, h, 3, readers, outputs=outputs) is table[h, readers, mxfp8]
+        assert choose(1024, h, 3, readers, outputs=outputs) is not table[h, readers, mxfp8]
+        assert choose(m, h, 2, readers, outputs=outputs) is not table[h, readers, mxfp8]
     for (hidden, readers, updates, quantized), cfg in forward_kernel._FORWARD_CONFIGS_BF16.items():
         assert cfg.LOADS_FIRST and cfg.WIDTH >= cfg.VECTOR * 32 * cfg.NUM_WARPS
         assert not cfg.PAIRED_REDUCE or readers == 2
-        options = dict(mxfp8=quantized, updates=updates, bf16_residual=True)
+        outputs = formats(readers, quantized)
+        options = dict(outputs=outputs, updates=updates, bf16_residual=True)
         assert choose(2048, hidden, 3, readers, **options) is cfg
         assert choose(512, hidden, 3, readers, inference=True, **options) is cfg
         assert choose(1024, hidden, 3, readers, **options) is not cfg  # short training rows
-        assert choose(2048, hidden, 3, readers, mxfp8=quantized, updates=updates) is not cfg
+        assert choose(2048, hidden, 3, readers, outputs=outputs, updates=updates) is not cfg
+    for (hidden, bf16), entries in forward_kernel._FORMAT_CONFIGS.items():
+        for (updates, outputs), cfg in entries.items():
+            readers = len(outputs)
+            # Only formats the MXFP8-presence tables cannot name: a non-BF16 reader one, or "both".
+            assert outputs != formats(readers, F) and outputs != formats(readers, T)
+            assert cfg.WIDTH >= cfg.VECTOR * 32 * cfg.NUM_WARPS
+            assert (cfg.PARTS, cfg.SPLIT, cfg.CLUSTER) == (1, False, 1)
+            assert not cfg.PAIRED_REDUCE or readers == 2
+            options = dict(outputs=outputs, updates=updates, bf16_residual=bf16)
+            for rows in (2048, 8192, 16384):
+                assert choose(rows, hidden, 3, readers, **options) is cfg
+            assert choose(1024, hidden, 3, readers, **options) is not cfg  # short training rows
+            assert choose(2048, hidden, 3, readers, inference=True, **options) is not cfg
+            assert choose(2048, hidden, 2, readers, **options) is not cfg
+            other_updates = dict(options, updates=3 - updates)
+            assert choose(2048, hidden, 3, readers, **other_updates) is not cfg
     widths = (1, 31, 32, 48, 288, 1025, 2052, 3072, 3584, 4096, 5632, 9728, 10240, 13312)
     widths += (15872, 16384, 17408, 32768)
     rows = (1, 16, 17, 32, 33, 40, 41, 64, 65, 72, 73, 88, 89, 128, 129, 160, 161, 256, 257)
@@ -711,7 +769,10 @@ def test_config_tables():
     for h, m, s, (n, u), mxfp8, inference, bf16 in itertools.product(
         widths, rows, range(1, 7), SEAMS, (F, T), (F, T), (F, T)
     ):
-        cfg = choose(m, h, s, n, mxfp8=mxfp8, inference=inference, updates=u, bf16_residual=bf16)
+        outputs = formats(n, mxfp8)
+        cfg = choose(
+            m, h, s, n, outputs=outputs, inference=inference, updates=u, bf16_residual=bf16
+        )
         assert cfg.WIDTH >= 32 and cfg.WIDTH & (cfg.WIDTH - 1) == 0
         assert 0 <= cfg.OFFLOAD_SEGMENTS <= (h + cfg.WIDTH - 1) // cfg.WIDTH
         assert cfg.REDUCE_VECTOR in (0, 1, 2, 4, 8, 16, 32) and cfg.NUM_WARPS in (4, 8, 16)
@@ -724,7 +785,7 @@ def test_config_tables():
             # Training and long prefill: one CTA per row, shared by one and two updates.
             assert (cfg.PARTS, cfg.SPLIT, cfg.CLUSTER) == (1, False, 1)
             if not bf16:
-                assert cfg == choose(m, h, s, n, mxfp8=mxfp8, inference=inference)
+                assert cfg == choose(m, h, s, n, outputs=outputs, inference=inference)
         elif tuned:
             assert cfg.WIDTH >= 128 * cfg.NUM_WARPS and cfg.PARTS * (1 + cfg.SPLIT) in (1, 2, 4)
             if cfg.CLUSTER > 1:
@@ -1316,10 +1377,10 @@ def test_generic_norm_matches_unfused_oracle(hidden):
     actual_rs = torch.empty(rows, device=x.device, dtype=F32)
     actual = quantizer.make_empty(x.shape, dtype=BF16, device=x.device)
     actual._rowwise_scale_inv.zero_()
-    forward_kernel.FORWARD_KERNELS[True, 1][(rows,)](
+    forward_kernel.FORWARD_KERNELS["mxfp8",][(rows,)](
         forward_kernel._WriteArgs(2 * x, update, update, torch.empty_like(x), None),
         read_tensors=forward_kernel._ReadArgs(
-            (gamma,), (actual_rs,), (actual._rowwise_data,), (actual._rowwise_scale_inv,)
+            (gamma,), (actual_rs,), (None,), (actual._rowwise_data,), (actual._rowwise_scale_inv,)
         ),
         controllers=(controller, None, controller, controller),
         saved_coefficients=coefficients,

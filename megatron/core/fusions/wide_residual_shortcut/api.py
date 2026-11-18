@@ -92,7 +92,8 @@ class _Boundary(torch.autograd.Function):
             retain,
             reads,
             gammas,
-            mxfp8_handoff=mxfp8_handoff,
+            # Only reader zero is MXFP8 (the router input, reader one, stays BF16).
+            outputs=("mxfp8" if mxfp8_handoff else "bf16",) + ("bf16",) * (count - 1),
             num_streams=streams,
             epsilon=epsilon,
             inference=ctx is None,

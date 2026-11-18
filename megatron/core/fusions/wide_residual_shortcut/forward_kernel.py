@@ -37,12 +37,18 @@ class _WriteArgs(NamedTuple):
 
 
 class _ReadArgs(NamedTuple):
-    """Per reader: gamma, saved rstd (None in inference), output, MXFP8 scales (None: BF16)."""
+    """Per reader: gamma, saved rstd (None in inference), BF16 output, rowwise MXFP8 data and
+    scales (each None when that format is not emitted)."""
 
     gammas: tuple
     rstd: tuple
     outputs: tuple
+    quantized: tuple
     scales: tuple
+
+
+# A reader's output formats: BF16, rowwise MXFP8, or both from the same normalized values.
+OUTPUT_FORMATS = ("bf16", "mxfp8", "both")
 
 
 class _ForwardConfig(NamedTuple):
@@ -119,6 +125,77 @@ _FORWARD_CONFIGS_BF16 = {
 
 # BF16 residual streams of other shapes from 2048 rows: the sweep's most robust config.
 _BF16_STREAM_CONFIG = _ForwardConfig(4096, 1, 1, False, 0, 8, 128, False, LOADS_FIRST=True)
+
+
+def _format_config(*fields, vector=4):
+    return _ForwardConfig(*fields, LOADS_FIRST=True, VECTOR=vector)
+
+
+# GB300 training configs (3 streams, rows >= 2048) for reader output formats that the tables
+# above, keyed only by whether reader zero is MXFP8, schedule slower. From a format sweep of ~15K
+# configs at 4K rows whose best were re-timed at 2K-16K rows: an entry beat the MXFP8-presence
+# choice by over 2% (geometric mean), and by no less than -1% at any row count.
+# Key: (hidden, BF16 residual) -> (updates, per-reader output formats).
+# fmt: off
+_FORMAT_CONFIGS = {
+    (3072, False): {
+        (1, ("bf16", "mxfp8")): _ForwardConfig(4096, 2, 0, True, 0, 8, 80, False),
+        (1, ("both", "both")): _format_config(1024, 2, 0, True, 0, 8, 80, False),
+        (1, ("both", "mxfp8")): _format_config(4096, 2, 0, True, 0, 8, 80, True),
+        (1, ("mxfp8", "both")): _format_config(4096, 2, 0, True, 0, 8, 80, True),
+        (1, ("mxfp8", "mxfp8")): _format_config(4096, 2, 0, True, 0, 8, 80, False),
+        (2, ("mxfp8", "mxfp8")): _format_config(4096, 2, 0, True, 0, 8, 80, False),
+    },
+    (3072, True): {
+        (1, ("both",)): _format_config(1024, 2, 2, False, 16, 4, None, False, vector=8),
+        (1, ("bf16", "both")): _format_config(2048, 1, 1, True, 0, 4, None, True, vector=8),
+        (1, ("bf16", "mxfp8")): _format_config(1024, 2, 2, False, 1, 4, 64, False, vector=8),
+        (1, ("both", "bf16")): _format_config(1024, 4, 0, False, 4, 8, 64, False),
+        (1, ("both", "both")): _format_config(4096, 2, 0, False, 16, 4, None, False, vector=8),
+        (1, ("both", "mxfp8")): _format_config(1024, 1, 2, False, 0, 4, None, False, vector=8),
+        (1, ("mxfp8", "both")): _format_config(2048, 2, 1, True, 0, 4, 64, False, vector=8),
+        (1, ("mxfp8", "mxfp8")): _format_config(2048, 4, 1, True, 4, 4, 80, True, vector=8),
+        (2, ("both", "both")): _format_config(1024, 4, 1, True, 16, 8, 80, True),
+        (2, ("both", "mxfp8")): _format_config(1024, 2, 0, False, 0, 4, None, False, vector=8),
+        (2, ("mxfp8", "both")): _format_config(1024, 2, 2, True, 4, 4, None, False, vector=8),
+        (2, ("mxfp8", "mxfp8")): _format_config(1024, 2, 2, False, 4, 4, None, True),
+    },
+    (4096, False): {
+        (2, ("bf16", "both")): _format_config(2048, 2, 1, False, 0, 8, 128, False),
+    },
+    (4096, True): {
+        (1, ("both",)): _format_config(2048, 2, 1, False, 1, 8, 80, True, vector=8),
+        (2, ("bf16", "both")): _format_config(2048, 1, 1, False, 4, 4, None, False, vector=8),
+        (2, ("bf16", "mxfp8")): _format_config(2048, 4, 0, False, 4, 8, 80, True, vector=8),
+        (2, ("both", "both")): _format_config(2048, 4, 1, False, 0, 4, None, False, vector=8),
+        (2, ("both", "mxfp8")): _format_config(2048, 4, 1, True, 16, 4, None, True, vector=8),
+        (2, ("mxfp8", "both")): _format_config(2048, 2, 0, True, 1, 8, 80, False, vector=8),
+        (2, ("mxfp8", "mxfp8")): _format_config(2048, 2, 1, False, 16, 8, 64, False, vector=8),
+    },
+    (10240, False): {
+        (2, ("bf16", "both")): _format_config(4096, 4, 1, False, 0, 16, 128, True),
+        (2, ("both", "bf16")): _format_config(4096, 4, 1, False, 0, 16, 128, True),
+        (2, ("both", "mxfp8")): _format_config(4096, 4, 1, False, 0, 16, 128, True),
+        (2, ("mxfp8", "both")): _format_config(4096, 4, 1, False, 0, 16, 128, True),
+        (2, ("mxfp8", "mxfp8")): _format_config(4096, 4, 1, False, 0, 16, 128, True),
+    },
+    (10240, True): {
+        (1, ("bf16", "both")): _format_config(2048, 2, 1, True, 0, 8, 128, False),
+        (1, ("bf16", "mxfp8")): _format_config(2048, 2, 1, True, 0, 8, 128, False),
+        (1, ("both", "bf16")): _format_config(2048, 2, 2, True, 0, 8, 128, False, vector=8),
+        (1, ("both", "both")): _format_config(2048, 2, 2, True, 0, 8, 128, False, vector=8),
+        (1, ("both", "mxfp8")): _format_config(2048, 2, 2, True, 0, 8, 128, False, vector=8),
+        (1, ("mxfp8", "both")): _format_config(2048, 2, 2, True, 0, 8, 128, False, vector=8),
+        (1, ("mxfp8", "mxfp8")): _format_config(2048, 2, 2, True, 0, 8, 128, False, vector=8),
+        (2, ("bf16", "both")): _format_config(4096, 1, 1, False, 0, 8, 128, False),
+        (2, ("bf16", "mxfp8")): _format_config(2048, 2, 1, True, 4, 8, 128, False, vector=8),
+        (2, ("both", "both")): _format_config(2048, 2, 2, True, 0, 8, 128, False, vector=8),
+        (2, ("both", "mxfp8")): _format_config(2048, 2, 2, True, 0, 8, 128, False, vector=8),
+        (2, ("mxfp8", "both")): _format_config(2048, 2, 2, True, 0, 8, 128, False, vector=8),
+        (2, ("mxfp8", "mxfp8")): _format_config(4096, 1, 1, False, 4, 8, 128, False, vector=8),
+    },
+}
+# fmt: on
 
 # Batch-invariant inference uses this row count's schedule at every row count, so a row's
 # arithmetic does not depend on the batch (a decode-cluster schedule, MXFP8-aligned).
@@ -213,10 +290,18 @@ def _programmatic_launch(device):
 
 
 def choose_forward_config(
-    m, h, streams, readers=1, *, mxfp8=False, inference=False, updates=None, bf16_residual=False
+    m, h, streams, readers=1, *, outputs=None, inference=False, updates=None, bf16_residual=False
 ):
-    """Choose the row-kernel schedule; ``updates`` None means one per reader."""
-    cfg = _choose(m, h, streams, readers, mxfp8, inference, updates, bf16_residual)
+    """Choose the row-kernel schedule; ``updates`` None means one per reader and ``outputs`` (the
+    readers' formats, ``OUTPUT_FORMATS``) None means BF16 readers."""
+    outputs = ("bf16",) * readers if outputs is None else tuple(outputs)
+    cfg = None
+    if not inference and streams == 3 and m >= 2048:
+        cfg = _FORMAT_CONFIGS.get((h, bf16_residual), {}).get((updates or readers, outputs))
+    if cfg is None:
+        # Otherwise schedules depend only on MXFP8 presence (reader zero's, where tuned).
+        mxfp8 = any(f != "bf16" for f in outputs)
+        cfg = _choose(m, h, streams, readers, mxfp8, inference, updates, bf16_residual)
     # Pairing the two readers' reductions needs two readers.
     return cfg._replace(PAIRED_REDUCE=False) if cfg.PAIRED_REDUCE and readers == 1 else cfg
 
@@ -273,7 +358,7 @@ def forward(
     reads,
     gammas,
     *,
-    mxfp8_handoff=False,
+    outputs=None,
     num_streams=3,
     epsilon=1.0e-5,
     inference=False,
@@ -283,14 +368,21 @@ def forward(
     ``updates`` is one BF16 ``[M, H]`` update or a shortcut add of two (its BF16 sum is rounded
     before the write); the ``[M, S * H]`` residual keeps its dtype. All arithmetic is FP32 and
     readers fold unrounded values. ``retain`` None is a static identity retention (not zero
-    logits). ``mxfp8_handoff`` quantizes reader zero to rowwise MXFP8; other readers are BF16.
+    logits). ``outputs`` gives each reader's format (``OUTPUT_FORMATS``, default BF16), whatever
+    the residual dtype: ``"mxfp8"`` is rowwise MXFP8 and ``"both"`` emits BF16 and MXFP8 from the
+    same normalized values.
 
-    Returns ``(current residual, SavedWrite or None in inference, reader operands)``.
+    Returns ``(current residual, SavedWrite or None in inference, reader operands)``: per reader a
+    BF16 tensor, an MXFP8 tensor, or with ``"both"`` an ``(MXFP8, BF16)`` pair.
     """
     validate_num_streams(num_streams)
     n = len(reads)
     if n not in (1, 2) or len(gammas) != n or len(updates) not in (1, 2):
         raise ValueError("one or two readers write one update or a shortcut add of two")
+    outputs = ("bf16",) * n if outputs is None else tuple(outputs)
+    if len(outputs) != n or any(f not in OUTPUT_FORMATS for f in outputs):
+        raise ValueError(f"each reader's output format must be one of {OUTPUT_FORMATS}")
+    mxfp8 = any(f != "bf16" for f in outputs)
     shortcut_add = len(updates) == 2
     if not residual.is_cuda or updates[0].ndim != 2:
         raise ValueError("expected CUDA [M,H] updates")
@@ -318,7 +410,7 @@ def forward(
         h,
         num_streams,
         n,
-        mxfp8=mxfp8_handoff,
+        outputs=outputs,
         inference=inference,
         updates=len(updates),
         bf16_residual=residual.dtype == torch.bfloat16,
@@ -333,21 +425,24 @@ def forward(
         aligned = ((residual,) if packets or tma else ()) + (tuple(updates) if tma else ())
         if any(t.data_ptr() % 16 for t in aligned):
             raise ValueError("FP32 packet or training TMA operands must be 16-byte aligned")
-    if mxfp8_handoff and (m % 32 or h % 32):
-        raise ValueError("MXFP8 handoff requires rows and hidden width divisible by 32")
+    if mxfp8 and (m % 32 or h % 32):
+        raise ValueError("MXFP8 outputs require rows and hidden width divisible by 32")
 
     current = torch.empty_like(residual)
     summed = torch.empty_like(updates[0]) if shortcut_add and not inference else None
     stats = tuple(
         None if inference else torch.empty(m, dtype=torch.float32, device=device) for _ in range(n)
     )
-    qs = []
-    for reader in range(n):
-        bf16 = not mxfp8_handoff or reader > 0
-        qs.append(allocate_operand((m, h), device, bf16))
+    plain, quantized, qs = [], [], []
+    for fmt in outputs:
+        bf16 = None if fmt == "mxfp8" else allocate_operand((m, h), device, True)
+        mx = None if fmt == "bf16" else allocate_operand((m, h), device)
         # Inference pads rows in-kernel; partial scale columns still need clearing.
-        if not bf16 and (h % 128 or (m % 128 and not inference)):
-            qs[-1]._rowwise_scale_inv.zero_()
+        if mx is not None and (h % 128 or (m % 128 and not inference)):
+            mx._rowwise_scale_inv.zero_()
+        plain.append(bf16)
+        quantized.append(mx)
+        qs.append(bf16 if mx is None else mx if bf16 is None else (mx, bf16))
 
     saved = None
     if not inference:
@@ -369,7 +464,9 @@ def forward(
         residual, updates[0], updates[1] if shortcut_add else None, current, summed
     )
     kwargs = dict(
-        read_tensors=_ReadArgs(gammas, stats, *operand_buffers(qs, columnwise=False)),
+        read_tensors=_ReadArgs(
+            gammas, stats, tuple(plain), *operand_buffers(quantized, columnwise=False)
+        ),
         H=h,
         STREAMS=num_streams,
         # A runtime unit retention coefficient preserves Ultra register occupancy.
@@ -378,13 +475,13 @@ def forward(
         # Logits (write, retain, read_a, read_b); read_b repeats read_a with one reader.
         controllers=(write, retain, reads[0], reads[-1]),
         saved_coefficients=c,
-        PAD_ROWS=inference and mxfp8_handoff and bool(m % 128),
+        PAD_ROWS=inference and mxfp8 and bool(m % 128),
         DEPENDENT=dependent,
         EXCHANGE=None,
         enable_fp_fusion=False,
         launch_pdl=dependent,
     )
-    kernel = FORWARD_KERNELS[bool(mxfp8_handoff), n]
+    kernel = FORWARD_KERNELS[outputs]
     if config.CLUSTER > 1:
         kwargs["EXCHANGE"] = _exchange_asm(config.CLUSTER, 1 if config.SPLIT else n)
         launch = dict(CONFIG=config, num_warps=config.NUM_WARPS, maxnreg=config.MAXNREG)
@@ -625,22 +722,23 @@ def _owns_columns(cols, H: gl.constexpr, CONFIG: gl.constexpr):
 
 @g.jit
 def _emit(x, OPERANDS, indices, rstd, H: gl.constexpr, CONFIG: gl.constexpr, rows):
-    """Normalize one reader fragment; store BF16 or (with scales) rowwise MXFP8.
+    """Normalize one reader fragment; store it as BF16 and/or rowwise MXFP8 (each output None
+    when not emitted).
 
     ``rows`` pads the last 128-row tile's MXFP8 scales, or None.
     """
-    weight, output, scales = OPERANDS
+    weight, output, quantized, scales = OPERANDS
     row, cols = indices
     mask = (cols < H) & _owns_columns(cols, H, CONFIG)
     y = (x * rstd) * weight
-    if scales is None:
+    if output is not None:
         gl.store(output + row * H + cols, y.to(gl.bfloat16), mask)
-    else:
+    if quantized is not None:
         grouped = gl.reshape(y, (x.numel // 32, 32))
         group = gl.min(gl.reshape(cols, (x.numel // 32, 32)), 1) // 32
         _emit_mxfp8(
             grouped,
-            (output + row * H + cols, mask),
+            (quantized + row * H + cols, mask),
             (scales, (group < H // 32) & _owns_columns(group, H // 32, CONFIG)),
             (row, group, H),
             rows,
@@ -874,13 +972,18 @@ def _forward_body(
             if reader_index * NUM_SEGMENTS + segment_index >= CONFIG.PIPELINE_DEPTH:
                 x, weight, rstd = queue[0]
                 output_stage = reader_index * NUM_SEGMENTS + segment_index - CONFIG.PIPELINE_DEPTH
-                for target in gl.static_range(len(read_tensors.outputs)):
+                for target in gl.static_range(len(read_tensors.gammas)):
                     if target == (
                         gl.program_id(1) if CONFIG.SPLIT else output_stage // NUM_SEGMENTS
                     ):
                         _emit(
                             x,
-                            (weight, read_tensors.outputs[target], read_tensors.scales[target]),
+                            (
+                                weight,
+                                read_tensors.outputs[target],
+                                read_tensors.quantized[target],
+                                read_tensors.scales[target],
+                            ),
                             (row, cols + (output_stage % NUM_SEGMENTS) * width),
                             rstd,
                             H,
@@ -890,10 +993,20 @@ def _forward_body(
                 queue = queue[1:]
 
 
-# One kernel body; its profiler name gives the variant (MXFP8 reader zero, reader count).
+# One kernel body; its profiler name gives the variant (reader count and output formats; reader
+# zero's format leads, a second reader's follows "_2reader" unless BF16).
+_FORMAT_TAGS = {"bf16": "", "mxfp8": "_mxfp8quant", "both": "_bf16_mxfp8quant"}
+
+
+def _forward_kernel_name(outputs):
+    name = "_fwd_wr_read_norm_wr_write" + _FORMAT_TAGS[outputs[0]]
+    if len(outputs) == 2:
+        name += "_2reader" + _FORMAT_TAGS[outputs[1]].replace("_", "_r1_", 1)
+    return name
+
+
 FORWARD_KERNELS = {
-    (False, 1): named_jit(_forward_body, "_fwd_wr_read_norm_wr_write"),
-    (False, 2): named_jit(_forward_body, "_fwd_wr_read_norm_wr_write_2reader"),
-    (True, 1): named_jit(_forward_body, "_fwd_wr_read_norm_wr_write_mxfp8quant"),
-    (True, 2): named_jit(_forward_body, "_fwd_wr_read_norm_wr_write_mxfp8quant_2reader"),
+    formats: named_jit(_forward_body, _forward_kernel_name(formats))
+    for formats in [(a,) for a in OUTPUT_FORMATS]
+    + [(a, b) for a in OUTPUT_FORMATS for b in OUTPUT_FORMATS]
 }
