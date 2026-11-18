@@ -213,5 +213,10 @@ class TestSafeDCPMetadata:
         if is_rank0:
             (ckpt / ".metadata").write_bytes(pickle.dumps(Evil()))
         barrier()
-        with pytest.raises(Exception, match="Refusing to unpickle"):
+        # DCP wraps per-rank errors in a CheckpointException whose str() only lists
+        # the failed ranks, so inspect the per-rank failures for the refusal message.
+        with pytest.raises(Exception) as exc_info:
             dcp.load(out, checkpoint_id=str(ckpt))
+        failures = getattr(exc_info.value, "failures", None)
+        details = " ".join(str(v) for v in failures.values()) if failures else str(exc_info.value)
+        assert "Refusing to unpickle" in details
