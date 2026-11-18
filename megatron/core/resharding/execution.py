@@ -97,7 +97,7 @@ def _collect_destination_receive_info(
     plan: ReshardPlan,
     dst_module: torch.nn.Module | None,
     transform: Optional[ReshardTransform] = None,
-) -> dict[int, tuple[bool, torch.dtype]]:
+) -> dict[int, tuple[bool, torch.dtype, str]]:
     """Map local recv tasks to their canonical destination dtype."""
     dst_tensors = get_refit_tensor_dict(dst_module) if dst_module is not None else {}
     destination_buffers = (
@@ -105,7 +105,7 @@ def _collect_destination_receive_info(
         if dst_module is not None
         else set()
     )
-    local_receives: dict[int, tuple[bool, torch.dtype]] = {}
+    local_receives: dict[int, tuple[bool, torch.dtype, str]] = {}
     for op in plan.recv_ops:
         transformed = transform is not None and transform.should_transform(op.param_name)
         if op.task_id is None or transformed:
@@ -114,7 +114,11 @@ def _collect_destination_receive_info(
         if dst_tensor is None:
             continue
         receive_dtype = torch.bfloat16 if _requires_bf16_staging(dst_tensor) else dst_tensor.dtype
-        local_receives[op.task_id] = (op.param_name in destination_buffers, receive_dtype)
+        local_receives[op.task_id] = (
+            op.param_name in destination_buffers,
+            receive_dtype,
+            op.param_name,
+        )
     return local_receives
 
 
@@ -131,10 +135,18 @@ def _resolve_refit_dtypes(gathered) -> dict[int, torch.dtype]:
 
     task_dtypes: dict[int, torch.dtype] = {}
     for rank_receives in destination_dtype_info:
-        for task_id, (is_buffer, receive_dtype) in rank_receives.items():
+        rank_buffer_dtypes: dict[str, torch.dtype] = {}
+        for task_id, (is_buffer, receive_dtype, param_name) in rank_receives.items():
             if is_buffer:
                 # For buffers, use the source dtype for the destination dtype.
                 receive_dtype = source_buffer_dtypes.get(task_id, receive_dtype)
+                previous_buffer_dtype = rank_buffer_dtypes.setdefault(param_name, receive_dtype)
+                if previous_buffer_dtype != receive_dtype:
+                    # Validate N-to-1 sends globally so every participating rank
+                    # fails before any destination buffer is modified.
+                    raise ValueError(
+                        f"Source shards disagree on buffer dtype for {param_name}."
+                    )
             # Track the destination dtype by task for source dtype casting.
             previous = task_dtypes.setdefault(task_id, receive_dtype)
             if previous != receive_dtype:
@@ -169,10 +181,7 @@ def _apply_buffer_dtypes(
         receive_dtype = task_dtypes.get(op.task_id)
         if receive_dtype is None:
             continue
-        previous = buffer_dtypes.setdefault(op.param_name, receive_dtype)
-        if previous != receive_dtype:
-            # Validate N-to-1 send/recv for this buffer.
-            raise ValueError(f"Source shards disagree on buffer dtype for {op.param_name}.")
+        buffer_dtypes[op.param_name] = receive_dtype
 
     invalidated = False
     for full_name, sub, buf_name, dst_buf in named_persistent_buffers(dst_module):
