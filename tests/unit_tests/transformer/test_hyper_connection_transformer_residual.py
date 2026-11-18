@@ -60,7 +60,7 @@ def _offload_interface(enabled, value, tag):
     return _NormContext(value)
 
 
-def _make_layer(stages="both", *, layer_type=None, **submodule_overrides):
+def _make_layer(stages="both", *, layer_type=None, cuda_graph_impl="none", **submodule_overrides):
     layer_type = layer_type or HyperConnectionTransformerLayer
     is_mhc = issubclass(layer_type, HyperConnectionTransformerLayer)
     is_wide = issubclass(layer_type, WideResidualTransformerLayer)
@@ -76,7 +76,7 @@ def _make_layer(stages="both", *, layer_type=None, **submodule_overrides):
         use_fused_mhc=False,
         hidden_dropout=0.25,
         bias_dropout_fusion=False,
-        cuda_graph_impl="none",
+        cuda_graph_impl=cuda_graph_impl,
     )
     has_attention, has_mlp = stages in ("both", "attention"), stages in ("both", "mlp")
     stage_specs = dict(
@@ -286,6 +286,7 @@ def test_optional_stages_construct_and_run_the_inherited_forward(stages):
     assert all(parameter.grad is not None for parameter in layer.parameters())
 
     # Exercise the real module enumeration and hook setup, including absent branches.
+    layer = _make_layer(stages, cuda_graph_impl="transformer_engine")
     for scopes in (
         [CudaGraphModule.attn],
         [CudaGraphModule.mlp],
@@ -295,7 +296,7 @@ def test_optional_stages_construct_and_run_the_inherited_forward(stages):
         layer.config.cuda_graph_modules = scopes
         hooked = []
         layer.setup_manual_hooks(lambda: hooked.append)
-        for hook, args in layer.cuda_graph_manual_hooks:
+        for hook, args in layer.te_cuda_graph_manual_hooks:
             hook(*args)
         assert len(hooked) == len(set(hooked))
         for scope, owner in (

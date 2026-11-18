@@ -10,8 +10,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin
 from megatron.core.transformer.enums import CudaGraphModule
-from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.megakernel import parameter_bridge
 from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
 from megatron.core.transformer.moe.megakernel.mok import backend as mok_backend
@@ -492,23 +492,26 @@ def test_te_cuda_graph_replay_refreshes_after_manual_hooks_and_before_the_graph(
     calls = []
     graph_output = object()
 
+    def hook(param_module):
+        calls.append(("hook", param_module))
+
     def graph(*args, **kwargs):
         calls.append(("replay", args, kwargs))
         return graph_output
 
     hidden = torch.zeros(2)
     module = SimpleNamespace(
-        current_microbatch=1,
-        cuda_graphs=[None, graph],
+        te_cuda_graph_current_microbatch=1,
+        te_cuda_graphs=[None, graph],
         _te_cuda_graph_index=lambda microbatch_idx: microbatch_idx,
-        cuda_graph_manual_hooks=[(lambda param_module: calls.append(("hook", param_module)), (7,))],
+        te_cuda_graph_manual_hooks=[(hook, (7,))],
         _get_te_cuda_graph_replay_args=lambda *args, **kwargs: (args, kwargs),
         _before_te_cuda_graph_replay=lambda: calls.append(("refresh",)),
     )
 
-    assert GraphableMegatronModule._te_cuda_graph_replay(module, hidden) is graph_output
+    assert TECudaGraphMixin._te_cuda_graph_replay_graph(module, hidden) is graph_output
     assert calls == [("hook", 7), ("refresh",), ("replay", (hidden,), {})]
-    assert GraphableMegatronModule._before_te_cuda_graph_replay(module) is None
+    assert TECudaGraphMixin._before_te_cuda_graph_replay(module) is None
 
 
 def _graph_layer(is_moe_layer, megakernel, cuda_graph_modules, **attributes):
@@ -576,7 +579,7 @@ def test_cuda_graphs_deleted_hooks_default_to_noop():
             return hidden_states
 
     assert _Backend().cuda_graphs_deleted() is None
-    assert GraphableMegatronModule._after_te_cuda_graphs_deleted(SimpleNamespace()) is None
+    assert TECudaGraphMixin._after_te_cuda_graphs_deleted(SimpleNamespace()) is None
 
 
 def _split_module(*, use_mxfp8_weights):
@@ -1179,7 +1182,11 @@ def test_deleting_te_cuda_graphs_releases_the_captured_mok_weight_views(
 
     graph = _Graph()
     layer = _graph_layer(
-        True, module, cuda_graph_modules, cuda_graphs=[graph], cuda_graph_manual_hooks=[object()]
+        True,
+        module,
+        cuda_graph_modules,
+        te_cuda_graphs=[graph],
+        te_cuda_graph_manual_hooks=[object()],
     )
     helper = cuda_graphs.TECudaGraphHelper.__new__(cuda_graphs.TECudaGraphHelper)
     helper.callables_per_chunk = [[layer]]
@@ -1192,7 +1199,7 @@ def test_deleting_te_cuda_graphs_releases_the_captured_mok_weight_views(
     helper.delete_cuda_graphs()
 
     assert not helper.graphs_created()
-    assert layer.cuda_graphs == [] and layer.cuda_graph_manual_hooks == []
+    assert layer.te_cuda_graphs == [] and layer.te_cuda_graph_manual_hooks == []
     assert not module._weight_views_captured
     # A checkpoint reload and a dtype move work again, and drop the views they invalidate.
     module.load_state_dict({}, strict=False)

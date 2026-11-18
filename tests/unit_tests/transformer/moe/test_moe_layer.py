@@ -468,13 +468,13 @@ class TestMoELayerInit:
                 **config_overrides,
             )
             # What the eager cuda_graph_warmup_steps record from masked batches.
-            layer._padding_mask_shape_seen = (2, 8)
+            layer._te_cuda_graph_padding_mask_shape_seen = (2, 8)
 
             static_mask = layer.get_layer_static_inputs(8, 2)["padding_mask"]
 
             assert static_mask.dtype == torch.bool and tuple(static_mask.shape) == (2, 8)
             assert bool(static_mask.all()) if all_padding else not bool(static_mask.any())
-            assert layer._cuda_graph_padding_mask_shape == (2, 8)
+            assert layer._te_cuda_graph_padding_mask_shape == (2, 8)
         finally:
             Utils.destroy_model_parallel()
 
