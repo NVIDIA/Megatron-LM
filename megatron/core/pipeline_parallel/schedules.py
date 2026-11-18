@@ -797,6 +797,10 @@ def forward_backward_no_pipelining(
         adjust_tensor_shapes_fn is None
     ), "adjust_tensor_shapes_fn is not supported for non-pipeline-parallel schedule"
 
+    prepare = getattr(forward_step_func, 'prepare_pipeline_inputs', None)
+    if prepare is not None:
+        data_iterator = prepare(data_iterator, model, num_microbatches, forward_only=forward_only)
+
     config = get_model_config(model)
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)

@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import fnmatch
 import math
@@ -166,6 +166,13 @@ class OptimizerConfig:
     apply_wd_to_qk_layernorm: bool = False
     """If true, apply weight decay to qk layernorm as a special case."""
 
+    apply_wd_to_norm: bool = False
+    """Apply weight decay to normalization weights named ``*norm.weight`` or
+    ``*layer_norm_weight`` (including fused TE norms), or tagged ``is_norm_weight``.
+    Biases and other vector parameters retain their standard exemptions.
+    Takes precedence over ``apply_wd_to_qk_layernorm``.
+    """
+
     ##############
     # Precision
     ##############
@@ -264,11 +271,21 @@ class OptimizerConfig:
     muon_split_qkv: bool = True
     """Whether to split QKV parameters for Muon optimizer."""
 
+    muon_split_qkv_per_head: bool = False
+    """Whether to orthogonalize each Q, gate, K, and V head independently. Requires
+    ``muon_split_qkv``. Uniform head sizes use the batched Newton-Schulz implementation
+    and require Emerging-Optimizers 0.3.0 or newer. By default, Muon orthogonalizes the
+    Q, gate, K, and V projection matrices separately."""
+
     muon_nesterov: bool = False
     """Whether to use Nesterov-style momentum in the internal SGD."""
 
     muon_scale_mode: str = "spectral"
-    """The mode to use for the scale factor. Defaults to "spectral"."""
+    """Update scaling mode. ``rms`` normalizes each nonzero NS output matrix to an
+    actual RMS of ``muon_extra_scale_factor``, independently per head when enabled.
+    Currently supported by ordinary Muon with TP=1 and no GTP weight sharding,
+    including LayerWiseDistributedOptimizer. Defaults to shape-based ``spectral``.
+    """
 
     muon_fp32_matmul_prec: str = "medium"
     """The precision to use for the fp32 matmul. Defaults to "medium"."""
@@ -285,7 +302,9 @@ class OptimizerConfig:
     each shard independently, which makes the update rule depend on the parallelism config;
     "duplicated" and "distributed" both orthogonalize the whole matrix, so results do not
     change as TP changes. "auto" select between duplicated and distributed mode per-weight for
-    dense weights. "layer_sharded" uses LayerShardedMuon instead of TensorParallelMuon:
+    dense weights. For QKV weights, ``distributed`` applies only to projection splits with
+    complete local query groups and no GTP; other QKV layouts fall back to non-TP NS with a
+    warning. "layer_sharded" uses LayerShardedMuon instead of TensorParallelMuon:
     each 2D weight is assigned one NS home rank in the (GTP_remat x TP) domain — i.e. the
     GTP domain — all_to_all stages over the gtp_remat and tp groups assemble the complete
     (P, Q) momentum on the home, the exact same full-matrix Newton-Schulz as duplicated
@@ -299,7 +318,7 @@ class OptimizerConfig:
     """Use the Triton SYRK kernel for the Gram matrix in Newton-Schulz iteration."""
 
     muon_extra_scale_factor: float = 1.0
-    """Additional scale factor for the muon update."""
+    """Additional scale factor, or target update RMS when ``muon_scale_mode='rms'``."""
 
     muon_ns_batch_size: int = 1
     """Max number of same-shape matrices fused into one batched Newton-Schulz under
@@ -320,7 +339,29 @@ class OptimizerConfig:
 
     muon_scalar_optimizer: str = 'adam'
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
-    One of 'adam' or 'lion'. Defaults to 'adam'."""
+    One of 'adam' or 'lion'. Defaults to 'adam'. Embeddings/output matrices use
+    Sinkhorn instead when ``muon_use_sinkhorn`` is enabled."""
+
+    muon_use_sinkhorn: bool = False
+    """Use Sinkhorn-balanced updates for embedding/output matrices alongside Muon.
+    Requires EO's sinkhorn_balance and TP=1. LayerWiseDistributedOptimizer assigns each
+    local matrix and its momentum to one replica owner. Explicit row shards share global
+    normalization statistics; flattened optimizer shards are unsupported."""
+
+    sinkhorn_momentum: float = 0.95
+    """EMA momentum for Sinkhorn; Nesterov is always enabled."""
+
+    sinkhorn_num_normalization_steps: int = 11
+    """Positive odd number of alternating row/column L2 normalizations, ending on rows."""
+
+    sinkhorn_zero_row_threshold: float = 1e-3
+    """Mask rows at or below this fraction of the mean pre-balancing row norm."""
+
+    sinkhorn_eps: float = 1e-20
+    """Epsilon added to each Sinkhorn row/column norm."""
+
+    sinkhorn_extra_scale_factor: float = 0.18
+    """Update RMS after balancing. Sinkhorn always uses zero weight decay."""
 
     # Lion.
     lion_beta1: float = 0.95
@@ -356,6 +397,11 @@ class OptimizerConfig:
     When set via ``--use-distributed-optimizer`` with an emerging optimizer, the training
     arguments layer sets this flag and resets ``use_distributed_optimizer`` to False so
     that the standard distributed-optimizer path is not triggered."""
+
+    use_layer_wise_param_layout: bool = True
+    """Use a padded layout for LayerWise-managed parameters. If false, use a compact
+    layout with whole-parameter ownership and all-reduced gradients. Scalar parameters
+    remain in DistributedOptimizer in both layouts."""
 
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute. 
@@ -424,6 +470,21 @@ class OptimizerConfig:
 
     def __post_init__(self):
         """Check the validity of the config."""
+
+        if self.optimizer == 'sinkhorn':
+            raise ValueError("Use optimizer='muon' with muon_use_sinkhorn=True")
+        if self.muon_use_sinkhorn and self.optimizer.removeprefix('dist_') not in (
+            'muon',
+            'adaptive_muon',
+        ):
+            raise ValueError('muon_use_sinkhorn requires a Muon-family optimizer')
+        if self.muon_scale_mode == 'rms':
+            if self.optimizer.removeprefix('dist_') != 'muon':
+                raise ValueError("muon_scale_mode='rms' requires optimizer='muon'")
+            if self.muon_tp_mode == 'layer_sharded':
+                raise ValueError("muon_scale_mode='rms' does not support layer_sharded Muon")
+            if not math.isfinite(self.muon_extra_scale_factor) or self.muon_extra_scale_factor <= 0:
+                raise ValueError('Muon RMS scaling requires a finite positive extra_scale_factor')
 
         # The following condition is used to avoid repetition in distrib_optimizer.py.
         # This is because in distrib_optimizer.py, the process to handle parameters are

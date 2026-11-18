@@ -104,6 +104,21 @@ def test_ddp_grad_accumulators_share_full_cuda_graph_stream():
     assert all(param.grad is not None for param in wrapped_model.parameters())
 
 
+def test_static_buffer_loader_returns_a_rebindable_copy():
+    """get_batch may rebind keys of the batch it reads, e.g. to CP slices; the next copy into
+    the static buffers must still land in the original tensors."""
+    loader = StaticBufferLoader()
+    tokens = torch.arange(8, device="cuda")
+    first = loader({"tokens": tokens, "max_seqlen": 8}, "training", 0)
+    static = StaticBufferLoader.static_buffers["training"][0]
+    assert first is not static and first["tokens"] is static["tokens"]
+    first["tokens"] = first["tokens"][:4]
+    second = loader({"tokens": tokens + 8, "max_seqlen": 8}, "training", 0)
+    torch.cuda.synchronize()
+    assert second["tokens"] is static["tokens"] and second["tokens"].shape == (8,)
+    assert torch.equal(second["tokens"], tokens + 8)
+
+
 @pytest.mark.skipif(
     not is_torch_min_version("2.14.0a0"),
     reason="Generator capture state is created lazily only on PyTorch >= 2.14",

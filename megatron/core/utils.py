@@ -972,7 +972,7 @@ def log_on_each_pipeline_stage(
 
 
 def check_param_hashes_across_dp_replicas(
-    model: List[torch.nn.Module], cross_check: bool = False
+    model: List[torch.nn.Module], cross_check: bool = False, *, pg_collection=None
 ) -> bool:
     """Computes hashes of all parameters in model, all-gathers hashes across DP replicas,
     and then checks for equality between the locally-computed hashes and those of other ranks.
@@ -985,48 +985,54 @@ def check_param_hashes_across_dp_replicas(
         model (List[torch.nn.Module]): List of model chunks whose parameter hashes need to
             be checked.
         cross_check (bool): If true, will check whether hashes match across all DP replicas.
+        pg_collection: Explicit replica domains; otherwise use model domains or the legacy MPU.
 
     Returns:
         True if all param hashes match with corresponding hash on DP replica 0 or
         across all replicas if cross_check is enabled, False otherwise.
     """
 
-    # Compute per-parameter hashes on this rank.
-    # Keep track of expert and non-expert parameters separately since they need to be
-    # all-gathered across different sets of ranks.
-    non_expert_params, expert_params = [], []
-    local_non_expert_param_hashes, local_expert_param_hashes = [], []
+    from .process_groups_config import get_parameter_parallel_domain
+
+    if pg_collection is None:
+        model_groups = getattr(unwrap_model(model[0]), 'pg_collection', None)
+        if model_groups is not None and getattr(model_groups, 'parameter_replica_groups', None):
+            pg_collection = model_groups
+    if pg_collection is None:
+        # Migration fallback for callers that have not threaded explicit groups.
+        replica_groups = {
+            'dense': parallel_state.get_data_parallel_group(with_gtp_remat=False),
+            'expert': parallel_state.get_expert_data_parallel_group(with_gtp_remat=False),
+        }
+    else:
+        replica_groups = {
+            'dense': pg_collection.dp_cp,
+            'expert': pg_collection.expt_dp,
+            **(pg_collection.parameter_replica_groups or {}),
+        }
+    params_by_domain = {name: [] for name in replica_groups}
+    hashes_by_domain = {name: [] for name in replica_groups}
     for model_chunk_id, model_chunk in enumerate(model):
         for param_name, param in model_chunk.named_parameters():
+            domain = get_parameter_parallel_domain(param)
             param_hash = torch.frombuffer(
                 array.array(
                     "B", hashlib.sha1(param.data.to("cpu").float().numpy(force=True)).digest()
                 ),
                 dtype=torch.uint8,
             )
-            if getattr(param, "allreduce", True):
-                non_expert_params.append((model_chunk_id, param_name, param))
-                local_non_expert_param_hashes.append(param_hash)
-            else:
-                expert_params.append((model_chunk_id, param_name, param))
-                local_expert_param_hashes.append(param_hash)
+            params_by_domain[domain].append((model_chunk_id, param_name, param))
+            hashes_by_domain[domain].append(param_hash)
 
-    # Use data-modulo-expert parallel group to all-gather expert param hashes, regular
-    # data-parallel group for non-expert param hashes.
     all_param_hashes_match = True
-    for params, local_param_hashes, all_gather_group in zip(
-        [non_expert_params, expert_params],
-        [local_non_expert_param_hashes, local_expert_param_hashes],
-        [
-            parallel_state.get_data_parallel_group(with_gtp_remat=False),
-            parallel_state.get_expert_data_parallel_group(with_gtp_remat=False),
-        ],
-    ):
+    for domain, all_gather_group in replica_groups.items():
+        params = params_by_domain[domain]
+        local_param_hashes = hashes_by_domain[domain]
         # Collect per-parameter hashes across all ranks in group.
         assert len(params) == len(local_param_hashes)
         if len(params) == 0:
             continue
-        local_param_hashes = torch.stack(local_param_hashes).cuda()
+        local_param_hashes = torch.stack(local_param_hashes).to(params[0][2].device)
         all_param_hashes = [
             torch.zeros_like(local_param_hashes) for _ in range(all_gather_group.size())
         ]

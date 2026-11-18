@@ -232,6 +232,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
         use_layer_wise_param_layout: bool = True,
+        use_sinkhorn_for_embeddings: bool = False,
     ) -> list[HybridModel]:
         """Build model stages and wrap for distributed training.
 
@@ -247,6 +248,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
             model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
+            use_sinkhorn_for_embeddings: Keep embedding/output matrices whole for Sinkhorn.
             use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
                 controls whether to compute and supply a shard-aligned param layout to DDP.
 
@@ -270,6 +272,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             model_type,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
             use_layer_wise_param_layout=use_layer_wise_param_layout,
+            use_sinkhorn_for_embeddings=use_sinkhorn_for_embeddings,
         )
 
         composed_post_wrap_hook = compose_hooks(self._model_config.post_wrap_hooks)

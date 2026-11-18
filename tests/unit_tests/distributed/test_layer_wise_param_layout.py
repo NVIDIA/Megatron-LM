@@ -21,6 +21,7 @@ from megatron.core.optimizer.layer_wise_optimizer import (
     tag_params_for_buffer_routing,
 )
 from megatron.core.optimizer.param_layout import BufferKey, pad_param_start, pad_to_divisor
+from megatron.core.process_groups_config import ProcessGroupCollection
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -74,6 +75,42 @@ class TestLayerwiseParameterRouting:
         assert model.muon_weight.is_managed_by_layer_wise_optimizer
         assert not model.scalar_weight.is_managed_by_layer_wise_optimizer
 
+    @pytest.mark.parametrize('enabled', [False, True])
+    def test_sinkhorn_embeddings_have_whole_parameter_ownership(self, enabled):
+        model = torch.nn.Module()
+        model.embedding = _make_param(
+            (32, 8), is_embedding_or_output_parameter=True, use_muon=False
+        )
+        model.output = _make_param((32, 8), is_embedding_or_output_parameter=True)
+        model.linear = _make_param((8, 8))
+        model.router = _make_param((8, 8), use_muon=False)
+        model.bias = _make_param((32,), is_embedding_or_output_parameter=True)
+        # Re-tagging before DDP construction must also clear a previous selection.
+        tag_params_for_buffer_routing([model], use_sinkhorn_for_embeddings=not enabled)
+        tag_params_for_buffer_routing([model], use_sinkhorn_for_embeddings=enabled)
+        for param in (model.embedding, model.output):
+            assert param.use_sinkhorn is enabled
+            assert param.is_managed_by_layer_wise_optimizer is enabled
+        assert model.linear.is_managed_by_layer_wise_optimizer
+        assert not model.router.is_managed_by_layer_wise_optimizer
+        assert not model.bias.is_managed_by_layer_wise_optimizer
+
+    @pytest.mark.parametrize('dp_size', [1, 2, 4])
+    def test_sinkhorn_embedding_layout_never_splits_matrix(self, dp_size):
+        embedding = _make_param(
+            (512, 32),
+            is_embedding_or_output_parameter=True,
+            use_sinkhorn=True,
+            shared_embedding=True,
+        )
+        matrices = [_make_param((32, 32)) for _ in range(3)]
+        layout = _LWO._compute_per_buffer_param_layout(
+            [embedding, *matrices], None, dp_size, _make_ddp_config()
+        )
+        for param in [embedding, *matrices]:
+            _assert_param_within_shard(layout, param, dp_size)
+        assert _get_shard_for_param(layout, embedding, dp_size) == 0
+
 
 @pytest.mark.parametrize(
     ("is_expert", "group_name", "group_size"), [(False, "dp_cp", 4), (True, "expt_dp", 2)]
@@ -81,7 +118,7 @@ class TestLayerwiseParameterRouting:
 def test_checkpoint_metadata_uses_owning_module_group(is_expert, group_name, group_size):
     dp_cp = mock.Mock()
     expt_dp = mock.Mock()
-    pg_collection = mock.Mock(dp_cp=dp_cp, expt_dp=expt_dp)
+    pg_collection = ProcessGroupCollection(dp_cp=dp_cp, expt_dp=expt_dp)
     param_group = {"is_expert_parallel": is_expert, "params": True}
     expected_group = getattr(pg_collection, group_name)
 

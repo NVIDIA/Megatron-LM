@@ -41,6 +41,7 @@ from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
+    get_parameter_parallel_domain,
 )
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 from megatron.core.transformer.module import param_is_not_shared
@@ -101,6 +102,13 @@ def calc_params_l2_norm(
             force_create_fp32_copy=force_create_fp32_copy,
             return_squared_tensor=return_squared_tensor,
         )
+
+    if pg_collection is None:
+        model_groups = getattr(unwrap_model(model[0]), 'pg_collection', None)
+        if model_groups is not None and getattr(model_groups, 'parameter_replica_groups', None):
+            pg_collection = model_groups
+    extra_replica_groups = getattr(pg_collection, 'parameter_replica_groups', None) or {}
+    domain_params_data = []
 
     args = get_args()
 
@@ -171,7 +179,16 @@ def calc_params_l2_norm(
                 param, tp_group=tp_group, expert_tp_group=expert_tp_group
             ):
                 continue
-            is_expert = not getattr(param, 'allreduce', True)
+            domain = get_parameter_parallel_domain(param)
+            if domain in extra_replica_groups:
+                if param_is_not_shared(param):
+                    data, is_sharded = _get_param_data(param, force_create_fp32_copy, args.bf16)
+                    if data is not None and (
+                        is_sharded or get_pg_rank(extra_replica_groups[domain]) == 0
+                    ):
+                        domain_params_data.append(data)
+                continue
+            is_expert = domain == 'expert'
 
             # Filter GTP_remat duplicates: non-GTP_remat params replicate across GTP_remat ranks.
             if is_expert:
@@ -253,6 +270,15 @@ def calc_params_l2_norm(
         _sum_reduce(norm_2, dense_reduce_group)
         _sum_reduce(moe_total_norm_2, expert_reduce_group)
         norm_2 += moe_total_norm_2
+
+    if extra_replica_groups:
+        # Count each row shard once within its replica domain (or sum distinct
+        # master-weight fragments). DP×CP then spans all row shards, and MP spans
+        # the physical pipeline stages; no expert topology is involved.
+        domain_norm_2 = _compute_norm_2(domain_params_data)
+        _sum_reduce(domain_norm_2, dp_cp_group)
+        _sum_reduce(domain_norm_2, dense_reduce_group)
+        norm_2 += domain_norm_2
 
     if return_squared_tensor:
         return norm_2

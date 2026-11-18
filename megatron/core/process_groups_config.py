@@ -11,6 +11,71 @@ import torch
 from megatron.core import parallel_state
 
 
+def get_parameter_parallel_domain(parameter) -> str:
+    """Resolve a parameter/group's replica domain, including legacy expert markers.
+
+    Only the stable domain name is saved in optimizer metadata. ProcessGroup
+    instances stay in ProcessGroupCollection and are rebuilt on checkpoint load.
+    """
+    if isinstance(parameter, dict):
+        return parameter.get('parallel_domain') or (
+            'expert' if parameter.get('is_expert_parallel', False) else 'dense'
+        )
+    return getattr(parameter, 'parallel_domain', None) or (
+        'dense' if getattr(parameter, 'allreduce', True) else 'expert'
+    )
+
+
+def create_row_parallel_groups(parent_group, shard_size: int, *, world_group, name: str):
+    """Collectively split disjoint parent groups into row shards and their replicas.
+
+    All ranks in world_group call this once during construction, in the same
+    order. No module forward creates process groups. A parent's rank ordering
+    defines the [replica, row-shard] mesh, independently of expert parallelism.
+    """
+    if torch.distributed.get_world_size(world_group) != torch.distributed.get_world_size():
+        raise ValueError('Row parallel group construction requires all world ranks')
+    ranks = tuple(torch.distributed.get_process_group_ranks(parent_group))
+    backend = torch.distributed.get_backend(parent_group)
+    descriptions = [None] * torch.distributed.get_world_size(world_group)
+    torch.distributed.all_gather_object(
+        descriptions, (ranks, shard_size, backend, name), group=world_group
+    )
+    # Validate after the collective, so a malformed local configuration cannot
+    # leave the other ranks waiting in new_group/all_gather_object.
+    if any(description[1:] != descriptions[0][1:] for description in descriptions):
+        raise ValueError('Row parallel size, backend and name must agree on all ranks')
+    parents = sorted({description[0] for description in descriptions})
+    if (
+        type(shard_size) is not int
+        or shard_size <= 0
+        or any(len(parent) % shard_size for parent in parents)
+    ):
+        raise ValueError(f'{name} parallel size must be a positive divisor of every parent group')
+    members = [member for parent in parents for member in parent]
+    if sorted(members) != list(range(torch.distributed.get_world_size())):
+        raise ValueError('Row parallel parent groups must partition all world ranks')
+    rank = torch.distributed.get_rank()
+    shard_group = replica_group = None
+    for parent in parents:
+        for start in range(0, len(parent), shard_size):
+            members = list(parent[start : start + shard_size])
+            group = torch.distributed.new_group(
+                members, backend=backend, group_desc=f'{name}_SHARD'
+            )
+            if rank in members:
+                shard_group = group
+        for offset in range(shard_size):
+            members = list(parent[offset::shard_size])
+            group = torch.distributed.new_group(
+                members, backend=backend, group_desc=f'{name}_REPLICA'
+            )
+            if rank in members:
+                replica_group = group
+    assert shard_group is not None and replica_group is not None
+    return shard_group, replica_group
+
+
 class ProcessGroupHelperMeta(type):
     """Metaclass to protect virtual_pipeline_model_parallel_size from direct assignment."""
 
@@ -156,6 +221,13 @@ class ProcessGroupCollection:
     # _EXPERT_DATA_PARALLEL_GROUP
     expt_dp: torch.distributed.ProcessGroup = field(init=False)
 
+    # Conditional-memory groups are independent of expert parallelism.
+    engram: torch.distributed.ProcessGroup = field(init=False)
+    engram_dp: torch.distributed.ProcessGroup = field(init=False)
+
+    # Optional replica domains used by DDP and optimizer parameter layouts.
+    parameter_replica_groups: Dict[str, torch.distributed.ProcessGroup] = field(init=False)
+
     # _EXPERT_DATA_PARALLEL_GROUP_WITH_EGTP — full expert data-distribution group, expt_dp x
     # egtp_remat. Used for non-egtp expert param broadcast / sharded state dict over the full
     # axis. Identical to ``expt_dp`` when egtp_remat_size=1.
@@ -190,6 +262,19 @@ class ProcessGroupCollection:
             return None
         raise AttributeError(f"'ProcessGroupCollection' object has no attribute '{name}'")
 
+    def get_parameter_replica_group(self, domain: str, *, partial: bool = False):
+        """Return the group synchronizing copies of a parameter in this domain."""
+        if domain == 'dense':
+            return self.intra_dp_cp if partial and self.intra_dp_cp is not None else self.dp_cp
+        if domain == 'expert':
+            return (
+                self.intra_expt_dp if partial and self.intra_expt_dp is not None else self.expt_dp
+            )
+        groups = self.parameter_replica_groups or {}
+        if domain not in groups:
+            raise ValueError(f'No replica process group registered for parameter domain {domain!r}')
+        return groups[domain]
+
     def __repr__(self):
         """Return a concise representation showing which process groups exist and their sizes."""
         active_pgs = []
@@ -201,6 +286,9 @@ class ProcessGroupCollection:
                 continue
             elif isinstance(pg, list):
                 sizes = [g.size() for g in pg]
+                active_pgs.append(f"{field_info.name}({sizes})")
+            elif isinstance(pg, dict):
+                sizes = {name: group.size() for name, group in pg.items()}
                 active_pgs.append(f"{field_info.name}({sizes})")
             else:
                 active_pgs.append(f"{field_info.name}({pg.size()})")
@@ -239,6 +327,9 @@ class ProcessGroupCollection:
 
         # Mapping of attribute names to their initialization functions
         pg_to_func = {
+            'engram': lambda: None,
+            'engram_dp': lambda: None,
+            'parameter_replica_groups': dict,
             'tp': partial(parallel_state.get_tensor_model_parallel_group, check_initialized=False),
             'pp': partial(
                 parallel_state.get_pipeline_model_parallel_group, check_initialized=False

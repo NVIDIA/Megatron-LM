@@ -432,3 +432,309 @@ def test_capture_failure_restores_process_settings(backend):
     assert te_graph.is_graph_capturing() == before_te
     if get_override is not None:
         assert get_override() == before_override
+
+
+@pytest.mark.usefixtures('te_rng_tracker')
+@pytest.mark.parametrize('backend', ['torch', 'transformer_engine'])
+def test_graph_capture_preserves_registered_statistics(backend):
+    """Graph warmup must not inflate router-like counters, including across slots."""
+
+    class Counter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(8, device='cuda'))
+            self.register_buffer('calls', torch.tensor(17, device='cuda'))
+
+        def forward(self, hidden, state):
+            self.calls.add_(1)
+            return hidden * self.weight, {}
+
+    module = Counter()
+    region = StatefulModule(module)
+    sample = torch.ones(4, 1, 8, device='cuda', requires_grad=True)
+    graphs = StatefulGraphs(region, sample, {}, slots=2, backend=backend)
+    pre_hooks = []
+    graphs.setup_manual_hooks(lambda: lambda owner: pre_hooks.append(owner))
+    try:
+        assert module.calls.item() == 17
+        outputs = [graphs.run(sample.clone(), {}, slot=i)[0] for i in range(2)]
+        for output in outputs:
+            output.sum().backward()
+        assert module.calls.item() == 19
+        assert pre_hooks == [module, module]
+    finally:
+        graphs.abort()
+        graphs.close()
+
+
+@pytest.mark.usefixtures('te_rng_tracker')
+def test_scheduled_graphs_reuse_backward_workspace_and_preserve_gradients():
+    """Temporary backward storage must be shared across layers, not pinned per layer."""
+    scratch_elements = 16 * 1024 * 1024
+
+    class Projection(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, hidden, weight):
+            ctx.save_for_backward(hidden, weight)
+            return hidden * weight
+
+        @staticmethod
+        def backward(ctx, gradient):
+            hidden, weight = ctx.saved_tensors
+            scratch = torch.empty(scratch_elements, device=hidden.device)
+            scratch.fill_(1)
+            return gradient * weight * scratch[0], (gradient * hidden).sum((0, 1))
+
+    class Region(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.linspace(0.5, 1, 8, device='cuda'))
+
+        def forward(self, hidden, state):
+            return Projection.apply(hidden, self.weight), {}
+
+    regions = [StatefulModule(Region()) for _ in range(4)]
+    reference = deepcopy(regions)
+    sample = torch.ones(4, 1, 8, device='cuda', requires_grad=True)
+    grouped, independent = [], []
+    try:
+        torch.cuda.empty_cache()
+        baseline = torch.cuda.memory_reserved()
+        grouped = StatefulGraphs.capture_many(
+            [(region, sample, {}, None) for region in regions],
+            order=[1, -1],
+            num_layers_per_chunk=[4],
+            capture_kwargs=dict(num_warmup_iters=1),
+        )
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        shared_bytes = torch.cuda.memory_reserved() - baseline
+        baseline = torch.cuda.memory_reserved()
+        independent = [
+            StatefulGraphs(region, sample, {}, backend='transformer_engine', num_warmup_iters=1)
+            for region in deepcopy(regions)
+        ]
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        independent_bytes = torch.cuda.memory_reserved() - baseline
+        assert independent_bytes - shared_bytes >= 2 * scratch_elements * sample.element_size()
+        for _ in range(2):
+            x = torch.randn_like(sample, requires_grad=True)
+            y = x.detach().clone().requires_grad_()
+            actual, expected = x, y
+            for graph, region in zip(grouped, reference):
+                actual, _ = graph.run(actual, {})
+                expected, _ = region.run(expected, {})
+            torch.testing.assert_close(actual, expected)
+            actual.square().sum().backward()
+            expected.square().sum().backward()
+            torch.testing.assert_close(x.grad, y.grad)
+            for graph, region in zip(grouped, reference):
+                for p, q in zip(graph.region.parameters(), region.parameters()):
+                    torch.testing.assert_close(p.grad, q.grad)
+                    with torch.no_grad():
+                        p.add_(p.grad, alpha=-0.01)
+                        q.add_(q.grad, alpha=-0.01)
+                    p.grad = q.grad = None
+    finally:
+        for graph in (*grouped, *independent):
+            graph.abort()
+            graph.close()
+
+
+@pytest.mark.usefixtures('te_rng_tracker')
+def test_scheduled_graphs_preserve_fifo_microbatches_and_shared_state():
+    """A pipeline schedule can reuse inputs only after the matching FIFO backward."""
+    regions = [StatefulModule(_Branches(), output_fields=_fields()) for _ in range(2)]
+    reference = deepcopy(regions)
+    sample = torch.ones(4, 1, 8, device='cuda', requires_grad=True)
+    order = [1, 1, 2, -1, 2, -1, -2, -2]
+    graphs = StatefulGraphs.capture_many(
+        [(region, sample, {}, None) for region in regions],
+        order=order,
+        num_layers_per_chunk=[1, 1],
+        capture_kwargs=dict(num_warmup_iters=1),
+    )
+    try:
+        for _ in range(2):
+            pending = [[], []]
+            slots = [0, 0]
+            for operation in order:
+                chunk = abs(operation) - 1
+                if operation > 0:
+                    x = torch.randn_like(sample, requires_grad=True)
+                    y = x.detach().clone().requires_grad_()
+                    actual, state = graphs[chunk].run(x, {}, slot=slots[chunk])
+                    expected, ref_state = reference[chunk].run(y, {})
+                    torch.testing.assert_close(actual, expected)
+                    torch.testing.assert_close(state['memory'], ref_state['memory'])
+                    pending[chunk].append((actual, state, expected, ref_state, x, y))
+                    slots[chunk] += 1
+                else:
+                    actual, state, expected, ref_state, x, y = pending[chunk].pop(0)
+                    _loss(actual, state, 'used').backward()
+                    _loss(expected, ref_state, 'used').backward()
+                    torch.testing.assert_close(x.grad, y.grad)
+            for graph, region in zip(graphs, reference):
+                for p, q in zip(graph.region.parameters(), region.parameters()):
+                    torch.testing.assert_close(p.grad, q.grad)
+                    p.grad = q.grad = None
+    finally:
+        for graph in graphs:
+            graph.abort()
+            graph.close()
+
+
+@pytest.mark.usefixtures('te_rng_tracker')
+@pytest.mark.parametrize('scheduled', [False, True])
+def test_mxfp8_graph_weight_cache_refreshes_after_parameter_update(scheduled):
+    """Reused graph slots must refresh updated weights once per training step."""
+    te = pytest.importorskip('transformer_engine.pytorch')
+    from transformer_engine.common.recipe import MXFP8BlockScaling
+    from transformer_engine.pytorch.fp8 import check_mxfp8_support
+
+    supported, reason = check_mxfp8_support()
+    if not supported:
+        pytest.skip(reason)
+
+    class Region(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.projection = te.Linear(
+                64, 64, bias=False, params_dtype=torch.bfloat16, device='cuda'
+            )
+
+        def forward(self, hidden, state):
+            return self.projection(hidden), state
+
+    region = StatefulModule(Region())
+    weight = region.module.projection.weight
+    with torch.no_grad():
+        weight.fill_(1 / 64)
+    sample = torch.ones(32, 1, 64, device='cuda', dtype=torch.bfloat16, requires_grad=True)
+    options = dict(fp8_enabled=True, fp8_recipe=MXFP8BlockScaling(), fp8_weight_caching=True)
+    graph = None
+    try:
+        if scheduled:
+            graph = StatefulGraphs.capture_many(
+                [(region, sample, {}, None)],
+                order=[1, -1],
+                num_layers_per_chunk=[1],
+                capture_kwargs=dict(options, num_warmup_iters=1),
+            )[0]
+        else:
+            graph = StatefulGraphs(
+                region,
+                sample,
+                {},
+                backend='transformer_engine',
+                num_warmup_iters=1,
+                capture_kwargs=options,
+            )
+        # Powers of two make the output, input grad and weight grad exactly
+        # representable. A stale quantized weight changes both sign and scale.
+        for weight_value in (1 / 64, -1 / 32):
+            with torch.no_grad():
+                weight.fill_(weight_value)
+            region.zero_grad(set_to_none=True)
+            for microbatch in range(3):
+                hidden = torch.full_like(sample, microbatch + 1, requires_grad=True)
+                output, _ = graph.run(hidden, {}, is_first_microbatch=microbatch == 0)
+                torch.testing.assert_close(
+                    output,
+                    torch.full_like(output, 64 * weight_value * (microbatch + 1)),
+                    rtol=0,
+                    atol=0,
+                )
+                output.sum().backward()
+                torch.testing.assert_close(
+                    hidden.grad, torch.full_like(hidden, 64 * weight_value), rtol=0, atol=0
+                )
+            torch.testing.assert_close(
+                weight.grad, torch.full_like(weight, 32 * (1 + 2 + 3)), rtol=0, atol=0
+            )
+    finally:
+        if graph is not None:
+            graph.abort()
+            graph.close()
+
+
+@pytest.mark.usefixtures('te_rng_tracker')
+@pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
+def test_shared_graph_replays_seven_and_eight_outputs_with_same_gradient_shapes(dtype):
+    """Different integer state layouts must not collide in TE's gradient cache."""
+    names = ('cu', 'cu_padded', 'memory', 'key', 'global_indices', 'candidate_ids', 'counts')
+
+    class Region(nn.Module):
+        def __init__(self, names):
+            super().__init__()
+            self.names = names
+            self.weight = nn.Parameter(torch.linspace(0.25, 0.5, 8, device='cuda', dtype=dtype))
+
+        def forward(self, hidden, state):
+            output = hidden * self.weight
+            values = {
+                name: (
+                    output * (2 if name == 'memory' else 3)
+                    if name in ('memory', 'key')
+                    else torch.arange(4, device=hidden.device, dtype=torch.int32)
+                )
+                for name in self.names
+            }
+            return output, values
+
+    def region(names):
+        fields = tuple(
+            TensorField(
+                name,
+                (4, 1, 8) if name in ('memory', 'key') else (4,),
+                dtype if name in ('memory', 'key') else torch.int32,
+                'contiguous',
+                name in ('memory', 'key'),
+            )
+            for name in names
+        )
+        return StatefulModule(Region(names), output_fields=fields)
+
+    regions = [region(names), region(tuple(name for name in names if name != 'global_indices'))]
+    reference = deepcopy(regions)
+    sample = torch.ones(4, 1, 8, device='cuda', dtype=dtype, requires_grad=True)
+    graphs = StatefulGraphs.capture_many(
+        [(module, sample, {}, None) for module in regions],
+        order=[1, 1, -1, -1],
+        num_layers_per_chunk=[2],
+        capture_kwargs=dict(num_warmup_iters=1),
+    )
+    try:
+        for _ in range(2):
+            pending = []
+            for slot in range(2):
+                x = torch.randn_like(sample, requires_grad=True)
+                y = x.detach().clone().requires_grad_()
+                actual, expected = x, y
+                actual_loss, expected_loss = 0, 0
+                for graph, module in zip(graphs, reference):
+                    actual, state = graph.run(actual, {}, slot=slot)
+                    expected, ref_state = module.run(expected, {})
+                    assert tuple(state) == tuple(ref_state)
+                    torch.testing.assert_close(actual, expected)
+                    for name in state:
+                        torch.testing.assert_close(state[name], ref_state[name])
+                        assert state[name].requires_grad == ref_state[name].requires_grad
+                    actual_loss = actual_loss + state['memory'].sum() + state['key'].sum()
+                    expected_loss = (
+                        expected_loss + ref_state['memory'].sum() + ref_state['key'].sum()
+                    )
+                pending.append((x, y, actual_loss + actual.sum(), expected_loss + expected.sum()))
+            for x, y, actual_loss, expected_loss in pending:
+                actual_loss.backward()
+                expected_loss.backward()
+                torch.testing.assert_close(x.grad, y.grad)
+            for module, ref in zip(regions, reference):
+                torch.testing.assert_close(module.module.weight.grad, ref.module.weight.grad)
+                module.zero_grad(set_to_none=True)
+                ref.zero_grad(set_to_none=True)
+    finally:
+        for graph in graphs:
+            graph.abort()
+            graph.close()

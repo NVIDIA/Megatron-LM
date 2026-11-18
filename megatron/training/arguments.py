@@ -620,7 +620,7 @@ def validate_args(args, defaults={}):
         for elt in [args.train_data_path, args.valid_data_path, args.test_data_path]) or \
             args.per_split_data_args_path is not None
     if use_per_split_data_path:
-         # Exactly one of the two has to be None if we use it.
+        # Exactly one of the two has to be None if we use it.
         assert any(elt is not None
                    for elt in [args.train_data_path, args.valid_data_path, args.test_data_path]) is False or \
             args.per_split_data_args_path is None
@@ -1026,6 +1026,9 @@ def validate_args(args, defaults={}):
     ):
         raise ValueError("MXFP8 with inference optimized layers requires FlashInfer >= 0.6.4")
 
+    if args.moe_megakernel_backend == "mok" and (args.use_megatron_fsdp or args.use_torch_fsdp2):
+        raise ValueError("MOK has not been validated with Megatron-FSDP or Torch FSDP2")
+
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
         #       Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
@@ -1402,7 +1405,6 @@ def validate_args(args, defaults={}):
         if args.expert_model_parallel_size  > 1 and 'ep_dp' not in args.high_priority_stream_groups:
             args.high_priority_stream_groups.append('ep_dp')
 
-
     # Derive the internal expert_gtp_weight_remat_size from the
     # user-facing --expert-tensor-parallel-num-weight-shards (expert_tensor_parallel_size is
     # defaulted earlier in validate_args). expert_gtp_weight_remat_size has no CLI flag.
@@ -1723,6 +1725,27 @@ def validate_args(args, defaults={}):
         "Muon semantics for a single grouped [E, N, K] expert weight are not defined. "
         "Disable --moe-single-grouped-weight or use Adam/DistributedOptimizer."
     )
+
+    if args.use_layer_wise_distributed_optimizer:
+        assert args.num_distributed_optimizer_instances == 1, (
+            "LayerWiseDistributedOptimizer requires " "num_distributed_optimizer_instances == 1."
+        )
+        if not args.use_layer_wise_param_layout:
+            # Compact gather supports whole plain MXFP8/blockwise parameters. Preserve
+            # the existing padded path's capabilities and the MXFP8 opt-in semantics.
+            assert not getattr(
+                args, 'fp4_param_gather', False
+            ), "Compact LayerWise parameter gather does not support NVFP4 parameters."
+            if args.fp8_param_gather:
+                assert args.fp8_recipe in ('mxfp8', 'blockwise'), (
+                    "Compact LayerWise FP8 parameter gather supports only mxfp8 and "
+                    f"blockwise recipes; got {args.fp8_recipe!r}."
+                )
+                if args.fp8_recipe == 'mxfp8':
+                    assert args.reuse_grad_buf_for_mxfp8_param_ag, (
+                        "Compact LayerWise MXFP8 parameter gather requires "
+                        "--reuse-grad-buf-for-mxfp8-param-ag."
+                    )
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
@@ -2456,9 +2479,18 @@ def _add_network_size_args(parser):
         "max_seqlen_per_dp_cp_rank",
         "hybrid_context_parallel",
         "sequence_packing_scheduler",
+        # Parsed manually as a JSON object below.
+        "moe_megakernel_backend_config",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
+    transformer_group.add_argument(
+        "--moe-megakernel-backend-config",
+        type=json.loads,
+        default=None,
+        metavar="JSON",
+        help="Backend-specific MoE megakernel options as a JSON object.",
+    )
 
     group = parser.add_argument_group(title='network size')
 
@@ -2718,6 +2750,10 @@ def _add_regularization_args(parser):
                        help='Weight decay coefficient for L2 regularization.')
     group.add_argument('--apply-wd-to-qk-layernorm', action='store_true',
                        help='Apply weight decay to qk layernorm as a special case.')
+    group.add_argument('--apply-wd-to-norm', action='store_true',
+                       help='Apply weight decay to normalization weights, including fused '
+                       'layernorm weights. Biases and other vector parameters retain their '
+                       'standard exemptions. Takes precedence over --apply-wd-to-qk-layernorm.')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
     group.add_argument('--adam-beta1', type=float, default=0.9,
@@ -2736,11 +2772,19 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-no-split-qkv', action='store_false', default=True,
                        dest='muon_split_qkv',
                        help='Whether to split QKV parameters for Muon optimizer')
+    group.add_argument('--muon-split-qkv-per-head', action='store_true',
+                       help='Orthogonalize each Q, gate, K, and V head independently. '
+                       'Uniform head sizes use batched Newton-Schulz and require '
+                       'emerging-optimizers 0.3.0 or newer. By default, '
+                       'Q, gate, K, and V projections are orthogonalized separately')
     group.add_argument('--muon-nesterov', action='store_true',
                        help='Whether to use Nesterov-style momentum in the internal SGD')
     group.add_argument('--muon-scale-mode', type=str, default='spectral',
-                       choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
-                       help='Scale mode for Muon optimizer. With MuP, set '
+                       choices=['spectral', 'unit_rms_norm', 'shape_scaling', 'rms'],
+                       help='Scale mode for Muon optimizer. rms normalizes each nonzero '
+                       'NS output matrix (each head with per-head Muon) to an actual RMS '
+                       'of muon-extra-scale-factor; requires ordinary Muon, TP=1 and no '
+                       'GTP weight sharding. The other modes use shape-based factors. With MuP, set '
                        '--muon-scale-mode unit_rms_norm to use unit_rms_norm scaling, '
                        'or set --muon-scale-mode spectral to keep spectral scaling.')
     group.add_argument('--muon-fp32-matmul-prec', type=str, default='medium',
@@ -2761,7 +2805,10 @@ def _add_regularization_args(parser):
                        'depends on the parallelism config; duplicated and distributed both '
                        'orthogonalize the whole matrix and give TP-invariant results; auto '
                        'select between duplicated and distributed mode per-weight for '
-                       'dense weights; layer_sharded assigns each 2D weight one NS home '
+                       'dense weights. For QKV weights, distributed mode applies only to '
+                       'projection splits with complete local query groups and no GTP; '
+                       'other layouts fall back to non-TP NS. layer_sharded assigns each '
+                       '2D weight one NS home '
                        'rank in the (gtp_remat x tp) domain and routes the shards there '
                        'with all_to_all (same math as duplicated, no redundant NS); '
                        'requires --use-distributed-optimizer and --muon-no-split-qkv. See '
@@ -2791,6 +2838,20 @@ def _add_regularization_args(parser):
                        choices=['adam', 'lion'],
                        help='Optimizer for scalar parameters (embeddings, biases, norms) '
                        'when using muon. Defaults to adam.')
+    group.add_argument('--muon-use-sinkhorn', action='store_true',
+                       help='Use Sinkhorn-balanced updates for embedding/output matrices '
+                       'alongside Muon. Requires TP=1 and EO with sinkhorn_balance. '
+                       'With distributed optimizer, each matrix belongs to one DP rank.')
+    group.add_argument('--sinkhorn-momentum', type=float, default=0.95,
+                       help='EMA momentum for Sinkhorn; Nesterov is always enabled.')
+    group.add_argument('--sinkhorn-num-normalization-steps', type=int, default=11,
+                       help='Positive odd number of row/column L2 normalizations.')
+    group.add_argument('--sinkhorn-zero-row-threshold', type=float, default=1e-3,
+                       help='Mask rows below this fraction of the mean pre-balancing norm.')
+    group.add_argument('--sinkhorn-eps', type=float, default=1e-20,
+                       help='Epsilon added to Sinkhorn row/column norms.')
+    group.add_argument('--sinkhorn-extra-scale-factor', type=float, default=0.18,
+                       help='Sinkhorn update RMS after balancing (zero weight decay).')
     group.add_argument('--lion-beta1', type=float, default=0.95,
                        help='First beta coefficient for Lion optimizer '
                        '(used in sign update). Default: 0.95.')
@@ -3132,17 +3193,17 @@ def _add_distributed_args(parser):
                        help='Use distributed optimizer.')
     group.add_argument('--megatron-fsdp-version', type=int, default=1, choices=[1, 2],
                        help='Megatron-FSDP implementation version. Defaults to 1.')
-    group.add_argument('--no-use-layer-wise-param-layout',
-                       action='store_false',
-                       dest='use_layer_wise_param_layout',
-                       help='Opt out of the precomputed LayerWise param layout. When set, '
-                       'falls back to the legacy LayerWise ping-pong path: all params '
-                       '(including non-Muon embeddings, biases, layernorm) live in a single '
-                       'LayerWise buffer and the optimizer uses the allgather_params() codepath. '
-                       'The default (precomputed layout) routes non-Muon params through a '
-                       'separate DistributedOptimizer with byte-level sharding, which is faster '
-                       'and uses less padding but produces different bf16 reduction ordering '
-                       'and so will not match legacy-path loss curves bit-for-bit.')
+    group.add_argument(
+        '--no-use-layer-wise-param-layout',
+        action='store_false',
+        dest='use_layer_wise_param_layout',
+        help='Use compact LayerWise buffers instead of shard-aligned padding. '
+        'Muon uses all-reduce gradients and whole-parameter ownership; '
+        'Adam uses DistributedOptimizer in both layouts. '
+        'FP8 gather staging is independent of this toggle. '
+        'The layouts can produce different reduction ordering and are not '
+        'guaranteed to match loss curves bit-for-bit.',
+    )
     group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub',
                        help='Use the userbuffer registration for DP/FSDP communication buffers.'
                        'This option will reduce GPU SM usage for the DP/FSDP communication,'

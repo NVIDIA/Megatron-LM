@@ -34,26 +34,17 @@ except ImportError:
 
         USING_PYTORCH_OPTIMIZER = True
 
-try:
-    from importlib.metadata import PackageNotFoundError
-    from importlib.metadata import version as _pkg_version
-
-    _eo_ver = tuple(int(x) for x in _pkg_version('emerging-optimizers').split('.')[:2])
-except (ImportError, PackageNotFoundError):
-    _eo_ver = (0, 0)
-
-HAVE_EMERGING_OPTIMIZERS = _eo_ver >= (0, 2)
-
-if HAVE_EMERGING_OPTIMIZERS:
-    from emerging_optimizers.scalar_optimizers import Lion
-
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
 from megatron.core.optimizer_param_scheduler import (
     ParamGroupOverride,
     combine_param_group_overrides,
     param_group_override_to_tuple,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    get_parameter_parallel_domain,
+    resolve_gtp_remat_group,
+)
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 
 from ..distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
@@ -64,8 +55,11 @@ from .distrib_optimizer import DistributedOptimizer
 from .emerging_optimizers import (
     _EMERGING_OPTIMIZERS,
     HAVE_EMERGING_OPTIMIZERS,
+    Lion,
     _create_emerging_optimizer,
+    _eopt_init_state_fn,
     _get_qkv_split_shapes,
+    _qkv_split_groups_are_complete,
 )
 from .fully_sharded_optimizer import FullyShardedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
@@ -102,10 +96,19 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
     """
     config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = {}
     # Select the model-family convention for zero weight decay on vector-like parameters:
-    # the classic rule skips all 1-D parameters and biases, while the Qwen3-Next rule keeps
-    # weight decay on Q/K layernorm parameters. Wide-residual retention controllers intentionally
+    # the classic rule skips all 1-D parameters and biases; optional rules keep weight decay
+    # on normalization weights or just Q/K layernorm parameters. Retention controllers intentionally
     # follow the run's ordinary weight-decay policy rather than this generic vector exemption.
-    if config.apply_wd_to_qk_layernorm:
+    if config.apply_wd_to_norm:
+        shape_1_not_norm_param = ParamWithNamePredicate(
+            name="s1_not_norm",
+            fn=lambda param, name: len(param.shape) == 1
+            and not name.endswith(("norm.weight", "layer_norm_weight"))
+            and not getattr(param, "is_norm_weight", False)
+            and not getattr(param, "is_wide_residual_retention_parameter", False),
+        )
+        param_wd_mult_key = ParamKey(name="*.bias", with_name_predicate=shape_1_not_norm_param)
+    elif config.apply_wd_to_qk_layernorm:
         shape_1_not_qkln_param = ParamWithNamePredicate(
             name="s1_not_qkln",
             fn=lambda param, name: (len(param.shape) == 1 or name.endswith(".bias"))
@@ -342,6 +345,8 @@ def _get_param_groups(
             uses_default_config = False
             # Get optimizer config overrides for this parameter.
             param_overrides_list: list[ParamGroupOverride] = []
+            if getattr(param, 'lr_mult', 1.0) != 1.0:
+                param_overrides_list.append(ParamGroupOverride(lr_mult=param.lr_mult))
             if config_overrides is not None:
                 for param_key, param_override in config_overrides.items():
                     if param_key.matches(param, name):
@@ -354,13 +359,14 @@ def _get_param_groups(
             else:
                 param_override = None
 
-            is_expert_parallel = not getattr(param, 'allreduce', True)
+            domain = get_parameter_parallel_domain(param)
+            is_expert_parallel = domain == 'expert'
 
             # Create config_tuple that is hash-able, and has a consistent ordering of the keys.
             param_override_tuple: tuple[tuple[str, Any], ...] | None = (
                 param_group_override_to_tuple(param_override)
             )
-            key = (param_override_tuple, is_expert_parallel)
+            key = (param_override_tuple, is_expert_parallel, domain)
             if key not in params_map:
                 params_map[key] = []
             params_map[key].append(param)
@@ -377,9 +383,10 @@ def _get_param_groups(
                 params_key.append(key)
     # Need to pick one of the param_override_tuples to use for the param group.
     param_groups = []
-    # Sort keys, None first.
-    for key in sorted(params_key, key=lambda x: (x[0] is not None, x[0])):
-        param_override_tuple, is_expert_parallel = key
+    # Sort keys, None first; break equal-override ties by replica domain so PP
+    # stages with different local parameters still build identical group order.
+    for key in sorted(params_key, key=lambda x: (x[0] is not None, x[0], x[1], x[2])):
+        param_override_tuple, is_expert_parallel, domain = key
         params = params_map[key] if key in params_map else []
         if param_override_tuple is None:
             param_override: ParamGroupOverride = {}
@@ -416,6 +423,8 @@ def _get_param_groups(
             **default_config,
             **param_override,  # keep **param_override last so that users can override other fields.
         }
+        if domain not in ('dense', 'expert'):
+            param_group['parallel_domain'] = domain
         param_groups.append(param_group)
 
     return param_groups
@@ -622,11 +631,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 weight_decay=config.weight_decay,
             )
 
-            def init_state_fn(opt, config=None):
-                for group in opt.param_groups:
-                    for p in group['params']:
-                        if len(opt.state[p]) == 0:
-                            opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
+            init_state_fn = _eopt_init_state_fn
 
         elif config.optimizer == 'sgd':
             optimizer = SGD(
@@ -741,12 +746,43 @@ def check_config_overrides_consistency(
     return True
 
 
+def qkv_rows_after_gtp_gather(
+    param: torch.nn.Parameter, gtp_remat_group: torch.distributed.ProcessGroup | None = None
+) -> tuple[int, int]:
+    """Return a fused QKV weight's logical TP-local rows and GTP shard count.
+
+    Not ``param.shape[0]``: once the GTP degree stops dividing the query-group count, a
+    shard-local test switches the split off on GTP ranks while TP1 keeps it, and one
+    weight gets two different Muon rules.
+
+    The count is still TP-local; callers compare the combined TP/GTP row count against the
+    owning layer's full logical QKV layout.
+
+    Args:
+        param: Fused QKV weight; reads ``is_gtp_weight_remat`` and ``pad_length``.
+        gtp_remat_group: The group the optimizer gathers over -- ``param.group`` can name
+            a different one under a ``MultiModuleProcessGroupCollection``.
+
+    Returns:
+        ``(gathered_rows, gtp_size)``, padding already subtracted.
+    """
+    gtp_size = (
+        get_pg_size(gtp_remat_group)
+        if gtp_remat_group is not None and getattr(param, 'is_gtp_weight_remat', False)
+        else 1
+    )
+    # Subtract the pad only when the rows were scaled up.
+    alignment_pad_rows = getattr(param, 'pad_length', 0) if gtp_size > 1 else 0
+    gathered_rows = param.shape[0] * gtp_size - alignment_pad_rows
+    return gathered_rows, gtp_size
+
+
 def _get_megatron_emerging_optimizer(
     config: OptimizerConfig,
-    model_chunks: List[MegatronModule],
-    config_overrides: Optional[Dict[ParamKey, Any]] = None,
-    pg_collection: Optional[ProcessGroupCollection] = None,
-    param_group_process_group: Optional[torch.distributed.ProcessGroup] = None,
+    model_chunks: list[MegatronModule],
+    config_overrides: dict[ParamKey, Any] | None = None,
+    pg_collection: ProcessGroupCollection | None = None,
+    param_group_process_group: torch.distributed.ProcessGroup | None = None,
 ) -> MegatronOptimizer:
     """Build an emerging optimizer (e.g. Muon) for the given model chunks.
 
@@ -791,41 +827,133 @@ def _get_megatron_emerging_optimizer(
         raise ValueError(f"Unsupported emerging optimizer: {eopt_name}")
     if config.fp16:
         raise ValueError('emerging optimizer with fp16 is not supported.')
+    if config.muon_split_qkv_per_head and not config.muon_split_qkv:
+        raise ValueError("muon_split_qkv_per_head requires muon_split_qkv=True")
+
+    if (
+        config.muon_use_sinkhorn
+        and not use_layer_wise
+        and (
+            config.use_distributed_optimizer
+            or any(
+                getattr(getattr(chunk, 'ddp_config', None), 'use_distributed_optimizer', False)
+                for chunk in model_chunks
+            )
+        )
+    ):
+        raise ValueError('Distributed Sinkhorn requires use_layer_wise_distributed_optimizer=True')
 
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
+    if pg_collection.parameter_replica_groups and not use_layer_wise:
+        raise ValueError('Emerging optimizers with additional parameter domains require LayerWise')
+
     log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
 
-    # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv).
+    # Tag parameters with optimizer-specific attributes (use_sinkhorn, expert_tp, is_qkv).
     for model_chunk in model_chunks:
-        qkv_split_shapes = None
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
+            use_sinkhorn = (
+                config.muon_use_sinkhorn
+                and param.ndim == 2
+                and getattr(param, 'is_embedding_or_output_parameter', False)
+            )
+            ddp_config = getattr(model_chunk, 'ddp_config', None)
+            if (
+                ddp_config is not None
+                and ddp_config.use_distributed_optimizer
+                and (
+                    getattr(param, 'use_sinkhorn', False) != use_sinkhorn
+                    or (
+                        use_sinkhorn
+                        and not getattr(param, 'is_managed_by_layer_wise_optimizer', False)
+                    )
+                )
+            ):
+                raise ValueError(
+                    f'Sinkhorn buffer routing disagrees with the optimizer for {name}. '
+                    'Call tag_params_for_buffer_routing with '
+                    'use_sinkhorn_for_embeddings=config.muon_use_sinkhorn before building DDP.'
+                )
+            param.use_sinkhorn = use_sinkhorn
             if 'experts' in name and 'shared' not in name:
                 param.expert_tp = True
-            # TODO(deyuf): support MLA
-            if 'linear_qkv.weight' in name and len(param.shape) == 2:
-                if qkv_split_shapes is None:
-                    qkv_split_shapes = _get_qkv_split_shapes(model_chunk.config)
-                # MUST be pre-GTP-sharding rows, not param.shape[0] (this rank's shard):
-                # a shard-local test flips as the GTP degree changes, giving the SAME
-                # weight two different Muon update rules depending on parallel layout.
-                rows_before_gtp_sharding = (
-                    param._unsharded_shape[0]
-                    if getattr(param, 'is_gtp_weight_remat', False)
-                    else param.shape[0]
+            qkv_layout = getattr(param, 'qkv_layout', None)
+            if (qkv_layout is not None or 'linear_qkv.weight' in name) and len(param.shape) == 2:
+                layout_or_config = qkv_layout
+                if layout_or_config is None:
+                    # Backward compatibility for custom QKV modules that do not annotate
+                    # their weight with the owning attention layer's logical layout.
+                    layout_or_config = model_chunk.config
+                qkv_split_shapes, logical_split_shapes = _get_qkv_split_shapes(
+                    layout_or_config, split_qkv_per_head=config.muon_split_qkv_per_head
                 )
-                if rows_before_gtp_sharding % sum(qkv_split_shapes) == 0:
-                    param.is_qkv = True
-                    param.qkv_split_shapes = qkv_split_shapes
-                else:
+
+                tp_group = (
+                    pg_collection.expt_tp
+                    if getattr(param, 'expert_tp', False)
+                    else pg_collection.tp
+                )
+                tp_size = get_pg_size(tp_group)
+                gtp_remat_group = (
+                    resolve_gtp_remat_group(
+                        pg_collection, is_expert=getattr(param, 'expert_tp', False)
+                    )
+                    if getattr(param, 'is_gtp_weight_remat', False)
+                    else None
+                )
+                logical_tp_local_rows, gtp_size = qkv_rows_after_gtp_gather(param, gtp_remat_group)
+
+                qkv_gtp_pad_length = (
+                    int(getattr(param, 'pad_length', 0))
+                    if getattr(param, 'is_gtp_weight_remat', False)
+                    else 0
+                )
+                physical_tp_local_rows = param.shape[0] * gtp_size
+                if not 0 <= qkv_gtp_pad_length < physical_tp_local_rows:
+                    raise RuntimeError(
+                        f"Invalid Muon QKV GTP padding for {name}: "
+                        f"pad_length={qkv_gtp_pad_length}, "
+                        f"physical_tp_local_rows={physical_tp_local_rows}"
+                    )
+                expected_logical_rows = logical_tp_local_rows * tp_size
+                if expected_logical_rows != sum(logical_split_shapes):
                     log_single_rank(
                         logger,
-                        logging.DEBUG,
+                        logging.INFO,
                         f"Emerging optimizer QKV split skipped for {name}: "
-                        f"shape={tuple(param.shape)}, split_shapes={qkv_split_shapes}",
+                        f"logical_rows={sum(logical_split_shapes)}, "
+                        f"local_rows={param.shape[0]}, tp_size={tp_size}, "
+                        f"gtp_remat_size={gtp_size}, "
+                        f"gtp_pad_length={qkv_gtp_pad_length}",
+                    )
+                    param.is_qkv = False
+                    param.qkv_split_shapes = None
+                    param.qkv_split_shapes_global = None
+                    param.qkv_gtp_pad_length = 0
+                    param.qkv_split_groups_are_complete = False
+                    continue
+
+                param.is_qkv = True
+                param.qkv_split_shapes_global = logical_split_shapes
+                param.qkv_gtp_pad_length = qkv_gtp_pad_length
+                if config.muon_split_qkv_per_head:
+                    # Per-head execution reconstructs row-sharded layouts before splitting;
+                    # no rank-local head-boundary metadata is needed.
+                    param.qkv_split_shapes = qkv_split_shapes
+                else:
+                    tp_rank = get_pg_rank(tp_group)
+                    gtp_rank = get_pg_rank(gtp_remat_group)
+                    local_start = tp_rank * logical_tp_local_rows + gtp_rank * param.shape[0]
+                    param.qkv_split_shapes = qkv_split_shapes
+                    param.qkv_split_groups_are_complete = (
+                        qkv_gtp_pad_length == 0
+                        and _qkv_split_groups_are_complete(
+                            qkv_split_shapes, local_start=local_start, local_rows=param.shape[0]
+                        )
                     )
 
     # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).
@@ -847,15 +975,23 @@ def _get_megatron_emerging_optimizer(
     grouped_param_groups = defaultdict(list)
     for group in all_param_groups:
         opt_name = group.get('optimizer', eopt_name)
-        is_expert = group['is_expert_parallel'] and not use_layer_wise
-        grouped_param_groups[(opt_name, is_expert)].append(group)
+        domain = get_parameter_parallel_domain(group)
+        # Matrix optimizers share the LayerWise owner assignment; scalar fallbacks
+        # need one DistributedOptimizer per replica domain.
+        if use_layer_wise and opt_name in (eopt_name, 'sinkhorn'):
+            domain = 'dense'
+        grouped_param_groups[(opt_name, domain)].append(group)
+
+    # Sinkhorn is a companion matrix optimizer, not a scalar fallback: its row/column
+    # normalizations require the same whole-parameter ownership as Muon.
+    matrix_optimizer_names = {eopt_name}
+    if config.muon_use_sinkhorn:
+        matrix_optimizer_names.add('sinkhorn')
 
     # Set up DistOpt process groups + filtered buffers once, only if we'll
     # construct a DistributedOptimizer for non-Muon groups in layer-wise mode.
-    # The DistOpt-vs-LayerWise buffer split only happens when DDP was wrapped
-    # with ``use_distributed_optimizer=True`` (i.e. the layout-based path); in
-    # legacy ping-pong mode all params share one unpadded DDP buffer that
-    # DistOpt cannot manage, so we keep non-Muon params inside LayerWise.
+    # DDP keeps Adam buffers sharded in both LayerWise layouts. Only compact
+    # Muon buffers disable DistOpt's reduce-scatter through a private config.
     ddp_uses_distributed_optimizer = (
         bool(getattr(model_chunks[0], 'ddp_config', None))
         and model_chunks[0].ddp_config.use_distributed_optimizer
@@ -868,14 +1004,11 @@ def _get_megatron_emerging_optimizer(
         assert ddp_config.num_distributed_optimizer_instances == 1, (
             "Layer-wise + DistributedOptimizer split path does not yet support "
             "num_distributed_optimizer_instances > 1: distributed_optimizer_instance_id "
-            "is hardcoded to 0 in this path. Disable use_layer_wise_param_layout to "
-            "fall back to the legacy LayerWise ping-pong path."
+            "is hardcoded to 0 in this path."
         )
     if use_separate_distributed_optimizer and any(
-        # A separate DistributedOptimizer with byte-level sharding handles any group
-        # whose optimizer is not the primary emerging optimizer (stored in ``eopt_name``,
-        # e.g., Muon). This includes scalar optimizers like Adam or Lion.
-        not (opt_name == eopt_name and opt_name in _EMERGING_OPTIMIZERS)
+        # Scalar fallbacks (Adam/Lion) can use byte-level sharding.
+        opt_name not in matrix_optimizer_names
         for (opt_name, _), groups in grouped_param_groups.items()
         if groups
     ):
@@ -885,41 +1018,24 @@ def _get_megatron_emerging_optimizer(
         distopt_process_groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
             pg_collection, model_chunks, use_gloo_process_groups=False
         )
-        # DistOpt should only manage non-LayerWise buffers (those holding
-        # embeddings, biases, layernorm, etc.). Filter out the LayerWise
-        # shard-aligned buffers that the LayerWiseDistributedOptimizer owns.
-        distopt_per_model_buffers = {}
-        for model_chunk_idx, model_chunk in enumerate(model_chunks):
-            if not hasattr(model_chunk, 'buffers'):
-                continue
-            non_layer_wise_buffers = [
-                buffer
-                for buffer in model_chunk.buffers
-                if buffer.params
-                and not getattr(buffer.params[0], 'is_managed_by_layer_wise_optimizer', False)
-            ]
-            if non_layer_wise_buffers:
-                distopt_per_model_buffers[model_chunk_idx] = non_layer_wise_buffers
 
     # Build an optimizer for each (optimizer_name, is_expert) bucket and combine.
-    # In layer-wise mode, emerging-optimizer (Muon) groups feed into LayerWise,
-    # while non-emerging (Adam) groups are managed by a separate DistributedOptimizer
-    # — that is, the LayerWise optimizer only owns Muon-managed matrix parameters,
-    # and the rest go through DistOpt's standard byte-level shard machinery.
+    # In layer-wise mode, Muon and Sinkhorn groups feed into LayerWise; scalar
+    # fallbacks use a separate DistributedOptimizer with byte-level sharding.
     results = []
     layer_wise_base_results = []  # (raw_optimizer, init_state_fn) feeding LayerWise.
-    for (opt_name, is_expert), groups in grouped_param_groups.items():
+    for (opt_name, domain), groups in grouped_param_groups.items():
         if not groups:
             continue
 
+        is_expert = domain == 'expert'
         model_parallel_group = pg_collection.tp_ep_pp if is_expert else pg_collection.mp
 
-        # Only the primary emerging optimizer (stored in ``eopt_name``, e.g., Muon) is
-        # constructed via ``_create_emerging_optimizer``. Scalar optimizers that also appear
-        # in ``_EMERGING_OPTIMIZERS`` (e.g., Lion) fall through to the standard fallback path.
-        if opt_name == eopt_name and opt_name in _EMERGING_OPTIMIZERS:
+        # The primary optimizer and Sinkhorn use whole matrices. Scalar optimizers that
+        # also appear in the registry (e.g. Lion) use the standard fallback path.
+        if opt_name in matrix_optimizer_names:
             optimizer, init_state_fn = _create_emerging_optimizer(
-                config, groups, eopt_name, model_chunks, pg_collection
+                config, groups, opt_name, model_chunks, pg_collection
             )
             if use_layer_wise:
                 layer_wise_base_results.append((optimizer, init_state_fn))
@@ -943,17 +1059,18 @@ def _get_megatron_emerging_optimizer(
             fallback_config = copy.copy(config)
             fallback_config.optimizer = opt_name
             if use_separate_distributed_optimizer:
-                # Route non-emerging params (adam/lion) through a real DistributedOptimizer
-                # (byte-level sharding) instead of stuffing them inside LayerWise.
-                for group in groups:
-                    assert not group['is_expert_parallel'], (
-                        "Non-emerging expert-parallel param groups are not yet "
-                        "supported on the layer-wise + DistributedOptimizer "
-                        "path: they need a separate DistOpt instance with the "
-                        "expert-DP process group, which is not wired up yet. "
-                        "Disable use_layer_wise_param_layout to fall back to "
-                        "the legacy LayerWise ping-pong path for MoE models."
-                    )
+                replica_group = pg_collection.get_parameter_replica_group(domain)
+                distopt_per_model_buffers = {
+                    i: [
+                        buffer
+                        for buffer in chunk.buffers_by_domain.get(domain, [])
+                        if buffer.params
+                        and not getattr(
+                            buffer.params[0], 'is_managed_by_layer_wise_optimizer', False
+                        )
+                    ]
+                    for i, chunk in enumerate(model_chunks)
+                }
                 fallback_config.use_distributed_optimizer = True
                 result = _get_megatron_optimizer_based_on_param_groups(
                     config=fallback_config,
@@ -961,9 +1078,13 @@ def _get_megatron_emerging_optimizer(
                     param_groups=groups,
                     per_model_buffers=distopt_per_model_buffers,
                     model_parallel_group=distopt_process_groups['mp_group'],
-                    data_parallel_group=distopt_process_groups['intra_dp_cp_group'],
-                    data_parallel_group_gloo=distopt_process_groups['intra_dp_cp_group_gloo'],
-                    data_parallel_group_idx=get_pg_rank(distopt_process_groups['mp_group']),
+                    data_parallel_group=replica_group,
+                    data_parallel_group_gloo=None,
+                    data_parallel_group_idx=(
+                        get_pg_rank(distopt_process_groups['mp_group'])
+                        if domain == 'dense'
+                        else torch.distributed.get_global_rank(replica_group, 0)
+                    ),
                     intra_dist_opt_group=distopt_process_groups['intra_dist_opt_group'],
                     distributed_optimizer_instance_id=0,
                     pg_collection=pg_collection,
@@ -1011,7 +1132,7 @@ def _get_megatron_emerging_optimizer(
             init_state_fn_list=list(init_fns),
             model_chunks=model_chunks,
         )
-        # LayerWise owns Muon-managed params; DistOpt instances in ``results``
+        # LayerWise owns matrix-optimizer params; DistOpt instances in ``results``
         # own the rest. Chain them so the training loop sees one optimizer.
         if results:
             return ChainedOptimizer([layer_wise_optimizer] + results)
@@ -1077,6 +1198,16 @@ def get_megatron_optimizer(
             len(model_chunks) == 1
         ), "MimoModel does not support virtual pipeline parallelism (multiple model chunks)"
         return get_mimo_optimizer(model_chunks[0], config)
+
+    if pg_collection is None:
+        owner = model_chunks[0]
+        while hasattr(owner, 'module'):
+            owner = owner.module
+        model_groups = getattr(owner, 'pg_collection', None)
+        if model_groups is not None and getattr(model_groups, 'parameter_replica_groups', None):
+            # Additional domains are materialized by the model builder, not MPU.
+            pg_collection = model_groups
+            use_gloo_process_groups = False
 
     # None → apply standard defaults. To extend defaults with custom overrides,
     # start from get_standard_config_overrides(config) and merge yours in.
@@ -1238,7 +1369,7 @@ def get_megatron_optimizer(
             model_chunk_offset=model_chunk_offset,
             config=config,
             config_overrides=config_overrides,
-            filter_fn=lambda g: not g['is_expert_parallel'],
+            filter_fn=lambda g: get_parameter_parallel_domain(g) == 'dense',
             buffer_name='buffers',
             process_group=param_group_process_group,
         )
@@ -1270,6 +1401,43 @@ def get_megatron_optimizer(
             )
         )
         model_chunk_offset += 1
+
+    for domain, replica_group in (
+        getattr(pg_collection, 'parameter_replica_groups', None) or {}
+    ).items():
+        if not config.use_distributed_optimizer:
+            raise ValueError('Additional parameter domains require a distributed optimizer')
+        param_groups = [
+            group
+            for group in _get_param_groups(
+                model_chunks, config, config_overrides, param_group_process_group
+            )
+            if get_parameter_parallel_domain(group) == domain
+        ]
+        buffers = {
+            i: chunk.buffers_by_domain.get(domain, []) for i, chunk in enumerate(model_chunks)
+        }
+        if dump_param_to_param_group_map is not None:
+            for param_group in param_groups:
+                for param in param_group['params']:
+                    param_name = get_global_unique_param_name(model_chunks, param)
+                    param_to_param_group[param_name] = param_group_id
+                param_group_id += 1
+        optimizers.append(
+            _get_megatron_optimizer_based_on_param_groups(
+                config=config,
+                model_chunks=model_chunks,
+                param_groups=param_groups,
+                per_model_buffers=buffers,
+                model_parallel_group=mp_group,
+                data_parallel_group=replica_group,
+                data_parallel_group_gloo=None,
+                data_parallel_group_idx=torch.distributed.get_global_rank(replica_group, 0),
+                intra_dist_opt_group=intra_dist_opt_group,
+                distributed_optimizer_instance_id=0,
+                pg_collection=pg_collection,
+            )
+        )
 
     moe_param_groups, moe_buffers = _get_param_groups_and_buffers(
         model_chunks,

@@ -207,12 +207,14 @@ def test_retry_disables_and_restores_per_module_configs(monkeypatch):
     ) == (True, True, True, False)
 
 
-def test_retry_stages_only_overlapped_reused_mxfp8_buffers(monkeypatch):
+def test_retry_stages_only_overlapped_reused_fp8_buffers(monkeypatch):
     class _DistributedOptimizer:
 
         def __init__(self, *, reuse_grad_buffer, overlap_param_gather):
+            self.reuse_grad_buffer_for_param_ag = reuse_grad_buffer
             self.ddp_config = SimpleNamespace(
-                reuse_grad_buf_for_mxfp8_param_ag=reuse_grad_buffer,
+                # The raw MXFP8 flag is deliberately opposite to the derived policy.
+                reuse_grad_buf_for_mxfp8_param_ag=not reuse_grad_buffer,
                 overlap_param_gather=overlap_param_gather,
             )
             self.shard_fp32_from_float16_groups = []

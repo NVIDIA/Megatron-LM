@@ -2306,6 +2306,7 @@ def wrap_model_chunks_with_ddp(
     *,
     use_layer_wise_distributed_optimizer=False,
     use_layer_wise_param_layout=True,
+    use_sinkhorn_for_embeddings=False,
     DP=DDP,
     pg_collection=None,
     bucket_sizes=None,
@@ -2316,12 +2317,10 @@ def wrap_model_chunks_with_ddp(
     Centralises the DDP-wrapping wiring shared between :func:`get_model` and
     unit tests.
 
-    For ``use_layer_wise_distributed_optimizer=True`` and ``use_layer_wise_param_layout=True``:
-    forces ``ddp_config.use_distributed_optimizer=True`` (mutated in place; needed
-    for reduce-scatter), and computes per-chunk shard-aligned layouts via
-    :meth:`LayerWiseDistributedOptimizer.compute_full_param_layout`. With
-    ``use_layer_wise_param_layout=False``, no layout is supplied and LayerWise falls back
-    to its legacy ``allgather_params`` sync path.
+    For ``use_layer_wise_distributed_optimizer=True``, enables DistributedOptimizer
+    and computes per-chunk layouts via
+    :meth:`LayerWiseDistributedOptimizer.compute_full_param_layout`. Muon uses the
+    selected padded or compact layout; Adam uses DistributedOptimizer in both cases.
 
     For non-layerwise with ``ddp_config.use_distributed_optimizer=True``:
     computes per-chunk byte-level layouts via
@@ -2337,11 +2336,13 @@ def wrap_model_chunks_with_ddp(
         model_chunks: List of model chunks to wrap (un-DDP-wrapped).
         config: :class:`TransformerConfig`.
         ddp_config: :class:`DistributedDataParallelConfig`. Mutated in place when
-            ``use_layer_wise_distributed_optimizer=True`` and ``use_layer_wise_param_layout=True``.
+            ``use_layer_wise_distributed_optimizer=True``.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
+        use_sinkhorn_for_embeddings: Keep embedding/output matrices whole for Sinkhorn.
+            Must match ``OptimizerConfig.muon_use_sinkhorn``.
         use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-            controls whether to compute and supply a shard-aligned param layout
-            to DDP. ``False`` keeps LayerWise on its legacy sync path.
+            selects padded (True) or compact (False) Muon parameter layouts.
+            Adam parameters remain sharded by DistributedOptimizer in both layouts.
         DP: The DDP class to construct (``DistributedDataParallel`` or an FSDP
             variant).
         pg_collection: Optional :class:`ProcessGroupCollection`. When provided,
@@ -2355,6 +2356,16 @@ def wrap_model_chunks_with_ddp(
     Returns:
         List of DDP-wrapped chunks.
     """
+
+    if DP is not DDP and (
+        (pg_collection is not None and pg_collection.parameter_replica_groups)
+        or any(
+            getattr(param, 'deferred_grad_producer', None) is not None
+            for chunk in model_chunks
+            for param in chunk.parameters()
+        )
+    ):
+        raise ValueError('Additional parameter domains and deferred gradients require standard DDP')
     n = len(model_chunks)
     if bucket_sizes is None:
         bucket_sizes = [ddp_config.bucket_size] * n
@@ -2364,14 +2375,15 @@ def wrap_model_chunks_with_ddp(
     # Compute per-chunk layouts (DDP only).
     per_chunk_layouts = [None] * n
     if DP is DDP:
-        if use_layer_wise_distributed_optimizer and use_layer_wise_param_layout:
+        if use_layer_wise_distributed_optimizer:
             ddp_config.use_distributed_optimizer = True
+            ddp_config.use_layer_wise_param_layout = use_layer_wise_param_layout
             compute_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
-            # Tag params so DDP buffer grouping routes LayerWise-managed matrices
-            # (Muon's Newton-Schulz domain) to a shard-aligned buffer and routes
-            # everything else (embeddings, biases, layernorm) to a separate
-            # DistOpt-style buffer.
-            tag_params_for_buffer_routing(model_chunks)
+            # Tag Muon matrices for the selected LayerWise layout, and keep scalar
+            # parameters (embeddings, biases, layernorm) in DistOpt-style buffers.
+            tag_params_for_buffer_routing(
+                model_chunks, use_sinkhorn_for_embeddings=use_sinkhorn_for_embeddings
+            )
         elif not use_layer_wise_distributed_optimizer and ddp_config.use_distributed_optimizer:
             compute_layout = DistributedOptimizer.compute_full_param_layout
         else:
@@ -2410,6 +2422,10 @@ def wrap_model_chunks_with_ddp(
                     data_parallel_world_size,
                     ddp_config,
                     expert_data_parallel_world_size=expert_data_parallel_world_size,
+                    parallel_group_sizes={
+                        name: group.size()
+                        for name, group in (layout_pgs.parameter_replica_groups or {}).items()
+                    },
                 )
 
     # Wrap each chunk.
@@ -2584,7 +2600,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             model.model_type = model_type
         return model
 
-
     if args.init_model_with_meta_device:
         with torch.device('meta'):
             model = build_model()
@@ -2708,11 +2723,14 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 use_layer_wise_distributed_optimizer=getattr(
                     args, 'use_layer_wise_distributed_optimizer', False
                 ),
-                use_layer_wise_param_layout=getattr(
-                    args, 'use_layer_wise_param_layout', True
-                ),
+                use_layer_wise_param_layout=getattr(args, 'use_layer_wise_param_layout', True),
+                use_sinkhorn_for_embeddings=getattr(args, 'muon_use_sinkhorn', False),
                 DP=DP,
-                pg_collection=pg_collection if args.use_megatron_fsdp else None,
+                pg_collection=(
+                    pg_collection
+                    if args.use_megatron_fsdp or pg_collection.parameter_replica_groups
+                    else None
+                ),
                 bucket_sizes=per_chunk_bucket_sizes,
                 disable_bucketing_per_chunk=per_chunk_disable_bucketing,
             )
@@ -2913,6 +2931,7 @@ def setup_model_and_optimizer(
                 data_parallel_random_init=cfg.rng.data_parallel_random_init,
                 use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
                 use_layer_wise_param_layout=getattr(args, 'use_layer_wise_param_layout', True),
+                use_sinkhorn_for_embeddings=cfg.optimizer.muon_use_sinkhorn,
             )
         else:
             assert model_provider_func is not None, "Must provide a model config via config_container or a model_provider_func."
@@ -3331,8 +3350,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         else:
             adjust_tensor_shapes_fn = None
 
-        # For the mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
-        # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
+        # For FP8 parameters that reuse gradient storage with overlapped gather,
+        # we need to call _copy_main_params_to_param_buffer() after the grad buffer
         # is zeroed by zero_grad_buffer() because param and grad buffer are shared.
         #
         # However, we should skip this on the first iteration when forward_pre_hook is disabled,
@@ -3354,7 +3373,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             for optim_instance in optimizer_instances
             if (
                 isinstance(optim_instance, DistributedOptimizer)
-                and optim_instance.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+                and optim_instance.reuse_grad_buffer_for_param_ag
                 and optim_instance.ddp_config.overlap_param_gather
             )
         ]
@@ -5555,7 +5574,7 @@ def train(
 
         for model_module in model:
             if isinstance(model_module, DDP):
-                for buf in model_module.buffers + model_module.expert_parallel_buffers:
+                for buf in model_module.all_buffers:
                     buf.deregister_nccl_mem_pools()
         one_logger and one_logger.log_metrics(
             {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}

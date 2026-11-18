@@ -1077,6 +1077,26 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
     assert batch["padding_mask"] is padding_mask
 
 
+def test_transformer_config_is_built_once_per_args(monkeypatch):
+    """get_batch and is_dataset_built_on_rank reuse the config built from the same args
+    namespace instead of rebuilding it per microbatch; a new namespace rebuilds it."""
+    built = []
+
+    def build(args):
+        built.append(args)
+        return SimpleNamespace(args=args)
+
+    monkeypatch.setattr(pretrain_hybrid, "_TRANSFORMER_CONFIG_CACHE", None)
+    monkeypatch.setattr(pretrain_hybrid, "core_transformer_config_from_args", build)
+    first, second = SimpleNamespace(), SimpleNamespace()
+    config = pretrain_hybrid._cached_transformer_config(first)
+    assert config.args is first
+    assert pretrain_hybrid._cached_transformer_config(first) is config
+    assert len(built) == 1
+    assert pretrain_hybrid._cached_transformer_config(second).args is second
+    assert len(built) == 2 and built[1] is second
+
+
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
 @pytest.mark.parametrize("pp_size", [1, 2, 4])
 @pytest.mark.parametrize("cp_size", [1, 2, 4])

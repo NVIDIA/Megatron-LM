@@ -18,10 +18,21 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core import parallel_state
+from megatron.core import fp8_utils, parallel_state
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE, TEFusedMLP
-from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
+from megatron.core.fp8_utils import (
+    copy_back_gathered_bf16_into_fp8_params,
+    get_fp8_context,
+    is_mxfp8tensor,
+)
+from megatron.core.models.engram.distributed_embedding import (
+    EPShardedMultiTableEmbedding,
+    _mxfp8_lookup_activation,
+    _mxfp8_pack_lookup,
+    _mxfp8_quantizer,
+)
+from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
@@ -45,6 +56,7 @@ from tests.unit_tests.determinism.kernels.harness import (
     bytes_equal,
     seeded,
 )
+from tests.unit_tests.models.test_v41_engram import _cuda_mxfp8_engram
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 pytestmark = pytest.mark.skipif(
@@ -86,6 +98,182 @@ def _config(**overrides):
     )
     kwargs.update(overrides)
     return TransformerConfig(**kwargs)
+
+
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(not _IS_BLACKWELL, reason='NCCL device transport needs Blackwell')
+def test_engram_device_exchange_replays():
+    """Striped transfers reuse both slots under competing stream work, byte for byte."""
+    pytest.importorskip('nccl.core.device.cute', exc_type=ImportError)
+    from megatron.core.ops.engram import EngramDeviceTransport
+
+    Utils.initialize_distributed()
+    group = torch.distributed.group.WORLD
+    rank, size = torch.distributed.get_rank(group), torch.distributed.get_world_size(group)
+    if size < 2:
+        pytest.skip('Needs at least two row shards')
+    transport = EngramDeviceTransport(group)
+    counts = torch.tensor([[153 + (src + dst) % 7 for dst in range(size)] for src in range(size)])
+    send, recv = counts[rank].tolist(), counts[:, rank].tolist()
+    plan = SimpleNamespace(peer_counts=counts, max_rows=int(counts.sum(1).max()))
+    # Eight stripes with 4 KiB slots force several rounds for 1040-byte packets.
+    workspace = (4096 * 2 * (size + transport.channels) + size * 32) * 8
+    source = torch.randint(256, (sum(send), 1040), device='cuda', dtype=torch.uint8)
+    expected = source.new_empty((sum(recv), 1040))
+    torch.distributed.all_to_all_single(expected, source, recv, send, group=group)
+
+    def exchange(values):
+        return transport.exchange(values, recv, send, plan, workspace)
+
+    try:
+        assert bytes_equal(exchange(source), expected)
+        assert transport.stripes == 8
+        assert_replays_bit_exact(
+            exchange,
+            (source,),
+            backward=False,
+            contention=True,
+            what='Engram striped LSA/GIN row exchange',
+        )
+    finally:
+        transport.close()
+
+
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(not _IS_BLACKWELL, reason='TE MXFP8 needs Blackwell')
+@pytest.mark.parametrize('width', [32, 256])
+@pytest.mark.parametrize('needs_wgrad', [False, True])
+@pytest.mark.parametrize('deduplicated', [False, True])
+def test_engram_mxfp8_fused_payload_replays(width, needs_wgrad, deduplicated):
+    """Replay all fused payload/activation bytes, including TE's scale padding."""
+    pytest.importorskip('triton')
+    seeded(123)
+    weight = _mxfp8_quantizer()(torch.randn(128, width, device='cuda', dtype=torch.bfloat16))
+    rows = 257 * 3
+    requests = torch.randint(0, 128, (rows, 2), device='cuda')
+    requests[:5, 1] = 0
+    order = (
+        torch.randint(0, 128, (rows,), device='cuda')
+        if deduplicated
+        else torch.randperm(rows, device='cuda')
+    )
+    if deduplicated:
+        requests = torch.arange(128, device='cuda').unsqueeze(-1).expand(-1, 2)
+
+    def lookup(row_ids, owner_order):
+        packed = _mxfp8_pack_lookup([weight], row_ids, None, [row_ids.numel()], width)
+        activation = _mxfp8_lookup_activation(
+            packed,
+            width,
+            width * 3,
+            torch.bfloat16,
+            needs_wgrad,
+            **({"inverse": owner_order} if deduplicated else {"order": owner_order}),
+        )
+        return (
+            packed,
+            activation._rowwise_data,
+            activation._rowwise_scale_inv,
+            activation._columnwise_data,
+            activation._columnwise_scale_inv,
+        )
+
+    assert_replays_bit_exact(
+        lookup,
+        (requests[:, 1], order),
+        backward=False,
+        contention=True,
+        what='Engram fused FP8 gather/pack and reorder/columnwise quantization',
+    )
+
+
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(not _IS_BLACKWELL, reason='MXFP8 needs Blackwell')
+@pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
+def test_mxfp8_chunked_copyback_replays(monkeypatch, dtype):
+    """Replay ordinary-optimizer and gathered-BF16 casts across chunk boundaries."""
+    monkeypatch.setattr(fp8_utils, '_MXFP8_QUANTIZE_CHUNK_ROWS', 128)
+    quantizer = _mxfp8_quantizer()
+    weight = torch.nn.Parameter(
+        quantizer.make_empty((416, 256), dtype=torch.bfloat16, device='cuda'), requires_grad=False
+    )
+    weight.mxfp8_requires_columnwise = False
+
+    def publish(master):
+        if dtype == torch.float32:
+            optimizer = SimpleNamespace(
+                float16_groups=[[weight]],
+                fp32_from_float16_groups=[[master]],
+                _layer_wise_ddp_config=None,
+                _dummy_overflow_buf=None,
+            )
+            Float16OptimizerWithFloat16Params._copy_main_params_to_model_params(optimizer)
+        else:
+            copy_back_gathered_bf16_into_fp8_params([weight], [master])
+        return weight._rowwise_data, weight._rowwise_scale_inv[:416, :8]
+
+    assert_replays_bit_exact(
+        publish,
+        (torch.randn(416, 256, dtype=dtype, device='cuda'),),
+        backward=False,
+        contention=True,
+        what='Chunked rowwise MXFP8 parameter copy-back',
+    )
+
+
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(not _IS_BLACKWELL, reason='MXFP8 GEMMs need Blackwell')
+@pytest.mark.parametrize('ep_size', [1, 2])
+@pytest.mark.parametrize("communication_backend", ["nccl", "hybridep"])
+def test_engram_mxfp8_lookup_projection_and_copyback_replays(ep_size, communication_backend):
+    """Replay quantized EP lookup, TE GEMMs, repeated-row gradients and rowwise copy-back."""
+    if communication_backend == "hybridep" and ep_size > 1:
+        pytest.importorskip("deep_ep", exc_type=ImportError)
+    Utils.initialize_distributed()
+    if torch.distributed.get_world_size() % ep_size:
+        pytest.skip('world size must be divisible by EP size')
+    Utils.initialize_model_parallel(expert_model_parallel_size=ep_size)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        module = _cuda_mxfp8_engram(pg, communication_backend=communication_backend)
+        assert isinstance(module.embed, EPShardedMultiTableEmbedding)
+        tokens = 35 + pg.ep.rank()
+        hashes = torch.randint(0, 198, (1, tokens, 1, 2), device='cuda')
+        hashes[:, :3] = 0
+        hidden = torch.randn(
+            tokens, 1, 128, device='cuda', dtype=torch.bfloat16, requires_grad=True
+        )
+        with get_fp8_context(module.config):
+            assert_module_replays_bit_exact(
+                module,
+                (hidden, hashes),
+                contention=True,
+                what=f'Engram MXFP8 {communication_backend} EP{ep_size} forward/backward',
+            )
+        weight = module.embed.tables[0].weight
+
+        def publish(master):
+            copy_back_gathered_bf16_into_fp8_params([weight], [master])
+            assert weight._columnwise_data is None
+            return (
+                weight._rowwise_data,
+                weight._rowwise_scale_inv[: weight.shape[0], : weight.shape[1] // 32],
+            )
+
+        assert_replays_bit_exact(
+            publish,
+            (torch.randn(weight.shape, device='cuda', dtype=torch.bfloat16),),
+            backward=False,
+            contention=True,
+            what='Engram rowwise MXFP8 master copy-back',
+        )
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("parallel_mode", ["column", "row"])

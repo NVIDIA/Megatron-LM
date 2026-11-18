@@ -161,8 +161,12 @@ class V41StateCodec:
             cp_group=self.cp_group,
         )
 
-    def restore(self, state, boundary):
-        """Create fresh Python state; original float tensors keep their gradient edges."""
+    def restore(self, state, boundary, *, previous=None):
+        """Create fresh Python state; original float tensors keep their gradient edges.
+
+        ``previous`` is this microbatch's state at an earlier boundary. Packed layouts depend
+        only on the transported prefixes and the compression ratio, so its layouts are reused.
+        """
         c = self.config
         result = CSA2State(attention_layer_ids=frozenset(range(0, c.num_layers, 2)))
         result.defer_indexer_loss = True
@@ -180,18 +184,21 @@ class V41StateCodec:
             result.candidate_source_layer = c.csa2_candidate_source_layer
         packed = self.packed(state)
         if packed is not None:
-            result.thd_layout = build_csa2_thd_layout(
-                packed, self.shape.sequence, cp_group=self.cp_group
-            )
+            layout = None if previous is None else previous.thd_layout
+            if layout is None:
+                layout = build_csa2_thd_layout(packed, self.shape.sequence, cp_group=self.cp_group)
+            result.thd_layout = layout
             if prior:
-                result.compressed_layout = result.thd_layout.for_compression(
-                    c.csa_compress_ratios[prior[-1]]
-                )
+                ratio = c.csa_compress_ratios[prior[-1]]
+                compressed = None if previous is None else previous.compressed_layout
+                if compressed is None or compressed.ratio != ratio:
+                    compressed = layout.for_compression(ratio)
+                result.compressed_layout = compressed
         if c.dsa_kernel_backend == 'cudnn':
             result.prepare_fused_kv()
         return result, SinglePassMHCState(state.get('mhc')), packed
 
-    def snapshot(self, csa, mhc, state, boundary, *, loss=False):
+    def snapshot(self, csa, mhc, state, boundary, *, loss=False, schema=None):
         """Publish live fields and discard consumed owners without detaching their uses."""
         values = dict(state)
         values.update(
@@ -205,7 +212,7 @@ class V41StateCodec:
             values.update(
                 candidate_ids=csa.candidates.indices, candidate_counts=csa.candidates.lengths
             )
-        schema = self.schema(boundary, loss=loss)
+        schema = self.schema(boundary, loss=loss) if schema is None else schema
         values = {f.key: values[f.key] for f in schema.fields}
         for field in schema.fields:
             if not field.differentiable:

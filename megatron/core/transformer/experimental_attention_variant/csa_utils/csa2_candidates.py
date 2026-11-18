@@ -9,6 +9,7 @@ Selection is discrete; indexer supervision keeps the original projection graph.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -16,6 +17,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core.env_flags import env_flag
 from megatron.core.ops.attention.csa.indexer_quantization import (
     create_indexer_mxfp8_quantization_buffers,
     indexer_mxfp8_thd_scale_capacity,
@@ -41,10 +43,42 @@ except ImportError:
     HAVE_TRITON = False
 
 
+def _score_chunk_max_bytes() -> int:
+    """Parse MCORE_CSA2_CANDIDATE_CHUNK_MIB, a positive number of MiB (default 152)."""
+    value = os.environ.get("MCORE_CSA2_CANDIDATE_CHUNK_MIB")
+    if value is None:
+        return 152 * 1024 * 1024
+    try:
+        mib = int(value)
+    except ValueError:
+        mib = 0
+    if mib < 1:
+        raise ValueError(
+            f"Environment variable MCORE_CSA2_CANDIDATE_CHUNK_MIB={value!r} is not a positive "
+            "integer"
+        )
+    return mib * 1024 * 1024
+
+
 # Score tiles are transient, including on the candidate-source layer. The
 # unavoidable output is [queries, topk_blocks], never [queries, global keys].
-_SCORE_CHUNK_MAX_BYTES = 32 * 1024 * 1024
+# MCORE_CSA2_CANDIDATE_CHUNK_MIB sets the per-chunk score budget (default 152 MiB; it was
+# 32 MiB). Rows are scored, ranked and blocked independently, so selections do not depend
+# on it. A dense-scorer launch has only rows * heads / 128 MMA tiles: at 64K keys, 32 MiB
+# chunks hold 128 rows, which occupy 64 (H64) or 32 (H32) SMs.
+_SCORE_CHUNK_MAX_BYTES = _score_chunk_max_bytes()
 _QUERY_CHUNK_SIZE = 2048
+# cuDNN's MXFP8 selection scorers (dense chunks here, compact Top-K in csa2_indexer) take H32
+# indexer heads natively, four query tokens per 128-row MMA tile. MCORE_CSA2_MXFP8_NATIVE_H32=0
+# restores the zero-padding to H64 (two tokens, each with 32 zero heads, per tile). The
+# quantized real heads, their tile products and the head-reduction order are the same on both
+# paths, and their scores and selections compare equal bit for bit.
+_MXFP8_NATIVE_H32 = env_flag("MCORE_CSA2_MXFP8_NATIVE_H32", True)
+
+
+def mxfp8_selection_heads(num_heads: int) -> int:
+    """Return the head count cuDNN MXFP8 selection scores: H32 natively or padded to H64."""
+    return 64 if num_heads == 32 and not _MXFP8_NATIVE_H32 else num_heads
 
 
 @dataclass(frozen=True)
@@ -340,7 +374,7 @@ def fused_candidate_blocks(
     cu_q, cu_k, max_q, score_max_k = inputs.packed_metadata
     causal_offsets = inputs.packed_causal_offsets
     # Account for cuDNN's four-float row alignment. Even a single very long
-    # row needs its own score buffer; otherwise cap the chunk at 32 MiB.
+    # row needs its own score buffer; otherwise cap the chunk at the score budget.
     row_bytes = ((score_max_k + 3) // 4 * 4) * 4
     chunk_size = min(_QUERY_CHUNK_SIZE, max(1, _SCORE_CHUNK_MAX_BYTES // row_bytes))
     kernel_k = k
@@ -350,10 +384,11 @@ def fused_candidate_blocks(
         # these buffers would synchronize once for K and once per Q chunk.
         num_sequences = cu_q.numel() - 1
         chunk_rows = min(chunk_size, q.shape[0])
-        q_scale_capacity = indexer_mxfp8_thd_scale_capacity(chunk_rows, num_sequences, 64)
+        kernel_heads = mxfp8_selection_heads(num_heads)
+        q_scale_capacity = indexer_mxfp8_thd_scale_capacity(chunk_rows, num_sequences, kernel_heads)
         k_scale_capacity = indexer_mxfp8_thd_scale_capacity(k.shape[0], num_sequences, 1)
         q_scale = torch.empty(
-            indexer_mxfp8_thd_scale_shape(q_scale_capacity, 64, q.shape[-1]),
+            indexer_mxfp8_thd_scale_shape(q_scale_capacity, kernel_heads, q.shape[-1]),
             dtype=torch.float8_e8m0fnu,
             device=q.device,
         )
@@ -368,9 +403,9 @@ def fused_candidate_blocks(
         )
         precision_kwargs.update(k_scale=k_scale, cu_seqlens_k_scale_padded=k_scale_prefix)
         q_buffers = None
-        if num_heads == 32:
-            padded_q = q.new_zeros((chunk_rows, 64, q.shape[-1]))
-            padded_w = weights.new_zeros((chunk_rows, 64))
+        if kernel_heads != num_heads:
+            padded_q = q.new_zeros((chunk_rows, kernel_heads, q.shape[-1]))
+            padded_w = weights.new_zeros((chunk_rows, kernel_heads))
 
     for start in range(0, q.shape[0], chunk_size):
         end = min(start + chunk_size, q.shape[0])
@@ -379,9 +414,9 @@ def fused_candidate_blocks(
         kernel_q = q[start:end]
         kernel_w = scaled_weights[start:end]
         if precision == "mxfp8":
-            # The existing MXFP8 scorer needs H64. Pad only this chunk; keep
-            # real H32 scaling and avoid doubling the full projected Q storage.
-            if num_heads == 32:
+            # MCORE_CSA2_MXFP8_NATIVE_H32=0 scores H32 as H64. Pad only this chunk;
+            # keep real H32 scaling and avoid doubling the projected Q storage.
+            if kernel_heads != num_heads:
                 padded_q[: end - start, :num_heads].copy_(kernel_q)
                 padded_w[: end - start, :num_heads].copy_(kernel_w)
                 kernel_q, kernel_w = padded_q[: end - start], padded_w[: end - start]

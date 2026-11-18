@@ -1,23 +1,29 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
+from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import NoReturn, Optional, Union
+from functools import partial
+from typing import Callable, NoReturn, Optional, Union
 
 import torch
 
 from megatron.core import tensor_parallel
+from megatron.core.component_nvtx import component, layer_scope
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict, ShardedTensor
+from megatron.core.env_flags import env_flag
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
     apply_rotary_pos_emb,
 )
+from megatron.core.ops.attention.csa.output_rope import OutputRopeParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.attention import Attention
+from megatron.core.transformer.attention import Attention, QKVLayout
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa import (
     CompressedSparseAttentionBuilder,
@@ -40,15 +46,80 @@ except Exception:
 
 
 if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input
+    from megatron.core.extensions.transformer_engine import (
+        TELinear,
+        fp8_autocast,
+        fp8_model_init,
+        set_save_original_input,
+    )
 else:
     TEColumnParallelLinear, TELinear, set_save_original_input = (None, None, None)
+    fp8_autocast, fp8_model_init = None, None
 
 
 @torch.compile
 def _q_rms_norm(q: torch.Tensor, eps: float) -> torch.Tensor:
     """Fused RMS normalization for query tensor (no learnable weight)."""
     return q * torch.rsqrt(q.square().mean(-1, keepdim=True) + eps)
+
+
+def _initialize_grouped_output_projection(
+    weight: torch.Tensor,
+    *,
+    init_method: Callable[[torch.Tensor], None],
+    perform_initialization: bool,
+) -> None:
+    """Preserve the legacy initialization layout and the no-initialization contract."""
+    if perform_initialization:
+        init_method(weight.view(-1, weight.size(-1)))
+
+
+# MCORE_DSV4_GROUP_PROJ_BMM (read once at import; on by default) runs the legacy (non-TE) grouped
+# output projection as strided-batched GEMMs on the token-major tensors instead of torch.einsum.
+# einsum runs the same per-group BF16 GEMMs over a group-major [g, tokens, *] layout, so its
+# output and, in backward, the [tokens, g, d] input gradient are copied back to token-major; at
+# the 64K CP16 proxy shape those copies cost ~0.6 s/step (one strided copy of the input gradient
+# per layer and microbatch dominates). Outputs and both gradients matched einsum bit for bit in
+# testing, but cuBLAS may select another algorithm for the strided operands on other GPUs or
+# library versions. MCORE_DSV4_GROUP_PROJ_BMM=0 restores einsum.
+_GROUP_PROJ_BMM = env_flag("MCORE_DSV4_GROUP_PROJ_BMM", True)
+
+
+class _GroupedProjectionBMM(torch.autograd.Function):
+    """y[..., j, :] = x[..., j, :] @ w[j].T with w = weight.view(groups, rank, d), copy-free.
+
+    cuBLAS reads and writes the token-major tensors through per-group strided views (leading
+    dimension groups * width, batch stride width), so neither direction materializes a
+    group-major copy of the input, the output or the input gradient.
+    """
+
+    @staticmethod
+    def forward(ctx, input_: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        """Project each group of the contiguous [..., groups, d] input to [..., groups, rank]."""
+        groups, width = input_.shape[-2:]
+        x = input_.view(-1, groups, width)
+        w = weight.view(groups, -1, width)
+        out = torch.empty((x.size(0), groups, w.size(1)), dtype=x.dtype, device=x.device)
+        torch.bmm(x.transpose(0, 1), w.transpose(1, 2), out=out.transpose(0, 1))
+        ctx.save_for_backward(input_, weight)
+        return out.view(*input_.shape[:-1], w.size(1))
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """Input and weight gradients, again through strided views of the token-major tensors."""
+        input_, weight = ctx.saved_tensors
+        groups, width = input_.shape[-2:]
+        x = input_.view(-1, groups, width)
+        w = weight.view(groups, -1, width)
+        grad = grad_output.contiguous().view(-1, groups, w.size(1)).transpose(0, 1)
+        grad_input = grad_weight = None
+        if ctx.needs_input_grad[0]:
+            grad_input = torch.empty_like(x)
+            torch.bmm(grad, w, out=grad_input.transpose(0, 1))
+            grad_input = grad_input.view(input_.shape)
+        if ctx.needs_input_grad[1]:
+            grad_weight = torch.bmm(grad.transpose(1, 2), x.transpose(0, 1)).view(weight.shape)
+        return grad_input, grad_weight
 
 
 @dataclass
@@ -62,6 +133,7 @@ class DSv4HybridSelfAttentionSubmodules:
     linear_q_up_proj: Union[ModuleSpec, type] = None
     linear_kv_proj: Union[ModuleSpec, type] = None
     core_attention: CompressedSparseAttentionBuilder | None = None
+    linear_o_group_proj: Union[ModuleSpec, type] = None
     linear_proj: Union[ModuleSpec, type] = None
 
 
@@ -208,15 +280,53 @@ class DSv4HybridAttention(Attention):
         group_proj_device = (
             'cpu' if self.config.use_cpu_initialization else torch.cuda.current_device()
         )
-        _linear_o_group_proj = torch.empty(
-            group_proj_out_size,
-            group_proj_in_size,
-            device=group_proj_device,
-            dtype=self.config.params_dtype,
+        self._uses_batched_linear = submodules.linear_o_group_proj is not None
+        # BatchedLinear supports MXFP8 and high precision. Other recipes retain
+        # the legacy grouped projection's high-precision weights and computation.
+        self._group_projection_high_precision = bool(
+            self.config.fp4 or (self.config.fp8 and self.config.fp8_recipe != 'mxfp8')
         )
-        if self.config.perform_initialization:
-            self.config.init_method(_linear_o_group_proj)
-        self.linear_o_group_proj = torch.nn.Parameter(_linear_o_group_proj)
+        if self._uses_batched_linear:
+            init_context = (
+                fp8_model_init(enabled=False)
+                if self._group_projection_high_precision
+                else nullcontext()
+            )
+            with init_context:
+                self.linear_o_group_proj = build_module(
+                    submodules.linear_o_group_proj,
+                    self.output_projection_local_groups,
+                    group_proj_in_size,
+                    self.config.output_projection_lora_rank,
+                    input_batch_dim=-2,
+                    device=group_proj_device,
+                    dtype=self.config.params_dtype,
+                    bias=False,
+                    accumulate_into_main_grad=self.config.gradient_accumulation_fusion,
+                    save_original_input=True,
+                    init_method=partial(
+                        _initialize_grouped_output_projection,
+                        init_method=self.config.init_method,
+                        perform_initialization=self.config.perform_initialization,
+                    ),
+                    name=(name + ".linear_o_group_proj") if name is not None else None,
+                )
+            if self.linear_o_group_proj.weight.shape != (group_proj_out_size, group_proj_in_size):
+                raise ValueError(
+                    'DSv4 grouped projection must preserve the flattened 2D weight layout.'
+                )
+            self._register_state_dict_hook(self._linear_o_group_proj_state_dict_hook)
+        else:
+            # Older TE versions and specs without BatchedLinear retain the existing path.
+            weight = torch.empty(
+                group_proj_out_size,
+                group_proj_in_size,
+                device=group_proj_device,
+                dtype=self.config.params_dtype,
+            )
+            if self.config.perform_initialization:
+                self.config.init_method(weight)
+            self.linear_o_group_proj = torch.nn.Parameter(weight)
 
         linear_proj_in_size = (
             self.config.output_projection_groups * self.config.output_projection_lora_rank
@@ -255,6 +365,75 @@ class DSv4HybridAttention(Attention):
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
 
+    @property
+    def _linear_o_group_proj_weight(self) -> torch.nn.Parameter:
+        """Return the grouped output-projection weight from either implementation."""
+        if self._uses_batched_linear:
+            return self.linear_o_group_proj.weight
+        return self.linear_o_group_proj
+
+    def _linear_o_group_proj_state_dict_hook(
+        self, module, state_dict, prefix, local_metadata
+    ) -> None:
+        """Keep the legacy parameter name when the projection is a submodule."""
+        assert module is self
+        checkpoint_key = f"{prefix}linear_o_group_proj"
+        state_dict[checkpoint_key] = state_dict.pop(f"{checkpoint_key}.weight")
+        state_dict.pop(f"{checkpoint_key}._extra_state", None)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        """Load the native grouped projection into the equivalent TE parameter."""
+        if self._uses_batched_linear:
+            checkpoint_key = f"{prefix}linear_o_group_proj"
+            if checkpoint_key in state_dict:
+                state_dict[f"{checkpoint_key}.weight"] = state_dict.pop(checkpoint_key)
+            state_dict.setdefault(f"{checkpoint_key}._extra_state", None)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    def sharded_state_dict(
+        self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
+    ) -> ShardedStateDict:
+        """Keep the native distributed-checkpoint key and 2D weight layout."""
+        state = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        if self._uses_batched_linear:
+            checkpoint_key = f"{prefix}linear_o_group_proj"
+            weight = state.pop(f"{checkpoint_key}.weight")
+            assert isinstance(weight, ShardedTensor)
+            weight.key = checkpoint_key
+            state[checkpoint_key] = weight
+            state.pop(f"{checkpoint_key}._extra_state", None)
+        return state
+
+    def _apply_linear_o_group_proj(self, input_: torch.Tensor) -> torch.Tensor:
+        """Apply TE BatchedLinear when available, otherwise the legacy grouped projection.
+
+        The legacy projection runs as copy-free strided-batched GEMMs (MCORE_DSV4_GROUP_PROJ_BMM)
+        for nonempty contiguous CUDA inputs with the weight's dtype, else as torch.einsum.
+        """
+        if self._uses_batched_linear:
+            input_ = input_.contiguous()
+            if self._group_projection_high_precision:
+                with fp8_autocast(enabled=False):
+                    return self.linear_o_group_proj(input_)
+            return self.linear_o_group_proj(input_)
+        weight = self._linear_o_group_proj_weight
+        if (
+            _GROUP_PROJ_BMM
+            and input_.is_cuda
+            and input_.numel() > 0
+            and input_.is_contiguous()
+            and weight.is_contiguous()
+            and input_.dtype == weight.dtype
+            and input_.size(-2) == self.output_projection_local_groups
+        ):
+            return _GroupedProjectionBMM.apply(input_, weight)
+        weight = weight.reshape(
+            self.output_projection_local_groups, self.config.output_projection_lora_rank, -1
+        )
+        return torch.einsum("...gd,grd->...gr", input_, weight)
+
+    @component("attention")
+    @layer_scope
     def forward(
         self,
         hidden_states,
@@ -334,6 +513,37 @@ class DSv4HybridAttention(Attention):
         key = key.contiguous()
         value = value.contiguous()
 
+        out_rope = None
+        if self.config.apply_rope_fusion and self.core_attention.use_fused_kernels:
+            cu_seqlens = None
+            rope_seqlen = hidden_states.shape[0]
+            if packed_seq:
+                cu_seqlens = packed_seq_params.cu_seqlens_q_padded
+                if cu_seqlens is None:
+                    cu_seqlens = packed_seq_params.cu_seqlens_q
+                rope_seqlen = packed_seq_params.max_seqlen_q
+            cos, sin = self.rotary_pos_emb.get_cached_cos_sin(
+                rope_seqlen, dtype=hidden_states.dtype, packed_seq=packed_seq, mscale=1.0
+            )
+            positions = (
+                cp_utils._thd_cp_position_ids(
+                    cu_seqlens, cp_group.rank() * query.shape[0], query.shape[0]
+                )
+                if use_thd_cp
+                else None
+            )
+            out_rope = OutputRopeParams(
+                cos,
+                sin,
+                self.config.v_head_dim - self.config.qk_pos_emb_head_dim,
+                self.config.qk_pos_emb_head_dim,
+                cu_seqlens,
+                0 if positions is not None else cp_group.rank(),
+                1 if positions is not None else cp_size,
+                positions,
+                None if packed_seq else hidden_states.shape[1],
+            )
+
         # ==================================
         # core attention computation
         # ==================================
@@ -352,6 +562,7 @@ class DSv4HybridAttention(Attention):
                 qr=q_compressed,
                 boundary_hidden=boundary_hidden,
                 boundary_kv=boundary_kv,
+                out_rope=out_rope,
                 **({"csa2_state": csa2_state} if self.config.dsv4_version == "v4.1" else {}),
             )
         forced_released_tensors = [query, key, value]
@@ -373,130 +584,132 @@ class DSv4HybridAttention(Attention):
             self.qkv_up_checkpoint.discard_output_and_register_recompute(core_attn_out)
             self.qkv_up_checkpoint = None
 
-        # inverse RoPE on last qk_pos_emb_head_dim of each head
-        seq_len = core_attn_out.size(0)
-        n_heads = self.num_attention_heads_per_partition
-        pos_dim = self.config.qk_pos_emb_head_dim
-        nope_dim = self.config.v_head_dim - pos_dim
-        core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), n_heads, -1)
-        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        if packed_seq:
-            cu_seqlens_kv = (
-                packed_seq_params.cu_seqlens_kv_padded
-                if packed_seq_params.cu_seqlens_kv_padded is not None
-                else packed_seq_params.cu_seqlens_kv
-            )
-            rope_seqlen = packed_seq_params.max_seqlen_kv
-            rope_max_seqlen_kv = packed_seq_params.max_seqlen_kv
-        else:
-            cu_seqlens_kv = None
-            rope_seqlen = seq_len
-            rope_max_seqlen_kv = None
-        # DSv4 reference (DS-Inf) RoPE is pure rotation (norm-preserving). Yarn's
-        # concentration factor (mscale) is NOT part of the DSv4 model contract --
-        # the model relies on Q/KV RMS-norm + unit-magnitude rotation. Force 1.0.
-        mscale = 1.0
-        rotary_pos_cos = None
-        rotary_pos_sin = None
-        if self.config.apply_rope_fusion:
-            # ``mscale=1.0`` strips yarn's concentration factor from the
-            # cached cos/sin so the fused kernel matches the unfused
-            # path's forced ``mscale=1.0`` (DSv4 "pure rotation").
-            rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                rope_seqlen, dtype=hidden_states.dtype, packed_seq=packed_seq, mscale=mscale
-            )
-            rotary_pos_emb = None
-            assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
-            assert (
-                fused_mla_rope_inplace is not None
-            ), "Fused MLA RoPE apply is not imported successfully"
-        elif self._dsv4_uses_yarn_rope:
-            rotary_pos_emb, _ = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
-        else:
-            rotary_pos_emb = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
-        if self.config.apply_rope_fusion:
-            if use_thd_cp:
+        if out_rope is None:
+            # inverse RoPE on last qk_pos_emb_head_dim of each head
+            seq_len = core_attn_out.size(0)
+            n_heads = self.num_attention_heads_per_partition
+            pos_dim = self.config.qk_pos_emb_head_dim
+            nope_dim = self.config.v_head_dim - pos_dim
+            core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), n_heads, -1)
+            packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+            if packed_seq:
+                cu_seqlens_kv = (
+                    packed_seq_params.cu_seqlens_kv_padded
+                    if packed_seq_params.cu_seqlens_kv_padded is not None
+                    else packed_seq_params.cu_seqlens_kv
+                )
+                rope_seqlen = packed_seq_params.max_seqlen_kv
+                rope_max_seqlen_kv = packed_seq_params.max_seqlen_kv
+            else:
+                cu_seqlens_kv = None
+                rope_seqlen = seq_len
+                rope_max_seqlen_kv = None
+            # DSv4 reference (DS-Inf) RoPE is pure rotation (norm-preserving). Yarn's
+            # concentration factor (mscale) is NOT part of the DSv4 model contract --
+            # the model relies on Q/KV RMS-norm + unit-magnitude rotation. Force 1.0.
+            mscale = 1.0
+            rotary_pos_cos = None
+            rotary_pos_sin = None
+            if self.config.apply_rope_fusion:
+                # ``mscale=1.0`` strips yarn's concentration factor from the
+                # cached cos/sin so the fused kernel matches the unfused
+                # path's forced ``mscale=1.0`` (DSv4 "pure rotation").
+                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
+                    rope_seqlen, dtype=hidden_states.dtype, packed_seq=packed_seq, mscale=mscale
+                )
+                rotary_pos_emb = None
+                assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
+                assert (
+                    fused_mla_rope_inplace is not None
+                ), "Fused MLA RoPE apply is not imported successfully"
+            elif self._dsv4_uses_yarn_rope:
+                rotary_pos_emb, _ = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
+            else:
+                rotary_pos_emb = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
+            if self.config.apply_rope_fusion:
+                if use_thd_cp:
+                    global_start = self.pg_collection.cp.rank() * core_attn_out.shape[0]
+                    core_attn_out = cp_utils.apply_thd_cp_local_rope_fused(
+                        core_attn_out,
+                        rotary_pos_cos,
+                        rotary_pos_sin,
+                        nope_dim,
+                        pos_dim,
+                        cu_seqlens_kv,
+                        global_start,
+                        inverse=True,
+                    )
+                else:
+                    if packed_seq:
+                        core_attn_out = core_attn_out.squeeze(1)
+                    # Fused DSA backward retains the raw attention output O. Applying
+                    # inverse RoPE to its view in-place corrupts the retained O used by
+                    # the softmax backward, so this call needs private storage.
+                    core_attn_out = fused_mla_rope_out_of_place(
+                        core_attn_out,
+                        rotary_pos_cos,
+                        rotary_pos_sin,
+                        nope_dim,
+                        pos_dim,
+                        cu_seqlens_kv,
+                        self.pg_collection.cp.rank(),
+                        self.pg_collection.cp.size(),
+                        inverse=True,
+                        remove_interleaving=True,
+                    )
+                    if packed_seq:
+                        core_attn_out = core_attn_out.unsqueeze(1)
+            elif use_thd_cp:
                 global_start = self.pg_collection.cp.rank() * core_attn_out.shape[0]
-                core_attn_out = cp_utils.apply_thd_cp_local_rope_fused(
+                core_attn_out = cp_utils.apply_thd_cp_local_rope_unfused(
                     core_attn_out,
-                    rotary_pos_cos,
-                    rotary_pos_sin,
+                    rotary_pos_emb,
                     nope_dim,
                     pos_dim,
                     cu_seqlens_kv,
                     global_start,
+                    self.config,
                     inverse=True,
                 )
             else:
+                content_part, rot_part = torch.split(
+                    core_attn_out, [core_attn_out.size(-1) - pos_dim, pos_dim], dim=-1
+                )
+                # ``_apply_rotary_pos_emb_thd`` documents 3-D ``(total, h, d)`` input
+                # and adds its own batch dim internally; drop the dummy ``b=1`` axis
+                # for THD before the rope and add it back after.
                 if packed_seq:
-                    core_attn_out = core_attn_out.squeeze(1)
-                # Fused DSA backward retains the raw attention output O. Applying
-                # inverse RoPE to its view in-place corrupts the retained O used by
-                # the softmax backward, so this call needs private storage.
-                core_attn_out = fused_mla_rope_out_of_place(
-                    core_attn_out,
-                    rotary_pos_cos,
-                    rotary_pos_sin,
-                    nope_dim,
-                    pos_dim,
-                    cu_seqlens_kv,
-                    self.pg_collection.cp.rank(),
-                    self.pg_collection.cp.size(),
+                    rot_part_in = rot_part.squeeze(1)
+                else:
+                    rot_part_in = rot_part
+                rot_part_out = apply_rotary_pos_emb(
+                    rot_part_in,
+                    rotary_pos_emb,
+                    self.config,
+                    cu_seqlens=cu_seqlens_kv,
+                    mscale=mscale,
+                    cp_group=self.pg_collection.cp,
+                    mla_rotary_interleaved=True,
                     inverse=True,
-                    remove_interleaving=True,
+                    mla_output_remove_interleaving=True,
+                    max_seqlen=rope_max_seqlen_kv,
                 )
                 if packed_seq:
-                    core_attn_out = core_attn_out.unsqueeze(1)
-        elif use_thd_cp:
-            global_start = self.pg_collection.cp.rank() * core_attn_out.shape[0]
-            core_attn_out = cp_utils.apply_thd_cp_local_rope_unfused(
-                core_attn_out,
-                rotary_pos_emb,
-                nope_dim,
-                pos_dim,
-                cu_seqlens_kv,
-                global_start,
-                self.config,
-                inverse=True,
-            )
-        else:
-            content_part, rot_part = torch.split(
-                core_attn_out, [core_attn_out.size(-1) - pos_dim, pos_dim], dim=-1
-            )
-            # ``_apply_rotary_pos_emb_thd`` documents 3-D ``(total, h, d)`` input
-            # and adds its own batch dim internally; drop the dummy ``b=1`` axis
-            # for THD before the rope and add it back after.
-            if packed_seq:
-                rot_part_in = rot_part.squeeze(1)
-            else:
-                rot_part_in = rot_part
-            rot_part_out = apply_rotary_pos_emb(
-                rot_part_in,
-                rotary_pos_emb,
-                self.config,
-                cu_seqlens=cu_seqlens_kv,
-                mscale=mscale,
-                cp_group=self.pg_collection.cp,
-                mla_rotary_interleaved=True,
-                inverse=True,
-                mla_output_remove_interleaving=True,
-                max_seqlen=rope_max_seqlen_kv,
-            )
-            if packed_seq:
-                rot_part = rot_part_out.unsqueeze(1)
-            else:
-                rot_part = rot_part_out
-            core_attn_out = torch.cat([content_part, rot_part], dim=-1)
-        core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), -1)
+                    rot_part = rot_part_out.unsqueeze(1)
+                else:
+                    rot_part = rot_part_out
+                core_attn_out = torch.cat([content_part, rot_part], dim=-1)
+            core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), -1)
+        return self._output_projection(core_attn_out)
 
+    @component("out_proj")
+    def _output_projection(self, core_attn_out):
+        """Grouped low-rank output projection followed by linear_proj."""
         # Grouped output
         core_attn_out = core_attn_out.view(
             core_attn_out.size(0), core_attn_out.size(1), self.output_projection_local_groups, -1
         )
-        wo_a_weight = self.linear_o_group_proj.view(
-            self.output_projection_local_groups, self.config.output_projection_lora_rank, -1
-        )
-        core_attn_out = torch.einsum("...gd,grd->...gr", core_attn_out, wo_a_weight)
+        core_attn_out = self._apply_linear_o_group_proj(core_attn_out)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
         # =================
@@ -602,6 +815,15 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             pg_collection=self.pg_collection,
             name=(name + ".linear_kv_proj") if name is not None else None,
         )
+        if self.config.dsv4_version == "v4.1":
+            # Each query head includes both its content and RoPE rows. The shared
+            # KV projection is a single head, so head-wise Muon keeps it intact.
+            self.linear_q_up_proj.weight.qkv_layout = QKVLayout.from_mla_head_components(
+                self.config.num_attention_heads, (self.q_head_dim,)
+            )
+            self.linear_kv_proj.weight.qkv_layout = QKVLayout.from_mla_head_components(
+                1, (self.config.v_head_dim,)
+            )
         self.kv_layernorm = submodules.kv_layernorm(
             hidden_size=self.config.v_head_dim,
             config=self.config,
@@ -613,6 +835,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             eps=self.config.attention_latent_norm_epsilon,
         )
 
+    @component("qkv_proj")
     def get_query_key_value_tensors(
         self,
         hidden_states,

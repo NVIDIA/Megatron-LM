@@ -9,12 +9,15 @@ and unit-loss gradients; backward only scales those gradients, as in V4. Shared
 K gradients still reach the owning Full layer.
 """
 
+import warnings
 from dataclasses import dataclass
-from functools import cached_property
+from functools import cached_property, lru_cache
 
 import torch
 from torch import Tensor
 
+from megatron.core.component_nvtx import forward_range
+from megatron.core.env_flags import env_flag
 from megatron.core.ops.attention.csa.indexer_quantization import (
     indexer_mxfp8_thd_scale_capacity,
     indexer_mxfp8_thd_scale_shape,
@@ -22,11 +25,29 @@ from megatron.core.ops.attention.csa.indexer_quantization import (
     quantize_indexer_mxfp8,
     quantize_indexer_mxfp8_logical,
 )
+from megatron.core.ops.attention.csa.output_rope import (
+    OutputRopeParams,
+    undo_output_rope_for_backward,
+)
 
 from . import fused_sparse_attention
-from .csa2_candidates import CSA2CandidateBlocks, select_compact_positions
+from .csa2_candidates import (
+    CSA2CandidateBlocks,
+    fused_candidate_blocks,
+    mxfp8_selection_heads,
+    select_compact_positions,
+)
 from .csa2_teacher_lse import fused_csa_window_lse
-from .thd_utils import CSA2THDCompressionLayout, CSA2THDLayout
+from .csa_indexer_loss_kernels import sparse_kl_loss
+from .thd_utils import (
+    SPARSE_PAD_ZERO,
+    CSA2THDCompressionLayout,
+    CSA2THDLayout,
+    padding_rows,
+    restore_rows_,
+    save_rows,
+    zero_rows_,
+)
 
 try:
     import triton
@@ -40,6 +61,22 @@ except ImportError:
 
 
 _QUERY_CHUNK_SIZE = 128
+# MCORE_CSA2_TOPK_PAD_SEGMENTS=0 restores compact Top-K's previous THD segments, which score
+# padding rows against their sequence's keys. Zeroed padding rows then tie on every causal
+# candidate, the deterministic tie-break's worst case, and that one block stalls the whole
+# stage-2 launch. The default gives padding rows segments with empty key spans (see
+# CSA2IndexerInputs.compact_topk_metadata).
+_COMPACT_TOPK_PAD_SEGMENTS = env_flag("MCORE_CSA2_TOPK_PAD_SEGMENTS", True)
+# MCORE_CSA2_CUDNN_INDEXER_LOSS=1 (opt-in) computes the sparse (Top-K) indexer objective of the
+# joint attention/KL function with the cuDNN-FE DSA kernels the V4 CSA path uses (sparse indexer
+# and attention score recompute, indexer backward) instead of the chunked Triton score, target,
+# KL and score-backward kernels. It is not bit-identical: the score gradient is rounded to BF16
+# before the dQ/dK MMAs, and dK accumulates with unordered FP32 adds. Other inputs keep Triton;
+# see _cudnn_indexer_loss_unsupported.
+_CUDNN_INDEXER_LOSS = env_flag("MCORE_CSA2_CUDNN_INDEXER_LOSS", False)
+# cuDNN sparse score recompute and indexer backward walk Top-K slots in 128-slot blocks.
+_CUDNN_LOSS_BLOCK = 128
+_CUDNN_LOSS_MAX_SLOTS = 2048
 _SCORE_CHUNK_MAX_BYTES = 32 * 1024 * 1024
 
 
@@ -104,6 +141,43 @@ class CSA2IndexerInputs:
             cu_q = self.thd_layout.cu_seqlens_padded
             offsets[: cu_q.numel() - 1] = (self.thd_layout.global_start - cu_q[:-1]).clamp_min(0)
         return offsets
+
+    @cached_property
+    def compact_topk_metadata(self) -> tuple[Tensor, Tensor, int, int, Tensor]:
+        """THD compact Top-K prefixes and causal offsets in which padding rows score no keys.
+
+        Splits each sequence's physical Q span into its real rows, which keep the
+        sequence's K span and causal offset, and its padding rows, whose K span is
+        empty at the real span's K end. Tail capacity keeps its bounded Q segments,
+        also with empty K spans. cuDNN then emits empty lists for rows whose results
+        fused_compact_topk discards anyway, instead of ranking their scores. Spans
+        only shrink, so the host-known bounds stay valid; no device value is read.
+        Returns ``(cu_q, cu_k, max_q, max_k, causal_offsets)``.
+        """
+        cu_q, cu_k, max_q, max_k = self.packed_metadata
+        offsets, layout = self.packed_causal_offsets, self.thd_layout
+        n = layout.cu_seqlens.numel() - 1
+        # Physical end of each sequence's real rows, made local like the Q prefixes under CP.
+        real_end = layout.cu_seqlens_padded[:-1] + layout.cu_seqlens.diff()
+        if layout.cp_size > 1:
+            real_end = (real_end - layout.global_start).clamp(0, self.q.shape[0])
+
+        def interleave(first: Tensor, second: Tensor, rest: Tensor) -> Tensor:
+            pairs = torch.stack((first, second.to(first.dtype)), dim=1).flatten()
+            return torch.cat((pairs, rest))
+
+        return (
+            # Q: start_0, real_end_0, start_1, ..., real_end_{n-1}, start_n, tail ends.
+            interleave(cu_q[:n], real_end, cu_q[n:]),
+            # K: real spans unchanged. Padding spans are empty at their real span's end,
+            # tail spans at the last sequence's end.
+            interleave(cu_k[:n], cu_k[1 : n + 1], cu_k[n : n + 1].expand(cu_k.numel() - n)),
+            max_q,
+            max_k,
+            # Real segments keep their offsets. Empty-K segments have no candidates at
+            # any offset; zero keeps their compact candidate slabs minimal.
+            interleave(offsets[:n], torch.zeros_like(offsets[:n]), offsets[n:]),
+        )
 
     def loss_divisor(self, calculate_per_token_loss: bool) -> Tensor:
         """Match DSv4: local sum divided by the global real-token count for mean loss."""
@@ -203,43 +277,75 @@ def _compact_candidate_offsets(cu_q: Tensor, offsets: Tensor, ratio: int) -> Ten
 
 
 @torch.no_grad()
-def fused_mxfp8_topk(inputs: CSA2IndexerInputs, topk: int) -> Tensor:
-    """Use cuDNN's compact MXFP8 scorer for ordinary Full/Reindex selection.
+def fused_compact_topk(inputs: CSA2IndexerInputs, topk: int, precision: str) -> Tensor:
+    """Use cuDNN's compact BF16/MXFP8 scorer for unrestricted key selection.
 
     All layouts use the existing packed rows, including CP-local queries and
     global keys. Dispatch-local scratch and host-known bounds keep capture
     independent of live prefix values without a second workspace/cache API.
+    BF16 retains bounded scoring on devices/frontends without compact support.
+    THD padding rows get empty key spans (MCORE_CSA2_TOPK_PAD_SEGMENTS). MXFP8
+    scores H32 natively unless MCORE_CSA2_MXFP8_NATIVE_H32=0 pads it to H64.
     """
+    if precision not in ("bf16", "mxfp8"):
+        raise ValueError("CSA2 compact selection precision must be bf16 or mxfp8")
     q, k, weights = inputs.q, inputs.k, inputs.weights
     width = min(topk, inputs.key_capacity)
     shape = (*inputs.output_shape, width)
     if q.shape[0] == 0 or k.shape[0] == 0 or width == 0 or inputs.max_keys == 0:
         return torch.full(shape, -1, dtype=torch.int32, device=q.device)
+    fused_sparse_attention._ensure_dsa_namespace()
+    compact = getattr(fused_sparse_attention._DSA, "indexer_forward_top_k_wrapper", None)
+    if not callable(compact) or torch.cuda.get_device_capability(q.device)[0] < 10:
+        if precision == "bf16":
+            indices, _ = fused_candidate_blocks(
+                inputs, topk_blocks=0, block_size=1, precision=precision, token_topk=topk
+            )
+            return indices
+        raise RuntimeError("CSA2 MXFP8 selection requires cuDNN compact support and SM100 or later")
     heads = q.shape[-2]
     weights = (weights.float() * (q.shape[-1] ** -0.5 * heads**-0.5)).to(weights.dtype)
-    if heads == 32:
+    if precision == "mxfp8" and mxfp8_selection_heads(heads) != heads:
         q = torch.nn.functional.pad(q, (0, 0, 0, 32))
         weights = torch.nn.functional.pad(weights, (0, 32))
-    cu_q, cu_k, max_q, max_k = inputs.packed_metadata
-    offsets = inputs.packed_causal_offsets
+    if _COMPACT_TOPK_PAD_SEGMENTS and inputs.thd_layout is not None:
+        cu_q, cu_k, max_q, max_k, offsets = inputs.compact_topk_metadata
+        # max_seqlen_q only sizes cuDNN's stage-1 grid of m-block tiles per segment.
+        # Every segment lies within the local rows, so under CP they bound it more
+        # tightly than the global max_q, and the padding segments add fewer empty
+        # tiles. max_k keeps the global bound because causal offsets reach global keys.
+        grid_q = min(max_q, q.shape[0])
+    else:
+        cu_q, cu_k, max_q, max_k = inputs.packed_metadata
+        offsets = inputs.packed_causal_offsets
+        grid_q = max_q
     # Odd r2 spans can have one more causal candidate than complete K groups.
     max_k = max(max_k, (max_q + inputs.ratio - 1) // inputs.ratio)
-    quantized = []
-    for value, prefix, num_heads in ((q, cu_q, q.shape[-2]), (k, cu_k, 1)):
-        scale_prefix = make_indexer_mxfp8_scale_cu_seqlens(prefix, num_heads)
-        capacity = indexer_mxfp8_thd_scale_capacity(value.shape[0], prefix.numel() - 1, num_heads)
-        scales = torch.empty(
-            indexer_mxfp8_thd_scale_shape(capacity, num_heads, value.shape[-1]),
-            dtype=torch.float8_e8m0fnu,
-            device=value.device,
+    precision_kwargs = {}
+    if precision == "mxfp8":
+        quantized = []
+        for value, prefix, num_heads in ((q, cu_q, q.shape[-2]), (k, cu_k, 1)):
+            scale_prefix = make_indexer_mxfp8_scale_cu_seqlens(prefix, num_heads)
+            capacity = indexer_mxfp8_thd_scale_capacity(
+                value.shape[0], prefix.numel() - 1, num_heads
+            )
+            scales = torch.empty(
+                indexer_mxfp8_thd_scale_shape(capacity, num_heads, value.shape[-1]),
+                dtype=torch.float8_e8m0fnu,
+                device=value.device,
+            )
+            data, scales = quantize_indexer_mxfp8(
+                value, cu_seqlens=prefix, cu_seqlens_scale_padded=scale_prefix, out_scale=scales
+            )
+            quantized.append((data, scales, scale_prefix))
+        (q, qs, q_prefix), (k, ks, k_prefix) = quantized
+        precision_kwargs.update(
+            q_scale=qs,
+            k_scale=ks,
+            cu_seqlens_q_scale_padded=q_prefix,
+            cu_seqlens_k_scale_padded=k_prefix,
         )
-        data, scales = quantize_indexer_mxfp8(
-            value, cu_seqlens=prefix, cu_seqlens_scale_padded=scale_prefix, out_scale=scales
-        )
-        quantized.append((data, scales, scale_prefix))
-    (q, qs, q_prefix), (k, ks, k_prefix) = quantized
-    fused_sparse_attention._ensure_dsa_namespace()
-    result = fused_sparse_attention._DSA.indexer_forward_top_k_wrapper(
+    result = compact(
         q,
         k.unsqueeze(1),
         weights,
@@ -247,19 +353,20 @@ def fused_mxfp8_topk(inputs: CSA2IndexerInputs, topk: int) -> Tensor:
         ratio=inputs.ratio,
         cu_seqlens_q=cu_q,
         cu_seqlens_k=cu_k,
-        max_seqlen_q=max_q,
+        max_seqlen_q=grid_q,
         max_seqlen_k=max_k,
         q_causal_offsets=offsets,
-        precision="mxfp8",
-        q_scale=qs,
-        k_scale=ks,
-        cu_seqlens_q_scale_padded=q_prefix,
-        cu_seqlens_k_scale_padded=k_prefix,
+        precision=precision,
         cand_buffer=torch.empty(q.shape[0] * max_k, dtype=torch.float32, device=q.device),
         cand_batch_offsets=_compact_candidate_offsets(cu_q, offsets, inputs.ratio),
+        # cuDNN requires explicit stage-2 outputs during capture. Allocate them
+        # in the caller's graph pool, not a module cache shared by in-flight slots.
+        out_indices=torch.empty((q.shape[0], width), dtype=torch.int32, device=q.device),
+        out_logits=torch.empty((q.shape[0], width), dtype=torch.float32, device=q.device),
         deterministic=True,
         return_softmax=False,
         topk_indices_global=False,
+        **precision_kwargs,
     )
     indices = result["indices"]
     valid = (indices >= 0) & (indices < inputs.visible[:, None]) & inputs.valid[:, None]
@@ -582,6 +689,24 @@ if HAVE_TRITON:
         tl.atomic_add(dk + keys[:, None] * DIM + d[None, :], grad_k, valid[:, None], sem="relaxed")
         tl.atomic_add(dw + row * HEADS + h, grad_w, sem="relaxed")
 
+    @triton.jit
+    def _sparse_loss_slots_kernel(
+        ids,
+        counts,
+        starts,
+        visible,
+        slots,
+        WIDTH: tl.constexpr,
+        ID_WIDTH: tl.constexpr,
+        STRIDE: tl.constexpr,
+        TILE: tl.constexpr,
+    ):
+        """Store the keys MODE 2 supervises as cuDNN slots, -1 elsewhere and in the tail."""
+        row = tl.program_id(0)
+        cols = tl.arange(0, TILE)
+        keys, valid = _key_ids(ids, counts, starts, visible, row, cols, WIDTH, ID_WIDTH, 2, 1)
+        tl.store(slots + row * STRIDE + cols, tl.where(valid, keys, -1), cols < STRIDE)
+
 
 def _score_chunk(
     q: Tensor,
@@ -856,6 +981,152 @@ def _precompute_indexer_loss(
     return losses.sum(), (dq, dk.to(k.dtype), dw)
 
 
+_CUDNN_INDEXER_LOSS_FALLBACKS: set = set()
+
+
+@lru_cache(maxsize=None)
+def _cudnn_loss_wrappers_available() -> bool:
+    try:
+        fused_sparse_attention._ensure_dsa_namespace()
+        dsa = fused_sparse_attention._DSA
+        names = (
+            "sparse_indexer_score_recompute_wrapper",
+            "sparse_attn_score_recompute_wrapper",
+            "indexer_backward_wrapper",
+        )
+        return all(callable(getattr(dsa, name, None)) for name in names)
+    except Exception:
+        # DSA imports each wrapper's cutlass-DSL module on first access and, unlike cudnn's
+        # top-level lazy import, does not turn its failures (e.g. a RuntimeError from a broken
+        # DSL install) into ImportError. Any of them keeps the Triton objective.
+        return False
+
+
+def _cudnn_indexer_loss_unsupported(
+    q, k, weights, teacher_q, teacher_k, lse, ids, options
+) -> str | None:
+    """Return why _precompute_indexer_loss_cudnn cannot take these inputs, or None."""
+    width = options[0]
+    rows, heads, dim = q.shape
+    if not (q.is_cuda and HAVE_TRITON) or torch.cuda.get_device_capability(q.device)[0] != 10:
+        # cuDNN-FE 1.29 builds these tcgen05 kernels only for SM100/SM103/SM107 (_ARCH_MAP in
+        # deepseek_sparse_attention/utils/compiler.py). Its own SM >= 10 check admits SM11x and
+        # SM12x, which then raise in cute.compile.
+        return "requires CUDA SM10x and Triton"
+    if not _cudnn_loss_wrappers_available():
+        return "requires cuDNN-FE DSA score recompute and indexer backward"
+    if rows == 0 or k.shape[0] == 0 or teacher_k.shape[0] == 0 or width == 0:
+        return "empty rows, keys or Top-K"
+    if any(t.dtype != torch.bfloat16 for t in (q, k, weights, teacher_q, teacher_k)):
+        return "requires BF16 indexer projections and teacher Q/KV"
+    if lse.dtype != torch.float32:
+        return "requires an FP32 teacher LSE"
+    if dim != 128 or heads != 32:
+        # The predict wrapper takes no score scale, so W is pre-scaled in BF16. Only H32 D128
+        # (scale 128^-0.5 * 32^-0.5 = 2^-6) makes that exact; H64 keeps Triton's FP32 scale.
+        return "requires an H32 D128 indexer"
+    if teacher_q.shape[1] not in (64, 128) or teacher_q.shape[2] not in (512, 576):
+        return "requires a 64/128-head teacher with head dim 512 or 576"
+    if ids.shape[-1] != width or width > _CUDNN_LOSS_MAX_SLOTS:
+        return f"requires at most {_CUDNN_LOSS_MAX_SLOTS} Top-K slots"
+    return None
+
+
+def _use_cudnn_indexer_loss(
+    q, k, weights, teacher_q, teacher_k, lse, ids, counts, starts, visible, divisor, options
+) -> bool:
+    """Whether the cuDNN sparse objective takes these inputs; warns once per fallback reason."""
+    reason = _cudnn_indexer_loss_unsupported(q, k, weights, teacher_q, teacher_k, lse, ids, options)
+    if reason is not None and reason not in _CUDNN_INDEXER_LOSS_FALLBACKS:
+        _CUDNN_INDEXER_LOSS_FALLBACKS.add(reason)
+        warnings.warn(f"MCORE_CSA2_CUDNN_INDEXER_LOSS keeps the Triton indexer loss: {reason}")
+    return reason is None
+
+
+def _precompute_indexer_loss_cudnn(
+    q, k, weights, teacher_q, teacher_k, lse, ids, counts, starts, visible, divisor, options
+):
+    """Sparse (MODE 2) objective of _precompute_indexer_loss(full_lse=True) on cuDNN-FE DSA.
+
+    Mirrors the V4 CSA path in one launch chain per layer. All rows form one fake
+    batch, so the physical ids index the flat indexer K and teacher KV directly
+    (global ids; no causal offsets) for THD, SBHD and CP alike. Sparse indexer
+    score recompute gives the predict softmax, sparse attention score recompute
+    the L1-normalized teacher over the same slots (``lse`` already includes the
+    FlashMLA window/Top-K mass and the sink), sparse_kl_loss the KL, and indexer
+    backward the unit-loss Q/K/W gradients. Slots MODE 2 does not supervise
+    (out-of-span ids, THD padding rows, the 128-slot tail) become -1, which every
+    kernel masks; rows without a supervised slot get zero loss and gradients.
+    Shapes are host-known and nothing reads device values, so the chain can be
+    captured in a CUDA graph.
+    """
+    width, _, _, scale, coefficient = options
+    rows, heads, dim = q.shape
+    stride = triton.cdiv(width, _CUDNN_LOSS_BLOCK) * _CUDNN_LOSS_BLOCK
+    slots = torch.empty((1, rows, stride), dtype=torch.int32, device=q.device)
+    _sparse_loss_slots_kernel[(rows,)](
+        ids,
+        counts,
+        starts,
+        visible,
+        slots,
+        width,
+        ids.shape[-1],
+        stride,
+        triton.next_power_of_2(stride),
+    )
+    fused_sparse_attention._ensure_dsa_namespace()
+    dsa = fused_sparse_attention._DSA
+    # Triton's SCALE; it rounds to exactly 2^-6 in FP32 for H32 D128.
+    index_scale = dim**-0.5 * heads**-0.5
+    predict = dsa.sparse_indexer_score_recompute_wrapper(
+        q.unsqueeze(0),
+        k.unsqueeze(0),
+        # The wrapper has no score scale; a power-of-two W scale is exact in BF16.
+        (weights * index_scale).unsqueeze(0),
+        slots,
+        qhead_per_kv_head=heads,
+        topk_indices_global=True,
+    )["predict"]
+    target = dsa.sparse_attn_score_recompute_wrapper(
+        teacher_q.unsqueeze(0),
+        teacher_k.unsqueeze(0),
+        lse.unsqueeze(0),
+        slots,
+        scale,
+        qhead_per_kv_head=teacher_q.shape[1],
+        topk_indices_global=True,
+    )["target"]
+    divisor = divisor.float().clamp_min(1)
+    # Read target before indexer backward overwrites it with the score gradient.
+    loss = sparse_kl_loss(
+        target, predict, slots, coefficient, calculate_per_token_loss=True, loss_divisor=divisor
+    )
+    # cuDNN scales the score gradient by coefficient / rows * grad_loss. A device-side
+    # grad_loss of rows / divisor gives Triton's coefficient / divisor without a sync.
+    row_scale = divisor.new_full((1,), float(rows)).div_(divisor)
+    if heads < 64:
+        # cuDNN-FE 1.29 indexer backward needs 64 heads. Zero Q heads score 0, which closes
+        # their ReLU gate: they add nothing to dK, and their dQ/dW are dropped below.
+        q = torch.nn.functional.pad(q, (0, 0, 0, 64 - heads))
+        weights = torch.nn.functional.pad(weights, (0, 64 - heads))
+    grads = dsa.indexer_backward_wrapper(
+        q.unsqueeze(0),
+        weights.unsqueeze(0),
+        k.unsqueeze(0),
+        target,
+        predict,
+        slots,
+        grad_loss=row_scale,
+        sm_scale=index_scale,
+        loss_coeff=coefficient,
+        block_I=_CUDNN_LOSS_BLOCK,
+    )
+    dq = grads["d_index_q"][0, :, :heads].contiguous()
+    dw = grads["d_weights"][0, :, :heads].contiguous()
+    return loss, (dq, grads["d_index_k"][0], dw)
+
+
 class _CSA2IndexerLoss(torch.autograd.Function):
     """V4-style eager indexer backward, retaining only unit-loss gradients."""
 
@@ -917,6 +1188,7 @@ class _CSA2IndexerSparseAttn(torch.autograd.Function):
         counts,
         options,
         query_shape,
+        out_rope=None,
     ):
         """Evaluate sparse attention and its detached teacher objective."""
         width, mode, block_size, scale, coefficient = options
@@ -925,49 +1197,65 @@ class _CSA2IndexerSparseAttn(torch.autograd.Function):
             q, kv, indices, scale, attn_sink=sink, topk_length=topk_length
         )
         del kv
-        # Sparse supervision has exactly the main attention's support. FlashMLA
-        # returns natural-log LSE excluding sink, matching V4's Path B contract.
-        sparse = mode == 2
-        teacher_q, teacher_lse = q, lse
-        if query_shape is not None:
-            seq_len, batch = query_shape
-            teacher_q = (
-                q.reshape(seq_len, batch, q.shape[1], q.shape[2])
-                .transpose(0, 1)
-                .reshape(-1, q.shape[1], q.shape[2])
-                .contiguous()
-            )
+        with forward_range("indexer_loss"):
+            # Sparse supervision has exactly the main attention's support. FlashMLA
+            # returns natural-log LSE excluding sink, matching V4's Path B contract.
+            sparse = mode == 2
+            teacher_q, teacher_lse = q, lse
+            if query_shape is not None:
+                seq_len, batch = query_shape
+                teacher_q = (
+                    q.reshape(seq_len, batch, q.shape[1], q.shape[2])
+                    .transpose(0, 1)
+                    .reshape(-1, q.shape[1], q.shape[2])
+                    .contiguous()
+                )
+                teacher_lse = (
+                    lse.reshape(seq_len, batch, -1)
+                    .transpose(0, 1)
+                    .reshape(-1, lse.shape[-1])
+                    .contiguous()
+                )
             teacher_lse = (
-                lse.reshape(seq_len, batch, -1)
-                .transpose(0, 1)
-                .reshape(-1, lse.shape[-1])
-                .contiguous()
+                torch.logaddexp(teacher_lse, sink.unsqueeze(0))
+                if sparse
+                else fused_csa_window_lse(teacher_q, local, sink, window, scale)
             )
-        teacher_lse = (
-            torch.logaddexp(teacher_lse, sink.unsqueeze(0))
-            if sparse
-            else fused_csa_window_lse(teacher_q, local, sink, window, scale)
-        )
-        loss, gradients = _precompute_indexer_loss(
-            iq,
-            ik,
-            weights,
-            teacher_q,
-            global_kv,
-            teacher_lse,
-            ids,
-            counts,
-            starts,
-            visible,
-            divisor,
-            options,
-            full_lse=sparse,
-        )
+            loss_args = (
+                iq,
+                ik,
+                weights,
+                teacher_q,
+                global_kv,
+                teacher_lse,
+                ids,
+                counts,
+                starts,
+                visible,
+                divisor,
+                options,
+            )
+            if sparse and _CUDNN_INDEXER_LOSS and _use_cudnn_indexer_loss(*loss_args):
+                loss, gradients = _precompute_indexer_loss_cudnn(*loss_args)
+            else:
+                loss, gradients = _precompute_indexer_loss(*loss_args, full_lse=sparse)
         if topk_length is not None:
             indices = indices.clamp_min(0)
             topk_length = topk_length.clone()
             if q_padding_mask is not None:
                 topk_length.masked_fill_(q_padding_mask, 1)
+        ctx.pad_rows = None
+        if q_padding_mask is not None:
+            if SPARSE_PAD_ZERO and out.is_contiguous():
+                # Touch only the padding rows; backward reuses their indices.
+                ctx.pad_rows = padding_rows(q_padding_mask)
+                zero_rows_(out, *ctx.pad_rows)
+            else:
+                out.masked_fill_(q_padding_mask[:, None, None], 0)
+        if out_rope is not None:
+            out_rope.apply_(out)
+        ctx.out_rope = out_rope
+        ctx.num_forward_inputs = len(ctx.needs_input_grad)
         ctx.save_for_backward(
             q, local, global_kv, sink, indices, topk_length, q_padding_mask, out, lse, *gradients
         )
@@ -984,19 +1272,38 @@ class _CSA2IndexerSparseAttn(torch.autograd.Function):
         dq = dlocal = dglobal = dsink = None
         if grad_out is not None:
             kv = torch.cat((local, global_kv))
+            restore = ()
             if q_padding_mask is not None:
-                grad_out = grad_out.masked_fill(q_padding_mask[:, None, None], 0)
-                lse = lse.masked_fill(q_padding_mask[:, None], 0)
+                with forward_range("pad_mask.bwd"):
+                    if SPARSE_PAD_ZERO:
+                        rows, keep = ctx.pad_rows or padding_rows(q_padding_mask)
+                        if q.is_contiguous():
+                            # mla_up_proj recompute refills q, zeroed in place by csa2, with raw
+                            # padding rows, which backward scores against lse 0 (exp can overflow).
+                            zero_rows_(q, rows, keep)
+                        # Zero grad_out/lse padding rows in place for the kernel and restore them
+                        # after it: the incoming gradient may be shared with another autograd
+                        # consumer, and lse is this Function's saved tensor.
+                        grad_out, lse = grad_out.contiguous(), lse.contiguous()
+                        restore = tuple((t, save_rows(t, rows)) for t in (grad_out, lse))
+                        zero_rows_(grad_out, rows, keep)
+                        zero_rows_(lse, rows, keep)
+                    else:
+                        grad_out = grad_out.masked_fill(q_padding_mask[:, None, None], 0)
+                        lse = lse.masked_fill(q_padding_mask[:, None], 0)
+            out, grad_out = undo_output_rope_for_backward(ctx.out_rope, out, grad_out)
             dq, dkv, dsink = fused_sparse_attention._csa_sparse_attention_backward(
                 q, kv, out, grad_out, lse, sink, indices, ctx.scale, topk_length=topk_length
             )
+            for tensor, saved in restore:
+                restore_rows_(tensor, rows, saved)
             dlocal, dglobal = dkv.split((local.shape[0], global_kv.shape[0]))
         gradients = (
             (None, None, None)
             if grad_loss is None
             else tuple(g * grad_loss for g in (diq, dik, dw))
         )
-        return dq, dlocal, dglobal, dsink, *gradients, *([None] * 11)
+        return (dq, dlocal, dglobal, dsink, *gradients, *([None] * 12))[: ctx.num_forward_inputs]
 
 
 def fused_csa2_indexer_sparse_attn(
@@ -1016,6 +1323,7 @@ def fused_csa2_indexer_sparse_attn(
     attention_indices: Tensor | None = None,
     attention_topk_length: Tensor | None = None,
     q_padding_mask: Tensor | None = None,
+    out_rope: OutputRopeParams | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Keep V4 attention layout; pack the detached teacher only for the loss work.
 
@@ -1098,6 +1406,7 @@ def fused_csa2_indexer_sparse_attn(
         counts,
         (width, mode, block_size, softmax_scale, loss_coeff),
         (seq_len, batch) if inputs.thd_layout is None else None,
+        out_rope,
     )
     if inputs.thd_layout is None:
         output = output.reshape(seq_len, batch, -1)

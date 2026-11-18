@@ -7,10 +7,12 @@ from dataclasses import dataclass, field, replace
 import torch
 from torch import nn
 
+from megatron.core.component_nvtx import layer_scope
 from megatron.core.extensions.transformer_engine import te_checkpoint
 from megatron.core.fp8_utils import get_fp8_context, get_fp8_recipe, is_first_last_bf16_layer
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_stack_adapter import HybridStackForwardContext
+from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 from megatron.core.transformer.experimental_attention_variant.csa2_module_spec import (
     csa2_layer_spec,
@@ -22,6 +24,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 from megatron.core.transformer.state_boundary import TensorField
 from megatron.core.transformer.stateful_module import StatefulGraphs, StatefulModule
 
+from .graph import attention_region, router_region
 from .state import V41StateCodec
 
 
@@ -32,6 +35,7 @@ class V41ForwardContext(HybridStackForwardContext):
     codec: V41StateCodec | None = None
     values: dict = field(default_factory=dict)
     hashes: torch.Tensor | None = None
+    engram_tickets: dict = field(default_factory=dict)
     hasher: nn.Module | None = None
     capture: dict | None = None
 
@@ -53,7 +57,7 @@ class _LayerRegion(nn.Module):
             engram = getattr(self.layer, 'engram', None)
             if engram is not None:
                 mask = csa.thd_layout.valid_tokens.unsqueeze(0) if packed is not None else None
-                hidden = engram(hidden, values['hashes'], mask)
+                hidden = engram(hidden, token_mask=mask, embeddings=values[f'engram_{boundary}'])
             hidden, _ = self.layer(
                 hidden_states=hidden,
                 cross_layer_state=csa,
@@ -64,8 +68,37 @@ class _LayerRegion(nn.Module):
         return hidden, self.codec.snapshot(csa, mhc, values, boundary + 1, loss=self.loss)
 
 
+class _LayerGroupRegion(nn.Module):
+    """Replay a local layer group with fresh shared state and explicit auxiliary losses."""
+
+    def __init__(self, layers, codec, kwargs, loss_layers):
+        super().__init__()
+        self.regions = nn.ModuleList(
+            _LayerRegion(layer, codec, kwargs, layer.layer_number - 1 in loss_layers)
+            for layer in layers
+        )
+        self.training = layers[0].training
+
+    def forward(self, hidden, values):
+        """Keep intermediate producers live inside the group, exporting only its boundary."""
+        embeddings = {key: value for key, value in values.items() if key.startswith('engram_')}
+        objectives = {}
+        for region in self.regions:
+            if getattr(region.layer, 'engram', None) is not None:
+                key = f'engram_{region.layer.layer_number - 1}'
+                values = {**values, key: embeddings[key]}
+            accumulator = hidden
+            hidden, values = region(hidden, values)
+            observe_layer_residuals(region.layer, accumulator, hidden)
+            if region.loss:
+                objectives[f'indexer_loss_{region.layer.layer_number - 1}'] = values.pop(
+                    'indexer_loss'
+                )
+        return hidden, {**values, **objectives}
+
+
 class DeepSeekV41Adapter:
-    """Model-owned layer execution; the generic stack retains its sole layer loop."""
+    """Model-owned eager, graph and checkpoint execution of explicit V4.1 state."""
 
     def __init__(
         self,
@@ -92,6 +125,80 @@ class DeepSeekV41Adapter:
         # Captures retain independent slots and static profiles, never caller activations.
         self.graphs = {}
         self._next_slot = {}
+        self._automatic_capture = None
+        self._make_forward_pre_hook = None
+        self._recording_layers = set()
+        self._recording_shape = None
+        self._capture_samples = {}
+        self._scheduled_layers = set()
+
+    def record_cuda_graphs(self):
+        """Collect one detached warmup profile per region for between-step capture."""
+        scopes = {getattr(scope, 'name', scope) for scope in self.config.cuda_graph_modules}
+        self._recording_layers = {
+            i
+            for i in range(self.start, self.end)
+            if ('attn' if i % 2 == 0 else 'moe_router') in scopes
+        }
+
+    def setup_cuda_graph_hooks(self, make_hook_func):
+        """Retain the common DDP hook factory without retaining microbatch tensors."""
+        self._make_forward_pre_hook = make_hook_func
+        for graph in self.graphs.values():
+            graph.setup_manual_hooks(make_hook_func)
+
+    def prepare_cuda_graphs(self, *, slots, backend):
+        """Publish warmed profiles, or arm explicitly requested independent captures."""
+        scopes = {getattr(scope, 'name', scope) for scope in self.config.cuda_graph_modules}
+        if not scopes or not scopes <= {'attn', 'moe_router'}:
+            raise ValueError('V4.1 automatic graphs require explicit attn/moe_router scopes')
+        if self.config.recompute_granularity == 'full':
+            raise ValueError('Full recompute and layer capture are separate execution profiles')
+        if self._recording_layers:
+            if len(self._capture_samples) != len(self._recording_layers):
+                raise ValueError('V4.1 automatic graphs require at least one complete warmup step')
+            self._recording_layers.clear()
+            self._automatic_capture = None
+            return [
+                (key, (*sample[:3], self._make_forward_pre_hook))
+                for key, sample in sorted(
+                    self._capture_samples.items(), key=lambda item: item[0][0]
+                )
+            ]
+        self._automatic_capture = dict(
+            layers={
+                i
+                for i in range(self.start, self.end)
+                if ('attn' if i % 2 == 0 else 'moe_router') in scopes
+            },
+            slots=slots,
+            backend=backend,
+        )
+
+    def install_cuda_graphs(self, captures, *, slots):
+        """Publish the common helper's completed captures and release warmup samples."""
+        for key, graph in captures:
+            self.graphs[key] = graph
+            self._next_slot[key] = (0, slots)
+        self._capture_samples.clear()
+        self._scheduled_layers = {key[0] for key in self.graphs}
+
+    def has_cuda_graphs(self):
+        """Report completed captures rather than merely an armed lazy profile."""
+        return bool(self.graphs)
+
+    def reset_cuda_graphs(self):
+        """Release completed profiles through their public slot lifecycle."""
+        for graph in self.graphs.values():
+            graph.close()
+        self.graphs.clear()
+        self._next_slot.clear()
+        self._automatic_capture = None
+        self._make_forward_pre_hook = None
+        self._recording_layers.clear()
+        self._recording_shape = None
+        self._capture_samples.clear()
+        self._scheduled_layers.clear()
 
     def prepare_forward(self, hidden_states, packed_seq_params, inference_context, context):
         """Validate explicit state supplied by the model wrapper or pipeline receiver."""
@@ -99,9 +206,12 @@ class DeepSeekV41Adapter:
             raise NotImplementedError('V4.1 draft supports training/full-sequence evaluation')
         if not isinstance(context, V41ForwardContext) or context.codec is None:
             raise ValueError('V4.1 requires a model-owned tensor-state forward context')
-        context.cross_layer_state, context.mhc_state, _ = context.codec.restore(
-            context.values, self.start
-        )
+        # The model wrapper already restored this boundary from the same values; a second
+        # restore would rebuild identical layouts for every chunk and microbatch.
+        if context.cross_layer_state is None:
+            context.cross_layer_state, context.mhc_state, _ = context.codec.restore(
+                context.values, self.start
+            )
         return context
 
     def _prepare_region(self, layer, hidden, context, kwargs, loss):
@@ -114,12 +224,12 @@ class DeepSeekV41Adapter:
         )
         inputs = context.codec.schema(boundary).fields
         if getattr(layer, 'engram', None) is not None:
-            values['hashes'] = context.hashes
+            key = f'engram_{boundary}'
+            embeddings = self._lookup_engram(layer, context)
+            values[key] = embeddings
             inputs = (
                 *inputs,
-                TensorField(
-                    'hashes', tuple(context.hashes.shape), torch.int64, 'contiguous', False
-                ),
+                TensorField(key, tuple(embeddings.shape), embeddings.dtype, 'contiguous', True),
             )
         region = _LayerRegion(layer, context.codec, kwargs, loss)
         return (
@@ -127,77 +237,313 @@ class DeepSeekV41Adapter:
             values,
         )
 
-    def run_layer(self, layer, hidden_states, context, **kwargs):
+    def _has_indexer_loss(self, layer):
+        return (
+            layer.layer_number - 1 in self.config.csa2_index_source_layers
+            and layer.training
+            and torch.is_grad_enabled()
+            and (self.config.dsa_indexer_loss_coeff or 0) > 0
+        )
+
+    def _lookup_engram(self, layer, context):
+        ticket = context.engram_tickets.pop(layer.layer_number - 1, None)
+        if ticket is not None:
+            return layer.engram.lookup(ticket=ticket)
+        self._prepare_hashes(context)
+        return layer.engram.lookup(context.hashes)
+
+    def _prepare_hashes(self, context):
+        if context.hashes is not None:
+            return
+        layout = context.cross_layer_state.thd_layout
+        context.hashes = context.hasher(
+            context.values['tokens'],
+            None if layout is None else layout.valid_tokens.unsqueeze(0),
+            None if layout is None else layout.sequence_ids.unsqueeze(0),
+            cp_group=self.pg_collection.cp,
+        )
+
+    def _run_graph(self, key, region, hidden, values, capture, *, is_first_microbatch):
+        """Use the shared graph owner for capture, replay and in-flight slot protection."""
+        if capture is not None and capture.get('record'):
+            if key not in self._capture_samples:
+                args = tuple(
+                    t.detach().clone().requires_grad_(t.requires_grad)
+                    for t in (hidden, *region.inputs.pack(values))
+                )
+                self._capture_samples[key] = (
+                    region,
+                    args[0],
+                    region.inputs.unpack(args[1:]),
+                    self._make_forward_pre_hook,
+                )
+            return region.run(hidden, values)
+        if capture is not None:
+            if key in self.graphs:
+                raise ValueError('This V4.1 graph profile is already captured')
+            capture_kwargs = {}
+            if self.config.fp8:
+                if capture['backend'] != 'transformer_engine':
+                    raise ValueError('V4.1 FP8 layer capture requires the TE graph backend')
+                capture_kwargs = dict(
+                    fp8_enabled=not is_first_last_bf16_layer(self.config, key[0]),
+                    fp8_recipe=get_fp8_recipe(self.config),
+                    fp8_group=self.pg_collection.tp,
+                )
+            self.graphs[key] = StatefulGraphs(
+                region,
+                hidden,
+                values,
+                slots=capture['slots'],
+                backend=capture['backend'],
+                capture_kwargs=capture_kwargs,
+                make_forward_pre_hook=self._make_forward_pre_hook,
+            )
+            self._next_slot[key] = (0, capture['slots'])
+        graph = self.graphs[key]
+        slot, slots = self._next_slot[key]
+        result = graph.run(hidden, values, slot=slot, is_first_microbatch=is_first_microbatch)
+        self._next_slot[key] = ((slot + 1) % slots, slots)
+        return result
+
+    def _run_consumer_graph(self, layer, hidden, context, kwargs, loss, key, capture):
+        """Keep mHC checkpoints and eager parameter hooks outside the consumer region."""
+        codec, inner = context.codec, layer.inner_layer
+        # Use the pipeline schedule's index, not the reusable graph slot number.
+        is_first_microbatch = getattr(layer, 'current_microbatch', 0) == 0
+        manager = kwargs.pop('mhc_recompute_manager', None)
+        kwargs.pop('packed_seq_params', None)
+        aggregated, h_res, h_post, residual = layer.hyper_connection(
+            hidden, mhc_state=context.mhc_state, mhc_recompute_manager=manager, return_residual=True
+        )
+        values = codec.snapshot(
+            context.cross_layer_state, context.mhc_state, context.values, key[0]
+        )
+        if key[0] % 2 == 0:
+            region = (
+                attention_region(inner, codec, kwargs, loss)
+                if capture is not None
+                else self.graphs[key].region
+            )
+            branch, values = self._run_graph(
+                key, region, aggregated, values, capture, is_first_microbatch=is_first_microbatch
+            )
+            values['mhc'] = context.mhc_state.pre_mix
+            values = {
+                field.key: values[field.key] for field in codec.schema(key[0] + 1, loss=loss).fields
+            }
+            # The region passes packed prefixes through unchanged, so their eager layouts still
+            # hold; rebuilding them would launch dozens of small kernels per replay (plus 17
+            # device asserts with MCORE_CSA2_DEVICE_CHECKS=1).
+            csa, mhc, _ = codec.restore(values, key[0] + 1, previous=context.cross_layer_state)
+            context.cross_layer_state, context.mhc_state = csa, mhc
+            objective = values.pop('indexer_loss', None)
+            output = (branch, None)
+        else:
+            moe = inner.mlp
+            if not callable(getattr(moe, 'compute_routing', None)):
+                raise ValueError('V4.1 router capture requires an explicit MoE routing interface')
+            moe.select_token_dispatcher()
+            normalized, _, _ = inner._pre_mlp_layernorm_and_residual(
+                aggregated, mhc_recompute_manager=manager
+            )
+            packed = codec.packed(values)
+            normalized, padding, ids, unflatten = inner._maybe_unflatten_for_moe(
+                normalized, kwargs.get('padding_mask'), kwargs.get('input_ids'), packed
+            )
+            if capture is not None:
+                region, router_values = router_region(
+                    moe, codec, normalized, values, padding_mask=padding, input_ids=ids
+                )
+            else:
+                region = self.graphs[key].region
+                router_values = {
+                    f.key: values[f.key]
+                    for f in region.inputs.fields
+                    if f.key not in ('padding_mask', 'input_ids')
+                }
+                if padding is not None:
+                    router_values['padding_mask'] = padding
+                if ids is not None:
+                    router_values['input_ids'] = ids
+            normalized, routed = self._run_graph(
+                key,
+                region,
+                normalized,
+                router_values,
+                capture,
+                is_first_microbatch=is_first_microbatch,
+            )
+            output = moe(
+                normalized,
+                router_output=(routed['probs'], routed['routes']),
+                padding_mask=padding,
+                input_ids=ids,
+                packed_seq_params=packed,
+            )
+            if unflatten is not None:
+                output = (inner._maybe_reflatten_from_moe(output[0], packed, unflatten), output[1])
+            if inner.recompute_pre_mlp_layernorm or (
+                manager is not None and inner.mhc_checkpoint_pre_mlp_layernorm
+            ):
+                inner.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(output[0])
+            objective = None
+            values = codec.snapshot(
+                context.cross_layer_state, context.mhc_state, values, key[0] + 1
+            )
+        hidden = layer.combine_branch(
+            aggregated, output, h_res, h_post, residual, mhc_recompute_manager=manager
+        )
+        context.values = values
+        return hidden, objective
+
+    def checkpointed_forward(self, layers, hidden_states, context, **kwargs):
+        """Honor uniform group sizes or a block count within this PP/VPP stage."""
+        c, codec = self.config, context.codec
+        if context.capture is not None or self.graphs:
+            raise ValueError('Full recompute and layer capture are separate execution profiles')
+        uniform = c.recompute_method == 'uniform'
+        group_size = c.recompute_num_layers if uniform else 1
+        kwargs = dict(kwargs)
+        kwargs.pop('packed_seq_params', None)
+        for start in range(0, len(layers), group_size):
+            group = layers[start : start + group_size]
+            if not uniform and start >= c.recompute_num_layers:
+                layer = group[0]
+                accumulator = hidden_states
+                with get_fp8_context(layer.config, layer.layer_number - 1):
+                    hidden_states = self.run_layer(
+                        layer,
+                        hidden_states,
+                        context,
+                        recompute=False,
+                        packed_seq_params=codec.packed(context.values),
+                        **kwargs,
+                    )
+                observe_layer_residuals(layer, accumulator, hidden_states)
+                continue
+            first, end = group[0].layer_number - 1, group[-1].layer_number
+            values = codec.snapshot(
+                context.cross_layer_state, context.mhc_state, context.values, first
+            )
+            inputs = codec.schema(first).fields
+            for layer in group:
+                if getattr(layer, 'engram', None) is not None:
+                    key = f'engram_{layer.layer_number - 1}'
+                    embeddings = self._lookup_engram(layer, context)
+                    values[key] = embeddings
+                    inputs = (
+                        *inputs,
+                        TensorField(
+                            key, tuple(embeddings.shape), embeddings.dtype, 'contiguous', True
+                        ),
+                    )
+            loss_layers = tuple(
+                layer.layer_number - 1 for layer in group if self._has_indexer_loss(layer)
+            )
+            loss_fields = tuple(
+                TensorField(f'indexer_loss_{i}', (), torch.float32, 'contiguous', True)
+                for i in loss_layers
+            )
+            region = StatefulModule(
+                _LayerGroupRegion(group, codec, kwargs, loss_layers),
+                inputs,
+                (*codec.schema(end).fields, *loss_fields),
+            )
+            if c.fp8:
+                result = te_checkpoint(
+                    region,
+                    c.distribute_saved_activations,
+                    get_cuda_rng_tracker,
+                    self.pg_collection.tp,
+                    hidden_states,
+                    *region.inputs.pack(values),
+                    use_reentrant=False,
+                )
+                hidden_states, values = region.restore_result(result, values)
+            else:
+                hidden_states, values = region.run(hidden_states, values, recompute=True)
+            objectives = [(i, values.pop(f'indexer_loss_{i}')) for i in loss_layers]
+            csa, mhc, _ = codec.restore(values, end)
+            context.cross_layer_state, context.mhc_state, context.values = csa, mhc, values
+            for layer_id, objective in objectives:
+                hidden_states = self._attach_loss(hidden_states, context, objective, layer_id)
+            self._retire_state(context)
+        return hidden_states
+
+    @layer_scope(layer_arg=True)
+    def run_layer(self, layer, hidden_states, context, *, recompute=None, **kwargs):
         """Run eagerly, with explicit checkpointing, or in a prepared graph slot."""
         c, codec, csa = self.config, context.codec, context.cross_layer_state
         layer_id = layer.layer_number - 1
-        loss = (
-            layer_id in c.csa2_index_source_layers
+        loss = self._has_indexer_loss(layer)
+        if recompute is None:
+            recompute = layer.training and c.recompute_granularity == 'full'
+        graph_key = (layer_id, codec.shape, loss, layer.training, torch.is_grad_enabled())
+        if (
+            layer_id in self._scheduled_layers
             and layer.training
             and torch.is_grad_enabled()
-            and (c.dsa_indexer_loss_coeff or 0) > 0
-        )
-        if getattr(layer, 'engram', None) is not None and context.hashes is None:
-            layout = csa.thd_layout
-            context.hashes = context.hasher(
-                context.values['tokens'],
-                None if layout is None else layout.valid_tokens.unsqueeze(0),
-                None if layout is None else layout.sequence_ids.unsqueeze(0),
-                cp_group=self.pg_collection.cp,
+            and graph_key not in self.graphs
+        ):
+            raise ValueError(
+                'V4.1 scheduled CUDA graphs require the warmed batch shape and loss profile; '
+                'use fixed packed shapes or disable CUDA graphs'
             )
-        recompute = layer.training and c.recompute_granularity == 'full'
-        graph_key = (layer_id, codec.shape, loss, layer.training)
-        capture = context.capture is not None and layer_id in context.capture['layers']
-        if capture and layer_id % 2:
-            raise ValueError('Variable-token MoE execution remains outside layer capture')
-        if recompute or graph_key in self.graphs or capture:
-            region, values = self._prepare_region(layer, hidden_states, context, kwargs, loss)
-            if capture:
-                if recompute:
-                    raise ValueError(
-                        'Full recompute and layer capture are separate execution profiles'
-                    )
-                if getattr(layer, 'engram', None) is not None:
-                    raise ValueError(
-                        'Variable-split Engram EP lookup remains outside layer capture'
-                    )
-                capture_kwargs = {}
-                if c.fp8:
-                    if context.capture['backend'] != 'transformer_engine':
-                        raise ValueError('V4.1 FP8 layer capture requires the TE graph backend')
-                    capture_kwargs = dict(
-                        fp8_enabled=not is_first_last_bf16_layer(c, layer_id),
-                        fp8_recipe=get_fp8_recipe(c),
-                        fp8_group=self.pg_collection.tp,
-                    )
-                self.graphs[graph_key] = StatefulGraphs(
-                    region,
+        request = context.capture
+        if (
+            request is None
+            and layer.training
+            and torch.is_grad_enabled()
+            and layer_id in self._recording_layers
+        ):
+            if self._recording_shape is None:
+                self._recording_shape = codec.shape
+            if codec.shape == self._recording_shape:
+                request = dict(layers=self._recording_layers, record=True)
+        if request is None and layer.training and torch.is_grad_enabled():
+            request = self._automatic_capture
+        capture = (
+            request is not None and layer_id in request['layers'] and graph_key not in self.graphs
+        )
+        if recompute and (capture or graph_key in self.graphs):
+            raise ValueError('Full recompute and layer capture are separate execution profiles')
+        if not recompute and (capture or graph_key in self.graphs):
+            engram = getattr(layer, 'engram', None)
+            if engram is not None:
+                layout = csa.thd_layout
+                hidden_states = engram(
                     hidden_states,
-                    values,
-                    slots=context.capture['slots'],
-                    backend=context.capture['backend'],
-                    capture_kwargs=capture_kwargs,
+                    token_mask=None if layout is None else layout.valid_tokens.unsqueeze(0),
+                    embeddings=self._lookup_engram(layer, context),
                 )
-                self._next_slot[graph_key] = (0, context.capture['slots'])
-            graph = self.graphs.get(graph_key)
-            if graph is None:
-                if recompute and c.fp8:
-                    result = te_checkpoint(
-                        region,
-                        False,
-                        get_cuda_rng_tracker,
-                        self.pg_collection.tp,
-                        hidden_states,
-                        *region.inputs.pack(values),
-                        use_reentrant=False,
-                    )
-                    hidden_states, values = region.restore_result(result, values)
-                else:
-                    hidden_states, values = region.run(hidden_states, values, recompute=recompute)
+            hidden_states, objective = self._run_consumer_graph(
+                layer,
+                hidden_states,
+                context,
+                dict(kwargs),
+                loss,
+                graph_key,
+                request if capture else None,
+            )
+            hidden_states = self._attach_loss(hidden_states, context, objective, layer_id)
+            self._retire_state(context)
+            return hidden_states
+        if recompute:
+            region, values = self._prepare_region(layer, hidden_states, context, kwargs, loss)
+            if c.fp8:
+                result = te_checkpoint(
+                    region,
+                    False,
+                    get_cuda_rng_tracker,
+                    self.pg_collection.tp,
+                    hidden_states,
+                    *region.inputs.pack(values),
+                    use_reentrant=False,
+                )
+                hidden_states, values = region.restore_result(result, values)
             else:
-                slot, slots = self._next_slot[graph_key]
-                hidden_states, values = graph.run(hidden_states, values, slot=slot)
-                self._next_slot[graph_key] = ((slot + 1) % slots, slots)
+                hidden_states, values = region.run(hidden_states, values, recompute=True)
             csa, mhc, _ = codec.restore(values, layer_id + 1)
             objective = values.pop('indexer_loss', None)
             context.cross_layer_state, context.mhc_state, context.values = csa, mhc, values
@@ -207,8 +553,8 @@ class DeepSeekV41Adapter:
                 layout = csa.thd_layout
                 hidden_states = layer.engram(
                     hidden_states,
-                    context.hashes,
-                    None if layout is None else layout.valid_tokens.unsqueeze(0),
+                    token_mask=None if layout is None else layout.valid_tokens.unsqueeze(0),
+                    embeddings=self._lookup_engram(layer, context),
                 )
             hidden_states, _ = layer(
                 hidden_states=hidden_states,
@@ -218,6 +564,12 @@ class DeepSeekV41Adapter:
             )
             objective = csa.indexer_loss
             context.values = codec.snapshot(csa, context.mhc_state, context.values, layer_id + 1)
+        hidden_states = self._attach_loss(hidden_states, context, objective, layer_id)
+        self._retire_state(context)
+        return hidden_states
+
+    def _attach_loss(self, hidden_states, context, objective, layer_id):
+        c, codec = self.config, context.codec
         if objective is not None:
             logged = objective.detach()
             if c.calculate_per_token_loss:
@@ -234,6 +586,10 @@ class DeepSeekV41Adapter:
                 reduce_group=self.pg_collection.cp if codec.shape.cp_size > 1 else None,
             )
             hidden_states = DSAIndexerLossAutoScaler.apply(hidden_states, objective)
+        return hidden_states
+
+    @staticmethod
+    def _retire_state(context):
         # Do not retain retired producers or layer objectives through subsequent forwards.
         csa = context.cross_layer_state
         csa.indexer_loss = None
@@ -243,7 +599,6 @@ class DeepSeekV41Adapter:
             csa.indexer_k = csa.indexer_k_flat = None
         if 'tokens' not in context.values:
             context.hashes = None
-        return hidden_states
 
     def finalize_forward(self, output, context):
         """Keep the ordinary stack contract; the model owns pipeline publication."""
