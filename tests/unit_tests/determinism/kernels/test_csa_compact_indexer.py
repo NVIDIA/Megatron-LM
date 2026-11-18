@@ -185,3 +185,77 @@ def test_compact_layout_cp16_static_capacity(compact_backend, real_tokens):
     assert (lengths <= source_rows.numel()).all()
     if real_tokens == 4095:
         assert lengths.max().item() > real_tokens // 4 + 2
+
+
+@pytest.mark.parametrize("ties", [False, True])
+def test_compact_indexer_score_cutoff(compact_backend, ties):
+    """Exercise real Top-K exclusion, independent quantized scoring and tied replay."""
+    from megatron.core.ops.attention.csa.indexer_quantization import (
+        create_indexer_mxfp8_quantization_buffers,
+    )
+
+    seeded()
+    q = torch.randn(1024, 64, 128, device="cuda", dtype=torch.bfloat16)
+    if ties:
+        q.zero_()
+    k = torch.randn(512, 128, device="cuda", dtype=torch.bfloat16)
+    w = torch.rand(1024, 64, device="cuda", dtype=torch.bfloat16) / (64**0.5 * 128**0.5)
+    cu = torch.tensor([0, 2048], device="cuda", dtype=torch.int32)
+    cu_k = torch.tensor([0, 512], device="cuda", dtype=torch.int32)
+    layout = cp_utils.build_cp_indexer_layout(cu, cu_k, 1024, 1024, 512)
+
+    def run(q, k, w):
+        return compact_backend.packed(
+            q,
+            k,
+            w,
+            256,
+            4,
+            cu_seqlens_compressed=cu_k,
+            indexer_layout=layout,
+            max_seqlen_q=2048,
+            return_softmax=True,
+        )
+
+    ids, lengths, predict = run(q, k, w)
+    assert torch.equal(lengths, torch.full_like(lengths, 256))
+    assert torch.isfinite(predict).all()
+    assert (ids[:, 1:] > ids[:, :-1]).all()  # canonical, unique slots
+    assert_replays_bit_exact(
+        run,
+        (q, k, w),
+        backward=False,
+        contention=True,
+        what="MXFP8 compact real Top-K cutoff and deterministic ties",
+    )
+    if ties:
+        torch.testing.assert_close(predict, torch.full_like(predict, 1 / 256), rtol=0, atol=0)
+        return
+
+    # Compare a few late queries, where more than 256 keys are visible, against
+    # explicit scoring of TE-dequantized tensors. This is independent of the
+    # packed scale byte permutation and the cuDNN compact selection kernel.
+    def dequantize(value):
+        buffers = create_indexer_mxfp8_quantization_buffers(value)
+        buffers.quantizer.update_quantized(value, buffers.quantized)
+        return buffers.quantized.dequantize().reshape(value.shape).float()
+
+    q_ref, k_ref = dequantize(q), dequantize(k)
+    for row in (255, 511, 767, 1023):
+        visible = (1024 + row + 1) // 4
+        scores = (
+            torch.einsum("hd,kd->hk", q_ref[row], k_ref[:visible]).relu()
+            * w[row].float().unsqueeze(-1)
+        ).sum(0)
+        selected = ids[row].long()
+        assert (selected >= 0).all() and (selected < visible).all()
+        cutoff = torch.topk(scores, 256).values[-1]
+        # Tensor-core accumulation may reorder almost-equal cutoff scores.
+        # Every well-separated winner must survive and no clear loser may enter.
+        tolerance = scores.abs().max() * 0.003 + 1e-5
+        selected_mask = torch.zeros(visible, device=q.device, dtype=torch.bool)
+        selected_mask[selected] = True
+        assert (scores[selected_mask] >= cutoff - tolerance).all()
+        assert (scores[~selected_mask] <= cutoff + tolerance).all()
+        reference = torch.softmax(scores[selected], dim=0)
+        torch.testing.assert_close(predict[row], reference, rtol=0.025, atol=0.002)
