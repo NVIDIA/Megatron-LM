@@ -4,6 +4,8 @@
 
 from typing import Any
 
+import torch.distributed as dist
+
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.disaggregation.coordinator_setup import (
@@ -17,6 +19,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.inference.shards_spec import resolve_inference_shard
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -67,6 +70,13 @@ def build_dynamic_inference_engine(
     inference_config.reserve_recurrent_state_dummy_slot = (
         engine_cls.requires_recurrent_state_dummy_slot
     )
+    if disaggregated:
+        assignment = resolve_inference_shard(
+            inference_config.disaggregation_shards, dist.get_world_size(), dist.get_rank()
+        )
+        # The role sizes role-specific buffers (decode holds no Mamba prefix
+        # cache), so the context must know it before it allocates them.
+        inference_config.disaggregation_role = assignment.spec.role
     context = DynamicInferenceContext(model.config, inference_config)
     inference_wrapped_model = inference_wrapper_cls(model, context)
     controller = TextGenerationController(

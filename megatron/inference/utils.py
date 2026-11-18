@@ -482,7 +482,9 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
 
 
 def get_dynamic_inference_engine(
-    model: MegatronModule | None = None, engine_class: type[DynamicInferenceEngine] | None = None
+    model: MegatronModule | None = None,
+    engine_class: type[DynamicInferenceEngine] | None = None,
+    disaggregation_role: Literal["prefill", "decode"] | None = None,
 ) -> DynamicInferenceEngine:
     """Build a dynamic inference engine.
 
@@ -491,6 +493,9 @@ def get_dynamic_inference_engine(
         engine_class: Optional engine implementation override. When omitted,
             the core factory selects the implementation from the inference
             configuration.
+        disaggregation_role: This engine's prefill/decode role when an external
+            router (not ``disaggregation_shards``) splits the work; sizes
+            role-specific buffers.
     """
     args = get_args()
     if model is None:
@@ -498,6 +503,8 @@ def get_dynamic_inference_engine(
     tokenizer = get_tokenizer()
 
     inference_config = get_inference_config_from_model_and_args(model, args)
+    if disaggregation_role is not None:
+        inference_config.disaggregation_role = disaggregation_role
     return build_dynamic_inference_engine(
         model=model, tokenizer=tokenizer, inference_config=inference_config, engine_cls=engine_class
     )
