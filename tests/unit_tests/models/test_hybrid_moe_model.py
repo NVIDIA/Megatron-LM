@@ -288,6 +288,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_use_norm_before_up_proj": False,
     "moe_layer_freq": 1,
     "moe_layer_recompute": False,
+    "moe_recompute_max_layer_number": None,
     "moe_megakernel_backend": None,
     "moe_megakernel_backend_config": None,
     "moe_n_hash_layers": 0,

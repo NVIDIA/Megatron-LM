@@ -1745,6 +1745,12 @@ class TransformerConfig(ModelParallelConfig):
     moe_layer_recompute: bool = False
     """Memory optimization: checkpointing moe_layer to save actiavtion memory."""
 
+    moe_recompute_max_layer_number: Optional[int] = None
+    """With 'moe' in recompute_modules, checkpoint only the MoE layers whose global layer
+    number is at most this value; later MoE layers keep their activations for backward.
+    None checkpoints every MoE layer. Spends spare memory on skipping part of the MoE
+    recompute."""
+
     moe_permute_fusion: bool = False
     """Fuse token rearrangement ops during token dispatching."""
 
