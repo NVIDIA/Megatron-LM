@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-name: Restore PR checkout on the Testmon baseline
-description: Use the same prepared PR checkout for unit-test planning and execution.
+name: Restore exact PR checkout with a pinned Testmon baseline
+description: Preserve the tested source tree for both unit-test planning and execution.
 inputs:
   artifact-id:
     required: true

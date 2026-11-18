@@ -627,17 +627,15 @@ jobs:
           ref: ${{ steps.resolve-sha.outputs.sha }}
           fetch-depth: 0
 
-      - name: Prepare PR on the Testmon baseline
+      - name: Prepare PR checkout with a pinned Testmon baseline
         id: prepare-testmon-checkout
         if: steps.unit-test-pr-files.outputs.ready == 'true' && fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref == 'main' && vars.UNIT_TESTMON_USE_CACHE_BASE != 'false'
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_HEAD: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').head.sha }}
-          PR_BASE: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
           TESTED_SHA: ${{ steps.resolve-sha.outputs.sha }}
         run: |
           python .github/scripts/testmon_checkout.py prepare \
-            --pr-head "$PR_HEAD" --pr-base "$PR_BASE" --tested-sha "$TESTED_SHA" \
+            --tested-sha "$TESTED_SHA" \
             --pr-files-dir "$RUNNER_TEMP/unit-test-pr-files" \
             --output-dir "$RUNNER_TEMP/unit-test-pr-files/testmon-checkout"
 

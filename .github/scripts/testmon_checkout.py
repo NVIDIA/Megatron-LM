@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Apply a complete PR diff to a trusted Testmon baseline for unit-test CI."""
+"""Preserve the tested source tree while pinning a trusted Testmon baseline."""
 
 import argparse
 import json
@@ -79,7 +79,7 @@ def outputs(manifest: dict[str, str]) -> None:
 
 
 def prepare(args: argparse.Namespace) -> None:
-    """Bundle the PR diff on the selected baseline, preserving the original on failure."""
+    """Bundle the tested tree with the cache baseline as its synthetic parent."""
     output = Path(args.output_dir).resolve()
     bundle = str(output / "checkout.bundle")
     metadata_path = Path(args.pr_files_dir).resolve() / "metadata.json"
@@ -87,7 +87,6 @@ def prepare(args: argparse.Namespace) -> None:
     rewritten = False
     try:
         original = sha(args.tested_sha)
-        head, base = sha(args.pr_head), sha(args.pr_base)
         if git("rev-parse", "HEAD") != original:
             raise ValueError("Checkout does not match the original tested commit")
         original_metadata = metadata_path.read_bytes()
@@ -96,15 +95,10 @@ def prepare(args: argparse.Namespace) -> None:
             raise ValueError("PR files metadata does not match the original tested commit")
         source, generation = latest_baseline()
         git("fetch", "--no-tags", "origin", source)
-        merge_base = git("merge-base", base, head)
-        patch = run("git", "diff", "--binary", "--full-index", "--no-ext-diff", merge_base, head)
+        tree = git("rev-parse", f"{original}^{{tree}}")
         with tempfile.TemporaryDirectory(prefix="testmon-checkout-") as temporary:
             checkout = Path(temporary) / "checkout"
             git("clone", "--shared", "--no-checkout", str(Path.cwd()), str(checkout))
-            git("checkout", "--detach", source, cwd=checkout)
-            if patch:
-                git("apply", "--3way", "--index", cwd=checkout, data=patch)
-            tree = git("write-tree", cwd=checkout)
             date = git("show", "-s", "--format=%cI", original)
             identity = {
                 f"GIT_{role}_{field}": value
@@ -120,7 +114,7 @@ def prepare(args: argparse.Namespace) -> None:
                 tree,
                 "-p",
                 source,
-                data=f"Apply PR {head} to Testmon baseline {source}\n".encode(),
+                data=f"Test {original} with Testmon baseline {source}\n".encode(),
                 env={**os.environ, **identity},
                 cwd=checkout,
             )
@@ -173,6 +167,8 @@ def restore(args: argparse.Namespace) -> None:
     git("fetch", "--no-tags", bundle, "HEAD")
     if git("rev-list", "--parents", "-n", "1", tested) != f"{tested} {source}":
         raise ValueError("Prepared checkout does not have the expected baseline parent")
+    if git("rev-parse", f"{tested}^{{tree}}") != git("rev-parse", f"{original}^{{tree}}"):
+        raise ValueError("Prepared checkout does not match the original tested source tree")
     git("checkout", "--detach", tested)
     outputs(manifest)
 
@@ -182,7 +178,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     prepare_parser = commands.add_parser("prepare")
-    for option in ("pr-head", "pr-base", "tested-sha", "pr-files-dir", "output-dir"):
+    for option in ("tested-sha", "pr-files-dir", "output-dir"):
         prepare_parser.add_argument(f"--{option}", required=True)
     restore_parser = commands.add_parser("restore")
     restore_parser.add_argument("--directory", required=True)
