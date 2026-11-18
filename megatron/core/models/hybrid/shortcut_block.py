@@ -34,7 +34,10 @@ from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLa
 from megatron.core.transformer.moe.experts import InferenceGroupedMLP
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.moe.router import InferenceTopKRouter
-from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequence_sr
+from megatron.core.transformer.moe.shared_experts import (
+    SharedExpertMLP,
+    set_tensor_grad_fn_sequence_sr,
+)
 from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import build_module
@@ -45,7 +48,6 @@ from megatron.core.transformer.wide_residual import (
     ShortcutAddWideResidualWriteReadNorm,
     StreamwiseSigmoidWideResidualRead,
     WriteReadNorm,
-    moe_reader_use,
     seam_connections,
 )
 from megatron.core.typed_torch import apply_module
@@ -251,16 +253,22 @@ class ShortcutMoEBlock(MegatronModule):
                     "residual-stream width."
                 )
         if self.fuses_residual_seams:
-            # The stack has linked the layer-to-layer seams (link_residual_seams). In a block the
-            # MoE read feeds only the shared expert; the router and the latent projection take the
-            # shortcut read, which the two-reader seam applying the compute read's write emits.
-            moe_layer.residual_read_mlp.use = moe_reader_use(moe_layer, routed=False)
+            # The stack links the layer-to-layer seams after grouping (link_residual_seams). In a
+            # block the MoE read feeds only the shared expert (its first Linear; TransformerConfig
+            # rejects the gate and grouped shared experts with MXFP8 fusion); the router and the
+            # latent projection take the shortcut read, which the two-reader seam applying the
+            # compute read's write emits in the compute layer's quantization context.
+            mlp, number = moe_layer.mlp, moe_layer.layer_number
+            shared = mlp.shared_experts
+            fc1 = shared.linear_fc1 if type(shared).forward is SharedExpertMLP.forward else shared
+            moe_layer.residual_read_mlp.link_consumer(fc1, number)
             if self.fused_shortcut_read:
-                # The compute layer's seam emits it in its quantization context.
-                self.shortcut_residual_read.use = moe_reader_use(
-                    moe_layer, shared=False, seam_layer=compute_layer
-                )
-                self.shortcut_residual_read.link(seam_connections(compute_layer)[0])
+                read = self.shortcut_residual_read
+                read.seam_layer_number = compute_layer.layer_number
+                read.link_consumer(mlp.router, number)
+                if self.config.moe_latent_size:
+                    read.link_consumer(mlp.fc1_latent_proj, number)
+                read.link(seam_connections(compute_layer)[0])
 
         shortcut_norm_spec = TENorm
         self.shortcut_pre_mlp_layernorm = (
@@ -342,7 +350,12 @@ class ShortcutMoEBlock(MegatronModule):
         packed_seq_params=None,
         recompute_context: ResidualStreamRecomputeContext | None = None,
     ):
-        """Run shortcut normalization, routing, and dispatch preprocessing."""
+        """Run shortcut normalization, routing, and dispatch preprocessing. A fused shortcut read
+        emitted as both formats is a (BF16, MXFP8) pair: the router reads BF16 and the latent
+        projection the MXFP8 operand."""
+        quantized = None
+        if isinstance(shortcut_hidden, tuple):  # the fused read's norm is an identity
+            shortcut_hidden, quantized = shortcut_hidden
         if recompute_context is not None:
             shortcut_input = recompute_context.checkpoint(
                 apply_module(self.shortcut_pre_mlp_layernorm), shortcut_hidden
@@ -363,8 +376,10 @@ class ShortcutMoEBlock(MegatronModule):
         probs, routing_map = self.moe_layer.mlp.route(
             shortcut_input, padding_mask, packed_seq_params=packed_seq_params
         )
+        # With a latent projection, preprocess reads its input only to project it.
+        latent_input = shortcut_input if quantized is None else quantized
         return self.moe_layer.mlp.preprocess(
-            shortcut_input, probs, routing_map, padding_mask, packed_seq_params=packed_seq_params
+            latent_input, probs, routing_map, padding_mask, packed_seq_params=packed_seq_params
         )
 
     def _moe_shared_experts(
@@ -608,7 +623,12 @@ class ShortcutMoEBlock(MegatronModule):
         # and padding mask until side-stream routing has consumed them.
         self.route_ready_event.record(main_stream)
         shortcut_stream.wait_event(self.route_ready_event)
-        shortcut_hidden.record_stream(shortcut_stream)
+        for tensor in shortcut_hidden if isinstance(shortcut_hidden, tuple) else (shortcut_hidden,):
+            if type(tensor) is torch.Tensor:
+                tensor.record_stream(shortcut_stream)
+            else:  # a "both" read's MXFP8 operand
+                tensor._rowwise_data.record_stream(shortcut_stream)
+                tensor._rowwise_scale_inv.record_stream(shortcut_stream)
         if isinstance(padding_mask, torch.Tensor) and padding_mask.is_cuda:
             padding_mask.record_stream(shortcut_stream)
         with torch.cuda.stream(shortcut_stream):

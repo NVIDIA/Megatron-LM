@@ -20,7 +20,7 @@ from megatron.core.fusions.wide_residual_shortcut import (
     shortcut_add_wide_residual_write_read_rmsnorm_quant,
     shortcut_add_wide_residual_write_two_reader_rmsnorm_quant,
 )
-from megatron.core.fusions.wide_residual_shortcut.api import quantized_twin, reader_for
+from megatron.core.fusions.wide_residual_shortcut.api import reader_for
 from megatron.core.fusions.wide_residual_shortcut.residual_replay import ReplayInterval
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -506,26 +506,6 @@ def wide_residual_recompute_enabled(config: TransformerConfig, training: bool) -
 
 
 @dataclass(frozen=True)
-class ReaderUse:
-    """Who consumes a fused read: Linears taking it directly as MXFP8 (each once per forward) and
-    whether anything else needs it in BF16. Fixed when the stack is wired, so precision never
-    changes per call."""
-
-    mxfp8_linears: tuple = ()
-    bf16: bool = True
-    # Whether a consumer re-runs its forward in backward (activation recompute): a "both" read
-    # then keeps its MXFP8 twin until the seam's backward rather than dropping it after use.
-    recomputed: bool = False
-
-    @property
-    def format(self) -> str:
-        """The seam kernel's output format for this read."""
-        if not self.mxfp8_linears:
-            return "bf16"
-        return "both" if self.bf16 else "mxfp8"
-
-
-@dataclass(frozen=True)
 class SeamInput:
     """A layer input whose residual read and RMSNorm a fused seam kernel already applied."""
 
@@ -539,10 +519,11 @@ class WriteReadNorm(nn.Module):
 
     A fused layer spec selects this as the layer's read connection (with an identity input norm);
     its predecessor's DeferredWrite always hands its write here, and the tensor this read is called
-    with is only that write's unwritten input residual. Its ``use`` (ReaderUse) sets the read's
-    format: MXFP8 for eligible consumer Linears, BF16 for everything else, or both. A SeamInput
-    (a fused shortcut block's two-reader kernel already applied the write) passes through.
-    Returns ``(branch_input, (residual,))`` like a residual-connection read.
+    with is only that write's unwritten input residual. Every module consuming the read is linked
+    to it (``link_consumer``), which fixes the read's format: MXFP8 if every consumer quantizes
+    it, BF16 if none does, else both, a (BF16, MXFP8) pair. A SeamInput (a fused shortcut block's
+    two-reader kernel already applied the write) passes through. Returns
+    ``(branch_input, (residual,))`` like a residual-connection read.
     """
 
     def __init__(
@@ -566,8 +547,12 @@ class WriteReadNorm(nn.Module):
         self.num_streams = config.wide_residual.num_streams
         self.residual_stream_hidden_size = self.num_streams * config.hidden_size
         self.branch_hidden_size = config.hidden_size
-        # Who consumes this read (set when the stack is wired); BF16 until then.
-        self.use = ReaderUse()
+        # Every module consuming this read, linked when the stack is wired: (module, quantizes).
+        self.consumers = []
+        # The layer whose quantization context emits this read (a block's shortcut read is
+        # emitted by its compute layer's seam).
+        self.seam_layer_number = layer_number
+        self.config = config
         # The write handed here by the previous layer's DeferredWrite, until this read takes it.
         self.pending = None
         # Checkpoint replay (training): every N consecutive seams form one interval. The stack's
@@ -577,6 +562,33 @@ class WriteReadNorm(nn.Module):
         self.starts_replay = self.replay_every is not None and (
             (layer_number - 2) % self.replay_every == 0
         )
+
+    def link_consumer(self, module, layer_number) -> bool:
+        """Link ``module`` (of layer ``layer_number``) as a consumer of this read; returns whether
+        it quantizes the read, which the seam then emits as MXFP8 directly: an eligible TELinear
+        whose layer and this read's seam layer both run in MXFP8."""
+        from megatron.core.fp8_utils import is_first_last_bf16_layer
+
+        layers = (layer_number, self.seam_layer_number)
+        quantizes = not any(is_first_last_bf16_layer(self.config, n - 1) for n in layers)
+        quantizes = quantizes and mxfp8_consumer(module, self.config) is not None
+        self.consumers.append((module, quantizes))
+        return quantizes
+
+    @property
+    def mxfp8_linears(self) -> tuple:
+        """The linked consumers that take this read as MXFP8."""
+        return tuple(module for module, quantizes in self.consumers if quantizes)
+
+    @property
+    def format(self) -> str:
+        """The seam kernel's output format for this read (fixed once its consumers are linked)."""
+        if not self.consumers:
+            raise RuntimeError("a fused read has no linked consumer")
+        quantized = len(self.mxfp8_linears)
+        if quantized == 0:
+            return "bf16"
+        return "mxfp8" if quantized == len(self.consumers) else "both"
 
     def hand(self, item) -> None:
         """Hand ``item`` (PendingWideResidualWrites or SeamInput) to this empty read."""
@@ -618,19 +630,19 @@ class WriteReadNorm(nn.Module):
     def apply_write(self, pending, shortcut: WriteReadNorm | None = None):
         """Write ``pending`` and return ``(residual, branch_input)`` (plus ``shortcut``'s
         normalized input, for a shortcut block's second reader) from one fused kernel. Each read
-        is emitted in its use's format (chosen at construction), and the write is recorded into
-        this seam's replay interval, which the output residual carries on to the next seam."""
+        is emitted in its linked format (a "both" read as a (BF16, MXFP8) pair), and the write is
+        recorded into this seam's replay interval, which the output residual carries on to the
+        next seam."""
         replay = self._replay_interval(pending)
-        uses = (self.use,) if shortcut is None else (self.use, shortcut.use)
+        reads = (self,) if shortcut is None else (self, shortcut)
         # Inference builds no autograd graph (and uses the inference MXFP8 eligibility) even with
         # gradients enabled.
         with torch.no_grad() if InferenceMode.is_active() else nullcontext():
-            if any(use.mxfp8_linears for use in uses):
+            if any(read.mxfp8_linears for read in reads):
                 check_mxfp8_call(pending.routed)  # never falls back to BF16
             options = dict(
-                outputs=tuple(use.format for use in uses),
-                mxfp8_consumers=tuple(use.mxfp8_linears for use in uses),
-                recomputed=tuple(use.recomputed for use in uses),
+                outputs=tuple(read.format for read in reads),
+                mxfp8_consumers=tuple(read.mxfp8_linears for read in reads),
                 num_streams=self.num_streams,
                 epsilon=self.eps,
                 replay=replay,
@@ -779,68 +791,14 @@ def mxfp8_linear_eligible(linear, config) -> bool:
 
 def mxfp8_consumer(linear, config):
     """``linear``, registered as an MXFP8 consumer of a read, if it takes that read directly as
-    MXFP8 (decided once, at construction): it is handed a "both" read's MXFP8 twin, and after
-    each forward on a seam's operand its saved copy is handed over to the replayed columns
-    (``_install_mxfp8_unpack``)."""
+    MXFP8 (decided once, at construction): after each forward on a seam's operand its saved copy
+    is handed over to the replayed columns (``_install_mxfp8_unpack``)."""
     if linear is None or not mxfp8_linear_eligible(linear, config):
         return None
     if not getattr(linear, "_shortcut_mxfp8_consumer", False):
-        linear.register_forward_pre_hook(_before_mxfp8_consumer_forward, with_kwargs=True)
         linear.register_forward_hook(_after_mxfp8_consumer_forward, with_kwargs=True)
         linear._shortcut_mxfp8_consumer = True
     return linear
-
-
-def reader_use(config, linears, *, bf16, layers, recomputed=False) -> ReaderUse:
-    """A read consumed by ``linears`` (None entries skipped) and, if ``bf16``, by modules needing
-    BF16. Eligible Linears take it as MXFP8, provided every layer in ``layers`` (the 1-based
-    layer numbers whose quantization contexts emit and consume it) runs in FP8; an ineligible one
-    reads the BF16 output."""
-    from megatron.core.fp8_utils import is_first_last_bf16_layer
-
-    linears = tuple(linear for linear in linears if linear is not None)
-    if any(is_first_last_bf16_layer(config, number - 1) for number in layers):
-        return ReaderUse((), bool(linears) or bf16)
-    eligible = tuple(linear for linear in linears if mxfp8_consumer(linear, config) is not None)
-    return ReaderUse(eligible, bf16 or len(eligible) < len(linears), recomputed)
-
-
-def moe_reader_use(moe_layer, *, shared=True, routed=True, seam_layer=None) -> ReaderUse:
-    """A fused read into ``moe_layer``'s MLP, consumed by the shared expert if ``shared`` (the
-    first Linear of a plain SharedExpertMLP takes it as MXFP8; its gate, or another shared-expert
-    forward, reads BF16) and if ``routed`` by the router (BF16) and the latent projection
-    (MXFP8). ``seam_layer`` is the layer whose seam emits it, when not the MoE layer's own."""
-    from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
-
-    mlp = moe_layer.mlp
-    shared = getattr(mlp, "shared_experts", None) if shared else None
-    linears, bf16 = [], routed
-    if shared is not None:
-        if type(shared).forward is SharedExpertMLP.forward:
-            linears.append(shared.linear_fc1)
-            bf16 = bf16 or shared.use_shared_expert_gate
-        else:
-            bf16 = True
-    if routed and moe_layer.config.moe_latent_size:
-        linears.append(mlp.fc1_latent_proj)
-    # A recomputed shared expert (or, for a lone MoE layer's whole forward, the MoE layer) re-runs
-    # its consumers in backward.
-    recomputed = shared is not None and (
-        mlp.shared_experts_recompute or (routed and mlp.moe_layer_recompute)
-    )
-    layers = (moe_layer.layer_number,) + (() if seam_layer is None else (seam_layer.layer_number,))
-    return reader_use(moe_layer.config, linears, bf16=bf16, layers=layers, recomputed=recomputed)
-
-
-def _before_mxfp8_consumer_forward(linear, args, kwargs):
-    """Hand a consumer the MXFP8 twin of a "both" read it is called on."""
-    del linear
-    if args:
-        twin = quantized_twin(args[0])
-        return None if twin is None else ((twin, *args[1:]), kwargs)
-    name = next(iter(kwargs), None)
-    twin = None if name is None else quantized_twin(kwargs[name])
-    return None if twin is None else (args, {**kwargs, name: twin})
 
 
 def _after_mxfp8_consumer_forward(linear, args, kwargs, output):
@@ -930,13 +888,15 @@ def _unfused_error(layer) -> ValueError:
 
 
 def link_residual_seams(layers) -> None:
-    """Check and wire a fused stack's residual seams (``layers``: physical layers in order).
+    """Check and wire a fused stack's residual seams (``layers``: physical layers in order, after
+    shortcut grouping, whose blocks have linked their own MoE and shortcut reads).
 
     The fused spec makes every write but the last a DeferredWrite and every read but the first a
-    WriteReadNorm. Each deferred write is linked to the next layer's fused read, whose layer's
-    input projection takes it as MXFP8 when eligible (an MoE layer's shared expert and latent
-    projection, with the router reading BF16); a layer the spec could not fuse is rejected with
-    its reason, and so is a one-layer stack. A shortcut block redeclares its reads' uses.
+    WriteReadNorm. Each deferred write is linked to the next layer's fused read, and each read not
+    yet linked to its consumer: a layer's input projection (MXFP8 when eligible), or for an MoE
+    layer outside a shortcut block the MoE layer itself (its read reaches the router, shared
+    expert and latent projection as one tensor, so it stays BF16, and MXFP8 is rejected). A layer
+    the spec could not fuse is rejected with its reason, and so is a one-layer stack.
     """
     from megatron.core.transformer.moe.moe_layer import MoELayer
 
@@ -962,10 +922,15 @@ def link_residual_seams(layers) -> None:
         if not isinstance(read, WriteReadNorm):
             raise _unfused_error(successor)
         write.link(read)
-        if isinstance(getattr(successor, "mlp", None), MoELayer):
-            read.use = moe_reader_use(successor)
-        else:
-            projection = (_input_projection(successor),)
-            read.use = reader_use(
-                successor.config, projection, bf16=False, layers=(successor.layer_number,)
+        if read.consumers:
+            continue  # a shortcut block's MoE read, linked by its block
+        if not isinstance(getattr(successor, "mlp", None), MoELayer):
+            read.link_consumer(_input_projection(successor), successor.layer_number)
+        elif successor.config.fp8 and successor.config.fp8_recipe == "mxfp8":
+            raise ValueError(
+                "moe_shortcut_wide_residual_norm_fusion with MXFP8 does not support an MoE layer "
+                f"outside a shortcut block (layer {successor.layer_number}): its Linears would "
+                "quantize the fused read themselves"
             )
+        else:
+            read.link_consumer(successor.mlp, successor.layer_number)
