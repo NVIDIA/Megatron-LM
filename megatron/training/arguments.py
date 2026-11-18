@@ -2982,6 +2982,9 @@ def _add_distributed_args(parser):
                        help='Use distributed optimizer.')
     group.add_argument('--megatron-fsdp-version', type=int, default=1, choices=[1, 2],
                        help='Megatron-FSDP implementation version. Defaults to 1.')
+    group.add_argument('--megatron-fsdp-weight-retention', action='store_true', default=False,
+                       help='Reuse MFSDP v2 gathered weights within its standard double-buffer '
+                            'window, planned from one complete recorded iteration.')
     group.add_argument('--overlap-outer-communication', action='store_true',
                        help="Overlap outer-DP and inner-DP gradient reductions "
                             "with Megatron-FSDP v2.")

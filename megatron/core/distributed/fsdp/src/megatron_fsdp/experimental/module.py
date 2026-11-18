@@ -402,7 +402,9 @@ class FsdpModule:
     ) -> None:
         """Select and release gathered storage after the current compute finishes."""
         if not force:
-            self._execution_event(ExecutionAction.RESHARD, rowwise_only=rowwise_only)
+            event = self._execution_event(ExecutionAction.RESHARD, rowwise_only=rowwise_only)
+            if event is not None and self.context.retain_mask.get(event.event_id, False):
+                return
         if rowwise_only:
             groups_to_release = tuple(
                 group for group in self._parameter_groups if group.is_rowwise_unsharded
