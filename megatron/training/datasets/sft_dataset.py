@@ -26,8 +26,7 @@ class SFTDatasetConfig(GPTDatasetConfig):
     packed_sequence_length: Optional[int] = None
     """Physical output width, including alignment padding. The training container derives this
     from the model execution bound, falling back to ``sequence_length`` when unset.
-    Real SFT truncates the combined pack, not each conversation independently.
-    Mock SFT also uses ``sequence_length`` to limit its generated sample."""
+    Both real and mock SFT retain their existing pack-level truncation behavior."""
 
 
 class SFTLowLevelDataset:
@@ -355,8 +354,6 @@ class MockSFTDataset(SFTDataset):
 
         # Convert tokens to list and add EOD
         tokens_list = tokens.tolist()
-        if self.config.sequence_length < pack_length and len(tokens_list) >= self.config.sequence_length:
-            tokens_list = tokens_list[: self.config.sequence_length - 1] + [eod]
         if tokens_list[-1] != eod:
             tokens_list.append(eod)
         targets_list = list(tokens_list)

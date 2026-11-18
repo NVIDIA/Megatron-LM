@@ -69,6 +69,16 @@ def test_sft_preserves_pack_level_truncation():
     assert sample["cu_seqlens"][:3].tolist() == [0, 10, 12]
     assert sample["loss_mask"].tolist() == [1] * 11 + [0]
 
+    # Mock samples also retain tokens beyond sequence_length when the pack fits them.
+    mock_dataset = object.__new__(MockSFTDataset)
+    mock_dataset.config = config
+    mock_dataset.dataset = [torch.arange(1, 11).numpy()]
+    mock_dataset.indices = [0]
+    mock_dataset.padding_divisor = 1
+    sample = mock_dataset[0]
+    assert sample["tokens"].tolist() == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 99, 0]
+    assert sample["labels"].tolist() == [2, 3, 4, 5, 6, 7, 8, 9, 10, 99, 0, 0]
+
 
 MODEL_ARGV = (
     "--num-layers 2 --hidden-size 128 --num-attention-heads 8 --micro-batch-size 1 "
