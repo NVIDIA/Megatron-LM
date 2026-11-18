@@ -22,6 +22,12 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
+from megatron.core.pipeline_parallel.pipeline_payload import TensorStatePayload
+from megatron.core.pipeline_parallel.pipeline_stage import (
+    PipelineStage,
+    PipelineStageState,
+    PipelineStateCodec,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_observation import observe_tensor
@@ -164,6 +170,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         hybrid_layer_config_list (Sequence[HybridLayerEntry], optional): First-class
             decoder, pipeline-split, and MTP configuration sequence. Mutually exclusive with
             ``hybrid_layer_pattern`` and its deprecated alternatives. Defaults to None.
+        pipeline_state_codec (PipelineStateCodec, optional): Carry the codec's state across
+            pipeline stages with typed payloads instead of the hidden tensor alone.
+            Defaults to None.
     """
 
     def __init__(
@@ -191,6 +200,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
         hybrid_layer_config_list: Optional[Sequence[HybridLayerEntry]] = None,
+        pipeline_state_codec: Optional[PipelineStateCodec] = None,
     ) -> None:
         # Snapshot the container immediately. If the root config is also used as a layer entry,
         # detach it before applying model-level normalization so that entry remains caller-owned.
@@ -535,6 +545,17 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             hash_moe_layer_threshold=hash_moe_layer_threshold or None,
             name="decoder",
         )
+        self.pipeline_stage = (
+            None
+            if pipeline_state_codec is None
+            else PipelineStage(
+                pipeline_state_codec,
+                layer_offset,
+                layer_offset + len(layer_config_list),
+                pre_process=self.pre_process,
+                post_process=self.post_process,
+            )
+        )
 
         # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
         if self.mtp_process:
@@ -608,7 +629,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             input_tensor = [input_tensor]
 
         assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
+        if self.pipeline_stage is not None:
+            input_tensor = [self.pipeline_stage.receive(input_tensor[0])]
         self.decoder.set_input_tensor(input_tensor[0])
+
+    @property
+    def pipeline_payload_factory(self):
+        """Select typed P2P for stages with a state codec; None keeps tensor-only P2P."""
+        return None if self.pipeline_stage is None else TensorStatePayload
 
     def preprocess_for_fine_grained_offloading(self):
         """Preprocess for fine-grained activation offloading."""
@@ -692,6 +720,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         padding_mask: Optional[Tensor] = None,
         compute_mtp_loss: bool = True,
         cp_batch: ContextParallelBatch | None = None,
+        pipeline_state: PipelineStageState | None = None,
         output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
     ) -> Any:
@@ -708,6 +737,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 ``labels`` still determine whether the model returns loss or logits.
                 Defaults to True.
             cp_batch: Input tensors and packed metadata keyed by CP layout.
+            pipeline_state: This microbatch's typed stage state. By default a model with a
+                ``pipeline_state_codec`` enters its stage here; a subclass whose layers consume
+                the state enters first and passes it. A nonterminal stage publishes its values.
             output_processor (Callable, optional): Caller-provided post-decoder hook. When set,
                 it receives the decoder output and output-layer/loss helpers, and its return
                 value is returned directly. The default output projection, logits/loss
@@ -725,6 +757,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             self.preprocess_for_paged_stash()
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        if self.pipeline_stage is not None:
+            if pipeline_state is None:
+                pipeline_state = self.pipeline_stage.enter(input_ids, packed_seq_params)
+            packed_seq_params = pipeline_state.packed_seq_params
 
         in_inference_mode = InferenceMode.is_active()
 
@@ -954,7 +991,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
 
         if not self.post_process:
-            return mtp_hidden_states if mtp_forward_ran else hidden_states
+            hidden_states = mtp_hidden_states if mtp_forward_ran else hidden_states
+            if self.pipeline_stage is not None:
+                return self.pipeline_stage.exit(hidden_states, pipeline_state)
+            return hidden_states
 
         if self.config.mtp_num_layers is not None and self.mtp_process:
             assert self.config.mtp_num_layers > 0

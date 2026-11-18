@@ -181,6 +181,20 @@ batched and VPP-overlapped P2P share one protocol. Terminal directions use `None
 Neighboring plans are compared once per schedule invocation, and each send is
 checked against its plan before it is posted. Peers exchange only tensor data.
 
+`PipelineStage` in `megatron/core/pipeline_parallel/pipeline_stage.py` implements
+this protocol once for any model. A model supplies a `PipelineStateCodec` with
+its own parts: `describe` (a microbatch's host metadata), `fields` (the hidden
+field, then the state live before a global layer index), `initial_state` (the
+first stage's state, e.g. tokens and cumulative sequence lengths) and
+`packed_seq_params` (packed metadata rebuilt on a later stage). The stage
+retains a received payload in `receive`, checks its boundary and restores it in
+`enter`, publishes the state with `exit`, and produces the per-microbatch
+`plan`. `prepare_stage_inputs`, bound to the batch-to-metadata function, is a
+ready-made `prepare_pipeline_inputs` hook. `HybridModel(..., pipeline_state_codec=codec)`
+uses these hooks: by default its forward enters the stage itself, while a
+subclass whose layers consume the state enters first and passes
+`pipeline_state=` so that a nonterminal stage publishes the updated values.
+
 Gradient eligibility is static per microbatch. A field declared differentiable
 must receive a gradient from its consumers; a missing gradient is an error rather
 than a silent zero, because a zero would still run producer-side auxiliary-loss
@@ -208,7 +222,8 @@ The tests include a shared-projection model independent of any attention family:
 
 ```bash
 uv run python -m torch.distributed.run --standalone --nproc-per-node=1 \
-  -m pytest tests/unit_tests/transformer/test_stateful_module.py
+  -m pytest tests/unit_tests/transformer/test_stateful_module.py \
+  tests/unit_tests/pipeline_parallel/test_pipeline_stage.py
 
 uv run python -m torch.distributed.run --standalone --nproc-per-node=2 \
   -m pytest tests/unit_tests/transformer/test_shared_state_cp.py \
@@ -216,11 +231,14 @@ uv run python -m torch.distributed.run --standalone --nproc-per-node=2 \
 
 uv run python -m torch.distributed.run --standalone --nproc-per-node=4 \
   -m pytest tests/unit_tests/pipeline_parallel/test_shared_state_parallel.py \
+  tests/unit_tests/pipeline_parallel/test_pipeline_stage.py \
   tests/unit_tests/determinism/kernels/test_shared_tensor_state.py
 ```
 
 The four-rank cases compare CP2 x PP2/VPP against the same unpartitioned layer
 chain, including model gradients, with eager execution, recomputation, and both
-graph backends. The determinism cases check that eager, checkpointed and graphed
+graph backends; `test_pipeline_stage.py` runs that matrix through `HybridModel`
+stages with a toy codec, plus a plain `HybridModel` relaying its codec state
+past ordinary MLP layers. The determinism cases check that eager, checkpointed and graphed
 replays and the CP layout/gather gradients are bit-exact across runs. Porting a particular model's state declarations and numerical
 operations remains separate from this general feature.
