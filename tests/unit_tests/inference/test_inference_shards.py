@@ -126,8 +126,8 @@ def test_prebuilt_disagg_checks_groups_and_model_config(monkeypatch, mismatch):
     from megatron.core.inference.disaggregation import coordinator_setup as setup
     from megatron.core.inference.disaggregation.transfer_backends import nccl as nccl_backend
 
-    setup_peer_groups = Mock()
-    monkeypatch.setattr(nccl_backend, "setup_peer_groups", setup_peer_groups)
+    setup_transfer_group = Mock()
+    monkeypatch.setattr(nccl_backend, "setup_transfer_group", setup_transfer_group)
     monkeypatch.setattr(setup.torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(setup.dist, "get_world_size", lambda: 2)
     monkeypatch.setattr(setup.dist, "get_rank", lambda: 0)
@@ -166,7 +166,7 @@ def test_prebuilt_disagg_checks_groups_and_model_config(monkeypatch, mismatch):
         setup.configure_prebuilt_disagg_engine(engine)
         engine.set_disaggregation_config.assert_called_once()
         # NCCL transfers get one group per prefill/decode rank pair.
-        assert setup_peer_groups.call_args.args[0] == [(0, 1)]
+        assert setup_transfer_group.call_args.args[0] == [(0, 1)]
 
 
 def test_shard_builder_keeps_replica_process_group(monkeypatch):

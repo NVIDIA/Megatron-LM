@@ -10,14 +10,14 @@ the same deterministic order, so the point-to-point operations match by post
 order per peer pair. Data moves straight out of the prefill's pinned blocks;
 there is no staging copy on the send side.
 
-Ordering is only consistent per peer pair: a prefill rank serves several decode
-ranks (and vice versa) in whatever order their hand-offs complete. Batched P2P
-on one process group runs on that group's single communicator and stream, so
-transfers to different peers serialize per rank and independently chosen orders
-can form a wait cycle (P0 -> D2 then D3, P1 -> D3 then D2, D2 <- P1 then P0,
-D3 <- P0 then P1). ``setup_peer_groups`` gives every prefill/decode rank pair its
-own two-rank group, hence its own communicator and stream, and transfers to
-different peers proceed independently.
+All transfers run on one communicator, so each rank executes its batches in
+post order. That is deadlock-free because every rank posts in one global order:
+a decode posts its receives right after its KV_TRANSFER_READY, and a prefill
+posts its sends as the coordinator relays those notifications (SEND_KV), so
+both follow the coordinator's processing order. Posting a batch to a peer
+for the first time sets up the connection and blocks the CPU until that peer
+posts too; ``setup_transfer_group`` connects every pair at startup, so serving
+never blocks there.
 """
 
 from __future__ import annotations
@@ -40,49 +40,42 @@ from megatron.core.inference.disaggregation.utils import transfer_peer_records
 
 logger = logging.getLogger(__name__)
 
-# Two-rank process group per transfer peer (global rank), set by setup_peer_groups.
-_PEER_GROUPS: Dict[int, dist.ProcessGroup] = {}
+# The process group every transfer runs on, set by setup_transfer_group (None: the default group).
+_TRANSFER_GROUP: Optional[dist.ProcessGroup] = None
 
 
-def setup_peer_groups(pairs: Sequence[Tuple[int, int]], device: torch.device) -> None:
-    """Create and initialize one two-rank NCCL group per (prefill, decode) rank pair.
+def setup_transfer_group(pairs: Sequence[Tuple[int, int]], device: torch.device) -> None:
+    """Create the transfer group and connect every (prefill, decode) rank pair on it.
 
     Collective over the whole world: every rank must call this with the same
-    ``pairs`` in the same order. Each pair's communicator is then initialized by
-    a one-element exchange, also in that global order, so no rank can wait on a
-    peer that is itself waiting further along a cycle.
+    ``pairs`` in the same order. One group spanning the transfer ranks keeps the
+    transfers off the default group, whose stream other collectives use. Every
+    pair is then connected by a one-element exchange, all posted as one batch per
+    rank so the connections are set up concurrently: the first batch between two
+    ranks blocks until both have posted, which must not happen while serving.
 
     Args:
         pairs: (prefill global rank, decode global rank) pairs that may transfer.
         device: This rank's CUDA device.
     """
+    global _TRANSFER_GROUP
     rank = dist.get_rank()
-    groups: Dict[int, dist.ProcessGroup] = {}
+    group = dist.new_group(sorted({r for pair in pairs for r in pair}))
+    ops = []
     for src, dst in pairs:
-        group = dist.new_group([src, dst])
-        if rank in (src, dst):
-            groups[dst if rank == src else src] = group
-    for src, dst in pairs:
-        if rank not in (src, dst):
-            continue
-        peer = dst if rank == src else src
-        probe = torch.zeros(1, device=device)
-        op = dist.isend if rank == src else dist.irecv
-        for work in dist.batch_isend_irecv([dist.P2POp(op, probe, peer, group=groups[peer])]):
+        if rank == src:
+            ops.append(dist.P2POp(dist.isend, torch.zeros(1, device=device), dst, group=group))
+        elif rank == dst:
+            ops.append(dist.P2POp(dist.irecv, torch.zeros(1, device=device), src, group=group))
+    if ops:
+        for work in dist.batch_isend_irecv(ops):
             work.wait()
     torch.cuda.synchronize(device)
-    _PEER_GROUPS.clear()
-    _PEER_GROUPS.update(groups)
-
-
-def _peer_group(peer: int) -> Optional[dist.ProcessGroup]:
-    """The dedicated group for transfers with ``peer``, or None for the default group."""
-    return _PEER_GROUPS.get(int(peer))
+    _TRANSFER_GROUP = group
 
 
 def _p2p(op, tensor: torch.Tensor, peer: int) -> Any:
-    peer = int(peer)
-    return dist.P2POp(op, tensor, peer, group=_peer_group(peer))
+    return dist.P2POp(op, tensor, int(peer), group=_TRANSFER_GROUP)
 
 
 @dataclass
@@ -386,13 +379,8 @@ class NcclTransferBackend:
         ops = [op for plan in plans for op in plan.ops]
         keepalive = [tensor for plan in plans for tensor in plan.keepalive]
         scatters = [scatter for plan in plans for scatter in plan.scatters]
-        # batch_isend_irecv requires one group per batch; post one batch per peer
-        # group, keeping each pair's operations in plan order.
-        batches: Dict[int, List[Any]] = {}
-        for op in ops:
-            batches.setdefault(id(op.group), []).append(op)
         try:
-            works = [work for batch in batches.values() for work in dist.batch_isend_irecv(batch)]
+            works = list(dist.batch_isend_irecv(ops)) if ops else []
         except Exception as error:
             raise TransferStartError(str(error), storage_safe=False, resources=plans) from error
         return NcclTransferHandle(works, keepalive, scatters)

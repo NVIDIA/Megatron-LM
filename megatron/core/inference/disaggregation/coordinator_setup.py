@@ -108,11 +108,14 @@ def configure_prebuilt_disagg_engine(engine: Any) -> None:
         )
 
     if engine.context.config.kv_transport_backend == "nccl":
-        # World-collective: dedicated per-pair groups keep transfers to different peers
-        # from serializing on one communicator stream (see transfer_backends/nccl.py).
-        from megatron.core.inference.disaggregation.transfer_backends.nccl import setup_peer_groups
+        # World-collective: one transfer group, with every prefill/decode pair connected
+        # up front so no first-use connection blocks a rank while serving
+        # (see transfer_backends/nccl.py).
+        from megatron.core.inference.disaggregation.transfer_backends.nccl import (
+            setup_transfer_group,
+        )
 
-        setup_peer_groups(
+        setup_transfer_group(
             transfer_rank_pairs(specs), torch.device("cuda", torch.cuda.current_device())
         )
 
