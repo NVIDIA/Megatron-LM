@@ -14,9 +14,13 @@ from torch.distributed.tensor import Partial, Replicate, Shard
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
+    PrefetchOrder,
     RuntimePolicy,
     fully_shard,
     fully_shard_context,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
+    ExecutionAction,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,15 +65,15 @@ def _default_placements() -> Placements:
     ],
 )
 def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
-    """A full training iteration should be CUDA-graphable, with and without symmetric memory.
+    """Two chunks and microbatches replay one complete U/R schedule under CUDA graphs.
 
     With ``use_symmetric_memory=True`` the FSDP collective path changes: unshard allocates the
     all-gather buffer from a symmetric-memory ``MemPool`` and calls
     ``symm_mem.rendezvous()``, and the backward reduce-scatter does the same for the
     partial-gradient buffer. Both allocation-from-pool and rendezvous are normally
     illegal inside CUDA-graph capture, so this confirms the warmup establishes reusable,
-    already-rendezvoused buffers that capture and replay cleanly -- reproducing the
-    non-symmetric-memory loss trajectory exactly.
+    already-rendezvoused buffers that capture and replay cleanly, matching eager
+    losses and parameter updates.
     """
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -79,7 +83,7 @@ def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
     mesh = init_device_mesh(device.type, (world_size,))
     torch.manual_seed(1234)
     dim = _HIDDEN
-    model = NestedModel(dim=dim, num_children=2).to(device)
+    model = nn.Sequential(*(NestedModel(dim=dim, num_children=2) for _ in range(2))).to(device)
 
     static_input = torch.eye(dim, device=device)
     static_target = torch.zeros_like(static_input)
@@ -87,27 +91,46 @@ def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
     placements = _default_placements()
     with fully_shard_context(
         FsdpContext(
-            device=device, runtime_policy=RuntimePolicy(use_symmetric_memory=use_symmetric_memory)
+            device=device,
+            runtime_policy=RuntimePolicy(
+                use_symmetric_memory=use_symmetric_memory,
+                prefetch_order=PrefetchOrder.RECORDED,
+                autograd_completes_execution=False,
+            ),
         )
-    ):
-        for layer in model.layers:
-            fully_shard(layer, mesh=mesh, placements=placements)
-        fully_shard(model, mesh=mesh, placements=placements)
+    ) as context:
+        for chunk in model:
+            for layer in chunk.layers:
+                fully_shard(layer, mesh=mesh, placements=placements)
+            fully_shard(chunk, mesh=mesh, placements=placements)
 
     optimizer = torch.optim.SGD(model.parameters(), lr=0.25, foreach=False)
 
     def train_iteration() -> torch.Tensor:
         optimizer.zero_grad(set_to_none=False)
-        output = model(static_input)
-        loss = torch.nn.functional.mse_loss(output, static_target)
-        loss.backward()
+        losses = []
+        for _ in range(2):
+            output = model(static_input)
+            loss = torch.nn.functional.mse_loss(output, static_target) / 2
+            loss.backward()
+            losses.append(loss.detach())
+        if not context.is_recording_execution_order:
+            assert context.execution_order_view.position == len(context.execution_order_view)
+        context.post_backward()
         optimizer.step()
-        return loss.detach()
+        return torch.stack(losses).sum()
 
     if use_symmetric_memory:
         # NCCL symmetric-memory window registration can fail when a rendezvous is the
         # first collective on a communicator, so establish it before capture.
         dist.barrier(group=mesh.get_group(0), device_ids=[device.index])
+
+    source = context.execution_order
+    model.eval()
+    with torch.no_grad():
+        model(static_input)
+    model.train()
+    assert context.is_recording_execution_order and len(source) == 0
 
     capture_stream = torch.cuda.Stream()
     capture_stream.wait_stream(torch.cuda.current_stream())
@@ -121,6 +144,36 @@ def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
         # iterations zero them in place for CUDA graph replay.
         for _ in range(3):
             train_iteration()
+
+    events = tuple(source)
+    full_view = context.execution_order_view
+    assert full_view.position == 0
+    assert {event.action for event in events} == {ExecutionAction.UNSHARD, ExecutionAction.RESHARD}
+    assert [event.event_id for event in events] == list(range(len(events)))
+    assert all(
+        event.allocated_bytes is not None and event.unsharded_bytes is not None for event in events
+    )
+    with torch.cuda.stream(capture_stream):
+        initial_parameters = [
+            parameter.to_local().detach().clone() for parameter in model.parameters()
+        ]
+        reference_losses = []
+        for step in range(5):
+            reference_losses.append(train_iteration())
+            if step == 0:
+                model.eval()
+                with torch.no_grad():
+                    model(static_input)
+                model.train()
+                assert context.execution_order is source
+                assert context.execution_order_view is full_view and full_view.position == 0
+                assert tuple(source) == events
+        reference_parameters = [
+            parameter.to_local().detach().clone() for parameter in model.parameters()
+        ]
+        with torch.no_grad():
+            for parameter, initial in zip(model.parameters(), initial_parameters):
+                parameter.to_local().copy_(initial)
 
     # Capture
     graph = torch.cuda.CUDAGraph()
@@ -136,6 +189,11 @@ def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
         # keeps a per-replay GPU snapshot without the CPU sync from .item().
         losses.append(static_loss.clone())
     loss_values = torch.stack(losses).tolist()
+    torch.testing.assert_close(torch.stack(losses), torch.stack(reference_losses))
+    for parameter, reference in zip(model.parameters(), reference_parameters):
+        torch.testing.assert_close(parameter.to_local(), reference)
+    assert context.execution_order is source and tuple(source) == events
+    assert context.execution_order_view is full_view and full_view.position == 0
 
     logger.info("CUDA graph replay losses: %s", loss_values)
     assert loss_values[-1] < loss_values[0], (
