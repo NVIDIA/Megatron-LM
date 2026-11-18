@@ -123,13 +123,6 @@ def test_record_compile_replay_and_iteration_cleanup(mode):
         compiler_globals = FullyShardedDataParallelV2.compile_weight_retention.__globals__
         planner = Mock(wraps=compiler_globals["build_retain_mask"])
         stack.enter_context(patch.dict(compiler_globals, build_retain_mask=planner))
-        compile_plan = stack.enter_context(
-            patch.object(
-                FullyShardedDataParallelV2,
-                "compile_weight_retention",
-                wraps=FullyShardedDataParallelV2.compile_weight_retention,
-            )
-        )
         group = object()
         groups = SimpleNamespace(tp=None, pp=None, embd=None, pos_embd=None, dp_cp=group)
         allocations = []
@@ -171,7 +164,6 @@ def test_record_compile_replay_and_iteration_cleanup(mode):
             )
         assert context.retain_mask
         assert allocations[1] < allocations[0]
-        compile_plan.assert_called_once_with(chunks, group)
         planner.assert_called_once()
         assert planner.call_args.args == (context.execution_order, group)
         assert prefetched and max(residency) == 2

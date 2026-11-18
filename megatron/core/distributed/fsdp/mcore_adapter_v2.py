@@ -267,17 +267,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
         # ncclCommWindowRegister:
         # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#window-registration
+        prefetch_size = (
+            None
+            if ddp_config.megatron_fsdp_weight_retention
+            else ddp_config.suggested_communication_unit_size
+        )
         schedule_policy = SchedulePolicy(
-            forward_prefetch_size=(
-                None
-                if ddp_config.megatron_fsdp_weight_retention
-                else ddp_config.suggested_communication_unit_size
-            ),
-            backward_prefetch_size=(
-                None
-                if ddp_config.megatron_fsdp_weight_retention
-                else ddp_config.suggested_communication_unit_size
-            ),
+            forward_prefetch_size=prefetch_size,
+            backward_prefetch_size=prefetch_size,
             register_hooks=not config.overlap_moe_expert_parallel_comm,
         )
         common_fully_shard_kwargs = dict(
@@ -349,11 +346,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
     @staticmethod
     def prefetch_order_for(
-        config: TransformerConfig, ddp_config: DistributedDataParallelConfig | None = None
+        config: TransformerConfig, ddp_config: DistributedDataParallelConfig
     ) -> "PrefetchOrder":
         """Record ordinary pipeline schedules and weight-retention iterations."""
         if not config.overlap_moe_expert_parallel_comm and (
-            (ddp_config is not None and ddp_config.megatron_fsdp_weight_retention)
+            ddp_config.megatron_fsdp_weight_retention
             or config.pipeline_model_parallel_size > 1
             or config.virtual_pipeline_model_parallel_size is not None
         ):
