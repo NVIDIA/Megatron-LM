@@ -1,14 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Schedule-plan helpers shared by GPTModel and HybridModel.
-
-These pieces used to live in ``core/models/gpt/fine_grained_callables.py`` and
-were imported by ``core/models/common/model_chunk_schedule_plan.py`` and the
-hybrid schedule plan via that path. They are model-agnostic in practice — the
-``Pre/PostProcessNode`` classes call the model's ``_preprocess`` /
-``_postprocess`` methods and don't otherwise care which model implements
-them — so they live here now.
-"""
+"""Shared schedule nodes for model preprocessing, layer execution, and postprocessing."""
 
 import weakref
 from functools import partial
@@ -224,8 +216,7 @@ class TransformerLayerNode(ScheduleNode):
     ``moe_dispatch``, ``mlp``, and ``moe_combine`` slots; this class is the scheduler-side
     handle for one slot. It owns the slot's stream / event, the per-slot
     ``free_input`` policy, and the optional delayed weight-gradient hook.
-    Subclasses override ``_resolve_free_input`` to specialize the policy
-    (HybridStackNode does this for grouped layers).
+    Subclasses can override ``_resolve_free_input`` to specialize the policy.
     """
 
     def __init__(

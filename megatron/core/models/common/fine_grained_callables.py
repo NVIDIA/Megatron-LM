@@ -1,15 +1,6 @@
 # Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Layer-callable builders for the combined-1F1B fine-grained schedule plan.
-
-These build_* functions assemble the per-layer ``(forward_funcs, backward_dw)``
-tuple that the schedule plan plugs into ``TransformerLayerNode``.
-
-The TransformerLayer-specific builder lives in ``gpt/fine_grained_callables.py``
-because it depends on GPT's MoE wiring; the MTP builder and the dispatcher
-``build_layer_callables`` are model-agnostic — both GPTModel and HybridModel
-schedule MTP layers identically — so they live here.
-"""
+"""Build combined-1F1B callables for transformer layers, hybrid groups, and MTP depths."""
 
 from contextlib import nullcontext
 from functools import partial
@@ -17,7 +8,9 @@ from functools import partial
 import torch
 
 from megatron.core import tensor_parallel
-from megatron.core.models.gpt.fine_grained_callables import build_transformer_layer_callables
+from megatron.core.models.common.transformer_layer_callables import (
+    build_transformer_layer_callables,
+)
 from megatron.core.models.hybrid.fine_grained_callables import (
     build_hybrid_stack_callables,
     get_hybrid_stack_moe_metadata,

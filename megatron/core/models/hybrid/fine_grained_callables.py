@@ -12,10 +12,8 @@ group such as ``[M*E]`` or a single layer symbol, into the schedule plan's slots
 * the dense MLP or the routed experts;
 * token combine and the MoE residual add, plus the final norm on the last layer.
 
-``HybridStackNode`` is the schedule node that runs these callables, and
 ``_MoEBackwardDWWrapper`` gives each slot the delayed MoE weight-gradient work it
-owns. The equivalent callables for GPTModel's ``TransformerLayer`` are in
-``megatron/core/models/gpt/fine_grained_callables.py``.
+owns.
 """
 
 from contextlib import nullcontext
@@ -28,7 +26,6 @@ from torch import Tensor
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.models.common.utils import TransformerLayerNode, should_free_input
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import LayerPatternItem
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
@@ -82,33 +79,6 @@ class _MoEBackwardDWWrapper:
         """
         for module in self.submodules:
             yield from module.parameters()
-
-
-class HybridStackNode(TransformerLayerNode):
-    """Schedule node for HybridStack-built fine-grained callables.
-
-    Subclassed from ``TransformerLayerNode`` so the runtime backbone (forward /
-    backward / backward_dw plumbing, detach bookkeeping, output-grad release)
-    is shared. The subclass is where the hybrid free-input policy lives: the
-    ``pre_dispatch_computation`` slot here covers the whole pre-dispatch loop
-    (mamba + attention + …) rather than a single attention block.
-    """
-
-    @staticmethod
-    def _resolve_free_input(name, is_moe, config, num_local_experts):
-        """Hybrid free-input policy.
-
-        Same as the GPTModel default: dense layers always retain their
-        input for backward; MoE-only "moe_dispatch", "mlp", and "moe_combine"
-        slots can free, subject to the dispatcher / cuda-graph constraints
-        encoded in ``should_free_input``. Hybrid groups have a
-        "pre_dispatch_computation" slot whose semantics differ (it covers a
-        loop over Mamba/attention/GDN sub-layers, not a single attention
-        block), but its policy resolves to ``False`` in
-        ``should_free_input``, which is correct: pre-layer outputs are needed
-        for backward through the loop.
-        """
-        return should_free_input(name, is_moe, config, num_local_experts)
 
 
 def _get_inner_quant_context(layer):
@@ -257,7 +227,7 @@ def _run_moe_combine(layer, node: ScheduleNode, output: Tensor):
     # already registered on ``expert_output`` in ``_run_moe_experts``. A second one
     # would run the layernorm recompute before attention's backward in the same
     # pre-dispatch slot of a bracketed group (``[*E]``), which corrupts the attention
-    # gradients. GPTModel's ``submodule_combine_forward`` inlines bda for the same reason.
+    # gradients.
     mlp_output_with_bias = (output, None)
     with layer.bias_dropout_add_exec_handler():
         output = layer.mlp_bda(layer.training, layer.config.bias_dropout_fusion)(

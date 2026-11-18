@@ -8,8 +8,8 @@ import torch.nn.functional as F
 
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_moe_residual_add import fused_moe_residual_add
+from megatron.core.models.common import transformer_layer_callables
 from megatron.core.models.common.model_chunk_schedule_plan import TransformerLayerSchedulePlan
-from megatron.core.models.gpt import fine_grained_callables
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -351,7 +351,7 @@ class TestA2AOverlap:
             )
             reset_model(gpt_model, params)
             with mock.patch.object(
-                fine_grained_callables, "fused_moe_residual_add", wraps=fused_moe_residual_add
+                transformer_layer_callables, "fused_moe_residual_add", wraps=fused_moe_residual_add
             ) as fused_residual_add:
                 capture_a2a_overlap = run_transformer_layer_a2a_overlap_with_capture(
                     gpt_model, input_tensors, microbatches

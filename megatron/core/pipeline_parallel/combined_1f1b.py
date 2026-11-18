@@ -375,11 +375,8 @@ def combined_forward_backward_step(
         set_input_tensor = get_attr_wrapped_model(f_model, "set_input_tensor")
         set_input_tensor(input_tensor)
 
-    # build the schedule plan and get loss function for forward step
     if f_model is not None:
-        # GPTModel.build_schedule_plan(model_forward_inputs) is called in the forward_step_func.
-        # The return value becomes (forward_schedule_plan, loss_function),
-        # which is used to be (forward_output_tensor, loss_function).
+        # Ask the forward step to build the model's schedule plan for this microbatch.
         with context_manager:  # autocast context
             unwrapped_model = get_attr_wrapped_model(
                 f_model, "build_schedule_plan", return_model_obj=True
@@ -464,7 +461,6 @@ def combined_forward_backward_step(
     b_grad = b_output_tensor_grad[0] if b_model else None
     # combined forward and backward model chunk execution of two micro-batches
     with context_manager, outer_fp8_context:  # autocast context and delayed fp8 context
-        # For GPT models, it calls common::TransformerModelChunkSchedulePlan.run(),
         output_tensor = type(f_schedule_plan or b_schedule_plan).run(
             f_schedule_plan,
             b_schedule_plan,

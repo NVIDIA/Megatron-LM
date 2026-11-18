@@ -618,8 +618,6 @@ class HybridStack(MegatronModule):
     def final_layernorm(self):
         """Alias for ``final_norm`` matching the attribute name on TransformerBlock.
 
-        Lets generic decoder consumers (e.g. ``GPTModel.PostProcessNode``) discover the
-        final norm via the same attribute name they use for non-hybrid decoders.
         ``final_norm`` remains the registered submodule name.
         """
         return self.final_norm

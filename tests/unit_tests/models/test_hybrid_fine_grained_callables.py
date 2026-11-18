@@ -82,7 +82,7 @@ def _chunk_state():
 
 
 def _node(layer, layer_state, function, name):
-    return hybrid_callables.HybridStackNode(
+    return node_utils.TransformerLayerNode(
         stream=object(),
         event=Mock(),
         layer_state=layer_state,

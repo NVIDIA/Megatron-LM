@@ -541,11 +541,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
     #: schedule plans. Subclasses override this to inject a layer-plan variant.
     LAYER_SCHEDULE_PLAN_CLASS = None
 
-    #: Pre/post-process node classes. Defaults below pull in the GPT-side
-    #: ``PreProcessNode`` / ``PostProcessNode`` (which call ``GPTModel._preprocess`` /
-    #: ``GPTModel._postprocess``). Subclasses set these to model-specific node
-    #: classes so the node calls the right model's ``_preprocess`` /
-    #: ``_postprocess`` methods.
+    #: The default nodes call the supplied model's _preprocess and _postprocess methods.
     PRE_PROCESS_NODE_CLASS = None
     POST_PROCESS_NODE_CLASS = None
 

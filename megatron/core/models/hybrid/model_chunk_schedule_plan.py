@@ -1,18 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Schedule-plan classes for HybridStack-based decoders.
-
-These extend GPTModel's schedule plans, ``TransformerLayerSchedulePlan`` and
-``TransformerModelChunkSchedulePlan``, with the per-layer ``layer_type`` symbol
-that HybridStack assigns to each entry of its ``layer_type_list`` (including
-bracketed groups like ``[*-]``). The base classes build callables from the layer
-module alone; this module adds the hybrid-specific dispatch into
-``build_hybrid_stack_callables``, which also needs the layer's symbol, and uses
-``HybridStackNode`` so the schedule node's free-input policy can diverge from the
-GPTModel default. The pre/post-process nodes from
-``core.models.common.utils`` are reused as-is — they already call
-``model._preprocess`` / ``model._postprocess`` which work on a HybridModel.
-"""
+"""Schedule HybridStack logical layers on the shared combined-1F1B executor."""
 
 from contextlib import nullcontext
 
@@ -20,10 +8,8 @@ from megatron.core.models.common.model_chunk_schedule_plan import (
     TransformerLayerSchedulePlan,
     TransformerModelChunkSchedulePlan,
 )
-from megatron.core.models.hybrid.fine_grained_callables import (
-    HybridStackNode,
-    build_hybrid_stack_callables,
-)
+from megatron.core.models.common.utils import TransformerLayerNode
+from megatron.core.models.hybrid.fine_grained_callables import build_hybrid_stack_callables
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.pipeline_parallel.utils import NoopScheduleNode
 from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
@@ -31,13 +17,7 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
 class HybridStackSchedulePlan(TransformerLayerSchedulePlan):
-    """Per-layer schedule plan for HybridStack decoders.
-
-    Adds the ``layer_type`` extra-arg propagation; routes through
-    ``build_hybrid_stack_callables`` when ``layer_type`` is set (i.e. the layer
-    is a HybridStack entry, possibly a bracketed group); falls back to the GPTModel
-    path for plain TransformerLayer / MTP layers when ``layer_type`` is None.
-    """
+    """Build schedule nodes for one layer symbol or bracketed group, such as ``[*E]``."""
 
     def __init__(self, layer, event, chunk_state, comp_stream, comm_stream, extra_args=None):
         if extra_args is None:
@@ -64,7 +44,7 @@ class HybridStackSchedulePlan(TransformerLayerSchedulePlan):
             node_extra_args = dict(extra_args)
             if bwd_dw_callables is None:
                 node_extra_args["delay_wgrad_compute"] = False
-            return HybridStackNode(
+            return TransformerLayerNode(
                 stream,
                 event,
                 self.layer_state,
@@ -99,11 +79,7 @@ class HybridStackSchedulePlan(TransformerLayerSchedulePlan):
         self.mtp_post_process = NoopScheduleNode()
 
     def get_low_precision_context(self):
-        """Return the layer-level quantization context for GPTModel-path layers.
-
-        Hybrid callables enter the quantization context of each physical layer
-        themselves, so hybrid layer plans use a null context here.
-        """
+        """Hybrid callables enter each physical layer's quantization context themselves."""
         if self.layer_type is None and isinstance(
             self.layer, (TransformerLayer, MultiTokenPredictionLayer)
         ):
@@ -112,16 +88,7 @@ class HybridStackSchedulePlan(TransformerLayerSchedulePlan):
 
 
 class HybridStackModelChunkSchedulePlan(TransformerModelChunkSchedulePlan):
-    """Model-chunk schedule plan that builds ``HybridStackSchedulePlan`` layer plans.
-
-    Threads HybridStack's ``layer_type_list[layer_idx]`` symbol into each
-    layer plan's ``extra_args`` so the per-layer plan can dispatch grouped
-    layers correctly. Layers of other modules (e.g. MTP layers) get
-    ``layer_type=None`` and follow the GPTModel path. The pre/post
-    process nodes inherit from the GPTModel base class — they already dispatch
-    on ``model._preprocess`` / ``model._postprocess`` which a HybridModel
-    implements.
-    """
+    """Pass each HybridStack entry's layer type to its per-layer schedule plan."""
 
     LAYER_SCHEDULE_PLAN_CLASS = HybridStackSchedulePlan
 

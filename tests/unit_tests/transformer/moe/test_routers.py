@@ -9,12 +9,12 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-import megatron.core.models.gpt.fine_grained_callables as fine_grained_callables
 import megatron.core.parallel_state as parallel_state
 import megatron.core.transformer.moe.moe_utils as moe_utils
 import megatron.core.transformer.moe.router as router_mod
 import megatron.core.transformer.moe.router as router_module
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.models.common import transformer_layer_callables
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -306,9 +306,11 @@ def test_fine_grained_router_receives_runtime_cp(monkeypatch):
         detach=lambda tensor: tensor.detach(),
     )
     monkeypatch.setattr(
-        fine_grained_callables, "off_interface", lambda _enabled, tensor, _name: nullcontext(tensor)
+        transformer_layer_callables,
+        "off_interface",
+        lambda _enabled, tensor, _name: nullcontext(tensor),
     )
-    forward_funcs, _ = fine_grained_callables.build_transformer_layer_callables(layer)
+    forward_funcs, _ = transformer_layer_callables.build_transformer_layer_callables(layer)
     forward_funcs[0](node, hidden)
     mlp.route.assert_called_once_with(hidden, padding_mask, packed_seq_params=packed)
 

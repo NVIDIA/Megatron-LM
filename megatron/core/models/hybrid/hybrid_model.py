@@ -647,8 +647,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 "overlap_moe_expert_parallel_comm with HybridModel does not support "
                 "enable_mhc_connections or moe_shortcut_connection."
             )
-        # The common schedule plan replays layer segments for full recompute (#6429), but that
-        # replay has only been validated for GPTModel layers, not Mamba or grouped layers.
+        # Segment replay still needs validation for Mamba and grouped layers.
         if self.config.recompute_granularity == "full":
             raise ValueError(
                 "overlap_moe_expert_parallel_comm with HybridModel does not support "
@@ -772,12 +771,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
     ):
         """Preprocess inputs for HybridStack or combined-1F1B scheduling.
 
-        Mirrors ``GPTModel._preprocess`` so the eager forward and the
-        EP-overlap ``PreProcessNode`` see the same embedding / rotary /
-        padding-mask code. Returns the canonical 6-tuple ``(decoder_input,
-        rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset,
-        padding_mask)`` -- slots HybridModel does not compute (rotary cos/sin)
-        come back as ``None``.
+        Return the fields consumed by eager forward and the shared schedule's
+        ``PreProcessNode``: decoder input, rotary embeddings, rotary cosine and
+        sine, sequence length offset, and padding mask.
         """
         in_inference_mode = InferenceMode.is_active()
 
@@ -909,18 +905,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
     ):
         """Postprocess HybridStack hidden states into logits or language-model loss.
 
-        Mirrors ``GPTModel._postprocess`` so the eager forward and the EP-overlap
-        ``PostProcessNode`` produce the same logits / loss / MTP outputs.
-        ``mtp_in_postprocess`` lets the EP-overlap path skip the inline MTP block
-        (it schedules MTP as separate layer nodes and hands over the concatenated
-        main / MTP hidden states); the eager forward leaves it ``True`` so the regular
-        MTP forward runs here. ``compute_mtp_loss`` disables the MTP auxiliary
-        objective (see ``forward``); ``cp_batch`` / ``mhc_multistream`` feed the MTP
-        block's CP-layout preparation on the eager path.
-        ``output_processor`` replaces the default logits / loss computation with a
-        caller-supplied hook (used by RL and other custom output paths); it is
-        forwarded by ``PostProcessNode`` and handled here exactly as in
-        ``GPTModel._postprocess``.
+        Eager forward runs MTP here when ``mtp_in_postprocess`` is enabled.
+        ``compute_mtp_loss`` controls the MTP auxiliary objective. The MTP block
+        uses ``cp_batch`` and ``mhc_multistream`` to prepare its inputs.
+        Eager forward and the schedule's ``PostProcessNode`` can supply an
+        ``output_processor`` to override the default logits or loss computation.
         """
         in_inference_mode = InferenceMode.is_active()
         if in_inference_mode:
@@ -1017,7 +1006,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 # In training/eval, fold the MTP loss into hidden_states. When the MTP block
                 # ran inline above, use its CP-layout-prepared inputs; on the EP-overlap path
                 # the MTP layer nodes already produced the concatenated hidden states and the
-                # raw inputs apply (mirrors ``GPTModel._postprocess``).
+                # raw inputs apply.
                 # For RL (labels is None), process_mtp_loss derives labels from
                 # input_ids to match the SFT label format.
                 if mtp_inputs is not None:
@@ -1170,12 +1159,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
     ):
-        """Build the HybridModel combined-1F1B schedule plan.
-
-        Mirrors ``GPTModel.build_schedule_plan``; ``mtp_input_mask``, ``output_processor``
-        and ``output_processor_context`` are stored on the chunk state so the schedule
-        plan's MTP layer nodes and ``PostProcessNode`` apply them.
-        """
+        """Build a combined-1F1B plan with one schedule entry per logical decoder layer."""
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
         if self.config.moe_paged_stash:
@@ -1207,8 +1191,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
         output_layer_extra_state_key = f'{prefix}output_layer._extra_state'
 
-        # Like GPTModel, publish only the output layer weight: drop its TE extra state,
-        # which is expected to be empty.
+        # Only the output layer weight is checkpointed. Its TE extra state must be empty.
         output_extra_state = sharded_state_dict.pop(output_layer_extra_state_key, None)
         assert not (
             output_extra_state and output_extra_state.data
@@ -1273,10 +1256,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         mtp_decoder_input = decoder_input
 
-        # Mirror GPTModel.forward: delegate the embedding / rotary computation and
-        # the output-layer / MTP / loss computation to the same hooks the
-        # EP-overlap PreProcessNode / PostProcessNode call. Keeps the eager and
-        # combined-1F1B paths on the same code.
         (
             decoder_input,
             rotary_pos_emb,
