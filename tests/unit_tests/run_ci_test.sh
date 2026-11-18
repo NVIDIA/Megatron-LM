@@ -3,7 +3,7 @@ set -euxo pipefail
 
 # Parse command line arguments
 usage() {
-    echo "Usage: $0 --tag {latest|legacy} --environment {lts|dev} --bucket BUCKET [--platform {h100|gb200}] [--unit-test-repeat N] [--unit-test-timeout N] --log-dir LOG_DIR"
+    echo "Usage: $0 --tag {latest|legacy} --environment {lts|dev} --bucket BUCKET [--platform {h100|gb200}] [--unit-test-repeat N] [--unit-test-timeout N] [--large] --log-dir LOG_DIR"
     exit 1
 }
 
@@ -16,6 +16,7 @@ UNIT_TEST_REPEAT=1
 UNIT_TEST_TIMEOUT=10
 LOG_DIR=$(pwd)/logs
 PLATFORM=h100
+LARGE=false
 UNIT_TESTMON_MODE=${UNIT_TESTMON_MODE:-full}
 UNIT_TESTMON_CACHE_DIR=${UNIT_TESTMON_CACHE_DIR:-assets_dir/testmon}
 
@@ -53,6 +54,10 @@ while [[ $# -gt 0 ]]; do
         LOG_DIR="$2"
         shift 2
         ;;
+    --large)
+        LARGE=true
+        shift
+        ;;
     *)
         echo "Unknown option: $1"
         usage
@@ -84,6 +89,10 @@ if [[ "$UNIT_TESTMON_MODE" != "full" && "$UNIT_TESTMON_MODE" != "enforce" && "$U
 fi
 if [[ "$UNIT_TESTMON_MODE" != "full" && ( "$TAG" != "latest" || "$ENVIRONMENT" != "dev" ) ]]; then
     echo "Testmon is only enabled for the latest dev suite; running the full bucket."
+    UNIT_TESTMON_MODE=full
+fi
+if [[ "$LARGE" == "true" && "$UNIT_TESTMON_MODE" != "full" ]]; then
+    echo "Large unit tests run every case; running the full bucket."
     UNIT_TESTMON_MODE=full
 fi
 
@@ -157,8 +166,17 @@ if (( ${#UNIT_PROFILES[@]} )); then
 fi
 
 MARKER=()
+if [[ "$LARGE" == "true" ]]; then
+    # Tests marked large need several GiB of device memory each. Only --large
+    # runs them, and every other launch deselects them below.
+    MARKER+=("large" "not experimental")
+fi
 if [[ "$PLATFORM" == "gb200" ]]; then
     MARKER+=("launch_on_gb200")
+elif [[ "$LARGE" == "true" ]]; then
+    # A large test that needs GB200 memory carries launch_on_gb200; here it
+    # could only skip.
+    MARKER+=("not launch_on_gb200")
 fi
 
 if [[ "$TAG" == "legacy" ]]; then
@@ -171,6 +189,10 @@ fi
 
 if [[ "$ENVIRONMENT" == "dev" ]]; then
     MARKER+=("not flaky_in_dev")
+fi
+
+if [[ "$LARGE" != "true" ]]; then
+    MARKER+=("not large")
 fi
 
 MARKER_ARG=$(printf "%s" "${MARKER[0]}")
@@ -287,6 +309,84 @@ for profile in profiles:
                 f"{profile}: rank {rank} has skipped or failed tests in {launch.name}"
             )
 PY
+}
+
+# Ranks of a large test file's cases; every other file's cases run on one GPU.
+large_test_ranks() {
+    case "$1" in
+    tests/unit_tests/inference/test_variable_collectives.py) echo 2 ;; # cross-rank collectives
+    *) echo 1 ;;
+    esac
+}
+
+# --large: run each case marked large under the bucket in its own torchrun, so
+# that one case's allocation or sticky CUDA error cannot reach the next.
+run_large_tests() {
+    local target file case_id rc i iteration
+    local -a files cases failed=()
+    # validate_profile_results reads these: each case is a profile of its own.
+    local -a UNIT_PROFILES
+    local GPUS_PER_NODE UNIT_RESULTS_MODE=full
+    target=$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')
+    # Search the whole bucket: IGNORE_ARGS skips the child buckets of
+    # unit-tests.yaml, which never runs large tests.
+    mapfile -t files < <(grep -rlE --include='test_*.py' 'mark\.large\b' "$target" | LC_ALL=C sort)
+    if (( ${#files[@]} == 0 )); then
+        echo "No test file under $target is marked large." >&2
+        return 1
+    fi
+    rc=0
+    uv run --no-sync python -m pytest --collect-only -q -p no:cacheprovider -m "$MARKER_ARG" \
+        "${files[@]}" > "$LOG_DIR/collected.txt" || rc=$?
+    # Exit 5 means nothing matched; the check below names the files.
+    if (( rc != 0 && rc != 5 )); then
+        cat "$LOG_DIR/collected.txt"
+        return "$rc"
+    fi
+    for file in "${files[@]}"; do
+        if ! grep -qF -- "$file::" "$LOG_DIR/collected.txt"; then
+            echo "$file is marked large, but none of its cases matches -m '$MARKER_ARG'." >&2
+            return 1
+        fi
+    done
+    mapfile -t cases < <(grep -E '^tests/.+::' "$LOG_DIR/collected.txt")
+
+    UNIT_RESULTS_DIR="$(cd "$LOG_DIR" && pwd)/unit-results"
+    rm -rf -- "$UNIT_RESULTS_DIR"
+    mkdir -p "$UNIT_RESULTS_DIR"
+    echo "Running ${#cases[@]} large cases from ${#files[@]} files, one process each."
+    for i in "${!cases[@]}"; do
+        case_id=${cases[$i]}
+        UNIT_PROFILES=("$i")
+        GPUS_PER_NODE=$(large_test_ranks "${case_id%%::*}")
+        echo "Large case $i on $GPUS_PER_NODE rank(s): $case_id"
+        rc=0
+        for iteration in $(seq "$UNIT_TEST_REPEAT"); do
+            export UNIT_TEST_JUNIT_DIR="$UNIT_RESULTS_DIR/$i/prod-$iteration"
+            mkdir -p "$UNIT_TEST_JUNIT_DIR"
+            # RANK expands inside each worker. A hung case must not use up the job.
+            # shellcheck disable=SC2016
+            timeout --kill-after=60 900 uv run --no-sync python -m torch.distributed.run \
+                --standalone --nnodes=1 --nproc-per-node="$GPUS_PER_NODE" --max-restarts=0 \
+                --log-dir "$LOG_DIR/$i" --redirects=3 --tee=3 --no-python bash -c \
+                'exec uv run --no-sync python -m pytest -vs "$@" --junitxml="$UNIT_TEST_JUNIT_DIR/rank-$RANK.xml"' \
+                bash -m "$MARKER_ARG" "$case_id" || rc=$?
+            (( rc == 0 )) || break
+        done
+        # The FP8 and disaggregation buckets' check: each rank's report holds a
+        # test, and none was skipped or failed.
+        if (( rc != 0 )); then
+            failed+=("$case_id (exit $rc)")
+        elif ! validate_profile_results; then
+            failed+=("$case_id (a rank ran no test, or one skipped)")
+        fi
+    done
+
+    echo "${#cases[@]} large cases ran; ${#failed[@]} failed."
+    if (( ${#failed[@]} )); then
+        printf 'FAILED %s\n' "${failed[@]}"
+        return 1
+    fi
 }
 
 # Keep this path identical to exhaustive CI. The installed Testmon plugin is
@@ -505,6 +605,11 @@ data.write()
     coverage combine -q
     write_testmon_summary "selective tests passed" "$((prod_count + experimental_count))" "$mandatory_count"
 }
+
+if [[ "$LARGE" == "true" ]]; then
+    run_large_tests
+    exit
+fi
 
 case "$UNIT_TESTMON_MODE" in
 full)
