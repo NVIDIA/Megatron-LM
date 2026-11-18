@@ -10,7 +10,7 @@ from weakref import WeakKeyDictionary, proxy
 import torch
 
 from megatron.core.transformer.enums import CudaGraphModule
-from megatron.core.utils import get_attr_wrapped_model
+from megatron.core.utils import expand_hybrid_layer_groups, get_attr_wrapped_model
 
 
 class _TECudaGraphBackwardDWWrapperMixin:
@@ -424,22 +424,6 @@ class TECudaGraphMixin:
         return self.training and (is_graph_capturing() or self.te_cuda_graphs)
 
 
-def iter_te_cuda_graph_decoder_layers(decoder):
-    """Yield decoder layers in capture order, expanding bracketed hybrid groups."""
-    try:
-        from megatron.core.models.hybrid.hybrid_block import HybridStack
-    except ImportError:
-        # Hybrid dependencies are optional for other decoder types.
-        yield from decoder.layers
-        return
-
-    for layer in decoder.layers:
-        if isinstance(layer, HybridStack):
-            yield from layer.layers
-        else:
-            yield layer
-
-
 # ---------------------------------------------------------------------------
 # set_te_cuda_graph_current_microbatch: sets per-layer microbatch index for TE graph replay
 # ---------------------------------------------------------------------------
@@ -464,7 +448,7 @@ def set_te_cuda_graph_current_microbatch(model, microbatch_id):
     except RuntimeError:
         decoder_exists = False
     if decoder_exists and model_with_decoder is not None:
-        for layer in iter_te_cuda_graph_decoder_layers(model_with_decoder.decoder):
+        for layer in expand_hybrid_layer_groups(model_with_decoder.decoder.layers):
             if layer.config.cuda_graph_impl == "transformer_engine":
                 layer.te_cuda_graph_current_microbatch = microbatch_id
         if hasattr(model_with_decoder, 'mtp'):

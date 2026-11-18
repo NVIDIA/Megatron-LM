@@ -18,7 +18,7 @@ from megatron.core.transformer.moe.ops.paged_stash import (
     paged_stash_pop_kernel,
 )
 from megatron.core.transformer.moe.token_dispatcher import nccl_ep_release_context
-from megatron.core.utils import get_attr_wrapped_model
+from megatron.core.utils import expand_hybrid_layer_groups, get_attr_wrapped_model
 
 logger = logging.getLogger(__name__)
 
@@ -1078,7 +1078,6 @@ class PagedStashRunner:
 
         # Local import avoids circular import: schedules -> paged_stash -> multi_token_prediction
         # -> megatron.core (still loading).
-        from megatron.core.transformer.cuda_graphs import _graphable_leaves
         from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
 
         def _moe_mlps_in(layer):
@@ -1087,7 +1086,7 @@ class PagedStashRunner:
             # finds zero MoE layers and the paged stash silently skips the whole model.
             if isinstance(layer, MultiTokenPredictionLayer):
                 layer = layer.mtp_model_layer
-            for leaf in _graphable_leaves(layer):
+            for leaf in expand_hybrid_layer_groups((layer,)):
                 mlp = getattr(leaf, 'mlp', None)
                 if (
                     mlp is not None

@@ -23,10 +23,7 @@ import torch
 from torch.utils._pytree import tree_flatten as tree_flatten_pyt
 from torch.utils._pytree import tree_map as tree_map_pyt
 
-from megatron.core.extensions.te_cuda_graphs import (
-    TECudaGraphMixin,
-    iter_te_cuda_graph_decoder_layers,
-)
+from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -48,6 +45,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     ensure_params_ready,
+    expand_hybrid_layer_groups,
     get_attr_wrapped_model,
     get_torch_version,
     is_te_min_version,
@@ -2391,7 +2389,7 @@ class TECudaGraphHelper:
             else:
                 # A bracketed HybridStack group is one entry of decoder.layers; capture the
                 # physical layers inside it, in execution order.
-                decoder_layers = list(iter_te_cuda_graph_decoder_layers(chunk_with_decoder.decoder))
+                decoder_layers = list(expand_hybrid_layer_groups(chunk_with_decoder.decoder.layers))
                 num_decoder_layers = len(decoder_layers)
                 if hasattr(chunk_with_decoder, 'mtp'):
                     num_mtp_layers = len(chunk_with_decoder.mtp.layers)
@@ -2532,7 +2530,7 @@ class TECudaGraphHelper:
             """
             assert any(
                 layer is leaf
-                for leaf in iter_te_cuda_graph_decoder_layers(chunk_of_the_layer.decoder)
+                for leaf in expand_hybrid_layer_groups(chunk_of_the_layer.decoder.layers)
             ) or any(
                 layer is mtp_layer.mtp_model_layer for mtp_layer in chunk_of_the_layer.mtp.layers
             ), "Layer is not in the chunk"
