@@ -53,8 +53,10 @@ def test_length_probe_preserves_iteration_and_skips_restore(
     assert training._get_train_full_dataset_sample_count(args, provider) == 84
     assert vars(args) == before
     provider.assert_called_once_with(None, restore_dataloader_state=False)
-    reduce_sum.assert_called_once_with(42 if owns_data else None, with_context_parallel=True)
-    reduce_max.assert_called_once_with(84 if owns_data else None)
+    reduce_sum.assert_called_once_with(
+        42 if owns_data else None, with_context_parallel=True, pg_collection=None
+    )
+    reduce_max.assert_called_once_with(84 if owns_data else None, group=None)
 
 
 @pytest.mark.parametrize("field", ["train_iters", "train_samples"])

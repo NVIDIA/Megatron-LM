@@ -1,12 +1,14 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 import inspect
+import logging
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 import torch
 from packaging.version import Version
 
-from megatron.core import dist_checkpointing, parallel_state
+from megatron.core import _rank_utils, dist_checkpointing, parallel_state
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -21,7 +23,8 @@ from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
     mcore_gpt_load_te_state_dict_pre_hook,
 )
 from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_stack_modelopt_spec
-from megatron.core.post_training.modelopt.layers import Linear, Norm
+from megatron.core.post_training.modelopt.layers import Linear, Norm, RealQuantTransformerLayer
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -95,6 +98,7 @@ class TestModelOptGPTModel:
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
             vocab_size=100,
             max_sequence_length=4,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         # Ensure that a GPTModel can be built with the modelopt spec.
         self.modelopt_model = GPTModel(
@@ -104,6 +108,7 @@ class TestModelOptGPTModel:
             ),
             vocab_size=100,
             max_sequence_length=4,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def test_sharded_state_dict_restore(self, tmp_path_dist_ckpt):
@@ -159,6 +164,7 @@ class TestModelOptMLAMoE(TestModelOptGPTModel):
             transformer_layer_spec=default_spec,
             vocab_size=100,
             max_sequence_length=8,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         modelopt_spec = get_gpt_modelopt_spec(transformer_config, remap_te_layernorm=True)
         # Ensure that a GPTModel can be built with the modelopt spec.
@@ -167,6 +173,7 @@ class TestModelOptMLAMoE(TestModelOptGPTModel):
             transformer_layer_spec=modelopt_spec,
             vocab_size=100,
             max_sequence_length=8,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
 
@@ -201,6 +208,7 @@ class TestModelOptLlama4MoE(TestModelOptGPTModel):
             transformer_layer_spec=default_spec,
             vocab_size=100,
             max_sequence_length=8,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         modelopt_spec = get_gpt_modelopt_spec(
             transformer_config, remap_te_layernorm=True, qk_l2_norm=True
@@ -211,6 +219,7 @@ class TestModelOptLlama4MoE(TestModelOptGPTModel):
             transformer_layer_spec=modelopt_spec,
             vocab_size=100,
             max_sequence_length=8,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
 
@@ -230,6 +239,7 @@ class TestModelOptHybridModel(TestModelOptGPTModel):
             vocab_size=100,
             max_sequence_length=4,
             hybrid_layer_pattern="M*-",
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         # A Hybrid HybridModel using ModelOpt spec (local + TENorm).
@@ -239,6 +249,7 @@ class TestModelOptHybridModel(TestModelOptGPTModel):
             vocab_size=100,
             max_sequence_length=4,
             hybrid_layer_pattern="M*-",
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def test_mhc_mtp_construction(self):
@@ -260,6 +271,7 @@ class TestModelOptHybridModel(TestModelOptGPTModel):
             vocab_size=64,
             max_sequence_length=8,
             hybrid_layer_pattern="-/-",
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         mtp_layer = model.mtp.layers[0]
@@ -283,6 +295,8 @@ def test_get_gpt_modelopt_spec_interface():
         "real_quant_cfg": inspect.Parameter.POSITIONAL_OR_KEYWORD,
         "qk_l2_norm": inspect.Parameter.POSITIONAL_OR_KEYWORD,
         "use_arbitrary_attention_mask": inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        "vp_stage": inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        "pp_rank": inspect.Parameter.POSITIONAL_OR_KEYWORD,
     }
 
     expected_defaults = {
@@ -291,6 +305,8 @@ def test_get_gpt_modelopt_spec_interface():
         "real_quant_cfg": "None",
         "qk_l2_norm": False,
         "use_arbitrary_attention_mask": False,
+        "vp_stage": None,
+        "pp_rank": None,
     }
 
     # Check expected parameters are in function signature
@@ -414,3 +430,44 @@ def test_modelopt_linear_accepts_duplicated_parallel_mode():
 
     with pytest.raises(ValueError, match="only supports parallel_mode"):
         Linear(4, 4, config=config, init_method=config.init_method, parallel_mode="column")
+
+
+def test_real_quant_report_logs_without_collectives(monkeypatch, caplog):
+    """RealQuant's verbose report logs on the default log ranks and issues no collective.
+
+    The report runs once per layer while the model is built. Pipeline stages build
+    different numbers of layers, and a model's grid need not span every rank, so a WORLD
+    barrier there pairs across stages or hangs.
+    """
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("the real-quant report must not issue a collective")
+
+    for name in ("barrier", "monitored_barrier", "all_reduce", "all_gather", "broadcast"):
+        monkeypatch.setattr(torch.distributed, name, _fail)
+
+    layer = SimpleNamespace(
+        state_dict=lambda: {
+            "mlp.linear_fc1.weight": torch.zeros(8, 4, dtype=torch.uint8),
+            "mlp.linear_fc1._extra_state": None,
+        },
+        _original_tensor_info={"mlp.linear_fc1.weight": ("torch.bfloat16", "torch.Size([8, 4])")},
+    )
+    logger_name = RealQuantTransformerLayer.__module__
+    rank = _rank_utils.safe_get_rank()
+
+    # This rank is a log rank: one line per tensor, with the original and quantized dtype.
+    monkeypatch.setattr(_rank_utils, "_DEFAULT_LOG_RANKS", (rank,))
+    with caplog.at_level(logging.INFO, logger=logger_name):
+        RealQuantTransformerLayer._report_quantize_tensor_info(layer)
+    messages = [r.getMessage() for r in caplog.records if r.name == logger_name]
+    assert len(messages) == 1
+    assert "mlp.linear_fc1.weight" in messages[0]
+    assert "torch.bfloat16" in messages[0] and "torch.uint8" in messages[0]
+
+    # Any other rank stays silent.
+    caplog.clear()
+    monkeypatch.setattr(_rank_utils, "_DEFAULT_LOG_RANKS", (rank + 1,))
+    with caplog.at_level(logging.INFO, logger=logger_name):
+        RealQuantTransformerLayer._report_quantize_tensor_info(layer)
+    assert not [r for r in caplog.records if r.name == logger_name]
