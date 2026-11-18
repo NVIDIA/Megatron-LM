@@ -11,13 +11,18 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.optimizer import (
     Adam,
     OptimizerConfig,
     _get_param_groups,
     get_standard_config_overrides,
 )
-from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32, get_grad_norm_fp32
+from megatron.core.optimizer.clip_grads import (
+    clip_grad_by_total_norm_fp32,
+    count_zeros_fp32,
+    get_grad_norm_fp32,
+)
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.training.tensor_metrics.definitions import L2NormMetric, _fused_l2_norm_impl
@@ -101,6 +106,38 @@ class TestGradNormAndClip:
                 continue
             for j, (a, b) in enumerate(zip(ref, got)):
                 assert bytes_equal(a, b), f"clipped grad {j} differs on replay {i}"
+
+    def test_count_zeros_fp32_replays_in_cuda_graph(self, monkeypatch):
+        """Under --optimizer-cuda-graph the zero count stays on the device and every replay
+        refreshes it. It is an exact integer reduction, so each replay must report the eager
+        count, with and without side-stream contention."""
+        seeded()
+        params = []
+        for g in _grads(num=64):
+            g[torch.rand_like(g) < 0.25] = 0.0
+            p = torch.nn.Parameter(torch.zeros_like(g))
+            p.grad = g
+            params.append(p)
+        group = parallel_state.get_model_parallel_group()
+        eager = count_zeros_fp32(params, grad_stats_parallel_group=group)
+        assert not isinstance(eager, torch.Tensor) and eager > 0
+
+        # On one rank the reduction is the identity. Capturing a collective needs a
+        # communicator set up for it, which this test is not about.
+        monkeypatch.setattr(torch.distributed, "all_reduce", lambda tensor, **_: None)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = count_zeros_fp32(params, grad_stats_parallel_group=group)
+        assert isinstance(captured, torch.Tensor) and captured.is_cuda
+
+        for i in range(8):
+            if i == 0:
+                graph.replay()
+            else:
+                with RacingStreams():
+                    graph.replay()
+            torch.cuda.synchronize()
+            assert captured.item() == eager, f"zero count differs on replay {i}"
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
