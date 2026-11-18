@@ -1,0 +1,61 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Determine PR CI scope
+on:
+  workflow_call:
+    outputs:
+      skip_builds_and_tests:
+        description: Whether all files changed by this PR match the configured skip paths
+        value: ${{ jobs.changes.outputs.skip_builds_and_tests }}
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      skip_builds_and_tests: ${{ steps.diff.outputs.skip_builds_and_tests || 'false' }}
+    steps:
+      # Keep the job successful with its default output on all other events so
+      # workflows depending on it continue through their normal job graph.
+      - name: Resolve the PR diff base
+        id: base
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/pull-request/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^pull-request/([0-9]+)$ ]] || exit 0
+          # Compare the full PR even when the last push touches only a subset.
+          pr_base=$(gh api "repos/$GITHUB_REPOSITORY/pulls/${BASH_REMATCH[1]}" \
+            --jq 'select(.head.sha == env.GITHUB_SHA) | .base.sha') || exit 0
+          [[ "$pr_base" =~ ^[0-9a-f]{40}$ ]] || exit 0
+          base=$(gh api "repos/$GITHUB_REPOSITORY/compare/$pr_base...$GITHUB_SHA?per_page=1" \
+            --jq '.merge_base_commit.sha') || exit 0
+          if [[ "$base" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "sha=$base" >> "$GITHUB_OUTPUT"
+            echo "target_sha=$pr_base" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        id: checkout
+        if: steps.base.outputs.sha != ''
+        continue-on-error: true
+        with:
+          sparse-checkout: .github/scripts
+
+      - name: Compare the complete trees
+        id: diff
+        if: steps.checkout.outcome == 'success'
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+          TARGET_SHA: ${{ steps.base.outputs.target_sha }}
+        run: |
+          if git fetch --no-tags --depth=1 --filter=blob:none origin "$BASE_SHA" "$TARGET_SHA"; then
+            skip_builds_and_tests=$(bash .github/scripts/pr_ci_skip_paths.sh "$BASE_SHA" "$GITHUB_SHA" "$TARGET_SHA")
+            echo "skip_builds_and_tests=$skip_builds_and_tests" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Diff base unavailable. Running normal CI."
+          fi
