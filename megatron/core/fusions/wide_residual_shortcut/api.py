@@ -15,9 +15,10 @@ from torch.multiprocessing.reductions import StorageWeakRef
 
 from .residual_replay import ReplayInterval, graph_retained
 
-# MXFP8 handoff: a seam writes a reader as rowwise MXFP8 for its consumer Linears' forward GEMMs
-# ("mxfp8"), or as a (BF16, MXFP8) pair when other modules need BF16 ("both"); callers hand each
-# consumer its tensor. The consumers' weight-gradient GEMMs share one columnwise operand replayed
+# MXFP8 handoff: a seam writes a reader as rowwise MXFP8 for its consumer Linears' forward GEMMs,
+# as BF16 for other modules, or both. A reader with two consumers returns one output per
+# consumer, in its format, so each consumer's gradient reaches the backward kernel separately
+# (summed there). The consumers' weight-gradient GEMMs share one columnwise operand replayed
 # from the seam (wide_residual.mxfp8_consumer swaps it into TE's saved slots at unpack).
 _READERS = WeakValueDictionary()
 
@@ -97,7 +98,8 @@ class _Boundary(torch.autograd.Function):
     @staticmethod
     def forward(ctx, options, residual, *values):
         """Run the seam; ``ctx`` None is an inference call without autograd state."""
-        streams, replay, formats, consumers, epsilon, update_count = options
+        streams, replay, uses, consumers, epsilon, update_count = options
+        formats = tuple(_kernel_format(use) for use in uses)
         from .forward_kernel import forward
 
         # values: updates, write, retain, then one read and one gamma per reader.
@@ -131,9 +133,17 @@ class _Boundary(torch.autograd.Function):
             )
             for q in outputs
         )
-        # A "both" reader is two autograd outputs, (BF16, MXFP8), with one summed gradient.
+        # One autograd output per consumer: its format's tensor, or a detached alias of it for a
+        # second consumer of the same format (each consumer's gradient arrives separately).
         quantized = tuple(q[0] if isinstance(q, tuple) else q for q in outputs)
-        flat = tuple(t for q in outputs for t in ((q[1], q[0]) if isinstance(q, tuple) else (q,)))
+        plain = tuple(q[1] if isinstance(q, tuple) else q for q in outputs)
+        flat = []
+        for use, mx, bf16 in zip(uses, quantized, plain):
+            handed = set()
+            for fmt in use:
+                tensor = mx if fmt == "mxfp8" else bf16
+                flat.append(tensor.detach() if fmt in handed else tensor)
+                handed.add(fmt)
         result = (current.view(*leading, streams * hidden), *flat)
         if ctx is None:
             return result
@@ -143,7 +153,7 @@ class _Boundary(torch.autograd.Function):
         ctx.replay = replay.record(residual, current, saved, prepare_columns=mxfp8)
         ctx.save_for_backward(saved.update, saved.coefficients, *saved.gammas, *saved.rstd)
         ctx.spec = replace(saved, update=None, coefficients=None, gammas=(), rstd=())
-        ctx.leading, ctx.formats = leading, formats
+        ctx.leading, ctx.uses = leading, uses
         for reader, (needs, operand) in enumerate(zip(mxfp8, quantized)):
             if needs:  # the consumers' weight-gradient GEMMs unpack replayed columns
                 Reader(operand, partial(ctx.replay.columns, reader), consumers[reader])
@@ -156,12 +166,12 @@ class _Boundary(torch.autograd.Function):
         """Fused seam backward; the replay interval supplies the predecessor."""
         from .backward_kernel import backward
 
-        # One gradient per reader: a "both" reader's BF16 and MXFP8 outputs are one value.
+        # Per reader, its consumers' gradients: one, or a pair the kernel sums.
         dys, position = [], 0
-        for fmt in ctx.formats:
-            grads = [g for g in flat[position : position + 1 + (fmt == "both")] if g is not None]
-            position += 1 + (fmt == "both")
-            dys.append(grads[0] if len(grads) == 1 else (grads[0] + grads[1]) if grads else None)
+        for use in ctx.uses:
+            grads = [g for g in flat[position : position + len(use)] if g is not None]
+            position += len(use)
+            dys.append(tuple(grads) if len(grads) == 2 else grads[0] if grads else None)
 
         streams, update_count, leading = ctx.spec.num_streams, ctx.spec.update_count, ctx.leading
         update, coefficients, *readers = ctx.saved_tensors
@@ -181,7 +191,11 @@ class _Boundary(torch.autograd.Function):
         )
         hidden = update.shape[1]
         previous = previous.view(-1, streams * hidden)
-        dy = tuple(None if t is None else t.contiguous().view(-1, hidden) for t in dys)
+        flat2d = lambda t: t.contiguous().view(-1, hidden)
+        dy = tuple(
+            None if t is None else tuple(map(flat2d, t)) if isinstance(t, tuple) else flat2d(t)
+            for t in dys
+        )
         dc = None if carry is None else carry.contiguous().view_as(previous)
         grads, _ = backward(saved, previous, dy, dc)
         if replay.index == 0:
@@ -229,15 +243,18 @@ def _apply_boundary(
     interval), which keeps or replays its input residual and its MXFP8 readers' columns."""
     updates = (p.routed,) if p.shared is None else (p.routed, p.shared)
     inputs = (p.residual, *updates, p.write, p.retain, *reads, *gammas)
-    formats = ("bf16",) * len(reads) if outputs is None else tuple(outputs)
+    uses = tuple(
+        _consumer_formats(fmt) for fmt in (("bf16",) * len(reads) if outputs is None else outputs)
+    )
+    formats = tuple(_kernel_format(use) for use in uses)
     consumers = (
         ((),) * len(reads) if mxfp8_consumers is None else tuple(map(tuple, mxfp8_consumers))
     )
     if not len(formats) == len(consumers) == len(reads):
         raise ValueError("a seam takes one output format and consumer set per reader")
     if not torch.is_grad_enabled():
-        options = (num_streams, None, formats, consumers, epsilon, len(updates))
-        return _regroup(formats, _Boundary.forward(None, options, *inputs))
+        options = (num_streams, None, uses, consumers, epsilon, len(updates))
+        return _regroup(uses, _Boundary.forward(None, options, *inputs))
     if any((fmt == "bf16") != (not linears) for fmt, linears in zip(formats, consumers)):
         raise ValueError(
             "in training an MXFP8 seam reader (and only one) requires its consumer Linears"
@@ -250,22 +267,41 @@ def _apply_boundary(
         )
     # Without checkpoint replay, the seam is a one-write interval keeping its input residual.
     replay = ReplayInterval() if replay is None else replay
-    options = (num_streams, replay, formats, consumers, epsilon, len(updates))
-    result = _regroup(formats, _Boundary.apply(options, *inputs))
-    for fmt, output in zip(formats, result[1:]):
-        if fmt != "bf16":
-            # TE caches requires_grad when it creates the quantized reader, before autograd
-            # attaches this seam: refresh it, or the consumer would skip its input gradient.
-            (output[1] if fmt == "both" else output).requires_grad_(True)
-    return result
+    options = (num_streams, replay, uses, consumers, epsilon, len(updates))
+    flat = _Boundary.apply(options, *inputs)
+    position = 1
+    for use in uses:
+        for fmt in use:
+            if fmt == "mxfp8":
+                # TE caches requires_grad when it creates the quantized reader, before autograd
+                # attaches this seam: refresh it, or the consumer would skip its input gradient.
+                flat[position].requires_grad_(True)
+            position += 1
+    return _regroup(uses, flat)
 
 
-def _regroup(formats, flat):
-    """``(residual, *readers)``: a "both" reader's two outputs as one (BF16, MXFP8) pair."""
+def _consumer_formats(fmt):
+    """A reader's per-consumer formats: a tuple of one or two, or a single format ("both" is a
+    BF16 consumer and an MXFP8 one)."""
+    use = ("bf16", "mxfp8") if fmt == "both" else (fmt,) if isinstance(fmt, str) else tuple(fmt)
+    if not 1 <= len(use) <= 2 or any(f not in ("bf16", "mxfp8") for f in use):
+        raise ValueError("a seam reader feeds one or two consumers, each BF16 or MXFP8")
+    return use
+
+
+def _kernel_format(use):
+    """The forward kernel's format for a reader's consumers: MXFP8, BF16 or both."""
+    if all(f == "mxfp8" for f in use):
+        return "mxfp8"
+    return "bf16" if all(f == "bf16" for f in use) else "both"
+
+
+def _regroup(uses, flat):
+    """``(residual, *readers)``: a reader with two consumers as a pair, in consumer order."""
     result, position = [flat[0]], 1
-    for fmt in formats:
-        width = 1 + (fmt == "both")
-        result.append(flat[position] if width == 1 else tuple(flat[position : position + 2]))
+    for use in uses:
+        width = len(use)
+        result.append(flat[position] if width == 1 else tuple(flat[position : position + width]))
         position += width
     return tuple(result)
 
@@ -304,8 +340,10 @@ def shortcut_add_wide_residual_write_read_rmsnorm_quant(pending, read, gamma, **
 
     Keyword options: ``num_streams`` (required), ``epsilon`` (RMSNorm, default 1e-5),
     ``outputs``, ``mxfp8_consumers`` and ``replay``. ``outputs`` gives each reader's format
-    (default BF16): "mxfp8" emits it directly from FP32 as rowwise MXFP8, and "both" returns a
-    (BF16, MXFP8) pair of the same values, for the caller to hand each consumer its tensor. In
+    (default BF16): "mxfp8" emits it directly from FP32 as rowwise MXFP8, or a tuple of two
+    consumers' formats (e.g. ("bf16", "mxfp8"), "both" for short) returns one output per consumer
+    in that order, for the caller to hand each its tensor; their gradients are summed by the
+    backward kernel. In
     training an MXFP8 reader's ``mxfp8_consumers`` entry declares the TELinears that take it (each
     once per graph; views of the whole reader are allowed): their backward shares one columnwise
     operand replayed by this write's interval. ``replay`` (a ReplayInterval, training only) is the

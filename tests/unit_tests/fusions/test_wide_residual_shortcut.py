@@ -1418,8 +1418,8 @@ def test_reads_feed_every_declared_linear_from_one_column_take(monkeypatch, form
     """Declared Linears take each MXFP8 read directly (a "both" read is a (BF16, MXFP8) pair: BF16
     modules read its first half); per read the replay emits the columnwise operand once, every
     read in one launch, and every consumer's forward and weight gradient match TE's own
-    quantization of the seam's FP32 values; a "both" read's seam backward receives the sum of its
-    two halves' gradients."""
+    quantization of the seam's FP32 values; a "both" read's seam backward receives its two
+    halves' gradients separately (summed in the kernel)."""
     m, h = 2048, 2048
     raw = mx_inputs(m, h, len(formats))
     _, saved, _ = fwd(raw, outputs=formats)  # the same schedule's tape, for the FP32 oracle
@@ -1489,12 +1489,13 @@ def test_reads_feed_every_declared_linear_from_one_column_take(monkeypatch, form
         for layer, y, expected_y, expected_wg in zip(linears, ys, y_ref, wg_ref):
             assert torch.equal(y, expected_y)
             assert torch.equal(layer.weight.main_grad, expected_wg)
-    # A "both" read's seam backward got exactly the sum of its two halves' gradients.
+    # A "both" read's seam backward got its two halves' gradients as a pair, unsummed.
     (dys,) = seam_dys
     for reader, (plain_grad, quantized_grad) in halves:
         assert plain_grad is not None and quantized_grad is not None
-        expected = (plain_grad + quantized_grad).reshape(m, h)
-        assert torch.equal(dys[reader], expected)
+        first, second = dys[reader]
+        assert torch.equal(first, plain_grad.reshape(m, h))
+        assert torch.equal(second, quantized_grad.reshape(m, h))
     assert raw[0].grad is not None and torch.isfinite(raw[0].grad).all()
     # The last unpack released the shared columns, and once the caller drops the seam's outputs
     # nothing keeps its replay interval alive past backward.
@@ -1502,6 +1503,42 @@ def test_reads_feed_every_declared_linear_from_one_column_take(monkeypatch, form
     del providers, out, results, outputs, extra, halves, plain
     gc.collect()
     assert len(intervals) == 1 and intervals[0]() is None
+
+
+@GPU
+@REQUIRES_FUSED_BACKWARD
+@pytest.mark.parametrize("dtype", [F32, BF16])
+def test_two_consumers_gradients_reach_the_kernel_separately(monkeypatch, dtype):
+    """A reader with two BF16 consumers returns two outputs sharing its storage; their gradients
+    reach the backward kernel as a pair (no add before it), and the seam's gradients match one
+    pre-summed gradient up to that sum's BF16 rounding."""
+    raw = inputs(3, 2, 2048, 2048, residual_dtype=dtype, logit_dtype=dtype, pad=0)
+    seen, backward = [], backward_kernel.backward
+    monkeypatch.setattr(
+        backward_kernel,
+        "backward",
+        lambda saved, previous, dys, *a, **k: seen.append(dys)
+        or backward(saved, previous, dys, *a, **k),
+    )
+    out = run(raw, 3, outputs=("bf16", ("bf16", "bf16")))
+    first, second = out[2]
+    assert first.data_ptr() == second.data_ptr() and first is not second
+    g0, g1 = torch.randn_like(first), torch.randn_like(first)
+    torch.autograd.backward((out[1], first, second), (torch.zeros_like(out[1]), g0, g1))
+    (dys,) = seen
+    assert isinstance(dys[1], tuple) and torch.equal(dys[1][0], g0) and torch.equal(dys[1][1], g1)
+    paired = [t.grad.clone() for t in (raw[0], *raw[1])]
+
+    raw_ref = (
+        raw[0].detach().clone().requires_grad_(),
+        tuple(u.detach().clone().requires_grad_() for u in raw[1]),
+        tuple(c.detach().clone().requires_grad_() for c in raw[2]),
+        tuple(g.detach().clone().requires_grad_() for g in raw[3]),
+    )
+    ref = run(raw_ref, 3)
+    torch.autograd.backward((ref[1], ref[2]), (torch.zeros_like(ref[1]), g0 + g1))
+    for actual, expected in zip(paired, (raw_ref[0].grad, *(u.grad for u in raw_ref[1]))):
+        torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
 
 
 @mxfp8_test
@@ -1591,4 +1628,4 @@ def test_direct_mxfp8_consumer_selection(monkeypatch, eligible):
     only._replay_interval = lambda pending: None
     pending = PendingWideResidualWrites(None, None, None, None, None)
     wide_residual.WriteReadNorm.apply_write(only, pending)
-    assert seen == [((only.format,), (only.mxfp8_linears,))]
+    assert seen == [((only.consumer_formats,), (only.mxfp8_linears,))]

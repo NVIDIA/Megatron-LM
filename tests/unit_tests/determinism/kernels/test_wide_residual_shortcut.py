@@ -184,7 +184,8 @@ INFERENCE = [
     for m, h, n, u in [(32, 3072, 1, 1), (64, 4096, 2, 2), (96, 10240, 2, 1), (1024, 3072, 1, 2)]
     + [(1024, 10240, 2, 2)]
 ]
-# backward: (streams, readers, hidden, rows, retention, grid, routes, updates, BF16 residual).
+# backward: (streams, readers, hidden, rows, retention, grid, routes, updates, BF16 residual[,
+# second gradient for the last reader (its two consumers' gradients summed in the kernel)]).
 # Column routes only prepend _bwd_wr_recompute_mxfp8quant launches (per reader index); explicit
 # grids include idle groups that must skip their bootstrap transfers.
 EXPLICIT_GRIDS = [(32, 1), (96, 1), (128, 64), (288, 4), (4128, 34), (4096, 32)]
@@ -207,6 +208,11 @@ BACKWARD = (
     + [
         (s, SEAMS[i % 4][0], h, m, T, grid, (T, F)[: SEAMS[i % 4][0]], SEAMS[i % 4][1], T)
         for i, (s, h, m, grid) in enumerate(_BF16_BACKWARD)
+    ]
+    # A shortcut read's two consumers (router and dispatcher or latent projection).
+    + [
+        (3, 2, h, 2048, T, "auto", (F, F), u, bf16, T)
+        for h, u, bf16 in [(3072, 2, F), (3072, 1, T), (10240, 2, T), (10240, 1, F)]
     ]
 )
 # fmt: on
@@ -317,13 +323,17 @@ def test_graph_replay_restores_poisoned_outputs(monkeypatch, kind, case):
             )
         assert observed == [True, True]
     elif kind == "backward":
-        streams, readers, hidden, rows, retention, grid, routes, updates, bf16 = case
+        streams, readers, hidden, rows, retention, grid, routes, updates, bf16, *second = case
         dtype = BF16 if bf16 else F32
         raw = inputs(
             streams, readers, hidden, rows, retention=retention, updates=updates,
             residual_dtype=dtype, logit_dtype=dtype,
         )  # fmt: skip
         _, args = backward_args(raw, streams)
+        if second and second[0]:
+            saved, previous, dys, carry = args
+            dys = (*dys[:-1], (dys[-1], torch.randn_like(dys[-1])))
+            args = (saved, previous, dys, carry)
         options = dict(config=grid, save_columns=routes)
         execute = lambda: run_with_scratch(backward_kernel.backward, *args, **options)[1]
         eager = execute()

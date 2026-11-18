@@ -39,6 +39,8 @@ class _BackwardInputs(NamedTuple):
     gammas: tuple
     carry: object
     reader_grads: tuple
+    # Per reader, a second consumer's gradient summed into its dy (None: one consumer).
+    second_grads: tuple
 
 
 class _BackwardOutputs(NamedTuple):
@@ -102,12 +104,13 @@ def backward(
 ):
     """Gradients of one seam from its ``SavedWrite`` and predecessor residual.
 
-    Returns ``(grads, columns)``: the residual gradient, one update gradient per branch update
-    (a shortcut add's share one tensor), the controller gradients (write, retain, one read per
-    reader) and one RMSNorm weight gradient per reader. ``save_columns`` (a bool for reader
-    zero, or one per reader) also returns columnwise MXFP8 reader operands, reusing any given
-    in ``columns``; ``on_columns_ready`` receives them before the fused kernel launches, so
-    dependent weight GEMMs overlap it. ``config`` may set an explicit grid (tests).
+    ``dys`` holds one gradient per reader, or a pair for a reader with two consumers (summed in
+    FP32 in the kernel). Returns ``(grads, columns)``: the residual gradient, one update gradient
+    per branch update (a shortcut add's share one tensor), the controller gradients (write,
+    retain, one read per reader) and one RMSNorm weight gradient per reader. ``save_columns``
+    (a bool for reader zero, or one per reader) also returns columnwise MXFP8 reader operands,
+    reusing any given in ``columns``; ``on_columns_ready`` receives them before the fused kernel
+    launches, so dependent weight GEMMs overlap it. ``config`` may set an explicit grid (tests).
     """
     n, streams, updates = saved.reader_count, saved.num_streams, saved.update_count
     m, h = saved.update.shape
@@ -124,7 +127,16 @@ def backward(
         carry = torch.zeros_like(previous)
     if carry.dtype != previous.dtype:
         raise ValueError("the residual gradient must have the residual's dtype")
-    dys = tuple(torch.zeros_like(saved.update) if dy is None else dy for dy in dys)
+    pairs = tuple(dy if isinstance(dy, tuple) else (dy, None) for dy in dys)
+    if any(len(pair) != 2 or (pair[0] is None and pair[1] is not None) for pair in pairs):
+        raise ValueError("a reader takes one gradient or a pair (first not None)")
+    dys = tuple(torch.zeros_like(saved.update) if dy is None else dy for dy, _ in pairs)
+    seconds = tuple(second for _, second in pairs)
+    for first, second in zip(dys, seconds):
+        if second is not None and (
+            second.shape != first.shape or second.dtype != first.dtype or not second.is_contiguous()
+        ):
+            raise ValueError("a reader's second gradient must match its first, contiguous")
     if not qualified_device(torch.cuda.get_device_properties(previous.device)):
         raise ValueError("shortcut backward requires a qualified GB300")
     nt = triton.cdiv(h, 256)
@@ -175,7 +187,7 @@ def backward(
 
     slice_shape = (16, 128)
     kw = dict(
-        inputs=_BackwardInputs(saved.coefficients, saved.rstd, saved.gammas, carry, dys),
+        inputs=_BackwardInputs(saved.coefficients, saved.rstd, saved.gammas, carry, dys, seconds),
         GEOMETRY=_Geometry(m, h, streams, saved.has_retention),
         CONFIG=_BackwardConfig(*(gl.constexpr(value) for value in knobs)),
         outputs=_BackwardOutputs(grads[0], grads[1], controllers, pp, gp, epochs),
@@ -378,18 +390,21 @@ def _widen_bf16(x):
 
 @g.jit
 def _load_dy(
-    reader_grads, ds, reader: gl.constexpr, part: gl.constexpr, offset, mask, WIDEN: gl.constexpr
+    inputs, ds, reader: gl.constexpr, part: gl.constexpr, offset, mask, WIDEN: gl.constexpr
 ):
-    """A reader's FP32 dy slice from global memory or staged BF16 (WIDEN: by bit shift).
+    """A reader's FP32 dy slice from global memory or staged BF16 (WIDEN: by bit shift), plus
+    a second consumer's gradient (from global memory) when the reader has one.
 
     Both conversions are exact, but they schedule (and so contract) differently.
     """
     if ds is None:
-        dy = gl.load(reader_grads[reader] + offset, mask, 0).to(gl.float32)
+        dy = gl.load(inputs.reader_grads[reader] + offset, mask, 0).to(gl.float32)
     elif WIDEN:
         dy = _widen_bf16(ds.slice(reader * 32 + part * 16, 16).load(_GRADIENT_LAYOUT))
     else:
         dy = ds.slice(reader * 32 + part * 16, 16).load(_GRADIENT_LAYOUT).to(gl.float32)
+    if inputs.second_grads[reader] is not None:
+        dy += gl.load(inputs.second_grads[reader] + offset, mask, 0).to(gl.float32)
     return dy
 
 
@@ -660,9 +675,7 @@ def _backward_body(
             new_projections = ()
             for reader in gl.static_range(NREADERS):
                 z = _fma2(mixes[reader], u, xs[reader]) * rs[reader][:, None]
-                dy = _load_dy(
-                    inputs.reader_grads, ds, reader, part, rr[:, None] * h + cols, mask, False
-                )
+                dy = _load_dy(inputs, ds, reader, part, rr[:, None] * h + cols, mask, False)
                 gamma = gs.slice(reader * 256 + part * 128, 128).load(
                     gl.constexpr(SliceLayout(0, L))
                 )
@@ -774,7 +787,7 @@ def _backward_body(
             dxs = ()
             update_mixes = ()
             for reader in gl.static_range(NREADERS):
-                dy = _load_dy(inputs.reader_grads, ds, reader, part, offset, mask, TWO)
+                dy = _load_dy(inputs, ds, reader, part, offset, mask, TWO)
                 gamma = gs.slice(reader * 256 + part * 128, 128).load(
                     gl.constexpr(SliceLayout(0, L))
                 )[None, :]
