@@ -50,19 +50,28 @@ import math
 from types import SimpleNamespace
 from typing import NamedTuple, Optional
 
-import cutlass
-import cutlass.cute as cute
-import nccl.core as nccl
-import nccl.core.device.cute as nc
 import torch
-from cuda.bindings import driver as cuda
-from cuda.core import Buffer
-from cutlass._mlir.dialects import llvm
-from cutlass.cute.runtime import from_dlpack, make_fake_stream, make_fake_tensor
-from cutlass.cutlass_dsl import dsl_user_op
-from nccl.core.device.cute.runtime import make_fake_dev_comm, make_fake_window
-from nccl.core.interop import torch as nccl_torch
 from packaging.version import Version
+
+try:
+    import cutlass
+    import cutlass.cute as cute
+    import nccl.core as nccl
+    import nccl.core.device.cute as nc
+    from cuda.bindings import driver as cuda
+    from cuda.core import Buffer
+    from cutlass._mlir.dialects import llvm
+    from cutlass.cute.runtime import from_dlpack, make_fake_stream, make_fake_tensor
+    from cutlass.cutlass_dsl import dsl_user_op
+    from nccl.core.device.cute.runtime import make_fake_dev_comm, make_fake_window
+    from nccl.core.interop import torch as nccl_torch
+except ImportError as exc:
+    # The Engram package reaches this module through megatron.core.ops._backends.require, which
+    # names what is missing; this marker handles direct imports in CI.
+    raise ImportError(
+        "UnavailableError: the Engram device transport needs nvidia-cutlass-dsl, nccl4py and "
+        f"cuda-python ({exc})"
+    ) from exc
 
 from megatron.core.ops._backends import installed_version
 

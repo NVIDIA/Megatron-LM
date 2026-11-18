@@ -15,9 +15,17 @@ This module imports Triton at module import. The Engram package reaches it only 
 """
 
 import torch
-import triton
-import triton.language as tl
 from torch import Tensor
+
+try:
+    import triton
+    import triton.language as tl
+except ImportError as exc:
+    # The Engram package reaches this module through megatron.core.ops._backends.require, which
+    # names what is missing; this marker handles direct imports in CI.
+    raise ImportError(
+        f"UnavailableError: the Engram row accumulation needs Triton ({exc})"
+    ) from exc
 
 
 @triton.jit
