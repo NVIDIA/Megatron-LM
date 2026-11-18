@@ -148,12 +148,16 @@ class MambaInferenceStateConfig:
 
 
 def layer_types_from_model(model: MegatronModule) -> Optional[List[str]]:
-    """Layer types of this pipeline stage's main decoder, or None for a non-hybrid model.
+    """Layer types of this pipeline stage's main decoder, or None for a non-hybrid model or a
+    model without a `decoder`.
 
     Lets `DynamicInferenceContext` give KV-cache planes to the attention layers of every hybrid
     model, including one without Mamba or GDN layers, which has no `MambaInferenceStateConfig`.
     """
-    decoder = get_attr_wrapped_model(model, "decoder")
+    try:
+        decoder = get_attr_wrapped_model(model, "decoder")
+    except RuntimeError:
+        return None
     layer_type_list = getattr(decoder, "layer_type_list", None)
     return list(layer_type_list) if layer_type_list is not None else None
 

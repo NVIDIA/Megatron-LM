@@ -17,6 +17,7 @@ from megatron.core.inference.disaggregation.engine import (
 )
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import Status
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
 
 class _DynamicEngine:
@@ -125,6 +126,44 @@ def test_builds_and_configures_engine(mock_pipeline, disaggregated):
         configure.assert_called_once_with(engine)
     else:
         configure.assert_not_called()
+
+
+@pytest.mark.parametrize("default_config", [True, False])
+def test_context_gets_the_hybrid_layer_types(mock_pipeline, default_config):
+    """A config without layer types takes the model's, so a hybrid model's KV cache has planes
+    for its attention layers only."""
+    layer_types = [Symbols.ATTENTION, Symbols.MOE, Symbols.ATTENTION, Symbols.MOE]
+    model = SimpleNamespace(
+        config=MagicMock(), decoder=SimpleNamespace(layer_type_list=layer_types)
+    )
+
+    factory_module.build_dynamic_inference_engine(
+        model=model,
+        tokenizer="tokenizer",
+        inference_config=None if default_config else InferenceConfig(),
+        inference_wrapper_cls=MagicMock(),
+    )
+
+    context_config = factory_module.DynamicInferenceContext.call_args.args[1]
+    assert context_config.layer_type_list == layer_types
+
+
+def test_context_keeps_explicit_layer_types(mock_pipeline):
+    """A config that sets its layer types keeps them."""
+    config = InferenceConfig(layer_type_list=[Symbols.ATTENTION])
+    model = SimpleNamespace(
+        config=MagicMock(), decoder=SimpleNamespace(layer_type_list=[Symbols.MLA])
+    )
+
+    factory_module.build_dynamic_inference_engine(
+        model=model,
+        tokenizer="tokenizer",
+        inference_config=config,
+        inference_wrapper_cls=MagicMock(),
+    )
+
+    context_config = factory_module.DynamicInferenceContext.call_args.args[1]
+    assert context_config.layer_type_list == [Symbols.ATTENTION]
 
 
 def test_disaggregation_rejects_incompatible_engine_override(mock_pipeline):

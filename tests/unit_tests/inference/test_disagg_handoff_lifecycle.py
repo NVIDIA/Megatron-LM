@@ -35,12 +35,17 @@ from megatron.core.inference.disaggregation.handoff_completion_tracker import (
 from megatron.core.inference.disaggregation.inference_state_handoff import (
     InferenceStateHandoffMixin,
 )
+from megatron.core.inference.disaggregation.kv_reshard import KVShardLayout, plan_kv_reshard
 from megatron.core.inference.disaggregation.pending_handoff_imports import (
     DeferredKvHandoff,
     PendingKvImport,
     PendingSSMImport,
 )
-from megatron.core.inference.disaggregation.transfer_backends.base import TransferStartError
+from megatron.core.inference.disaggregation.transfer_backends.base import (
+    TransferStartError,
+    compute_buffer_geometry,
+    export_geometry_meta,
+)
 from megatron.core.inference.engines.dynamic_engine import (
     DynamicInferenceEngine,
     EngineState,
@@ -549,6 +554,75 @@ def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache():
     assert _Backend.instances[1].kwargs["memory_buffer"] is engine.context.mamba_conv_states
     assert _Backend.instances[2].kwargs["memory_buffer"] is engine.context.mamba_ssm_states
     assert [backend.kwargs["expected_num_blocks"] for backend in _Backend.instances[1:]] == [9, 9]
+
+
+def test_setup_counts_no_kv_layer_for_a_stage_with_only_a_placeholder_plane():
+    """Stage 1 of the hybrid pattern `*|-` holds no KV-cache layer but keeps one placeholder
+    plane. It must advertise one global KV layer and an empty local range, so a PP=1 peer, which
+    also counts one layer, plans a transfer from stage 0 only."""
+
+    class _Backend:
+        def __init__(self, *, agent_name, **kwargs):
+            self.geometry = compute_buffer_geometry(backend_name="test", **kwargs)
+
+        def export_meta(self):
+            return export_geometry_meta(self.geometry)
+
+    engine = object.__new__(InferenceStateHandoffMixin)
+    engine._initialize_disaggregation_state()
+    engine.context = SimpleNamespace(
+        config=SimpleNamespace(kv_transport_backend="nccl", cuda_graph_all_prefills=False),
+        kv_cache_management_mode=KVCacheManagementMode.PERSIST,
+        moe_enable_routing_replay=False,
+        cache_dsa_indexer_keys=False,
+        kv_block_allocator=SimpleNamespace(
+            enable_prefix_caching=True, enable_handoff_pinning=False, pool_size=8
+        ),
+        # [K/V, placeholder plane, blocks, tokens, heads, head dim]
+        memory_buffer=torch.empty(2, 1, 8, 4, 1, 1),
+        is_hybrid_model=False,
+        num_attention_layers=0,
+        num_mamba_layers=0,
+        num_attention_heads_per_partition=1,
+        hidden_size_per_attention_head=1,
+        block_size_tokens=4,
+    )
+    model_config = SimpleNamespace(num_query_groups=1, num_attention_heads=1)
+    engine.controller = SimpleNamespace(
+        inference_wrapped_model=SimpleNamespace(model=SimpleNamespace(config=model_config))
+    )
+    engine.pg_collection = SimpleNamespace(tp="tp", pp="pp", mp=None)
+
+    # (KV layers, SSM layers) of stages 0 and 1, as their contexts report them.
+    stage_layer_counts = [(1, 0), (0, 0)]
+
+    def all_gather_object(output, obj, group=None):
+        # The first gather exchanges layer counts, the second the stages' transfer metadata.
+        if isinstance(obj, tuple):
+            assert obj == stage_layer_counts[1]
+            output[:] = stage_layer_counts
+        else:
+            output[:] = [obj] * len(output)
+
+    handoff_module = "megatron.core.inference.disaggregation.inference_state_handoff"
+    with (
+        mock.patch(f"{handoff_module}.construct_kv_transfer_backend_class", return_value=_Backend),
+        mock.patch(f"{handoff_module}.get_pg_size", side_effect=lambda g: 2 if g == "pp" else 1),
+        mock.patch(f"{handoff_module}.get_pg_rank", side_effect=lambda g: 1 if g == "pp" else 0),
+        mock.patch("torch.distributed.is_initialized", return_value=True),
+        mock.patch("torch.distributed.get_rank", return_value=1),
+        mock.patch("torch.distributed.all_gather_object", side_effect=all_gather_object),
+    ):
+        engine.setup_kv_transfer("prefill")
+
+    stage_1 = engine._kv_transfer_agent.geometry.layout
+    assert stage_1.num_layers == 1
+    assert stage_1.layer_range() == (1, 1)
+
+    stage_0 = KVShardLayout(1, 1, 1, 0, 2, 0, 0, layer_start=0, num_local_layers=1)
+    decode = KVShardLayout(1, 1, 1, 0, 1, 0, 2)
+    plan = plan_kv_reshard([stage_0, stage_1], [decode])
+    assert [(t.src_rank, t.global_layer_lo, t.global_layer_hi) for t in plan] == [(0, 0, 1)]
 
 
 def test_handoff_salt_is_used_for_lookup_and_retained_after_import(handoff_loop):

@@ -87,6 +87,26 @@ class TestSymbols:
     def test_dsv4_symbols_map_to_fixed_compress_ratios(self):
         assert layer_utils.Symbols.DSV4_COMPRESS_RATIO_MAP == _DSV4_COMPRESS_RATIOS
 
+    def test_every_layer_symbol_has_one_inference_cache_class(self):
+        """Each layer type keeps its dynamic-inference state in the KV cache or the
+        recurrent-state cache, keeps none, or does not support inference yet.
+
+        A new layer symbol fails this test until it is placed in exactly one class, so that
+        `DynamicInferenceContext` gives it cache space only by decision.
+        """
+        symbols = layer_utils.Symbols
+        cache_classes = [
+            symbols.KV_CACHE_LAYERS,
+            symbols.RECURRENT_STATE_LAYERS,
+            # MLP and MoE layers keep no per-request state.
+            {symbols.MLP, symbols.MOE},
+            # KimiDeltaAttention raises on any inference context, and DSv4HybridAttention
+            # (CSA, HCA, WINDOW) asserts it gets none.
+            {symbols.KDA, symbols.CSA, symbols.HCA, symbols.WINDOW},
+        ]
+        classified = [symbol for cache_class in cache_classes for symbol in cache_class]
+        assert sorted(classified) == sorted(symbols.name_sorted_valid_layer_symbols())
+
 
 @pytest.mark.internal
 class TestCreateLayerConfig:

@@ -54,7 +54,9 @@ class Symbols:
     ATTENTION_LAYER_CONFIGS = {AttentionLayerConfig, DSALayerConfig, CSALayerConfig, MLALayerConfig}
     # Dynamic inference keeps these layers' state in the paged KV cache ...
     KV_CACHE_LAYERS = {ATTENTION, DS_ATTENTION, MLA}
-    # ... and these layers' state in the per-request recurrent-state cache.
+    # ... and these layers' state in the per-request recurrent-state cache. MLP and MoE layers
+    # keep no inference state, and KDA and the DSv4 layers (CSA, HCA, WINDOW) do not support
+    # inference yet, so they get no cache space.
     RECURRENT_STATE_LAYERS = {MAMBA, GDN}
 
     @classmethod

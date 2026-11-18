@@ -342,7 +342,9 @@ class InferenceStateHandoffMixin:
         tp_size = get_pg_size(self.pg_collection.tp)
         tp_rank = get_pg_rank(self.pg_collection.tp)
 
-        # Compute this PP rank's global attention- and SSM-layer ranges.
+        # Compute this PP rank's global attention- and SSM-layer ranges. A stage without
+        # KV-cache layers reports 0 and owns an empty range, though its buffer keeps a
+        # placeholder plane.
         pp_size = get_pg_size(self.pg_collection.pp)
         pp_rank = get_pg_rank(self.pg_collection.pp)
         local_num_layers = self.context.num_attention_layers

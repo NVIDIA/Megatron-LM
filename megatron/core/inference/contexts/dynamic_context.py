@@ -644,16 +644,17 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self._mtp_initialize_kv_cache(model_config, inference_config.mtp_layer_type_list)
 
         has_local_kv_layers = self.num_attention_layers > 0
-        if not has_local_kv_layers:
-            if pp_size == 1:
-                raise NotImplementedError(
-                    f"Using `DynamicInferenceContext` with no attention is not supported."
-                )
-            # A pipeline stage can hold no KV-cache layer while other stages do, as stage 1 of
-            # the hybrid pattern `*|-` does. It keeps one placeholder plane that no layer maps
-            # to, so it sizes its cache and joins the pipeline collective below like the other
-            # stages. That collective rejects a model with no KV-cache layer on any stage.
-            self.num_attention_layers = 1
+        if not has_local_kv_layers and pp_size == 1:
+            raise NotImplementedError(
+                f"Using `DynamicInferenceContext` with no attention is not supported."
+            )
+        # A pipeline stage can hold no KV-cache layer while other stages do, as stage 1 of the
+        # hybrid pattern `*|-` does. Its buffer keeps one placeholder plane that no layer maps
+        # to, so it sizes its cache and joins the pipeline collective below like the other
+        # stages; that collective rejects a model with no KV-cache layer on any stage. The
+        # placeholder is not a layer: `num_attention_layers` stays 0, so readers that sum it
+        # across stages, such as the disaggregated KV handoff, count only planes a layer uses.
+        self.num_kv_cache_planes = max(self.num_attention_layers, 1)
 
         # Block size tokens, bytes.
         kv_dtype_size_bytes = model_config.params_dtype.itemsize
@@ -663,7 +664,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.kv_reduced_dim = model_config.kv_lora_rank + model_config.qk_pos_emb_head_dim
             self.block_size_bytes = (
                 kv_dtype_size_bytes
-                * self.num_attention_layers
+                * self.num_kv_cache_planes
                 * self.block_size_tokens
                 * self.kv_reduced_dim
             )
@@ -671,7 +672,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.block_size_bytes = (
                 kv_dtype_size_bytes
                 * 2  # key, value
-                * self.num_attention_layers
+                * self.num_kv_cache_planes
                 * self.block_size_tokens
                 * self.num_attention_heads_per_partition
                 * self.hidden_size_per_attention_head
@@ -679,7 +680,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if self.cache_dsa_indexer_keys:
             self.block_size_bytes += (
                 kv_dtype_size_bytes
-                * self.num_attention_layers
+                * self.num_kv_cache_planes
                 * self.block_size_tokens
                 * self.dsa_indexer_head_dim
             )
@@ -1265,7 +1266,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if self.cache_mla_latent:
             self.memory_buffer = torch.empty(
                 (
-                    self.num_attention_layers,
+                    self.num_kv_cache_planes,
                     self.kv_block_allocator.pool_size,
                     self.block_size_tokens,
                     self.kv_reduced_dim,
@@ -1277,7 +1278,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.memory_buffer = torch.empty(
                 (
                     2,  # key and value
-                    self.num_attention_layers,
+                    self.num_kv_cache_planes,
                     self.kv_block_allocator.pool_size,
                     self.block_size_tokens,
                     self.num_attention_heads_per_partition,
@@ -1289,7 +1290,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if self.cache_dsa_indexer_keys:
             self.dsa_memory_buffer = torch.empty(
                 (
-                    self.num_attention_layers,
+                    self.num_kv_cache_planes,
                     self.kv_block_allocator.pool_size,
                     self.block_size_tokens,
                     self.dsa_indexer_head_dim,

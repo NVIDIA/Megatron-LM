@@ -2820,24 +2820,29 @@ class TestDynamicContext:
         """In the pattern `*|-`, the MLP-only stage 1 initializes alongside the attention stage.
 
         It has no KV-cache layer to map, so it keeps one placeholder plane and the stages
-        agree on the KV block capacity that drives scheduling.
+        agree on the KV block capacity that drives scheduling. The placeholder is not a layer:
+        the stages' KV-layer counts, which the disaggregated KV handoff sums, add up to 1.
         """
         self._setup_model_parallel_group(tensor_parallel_size=1, pipeline_parallel_size=2)
         try:
             context = self._get_context_for_stage_layer_types(([Symbols.ATTENTION], [Symbols.MLP]))
             rank = parallel_state.get_pipeline_model_parallel_rank()
             assert context.layer_map == ({0: 0} if rank == 0 else {})
-            assert context.num_attention_layers == 1
+            assert context.num_attention_layers == (1 if rank == 0 else 0)
+            assert context.num_kv_cache_planes == 1
             assert context.memory_buffer.shape[1] == 1
 
-            pool_size = torch.tensor(
-                [context.kv_block_allocator.pool_size], device="cuda", dtype=torch.long
+            stage_counts = torch.tensor(
+                [context.kv_block_allocator.pool_size, context.num_attention_layers],
+                device="cuda",
+                dtype=torch.long,
             )
-            gathered = [torch.zeros_like(pool_size) for _ in range(2)]
+            gathered = [torch.zeros_like(stage_counts) for _ in range(2)]
             torch.distributed.all_gather(
-                gathered, pool_size, group=parallel_state.get_pipeline_model_parallel_group()
+                gathered, stage_counts, group=parallel_state.get_pipeline_model_parallel_group()
             )
-            assert len({t.item() for t in gathered}) == 1
+            assert len({t[0].item() for t in gathered}) == 1
+            assert sum(t[1].item() for t in gathered) == 1
         finally:
             self._restore_model_parallel()
 
