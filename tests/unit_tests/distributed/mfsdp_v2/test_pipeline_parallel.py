@@ -46,6 +46,8 @@ class _VirtualPipelineChunk(nn.Module):
         super().__init__()
         # finalize_model_grads reads the model config and embedding-sharing contract.
         self.config = config
+        # This dense chunk has no input embeddings. The finalizer also uses this
+        # attribute to locate the underlying MCore model through its wrappers.
         self.pre_process = False
         self.share_embeddings_and_output_weights = False
         self.fc = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
