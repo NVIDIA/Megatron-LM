@@ -264,9 +264,14 @@ class ShortcutMoEBlock(MegatronModule):
             if self.fused_shortcut_read:
                 read = self.shortcut_residual_read
                 read.seam_layer_number = compute_layer.layer_number
+                # Two consumers, so two outputs whose gradients the backward kernel sums: the
+                # router (BF16), then preprocess: the latent projection (MXFP8 when it quantizes)
+                # or, without one, the dispatcher (BF16).
                 read.link_consumer(mlp.router, number)
-                if self.config.moe_latent_size:
-                    read.link_consumer(mlp.fc1_latent_proj, number)
+                read.link_consumer(
+                    mlp.fc1_latent_proj if self.config.moe_latent_size else mlp.token_dispatcher,
+                    number,
+                )
                 read.link(seam_connections(compute_layer)[0])
 
         shortcut_norm_spec = TENorm
@@ -335,12 +340,12 @@ class ShortcutMoEBlock(MegatronModule):
         packed_seq_params=None,
         recompute_context: ResidualStreamRecomputeContext | None = None,
     ):
-        """Run shortcut normalization, routing, and dispatch preprocessing. A fused shortcut read
-        emitted as both formats is a (BF16, MXFP8) pair: the router reads BF16 and the latent
-        projection the MXFP8 operand."""
-        quantized = None
+        """Run shortcut normalization, routing, and dispatch preprocessing. A fused shortcut read is
+        a pair, one tensor per consumer: the router's (BF16) and preprocess's (the latent
+        projection's, MXFP8 when it quantizes, or the dispatcher's)."""
+        preprocess_input = None
         if isinstance(shortcut_hidden, tuple):  # the fused read's norm is an identity
-            shortcut_hidden, quantized = shortcut_hidden
+            shortcut_hidden, preprocess_input = shortcut_hidden
         if recompute_context is not None:
             shortcut_input = recompute_context.checkpoint(
                 apply_module(self.shortcut_pre_mlp_layernorm), shortcut_hidden
@@ -361,10 +366,10 @@ class ShortcutMoEBlock(MegatronModule):
         probs, routing_map = self.moe_layer.mlp.route(
             shortcut_input, padding_mask, packed_seq_params=packed_seq_params
         )
-        # With a latent projection, preprocess reads its input only to project it.
-        latent_input = shortcut_input if quantized is None else quantized
+        if preprocess_input is None:
+            preprocess_input = shortcut_input
         return self.moe_layer.mlp.preprocess(
-            latent_input, probs, routing_map, padding_mask, packed_seq_params=packed_seq_params
+            preprocess_input, probs, routing_map, padding_mask, packed_seq_params=packed_seq_params
         )
 
     def _moe_shared_experts(

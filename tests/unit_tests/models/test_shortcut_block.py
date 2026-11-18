@@ -1243,8 +1243,10 @@ def test_fusion_spec_links_every_seam(monkeypatch):
         assert links(seam_connections(compute)[0]) == [(projection, True)]
         fc1 = moe.mlp.shared_experts.linear_fc1
         assert links(seam_connections(moe)[0]) == [(fc1, True)]
-        assert links(block.shortcut_residual_read) == [(moe.mlp.router, False)]  # the router alone
-        assert block.shortcut_residual_read.format == "bf16"
+        # The router and the dispatcher: two BF16 consumers, each handed its own output.
+        dispatcher = moe.mlp.token_dispatcher
+        assert links(block.shortcut_residual_read) == [(moe.mlp.router, False), (dispatcher, False)]
+        assert block.shortcut_residual_read.consumer_formats == ("bf16", "bf16")
         assert block.shortcut_residual_read.seam_layer_number == compute.layer_number
     plain = [layer for layer in model.decoder.layers if not isinstance(layer, ShortcutMoEBlock)]
     mlp_read = seam_connections(plain[1])[0]  # an MLP layer
