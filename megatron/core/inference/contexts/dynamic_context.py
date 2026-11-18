@@ -407,6 +407,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.enable_prefix_caching = inference_config.enable_prefix_caching
         self.prefix_caching_eviction_policy = inference_config.prefix_caching_eviction_policy
         self.prefix_caching_coordinator_policy = inference_config.prefix_caching_coordinator_policy
+        # An external router (Dynamo) splits work without shards, so only native
+        # disaggregation can be checked here; its factory sets the role first.
+        assert (
+            inference_config.disaggregation_shards is None
+            or inference_config.disaggregation_role is not None
+        ), (
+            "disaggregation_shards is set but disaggregation_role is not; build the engine "
+            "with build_dynamic_inference_engine or set the role before the context"
+        )
         # Decode imports each handoff straight into live SSM state and never
         # restores a cached one, so it holds no Mamba prefix cache.
         self.prefix_caching_mamba_gb = (
