@@ -76,8 +76,11 @@ Square brackets group consecutive layers into one logical layer, for example
 `HybridStack`. Groups change how layers execute, not what is stored: every layer
 keeps the layer number and distributed-checkpoint key it has in the pattern
 without brackets, so a `torch_dist` checkpoint saved with `[*E][*E]` loads into
-a model built with `*E*E`, and the reverse. Layer-indexed settings such as FP8
-layer ranges and hash-routed MoE thresholds are also unchanged.
+a model built with `*E*E`, and the reverse. Live weight refit also matches
+parameters and persistent buffers by physical layer number, so the trainer and
+receiver can use different groupings and pipeline partitions. Layer-indexed
+settings such as FP8 layer ranges and hash-routed MoE thresholds are also
+unchanged.
 
 Use groups with MoE expert-parallel communication overlap
 (`--overlap-moe-expert-parallel-comm`). The overlap schedule interleaves one

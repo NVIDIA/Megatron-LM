@@ -22,6 +22,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.resharding.refit import clear_all_caches, swap_model_weights
+from megatron.core.resharding.utils import named_refit_tensors
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
@@ -245,6 +246,62 @@ def _hybrid_layer_pattern(base: str, num_layers: int, pp_size: int) -> str:
     repeats_per_stage = layers_per_stage // unit_len
     stage = base * repeats_per_stage
     return "|".join([stage] * pp_size)
+
+
+@pytest.mark.parametrize(
+    "src_pattern,dst_pattern",
+    [("[*E][*E]", "*E|*E"), ("*E|*E", "[*E][*E]"), ("[*E][*E]", "[*E]|[*E]")],
+)
+@torch.no_grad()
+def test_swap_grouped_hybrid_pipeline(src_pattern, dst_pattern):
+    """Refit the same physical layers across bracketed groups and pipeline stages."""
+    if not has_mamba_deps:
+        pytest.skip("HybridModel dependencies not available")
+    if Utils.world_size % 2:
+        pytest.skip("PP=2 requires an even world size")
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(1234)
+    models = []
+    process_groups = []
+    try:
+        for pattern in (src_pattern, dst_pattern):
+            pp = pattern.count("|") + 1
+            pg = _build_pg_collection(tp_size=1, pp_size=pp)
+            process_groups.append(pg)
+            config = TransformerConfig(
+                num_layers=4,
+                hidden_size=32,
+                num_attention_heads=4,
+                pipeline_model_parallel_size=pp,
+                pipeline_dtype=torch.float32,
+                num_moe_experts=2,
+                moe_grouped_gemm=True,
+                moe_router_enable_expert_bias=True,
+                moe_router_score_function="sigmoid",
+                add_bias_linear=False,
+            )
+            models.append(_build_hybrid(config, 64, 8, pg, pattern).cuda())
+
+        def layer_tensors(model):
+            for layer in model.decoder.physical_layers():
+                for index, (name, tensor) in enumerate(named_refit_tensors(layer)):
+                    yield name, tensor, 100 * layer.layer_number + index
+
+        source, target = models
+        for _, tensor, value in layer_tensors(source):
+            tensor.fill_(value)
+        for _, tensor, _ in layer_tensors(target):
+            tensor.zero_()
+
+        swap_model_weights(source, target, refit_method="nccl")
+
+        for name, tensor, value in layer_tensors(target):
+            assert torch.all(tensor == value), name
+    finally:
+        clear_all_caches()
+        for pg in process_groups:
+            _destroy_pg_collection(pg)
+        Utils.destroy_model_parallel()
 
 
 class _DSGQACoreAttention(DSAttention):
