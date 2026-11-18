@@ -129,7 +129,7 @@ class TestTensorParallelLayers:
         embedding.weight.grad_added_to_main_grad = False
 
         class TwoUses(torch.nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.embedding = embedding
 
