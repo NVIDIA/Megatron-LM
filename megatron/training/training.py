@@ -161,6 +161,7 @@ from megatron.training.checkpointing import (
 from megatron.training.config import TrainingConfig, ValidationConfig
 from megatron.training.config.container import PretrainConfigContainer
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
+from megatron.training.datasets.utils import get_training_data_sequence_length
 from megatron.training.initialize import (
     initialize_megatron,
     set_jit_fusion_options,
@@ -174,7 +175,6 @@ from megatron.training.logging.packed_sequence_stats import (
     update_packed_sequence_stats,
 )
 from megatron.training.models import ModelConfig, T5ModelConfig
-from megatron.training.sequence_lengths import get_dataset_input_length
 from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
 
 # Local.
@@ -3965,14 +3965,7 @@ def _consume_embedding_min_norm_metrics(optimizer) -> Dict[str, float]:
 
 def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point_operations_so_far):
     cfg = get_run_config()
-    dataset = cfg.data.dataset
-    sequence_length = (
-        get_dataset_input_length(dataset)
-        if dataset is not None
-        else cfg.model.encoder_seq_length
-        if isinstance(cfg.model, T5ModelConfig)
-        else cfg.model.transformer.max_seq_length_per_sample
-    )
+    sequence_length = get_training_data_sequence_length(cfg)
     checkpoint = cfg.checkpoint
     train_state = get_train_state()
     if checkpoint.save is None:

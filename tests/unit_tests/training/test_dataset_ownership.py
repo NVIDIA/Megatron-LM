@@ -912,18 +912,22 @@ def test_runtime_services_read_config_lengths_not_legacy_args(container_factory,
     assert global_vars.build_telemetry_resource_attrs(args)["dl.sequence_length"] == 16
 
 
-def test_vlm_resolves_expanded_width_before_startup(monkeypatch):
+@pytest.mark.parametrize("decoder_length", [None, 96])
+def test_vlm_resolves_expanded_width_before_startup(monkeypatch, decoder_length):
     """Text rows and expanded model inputs stay distinct without a second VLM length field."""
     import pretrain_vlm
+    from megatron.core.pipeline_parallel.schedules import get_tensor_shapes
 
     monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 1)
     monkeypatch.setattr(pretrain_vlm, "get_num_image_embeddings", lambda *a, **kw: 4)
     monkeypatch.setattr(pretrain_vlm.context_parallel, "get_padding", lambda *a: 0)
     argv = MODEL_ARGV + ["--seq-length", "64", "--max-position-embeddings", "128", "--mock-data"]
+    if decoder_length is not None:
+        argv += ["--decoder-seq-length", str(decoder_length)]
     with patch("sys.argv", ["test"] + argv):
         args = validate_args(parse_args(extra_args_provider=pretrain_vlm.add_vlm_extra_args))
     text_length, padding = pretrain_vlm.resolve_vlm_sequence_lengths(args)
-    width = 68
+    width = decoder_length or 68
     assert (text_length, padding) == (64, width - 68)
     model = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
     cfg = pretrain_cfg_container_from_args(
@@ -935,6 +939,22 @@ def test_vlm_resolves_expanded_width_before_startup(monkeypatch):
     cfg.finalize()
     assert model.transformer.max_seq_length_per_sample == width
     assert cfg.data.dataset.sequence_length == 64
+    # Core still accepts decoder_seq_length. Passing the resolved VLM width as
+    # seq_length must yield the same pipeline buffers as the old decoder override.
+    groups = {"tp_group": Mock(size=lambda: 1), "cp_group": Mock(size=lambda: 1)}
+    assert get_tensor_shapes(
+        seq_length=model.transformer.max_seq_length_per_sample,
+        decoder_seq_length=None,
+        micro_batch_size=1,
+        config=model.transformer,
+        **groups,
+    ) == get_tensor_shapes(
+        seq_length=64,
+        decoder_seq_length=width,
+        micro_batch_size=1,
+        config=model.transformer,
+        **groups,
+    )
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
     assert global_vars.build_telemetry_resource_attrs(args)["dl.sequence_length"] == 64
     saved = cfg.to_dict()

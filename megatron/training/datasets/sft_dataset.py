@@ -13,8 +13,7 @@ import torch
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset
 from megatron.core.datasets.utils import Split
-from megatron.training.datasets.utils import load_json_arg
-from megatron.training.sequence_lengths import get_dataset_input_length
+from megatron.training.datasets.utils import get_dataset_input_length, load_json_arg
 
 IGNORE_INDEX = -100
 

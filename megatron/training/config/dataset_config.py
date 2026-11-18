@@ -96,10 +96,7 @@ def upgrade_legacy_dataset_section(section: dict) -> dict:
 
 @dataclass(kw_only=True)
 class DataloaderConfig:
-    """Settings for building torch DataLoaders on top of a dataset. The CLI options are generated
-    from these fields (``ArgumentGroupFactory`` in ``_add_data_args``), except ``drop_last``; the
-    three store-false flags take the factory's ``--no-*`` and ``--disable-*`` spellings and
-    ``dataloader_type``'s choices come from its ``Literal`` annotation."""
+    """Settings for building torch DataLoaders on top of a dataset."""
 
     dataloader_type: DataloaderType | None = None
     """Single pass vs multiple pass data loader. 'external' passes the dataset through unchanged.
@@ -112,14 +109,13 @@ class DataloaderConfig:
     """Shard the dataset per data-parallel rank before shuffling (cyclic sampler only)."""
 
     pin_memory: bool = True
-    """Pin host memory in the torch DataLoader (``--no-pin-memory`` turns it off)."""
+    """Pin host memory in the torch DataLoader."""
 
     persistent_workers: bool = True
-    """Keep the DataLoader workers alive between passes (``--no-persistent-workers`` turns it off).
-    Forced to False when ``num_workers == 0``: there are no workers to keep."""
+    """Keep DataLoader workers alive between epochs. Forced to False when num_workers == 0."""
 
     drop_last: bool = True
-    """Drop the last incomplete micro-batch. Declared only for now (no CLI option): the training
+    """Drop the last incomplete micro-batch. Declared only for now: the training
     loop keeps its built-in value until the loader consumers read this config."""
 
     def validate(self) -> None:

@@ -53,10 +53,10 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     except TypeError:
         pass
     cfg = get_run_config()
-    loader = cfg.data.dataloader
+    dataloader_cfg = cfg.data.dataloader
     # Unset selects 'single', as DataloaderConfig.finalize() and validate_args do (a section can be
     # registered unfinalized by tests and direct callers).
-    dataloader_type = loader.dataloader_type or 'single'
+    dataloader_type = dataloader_cfg.dataloader_type or 'single'
 
     if hasattr(dataset, 'split'):
         split = dataset.split
@@ -96,7 +96,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             micro_batch_size=micro_batch_size,
             data_parallel_rank=mpu.get_data_parallel_rank(),
             data_parallel_size=mpu.get_data_parallel_world_size(),
-            data_sharding=loader.data_sharding,
+            data_sharding=dataloader_cfg.data_sharding,
         )
     else:
         raise Exception('{} dataloader type is not supported.'.format(dataloader_type))
@@ -106,7 +106,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             _worker_init_fn,
             exit_signal_handler=cfg.train.exit_signal_handler,
             exit_signal=cfg.train.exit_signal,
-        ) if loader.num_workers > 0 else None
+        ) if dataloader_cfg.num_workers > 0 else None
     )
     # Identity collate for the datasets that emit one variable-length dict per sample for an
     # upstream packing scheduler (the varlen family without SBHD validation: the section's
@@ -129,9 +129,9 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     return torch.utils.data.DataLoader(
         dataset,
         batch_sampler=batch_sampler,
-        num_workers=loader.num_workers,
-        pin_memory=loader.pin_memory,
-        persistent_workers=loader.persistent_workers if loader.num_workers > 0 else False,
+        num_workers=dataloader_cfg.num_workers,
+        pin_memory=dataloader_cfg.pin_memory,
+        persistent_workers=dataloader_cfg.persistent_workers if dataloader_cfg.num_workers > 0 else False,
         worker_init_fn=maybe_worker_init_fn,
         generator=loader_generator,
         **extra_kwargs,

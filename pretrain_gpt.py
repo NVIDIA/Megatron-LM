@@ -60,8 +60,8 @@ from megatron.training.argument_utils import (
 )
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.datasets.providers import build_gpt_datasets, is_dataset_built_on_rank
+from megatron.training.datasets.utils import get_dataset_input_length
 from megatron.training.global_vars import get_run_config, set_run_config
-from megatron.training.sequence_lengths import get_dataset_input_length
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import is_first_or_last_pipeline_stage
 from model_provider import model_provider

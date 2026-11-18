@@ -52,8 +52,8 @@ from megatron.training.argument_utils import (
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.providers import build_gpt_datasets
+from megatron.training.datasets.utils import get_dataset_input_length
 from megatron.training.global_vars import get_run_config, set_run_config
-from megatron.training.sequence_lengths import get_dataset_input_length
 from megatron.training.utils import is_first_or_last_pipeline_stage
 
 # modelopt distillation
