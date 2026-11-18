@@ -444,6 +444,13 @@ if HAVE_TRITON:
         )
 
     @triton.jit
+    def _accumulate_logsumexp(values, maximum, total):
+        """Online reduction over axis zero, including all-masked tiles."""
+        next_max = tl.maximum(maximum, tl.max(values, 0))
+        safe = tl.where(next_max > -float("inf"), next_max, 0.0)
+        return next_max, total * tl.exp(maximum - safe) + tl.sum(tl.exp(values - safe), 0)
+
+    @triton.jit
     def _teacher_target_kernel(
         q,
         k,
@@ -471,16 +478,25 @@ if HAVE_TRITON:
         )
         d = tl.arange(0, DIM)
         kv = tl.load(k + keys[None, :] * DIM + d[:, None], valid[None, :], other=0)
-        result = tl.full((TILE_K,), 0.0, tl.float32)
+        # Remove one common row offset before subtracting the head-specific LSEs.
+        # This keeps small differences between key logits even with a very large sink.
+        all_h = tl.arange(0, triton.next_power_of_2(HEADS))
+        all_lse = tl.load(lse + row * HEADS + all_h, all_h < HEADS, other=float("inf"))
+        anchor = tl.min(tl.where(all_lse > -float("inf"), all_lse, float("inf")), 0)
+        anchor = tl.where(anchor < float("inf"), anchor, 0.0)
+        maximum = tl.full((TILE_K,), -float("inf"), tl.float32)
+        total = tl.full((TILE_K,), 0.0, tl.float32)
         for head_start in range(0, tl.cdiv(HEADS, TILE_H)):
             h = head_start * TILE_H + tl.arange(0, TILE_H)
             qv = tl.load(
                 q + (row * HEADS + h[:, None]) * DIM + d[None, :], h[:, None] < HEADS, other=0
             )
             denom = tl.load(lse + row * HEADS + h, h < HEADS, other=0.0)
-            probs = tl.exp(tl.dot(qv, kv) * SCALE - denom[:, None])
-            result += tl.sum(tl.where((h[:, None] < HEADS) & valid[None, :], probs, 0.0), 0)
-        tl.store(target + row * STRIDE + cols, result, cols < STRIDE)
+            logp = tl.dot(qv, kv) * SCALE - (denom - anchor)[:, None]
+            keep = (h < HEADS) & (denom > -float("inf"))
+            logp = tl.where(keep[:, None] & valid[None, :], logp, -float("inf"))
+            maximum, total = _accumulate_logsumexp(logp, maximum, total)
+        tl.store(target + row * STRIDE + cols, maximum + tl.log(total), cols < STRIDE)
 
     @triton.jit
     def _loss_kernel(
@@ -497,28 +513,29 @@ if HAVE_TRITON:
         row = tl.program_id(0)
         offsets = tl.arange(0, TILE)
         maximum = tl.full((), -float("inf"), tl.float32)
-        denom, mass = tl.full((), 0.0, tl.float32), tl.full((), 0.0, tl.float32)
+        denom = tl.full((), 0.0, tl.float32)
+        target_max = tl.full((), -float("inf"), tl.float32)
+        mass = tl.full((), 0.0, tl.float32)
         for start in range(0, tl.cdiv(STRIDE, TILE)):
             cols = start * TILE + offsets
             score = tl.load(scores + row * STRIDE + cols, cols < STRIDE, other=-float("inf"))
-            valid = score > -float("inf")
-            next_max = tl.maximum(maximum, tl.max(score, 0))
-            denom = denom * tl.where(maximum > -float("inf"), tl.exp(maximum - next_max), 0.0)
-            denom += tl.sum(tl.where(valid, tl.exp(score - next_max), 0.0), 0)
-            mass += tl.sum(tl.load(target + row * STRIDE + cols, cols < STRIDE, other=0.0), 0)
-            maximum = next_max
+            maximum, denom = _accumulate_logsumexp(score, maximum, denom)
+            log_target = tl.load(target + row * STRIDE + cols, cols < STRIDE, other=-float("inf"))
+            target_max, mass = _accumulate_logsumexp(log_target, target_max, mass)
         logsum = tl.where(denom > 0, maximum + tl.log(denom), 0.0)
-        safe_mass = tl.maximum(mass, 1.1754943508222875e-38)
+        shift = tl.where(mass > 0, target_max, 0.0)
+        safe_mass = tl.where(mass > 0, mass, 1.0)
         loss = tl.full((), 0.0, tl.float32)
         for start in range(0, tl.cdiv(STRIDE, TILE)):
             cols = start * TILE + offsets
             score = tl.load(scores + row * STRIDE + cols, cols < STRIDE, other=-float("inf"))
-            t = tl.load(target + row * STRIDE + cols, cols < STRIDE, other=0.0) / safe_mass
+            log_target = tl.load(target + row * STRIDE + cols, cols < STRIDE, other=-float("inf"))
+            t = tl.exp(log_target - shift) / safe_mass
+            tl.store(target + row * STRIDE + cols, t, cols < STRIDE)
             term = t * (tl.log(tl.maximum(t, 1.0e-10)) - (score - logsum))
             loss += tl.sum(tl.where(score > -float("inf"), term, 0.0), 0)
-        tl.store(stats + row * 3, logsum)
-        tl.store(stats + row * 3 + 1, safe_mass)
-        tl.store(stats + row * 3 + 2, mass / safe_mass)
+        tl.store(stats + row * 2, logsum)
+        tl.store(stats + row * 2 + 1, mass > 0)
         tl.store(losses + row, loss * COEFFICIENT / tl.maximum(tl.load(divisor), 1.0))
 
     @triton.jit
@@ -536,10 +553,10 @@ if HAVE_TRITON:
         row, cols = tl.program_id(0), tl.program_id(1) * TILE + tl.arange(0, TILE)
         score = tl.load(scores + row * STRIDE + cols, cols < STRIDE, other=-float("inf"))
         t = tl.load(target + row * STRIDE + cols, cols < STRIDE, other=0.0)
-        logsum, mass = tl.load(stats + row * 3), tl.load(stats + row * 3 + 1)
-        target_sum = tl.load(stats + row * 3 + 2)
+        logsum = tl.load(stats + row * 2)
+        target_sum = tl.load(stats + row * 2 + 1)
         scale = COEFFICIENT * tl.load(grad_loss) / tl.maximum(tl.load(divisor), 1.0)
-        grad = (tl.exp(score - logsum) * target_sum - t / mass) * scale
+        grad = (tl.exp(score - logsum) * target_sum - t) * scale
         tl.store(grad_scores + row * STRIDE + cols, grad, cols < STRIDE)
 
     @triton.jit
@@ -824,7 +841,7 @@ def _precompute_indexer_loss(
             block_size=block_size,
             scale=scale,
         )
-        stats = torch.empty((end - start, 3), device=q.device, dtype=torch.float32)
+        stats = torch.empty((end - start, 2), device=q.device, dtype=torch.float32)
         _loss_kernel[(end - start,)](
             scores, target, stats, losses[start:end], divisor, stride, coefficient, 1024
         )

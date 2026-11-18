@@ -81,10 +81,10 @@ def _setup():
         params_dtype=torch.float32,
         use_cpu_initialization=True,
         multi_latent_attention=True,
-        experimental_attention_variant='dsv4_hybrid',
-        dsv4_version='v4.1',
+        experimental_attention_variant="dsv4_hybrid",
+        dsv4_version="v4.1",
         qk_layernorm=True,
-        normalization='RMSNorm',
+        normalization="RMSNorm",
         q_lora_rank=8,
         v_head_dim=8,
         qk_head_dim=4,
@@ -98,7 +98,7 @@ def _setup():
         dsa_indexer_head_dim=8,
         dsa_indexer_topk=2,
         dsa_indexer_rotate_activation=False,
-        dsa_kernel_backend='none',
+        dsa_kernel_backend="none",
         add_bias_linear=False,
         attention_dropout=0,
         hidden_dropout=0,
@@ -121,11 +121,21 @@ def _setup():
     )
     layers = [
         CompressedSparseAttention2(
-            cfg, mods, i + 1, AttnMaskType.causal, 'self', groups, rotary_pos_emb=rope
+            cfg, mods, i + 1, AttnMaskType.causal, "self", groups, rotary_pos_emb=rope
         )
         for i in range(3)
     ]
     return cfg, layers
+
+
+def test_ordinary_stack_rejects_shared_csa2_at_construction():
+    from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+        get_experimental_attention_variant_module_spec,
+    )
+
+    config, _ = _setup()
+    with pytest.raises(ValueError, match="state-aware stack"):
+        get_experimental_attention_variant_module_spec(config)
 
 
 def _forward(layers, state):
@@ -324,7 +334,7 @@ def test_cp_layout_uses_main_packed_metadata():
     logical = torch.tensor([0, 5, 12], dtype=torch.int32)
     padded = torch.tensor([0, 8, 16], dtype=torch.int32)
     packed = PackedSeqParams(
-        qkv_format='thd',
+        qkv_format="thd",
         cu_seqlens_q=logical,
         cu_seqlens_kv=logical,
         cu_seqlens_q_padded=padded,
@@ -405,7 +415,7 @@ def test_fused_shared_attention_and_indexer_gradients_match_native(monkeypatch, 
         nn.ModuleList(
             [
                 CompressedSparseAttention2(
-                    cfg, modules, i + 1, AttnMaskType.causal, 'self', groups, rotary_pos_emb=rope
+                    cfg, modules, i + 1, AttnMaskType.causal, "self", groups, rotary_pos_emb=rope
                 )
                 for i in range(3)
             ]
@@ -417,11 +427,11 @@ def test_fused_shared_attention_and_indexer_gradients_match_native(monkeypatch, 
         nn.ModuleList(
             [
                 CompressedSparseAttention2(
-                    replace(cfg, dsa_kernel_backend='cudnn'),
+                    replace(cfg, dsa_kernel_backend="cudnn"),
                     modules,
                     i + 1,
                     AttnMaskType.causal,
-                    'self',
+                    "self",
                     groups,
                     rotary_pos_emb=rope,
                 )
@@ -438,7 +448,7 @@ def test_fused_shared_attention_and_indexer_gradients_match_native(monkeypatch, 
     fused.load_state_dict(native.state_dict())
     shapes = ((32, 2, 64, 512), (32, 2, 1, 512), (32, 2, 16), (32, 2, 128))
     inputs = [
-        tuple(torch.randn(shape, device='cuda', dtype=torch.bfloat16) for shape in shapes)
+        tuple(torch.randn(shape, device="cuda", dtype=torch.bfloat16) for shape in shapes)
         for _ in range(3)
     ]
     out_rope = None
@@ -531,7 +541,7 @@ def test_mxfp8_packed_selection_matches_quantized_scores(monkeypatch, ratio, hea
 
     weights = (w.float() * (128**-0.5 * heads**-0.5)).bfloat16().float()
     scores = (
-        torch.einsum('qhd,kd->qhk', dequantize(q), dequantize(k)).relu() * weights[..., None]
+        torch.einsum("qhd,kd->qhk", dequantize(q), dequantize(k)).relu() * weights[..., None]
     ).sum(1)
     keys = torch.arange(k.shape[0], device=q.device)[None, :]
     valid = (keys >= inputs.starts[:, None]) & (keys < (inputs.starts + inputs.visible)[:, None])
@@ -578,3 +588,113 @@ def test_mxfp8_packed_selection_matches_quantized_scores(monkeypatch, ratio, hea
     assert_replays_bit_exact(
         select, (q, k, w), backward=False, replays=3, what="CSA2 MXFP8 packed selection"
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mxfp8_scale_capacity_tail_is_zero():
+    from megatron.core.ops.attention.csa.indexer_quantization import (
+        indexer_mxfp8_thd_scale_capacity,
+        indexer_mxfp8_thd_scale_shape,
+        make_indexer_mxfp8_scale_cu_seqlens,
+        quantize_indexer_mxfp8,
+        quantize_indexer_mxfp8_logical,
+    )
+
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("MXFP8 selection requires SM100")
+    key = torch.randn(256, 128, device="cuda", dtype=torch.bfloat16)
+    cu = torch.tensor([0, 128, 256], dtype=torch.int32, device="cuda")
+    capacity = indexer_mxfp8_thd_scale_capacity(256, 2, 1)
+    assert capacity == 384
+    out = torch.empty(
+        indexer_mxfp8_thd_scale_shape(capacity, 1, 128), dtype=torch.float8_e8m0fnu, device="cuda"
+    )
+    _, packed = quantize_indexer_mxfp8(
+        key,
+        cu_seqlens=cu,
+        cu_seqlens_scale_padded=make_indexer_mxfp8_scale_cu_seqlens(cu, 1),
+        out_scale=out,
+    )
+    _, logical = quantize_indexer_mxfp8_logical(key)
+    row = torch.arange(256, device="cuda")[:, None]
+    offset = row // 128 * 512 + row % 32 * 16 + row % 128 // 32 * 4 + torch.arange(4, device="cuda")
+    storage = packed.view(torch.uint8).flatten()
+    torch.testing.assert_close(storage[offset], logical)
+    assert torch.count_nonzero(storage[256 * 4 :]) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("sparse", [False, True])
+def test_underflowing_teacher_matches_native_indexer_gradients(sparse):
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_indexer import (
+        _precompute_indexer_loss,
+    )
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        compute_dsa_indexer_loss,
+    )
+
+    rows, heads, dim = 3, 32, 128
+    q = torch.ones(rows, heads, dim, dtype=torch.bfloat16, device="cuda").requires_grad_()
+    k = (
+        torch.tensor([0.0625, 0.09375], dtype=q.dtype, device=q.device)[:, None]
+        .expand(2, dim)
+        .contiguous()
+        .requires_grad_()
+    )
+    w = torch.ones(rows, heads, dtype=q.dtype, device=q.device).requires_grad_()
+    # Row 0 has a uniform teacher, row 1 has unequal head contributions, row 2 has no keys.
+    teacher_q = q.new_zeros(rows, 64, 16)
+    teacher_q[1, :32, 0], teacher_q[1, 32:, 0] = 2, -2
+    teacher_k = q.new_zeros(2, 16)
+    teacher_k[1, 0] = 1
+    non_compressed = torch.full((rows, 64), 200.0, device=q.device)
+    non_compressed[1, 32:] += 4
+    visible = torch.tensor([2, 2, 0], dtype=torch.int32, device=q.device)
+    starts = torch.zeros_like(visible)
+    ids = torch.tensor([[0, 1], [0, 1], [-1, -1]], dtype=torch.int32, device=q.device)
+    mask = torch.zeros((rows, 2), device=q.device).masked_fill(
+        torch.arange(2, device=q.device) >= visible[:, None], -torch.inf
+    )
+    scores = (
+        torch.einsum("rhd,kd->rhk", q.float(), k.float()).relu() * w.float().unsqueeze(-1)
+    ).sum(1) * (heads * dim) ** -0.5
+    expected = compute_dsa_indexer_loss(
+        scores.unsqueeze(0),
+        ids.long().unsqueeze(0),
+        teacher_q[:, None],
+        teacher_k[:, None, None, :].expand(-1, 1, 64, -1),
+        1.0,
+        1.0,
+        sparse,
+        ProcessGroupCollection(tp=Group()),
+        mask=mask,
+        non_compressed_lse=non_compressed.T[None],
+    )
+    lse = non_compressed
+    if sparse:
+        # The joint sparse path receives the full attention LSE from FlashMLA.
+        logits = (
+            torch.einsum("rhd,kd->rhk", teacher_q.float(), teacher_k.float()) + mask[:, None, :]
+        )
+        lse = torch.logaddexp(non_compressed, logits.logsumexp(-1))
+    actual, grads = _precompute_indexer_loss(
+        q,
+        k,
+        w,
+        teacher_q,
+        teacher_k,
+        lse,
+        ids,
+        visible,
+        starts,
+        visible,
+        torch.tensor(rows, device=q.device),
+        (2, 2 if sparse else 0, 1, 1.0, 1.0),
+        full_lse=sparse,
+    )
+    assert expected > 0 and actual > 0
+    torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
+    for grad, reference in zip(grads, torch.autograd.grad(expected, (q, k, w))):
+        assert torch.count_nonzero(reference) > 0
+        torch.testing.assert_close(grad, reference, rtol=8e-3, atol=1e-5)
+    assert not grads[0][-1].any() and not grads[2][-1].any()

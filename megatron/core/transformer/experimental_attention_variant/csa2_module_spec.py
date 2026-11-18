@@ -5,9 +5,7 @@
 from functools import partial
 from typing import Protocol
 
-from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa import (
@@ -25,7 +23,6 @@ from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid
     DSv4HybridSelfAttentionSubmodules,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
 
 class CSA2BackendSpecProvider(BackendSpecProvider, Protocol):
@@ -75,15 +72,5 @@ def get_csa2_module_spec_for_backend(backend: CSA2BackendSpecProvider) -> Module
     )
 
 
-# A precise Transformer Engine composition for static HybridModel specs.
+# Transformer Engine attention for callers that own the per-forward CSA2State.
 csa2_attention_spec = get_csa2_module_spec_for_backend(TESpecProvider())
-
-
-csa2_layer_spec = ModuleSpec(
-    module=TransformerLayer,
-    submodules=TransformerLayerSubmodules(
-        input_layernorm=TENorm,
-        self_attention=csa2_attention_spec,
-        self_attn_bda=get_bias_dropout_add,
-    ),
-)

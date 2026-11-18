@@ -204,14 +204,14 @@ def _pack_indexer_mxfp8_scale_thd_kernel(
     packed_row_start = mn_tile * 128
 
     batch_lo = 0
-    batch_hi = BATCH_SIZE
+    batch_hi = BATCH_SIZE - 1
     for _ in range(SEARCH_STEPS):
         batch_mid = (batch_lo + batch_hi) // 2
         next_packed_row = tl.load(cu_seqlens_scale_padded_ptr + batch_mid + 1) * NUM_HEADS
         in_lower_half = packed_row_start < next_packed_row
         batch_hi = tl.where(in_lower_half, batch_mid, batch_hi)
-        batch_lo = tl.where(in_lower_half, batch_lo, batch_mid + 1)
-    batch = tl.minimum(batch_lo, BATCH_SIZE - 1)
+        batch_lo = tl.where(in_lower_half, batch_lo, tl.minimum(batch_mid + 1, batch_hi))
+    batch = batch_lo
 
     logical = tl.arange(0, 512)
     row_in_tile = logical // 4

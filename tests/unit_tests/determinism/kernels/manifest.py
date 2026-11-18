@@ -1069,10 +1069,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/experimental_attention_variant/csa_utils/csa2_context_parallel.py",
             "megatron/core/transformer/experimental_attention_variant/csa_utils/thd_utils.py",
         ),
-        tests=("tests/unit_tests/transformer/experimental_attention_variant/test_csa2.py",),
+        tests=(
+            K + "test_csa_packed_kernels.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa2.py",
+        ),
         kind="triton",
         notes="CPU owner-gradient and packed-capacity contracts, plus window/sink teacher GPU parity "
-        "and bit-exact replay. Full FlashMLA attention and shared-K atomic gradients remain "
+        "and KL forward replay. Shared-K backward has an atomic-add negative control. Full FlashMLA attention and shared-K atomic gradients remain "
         "unqualified for deterministic mode; this draft rejects that mode.",
     ),
     KernelEntry(
