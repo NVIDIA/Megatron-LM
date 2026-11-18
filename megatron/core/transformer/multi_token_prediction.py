@@ -1648,6 +1648,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             self.config, vp_stage, pp_rank=pg_collection.pp.rank()
         )
         self.vp_stage = vp_stage
+        self.pg_collection = pg_collection
         self.cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp if pg_collection is not None else None
         self.mhc_enabled = self.config.enable_mhc_connections
@@ -1847,9 +1848,9 @@ class MultiTokenPredictionLayer(MegatronModule):
     def get_inner_quantization_context(self) -> AbstractContextManager:
         """Return the quantization context for fine-grained MTP execution."""
         if self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed:
-            return get_fp8_context(self.config)
+            return get_fp8_context(self.config, pg_collection=self.pg_collection)
         if self.config.fp4:
-            return get_fp4_context(self.config)
+            return get_fp4_context(self.config, pg_collection=self.pg_collection)
         return nullcontext()
 
     def _get_embeddings(
@@ -2092,11 +2093,15 @@ class MultiTokenPredictionLayer(MegatronModule):
         # different layers, currently MTP only uses a global quantization context.
         # FP8 and FP4 are mutually exclusive.
         if self.config.fp8:
-            quantization_context = get_fp8_context(self.config)
-            transformer_layer_quantization_context = get_fp8_context(self.config)
+            quantization_context = get_fp8_context(self.config, pg_collection=self.pg_collection)
+            transformer_layer_quantization_context = get_fp8_context(
+                self.config, pg_collection=self.pg_collection
+            )
         elif self.config.fp4:
-            quantization_context = get_fp4_context(self.config)
-            transformer_layer_quantization_context = get_fp4_context(self.config)
+            quantization_context = get_fp4_context(self.config, pg_collection=self.pg_collection)
+            transformer_layer_quantization_context = get_fp4_context(
+                self.config, pg_collection=self.pg_collection
+            )
         else:
             quantization_context = nullcontext()
             transformer_layer_quantization_context = nullcontext()
@@ -2304,7 +2309,9 @@ class MultiTokenPredictionLayer(MegatronModule):
         # the inner context entered inside ``_proj_and_transformer_layer``
         # is sufficient.
         if self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed:
-            outer_quantization_context = get_fp8_context(self.config)
+            outer_quantization_context = get_fp8_context(
+                self.config, pg_collection=self.pg_collection
+            )
         else:
             outer_quantization_context = nullcontext()
 
@@ -2673,8 +2680,9 @@ class MultiTokenPredictionBlock(MegatronModule):
         # to the roll_tensor function for proper boundary communication
         if pg_collection is None:
             warn_global_process_group_fallback(type(self).__name__)
-            # hcp feeds TEDotProductAttention's a2a+p2p path in the MTP layers.
-            required_pgs = ['cp', 'hcp', 'tp', 'pp'] + (
+            # hcp feeds TEDotProductAttention's a2a+p2p path in the MTP layers. tp_cp and tp_dp_cp
+            # are the FP8/FP4 amax reduction groups of the MTP layers.
+            required_pgs = ['cp', 'hcp', 'tp', 'pp', 'tp_cp', 'tp_dp_cp'] + (
                 ['dp', 'gtp_remat'] if self.config.mtp_hsm else []
             )
             if self.config.test_mode and self.config.qk_layernorm:
