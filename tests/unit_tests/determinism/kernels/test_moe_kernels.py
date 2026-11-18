@@ -1214,8 +1214,22 @@ class TestMoEModules:
         )
 
     @pytest.mark.parametrize("accumulate", [True, False])
-    def test_global_batch_quantile_router_replays(self, accumulate):
+    @pytest.mark.parametrize("output_mode", ["bool", "moonep", "moonep-fused", "moonep-fallback"])
+    def test_global_batch_quantile_router_replays(self, accumulate, output_mode, monkeypatch):
         """Include the router's nonpersistent histogram in the replay comparison."""
+        fused = output_mode in ("moonep-fused", "moonep-fallback")
+        compact = output_mode != "bool"
+        if output_mode == "moonep-fused" and not (
+            te_ext.fused_topk_with_score_function_supports_qb
+            and moe_utils.fused_topk_with_score_function_supports_topk_indices
+        ):
+            pytest.skip("TE fused routing needs both QB and compact expert ID support")
+        if output_mode == "moonep-fallback":
+            monkeypatch.setattr(
+                "megatron.core.transformer.moe.router."
+                "fused_topk_with_score_function_supports_topk_indices",
+                False,
+            )
         self._init()
         seeded()
         config = _moe_config(
@@ -1225,6 +1239,13 @@ class TestMoEModules:
             moe_router_quantile_balancing_estimation_scope="global_batch",
             moe_router_score_function="sigmoid",
             moe_aux_loss_coeff=0.0,
+            moe_router_fusion=fused,
+            moe_virtual_expert_load_balance=compact,
+            moe_token_dispatcher_type="flex" if compact else "alltoall",
+            moe_flex_dispatcher_backend="hybridep",
+            expert_model_parallel_size=2 if compact else 1,
+            gradient_accumulation_fusion=compact,
+            use_transformer_engine_op_fuser=compact,
         )
         router = TopKRouter(
             config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
@@ -1233,21 +1254,46 @@ class TestMoEModules:
         with torch.no_grad():
             router.expert_bias.copy_(torch.linspace(-0.1, 0.1, 64, device="cuda"))
         logits = torch.randn(8192, 64, device="cuda", requires_grad=True)
+        full_grad = torch.randn_like(logits)
+        reference_histogram = torch.zeros_like(router.qb_histogram)
+        reference_probs, reference_map = moe_utils.topk_routing_with_score_function(
+            logits,
+            topk=8,
+            score_function="sigmoid",
+            expert_bias=router.expert_bias,
+            qb_histogram=reference_histogram if accumulate else None,
+            qb_bin_bounds=router.qb_bin_bounds if accumulate else None,
+            allow_batch_invariant_sigmoid_topk=False,
+        )
+        reference_grad = torch.autograd.grad(reference_probs, logits, full_grad)[0]
+        probs, routing_map = router.routing(logits)
+        if compact:
+            assert probs.shape == routing_map.shape == (8192, 8)
+            assert routing_map.dtype == torch.int64
+            torch.testing.assert_close(
+                torch.zeros_like(reference_map).scatter(1, routing_map, True), reference_map
+            )
+            torch.testing.assert_close(probs, reference_probs.gather(1, routing_map))
+        else:
+            torch.testing.assert_close(routing_map, reference_map)
+            torch.testing.assert_close(probs, reference_probs)
 
         def fn(logits):
             router.qb_histogram.zero_()
-            probs, routing_map = router.quantile_balancing(logits)
+            probs, routing_map = router.routing(logits)
             return probs, routing_map, router.qb_histogram.clone()
 
         outputs, grads = assert_replays_bit_exact(
             fn,
             (logits,),
-            grad_outputs={"out[0]": torch.randn_like(logits)},
+            grad_outputs={"out[0]": full_grad.gather(1, routing_map) if compact else full_grad},
             replays=3,
             contention=True,
             what=f"global-batch TopKRouter[accumulate={accumulate}]",
         )
         assert torch.all(outputs["out[2]"].sum(dim=-1) == (8192 if accumulate else 0))
+        torch.testing.assert_close(outputs["out[2]"], reference_histogram, rtol=0, atol=0)
+        torch.testing.assert_close(grads["in[0]"], reference_grad)
         assert grads["in[0]"].abs().sum() > 0
 
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
