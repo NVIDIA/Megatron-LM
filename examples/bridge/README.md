@@ -5,10 +5,13 @@ This directory provides Hugging Face import/export examples backed by
 
 ## Supported models and scope
 
-The registered families are Llama (including Llama 3.1 RoPE scaling), Nemotron-H,
+The registered families are GPT-OSS, Llama (including Llama 3.1 RoPE scaling), Nemotron-H,
 Nemotron 3.5 Super VL, and the Qwen 3.5 family's dense/MoE text and vision-language
 models, including compatible Qwen 3.8 checkpoints. Other Bridge model families are not
 registered by this package.
+GPT-OSS imports dequantize MXFP4 expert weights to BF16, and exports always write BF16
+experts. Export GPT-OSS with a BF16 checkpoint such as `unsloth/gpt-oss-20b-BF16` as
+`--hf-model`, since the MXFP4 checkpoint's tensor names do not match the exported ones.
 Super VL can also import/export its text-only projection with `--text-only`;
 Qwen VL does not support that projection.
 
