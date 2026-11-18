@@ -307,6 +307,12 @@ def find_optimal_num_workers(performance, partitions):
     print("-----------------------------------")
 
 
+def process_json_file(partition: Partition, name: dict, q, input_key: str) -> None:
+    """Encode a partition and report performance from a pickleable process target."""
+    worker_performance = partition.process_json_file((name[input_key], name['output_prefix']))
+    q.put(worker_performance)
+
+
 def main():
     args = get_args()
 
@@ -415,16 +421,12 @@ def main():
             if args.partitions == 1:
                 continue
 
-        def process_json_file(name, q, input_key):
-            worker_performance = partition.process_json_file((name[input_key], name['output_prefix']))
-            q.put(worker_performance)
-
         # encode partition files in parallel
         processes = []
         input_key = 'sentence_split' if args.split_sentences else 'partition'
         q = multiprocessing.Queue()
         for name in in_ss_out_names:
-            p = multiprocessing.Process(target=process_json_file, args=(name, q, input_key))
+            p = multiprocessing.Process(target=process_json_file, args=(partition, name, q, input_key))
 
             p.start()
             processes.append(p)

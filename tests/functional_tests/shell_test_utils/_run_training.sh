@@ -84,6 +84,12 @@ while IFS= read -r ARGUMENT; do
 done <<<"$ENV_VARS"
 set -x
 
+# --deterministic-mode needs TRITON_CACHE_DIR on a path shared by all ranks when
+# TRITON_CACHE_AUTOTUNING=1. OUTPUT_PATH is per-run and written by every node.
+if [[ "${TRITON_CACHE_AUTOTUNING:-}" == "1" ]]; then
+    export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$OUTPUT_PATH/triton_cache}"
+fi
+
 # Run before script
 BEFORE_SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | /usr/local/bin/yq '.BEFORE_SCRIPT')
 if [[ "$BEFORE_SCRIPT" != null ]]; then

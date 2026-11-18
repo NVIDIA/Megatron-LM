@@ -67,6 +67,13 @@ def test_hash_resets_and_memory_gradients():
     hidden = torch.randn(8, 1, 8, requires_grad=True)
     out = model(hidden, hashes, mask)
     torch.testing.assert_close(out[3], hidden[3])
+    precomputed = model(hidden, token_mask=mask, embeddings=model.lookup(hashes))
+    torch.testing.assert_close(precomputed, out)
+    weights = (hidden, *model.parameters())
+    grad = torch.autograd.grad(precomputed.sum(), weights)
+    expected = torch.autograd.grad(out.sum(), weights, retain_graph=True)
+    for actual, reference in zip(grad, expected):
+        torch.testing.assert_close(actual, reference)
     out.square().sum().backward()
     for parameter in model.parameters():
         assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
@@ -99,7 +106,7 @@ def _distributed_worker(rank, path):
         assert shard.global_shape == tuple(full[i].shape)
     hasher = _hasher()
     # Check both normal halo exchange and tiny shards spanning multiple neighbors.
-    for local_length in (4, 1):
+    for local_length in (4, 1, 0):
         tokens = torch.arange(1, 2 * local_length + 1).unsqueeze(0)
         sequences = torch.arange(2 * local_length).unsqueeze(0) // 3
         local = slice(rank * local_length, (rank + 1) * local_length)

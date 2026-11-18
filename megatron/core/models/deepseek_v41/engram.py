@@ -83,7 +83,7 @@ class EngramHasher(nn.Module):
         for i in range(1, self.layout.max_ngram_size):
             rolling = torch.bitwise_xor(rolling, products[..., i])
             hashes.append(rolling.unsqueeze(-1) % self.primes[:, i - 1])
-        return (torch.cat(hashes, -1) + self.offsets)[:, -local_length:]
+        return (torch.cat(hashes, -1) + self.offsets)[:, length - local_length :]
 
 
 class EngramEmbedding(EPShardedMultiTableEmbedding):
@@ -135,10 +135,16 @@ class Engram(MegatronModule):
         if config.perform_initialization:
             config.init_method(self.wkv.weight)
 
-    def forward(self, hidden_states, hash_ids, token_mask=None):
-        """Preserve FP32 gating arithmetic and the reference signed-square-root gate."""
+    def lookup(self, hash_ids: torch.Tensor) -> torch.Tensor:
+        """Look up one layer's fused table before a recomputed region, if desired."""
         addresses = hash_ids[:, :, self.hash_index]
-        kv = self.wkv(self.embed(addresses).flatten(-2)).transpose(0, 1)
+        return self.embed(addresses).flatten(-2)
+
+    def forward(self, hidden_states, hash_ids=None, token_mask=None, *, embeddings=None):
+        """Apply the FP32 signed-square-root gate to inline or already looked-up rows."""
+        if embeddings is None:
+            embeddings = self.lookup(hash_ids)
+        kv = self.wkv(embeddings).transpose(0, 1)
         key, value = kv.split([self.n * self.hidden_size, self.hidden_size], dim=-1)
         key = key.float().unflatten(-1, (self.n, self.hidden_size))
         h = hidden_states.float().unflatten(-1, (self.n, self.hidden_size))

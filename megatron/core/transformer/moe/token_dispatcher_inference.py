@@ -334,6 +334,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     _symm_agv_routing: Optional[dict] = None
     _symm_agv_probs: Optional[dict] = None
     _symm_rsv: Optional[dict] = None
+    # moe_ep_invariant_combine: the RSV combine finishes the EP-invariant combine tree.
+    _ep_invariant_combine: bool = False
 
     @classmethod
     def _get_rsv_tensor(cls) -> Optional[torch.Tensor]:
@@ -382,6 +384,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         cls._symm_agv_routing = None
         cls._symm_agv_probs = None
         cls._symm_rsv = None
+        cls._ep_invariant_combine = False
         cls._symm_metadata = None
         cls._real_token_count_tensor = None
 
@@ -391,7 +394,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         per_rank_worst_case_token_count: int,
         topk: int,
         hidden_size: int,
-        ep_group: torch.distributed.ProcessGroup,
+        tp_ep_group: torch.distributed.ProcessGroup,
+        ep_invariant_combine: bool = False,
     ) -> None:
         """Allocate all symmetric buffers and initialize class-level metadata.
 
@@ -404,11 +408,15 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
                 computed by the context as round_up_tokens(max_tokens) // tp_size.
             topk: MoE router top-k value.
             hidden_size: Model hidden dimension.
-            ep_group: Expert parallel process group.
+            tp_ep_group: Expert tensor and model parallel process group (the EP
+                group when expert tensor parallelism is 1).
+            ep_invariant_combine: ``moe_ep_invariant_combine``: token_combine sums the
+                rank partials as the top of the EP-invariant combine tree.
         """
-        ep_size = get_pg_size(ep_group)
+        tp_ep_size = get_pg_size(tp_ep_group)
+        cls._ep_invariant_combine = ep_invariant_combine
         cls._per_rank_worst_case_token_count = per_rank_worst_case_token_count
-        global_max = per_rank_worst_case_token_count * ep_size
+        global_max = per_rank_worst_case_token_count * tp_ep_size
         device = torch.cuda.current_device()
 
         # Each buffer self-sizes from its exact tensor footprint so non-default
@@ -424,27 +432,27 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         agv_r_shape = [global_max, topk]
         agv_p_shape = [global_max, topk]
         rsv_shape = [global_max, hidden_size]
-        meta_shape = [ep_size]
+        meta_shape = [tp_ep_size]
 
         cls._symm_agv_hidden = SymmetricMemoryManager.get_buffer(
-            "ep_agv_h", process_group=ep_group, size_mb=_size_mb(agv_h_shape, torch.bfloat16)
+            "ep_agv_h", process_group=tp_ep_group, size_mb=_size_mb(agv_h_shape, torch.bfloat16)
         ).maybe_get_tensor(agv_h_shape, dtype=torch.bfloat16)
 
         cls._symm_agv_routing = SymmetricMemoryManager.get_buffer(
-            "ep_agv_r", process_group=ep_group, size_mb=_size_mb(agv_r_shape, torch.int64)
+            "ep_agv_r", process_group=tp_ep_group, size_mb=_size_mb(agv_r_shape, torch.int64)
         ).maybe_get_tensor(agv_r_shape, dtype=torch.int64)
 
         cls._symm_agv_probs = SymmetricMemoryManager.get_buffer(
-            "ep_agv_p", process_group=ep_group, size_mb=_size_mb(agv_p_shape, torch.float32)
+            "ep_agv_p", process_group=tp_ep_group, size_mb=_size_mb(agv_p_shape, torch.float32)
         ).maybe_get_tensor(agv_p_shape, dtype=torch.float32)
 
         cls._symm_rsv = SymmetricMemoryManager.get_buffer(
-            "ep_rsv", process_group=ep_group, size_mb=_size_mb(rsv_shape, torch.float32)
+            "ep_rsv", process_group=tp_ep_group, size_mb=_size_mb(rsv_shape, torch.float32)
         ).maybe_get_tensor(rsv_shape, dtype=torch.float32)
 
         # Small scratch buffer for fused metadata allgather (WORLD_SIZE int32s).
         cls._symm_metadata = SymmetricMemoryManager.get_buffer(
-            "ep_meta", process_group=ep_group, size_mb=_size_mb(meta_shape, torch.int32)
+            "ep_meta", process_group=tp_ep_group, size_mb=_size_mb(meta_shape, torch.int32)
         ).maybe_get_tensor(meta_shape, dtype=torch.int32)
 
         failed = [
@@ -488,7 +496,10 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             symm_mem_hdl=cls._symm_metadata["handle"],
             step_metadata=cls._step_metadata,
         )
-        InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = local_tokens * self.ep_size
+        # self.tp_size is the expert-TP size: the AGV spans the tp_ep group.
+        InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = (
+            local_tokens * self.tp_size * self.ep_size
+        )
 
     def __init__(
         self,
@@ -579,7 +590,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
                 self.routing_map, self.__class__._real_token_count_tensor, self.sp_rank
             )
 
-        if self.ep_size == 1:
+        if self.tp_size * self.ep_size == 1:
             if self._runs_metadata_sync:
                 InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(hidden_states.shape[0])
                 # local_tokens * ep_size, with ep_size == 1. Set explicitly
@@ -600,7 +611,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         agv_p = self.__class__._symm_agv_probs
 
         per_rank_max = self._per_rank_worst_case_token_count
-        global_max = per_rank_max * self.ep_size
+        global_max = per_rank_max * self.tp_size * self.ep_size
         rank_token_offset = self._rank_token_offset()
         ep_max_tokens = self._ep_max_tokens()
 
@@ -650,7 +661,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         Returns:
             [local_tokens, hidden_size] bf16 local token outputs.
         """
-        if self.ep_size == 1:
+        if self.tp_size * self.ep_size == 1:
             return hidden_states.to(torch.bfloat16)
 
         rsv = self.__class__._symm_rsv
@@ -663,7 +674,13 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             dtype=rsv["tensor"].dtype,
             device=hidden_states.device,
         )
-        use_ordered = batch_invariant.enabled() and get_batch_invariant_collective() == "ordered"
+        # moe_ep_invariant_combine: the rank partials are subtrees of the EP-invariant
+        # combine tree, so they are summed as its top levels, pairwise in rank order
+        # (ordered kernel, whatever the configured collective).
+        ep_invariant = self.__class__._ep_invariant_combine
+        use_ordered = ep_invariant or (
+            batch_invariant.enabled() and get_batch_invariant_collective() == "ordered"
+        )
         # Under batch-invariant mode the "multimem" option keeps the native
         # NVLS in-switch reduce: measured correctly-rounded (exact fp32 sum,
         # bitwise-equal to an fp64 reference), deterministic and
@@ -679,6 +696,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             rank_token_offset=self._rank_token_offset(),
             ep_max_tokens=self._ep_max_tokens(),
             per_rank_max_tokens=self._per_rank_worst_case_token_count,
+            pairwise_tree=ep_invariant,
         )
         return output.to(torch.bfloat16)
 

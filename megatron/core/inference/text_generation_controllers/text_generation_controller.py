@@ -4,6 +4,7 @@ import asyncio
 import concurrent
 import copy
 import functools
+import gc
 import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -294,6 +295,10 @@ class TextGenerationController(MTPControllerMixin):
     # it) for batched `torch.isin`. Empty => the model declares a single eos.
     extra_eos_token_id_set: frozenset = frozenset()
 
+    # Inference consumes logits in fp32, so they are held and broadcast in fp32.
+    # The LM head emits them in fp32 when it can; otherwise they are upcast out of the model.
+    _logits_dtype: torch.dtype = torch.float32
+
     def __init__(self, inference_wrapped_model: AbstractModelInferenceWrapper, tokenizer):
         self.inference_wrapped_model = inference_wrapped_model
         self.model_config = self.inference_wrapped_model.model.config
@@ -311,6 +316,9 @@ class TextGenerationController(MTPControllerMixin):
             self.dp_group = parallel_state.get_data_parallel_group()
 
         self.model_is_pipeline_parallel = self.model_config.pipeline_model_parallel_size > 1
+
+        # Default False, unless overridden by gc_mode="freeze_overlap" in the engine.
+        self._overlap_gc = False
 
         # The language model holds the vocab, the MTP block and the embedding; a multimodal
         # wrapper keeps it under `language_model`.
@@ -397,7 +405,7 @@ class TextGenerationController(MTPControllerMixin):
         self._get_stop_word_finished_ids_callback = None
 
         device = torch.cuda.current_device()
-        logits_dtype = self.inference_wrapped_model.config.params_dtype
+        logits_dtype = self._logits_dtype
 
         self._sampling_backend = context.config.sampling_backend
         self._enable_cuda_graph = self.model_config.cuda_graph_impl == "local"
@@ -407,6 +415,7 @@ class TextGenerationController(MTPControllerMixin):
             self._all_logits_cuda = torch.zeros(
                 (1, max_logits, self.vocab_size), dtype=logits_dtype, device=device
             )
+            context.logits_output_buffer = self._all_logits_cuda
         else:
             self._all_logits_cuda = None
         self._async_sched_forward = AsyncScheduleForwardState()
@@ -936,8 +945,9 @@ class TextGenerationController(MTPControllerMixin):
             * (self.num_speculative_tokens + 1)
             * self.model_config.expert_model_parallel_size
         )
+        # The bound covers the tokens of all EP ranks, so every EP rank must be decoding.
         InferenceMode.set_bounded_mxfp8_rows(
-            context.is_decode_only()
+            context.is_ep_decode_only()
             and token_capacity is not None
             and decode_token_upper_bound <= token_capacity
         )
@@ -995,19 +1005,29 @@ class TextGenerationController(MTPControllerMixin):
 
             if is_pipeline_last_stage(self.pp_group):
                 assert logits is not None and torch.Size(logits_shape) == logits.shape
+            elif self._enable_cuda_graph:
+                logits = self._all_logits_cuda[:, :logits_seq_len, :]
 
             logits = broadcast_from_last_pipeline_stage(
-                logits_shape,
-                dtype=self.model_config.params_dtype,
-                tensor=logits,
-                pp_group=self.pp_group,
+                logits_shape, dtype=self._logits_dtype, tensor=logits, pp_group=self.pp_group
             )
 
-        # Copy logits to contiguous buffer.
         if self._enable_cuda_graph:
-            self._all_logits_cuda[:, :logits_seq_len, :].copy_(logits[:, :logits_seq_len, :])
+            # Ensure that the model wrote the logits into the correct buffer.
+            assert logits.data_ptr() == self._all_logits_cuda.data_ptr()
         else:
             self._all_logits_cuda = logits
+
+        # The forward is queued on the GPU. Collect now, while it runs, instead of letting
+        # automatic collection start right before the next launch.
+        if self._overlap_gc:
+            self._trigger_gc_now()
+
+    def _trigger_gc_now(self) -> None:
+        """Trigger GC now by CPython's thresholds."""
+        count, threshold = gc.get_count(), gc.get_threshold()
+        if threshold[0] and count[0] > threshold[0]:
+            gc.collect(next(gen for gen in (2, 1, 0) if count[gen] > threshold[gen]))
 
     def _rewind_kv_cache(self, accepted_counts_cpu: Optional[Tensor] = None) -> tuple:
         """Update the KV cache bookkeeping for speculative decoding.
@@ -1062,6 +1082,7 @@ class TextGenerationController(MTPControllerMixin):
             mamba_state_idx = context.mamba_metadata.request_to_mamba_state_idx[
                 active_request_slice
             ].to(cuda_device, non_blocking=True)
+            # Conv state rollback (full-window checkpoint copy).
             mamba_state_selective_copy(
                 intermediate_states=context.mamba_intermediate_conv_states,
                 current_states=context.mamba_conv_states,
@@ -1070,14 +1091,26 @@ class TextGenerationController(MTPControllerMixin):
                 accepted_counts=accepted_counts_gpu,
                 num_layers=context.num_mamba_layers,
             )
-            mamba_state_selective_copy(
-                intermediate_states=context.mamba_intermediate_ssm_states,
-                current_states=context.mamba_ssm_states,
-                prefill_status=prefill_status_gpu,
-                state_idx=mamba_state_idx,
-                accepted_counts=accepted_counts_gpu,
-                num_layers=context.num_mamba_layers,
-            )
+            # SSM state rollback: ReplaySSM ring-pointer commit, or the full
+            # intermediate-state copy.
+            if context.mamba_replay is not None:
+                # ReplaySSM: no state copy at all. Advance each slot's ring cursor by
+                # (accepted drafts + bonus token); rejected drafts are simply left
+                # behind the new write_pos and get overwritten next step.
+                context.mamba_replay.commit(
+                    accepted_draft_counts=accepted_counts_gpu,
+                    prefill_status=prefill_status_gpu,
+                    state_batch_indices=mamba_state_idx,
+                )
+            else:
+                mamba_state_selective_copy(
+                    intermediate_states=context.mamba_intermediate_ssm_states,
+                    current_states=context.mamba_ssm_states,
+                    prefill_status=prefill_status_gpu,
+                    state_idx=mamba_state_idx,
+                    accepted_counts=accepted_counts_gpu,
+                    num_layers=context.num_mamba_layers,
+                )
 
         return blocks_to_release, remove_mask
 
@@ -1362,7 +1395,7 @@ class TextGenerationController(MTPControllerMixin):
             positions (Tensor): CPU position within the KV block for each routing row.
         """
         context = self.inference_wrapped_model.inference_context
-        context.kv_block_allocator.store_routing_per_block(
+        context.kv_block_allocator.routing_replay.scatter_routing_to_blocks(
             routing_indices, block_ids.numpy(), positions.numpy()
         )
 
@@ -1728,6 +1761,8 @@ class TextGenerationController(MTPControllerMixin):
             input_ids (Tensor): Dummy input token IDs.
             position_ids (Tensor): Dummy input position IDs.
         """
+        # The forward overwrites `_all_logits_cuda`: nothing pending may still await sampling.
+        assert not self._async_sched_forward.is_valid
         self._dynamic_step_forward_logits(input_ids, position_ids)
 
     def _run_dummy_legacy_step(self, input_ids: Tensor, position_ids: Tensor) -> None:
@@ -1878,15 +1913,13 @@ class TextGenerationController(MTPControllerMixin):
         """
         context = self.inference_wrapped_model.inference_context
         finished_routing_block_ids = {}
-        if not context.kv_block_allocator.block_routing:
+        if not context.kv_block_allocator.routing_replay.has_data():
             return finished_routing_block_ids
 
         for finished_idx in finished_idxs.tolist():
             request_id = int(context.request_ids[finished_idx].item())
             # Draft-only lookahead has no main-model routing to reconstruct.
-            committed_blocks = int(context.get_committed_kv_block_counts(finished_idx).item())
-            blocks = context.request_to_kv_block_ids[finished_idx, :committed_blocks]
-            valid_blocks = blocks[blocks >= 0].tolist()
+            valid_blocks = context.get_committed_kv_block_ids(finished_idx)
             if valid_blocks:
                 finished_routing_block_ids[request_id] = valid_blocks
         return finished_routing_block_ids
@@ -3138,6 +3171,7 @@ class TextGenerationController(MTPControllerMixin):
         request_result = None
         cuda_graph_request_count = None
         log_probs_transfer = None
+        prompt_logprob_writes = []
 
         with torch.inference_mode():
             if had_pending_forward:
@@ -3154,6 +3188,9 @@ class TextGenerationController(MTPControllerMixin):
 
                 log_probs_gpu_result = self._run_async_sched_log_probs(sample_result)
                 log_probs_transfer = self._copy_async_sched_log_probs_to_cpu(log_probs_gpu_result)
+                # The rows arrive after update and admission, so record their
+                # blocks now and pin them until the rows are stored.
+                prompt_logprob_writes = context.capture_prompt_logprob_writes()
 
                 self._synchronize_async_sched_event(sample_result.sample_cpu_ready_event)
 
@@ -3204,6 +3241,7 @@ class TextGenerationController(MTPControllerMixin):
 
         self._finalize_async_sched_log_probs(request_result, sample_result, log_probs_transfer)
         log_probs, top_n_logprobs = request_result.log_probs_result
+        context.commit_prompt_logprob_writes(prompt_logprob_writes, log_probs, top_n_logprobs)
         result = self._build_async_sched_step_result(
             request_result,
             cuda_graph_request_count,
@@ -3532,6 +3570,12 @@ class TextGenerationController(MTPControllerMixin):
                             log_probs_tensor
                         )
             range_pop()
+
+            # Cache prompt log-prob rows on their blocks before update_requests
+            # changes the layout that locates them.
+            context.commit_prompt_logprob_writes(
+                context.capture_prompt_logprob_writes(), log_probs, top_n_logprobs
+            )
 
             # Capture before update_requests (called by _dynamic_step_context_bookkeeping)
             # resets num_prefill_requests to 0, which would make num_decode_requests
@@ -3934,7 +3978,7 @@ class TextGenerationController(MTPControllerMixin):
                     # and then broadcast the sampled tokens rather than broadcasting the raw logits.
                     logits = broadcast_from_last_pipeline_stage(
                         [batch_size, logits_seq_len, self.vocab_size],
-                        dtype=self.model_config.params_dtype,
+                        dtype=self._logits_dtype,
                         tensor=logits,
                         pp_group=self.pp_group,
                     )
