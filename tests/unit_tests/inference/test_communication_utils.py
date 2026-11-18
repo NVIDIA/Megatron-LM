@@ -27,6 +27,31 @@ class TestCommunicationWithCustomPPGroup:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.parametrize("strided", [False, True])
+    def test_broadcast_logits_layout(self, strided):
+        Utils.initialize_model_parallel(1, Utils.world_size)
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+        source = torch.arange(64, device="cuda", dtype=self.dtype).reshape(4, 2, 8)
+        source = source.transpose(0, 1)
+        if not strided:
+            source = source.contiguous()
+        is_last_stage = pp_group.rank() == pp_group.size() - 1
+        receive_buffer = torch.empty(source.shape, device="cuda", dtype=self.dtype)
+
+        actual = broadcast_from_last_pipeline_stage(
+            list(source.shape),
+            self.dtype,
+            tensor=source if is_last_stage else receive_buffer,
+            pp_group=pp_group,
+        )
+
+        assert actual.is_contiguous()
+        assert torch.equal(actual, source)
+        if not is_last_stage:
+            assert actual is receive_buffer
+        elif not strided:
+            assert actual is source
+
     @pytest.mark.skipif(
         not is_torch_min_version("2.4.0"),
         reason="torch.distributed.init_device_mesh requires torch >= 2.4.0",

@@ -631,6 +631,13 @@ class TextGenerationController(MTPControllerMixin):
 
         return text, prompts_plus_generations_segments
 
+    @staticmethod
+    def _full_sequence_log_probs(logits: Tensor) -> Tensor:
+        """Normalize vocabulary rows without copying sequence-major model outputs."""
+        if logits.is_contiguous():
+            return F.log_softmax(logits, dim=-1).to(torch.float32)
+        return F.log_softmax(logits.transpose(0, 1), dim=-1).transpose(0, 1).to(torch.float32)
+
     def sample_from_logits(
         self,
         last_token_logits: torch.Tensor,
@@ -694,7 +701,7 @@ class TextGenerationController(MTPControllerMixin):
 
                 # Compute the prompt logprobs
                 batch_size, seq_length, _ = logits.shape
-                log_probs = F.log_softmax(logits, dim=2).to(torch.float32)
+                log_probs = self._full_sequence_log_probs(logits)
                 top_n_logits_this_step = torch.topk(log_probs, k=sampling_params.top_n_logprobs)
 
                 # Move the token dimension to the front and then add each token logprobs
@@ -4022,7 +4029,7 @@ class TextGenerationController(MTPControllerMixin):
 
                 # Compute log probs
                 if sampling_params.return_log_probs:
-                    log_probs = F.log_softmax(logits, dim=2).to(torch.float32)
+                    log_probs = self._full_sequence_log_probs(logits)
 
                     indices = torch.unsqueeze(
                         batch_prompt_tokens[

@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from megatron.core.models.common.language_module import language_module as language_module_module
@@ -19,7 +20,8 @@ class _FakeTPGroup:
         return 1
 
 
-def test_vocab_parallel_cross_entropy_uses_explicit_tp_group(monkeypatch):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_vocab_parallel_cross_entropy_uses_explicit_tp_group(monkeypatch, dtype):
     tp_group = _FakeTPGroup()
     all_reduce_groups = []
 
@@ -35,15 +37,20 @@ def test_vocab_parallel_cross_entropy_uses_explicit_tp_group(monkeypatch):
         cross_entropy_module, "get_tensor_model_parallel_group", fail_parallel_state_call
     )
 
-    vocab_parallel_logits = torch.tensor([[1.0, 2.0, 3.0], [0.5, -0.5, 1.0]])
-    target = torch.tensor([2, 0])
+    vocab_parallel_logits = torch.arange(24, dtype=dtype).reshape(4, 2, 3).transpose(0, 1)
+    vocab_parallel_logits.requires_grad_()
+    reference_logits = vocab_parallel_logits.detach().float().contiguous().requires_grad_()
+    target = torch.tensor([[2, 0, 1, 2], [0, 1, 2, 0]])
     expected_output = torch.nn.functional.cross_entropy(
-        vocab_parallel_logits.clone(), target, reduction="none"
-    )
+        reference_logits.reshape(-1, 3), target.flatten(), reduction="none"
+    ).reshape_as(target)
 
     output = vocab_parallel_cross_entropy(vocab_parallel_logits, target, tp_group=tp_group)
 
     torch.testing.assert_close(output, expected_output)
+    actual_grad = torch.autograd.grad(output.sum(), vocab_parallel_logits)[0]
+    expected_grad = torch.autograd.grad(expected_output.sum(), reference_logits)[0]
+    torch.testing.assert_close(actual_grad.float(), expected_grad, atol=0.002, rtol=0.01)
     assert all_reduce_groups == [tp_group, tp_group, tp_group]
 
 
