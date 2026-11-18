@@ -19,6 +19,8 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     GradientFinalizationMode,
     Placements,
+    PrefetchOrder,
+    RuntimePolicy,
     SchedulePolicy,
     fully_shard,
     fully_shard_context,
@@ -371,8 +373,13 @@ def test_mxfp8_unshard_gathers_rowwise_for_forward_and_columnwise_for_backward(d
 @requires_mxfp8
 @pytest.mark.parametrize("placements", _MXFP8_PLACEMENTS)
 @pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
+@pytest.mark.parametrize(
+    "prefetch_order",
+    [PrefetchOrder.REGISTRATION, PrefetchOrder.RECORDED],
+    ids=["registration", "recorded"],
+)
 def test_mxfp8_activation_recompute_matches_no_recompute(
-    distributed_setup, use_reentrant, placements
+    distributed_setup, use_reentrant, placements, prefetch_order
 ):
     """Recomputation regathers rowwise planes in backward without changing numerics."""
     device = distributed_setup.device
@@ -386,7 +393,8 @@ def test_mxfp8_activation_recompute_matches_no_recompute(
         with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
             torch.manual_seed(2026)
             model = _RecomputedMLP(device, use_reentrant)
-        with fully_shard_context(FsdpContext(device=device)):
+        runtime_policy = RuntimePolicy(prefetch_order=prefetch_order)
+        with fully_shard_context(FsdpContext(device=device, runtime_policy=runtime_policy)):
             fully_shard(model.fc1, mesh=mesh, placements=placements)
             fully_shard(model.fc2, mesh=mesh, placements=placements)
             fully_shard(model, mesh=mesh, placements=placements)
@@ -395,6 +403,54 @@ def test_mxfp8_activation_recompute_matches_no_recompute(
         return model, optimizer
 
     _check_recompute_matches_no_recompute(distributed_setup, recipe, build, use_reentrant)
+
+
+@pytest.mark.launch_on_gb200
+@requires_mxfp8
+@pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
+def test_mxfp8_recorded_order_prefetches_rowwise_for_recompute(distributed_setup, use_reentrant):
+    """Checks a recorded order prefetches rowwise planes before each recomputation.
+
+    Backward prefetch gathers only columnwise planes, so without recorded recomputation
+    events the rowwise planes would be gathered on demand.
+    """
+    device = distributed_setup.device
+    if distributed_setup.world_size < 2:
+        pytest.skip("Distributed MXFP8 coverage requires at least two ranks.")
+
+    recipe = MXFP8BlockScaling()
+    with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
+        model = _RecomputedMLP(device, use_reentrant)
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    runtime_policy = RuntimePolicy(prefetch_order=PrefetchOrder.RECORDED)
+    with fully_shard_context(FsdpContext(device=device, runtime_policy=runtime_policy)):
+        fully_shard(model.fc1, mesh=mesh, placements=_ZERO3_PLACEMENTS)
+        fully_shard(model.fc2, mesh=mesh, placements=_ZERO3_PLACEMENTS)
+        fully_shard(model, mesh=mesh, placements=_ZERO3_PLACEMENTS)
+
+    # Reentrant checkpointing produces gradients only for inputs requiring grad.
+    x = torch.randn(32, 64, dtype=torch.bfloat16, device=device, requires_grad=True)
+
+    def train_step():
+        with te.autocast(recipe=recipe):
+            output = model(x)
+        output.float().square().mean().backward()
+
+    # The first step records the execution order.
+    train_step()
+
+    recomputed = []
+
+    def check_rowwise_prefetched(module, _args):
+        if is_in_backward():
+            assert _is_rowwise_allocated(module)
+            recomputed.append(module)
+
+    for module in (model.fc1, model.fc2):
+        # Check before FSDP's own hook, so on-demand unsharding cannot satisfy the assertion.
+        module.register_forward_pre_hook(check_rowwise_prefetched, prepend=True)
+    train_step()
+    assert recomputed == [model.fc2, model.fc1]
 
 
 @pytest.mark.launch_on_gb200
