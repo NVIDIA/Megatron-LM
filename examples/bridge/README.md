@@ -101,17 +101,6 @@ They cover config serialization and copying, dispatch, tensor mappings, Hybrid
 builders, Nemotron-H and Qwen config/mapping conversion, and native checkpoint I/O.
 Tests for unported model families, Bridge's training CLI, and PEFT are excluded.
 
-An offline reduced-model check also exercises real Nemotron-H forward/backward,
-native checkpoint save/load, and Super VL text-only export:
-
-```bash
-PYTHONPATH=. uv run --no-sync python -m torch.distributed.run --standalone \
-  --nproc-per-node=1 examples/bridge/training/smoke_super_vl.py
-```
-
-This uses random reduced weights, downloads no model weights, and is not a
-pretrained quality, convergence, or performance test.
-
 ## Source
 
 Model/conversion code is adapted from Apache-2.0 Megatron Bridge at
