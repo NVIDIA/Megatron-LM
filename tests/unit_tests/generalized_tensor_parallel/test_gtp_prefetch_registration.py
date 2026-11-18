@@ -262,7 +262,7 @@ def test_model_initialization_registers_defaults_and_preserves_overrides(monkeyp
         return original(name, weights)
 
     monkeypatch.setattr(gtp, "register_prefetch_chain", record)
-    # Two chunks/wrappers: grouping must span the complete model, not reset per chunk.
+    # Independently scheduled chunks need separate defaults; explicit overrides survive.
     models = [
         _model(
             **{
@@ -277,14 +277,30 @@ def test_model_initialization_registers_defaults_and_preserves_overrides(monkeyp
         _model(optional_enabled=optional_enabled, excluded=replicated, custom=custom),
     ]
     gtp.classify_gtp_remat_chains(models, cuda_graph_impl=impl, cuda_graph_modules=scope)
-    assert set(calls) == {"default_dense", "default_expert_fc1", "default_expert_fc2"}
+    assert set(calls) == {
+        "default_dense",
+        "default_dense_1",
+        "default_expert_fc1",
+        "default_expert_fc2",
+    }
     assert mamba_fc1.chain_id == mamba_fc2.chain_id
-    assert mamba_fc1._gtp_prefetch_chain_name == optional_enabled._gtp_prefetch_chain_name
+    assert mamba_fc1._gtp_prefetch_chain_name != optional_enabled._gtp_prefetch_chain_name
     assert custom._gtp_prefetch_chain_name == "custom"
     assert not hasattr(replicated, "_gtp_prefetch_chain_name")
     assert fc1[0].chain_id == fc1[1].chain_id
     assert fc2[0].chain_id == fc2[1].chain_id
-    assert len({mamba_fc1.chain_id, fc1[0].chain_id, fc2[0].chain_id, custom.chain_id}) == 4
+    assert (
+        len(
+            {
+                mamba_fc1.chain_id,
+                optional_enabled.chain_id,
+                fc1[0].chain_id,
+                fc2[0].chain_id,
+                custom.chain_id,
+            }
+        )
+        == 5
+    )
     assert gtp._chain_is_graphed(mamba_fc1.chain_id) == (impl != "none")
     assert gtp._chain_is_graphed(fc1[0].chain_id) == (impl == "full_iteration")
 
@@ -306,7 +322,7 @@ def test_default_registration_preserves_chain_free_opt_out():
 
 def test_default_registration_keeps_process_groups_separate():
     first, second = _weight(object()), _weight(object())
-    gtp.classify_gtp_remat_chains([_model(first=first), _model(second=second)])
+    gtp.classify_gtp_remat_chains(_model(first=first, second=second))
     assert first.chain_id != second.chain_id
 
 
