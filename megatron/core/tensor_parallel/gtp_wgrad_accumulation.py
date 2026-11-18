@@ -14,10 +14,10 @@ class _Phase(Enum):
     #
     # FENCE_ONLY waits for the final fence; COMPLETE allows early reduction.
     # reset() after the final fence: any state -> COUNTING.
-    COUNTING = auto()          # More forwards may arrive.
+    COUNTING = auto()  # More forwards may arrive.
     FORWARD_COMPLETE = auto()  # The caller declared the last forward.
-    FENCE_ONLY = auto()        # Forward calls cannot reliably predict backward contributions.
-    COMPLETE = auto()          # All declared contributions arrived; early reduction is due.
+    FENCE_ONLY = auto()  # Forward calls cannot reliably predict backward contributions.
+    COMPLETE = auto()  # All declared contributions arrived; early reduction is due.
 
 
 @dataclass
