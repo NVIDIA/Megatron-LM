@@ -1135,7 +1135,6 @@ class MoEDeduplicatingAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
         self._dedup_wire_tokens = None
         self._dedup_wire_to_expert_rows = None
         self._dedup_expert_wire_rows = None
-        self._dedup_num_tokens = 0
         self._dedup_topk = 0
 
     def _metadata_gather_launch(
@@ -1191,7 +1190,6 @@ class MoEDeduplicatingAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
             self.ep_rank, self.num_experts : counts_width
         ].tolist()
         self.dedup_output_splits = gathered_cpu[:, self.num_experts + self.ep_rank].tolist()
-        self.num_global_tokens_per_local_expert_cpu = local_expert_counts_cpu
         self.cuda_sync_point = "no_sync"
         self.tokens_per_expert_gpu = gathered[:, self.local_slot_start : self.local_slot_end].sum(
             dim=0
@@ -1261,7 +1259,6 @@ class MoEDeduplicatingAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
             torch.arange(num_wire_rows, device=indices.device),
         )
         token_wire_rows = token_wire_rows.view(num_tokens, topk)
-        self._dedup_num_tokens = num_tokens
         self._dedup_topk = topk
         self._dedup_token_wire_rows = token_wire_rows
         self._dedup_wire_tokens = wire_tokens
@@ -1413,7 +1410,6 @@ class MoEDeduplicatingAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
             self.dedup_row_elems = dedup_payload_width(
                 hidden_size, topk, hidden_states.element_size()
             )
-            self._dedup_num_tokens = num_tokens
             self._dedup_topk = topk
             self._dedup_token_wire_rows = token_wire_rows
             self._dedup_wire_tokens = wire_tokens_full.narrow(0, 0, num_wire_rows)
