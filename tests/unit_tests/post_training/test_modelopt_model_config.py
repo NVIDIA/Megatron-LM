@@ -238,7 +238,7 @@ class TestModelOptModelConfigFromArgs:
         config = mc.modelopt_model_config_from_args(args)
 
         assert config.transformer.num_layers == 0
-        # GPTModelBuilder copies it onto the TransformerConfig at build time.
+        # GPTModelConfig.finalize() copies it onto the TransformerConfig.
         assert not hasattr(config.transformer, "original_num_layers")
         assert config.transformations.original_num_layers == 2
 
@@ -250,12 +250,22 @@ class TestModelOptModelConfigFromArgs:
         with pytest.raises(ValueError, match="inference_optimized"):
             config.validate()
 
+    @pytest.mark.parametrize("hybrid", [False, True])
+    def test_rejects_unsupported_real_quant_cfg(self, hybrid):
+        args = make_modelopt_test_args(hybrid_layer_pattern="M*" if hybrid else None)
+        config = mc.modelopt_model_config_from_args(args)
+        config.transformations.real_quant_cfg = "unsupported"
+        with pytest.raises(ValueError, match="Unsupported real_quant_cfg"):
+            config.validate()
+
     def test_offline_layer_count_survives_serialization(self):
         args = make_modelopt_test_args(export_offline_model=True)
         restored = ModelConfig.from_dict(mc.modelopt_model_config_from_args(args).as_dict())
         assert restored.transformer.num_layers == 0
         assert not hasattr(restored.transformer, "original_num_layers")
 
+        restored.finalize()
+        assert restored.transformer.original_num_layers == 2
         with (
             patch("megatron.training.models.gpt.default_layer_spec"),
             patch("megatron.training.models.gpt.mtp_block_spec", return_value=None),

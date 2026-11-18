@@ -40,6 +40,7 @@ from megatron.core.transformer.transformer_block import TransformerBlockSubmodul
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
 from megatron.training.models.dist_utils import unimodal_build_distributed_models
+from megatron.training.models.transforms import ModelTransformConfig
 from megatron.training.vocab_utils import calculate_padded_vocab_size
 
 logger = logging.getLogger(__name__)
@@ -213,6 +214,12 @@ class GPTModelConfig(ModelConfig):
     use_arbitrary_attention_mask: bool | None = None
     """Megatron-Bridge compatibility only: read by the ``restore_modelopt_state`` layer spec."""
 
+    ### ModelOpt ###
+    transformations: ModelTransformConfig | None = None
+    """Declarative ModelOpt options. The builder selects the ModelOpt layer spec from it; the
+    training and inference entry points install the matching pre-wrap hooks
+    (``megatron.post_training.model_hooks.modelopt_setup_hooks``)."""
+
     @override
     def __getattr__(self, name: str, /) -> Any:
         # __getattr__ is only called when normal attribute lookup has already failed,
@@ -242,7 +249,8 @@ class GPTModelConfig(ModelConfig):
 
     def validate(self) -> None:
         """Check model layout without mutation or runtime-derived RNG settings."""
-        super().validate()
+        if self.transformations is not None:
+            self.transformations.validate(self.transformer.transformer_impl)
         vp_size = self.transformer.virtual_pipeline_model_parallel_size
         is_pipeline_asymmetric = (
             self.transformer.account_for_embedding_in_pipeline_split
@@ -262,6 +270,13 @@ class GPTModelConfig(ModelConfig):
         """Finalize nested model settings after the run has propagated its RNG policy."""
         if hasattr(self.transformer, "finalize") and callable(self.transformer.finalize):
             self.transformer.finalize()
+
+        # Offline speculative decoding builds the base model with num_layers=0; ModelOpt reads
+        # the original layer count from the TransformerConfig. It is not a TransformerConfig
+        # field, so it is serialized in ``transformations`` and restored here.
+        options = self.transformations
+        if options is not None and options.original_num_layers is not None:
+            self.transformer.original_num_layers = options.original_num_layers
 
         # Standalone model finalization retains the same layout checks as container startup.
         self.validate()
@@ -302,9 +317,6 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
         Returns:
             The constructed model
         """
-        options = self._model_config.transformations
-        if options is not None and options.original_num_layers is not None:
-            self._model_config.transformer.original_num_layers = options.original_num_layers
         transformer_layer_spec = self._model_config.transformer_layer_spec
         if transformer_layer_spec is None:
             transformer_layer_spec = default_layer_spec(self._model_config, vp_stage)

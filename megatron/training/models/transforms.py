@@ -34,9 +34,18 @@ class ModelTransformConfig:
     """Offline speculative decoding: the base model's layer count. The model is built with
     ``num_layers=0``, and ModelOpt reads this from the built ``TransformerConfig``."""
 
-    def validate(self) -> None:
-        """Validate transformation settings before allocating models or loading checkpoints."""
+    def validate(self, transformer_impl: str | None = None) -> None:
+        """Validate transformation settings before allocating models or loading checkpoints.
+
+        Args:
+            transformer_impl: The model's ``TransformerConfig.transformer_impl``, if known.
+        """
         if self.qad_train_target not in (None, "mtp", "base", "both"):
             raise ValueError(f"Unsupported qad_train_target: {self.qad_train_target}")
         if self.real_quant_cfg not in ("None", "fp8_real_quant", "fp8_blockwise_real_quant"):
             raise ValueError(f"Unsupported real_quant_cfg: {self.real_quant_cfg}")
+        if transformer_impl == "inference_optimized":
+            raise ValueError(
+                "ModelOpt transformations require the ModelOpt layer spec and cannot be "
+                "combined with transformer_impl='inference_optimized'."
+            )

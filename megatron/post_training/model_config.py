@@ -286,17 +286,3 @@ def build_inference_models(cfg, *, device: str = "cuda", mixed_precision: bool =
         device=device,
         **kwargs,
     )
-
-
-def build_modelopt_models(args: Namespace) -> list:
-    """Bridge legacy inference callers that initialize a run container without a model.
-
-    New entry points should translate with modelopt_inference_config_from_args
-    before initialization and call build_inference_models directly.
-    """
-    from megatron.training.global_vars import get_run_config
-
-    cfg = get_run_config()
-    if cfg.model is None or cfg.model.transformations is None:
-        cfg.model = modelopt_inference_config_from_args(args).model
-    return build_inference_models(cfg)

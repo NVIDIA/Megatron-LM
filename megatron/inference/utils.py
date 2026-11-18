@@ -22,7 +22,11 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_size, log_single_rank, unwrap_model
 from megatron.training import get_args, get_wandb_writer
-from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
+from megatron.training.argument_utils import (
+    gpt_config_from_args,
+    hybrid_config_from_args,
+    inference_cfg_container_from_args,
+)
 from megatron.training.checkpointing import (
     get_checkpoint_name,
     get_checkpoint_tracker_filename,
@@ -40,7 +44,10 @@ from megatron.training.models import (
 )
 
 try:
-    from megatron.post_training.model_config import build_inference_models, build_modelopt_models
+    from megatron.post_training.model_config import (
+        build_inference_models,
+        modelopt_inference_config_from_args,
+    )
     from megatron.post_training.utils import should_use_modelopt_config
 
     HAS_NVIDIA_MODELOPT = True
@@ -183,6 +190,18 @@ def _warn_on_unloaded_checkpoint_tensors(
         )
 
 
+def inference_config_from_args(args: Namespace):
+    """Create the inference run config from the arguments, before ``initialize_megatron``.
+
+    Runs that need ModelOpt (``--modelopt-enabled``, or a checkpoint with ModelOpt state) get the
+    ModelOpt model settings here, so the config is complete from the start and
+    ``get_model_for_inference`` builds exactly the model it declares.
+    """
+    if HAS_NVIDIA_MODELOPT and should_use_modelopt_config(args):
+        return modelopt_inference_config_from_args(args)
+    return inference_cfg_container_from_args(args)
+
+
 def get_model_for_inference(
     pg_collection: Optional[ProcessGroupCollection] = None,
     checkpoint_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -196,24 +215,16 @@ def get_model_for_inference(
             complete checkpoint view. Defaults to the global process group.
     """
 
-    from megatron.training.global_vars import is_run_config_initialized
-
     args = get_args()
-    cfg = get_run_config() if is_run_config_initialized() else None
-    declared_modelopt = (
-        cfg is not None and cfg.model is not None and cfg.model.transformations is not None
-    )
-    use_modelopt = declared_modelopt or (
-        HAS_NVIDIA_MODELOPT
-        and should_use_modelopt_config(args, checkpoint=cfg.checkpoint if cfg is not None else None)
-    )
-    if use_modelopt:
+    cfg = get_run_config()
+    # The run config was created with ModelOpt settings by inference_config_from_args.
+    if getattr(cfg.model, "transformations", None) is not None:
         # The ModelOpt model config is translated with the global parallel sizes.
         if pg_collection is not None:
             raise ValueError(
                 "Custom inference process groups are not supported by the ModelOpt builder"
             )
-        model = build_inference_models(cfg) if declared_modelopt else build_modelopt_models(args)
+        model = build_inference_models(cfg)
     else:
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()

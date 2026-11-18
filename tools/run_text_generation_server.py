@@ -24,17 +24,13 @@ from megatron.core.inference.text_generation_server import MegatronServer
 from megatron.core.inference.text_generation_server.run_mcore_engine import run_mcore_engine
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
-from megatron.inference.utils import get_model_builder
+from megatron.inference.utils import get_model_builder, inference_config_from_args
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import print_rank_0
 from megatron.training.global_vars import get_run_config, set_run_config
 
 try:
-    from megatron.post_training.model_config import (
-        build_inference_models,
-        modelopt_inference_config_from_args,
-    )
-    from megatron.post_training.utils import should_use_modelopt_config
+    from megatron.post_training.model_config import build_inference_models
 
     HAS_NVIDIA_MODELOPT = True
 except ImportError:
@@ -46,7 +42,6 @@ sys.path.append(
 
 from megatron.core import mpu
 from megatron.training import get_args, get_tokenizer
-from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
@@ -130,12 +125,7 @@ def main(model_type: str = "gpt"):
             'exit_on_missing_checkpoint': True,
         },
     )
-    use_modelopt = HAS_NVIDIA_MODELOPT and should_use_modelopt_config(args)
-    cfg = (
-        modelopt_inference_config_from_args(args)
-        if use_modelopt
-        else inference_cfg_container_from_args(args)
-    )
+    cfg = inference_config_from_args(args)
     set_run_config(cfg)
     initialize_megatron()
     args = get_args()
@@ -150,7 +140,7 @@ def main(model_type: str = "gpt"):
 
         load_context = fp8_model_init()
     with load_context:
-        if use_modelopt:
+        if getattr(cfg.model, "transformations", None) is not None:
             # ModelOpt layer specs and hooks come from the config; the builder is the stock one.
             model = build_inference_models(cfg)
         else:

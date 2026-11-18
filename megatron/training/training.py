@@ -2526,7 +2526,9 @@ def setup_model_and_optimizer(
             # ModelOpt hooks surround the config's own hooks (including the freezes above):
             # setup (state restore, QAD freeze, LSQ, TE-load) runs first, KD conversion last.
             # They go on a copy, so cfg.model keeps only its own hooks across repeated builds.
-            if model_config.transformations is not None or cfg.distillation is not None:
+            # Only GPT/Hybrid configs have ModelOpt transformations.
+            transformations = getattr(model_config, "transformations", None)
+            if transformations is not None or cfg.distillation is not None:
                 from megatron.post_training.model_hooks import (
                     distillation_hooks,
                     modelopt_setup_hooks,

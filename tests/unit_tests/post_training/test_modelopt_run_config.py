@@ -9,7 +9,6 @@ from megatron.post_training import model_config as mc
 from megatron.post_training import model_hooks
 from megatron.post_training import utils as modelopt_utils
 from megatron.training.argument_utils import (
-    inference_cfg_container_from_args,
     pretrain_cfg_container_from_args,
     resolve_tokenizer_vocab_size,
 )
@@ -163,21 +162,6 @@ def test_direct_training_config_rejects_manual_gc(tmp_path):
         cfg.validate()
 
 
-def test_legacy_inference_helper_reuses_declared_model():
-    args = make_modelopt_test_args()
-    cfg = mc.modelopt_inference_config_from_args(args)
-    model = cfg.model
-    with (
-        patch("megatron.training.global_vars.get_run_config", return_value=cfg),
-        patch.object(mc, "build_inference_models") as build,
-        patch.object(mc, "modelopt_inference_config_from_args") as translate,
-    ):
-        mc.build_modelopt_models(args)
-    translate.assert_not_called()
-    assert cfg.model is model
-    build.assert_called_once()
-
-
 def test_inference_uses_config_without_cli_enable_flag():
     from argparse import Namespace
 
@@ -199,7 +183,6 @@ def test_inference_uses_config_without_cli_enable_flag():
     with (
         patch.object(utils, "get_args", return_value=args),
         patch.object(utils, "get_run_config", return_value=cfg),
-        patch("megatron.training.global_vars.is_run_config_initialized", return_value=True),
         patch.object(utils, "build_inference_models", return_value=[stage]) as build,
         patch.object(utils, "get_model_builder") as legacy_builder,
         patch.object(
@@ -215,13 +198,14 @@ def test_inference_uses_config_without_cli_enable_flag():
 @pytest.mark.parametrize(
     "hybrid,builder_cls", [(False, GPTModelBuilder), (True, HybridModelBuilder)]
 )
-def test_checkpoint_detected_inference_defaults_unregistered_modelopt_options(hybrid, builder_cls):
-    """Checkpoint detection works for callers that did not register ModelOpt CLI flags."""
+def test_checkpoint_detected_inference_config_defaults_unregistered_modelopt_options(
+    hybrid, builder_cls
+):
+    """Checkpoint detection works for entry points that did not register ModelOpt CLI flags."""
     from megatron.inference import utils
 
     args = make_modelopt_test_args(hybrid_layer_pattern="M*" if hybrid else None)
     args.load = "/modelopt-checkpoint"
-    args.inference_ckpt_non_strict = False
     modelopt_only_options = (
         "export_offline_model",
         "freeze_base_for_mtp",
@@ -231,37 +215,39 @@ def test_checkpoint_detected_inference_defaults_unregistered_modelopt_options(hy
     )
     for name in modelopt_only_options:
         delattr(args, name)
-    cfg = inference_cfg_container_from_args(args, model_cfg=None, build_model_config=False)
-    stage = Mock()
 
-    with (
-        patch.object(utils, "get_args", return_value=args),
-        # utils imports get_run_config directly; build_modelopt_models reads it from global_vars.
-        patch.object(utils, "get_run_config", return_value=cfg),
-        patch("megatron.training.global_vars.get_run_config", return_value=cfg),
-        patch("megatron.training.global_vars.is_run_config_initialized", return_value=True),
-        patch.object(utils, "should_use_modelopt_config", return_value=True),
-        patch.object(mc, "build_inference_models", return_value=[stage]) as build,
-        patch.object(utils, "load_checkpoint"),
-    ):
-        assert utils.get_model_for_inference() is stage
+    with patch.object(utils, "should_use_modelopt_config", return_value=True):
+        cfg = utils.inference_config_from_args(args)
 
     assert cfg.model.get_builder_cls() is builder_cls
     assert cfg.model.transformations == mc.ModelTransformConfig()
     assert all(not hasattr(args, name) for name in modelopt_only_options)
-    build.assert_called_once_with(cfg)
 
 
-def test_inference_rejects_custom_pg_collection_for_checkpoint_detected_modelopt():
+def test_inference_config_without_modelopt_uses_plain_container():
+    from megatron.inference import utils
+
+    args = Mock()
+    with (
+        patch.object(utils, "should_use_modelopt_config", return_value=False),
+        patch.object(utils, "inference_cfg_container_from_args") as plain,
+        patch.object(utils, "modelopt_inference_config_from_args") as modelopt,
+    ):
+        assert utils.inference_config_from_args(args) is plain.return_value
+    plain.assert_called_once_with(args)
+    modelopt.assert_not_called()
+
+
+def test_inference_rejects_custom_pg_collection_for_modelopt_config():
     from argparse import Namespace
 
     from megatron.inference import utils
 
     args = Namespace(load="/modelopt-ckpt", modelopt_enabled=False)
+    cfg = Mock(model=Mock(transformations=object()))
     with (
         patch.object(utils, "get_args", return_value=args),
-        patch("megatron.training.global_vars.is_run_config_initialized", return_value=False),
-        patch.object(utils, "should_use_modelopt_config", return_value=True),
+        patch.object(utils, "get_run_config", return_value=cfg),
         pytest.raises(ValueError, match="Custom inference process groups are not supported"),
     ):
         utils.get_model_for_inference(pg_collection=Mock())

@@ -11,7 +11,6 @@ from megatron.core.enums import ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
-from megatron.training.models.transforms import ModelTransformConfig
 
 
 @runtime_checkable
@@ -63,13 +62,9 @@ class ModelConfig:
     # === ModelOpt ===
     restore_modelopt_state: bool = False
     """Megatron-Bridge compatibility only: select the ModelOpt layer spec so Bridge can restore
-    ModelOpt quantization/sparsity state itself. Megatron-LM never sets this; it uses
-    ``transformations``. Remove together with its spec branches once Bridge no longer needs it."""
-
-    transformations: ModelTransformConfig | None = None
-    """Declarative ModelOpt options. The GPT/Hybrid builders select the ModelOpt layer spec from
-    it; the training and inference entry points install the matching pre-wrap hooks
-    (``megatron.post_training.model_hooks.modelopt_setup_hooks``)."""
+    ModelOpt quantization/sparsity state itself. Megatron-LM never sets this; its GPT/Hybrid
+    configs use ``transformations``. Remove together with its spec branches once Bridge no
+    longer needs it."""
 
     extra_checkpoint_metadata: dict[str, Any] | None = None
     """Store for additional model-related metadata to save in the checkpoint. This 
@@ -86,17 +81,6 @@ class ModelConfig:
     """List of functions that are executed after model initialization is complete.
     Should take the model as the only argument and return a new model as the only return value.
     """
-
-    def validate(self) -> None:
-        """Validate transformations before allocating models or loading checkpoints."""
-        if self.transformations is not None:
-            self.transformations.validate()
-            transformer_impl = getattr(self.transformer, "transformer_impl", None)
-            if transformer_impl == "inference_optimized":
-                raise ValueError(
-                    "ModelOpt transformations require the ModelOpt layer spec and cannot be "
-                    "combined with transformer_impl='inference_optimized'."
-                )
 
     def get_builder_cls(self) -> type:
         """Get the appropriate builder type for this config.

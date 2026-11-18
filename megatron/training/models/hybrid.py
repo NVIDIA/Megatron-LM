@@ -25,6 +25,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
 from megatron.training.models.dist_utils import unimodal_build_distributed_models
+from megatron.training.models.transforms import ModelTransformConfig
 from megatron.training.vocab_utils import calculate_padded_vocab_size
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,12 @@ class HybridModelConfig(ModelConfig):
     tp_comm_overlap_cfg: str | dict[str, Any] | None = None
     """User-buffer settings, or their YAML path, when TP communication overlap is enabled."""
 
+    ### ModelOpt ###
+    transformations: ModelTransformConfig | None = None
+    """Declarative ModelOpt options. The builder selects the ModelOpt layer spec from it; the
+    training and inference entry points install the matching pre-wrap hooks
+    (``megatron.post_training.model_hooks.modelopt_setup_hooks``)."""
+
     @property
     def mamba_stack_spec(self):
         """Deprecated alias for hybrid_stack_spec."""
@@ -114,6 +121,11 @@ class HybridModelConfig(ModelConfig):
             setattr(transformer, name, value)
         else:
             super().__setattr__(name, value)
+
+    def validate(self) -> None:
+        """Check the ModelOpt transformations against the transformer implementation."""
+        if self.transformations is not None:
+            self.transformations.validate(self.transformer.transformer_impl)
 
     def finalize(self) -> None:
         """Finalize nested model settings before the run derives optimizer precision."""
