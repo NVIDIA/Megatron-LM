@@ -427,6 +427,9 @@ def test_ep_a2a_full_recompute_cuda_graph_compatibility(
         num_moe_experts=2,
         expert_model_parallel_size=2,
         moe_token_dispatcher_type="alltoall",
+        # Full-iteration CUDA graphs need the static-shape (padded) AlltoAll path.
+        moe_expert_capacity_factor=1.0,
+        moe_pad_expert_input_to_capacity=True,
         overlap_moe_expert_parallel_comm=overlap_enabled,
         bf16=True,
         attention_dropout=0.0,
