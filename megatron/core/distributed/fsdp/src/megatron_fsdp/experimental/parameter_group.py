@@ -170,6 +170,7 @@ class FsdpParameterGroup:
         )
         self._owning_module = ref(owning_module)
         self._unshard_events = {}
+        self._external_wgrads: dict[nn.Parameter, torch.Tensor] = {}
         self.mesh = mesh
         self.grad_scale = grad_scale
         self.shard_layout = shard_layout
@@ -643,8 +644,29 @@ class FsdpParameterGroup:
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
         """Pack full local gradients on compute into the reduce-scatter input buffer."""
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            partial_grad.get_tensor_view(index).copy_(fsdp_parameter.unsharded.grad)
+            partial_grad.get_tensor_view(index).copy_(self._take_unsharded_gradient(fsdp_parameter))
             fsdp_parameter.unsharded.grad = None
+
+    def allocate_external_wgrad(self, parameter: nn.Parameter) -> torch.Tensor:
+        """Allocate an additive destination for a weight handled by one custom backward.
+
+        The custom backward must produce the entire gradient for this parameter.
+        The autograd gradient only triggers the post-accumulate hook.
+        """
+        if self.main_grad is None or self.main_grad.dtype != torch.float32:
+            raise ValueError("External wgrad accumulation requires FP32 main gradients.")
+        if parameter in self._external_wgrads:
+            raise RuntimeError("An external wgrad for this FSDP parameter is still pending.")
+        gradient = torch.zeros(parameter.shape, device=parameter.device, dtype=torch.float32)
+        self._external_wgrads[parameter] = gradient
+        return gradient
+
+    def _take_unsharded_gradient(self, parameter: FsdpParameter) -> torch.Tensor:
+        gradient = self._external_wgrads.pop(parameter.unsharded, None)
+        if gradient is None:
+            gradient = parameter.unsharded.grad
+        assert gradient is not None
+        return gradient
 
     def accumulate_local_gradients(self) -> None:
         """Accumulate on compute, retaining source gradients for caller cleanup.
@@ -660,7 +682,7 @@ class FsdpParameterGroup:
         has_sharded_grads = self._has_sharded_grads()
         self._clear_stale_main_grad()
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            grad = fsdp_parameter.unsharded.grad
+            grad = self._take_unsharded_gradient(fsdp_parameter)
             destination = self.main_grad.get_tensor_view(index)
             if has_sharded_grads:
                 # Scale and accumulate in one pass, rounding once in the accumulation dtype,

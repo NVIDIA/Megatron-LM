@@ -1244,6 +1244,8 @@ class TEGroupedMLP(MegatronModule):
         permuted_probs: torch.Tensor,
         output_buffer: Optional[torch.Tensor] = None,
         grad_input_buffer: Optional[torch.Tensor] = None,
+        *,
+        megakernel: Callable | None = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward of TEGroupedMLP
 
@@ -1256,10 +1258,16 @@ class TEGroupedMLP(MegatronModule):
             (NCCL-EP zero-copy fwd combine); only the fused op-fuser path supports it.
             grad_input_buffer (torch.Tensor, optional): Preallocated buffer to write the fc1 dgrad
             into (NCCL-EP zero-copy bwd dispatch); only the fused op-fuser path supports it.
+            megakernel (callable, optional): Execute a fused MoE backend inside this
+                module's FSDP hooks. The three tensor arguments are the hidden states,
+                router probabilities, and routing map for that backend.
 
         Return:
             output (torch.Tensor): The output of the local experts.
         """
+
+        if megakernel is not None:
+            return megakernel(permuted_local_hidden_states, tokens_per_expert, permuted_probs), None
 
         # Call fused impl if enabled
         if self._with_fused_impl:

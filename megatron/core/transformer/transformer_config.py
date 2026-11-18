@@ -2925,7 +2925,22 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("MOK does not support moe_router_dtype='fp64'; use 'fp32' instead")
             if self.use_transformer_engine_op_fuser:
                 raise ValueError("MOK requires use_transformer_engine_op_fuser=False")
-            if not self.gradient_accumulation_fusion:
+            mok_fsdp_eager = (self.moe_megakernel_backend_config or {}).get(
+                "mfsdp_v2_eager"
+            ) is True
+            if mok_fsdp_eager:
+                if (
+                    self.gradient_accumulation_fusion
+                    or self.cuda_graph_impl != "none"
+                    or self.recompute_granularity == "full"
+                    or "moe" in (self.recompute_modules or ())
+                    or (self.mtp_use_repeated_layer and (self.mtp_num_layers or 0) > 1)
+                ):
+                    raise ValueError(
+                        "MoK mfsdp_v2_eager requires eager execution without fused TE wgrad, "
+                        "MoE recompute, or repeated MTP layers"
+                    )
+            elif not self.gradient_accumulation_fusion:
                 raise ValueError("MOK currently requires gradient_accumulation_fusion=True")
             if not self.moe_grouped_gemm:
                 raise ValueError("MOK currently requires moe_grouped_gemm=True")

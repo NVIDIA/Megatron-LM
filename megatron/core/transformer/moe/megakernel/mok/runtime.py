@@ -7,13 +7,6 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
-from megatron.core.transformer.moe.megakernel.parameter_bridge import (
-    finish_weight_gradient as _finish_weight_gradient,
-)
-from megatron.core.transformer.moe.megakernel.parameter_bridge import (
-    main_grad_buffer as _main_grad_buffer,
-)
-
 if TYPE_CHECKING:
     from megatron.core.transformer.moe.megakernel.mok.backend import MoKMegakernel
 
@@ -174,7 +167,7 @@ class _MoKAutograd(torch.autograd.Function):
         if shared_output_gate_weight is not None:
             gate_kwargs = {
                 "shared_output_gate_weight": shared_output_gate_weight,
-                "shared_output_gate_main_grad": _main_grad_buffer(
+                "shared_output_gate_main_grad": ctx.module.weight_grad_buffer(
                     ctx.module.shared_output_gate_weight
                 ),
             }
@@ -194,10 +187,10 @@ class _MoKAutograd(torch.autograd.Function):
         )
 
         routed_parameter_grads = ctx.module.finish_routed_weight_gradients()
-        d_shared_fc1 = _finish_weight_gradient(ctx.module.shared_fc1_weight)
-        d_shared_fc2 = _finish_weight_gradient(ctx.module.shared_fc2_weight)
+        d_shared_fc1 = ctx.module.finish_weight_gradient(ctx.module.shared_fc1_weight)
+        d_shared_fc2 = ctx.module.finish_weight_gradient(ctx.module.shared_fc2_weight)
         d_output_gate = (
-            _finish_weight_gradient(ctx.module.shared_output_gate_weight)
+            ctx.module.finish_weight_gradient(ctx.module.shared_output_gate_weight)
             if shared_output_gate_weight is not None
             else None
         )

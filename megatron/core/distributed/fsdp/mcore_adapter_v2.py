@@ -258,6 +258,13 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         expert_dp_mesh, expert_placements = _build_expert_mesh_and_placements(
             config, ddp_config, pg_collection, device_type
         )
+        if (config.moe_megakernel_backend_config or {}).get("mfsdp_v2_eager") is True:
+            if (
+                expert_dp_mesh is None
+                or expert_dp_mesh.size() != 1
+                or self.mp_policy.main_grads_dtype != torch.float32
+            ):
+                raise ValueError("MoK mfsdp_v2_eager requires EDP=1 and FP32 main gradients")
         dense_grad_scale, expert_grad_scale = _get_grad_scales(config, dp_mesh, expert_dp_mesh)
 
         # NCCL symmetric memory requires UB. MFSDP v2 intentionally does not support UB
