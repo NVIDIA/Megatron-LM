@@ -834,9 +834,9 @@ class CheckpointConfig:
                     "async save with async_strategy='nvrx'."
                 )
 
-        if self.verify_integrity:
-            assert self.ckpt_format == "torch_dist", \
-                f"`verify_integrity` is only supported with torch_dist checkpoint format."
+        # verify_integrity is only supported for torch_dist checkpoints.
+        if self.verify_integrity and self.ckpt_convert_format != "torch_dist":
+            self.verify_integrity = False
 
         if self.ckpt_convert_format is not None:
             assert self.ckpt_convert_save is not None
