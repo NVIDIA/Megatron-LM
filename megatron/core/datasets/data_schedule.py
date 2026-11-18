@@ -563,14 +563,10 @@ def validate_dynamic_cp_runtime(config, pg_collection: ProcessGroupCollection) -
     Call it on every rank once the model configuration and its process groups exist. It
     reads the JSON file, checks it against the training configuration, creates the trace
     directory, has the DPxCP leader probe the cost model for every CP size the scheduler
-    may use, and confirms that every rank read the same file. With more than one pipeline
-    stage it also confirms that every rank of every stage validated the same settings,
-    within each stage and, over the pipeline group, between the stages: every stage plans
-    alone. Both comparisons are made over the groups of one tensor-parallel rank: with a
-    tensor-parallel size above 1 a difference on a single process stops the ranks of its
-    own tensor-parallel rank only, and the other ranks wait until the time-out of the
-    process groups (``check_cost_model_coverage``). The file is not read again:
-    ``wrap_data_iterator`` reuses the validated result.
+    may use, and confirms that every rank read the same file and, with more than one
+    pipeline stage, that every rank of every stage validated the same settings
+    (``check_cost_model_coverage``, which also says what a tensor-parallel size above 1
+    changes). The file is not read again: ``wrap_data_iterator`` reuses the validated result.
 
     Args:
         config: Model configuration carrying ``dynamic_cp_runtime_config``.
@@ -613,10 +609,8 @@ def wrap_data_iterator(
         data_iterator: The original data_iterator to wrap around. With virtual pipeline
             stages it is the list with one iterator per model chunk, of which the scheduler
             reads the first one that is not None. With the runtime DCP scheduler and more
-            than one pipeline stage it must be None or, with virtual pipeline stages, that
-            list, with one entry per virtual stage (another type raises TypeError, another
-            length ValueError), and, without virtual pipeline stages, the data iterator
-            itself (a list raises TypeError).
+            than one pipeline stage another form raises TypeError, and a list of another
+            length ValueError.
         config: The config object containing the max_seqlen_per_dp_cp_rank
         pg_collection: Caller-owned process groups; must define dp_cp, dp, tp, and pp.
     """
@@ -716,17 +710,13 @@ def wrap_data_iterator(
                 f'{config.max_seqlen_per_dp_cp_rank}, which must be a multiple of the packed '
                 f'sequence alignment {alignment}'
             )
-        # A specification with a pipeline is one of a run with more than one pipeline stage.
-        # With virtual pipeline stages the training loop passes a list with one entry per
-        # virtual stage: the data iterator of that model chunk, or None. run() reads the
-        # first iterator of the list, so the prefetcher belongs to that one; a list without
-        # any iterator (a rank that reads no data) gets none. Without virtual pipeline stages
-        # (one virtual stage in the specification) the training loop passes the data iterator
-        # itself, or None, as with one pipeline stage; run() reads no list then. An object
-        # of the other form is refused here, on every rank alike, before a prefetcher or a
-        # CPU worker exists: run() would fail on it later and less clearly. Only the type of
-        # the argument and, with virtual stages, the length of the list are checked, not
-        # the entries of the list. With one pipeline stage the argument is taken as it is.
+        # With more than one pipeline stage (a specification with a pipeline) the training
+        # loop passes, under virtual stages, a list with one entry per virtual stage (a data
+        # iterator or None): run() reads its first iterator, so the prefetcher belongs to
+        # that one, and a list without an iterator gets none. Without virtual stages it
+        # passes the data iterator itself, or None. Another form is refused here, on every
+        # rank alike and before a CPU worker exists; only the type of the argument and the
+        # length of the list are checked.
         has_pipeline = spec.get('pipeline') is not None
         source = data_iterator
         if has_pipeline and data_iterator is not None:

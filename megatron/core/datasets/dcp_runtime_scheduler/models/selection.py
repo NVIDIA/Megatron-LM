@@ -2,6 +2,8 @@
 
 """Match the full Qwen3.5 prediction domain to normal training configuration."""
 
+from .base import uses_p2p
+
 
 def is_full_qwen35_config(config):
     """Select the GDN/GQA model through the training architecture, not a JSON profile."""
@@ -107,15 +109,10 @@ def validate_full_qwen35_config(config):
             'Full Qwen3.5 module parameters describe Transformer Engine attention selected '
             f"with attention_backend 'auto' or 'fused' (got {backend!r})"
         )
-    communication = getattr(config, 'cp_comm_type', None)
-    if communication != 'p2p' and not (
-        isinstance(communication, list)
-        and communication
-        and all(value == 'p2p' for value in communication)
-    ):
+    if not uses_p2p(config):
         raise ValueError(
             'Full Qwen3.5 module parameters require P2P attention communication: '
-            f"cp_comm_type='p2p', got {communication!r}"
+            f"cp_comm_type='p2p', got {getattr(config, 'cp_comm_type', None)!r}"
         )
     # The tail policy is not checked: for GDN with pad_packed_seq_alignment, TransformerConfig
     # accepts append_dummy_seq only, so the training configuration already fixes it.

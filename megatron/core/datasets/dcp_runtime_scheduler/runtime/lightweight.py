@@ -4,11 +4,10 @@
 
 from __future__ import annotations
 
-import math
 import time
 from dataclasses import dataclass
 
-from .planner import RuntimePlanner, RuntimeScheduleError, encode_rows, validate_rows
+from .planner import RuntimePlanner, RuntimeScheduleError
 
 
 @dataclass(frozen=True)
@@ -20,31 +19,16 @@ class LightweightOptions:
     cp_floors: tuple[int, ...] = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
     max_guide_candidates: int = 4
 
-    def __post_init__(self):
-        if not math.isfinite(self.time_budget_s) or self.time_budget_s <= 0:
-            raise ValueError("time_budget_s must be finite and positive")
-        if type(self.max_scored_candidates) is not int or self.max_scored_candidates < 1:
-            raise ValueError("max_scored_candidates must be a positive integer")
-        if not self.cp_floors or any(type(c) is not int or c < 1 for c in self.cp_floors):
-            raise ValueError("cp_floors must contain positive integers")
-        if type(self.max_guide_candidates) is not int or self.max_guide_candidates < 1:
-            raise ValueError("max_guide_candidates must be a positive integer")
-
 
 class LightweightRuntimePlanner(RuntimePlanner):
-    """No offline solver, CP-SAT, GPU search, or iterative global polishing.
+    """Deterministic first-fit and cost-per-token proposals, scored with the exact timeline.
 
-    Deterministic FFD and cost-per-token candidates cover different pack widths.
-    candidates are scored by the same exact E2E timeline as the offline solver.
-    The deadline is cooperative: one mandatory feasible score is always completed,
-    and any overrun from that score is reported, never hidden as a hard deadline.
-    An optional authenticated incumbent can be injected by the MCore caller.
+    The deadline is cooperative: one feasible candidate is always scored (two with a default
+    layout), and an overrun is reported in the statistics, never hidden.
     """
 
     def __init__(self, geometry, cost_model, options=None) -> None:
         self.options = options or LightweightOptions()
-        if not any(floor <= geometry.world_size for floor in self.options.cp_floors):
-            raise ValueError("cp_floors must include a width no larger than world_size")
         super().__init__(geometry, cost_model)
 
     def _packing_tables(self, lengths):
@@ -277,74 +261,32 @@ class LightweightRuntimePlanner(RuntimePlanner):
                 start += cp
         return max(loads), sum(loads), len(rounds)
 
-    def _balance_exact(self, rounds, lengths):
-        """One cyclic-rotation sweep, reusing placement-invariant exact pack costs."""
-        if not getattr(self.model, "placement_invariant", False):
-            return rounds, None, 0
-        costed = self._costed(rounds, lengths)
-        state = self.timeline.initial_state()
-        balanced, changed = [], 0
-        for index, (row, priced) in enumerate(zip(rounds, costed)):
-            best = None
-            for offset in range(len(row)):
-                rotated = priced[offset:] + priced[:offset]
-                start, shifted = 0, []
-                for group in rotated:
-                    if not self.geometry.supports_group(start, group[1]):
-                        break
-                    shifted.append((start, *group[1:]))
-                    start += group[1]
-                if len(shifted) != len(rotated):
-                    continue
-                next_state = self.timeline.advance(state, shifted, index == 0)
-                key = max(next_state), sum(next_state), sum(v * v for v in next_state)
-                if best is None or key < best[0]:
-                    best = key, next_state, offset
-            if best is None:
-                raise RuntimeScheduleError("no supported group placement in rotation candidates")
-            _, state, offset = best
-            balanced.append(row[offset:] + row[:offset])
-            changed += offset != 0
-        return balanced, self.timeline.makespan(state), changed
-
     def plan(self, lengths, *, incumbent_rounds=None):
         """Search bounded candidates and score the selected complete schedule."""
         begin = time.perf_counter()
         lengths = self._start_plan(lengths)
         tables = self._packing_tables(lengths)
-        candidates, seen, rejected = [], set(), []
+        proposals, rejected = [], []
         for floor in self.options.cp_floors:
             if floor > self.geometry.world_size:
                 continue
             try:
-                proposals = [self._pack(lengths, floor, tables)]
+                proposals.append(self._pack(lengths, floor, tables))
             except RuntimeScheduleError as exc:
                 rejected.append(str(exc))
-                proposals = []
             if floor in (1, 4, 8, 16, 32):
                 proposals.append(self._global_pack(lengths, floor, tables=tables))
             if floor == 1:
                 proposals.extend(
                     self._global_pack(lengths, floor, extra, tables) for extra in (1, 2, 4)
                 )
-            for rounds in proposals:
-                if rounds is None:
-                    continue
-                signature = tuple(
-                    tuple((g["cp"], tuple(g["sample_ids"])) for g in row) for row in rounds
-                )
-                if signature not in seen:
-                    seen.add(signature)
-                    candidates.append(rounds)
-        for ep_aligned in (False, True):
-            rounds = self._cost_pack(lengths, tables, ep_aligned)
+        proposals.extend(self._cost_pack(lengths, tables, aligned) for aligned in (False, True))
+        unique = {}  # the first proposal of every distinct layout, in the order proposed
+        for rounds in proposals:
             if rounds is not None:
-                signature = tuple(
-                    tuple((g["cp"], tuple(g["sample_ids"])) for g in row) for row in rounds
-                )
-                if signature not in seen:
-                    seen.add(signature)
-                    candidates.append(rounds)
+                key = tuple(tuple((g["cp"], tuple(g["sample_ids"])) for g in row) for row in rounds)
+                unique.setdefault(key, rounds)
+        candidates = list(unique.values())
         capacity_fallback = False
         if not candidates and incumbent_rounds is None:
             rounds = self._capacity_fallback(lengths)
@@ -357,12 +299,7 @@ class LightweightRuntimePlanner(RuntimePlanner):
         candidates = candidates[: self.options.max_guide_candidates]
         candidates.sort(key=lambda rounds: self._guide(rounds, lengths))
         if incumbent_rounds is not None:
-            validate_rows(
-                encode_rows(incumbent_rounds, self.geometry.world_size),
-                lengths,
-                self.geometry,
-                min(self.geometry.allowed_cp_sizes),
-            )
+            self._validated(incumbent_rounds, lengths)
             candidates.insert(0, incumbent_rounds)
         if not candidates:
             raise self._no_layout(
@@ -416,17 +353,8 @@ class LightweightRuntimePlanner(RuntimePlanner):
             raise RuntimeScheduleError(
                 "the cost model priced none of the candidate layouts: " + "; ".join(rejected[-3:])
             )
-        balance_begin = time.perf_counter()
-        balanced, balanced_ms, changed_rows = self._balance_exact(best[1], lengths)
-        balance_improvement = 0.0
-        if balanced_ms is not None and balanced_ms < best[0] - 1e-9:
-            balance_improvement = best[0] - balanced_ms
-            best = balanced_ms, balanced
-        else:
-            changed_rows = 0
-        balance_s = time.perf_counter() - balance_begin
-        plan = self._make_plan(best[1], lengths, best[0], begin)
-        elapsed = plan.planning_s
+        plan = self._make_plan(best[1], lengths, best[0])
+        elapsed = time.perf_counter() - begin
         self.last_statistics = dict(
             candidate_count=len(candidates),
             generated_candidates=generated,
@@ -435,20 +363,16 @@ class LightweightRuntimePlanner(RuntimePlanner):
             attempted_candidates=attempted,
             time_budget_s=self.options.time_budget_s,
             budget_overrun=elapsed > self.options.time_budget_s,
-            selected_incumbent=incumbent_rounds is not None and selected == 0 and changed_rows == 0,
-            seed_incumbent=incumbent_rounds is not None and selected == 0,
+            selected_incumbent=incumbent_rounds is not None and selected == 0,
             capacity_fallback=capacity_fallback,
-            rotation_changed_rows=changed_rows,
-            rotation_improvement_ms=balance_improvement,
-            rotation_s=balance_s,
             rejected_candidates=rejected,
             candidate_generation_s=generation_s,
-            exact_scoring_s=elapsed - generation_s - balance_s,
+            exact_scoring_s=elapsed - generation_s,
             pack_cost_stats=dict(self.costs.stats),
             model_sequence_limits=self.model_sequence_limits(),
             algorithm=(
                 "FFD + all-width work/token + EP-aligned proposals + bounded guide "
-                "+ exact E2E acceptance + rank rotation"
+                "+ exact E2E acceptance"
             ),
         )
         return plan

@@ -38,10 +38,7 @@ def _initialize_planner(spec):
     pipeline = spec.get('pipeline')
     if schedulers[spec['type']]['solver'] == 'dynamic_usp':
         if pipeline is not None:
-            # The planner then scores the pipeline schedule of the run: the interleaved one
-            # with virtual stages, where every count of microbatches it returns is a
-            # multiple of the stages, and the non-interleaved one without (one virtual
-            # stage in the specification), which runs any count.
+            # The planner then scores the pipeline schedule of the run.
             schedule = _runtime_module('models.solver_section').pipeline_schedule(
                 pipeline['virtual_stages']
             )
@@ -132,8 +129,6 @@ def coverage_gaps(planner):
 
 def _solve(planner, spec, lengths, padded, baseline_rows):
     planner_module = _runtime_module('runtime.planner')
-    validate_rows = planner_module.validate_rows
-
     started = {'monotonic_ns': time.monotonic_ns(), 'wall_ns': time.time_ns()}
     geometry = planner.geometry
     alignment = geometry.dataset_alignment
@@ -171,7 +166,7 @@ def _solve(planner, spec, lengths, padded, baseline_rows):
         # contract (per-group sequence cap, max_cp_size, the cost model's CP widths),
         # so a violation discards the seed and never fails the step.
         try:
-            validate_rows(
+            planner_module.validate_rows(
                 baseline_rows, dict(enumerate(padded)), geometry, min(geometry.allowed_cp_sizes)
             )
         except planner_module.RuntimeScheduleError as error:
@@ -193,21 +188,10 @@ def _solve(planner, spec, lengths, padded, baseline_rows):
                 'incumbent_unsupported_cp_sizes': unsupported,
             }
             baseline_rows = None
-    # plan_padded validates the final rows against the same geometry, cap included.
+    # The planner validates the final rows against the same geometry, cap included.
     plan = planner.plan_padded(
         dict(enumerate(padded)), logical_lengths=logical, incumbent_rows=baseline_rows
     )
-    rows = plan.rows
-    multiple = (spec.get('pipeline') or {}).get('count_multiple', 1)
-    if len(rows) % multiple:
-        # Checked against the specification, whatever planner made the plan: the pipeline
-        # schedule of the run cannot execute another count, so such rows never leave here.
-        raise planner_module.RuntimeScheduleError(
-            f'the runtime schedule has {len(rows)} microbatches, which is not a multiple of '
-            f'{multiple}, the count multiple of the pipeline in the planner specification'
-        )
-    statistics = {**planner.last_statistics, **incumbent_rejection}
-    predicted_ms = plan.predicted_ms
     metadata = getattr(planner.model, 'metadata', None)
     model_metadata = metadata() if callable(metadata) else None
     torch = sys.modules.get('torch')
@@ -216,9 +200,9 @@ def _solve(planner, spec, lengths, padded, baseline_rows):
     if cuda_initialized or distributed_initialized:
         raise RuntimeError('CPU predictor must not initialize CUDA or distributed')
     return dict(
-        rows=rows,
-        statistics=statistics,
-        predicted_ms=predicted_ms,
+        rows=plan.rows,
+        statistics={**planner.last_statistics, **incumbent_rejection},
+        predicted_ms=plan.predicted_ms,
         model_metadata=model_metadata,
         planner_options=(
             asdict(planner.options)

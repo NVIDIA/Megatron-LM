@@ -123,7 +123,6 @@ class Group:
     size: int
     sample_ids: list[int]
     load: float = 0.0
-    tokens: int = 0
 
 
 class HotSwitchScheduler:
@@ -175,14 +174,6 @@ class HotSwitchScheduler:
         fits: Callable[[list[int], int], bool],
     ) -> list[list[Group]]:
         """Allocate one candidate count, preserving upstream sample and rank ties."""
-        if type(count) is not int or count < 1:
-            raise ValueError("microbatch count must be a positive integer")
-        if tokens.keys() != weights.keys() or not tokens:
-            raise ValueError("tokens and weights must have the same nonempty sample IDs")
-        if any(type(t) is not int or t <= 0 for t in tokens.values()) or any(
-            isinstance(w, bool) or not math.isfinite(w) or w <= 0 for w in weights.values()
-        ):
-            raise ValueError("tokens and scheduling weights must be finite and positive")
         needed = self._requirements(tokens, fits)
         table = self.options.tier_time_factors
         # Time balance is off without a table and for a table of ones on the sizes in use.
@@ -251,11 +242,7 @@ class HotSwitchScheduler:
             column_load[column] += weights[sample_id] * factor(size)
             column_tokens[column] += tokens[sample_id]
             hosts[column].add(size)
-            long_groups.append(
-                Group(
-                    column, start, size, [sample_id], weights[sample_id] / size, tokens[sample_id]
-                )
-            )
+            long_groups.append(Group(column, start, size, [sample_id], weights[sample_id] / size))
 
         def can_take(group, sample_id):
             return column_tokens[group.microbatch] + tokens[sample_id] <= capacity and fits(
@@ -265,7 +252,6 @@ class HotSwitchScheduler:
         def add(group, sample_id):
             group.sample_ids.append(sample_id)
             group.load += weights[sample_id] / group.size
-            group.tokens += tokens[sample_id]
             column_tokens[group.microbatch] += tokens[sample_id]
 
         empty_count = sum(masks[minimum].bit_count() for masks in free)
@@ -338,7 +324,6 @@ class HotSwitchScheduler:
                     continue
                 donor.sample_ids.remove(sample_id)
                 donor.load -= weights[sample_id] / donor.size
-                donor.tokens -= tokens[sample_id]
                 column_tokens[donor.microbatch] -= tokens[sample_id]
                 add(empty, sample_id)
                 break
@@ -449,8 +434,6 @@ class HotSwitchScheduler:
                 self.last_candidates.append(dict(microbatches=count, rejection=str(error)))
                 return False
             value = float(objective(layout))
-            if not math.isfinite(value) or value < 0:
-                raise ValueError("layout objective must be finite and nonnegative")
             record = dict(microbatches=count, predicted_ms=value)
             if self.options.keep_candidate_layouts:
                 record["layout"] = [

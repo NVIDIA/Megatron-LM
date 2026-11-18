@@ -54,10 +54,9 @@ Differences from upstream (``../ORIGIN.json`` is the provenance record of the po
 - Upstream keeps the least margin of a priced layout (``guard_min_margin``); no margin is
   recorded here.
 - The capacity predicate of the runtime (``fits``: padding and the sequences of a group) is
-  applied to every placement, after the token cap and the guard, and to the finished
-  layout. Where it rejects a placement that upstream admits, the next group of the size is
-  tried and the result can differ from upstream's; the record of the microbatch then
-  carries ``runtime_capacity``.
+  applied to every placement, after the token cap and the guard. Where it rejects a
+  placement that upstream admits, the next group of the size is tried and the result can
+  differ from upstream's; the record of the microbatch then carries ``runtime_capacity``.
 - A sample has two sizes: its token count as Stage 1 uses it (the padded length), for the
   token cap and the memory queue, and its logical length, for work, loads, group times and
   guard margins. Upstream has one; the two are equal for a length that the runtime does not
@@ -65,6 +64,10 @@ Differences from upstream (``../ORIGIN.json`` is the provenance record of the po
 - Upstream's balanced index and heap over the groups are replaced by scans over the groups
   of one microbatch, with the same result.
 - The groups are taken to cover the ranks (upstream checks it).
+- Upstream checks a finished construction once more (no empty group, the token cap, the
+  groups of the keep samples). For a layout that holds every sample once, as every layout
+  of the planner does, the construction guarantees all of it, and that every group passed
+  the capacity predicate, so none of it is checked again.
 - Of upstream's outcome codes, those of a run that cannot start (disabled, empty problem,
   profile or features unavailable, unsupported domain) have no counterpart here.
 - An exception is contained as in upstream's fallback mode (``repack_layout``); there is no
@@ -112,12 +115,7 @@ def _finite(value) -> bool:
 
 
 def _threshold(value):
-    """The guard threshold that a cost model gives, as a float; None stays None.
-
-    The value is converted once, as upstream converts its threshold: the float that is
-    tested here is the one that is compared with a validated threshold and that the
-    microbatch is priced under, whatever the object answers when it is asked again.
-    """
+    """The guard threshold that a cost model gives, converted once to a float; None stays None."""
     if value is None:
         return None
     number = float(value) if _finite(value) else math.nan
@@ -127,16 +125,17 @@ def _threshold(value):
 
 
 def error_text(error: BaseException, limit: int = 500) -> str:
-    """Text of a contained exception for a record: ``str(error)`` cut to ``limit`` characters.
-
-    An exception whose ``__str__`` raises gives ``"<unprintable>"``: writing the record of a
-    contained error does not raise another one.
-    """
+    """Text of a contained exception for a record, cut to ``limit`` characters; never raises."""
     try:
         text = str(error)
     except Exception:
         text = "<unprintable>"
     return text[:limit]
+
+
+def _record(code=NO_VALID_CANDIDATE, **more) -> dict:
+    """Record of a microbatch that has no finished construction."""
+    return dict(code=code, order=None, base_ms=None, selected_ms=None, routes=[], **more)
 
 
 @dataclass(frozen=True)
@@ -165,28 +164,15 @@ def _margin(batch, ids, size):
     return margin
 
 
-def _price(batch, members, cap=None, keep=frozenset()):
+def _price(batch, members, finished=False):
     """Slowest group time of a complete layout plus the global constant, in ms.
 
-    With ``cap`` the layout is a finished construction and its groups are checked once more,
-    each as it is priced; the test of the guard follows the time of the group. None is
-    returned for a layout that fails a check. The Stage 1 layout is priced without checks,
-    also without the test of the guard.
+    A finished construction (``finished``) gives None when the margin of one of its groups
+    above the reference size is below the guard threshold. The Stage 1 layout is priced
+    without that test.
     """
     times = []
     for ids, size in zip(members, batch.sizes):
-        if cap is not None:
-            # Defensive, as upstream: the construction leaves no group empty, places under
-            # the token cap, and gives every keep sample a group above the reference size
-            # that holds no other keep sample.
-            if not ids or sum(batch.tokens[i] for i in ids) * cap[1] > cap[0] * size:
-                return None
-            kept = keep.intersection(ids)
-            if kept and (size <= batch.reference or len(kept) != 1):
-                return None
-            # Defensive as well: the capacity predicate admitted every placement.
-            if batch.fits is not None and not batch.fits(ids, size):
-                return None
         group_ms = batch.costs.stage2_group_time(tuple(batch.lengths[i] for i in ids), size)
         if not _finite(group_ms) or group_ms <= 0.0:
             raise ValueError("the Stage 2 time of a group must be finite and positive")
@@ -194,11 +180,9 @@ def _price(batch, members, cap=None, keep=frozenset()):
             # As upstream, the margin is taken in every layout and tested only in a finished
             # construction: the absolute test, where a placement met the ratchet.
             margin = _margin(batch, ids, size)
-            if cap is not None and float(margin) < batch.guard:
+            if finished and float(margin) < batch.guard:
                 return None
         times.append(float(group_ms))
-    if cap is not None and not keep <= {i for ids in members for i in ids}:
-        return None  # defensive, as upstream: every keep sample was placed
     value = max(times) + batch.constant
     if not math.isfinite(value) or value <= 0.0:
         raise ValueError("the Stage 2 time of a microbatch must be finite and positive")
@@ -214,8 +198,6 @@ def _construct(batch, queue, keep, cap, noted):
     """
     sizes, reference = batch.sizes, batch.reference
     groups = range(len(sizes))
-    if len(sizes) > len(queue):
-        return None
     load = []
     for size in sizes:
         initial = batch.costs.stage2_empty_group_load(size)
@@ -288,15 +270,10 @@ def _construct(batch, queue, keep, cap, noted):
             return None
     rest = [sample for sample in queue if sample not in keep]
     for index, sample in enumerate(rest):
-        remaining = len(rest) - index
-        empty = sum(not ids for ids in members)
-        if remaining < empty:
-            return None  # defensive, as upstream
         # As many samples left as empty groups: only an empty group takes one.
-        if not place(sample, batch.tiers, remaining == empty):
+        empty_only = len(rest) - index == sum(not ids for ids in members)
+        if not place(sample, batch.tiers, empty_only):
             return None
-    if not all(members):
-        return None  # defensive, as upstream
     return members
 
 
@@ -312,15 +289,10 @@ def repack_microbatch(
 ):
     """Stage 2 on the Stage 1 layout of one microbatch.
 
-    ``groups`` is ``[(first rank, size, [sample ids])]``, covering the DPxCP ranks.
-    ``lengths`` gives the logical length of a sample, ``tokens`` its token count for the
-    token cap and the memory queue, ``position`` its position in the global batch.
-    ``costs`` has the Stage 2 hooks of a cost model, with or without those of the placement
-    guard. ``fits(sample ids, size)`` is the capacity predicate of the runtime.
-    ``guard_threshold`` is the threshold of the placement guard that the caller validated
-    (None: no guard): ``costs`` must give that threshold, else it is in error. The two are
-    compared as floats, and the microbatch is priced under the float of the validated one.
-    Without the argument the threshold is the one ``costs`` gives now.
+    ``groups`` is ``[(first rank, size, [sample ids])]``, covering the DPxCP ranks; the
+    other arguments are the fields of ``_Microbatch``. ``guard_threshold`` is the threshold
+    of the placement guard that the caller validated (None: no guard; see the module
+    docstring). Without the argument the threshold is the one ``costs`` gives now.
 
     Returns ``(groups, record)``. ``groups`` is None unless the outcome is ``ADOPTED``; then
     it lists the same groups in rank order with their new samples, in the order they were
@@ -335,16 +307,13 @@ def repack_microbatch(
         raise ValueError("stage2_reference_cp_size must be a positive integer")
     if not _finite(constant) or constant < 0.0:
         raise ValueError("stage2_global_constant_ms must be finite and nonnegative")
-    # The placement guard is optional: a cost model without a threshold has none.
     given = getattr(costs, "stage2_guard_threshold", None)
     current = _threshold(given)
     if guard_threshold is _NOT_VALIDATED:
         guard = current
     else:
-        # The caller's run has one threshold, the validated one, and the microbatch is priced
-        # under it. A cost model that lost its threshold must not be planned without its
-        # guard, nor one that changed it with another: the float of what it gives now is
-        # compared with the float of the validated threshold, None with None.
+        # The run has one threshold, the validated one: what the cost model gives now is
+        # compared with it as floats, None with None.
         guard = None if guard_threshold is None else float(guard_threshold)
         if current != guard:
             raise ValueError(
@@ -354,10 +323,7 @@ def repack_microbatch(
     groups = sorted(groups, key=lambda group: group[0])
     sizes = tuple(size for _, size, _ in groups)
     stage1 = [list(ids) for _, _, ids in groups]
-    # The outcome until a construction is finished.
-    record: dict = dict(
-        code=NO_VALID_CANDIDATE, order=None, base_ms=None, selected_ms=None, routes=[]
-    )
+    record = _record()  # the outcome until a construction is finished
     if not all(stage1):
         # A group without a sample leaves nothing to construct. The runtime forms none.
         return None, record
@@ -434,7 +400,7 @@ def repack_microbatch(
     built = []
     for name, queue in queues:
         members = _construct(batch, queue, keep, cap, noted)
-        value = None if members is None else _price(batch, members, cap, keep)
+        value = None if members is None else _price(batch, members, finished=True)
         if value is not None:
             built.append((name, value, members))
             record["routes"].append([name, value])
@@ -468,15 +434,11 @@ def repack_layout(
     ``layout`` is ``[[(first rank, size, [sample ids])]]``; the order of ``lengths`` is the
     order of the global batch. Returns ``(layout, records)``: a re-packed microbatch has
     new sample lists on its groups, any other its Stage 1 groups; ``records`` has one
-    record of ``repack_microbatch`` per microbatch. ``guard_threshold`` is that of
-    ``repack_microbatch``, for every microbatch.
+    record of ``repack_microbatch`` per microbatch.
 
-    As upstream's fallback mode, any exception raised while a microbatch is re-packed keeps
-    the Stage 1 layout of that microbatch: its record has the code
-    ``PROFILE_EXECUTION_ERROR``, the type of the exception as ``error`` and its text
-    (``error_text``) as ``reason``, and neither times nor routes (upstream keeps the time
-    of the Stage 1 layout when the error came after it was priced). ``KeyboardInterrupt``
-    and ``SystemExit`` are not caught.
+    As upstream's fallback mode, an exception raised while a microbatch is re-packed keeps
+    its Stage 1 layout: its record has the code ``PROFILE_EXECUTION_ERROR``, the type of
+    the exception as ``error`` and its text as ``reason``, and neither times nor routes.
     """
     position = {sample: index for index, sample in enumerate(lengths)}
     result, records = [], []
@@ -487,14 +449,8 @@ def repack_layout(
             )
         except Exception as error:
             repacked = None
-            record = dict(
-                code=PROFILE_EXECUTION_ERROR,
-                order=None,
-                base_ms=None,
-                selected_ms=None,
-                routes=[],
-                error=type(error).__name__,
-                reason=error_text(error),
+            record = _record(
+                PROFILE_EXECUTION_ERROR, error=type(error).__name__, reason=error_text(error)
             )
         result.append(list(groups) if repacked is None else repacked)
         records.append(record)

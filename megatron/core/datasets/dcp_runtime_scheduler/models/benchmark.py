@@ -13,7 +13,7 @@ from functools import lru_cache
 from ..runtime.planner import MAX_PRICED_GROUP_SEQUENCES
 from ..runtime.timeline import layer_program
 from . import attention
-from .base import NVLINK_DOMAIN_SIZES
+from .base import NVLINK_DOMAIN_SIZES, uses_p2p
 
 
 def _duration(value, label):
@@ -45,10 +45,6 @@ class BenchmarkCostModel:
     projections) for the forward and the backward pass, at every CP size including 1; the
     rest of a layer is the user's measurement. No coefficient is refitted, no residual is
     added, and no missing non-attention time is inferred.
-
-    NVLink topology follows from ``hardware``: rank ``r`` is a GPU of domain
-    ``r // nvlink_domain_size``, and the predictor prices a CP group from the domain of
-    each of its ranks. No argument sets the domain size.
     """
 
     name = "dcp_benchmark"
@@ -75,10 +71,6 @@ class BenchmarkCostModel:
         first_forward_dp_cp_sync=True,
         recompute_forward=False,
     ):
-        if type(layer_count) is not int or layer_count < 1:
-            raise ValueError("layer_count must be a positive integer")
-        if not isinstance(non_attention, dict):
-            raise TypeError("Explicit non_attention measurements are required")
         if not isinstance(hardware, str) or hardware not in NVLINK_DOMAIN_SIZES:
             raise ValueError("hardware must be h100 or gb200; GB300 is not this calibration")
         for flag in (first_forward_dp_cp_sync, recompute_forward):
@@ -128,7 +120,6 @@ class BenchmarkCostModel:
                 json.dumps(self.non_attention, sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest(),
         }
-        self.check_domain(geometry, None)
 
     def _packaged_predictor(self, lengths, cp, ranks):
         # The per-rank capacity is fixed, so the pack buffer grows with the CP size.
@@ -150,20 +141,8 @@ class BenchmarkCostModel:
             self.geometry.max_group_seqs or MAX_PRICED_GROUP_SEQUENCES, MAX_PRICED_GROUP_SEQUENCES
         ):
             raise ValueError("A pack needs one to the configured maximum real sequences")
-        if any(type(n) is not int or n < 1 for n in lengths):
-            raise ValueError("Logical sequence lengths must be positive integers")
-        if sum(self.geometry.stored_length(n, cp) for n in lengths) > self.geometry.capacity(cp):
-            raise ValueError("Pack exceeds physical per-rank capacity")
-        if not ranks or ranks != tuple(range(ranks[0], ranks[0] + cp)):
-            raise ValueError("Actual contiguous physical rank IDs are required")
-        if ranks[0] < 0 or ranks[-1] >= self.geometry.world_size:
-            raise ValueError("Physical rank IDs must be inside the parent domain")
-        costs = {}
-        for phase, value in zip(("forward", "backward"), self.predictor(lengths, cp, ranks)):
-            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
-                raise ValueError("Core attention prediction must be finite nonnegative ms")
-            costs["gqa:" + phase] = float(value)
-        return costs
+        forward, backward = self.predictor(lengths, cp, ranks)
+        return {"gqa:forward": float(forward), "gqa:backward": float(backward)}
 
     def program_costs(self, lengths, cp, *, ranks=None):
         """Return the core-attention forward and backward prediction of one pack."""
@@ -187,18 +166,6 @@ class BenchmarkCostModel:
 
     def check_domain(self, geometry, config=None):
         """Reject incompatible storage, model structure or execution configuration."""
-        if geometry != self.geometry:
-            raise ValueError("Cost model and planner geometry differ")
-        if any(geometry.dataset_alignment % (2 * cp) for cp in geometry.allowed_cp_sizes):
-            raise ValueError("Sequence alignment must be divisible by 2*CP for every allowed width")
-        if (
-            geometry.world_size > self.max_dp_cp_size
-            or max(geometry.allowed_cp_sizes) > self.largest_cp_size
-        ):
-            raise ValueError(
-                f"The attention parameters cover DPxCP up to {self.max_dp_cp_size} and CP "
-                f"groups up to {self.largest_cp_size}"
-            )
         if config is None:
             return
         if getattr(config, "thd_tail_padding_policy", None) != "extend_last":
@@ -214,18 +181,6 @@ class BenchmarkCostModel:
             raise ValueError("The current runtime scheduler adapter requires PP1/VPP1")
         if getattr(config, "tensor_model_parallel_size", 1) != 1:
             raise ValueError("The current benchmark rank/attention mapping requires TP1")
-        actual = (
-            getattr(config, "num_attention_heads", None),
-            getattr(config, "num_query_groups", None),
-            getattr(config, "kv_channels", None),
-        )
-        if (
-            actual != self.attention_geometry
-            or getattr(config, "num_layers", None) != self.layer_count
-        ):
-            raise ValueError(
-                "Runtime model shape must match the supplied attention geometry and layers"
-            )
         if (
             not getattr(config, "bf16", False)
             or getattr(config, "fp8", None)
@@ -244,12 +199,7 @@ class BenchmarkCostModel:
         backend = getattr(config, "attention_backend", None)
         if getattr(backend, "name", backend) != "fused":
             raise ValueError("The attention parameters require fused attention")
-        communication = getattr(config, "cp_comm_type", None)
-        if communication != "p2p" and not (
-            isinstance(communication, list)
-            and communication
-            and all(value == "p2p" for value in communication)
-        ):
+        if not uses_p2p(config):
             raise ValueError("The attention parameters describe TE P2P communication")
         if getattr(config, "cuda_graph_impl", None) not in (None, "none", ""):
             raise ValueError("This runtime recipe uses eager execution")
@@ -259,8 +209,6 @@ class BenchmarkCostModel:
                 "The benchmark layer program covers recompute_granularity None or 'full', "
                 f"got {recompute!r}"
             )
-        if (recompute == "full") != self.recompute_forward:
-            raise ValueError("Runtime recomputation must match the supplied layer program")
         if recompute == "full" and getattr(config, "recompute_method", None) != "uniform":
             raise ValueError("The recompute layer program requires all layers to be recomputed")
 

@@ -4,10 +4,11 @@
 
 from __future__ import annotations
 
+import itertools
 import math
-import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field, replace
+from collections import Counter
+from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from ..models.cache import PackCostModel
@@ -164,37 +165,23 @@ class RuntimePlan:
     rows: List[List[List[int]]]
     groups: List[List[Tuple[int, int, List[int]]]]
     predicted_ms: float
-    planning_s: float
     microbatches: int
-    dummy_tokens: List[List[int]] = field(default_factory=list)
 
 
-def encode_rows(rounds, world_size: int) -> List[List[List[int]]]:
+def encode_rows(rounds) -> List[List[List[int]]]:
     """``sched`` rounds (``[[{'cp', 'sample_ids'}]]``) -> MCore rows (``[mb][rank] -> ids``)."""
-    rows = []
-    for row in rounds:
-        encoded = [list(group["sample_ids"]) for group in row for _ in range(int(group["cp"]))]
-        if len(encoded) != world_size:
-            raise RuntimeScheduleError(
-                f"scheduler row covers {len(encoded)} ranks, expected {world_size}: "
-                f"{[(g['cp'], len(g['sample_ids'])) for g in row]}"
-            )
-        rows.append(encoded)
-    return rows
+    return [
+        [list(group["sample_ids"]) for group in row for _ in range(int(group["cp"]))]
+        for row in rounds
+    ]
 
 
 def decode_groups(row: Sequence[Sequence[int]]) -> List[Tuple[int, int, List[int]]]:
     """One MCore row -> ``[(start, cp, ids)]`` (maximal runs of equal id lists, rank order)."""
-    groups = []
-    first = 0
-    n = len(row)
-    while first < n:
-        ids = list(row[first])
-        end = first + 1
-        while end < n and list(row[end]) == ids:
-            end += 1
-        groups.append((first, end - first, ids))
-        first = end
+    groups, start = [], 0
+    for ids, run in itertools.groupby(map(list, row)):
+        groups.append((start, len(list(run)), ids))
+        start += groups[-1][1]
     return groups
 
 
@@ -259,28 +246,13 @@ def validate_rows(
         # any ID appearing in two non-adjacent groups as a duplicate.
         decoded.append(groups)
     if sorted(seen) != sorted(lengths):
-        counts: Dict[int, int] = {}
-        for i in seen:
-            counts[i] = counts.get(i, 0) + 1
+        counts = Counter(seen)
         missing = sorted(i for i in lengths if i not in counts)
         extra = sorted(i for i, c in counts.items() if c > 1 or i not in lengths)
         raise RuntimeScheduleError(
             f"schedule lost or duplicated samples: missing {missing}, duplicated/unknown {extra}"
         )
     return decoded
-
-
-def dummy_tokens_per_group(
-    groups, lengths: Dict[int, int], geometry: RuntimePlanGeometry
-) -> List[List[int]]:
-    """Padding MCore materialises per group under pad 'max' + append_dummy_seq (telemetry)."""
-    return [
-        [
-            geometry.capacity(cp) - sum(geometry.stored_length(lengths[i], cp) for i in ids)
-            for _, cp, ids in row
-        ]
-        for row in groups
-    ]
 
 
 class RuntimePlanner(ABC):
@@ -296,9 +268,6 @@ class RuntimePlanner(ABC):
         self.model = cost_model
         cost_model.check_domain(geometry, None)
         self.timeline = build_timeline(cost_model, geometry)
-        prepare = getattr(cost_model, "prepare_guide", None)
-        if prepare is not None:
-            prepare(geometry.allowed_cp_sizes)
         self._sequence_limits = {}
         self.costs = self._new_costs()
         self.last_statistics = {}
@@ -318,7 +287,6 @@ class RuntimePlanner(ABC):
                 if getattr(self.model, "placement_invariant", False)
                 else self.geometry.world_size
             ),
-            max_group_seqs=self.geometry.max_group_seqs or MAX_PRICED_GROUP_SEQUENCES,
             sequence_limit=self.sequence_limit,
         )
 
@@ -429,17 +397,14 @@ class RuntimePlanner(ABC):
             for start in range(0, len(packs), per_row)
         ]
 
-    def _make_plan(self, rounds, lengths, predicted, begin):
-        rows = encode_rows(rounds, self.geometry.world_size)
-        groups = validate_rows(rows, lengths, self.geometry, min(self.geometry.allowed_cp_sizes))
-        return RuntimePlan(
-            rows=rows,
-            groups=groups,
-            predicted_ms=predicted,
-            planning_s=time.perf_counter() - begin,
-            microbatches=len(rows),
-            dummy_tokens=dummy_tokens_per_group(groups, lengths, self.geometry),
-        )
+    def _validated(self, rounds, lengths):
+        """``rounds`` as rank rows that satisfy the runtime contract, with their groups."""
+        rows, smallest = encode_rows(rounds), min(self.geometry.allowed_cp_sizes)
+        return rows, validate_rows(rows, lengths, self.geometry, smallest)
+
+    def _make_plan(self, rounds, lengths, predicted):
+        rows, groups = self._validated(rounds, lengths)
+        return RuntimePlan(rows=rows, groups=groups, predicted_ms=predicted, microbatches=len(rows))
 
     def _costed(self, rounds, lengths, guide=None):
         out = []
@@ -461,49 +426,19 @@ class RuntimePlanner(ABC):
         return out
 
     def plan_padded(self, padded_lengths, *, logical_lengths=None, incumbent_rows=None):
-        """MCore input [(global_sample_id, dataset-padded length)]; pure CPU.
+        """Plan ``{sample id: dataset-padded length}``, or such pairs; pure CPU.
 
-        No LM shift is inferred. Exact logical lengths are optional and must ceil
-        to the supplied padded lengths. Otherwise the cost input is explicitly
-        the padded upper bound, not fabricated logical lengths.
+        The cost input is ``logical_lengths`` when given, else the padded upper bound; no LM
+        shift is inferred. The caller checks the padded lengths, that the logical ones round
+        up to them, and any incumbent rows, as the CPU worker does (``plan`` checks its own
+        input again: the cost lengths and the rows, not the padding).
         """
-        items = list(padded_lengths.items() if hasattr(padded_lengths, "items") else padded_lengths)
-        padded = dict(items)
-        if (
-            len(padded) != len(items)
-            or not padded
-            or any(
-                type(i) is not int
-                or i < 0
-                or type(n) is not int
-                or n <= 0
-                or n % self.geometry.dataset_alignment
-                for i, n in items
-            )
-        ):
-            raise ValueError("unique nonnegative IDs and dataset-aligned positive lengths required")
-        logical = padded if logical_lengths is None else dict(logical_lengths)
-        if logical.keys() != padded.keys() or any(
-            type(n) is not int
-            or n <= 0
-            or (n + self.geometry.dataset_alignment - 1)
-            // self.geometry.dataset_alignment
-            * self.geometry.dataset_alignment
-            != padded[i]
-            for i, n in logical.items()
-        ):
-            raise ValueError(
-                "logical lengths must match every padded input after dataset alignment"
-            )
-        self.geometry.validate_lengths(logical)
-        incumbent = None
-        if incumbent_rows is not None:
-            groups = validate_rows(
-                incumbent_rows, padded, self.geometry, min(self.geometry.allowed_cp_sizes)
-            )
-            incumbent = [[dict(cp=cp, sample_ids=ids) for _, cp, ids in row] for row in groups]
+        logical = dict(padded_lengths if logical_lengths is None else logical_lengths)
+        incumbent = incumbent_rows and [
+            [dict(cp=cp, sample_ids=ids) for _, cp, ids in decode_groups(row)]
+            for row in incumbent_rows
+        ]
         plan = self.plan(logical, incumbent_rounds=incumbent)
-        validate_rows(plan.rows, padded, self.geometry, min(self.geometry.allowed_cp_sizes))
         if plan.microbatches % self.count_multiple:
             # The pipeline schedule cannot run such a count: no plan source may return one.
             raise RuntimeScheduleError(

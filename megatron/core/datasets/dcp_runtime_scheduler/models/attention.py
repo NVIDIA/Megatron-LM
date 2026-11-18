@@ -101,8 +101,7 @@ def _parameters(hardware: str) -> dict:
 def _integers(values, name: str, minimum: int = 1) -> List[int]:
     """``values`` as Python ints; ValueError unless all are integers of at least ``minimum``.
 
-    A bool or a float is no integer here. Text, bytes, mappings and sets are refused whole:
-    their items are not the numbers a caller meant, or have no order.
+    A bool or a float is no integer here; text, bytes, mappings and sets are refused whole.
     """
     numbers, valid = [], not isinstance(values, (str, bytes, bytearray, Mapping, Set))
     try:
@@ -290,9 +289,7 @@ def _causal_block(hardware, query_heads, kv_heads, head_dim, tokens, stored_toke
     """Fixed forward time, forward kernel time and backward time of one causal block.
 
     ``tokens`` are the valid tokens per sequence, ``stored_tokens`` the size of the buffer
-    with its padding. The block is priced as a whole causal attention call on one GPU (see
-    the module docstring); this one function serves ``cp_size`` 1 and step 0 of every ring
-    member. Its numbers are ``causal_ms`` and ``causal_program`` of the coefficient file.
+    with its padding; the numbers are ``causal_ms`` and ``causal_program`` of the file.
     """
     par = _parameters(hardware)
     workers = _thread_blocks(par, head_dim)
@@ -477,11 +474,7 @@ def predict_pair(
     (default ``0..cp_size-1``); rank ``r`` is a GPU of NVLink domain ``r // N`` with the
     ``N`` of ``NVLINK_DOMAIN_SIZES``.
 
-    Raises ValueError outside this domain: unknown hardware or attention geometry, a value
-    that is not a positive integer, ``cp_size`` above ``MAX_CP_SIZE``, a pack that does not
-    divide into the chunks of the ring or stores more than ``MAX_TOKENS_PER_RANK`` tokens
-    per rank, ranks that are not one distinct rank per member, and a ring across NVLink
-    domains without a measured exchange for it.
+    Raises ValueError outside the domain that the checks below spell out.
     """
     if not isinstance(hardware, str) or hardware not in PARAMETERS_SHA256:
         raise ValueError(f"hardware must be one of {sorted(PARAMETERS_SHA256)}, got {hardware!r}")

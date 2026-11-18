@@ -3543,8 +3543,15 @@ def pretrain(
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     model_cfg = get_model_config(model[0])
-    # Every rank validates the runtime DCP scheduler file before data loading and training.
-    _validate_dynamic_cp_runtime_config(model, model_cfg)
+    if getattr(model_cfg, 'dynamic_cp_runtime_config', None) is not None:
+        # Every rank validates the runtime DCP scheduler file before data loading and training,
+        # with the model's own process groups; the log gets one line saying what it selected.
+        runtime_groups = get_attr_wrapped_model(model[0], "pg_collection")
+        if runtime_groups is None:
+            runtime_groups = ProcessGroupCollection.use_mpu_process_groups()
+        runtime_spec = validate_dynamic_cp_runtime(model_cfg, runtime_groups)
+        _check_dynamic_cp_runtime_batch_sizes(runtime_spec)
+        print_rank_0(describe_runtime_spec(runtime_spec))
 
     callback_manager.callback_context.model = model
     callback_manager.callback_context.optimizer = optimizer
@@ -4830,19 +4837,6 @@ def _get_model_pg_collection(
     return pg_collection
 
 
-def _validate_dynamic_cp_runtime_config(model, config):
-    """Check ``--dynamic-cp-runtime-config`` on this rank with the model's own process groups."""
-    if getattr(config, 'dynamic_cp_runtime_config', None) is None:
-        return
-    pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
-    if pg_collection is None:
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-    spec = validate_dynamic_cp_runtime(config, pg_collection)
-    _check_dynamic_cp_runtime_batch_sizes(spec)
-    # One line in the log saying which scheduler this run uses and with which CP sizes.
-    print_rank_0(describe_runtime_spec(spec))
-
-
 def _check_dynamic_cp_runtime_batch_sizes(spec):
     """Stop on every rank when a configured batch size is one the cost model does not price.
 
@@ -5100,8 +5094,6 @@ def train_step(
                     data_iterator,
                     config,
                     get_num_microbatches(),
-                    # The model's own groups: the schedule carrier can be a multi-module
-                    # collection, which has no dp_cp group of its own.
                     pg_collection=get_attr_wrapped_model(model[0], "pg_collection"),
                     prefetch_next=(
                         iteration is not None

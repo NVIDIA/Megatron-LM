@@ -28,7 +28,7 @@ multiple of the stages. At most 32 plans are kept; upstream keeps every plan it 
 ``non_interleaved_plan`` is not part of DynamicUSP, which has the one plan builder above:
 it lists the order in which Megatron runs a training step with more than one pipeline
 stage and no virtual pipeline stages (``forward_backward_pipelining_without_interleaving``
-of ``megatron/core/pipeline_parallel/schedules.py``), written here from that function. It
+of ``megatron/core/pipeline_parallel/schedules.py``), built by ``_plan`` from its warm-up rule. It
 has one model chunk per stage. Against upstream's order for one chunk per stage
 (``interleaved_plan`` with ``virtual_stages`` 1) it is one-forward-one-backward with the
 same dependencies as well, and differs in two points. The warm-up: stage ``r`` first runs
@@ -83,36 +83,23 @@ def _execution_order(sequences, predecessor) -> tuple:
     return tuple(order)
 
 
-# At most 32 plans are kept: a plan has 2 * microbatches * stages * virtual_stages entries.
-# Typed, so that a kept plan never answers for arguments that only compare equal (True, 2.0).
-@lru_cache(maxsize=32, typed=True)
-def interleaved_plan(microbatches: int, stages: int, virtual_stages: int) -> tuple:
-    """Operations of the interleaved one-forward-one-backward schedule, in a runnable order.
-
-    Stage ``r`` first runs ``2 * (stages - r - 1) + (virtual_stages - 1) * stages`` forward
-    chunks, or all of them when ``microbatches == stages``; then it alternates one forward
-    and one backward chunk, then runs the backward chunks that are left. Forward chunks
-    come in blocks of ``stages`` microbatches: chunk 0 of each of them, then chunk 1, and
-    so on; backward chunks walk the chunks of a block in reverse. A forward chunk needs
-    the same chunk on the previous stage, or the previous chunk on the last stage; a
-    backward chunk needs the same chunk on the next stage, or the next chunk on the first
-    stage, or, for the last chunk on the last stage, its own forward chunk.
-
-    The entries are those of ``_execution_order``. The count of microbatches must be a
-    multiple of ``stages``.
-    """
-    for name, value in (
-        ("microbatches", microbatches),
-        ("stages", stages),
-        ("virtual_stages", virtual_stages),
-    ):
+def _positive(**counts) -> None:
+    for name, value in counts.items():
         if type(value) is not int or value < 1:
             raise ValueError(f"{name} must be a positive integer")
-    if microbatches % stages:
-        raise ValueError(
-            "the interleaved schedule needs a microbatch count that is a multiple of the "
-            f"pipeline-parallel size ({microbatches} vs {stages})"
-        )
+
+
+def _plan(microbatches, stages, virtual_stages, warm_up) -> tuple:
+    """The one-forward-one-backward order of every stage, merged by ``_execution_order``.
+
+    Stage ``r`` first runs ``warm_up(r)`` forward chunks; then it alternates one forward and
+    one backward chunk, then runs the backward chunks that are left. Forward chunks come in
+    blocks of ``stages`` microbatches: chunk 0 of each of them, then chunk 1, and so on;
+    backward chunks walk the chunks of a block in reverse. A forward chunk needs the same
+    chunk on the previous stage, or the previous chunk on the last stage; a backward chunk
+    needs the same chunk on the next stage, or the next chunk on the first stage, or, for
+    the last chunk on the last stage, its own forward chunk.
+    """
     total, block = microbatches * virtual_stages, stages * virtual_stages
 
     def chunk_of(index, direction):
@@ -125,14 +112,12 @@ def interleaved_plan(microbatches: int, stages: int, virtual_stages: int) -> tup
 
     sequences = []
     for stage in range(stages):
-        warm_up = 2 * (stages - stage - 1) + (virtual_stages - 1) * stages
-        if microbatches == stages:
-            warm_up = total
-        sequence = [chunk_of(index, "F") for index in range(warm_up)]
-        for index in range(total - warm_up):
-            sequence.append(chunk_of(warm_up + index, "F"))
+        first = warm_up(stage)
+        sequence = [chunk_of(index, "F") for index in range(first)]
+        for index in range(total - first):
+            sequence.append(chunk_of(first + index, "F"))
             sequence.append(chunk_of(index, "B"))
-        sequence.extend(chunk_of(index, "B") for index in range(total - warm_up, total))
+        sequence.extend(chunk_of(index, "B") for index in range(total - first, total))
         sequences.append(sequence)
 
     def predecessor(direction, microbatch, chunk, stage):
@@ -149,45 +134,45 @@ def interleaved_plan(microbatches: int, stages: int, virtual_stages: int) -> tup
     return _execution_order(sequences, predecessor)
 
 
-# The plans of this order have their own cache, with the parameters of the one above: a
-# plan has 2 * microbatches * stages entries.
+# At most 32 plans are kept: a plan has 2 * microbatches * stages * virtual_stages entries.
+# Typed, so that a kept plan never answers for arguments that only compare equal (True, 2.0).
+@lru_cache(maxsize=32, typed=True)
+def interleaved_plan(microbatches: int, stages: int, virtual_stages: int) -> tuple:
+    """Operations of the interleaved one-forward-one-backward schedule, in a runnable order.
+
+    The order is that of ``_plan``, where stage ``r`` first runs ``2 * (stages - r - 1) +
+    (virtual_stages - 1) * stages`` forward chunks, or all of them when ``microbatches ==
+    stages``. The entries are those of ``_execution_order``. The count of microbatches must
+    be a multiple of ``stages``.
+    """
+    _positive(microbatches=microbatches, stages=stages, virtual_stages=virtual_stages)
+    if microbatches % stages:
+        raise ValueError(
+            "the interleaved schedule needs a microbatch count that is a multiple of the "
+            f"pipeline-parallel size ({microbatches} vs {stages})"
+        )
+
+    def warm_up(stage):
+        if microbatches == stages:
+            return microbatches * virtual_stages
+        return 2 * (stages - stage - 1) + (virtual_stages - 1) * stages
+
+    return _plan(microbatches, stages, virtual_stages, warm_up)
+
+
+# A cache of its own, with the parameters of the one above.
 @lru_cache(maxsize=32, typed=True)
 def non_interleaved_plan(microbatches: int, stages: int) -> tuple:
     """Operations of Megatron's non-interleaved schedule, in a runnable order.
 
-    This is the order of a Megatron training step without virtual pipeline stages; it is
-    not part of DynamicUSP (see the module docstring, also for evaluation steps, whose
-    batches are planned with this order too). Every stage has one model chunk. Stage ``r``
-    first runs ``min(stages - r - 1, microbatches)`` forward microbatches; then it
-    alternates one forward and one backward microbatch, then runs the backward
-    microbatches that are left. A forward microbatch needs the same microbatch on the
-    previous stage; a backward microbatch needs the same microbatch on the next stage, or,
-    on the last stage, its own forward.
-
-    The entries are those of ``_execution_order``, with chunk 0. Any count of microbatches
-    runs, also one that is below the number of stages or no multiple of it.
+    The order of a Megatron training step without virtual pipeline stages, which is not
+    part of DynamicUSP (see the module docstring): that of ``_plan`` with one model chunk
+    per stage, where stage ``r`` first runs ``min(stages - r - 1, microbatches)`` forward
+    microbatches. The entries are those of ``_execution_order``, with chunk 0. Any count
+    of microbatches runs.
     """
-    for name, value in (("microbatches", microbatches), ("stages", stages)):
-        if type(value) is not int or value < 1:
-            raise ValueError(f"{name} must be a positive integer")
-    sequences = []
-    for stage in range(stages):
-        warm_up = min(stages - stage - 1, microbatches)
-        sequence = [("F", index, 0) for index in range(warm_up)]
-        for index in range(microbatches - warm_up):
-            sequence.append(("F", warm_up + index, 0))
-            sequence.append(("B", index, 0))
-        sequence.extend(("B", index, 0) for index in range(microbatches - warm_up, microbatches))
-        sequences.append(sequence)
-
-    def predecessor(direction, microbatch, chunk, stage):
-        if direction == "F":
-            return ("F", microbatch, chunk, stage - 1) if stage > 0 else None
-        if stage < stages - 1:
-            return ("B", microbatch, chunk, stage + 1)
-        return ("F", microbatch, chunk, stage)
-
-    return _execution_order(sequences, predecessor)
+    _positive(microbatches=microbatches, stages=stages)
+    return _plan(microbatches, stages, 1, lambda stage: min(stages - stage - 1, microbatches))
 
 
 def _tiles(groups, world_size) -> bool:
@@ -218,13 +203,9 @@ def step_time(
     groups overlap or leave a rank without a group raises ValueError, and so does a group
     that ends past the last rank. ``per_mb_overhead_ms`` is added once per microbatch.
 
-    The order of execution is that of the plan builder that ``schedule`` names; the replay
-    reads nothing but the entries of the plan. ``"interleaved"``, the default, is
-    ``interleaved_plan``, the order of DynamicUSP, also for one chunk per stage
-    (``virtual_stages`` 1). ``"non_interleaved"`` is ``non_interleaved_plan``, the order of
-    Megatron without virtual pipeline stages: it has one chunk per stage, so
-    ``virtual_stages`` must be 1, and an operation takes the time of its group divided by
-    the number of stages. Another name raises ValueError.
+    ``schedule`` names the plan builder whose order is replayed: ``"interleaved"``
+    (``interleaved_plan``) or ``"non_interleaved"`` (``non_interleaved_plan``, which has one
+    chunk per stage: ``virtual_stages`` must be 1).
     """
     if schedule == "interleaved":
         plan = interleaved_plan(len(rows), stages, virtual_stages)

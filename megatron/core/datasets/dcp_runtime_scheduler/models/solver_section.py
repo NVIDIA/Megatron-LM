@@ -18,17 +18,9 @@ The section holds the coefficients of the scheduler that are not group times::
         "stage2": {"enabled": false, "keep_threshold": 8.4}
     }
 
-``sample_weight`` gives the Stage 1 weight of a sample of L tokens,
-``max(1, A * L**2 / 1e10 + B * L / 1e5 + C)``. ``tier_time_factors`` switches Stage 1 from
-weight balance to time balance. ``pipeline`` holds the step terms of the step-time
-objective; with one pipeline stage only ``per_mb_overhead_ms`` changes a score, with more
-than one all three do. Its ``fitted_at`` records the run the three terms were fitted in:
-the pipeline-parallel size, the virtual stages per pipeline stage (1 without virtual
-stages) and the pipeline schedule, ``"interleaved"`` or ``"non_interleaved"``. The record
-changes no score. ``stage2`` switches on DynamicUSP's Stage 2 (``runtime.stage2``), which
-re-packs the samples inside each microbatch of the chosen count; ``keep_threshold`` is its
-one coefficient. Both defaults are DynamicUSP's: Stage 2 is off. Every part is optional, and
-unknown keys are rejected.
+The README of the package (Original profile) has the meaning and the default of every key;
+the defaults are DynamicUSP's, with Stage 2 (``runtime.stage2``) off. Every part is
+optional, and unknown keys are rejected.
 """
 
 from __future__ import annotations
@@ -37,7 +29,7 @@ import math
 from dataclasses import dataclass
 
 from ..runtime.hot_switch import validate_tier_time_factors
-from ..runtime.stage2 import DEFAULT_KEEP_THRESHOLD
+from ..runtime.stage2 import DEFAULT_KEEP_THRESHOLD, _finite
 
 # DynamicUSP's published measured fit of the forward cost of one sample in a group of eight
 # ranks. It is the default of the original profile and is not derived from the packaged
@@ -87,8 +79,11 @@ class SolverSection:
     stage2_keep_threshold: float = DEFAULT_KEEP_THRESHOLD
 
 
-def _object(value, label, keys, record=None):
-    """``value`` as a JSON object with no key outside ``keys`` and the key ``record``."""
+def _object(value, label, keys, record=None, required=False):
+    """``value`` as a JSON object with no key outside ``keys`` and the key ``record``.
+
+    With ``required`` it has every key of ``keys``.
+    """
     if not isinstance(value, dict):
         raise ValueError(f"{label} must be a JSON object")
     allowed = set(keys) if record is None else set(keys) | {record}
@@ -96,16 +91,16 @@ def _object(value, label, keys, record=None):
     if unknown:
         also = "" if record is None else f" and the record {record!r}"
         raise ValueError(f"Unknown key(s) {unknown} in {label}; allowed keys: {list(keys)}{also}")
+    missing = [key for key in keys if key not in value]
+    if required and missing:
+        raise ValueError(f"{label} requires the keys {list(keys)}; missing: {missing}")
     return value
 
 
 def _fitted_at(value) -> dict:
     """Validated copy of ``solver.pipeline.fitted_at``."""
     label = "solver.pipeline.fitted_at"
-    record = _object(value, label, _FITTED_AT_KEYS)
-    missing = [key for key in _FITTED_AT_KEYS if key not in record]
-    if missing:
-        raise ValueError(f"{label} requires the keys {list(_FITTED_AT_KEYS)}; missing: {missing}")
+    record = _object(value, label, _FITTED_AT_KEYS, required=True)
     for key in ("pipeline_parallel", "virtual_stages"):
         if type(record[key]) is not int or record[key] < 1:
             raise ValueError(f"{label}.{key} must be a positive integer")
@@ -115,11 +110,7 @@ def _fitted_at(value) -> dict:
 
 
 def _number(value, label, low=-math.inf, high=math.inf, kind="a finite number"):
-    try:
-        valid = type(value) in (int, float) and math.isfinite(value) and low <= value <= high
-    except OverflowError:
-        valid = False
-    if not valid:
+    if not _finite(value) or not low <= value <= high:
         raise ValueError(f"{label} must be {kind}")
     return float(value)
 
@@ -166,12 +157,9 @@ def parse_solver_section(
     section = _object(table["solver"], "the solver section of the coefficient file", _KEYS)
     values: dict = {}
     if "sample_weight" in section:
-        weight = _object(section["sample_weight"], "solver.sample_weight", _WEIGHT_KEYS)
-        missing = [key for key in _WEIGHT_KEYS if key not in weight]
-        if missing:
-            raise ValueError(
-                f"solver.sample_weight requires the keys {list(_WEIGHT_KEYS)}; missing: {missing}"
-            )
+        weight = _object(
+            section["sample_weight"], "solver.sample_weight", _WEIGHT_KEYS, required=True
+        )
         values["sample_weight"] = tuple(
             _number(weight[key], f"solver.sample_weight.{key}") for key in _WEIGHT_KEYS
         )
@@ -189,18 +177,13 @@ def parse_solver_section(
                 f"overhead is {pipeline_field}"
             )
         pipeline = _object(section["pipeline"], "solver.pipeline", _PIPELINE_KEYS, "fitted_at")
-        if "per_mb_overhead_ms" in pipeline:
-            values["per_mb_overhead_ms"] = _number(
-                pipeline["per_mb_overhead_ms"],
-                "solver.pipeline.per_mb_overhead_ms",
-                low=0.0,
-                kind="a finite nonnegative number",
-            )
-        for key in ("compute_fwd_share", "comm_fwd_share"):
+        for key, high, kind in (
+            ("per_mb_overhead_ms", math.inf, "a finite nonnegative number"),
+            ("compute_fwd_share", 1.0, "a number in [0, 1]"),
+            ("comm_fwd_share", 1.0, "a number in [0, 1]"),
+        ):
             if key in pipeline:
-                values[key] = _number(
-                    pipeline[key], f"solver.pipeline.{key}", 0.0, 1.0, "a number in [0, 1]"
-                )
+                values[key] = _number(pipeline[key], f"solver.pipeline.{key}", 0.0, high, kind)
         values["pipeline_default_terms"] = tuple(
             key for key in _PIPELINE_KEYS if key not in pipeline
         )
@@ -224,10 +207,7 @@ def check_factor_sizes(factors, cp_sizes) -> None:
 def sample_weight(length, coefficients) -> float:
     """Stage 1 weight of one sample of ``length`` tokens, floored at one."""
     a, b, c = coefficients
-    try:
-        weight = a * (length * length / 1e10) + b * (length / 1e5) + c
-    except OverflowError:  # an integer length beyond the float range
-        weight = math.inf
+    weight = a * (length * length / 1e10) + b * (length / 1e5) + c
     if not math.isfinite(weight):
         raise ValueError("solver.sample_weight gives a Stage 1 weight that is not finite")
     return max(1.0, float(weight))

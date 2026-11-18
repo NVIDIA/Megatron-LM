@@ -24,21 +24,10 @@ class TimelineModel:
     first_forward_dp_cp_sync: bool = True
     program: tuple | None = None  # (forward_ops, backward_ops) for program mode
 
-    @property
-    def blocks(self):
-        """Return the number of expert-parallel blocks in the parent domain."""
-        return self.world_size // self.ep_size
-
-    @property
-    def scalar(self):
-        """Indicate whether timing uses scalar forward/backward costs."""
-        return self.program is None
-
-    # ------------------------------------------------------------------ state
     def initial_state(self):
-        """Initialize completion times for each modeled block or rank."""
-        n = self.blocks if self.scalar else self.world_size
-        return [0.0] * n
+        """Completion times of every EP block (scalar costs) or of every rank (program)."""
+        blocks = self.world_size // self.ep_size
+        return [0.0] * (blocks if self.program is None else self.world_size)
 
     def makespan(self, state):
         """Return step completion time including the configured iteration tail."""
@@ -46,17 +35,12 @@ class TimelineModel:
 
     def advance(self, state, groups: Sequence[tuple], first: bool):
         """Apply one microbatch (forward then backward) to a state; returns the new state."""
-        if self.scalar:
-            state = self._scalar_phase(state, groups, 0)
-            if first and self.first_forward_dp_cp_sync:
-                m = max(state)
-                state = [m] * len(state)
-            return self._scalar_phase(state, groups, 1)
-        state = self._program_phase(state, groups, self.program[0])
+        run = self._scalar_phase if self.program is None else self._program_phase
+        forward, backward = (0, 1) if self.program is None else self.program
+        state = run(state, groups, forward)
         if first and self.first_forward_dp_cp_sync:
-            m = max(state)
-            state = [m] * len(state)
-        return self._program_phase(state, groups, self.program[1])
+            state = [max(state)] * len(state)
+        return run(state, groups, backward)
 
     def evaluate(self, rounds: Sequence[Sequence[tuple]]):
         """Score all microbatches with the shared forward/backward timeline."""
@@ -65,7 +49,6 @@ class TimelineModel:
             state = self.advance(state, groups, index == 0)
         return self.makespan(state)
 
-    # ---------------------------------------------------------------- scalar
     def _scalar_phase(self, state, groups, phase):
         e = self.ep_size
         na = self.forward_non_attention_ms if phase == 0 else self.backward_non_attention_ms
@@ -95,7 +78,6 @@ class TimelineModel:
                 break
         return t
 
-    # --------------------------------------------------------------- program
     def _program_phase(self, state, groups, ops):
         w, e = self.world_size, self.ep_size
         t = list(state)
@@ -174,18 +156,9 @@ def build_timeline(model, geometry: "RuntimePlanGeometry") -> TimelineModel:
             int(getattr(model, "layer_count", 1)),
             float(getattr(model, "forward_non_attention_ms", 0.0)),
             float(getattr(model, "backward_non_attention_ms", 0.0)),
-            0.0,
-            True,
-            None,
         )
-    programs = timing["execution_program"]
-    if len(programs) != 1:
-        raise ValueError("program mode supports one virtual stage (PP1/VPP1)")
-    program = programs[0]
-    ops = (
-        tuple(_freeze_op(op) for op in program["forward"]),
-        tuple(_freeze_op(op) for op in program["backward"]),
-    )
+    (program,) = timing["execution_program"]  # one program: one virtual stage
+    ops = tuple(tuple(_freeze_op(op) for op in program[phase]) for phase in ("forward", "backward"))
     sync = timing.get("first_forward_dp_cp_sync", True)
     if type(sync) is not bool:
         raise ValueError("timing()['first_forward_dp_cp_sync'] must be a boolean")
@@ -193,9 +166,7 @@ def build_timeline(model, geometry: "RuntimePlanGeometry") -> TimelineModel:
         geometry.world_size,
         geometry.ep_size,
         int(program["layer_count"]),
-        0.0,
-        0.0,
-        float(timing.get("iteration_tail_ms", 0.0)),
-        sync,
-        ops,
+        iteration_tail_ms=float(timing.get("iteration_tail_ms", 0.0)),
+        first_forward_dp_cp_sync=sync,
+        program=ops,
     )

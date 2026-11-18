@@ -1473,6 +1473,8 @@ def validate_args(args, defaults={}):
                 f"{dp_cp_size}; expected one of {valid_group_sizes}"
             )
 
+        import warnings
+
         if getattr(args, 'dynamic_cp_runtime_config', None) is not None:
             # Fail on a misspelled or incomplete file before the model is built. The check
             # against the model and parallel configuration runs once the model exists.
@@ -1481,10 +1483,6 @@ def validate_args(args, defaults={}):
             )
 
             load_runtime_config(args.dynamic_cp_runtime_config)
-
-        import warnings
-
-        if getattr(args, 'dynamic_cp_runtime_config', None) is not None:
             # The runtime scheduler decides the CP group sizes, not the range below.
             warnings.warn(
                 f"Dynamic CP enabled with the runtime scheduler file "

@@ -6,19 +6,16 @@ from __future__ import annotations
 
 import copy
 import math
-import time
 from collections.abc import Mapping
 from typing import Any
 
 from ..models.solver_section import PIPELINE_SCHEDULES, check_factor_sizes, sample_weight
 from .hot_switch import HotSwitchOptions, HotSwitchScheduler, InfeasibleLayout
 from .pipeline import step_time
-from .planner import RuntimePlan, RuntimePlanner, RuntimeScheduleError, encode_rows, validate_rows
+from .planner import RuntimePlan, RuntimePlanner, RuntimeScheduleError
 from .stage2 import ADOPTED, PROFILE_EXECUTION_ERROR, _finite, error_text, repack_layout
 
-# The members of a cost model that Stage 2 reads (``models.base.DcpCostModel``). Two more are
-# optional, those of the placement guard: ``stage2_guard_threshold`` and, for a model whose
-# threshold is not None, ``stage2_guard_margin``.
+# The members of a cost model that Stage 2 reads (``models.base.DcpCostModel``).
 _STAGE2_HOOKS = (
     "stage2_reference_cp_size",
     "stage2_global_constant_ms",
@@ -29,10 +26,7 @@ _STAGE2_HOOKS = (
 # Outcome of a microbatch that Stage 2 re-packed when the re-packed layout of the step could
 # not be scored: the step keeps its Stage 1 layout. DynamicUSP has no such outcome.
 RESCORE_REJECTED = "RESCORE_REJECTED"
-# What the plan statistics keep of the Stage 2 record of a microbatch: the outcome, the queue
-# of an adopted layout and the slowest group time, plus the global constant, before and
-# after; the type of a contained exception; and the mark of a placement that the capacity
-# predicate of the runtime rejected.
+# What the plan statistics keep of the Stage 2 record of a microbatch (``stage2``).
 _STAGE2_RECORD = ("code", "order", "base_ms", "selected_ms", "error", "runtime_capacity")
 # The statistics keep that record only for a microbatch with one of these outcomes or with
 # the capacity mark, and for at most this many microbatches of a plan: the statistics travel
@@ -42,66 +36,36 @@ _STAGE2_RECORD_LIMIT = 64
 
 
 def _offers_pipeline_step_time(cost_model) -> bool:
-    """True when the cost model has what the step time of several pipeline stages reads.
-
-    ``pipeline_group_times`` must be callable, and ``pipeline_terms`` a mapping whose
-    ``per_mb_overhead_ms`` is a finite nonnegative number (the ``DcpCostModel`` contract).
-    """
+    """True when the cost model has what the step time of several pipeline stages reads."""
     if not callable(getattr(cost_model, "pipeline_group_times", None)):
         return False
     terms = getattr(cost_model, "pipeline_terms", None)
     if not isinstance(terms, Mapping):
         return False
     overhead = terms.get("per_mb_overhead_ms")
-    if isinstance(overhead, bool) or not isinstance(overhead, (int, float)):
-        return False
-    try:
-        return math.isfinite(overhead) and overhead >= 0
-    except OverflowError:  # an integer beyond the float range
-        return False
+    return _finite(overhead) and overhead >= 0
 
 
 class DynamicUSPRuntimePlanner(RuntimePlanner):
     """Optional solver sharing the existing cost wrapper and padded-input contract.
 
-    Both solvers share model injection, validation, pricing and rank-row output.
-    Neither solver inherits the other's search algorithm.
-    This adapter never selects or initializes an attention communication backend.
+    Both solvers share model injection, validation, pricing and rank-row output; neither
+    inherits the other's search algorithm. Keyword options are those of ``HotSwitchOptions``.
+    The cost model supplies the Stage 1 coefficients, the step time and the Stage 2 members
+    (``models.base.DcpCostModel``).
 
-    Keyword options are those of ``HotSwitchOptions``. The cost model supplies the rest:
-    ``sample_weight_coefficients`` for the Stage 1 sample weight and ``tier_time_factors``
-    for Stage 1 time balance, both optional, and the step time that scores a candidate
-    count through its timeline.
+    ``pipeline`` is ``(pipeline stages, virtual stages per pipeline stage)`` of the run and
+    ``pipeline_schedule`` the name of its schedule (``runtime.pipeline``). None or
+    ``"interleaved"`` is DynamicUSP's order, with counts that are multiples of the stages
+    (``pp_multiple``), also for one chunk per stage. ``"non_interleaved"`` is Megatron's order
+    without virtual pipeline stages: it takes ``(stages, 1)`` only and any count. With one
+    pipeline stage both arguments are checked and not read further.
 
-    ``pipeline`` is ``(pipeline stages, virtual stages per pipeline stage)`` of the training
-    run. With one pipeline stage, whatever the second number, everything is as without it.
-    With more, the count of microbatches is a multiple of the stages (``pp_multiple``), and
-    a candidate is scored with the step time of the interleaved pipeline schedule
-    (``pipeline.step_time``) on the group times of the cost model's
-    ``pipeline_group_times``, plus its ``pipeline_terms["per_mb_overhead_ms"]`` per
-    microbatch; a cost model that does not offer both is rejected.
-
-    ``pipeline_schedule`` names the schedule of a run with more than one pipeline stage.
-    None or ``"interleaved"`` is the above: DynamicUSP's order, also for one chunk per
-    stage, ``(stages, 1)``. ``"non_interleaved"`` is the order of Megatron without virtual
-    pipeline stages (``pipeline.non_interleaved_plan``), which DynamicUSP does not have.
-    It takes ``(stages, 1)`` only. It runs any count of microbatches, so the count
-    multiple is 1 and the count search is DynamicUSP's with ``pp_multiple`` 1; the group
-    times, the step terms and everything else are as for the interleaved schedule.
-    ``pipeline_schedule`` (the attribute) is the name, or None with one pipeline stage,
-    where the argument is checked and not read further.
-
-    Stage 2 (``stage2``) is switched by the cost model: ``stage2_enabled``, which the model
-    reads from its coefficient file, with ``stage2_keep_threshold``. It is off by default.
-    When on, the layout of the chosen count is re-packed microbatch by microbatch and
-    scored again; ``_stage2`` has the rules and ``last_statistics["stage2"]`` the outcome.
-    A cost model with a placement guard (``stage2_guard_threshold``) has it applied inside
-    Stage 2, and the statistics then record the threshold. The threshold is validated once, here,
-    and read again for every microbatch: every plan uses the validated one, and a cost model that
-    then gives another, or none, fails Stage 2 for the microbatch, as any error of its hooks.
-    The planner says what it does in three attributes, which exist whether Stage 2 is on or
-    off: ``stage2_enabled``, ``stage2_keep_threshold`` (None when off) and ``stage2_idle``
-    (why a Stage 2 that is on has no work in any plan of this run, else None).
+    Stage 2 is switched by the cost model (``stage2_enabled``, off by default); ``_stage2``
+    has the rules and ``last_statistics["stage2"]`` the outcome. Three attributes, which
+    exist whether it is on or off, say what the planner does: ``stage2_enabled``,
+    ``stage2_keep_threshold`` (None when off) and ``stage2_idle`` (why a Stage 2 that is on
+    has no work in any plan of this run, else None).
     """
 
     def __init__(
@@ -142,10 +106,8 @@ class DynamicUSPRuntimePlanner(RuntimePlanner):
                 "pipeline stage (it must offer pipeline_group_times and pipeline_terms); "
                 f"this run has {stages} pipeline stages"
             )
-        # The count multiple is the number of pipeline stages (DynamicUSP's ``pp_multiple``),
-        # for the search, the incumbent and the capacity fallback alike. Megatron's
-        # non-interleaved schedule runs any count: its multiple is 1, with which the search
-        # is DynamicUSP's for a count that is left free.
+        # The count multiple (DynamicUSP's ``pp_multiple``) of the search, the incumbent and
+        # the capacity fallback: the stages, or 1 on Megatron's non-interleaved schedule.
         multiple = 1 if non_interleaved else stages
         if options.setdefault("pp_multiple", multiple) != multiple:
             if non_interleaved:
@@ -175,9 +137,7 @@ class DynamicUSPRuntimePlanner(RuntimePlanner):
         self.scheduler = HotSwitchScheduler(
             geometry.world_size, sizes, geometry.tokens_per_rank, self.options
         )
-        # Stage 2 is switched by the cost model, which reads the switch from its coefficient
-        # file. Anything but True leaves it off, and then no Stage 2 member is read. The
-        # three public attributes exist either way (the runtime reports them at start-up).
+        # Anything but True leaves Stage 2 off, and then no Stage 2 member is read.
         self.stage2_enabled = getattr(cost_model, "stage2_enabled", False) is True
         self.stage2_keep_threshold: float | None = None
         self.stage2_idle: str | None = None
@@ -282,39 +242,24 @@ class DynamicUSPRuntimePlanner(RuntimePlanner):
                 values = tuple(lengths[i] for i in group["sample_ids"])
                 groups.append((start, cp, *self.model.pipeline_group_times(values, cp)))
             rows.append(groups)
-        stages, virtual_stages = self.pipeline
         overhead = self.model.pipeline_terms["per_mb_overhead_ms"]
-        world_size = self.geometry.world_size
+        world, schedule = self.geometry.world_size, self.pipeline_schedule
         return (
-            step_time(
-                rows, world_size, stages, virtual_stages, overhead, schedule=self.pipeline_schedule
-            )
+            step_time(rows, world, *self.pipeline, overhead, schedule=schedule)
             + self.timeline.iteration_tail_ms
         )
 
     def _stage2(self, layout, predicted, lengths, tokens, score):
         """Stage 2 on the layout of the chosen count: ``(step time, rounds, statistics)``.
 
-        Every microbatch is re-packed on its own (``stage2.repack_layout``): as in
-        DynamicUSP the rule looks at the slowest group of the microbatch, not at the step.
-        The capacity predicate of the runtime holds for every placement, and the guard
-        threshold is the one read at construction (None without a guard). When a microbatch
-        was re-packed the whole layout is scored again, with the step time that scored the
-        counts. The re-packed layout with that step time is then the result of the search,
-        as in DynamicUSP: the step time can be higher than ``predicted``, the step time of
-        the Stage 1 layout, and the Stage 1 layout is not a candidate any more.
-
-        Nothing raised in here loses the Stage 1 layout. An exception while one microbatch
-        is re-packed keeps the Stage 1 layout of that microbatch (DynamicUSP's fallback
-        mode). An exception while the re-packed layout is scored keeps the Stage 1 layout of
-        the step; the microbatches that were re-packed are then recorded as
-        ``RESCORE_REJECTED``.
-
-        The statistics count the outcome of every microbatch. They hold a record only for a
-        microbatch that was re-packed, hit an exception or had a placement rejected by the
-        capacity predicate, with its ``index`` in the layout (its position in the plan,
-        unless the default layout is planned), and for at most ``_STAGE2_RECORD_LIMIT`` of
-        them; ``microbatches_omitted``, present when some are left out, counts the rest.
+        Every microbatch is re-packed on its own (``stage2.repack_layout``). When one was
+        re-packed the whole layout is scored again and is then the result of the search, as
+        in DynamicUSP: its step time can be higher than ``predicted``, that of the Stage 1
+        layout. An exception while the re-packed layout is scored keeps the Stage 1 layout
+        of the step; the re-packed microbatches are then recorded as ``RESCORE_REJECTED``.
+        The statistics count every outcome and hold the records that ``_STAGE2_RECORDED``
+        selects or that carry the capacity mark, at most ``_STAGE2_RECORD_LIMIT`` of them,
+        each with its ``index`` in the layout.
         """
         rounds = self._rounds(layout)
         repacked, records = repack_layout(
@@ -368,41 +313,19 @@ class DynamicUSPRuntimePlanner(RuntimePlanner):
         """Search hot-switch count candidates with the injected complete-step cost.
 
         The layout of the default heuristic (``incumbent_rounds``) is scored with the same
-        step time and kept unless the search result is predicted faster. When the search
-        yields no layout and no incumbent was priced, a capacity-only layout is used.
-        DynamicUSP has neither; ``last_statistics`` marks such plans (``selected_incumbent``,
-        ``capacity_fallback``). With more than one pipeline stage both have a count of
-        microbatches that is a multiple of the stages, as every count of the search: an
-        incumbent with another count is dropped, and the capacity-only layout is built
-        with such a count. On the non-interleaved schedule the multiple is 1: every
-        incumbent is priced.
-
-        With Stage 2 switched on, the layout of the search is re-packed (``_stage2``)
-        and the re-packed layout, with its step time, is what is compared with the default
-        layout: the one rule of DynamicUSP, with or without a default layout. Stage 2 is
-        not applied to the default layout or to the capacity-only layout.
-        ``last_statistics["stage2"]``, which exists only then, holds the switch and the keep
-        threshold, ``guard_threshold`` when the cost model has a placement guard,
-        ``skipped`` (why Stage 2 did no work for this plan, else None) and, when
-        it ran: the outcome ``counts`` of all microbatches, the number of re-packed
-        microbatches, the predicted step time before and after, the records
-        ``microbatches`` (see ``_stage2``), and ``planned``: which layout the plan is.
-        ``"stage2"`` is the re-packed layout, scored again; ``"stage1"`` the Stage 1 layout,
-        when no microbatch was re-packed or the re-packed layout could not be scored;
-        ``"default"`` the default layout, when it was kept. ``first_error`` and
-        ``rescore_error`` are present when an exception was contained.
+        step time and kept unless the search result is predicted faster; an incumbent whose
+        count of microbatches is no multiple of ``count_multiple`` is dropped. When the
+        search yields no layout and no incumbent was priced, a capacity-only layout is used.
+        With Stage 2 on, the layout of the search is re-packed first (``_stage2``); Stage 2
+        is not applied to the other two layouts. ``last_statistics`` marks which layout the
+        plan is (``selected_incumbent``, ``capacity_fallback``, ``stage2["planned"]``); the
+        README of the package ("Trace records") lists its main fields.
         """
-        begin = time.perf_counter()
         lengths = self._start_plan(lengths)
         self.scheduler.last_candidates = []
 
         def score(rounds):
-            validate_rows(
-                encode_rows(rounds, self.geometry.world_size),
-                lengths,
-                self.geometry,
-                min(self.geometry.allowed_cp_sizes),
-            )
+            self._validated(rounds, lengths)
             if self.pipeline[0] > 1:
                 value = self._pipeline_step_time(rounds, lengths)
             else:
@@ -413,12 +336,7 @@ class DynamicUSPRuntimePlanner(RuntimePlanner):
 
         best, rejection, incumbent_unpriced = None, None, None
         if incumbent_rounds is not None:
-            validate_rows(
-                encode_rows(incumbent_rounds, self.geometry.world_size),
-                lengths,
-                self.geometry,
-                min(self.geometry.allowed_cp_sizes),
-            )
+            self._validated(incumbent_rounds, lengths)
             # The incumbent is a seed: one the cost model cannot price is dropped, and so is
             # one with a count of microbatches that the pipeline schedule cannot run.
             if len(incumbent_rounds) % self.count_multiple:
@@ -484,14 +402,21 @@ class DynamicUSPRuntimePlanner(RuntimePlanner):
                 best = score(rounds), rounds
                 capacity_fallback = True
 
+        # The step time that scores a count is called DynamicUSP's objective only where it is:
+        # on the interleaved order, and at one pipeline stage when no rank waits for all others
+        # after the first forward pass. The non-interleaved order is Megatron's.
+        if self.pipeline_schedule == PIPELINE_SCHEDULES[1]:
+            objective = "step time of Megatron's non-interleaved pipeline schedule"
+        elif self.pipeline[0] > 1:
+            objective = "step-time objective of the interleaved pipeline schedule"
+        elif self.timeline.first_forward_dp_cp_sync:
+            objective = "step time of the cost model"
+        else:
+            objective = "step-time objective at one pipeline stage"
+        if stage2 is not None:
+            objective += ", Stage 2 on"
         self.last_statistics = dict(
-            # The step time that scores a count is DynamicUSP's objective only when no rank
-            # waits for all others after the first forward pass; else it is the model's own.
-            algorithm=(
-                "DynamicUSP solve_gbs Stage 1 + step time of the cost model"
-                if self.timeline.first_forward_dp_cp_sync
-                else "DynamicUSP solve_gbs Stage 1 + step-time objective at one pipeline stage"
-            ),
+            algorithm=f"DynamicUSP solve_gbs Stage 1 + {objective}",
             source_commit="1ff97a4ae0beb5e088fadb9e112265bdd194b24d",
             group_sizes=self.scheduler.sizes,
             stage1_weight=(
@@ -506,40 +431,22 @@ class DynamicUSPRuntimePlanner(RuntimePlanner):
             selected_incumbent=selected_incumbent,
             capacity_fallback=capacity_fallback,
             rejection=rejection,
-            # Why the incumbent has no score: the cost model rejected one of its packs, or,
-            # with more than one pipeline stage, its count of microbatches is no multiple of
-            # the stages; such an incumbent is not priced. ``selected_incumbent`` therefore
-            # marks an incumbent whose count is a multiple of the stages (of the count
-            # multiple, which is 1 on the non-interleaved schedule).
+            # Why the incumbent has no score: a pack the cost model rejected, or a count of
+            # microbatches that the pipeline schedule cannot run.
             incumbent_unpriced=incumbent_unpriced,
             pack_cost_stats=dict(self.costs.stats),
             model_sequence_limits=self.model_sequence_limits(),
         )
         if self.pipeline[0] > 1:
-            stages, virtual_stages = self.pipeline
-            self.last_statistics.update(
-                # The interleaved order is DynamicUSP's objective; the non-interleaved order
-                # is Megatron's, so its step time is not called DynamicUSP's objective.
-                algorithm=(
-                    "DynamicUSP solve_gbs Stage 1 + step time of Megatron's non-interleaved "
-                    "pipeline schedule"
-                    if self.pipeline_schedule == PIPELINE_SCHEDULES[1]
-                    else "DynamicUSP solve_gbs Stage 1 + step-time objective of the interleaved "
-                    "pipeline schedule"
-                ),
-                # What scored the counts: the replayed schedule and the step terms of the
-                # cost model, with the names of those left at their defaults. The terms are
-                # copied with their nested values: the statistics share no object with the
-                # cost model.
-                pipeline=dict(
-                    stages=stages,
-                    virtual_stages=virtual_stages,
-                    schedule=self.pipeline_schedule,
-                    count_multiple=self.count_multiple,
-                    **copy.deepcopy(dict(self.model.pipeline_terms)),
-                ),
+            # What scored the counts: the replayed schedule and the step terms of the cost
+            # model, copied so that the statistics share no object with it.
+            self.last_statistics["pipeline"] = dict(
+                stages=self.pipeline[0],
+                virtual_stages=self.pipeline[1],
+                schedule=self.pipeline_schedule,
+                count_multiple=self.count_multiple,
+                **copy.deepcopy(dict(self.model.pipeline_terms)),
             )
         if stage2 is not None:
-            self.last_statistics["algorithm"] += ", Stage 2 on"
             self.last_statistics["stage2"] = stage2
-        return self._make_plan(best[1], lengths, best[0], begin)
+        return self._make_plan(best[1], lengths, best[0])

@@ -12,7 +12,6 @@ from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
 
-from ..runtime.planner import MAX_PRICED_GROUP_SEQUENCES
 from ..runtime.timeline import layer_program
 from .base import NVLINK_DOMAIN_SIZES
 from .full35b import PARAMETERS_SHA256
@@ -49,10 +48,6 @@ class Qwen35FullCostModel:
     FA/GDN predictions cover the whole attention module, including its
     projections and layout work. Required user timings exclude that module and
     include MoE/EP and other remaining work. No density regression is loaded.
-
-    One coefficient vector per direction prices a module at every CP size: the
-    CP size enters through the features (a ring set-up, one round per further
-    rank, the work of the slowest rank of each round), not through a table.
 
     The features evaluate every pack in the layout of the measured source, where the
     padding tail extends the last sequence. The tail policy the training run executes
@@ -92,17 +87,12 @@ class Qwen35FullCostModel:
             raise ValueError(
                 f'tail_padding must be one of {list(_TAIL_PADDING_POLICIES)}, got {tail_padding!r}'
             )
-        # The THD tail policy of the training run. It is reported in the metadata only: the
-        # FA/GDN features keep the pack layout of the measured source (see ``metadata``).
-        self.executed_tail_padding = tail_padding
-        self.check_domain(geometry)
+        self.executed_tail_padding = tail_padding  # Reported only (see the class docstring).
         root = Path(__file__).with_name('full35b')
         raw = (root / 'parameters.json').read_bytes()
         if hashlib.sha256(raw).hexdigest() != PARAMETERS_SHA256:
             raise ValueError('Frozen full Qwen3.5-35B parameter hash mismatch')
         parameters = json.loads(raw)
-        if parameters.get('schema') != 'qwen35-full35b-module-costs/2':
-            raise ValueError('Unsupported full Qwen3.5-35B parameter schema')
         manifest_raw = (root / 'manifest.json').read_bytes()
         manifest = json.loads(manifest_raw)
         for name, digest in manifest['packaged_sha256'].items():
@@ -200,8 +190,6 @@ class Qwen35FullCostModel:
 
     def check_domain(self, geometry, config=None):
         """Check the measured parallel geometry; model and execution checks live in selection."""
-        if geometry != self.geometry:
-            raise ValueError('Full Qwen3.5-35B parameters were bound to a different geometry')
         # Name the first setting that differs, with the measured and the actual value.
         for label, measured, field in _MEASURED_GEOMETRY:
             actual = getattr(geometry, field)
@@ -210,50 +198,13 @@ class Qwen35FullCostModel:
                     f'Full Qwen3.5-35B parameters were measured with {label}={measured}, '
                     f'got {actual}'
                 )
-        allowed = tuple(geometry.allowed_cp_sizes)
-        if not allowed or any(
-            type(cp) is not int or not 1 <= cp <= self.largest_cp_size for cp in allowed
-        ):
-            raise ValueError(
-                'Full Qwen3.5-35B parameters cover CP groups of 1 to '
-                f'{self.largest_cp_size} ranks, got {list(allowed)}'
-            )
-        # The parameters cover packs of up to 64 sequences. A smaller cap is inside that
-        # domain: 63 when a 64-entry THD buffer reserves one slot for a dummy tail sequence.
-        sequence_cap = geometry.max_group_seqs
-        if not (
-            sequence_cap is None
-            or (type(sequence_cap) is int and 1 <= sequence_cap <= MAX_PRICED_GROUP_SEQUENCES)
-        ):
-            raise ValueError(
-                f'Full Qwen3.5-35B parameters cover at most {MAX_PRICED_GROUP_SEQUENCES} '
-                f'sequences per CP group, got {sequence_cap}'
-            )
         if config is not None:
             validate_full_qwen35_config(config)
 
-    def _check_cp(self, cp):
+    @lru_cache(maxsize=65536)
+    def _program_costs(self, lengths, cp):
         if type(cp) is not int or cp not in self.geometry.allowed_cp_sizes:
             raise ValueError('CP size is outside the full Qwen3.5-35B prediction domain')
-
-    def _ranks(self, cp, ranks):
-        self._check_cp(cp)
-        if ranks is None:
-            raise ValueError('Actual contiguous physical rank IDs are required')
-        ranks = tuple(ranks)
-        if (
-            len(ranks) != cp
-            or any(type(rank) is not int for rank in ranks)
-            or ranks != tuple(range(ranks[0], ranks[0] + cp))
-            or ranks[0] < 0
-            or ranks[-1] >= 32
-        ):
-            raise ValueError('Actual contiguous physical ranks must be inside the 32-rank domain')
-        return ranks
-
-    @lru_cache(maxsize=65536)
-    def _attention_costs(self, lengths, cp):
-        self._check_cp(cp)
         point = pack_geometry(lengths, cp)
         features = fa_features(point)
         fa = {phase: dot(self.full_attention[phase], features) for phase in ('forward', 'backward')}
@@ -262,30 +213,6 @@ class Qwen35FullCostModel:
             phase: dot(self.gdn[phase], gdn_features(point, phase))
             for phase in ('forward', 'backward')
         }
-        return fa, gdn
-
-    def attention_components(self, lengths, cp, *, cache_pass=0, scope='module'):
-        """Expose the FA/GDN module predictions for the cold (0) or the hot (1) GDN pass.
-
-        ``cache_pass=0`` adds the cold constant to the GDN forward price. The constant was
-        fitted at CP > 1; the planner never prices a cold pass at CP 1.
-        """
-        if scope != 'module':
-            raise ValueError(
-                'Full Qwen3.5-35B predicts whole attention modules, not core attention'
-            )
-        if type(cache_pass) is not int or cache_pass not in (0, 1):
-            raise ValueError('GDN cache_pass must be 0 or 1')
-        fa, gdn = self._attention_costs(tuple(lengths), cp)
-        cold = self.gdn['first_layer_cold_forward_ms'] if cache_pass == 0 else 0.0
-        return {
-            'fa': {'module': dict(fa)},
-            'gdn': {'module': {'forward': gdn['forward'] + cold, 'backward': gdn['backward']}},
-        }
-
-    @lru_cache(maxsize=65536)
-    def _program_costs(self, lengths, cp, ranks):
-        fa, gdn = self._attention_costs(lengths, cp)
         result = {}
         for layer in self.layers:
             name, kind = layer['name'], layer['kind']
@@ -300,8 +227,7 @@ class Qwen35FullCostModel:
 
     def program_costs(self, lengths, cp, *, ranks=None):
         """Return all 41 named module costs and fixed user non-attention inputs."""
-        ranks = self._ranks(cp, ranks)
-        return dict(self._program_costs(tuple(lengths), cp, ranks))
+        return dict(self._program_costs(tuple(lengths), cp))
 
     def forward(self, lengths, cp, *, ranks=None):
         """Return the mean whole-attention-module forward cost for search ordering."""
@@ -337,8 +263,7 @@ class Qwen35FullCostModel:
         )
 
     def clear(self):
-        """Reset all per-global-batch module and program prediction caches."""
-        self._attention_costs.cache_clear()
+        """Reset the per-global-batch module and program prediction cache."""
         self._program_costs.cache_clear()
 
     def metadata(self):

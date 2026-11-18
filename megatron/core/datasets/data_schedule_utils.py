@@ -355,10 +355,8 @@ def _get_global_seqlens_and_ids(subsample_seqlens: torch.Tensor, dp_group):
         subsample_seqlens_padded = torch.cat(
             [
                 subsample_seqlens,
-                torch.zeros(
-                    (max_sub_samples - num_local_subsamples, *subsample_seqlens.shape[1:]),
-                    dtype=torch.int32,
-                    device=subsample_seqlens.device,
+                subsample_seqlens.new_zeros(
+                    (max_sub_samples - num_local_subsamples, *subsample_seqlens.shape[1:])
                 ),
             ],
             dim=0,

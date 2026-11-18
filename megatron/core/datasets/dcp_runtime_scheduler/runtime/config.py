@@ -77,12 +77,6 @@ def _per_layer_times(value, label):
     return _milliseconds(value, label)
 
 
-def allowed_keys(scheduler_type):
-    """Top-level keys accepted for one scheduler type, in documentation order."""
-    entry = SCHEDULERS[scheduler_type]
-    return ("type",) + entry["required"] + entry["optional"] + COMMON_KEYS
-
-
 def validate_runtime_config(data, config_path="<runtime configuration>"):
     """Check the complete user-facing schema and return normalized settings.
 
@@ -97,14 +91,15 @@ def validate_runtime_config(data, config_path="<runtime configuration>"):
         raise ValueError(
             f"{where}: 'type' must be one of {sorted(SCHEDULERS)}, got {scheduler_type!r}"
         )
-    allowed = allowed_keys(scheduler_type)
+    entry = SCHEDULERS[scheduler_type]
+    allowed = ("type",) + entry["required"] + entry["optional"] + COMMON_KEYS
     unknown = sorted(set(data) - set(allowed), key=str)
     if unknown:
         raise ValueError(
             f"{where}: unknown key(s) {unknown} for type {scheduler_type!r}; "
             f"allowed keys: {list(allowed)}"
         )
-    missing = [key for key in SCHEDULERS[scheduler_type]["required"] if key not in data]
+    missing = [key for key in entry["required"] if key not in data]
     if missing:
         raise ValueError(f"{where}: type {scheduler_type!r} requires key(s) {missing}")
 

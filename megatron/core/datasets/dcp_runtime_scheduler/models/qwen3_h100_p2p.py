@@ -25,7 +25,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from ..runtime.config import _unique_object
-from .base import NVLINK_DOMAIN_SIZES, PackLimits
+from .base import NVLINK_DOMAIN_SIZES, PackLimits, uses_p2p
 from .solver_section import parse_solver_section
 
 _MODEL_NAME = "qwen3_h100_p2p"
@@ -110,23 +110,8 @@ def _zigzag_max_causal_work(logical_lengths, physical_lengths, cp, token_unit):
     keys. Only q < logical_length contributes, even when the physical tail is
     much larger. Each interval is summed exactly with integer arithmetic.
     """
-    cp = _positive_int(cp, "causal-work CP size")
-    token_unit = _positive_int(token_unit, "causal-work token unit")
-    logical_lengths = tuple(logical_lengths)
-    physical_lengths = tuple(physical_lengths)
-    if not logical_lengths or len(logical_lengths) != len(physical_lengths):
-        raise ValueError("Causal-work logical and physical sequence arrays must match")
     work = [0] * cp
     for logical, physical in zip(logical_lengths, physical_lengths):
-        if (
-            type(logical) is not int
-            or logical < 0
-            or type(physical) is not int
-            or physical < 1
-            or logical > physical
-            or physical % (2 * cp)
-        ):
-            raise ValueError("Causal-work storage must be positive and divisible by 2*CP")
         block_size = physical // (2 * cp)
         for rank in range(cp):
             for block in (rank, 2 * cp - 1 - rank):
@@ -163,8 +148,6 @@ class Qwen3H100P2PCostModel:
         """Load the packaged coefficients, or a refit of the same recipe from ``calibration``."""
         self.geometry = geometry
         self.packaged = calibration is None
-        if calibration is not None and not isinstance(calibration, (str, Path)):
-            raise ValueError("The H100 calibration must be a coefficient file path")
         path = Path(__file__).with_suffix(".json") if calibration is None else Path(calibration)
         try:
             raw = path.read_bytes()
@@ -183,7 +166,6 @@ class Qwen3H100P2PCostModel:
         except (KeyError, TypeError, AttributeError, OverflowError) as error:
             raise ValueError("Malformed H100 calibration file") from error
         self._limits = PackLimits(max_sample_length=self.maximum_length)
-        self.check_domain(geometry, None)
 
     def _validate_profile(self):
         data = self.profile
@@ -317,8 +299,6 @@ class Qwen3H100P2PCostModel:
     def check_domain(self, geometry, config=None):
         """Reject geometry, model and execution settings outside the measured recipe."""
         domain = self.domain
-        if geometry != self.geometry:
-            raise ValueError(f"{_SCOPE} was built for a different planner geometry")
         for label, measured, actual in (
             ("DPxCP", domain["world_size"], geometry.world_size),
             ("expert_model_parallel_size", domain["ep_size"], geometry.ep_size),
@@ -327,14 +307,6 @@ class Qwen3H100P2PCostModel:
         ):
             if actual != measured:
                 raise ValueError(f"{_SCOPE} was measured with {label}={measured}, got {actual}")
-        allowed = tuple(geometry.allowed_cp_sizes)
-        if not allowed or not set(allowed) <= set(self.supported_cp_sizes):
-            raise ValueError(
-                f"{_SCOPE} covers CP groups of {list(self.supported_cp_sizes)} ranks, "
-                f"got {list(allowed)}"
-            )
-        if not geometry.align_group_starts:
-            raise ValueError(f"{_SCOPE} covers size-aligned CP groups only")
         if geometry.max_group_seqs is None or geometry.max_group_seqs > self.maximum_sequences:
             raise ValueError(
                 f"{_SCOPE} covers at most {self.maximum_sequences} sequences per CP group, "
@@ -363,12 +335,8 @@ class Qwen3H100P2PCostModel:
                 raise ValueError(f"{_SCOPE} was measured with {key}={measured}, got {actual!r}")
         if getattr(config, "virtual_pipeline_model_parallel_size", None) is not None:
             raise ValueError(f"{_SCOPE} was measured with PP1/VPP1")
-        communication = getattr(config, "cp_comm_type", None)
-        if communication != "p2p" and not (
-            isinstance(communication, list)
-            and communication
-            and all(c == "p2p" for c in communication)
-        ):
+        if not uses_p2p(config):
+            communication = getattr(config, "cp_comm_type", None)
             raise ValueError(
                 f"{_SCOPE} was measured with cp_comm_type='p2p', got {communication!r}"
             )
@@ -479,32 +447,15 @@ class Qwen3H100P2PCostModel:
 
     def timing(self):
         """Build the measured layer order, per-microbatch overhead and one iteration tail."""
-        return {
-            "iteration_tail_ms": self.iteration_tail_ms,
-            "execution_program": [
-                {
-                    "layer_count": self.layer_count,
-                    "forward": [dict(sync="local", duration_ms=self.outer["forward"])]
-                    + [
-                        operation
-                        for _ in range(self.layer_count)
-                        for operation in (
-                            dict(sync="cp", cost="att_f"),
-                            dict(sync="ep", cost="rest_f", aggregation="mean"),
-                        )
-                    ],
-                    "backward": [
-                        operation
-                        for _ in range(self.layer_count)
-                        for operation in (
-                            dict(sync="ep", cost="rest_b", aggregation="mean"),
-                            dict(sync="cp", cost="att_b"),
-                        )
-                    ]
-                    + [dict(sync="local", duration_ms=self.outer["backward"])],
-                }
-            ],
-        }
+        layers, outer, mean = self.layer_count, self.outer, dict(sync="ep", aggregation="mean")
+        forward = [dict(sync="cp", cost="att_f"), dict(mean, cost="rest_f")]
+        backward = [dict(mean, cost="rest_b"), dict(sync="cp", cost="att_b")]
+        program = dict(
+            layer_count=layers,
+            forward=[dict(sync="local", duration_ms=outer["forward"])] + forward * layers,
+            backward=backward * layers + [dict(sync="local", duration_ms=outer["backward"])],
+        )
+        return dict(iteration_tail_ms=self.iteration_tail_ms, execution_program=[program])
 
     def clear(self):
         """Drop pack prediction caches before planning another global batch."""

@@ -6,45 +6,38 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import (
-    TYPE_CHECKING,
-    Callable,
-    Dict,
-    Optional,
-    Protocol,
-    Sequence,
-    Tuple,
-    runtime_checkable,
-)
+from typing import TYPE_CHECKING, Callable, Protocol, Sequence, runtime_checkable
 
 if TYPE_CHECKING:
     from ..runtime.planner import RuntimePlanGeometry
 
-# GPUs per NVLink domain, by the ``hardware`` of the runtime file: an H100 node has eight
-# GPUs, a GB200 rack one domain of 72. A cost model takes its domain size from this table and
-# exposes it as ``nvlink_domain_size``; no option, constructor argument or runtime-file key
-# sets one. The packaged attention predictor reads the same table. The models read DPxCP
-# rank ``r`` as a GPU of domain ``r // size``, so the launch has to place ranks
-# consecutively, domain by domain.
+# GPUs per NVLink domain, by the ``hardware`` of the runtime file; nothing else sets one. A
+# cost model exposes its entry as ``nvlink_domain_size`` and reads DPxCP rank ``r`` as a GPU
+# of domain ``r // size``, so the launch has to place ranks consecutively, domain by domain.
 NVLINK_DOMAIN_SIZES = MappingProxyType({"h100": 8, "gb200": 72})
+
+
+def uses_p2p(config) -> bool:
+    """Whether ``cp_comm_type`` selects P2P communication, for the model or for every layer."""
+    value = getattr(config, "cp_comm_type", None)
+    return value == "p2p" or (isinstance(value, list) and value.count("p2p") == len(value) > 0)
 
 
 @dataclass(frozen=True)
 class PackLimits:
     """What a cost model can price in one pack of a CP size, beyond the planner geometry.
 
-    A model that cannot price every pack the geometry admits declares it through an
-    optional ``pack_limits(cp)`` method returning this object. The planner then never
-    builds a pack outside the declared limits, and the start-up probe prices the largest
-    pack the planner may build. ``None`` means no limit of the model's own; a new kind of
-    limit is one more field here, read where the planner or the worker enforces it.
+    A model declares it through an optional ``pack_limits(cp)`` method. The planner then
+    builds no pack outside the limits, and the start-up probe prices the largest pack the
+    planner may build. ``None`` means no limit of the model's own; a new kind of limit is
+    one more field here, read where the planner or the worker enforces it.
     """
 
     # Largest number of sequences in one pack of this CP size.
-    max_sequences: Optional[int] = None
+    max_sequences: int | None = None
     # Longest sample, in logical tokens before any padding, in a pack of this CP size. The
     # CPU worker rejects a global batch holding a sample that no allowed CP size prices.
-    max_sample_length: Optional[int] = None
+    max_sample_length: int | None = None
 
 
 @runtime_checkable
@@ -52,38 +45,31 @@ class DcpCostModel(Protocol):
     """Callable contract consumed by ``models.cache.PackCostModel`` and the planner.
 
     ``nvlink_domain_size`` is the number of consecutive DPxCP ranks the model takes to share
-    one NVLink domain: the ``NVLINK_DOMAIN_SIZES`` entry of its hardware, or None when the
-    model does not know the hardware its coefficients describe. Start-up prints it and the
-    plan metadata records it.
+    one NVLink domain (``NVLINK_DOMAIN_SIZES``), or None when it does not know the hardware.
 
-    Optional: ``pack_limits(cp) -> PackLimits`` when the model cannot price every pack
-    that the planner geometry admits at a CP size; the class attribute ``largest_cp_size``
-    when it prices CP groups up to that size only (the scheduler then forms no larger
-    one); ``required_global_batch_size`` when its step overhead describes one global
-    batch size (start-up and the CPU worker then reject any other). Read by the DynamicUSP
-    solver only: ``sample_weight_coefficients``, the ``(A, B, C)`` of its Stage 1 sample
-    weight (absent or None: the weight is derived from the model's step times), and
-    ``tier_time_factors``, a ``{CP size: factor}`` table that switches Stage 1 to time
-    balance; its keys are among ``supported_cp_sizes`` when the model declares them.
-    ``sample_weight_is_default`` is True when the coefficients are the published default
-    because the coefficient file gives none; the plan statistics and, for a user's file,
-    the start-up line say so. A model that offers a step time for more than one pipeline
-    stage has ``pipeline_group_times(lengths, cp) -> (forward_ms, backward_ms)``, the
-    whole-model times of one CP group, and ``pipeline_terms``, a dictionary recorded with
-    every such plan whose ``per_mb_overhead_ms``, a finite nonnegative number, is added to
-    the step time once per microbatch; the solver rejects more than one pipeline stage for
-    a model without both.
+    Optional members:
 
-    Stage 2 of the DynamicUSP solver (``runtime.stage2``) re-packs the samples of one
-    microbatch on its CP groups. A model offers it through these members, all of them
-    optional as a set. None of the methods has a rank argument: a model whose group time
-    depends on the ranks of the group cannot offer them.
+    - ``pack_limits(cp) -> PackLimits`` when the model cannot price every pack that the
+      geometry admits; the class attribute ``largest_cp_size`` when it prices CP groups up
+      to that size only; ``required_global_batch_size`` when its step overhead describes
+      one global batch size (start-up and the CPU worker then reject any other).
+    - For the DynamicUSP solver: ``sample_weight_coefficients``, the ``(A, B, C)`` of the
+      Stage 1 sample weight (absent or None: the weight is derived from the step times),
+      with ``sample_weight_is_default`` True when they are the published default, and
+      ``tier_time_factors``, a ``{CP size: factor}`` table that switches Stage 1 to time
+      balance; its keys are among ``supported_cp_sizes`` when the model declares them.
+    - For more than one pipeline stage: ``pipeline_group_times(lengths, cp) ->
+      (forward_ms, backward_ms)``, the whole-model times of one CP group, and
+      ``pipeline_terms``, a dictionary recorded with every such plan whose
+      ``per_mb_overhead_ms``, a finite nonnegative number, is added once per microbatch.
+
+    Stage 2 of the DynamicUSP solver (``runtime.stage2``, which has the rules) reads these
+    members, all of them optional as a set. None of the methods has a rank argument: a
+    model whose group time depends on the ranks of the group cannot offer them.
 
     - ``stage2_enabled`` (True switches Stage 2 on; absent or False, nothing else is read)
-      and ``stage2_keep_threshold`` (a finite positive number): both from the ``solver``
-      section of the coefficient file, as ``tier_time_factors``.
+      and ``stage2_keep_threshold`` (a finite positive number).
     - ``stage2_reference_cp_size``: CP groups of at most this size are the reference tier.
-      Stage 2 leaves a microbatch of such groups alone.
     - ``stage2_global_constant_ms``: a finite nonnegative time added to the slowest group
       of a microbatch before two layouts are compared.
     - ``stage2_sample_loads(length, cp_sizes) -> (work, {cp: load})``: the work of one
@@ -93,45 +79,32 @@ class DcpCostModel(Protocol):
       sample; finite and nonnegative.
     - ``stage2_group_time(lengths, cp) -> float``: the exact time in ms of one CP group for
       one microbatch; finite and positive.
-    - Optional, the placement guard that DynamicUSP applies to groups above the reference
-      size: ``stage2_guard_threshold``, a finite number (absent or None: the model has no
-      guard, and the next member is not read), and ``stage2_guard_margin(lengths, cp)
-      -> float``, the margin of a group of ``cp`` ranks that holds the samples whose
-      logical lengths are in the tuple ``lengths``, possibly none; a finite number. A
-      sample joins such a group only if the margin with it is at least the smaller of the
-      margin without it and the threshold, and a re-packed microbatch has no such group
-      with a margin below the threshold (``runtime.stage2`` has the rules). The margin is
-      also taken for these groups of the Stage 1 layout, where it is not tested but must
-      be a finite number. The threshold is read when the planner is built, where a
-      property that raises AttributeError reads as no guard, and again for every
-      microbatch of a plan, where it is checked: a model that then gives another
-      threshold, or none, fails Stage 2 for that microbatch.
+    - Optional, the placement guard of groups above the reference size:
+      ``stage2_guard_threshold``, a finite number (absent or None: no guard), and
+      ``stage2_guard_margin(lengths, cp) -> float``, the finite margin of a group of ``cp``
+      ranks that holds samples of the logical ``lengths``, possibly none.
 
     A cost model must not change what its Stage 2 members give after the planner was
-    built: the reference size, the global constant, the loads and times that the methods
-    return for the same arguments, and the guard threshold belong to the run. Only the
-    guard threshold is checked. The others are read again for every microbatch: a model
-    that, say, raises its reference size is planned with the groups up to the new size as
-    the reference tier, without a guard on them and without an error, while the plan
-    statistics name the size that was read when the planner was built.
+    built. Only the guard threshold is checked; the others are read again for every
+    microbatch, and the plan statistics name the reference size read at construction.
     """
 
     name: str
-    source_hashes: Dict[str, str]
-    nvlink_domain_size: Optional[int]
-    program_costs: Optional[Callable[..., Dict[str, float]]]
+    source_hashes: dict[str, str]
+    nvlink_domain_size: int | None
+    program_costs: Callable[..., dict[str, float]] | None
 
     def forward(
-        self, lengths: Tuple[int, ...], cp: int, *, ranks: Optional[Sequence[int]] = None
+        self, lengths: tuple[int, ...], cp: int, *, ranks: Sequence[int] | None = None
     ) -> float:
         """Forward attention ms per layer for one pack."""
 
     def backward(
-        self, lengths: Tuple[int, ...], cp: int, *, ranks: Optional[Sequence[int]] = None
+        self, lengths: tuple[int, ...], cp: int, *, ranks: Sequence[int] | None = None
     ) -> float:
         """Backward attention ms per layer for one pack."""
 
-    def timing(self) -> Optional[dict]:
+    def timing(self) -> dict | None:
         """Execution program for ``TimelineModel`` (program mode) or None (scalar mode)."""
 
     def clear(self) -> None:
@@ -178,12 +151,9 @@ class QuadraticCostModel:
 
     def timing(self) -> None:
         """Use the shared scalar timeline for this smoke model."""
-        return None
 
     def clear(self) -> None:
         """Accept the cache-reset hook for this stateless smoke model."""
-        return None
 
     def check_domain(self, geometry, config) -> None:
         """Accept any geometry supported by the shared smoke-test planner."""
-        return None
