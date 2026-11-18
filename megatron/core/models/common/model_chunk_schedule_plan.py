@@ -943,7 +943,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             if isinstance(model, FsdpModule):
                 # This schedule bypasses the root's autograd completion callback.
                 # Finish this microbatch's weight cleanup; gradient sync stays caller-managed.
-                model.context.run_delayed_post_backward_callbacks()
+                model.context.post_microbatch()
             # Release reference as early as possible, this helps avoid memory leak.
             b_schedule_plan.release_state()
 
