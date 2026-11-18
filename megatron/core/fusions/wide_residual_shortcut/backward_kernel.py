@@ -139,10 +139,8 @@ def backward(
     if any(missing):
         from .replay_kernel import replay_interval
 
-        generated = tuple(
-            replay_interval(previous, (saved,), prepare_columns=need, reader=r)[1][0]
-            for r, need in enumerate(missing)
-        )
+        # One launch emits every missing reader's columns.
+        generated = replay_interval(previous, (saved,), prepare_columns=(missing,))[1][0]
         columns = tuple(old if old is not None else new for old, new in zip(columns, generated))
     if on_columns_ready is not None:
         on_columns_ready(columns)

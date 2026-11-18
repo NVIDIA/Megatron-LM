@@ -417,7 +417,8 @@ def test_backward_owns_independent_scratch(explicit_grid, rows, hidden, columns)
     + [pytest.param(d, s, T, marks=QUALIFIED) for d, s in [(1, 3), (3, 6), (16, 6)]],
 )
 def test_interval_replay_matches_forward_bits(depth, streams, columns):
-    """Mixed one-/two-reader intervals replay original states and overwrite all MX padding."""
+    """Mixed one-/two-reader intervals replay original states and, with ``columns``, every
+    reader's MXFP8 columns from one launch, overwriting all MX padding."""
     seeded()
     checkpoint = torch.randn(128, streams * 96, device="cuda")
     current, states, tapes = checkpoint, [checkpoint], []
@@ -430,15 +431,18 @@ def test_interval_replay_matches_forward_bits(depth, streams, columns):
         tapes.append(saved)
         states.append(current)
     terminal = torch.empty_like(checkpoint)
+    requests = tuple((columns,) * len(tape.rstd) for tape in tapes)
     previous, operands = replay_interval(
-        checkpoint, tapes, prepare_columns=columns, terminal_output=terminal
+        checkpoint, tapes, prepare_columns=requests, terminal_output=terminal
     )
     assert previous[0] is checkpoint
     all_bytes_equal((*previous, terminal), states)
+    assert [len(per_tape) for per_tape in operands] == [len(tape.rstd) for tape in tapes]
     if columns:
-        # TE independently quantizes the matched FP32 forward values.
-        for before, tape, operand in zip(states, tapes, operands):
-            assert_columns_equal((operand,), (reference_columns(tape, before),))
+        # TE independently quantizes the matched FP32 forward values of every reader.
+        for before, tape, per_tape in zip(states, tapes, operands):
+            expected = tuple(reference_columns(tape, before, r) for r in range(len(per_tape)))
+            assert_columns_equal(per_tape, expected)
     expected = [*states[1:], *(t.clone() for t in workspace_tensors(operands))]
 
     def execute():
@@ -447,7 +451,7 @@ def test_interval_replay_matches_forward_bits(depth, streams, columns):
             tapes,
             outputs=previous[1:],
             columns=operands,
-            prepare_columns=columns,
+            prepare_columns=requests,
             terminal_output=terminal,
         )
         outputs = (*previous[1:], terminal, *workspace_tensors(operands))

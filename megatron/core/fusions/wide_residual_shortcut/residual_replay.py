@@ -5,10 +5,10 @@ Every training seam records its write into a ``ReplayInterval`` (one write per i
 checkpoint replay). An interval keeps only its first input residual (the checkpoint) and the
 writes' tapes, which the seams save for their backward anyway; a seam's backward takes its input
 residual from its ``ReplayHandle``. The interval replays its writes bit-exactly in one launch
-(also emitting reader zero's columnwise MXFP8 operands for the consumers' weight-gradient GEMMs;
-a one-write interval without them launches nothing) in the backward of the seam that applies its
-last write, which precedes every backward GEMM of the interval, or on first request. The caller
-decides where intervals start (see ``WriteReadNorm``).
+(also emitting the requested readers' columnwise MXFP8 operands, once each, for their
+consumers' weight-gradient GEMMs; a one-write interval without them launches nothing) in the
+backward of the seam that applies its last write, which precedes every backward GEMM of the
+interval, or on first request. The caller decides where intervals start (see ``WriteReadNorm``).
 """
 
 import weakref
@@ -34,7 +34,8 @@ class ReplayInterval:
         self.predecessors = self.columns = self.ready = None
 
     def record(self, previous, current, saved, *, prepare_columns=False) -> "ReplayHandle":
-        """Record one write (its input, output and ``SavedWrite`` tape)."""
+        """Record one write (its input, output and ``SavedWrite`` tape); ``prepare_columns`` is
+        a bool (reader zero) or one bool per reader."""
         if self.checkpoint is None:
             self.checkpoint = previous  # the only residual the interval keeps
         elif previous.data_ptr() != self.last:
@@ -63,7 +64,8 @@ class ReplayInterval:
         predecessors, columns = replay_interval(
             checkpoint, tapes, prepare_columns=tuple(self.prepare_columns)
         )
-        self.predecessors, self.columns = list(predecessors), list(columns)
+        self.predecessors = list(predecessors)
+        self.columns = [list(per_tape) for per_tape in columns]
         self.ready = torch.cuda.Event()
         self.ready.record(stream)
 
@@ -91,12 +93,19 @@ class ReplayInterval:
         previous.record_stream(stream)
         return previous
 
-    def take_columns(self, index):
-        """Write ``index``'s reader-zero columnwise MXFP8 operand (recorded with
-        ``prepare_columns``)."""
-        if not self.prepare_columns[index]:
-            raise RuntimeError("this replayed write did not record MXFP8 columns")
-        column, stream = self._take("columns", index)
+    def take_columns(self, index, reader=0):
+        """Write ``index``'s columnwise MXFP8 operand of ``reader`` (requested with
+        ``prepare_columns``), handed out once like a predecessor."""
+        requested = self.prepare_columns[index]
+        requested = (requested,) if isinstance(requested, bool) else tuple(requested)
+        if reader >= len(requested) or not requested[reader]:
+            raise RuntimeError("this replayed write did not record this reader's MXFP8 columns")
+        if self.columns is None or self.columns[index][reader] is None:
+            with torch.no_grad():
+                self._replay()
+        column, self.columns[index][reader] = self.columns[index][reader], None
+        stream = torch.cuda.current_stream(self.checkpoint.device)
+        stream.wait_event(self.ready)
         column._columnwise_data.record_stream(stream)
         column._columnwise_scale_inv.record_stream(stream)
         return column
@@ -113,6 +122,6 @@ class ReplayHandle:
         """The write's input residual."""
         return self.interval.take_previous(self.index)
 
-    def columns(self):
-        """The write's reader-zero columnwise MXFP8 operand."""
-        return self.interval.take_columns(self.index)
+    def columns(self, reader=0):
+        """The write's columnwise MXFP8 operand of ``reader``."""
+        return self.interval.take_columns(self.index, reader)

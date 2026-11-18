@@ -6,7 +6,7 @@ gradients; no-grad calls bypass autograd and save nothing for backward.
 """
 
 from dataclasses import dataclass, replace
-from functools import lru_cache
+from functools import lru_cache, partial
 from weakref import WeakValueDictionary, ref
 
 import torch
@@ -15,10 +15,14 @@ from torch.multiprocessing.reductions import StorageWeakRef
 
 from .residual_replay import ReplayInterval, graph_retained
 
-# MXFP8 handoff: a seam writes reader zero only as rowwise MXFP8 for its consumer Linear's forward
-# GEMM; the consumer's weight-gradient GEMM gets the columnwise operand replayed from the seam
-# (wide_residual.mxfp8_consumer swaps it into TE's saved slot at unpack).
+# MXFP8 handoff: a seam writes a reader as rowwise MXFP8 for its consumer Linears' forward GEMMs
+# ("mxfp8"), or as BF16 plus that MXFP8 twin when other modules need BF16 ("both"). The consumers'
+# weight-gradient GEMMs share one columnwise operand replayed from the seam
+# (wide_residual.mxfp8_consumer swaps it into TE's saved slots at unpack).
 _READERS = WeakValueDictionary()
+# A "both" reader's BF16 storage -> its _Twin, alive while the BF16 output or the seam's autograd
+# context (until its backward) holds it.
+_TWINS = WeakValueDictionary()
 
 
 def reader_for(tensor):
@@ -30,11 +34,14 @@ def reader_for(tensor):
 
 
 class Reader:
-    """Where one seam call's MXFP8 reader zero gets its columnwise operand from."""
+    """Where one seam call's MXFP8 reader gets its columnwise operand from: taken from the replay
+    once per backward and shared by its declared consumers' weight-gradient GEMMs."""
 
-    def __init__(self, tensor, columns, consumer):
-        self.columns = columns  # () -> the columnwise MXFP8 operand
-        self.consumer = ref(consumer)
+    def __init__(self, tensor, columns, consumers):
+        self._take = columns  # () -> the columnwise MXFP8 operand (one replay hand-out)
+        self.consumers = tuple(ref(linear) for linear in consumers)
+        self.hooked = 0  # consumer saved slots unpacking these columns in the current graph
+        self._columns, self._pending = None, 0
         # The weak reference prevents StorageImpl address reuse without retaining bytes.
         _READERS[StorageWeakRef(tensor._rowwise_data.untyped_storage())] = self
         # Pin the Reader on the rowwise data tensor, which detached aliases share, rather than
@@ -43,6 +50,83 @@ class Reader:
         # on a detached alias, whose lookup must still find the Reader.
         tensor._rowwise_data._shortcut_mxfp8_reader = self
         tensor._shortcut_mxfp8_reader = self
+
+    def declares(self, linear):
+        """Whether ``linear`` is one of this reader's declared MXFP8 consumers."""
+        return any(consumer() is linear for consumer in self.consumers)
+
+    def hook(self):
+        """Count one consumer slot that will unpack the columns; each declared consumer runs
+        once per graph (a recompute's no-grad pass installs nothing)."""
+        if self.hooked == len(self.consumers):
+            raise RuntimeError("a seam's MXFP8 reader was consumed more often than declared")
+        self.hooked += 1
+
+    def columns(self):
+        """The columnwise operand for one consumer's unpack: the first unpack takes it from the
+        replay, the declared consumers share it, and the last releases it (a retained graph's
+        next backward, whose recomputed consumers install again, takes it anew)."""
+        if self._columns is None:
+            self._columns, self._pending = self._take(), len(self.consumers)
+        columns, self._pending = self._columns, self._pending - 1
+        if self._pending == 0:
+            self._columns, self.hooked = None, 0
+        return columns
+
+
+class _AsQuantized(torch.autograd.Function):
+    """A "both" reader's MXFP8 twin in place of its BF16 output; the gradient goes to the BF16
+    output (one reader, one gradient)."""
+
+    @staticmethod
+    def forward(ctx, plain, twin):  # pylint: disable=arguments-differ
+        return twin[0].view(plain.shape)
+
+    @staticmethod
+    def backward(ctx, grad):  # pylint: disable=arguments-differ
+        return grad, None
+
+
+class _Twin:
+    """A "both" reader's MXFP8 operand. Without recomputed consumers it is dropped after its
+    declared consumers' graph-building forwards (``pending``); otherwise it lives as long as the
+    BF16 output or the seam's autograd context."""
+
+    __slots__ = ("pointer", "numel", "quantized", "pending", "__weakref__")
+
+    def __init__(self, plain, quantized, consumers, recomputed):
+        self.pointer, self.numel, self.quantized = plain.data_ptr(), plain.numel(), quantized
+        self.pending = None if recomputed else consumers
+
+
+def quantized_twin(tensor):
+    """The MXFP8 operand a "both" reader emitted along with ``tensor`` (its BF16 output, a view
+    of all of it or a detached alias), autograd-linked to ``tensor``; None for other tensors."""
+    if type(tensor) is not torch.Tensor or not _TWINS:
+        return None
+    entry = _TWINS.get(StorageWeakRef(tensor.untyped_storage()))
+    if entry is None:
+        return None
+    if tensor.data_ptr() != entry.pointer or tensor.numel() != entry.numel:
+        raise ValueError("a seam reader's MXFP8 consumer must take the whole reader")
+    quantized = entry.quantized
+    if quantized is None:
+        raise RuntimeError(
+            "a seam reader's MXFP8 twin was consumed more often than declared (a recomputed "
+            "consumer must be declared as such)"
+        )
+    if torch.is_grad_enabled() and entry.pending is not None:
+        entry.pending -= 1
+        if entry.pending == 0:  # TE's saved slot keeps only the columns, replayed in backward
+            entry.quantized = None
+    twin = _AsQuantized.apply(tensor, (quantized,))
+    reader = getattr(quantized, "_shortcut_mxfp8_reader", None)
+    if reader is not None:  # pinned by the operand handed out, which outlives a dropped twin
+        twin._shortcut_mxfp8_reader = twin._rowwise_data._shortcut_mxfp8_reader = reader
+    if tensor.requires_grad:
+        # TE caches requires_grad when it creates the operand: refresh it for the consumer.
+        twin.requires_grad_(True)
+    return twin
 
 
 def validate_input(residual, hidden_size, num_streams, *, inference=False):
@@ -71,7 +155,7 @@ class _Boundary(torch.autograd.Function):
     @staticmethod
     def forward(ctx, options, residual, *values):
         """Run the seam; ``ctx`` None is an inference call without autograd state."""
-        streams, replay, mxfp8_handoff, mxfp8_consumer, epsilon, update_count = options
+        streams, replay, formats, consumers, recomputed, epsilon, update_count = options
         from .forward_kernel import forward
 
         # values: updates, write, retain, then one read and one gamma per reader.
@@ -92,24 +176,46 @@ class _Boundary(torch.autograd.Function):
             retain,
             reads,
             gammas,
-            # Only reader zero is MXFP8 (the router input, reader one, stays BF16).
-            outputs=("mxfp8" if mxfp8_handoff else "bf16",) + ("bf16",) * (count - 1),
+            outputs=formats,
             num_streams=streams,
             epsilon=epsilon,
             inference=ctx is None,
         )
-        outputs = tuple(q.view(*leading, hidden) for q in outputs)
+        outputs = tuple(
+            (
+                tuple(t.view(*leading, hidden) for t in q)
+                if isinstance(q, tuple)
+                else q.view(*leading, hidden)
+            )
+            for q in outputs
+        )
+        # A "both" reader returns its BF16 output; its declared consumers take the MXFP8 twin.
+        quantized = tuple(q[0] if isinstance(q, tuple) else q for q in outputs)
+        outputs = tuple(q[1] if isinstance(q, tuple) else q for q in outputs)
+        twins = []
+        for fmt, plain, operand, linears, again in zip(
+            formats, outputs, quantized, consumers, recomputed
+        ):
+            if fmt == "both":
+                twins.append(_Twin(plain, operand, len(linears), again))
+                _TWINS[StorageWeakRef(plain.untyped_storage())] = twins[-1]
+                plain._shortcut_mxfp8_twin = twins[-1]
         result = (current.view(*leading, streams * hidden), *outputs)
         if ctx is None:
             return result
-        # The interval keeps or replays this seam's input residual (and reader zero's MXFP8
+        # Recomputed consumers may look the twin up through a detached alias until this seam's
+        # backward, after theirs.
+        ctx.twins = twins
+        # The interval keeps or replays this seam's input residual (and its MXFP8 readers'
         # columns): the backward never reconstructs it from a rounded successor.
-        ctx.replay = replay.record(residual, current, saved, prepare_columns=mxfp8_handoff)
+        mxfp8 = tuple(fmt != "bf16" for fmt in formats)
+        ctx.replay = replay.record(residual, current, saved, prepare_columns=mxfp8)
         ctx.save_for_backward(saved.update, saved.coefficients, *saved.gammas, *saved.rstd)
         ctx.spec = replace(saved, update=None, coefficients=None, gammas=(), rstd=())
         ctx.leading = leading
-        if mxfp8_handoff:  # the consumer's weight-gradient GEMM unpacks replayed columns
-            Reader(outputs[0], ctx.replay.columns, mxfp8_consumer)
+        for reader, (needs, operand) in enumerate(zip(mxfp8, quantized)):
+            if needs:  # the consumers' weight-gradient GEMMs unpack replayed columns
+                Reader(operand, partial(ctx.replay.columns, reader), consumers[reader])
         ctx.set_materialize_grads(False)
         return result
 
@@ -126,7 +232,7 @@ class _Boundary(torch.autograd.Function):
         # Autograd frees saved tensors after backward but not ctx attributes, and the graph's
         # nodes may outlive it (until the next forward): release the interval explicitly.
         if not graph_retained():
-            ctx.replay = None
+            ctx.replay = ctx.twins = None
         count = len(dys)
         saved = replace(
             ctx.spec,
@@ -176,21 +282,30 @@ def _apply_boundary(
     gammas,
     *,
     num_streams,
-    mxfp8_handoff=False,
-    mxfp8_consumer=None,
+    outputs=None,
+    mxfp8_consumers=None,
+    recomputed=None,
     epsilon=1.0e-5,
     replay=None,
 ):
     """In training the write records into ``replay`` (a ReplayInterval; None: its own one-write
-    interval), which keeps or replays its input residual and reader zero's MXFP8 columns."""
+    interval), which keeps or replays its input residual and its MXFP8 readers' columns."""
     updates = (p.routed,) if p.shared is None else (p.routed, p.shared)
     inputs = (p.residual, *updates, p.write, p.retain, *reads, *gammas)
-    mxfp8 = bool(mxfp8_handoff or mxfp8_consumer is not None)
+    formats = ("bf16",) * len(reads) if outputs is None else tuple(outputs)
+    consumers = (
+        ((),) * len(reads) if mxfp8_consumers is None else tuple(map(tuple, mxfp8_consumers))
+    )
+    recomputed = (False,) * len(reads) if recomputed is None else tuple(recomputed)
+    if not len(formats) == len(consumers) == len(recomputed) == len(reads):
+        raise ValueError("a seam takes one output format and consumer set per reader")
     if not torch.is_grad_enabled():
-        options = (num_streams, None, mxfp8, mxfp8_consumer, epsilon, len(updates))
+        options = (num_streams, None, formats, consumers, recomputed, epsilon, len(updates))
         return _Boundary.forward(None, options, *inputs)
-    if mxfp8_handoff and mxfp8_consumer is None:
-        raise ValueError("training shortcut MXFP8 requires an explicit consumer Linear")
+    if any((fmt == "bf16") != (not linears) for fmt, linears in zip(formats, consumers)):
+        raise ValueError(
+            "in training an MXFP8 seam reader (and only one) requires its consumer Linears"
+        )
     if p.residual.is_cuda and not _trains_on(p.residual.device.index):
         # Fail at the first seam rather than after a whole forward pass.
         raise ValueError(
@@ -199,12 +314,13 @@ def _apply_boundary(
         )
     # Without checkpoint replay, the seam is a one-write interval keeping its input residual.
     replay = ReplayInterval() if replay is None else replay
-    options = (num_streams, replay, mxfp8, mxfp8_consumer, epsilon, len(updates))
+    options = (num_streams, replay, formats, consumers, recomputed, epsilon, len(updates))
     result = _Boundary.apply(options, *inputs)
-    if mxfp8:
-        # TE caches requires_grad when it creates the quantized reader, before autograd attaches
-        # this seam: refresh it, or the consumer would skip its input gradient.
-        result[1].requires_grad_(True)
+    for fmt, output in zip(formats, result[1:]):
+        if fmt == "mxfp8":
+            # TE caches requires_grad when it creates the quantized reader, before autograd
+            # attaches this seam: refresh it, or the consumer would skip its input gradient.
+            output.requires_grad_(True)
     return result
 
 
@@ -228,8 +344,7 @@ class PendingWideResidualWrites:
 def shortcut_add_wide_residual_write_two_reader_rmsnorm_quant(pending, reads, gammas, **options):
     """Write a pending update and emit the next block's two independent read/RMSNorms.
 
-    Options match ``shortcut_add_wide_residual_write_read_rmsnorm_quant``; only reader zero may
-    use MXFP8, the router input (reader one) stays BF16.
+    Options match ``shortcut_add_wide_residual_write_read_rmsnorm_quant``, per reader.
     """
     if len(reads) != 2 or len(gammas) != 2:
         raise ValueError(
@@ -242,10 +357,13 @@ def shortcut_add_wide_residual_write_read_rmsnorm_quant(pending, read, gamma, **
     """Write a pending update and emit one following read/RMSNorm.
 
     Keyword options: ``num_streams`` (required), ``epsilon`` (RMSNorm, default 1e-5),
-    ``mxfp8_handoff``, ``mxfp8_consumer`` and ``replay``. Either MXFP8 option emits reader zero
-    directly from FP32 as rowwise MXFP8. ``mxfp8_consumer`` (required in training) declares the
-    TELinear that exclusively consumes that reader (views of it are allowed): its backward
-    unpacks the columnwise operand replayed by this write's interval. ``replay`` (a
+    ``outputs``, ``mxfp8_consumers`` and ``replay``. ``outputs`` gives each reader's format
+    (default BF16): "mxfp8" emits it directly from FP32 as rowwise MXFP8, and "both" returns the
+    BF16 output while its MXFP8 consumers take the twin (``quantized_twin``). In training an MXFP8
+    reader's ``mxfp8_consumers`` entry declares the TELinears that take it (each once per graph;
+    views of the whole reader are allowed): their backward shares one columnwise operand replayed
+    by this write's interval. ``recomputed`` (one bool per reader) keeps a "both" reader's twin
+    for consumers re-run in backward; otherwise it is dropped after their forwards. ``replay`` (a
     ReplayInterval, training only) is the checkpoint-replay interval to record into.
     """
     return _apply_boundary(pending, (read,), (gamma,), **options)
