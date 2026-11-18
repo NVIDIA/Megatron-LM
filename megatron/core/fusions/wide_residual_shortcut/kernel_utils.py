@@ -220,31 +220,10 @@ def _mul2(a, b):
     )
 
 
-# Uncontracted IEEE FP32 multiply/add for replay. Inline PTX: replay must reproduce the
-# forward's FP32 rounding exactly, but the compiler still contracts a plain ``*`` / ``+`` into an
-# FMA even with enable_fp_fusion=False (measured: replay no longer bit-identical), and
+# Uncontracted IEEE FP32 multiply for replay. Inline PTX: replay must reproduce the forward's
+# FP32 rounding exactly, but the compiler still contracts a plain ``*`` into a neighboring FMA
+# even with enable_fp_fusion=False (measured: replay no longer bit-identical), and
 # libdevice.mul_rn flushes subnormals under reflect-FTZ.
-
-
-@g.jit
-def _add2(a, b):
-    """Two independent RN FP32 sums as one packed f32x2 instruction (never fused)."""
-    return gl.inline_asm_elementwise(
-        """
-        {
-            .reg .b64 a,b,r;
-            mov.b64 a,{$2,$3};
-            mov.b64 b,{$4,$5};
-            add.rn.f32x2 r,a,b;
-            mov.b64 {$0,$1},r;
-        }
-        """,
-        "=f,=f,f,f,f,f",
-        [a, b],
-        dtype=gl.float32,
-        is_pure=True,
-        pack=2,
-    )
 
 
 @g.jit
@@ -257,6 +236,62 @@ def _round_bf16(x):
 
 
 @g.jit
+def _store_bf16x4(pointer, x):
+    """Store FP32 ``x`` RN-rounded to BF16, four contiguous 8-byte-aligned values per store, and
+    return the stored values widened back to FP32 (exact). Inline PTX: packing in the conversion
+    and widening from the packed words avoids the compiler's half-word repacking."""
+    return gl.inline_asm_elementwise(
+        """
+        {
+            .reg .b32 p, q;
+            cvt.rn.bf16x2.f32 p, $5, $4;
+            cvt.rn.bf16x2.f32 q, $7, $6;
+            st.global.v2.b32 [$8], {p, q};
+            shl.b32 $0, p, 16;
+            and.b32 $1, p, 0xffff0000;
+            shl.b32 $2, q, 16;
+            and.b32 $3, q, 0xffff0000;
+        }
+        """,
+        "=f,=f,=f,=f,f,f,f,f,l,l,l,l",
+        [x, pointer.to(gl.int64, bitcast=True)],
+        dtype=gl.float32,
+        is_pure=False,
+        pack=4,
+    )
+
+
+@g.jit
+def _load_f32x4(pointer):
+    """Four FP32 scalars from a 16-byte-aligned address in one vector load (one L1 wavefront
+    instead of four uniform scalar loads)."""
+    return gl.inline_asm_elementwise(
+        "ld.global.nc.v4.f32 {$0, $1, $2, $3}, [$4];",
+        "=f,=f,=f,=f,l",
+        [pointer.to(gl.int64, bitcast=True)],
+        dtype=(gl.float32, gl.float32, gl.float32, gl.float32),
+        is_pure=True,
+        pack=1,
+    )
+
+
+@g.jit
+def _widen_bf16(x):
+    """Exact widening to FP32; BF16 bits become the upper half of the FP32 word. Inline PTX on
+    the packed pair: one shift or mask per value, without unpacking the halves first."""
+    if x.dtype == gl.bfloat16:
+        return gl.inline_asm_elementwise(
+            "shl.b32 $0, $2, 16;\n and.b32 $1, $2, 0xffff0000;",
+            "=f,=f,r",
+            [x],
+            dtype=gl.float32,
+            is_pure=True,
+            pack=2,
+        )
+    return x.to(gl.float32)
+
+
+@g.jit
 def _mul_rn(a, b):
     """``a * b`` rounded to nearest, never fused into an FMA."""
     return gl.inline_asm_elementwise(
@@ -265,20 +300,9 @@ def _mul_rn(a, b):
 
 
 @g.jit
-def _add_rn(a, b):
-    """``a + b`` rounded to nearest, never fused into an FMA."""
-    return gl.inline_asm_elementwise(
-        "add.rn.f32 $0,$1,$2;", "=f,f,f", [a, b], dtype=gl.float32, is_pure=True, pack=1
-    )
-
-
-@g.jit
-def _forward_value(previous, update, write, retain, rows, stream):
-    """The forward's residual write with its explicit fused/separate FP32 rounding."""
-    retained = _mul_rn(retain, previous)
-    separate = _add_rn(_mul_rn(write, update), retained)
-    contracted = (stream == 0) | ((stream == 1) & (rows % 32 < 12))
-    return gl.where(contracted, gl.fma(write, update, retained), separate)
+def _forward_value(previous, update, write, retain):
+    """The forward's residual write: the rounded retain product, then one fused write."""
+    return gl.fma(write, update, _mul_rn(retain, previous))
 
 
 def named_jit(fn, name):
