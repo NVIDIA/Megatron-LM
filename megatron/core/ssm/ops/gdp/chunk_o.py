@@ -84,12 +84,11 @@ def chunk_fwd_kernel_o(
         i_tg = i_t
         i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
         i_t = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-        bos = tl.load(cu_seqlens + i_n).to(tl.int32)
-        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-        T = eos - bos
-        NT = tl.cdiv(T, BT)
+        bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         # T stays int32: the block pointers below take int32 offsets.
-        bos = bos.to(tl.int64)
+        T = (eos - bos).to(tl.int32)
+        NT = tl.cdiv(T, BT)
     else:
         NT = tl.cdiv(T, BT)
         i_tg = i_b * NT + i_t
