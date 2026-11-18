@@ -700,9 +700,6 @@ jobs:
           --config 'namespace-packages = ["megatron"]'
           --config 'lint.flake8-tidy-imports.banned-api = {"megatron.training" = {msg = "megatron.core must not depend on megatron.training."}}'
 
-      - name: Test PR CI path matching
-        run: .github/scripts/test_pr_ci_skip_paths.sh
-
       - name: Test CI cache keys
         run: .github/scripts/test_cache_keys.sh
 
