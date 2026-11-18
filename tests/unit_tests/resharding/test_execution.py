@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+import megatron.core.resharding.execution as execution
 from megatron.core.resharding.copy_services.base import CopyService
 from megatron.core.resharding.execution import execute_reshard_plan
 from megatron.core.resharding.transforms import ReshardTransform
@@ -58,6 +59,7 @@ class MockCopyService(CopyService):
         for recv_tensor, _, tid in self.recvs:
             if tid is not None and tid in sends_by_id:
                 src = sends_by_id[tid]
+                assert src.dtype == recv_tensor.dtype
                 recv_tensor.copy_(src[: recv_tensor.numel()].reshape(recv_tensor.shape))
         self.sends.clear()
         self.recvs.clear()
@@ -194,13 +196,12 @@ class TestExecuteReshard:
 
         s = _full_slice(2)
         send = _make_transfer_op("weight", 1, True, s, s, task_id=0)
-        send.dst_dtype = torch.bfloat16
         plan = ReshardPlan(
             send_ops=[send], recv_ops=[_make_transfer_op("weight", 0, False, s, s, task_id=0)]
         )
 
         class DtypeRecordingService(MockCopyService):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.sent_dtypes = []
 
@@ -215,6 +216,48 @@ class TestExecuteReshard:
         assert torch.equal(
             dict(dst_module.named_parameters())["weight"].data, src_data.to(torch.bfloat16)
         )
+
+    def test_cached_plan_renegotiates_replacement_destination_dtype(self):
+        """A cached topology plan must not retain the previous model's precision."""
+        src_data = torch.full((1,), 1.001, device="cuda")
+        src_module = _make_module_with_params({"weight": src_data.clone()})
+        s = _full_slice(1)
+        plan = ReshardPlan(
+            send_ops=[_make_transfer_op("weight", 1, True, s, s, task_id=0)],
+            recv_ops=[_make_transfer_op("weight", 0, False, s, s, task_id=0)],
+        )
+
+        bf16_target = _make_module_with_params(
+            {"weight": torch.zeros(1, dtype=torch.bfloat16, device="cuda")}
+        )
+        _run(plan, src_module, bf16_target, MockCopyService())
+        assert plan.send_ops[0].wire_dtype == torch.bfloat16
+
+        fp32_target = _make_module_with_params(
+            {"weight": torch.zeros(1, dtype=torch.float32, device="cuda")}
+        )
+        _run(plan, src_module, fp32_target, MockCopyService())
+        assert plan.send_ops[0].wire_dtype == torch.float32
+        assert torch.equal(fp32_target.weight, src_module.weight)
+
+    def test_quantized_destination_negotiates_bf16_staging_dtype(self, monkeypatch):
+        """Logical FP32 destinations that stage quantization receive BF16."""
+        Utils.initialize_distributed()
+        target = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32, device="cuda"))
+        target_module = torch.nn.Module()
+        target_module.register_parameter("weight", target)
+        monkeypatch.setattr(
+            execution, "_requires_bf16_staging", lambda param: param is target
+        )
+        s = _full_slice(1)
+        plan = ReshardPlan(
+            send_ops=[_make_transfer_op("weight", 1, True, s, s, task_id=0)],
+            recv_ops=[_make_transfer_op("weight", 0, False, s, s, task_id=0)],
+        )
+
+        execution._prepare_refit_dtypes(plan, None, target_module)
+
+        assert plan.send_ops[0].wire_dtype == torch.bfloat16
 
 
 class TestExecutionBatches:

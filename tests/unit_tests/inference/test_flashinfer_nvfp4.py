@@ -251,7 +251,6 @@ def test_refit_accepts_built_nvfp4_expert_weights(monkeypatch, built):
     executed = []
     monkeypatch.setattr(refit, "_unwrap_model_cores", lambda src, tgt: (None, tgt, 2))
     monkeypatch.setattr(refit, "_build_or_get_plan", lambda *args, **kwargs: "plan")
-    monkeypatch.setattr(refit, "_harmonize_buffer_dtypes", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         refit, "execute_reshard_plan", lambda plan, *args, **kwargs: executed.append(plan)
     )
