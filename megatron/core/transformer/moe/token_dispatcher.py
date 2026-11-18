@@ -1387,7 +1387,11 @@ class _VirtualExpertHybridEPManager(VirtualExpertLoadBalancer, _HybridEPManager)
         # preprocessing returns them; HybridEP's ``setup_metadata`` then replaces them with the
         # dense runtime probabilities it transports (a CUDA-graph attribute, so one field).
         if padding_mask is not None:
-            probs = probs.masked_fill(padding_mask.transpose(0, 1).reshape(-1, 1), 0)
+            padding_rows = padding_mask.transpose(0, 1).reshape(-1, 1)
+            if padding_rows.shape[0] != top_indices.shape[0]:
+                raise ValueError("MoonEP padding mask must match the number of token rows.")
+            top_indices = top_indices.masked_fill(padding_rows, -1)
+            probs = probs.masked_fill(padding_rows, 0)
         self.token_probs = probs
         self.plan_dispatch(top_indices)
 
@@ -1399,10 +1403,15 @@ class _VirtualExpertHybridEPManager(VirtualExpertLoadBalancer, _HybridEPManager)
     ) -> torch.Tensor:
         hidden_states, runtime_experts = self.prepare_virtual_expert_dispatch(hidden_states)
         # HybridEP's metadata from the planner's runtime ids and the router's probabilities.
-        # Upstream HybridEP accepts expert IDs with full-width probabilities.
+        # HybridEP consumes the original -1 sentinels and full-width probabilities. Invalid
+        # lanes contribute zero when mapped to column 0, even if expert 0 is also selected.
         runtime_probs = self.token_probs.new_zeros(
             (runtime_experts.shape[0], self.num_experts)
-        ).scatter(1, runtime_experts.long(), self.token_probs)
+        ).scatter_add_(
+            1,
+            runtime_experts.long().clamp_min(0),
+            self.token_probs.masked_fill(runtime_experts < 0, 0),
+        )
         super().setup_metadata(runtime_experts, runtime_probs)
 
         return super().dispatch(

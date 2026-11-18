@@ -155,9 +155,8 @@ def _plan_virtual_expert_routes_kernel(
     histogram cannot overwrite rows still consumed by the prior plan. Contiguous route tiles avoid
     padding top-k to a power of two. Remapping sorts each tile by (expert, original position), scans
     equal-expert runs to recover stable ordinals, and scatters runtime IDs back to their original
-    positions. Alignment 1 retains the original quotas. Aligned placement balances rounded
-    expert blocks, assigning remainder blocks to lower ranks. Tie breaks, router scores, and
-    per-expert real-route order are unchanged.
+    positions. Padding routes stay at -1. Placement balances valid routes (rounded to blocks
+    for aligned transport), assigning the remainder to lower ranks.
     """
     PLACEMENT_PROGRAMS: tl.constexpr = min(EP_SIZE, _PLANNER_PROGRAMS)
     RANKS_PER_PROGRAM: tl.constexpr = tl.cdiv(EP_SIZE, _PLANNER_PROGRAMS)
@@ -196,7 +195,11 @@ def _plan_virtual_expert_routes_kernel(
         offsets = route_start + flat
         valid = offsets < program_end
         ids = tl.load(top_indices + offsets, mask=valid, other=0)
-        row += tl.histogram(ids.to(tl.int32), BLOCK_NUM_EXPERTS, mask=valid)
+        tl.device_assert(
+            ~valid | ((ids >= -1) & (ids < NUM_EXPERTS)),
+            "virtual-expert planner: expected an expert id or -1 for padding",
+        )
+        row += tl.histogram(ids.to(tl.int32), BLOCK_NUM_EXPERTS, mask=valid & (ids >= 0))
     tl.store(histogram_rows + program * NUM_EXPERTS + experts, row, mask=valid_experts)
     tl.atomic_add(totals + experts, row, mask=valid_experts)
     _grid_sync(grid_sync, _GRID_SYNC_TAG, _PLANNER_PROGRAMS)
@@ -264,8 +267,8 @@ def _plan_virtual_expert_routes_kernel(
             axis=1,
         )
         tl.device_assert(
-            (source_total == NUM_ROUTES) | ~valid_owned_ranks,
-            "virtual-expert planner: a rank's route count differs from tokens * topk",
+            (source_total <= NUM_ROUTES) | ~valid_owned_ranks,
+            "virtual-expert planner: a rank's route count exceeds tokens * topk",
         )
         tl.store(
             balance + owned_ranks,
@@ -291,11 +294,9 @@ def _plan_virtual_expert_routes_kernel(
                 # virtual-expert slots. Moving only min(excess, deficit) could draw from several
                 # senders and overflow those slots.
                 loads = tl.load(balance + ranks, mask=valid_ranks, other=0)
-                if ALIGNMENT == 1:
-                    targets = NUM_ROUTES
-                else:
-                    total_blocks = tl.sum(loads, 0)
-                    targets = total_blocks // EP_SIZE + (ranks < total_blocks % EP_SIZE)
+                # Source ranks have equal token capacity but can have different valid counts.
+                total_blocks = tl.sum(loads, 0, dtype=tl.int64)
+                targets = (total_blocks // EP_SIZE + (ranks < total_blocks % EP_SIZE)).to(tl.int32)
                 balances = tl.where(valid_ranks, loads - targets, 0)
                 # quotas[d] counts placement units sent to d: rows at A=1, blocks otherwise.
                 quotas = tl.zeros((BLOCK_EP_SIZE,), dtype=tl.int32)
@@ -388,8 +389,10 @@ def _plan_virtual_expert_routes_kernel(
             tl.store(running_counts + program * NUM_EXPERTS + experts, running, mask=valid_experts)
             tl.debug_barrier()
         route_offsets = route_start + flat
-        valid = route_offsets < program_end
-        ids = tl.load(top_indices + route_offsets, mask=valid, other=0).to(tl.int32)
+        ids = tl.load(top_indices + route_offsets, mask=route_offsets < program_end, other=-1).to(
+            tl.int32
+        )
+        valid = (ids >= 0) & (ids < NUM_EXPERTS)
         packed = tl.sort(tl.where(valid, ids, NUM_EXPERTS) * ROUTE_TILE + flat, descending=False)
         sorted_ids = packed // ROUTE_TILE
         previous_ids = tl.gather(sorted_ids, tl.maximum(flat - 1, 0), axis=0)
@@ -421,7 +424,11 @@ def _plan_virtual_expert_routes_kernel(
         runtime = destination * (2 * NUM_EXPERTS_PER_GPU) + tl.where(
             remote, NUM_EXPERTS_PER_GPU + slot, ids % NUM_EXPERTS_PER_GPU
         )
-        tl.store(virtual_experts + route_offsets, runtime.to(tl.int16), mask=valid)
+        tl.store(
+            virtual_experts + route_offsets,
+            tl.where(valid, runtime, -1).to(tl.int16),
+            mask=route_offsets < program_end,
+        )
         running += tl.histogram(ids, BLOCK_NUM_EXPERTS, mask=valid)
 
 

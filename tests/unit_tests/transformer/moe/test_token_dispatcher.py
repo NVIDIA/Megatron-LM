@@ -1124,6 +1124,33 @@ def test_hybridep_dropless_excludes_padding_rows(monkeypatch):
     torch.testing.assert_close(manager.token_probs[:3], probs[:3])
 
 
+def test_virtual_expert_dispatch_preserves_zero_weight_and_padding_gradients(monkeypatch):
+    """Check the exact metadata and its gradients at the HybridEP transport boundary."""
+    manager = object.__new__(token_dispatcher._VirtualExpertHybridEPManager)
+    manager.config = SimpleNamespace(moe_hybridep_pad_uneven_dispatch_inputs=False)
+    manager.num_experts = 4
+    manager.router_topk = 2
+    manager.rank_capacity = 8
+    manager.dense_routing_supported = True
+    manager.capacity_factor = manager.moe_expert_rank_capacity_factor = None
+    manager.drop_and_pad = False
+    # Middle row is physical padding. The last row has one valid route to expert zero.
+    runtime_ids = torch.tensor([[2, 0], [-1, -1], [0, -1]], dtype=torch.int16)
+    probs = torch.tensor([[0.0, 0.25], [0.75, 0.5], [0.5, 0.75]], requires_grad=True)
+    manager.token_probs = probs
+    monkeypatch.setattr(manager, "prepare_virtual_expert_dispatch", lambda x: (x, runtime_ids))
+    monkeypatch.setattr(
+        _HybridEPManager, "dispatch", lambda self, *args, **kwargs: self.token_probs
+    )
+    dense = manager.dispatch(torch.zeros(3, 1))
+    torch.testing.assert_close(manager.topk_idx, runtime_ids)
+    torch.testing.assert_close(
+        dense, torch.tensor([[0.25, 0, 0, 0], [0, 0, 0, 0], [0.5, 0, 0, 0]]), rtol=0, atol=0
+    )
+    dense.backward(torch.tensor([[1.0, 2.0, 3.0, 4.0]]).expand_as(dense))
+    torch.testing.assert_close(probs.grad, torch.tensor([[3.0, 1.0], [0, 0], [1, 0]]))
+
+
 def test_hybridep_indices_mode_keeps_bool_map_with_pad_to_capacity(monkeypatch):
     """With pad-to-capacity the routing map is the capacity mask (a token can carry more than
     topk assignments); the indices-mode topk reconstruction would drop the padded assignments

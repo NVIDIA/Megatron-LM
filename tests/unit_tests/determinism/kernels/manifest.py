@@ -374,8 +374,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         kind="triton",
         notes="Route planning agrees with an independent CPU oracle for EP=1/2/4/8, skew/ties, "
-        "empty and strided inputs. Cached shapes and alignments replay bit-exactly with changing "
-        "routes in CUDA graphs. Production barrier timeouts cover both peer handshake phases "
+        "strided inputs and uneven valid-route counts, including all-padding ranks. Cached shapes "
+        "and alignments replay bit-exactly with changing routes and masks in CUDA graphs. "
+        "Production barrier timeouts cover both peer handshake phases "
         "and missing grid participants; delayed peers complete in eager and graph replay. "
         "Transport replay checks BF16/MXFP8 weights and FP32/BF16 gradients with scoped allocators.",
     ),
