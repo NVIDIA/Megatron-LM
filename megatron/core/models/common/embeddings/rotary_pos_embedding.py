@@ -358,6 +358,14 @@ class RotaryEmbedding(nn.Module):
         if packed_seq_params is not None:
             # max_seqlen are the max sequence length in the packed sequence before being divived
             # by the tp and cp size.
+            if packed_seq_params.cp_layout_views is not None:
+                views = packed_seq_params.cp_layout_views
+                return max(
+                    views.contiguous.max_seqlen_q,
+                    views.contiguous.max_seqlen_kv,
+                    views.zigzag.max_seqlen_q,
+                    views.zigzag.max_seqlen_kv,
+                )
             return max(packed_seq_params.max_seqlen_q, packed_seq_params.max_seqlen_kv)
         elif inference_context is not None:
             # Dynamic MTP forwards can stage unpublished lookahead beyond the logical

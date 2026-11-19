@@ -23,6 +23,7 @@ from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.ssm.gated_delta_net.common import (
     _GDNBase,
     a2a_cp_to_hp,
+    build_cp_context,
     causal_conv1d,
     chunk_gated_delta_rule,
     get_parameter_local_cp,
@@ -91,6 +92,14 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
 
     def _setup_variant_attrs(self):
         """Set the GDN in_proj sizing, split tables, gate parameter dims, and kernel."""
+        if (
+            self.cp_size > 1
+            and self.config.linear_cp_mode == "chunkwise"
+            and self.config.gdn_kernel_backend != "fla"
+        ):
+            raise ValueError(
+                "GDN chunkwise CP requires FLA; deterministic torch/TE CP is headwise only"
+            )
         self.gdn_pre_gated_delta_rule_fusion = self.config.gdn_pre_gated_delta_rule_fusion
         if self.config.deterministic_mode and self.gdn_pre_gated_delta_rule_fusion:
             raise ValueError(
@@ -113,7 +122,9 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             self.num_value_heads // self.tp_size,  # beta
             self.num_value_heads // self.tp_size,  # alpha
         )
-        self.feat_dim_split = self._get_feat_dim_split(self.cp_size)
+        self.feat_dim_split = self._get_feat_dim_split(
+            self.cp_size if self.config.linear_cp_mode == "headwise" else 1
+        )
 
         self.dt_bias_dim = self.num_v_heads_local_tp
         self.a_log_dim = self.num_v_heads_local_tp
@@ -281,6 +292,64 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             cu_seqlens_q = None
             cu_seqlens_kv = None
 
+        cp_context = None
+        if self.config.linear_cp_mode == "chunkwise" and cp_size > 1:
+            if self.config.cuda_graph_impl != "none":
+                raise ValueError(
+                    "FLA chunkwise CP context construction is not CUDA graph supported"
+                )
+            if self.gdn_backend != "fla" or self.gdn_pre_gated_delta_rule_fusion:
+                raise ValueError("GDN chunkwise CP requires the unfused FLA backend")
+            if batch != 1:
+                raise ValueError("GDN chunkwise CP requires THD or SBHD micro_batch_size=1")
+            if self.config.gdn_conv_pad_alignment is not None:
+                raise ValueError(
+                    "GDN chunkwise CP cannot pad local convolution inputs independently"
+                )
+            if build_cp_context is None:
+                raise ImportError("GDN chunkwise CP requires fla.ops.cp.build_cp_context")
+            if cu_seqlens_q is None:
+                # Runtime groups are part of the key: equal sizes need not identify the same grid.
+                key = (id(cp_group), cp_size, seq_len, batch)
+                cached = self._chunkwise_cp_context_cache.get(key)
+                if cached is None:
+                    cu_seqlens_q = (
+                        torch.arange(batch + 1, device=hidden_states.device, dtype=torch.int64)
+                        * seq_len
+                    )
+                    cached = (
+                        cu_seqlens_q,
+                        build_cp_context(
+                            cu_seqlens=cu_seqlens_q,
+                            group=cp_group,
+                            conv1d_kernel_size=self.conv_kernel_dim,
+                        ),
+                    )
+                    self._chunkwise_cp_context_cache[key] = cached
+                cu_seqlens_q, cp_context = cached
+            else:
+                # Reuse producer-owned recurrence metadata across matching layers in a batch.
+                cache = getattr(packed_seq_params, "_gdn_cp_contexts", None)
+                if cache is None:
+                    cache = {}
+                    packed_seq_params._gdn_cp_contexts = cache
+                key = (
+                    id(cp_group),
+                    self.conv_kernel_dim,
+                    cu_seqlens_q.data_ptr(),
+                    cu_seqlens_q._version,
+                )
+                if key not in cache:
+                    cache[key] = build_cp_context(
+                        cu_seqlens=cu_seqlens_q,
+                        group=cp_group,
+                        conv1d_kernel_size=self.conv_kernel_dim,
+                    )
+                cp_context = cache[key]
+            # Keep all TP-local heads. FLA owns sequence-neighbour communication.
+            seq_len //= cp_size
+            cp_group, cp_size = None, 1
+
         # Input projection
         nvtx_range_push(suffix="in_proj")
         qkvzba, _ = self.in_proj(hidden_states)
@@ -315,7 +384,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         else:
             nvtx_range_push(suffix="pre_gated_delta_rule")
             query, key, value, gate, beta, g = self.pre_gated_delta_rule(
-                qkvzba, batch, seq_len, cp_size, cp_group, cu_seqlens_q
+                qkvzba, batch, seq_len, cp_size, cp_group, cu_seqlens_q, cp_context
             )
             kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta}
             nvtx_range_pop(suffix="pre_gated_delta_rule")
@@ -327,6 +396,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             output_final_state=False,
             use_qk_l2norm_in_kernel=False,
             cu_seqlens=cu_seqlens_q,
+            **({"cp_context": cp_context} if cp_context is not None else {}),
         )
         nvtx_range_pop(suffix="gated_delta_rule")
 
@@ -559,7 +629,9 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         y = self._apply_gated_norm(core_attn_out, gate)
         return y.reshape(1, token_count, -1).transpose(0, 1).contiguous()
 
-    def pre_gated_delta_rule(self, qkvzba, batch, seq_len, cp_size, cp_group, cu_seqlens_q=None):
+    def pre_gated_delta_rule(
+        self, qkvzba, batch, seq_len, cp_size, cp_group, cu_seqlens_q=None, cp_context=None
+    ):
         """Prepare QKV, gate, beta, and decay tensors before the gated delta rule."""
 
         # Transpose: s b x --> b s x
@@ -613,6 +685,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 initial_state=None,
                 output_final_state=False,
                 cu_seqlens=cu_seqlens_q,
+                **({"cp_context": cp_context} if cp_context is not None else {}),
             )
         nvtx_range_pop(suffix="conv1d")
 

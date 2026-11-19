@@ -76,6 +76,8 @@ class GatedDeltaNet2(_GDNBase):
 
     def _setup_variant_attrs(self):
         """Set the GDN2 in_proj sizing, split tables, gate parameter dims, and kernel."""
+        if self.cp_size > 1 and self.config.linear_cp_mode != "headwise":
+            raise ValueError("GDN2 context parallelism requires linear_cp_mode='headwise'")
         # f (decay pre-activation), b (erase gate), w (write gate), on top of the
         # q/k/v/z sections the base class already accounts for.
         # TODO: for now, output gate is forced for GDN2.
@@ -203,6 +205,8 @@ class GatedDeltaNet2(_GDNBase):
 
         cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
         cp_size = get_pg_size(cp_group)
+        if cp_size > 1 and self.config.linear_cp_mode != "headwise":
+            raise ValueError("GDN2 runtime context parallelism requires linear_cp_mode='headwise'")
 
         seq_len, batch, _ = hidden_states.shape
         seq_len = seq_len * self.sp_size * cp_size

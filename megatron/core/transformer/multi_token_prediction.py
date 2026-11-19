@@ -14,6 +14,7 @@ from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.context_parallel import ContextParallelBatch, convert_cp_layout
+from megatron.core.context_parallel.module import get_cp_boundary_layout
 from megatron.core.context_parallel.sequence_roll import roll_contiguous, roll_contiguous_fields
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
@@ -2738,7 +2739,12 @@ class MultiTokenPredictionBlock(MegatronModule):
     ) -> MultiTokenPredictionInputs:
         """Prepare MTP inputs, including the batch-major, optionally SP-sharded padding mask."""
         source_layout = (
-            cp_batch.boundary_layout if cp_batch is not None else self.config.linear_cp_layout
+            cp_batch.boundary_layout
+            if cp_batch is not None
+            else (
+                getattr(packed_seq_params, "cp_partition_mode", None)
+                or get_cp_boundary_layout(self.config)
+            )
         )
         target_layout = self.config.attention_cp_layout
         runtime_cp_group = resolve_cp_group(self.cp_group, packed_seq_params)

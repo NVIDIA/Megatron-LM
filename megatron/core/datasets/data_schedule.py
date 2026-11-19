@@ -8,6 +8,7 @@ import torch
 
 from megatron.core.context_parallel import get_batches_on_this_cp_rank
 from megatron.core.context_parallel.groups import get_valid_dynamic_context_parallel_group_sizes
+from megatron.core.context_parallel.module import get_cp_boundary_layout, uses_fixed_cp_layout
 from megatron.core.datasets.data_schedule_utils import (
     align_sample_id_groups,
     broadcast_scalars,
@@ -627,6 +628,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     dynamic_cp_group_func: Optional[Callable[..., torch.distributed.ProcessGroup]] = None,
     dynamic_tp_cp_group_func: Optional[Callable[..., torch.distributed.ProcessGroup]] = None,
     tp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    required_cp_layouts=None,
 ):
     """
     Get a batch of data for sequence packing.
@@ -842,12 +844,15 @@ def get_batch_on_this_rank_for_sequence_packing(
         # flatten_batch_for_packed_sequences; the per-document sharder reads row 0.
         batch['cu_seqlens'] = batch['cu_seqlens'].unsqueeze(0)
         batch['cu_seqlens_padded'] = batch['cu_seqlens_padded'].unsqueeze(0)
-        additional_layouts = set()
-        if config.linear_cp_layout != config.attention_cp_layout:
-            additional_layouts.add(config.attention_cp_layout)
+        boundary_layout = get_cp_boundary_layout(config)
+        additional_layouts = {config.linear_cp_layout, config.attention_cp_layout} - {
+            boundary_layout
+        }
+        if required_cp_layouts is not None:
+            additional_layouts.update(required_cp_layouts)
         cp_batch = get_batches_on_this_cp_rank(
             batch,
-            boundary_layout=config.linear_cp_layout,
+            boundary_layout=boundary_layout,
             dynamic_cp=dynamic_cp,
             cp_group=runtime_cp_group,
             additional_layouts=additional_layouts,
@@ -876,6 +881,8 @@ def get_batch_on_this_rank_for_sequence_packing(
                 params.max_seqlen_q = params.max_seqlen_kv = int(bound.item())
                 params.pad_between_seqs = True
                 values["max_seqlen"] = bound
+        if uses_fixed_cp_layout(config):
+            cp_batch.prepare_module_layouts()
         return cp_batch
 
     # Extract the data from batch after broadcasting.

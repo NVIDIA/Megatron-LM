@@ -2,6 +2,7 @@
 
 """Context-parallel batch partitioning helpers."""
 
+from copy import copy
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable
 
@@ -10,6 +11,7 @@ import torch
 from megatron.core.packed_seq_params import PackedSeqParams
 
 from .layout import CPLayout, THDCPLayoutPlan, _build_thd_zigzag_metadata, build_thd_cp_layout_plan
+from .module import attach_cp_layout_views
 
 
 @dataclass(eq=False)
@@ -27,6 +29,39 @@ class ContextParallelBatch:
     batches_by_layout: dict[CPLayout, Dict[str, Any]]
     packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None]
     thd_plan: THDCPLayoutPlan | None = None
+
+    def __post_init__(self) -> None:
+        """Attach concrete layouts without mutating caller-owned packed metadata."""
+        params_by_layout = {}
+        for layout, params in self.packed_seq_params_by_layout.items():
+            if layout not in ("contiguous", "zigzag"):
+                raise ValueError(f"Expected a concrete CP layout, got {layout!r}")
+            if params is not None:
+                if params.cp_partition_mode not in (None, layout):
+                    raise ValueError(
+                        f"Packed metadata layout {params.cp_partition_mode!r} does not match "
+                        f"the batch view {layout!r}"
+                    )
+                if params.cp_partition_mode is None:
+                    # A shallow copy preserves precomputed seq_idx and avoids repeating
+                    # PackedSeqParams.__post_init__ for every view of the same batch.
+                    params = copy(params)
+                    params.cp_partition_mode = layout
+            params_by_layout[layout] = params
+        if any(
+            params is not self.packed_seq_params_by_layout[layout]
+            for layout, params in params_by_layout.items()
+        ):
+            self.packed_seq_params_by_layout = params_by_layout
+
+    def prepare_module_layouts(self):
+        """Prebuild acyclic module views once; legacy/auto graph metadata stays unchanged."""
+        params = self.get_packed_seq_params()
+        if self.thd_plan is not None and params.cp_layout_views is None:
+            self.packed_seq_params_by_layout = attach_cp_layout_views(
+                self.packed_seq_params_by_layout, self.thd_plan
+            )
+        return self
 
     @classmethod
     def from_single_layout(
@@ -199,6 +234,7 @@ def _build_packed_seq_params(
         total_tokens=int(physical_cu_seqlens[-1].item()),
         tokens_per_sample=tokens_per_sample,
         pad_between_seqs=pad_between_seqs,
+        cp_partition_mode=layout,
     )
 
 
