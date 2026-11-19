@@ -215,8 +215,14 @@ class TestSafeDCPMetadata:
         barrier()
         # DCP wraps per-rank errors in a CheckpointException whose str() only lists
         # the failed ranks, so inspect the per-rank failures for the refusal message.
-        with pytest.raises(Exception) as exc_info:
+        # CheckpointException derives from BaseException (not Exception), so catch that.
+        with pytest.raises(BaseException) as exc_info:
             dcp.load(out, checkpoint_id=str(ckpt))
         failures = getattr(exc_info.value, "failures", None)
-        details = " ".join(str(v) for v in failures.values()) if failures else str(exc_info.value)
+        # Each failure is an (exception, traceback) tuple; stringify the exception only.
+        details = (
+            " ".join(str(v[0] if isinstance(v, tuple) else v) for v in failures.values())
+            if failures
+            else str(exc_info.value)
+        )
         assert "Refusing to unpickle" in details
