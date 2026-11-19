@@ -488,14 +488,14 @@ _INFLIGHT_WGRAD_RS_AT_FENCE: List["GTPShardedParam"] = []
 def _drain_wgrad_reduce_scatters(
     queue: List["GTPShardedParam"], through: Optional["GTPShardedParam"] = None
 ) -> None:
-    """Drain ``queue``'s reduce-scatters in issue order: all, or up to and including ``through``
-    (nothing if it is not queued). See GTPShardedParam._drain_reduce_scatter.
+    """Finalize ``queue``'s reduce-scatters in issue order: all, or up to and including ``through``
+    (nothing if it is not queued). See GTPShardedParam._finalize_pending_wgrad_rs.
     """
     if through is not None and not any(param is through for param in queue):
         return
     while queue:
         param = queue.pop(0)
-        param._drain_reduce_scatter()
+        param._finalize_pending_wgrad_rs()
         if param is through:
             return
 
@@ -1915,7 +1915,7 @@ class GTPShardedParam(torch.nn.Parameter):
                 if p._ag_ticket_bwd is None:
                     p._ag_ticket_bwd = cache.reserve(p, dt, fwd=False)
                 out_buffers.append(cache.get(p._ag_ticket_bwd))
-        if not recompute and self._residency_active():
+        if not recompute and self._residency_enabled():
             # Residency: the buffers now hold this gather; a BF16 one serves both directions.
             direction = None if isinstance(dtypes[0], torch.dtype) else fwd
             cache.stamp(out_buffers[0], self, direction, ordered=async_op)
@@ -2015,7 +2015,7 @@ class GTPShardedParam(torch.nn.Parameter):
         result = [r.detach().requires_grad_(w.requires_grad) for r, w in zip(result, self._weights)]
         return result if self.is_routed_expert else result[0]
 
-    def _residency_active(self) -> bool:
+    def _residency_enabled(self) -> bool:
         """Prefetch plans and residency apply: an eager (ungraphed) chain outside capture that the
         fence has reached (it sets both directions' plans, so the forward one stands for both).
         Residency trusts the fence to clear the stamps before any shard changes, so a loop that
@@ -2042,11 +2042,11 @@ class GTPShardedParam(torch.nn.Parameter):
         drained marker, so the consume that follows takes the prefetched path even at a chain
         head, where no neighbour ever issues an AG.
 
-        Once residency is active (``_residency_active``), the test is instead whether the
+        Once residency is enabled (``_residency_enabled``), the test is instead whether the
         consume's buffers hold its gather, whichever gather put it there: a prefetch, a peek, or
         an earlier consume's gather not overwritten since.
         """
-        if self._residency_active():
+        if self._residency_enabled():
             return _holds_gather(get_global_GTP_cache().stamp_of(self, fwd), self, fwd)
         return self._prefetch_handle is not None or getattr(self, "_already_ag_drained", False)
 
@@ -2064,7 +2064,7 @@ class GTPShardedParam(torch.nn.Parameter):
         """``(plan, position)`` of this consume on a built prefetch plan, else ``(None, None)``.
         Between the first and second fence the consume is recorded instead.
         """
-        if not self._residency_active():
+        if not self._residency_enabled():
             return None, None
         plan = self._get_chain_state(self.chain_id)["fwd" if fwd else "bwd"]
         if plan.prefetches is None:
@@ -2085,7 +2085,7 @@ class GTPShardedParam(torch.nn.Parameter):
         # Stale-read guard: state must reflect an AG issued for this cycle;
         # otherwise cache.get() would return the prior iter's AG buffer.
         # A resident read issued no AG of its own: the stamp, cleared at the fence, vouches for it.
-        if GTP_CONFIG.check_param_states and not self._residency_active():
+        if GTP_CONFIG.check_param_states and not self._residency_enabled():
             for w in self._weights:
                 assert w.state in (
                     GTPWeightState.ASYNC_WAIT,
@@ -2899,11 +2899,11 @@ class GTPShardedParam(torch.nn.Parameter):
         return ret
 
     def _drain_own_reduce_scatter(self) -> None:
-        """Drain this weight's in-flight reduce-scatter, and anything queued before it."""
+        """Finalize this weight's pending reduce-scatter, and anything queued before it."""
         for queue in (_INFLIGHT_WGRAD_RS[self.chain_id], _INFLIGHT_WGRAD_RS_AT_FENCE):
             _drain_wgrad_reduce_scatters(queue, through=self)
 
-    def _drain_reduce_scatter(self) -> None:
+    def _finalize_pending_wgrad_rs(self) -> None:
         """Wait for this weight's async reduce-scatter, add it into main_grad on the current
         stream, fire grad-ready and release the output tickets. Adding on the current stream
         orders a DP collective that grad-ready dispatches after the add.

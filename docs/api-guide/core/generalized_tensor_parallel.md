@@ -870,7 +870,7 @@ Two independent violations of the *one consume per weight per step* assumption i
 
 The chain stays a plain linear list — one slot per weight, no branching. MTP is absorbed by three rules:
 
-- **Every consume needs its own all-gather.** A weight is gathered by its chain *neighbour* — predecessor in forward, successor in backward — so one pass of the chain issues exactly one gather per node. Consumes past the first have none of their own, and the prefetched path would hand the GEMM whatever the shared buffer last held. They fall back to an on-demand gather instead: correct, at the cost of that consume's comm/compute overlap.
+- **Every consume needs a current gathered weight, not necessarily its own all-gather.** On the linked chain a weight is gathered by its chain *neighbour* — predecessor in forward, successor in backward — so one pass of the chain issues exactly one gather per node. Consumes past the first have none of their own, and the prefetched path would hand the GEMM whatever the shared buffer last held, so they gather on demand. With weight prefetch on, an eager (ungraphed) chain stops relying on that once it reaches the first gradient fence: a consume reads the gather its buffers still hold, whichever gather put it there (residency), and only a consume whose weight no buffer holds gathers on demand. The fence clears residency before the optimizer changes any shard. Consumes between the first and second fence are recorded, and the second fence builds them into the chain's per-use prefetch plan. Graphed chains and activation recompute keep the linked prefetch, and a loop that never calls the fence never enables residency.
 
 - **Per-consume gradients accumulate.** Every consume produces its own wgrad and its own reduce-scatter, and the weight's `main_grad` ends up holding their sum — which is its true gradient. A weight keeps only one reduce-scatter in flight at a time, so an outstanding one is completed and accumulated before the next begins.
 
@@ -896,9 +896,9 @@ The chain stays a plain linear list — one slot per weight, no branching. MTP i
   Pipeline-parallel and CUDA-graphed weights retain per-consume reduction. TE-backed weights
   never reach this accumulation hook.
 
-- **The deferred finalize follows issue order, not the chain.** Each reduce-scatter drains the one its chain issued before it, hiding that latency behind the next backward. Once backward stops following chain order, that is not the chain successor, so the in-flight reduce-scatters are queued per chain rather than looked up through `next_w`.
+- **The deferred finalize follows issue order, not the chain.** Each reduce-scatter finalizes the one its chain issued before it, hiding that latency behind the next backward. Once backward stops following chain order, that is not the chain successor, so the in-flight reduce-scatters are queued per chain rather than looked up through `next_w`.
 
-Output-layer accumulation is independent of `async_reduction`. Deferred finalization applies only when that option is on; with it off, each issued reduce-scatter completes inline.
+The first rule applies with or without `async_reduction`, and so does output-layer accumulation. Deferred finalization applies only when that option is on; with it off, each issued reduce-scatter completes inline.
 
 > Both hazards are **silent**. A stale gather keeps the loss finite and merely wrong, and a dropped reduce-scatter trains on an incomplete gradient — neither raises. The state guard that would catch the first (`check_param_states`) is off outside debug builds.
 
