@@ -18,12 +18,10 @@ from unittest.mock import patch
 import pytest
 import torch
 import triton
-import triton.language as tl
 from torch.multiprocessing.reductions import StorageWeakRef
 
 from megatron.core.fusions.wide_residual_shortcut import (
     PendingWideResidualWrites,
-    api,
     backward_kernel,
     forward_kernel,
     kernel_utils,
@@ -35,6 +33,10 @@ from megatron.core.fusions.wide_residual_shortcut.api import Reader, reader_for
 from megatron.core.fusions.wide_residual_shortcut.residual_replay import (
     ReplayHandle,
     ReplayInterval,
+)
+from megatron.core.tensor_parallel.random import (
+    CheckpointWithoutOutput,
+    model_parallel_cuda_manual_seed,
 )
 from megatron.core.transformer import wide_residual
 from megatron.core.transformer.streamwise_residual_ops import streamwise_sigmoid_writeback
@@ -277,6 +279,12 @@ def forced_forward(cfg, raw, streams, **options):
             return fwd(raw, streams, **options)
 
 
+def spy(monkeypatch, owner, name, record):
+    """Patch ``owner.name`` to pass each call's arguments to ``record``, then run it."""
+    original = getattr(owner, name)
+    monkeypatch.setattr(owner, name, lambda *a, **k: (record(*a, **k), original(*a, **k))[1])
+
+
 # ---------------------------------------------------------------- the FP64 reference
 
 
@@ -380,11 +388,15 @@ def folded_reader(saved, previous, reader):
     return (q.double() * saved.update.double() + x.double()).float()
 
 
-def reference_columns(saved, previous, reader=0):
-    """TE's columnwise MXFP8 encoding of the exactly emulated FP32 normalized reader."""
+def normalized_reader(saved, previous, reader=0):
+    """The exactly emulated FP32 normalized reader: the input of TE's MXFP8 encoding."""
     x = folded_reader(saved, previous, reader)
-    normalized = (x * saved.rstd[reader][:, None]) * saved.gammas[reader].float()
-    return mxfp8_quantizer(rowwise=False)(normalized)
+    return (x * saved.rstd[reader][:, None]) * saved.gammas[reader].float()
+
+
+def reference_columns(saved, previous, reader=0):
+    """TE's columnwise MXFP8 encoding of the emulated normalized reader."""
+    return mxfp8_quantizer(rowwise=False)(normalized_reader(saved, previous, reader))
 
 
 def mxfp8_quantizer(*, rowwise=True, columnwise=True):
@@ -447,7 +459,6 @@ SEAM_CASES = (
 )  # fmt: skip
 
 
-@GPU
 @REQUIRES_FUSED_BACKWARD
 @pytest.mark.parametrize(
     "streams,readers,updates,hidden,tokens,rd,ld,eps,ctrl,retention,route,frozen", SEAM_CASES
@@ -520,7 +531,6 @@ BACKWARD_CASES = [
 # fmt: on
 
 
-@GPU
 @REQUIRES_FUSED_BACKWARD
 @pytest.mark.parametrize(
     "streams,readers,updates,hidden,rows,columns,retention,grid,pruned", BACKWARD_CASES
@@ -818,7 +828,6 @@ def test_config_tables():
 _OPS = {"A": (1, 1), "W": (2, 1), "R": (1, 2), "N": (0, 1), "M": (0, 1)}
 
 
-@GPU
 @REQUIRES_FUSED_BACKWARD
 @pytest.mark.parametrize(
     "ops,interval,dtype,streams,hidden,retention,pad",
@@ -991,30 +1000,14 @@ def leaf_grads(raw, *extra):
     return [t.grad for t in (raw[0], *raw[1], *raw[2], *raw[3])] + list(extra)
 
 
-@triton.jit
-def normalized_reader_oracle(R, U, C, RS, G, OUT, H: tl.constexpr, BLOCK: tl.constexpr):
-    row = tl.program_id(0)
-    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    x = tl.full((BLOCK,), 0, tl.float32)
-    q = 0.0
-    for stream in tl.static_range(3):
-        value = tl.load(R + row * 3 * H + stream * H + cols, cols < H, 0)
-        beta = tl.load(C + 6 + stream)
-        alpha = beta * tl.load(C + 3 + stream)
-        x = tl.fma(alpha, value, x)
-        q = tl.fma(beta, tl.load(C + stream), q)
-    x = tl.fma(q, tl.load(U + row * H + cols, cols < H, 0).to(tl.float32), x)
-    normalized = (x * tl.load(RS + row)) * tl.load(G + cols, cols < H, 0).to(tl.float32)
-    tl.store(OUT + row * H + cols, normalized, cols < H)
-
-
-def oracle_normalized(r, update, coefficients, rstd, gamma):
-    m, h = update.shape
-    x = torch.empty((m, h), device="cuda", dtype=F32)
-    normalized_reader_oracle[(m, triton.cdiv(h, 256))](
-        r, update, coefficients, rstd, gamma, x, h, 256, enable_fp_fusion=False
-    )
-    return x
+def checkpointed_loss(layer, operand, hooks=nullcontext()):
+    """Consume ``operand`` under a reentrant (GDP-style) checkpoint: (output, loss)."""
+    checkpoint = CheckpointWithoutOutput(fp8=MXFP8BlockScaling())
+    with te.fp8_autocast(enabled=True, fp8_recipe=MXFP8BlockScaling()), hooks:
+        output = checkpoint.checkpoint(lambda value: consume(layer, value), operand)
+    loss = output.square().sum()
+    checkpoint.discard_output_and_register_recompute(loss)
+    return output, loss
 
 
 class _ReferenceQuantization(torch.autograd.Function):
@@ -1035,7 +1028,11 @@ def reference_operand(operand, raw):
     # The boundary saves (update, coefficients, *gammas, *rstd); its interval keeps the residual.
     _, coefficients, *norms = operand.grad_fn.saved_tensors
     update = us[0] if len(us) == 1 else (us[0].float() + us[1].float()).bfloat16()
-    normalized = oracle_normalized(r, update, coefficients, norms[len(gs)], gs[0])
+    tape = SimpleNamespace(
+        update=update, coefficients=coefficients, num_streams=3, rstd=norms[len(gs) :], gammas=gs
+    )
+    with torch.no_grad():
+        normalized = normalized_reader(tape, r)
     # TE caches requires_grad at quantization, before autograd attaches this function.
     return _ReferenceQuantization.apply(operand, normalized).requires_grad_(True)
 
@@ -1049,7 +1046,7 @@ def test_fp32_bytes_and_te_weight_gradient(monkeypatch, m, h, readers):
     # Use the quantized path's statistics so TE receives identical FP32 inputs;
     # BF16-only schedules may use a different RMSNorm reduction order.
     current, saved, operands = fwd(raw, mxfp8_handoff=True)
-    x = oracle_normalized(r, saved.update, saved.coefficients, saved.rstd[0], gs[0])
+    x = normalized_reader(saved, r)
     qref = mxfp8_quantizer()(x.detach()).to_dtype(BF16).requires_grad_(True)
     layer = linear(h)
     out = boundary(raw, layer)
@@ -1247,11 +1244,6 @@ def test_checkpointed_handoff_publishes_one_weight_gradient(native_fp8_weight):
     The last variant drops every reference to the seam's operand and Reader before backward and
     stashes the checkpoint input through a detaching saved-tensor hook, as a model does: the
     rebuild then consumes a detached alias, whose lookup must still find the Reader."""
-    from megatron.core.tensor_parallel.random import (
-        CheckpointWithoutOutput,
-        model_parallel_cuda_manual_seed,
-    )
-
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
     model_parallel_cuda_manual_seed(123)
     try:
@@ -1268,16 +1260,12 @@ def test_checkpointed_handoff_publishes_one_weight_gradient(native_fp8_weight):
             current, q, router = boundary(mx_inputs(8192, 4096, 2), layer)
             provider = reader_for(q)
             if checkpointed:
-                checkpoint = CheckpointWithoutOutput(fp8=MXFP8BlockScaling())
                 stash_hooks = (
                     torch.autograd.graph.saved_tensors_hooks(lambda t: t.detach(), lambda t: t)
                     if drop_operand
                     else nullcontext()
                 )
-                with te.fp8_autocast(enabled=True, fp8_recipe=MXFP8BlockScaling()), stash_hooks:
-                    output = checkpoint.checkpoint(lambda value: consume(layer, value), q)
-                loss = output.square().sum()
-                checkpoint.discard_output_and_register_recompute(loss)
+                _, loss = checkpointed_loss(layer, q, stash_hooks)
             else:
                 loss = consume(layer, q).square().sum()
             if drop_operand:
@@ -1312,10 +1300,6 @@ def test_gtp_weight_gradient_matches_independent_columns(checkpointed, other_str
         _GTP_PARAMS,
         reset_gtp_state,
     )
-    from megatron.core.tensor_parallel.random import (
-        CheckpointWithoutOutput,
-        model_parallel_cuda_manual_seed,
-    )
     from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import _make_gtp_linear
 
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
@@ -1343,11 +1327,7 @@ def test_gtp_weight_gradient_matches_independent_columns(checkpointed, other_str
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
                 if checkpointed:
-                    checkpoint = CheckpointWithoutOutput(fp8=MXFP8BlockScaling())
-                    with te.fp8_autocast(enabled=True, fp8_recipe=MXFP8BlockScaling()):
-                        output = checkpoint.checkpoint(lambda value: consume(layer, value), q)
-                    loss = output.square().sum()
-                    checkpoint.discard_output_and_register_recompute(loss)
+                    output, loss = checkpointed_loss(layer, q)
                 else:
                     output = consume(layer, q)
                     loss = output.square().sum()
@@ -1426,8 +1406,7 @@ def test_reads_feed_every_declared_linear_from_one_column_take(monkeypatch, form
     consumers = [tuple(linear(h, mcore=True) for _ in range(count)) for count in counts]
     reference = []
     for reader, linears in enumerate(consumers):
-        x = folded_reader(saved, raw[0], reader)
-        x = (x * saved.rstd[reader][:, None]) * saved.gammas[reader].float()
+        x = normalized_reader(saved, raw[0], reader)
         dys = [torch.randn(m, 128, device="cuda", dtype=BF16) for _ in linears]
         outputs, weight_grads = [], []
         for layer, dy in zip(linears, dys):
@@ -1438,25 +1417,11 @@ def test_reads_feed_every_declared_linear_from_one_column_take(monkeypatch, form
             layer.weight.main_grad.zero_()
         reference.append((dys, outputs, weight_grads))
 
+    launches, intervals, seam_dys = [], [], []
     kernel = replay_kernel._bwd_wr_recompute_mxfp8quant
-    launches = []
-    launch = kernel.run
-    monkeypatch.setattr(
-        kernel, "run", lambda *a, **k: (k.get("warmup") or launches.append(1), launch(*a, **k))[1]
-    )
-    intervals, record = [], ReplayInterval.record
-    monkeypatch.setattr(
-        ReplayInterval,
-        "record",
-        lambda self, *a, **k: intervals.append(weakref.ref(self)) or record(self, *a, **k),
-    )
-    seam_dys, backward = [], backward_kernel.backward
-    monkeypatch.setattr(
-        backward_kernel,
-        "backward",
-        lambda saved, previous, dys, *a, **k: seam_dys.append(dys)
-        or backward(saved, previous, dys, *a, **k),
-    )
+    spy(monkeypatch, kernel, "run", lambda *a, **k: k.get("warmup") or launches.append(1))
+    spy(monkeypatch, ReplayInterval, "record", lambda i, *a, **k: intervals.append(weakref.ref(i)))
+    spy(monkeypatch, backward_kernel, "backward", lambda s, p, dys, *a, **k: seam_dys.append(dys))
     out = run(raw, 3, outputs=formats, mxfp8_consumers=tuple(consumers))
     providers, results, extra, halves = [], [], [], []
     for reader, (fmt, linears) in enumerate(zip(formats, consumers)):
@@ -1505,7 +1470,6 @@ def test_reads_feed_every_declared_linear_from_one_column_take(monkeypatch, form
     assert len(intervals) == 1 and intervals[0]() is None
 
 
-@GPU
 @REQUIRES_FUSED_BACKWARD
 @pytest.mark.parametrize("dtype", [F32, BF16])
 def test_two_consumers_gradients_reach_the_kernel_separately(monkeypatch, dtype):
@@ -1513,13 +1477,8 @@ def test_two_consumers_gradients_reach_the_kernel_separately(monkeypatch, dtype)
     reach the backward kernel as a pair (no add before it), and the seam's gradients match one
     pre-summed gradient up to that sum's BF16 rounding."""
     raw = inputs(3, 2, 2048, 2048, residual_dtype=dtype, logit_dtype=dtype, pad=0)
-    seen, backward = [], backward_kernel.backward
-    monkeypatch.setattr(
-        backward_kernel,
-        "backward",
-        lambda saved, previous, dys, *a, **k: seen.append(dys)
-        or backward(saved, previous, dys, *a, **k),
-    )
+    seen = []
+    spy(monkeypatch, backward_kernel, "backward", lambda s, p, dys, *a, **k: seen.append(dys))
     out = run(raw, 3, outputs=("bf16", ("bf16", "bf16")))
     first, second = out[2]
     assert first.data_ptr() == second.data_ptr() and first is not second
@@ -1529,12 +1488,8 @@ def test_two_consumers_gradients_reach_the_kernel_separately(monkeypatch, dtype)
     assert isinstance(dys[1], tuple) and torch.equal(dys[1][0], g0) and torch.equal(dys[1][1], g1)
     paired = [t.grad.clone() for t in (raw[0], *raw[1])]
 
-    raw_ref = (
-        raw[0].detach().clone().requires_grad_(),
-        tuple(u.detach().clone().requires_grad_() for u in raw[1]),
-        tuple(c.detach().clone().requires_grad_() for c in raw[2]),
-        tuple(g.detach().clone().requires_grad_() for g in raw[3]),
-    )
+    clone = lambda t: t.detach().clone().requires_grad_()
+    raw_ref = (clone(raw[0]), *(tuple(map(clone, group)) for group in raw[1:]))
     ref = run(raw_ref, 3)
     torch.autograd.backward((ref[1], ref[2]), (torch.zeros_like(ref[1]), g0 + g1))
     for actual, expected in zip(paired, (raw_ref[0].grad, *(u.grad for u in raw_ref[1]))):
