@@ -303,10 +303,17 @@ def validate_yaml(args, defaults={}):
             args.language_model.ffn_hidden_size = 4 * args.language_model.hidden_size
 
     if args.language_model.kv_channels is None:
-        assert args.language_model.hidden_size % args.language_model.num_attention_heads == 0
-        args.language_model.kv_channels = (
-            args.language_model.hidden_size // args.language_model.num_attention_heads
-        )
+        if getattr(args.language_model, 'multi_latent_attention', False):
+            # MLA head dim comes from qk_head_dim / qk_pos_emb_head_dim and need not satisfy
+            # hidden_size % num_attention_heads == 0 (e.g. Kimi-K3 / K3.1). See validate_args.
+            args.language_model.kv_channels = (
+                args.language_model.qk_head_dim + args.language_model.qk_pos_emb_head_dim
+            )
+        else:
+            assert args.language_model.hidden_size % args.language_model.num_attention_heads == 0
+            args.language_model.kv_channels = (
+                args.language_model.hidden_size // args.language_model.num_attention_heads
+            )
 
     # TODO: Implement arguments for encoder-decoder
     if args.seq_length is not None:

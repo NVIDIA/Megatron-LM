@@ -20,9 +20,18 @@ class PackedSeqParams:
     before forwarding arguments to Transformer Engine. Runtime CP includes a real
     singleton group; ``local_cp_size`` requires a matching ``cp_group``.
 
-    ``cp_partition_route`` is a per-microbatch THD CP layout conversion route.
-    Metadata annotation helpers update the current partition mode in-place while
-    preserving the route identity.
+    ``cp_partition_route`` is a per-microbatch THD CP layout conversion route over the
+    CP group. ``tp_cp_partition_route`` is the same kind of plan for the fused TP x CP
+    conversion of sequence-parallel shards, with split sizes in TP x CP group order.
+    A microbatch always carries the CP-only route and, under sequence parallelism with
+    fusable groups, the fused route as well: a module's sequence-parallel input shard
+    takes the fused exchange while its sequence-gathered core-attention output is
+    restored over the CP-only one (``prebuild_thd_cp_partition_routes`` builds both from
+    one host copy of ``cu_seqlens``). ``tp_cp_group`` is set only under dynamic CP with
+    sequence parallelism and TP > 1: the TP x sub-group that pairs with ``cp_group``;
+    otherwise it is None and modules use their own TP x CP group. Metadata annotation
+    helpers update the current
+    partition mode in-place while preserving the route identities.
     """
 
     qkv_format: str = None
@@ -48,6 +57,7 @@ class PackedSeqParams:
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     tokens_per_sample: int = None
     cp_partition_route: Optional["ThdCpRoute"] = None
+    tp_cp_partition_route: Optional["ThdCpRoute"] = None
     cp_scatter_cache: object = None
 
     def __post_init__(self):

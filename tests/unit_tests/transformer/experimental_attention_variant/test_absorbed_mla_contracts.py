@@ -41,6 +41,7 @@ def test_checkpointed_attention_forward_captures_metadata(monkeypatch):
         (),
         {
             "attn_mask_type": AttnMaskType.causal,
+            "config": SimpleNamespace(),
             "core_attention": CoreAttention(),
             "pg_collection": SimpleNamespace(cp=object()),
         },

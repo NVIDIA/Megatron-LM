@@ -417,7 +417,7 @@ try:
                 gLabels = cute.local_tile(mLabels, (self.epi_tile[0],), (pidm,))
 
                 tLabelsCAcc = thr_copy_g2r.partition_S(cAcc)[(None, None, 0)]
-                tLabelsCAcc_mask = cute.make_fragment(tLabelsCAcc.shape, cutlass.Boolean)
+                tLabelsCAcc_mask = cute.make_rmem_tensor(tLabelsCAcc.shape, cutlass.Boolean)
                 # [(1, 1), 1]
                 tLabelsCAcc_mask[0] = cute.elem_less(pidm * self.epi_tile[0] + tidx, problem_mnk[0])
                 # to align shape with gMax and gAccu
@@ -425,7 +425,7 @@ try:
 
                 # [(1, 1), 1, 1]
                 tLabelsgLabels = thr_copy_g2r.partition_S(cute.append_ones(gLabels))
-                tLabelsrLabels = cute.make_fragment(
+                tLabelsrLabels = cute.make_rmem_tensor(
                     tLabelsgLabels.shape, tLabelsgLabels.element_type
                 )
                 cute.copy(tiled_copy_g2r, tLabelsgLabels, tLabelsrLabels, pred=tLabelsCAcc_mask)
@@ -437,14 +437,14 @@ try:
                 gMax = cute.local_tile(mMax, (self.epi_tile[0], 1), (pidm, pidn))
                 # [(CPYM, CPYN), loopM, loopN]
                 tR2GgMax = thr_copy_r2g.partition_D(gMax)
-                tR2GrMax = cute.make_fragment(tR2GgMax.shape, tR2GgMax.element_type)
+                tR2GrMax = cute.make_rmem_tensor(tR2GgMax.shape, tR2GgMax.element_type)
                 tR2GrMax.fill(-1e30)
 
                 # [tileM, 1]
                 gAccu = cute.local_tile(mAccu, (self.epi_tile[0], 1), (pidm, pidn))
                 # [(CPYM, CPYN), loopM, loopN]
                 tR2GgAccu = thr_copy_r2g.partition_D(gAccu)
-                tR2GrAccu = cute.make_fragment(tR2GgAccu.shape, tR2GgAccu.element_type)
+                tR2GrAccu = cute.make_rmem_tensor(tR2GgAccu.shape, tR2GgAccu.element_type)
                 tR2GrAccu.fill(0.0)
 
                 # [tileM, 1]
@@ -453,11 +453,13 @@ try:
                 )
                 # [(CPYM, CPYN), loopM, loopN]
                 tR2GgLogprobs = thr_copy_r2g.partition_D(gLogprobs)
-                tR2GrLogprobs = cute.make_fragment(tR2GgLogprobs.shape, tR2GgLogprobs.element_type)
+                tR2GrLogprobs = cute.make_rmem_tensor(
+                    tR2GgLogprobs.shape, tR2GgLogprobs.element_type
+                )
                 tR2GrLogprobs.fill(0.0)
 
                 # [(tileN // num_epi_stage_per_tile, 1), 1, 1]
-                tTMEM_load_rAcc = cute.make_fragment(tTMEM_load_cAcc_shape, self.acc_dtype)
+                tTMEM_load_rAcc = cute.make_rmem_tensor(tTMEM_load_cAcc_shape, self.acc_dtype)
 
                 for n in cutlass.range(num_n_tiles):
                     mma_pipeline.consumer_wait(mma_consumer_state)

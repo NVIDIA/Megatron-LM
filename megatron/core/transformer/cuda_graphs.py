@@ -2308,6 +2308,24 @@ class CudaGraphManager(torch.nn.Module):
 
 
 # The following functions are for capturing CUDA Graphs using TE make_graphed_callables().
+def _attention_runs_eager_under_packing(attention, config) -> bool:
+    """Whether a packed-THD GDN-family (GDN / KDA) attention must stay out of per-layer graphs.
+
+    Packed GDN-family layers check their boundaries on the host, and FLA derives its chunk
+    indices on the host from the boundary values (cached by tensor identity), so a captured
+    layer would replay the pack layout of its capture sample, or fail on the host copy during
+    capture. With a sequence packing scheduler these layers therefore run eagerly while the
+    other layers of the scope are captured. (Upstream, NVIDIA/Megatron-LM#8840 makes them
+    capturable in chunk-wise graphs with FLA >= 0.6.)
+    """
+    if getattr(config, "sequence_packing_scheduler", None) is None:
+        return False
+    # import here to avoid a circular import
+    from megatron.core.ssm.gated_delta_net.common import _GDNBase
+
+    return isinstance(attention, _GDNBase)
+
+
 def _layer_is_graphable(layer, config):
     """
     Check if a layer is graphable.
@@ -2350,9 +2368,13 @@ def _layer_is_graphable(layer, config):
                 # attn-only scope on an MoE inner: the (identity) attention prefix has
                 # nothing graph-worthy, so leave eager.
                 return False
-            if CudaGraphModule.attn in config.cuda_graph_modules and not (
-                isinstance(inner.self_attention, IdentityOp)
-                and isinstance(inner.cross_attention, IdentityOp)
+            if (
+                CudaGraphModule.attn in config.cuda_graph_modules
+                and not (
+                    isinstance(inner.self_attention, IdentityOp)
+                    and isinstance(inner.cross_attention, IdentityOp)
+                )
+                and not _attention_runs_eager_under_packing(inner.self_attention, config)
             ):
                 return True
             if CudaGraphModule.mlp in config.cuda_graph_modules and isinstance(inner.mlp, MLP):
@@ -2363,9 +2385,13 @@ def _layer_is_graphable(layer, config):
         # mamba layer.
         return True
     if isinstance(layer, TransformerLayer):
-        if CudaGraphModule.attn in config.cuda_graph_modules and not (
-            isinstance(layer.self_attention, IdentityOp)
-            and isinstance(layer.cross_attention, IdentityOp)
+        if (
+            CudaGraphModule.attn in config.cuda_graph_modules
+            and not (
+                isinstance(layer.self_attention, IdentityOp)
+                and isinstance(layer.cross_attention, IdentityOp)
+            )
+            and not _attention_runs_eager_under_packing(layer.self_attention, config)
         ):
             # attn layer.
             return True

@@ -23,7 +23,7 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
 )
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net.common import (
     _GDNBase,
@@ -35,6 +35,7 @@ from megatron.core.ssm.gated_delta_net.common import (
     get_parameter_local_cp,
     l2norm,
 )
+from megatron.core.ssm.gated_delta_net.packed_cp_metadata import _cpu_cu_seqlens, _packed_cp_context
 from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.ops.common.causal_conv1d_varlen import (
     causal_conv1d_varlen_carry_states,
@@ -617,7 +618,12 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 packed_seq_params=packed_seq_params,
                 cp_group=cp_group_chunkwise,
                 tp_group=self.tp_group,
-                tp_cp_group=getattr(active_pg_collection, "tp_cp", None),
+                tp_cp_group=resolve_tp_cp_group(
+                    getattr(active_pg_collection, "tp_cp", None),
+                    packed_seq_params,
+                    sequence_parallel=self.config.sequence_parallel,
+                    tp_group=self.tp_group,
+                ),
                 target_partition_mode="contiguous",
                 sequence_parallel=self.config.sequence_parallel,
                 config=self.config,
@@ -681,6 +687,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 "conversion must be handled before calling GatedDeltaNet."
             )
 
+        cu_seqlens_q_cpu = cu_seqlens_kv_cpu = None
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             assert batch == 1, "Packed sequence expects batch dimension to be 1"
             assert (
@@ -688,12 +695,26 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             ), "Packed sequence does not support deterministic mode."
 
             # Resolve cu_seqlens with alignment padding handling.
+            if cp_size_chunkwise > 1:
+                for boundary_name in ('q', 'kv'):
+                    padded = getattr(packed_seq_params, f'cu_seqlens_{boundary_name}_padded')
+                    offsets = (
+                        padded
+                        if padded is not None
+                        else getattr(packed_seq_params, f'cu_seqlens_{boundary_name}')
+                    )
+                    cpu_offsets = _cpu_cu_seqlens(packed_seq_params, offsets)
+                    if boundary_name == 'q':
+                        cu_seqlens_q_cpu = cpu_offsets
+                    else:
+                        cu_seqlens_kv_cpu = cpu_offsets
             cu_seqlens_q = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_q_padded,
                 packed_seq_params.cu_seqlens_q,
                 seq_len_global,
                 "cu_seqlens_q",
                 cp_size=cp_size_runtime,
+                cu_seqlens_cpu=cu_seqlens_q_cpu,
             )
             cu_seqlens_kv = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_kv_padded,
@@ -701,8 +722,12 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 seq_len_global,
                 "cu_seqlens_kv",
                 cp_size=cp_size_runtime,
+                cu_seqlens_cpu=cu_seqlens_kv_cpu,
             )
-            assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
+            assert torch.equal(
+                cu_seqlens_q_cpu if cu_seqlens_q_cpu is not None else cu_seqlens_q,
+                cu_seqlens_kv_cpu if cu_seqlens_kv_cpu is not None else cu_seqlens_kv,
+            ), (
                 "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
                 f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
             )
@@ -740,10 +765,12 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                     self._chunkwise_cp_context_cache[cache_key] = cached
                 cu_seqlens_q, chunkwise_cp_context = cached
             else:
-                chunkwise_cp_context = build_cp_context(
-                    cu_seqlens=cu_seqlens_q,
-                    group=cp_group_chunkwise,
-                    conv1d_kernel_size=self.conv_kernel_dim,
+                chunkwise_cp_context = _packed_cp_context(
+                    packed_seq_params,
+                    cu_seqlens_q,
+                    cp_group_chunkwise,
+                    self.conv_kernel_dim,
+                    build_cp_context,
                 )
         else:
             chunkwise_cp_context = None

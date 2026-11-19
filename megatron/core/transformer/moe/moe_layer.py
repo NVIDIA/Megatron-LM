@@ -295,10 +295,13 @@ class MoELayer(BaseMoELayer):
             is_mtp_layer=is_mtp_layer,
         )
         # If using mcore cudagraphs, recompute is handled by transformer_layer.MoETransformerLayer
-        self.moe_layer_recompute = (
+        self._moe_recompute_module_enabled = (
             config.recompute_granularity == 'selective'
             and "moe" in config.recompute_modules
             and config.cuda_graph_impl != 'local'
+        )
+        self.moe_layer_recompute = self._moe_recompute_module_enabled and (
+            self._moe_recompute_covers(layer_number)
         )
         self.shared_experts_recompute = (
             config.recompute_granularity == 'selective'
@@ -537,6 +540,18 @@ class MoELayer(BaseMoELayer):
 
         # Setup events and streams for delayed wgrad computation.
         self.setup_delayed_wgrad_for_dispatch_backward_overlap()
+
+    def _moe_recompute_covers(self, layer_number: Optional[int]) -> bool:
+        """Whether moe_recompute_max_layer_number lets this layer number checkpoint its MoE."""
+        limit = self.config.moe_recompute_max_layer_number
+        return limit is None or layer_number is None or layer_number <= limit
+
+    def set_layer_number(self, layer_number: int):
+        """Set the layer number and re-apply moe_recompute_max_layer_number to it."""
+        super().set_layer_number(layer_number)
+        self.moe_layer_recompute = self._moe_recompute_module_enabled and (
+            self._moe_recompute_covers(layer_number)
+        )
 
     def _setup_inference_mode(self, pg_collection):
         """Set up inference-optimized token dispatcher.
