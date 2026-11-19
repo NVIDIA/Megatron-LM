@@ -1773,8 +1773,15 @@ class InferenceGroupedMLP(TEGroupedMLP):
             raise RuntimeError("Expert weight preparation requires InferenceMode")
         if self._concatenated_weights_built:
             return
-        # The build rebinds parameter storage. Its copies may run on a different
-        # stream from checkpoint loading, so protect both MXFP8 data and scales.
+        # Packing happens on the first expert forward, normally during warmup before
+        # CUDA graph capture; later forwards reuse the packed weights. With shortcut
+        # overlap, this first forward runs on the side stream, while the original
+        # weights may have been allocated on the main stream. Rebinding parameters
+        # releases their old storage before the asynchronous packing copies finish.
+        # Without record_stream, a main-stream allocation could reuse and overwrite
+        # that storage while the side stream is still reading it. Protect the source
+        # allocations (both data and scales for MXFP8) until those reads finish;
+        # this delays allocator reuse without synchronizing the two streams.
         for linear_name, _ in self._EXPERT_WEIGHT_GROUPS:
             for i in range(self.num_local_experts):
                 weight = getattr(getattr(self, linear_name), f"weight{i}")
