@@ -6836,11 +6836,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.parametrize("kv_cache_management_mode", ["recompute", "persist"])
     @torch.inference_mode()
     def test_abort_while_suspended_keeps_generated_tokens(self, kv_cache_management_mode):
-        """An abort that reaches a suspended engine finishes the request, after resume,
-        with exactly the tokens it had generated.
+        """An abort that reaches a suspended engine is acknowledged at once and finishes
+        the request, after resume, with exactly the tokens it had generated.
 
         A RECOMPUTE suspend without static KV pointers deletes the context's request
-        tensors, so the abort handler must not read them; PERSIST keeps its rows.
+        tensors, so the abort handler must not read them; PERSIST keeps its rows, and
+        the handler marks the request finished there.
         """
         env = self._build_test_env(
             DynamicEngineTestConfig(
@@ -6884,6 +6885,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert not engine.context.is_tensor_state_allocated
 
         # The abort arrives through the coordinator socket, as a client cancellation does.
+        engine.use_coordinator = True
         engine.is_mp_coordinator = True
         engine.socket_for_receiving_requests = mock.Mock()
         engine.socket_for_receiving_requests.recv_multipart.side_effect = [
@@ -6893,6 +6895,21 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         engine.model_parallel_publisher_socket = mock.Mock()
         assert engine.schedule_requests() == 1
 
+        # The coordinator learns that the abort is safe to finalize.
+        engine.socket_for_receiving_requests.send.assert_called_once_with(
+            msgpack.packb([Headers.REQUEST_ABORTED.value, 0, True], use_bin_type=True)
+        )
+        # PERSIST keeps the request's row, so the abort must also mark it finished there.
+        if kv_cache_management_mode != "recompute":
+            context = engine.context
+            assert context.get_active_request_count() == 1
+            assert (
+                context.get_active_sequence_lengths() >= context.get_max_sequence_lengths()
+            ).all()
+
+        # No coordinator loop drives this engine, and suspend and resume update its
+        # state themselves only without a coordinator.
+        engine.use_coordinator = False
         engine.resume()
         finished = []
         for _ in range(10):
