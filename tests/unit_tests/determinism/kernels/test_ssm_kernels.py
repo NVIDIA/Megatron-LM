@@ -572,8 +572,11 @@ def test_causal_conv1d_varlen_replays(monkeypatch, cache_autotuning):
 
     # Replay the real module-level autotuner, which keeps every candidate because it was
     # imported before determinism was enabled, as in training.
-    tuner = _autotuner(causal_conv1d_varlen._causal_conv1d_varlen_kernel)
-    _forbid_benchmarks(monkeypatch, tuner, cache_results=cache_autotuning)
+    tuners = [
+        _autotuner(causal_conv1d_varlen._causal_conv1d_varlen_kernel),
+        _autotuner(causal_conv1d_varlen._causal_conv1d_carry_states_kernel),
+    ]
+    _forbid_benchmarks(monkeypatch, *tuners, cache_results=cache_autotuning)
 
     seeded()
     dim, width = 2048, 4
@@ -592,7 +595,15 @@ def test_causal_conv1d_varlen_replays(monkeypatch, cache_autotuning):
         backward=False,
         what="causal_conv1d_varlen_fn",
     )
-    _assert_pinned(tuner)
+    previous_states = torch.randn(len(bounds) - 1, dim, width, device="cuda", dtype=torch.bfloat16)
+    assert_replays_bit_exact(
+        lambda x, s: causal_conv1d_varlen.causal_conv1d_varlen_carry_states(x, cu_seqlens, s),
+        (x, previous_states),
+        replays=4,
+        backward=False,
+        what="causal_conv1d_varlen_carry_states",
+    )
+    _assert_pinned(*tuners)
 
 
 # --- Gated Delta Product ----------------------------------------------------------------------
