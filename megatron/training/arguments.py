@@ -1171,6 +1171,12 @@ def validate_args(args, defaults={}):
         if args.create_attention_mask_in_dataloader:
             args.create_attention_mask_in_dataloader = False
 
+    if getattr(args, 'sft', False) and args.create_attention_mask_in_dataloader:
+        # SFT batches are packed sequences described by cu_seqlens and carry no
+        # attention_mask; with the flag set, the other TP ranks wait for a broadcast
+        # that TP rank 0 never sends.
+        args.create_attention_mask_in_dataloader = False
+
     if args.seq_length is not None:
         assert args.encoder_seq_length is None
         args.encoder_seq_length = args.seq_length
