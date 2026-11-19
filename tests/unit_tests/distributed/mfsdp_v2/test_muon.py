@@ -10,6 +10,7 @@ from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
     Placements,
     fully_shard,
     fully_shard_context,
@@ -92,7 +93,7 @@ def test_muon_matches_reference(
     # Match FSDP's FP32 optimizer weights; autocast handles BF16 computation.
     reference = copy.deepcopy(model).float()
     reference_params = dict(reference.named_parameters())
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(
             model,
             mesh=mesh,

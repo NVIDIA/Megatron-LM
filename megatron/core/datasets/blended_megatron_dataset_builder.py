@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextvars
 import logging
@@ -56,6 +56,10 @@ class BlendedMegatronDatasetBuilder(object):
         self.is_built_on_rank = is_built_on_rank
         self.config = config
         self.vp_stage = vp_stage
+
+        # The config may have been completed after construction (its tokenizer bound later):
+        # validate it before it is read.
+        self.config.validate()
 
         log_single_rank(
             logger,

@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 from abc import ABC, abstractmethod
@@ -8,6 +8,8 @@ from typing import Optional, Sequence, Union
 
 import torch
 
+from megatron.core.inference.moe.sigmoid_topk import HAVE_TRITON as HAVE_SIGMOID_TOPK_KERNEL
+from megatron.core.inference.moe.sigmoid_topk import is_sigmoid_topk_supported, sigmoid_topk_routing
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
@@ -489,6 +491,9 @@ class TopKRouter(Router):
                 fused=self.config.moe_router_fusion,
                 qb_histogram=self.qb_histogram if accumulate_histogram else None,
                 qb_bin_bounds=self.qb_bin_bounds if accumulate_histogram else None,
+                # The histogram is only supplied while accumulating, so every pass must
+                # use the reference router to stay bitwise identical across passes.
+                allow_batch_invariant_sigmoid_topk=False,
             )
 
         assert (
@@ -640,6 +645,7 @@ class TopKRouter(Router):
             num_experts=self.config.num_moe_experts,
             moe_aux_loss_coeff=aux_loss_coeff,
             fused=self.config.moe_router_aux_loss_fusion,
+            deterministic=self.config.deterministic_mode,
         )
 
         probs = self.attach_and_log_load_balancing_loss(
@@ -704,6 +710,7 @@ class TopKRouter(Router):
                 num_experts=self.config.num_moe_experts,
                 moe_aux_loss_coeff=seq_aux_loss_coeff,
                 fused=self.config.moe_router_aux_loss_fusion,
+                deterministic=self.config.deterministic_mode,
             )
             / bsz
         )
@@ -756,6 +763,7 @@ class TopKRouter(Router):
             num_experts=self.config.num_moe_experts,
             moe_aux_loss_coeff=global_aux_loss_coeff,
             fused=self.config.moe_router_aux_loss_fusion,
+            deterministic=self.config.deterministic_mode,
         )
 
         probs = self.attach_and_log_load_balancing_loss(
@@ -1172,11 +1180,11 @@ class TopKRouter(Router):
                 and torch.is_grad_enabled()
                 and not self.frozen_expert_bias
             )
-            if accumulate_qb_histogram and padding_mask is not None:
-                raise RuntimeError(
-                    "Quantile Balancing does not yet support padding masks because the "
-                    "histogram APIs do not accept a valid-token mask."
-                )
+            # Exclude tokens marked by any supplied padding mask from the K3 margin
+            # histogram. Evaluation, no-grad, and frozen-bias forwards do not accumulate.
+            qb_valid_mask = (
+                ~padding_mask if accumulate_qb_histogram and padding_mask is not None else None
+            )
             # TE capability controls the implementation, not the requested output format.
             fused = self.config.moe_router_fusion and (
                 not dense_output or fused_topk_with_score_function_supports_topk_indices
@@ -1203,6 +1211,11 @@ class TopKRouter(Router):
                 qb_bin_bounds=self.qb_bin_bounds if accumulate_qb_histogram else None,
                 topk_indices=topk_indices,
                 dense_output=dense_output and not fused,
+                qb_valid_mask=qb_valid_mask,
+                # Global-batch QB supplies its histogram only on grad-enabled training
+                # passes, so every pass must use the reference router to stay bitwise
+                # identical across activation-checkpoint recompute, evaluation and inference.
+                allow_batch_invariant_sigmoid_topk=not self.use_quantile_balancing,
             )
             if self.config.moe_virtual_expert_load_balance and fused:
                 # TE returns compact IDs but full-width probabilities; normalize the pair.
@@ -1460,6 +1473,7 @@ class InferenceTopKRouter(TopKRouter):
         router_replay,
         dense_output,
         precomputed_indices=None,
+        allow_batch_invariant_sigmoid_topk=True,
     ):
         return topk_routing_with_score_function(
             logits,
@@ -1474,6 +1488,38 @@ class InferenceTopKRouter(TopKRouter):
             router_replay=router_replay,
             dense_output=dense_output,
             precomputed_indices=precomputed_indices,
+            allow_batch_invariant_sigmoid_topk=allow_batch_invariant_sigmoid_topk,
+        )
+
+    def _uses_sigmoid_topk_kernel(
+        self, logits: torch.Tensor, precomputed_indices: Optional[torch.Tensor]
+    ) -> bool:
+        """Whether this inference call uses the fused sigmoid top-k kernel.
+
+        It is selected by config.inference_moe_router_backend='triton' and covers sigmoid
+        scores with an expert bias, fp32 logits and supported shapes, without
+        group-limited routing, router replay, precomputed indices or TE's fused
+        router. Batch-invariant mode routes through topk_routing_with_score_function,
+        which runs this kernel with a batch-invariant launch in both training and
+        inference, so it does not take this path. forward()
+        only reaches this path while InferenceMode is active, whether or not
+        gradients are enabled, and the kernel's outputs carry no autograd graph.
+        Expert selection matches the compiled path; for top-k of eight or more a
+        probability can differ from it in the last bit.
+        """
+        return (
+            self.config.inference_moe_router_backend == 'triton'
+            and HAVE_SIGMOID_TOPK_KERNEL
+            and logits.is_cuda
+            and logits.dtype == torch.float32
+            and self.score_function == "sigmoid"
+            and self.expert_bias is not None
+            and is_sigmoid_topk_supported(logits.shape[-1], self.topk)
+            and precomputed_indices is None
+            and self.config.moe_router_group_topk is None
+            and not self.config.moe_router_fusion
+            and self.router_replay is None
+            and not is_batch_invariant_mode_enabled()
         )
 
     def _forward(
@@ -1505,6 +1551,13 @@ class InferenceTopKRouter(TopKRouter):
             if precomputed_indices is not None or is_batch_invariant_mode_enabled()
             else self._compiled_topk_routing
         )
+        if self._uses_sigmoid_topk_kernel(logits, precomputed_indices):
+            return sigmoid_topk_routing(
+                logits.contiguous(),
+                self.expert_bias.float(),
+                self.topk,
+                self.config.moe_router_topk_scaling_factor,
+            )
         routing_kwargs = (
             {"precomputed_indices": precomputed_indices} if precomputed_indices is not None else {}
         )
@@ -1520,6 +1573,7 @@ class InferenceTopKRouter(TopKRouter):
             fused=self.config.moe_router_fusion,
             router_replay=self.router_replay,
             dense_output=True,
+            allow_batch_invariant_sigmoid_topk=self.routing_type != "quantile_balancing",
             **routing_kwargs,
         )
         return probs.squeeze(1), top_indices.squeeze(1)

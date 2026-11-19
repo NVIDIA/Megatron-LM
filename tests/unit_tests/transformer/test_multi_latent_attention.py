@@ -19,7 +19,6 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import Attention
@@ -44,63 +43,15 @@ from tests.unit_tests.dist_checkpointing import (
     init_basic_mock_args,
     init_checkpointing_mock_args,
 )
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
+from tests.unit_tests.transformer.packed_seq_test_utils import (
+    make_test_packed_seq_params as make_test_packed_seq_params,
+)
+from tests.unit_tests.transformer.packed_seq_test_utils import (
+    make_test_packed_seq_params_with_padding as make_test_packed_seq_params_with_padding,
+)
 
 pytestmark = pytest.mark.usefixtures("run_config")
-
-
-def make_test_packed_seq_params(sequence_length=None, cu_seqlens=None):
-    if cu_seqlens is None:
-        assert sequence_length is not None
-        cu_seqlens = [0, 6, 19, 22, sequence_length]
-    cu_seqlens = torch.IntTensor(cu_seqlens).cuda()
-    seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
-    max_seqlen = seqlens.max().item()
-    packed_seq_params = PackedSeqParams(
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_kv=cu_seqlens,
-        max_seqlen_q=max_seqlen,
-        max_seqlen_kv=max_seqlen,
-        qkv_format='thd',
-    )
-    return packed_seq_params
-
-
-def make_test_packed_seq_params_with_padding(
-    sequence_length=None, cu_seqlens=None, cu_seqlens_padded=None
-):
-    """Create PackedSeqParams with both regular and padded cu_seqlens for testing padded sequences."""
-    if cu_seqlens is None:
-        assert sequence_length is not None
-        cu_seqlens = [
-            0,
-            6,
-            19,
-            22,
-            sequence_length - 8,
-        ]  # Actual sequence lengths (with some padding removed)
-    if cu_seqlens_padded is None:
-        assert sequence_length is not None
-        cu_seqlens_padded = [0, 8, 22, 28, sequence_length]  # Padded sequence lengths
-
-    cu_seqlens = torch.IntTensor(cu_seqlens).cuda()
-    cu_seqlens_padded = torch.IntTensor(cu_seqlens_padded).cuda()
-
-    # Use padded lengths for max_seqlen calculation
-    seqlens_padded = cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
-    max_seqlen, _ = seqlens_padded.max(dim=0, keepdim=True)
-    max_seqlen = max_seqlen.tolist()[0]
-
-    packed_seq_params = PackedSeqParams(
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_kv=cu_seqlens,
-        cu_seqlens_q_padded=cu_seqlens_padded,
-        cu_seqlens_kv_padded=cu_seqlens_padded,
-        max_seqlen_q=max_seqlen,
-        max_seqlen_kv=max_seqlen,
-        qkv_format='thd',
-    )
-    return packed_seq_params
 
 
 def get_mla_self_attn_submodules(linear_qkv_down_proj=None, qk_layernorm=False):
@@ -268,6 +219,20 @@ class TestParallelMLAAttention:
         # we can't currently do this because the global memory buffer is on GPU
         pass
 
+    def test_no_rope_rejects_cache_mla_latents(self):
+        self.transformer_config.no_rope_freq = [1, 0]
+        self.transformer_config.cache_mla_latents = True
+
+        with pytest.raises(
+            AssertionError, match="Caching MLA latents is not supported for layers without RoPE"
+        ):
+            MLASelfAttention(
+                self.transformer_config,
+                get_mla_self_attn_submodules(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+            )
+
     def test_gpu_forward(self):
         if is_te_min_version("1.10.0"):
             config = self.parallel_attention.config
@@ -291,6 +256,35 @@ class TestParallelMLAAttention:
             assert output.shape[1] == micro_batch_size
             assert output.shape[2] == config.hidden_size
             assert bias.shape[0] == config.hidden_size
+
+    def test_gpu_forward_no_rope(self):
+        if is_te_min_version("1.10.0"):
+            self.transformer_config.no_rope_freq = [1, 0]
+            no_rope_attention = MLASelfAttention(
+                self.transformer_config,
+                get_mla_self_attn_submodules(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+            )
+            config = no_rope_attention.config
+            sequence_length = 32
+            micro_batch_size = 2
+
+            assert not no_rope_attention.use_rope
+            assert no_rope_attention.rotary_pos_emb is None
+
+            no_rope_attention.cuda()
+            hidden_states = torch.ones(
+                (sequence_length, micro_batch_size, config.hidden_size), device="cuda"
+            )
+            attention_mask = torch.ones(
+                (1, 1, sequence_length, sequence_length), dtype=bool, device="cuda"
+            )
+
+            output, bias = no_rope_attention(hidden_states, attention_mask)
+
+            assert output.shape == hidden_states.shape
+            assert bias.shape == (config.hidden_size,)
 
     @pytest.mark.experimental
     def test_gpu_forward_with_yarn_rope_fusion(self):
@@ -1774,6 +1768,7 @@ def test_parallel_multi_latent_attention_correctness(
         mock_args.no_save_rng = True
         mock_args.no_load_optim = True
         mock_args.no_load_rng = True
+        sync_checkpoint_config(mock_args)
         save_checkpoint(10, gpt_model, None, None, 0)
 
         # Calculate baseline output
@@ -1803,6 +1798,7 @@ def test_parallel_multi_latent_attention_correctness(
         mock_args.sequence_parallel = sp
         gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
         with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
+            sync_checkpoint_config(mock_args)
             load_checkpoint(gpt_model, None, None)
 
         # Function to get tensor on this tp and cp rank
@@ -1975,7 +1971,7 @@ class TestFusedMLAPreMLPResidualNorm:
         results = []
         for layer in (reference, fused):
             layer_input = hidden_states.clone().requires_grad_(True)
-            output, _ = layer(hidden_states=layer_input, attention_mask=attention_mask)
+            output, _ = layer(layer_input, attention_mask=attention_mask)
             output.backward(output_grad)
             grads = {
                 name: param.grad

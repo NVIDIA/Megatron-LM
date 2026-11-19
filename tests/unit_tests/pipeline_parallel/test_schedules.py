@@ -156,6 +156,7 @@ def test_dynamic_context_parallel_forward_batch_has_tp_schema(monkeypatch):
             dynamic_cp_group_func=lambda group_size: group,
             dynamic_tp_cp_group_func=lambda group_size: group,
             tp_cp_group=group,
+            config=SimpleNamespace(sequence_parallel=False),
         )
     )
     for value in (tokens, labels, loss_mask, position_ids, padding_mask):
@@ -213,6 +214,7 @@ def test_dynamic_context_parallel_non_source_tp_receives_batch_metadata(monkeypa
         dynamic_cp_group_func=dynamic_cp_group_func,
         dynamic_tp_cp_group_func=dynamic_cp_group_func,
         tp_cp_group=tp_group,
+        config=SimpleNamespace(sequence_parallel=False),
     )
     assert not payloads
     tokens, labels, loss_mask, attention_mask, position_ids, params, padding_mask = result

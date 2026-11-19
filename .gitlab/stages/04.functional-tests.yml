@@ -152,7 +152,7 @@ functional:configure:
         --output-path "functional-test-job-lts-GB200.yaml" \
         ${RELEASE_ARGS[@]}
     - |
-      if [[ "$FUNCTIONAL_TEST_SCOPE" == "nightly" ]]; then
+      if [[ "$FUNCTIONAL_TEST_SCOPE" =~ ^(mr|mr-slim|nightly)$ ]]; then
         export PYTHONPATH=$(pwd)
         python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
           ${ARGS[@]} \
@@ -361,7 +361,7 @@ functional:run_dev_dgx_gb200:
     ENVIRONMENT: dev
     CLUSTER: GB200
 
-# Run the GB200 nightly matrix on GB300 without delaying or failing the parent.
+# Run the GB200 MR and nightly matrices on GB300 without delaying or failing the parent.
 functional:run_dev_dgx_gb300:
   extends: [.functional_run]
   allow_failure: true
@@ -374,7 +374,7 @@ functional:run_dev_dgx_gb300:
   rules:
     - if: $BUILD == "no"
       when: never
-    - if: $FUNCTIONAL_TEST == "yes" && $FUNCTIONAL_TEST_SCOPE == "nightly"
+    - if: $FUNCTIONAL_TEST == "yes" && $FUNCTIONAL_TEST_SCOPE =~ /^(mr|mr-slim|nightly)$/
       when: on_success
     - when: never
 

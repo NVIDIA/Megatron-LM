@@ -662,7 +662,7 @@ def test_thd_format(tc: TestCase):
     # --- SBHD forward/backward ---
     local_sbhd = shard_sbhd(full_sbhd, cp_rank, cp_size, tp_rank, tp_size, sp)
     input_sbhd = local_sbhd.detach().clone().requires_grad_(True)
-    out_sbhd, _ = layer(hidden_states=input_sbhd)
+    out_sbhd, _ = layer(input_sbhd)
     gathered_sbhd = gather_sbhd(out_sbhd, cp_size, tp_size, sp)
     gathered_sbhd.backward(grad_sbhd)
     sbhd_grads = {n: p.grad.clone() for n, p in layer.named_parameters()}
@@ -672,7 +672,7 @@ def test_thd_format(tc: TestCase):
     local_thd = shard_thd(seq_data, seqlens, cp_rank, cp_size, tp_rank, tp_size, sp, H, pad_to_max)
     packed_seq_params = make_packed_seq_params(seqlens, cp_size, tp_size, sp, pad_to_max)
     input_thd = local_thd.detach().clone().requires_grad_(True)
-    out_thd, _ = layer(hidden_states=input_thd, packed_seq_params=packed_seq_params)
+    out_thd, _ = layer(input_thd, packed_seq_params=packed_seq_params)
     gathered_thd = gather_thd(out_thd, seqlens, cp_size, tp_size, sp, H, pad_to_max)
     gathered_thd.backward(grad_thd)
     thd_grads = {n: p.grad.clone() for n, p in layer.named_parameters()}
@@ -1010,7 +1010,7 @@ def test_dynamic_cp_format(tc: DynamicCPTestCase):
     rotary_pos_emb_base = rope(packed_base.max_seqlen_q, packed_seq=True)
     input_base = local_thd_base.detach().clone().requires_grad_(True)
     out_base, _ = layer(
-        hidden_states=input_base, packed_seq_params=packed_base, rotary_pos_emb=rotary_pos_emb_base
+        input_base, packed_seq_params=packed_base, rotary_pos_emb=rotary_pos_emb_base
     )
     gathered_base = gather_thd(out_base, base_seqlens, cp_size, tp_size, sp, H, dynamic_cp=True)
     grad_base = torch.cat(base_grad_data, dim=0).unsqueeze(1)
@@ -1052,9 +1052,7 @@ def test_dynamic_cp_format(tc: DynamicCPTestCase):
     rotary_pos_emb_dcp = rope(packed_dcp.max_seqlen_q, packed_seq=True)
 
     input_dcp = local_thd_dcp.detach().clone().requires_grad_(True)
-    out_dcp, _ = layer(
-        hidden_states=input_dcp, packed_seq_params=packed_dcp, rotary_pos_emb=rotary_pos_emb_dcp
-    )
+    out_dcp, _ = layer(input_dcp, packed_seq_params=packed_dcp, rotary_pos_emb=rotary_pos_emb_dcp)
     gathered_dcp = gather_thd_dynamic(
         out_dcp, dcp_seqlens, local_cp_size, tp_size, sp, H, dcp_cp_group, dcp_cp_rank
     )

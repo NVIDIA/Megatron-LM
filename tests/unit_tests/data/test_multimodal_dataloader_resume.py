@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import importlib.util
 from pathlib import Path
@@ -14,30 +14,39 @@ _SPEC.loader.exec_module(dataloader_resume)
 
 
 def _args(**overrides) -> SimpleNamespace:
-    values = {
-        "finetune": False,
-        "pretrained_checkpoint": None,
-        "strict_dataloader_state_load": False,
-    }
+    values = {"strict_dataloader_state_load": False}
     values.update(overrides)
     return SimpleNamespace(**values)
 
 
+def _train_state(iteration=0, effective_finetune=False) -> SimpleNamespace:
+    return SimpleNamespace(iteration=iteration, effective_finetune=effective_finetune)
+
+
+def _checkpoint(pretrained_checkpoint=None) -> SimpleNamespace:
+    return SimpleNamespace(pretrained_checkpoint=pretrained_checkpoint)
+
+
 def test_initial_finetune_load_tolerates_missing_dataloader_state():
+    """The primary load applied finetune semantics (--finetune, the pretrained fallback or
+    --freeze-all-layers at a fresh position): the train state says so, not the namespace."""
     assert dataloader_resume.is_initial_checkpoint_load_without_dataloader_state(
-        _args(finetune=True), iteration=0
+        _train_state(effective_finetune=True), _checkpoint()
     )
 
 
 def test_initial_pretrained_load_tolerates_missing_dataloader_state():
     assert dataloader_resume.is_initial_checkpoint_load_without_dataloader_state(
-        _args(pretrained_checkpoint="/checkpoints/initial"), iteration=0
+        _train_state(), _checkpoint(pretrained_checkpoint="/checkpoints/initial")
     )
 
 
 def test_nonzero_resume_is_not_an_initial_load():
+    """A --freeze-all-layers resume at a later position is weights-only too, but its dataloader
+    state is required as for any resume."""
     assert not dataloader_resume.is_initial_checkpoint_load_without_dataloader_state(
-        _args(finetune=True, pretrained_checkpoint="/checkpoints/initial"), iteration=250
+        _train_state(iteration=250, effective_finetune=True),
+        _checkpoint(pretrained_checkpoint="/checkpoints/initial"),
     )
 
 

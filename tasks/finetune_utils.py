@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Finetune utilities."""
 
@@ -226,16 +226,15 @@ def _train(
             )
 
             # Autoresume
-            if args.adlr_autoresume and (
-                train_state.iteration % args.adlr_autoresume_interval == 0
-            ):
-                check_adlr_autoresume_termination(
-                    train_state.iteration, model, optimizer, opt_param_scheduler
-                )
+            if cfg.fault_tolerance.adlr_autoresume and \
+               (train_state.iteration % cfg.fault_tolerance.adlr_autoresume_interval == 0):
+                check_adlr_autoresume_termination(train_state.iteration, model,
+                                                  optimizer, opt_param_scheduler)
 
             # Checkpointing
             saved_checkpoint = False
-            if args.save and args.save_interval and train_state.iteration % args.save_interval == 0:
+            if cfg.checkpoint.save and cfg.checkpoint.save_interval and \
+               train_state.iteration % cfg.checkpoint.save_interval == 0:
                 save_checkpoint(train_state.iteration, model, optimizer, opt_param_scheduler)
                 saved_checkpoint = True
 
@@ -262,7 +261,7 @@ def _train(
                 sys.exit()
 
         # Checkpointing at the end of each epoch.
-        if args.save:
+        if cfg.checkpoint.save:
             save_checkpoint(train_state.iteration, model, optimizer, opt_param_scheduler)
 
         # Callback at the end of each epoch.
@@ -310,15 +309,18 @@ def finetune(
     # any iteration (i.e., iteration is zero), then load the pretrained
     # checkpoint.
     timers('pretrained checkpoint', log_level=0).start(barrier=True)
-    if train_state.iteration == 0 and args.pretrained_checkpoint is not None:
-        original_load = args.load
-        args.load = args.pretrained_checkpoint
-        original_rng = args.no_load_rng
-        args.no_load_rng = True
-        _ = load_checkpoint(model, None, None, restore_training_state=True)
+    checkpoint = get_run_config().checkpoint
+    if train_state.iteration == 0 and checkpoint.pretrained_checkpoint is not None:
+        # Weights from the pretrained checkpoint, without its RNG state, for this load only.
+        _ = load_checkpoint(
+            model,
+            None,
+            None,
+            restore_training_state=True,
+            load_dir=checkpoint.pretrained_checkpoint,
+            load_rng=False,
+        )
         update_num_microbatches(consumed_samples=train_state.consumed_train_samples, verbose=True)
-        args.load = original_load
-        args.no_load_rng = original_rng
         # This is critical when only model is loaded. We should make sure
         # main parameters are also updated.
         optimizer.reload_model_params()

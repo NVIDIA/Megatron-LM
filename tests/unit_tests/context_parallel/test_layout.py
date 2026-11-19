@@ -181,6 +181,8 @@ def test_prebuilt_packed_layout_state_is_reused():
     zigzag_mask = torch.tensor([True, False])
     masks_by_layout = {"contiguous": contiguous_mask, "zigzag": zigzag_mask}
     assert state.get_layer_padding_mask(0, contiguous_mask, masks_by_layout) is zigzag_mask
+    # A middle pipeline stage without masks carries only the boundary layout's view.
+    assert state.get_layer_padding_mask(0, None, {"contiguous": None}) is None
 
 
 @pytest.mark.parametrize(

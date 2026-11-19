@@ -1186,7 +1186,10 @@ def test_moe_layer_preprocess_forwards_padding_mask_only_to_flex_dispatcher(flex
     layer = object.__new__(MoELayer)
     torch.nn.Module.__init__(layer)
     layer.config = SimpleNamespace(
-        cuda_graph_impl="local", moe_latent_size=None, sequence_parallel=False
+        cuda_graph_impl="local",
+        moe_latent_size=None,
+        sequence_parallel=False,
+        moe_megakernel_backend=None,
     )
     layer.shared_expert_overlap = False
     layer.token_dispatcher = _FlexSpy() if flex else _OtherSpy()
@@ -1213,7 +1216,7 @@ def test_alltoall_combine_postprocess_releases_router_probs():
     the rest of backward). The combined output is unchanged.
     """
     dispatcher = object.__new__(MoEAlltoAllTokenDispatcher)
-    dispatcher.config = SimpleNamespace(moe_permute_fusion=False)
+    dispatcher.config = SimpleNamespace(moe_permute_fusion=False, moe_ep_invariant_combine=False)
     dispatcher.drop_and_pad = False
     dispatcher.batch_invariant_inverse_permutation_mapping = None
     dispatcher.shared_experts = None

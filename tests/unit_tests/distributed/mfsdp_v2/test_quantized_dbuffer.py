@@ -264,6 +264,50 @@ def test_quantized_dbuffer_partial_updated_tensor_supports_gemm(distributed_setu
         torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
 
 
+def test_quantized_dbuffer_is_alias_of(distributed_setup):
+    """Views alias every plane across storage release; independent buffers do not."""
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    source = QuantizedDBuffer.empty(
+        mesh, [Replicate()], [(128, 64), (32, 128)], distributed_setup.device
+    )
+    view = source.view([BlockAtomic(32)])
+    separate = QuantizedDBuffer.empty(
+        mesh, [Replicate()], [(128, 64), (32, 128)], distributed_setup.device
+    )
+
+    assert source.is_alias_of(view)
+    assert view.is_alias_of(source)
+    assert not source.is_alias_of(separate)
+
+    source.release_storage()
+    separate.release_storage()
+    assert source.is_alias_of(view)
+    assert not source.is_alias_of(separate)
+
+    source.reallocate_storage()
+    assert source.is_alias_of(view)
+    assert not source.is_alias_of(separate)
+
+
+@pytest.mark.parametrize("mesh_axis", ["dp", "local"])
+def test_quantized_dbuffer_can_redistribute_locally(distributed_setup, mesh_axis):
+    """Replication can be sliced locally; gathering shards requires a singleton mesh."""
+    mesh = init_device_mesh(
+        distributed_setup.device.type,
+        (distributed_setup.world_size, 1),
+        mesh_dim_names=("dp", "local"),
+    )[mesh_axis]
+    source = QuantizedDBuffer.empty(
+        mesh, [Replicate()], [(128, 64), (32, 128)], distributed_setup.device
+    )
+    view = source.view([BlockAtomic(32)])
+
+    assert source.can_redistribute_locally([Replicate()])
+    assert source.can_redistribute_locally([BlockAtomic(32)])
+    assert view.can_redistribute_locally([BlockAtomic(32)])
+    assert view.can_redistribute_locally([Replicate()]) == (mesh.size() == 1)
+
+
 def test_quantized_dbuffer_view_shares_every_plane(distributed_setup):
     """A sharded view aliases exactly this rank's slice of each replicated plane."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))

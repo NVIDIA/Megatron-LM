@@ -4,9 +4,10 @@ import copy
 import functools
 import logging
 import math
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import Iterator, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -20,7 +21,7 @@ from megatron.core.models.common.embeddings import (
     apply_rotary_pos_emb,
     should_use_fused_mla_rope,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import AttnMaskType
@@ -61,6 +62,25 @@ try:
     from fast_hadamard_transform import hadamard_transform
 except ImportError:
     hadamard_transform = None
+
+
+class _DSAIndexShareCarrier:
+    """Per-forward DSA index-share carrier for non-packed activation recompute."""
+
+
+_CURRENT_DSA_INDEX_SHARE_CARRIER: ContextVar[Optional[object]] = ContextVar(
+    "current_dsa_index_share_carrier", default=None
+)
+
+
+@contextmanager
+def _dsa_index_share_carrier_scope(carrier: object) -> Iterator[None]:
+    """Expose one non-packed forward's index-share carrier to its checkpoint closures."""
+    token = _CURRENT_DSA_INDEX_SHARE_CARRIER.set(carrier)
+    try:
+        yield
+    finally:
+        _CURRENT_DSA_INDEX_SHARE_CARRIER.reset(token)
 
 
 def is_dsa_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> bool:
@@ -2098,8 +2118,10 @@ class DSAIndexer(MegatronModule):
         max_seqlen: Optional[int] = None,
         rotary_pos_cos: Optional[torch.Tensor] = None,
         rotary_pos_sin: Optional[torch.Tensor] = None,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """Apply RoPE to the input tensor."""
+        cp_group = self.pg_collection.cp if cp_group is None else cp_group
         # NoPE: no positional component; x is all nope, return unchanged.
         if not self.use_rope:
             return x
@@ -2120,8 +2142,8 @@ class DSAIndexer(MegatronModule):
                 nope_dim=self.index_head_dim - self.qk_pos_emb_head_dim,
                 emb_dim=self.qk_pos_emb_head_dim,
                 cu_seqlens_q=cu_seqlens,
-                cp_rank=self.pg_collection.cp.rank(),
-                cp_size=self.pg_collection.cp.size(),
+                cp_rank=cp_group.rank(),
+                cp_size=cp_group.size(),
                 rope_first=True,
             )
             if squeezed_batch_dim:
@@ -2149,7 +2171,7 @@ class DSAIndexer(MegatronModule):
             config=self.config,
             cu_seqlens=cu_seqlens,
             mscale=mscale,
-            cp_group=self.pg_collection.cp,
+            cp_group=cp_group,
             # This flag is for the MLA-style interleaving in RoPE.
             mla_rotary_interleaved=self.config.dsa_indexer_rope_interleaved,
             max_seqlen=max_seqlen,
@@ -2164,6 +2186,7 @@ class DSAIndexer(MegatronModule):
         self, x: torch.Tensor, qr: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """All computations before topk."""
+        cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
 
         # =========================================
@@ -2229,6 +2252,7 @@ class DSAIndexer(MegatronModule):
             max_seqlen=max_seqlen_q,
             rotary_pos_cos=rotary_pos_cos,
             rotary_pos_sin=rotary_pos_sin,
+            cp_group=cp_group,
         )
         if self.config.dsa_indexer_rotate_activation and self.index_kpool <= 1:
             q = rotate_activation(q)
@@ -2267,6 +2291,7 @@ class DSAIndexer(MegatronModule):
                 max_seqlen=max_seqlen_kv,
                 rotary_pos_cos=rotary_pos_cos,
                 rotary_pos_sin=rotary_pos_sin,
+                cp_group=cp_group,
             )
             # [seqlen, batch, 1, index_head_dim] -> [seqlen, batch, index_head_dim]
             k = k.reshape(seqlen, bsz, self.index_head_dim)
@@ -2601,6 +2626,9 @@ class DSAttention(MegatronModule):
         """Return the object that carries DSA top-k sharing state for this forward."""
         if packed_seq_params is not None:
             return packed_seq_params
+        carrier = _CURRENT_DSA_INDEX_SHARE_CARRIER.get()
+        if carrier is not None:
+            return carrier
         return attention_mask if attention_mask is not None else self.config
 
     def _get_index_share_topk_holder(
@@ -2673,6 +2701,19 @@ class DSAttention(MegatronModule):
         if self.indexer is not None:
             self.indexer.backward_dw()
 
+    def _resolve_runtime_process_groups(
+        self, packed_seq_params: Optional[PackedSeqParams]
+    ) -> tuple[Optional[torch.distributed.ProcessGroup], ProcessGroupCollection]:
+        """Return forward-local process groups for the selected runtime CP size."""
+        static_cp_group = getattr(self.pg_collection, "cp", None)
+        cp_group = resolve_cp_group(static_cp_group, packed_seq_params)
+        if cp_group is static_cp_group:
+            return cp_group, self.pg_collection
+
+        runtime_pg_collection = copy.copy(self.pg_collection)
+        runtime_pg_collection.cp = cp_group
+        return cp_group, runtime_pg_collection
+
     def forward(
         self,
         query: torch.Tensor,
@@ -2743,7 +2784,7 @@ class DSAttention(MegatronModule):
         sq, b, _, _ = query.size()
         local_sequence_rows = x.size(0)
 
-        cp_group = getattr(self.pg_collection, "cp", None)
+        cp_group, runtime_pg_collection = self._resolve_runtime_process_groups(packed_seq_params)
         cp_size = get_pg_size(cp_group)
         cp_rank = cp_group.rank() if cp_group is not None else 0
         tp_group = getattr(self.pg_collection, "tp", None)
@@ -3170,7 +3211,7 @@ class DSAttention(MegatronModule):
                 indexer_loss_coeff,
                 float_mask,
                 sparse_indexer_loss,
-                self.pg_collection,
+                runtime_pg_collection,
                 varlen_starts,
                 varlen_ends,
                 key_positions,
@@ -3215,7 +3256,7 @@ class DSAttention(MegatronModule):
                 local_packed_cp_rank=cp_rank,
                 local_packed_cp_query_start=local_packed_cp_query_start,
                 local_packed_cp_query_len=local_packed_cp_query_len,
-                pg_collection=self.pg_collection,
+                pg_collection=runtime_pg_collection,
             )
         if fused_output is not None:
             output, indexer_loss = fused_output
@@ -3291,7 +3332,7 @@ class DSAttention(MegatronModule):
                     key=key.detach(),
                     softmax_scale=self.softmax_scale,
                     loss_coeff=indexer_loss_coeff,
-                    pg_collection=self.pg_collection,
+                    pg_collection=runtime_pg_collection,
                     query_valid_rows=query_valid_rows,
                     calculate_per_token_loss=self.config.calculate_per_token_loss,
                     use_relu=self.config.dsa_indexer_scoring_relu,

@@ -1,10 +1,10 @@
-# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import inspect
 import warnings
 from contextlib import AbstractContextManager, nullcontext
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Union
 
@@ -24,7 +24,8 @@ from megatron.core.fusions.fused_mtp_prefix import mtp_e2e_prefix_objective
 from megatron.core.fusions.fused_mtp_tv import vocab_parallel_tv_distance
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, get_backend
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.ops.norm.torch_norm import LayerNormBuilder
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
@@ -37,11 +38,11 @@ from megatron.core.tensor_parallel.inference_layers import (
     inference_all_gather_from_tensor_model_parallel_region,
     is_inference_column_parallel_linear,
 )
+from megatron.core.transformer.attention_residual import AttentionResidual
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import precision_aware_checkpoint
@@ -52,6 +53,8 @@ from megatron.core.utils import (
     is_torch_min_version,
     make_tp_sharded_tensor_for_checkpoint,
     make_viewless_tensor,
+    nvtx_range_pop,
+    nvtx_range_push,
 )
 
 if TYPE_CHECKING:
@@ -488,14 +491,20 @@ _HIDDEN_STATE_MIXING_RNG_SEED_OFFSET = 1 << 40
 
 def _initialize_hidden_state_mixing_rng_tracker(
     dp_group: Optional[torch.distributed.ProcessGroup],
+    gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Optional[str]:
-    """Create one checkpointable hidden-state-mixing RNG stream per DP replica."""
+    """Create one checkpointable HSM RNG stream per distinct-data rank."""
     rng_tracker = tensor_parallel.get_cuda_rng_tracker()
     if not rng_tracker.is_initialized():
         return None
     if _HIDDEN_STATE_MIXING_RNG_TRACKER_NAME not in rng_tracker.get_states():
+        # GTP is the innermost sub-axis of the full data-parallel rank. Its peers carry
+        # distinct microbatches, while TP/CP peers must retain a common HSM stream.
+        data_parallel_rank = get_pg_rank(dp_group) * get_pg_size(gtp_remat_group) + get_pg_rank(
+            gtp_remat_group
+        )
         seed = (
-            torch.cuda.initial_seed() + _HIDDEN_STATE_MIXING_RNG_SEED_OFFSET + get_pg_rank(dp_group)
+            torch.cuda.initial_seed() + _HIDDEN_STATE_MIXING_RNG_SEED_OFFSET + data_parallel_rank
         ) % (2**63 - 1)
         rng_tracker.add(_HIDDEN_STATE_MIXING_RNG_TRACKER_NAME, seed)
     return _HIDDEN_STATE_MIXING_RNG_TRACKER_NAME
@@ -1595,6 +1604,14 @@ class MTPLossLoggingHelper:
             tracker["acceptance_counts"].zero_()
 
     @staticmethod
+    def reset_metrics_tracker():
+        """Discard metrics and mode metadata before model reconfiguration or a test.
+
+        Do not call while a CUDA graph retains references to the current accumulators.
+        """
+        MTPLossLoggingHelper.tracker = {}
+
+    @staticmethod
     def clean_metrics_in_tracker():
         """Clear all MTP metrics through the legacy entry point."""
         MTPLossLoggingHelper.clean_loss_in_tracker()
@@ -2319,6 +2336,7 @@ def process_mtp_loss(
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
     """
     runtime_gather_output = False
+    cp_group = resolve_cp_group(cp_group, packed_seq_params)
     hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
     hidden_states = hidden_states_list[0] if main_hidden_states is None else main_hidden_states
 
@@ -2540,17 +2558,31 @@ def process_mtp_loss(
                 calculate_per_token_loss=config.calculate_per_token_loss,
             )
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
-        if config.calculate_per_token_loss:
-            # When calculate_per_token_loss is enabled, finalize_model_grads will
-            # divide all gradients by total_num_tokens (from main loss).
-            # However, MTP has fewer valid tokens due to rolling. To ensure correct
-            # per-token gradient weighting, we normalize by the rolled token count
-            # and re-scale by the original token count.
-            # Avoid division by zero
+        if config.calculate_per_token_loss and getattr(
+            config, "mtp_normalize_loss_by_main_tokens", False
+        ):
+            # Preserve the loss as a sum. Gradient finalization divides the accumulated main
+            # and MTP gradients once by the global main-loss token count, making the result
+            # invariant to rank and microbatch partitioning.
+            mtp_loss_normalized = mtp_loss_scale * mtp_loss
+        elif config.calculate_per_token_loss:
+            # finalize_model_grads divides by the global main-loss token count.
+            # Use one main/MTP token ratio for this logical microbatch, independent
+            # of its CP partition. Rolling and masking can leave different ratios
+            # (or no valid tokens) on individual ranks. Keep the local counts above
+            # unchanged for logging, which reduces them separately over DP+CP.
             assert original_num_tokens is not None
-            num_tokens_safe = torch.clamp(num_tokens, min=1)
+            normalization_tokens = torch.stack((original_num_tokens, num_tokens))
+            if cp_group is not None and cp_group.size() > 1:
+                torch.distributed.all_reduce(
+                    normalization_tokens, op=torch.distributed.ReduceOp.SUM, group=cp_group
+                )
+            main_num_tokens, mtp_num_tokens = normalization_tokens.unbind()
+            # Clamp only after the collective; empty ranks must participate too.
+            # This preserves CP partition invariance, not a global MTP-token mean
+            # across different DP microbatches with different main/MTP ratios.
             mtp_loss_normalized = (
-                mtp_loss_scale * mtp_loss * (original_num_tokens / num_tokens_safe)
+                mtp_loss_scale * mtp_loss * (main_num_tokens / mtp_num_tokens.clamp(min=1))
             )
         else:
             safe_num_tokens = num_tokens.clamp(min=1)
@@ -2593,6 +2625,11 @@ class MultiTokenPredictionLayer(MegatronModule):
     For more information, refer to DeepSeek-V3 Technical Report
     https://arxiv.org/pdf/2412.19437.pdf
     """
+
+    # Class-level default so layers assembled without ``__init__`` (unit tests build them
+    # with ``__new__`` and a minimal config namespace) take the plain MTP forward path;
+    # ``__init__`` overrides it from ``config.enable_attention_residuals``.
+    attn_res_enabled: bool = False
 
     def __init__(
         self,
@@ -2780,8 +2817,17 @@ class MultiTokenPredictionLayer(MegatronModule):
                 if self.config.keep_mtp_in_bf16:
                     layer_config.fp4 = None
                     layer_config.fp8 = None
+            stack_config = self.config
+            if self.config.moe_shortcut_disable_mtp:
+                # The stack groups its layers from its own config, and each layer reads its
+                # layer config, so both drop shortcut MoE. The decoder's config is untouched.
+                stack_config = copy(self.config)
+                for shortcut_config in (stack_config, *layer_config_list):
+                    shortcut_config.moe_shortcut_connection = False
+                    shortcut_config.moe_shortcut_parallel = False
+                    shortcut_config.moe_shortcut_post_norm = False
             self.mtp_model_layer = HybridStack(
-                config=self.config,
+                config=stack_config,
                 submodules=hybrid_submodules,
                 layer_config_list=layer_config_list,
                 pp_layer_offset=0,
@@ -2844,6 +2890,13 @@ class MultiTokenPredictionLayer(MegatronModule):
                     setattr(self.hc_head_fn, "sequence_parallel", True)
                     setattr(self.hc_head_base, "sequence_parallel", True)
                     setattr(self.hc_head_scale, "sequence_parallel", True)
+
+        self.attn_res_enabled = self.config.enable_attention_residuals
+        if self.attn_res_enabled:
+            # Per-depth AttnRes output head: aggregates the trunk depth history
+            # plus this MTP depth's partial sum before its final layernorm.
+            self.final_attn_res = AttentionResidual(self.config)
+
         self.offload_context = nullcontext()
 
     def get_inner_quantization_context(self) -> AbstractContextManager:
@@ -3063,6 +3116,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         sequence_len_offset: Optional[torch.Tensor] = None,
         packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
         cp_layout_plan: Optional[THDCPLayoutPlan] = None,
+        attn_res_sources: Optional[tuple] = None,
     ) -> torch.Tensor:
         """
         Concatenates embeddings with hidden states and then applies transformer layer forward.
@@ -3094,6 +3148,12 @@ class MultiTokenPredictionLayer(MegatronModule):
             # FP8GlobalStateManager.is_first_fp8_module() is True so that the fp8 weight caching
             # can be triggered correctly.
             with transformer_layer_quantization_context:
+                # Only AttnRes-enabled inner layers (a nested AttnRes HybridStack or
+                # the GPT AttnResTransformerLayer) accept the trunk depth-source
+                # tuple; plain MTP inner layers must not see the keyword.
+                attn_res_kwargs = (
+                    {"attn_res_sources": attn_res_sources} if self.attn_res_enabled else {}
+                )
                 if self.is_hybrid_mtp:
                     hidden_states = self.mtp_model_layer(
                         hidden_states=hidden_states,
@@ -3105,11 +3165,12 @@ class MultiTokenPredictionLayer(MegatronModule):
                         input_ids=input_ids,
                         packed_seq_params_by_layout=packed_seq_params_by_layout,
                         cp_layout_plan=cp_layout_plan,
+                        **attn_res_kwargs,
                     )
                 else:
                     # GPT path: single TransformerLayer
                     hidden_states, _ = self.mtp_model_layer(
-                        hidden_states=hidden_states,
+                        hidden_states,
                         attention_mask=attention_mask,
                         context=context,
                         context_mask=context_mask,
@@ -3122,17 +3183,28 @@ class MultiTokenPredictionLayer(MegatronModule):
                         sequence_len_offset=sequence_len_offset,
                         padding_mask=padding_mask,
                         input_ids=input_ids,
+                        **attn_res_kwargs,
                     )
 
         if not self.mhc_enabled:
-            hidden_states = self._postprocess(hidden_states)
+            hidden_states = self._postprocess(hidden_states, attn_res_sources=attn_res_sources)
 
         return hidden_states
 
-    def _postprocess(self, hidden_states: torch.Tensor):
+    def _postprocess(self, hidden_states: torch.Tensor, attn_res_sources: Optional[tuple] = None):
         """
         Postprocesses the output of the transformer layers.
         """
+
+        if self.attn_res_enabled:
+            assert (
+                attn_res_sources is not None
+            ), "AttnRes MTP postprocess requires the trunk depth-source tuple."
+            # Per-depth output head: this depth's partial sum joins the trunk
+            # depth history for the final aggregation.
+            nvtx_range_push(msg="attn_res.mtp_final_aggregate")
+            hidden_states = self.final_attn_res([*attn_res_sources, hidden_states])
+            nvtx_range_pop(msg="attn_res.mtp_final_aggregate")
 
         if self.mhc_enabled:
             if self.config.mhc_learned_output_contract:
@@ -3379,6 +3451,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         mtp_input_mask: Optional[Tensor] = None,
         packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
         cp_layout_plan: Optional[THDCPLayoutPlan] = None,
+        attn_res_sources: Optional[tuple] = None,
     ):
         """
         Execute the forward pass through the Multi-Token Prediction (MTP) layer.
@@ -3402,6 +3475,8 @@ class MultiTokenPredictionLayer(MegatronModule):
             sequence_len_offset (Tensor, optional): Offset for sequence length, if applicable.
             embedding (Callable): The embedding module from gpt model to compute the decoder input.
             mtp_input_mask (Tensor, optional): Mask of valid MTP conditioning tokens.
+            attn_res_sources (tuple, optional): Immutable trunk depth-source tuple consumed
+                by this depth's AttnRes aggregations when Attention Residuals are enabled.
 
         Returns:
             Union[Tensor, Tuple[Tensor, Tensor]]: The output hidden states tensor of shape
@@ -3440,6 +3515,9 @@ class MultiTokenPredictionLayer(MegatronModule):
             self.config.recompute_granularity == 'full' and self.training and not self.is_hybrid_mtp
         )
         if use_outer_recompute:
+            assert (
+                not self.attn_res_enabled
+            ), "Attention residuals do not support full recompute (rejected in config)."
             hidden_states = self._checkpointed_forward(
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
@@ -3459,6 +3537,11 @@ class MultiTokenPredictionLayer(MegatronModule):
                 cp_layout_plan=cp_layout_plan,
             )
         else:
+            # Thread the depth sources only when attention residuals are on, so overrides of
+            # ``_proj_and_transformer_layer`` with the pre-AttnRes signature keep working.
+            attn_res_kwargs = (
+                {"attn_res_sources": attn_res_sources} if self.attn_res_enabled else {}
+            )
             hidden_states = self._proj_and_transformer_layer(
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
@@ -3476,6 +3559,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 sequence_len_offset=sequence_len_offset,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
+                **attn_res_kwargs,
             )
 
         return hidden_states, input_ids, position_ids, padding_mask, mtp_input_mask
@@ -3541,6 +3625,8 @@ class MultiTokenPredictionInputs:
     mtp_input_mask: Optional[Tensor]
     packed_seq_params: Optional[PackedSeqParams]
     padding_mask: Optional[Tensor] = None
+    # Immutable trunk depth-source tuple (Attention Residuals), in the MTP layout.
+    attn_res_sources: Optional[tuple] = None
 
 
 def _get_mtp_block_submodules(
@@ -3674,7 +3760,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         # to the roll_tensor function for proper boundary communication
         if pg_collection is None:
             # Use default MPU process groups if not provided
-            required_pgs = ['cp', 'tp', 'pp'] + (['dp'] if self.config.mtp_hsm else [])
+            required_pgs = ['cp', 'tp', 'pp'] + (['dp', 'gtp_remat'] if self.config.mtp_hsm else [])
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)
         else:
             # Ensure the provided process groups include TP, CP, and PP.
@@ -3683,9 +3769,10 @@ class MultiTokenPredictionBlock(MegatronModule):
                     getattr(pg_collection, group_name, None) is not None
                 ), f"MultiTokenPredictionBlock pg_collection must have {group_name} process group"
             if self.config.mtp_hsm:
-                assert hasattr(
-                    pg_collection, 'dp'
-                ), "MultiTokenPredictionBlock with HSM requires a dp process group"
+                for group_name in ('dp', 'gtp_remat'):
+                    assert (
+                        getattr(pg_collection, group_name, None) is not None
+                    ), f"MultiTokenPredictionBlock with HSM requires a {group_name} process group"
 
         self._build_layers(pg_collection)
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
@@ -3701,8 +3788,9 @@ class MultiTokenPredictionBlock(MegatronModule):
         self.tp_cp_group = getattr(pg_collection, 'tp_cp', None)
         self.pp_rank = pg_collection.pp.rank()
         self.dp_group = pg_collection.dp if self.config.mtp_hsm else None
+        self.gtp_remat_group = pg_collection.gtp_remat if self.config.mtp_hsm else None
         self.hidden_state_mixing_rng_tracker_name = (
-            _initialize_hidden_state_mixing_rng_tracker(self.dp_group)
+            _initialize_hidden_state_mixing_rng_tracker(self.dp_group, self.gtp_remat_group)
             if self.config.mtp_hsm
             else None
         )
@@ -3726,6 +3814,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams],
         cp_batch: Optional[ContextParallelBatch],
         padding_mask: Optional[Tensor] = None,
+        attn_res_sources: Optional[tuple] = None,
     ) -> MultiTokenPredictionInputs:
         """Prepare MTP inputs, including the batch-major, optionally SP-sharded padding mask."""
         source_layout = (
@@ -3742,7 +3831,15 @@ class MultiTokenPredictionBlock(MegatronModule):
             if getattr(self.config, "_linear_cp_layout_explicit", True)
             else source_layout
         )
-        requires_conversion = self.cp_group.size() > 1 and source_layout != target_layout
+        runtime_cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
+        assert runtime_cp_group is not None, "MTP requires a context-parallel group"
+        runtime_tp_cp_group = resolve_tp_cp_group(
+            self.tp_cp_group,
+            packed_seq_params,
+            sequence_parallel=self.sequence_parallel,
+            tp_group=self.tp_group,
+        )
+        requires_conversion = runtime_cp_group.size() > 1 and source_layout != target_layout
         padding_mask_is_replicated = (
             padding_mask is not None
             and self.sequence_parallel
@@ -3756,10 +3853,10 @@ class MultiTokenPredictionBlock(MegatronModule):
                 hidden_states,
                 source_layout,
                 target_layout,
-                self.cp_group,
+                runtime_cp_group,
                 self.sequence_parallel,
                 self.tp_group,
-                self.tp_cp_group,
+                runtime_tp_cp_group,
                 cp_batch.thd_plan,
             )
             if decoder_input is not None:
@@ -3767,10 +3864,10 @@ class MultiTokenPredictionBlock(MegatronModule):
                     decoder_input,
                     source_layout,
                     target_layout,
-                    self.cp_group,
+                    runtime_cp_group,
                     self.sequence_parallel,
                     self.tp_group,
-                    self.tp_cp_group,
+                    runtime_tp_cp_group,
                     cp_batch.thd_plan,
                 )
             if mhc_multistream is not None:
@@ -3778,11 +3875,29 @@ class MultiTokenPredictionBlock(MegatronModule):
                     mhc_multistream,
                     source_layout,
                     target_layout,
-                    self.cp_group,
+                    runtime_cp_group,
                     self.sequence_parallel,
                     self.tp_group,
-                    self.tp_cp_group,
+                    runtime_tp_cp_group,
                     cp_batch.thd_plan,
+                )
+            if attn_res_sources is not None:
+                # Every trunk depth source is an [s, b, h] activation in the
+                # decoder layout. MTP depths aggregate them token-aligned with
+                # the converted trunk hidden state, so convert each one the same
+                # way; the result stays an immutable tuple.
+                attn_res_sources = tuple(
+                    convert_cp_layout(
+                        source,
+                        source_layout,
+                        target_layout,
+                        runtime_cp_group,
+                        self.sequence_parallel,
+                        self.tp_group,
+                        runtime_tp_cp_group,
+                        cp_batch.thd_plan,
+                    )
+                    for source in attn_res_sources
                 )
             if padding_mask is not None:
                 # Convert validity so any new THD padding slots (zero-filled by
@@ -3794,10 +3909,10 @@ class MultiTokenPredictionBlock(MegatronModule):
                     validity,
                     source_layout,
                     target_layout,
-                    self.cp_group,
+                    runtime_cp_group,
                     self.sequence_parallel,
                     self.tp_group,
-                    self.tp_cp_group,
+                    runtime_tp_cp_group,
                     cp_batch.thd_plan,
                 )
                 if padding_mask_is_replicated:
@@ -3823,6 +3938,7 @@ class MultiTokenPredictionBlock(MegatronModule):
             mtp_input_mask=mtp_input_mask,
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
+            attn_res_sources=attn_res_sources,
         )
 
     def _build_layers(self, pg_collection):
@@ -3942,6 +4058,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         mhc_multistream: Optional[Tensor] = None,
         packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
         cp_layout_plan: Optional[THDCPLayoutPlan] = None,
+        attn_res_sources: Optional[tuple] = None,
     ) -> Tensor:
         """
         Perform the forward pass through all of the MTP modules.
@@ -3959,6 +4076,10 @@ class MultiTokenPredictionBlock(MegatronModule):
             sequence_roll_context: Layout-specific metadata shared across all MTP
                 depths.
             mtp_input_mask (Tensor, optional): Mask of valid MTP conditioning tokens.
+            attn_res_sources: Complete immutable trunk depth-source tuple used by
+                every MTP depth when Attention Residuals are enabled. With
+                ``mtp_detach_heads``, the tuple is detached together with the
+                trunk hidden state before entering the first depth.
 
         Returns:
             (Tensor): The mtp loss tensor of shape [b, s].
@@ -3975,6 +4096,10 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         if self.config.mtp_detach_heads:
             hidden_states = hidden_states.detach()
+            if attn_res_sources is not None:
+                # Keep the detach semantics: MTP depths must not backprop into
+                # the trunk through the depth-source history either.
+                attn_res_sources = tuple(source.detach() for source in attn_res_sources)
 
         hidden_state_mixing_enabled = self.config.mtp_hsm and self.training
         if hidden_state_mixing_enabled:
@@ -4102,6 +4227,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                 embedding=embedding,
                 decoder_input=decoder_input,
                 mtp_input_mask=mtp_input_mask,
+                attn_res_sources=attn_res_sources,
                 **(extra_block_kwargs or {}),
             )
 

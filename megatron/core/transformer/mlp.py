@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import warnings
@@ -412,7 +412,7 @@ class MLP(MegatronModule):
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         for name, module in self._modules.items():
             sub_sd = sharded_state_dict_default(
-                module, f"{prefix}{name}.", sharded_offsets, metadata
+                module, f"{prefix}{name}.", sharded_offsets, metadata, tp_group=self.tp_group
             )
             if self.config.gated_linear_unit and name == "linear_fc1":
                 for k, v in sub_sd.items():
@@ -501,6 +501,15 @@ def apply_swiglu_sharded_factory(
         is_dp_sharded = dp_size > 1
     else:
         is_dp_sharded = False
+
+    source_param = getattr(original_sh_ten.data, "_gtp_dequant_src", original_sh_ten.data)
+    gtp_size = getattr(source_param, "gtp_remat_size", 1)
+    if gtp_size > 1 and not is_dp_sharded:
+        from megatron.core.tensor_parallel.gtp_ckpt_util import make_gtp_swiglu_sharded_factory
+
+        return make_gtp_swiglu_sharded_factory(
+            original_sh_ten, sharded_offsets, singleton_local_shards, gtp_size
+        )
 
     @torch.no_grad()
     def sh_ten_build_fn(

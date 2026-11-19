@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import math
 import weakref
 from contextlib import contextmanager
 from typing import Optional
@@ -115,7 +116,17 @@ class DistributedDataParallel(_BaseDataParallel):
     def _validate_config(
         config: TransformerConfig, ddp_config: DistributedDataParallelConfig
     ) -> None:
-        """Validate model settings that depend on the data-parallel configuration."""
+        """Validate resolved buffer policy and model settings before wrapper setup."""
+        if ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+            assert (
+                ddp_config.fp8_param_gather
+            ), "Reuse grad buffer only when keeping params in MXFP8."
+            if ddp_config.grad_buffer_offload:
+                raise ValueError(
+                    "Gradient-buffer offload is incompatible with "
+                    "reuse_grad_buf_for_mxfp8_param_ag because parameters share gradient storage."
+                )
+
         if config.moe_virtual_expert_load_balance and config.fp8:
             if not ddp_config.fp8_param_gather:
                 raise ValueError(
@@ -136,6 +147,7 @@ class DistributedDataParallel(_BaseDataParallel):
         pg_collection: Optional[ProcessGroupCollection] = None,
         full_param_layout: Optional[FullParamLayout] = None,
     ):
+        ddp_config.finalize()
         self._validate_config(config, ddp_config)
         super().__init__(config=config, module=module)
         if has_config_logger_enabled(config):
@@ -154,6 +166,7 @@ class DistributedDataParallel(_BaseDataParallel):
         dp_group = process_group_dict['dp_group']
         if ddp_config.bucket_size is None:
             ddp_config.bucket_size = max(40000000, 1000000 * dp_group.size())
+            ddp_config._bucket_size_resolved = True
         # Set bucket_size to infinity if overlap_grad_reduce is False.
         if not ddp_config.overlap_grad_reduce:
             ddp_config.bucket_size = None
@@ -347,15 +360,18 @@ class DistributedDataParallel(_BaseDataParallel):
                 if self.ddp_config.average_in_collective:
                     if self.ddp_config.num_distributed_optimizer_instances == 1:
                         # Collective is averaging gradients in collective with data_parallel_group.
-                        assert (
-                            scaling_factor / data_parallel_group.size()
-                            == target_gradient_scaling_factor
+                        assert math.isclose(
+                            scaling_factor / data_parallel_group.size(),
+                            target_gradient_scaling_factor,
+                            rel_tol=1e-9,
                         )
                     else:
                         # For non-expert parameters, gradient_scaling_factor is 1.
                         # For expert parameters, gradient_scaling_factor is edp_size/dp_size.
-                        assert (scaling_factor == 1) or (
-                            scaling_factor == (self.expt_dp_group.size() / self.dp_cp_group.size())
+                        assert math.isclose(scaling_factor, 1, rel_tol=1e-9) or math.isclose(
+                            scaling_factor,
+                            self.expt_dp_group.size() / self.dp_cp_group.size(),
+                            rel_tol=1e-9,
                         )
                 else:
                     # Expert params carry the extra egtp/gtp correction folded into
@@ -363,7 +379,9 @@ class DistributedDataParallel(_BaseDataParallel):
                     # matching non-expert params).
                     if buffer_key.is_expert_parallel:
                         target_gradient_scaling_factor *= expert_gtp_correction
-                    assert scaling_factor == target_gradient_scaling_factor
+                    assert math.isclose(
+                        scaling_factor, target_gradient_scaling_factor, rel_tol=1e-9
+                    )
 
             param_layout = (
                 full_param_layout.layouts.get(buffer_key) if full_param_layout is not None else None
@@ -694,11 +712,35 @@ class DistributedDataParallel(_BaseDataParallel):
                 return
 
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            # LayerWise buckets force-synced right before their fp32 masters were offloaded
+            # (LayerWiseDistributedOptimizer.start_param_sync_for_bucket_group_subset under
+            # chunked optimizer-state offload) stay pinned until the next dispatch-state reset:
+            # the aligned VPP schedule revisits them through this entry, and re-gathering would
+            # stage stale weights from CPU-resident masters. Any other completed gather, e.g. a
+            # manual force_sync while the forward hooks are disabled, is re-dispatched as before.
+            if (
+                not force_sync
+                and not force_dispatch
+                and bucket_group.param_gather_pinned_before_master_offload
+                and bucket_group.param_gather_dispatched
+                and bucket_group.param_gather_handle is None
+            ):
+                continue
             self._start_bucket_group_param_sync(bucket_group, force_sync=force_sync)
 
-    def reset_param_sync_dispatch_state(self):
-        """Mark DDP param all-gathers as not dispatched for the next forward pre-hook."""
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+    def reset_param_sync_dispatch_state(self, bucket_groups=None):
+        """Mark DDP param all-gathers as not dispatched for the next forward pre-hook.
+
+        Args:
+            bucket_groups (list, optional): the bucket groups to reset; all bucket groups of
+                this model chunk by default. An optimizer that re-stages its own param buffers
+                passes only the bucket groups it owns, so a sibling optimizer's completed
+                gathers (e.g. LayerWise groups force-synced before their fp32 masters were
+                offloaded to CPU) keep their state.
+        """
+        if bucket_groups is None:
+            bucket_groups = self.bucket_groups + self.expert_parallel_bucket_groups
+        for bucket_group in bucket_groups:
             # A non-None handle means the previous all-gather is still in flight. Resetting only
             # the dispatch flag would create the invalid state
             # `param_gather_dispatched=False, param_gather_handle!=None` and could dispatch a
@@ -708,6 +750,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 "parameter all-gather is still in flight."
             )
             bucket_group.param_gather_dispatched = False
+            bucket_group.param_gather_pinned_before_master_offload = False
 
     @_otel_trace_fn('communication', 'megatron.grad_sync.start')
     def start_grad_sync(self, *unused):

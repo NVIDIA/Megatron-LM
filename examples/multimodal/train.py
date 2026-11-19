@@ -17,6 +17,7 @@ from model import model_provider
 from multimodal_args import add_multimodal_extra_args
 
 from megatron.core import mpu, parallel_state, tensor_parallel
+from megatron.core.distributed import TorchFullyShardedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, LLaVAModel
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -163,7 +164,7 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
     if imgs.shape == torch.Size([1, 1]):
         # FSDP can hang with text-only samples. A workaround is to run a valid dummy image through the vision
         # model and then add image embeddings with a zero multiplier.
-        if cfg.dist.use_torch_fsdp2:
+        if isinstance(cfg.ddp, TorchFullyShardedDataParallelConfig):
             imgs = torch.zeros(
                 (1, 3, args.img_h, args.img_w), dtype=torch.float32, device=data_text.device
             )
@@ -529,7 +530,7 @@ def run_online_eval(model):
     # The inference code assumes the first rank is the leader.
     # Tensorboard writer is on the last rank.
     # We must write to a storage space that all ranks see.
-    output_dir = os.path.join(args.save, "online_eval")
+    output_dir = os.path.join(get_run_config().checkpoint.save, "online_eval")
     os.makedirs(output_dir, exist_ok=True)
 
     # Use the common evaluation loop
@@ -554,11 +555,11 @@ def write_online_eval_to_tensorboard(data, iteration, writer, walltime=None):
     """Write online evaluation data to Tensorboard."""
     import shutil
 
-    args = get_args()
+    checkpoint = get_run_config().checkpoint
 
     # Define source and destination directories
-    source_dir = os.path.join(args.save, "online_eval")
-    destination_dir = os.path.join(args.save, f"online_eval_{iteration}")
+    source_dir = os.path.join(checkpoint.save, "online_eval")
+    destination_dir = os.path.join(checkpoint.save, f"online_eval_{iteration}")
     if os.path.exists(source_dir):
         print("Moving online eval data from", source_dir, "to", destination_dir)
 
@@ -577,7 +578,11 @@ if __name__ == "__main__":
         extra_args_provider=add_multimodal_extra_args,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
-    full_config = pretrain_cfg_container_from_args(args)
+    from megatron.training.argument_utils import model_config_from_args
+    from megatron.training.models import LLaVAModelConfig
+
+    model_cfg = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
+    full_config = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(full_config)
     pretrain(
         full_config,

@@ -54,7 +54,7 @@ def is_managed_by_layer_wise_optimizer(param: torch.nn.Parameter) -> bool:
     """
     if not getattr(param, 'use_muon', True):
         return False
-    if not param.dim() == 2:
+    if param.dim() != 2 and getattr(param, "muon_matrix_shape", None) is None:
         return False
     if getattr(param, 'is_embedding_or_output_parameter', False):
         return False
@@ -316,9 +316,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             GTP-sharded params reconstruct the full post-AllGather shape first
             (GTP always shards along dim 0).
             """
-            if param.dim() != 2:
+            matrix_shape = getattr(param, "muon_matrix_shape", None)
+            if param.dim() != 2 and matrix_shape is None:
                 return param.data.nelement()
-            m, n = param.data.shape
+            m, n = matrix_shape if matrix_shape is not None else param.data.shape
             if getattr(param, 'is_gtp_weight_remat', False):
                 m = m * getattr(param, 'gtp_remat_size', 1)
             small = min(m, n)
@@ -382,6 +383,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     shard_compute_loads[min_shard] += _ns_compute_cost(param)
 
             padded_shard_size = pad_to_divisor(max(shard_cursors), shard_divisor)
+            # The shard is the fullest bin, so one outsized param forces every shard to
+            # its size however well the rest pack. Log the largest to tell those apart.
+            sizes = sorted((p.data.nelement() for p in chunk_params if p is not None), reverse=True)
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"Layerwise bucket {bucket_id}: shard={padded_shard_size} x dp={dp_size}, "
+                f"real={sum(sizes)}, largest={sizes[:3]}",
+            )
             bucket_start_index = buffer_cursor
             for shard_id in range(dp_size):
                 shard_start_index = bucket_start_index + shard_id * padded_shard_size
@@ -669,6 +679,17 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 for chunk in model_chunks
                 if hasattr(chunk, 'full_param_layout') and chunk.full_param_layout is not None
             ] or None
+        # Mark all main weights as DP-sharded so parameter norms count only owners.
+        if config.bf16:
+            for optimizer in optimizers:
+                for group in optimizer.param_groups:
+                    for param in group['params']:
+                        if param.requires_grad and param.type() in [
+                            'torch.cuda.HalfTensor',
+                            'torch.cuda.BFloat16Tensor',
+                        ]:
+                            param.main_param_sharded = True
+
         # Decouple path keeps whole-matrix ping-pong ownership (Newton-Schulz runs on whole
         # matrices on one rank; param sync via ``allgather_params``). ``model_chunks`` lets the
         # ping-pong fallback break equal-numel ties by a rank-independent identity (see below).
@@ -775,6 +796,17 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 and config.optimizer_state_offload_fraction > 0.0
             ):
                 from .emerging_optimizers import TensorParallelMuon
+
+                # The offload lifecycle (pre-forward master restore, forced LayerWise gather,
+                # master offload) is wired for the compact layout, whose fp8 gather stages from
+                # the fp32 masters. The padded layout all-gathers the DDP param buffer the
+                # step updated in place and has no such staging point, so reject it here as
+                # well as in OptimizerConfig.
+                if not self.decouple_ddp_layout:
+                    raise ValueError(
+                        "Muon chunked optimizer-state offload requires the compact LayerWise "
+                        "layout (use_layer_wise_param_layout=False); got the padded layout."
+                    )
 
                 offload_children = []
                 state_dtypes = (torch.float32,)
@@ -1485,6 +1517,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         :meth:`DistributedDataParallel._start_bucket_group_param_sync` so FP8
         post-all-gather processing (and MXFP8 copy) still runs.
         """
+        # A forced pre-forward sync under chunked optimizer-state offload is the last gather
+        # that may read the fp32 masters before they move to CPU: pin those buckets so the
+        # regular DDP dispatch (e.g. the aligned VPP schedule) does not re-gather them until
+        # the next dispatch-state reset.
+        # getattr: duck-typed callers (unit tests) may not carry the offload query.
+        requires_pre_forward_sync = getattr(
+            self, "optimizer_state_offload_requires_pre_forward_param_sync", None
+        )
+        pin = force_sync and requires_pre_forward_sync is not None and requires_pre_forward_sync()
         for model_chunk in self.model_chunks:
             for bucket_group in (
                 model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
@@ -1493,6 +1534,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     bucket_group.buckets[0]
                 ):
                     model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=force_sync)
+                    if pin:
+                        bucket_group.param_gather_pinned_before_master_offload = True
 
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
@@ -1577,16 +1620,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # Adjust dict rank 0 output correct global metadata into common_dict
         for sd in wrapped_sharded_state_dict.values():
             # wrap empty containers into LocalNonpersistentObject so it won't be saved/loaded
-            # params is already wrapped, we only need to handle fp32_from_fp16_params and state
-            # more details in load_state_dict comment
-            if 'fp32_from_fp16_params' in sd:
-                sd['fp32_from_fp16_params'][:] = [
-                    group if group else LocalNonpersistentObject(group)
-                    for group in sd['fp32_from_fp16_params']
-                ]
-                sd['fp32_from_fp16_params'] = {
-                    i: v for i, v in enumerate(sd['fp32_from_fp16_params'])
-                }
+            # params and fp32_from_fp16_params are already handled by the wrapped optimizers,
+            # we only need to handle state
             # state is a single dict and will be empty if optimizer is fully empty
             if not sd['optimizer']['state']:
                 sd['optimizer']['state'] = LocalNonpersistentObject(sd['optimizer']['state'])
