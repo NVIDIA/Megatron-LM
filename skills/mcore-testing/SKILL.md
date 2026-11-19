@@ -1,8 +1,7 @@
 ---
 name: mcore-testing
-description: Test system for Megatron-LM. Covers test layout, recipe YAML structure, adding and running unit and functional tests, golden values, marker filters, and CI parity.
+description: Test system for Megatron-LM. Covers test layout, recipe YAML structure, adding and running unit and functional tests, golden values, marker filters, and CI parity. Use when adding or running a unit or functional test; understanding the test layout; writing a recipe YAML; downloading or updating golden values; reproducing a test failure locally; 'how do I add a test', 'run unit tests', 'pytest fails', 'test layout', 'golden values', 'recipe YAML', 'marker filter'.
 license: Apache-2.0
-when_to_use: Adding or running a unit or functional test; understanding the test layout; writing a recipe YAML; downloading or updating golden values; reproducing a test failure locally; 'how do I add a test', 'run unit tests', 'pytest fails', 'test layout', 'golden values', 'recipe YAML', 'marker filter'.
 metadata:
   author: Oliver Koenig <okoenig@nvidia.com>
 ---
@@ -168,6 +167,64 @@ For ad-hoc runs, prefer the direct `torch.distributed.run` invocations above.
 
 ## Adding a Unit Test
 
+### Choose focused behavioral coverage
+
+- **Write succinct, necessary tests only. There is a limited GPU budget.**
+  Protect changed behavior with focused coverage. Bug fixes should include
+  a focused regression test where practical, even when the fix is small or
+  mechanically simple; change size is not a reason to omit regression
+  coverage.
+- **Inspect nearby tests before adding coverage.** Extend or parameterize
+  existing tests when appropriate; do not duplicate behavior checks.
+  Identical line coverage alone does not establish redundancy.
+- **Assert meaningful results against independent expectations.** Do not
+  reproduce production logic, assert only mocked return values, or check
+  private call sequences without a behavioral reason.
+- **Use representative cases and relevant boundaries.** Do not generate
+  exhaustive matrices of shapes, dtypes, seeds, and TP/PP/DP configurations
+  by default. Each additional dimension or case should address a distinct
+  failure mode.
+- **Reuse fixtures and helpers and keep compute costs proportional.** Avoid
+  unnecessary GPU allocation, distributed launches, large tensors, model
+  downloads, or new dependencies when a smaller test adequately validates
+  the behavior. Follow the target suite's runner and fixture requirements;
+  retain GPU or distributed execution when it is needed to exercise the
+  changed behavior. These scope rules do not waive the kernel determinism
+  coverage required in the implementation steps below.
+
+### Test behavior, not configuration snapshots
+
+- **Do not test recipe or test-script settings.** Do not add a unit test
+  that only asserts that a key in an existing config, or an argument in an
+  existing functional or nightly test script, has a given value. Do not
+  unit-test functional test scripts at all; running them is their test.
+  Recipe and script changes have a reason; snapshot assertions only fail CI
+  on the next intentional change. A check across all configs that prevents
+  a known issue is appropriate, such as rejecting a parallelism combination
+  with a documented accuracy bug.
+- **Do not add a unit test that only checks that an individual shipped
+  example config loads or validates.** Put shared loading, inheritance, and
+  schema-validation checks in a parametrized config-validation test. Extend
+  that coverage when a new kind of config needs a check instead of adding
+  a separate test for each config. Check for existing coverage first; do not
+  assume every shipped config is already covered.
+- **Do not add a unit test that only asserts a config field's default
+  value.** A default change affects every run that omits the key; its reason
+  belongs in the PR, not in a test that fails on the change. Test what the
+  code does with the value instead, such as rejecting an invalid combination
+  or computing a derived property.
+- **Do not add a unit test that only checks what Pydantic already does.**
+  This includes omitted fields falling back to defaults, passed values
+  reading back unchanged, and rejection of missing required fields or
+  violations of a `Literal`, type, or `Field` constraint (`ge`, `gt`,
+  `allow_inf_nan`, `PositiveInt`). Test these cases only when our own code
+  sits between the input and the model, such as a custom merge or a
+  `mode="before"` validator. For a custom validator, testing that an edge
+  value is accepted is appropriate: constructing the model without an error
+  is the check, so do not read the value back.
+
+### Implementation steps
+
 1. Create `tests/unit_tests/<category>/test_<name>.py`.
 2. Use fixtures from `tests/unit_tests/conftest.py`.
 3. Apply markers as needed:
@@ -196,7 +253,12 @@ For ad-hoc runs, prefer the direct `torch.distributed.run` invocations above.
 3. Add a YAML recipe under `tests/test_utils/recipes/h100/` (and `gb200/` if
    needed). Required fields: `scope`, `environment`, `platform`, `n_repeat`,
    `time_limit`.
-4. Push the PR, add the label **"Run functional tests"** to trigger a full run.
+4. Request **"Run Merge-Queue jobs"** to use the actual merge-group configuration:
+   one repetition, L1 scope, merge-group cadence filtering, full unit buckets,
+   and normal training steps and golden comparisons. **"Run functional tests"**
+   requests five repetitions and bypasses cadence filtering. Apply the label
+   before the synthetic PR push or rerun the workflow after changing labels;
+   labels alone do not start CI.
 5. After a successful run, download golden values:
 
    ```bash

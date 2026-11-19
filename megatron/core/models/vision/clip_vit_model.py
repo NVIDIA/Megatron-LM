@@ -280,6 +280,9 @@ def _get_num_non_spatial_embeddings(
     elif vision_model_type == "cradio-g":
         class_token_len = 8
         keep_class_token = not disable_vision_class_token
+    elif vision_model_type in ("pixtral-vit", "pixtral-vit-large", "qwen-vl", "kimi-vit"):
+        # Native mcore ViTs are built without class tokens.
+        keep_class_token = False
     elif "radio" in vision_model_type:
         keep_class_token = not disable_vision_class_token
     elif vision_model_type.startswith("hf://"):

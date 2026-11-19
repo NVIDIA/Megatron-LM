@@ -25,7 +25,10 @@ from megatron.core.models.vision.clip_vit_model import CLIPViTModel, get_num_ima
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.models.vision.radio import RADIOViTModel
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -99,6 +102,7 @@ class LLaVAModel(MegatronModule):
         language_rotary_base (int): RoPE base.
         language_rope_scaling (bool): Toggle RoPE scaling.
         language_rope_scaling_factor (float): RoPE scaling factor. Defaults to 8.
+        logit_dtype (torch.dtype, optional): Dtype of the language model's output-layer GEMM.
         image_token_index (int): Token ID for image token such as <image>.
         pixel_shuffle (bool): Enable pixel shuffle.
         conv_merging (bool): Account for a native 2x2 vision-token merger.
@@ -106,6 +110,9 @@ class LLaVAModel(MegatronModule):
         pg_collection (ProcessGroupCollection): Model communication process groups.
         vp_stage (int): Virtual pipeline stage.
     """
+
+    # Set by vision encoders (e.g. ViTModel) that read the per-image patch grid on the host.
+    _vision_reads_host_imgs_sizes = False
 
     def __init__(
         self,
@@ -137,6 +144,7 @@ class LLaVAModel(MegatronModule):
         language_rope_scaling_factor: float = 8.0,
         hybrid_layer_pattern: str = None,
         fp16_lm_cross_entropy: bool = False,
+        logit_dtype: Optional[torch.dtype] = None,
         image_token_index: int = DEFAULT_IMAGE_TOKEN_INDEX,
         pixel_shuffle: bool = False,
         conv_merging: bool = False,
@@ -176,8 +184,11 @@ class LLaVAModel(MegatronModule):
         )
 
         if pg_collection is None:
+            # A vision encoder and a language model may run on independent parallel grids, so the
+            # global grid is only a compatibility default.
+            warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        language_model_type = getattr(language_transformer_config, "language_model_type", "")
+        is_hybrid_language_model = language_transformer_config.is_hybrid_model
 
         # Constructor configuration and initial module state.
         self.pre_process = pre_process
@@ -219,11 +230,7 @@ class LLaVAModel(MegatronModule):
         self._balance_vision_context_parallel_by_tokens = balance_vision_context_parallel_by_tokens
         self._profile_vision_context_parallel_partition = profile_vision_context_parallel_partition
         if self.sequence_parallel_lm or self.context_parallel_lm > 1:
-            if not (
-                language_model_type.startswith('nemotron5-hybrid')
-                or language_model_type == 'nemotron6-moe'
-                or language_model_type == 'nemotron6-super'
-            ):  # pylint: disable=line-too-long
+            if not is_hybrid_language_model:
                 assert isinstance(
                     language_transformer_layer_spec.submodules, TransformerLayerSubmodules
                 )
@@ -258,9 +265,7 @@ class LLaVAModel(MegatronModule):
                 self.language_model = build_hf_model(
                     language_transformer_config, language_transformer_config.language_model_type
                 )
-            elif language_model_type.startswith(
-                ('nemotron5-hybrid', 'nemotron6-moe', 'nemotron6-super')
-            ):
+            elif is_hybrid_language_model:
                 self.language_model = HybridModel(
                     config=language_transformer_config,
                     hybrid_stack_spec=language_transformer_layer_spec,
@@ -274,9 +279,11 @@ class LLaVAModel(MegatronModule):
                     rotary_percent=language_rotary_percent,
                     rotary_base=language_rotary_base,
                     fp16_lm_cross_entropy=fp16_lm_cross_entropy,
+                    logit_dtype=logit_dtype,
                     scatter_embedding_sequence_parallel=False,
                     share_embeddings_and_output_weights=share_embeddings_and_output_weights,
                     pg_collection=self.pg_collection,
+                    vp_stage=self.vp_stage,
                 )
             else:
                 self.language_model = GPTModel(
@@ -292,6 +299,7 @@ class LLaVAModel(MegatronModule):
                     rotary_base=language_rotary_base,
                     rope_scaling=language_rope_scaling,
                     rope_scaling_factor=language_rope_scaling_factor,
+                    logit_dtype=logit_dtype,
                     scatter_embedding_sequence_parallel=False,
                     share_embeddings_and_output_weights=share_embeddings_and_output_weights,
                     pg_collection=self.pg_collection,
@@ -443,6 +451,7 @@ class LLaVAModel(MegatronModule):
                 class_token_len = 0
                 vmt = vision_transformer_config.vision_model_type
                 if vmt in ("pixtral-vit", "pixtral-vit-large"):
+                    self._vision_reads_host_imgs_sizes = True
                     self.vision_model = ViTModel(
                         transformer_config=vision_transformer_config,
                         transformer_layer_spec=vision_transformer_layer_spec,
@@ -455,6 +464,9 @@ class LLaVAModel(MegatronModule):
                         pg_collection=self.pg_collection,
                         vp_stage=self.vp_stage,
                     )
+                    # The native 2x2 merger always reduces the image tokens, whatever the
+                    # conv_merging argument says; token accounting must follow it.
+                    self._conv_merging = self._conv_merging or self.vision_model.merger is not None
                 elif vmt == "qwen-vl":
                     num_pos_per_side = int(
                         getattr(vision_transformer_config, 'num_position_embeddings', 2304) ** 0.5
@@ -1136,7 +1148,7 @@ class LLaVAModel(MegatronModule):
                 from megatron.core.utils import get_batch_on_this_cp_rank
 
                 batch = get_batch_on_this_cp_rank(
-                    batch, is_hybrid_cp=False, cp_group=self.pg_collection.cp
+                    batch, dynamic_cp=False, cp_group=self.pg_collection.cp
                 )
             else:
                 assert HAVE_TEX and is_te_min_version(
@@ -1377,6 +1389,7 @@ class LLaVAModel(MegatronModule):
                     vision_images,
                     imgs_sizes,
                     vision_packed_seq_params,
+                    cp_group=self.pg_collection.cp,
                     patch_dim=self.vision_model.patch_dim,
                     dummy_image_size=dummy_image_size,
                     fp8_enabled=self._vision_fp8,
@@ -1392,7 +1405,9 @@ class LLaVAModel(MegatronModule):
                 if local_num_frames is not None:
                     num_frames = local_num_frames.tolist()
             elif self.context_parallel_lm > 1 and imgs_sizes is None and images.shape[0] >= 2:
-                vision_images, static_vision_cp_pad = split_to_context_parallel_ranks(images)
+                vision_images, static_vision_cp_pad = split_to_context_parallel_ranks(
+                    images, cp_group=self.pg_collection.cp
+                )
 
             use_temporal = self.temporal_patch_dim > 1 and imgs_sizes is not None
             if use_temporal:
@@ -1475,7 +1490,16 @@ class LLaVAModel(MegatronModule):
                 if vision_packed_seq_params is not None:
                     vision_kwargs["packed_seq_params"] = vision_packed_seq_params
                 if imgs_sizes is not None:
-                    vision_kwargs["imgs_sizes"] = imgs_sizes
+                    # The inference engine keeps imgs_sizes on the device; copy them to the host for
+                    # ViTModel there. Training keeps ViTModel's error on device imgs_sizes, which
+                    # guards against unintended host syncs.
+                    vision_kwargs["imgs_sizes"] = (
+                        imgs_sizes.cpu()
+                        if self._vision_reads_host_imgs_sizes
+                        and inference_context is not None
+                        and torch.is_tensor(imgs_sizes)
+                        else imgs_sizes
+                    )
                 image_embeddings = self.vision_model(
                     vision_images, **vision_kwargs
                 )  # [num_tiles, img_seq_len, h_vision]
@@ -1605,15 +1629,21 @@ class LLaVAModel(MegatronModule):
 
             if dynamic_vision_cp:
                 image_embeddings = gather_from_context_parallel_ranks_dynamic_res(
-                    image_embeddings, num_padded_vision_ranks
+                    image_embeddings,
+                    cp_group=self.pg_collection.cp,
+                    num_padded_imgs=num_padded_vision_ranks,
                 )
                 if use_temporal:
                     imgs_sizes = gather_from_context_parallel_ranks_dynamic_res(
-                        imgs_sizes, num_padded_vision_ranks
+                        imgs_sizes,
+                        cp_group=self.pg_collection.cp,
+                        num_padded_imgs=num_padded_vision_ranks,
                     )
                     if tubelet_token_counts is not None:
                         tubelet_token_counts = gather_from_context_parallel_ranks_dynamic_res(
-                            tubelet_token_counts.unsqueeze(-1), num_padded_vision_ranks
+                            tubelet_token_counts.unsqueeze(-1),
+                            cp_group=self.pg_collection.cp,
+                            num_padded_imgs=num_padded_vision_ranks,
                         ).squeeze(-1)
                         media_token_counts = _align_temporal_token_counts_to_placeholders(
                             tubelet_token_counts,
@@ -1654,7 +1684,7 @@ class LLaVAModel(MegatronModule):
                 )
             elif static_vision_cp_pad is not None:
                 image_embeddings = gather_from_context_parallel_ranks(
-                    image_embeddings, static_vision_cp_pad
+                    image_embeddings, static_vision_cp_pad, cp_group=self.pg_collection.cp
                 )
 
             # Apply tile tagging if enabled and an image token is present.

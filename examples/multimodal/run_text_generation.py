@@ -42,7 +42,12 @@ from megatron.training import get_args, get_model, get_tokenizer, print_rank_0, 
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import (
+    get_run_config,
+    set_run_config,
+)
+from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.models import LLaVAModelConfig
 
 
 def is_first_rank():
@@ -157,14 +162,19 @@ def get_evaluation_dataloader(
 
 def generate_samples(model, config: EvaluationConfig, print_output):
     """Text generation using a trained vision language model."""
+    cfg = get_run_config()
+    if not isinstance(cfg.model, LLaVAModelConfig):
+        raise TypeError(
+            f"Expected cfg.model to be LLaVAModelConfig, got {type(cfg.model).__name__}"
+        )
     args = get_args()
 
     dataloader = get_evaluation_dataloader(
         config.task,
         config.input_image_path,
         config.gt_path,
-        args.img_h,
-        args.img_w,
+        cfg.model.img_h,
+        cfg.model.img_w,
         args.use_tiling,
         args.max_num_tiles,
         args.use_thumbnail,
@@ -178,16 +188,16 @@ def generate_samples(model, config: EvaluationConfig, print_output):
     )
 
     num_img_embeddings_per_tile = get_num_image_embeddings(
-        args.img_h,
-        args.img_w,
-        args.patch_dim,
+        cfg.model.img_h,
+        cfg.model.img_w,
+        cfg.model.patch_dim,
         args.vision_model_type,
-        args.disable_vision_class_token,
+        cfg.model.drop_vision_class_token,
         1,
         args.pixel_shuffle,
         args.use_tile_tags,
         args.max_num_tiles,
-        args.tokenizer_prompt_format,
+        cfg.tokenizer.tokenizer_prompt_format,
     )
 
     if args.use_mcore_inference:
@@ -196,7 +206,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
             inference_batch_times_seqlen_threshold=args.inference_batch_times_seqlen_threshold,
             fp32_residual_connection=args.fp32_residual_connection,
             params_dtype=args.params_dtype,
-            padded_vocab_size=args.padded_vocab_size,
+            padded_vocab_size=cfg.tokenizer.padded_vocab_size,
         )
         inference_wrapped_model = VLMInferenceWrapper(model, inference_wrapper_config)
         tokenizer = get_tokenizer()
@@ -204,7 +214,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
             inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
         )
         inference_engine = StaticInferenceEngine(
-            controller, max_batch_size=1, random_seed=args.seed, legacy=True
+            controller, max_batch_size=1, random_seed=cfg.rng.seed, legacy=True
         )
         sampling_params = SamplingParams(
             temperature=config.temperature,
@@ -254,7 +264,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                     top_p_sampling=config.top_p,
                     add_BOS=False,
                     temperature=config.temperature,
-                    random_seed=args.seed,
+                    random_seed=cfg.rng.seed,
                     detokenize_segments=False,
                     data_parallel=True,
             )
@@ -295,7 +305,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                     raise NotImplementedError("no output name defined for", config.task)
 
                 prompt, generated = get_prompt_and_generated(
-                    generation, args.tokenizer_prompt_format
+                    generation, cfg.tokenizer.tokenizer_prompt_format
                 )
                 if config.task == "VideoMME":
                     output["questions"][0][output_name] = generated
@@ -844,9 +854,12 @@ def run_evaluation_loop(model, configs, output_dir_override=None, iteration=None
 
 def eval_tasks():
     """Vision language model text generation for single or batch tasks."""
+    from megatron.training.argument_utils import model_config_from_args
+
     args = parse_and_validate_args(extra_args_provider=add_text_generation_args)
-    initialize_runtime_services(args)
-    initialize_megatron()
+    model_cfg = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
+    set_run_config(inference_cfg_container_from_args(args, model_cfg))
+    initialize_megatron(training=False)
 
     args = get_args()
 

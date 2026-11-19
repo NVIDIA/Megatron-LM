@@ -15,7 +15,6 @@ from megatron.core.inference.communication_utils import (
 from megatron.core.inference.config import MultimodalPromptConfig
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import deprecate_args, get_attr_wrapped_model, get_model_config
 
 DEPRECATED_ARGS = ["inference_wrapper_config", "pg_collection"]
@@ -54,14 +53,6 @@ class AbstractModelInferenceWrapper(abc.ABC):
         ), 'interleaving schedule is not supported for inference'
         self.model = model
         self.config = get_model_config(self.model)
-        if getattr(self.config, "moe_shortcut_connection", False):
-            raise NotImplementedError(
-                "Inference is not supported with moe_shortcut_connection. The shortcut block "
-                "regroups each attention/MoE pair into one logical layer, so the decoder's "
-                "layers no longer line up with the physical layer types that recurrent state "
-                "discovery indexes them with, and its paired attention layer runs a "
-                "training-only two-stage path that never updates the KV cache."
-            )
         self.pipeline_communication_dtype = (
             torch.float if self.config.fp32_residual_connection else self.config.params_dtype
         )
@@ -74,14 +65,22 @@ class AbstractModelInferenceWrapper(abc.ABC):
         if configured_prompt_contract is not None:
             self.multimodal_prompt_config = configured_prompt_contract
 
-        # Get the inference pg_collection from the config if it exists; otherwise the training
-        # pg_collection might be used during RL
-        if (pg_collection := self.inference_context.config.pg_collection) is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        # Resolved once at the inference-config boundary; during RL this may be the training
+        # collection rather than an inference-specific one.
+        pg_collection = self.inference_context.config.resolve_pg_collection()
 
         self.tp_group = pg_collection.tp
         self.pp_group = pg_collection.pp
         self.tp_size = torch.distributed.get_world_size(self.tp_group)
+
+        if (
+            getattr(self.config, "enable_mhc_connections", False)
+            and torch.distributed.get_world_size(self.pp_group) > 1
+        ):
+            raise NotImplementedError(
+                "mHC inference with pipeline parallelism is not supported: receive buffers "
+                "do not account for the expanded residual streams."
+            )
 
         if self.config.fp8 is not None and self.config.transformer_impl != "inference_optimized":
             self.model = prepare_model_for_fp8_inference(self.model)
@@ -325,14 +324,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
         self.inference_context.increment_sequence_len_offset(seq_len)
 
-        logits = None
-        if is_pipeline_last_stage(self.pp_group):
-            logits = output_tensor
-
-            # Explicitly cast logits to expected dtype
-            logits = logits.to(self.config.params_dtype)
-
-        return logits
+        return output_tensor if is_pipeline_last_stage(self.pp_group) else None
 
     @torch.inference_mode()
     def run_one_forward_step(

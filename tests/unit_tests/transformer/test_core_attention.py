@@ -112,6 +112,7 @@ class TestDotProductAttentionSoftcap:
             layer_number=self._LAYER_NUMBER,
             attn_mask_type=AttnMaskType.causal,
             attention_type="self",
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp']),
         ).cuda()
 
     def _qkv(self, seed=7):

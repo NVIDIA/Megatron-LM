@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -15,6 +16,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.recompute import checkpointed_forward
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import dsa_indexer_loss, dsa_kernels
@@ -198,6 +200,92 @@ class TestDSAIndexShareHelpers:
         assert not hasattr(attention_mask, DSAttention._HOLDER_ATTR)
         assert not hasattr(attention_mask, DSAttention._LENGTH_HOLDER_ATTR)
 
+    @pytest.mark.parametrize("recompute_method", ["block", "uniform"])
+    def test_nonpacked_checkpointed_forwards_keep_index_share_holders_isolated(
+        self, monkeypatch, recompute_method
+    ):
+        config = SimpleNamespace(
+            dsa_indexer_topk=8,
+            dsa_indexer_topk_freq=4,
+            dsa_indexer_skip_topk_offset=1,
+            kv_channels=16,
+        )
+        attention = DSAttention(
+            config=config,
+            submodules=DSAttentionSubmodules(indexer=object()),
+            layer_number=2,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type="self",
+            softmax_scale=1.0,
+            pg_collection=SimpleNamespace(),
+        )
+        recomputed_supports = []
+
+        class HolderLayer:
+            layer_number = 2
+
+            def __call__(self, hidden_states, attention_mask, packed_seq_params, **_kwargs):
+                topk_holder = attention._get_index_share_topk_holder(
+                    packed_seq_params, attention_mask
+                )
+                length_holder = attention._get_index_share_topk_length_holder(
+                    packed_seq_params, attention_mask
+                )
+                if torch.is_grad_enabled():
+                    recomputed_supports.append((topk_holder[1].clone(), length_holder[1].clone()))
+                else:
+                    topk_holder[1] = hidden_states.detach().to(torch.int64)
+                    length_holder[1] = hidden_states.detach().to(torch.int32)
+                return hidden_states
+
+        block = SimpleNamespace(
+            config=SimpleNamespace(
+                experimental_attention_variant="dsa",
+                dsa_indexer_topk_freq=4,
+                fp8=False,
+                fp4=False,
+                enable_mhc_connections=False,
+                distribute_saved_activations=False,
+                recompute_method=recompute_method,
+                recompute_num_layers=1,
+            ),
+            layers=[HolderLayer()],
+            num_layers_per_pipeline_rank=1,
+            pg_collection=SimpleNamespace(tp=None),
+        )
+        checkpoint_calls = []
+
+        def fake_checkpoint(function, _distribute_saved_activations, *args):
+            checkpoint_calls.append((function, args))
+            with torch.no_grad():
+                return function(*args)
+
+        monkeypatch.setattr(
+            "megatron.core.transformer.utils.tensor_parallel.checkpoint", fake_checkpoint
+        )
+        shared_attention_mask = torch.empty(1)
+        for value in (1.0, 2.0):
+            checkpointed_forward(
+                block,
+                hidden_states=torch.tensor([value]),
+                attention_mask=shared_attention_mask,
+                context=None,
+                context_mask=None,
+                rotary_pos_emb=torch.empty(1),
+                attention_bias=None,
+                packed_seq_params=None,
+                use_inner_quantization_context=False,
+            )
+
+        for function, args in checkpoint_calls:
+            with torch.enable_grad():
+                function(*args)
+
+        assert [support.item() for support, _length in recomputed_supports] == [1, 2]
+        assert [length.item() for _support, length in recomputed_supports] == [1, 2]
+        assert not hasattr(shared_attention_mask, DSAttention._HOLDER_ATTR)
+        assert not hasattr(shared_attention_mask, DSAttention._LENGTH_HOLDER_ATTR)
+
 
 def _build_packed_causal_mask_for_test(
     query_idx: torch.Tensor, key_idx: torch.Tensor, cu_seqlens: torch.Tensor
@@ -357,6 +445,13 @@ def test_dsa_kernel_backend_selects_optional_kernel_module():
         == "megatron.core.transformer.experimental_attention_variant.dsa_cudnn_kernels"
     )
 
+    # The DSA-over-GQA backends load no module, so they behave like "none" here.
+    for backend in ("reference", "min-memory-torch", "min-memory-triton"):
+        config.dsa_kernel_backend = backend
+        assert dsa_kernels._get_backend_module_name(config) is None
+        assert not dsa_kernels.use_fused_dsa_kernels(config)
+
+    config.dsa_kernel_backend = "cudnn"
     config.attention_backend = "unfused"
     assert not dsa_kernels.use_fused_dsa_kernels(config)
 
@@ -1767,6 +1862,35 @@ def test_indexer_teacher_valid_zero_mass_has_zero_manual_gradient():
     torch.testing.assert_close(grad_k, torch.zeros_like(grad_k))
 
 
+def test_indexer_loss_empty_query_returns_zero_key_gradient():
+    """An empty query batch must not return an empty-shaped key gradient."""
+    q = torch.empty((0, 1, 1, 2), dtype=torch.float32)
+    weights = torch.empty((0, 1, 1), dtype=torch.float32)
+    k = torch.ones((3, 1, 2), dtype=torch.float32)
+    query = torch.empty((0, 1, 1, 2), dtype=torch.float32)
+    key = torch.ones((3, 1, 1, 2), dtype=torch.float32)
+
+    grad_q, grad_weights, grad_k = bwd_fused_indexer_loss_naive(
+        q=q,
+        weights=weights,
+        k=k,
+        query=query,
+        key=key,
+        topk_indices=torch.empty((1, 0, 1), dtype=torch.long),
+        softmax_scale=1.0,
+        loss_coeff=1.0,
+        sparse_loss=False,
+        mask=torch.empty((0, 3), dtype=torch.float32),
+        grad_loss=torch.tensor(1.0),
+        pg_collection=SimpleNamespace(tp=SimpleNamespace(size=lambda: 1)),
+    )
+
+    assert grad_q.shape == q.shape
+    assert grad_weights.shape == weights.shape
+    assert grad_k.shape == k.shape
+    torch.testing.assert_close(grad_k, torch.zeros_like(k))
+
+
 @pytest.mark.parametrize("seqlen_and_topk", [[16, 32], [64, 32]])
 class TestComputeDSAIndexerLoss:
     """Test compute_dsa_indexer_loss function."""
@@ -1968,6 +2092,11 @@ class TestDSAIndexerLossAutoScaler:
         )
         yield
         Utils.destroy_model_parallel()
+
+    @pytest.fixture(autouse=True)
+    def reset_loss_scale(self):
+        yield
+        DSAIndexerLossAutoScaler.main_loss_backward_scale = None
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_forward_pass(self):
@@ -2400,6 +2529,71 @@ class TestDSAIndexer:
         assert self.indexer.index_head_dim == 64
         assert self.indexer.index_topk == 32
         assert self.indexer.k_norm.eps == pytest.approx(1e-6)
+        assert all(not param.requires_grad for param in self.indexer.parameters())
+
+    def test_kpool_projection_precision_and_backward(self, seqlen):
+        self.indexer.cuda()
+        x = torch.randn(seqlen, 1, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        qr = torch.randn(seqlen, 1, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        gate = torch.nn.Parameter(torch.randn(64, 256, device="cuda", dtype=torch.bfloat16))
+        with (
+            patch.object(self.indexer, "index_kpool", 4),
+            patch.object(self.indexer, "index_kpool_compress_gate", gate),
+            patch.object(self.config, "dsa_indexer_rotate_activation", False),
+        ):
+            q, k, weights = self.indexer.forward_before_topk(x, qr)
+            gate_score = self.indexer._kpool_gate_score
+            assert q.dtype == k.dtype == gate_score.dtype == torch.bfloat16
+            torch.testing.assert_close(gate_score, torch.nn.functional.linear(x, gate))
+            (
+                q.float().sum() + k.float().sum() + weights.sum() + gate_score.float().sum()
+            ).backward()
+            assert torch.isfinite(x.grad).all()
+            assert torch.isfinite(qr.grad).all()
+            assert torch.isfinite(gate.grad).all()
+
+    @pytest.mark.parametrize("zero_centered", [False, True])
+    def test_k_norm_fp32_honors_zero_centered_gamma(self, seqlen, zero_centered):
+        """The explicit FP32 LayerNorm path must match TE's zero-centered gamma contract."""
+        del seqlen
+        self.indexer.cuda()
+        x = torch.randn(4, 1, 256, device="cuda", dtype=torch.bfloat16)
+        qr = torch.randn(4, 1, 64, device="cuda", dtype=torch.bfloat16)
+        original_weight = self.indexer.k_norm.weight.detach().clone()
+        original_bias = self.indexer.k_norm.bias.detach().clone()
+        original_fp32 = self.config.dsa_indexer_k_norm_fp32
+        original_zero_centered = self.config.layernorm_zero_centered_gamma
+        original_rotate = self.config.dsa_indexer_rotate_activation
+        try:
+            self.config.dsa_indexer_k_norm_fp32 = True
+            self.config.layernorm_zero_centered_gamma = zero_centered
+            self.config.dsa_indexer_rotate_activation = False
+            with torch.no_grad():
+                # TE stores gamma - 1 when zero-centered gamma is enabled.
+                self.indexer.k_norm.weight.fill_(0.0 if zero_centered else 1.0)
+                self.indexer.k_norm.bias.zero_()
+            with self.indexer._projection_quantization_context():
+                k_linear, _ = self.indexer.linear_wk(x)
+            with patch.object(
+                self.indexer, "_apply_rope", side_effect=lambda value, *args, **kwargs: value
+            ):
+                _, k, _ = self.indexer.forward_before_topk(x, qr)
+            expected = torch.nn.functional.layer_norm(
+                k_linear.float(),
+                (self.indexer.index_head_dim,),
+                torch.ones(self.indexer.index_head_dim, device="cuda"),
+                torch.zeros(self.indexer.index_head_dim, device="cuda"),
+                self.indexer.k_norm.eps,
+            ).to(dtype=k.dtype)
+            torch.testing.assert_close(k, expected)
+            assert torch.count_nonzero(k).item() > 0
+        finally:
+            with torch.no_grad():
+                self.indexer.k_norm.weight.copy_(original_weight)
+                self.indexer.k_norm.bias.copy_(original_bias)
+            self.config.dsa_indexer_k_norm_fp32 = original_fp32
+            self.config.layernorm_zero_centered_gamma = original_zero_centered
+            self.config.dsa_indexer_rotate_activation = original_rotate
 
     @pytest.mark.parametrize("interleaved", [False, True])
     def test_dsa_indexer_rope_interleave_follows_config(self, seqlen, interleaved):
@@ -2471,6 +2665,44 @@ class TestDSAIndexer:
         _assert_topk_indices_in_bounds_or_invalid(topk_indices, seqlen)
         # Make sure no duplicate indices are selected
         _assert_valid_topk_indices_unique(topk_indices)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_kpool_gate_score_released_after_selection(self, seqlen):
+        """KPool selection must not retain its token-aligned gate activation."""
+        self.indexer.cuda()
+        x = torch.randn(seqlen, 1, self.config.hidden_size, dtype=torch.bfloat16, device="cuda")
+        qr = torch.randn(seqlen, 1, self.config.q_lora_rank, dtype=torch.bfloat16, device="cuda")
+        gate = torch.nn.Parameter(
+            torch.randn(
+                self.indexer.index_head_dim,
+                self.config.hidden_size,
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+        )
+        seen_gate = []
+
+        def fake_kpool(*args, **kwargs):
+            del kwargs
+            seen_gate.append(args[5])
+            return (
+                torch.zeros(1, seqlen, seqlen, device="cuda", dtype=torch.float32),
+                torch.zeros(1, seqlen, 8, device="cuda", dtype=torch.long),
+            )
+
+        with (
+            patch.object(self.indexer, "index_kpool", 4),
+            patch.object(self.indexer, "index_topk", 8),
+            patch.object(self.indexer, "index_kpool_compress_gate", gate),
+            patch(
+                "megatron.core.transformer.experimental_attention_variant.dsa.fused_qk_topk_kpool",
+                side_effect=fake_kpool,
+            ),
+        ):
+            self.indexer.forward_with_scores(x, qr)
+
+        assert seen_gate and seen_gate[0] is not None
+        assert self.indexer._kpool_gate_score is None
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_dsa_indexer_forward_with_scores(self, seqlen):
@@ -3274,6 +3506,7 @@ class TestIndexerTensorParallel:
             dsa_indexer_n_heads=8,
             dsa_indexer_head_dim=64,
             dsa_indexer_topk=32,
+            dsa_indexer_loss_coeff=1.0,
         )
 
     def _create_indexer(self, config, pg_collection):

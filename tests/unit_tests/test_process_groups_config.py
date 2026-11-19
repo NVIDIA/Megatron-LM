@@ -14,6 +14,69 @@ from tests.unit_tests.test_utilities import Utils
 class TestProcessGroupsConfig:
     """Simple tests for process group dataclasses."""
 
+    def test_dp_cp_replicas_for_ddp_and_optimizer(self, mocker):
+        """Weight replica groups are used directly without multiplying by CP size."""
+        replicas = mocker.Mock(spec=dist.ProcessGroup)
+        replicas.size.return_value = 2
+        other = mocker.Mock(spec=dist.ProcessGroup)
+        other.size.return_value = 1
+        pg = ProcessGroupCollection(
+            dp=other,
+            dp_cp=replicas,
+            expt_dp=other,
+            tp=other,
+            pp=other,
+            ep=other,
+            mp=other,
+            tp_ep_pp=other,
+            intra_dist_opt=other,
+        )
+        config = mocker.Mock(context_parallel_size=128)
+        ddp_config = mocker.Mock(
+            num_distributed_optimizer_instances=1, use_distributed_optimizer=True
+        )
+        chunk = mocker.Mock(ddp_config=ddp_config)
+        ddp_groups = ProcessGroupCollection.setup_process_groups_for_ddp(pg, config, ddp_config)
+        optimizer_groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
+            pg, [chunk], use_gloo_process_groups=False
+        )
+        for groups in (ddp_groups, optimizer_groups):
+            assert groups["dp_cp_group"] is replicas
+            assert groups["intra_dp_cp_group"] is replicas
+
+    @pytest.mark.parametrize("has_ddp_config", [True, False], ids=["fsdp", "no_ddp_config"])
+    def test_intra_dist_opt_passes_through_without_ddp_distributed_optimizer(
+        self, mocker, has_ddp_config
+    ):
+        """Megatron-FSDP leaves ddp_config.use_distributed_optimizer False but still needs the
+        intra distributed-optimizer group for gradient statistics. A model chunk without a
+        ddp_config gets the group from the collection too, like the parallel_state path."""
+        group = mocker.Mock(spec=dist.ProcessGroup)
+        group.size.return_value = 1
+        intra_dist_opt = mocker.Mock(spec=dist.ProcessGroup)
+        pg = ProcessGroupCollection(
+            dp=group,
+            dp_cp=group,
+            expt_dp=group,
+            tp=group,
+            pp=group,
+            ep=group,
+            mp=group,
+            tp_ep_pp=group,
+            intra_dist_opt=intra_dist_opt,
+        )
+        if has_ddp_config:
+            ddp_config = mocker.Mock(
+                num_distributed_optimizer_instances=1, use_distributed_optimizer=False
+            )
+            chunk = mocker.Mock(ddp_config=ddp_config)
+        else:
+            chunk = mocker.Mock(spec=[])
+        groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
+            pg, [chunk], use_gloo_process_groups=False
+        )
+        assert groups["intra_dist_opt_group"] is intra_dist_opt
+
     def test_transformer_process_groups(self, mocker):
         """Test basic functionality of TransformerProcessGroups."""
         mock_pg1 = mocker.Mock(spec=dist.ProcessGroup)

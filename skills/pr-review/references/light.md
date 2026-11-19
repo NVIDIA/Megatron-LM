@@ -12,10 +12,18 @@ this file → applicable style guidance → review).
 - Critical bugs or logic errors
 - Typos in code, comments, or strings
 - Missing or insufficient test coverage for changed code
+  - Follow the [focused coverage guidance](../../mcore-testing/SKILL.md#choose-focused-behavioral-coverage):
+    inspect existing tests and request only the coverage needed to protect
+    changed behavior, with representative cases and proportional compute
+    costs
+  - Apply the [unit-test scope rules](../../mcore-testing/SKILL.md#test-behavior-not-configuration-snapshots)
+    before requesting tests: do not request configuration snapshots,
+    functional-script unit tests, per-config load-only tests, default-value
+    assertions, or tests of built-in Pydantic behavior
   - If the PR adds a new feature or significant functionality without
     corresponding tests, suggest adding tests
   - If the PR fixes a bug that was not caught by an existing unit test, suggest
-    adding a regression test to prevent recurrence
+    adding a focused regression test where practical to prevent recurrence
 - Outdated or inaccurate documentation affected by the changes
 - Clear violations of [style-guide.md](../../../style-guide.md) in changed
   Python code that configured linters/formatters do not enforce
@@ -27,6 +35,14 @@ this file → applicable style guidance → review).
     migration fallback
   - Prefer passing a `ProcessGroupCollection` or explicit
     `torch.distributed.ProcessGroup` from the caller
+- GPU kernel changes without a determinism test
+  - If the PR adds or changes a GPU kernel (Triton kernel,
+    `jit_fuser`/`torch.compile` function, CUDA extension, Transformer Engine
+    or external-library dispatch, or a scatter/index accumulation), check that
+    a bit-exact determinism test under
+    `tests/unit_tests/determinism/kernels/` is added or updated and that the
+    kernel is registered in `tests/unit_tests/determinism/kernels/manifest.py`
+    (see `docs/developer/determinism/testing.md`)
 
 ## Do NOT comment on
 
@@ -37,7 +53,7 @@ this file → applicable style guidance → review).
 
 These are the strict-review categories. Raising them here turns a fast sanity
 check into a design debate the author did not ask for; if they want that, they
-will run `/claude strict-review`.
+will run `/review mode=strict`.
 
 ## Completion
 

@@ -16,6 +16,7 @@ Public API:
 
 import json
 import os
+import shutil
 import tarfile
 import tempfile
 from dataclasses import asdict
@@ -32,9 +33,9 @@ MODEL_WEIGHTS_NAME = "model_weights.ckpt"
 CHECKPOINT_NEMO_TRANSFORMER_AUDIO_CONFIG_NAME = "nemo_transformer_audio_config.json"
 CHECKPOINT_NEMO_AUDIO_PREPROCESSOR_CONFIG_NAME = "nemo_audio_preprocessor_config.json"
 
-# Encoder _target_s we know map onto the vendored ``transformer_encoder.TransformerEncoder``.
-# ``transformer_encoder_flex`` is parameter-compatible with the non-flex variant for
-# ``attn_mode == "full"`` (FlexAttention only adds attention-mask plumbing, not new params).
+# Encoder _target_s we know map onto one of the checkpoint-compatible vendored
+# Transformer encoders. ``self_attention_model=rope`` selects the RoPE tower;
+# other recognized configs select ``transformer_encoder.TransformerEncoder``.
 _KNOWN_ENCODER_TARGETS = {
     "nemo.collections.asr.modules.TransformerEncoder",
     "nemo.collections.asr.modules.transformer_encoder.TransformerEncoder",
@@ -62,10 +63,16 @@ def _load_omegaconf(path: str):
 
 
 def _torch_load(path: str) -> Any:
+    # SECURITY: .nemo archives are untrusted input. Never allow full pickle
+    # deserialization (weights_only=False) and never fall back to it when the
+    # installed torch lacks the ``weights_only`` kwarg.
     try:
-        return torch.load(path, map_location="cpu", weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location="cpu")
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError as e:
+        raise RuntimeError(
+            "Refusing to load .nemo weights: installed torch does not support "
+            "torch.load(weights_only=True). Please upgrade torch."
+        ) from e
 
 
 def _load_json(path: str | Path) -> Dict[str, Any]:
@@ -156,6 +163,21 @@ def resolve_nemo_audio_configs_from_args(
     left_context = getattr(args, "nemo_transformer_audio_left_context", None)
     if left_context is not None:
         encoder_cfg.left_context = None if left_context < 0 else left_context
+    # ``checkpoint`` is the no-override setting: preserve ``causal_mask`` from
+    # the resolved .nemo or JSON config rather than inferring it from weights.
+    causal_mode = getattr(args, "nemo_transformer_audio_causal_mode", "checkpoint")
+    if causal_mode not in ("checkpoint", "causal", "offline"):
+        raise ValueError(
+            "nemo_transformer_audio_causal_mode must be 'checkpoint', 'causal', or 'offline', "
+            f"got {causal_mode!r}"
+        )
+    if causal_mode != "checkpoint":
+        if encoder_cfg.architecture != "rope_transformer":
+            raise ValueError(
+                "Runtime causal/offline selection requires a rope_transformer audio checkpoint; "
+                f"got architecture={encoder_cfg.architecture!r}"
+            )
+        encoder_cfg.causal_mask = causal_mode == "causal"
     encoder_cfg.recompute_layers = bool(getattr(args, "recompute_audio", False))
     return encoder_cfg, preproc_cfg
 
@@ -213,15 +235,26 @@ def _extract_member(tar: tarfile.TarFile, member_name: str, out_dir: str) -> str
                 break
             seen.append(member.name)
             if os.path.basename(member.name) == member_name:
+                if not member.isreg():
+                    raise ValueError(
+                        f"Archive member {member.name!r} is not a regular file; refusing to extract"
+                    )
+                # Write to a fixed flat filename so the archive-controlled member
+                # path is never used on the filesystem (no traversal/symlinks).
+                dest = os.path.join(out_dir, member_name)
                 try:
-                    tar.extract(member, out_dir)
+                    src = tar.extractfile(member)
+                    if src is None:
+                        raise ValueError(f"Cannot read archive member {member.name!r}")
+                    with src, open(dest, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
                 except tarfile.ReadError as e:
                     raise ValueError(
                         f"Archive ended unexpectedly while extracting {member.name} "
                         f"from {tar.name}. The archive may be truncated or the member "
                         f"size metadata may not match the stored payload."
                     ) from e
-                return os.path.join(out_dir, member.name)
+                return dest
     except tarfile.ReadError as e:
         raise ValueError(
             f"Archive ended unexpectedly while searching for {member_name}; "
@@ -318,6 +351,17 @@ def _split_audio_configs(
     pre_cfg = dict(cfg["preprocessor"])
     if "causal_mask" not in enc_cfg and enc_cfg.get("attn_mode") == "causal":
         enc_cfg["causal_mask"] = True
+    # The LLM-style NeMo encoder names its input dimension ``feat_in`` and
+    # uses zero-padded frame stacking + fused QKV/RoPE. Keep this compatibility
+    # mapping here so config-only inspection produces the same model shape as
+    # a converted archive.
+    if "n_mels" not in enc_cfg and "feat_in" in enc_cfg:
+        enc_cfg["n_mels"] = enc_cfg["feat_in"]
+    if enc_cfg.get("self_attention_model") == "rope":
+        enc_cfg.setdefault("architecture", "rope_transformer")
+        enc_cfg.setdefault("pre_encode", "stacking")
+        enc_cfg.setdefault("stacking_pad_mode", "zeros")
+        enc_cfg.setdefault("attn_impl", "te")
 
     enc_target = enc_cfg.get("_target_", "")
     pre_target = pre_cfg.get("_target_", "")
@@ -426,8 +470,15 @@ def _validate_encoder_cfg(
         "n_layers",
         "pre_encode",
         "subsampling_factor",
+        "stacking_pad_mode",
         "qk_norm",
         "qkv_bias",
+        "architecture",
+        "self_attention_model",
+        "rope_base",
+        "rotary_fraction",
+        "ff_expansion",
+        "pre_block_norm",
     )
     mismatches = []
     for field in structural:

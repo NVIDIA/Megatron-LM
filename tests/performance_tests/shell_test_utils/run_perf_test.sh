@@ -33,6 +33,8 @@ for ARG in "$@"; do
     export "$KEY"="$VAL"
 done
 
+export NVTE_FLASH_ATTN_V4=0
+
 : "${CONFIG_PATH:?CONFIG_PATH (path to model_config.yaml) is required}"
 : "${CHECKPOINT_LOAD_PATH:?CHECKPOINT_LOAD_PATH is required}"
 : "${RESULTS_ROOT:?RESULTS_ROOT is required}"
@@ -73,6 +75,11 @@ mkdir -p "$SERVER_LOG_DIR" "$TORCHRUN_LOG_DIR"
 rm -f "$RESULTS_JSON"
 
 # ── Read model_config.yaml ────────────────────────────────────────────────────
+
+# Opt in only for configs using trusted legacy CI checkpoints.
+if [[ "$("$YQ" '.ENV_VARS.NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE // 0' "$CONFIG_PATH")" == 1 ]]; then
+    export NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE=1
+fi
 
 MODEL=$("$YQ" '.MODEL' "$CONFIG_PATH")
 TP=$("$YQ" '.TP // 1' "$CONFIG_PATH")
@@ -135,6 +142,7 @@ MODEL_ARGS+=(
     --tensor-model-parallel-size "$TP"
     --pipeline-model-parallel-size "$PP"
     --expert-model-parallel-size "$EP"
+    --flash-attention-version 2
 )
 
 # ── Make image-bundled extras (mamba-ssm) visible to the cog venv ─────────────

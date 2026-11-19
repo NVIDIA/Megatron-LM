@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Schedule-plan helpers shared by GPTModel and HybridModel.
 
@@ -16,11 +16,11 @@ from typing import Callable
 
 import torch
 
+from megatron.core.extensions.te_cuda_graphs import _TECudaGraphBackwardDWWrapperMixin
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
 from megatron.core.transformer.enums import CudaGraphModule
-from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
-from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
-from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
+from megatron.core.transformer.module import float16_to_fp32
+from megatron.core.utils import internal_api, make_viewless_tensor, nvtx_range_pop, nvtx_range_push
 
 
 def weak_method(method):
@@ -67,7 +67,7 @@ def should_free_input(name, is_moe, config, num_local_experts):
         return False
     enable_deepep = (
         config.moe_token_dispatcher_type == "flex"
-        and config.moe_flex_dispatcher_backend == "deepep"
+        and config.moe_flex_dispatcher_backend in ("deepep", "deepepv2")
     )
     enable_hybridep = (
         config.moe_token_dispatcher_type == "flex"
@@ -283,23 +283,46 @@ class TransformerLayerNode(ScheduleNode):
         """Free-input policy hook. Subclasses override to specialize."""
         return should_free_input(name, is_moe, config, num_local_experts)
 
+    def reset_for_recompute(self):
+        """Release this node's forward activations, keeping it reusable for a replay.
+
+        Called as soon as the node's recompute segment has finished forwarding, so a
+        recomputed layer's boundary tensors do not stay pinned for the rest of the chunk
+        forward; the same node is later re-run with grad enabled to rebuild its state.
+
+        Only the references are dropped. The storages are deliberately left intact: the
+        replay rebuilds the autograd graph on top of these tensors, so resizing them the
+        way ``ScheduleNode``'s ``free_input`` path does corrupts that graph.
+        """
+        self.inputs = None
+        self._output_edges = None
+        self.detached = tuple()
+        self.before_detached = tuple()
+
     def detach(self, t):
-        """Detach a tensor and remember it for backward through the schedule node."""
-        detached = make_viewless(t).detach()
-        detached.requires_grad = t.requires_grad
-        self.before_detached = self.before_detached + (t,)
-        self.detached = self.detached + (detached,)
+        """Detach a saved side output and retain only its producer gradient edge."""
+        t = make_viewless(t)
+        before_detached_edge = (
+            torch.autograd.graph.get_gradient_edge(t) if t.requires_grad else None
+        )
+        detached = t.detach()
+        detached.requires_grad_(t.requires_grad)
+        if before_detached_edge is not None:
+            self.before_detached = self.before_detached + (before_detached_edge,)
+            self.detached = self.detached + (detached,)
         return detached
 
     def forward_impl(self, *args):
         """Invoke the slot's submodule forward."""
         return self.submodule(self, *args)
 
-    def backward_impl(self, outputs, output_grad):
+    def backward_impl(self, output_edges, output_grads):
         """Run the slot's backward and return the input grads."""
-        detached_grad = tuple([e.grad for e in self.detached])
-        grads = output_grad + detached_grad
-        self.default_backward_func(outputs + self.before_detached, grads)
+        detached_grads = tuple(detached.grad for detached in self.detached)
+        grads = output_grads + detached_grads
+        self.default_backward_func(output_edges + self.before_detached, grads)
+        self.detached = tuple()
+        self.before_detached = tuple()
 
         return grads
 
@@ -381,22 +404,18 @@ class _BackwardDWWrapper:
     """Backward weight-gradient wrapper for a transformer pre-dispatch slot.
 
     Runs the layer's ``self_attention.backward_dw`` plus, on MoE layers, the
-    shared-expert ``backward_dw``; coordinates with the cuda-graph wgrad
-    capture (``set_graphed_backward_dw_callable``) so that scopes covered by
-    the graph are not re-run eagerly. Used when
+    shared-expert ``backward_dw``. Used when
     ``overlap_moe_expert_parallel_comm`` and ``delay_wgrad_compute`` are both
     enabled.
     """
 
-    def __init__(self, layer):
-        assert isinstance(
-            layer, GraphableMegatronModule
-        ), "cuda graphed ep overlap only supports GraphableMegatronModule."
+    def __init__(self, layer) -> None:
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
         assert isinstance(
             layer, TransformerLayer
-        ), "cuda graphed ep overlap only supports TransformerLayer for now."
+        ), "Delayed-wgrad EP overlap only supports TransformerLayer for now."
         self.layer = layer
-        self.graphed_backward_dw_callable = None
         self.attn_dw_callable = layer.self_attention.backward_dw
         self.submodules = [layer.self_attention]
         if layer.is_moe_layer:
@@ -407,24 +426,13 @@ class _BackwardDWWrapper:
                 self.submodules.append(layer.mlp.shared_experts)
         else:
             self.shared_expert_dw_callable = None
-        self.cuda_graph_modules = layer.config.cuda_graph_modules
 
     def backward_dw(self):
-        """Run eager or graphed backward wgrad callables for the wrapped layer."""
-        is_replay = hasattr(self.layer, 'cuda_graphs') and self.layer.cuda_graphs
-        if self.shared_expert_dw_callable is not None and (
-            not is_replay or CudaGraphModule.moe_router not in self.cuda_graph_modules
-        ):
+        """Run eager backward wgrad callables for the wrapped layer."""
+        if self.shared_expert_dw_callable is not None:
             self.shared_expert_dw_callable()
-        if not is_replay or CudaGraphModule.attn not in self.cuda_graph_modules:
-            self.attn_dw_callable()
-        if is_replay and self.graphed_backward_dw_callable is not None:
-            self.graphed_backward_dw_callable()
+        self.attn_dw_callable()
         self.layer = None
-
-    def set_graphed_backward_dw_callable(self, graphed_backward_dw_callable):
-        """Plug the cuda-graph backward wgrad replay callable."""
-        self.graphed_backward_dw_callable = graphed_backward_dw_callable
 
     def parameters(self):
         """Yield parameters from the wrapped layer's wgrad submodules.
@@ -436,3 +444,7 @@ class _BackwardDWWrapper:
         for module in self.submodules:
             for param in module.parameters():
                 yield param
+
+
+class _TECudaGraphBackwardDWWrapper(_TECudaGraphBackwardDWWrapperMixin, _BackwardDWWrapper):
+    """Backward weight-gradient wrapper with TE CUDA graph replay."""

@@ -129,6 +129,80 @@ def ref_swizzle(input_matrix) -> torch.Tensor:
 
 class TestMxfp8Quantize:
 
+    @staticmethod
+    def _make_layout_input(layout, dtype):
+        if layout == "transpose":
+            return torch.randn(160, 129, device="cuda", dtype=dtype).t()
+        if layout == "row_slice":
+            return torch.randn(258, 160, device="cuda", dtype=dtype)[::2]
+        if layout == "column_slice":
+            return torch.randn(129, 320, device="cuda", dtype=dtype)[:, ::2]
+        if layout == "offset":
+            return torch.randn(130, 160, device="cuda", dtype=dtype)[1:]
+        return torch.randn(129, 160, device="cuda", dtype=dtype)
+
+    @pytest.mark.parametrize(
+        "layout", ["transpose", "row_slice", "column_slice", "offset", "contiguous"]
+    )
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+    @pytest.mark.parametrize("api", ["allocate", "into_uint8", "into_e8m0", "tensor"])
+    def test_input_layout_matches_contiguous(self, layout, dtype, api):
+        """Read logical values for each layout without changing inputs or output storage."""
+        x = self._make_layout_input(layout, dtype)
+        original = x.clone()
+        expected_data, expected_scale = mxfp8_quantize(x.contiguous())
+
+        if api == "allocate":
+            data, scale = mxfp8_quantize(x)
+        elif api == "tensor":
+            quantized = MXFP8Tensor.from_bf16(x, backend="triton")
+            data, scale = quantized.data, quantized.scale
+        else:
+            data = torch.empty_like(expected_data)
+            scale = torch.full_like(expected_scale.view(torch.uint8), 0xFF)
+            if api == "into_e8m0":
+                scale = scale.view(torch.float8_e8m0fnu)
+            pointers = (data.data_ptr(), scale.data_ptr())
+            mxfp8_quantize_into(x, data, scale)
+            assert (data.data_ptr(), scale.data_ptr()) == pointers
+
+        torch.testing.assert_close(
+            data.view(torch.uint8), expected_data.view(torch.uint8), atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            scale.view(torch.uint8), expected_scale.view(torch.uint8), atol=0, rtol=0
+        )
+        torch.testing.assert_close(x, original, atol=0, rtol=0)
+
+    @pytest.mark.parametrize("layout", ["transpose", "row_slice", "column_slice"])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+    def test_strided_input_cuda_graph_replay(self, layout, dtype):
+        """Captured input normalization must read updated values on every replay."""
+        x = self._make_layout_input(layout, dtype)
+        expected_data, expected_scale = mxfp8_quantize(x.contiguous())
+        data, scale = torch.empty_like(expected_data), torch.empty_like(expected_scale)
+        pointers = (data.data_ptr(), scale.data_ptr())
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            mxfp8_quantize_into(x, data, scale)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            mxfp8_quantize_into(x, data, scale)
+
+        for _ in range(3):
+            x.copy_(torch.randn(x.shape, device=x.device, dtype=dtype))
+            expected_data, expected_scale = mxfp8_quantize(x.contiguous())
+            graph.replay()
+            assert (data.data_ptr(), scale.data_ptr()) == pointers
+            torch.testing.assert_close(
+                data.view(torch.uint8), expected_data.view(torch.uint8), atol=0, rtol=0
+            )
+            torch.testing.assert_close(
+                scale.view(torch.uint8), expected_scale.view(torch.uint8), atol=0, rtol=0
+            )
+
     @pytest.mark.parametrize(
         "M,K",
         [
@@ -1025,6 +1099,209 @@ class TestPermuteAndQuantizeMxfp8:
             assert (
                 offs[i].item() % alignment == 0
             ), f"Offset {i}={offs[i].item()} not aligned to {alignment}"
+
+    def test_batch_invariant_outputs_match_separate_permute_and_quantize(self):
+        """Fused batch-invariant preprocessing preserves every logical routed row."""
+        from megatron.core.inference.moe.permute import permute_and_quantize_mxfp8, permute_tokens
+
+        num_tokens, K, topk, num_experts = 17, 256, 2, 4
+        hidden, probs, _ = self._make_inputs(num_tokens, K, topk, num_experts)
+        token_ids = torch.arange(num_tokens, device="cuda")
+        routing_map = torch.stack((token_ids % num_experts, (token_ids + 1) % num_experts), dim=1)
+        valid_tokens = _vt(num_tokens - 3)
+
+        permuted, separate_probs, separate_map, separate_offs, separate_inverse = permute_tokens(
+            hidden,
+            probs,
+            routing_map,
+            0,
+            num_experts,
+            valid_tokens,
+            alignment=128,
+            row_alignment=128,
+            zero_padding=True,
+            return_batch_invariant_inverse_map=True,
+        )
+        separate = MXFP8Tensor.from_bf16(permuted, backend="triton")
+        fused, fused_probs, fused_map, fused_offs, fused_inverse = permute_and_quantize_mxfp8(
+            hidden,
+            probs,
+            routing_map,
+            0,
+            num_experts,
+            valid_tokens,
+            alignment=128,
+            zero_padding=True,
+            return_batch_invariant_inverse_map=True,
+        )
+
+        assert torch.equal(fused_offs, separate_offs)
+        live = fused_inverse >= 0
+        assert torch.equal(live, separate_inverse >= 0)
+        fused_rows = fused_inverse[live].long()
+        separate_rows = separate_inverse[live].long()
+
+        def scale_bytes(tensor, rows):
+            scale_cols = tensor.data.shape[1] // 32
+            n_col_blocks = ceil_div(scale_cols, 4)
+            rows = rows[:, None]
+            cols = torch.arange(scale_cols, device="cuda")[None, :]
+            offsets = (
+                (rows // 128 * n_col_blocks + cols // 4) * 512
+                + rows % 32 * 16
+                + (rows % 128) // 32 * 4
+                + cols % 4
+            )
+            return tensor.scale.view(torch.uint8)[offsets]
+
+        assert torch.equal(fused_map[fused_rows], separate_map[separate_rows])
+        torch.testing.assert_close(
+            fused_probs[fused_rows], separate_probs[separate_rows], atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            fused.data[fused_rows].view(torch.uint8),
+            separate.data[separate_rows].view(torch.uint8),
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            scale_bytes(fused, fused_rows), scale_bytes(separate, separate_rows), atol=0, rtol=0
+        )
+
+        n_used = int(fused_offs[-1].item())
+        fused_padding = fused_map[:n_used] < 0
+        separate_padding = separate_map[:n_used] < 0
+        torch.testing.assert_close(
+            fused.data[:n_used][fused_padding].view(torch.uint8),
+            separate.data[:n_used][separate_padding].view(torch.uint8),
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            scale_bytes(fused, fused_padding.nonzero().flatten()),
+            scale_bytes(separate, separate_padding.nonzero().flatten()),
+            atol=0,
+            rtol=0,
+        )
+
+    @pytest.mark.parametrize("activation_type", ["squared_relu", "swiglu"])
+    def test_batch_invariant_moe_dispatches_fused_permute_quantize(
+        self, monkeypatch, activation_type
+    ):
+        """The MCore MXFP8 batch-invariant route must use fused input preprocessing."""
+        from megatron.core.inference.moe import fused_moe
+
+        num_tokens, hidden_size, ffn_size, topk, num_experts = 8, 128, 128, 2, 4
+        hidden, probs, routing_map = self._make_inputs(num_tokens, hidden_size, topk, num_experts)
+
+        def stack_weight(out_features, in_features):
+            weights = [
+                MXFP8Tensor.from_bf16(
+                    torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16),
+                    backend="triton",
+                )
+                for _ in range(num_experts)
+            ]
+            return MXFP8Tensor(
+                data=torch.stack([weight.data for weight in weights]),
+                scale=torch.stack([weight.scale for weight in weights]),
+                dtype=torch.bfloat16,
+                backend="triton",
+            )
+
+        fused_calls = 0
+        real_fused_permute = fused_moe.permute_and_quantize_mxfp8
+
+        def tracked_fused_permute(*args, **kwargs):
+            nonlocal fused_calls
+            fused_calls += 1
+            return real_fused_permute(*args, **kwargs)
+
+        def fake_grouped_mm(act, weight, _offs):
+            return torch.zeros(
+                act.data.shape[0], weight.data.shape[1], device="cuda", dtype=torch.bfloat16
+            )
+
+        monkeypatch.setattr(fused_moe, "permute_and_quantize_mxfp8", tracked_fused_permute)
+        monkeypatch.setattr(fused_moe, "_mxfp8_grouped_mm", fake_grouped_mm)
+        monkeypatch.setattr(fused_moe.batch_invariant, "enabled", lambda: True)
+
+        is_swiglu = activation_type == "swiglu"
+        fc1 = stack_weight(ffn_size * (2 if is_swiglu else 1), hidden_size)
+        fc2 = stack_weight(hidden_size, ffn_size)
+        activation = (
+            fused_moe.ActivationType.SWIGLU if is_swiglu else fused_moe.ActivationType.SQUARED_RELU
+        )
+        with torch.no_grad():
+            output = fused_moe.mcore_fused_moe(
+                hidden, probs, fc1, fc2, activation, num_experts, 0, _vt(num_tokens), routing_map
+            )
+
+        assert fused_calls == 1
+        assert output.shape == hidden.shape
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.parametrize("activation_type", ["squared_relu", "swiglu"])
+    def test_batch_invariant_moe_fused_matches_unfused(self, activation_type):
+        """Fused input preprocessing preserves the complete MXFP8 MoE output bitwise."""
+        from megatron.core.inference.moe import fused_moe
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+
+        if not fused_moe.HAVE_SCALED_GMM or torch.cuda.get_device_capability() != (10, 0):
+            pytest.skip("MXFP8 scaled_grouped_mm parity requires PyTorch 2.10+ and SM100")
+
+        torch.manual_seed(1234)
+        num_tokens, hidden_size, ffn_size, topk, num_experts = 17, 128, 128, 2, 4
+        hidden, probs, _ = self._make_inputs(num_tokens, hidden_size, topk, num_experts)
+        token_ids = torch.arange(num_tokens, device="cuda")
+        routing_map = torch.stack((token_ids % num_experts, (token_ids + 1) % num_experts), dim=1)
+        valid_tokens = _vt(num_tokens - 3)
+
+        def stack_weight(out_features, in_features):
+            weights = [
+                MXFP8Tensor.from_bf16(
+                    torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16),
+                    backend="triton",
+                )
+                for _ in range(num_experts)
+            ]
+            return MXFP8Tensor(
+                data=torch.stack([weight.data for weight in weights]).contiguous(),
+                scale=torch.stack([weight.scale for weight in weights]).contiguous(),
+                dtype=torch.bfloat16,
+                backend="triton",
+            )
+
+        is_swiglu = activation_type == "swiglu"
+        fc1 = stack_weight(ffn_size * (2 if is_swiglu else 1), hidden_size)
+        fc2 = stack_weight(hidden_size, ffn_size)
+        activation = (
+            fused_moe.ActivationType.SWIGLU if is_swiglu else fused_moe.ActivationType.SQUARED_RELU
+        )
+
+        with torch.no_grad(), set_batch_invariant_mode(True, backend="te_native"):
+            fused = fused_moe.mcore_fused_moe(
+                hidden, probs, fc1, fc2, activation, num_experts, 0, valid_tokens, routing_map
+            )
+            unfused = fused_moe.mcore_fused_moe(
+                hidden,
+                probs,
+                fc1,
+                fc2,
+                activation,
+                num_experts,
+                0,
+                valid_tokens,
+                routing_map,
+                disable_fused_quant_kernels=True,
+            )
+
+        fused = fused[: num_tokens - 3]
+        unfused = unfused[: num_tokens - 3]
+        assert torch.count_nonzero(fused) > 0
+        assert torch.equal(fused.view(torch.uint8), unfused.view(torch.uint8))
 
 
 def _make_te_mxfp8_expert_linear(quantizer, out_features, in_features):

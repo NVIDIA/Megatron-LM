@@ -17,8 +17,10 @@ from megatron.core.extensions.transformer_engine import (
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-    HAVE_DEEPGEMM_BF16,
     assert_te_supports_batch_invariant_attention,
+    get_batch_invariant_backend,
+    matmul_persistent,
+    mean_batch_invariant,
     set_batch_invariant_mode,
     te_supports_batch_invariant_attention,
 )
@@ -63,6 +65,29 @@ def test_batch_invariant_rejects_incompatible_te(monkeypatch):
     monkeypatch.setattr(transformer_engine, "__version__", "2.17.0+deadbeef")
     with pytest.raises(AssertionError, match="TransformerEngine PR #3204"):
         assert_te_supports_batch_invariant_attention()
+
+
+@pytest.mark.parametrize("dim", ([], (), None))
+@pytest.mark.parametrize("keepdim", (False, True))
+def test_mean_batch_invariant_full_reduction(dim, keepdim):
+    """An empty (or None) dim list reduces over every dimension, as aten::mean does."""
+    x = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+    out = mean_batch_invariant(x, dim, keepdim=keepdim)
+    torch.testing.assert_close(out, x.mean(dim=(0, 1, 2), keepdim=keepdim))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_full_mean_under_batch_invariant_mode():
+    """`x.mean()` / `torch.mean(x)` dispatch to aten::mean.dim with dim=[]."""
+    x = torch.randn(4, 8, device="cuda", requires_grad=True)
+    ref = x.detach().sum() / x.numel()
+    with set_batch_invariant_mode(True):
+        out = x.mean()
+        out_fn = torch.mean(x)
+        out.backward()
+    torch.testing.assert_close(out.detach(), ref)
+    torch.testing.assert_close(out_fn.detach(), ref)
+    torch.testing.assert_close(x.grad, torch.full_like(x, 1.0 / x.numel()))
 
 
 # ============================================================================
@@ -826,23 +851,28 @@ def test_bik_te_general_gemm_numerical_parity(dtype):
     torch.testing.assert_close(C_bik, C_ref, **_tols(dtype))
 
 
-@pytest.mark.skipif(not HAVE_DEEPGEMM_BF16, reason="DeepGEMM bf16 bindings are unavailable")
-def test_bik_te_general_gemm_deepgemm_backend_supports_fp32_router():
-    torch.manual_seed(123)
-    M1, M2, K, N = 37, 23, 128, 128
-    A1 = torch.randn(M1, K, **_device(torch.float32))
-    A2 = torch.randn(M2, K, **_device(torch.float32))
-    A = torch.cat([A1, A2], dim=0)
-    B = torch.randn(K, N, **_device(torch.float32))
+@pytest.mark.parametrize("rows", [1, 4, 8, 32, 64, 96, 127, 128, 129, 160, 192, 224, 255, 256, 257])
+def test_bik_te_general_gemm_triton_strided_weight_is_bit_exact(rows):
+    """A partial M tile and strided weight preserve bits across batch sizes."""
+    torch.manual_seed(193)
+    weight = torch.randn(256, 128, **_device(torch.bfloat16))
+    full_inputs = torch.randn(384, 128, **_device(torch.bfloat16))
+    inputs = full_inputs[:rows].contiguous()
+    pointer = weight.untyped_storage().data_ptr()
+    with set_batch_invariant_mode(True, backend="triton"):
+        expected = matmul_persistent(inputs, weight.transpose(0, 1).contiguous())
+        actual = _te_general_gemm(weight, inputs, out_dtype=torch.bfloat16, layout="TN")[0]
+        full_actual = _te_general_gemm(weight, full_inputs, out_dtype=torch.bfloat16, layout="TN")[
+            0
+        ]
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual, full_actual[:rows])
+    assert weight.untyped_storage().data_ptr() == pointer
+    assert weight.stride(1) == 1
 
-    with set_batch_invariant_mode(True, backend="deepgemm"):
-        full = _te_general_gemm(A, B, out_dtype=torch.float32, layout="TN")[0]
-        chunks = torch.cat(
-            [
-                _te_general_gemm(A1, B, out_dtype=torch.float32, layout="TN")[0],
-                _te_general_gemm(A2, B, out_dtype=torch.float32, layout="TN")[0],
-            ],
-            dim=1,
-        )
 
-    assert torch.equal(full, chunks)
+def test_deepgemm_backend_is_deprecated_to_te_native():
+    """The removed DeepGEMM dense backend still enables, as te_native, with a warning."""
+    with pytest.warns(DeprecationWarning, match="deepgemm"):
+        with set_batch_invariant_mode(True, backend="deepgemm"):
+            assert get_batch_invariant_backend() == "te_native"

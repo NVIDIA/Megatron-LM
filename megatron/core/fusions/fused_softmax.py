@@ -253,6 +253,7 @@ class FusedScaleMaskSoftmax(nn.Module):
         if (
             self.scaled_masked_softmax_fusion  # user want to fuse
             and self.input_in_float16  # input must be fp16
+            and self.window_size is None  # apex kernels have no sliding-window support
             and 16 < sk <= 4096  # sk must be 16 ~ 2048
             and sq % 4 == 0  # sq must be divisor of 4
             and sk % 4 == 0  # sk must be divisor of 4

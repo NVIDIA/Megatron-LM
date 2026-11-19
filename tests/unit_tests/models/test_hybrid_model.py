@@ -19,7 +19,8 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
-from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.models.hybrid.hybrid_layer_allocation import MTPSplit, Symbols
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     gated_delta_product_stack_spec,
     hybrid_inference_stack_spec,
@@ -27,6 +28,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel, _hybrid_logging_pg_kwargs
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.tensor_observation import capture_tensor_observations
@@ -34,7 +36,13 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
+from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
+    CSALayerConfig,
+)
+from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
 
@@ -77,6 +85,140 @@ def test_hybrid_logging_process_groups_are_paired():
         _hybrid_logging_pg_kwargs(SimpleNamespace(tp=None, dp_cp=dp_cp_group))
 
 
+@pytest.fixture
+def config_list_model_boundary(monkeypatch):
+    """Exercise model-owned config setup without allocating modules or process groups."""
+
+    class AllocationReached(Exception):
+        pass
+
+    def init_language_module(model, config, pg_collection=None):
+        torch.nn.Module.__init__(model)
+        model.config = config
+        model.pg_collection = SimpleNamespace(pp=None)
+
+    def allocation_reached(*args, **kwargs):
+        raise AllocationReached()
+
+    monkeypatch.setattr(LanguageModule, "__init__", init_language_module)
+    monkeypatch.setattr(
+        "megatron.core.models.hybrid.hybrid_layer_allocation.select_pipeline_segment_from_config_list",
+        allocation_reached,
+    )
+
+    def build(config, layer_configs, position_embedding_type="rope"):
+        with pytest.raises(AllocationReached):
+            HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=16,
+                max_sequence_length=4,
+                hybrid_layer_config_list=layer_configs,
+                position_embedding_type=position_embedding_type,
+            )
+
+    return build
+
+
+@pytest.fixture
+def config_list_root():
+    return TransformerConfig(
+        num_layers=1, hidden_size=128, num_attention_heads=4, use_cpu_initialization=True
+    )
+
+
+@pytest.mark.parametrize("position_embedding_type", ["rope", "yarn"])
+@pytest.mark.parametrize("in_mtp", [False, True])
+def test_config_list_rejects_shared_rotary_width_mismatch(
+    config_list_model_boundary, config_list_root, position_embedding_type, in_mtp
+):
+    attention = AttentionLayerConfig.from_config(config_list_root)
+    attention.kv_channels = 128
+    layers = (
+        [MLPLayerConfig.from_config(config_list_root), MTPSplit, attention]
+        if in_mtp
+        else [attention]
+    )
+    with pytest.raises(ValueError, match="kv_channels"):
+        config_list_model_boundary(config_list_root, layers, position_embedding_type)
+    assert config_list_root.kv_channels == 32
+    assert attention.kv_channels == 128
+
+
+@pytest.mark.parametrize(
+    "layer_type,kv_channels,position_embedding_type",
+    [
+        (AttentionLayerConfig, 32, "rope"),
+        (AttentionLayerConfig, 128, "none"),
+        (MLALayerConfig, 128, "rope"),
+    ],
+)
+def test_config_list_accepts_supported_rotary_layouts(
+    config_list_model_boundary, config_list_root, layer_type, kv_channels, position_embedding_type
+):
+    layer_config = layer_type.from_config(config_list_root)
+    layer_config.kv_channels = kv_channels
+    config_list_model_boundary(config_list_root, [layer_config], position_embedding_type)
+
+
+@pytest.mark.parametrize("layer_type", [DSALayerConfig, CSALayerConfig])
+@pytest.mark.parametrize("in_mtp", [False, True])
+def test_config_list_registers_indexer_loss_scaling(
+    monkeypatch, config_list_model_boundary, config_list_root, layer_type, in_mtp
+):
+    from megatron.core.pipeline_parallel.schedules import forward_step_calc_loss
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        DSAIndexerLossAutoScaler,
+    )
+    from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
+
+    layer_config = layer_type.from_config(config_list_root)
+    layer_config.dsa_indexer_loss_coeff = 1.0
+    if layer_type is CSALayerConfig:
+        layer_config.compress_ratio = 4
+    layers = (
+        [MLPLayerConfig.from_config(config_list_root), MTPSplit, layer_config]
+        if in_mtp
+        else [layer_config]
+    )
+    config_list_model_boundary(config_list_root, layers)
+    assert config_list_root.experimental_attention_variant is None
+    assert layer_config.experimental_attention_variant_loss_scale_func is None
+    monkeypatch.setattr(DSAIndexerLossAutoScaler, "main_loss_backward_scale", None)
+    monkeypatch.setattr(MTPLossAutoScaler, "main_loss_backward_scale", torch.tensor(1.0))
+    indexer_parameter = torch.tensor(2.0, requires_grad=True)
+    output = DSAIndexerLossAutoScaler.apply(
+        torch.tensor(1.0, requires_grad=True), indexer_parameter.square()
+    )
+    loss, _ = forward_step_calc_loss(
+        model=None,
+        output_tensor=output,
+        loss_func=lambda value: (value.clone(), {}),
+        config=config_list_root,
+        vp_stage=None,
+        collect_non_loss_data=False,
+        num_microbatches=8,
+        forward_data_store=[],
+        cp_group_size=1,
+        is_last_stage=True,
+    )
+    loss.backward()
+    torch.testing.assert_close(indexer_parameter.grad, torch.tensor(0.5))
+
+
+def test_config_list_preserves_explicit_indexer_scale_hook(
+    config_list_model_boundary, config_list_root
+):
+    def hook(scale):
+        pass
+
+    layer_config = DSALayerConfig.from_config(config_list_root)
+    config_list_root.experimental_attention_variant_loss_scale_func = hook
+    config_list_model_boundary(config_list_root, [layer_config])
+    assert config_list_root.experimental_attention_variant_loss_scale_func is hook
+    assert layer_config.experimental_attention_variant_loss_scale_func is None
+
+
 @pytest.mark.skipif(
     not is_torch_min_version("2.4.0"),
     reason="torch.distributed.init_device_mesh requires torch >= 2.4.0",
@@ -84,6 +226,8 @@ def test_hybrid_logging_process_groups_are_paired():
 @pytest.mark.parametrize("tp_size,cp_size,pp_size", [(2, 1, 4), (1, 1, 8), (8, 1, 1)])
 def test_hybrid_model_with_custom_process_groups(tmp_path, tp_size, cp_size, pp_size):
     """Test HybridModel with custom process groups."""
+    if Utils.world_size != 8:
+        pytest.skip(f"requires 8 ranks, got {Utils.world_size}")
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=tp_size,
         context_parallel_size=cp_size,
@@ -107,11 +251,13 @@ def test_hybrid_model_with_custom_process_groups(tmp_path, tp_size, cp_size, pp_
         cp_group = grid.create_pg("cp")
         tp_group = grid.create_pg("tp")
         dp_cp_group = grid.create_pg(["cp", "dp"])
-        embd_group_ranks = parallel_state.default_embedding_ranks(
-            torch.distributed.get_process_group_ranks(pp_group)
-        )
-        embd_group = torch.distributed.new_group(
-            ranks=embd_group_ranks, timeout=timedelta(minutes=30)
+        # Every world rank must create all embedding groups in the same order.
+        embd_rank_groups = [
+            parallel_state.default_embedding_ranks(pp_ranks)
+            for pp_ranks in grid.get_rank_enum("pp")
+        ]
+        embd_group, _ = torch.distributed.new_subgroups_by_enumeration(
+            embd_rank_groups, timeout=timedelta(minutes=30)
         )
 
         # Create model with custom process groups
@@ -466,6 +612,7 @@ class TestHybridModel:
             # Exercise both layout boundaries without requiring a multi-rank CP group.
             layout_state = SimpleNamespace(
                 prepare_layer=lambda index, tensor: (tensor.roll(1, dims=0), None),
+                get_layer_padding_mask=lambda index, default, masks: default,
                 finalize_layer=lambda index, tensor: tensor.roll(-1, dims=0),
             )
             monkeypatch.setattr(
@@ -474,10 +621,23 @@ class TestHybridModel:
                 SimpleNamespace(build_forward_state=lambda *args, **kwargs: layout_state),
             )
 
+        backward_layers = []
+
+        def check_activation_gradient(layer, grad_input, _grad_output):
+            assert grad_input and grad_input[0] is not None
+            backward_layers.append(layer)
+
+        boundary_layers = [
+            layer for layer in decoder.layers if isinstance(layer, (TransformerLayer, MambaLayer))
+        ]
+        backward_hooks = [
+            layer.register_full_backward_hook(check_activation_gradient)
+            for layer in boundary_layers
+        ]
         expected_residuals = {}
 
         def record_layer_residuals(layer, args, kwargs, output):
-            accumulator = kwargs["hidden_states"].detach().clone()
+            accumulator = args[0].detach().clone()
             output = output[0] if isinstance(output, tuple) else output
             # Keep the original forward values; backward recomputation must not be observed.
             expected_residuals.setdefault((layer, "residual_accumulator"), accumulator)
@@ -507,8 +667,9 @@ class TestHybridModel:
             )
             logits.sum().backward()
 
-        for hook in hooks:
+        for hook in hooks + backward_hooks:
             hook.remove()
+        assert set(backward_layers) == set(boundary_layers)
 
         assert logits.shape[0] == micro_batch_size
         assert logits.shape[1] == sequence_length
@@ -710,7 +871,7 @@ class TestHybridQKLayernorm:
 
     def test_qk_l2_norm_from_config(self):
         """config.qk_l2_norm=True creates L2Norm q/k layernorm."""
-        from megatron.core.transformer.torch_norm import L2Norm
+        from megatron.core.ops.norm.torch_norm import L2Norm
 
         model = self._build_model(qk_l2_norm=True)
         attn = self._get_attention_layer(model)

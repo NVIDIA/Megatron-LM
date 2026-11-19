@@ -16,6 +16,7 @@ from model import model_provider
 from multimodal_args import add_multimodal_extra_args
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.distributed import TorchFullyShardedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, LLaVAModel
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -26,13 +27,13 @@ from megatron.core.parallel_state import (
     is_pipeline_last_stage,
 )
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
-from megatron.training import get_args, get_timers, get_tokenizer, pretrain
+from megatron.training import get_args, get_run_config, get_timers, get_tokenizer, pretrain
 from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
-    resolve_tokenizer_vocab_size,
 )
 from megatron.training.arguments import parse_and_validate_args
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import set_run_config
+from megatron.training.models import LLaVAModelConfig
 from megatron.training.training import (
     update_packed_sequence_stats,
     update_seqlen_stats_from_cu_seqlens,
@@ -54,6 +55,11 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
 
     Note: attn_mask_type in layer_specs.py sets the attention mask. Attention mask is None here.
     """
+    cfg = get_run_config()
+    if not isinstance(cfg.model, LLaVAModelConfig):
+        raise TypeError(
+            f"Expected cfg.model to be LLaVAModelConfig, got {type(cfg.model).__name__}"
+        )
     imgs = None
     tokens = None
     labels = None
@@ -164,8 +170,8 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
     if imgs.shape == torch.Size([1, 1]):
         # FSDP can hang with text-only samples. A workaround is to run a valid dummy image through the vision
         # model and then add image embeddings with a zero multiplier.
-        if args.use_torch_fsdp2:
-            imgs = torch.zeros((1, 3, args.img_h, args.img_w), dtype=torch.float32, device=data_text.device)
+        if isinstance(cfg.ddp, TorchFullyShardedDataParallelConfig):
+            imgs = torch.zeros((1, 3, cfg.model.img_h, cfg.model.img_w), dtype=torch.float32, device=data_text.device)
         else:
             # Similar workaround is not needed without FSDP and we can use an empty image.
             # FIXME: text-only data can cause still cause a hang in the special case where
@@ -527,7 +533,7 @@ def run_online_eval(model):
     # The inference code assumes the first rank is the leader.
     # Tensorboard writer is on the last rank.
     # We must write to a storage space that all ranks see.
-    output_dir = os.path.join(args.save, "online_eval")
+    output_dir = os.path.join(get_run_config().checkpoint.save, "online_eval")
     os.makedirs(output_dir, exist_ok=True)
     
     # Use the common evaluation loop
@@ -549,11 +555,11 @@ def write_eval_to_tensorboard(data, iteration, writer, walltime=None):
 def write_online_eval_to_tensorboard(data, iteration, writer, walltime=None):
     """Write online evaluation data to Tensorboard."""
     import shutil
-    args = get_args()
+    checkpoint = get_run_config().checkpoint
 
     # Define source and destination directories
-    source_dir = os.path.join(args.save, "online_eval")
-    destination_dir = os.path.join(args.save, f"online_eval_{iteration}")
+    source_dir = os.path.join(checkpoint.save, "online_eval")
+    destination_dir = os.path.join(checkpoint.save, f"online_eval_{iteration}")
     if os.path.exists(source_dir):
         print("Moving online eval data from", source_dir, "to", destination_dir)
 
@@ -565,16 +571,17 @@ def write_online_eval_to_tensorboard(data, iteration, writer, walltime=None):
 
 if __name__ == "__main__":
 
-    train_valid_test_dataloaders_provider.is_distributed = True
-    train_valid_test_dataloaders_provider.supports_train_full_dataset = True
-
     args = parse_and_validate_args(
         extra_args_provider=add_multimodal_extra_args,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
-    full_config = pretrain_cfg_container_from_args(args)
-    initialize_runtime_services(args)
-    resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
+    from megatron.training.argument_utils import model_config_from_args
+
+    model_cfg = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
+    full_config = pretrain_cfg_container_from_args(args, model_cfg)
+    set_run_config(full_config)
+    train_valid_test_dataloaders_provider.is_distributed = True
+    train_valid_test_dataloaders_provider.supports_train_full_dataset = True
     pretrain(
         full_config,
         train_valid_test_dataloaders_provider,
