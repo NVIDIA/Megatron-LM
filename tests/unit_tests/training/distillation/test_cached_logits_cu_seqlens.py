@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.training.config.dataset_config import dataset_type_from_family
 from megatron.training.distillation import cached_logits_loss
 from megatron.training.distillation import utils as distillation_utils
 from megatron.training.distillation.cached_logits_loss import make_teacher_tar_dataset
@@ -87,17 +88,15 @@ def _write_v2_shard(
 
 
 def _load_args(monkeypatch, *, sft: bool, num_samples: int):
-    args = SimpleNamespace(
-        micro_batch_size=1,
-        global_batch_size=num_samples,
-        sft=sft,
-        dataloader_inter_document_masking=False,
+    cfg = SimpleNamespace(
+        train=SimpleNamespace(micro_batch_size=1, global_batch_size=num_samples),
+        data=SimpleNamespace(
+            dataset_type=dataset_type_from_family("sft" if sft else "gpt", mock=False),
+            dataset=SimpleNamespace(inter_document_masking=False),
+        ),
     )
-    monkeypatch.setattr(cached_logits_loss, "get_args", lambda: args)
-    # is_packed_sequence_run() reads get_args() bound inside utils.py itself,
-    # not cached_logits_loss's binding -- patch both so TeacherTarDataset's
-    # _requires_cu_seqlens sees the same args.
-    monkeypatch.setattr(distillation_utils, "get_args", lambda: args)
+    monkeypatch.setattr(cached_logits_loss, "get_run_config", lambda: cfg)
+    monkeypatch.setattr(distillation_utils, "get_run_config", lambda: cfg)
 
 
 # ---------------------------------------------------------------------------

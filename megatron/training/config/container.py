@@ -32,6 +32,7 @@ from megatron.training.config.common_config import DistributedInitConfig, Profil
 from megatron.training.config.dataset_config import DataConfig
 from megatron.training.config.inference_config import InferenceSetupConfig
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
+from megatron.training.config.offline_distillation_config import OfflineDistillationConfig
 from megatron.training.config.resilience_config import (
     FaultToleranceConfig,
     RerunStateMachineConfig,
@@ -304,6 +305,9 @@ class PretrainConfigContainer(ConfigContainerBase):
     distillation: DistillationConfig | None = None
     """ModelOpt knowledge distillation (teacher and loss). ``None`` disables it."""
 
+    offline_distillation: OfflineDistillationConfig | None = None
+    """Offline logits KD: exactly one of teacher_save or student_load. None disables it."""
+
     def get_model_world_size(self) -> int:
         """Return ranks in the model grid, which may be a subset of the launch."""
         launch_world_size = safe_get_world_size()
@@ -486,6 +490,16 @@ class PretrainConfigContainer(ConfigContainerBase):
         if self.fault_tolerance.enable_ft_package and not self.checkpoint.save:
             raise ValueError("checkpointing save dir must be set to enable fault tolerance")
         self._validate_distillation()
+        if self.offline_distillation is not None:
+            self.offline_distillation.validate_run(
+                train=self.train, checkpoint=self.checkpoint, distillation=self.distillation
+            )
+            if self.data.dataset is None:
+                raise ValueError(
+                    "Offline distillation requires cfg.data.dataset for cache identity."
+                )
+        if self.train.freeze_all_layers and transformer.freeze_base_model_for_mtp:
+            raise ValueError("freeze_all_layers cannot be combined with freeze_base_model_for_mtp.")
         global_batch_size, _, _ = self._resolve_batch_sizes()
         self._validate_ddp_config()
         self._validate_rl_config(global_batch_size)
@@ -781,6 +795,23 @@ class PretrainConfigContainer(ConfigContainerBase):
                     "falling back to unquantized parameter gathering."
                 )
                 self.ddp.fp4_param_gather = False
+        if self.train.freeze_all_layers:
+            enabled = [
+                name
+                for name in (
+                    "use_distributed_optimizer",
+                    "overlap_param_gather",
+                    "overlap_param_gather_with_optimizer_step",
+                )
+                if getattr(self.optimizer, name)
+            ]
+            if enabled:
+                logger.warning(
+                    "train.freeze_all_layers: disabling incompatible optimizer settings %s.",
+                    enabled,
+                )
+            for name in enabled:
+                setattr(self.optimizer, name, False)
         self.ddp.overlap_param_gather = self.optimizer.overlap_param_gather
         self.ddp.reuse_grad_buf_for_mxfp8_param_ag = (
             self.optimizer.reuse_grad_buf_for_mxfp8_param_ag

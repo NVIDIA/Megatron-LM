@@ -32,6 +32,7 @@ from megatron.core.transformer import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.core.tuning import AutotunePolicy
 from megatron.training.config import (
+    CachedLogitsConfig,
     CheckpointConfig,
     DataConfig,
     DataloaderConfig,
@@ -41,7 +42,9 @@ from megatron.training.config import (
     InferenceConfigContainer,
     InferenceSetupConfig,
     LoggerConfig,
+    LogitsSaveConfig,
     MultiModalTokenizerConfig,
+    OfflineDistillationConfig,
     PretrainConfigContainer,
     ProfilingConfig,
     RerunStateMachineConfig,
@@ -1208,6 +1211,34 @@ def fault_tolerance_config_from_args(args: Namespace) -> FaultToleranceConfig:
     return config
 
 
+def offline_distillation_config_from_args(args: Namespace) -> OfflineDistillationConfig | None:
+    """Translate the existing logits CLI flags once, at the run-config boundary."""
+    teacher_save = None
+    student_load = None
+    if getattr(args, "logits_save_dir", None) is not None:
+        teacher_save = LogitsSaveConfig(
+            directory=args.logits_save_dir,
+            top_k=args.logits_save_top_k,
+            top_p=args.logits_save_top_p,
+            min_k=args.logits_save_top_p_min_k,
+            dtype=args.logits_save_dtype,
+        )
+    if getattr(args, "logits_load_dir", None) is not None:
+        student_load = CachedLogitsConfig(
+            directory=args.logits_load_dir,
+            loss_alpha=args.logits_load_kd_loss_alpha,
+            decode_threads=args.logits_load_decode_threads,
+            msc_prefetch_depth=args.logits_load_msc_prefetch_depth,
+            ignore_errors=args.logits_load_ignore_errors,
+            ignore_hash=args.logits_load_ignore_hash,
+        )
+    if teacher_save is None and student_load is None:
+        return None
+    config = OfflineDistillationConfig(teacher_save=teacher_save, student_load=student_load)
+    config.validate()
+    return config
+
+
 def pretrain_cfg_container_from_args(
     args: Namespace, model_cfg=None, *, data_cfg: DataConfig | None = None
 ) -> PretrainConfigContainer:
@@ -1256,10 +1287,10 @@ def pretrain_cfg_container_from_args(
         profiling=profiling_config_from_args(args),
         tokenizer=tokenizer_config_from_args(args),
         rl=_default_config_from_args(RLConfig, args),
-
         rerun_state_machine=RerunStateMachineConfig(**rerunsm_kwargs),
         straggler=_default_config_from_args(StragglerDetectionConfig, args),
         fault_tolerance=fault_tolerance_config_from_args(args),
+        offline_distillation=offline_distillation_config_from_args(args),
     )
 
     return cfg
