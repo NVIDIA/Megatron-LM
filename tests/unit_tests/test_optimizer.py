@@ -1670,7 +1670,7 @@ def test_get_megatron_optimizer_with_custom_process_groups(world_size, tp_size, 
     optimizer = get_megatron_optimizer(
         config=optimizer_config,
         model_chunks=model_chunks,
-        use_gloo_process_groups=False,  # Required when using custom process groups
+        use_gloo_process_groups=False,
         pg_collection=pg_collection,
     )
 
@@ -1785,17 +1785,51 @@ def test_get_megatron_optimizer_custom_process_groups_validation():
             config=optimizer_config, model_chunks=model_chunks, pg_collection=pg_collection_complete
         )
 
-    # Test 6: Gloo process groups should not be used with custom process groups
+    # Test 6: A custom collection must provide the requested Gloo mirror.
     pg_collection_complete.mp = None  # Explicitly set to None as allowed
     pg_collection_complete.tp_ep_pp = None  # Explicitly set to None as allowed
 
-    with pytest.raises(ValueError, match="Gloo process groups are not supported"):
+    with pytest.raises(ValueError, match="requires pg_collection.intra_dp_cp_gloo"):
         get_megatron_optimizer(
             config=optimizer_config,
             model_chunks=model_chunks,
-            use_gloo_process_groups=True,  # Should be False when using custom groups
+            use_gloo_process_groups=True,
             pg_collection=pg_collection_complete,
         )
+
+
+@pytest.mark.parametrize('num_distributed_optimizer_instances', [1, 2])
+def test_optimizer_gloo_groups_must_mirror_sharding_groups(num_distributed_optimizer_instances):
+    """Each Gloo group must hold the ranks of the group the distributed optimizer shards over."""
+    if torch.distributed.get_world_size() < 2 * num_distributed_optimizer_instances:
+        pytest.skip("Needs an optimizer-instance data-parallel group larger than one rank")
+    Utils.initialize_model_parallel(
+        num_distributed_optimizer_instances=num_distributed_optimizer_instances
+    )
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    ddp_config = SimpleNamespace(
+        use_distributed_optimizer=True,
+        num_distributed_optimizer_instances=num_distributed_optimizer_instances,
+    )
+    model_chunks = [SimpleNamespace(ddp_config=ddp_config)]
+
+    # The groups built by parallel_state mirror each other (intra_dp_cp / intra_expt_dp with
+    # more than one optimizer instance, dp_cp / expt_dp otherwise).
+    groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
+        pg_collection, model_chunks, use_gloo_process_groups=True
+    )
+    assert groups['intra_dp_cp_group_gloo'] is pg_collection.intra_dp_cp_gloo
+    assert groups['intra_expt_dp_group_gloo'] is pg_collection.intra_expt_dp_gloo
+
+    single_rank_gloo_group, _ = torch.distributed.new_subgroups(group_size=1, backend="gloo")
+    for gloo_group_name in ('intra_dp_cp_gloo', 'intra_expt_dp_gloo'):
+        mirrored_gloo_group = getattr(pg_collection, gloo_group_name)
+        setattr(pg_collection, gloo_group_name, single_rank_gloo_group)
+        with pytest.raises(ValueError, match=f"pg_collection.{gloo_group_name} has ranks"):
+            ProcessGroupCollection.setup_process_groups_for_optimizer(
+                pg_collection, model_chunks, use_gloo_process_groups=True
+            )
+        setattr(pg_collection, gloo_group_name, mirrored_gloo_group)
 
 
 def _chain_member(param_groups):
