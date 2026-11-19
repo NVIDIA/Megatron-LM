@@ -7,7 +7,11 @@ To go straight to engineering review, add `skip-bot-approval` first. If you mark
 
 ```mermaid
 flowchart LR
-    D[Draft] -->|Mark ready| G{Approved or label-exempt?}
-    G -->|Yes| R[Team review]
-    G -->|No| D
+    D[Work in draft] -->|Request a review| B[Autobot review]
+    B -->|Address findings and push fixes| D
+    B -->|Latest commit approved| R[Mark ready for review]
+    D -->|Apply skip-bot-approval| R
+    R --> G{Approved or label-exempt?}
+    G -->|No · return to draft| D
+    G -->|Yes| E[Engineering review by code owners]
 ```
