@@ -259,8 +259,8 @@ below), not by an operation constructor. Say a library `foo` provides both.
   `LayerNormInterface`. Use the parameter names the existing norms use (`weight`,
   and `bias` for LayerNorm) so a checkpoint loads under either backend. An RMSNorm
   kernel is a value of `rmsnorm_impl` with a branch in `select_rms_norm`
-  (`norm/backends.py`). `TENorm` and `WrappedTorchNorm` ask it when they build an
-  RMSNorm, so every spec that names them follows the config with no spec change.
+  (`norm/backends.py`). `TENorm` asks it when it builds an RMSNorm, so every spec
+  that names it follows the config with no spec change.
 - **Tests:** parity against `cross_entropy.vocab_parallel_cross_entropy` or the
   Torch norm, including backward and TP > 1 for cross entropy; a missing library
   is an `ImportError` naming the backend when it is selected; the existing values
@@ -269,11 +269,9 @@ below), not by an operation constructor. Say a library `foo` provides both.
 ## Liger RMSNorm
 
 Install `liger-kernel>=0.8.5` (the dev image has it) and select `--normalization RMSNorm
---rmsnorm-impl liger` with `--transformer-impl local` or `transformer_engine`. Every RMSNorm
-built by `TENorm` or `WrappedTorchNorm` then uses Liger, in GPT and HybridModel specs alike;
-norms fused into a Transformer Engine linear and Mamba's gated norm are unchanged. It is not a
-speedup: Liger is usually slower than the native norms. On `local` it adds sequence
-parallelism and zero-centered gamma, which the PyTorch norm lacks.
+--rmsnorm-impl liger` for HybridModel; GPTModel rejects it. Every RMSNorm built by `TENorm`
+then uses Liger; norms fused into a Transformer Engine linear and Mamba's gated norm are
+unchanged. It is not a speedup: Liger is usually slower than the native norms.
 
 ## Dependency checks
 

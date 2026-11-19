@@ -849,14 +849,12 @@ class TransformerConfig(ModelParallelConfig):
     """Use the kitchen extension for transformer quantization."""
 
     rmsnorm_impl: Literal["native", "liger"] = "native"
-    """Kernel for the RMSNorm modules built by `TENorm` and `WrappedTorchNorm`.
+    """Kernel for the RMSNorm modules built by `TENorm`. HybridModel only; GPTModel rejects it.
 
-    "liger" uses Liger-Kernel for every such RMSNorm (layer, QK, final and MTP norms, in GPT
-    and HybridModel specs); norms fused into a Transformer Engine linear and Mamba's gated norm
-    are unchanged. It is not a speedup: Liger is usually slower than the native norms. On
-    `transformer_impl="local"` it adds sequence parallelism and zero-centered gamma, which the
-    PyTorch norm lacks. Requires `normalization="RMSNorm"` and `transformer_impl` "local" or
-    "transformer_engine"; see `__post_init__` for the other restrictions.
+    "liger" uses Liger-Kernel for every such RMSNorm (layer, QK, final and MTP norms); norms
+    fused into a Transformer Engine linear and Mamba's gated norm are unchanged. It is not a
+    speedup: Liger is usually slower than the native norms. Requires `normalization="RMSNorm"`
+    and `transformer_impl="transformer_engine"`; see `__post_init__` for the other restrictions.
     """
 
     use_kitchen_attention: bool = False
@@ -1922,8 +1920,8 @@ class TransformerConfig(ModelParallelConfig):
         for unsupported, requirement in (
             (self.normalization != "RMSNorm", "normalization='RMSNorm'"),
             (
-                self.transformer_impl not in ("local", "transformer_engine"),
-                "transformer_impl 'local' or 'transformer_engine'",
+                self.transformer_impl != "transformer_engine",
+                "transformer_impl='transformer_engine'",
             ),
             (
                 self.fused_residual_rmsnorm,

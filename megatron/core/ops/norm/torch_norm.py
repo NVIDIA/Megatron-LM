@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Protocol
 import torch
 
 from megatron.core.jit import jit_fuser
-from megatron.core.ops.norm.backends import select_rms_norm
 from megatron.core.utils import is_torch_min_version
 
 if TYPE_CHECKING:
@@ -50,10 +49,6 @@ class WrappedTorchNorm:
         zero_centered_gamma: bool = False,
         normalization: str = "LayerNorm",
     ) -> LayerNormInterface:
-        selected = select_rms_norm(config)  # e.g. rmsnorm_impl="liger"
-        if selected is not None:
-            return selected(config=config, hidden_size=hidden_size, eps=eps)
-
         assert (
             not config.layernorm_zero_centered_gamma
         ), f"zero_centered_gamma not supported by torch LayerNorm"

@@ -14,9 +14,9 @@ if TYPE_CHECKING:
 def select_rms_norm(config: TransformerConfig) -> Optional[LayerNormBuilder]:
     """Return the RMSNorm ``config.rmsnorm_impl`` selects, or ``None`` for the caller's own.
 
-    ``TENorm`` and ``WrappedTorchNorm`` ask this when they build an RMSNorm, so the choice
-    follows the config wherever a spec or provider names those norms, as cross entropy
-    follows ``select_cross_entropy``. Liger is imported only when its norm is built.
+    ``TENorm`` asks this when it builds an RMSNorm, so the choice follows the config wherever
+    a spec or provider names it, as cross entropy follows ``select_cross_entropy``. Liger is
+    imported only when its norm is built.
     """
     if getattr(config, "rmsnorm_impl", "native") != "liger" or config.normalization != "RMSNorm":
         return None

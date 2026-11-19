@@ -254,18 +254,12 @@ def test_l2norm_replays_bit_exactly():
     assert_replays_bit_exact(norm, (x,), replays=3, what="L2Norm")
 
 
-@pytest.mark.parametrize(
-    "normalization,rmsnorm_impl",
-    [("LayerNorm", "native"), ("RMSNorm", "native"), ("RMSNorm", "liger")],
-)
-def test_wrapped_torch_norm_gamma_replays(normalization, rmsnorm_impl):
-    """Replay outputs and gamma gradients of the norm the builder returns, Liger included."""
-    if rmsnorm_impl == "liger":
-        pytest.importorskip("liger_kernel.megatron")
+@pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
+def test_wrapped_torch_norm_gamma_replays(normalization):
+    """Replay outputs and gamma gradients after the constructor marks RMSNorm weights."""
     seeded()
     config = SimpleNamespace(
         normalization=normalization,
-        rmsnorm_impl=rmsnorm_impl,
         layernorm_zero_centered_gamma=False,
         persist_layer_norm=False,
         sequence_parallel=False,
@@ -275,11 +269,7 @@ def test_wrapped_torch_norm_gamma_replays(normalization, rmsnorm_impl):
     assert getattr(norm.weight, "is_rmsnorm_weight", False) == (normalization == "RMSNorm")
     x = _act((4096, 2, 2048))
     assert_module_replays_bit_exact(
-        norm,
-        (x,),
-        replays=3,
-        contention=True,
-        what=f"WrappedTorchNorm[{normalization},{rmsnorm_impl}]",
+        norm, (x,), replays=3, contention=True, what=f"WrappedTorchNorm[{normalization}]"
     )
 
 

@@ -60,7 +60,6 @@ def _make_dispatch_config(**transformer_kwargs):
     transformer.qk_l2_norm = False
     transformer.multi_latent_attention = False
     transformer.normalization = "LayerNorm"
-    transformer.rmsnorm_impl = "native"
     transformer.use_kitchen = False
     transformer.use_kitchen_attention = False
     transformer.kitchen_attention_backend = None
@@ -151,7 +150,7 @@ class TestDefaultLayerSpecDispatch:
         # use_te flag depends on transformer_impl
         config.transformer.transformer_impl = "transformer_engine"
 
-        result = default_layer_spec(config, vp_stage=1, pp_rank=2)
+        result = default_layer_spec(config, vp_stage=1)
 
         mock_get_spec.assert_called_once_with(
             config.transformer,
@@ -159,7 +158,6 @@ class TestDefaultLayerSpecDispatch:
             normalization=config.transformer.normalization,
             qk_l2_norm=config.transformer.qk_l2_norm,
             vp_stage=1,
-            pp_rank=2,
         )
         assert result is spec
 
@@ -172,7 +170,6 @@ class TestDefaultLayerSpecDispatch:
         transformer.transformer_impl = "transformer_engine"
         transformer.experimental_attention_variant = None
         transformer.num_moe_experts = None
-        transformer.rmsnorm_impl = "native"
         config = Mock()
         config.restore_modelopt_state = False
         config.transformer = transformer
@@ -247,12 +244,6 @@ class TestDefaultLayerSpecDispatch:
             kitchen_attention_backend=config.transformer.kitchen_attention_backend,
         )
         assert result is spec
-
-    def test_liger_rejects_modelopt_specs(self):
-        config = _make_dispatch_config(rmsnorm_impl="liger", normalization="RMSNorm")
-        config.restore_modelopt_state = True
-        with pytest.raises(ValueError, match="rmsnorm_impl='liger' is not supported by ModelOpt"):
-            default_layer_spec(config, vp_stage=1)
 
 
 # =============================================================================
@@ -538,11 +529,10 @@ class TestGPTModelBuilderBuildModel:
         default_spec = ModuleSpec(module=object)
         mock_default.return_value = default_spec
         self.config.__dict__["transformer_layer_spec"] = None
-        self.pg.pp.rank.return_value = 2
 
         self.builder.build_model(self.pg, pre_process=True, post_process=True, vp_stage=3)
 
-        mock_default.assert_called_once_with(self.config, 3, pp_rank=2)
+        mock_default.assert_called_once_with(self.config, 3)
         assert mock_model.call_args.kwargs["transformer_layer_spec"] is default_spec
 
     @patch("megatron.training.models.gpt.mtp_block_spec", return_value=None)
