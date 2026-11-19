@@ -316,8 +316,8 @@ def build_hybrid_stack_callables(layer, layer_config: Optional[LayerConfigItem] 
                     )
                 else:
                     raise ValueError(
-                        f"HybridStack overlap does not support layer type '{item_type.__name__}' before "
-                        "the terminal MLP/MoE layer."
+                        f"HybridStack overlap does not support layer type '{item_type.__name__}' "
+                        "before the terminal MLP/MoE layer."
                     )
 
             if isinstance(hidden_states, tuple):
