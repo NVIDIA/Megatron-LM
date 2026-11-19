@@ -135,18 +135,32 @@ def test_forward_step_passes_groups_from_wrapped_model(packed_entrypoint, monkey
     assert fetch.call_args.kwargs["pg_collection"] is pgs
 
 
-@pytest.mark.parametrize("scheduler", ["default_dynamic_cp", None])
-def test_hybrid_forward_step_leaves_scheduler_batches_to_the_scheduler(monkeypatch, scheduler):
+@pytest.mark.parametrize(
+    ("scheduler", "cli_scheduler"),
+    [("default_dynamic_cp", None), (None, "dp_balanced"), (None, None)],
+    ids=["scheduler", "stale-cli-scheduler", "no-scheduler"],
+)
+def test_hybrid_forward_step_leaves_scheduler_batches_to_the_scheduler(
+    monkeypatch, scheduler, cli_scheduler
+):
     """With a packing scheduler, the hybrid forward step keeps get_batch's packed metadata.
 
     get_batch already prepares the scheduler's packed metadata, so the forward step does not
-    prepare it a second time; without a scheduler it still does. The microbatch boundaries
-    always go to update_seqlen_stats_from_cu_seqlens, which ignores them once train_step
-    has seeded the global statistics from the scheduler.
+    prepare it a second time; without a scheduler it still does. Like get_batch, it reads the
+    scheduler from the run config, so a stale CLI value cannot make it skip the preparation.
+    The microbatch boundaries always go to update_seqlen_stats_from_cu_seqlens, which ignores
+    them once train_step has seeded the global statistics from the scheduler.
     """
     module = pretrain_hybrid
     monkeypatch.setattr(
-        module, "get_args", lambda: SimpleNamespace(sequence_packing_scheduler=scheduler)
+        module, "get_args", lambda: SimpleNamespace(sequence_packing_scheduler=cli_scheduler)
+    )
+    monkeypatch.setattr(
+        module,
+        "get_run_config",
+        lambda: SimpleNamespace(
+            model=SimpleNamespace(transformer=SimpleNamespace(sequence_packing_scheduler=scheduler))
+        ),
     )
     output, iterator = object(), object()
     model = _Wrapper(

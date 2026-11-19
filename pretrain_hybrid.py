@@ -379,11 +379,14 @@ def forward_step(data_iterator, model: HybridModel):
         # so preparing it again would only rebuild the THD routes and DSA layout tables. It
         # stays for the get_batch path that builds its batch locally. (The FLOPs statistics
         # need no such gate: update_seqlen_stats_from_cu_seqlens ignores microbatch updates
-        # once train_step has seeded the global statistics from the scheduler.)
-        uses_packing_scheduler = getattr(get_args(), "sequence_packing_scheduler", None) is not None
+        # once train_step has seeded the global statistics from the scheduler.) The scheduler
+        # setting is read from the run config, as get_batch and train_step read it.
         if cu_seqlens is not None:
             update_seqlen_stats_from_cu_seqlens(cu_seqlens.squeeze(0))
-        if packed_seq_params is not None and not uses_packing_scheduler:
+        if (
+            packed_seq_params is not None
+            and get_run_config().model.transformer.sequence_packing_scheduler is None
+        ):
             # NOTE(nightly-sync 26_10_2026): restored dev-only hook (dev's forward_step
             # carried it as well as get_batch). This covers the non-packing get_batch path,
             # whose ContextParallelBatch is built locally and so never passes through the
