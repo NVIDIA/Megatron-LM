@@ -2,6 +2,7 @@
 """Tests for selective wide-residual replay and offload ownership."""
 
 import copy
+import json
 
 import pytest
 import torch
@@ -47,6 +48,10 @@ from megatron.core.transformer.wide_residual import (
 from megatron.core.transformer.wide_residual_transformer_layer import WideResidualTransformerLayer
 from megatron.core.typed_torch import apply_module
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.replay_test_utils import (
+    assert_replay_peak_memory_saving,
+    measure_replay_peak_memory,
+)
 
 
 class _StaticTestConnection(ResidualConnection):
@@ -263,11 +268,15 @@ class _RecordingMambaLayer(WideResidualMambaLayer):
         residual_stream_recompute_context=None,
         **kwargs,
     ):
-        del args, kwargs
-        self.event_log.append("mamba_forward")
         self.received_packed_seq_params = packed_seq_params
         self.received_residual_recompute_context = residual_stream_recompute_context
-        return hidden_states
+        return super().forward(
+            hidden_states,
+            *args,
+            packed_seq_params=packed_seq_params,
+            residual_stream_recompute_context=residual_stream_recompute_context,
+            **kwargs,
+        )
 
 
 class _OffloadedQKVBranch(_TransformerBranch):
@@ -414,11 +423,17 @@ def _recording_mamba_spec() -> ModuleSpec:
 
 
 def _assert_matching_gradients(reference: nn.Module, recomputed: nn.Module) -> None:
-    for (reference_name, reference_parameter), (recomputed_name, recomputed_parameter) in zip(
-        reference.named_parameters(), recomputed.named_parameters()
-    ):
-        assert reference_name == recomputed_name
-        torch.testing.assert_close(recomputed_parameter.grad, reference_parameter.grad)
+    # Compare all names because zip() would silently skip an unmatched trailing parameter.
+    reference_parameters = dict(reference.named_parameters())
+    recomputed_parameters = dict(recomputed.named_parameters())
+    assert reference_parameters
+    assert reference_parameters.keys() == recomputed_parameters.keys()
+    for name, reference_parameter in reference_parameters.items():
+        recomputed_parameter = recomputed_parameters[name]
+        # assert_close(None, None) would pass if both backward passes skipped this parameter.
+        assert reference_parameter.grad is not None, f"Missing eager gradient for {name}"
+        assert recomputed_parameter.grad is not None, f"Missing replay gradient for {name}"
+        torch.testing.assert_close(recomputed_parameter.grad, reference_parameter.grad, msg=name)
 
 
 def test_residual_connection_subclass_honors_requested_branch_dtype():
@@ -988,88 +1003,151 @@ class TestResidualStreamRecomputeIntegration:
         assert reference_output.dtype == expected_dtype
         assert recomputed_output.dtype == expected_dtype
 
-    def test_hybrid_mamba_cp_layout_finalizes_before_residual_replay(self, monkeypatch):
-        config = _wide_recompute_config(num_layers=1)
-        stack = HybridStack(
-            config,
-            HybridStackSubmodules(mamba_layer=_recording_mamba_spec()),
-            layer_type_list=[Symbols.MAMBA],
-            post_layer_norm=False,
-            pg_collection=_process_groups(),
-        ).cuda()
+    @pytest.mark.parametrize("num_layers,block_size", [(1, 1), (2, 1), (2, 2), (3, 2)])
+    def test_hybrid_mamba_cp_boundary_replay_matches_eager(
+        self, monkeypatch, num_layers, block_size
+    ):
+        """Real WR replay survives an input-saving synthetic CP boundary and backward."""
+        recomputed_config = _wide_recompute_config(num_layers=num_layers)
+        recomputed_config.residual_stream_recompute_num_layers = block_size
+        reference_config = copy.deepcopy(recomputed_config)
+        reference_config.recompute_granularity = None
+        reference_config.recompute_modules = ["core_attn"]
+        reference_config.residual_stream_recompute_num_layers = None
 
-        events = []
-        # HybridStack reads the runtime CP fields, so the boundary metadata must be real.
+        def build_stack(config):
+            return HybridStack(
+                config,
+                HybridStackSubmodules(mamba_layer=_recording_mamba_spec()),
+                layer_type_list=[Symbols.MAMBA] * num_layers,
+                post_layer_norm=False,
+                pg_collection=_process_groups(),
+            ).cuda()
+
+        torch.manual_seed(1234)
+        reference = build_stack(reference_config)
+        recomputed = build_stack(recomputed_config)
+        recomputed.load_state_dict(reference.state_dict())
         boundary_packed_seq_params = PackedSeqParams()
-        layer_packed_seq_params = object()
+        layer_packed_seq_params = [PackedSeqParams() for _ in range(num_layers)]
+        cp_layers_in_backward = set()
 
-        class _RecordingCPLayoutState:
-            finalized_hidden_states = None
-
+        class _CPLayoutState:
             def prepare_layer(self, layer_index, hidden_states):
-                assert layer_index == 0
-                assert hidden_states.shape[-1] == 3 * config.hidden_size
-                events.append("cp_prepare")
-                return hidden_states, layer_packed_seq_params
+                assert hidden_states.shape[-1] == 3 * recomputed_config.hidden_size
+                return hidden_states, layer_packed_seq_params[layer_index]
 
             def get_layer_padding_mask(self, layer_index, default, masks):
-                assert layer_index == 0
                 assert masks is None
                 return default
 
             def finalize_layer(self, layer_index, hidden_states):
-                assert layer_index == 0
-                events.append("cp_finalize")
-                self.finalized_hidden_states = hidden_states + 1.0
-                return self.finalized_hidden_states
+                # This boundary isolates lifetime handling; it is not a CP collective.
+                # square() saves its input for backward, including nonterminal WR writes.
+                assert hidden_states.untyped_storage().size() > 0
+                finalized = hidden_states + 0.01 * hidden_states.square()
+                # Count this layer only if backward reaches the returned tensor.
+                finalized.register_hook(lambda _grad: cp_layers_in_backward.add(layer_index))
+                return finalized
 
-            def get_layer_padding_mask(self, layer_index, default, padding_masks_by_layout):
-                return default
-
-        cp_layout_state = _RecordingCPLayoutState()
-
-        class _RecordingCPLayoutManager:
+        class _CPLayoutManager:
             def build_forward_state(
                 self, packed_seq_params, packed_seq_params_by_layout=None, thd_plan=None
             ):
                 assert packed_seq_params is boundary_packed_seq_params
                 assert packed_seq_params_by_layout is None
                 assert thd_plan is None
-                events.append("cp_build")
-                return cp_layout_state
+                return _CPLayoutState()
 
-        stack._cp_layout_manager = _RecordingCPLayoutManager()
-        stack.layers[0].event_log = events
+        def backward_and_check_cp(output, weights):
+            cp_layers_in_backward.clear()
+            (output * weights).sum().backward()
+            assert cp_layers_in_backward == set(range(num_layers))
 
-        replay_inputs = []
-        original_finalize = ResidualStreamRecomputeContext.finalize
-
-        def record_replay_finalize(context, hidden_states):
-            events.append("replay_finalize")
-            replay_inputs.append(hidden_states)
-            return original_finalize(context, hidden_states)
-
-        monkeypatch.setattr(ResidualStreamRecomputeContext, "finalize", record_replay_finalize)
-
-        hidden_states = torch.randn(4, 3, config.hidden_size, device="cuda", requires_grad=True)
-        output = stack(
-            hidden_states=hidden_states,
+        reference._cp_layout_manager = _CPLayoutManager()
+        recomputed._cp_layout_manager = _CPLayoutManager()
+        reference_input = torch.randn(
+            4, 3, reference_config.hidden_size, device="cuda", requires_grad=True
+        )
+        recomputed_input = reference_input.detach().clone().requires_grad_(True)
+        reference_output = reference(
+            hidden_states=reference_input,
             attention_mask=None,
             packed_seq_params=boundary_packed_seq_params,
         )
+        loss_weights = torch.randn_like(reference_output)
+        backward_and_check_cp(reference_output, loss_weights)
 
-        assert events == [
-            "cp_build",
-            "cp_prepare",
-            "mamba_forward",
-            "cp_finalize",
-            "replay_finalize",
-        ]
-        assert stack.layers[0].received_packed_seq_params is layer_packed_seq_params
-        assert stack.layers[0].received_residual_recompute_context is not None
-        assert len(replay_inputs) == 1
-        assert replay_inputs[0] is cp_layout_state.finalized_hidden_states
-        assert output.shape == hidden_states.shape
+        reconstructed = {}
+        original_finalize = ResidualStreamRecomputeContext.finalize
+
+        def observe_replay_finalize(context, boundary):
+            # A manager may attach multiple replay triggers; observe its release only once.
+            manager = context.manager
+            if not context.is_block_end or manager in reconstructed:
+                return original_finalize(context, boundary)
+
+            # The fixture's WR reads, norms, and nonterminal writes produce fresh outputs;
+            # no checkpoint output aliases an input that must be retained.
+            assert manager.checkpoints, "The real WR path must register replay work"
+            outputs = [
+                output.detach()
+                for checkpoint in manager.checkpoints
+                for output in checkpoint.outputs
+                if isinstance(output, Tensor)
+            ]
+            assert outputs
+            assert all(output.untyped_storage().size() > 0 for output in outputs)
+            expected = [output.clone() for output in outputs]
+            live_boundary = boundary.detach()
+            reconstructed[manager] = False
+
+            original_finalize(context, boundary)
+
+            assert all(output.untyped_storage().size() == 0 for output in outputs)
+            assert live_boundary.untyped_storage().size() > 0
+
+            def check_reconstruction(gradient):
+                # The real replay hook is registered first, so guard backward consumers next.
+                assert all(output.untyped_storage().size() > 0 for output in outputs)
+                assert live_boundary.untyped_storage().size() > 0
+                torch.testing.assert_close(outputs, expected)
+                reconstructed[manager] = True
+                return gradient
+
+            boundary.register_hook(check_reconstruction)
+
+        monkeypatch.setattr(ResidualStreamRecomputeContext, "finalize", observe_replay_finalize)
+        recomputed_output = recomputed(
+            hidden_states=recomputed_input,
+            attention_mask=None,
+            packed_seq_params=boundary_packed_seq_params,
+        )
+        torch.testing.assert_close(recomputed_output, reference_output)
+        backward_and_check_cp(recomputed_output, loss_weights)
+
+        assert reference_input.grad is not None
+        assert recomputed_input.grad is not None
+        torch.testing.assert_close(recomputed_input.grad, reference_input.grad)
+        _assert_matching_gradients(reference, recomputed)
+        for index, (eager_layer, replay_layer) in enumerate(
+            zip(reference.layers, recomputed.layers, strict=True)
+        ):
+            assert eager_layer.received_packed_seq_params is layer_packed_seq_params[index]
+            assert replay_layer.received_packed_seq_params is layer_packed_seq_params[index]
+            assert eager_layer.received_residual_recompute_context is None
+            assert replay_layer.received_residual_recompute_context is not None
+
+        block_starts = range(0, num_layers, block_size)
+        assert len(reconstructed) == len(block_starts)
+        for start in block_starts:
+            block = recomputed.layers[start : start + block_size]
+            manager = block[0].received_residual_recompute_context.manager
+            assert reconstructed[manager], f"Block starting at layer {start} did not rebuild"
+            for layer in block:
+                context = layer.received_residual_recompute_context
+                assert context.manager is manager
+                assert context.is_block_end == (layer is block[-1])
 
     def test_hybrid_mtp_stack_stays_ordinary_width_and_skips_residual_replay(self):
         config = _wide_recompute_config(num_layers=1)
@@ -1098,3 +1176,44 @@ class TestResidualStreamRecomputeIntegration:
             assert layer._get_residual_connection_for_mlp(operation=operation) is None
         assert not layer.received_residual_recompute_kwarg
         assert hidden_states.grad is not None
+
+    @pytest.mark.parametrize("block_size", [1, 2])
+    def test_hybrid_mamba_replay_reduces_peak_memory(self, block_size, record_property):
+        """Small replay regions reduce the full forward/backward CUDA allocation peak."""
+        # Several regions let earlier activations stay discarded while one region is rebuilt.
+        # Use real WR layers with the numerical mixer, without CP doubles or tensor observers.
+        num_layers, hidden_size = 8, 256
+        seq_len, batch_size = 2048, 2
+        device = torch.cuda.current_device()
+
+        def build_model_and_input(recompute):
+            config = _wide_recompute_config(num_layers=num_layers, hidden_size=hidden_size)
+            config.residual_stream_recompute_num_layers = block_size
+            if not recompute:
+                config.recompute_granularity = None
+                config.recompute_modules = ["core_attn"]
+                config.residual_stream_recompute_num_layers = None
+
+            # Both configurations construct the same parameters and draw the same input.
+            torch.manual_seed(1234)
+            model = HybridStack(
+                config,
+                HybridStackSubmodules(mamba_layer=_mamba_spec()),
+                layer_type_list=[Symbols.MAMBA] * num_layers,
+                post_layer_norm=False,
+                pg_collection=_process_groups(),
+            ).cuda()
+            hidden_states = torch.randn(
+                seq_len, batch_size, hidden_size, device=device, requires_grad=True
+            )
+            return model, hidden_states
+
+        measurements = measure_replay_peak_memory(build_model_and_input)
+        record_property("wr_peak_memory", json.dumps(measurements))
+        # Require a material saving: at least one FP32 branch activation (4 MiB here).
+        # This is much smaller than the activations released across earlier regions, but
+        # larger than the small autograd buffers checkpointing can omit without discarding.
+        activation_bytes = seq_len * batch_size * hidden_size * torch.float32.itemsize
+        assert_replay_peak_memory_saving(
+            measurements, block_size=block_size, min_saving_bytes=activation_bytes
+        )

@@ -35,10 +35,8 @@ from megatron.core.transformer.hyper_connection_transformer_layer import (
 )
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.residual_recompute import (
-    ResidualStreamRecomputeContext,
-    build_residual_stream_recompute_plan,
-)
+from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
+from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     MoETransformerLayer,
@@ -48,6 +46,10 @@ from megatron.core.transformer.transformer_layer import (
 )
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.replay_test_utils import (
+    assert_replay_peak_memory_saving,
+    measure_replay_peak_memory,
+)
 
 
 def _make_mhc_layer_spec(*, stages="both", **kwargs):
@@ -481,8 +483,6 @@ def _make_cuda_graph_gpt_block(**config_kwargs):
         use_cpu_initialization=True,
         **config_kwargs,
     )
-    from megatron.core.transformer.transformer_block import TransformerBlock
-
     return TransformerBlock(cfg, get_gpt_layer_with_transformer_engine_spec())
 
 
@@ -1045,108 +1045,39 @@ class TestMHCRecomputeMemorySaving:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @staticmethod
-    def _run_forward_backward(
-        num_layers,
-        hidden_size,
-        num_streams,
-        seq_len,
-        batch_size,
-        use_recompute,
-        recompute_block_size=2,
-    ):
-        """Run a full forward + backward pass and return (peak memory, output grad).
+    @pytest.mark.parametrize("block_size", [1, 2])
+    def test_recompute_reduces_peak_memory(self, block_size):
+        num_layers, hidden_size, num_streams = 8, 128, 4
+        seq_len, batch_size = 64, 32
 
-        When use_recompute=True, a new CheckpointWithoutOutputManager is created every
-        `recompute_block_size` layers, mirroring TransformerBlock's
-        build_residual_stream_recompute_plan logic.
-        """
-        config = _make_mhc_config(
-            hidden_size=hidden_size,
-            num_streams=num_streams,
-            num_layers=num_layers,
-            recompute_modules=["core_attn", "mhc"] if use_recompute else None,
-            recompute_granularity='selective' if use_recompute else None,
-        )
-        layer_spec = _make_mhc_layer_spec()
-        layers = [
-            HyperConnectionTransformerLayer(
-                config, layer_spec.submodules, layer_number=i + 1
-            ).cuda()
-            for i in range(num_layers)
-        ]
-        for layer in layers:
-            layer.train()
+        def build_model_and_input(recompute):
+            torch.manual_seed(123)
+            model_parallel_cuda_manual_seed(123, force_reset_rng=True)
+            # Select mHC alone so attention checkpointing cannot account for the saving.
+            config = _make_mhc_config(
+                hidden_size=hidden_size,
+                num_streams=num_streams,
+                num_layers=num_layers,
+                recompute_granularity="selective",
+                recompute_modules=["mhc"] if recompute else [],
+                mhc_recompute_layer_num=block_size,
+            )
+            # The block expands the input and owns the per-block managers and replay hooks.
+            model = TransformerBlock(config, _make_mhc_layer_spec(), post_layer_norm=False).cuda()
+            hidden_states = torch.randn(
+                seq_len, batch_size, hidden_size, device="cuda", requires_grad=True
+            )
+            return model, hidden_states
 
-        n_channels = num_streams * hidden_size
-        hidden_states = torch.randn(
-            seq_len, batch_size, n_channels, device='cuda', requires_grad=True
-        )
-        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
-
-        torch.cuda.reset_peak_memory_stats()
-        torch.cuda.synchronize()
-
-        contexts = (
-            build_residual_stream_recompute_plan(num_layers, recompute_block_size)
-            if use_recompute
-            else [None] * num_layers
-        )
-
-        h = hidden_states
-        for layer, recompute_context in zip(layers, contexts):
-            kwargs = dict(attention_mask=attention_mask)
-            if recompute_context is not None:
-                kwargs["residual_stream_recompute_context"] = recompute_context
-            h, _ = layer(h, **kwargs)
-            if recompute_context is not None:
-                recompute_context.finalize(h)
-
-        loss = h.sum()
-        loss.backward()
-        torch.cuda.synchronize()
-
-        peak_mem = torch.cuda.max_memory_allocated()
-        grad = hidden_states.grad.clone()
-
-        del layers, hidden_states, h, loss, contexts, recompute_context
-        torch.cuda.empty_cache()
-
-        return peak_mem, grad
-
-    def test_recompute_reduces_peak_memory(self):
-        """Peak memory with recompute (block_size=2) should be lower than without."""
-        num_layers = 8
-        hidden_size = 128
-        num_streams = 4
-        seq_len = 64
-        batch_size = 4
-
-        peak_no_recompute, _ = self._run_forward_backward(
-            num_layers, hidden_size, num_streams, seq_len, batch_size, use_recompute=False
-        )
-        peak_recompute, _ = self._run_forward_backward(
-            num_layers,
-            hidden_size,
-            num_streams,
-            seq_len,
-            batch_size,
-            use_recompute=True,
-            recompute_block_size=2,
-        )
-
-        saving_pct = (peak_no_recompute - peak_recompute) / peak_no_recompute * 100
-
-        assert peak_recompute < peak_no_recompute, (
-            f"Recompute should reduce peak memory, but got "
-            f"no_recompute={peak_no_recompute / 1e6:.1f}MB vs "
-            f"recompute={peak_recompute / 1e6:.1f}MB "
-            f"(saving={saving_pct:.1f}%)"
+        measurements = measure_replay_peak_memory(build_model_and_input)
+        # Require at least one ordinary-width FP32 aggregate activation (1 MiB in this fixture).
+        activation_bytes = seq_len * batch_size * hidden_size * torch.float32.itemsize
+        assert_replay_peak_memory_saving(
+            measurements, block_size=block_size, min_saving_bytes=activation_bytes
         )
 
 
