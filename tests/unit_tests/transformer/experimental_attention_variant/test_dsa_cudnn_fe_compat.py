@@ -157,3 +157,50 @@ def test_plain_causal_dense_scores_keep_the_call_unchanged(frontend):
         assert all(call["q_causal_offsets"] is None for call in dsa.calls)
     torch.testing.assert_close(outputs[0][0], outputs[1][0])
     torch.testing.assert_close(outputs[0][2], outputs[1][2])
+
+
+def _sparse_backward_call(monkeypatch, wrapper):
+    monkeypatch.setattr(
+        dsa_cudnn_kernels, "_cudnn_dsa", types.SimpleNamespace(indexer_backward_wrapper=wrapper)
+    )
+    tensors = [torch.zeros(1) for _ in range(6)]
+    return dsa_cudnn_kernels._call_sparse_indexer_backward(
+        *tensors, loss_coeff=0.5, grad_loss=torch.ones(()), block_i=64
+    )
+
+
+def test_sparse_indexer_backward_keeps_the_historical_call(monkeypatch):
+    """A wrapper without topk_indices_global gets the historical call, without a TypeError."""
+
+    def historical(q, w, k, attn, index, topk, sm_scale, loss_coeff, grad_loss, block_I):
+        return {"block_I": block_I}
+
+    assert _sparse_backward_call(monkeypatch, historical) == {"block_I": 64}
+
+
+@pytest.mark.parametrize("keyword_style", ["named", "var_keyword"])
+def test_sparse_indexer_backward_requests_global_ids(monkeypatch, keyword_style):
+    """A wrapper that names topk_indices_global, or takes **kwargs, gets True."""
+    if keyword_style == "named":
+
+        def wrapper(
+            q,
+            w,
+            k,
+            attn,
+            index,
+            topk,
+            sm_scale,
+            loss_coeff,
+            grad_loss,
+            block_I,
+            topk_indices_global=False,
+        ):
+            return {"topk_indices_global": topk_indices_global}
+
+    else:
+
+        def wrapper(q, w, k, attn, index, topk, **kwargs):
+            return {"topk_indices_global": kwargs.get("topk_indices_global", False)}
+
+    assert _sparse_backward_call(monkeypatch, wrapper) == {"topk_indices_global": True}

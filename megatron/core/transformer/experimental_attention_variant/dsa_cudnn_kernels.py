@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import functools
-import inspect
 import logging
 import re
 from typing import TYPE_CHECKING, Optional, Protocol, Tuple
@@ -95,6 +94,7 @@ class CudnnDsaInterface(Protocol):
         softmax_scale: float,
         qhead_per_kv_head: int,
         ratio: int,
+        q_causal_offsets: Optional[Tensor] = None,
     ) -> dict:
         """Recompute the dense head-summed attention distribution and its L1 norm."""
 
@@ -112,6 +112,7 @@ class CudnnDsaInterface(Protocol):
         grad_loss: Tensor,
         ratio: int,
         block_I: int,
+        q_causal_offsets: Optional[Tensor] = None,
     ) -> dict:
         """Backprop the dense (full-KV) indexer KL loss to the indexer q/k/weights."""
 
@@ -1238,10 +1239,13 @@ def _bottom_right_q_offset_kwargs(
     kernels of cuDNN frontend <= 1.25 align the causal mask bottom-right, i.e. local query
     row ``i`` sees keys ``[0, (seqlen_k * ratio - seqlen_q + i + 1) // ratio)``. Frontend
     1.26 (NVIDIA/cudnn-frontend#316) added ``q_causal_offsets`` and, when it is not given,
-    uses a zero offset (top-left), so FE >= 1.26 masks differently by default. Every
-    MCore BSHD call site was written against the bottom-right contract -- the score-chunk
-    path crops the key prefix precisely so that bottom-right masking reproduces each row's
-    absolute length -- so pass the legacy offset explicitly whenever the default differs.
+    uses a zero offset (top-left), so FE >= 1.26 masks differently by default. The cropped
+    segment scorer in ``_indexer_topk_from_score_chunks`` crops the key prefix so that
+    bottom-right masking reproduces each row's absolute length, so pass the legacy offset
+    explicitly whenever the default differs. The plain-causal and dense-loss call sites are
+    square (``run_fused_dsa_attention`` requires ``sq == sk`` there), so their offset is
+    zero; their PyTorch-side masks (``_causal_seq_lens``, ``_compute_dense_attn_lse``) are
+    top-left and must change too before a non-square call can reach them.
 
     Returns no kwargs when the offset is zero (both conventions agree) or when the
     installed frontend still has the legacy default, which keeps those calls, and their
@@ -2004,15 +2008,9 @@ def _call_sparse_indexer_backward(
         "loss_coeff": loss_coeff,
         "grad_loss": grad_loss,
         "block_I": block_i,
+        # Newer frontends default to batch-local ids; MCore passes global ids.
+        **filter_kwargs_for_callable(wrapper, {"topk_indices_global": True}),
     }
-    try:
-        parameters = inspect.signature(wrapper).parameters
-    except (TypeError, ValueError):
-        parameters = {}
-    if "topk_indices_global" in parameters or any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
-    ):
-        kwargs["topk_indices_global"] = True
     return wrapper(q_idx_bshd, w_bsh, k_idx_bsd, attn_score, index_score, topk_indices, **kwargs)
 
 
