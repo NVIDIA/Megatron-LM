@@ -128,7 +128,7 @@ def corpus(tmp_path_factory):
         "data_args_file": (["--data-args-path", str(data_args), "--split", "9,1,0"], {}),
         "per_split_file": (["--per-split-data-args-path", str(per_split)], {}),
         "sft_mock": (["--sft", "--mock-data"], {}),
-        "sft": (["--sft", "--data-path", "prefix-a"], {}),
+        "sft": (["--sft", "--data-path", "prefix-a", "--sft-loss-log-mode", "microbatch"], {}),
         "varlen_mock": (
             ["--use-varlen-dataset", "--mock-data", "--calculate-per-token-loss", "--max-seqlen-per-dp-cp-rank", "32"],
             {},
@@ -185,6 +185,10 @@ CASE_NAMES = [
     "forwarded", "sft_fim", "varlen_fim", "implicit_mock",
 ]  # fmt: skip
 MIXED_FIM_CASES = {"sft_fim", "varlen_fim"}
+# SFTDatasetConfig's own fields. The legacy oracle is the Core config the providers handed to
+# the SFT dataset: it carried neither the physical pack width nor the loss-log mode, which the
+# loop read from the arguments, so both are checked against their source, not the oracle.
+SFT_ONLY_FIELDS = ("packed_sequence_length", "sft_loss_log_mode")
 ENTRY_POINTS = ("gpt", "hybrid", "hybrid_flex", "prepare_cache")
 # What a script cannot build, it rejects itself: pretrain_hybrid_flex.py has no varlen batch path
 # (it used to build plain GPT data for the request); tools/prepare_cache.py prepares the plain
@@ -385,7 +389,7 @@ def test_entry_points_build_the_dataset_config_pretrain_gpt_built(
         # FIM runtime wrapper pretrain_gpt built around an SFT / varlen dataset is gone.
         assert isinstance(expected, GPTFIMDatasetConfig)
         assert not isinstance(actual, GPTFIMDatasetConfig)
-        names = [f.name for f in fields(actual) if f.name != "packed_sequence_length"]
+        names = [f.name for f in fields(actual) if f.name not in SFT_ONLY_FIELDS]
     else:
         expected_config_type = (
             SFTDatasetConfig
@@ -393,10 +397,12 @@ def test_entry_points_build_the_dataset_config_pretrain_gpt_built(
             else GPTFIMDatasetConfig if args.fim_data else GPTDatasetConfig
         )
         assert type(actual) is expected_config_type
-        names = [f.name for f in fields(actual) if f.name != "packed_sequence_length"]
+        names = [f.name for f in fields(actual) if f.name not in SFT_ONLY_FIELDS]
     if dataset_class in (SFTDataset, MockSFTDataset):
-        # Physical pack width is now derived independently of the content limit.
+        # Physical pack width is now derived independently of the content limit; the loss-log
+        # mode the loop read from the arguments travels on the SFT section.
         assert actual.packed_sequence_length == expected.sequence_length
+        assert actual.sft_loss_log_mode == args.sft_loss_log_mode
     assert _signature(actual, names) == _signature(expected, names)
     if entry_point == "prepare_cache":
         return
@@ -440,9 +446,7 @@ def test_fields_the_legacy_factories_left_out_are_forwarded(monkeypatch, corpus,
         actual = _entry_point(entry_point).core_gpt_dataset_config_from_args(args)
     else:
         _, actual, _ = _ready(cfg).builder_inputs()
-    names = [
-        f.name for f in fields(actual) if f.name not in ("tokenizer", "packed_sequence_length")
-    ]
+    names = [f.name for f in fields(actual) if f.name not in ("tokenizer", *SFT_ONLY_FIELDS)]
     changed = {name for name in names if getattr(actual, name) != getattr(own, name)}
     if entry_point == "hybrid_flex":
         assert changed - set(LAYOUT_FIELDS) == (LEGACY_OMISSIONS[entry_point] & set(names))
