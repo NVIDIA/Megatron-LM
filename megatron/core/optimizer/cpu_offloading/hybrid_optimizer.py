@@ -4,7 +4,7 @@ from typing import Dict
 
 import torch
 
-from ..main_params_rounding import MainParamsRounding, copy_main_to_model_param_
+from ..stochastic_rounding import RoundingMode, copy_with_rounding_
 
 
 def _param_generator(cpu_optimizer):
@@ -54,7 +54,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         pin_cpu_grads: bool = True,
         pin_cpu_params: bool = True,
         overlap_cpu_optimizer_d2h_h2d: bool = True,
-        main_params_rounding: MainParamsRounding = "nearest",
+        main_params_rounding: RoundingMode = "nearest",
         main_params_rounding_seed: int = 0,
         **kwargs,
     ):
@@ -129,7 +129,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 with torch.cuda.stream(self._h2d_stream):
                     for param in _param_generator(optimizer):
                         gpu_param = self.cpu_copys_map_gpu_param[param]
-                        copy_main_to_model_param_(
+                        copy_with_rounding_(
                             gpu_param.data,
                             param.data,
                             self.main_params_rounding,
@@ -150,7 +150,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
                         if param in self.param_to_fp32_param:
                             fp32_param = self.param_to_fp32_param[param]
-                            copy_main_to_model_param_(
+                            copy_with_rounding_(
                                 param.data,
                                 fp32_param.data,
                                 self.main_params_rounding,
