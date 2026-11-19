@@ -141,6 +141,28 @@ def _run(stack, x, cfg, groups, values=None):
     return out, context
 
 
+def test_whole_head_optimizer_layouts(setup):
+    cfg, spec, groups = setup
+    stack = _stack(cfg, spec, groups)
+    queries, indexers = 0, 0
+    for module in stack.modules():
+        if hasattr(module, 'linear_q_up_proj') and hasattr(module, 'linear_kv_proj'):
+            q = module.linear_q_up_proj.weight.qkv_layout
+            k = module.linear_kv_proj.weight.qkv_layout
+            assert q.num_groups == cfg.num_attention_heads
+            assert q.per_head_split_shapes == (cfg.v_head_dim,)
+            assert k.num_groups == 1 and k.per_head_split_shapes == (cfg.v_head_dim,)
+            queries += 1
+        if hasattr(module, 'linear_wq_b') and hasattr(module, 'head_dim'):
+            q = module.linear_wq_b.weight.qkv_layout
+            assert q.num_groups == module.n_heads
+            assert q.per_head_split_shapes == (module.head_dim,)
+            if module.linear_wk is not None:
+                assert module.linear_wk.weight.qkv_layout.num_groups == 1
+            indexers += 1
+    assert queries == 3 and indexers == 2
+
+
 def test_hybrid_stack_checkpoint_and_pipeline_owner_gradients(setup):
     cfg, spec, groups = setup
     full = _stack(cfg, spec, groups)

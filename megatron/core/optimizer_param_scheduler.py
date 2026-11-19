@@ -1,6 +1,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Learning rate decay and weight decay incr functions."""
+
 import logging
 import math
 from typing import TYPE_CHECKING, Any, Optional, TypedDict
@@ -35,6 +36,7 @@ class ParamGroupOverride(TypedDict, total=False):
     end_wd: float
     wd_mult: float
     optimizer: str
+    schedule_lr_multiplier: float
 
 
 def get_canonical_lr_for_logging(param_groups: list[dict]) -> float | None:
@@ -293,10 +295,11 @@ class OptimizerParamScheduler:
         # This is important for logging under model parallelism that may leave
         # some ranks with empty default_config parameter groups.
         for param_group in self.optimizer.param_groups:
+            lr = self.get_lr(param_group) * param_group.get('schedule_lr_multiplier', 1.0)
             if isinstance(param_group.get('lr'), torch.Tensor):
-                param_group['lr'].fill_(self.get_lr(param_group))
+                param_group['lr'].fill_(lr)
             else:
-                param_group['lr'] = self.get_lr(param_group)
+                param_group['lr'] = lr
             param_group['weight_decay'] = self.get_wd(param_group) * param_group.get('wd_mult', 1.0)
 
     def state_dict(self) -> dict:

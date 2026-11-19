@@ -162,7 +162,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="attention_kernels_and_dispatch",
         sources=("megatron/core/transformer/attention.py",),
-        tests=(K + "test_fused_activations.py", K + "test_runtime_cp_attention.py"),
+        tests=(
+            K + "test_fused_activations.py",
+            K + "test_runtime_cp_attention.py",
+            K + "test_optimizer_kernels.py",
+        ),
         kind="dispatch",
         notes="Attention._apply_output_gate is replayed in test_fused_activations.py. "
         "Packed SelfAttention dispatch through RoPE and TE attention is replayed with runtime "
@@ -198,6 +202,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/transformer/experimental_attention_variant/test_csa2.py",
             K + "test_fused_activations.py",
             "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_attention.py",
+            "tests/unit_tests/models/test_v41_state_integration.py",
         ),
         kind="torch.compile",
         notes="Weightless query RMS norm compiled with torch.compile (row reduction over head_dim); "
@@ -292,6 +297,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_tensor_parallel_kernels.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
+            K + "test_optimizer_kernels.py",
         ),
         kind="torch-op",
         notes="VocabParallelEmbedding (weight[idx] deterministic branch vs F.embedding, and the main_grad "
@@ -546,6 +552,22 @@ KERNELS: Tuple[KernelEntry, ...] = (
         exempt_reason="Triton compile-cache manager; no kernel.",
     ),
     # ---------------------------------------------------------------- optimizer / distributed
+    KernelEntry(
+        name="matrix_optimizer_transforms",
+        sources=(
+            "megatron/core/optimizer/emerging_optimizers.py",
+            "megatron/core/optimizer/sinkhorn.py",
+            "megatron/core/ops/optimizers/sinkhorn.py",
+        ),
+        tests=(
+            K + "test_optimizer_kernels.py",
+            "tests/unit_tests/optimizer/test_sinkhorn_optimizer.py",
+        ),
+        kind="dispatch",
+        notes="Per-head Newton-Schulz, exact per-block RMS, and independent logical-table "
+        "Sinkhorn replay under GPU contention; row-shard statistics use explicit Gloo "
+        "EP groups with DP replicas excluded in the distributed reference test.",
+    ),
     KernelEntry(
         name="optimizer_kernels",
         sources=(
@@ -840,6 +862,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             "tests/unit_tests/optimizer/test_layer_sharded_muon.py",
             "tests/unit_tests/optimizer/test_layer_sharded_e2e_parity.py",
+            "tests/unit_tests/optimizer/test_sinkhorn_optimizer.py",
         ),
         kind="dispatch",
         notes="LayerShardedMuon._run_ns calls emerging-optimizers newton_schulz on the assembled "
@@ -864,7 +887,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/experimental_attention_variant/csa_utils/csa2_context_parallel.py",
             "megatron/core/transformer/experimental_attention_variant/csa_utils/thd_utils.py",
         ),
-        tests=("tests/unit_tests/transformer/experimental_attention_variant/test_csa2.py",),
+        tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa2.py",
+            "tests/unit_tests/models/test_v41_state_integration.py",
+        ),
         kind="triton",
         notes="CPU owner-gradient and packed-capacity contracts, plus window/sink teacher GPU parity "
         "and bit-exact replay. Full FlashMLA attention and shared-K atomic gradients remain "

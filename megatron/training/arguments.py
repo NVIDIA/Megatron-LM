@@ -2736,6 +2736,11 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-no-split-qkv', action='store_false', default=True,
                        dest='muon_split_qkv',
                        help='Whether to split QKV parameters for Muon optimizer')
+    group.add_argument('--muon-split-qkv-per-head', action='store_true',
+                       help='Orthogonalize each Q, gate, K, and V head independently. '
+                       'Uniform head sizes use batched Newton-Schulz and require '
+                       'emerging-optimizers 0.3.0 or newer. By default, '
+                       'Q, gate, K, and V projections are orthogonalized separately')
     group.add_argument('--muon-nesterov', action='store_true',
                        help='Whether to use Nesterov-style momentum in the internal SGD')
     group.add_argument('--muon-scale-mode', type=str, default='spectral',
@@ -2761,7 +2766,10 @@ def _add_regularization_args(parser):
                        'depends on the parallelism config; duplicated and distributed both '
                        'orthogonalize the whole matrix and give TP-invariant results; auto '
                        'select between duplicated and distributed mode per-weight for '
-                       'dense weights; layer_sharded assigns each 2D weight one NS home '
+                       'dense weights. For QKV weights, distributed mode applies only to '
+                       'projection splits with complete local query groups and no GTP; '
+                       'other layouts fall back to non-TP NS. layer_sharded assigns each '
+                       '2D weight one NS home '
                        'rank in the (gtp_remat x tp) domain and routes the shards there '
                        'with all_to_all (same math as duplicated, no redundant NS); '
                        'requires --use-distributed-optimizer and --muon-no-split-qkv. See '
@@ -2791,6 +2799,50 @@ def _add_regularization_args(parser):
                        choices=['adam', 'lion'],
                        help='Optimizer for scalar parameters (embeddings, biases, norms) '
                        'when using muon. Defaults to adam.')
+    for role in ('embedding', 'output-layer', 'engram'):
+        group.add_argument(
+            f'--{role}-optimizer',
+            type=str,
+            default=None,
+            choices=['adam', 'sinkhorn'],
+            help=f'Optimizer for {role} table weights only; requires Muon.',
+        )
+    group.add_argument(
+        '--engram-lr-multiplier',
+        type=float,
+        default=1.0,
+        help='Engram table LR multiplier, including warmup and minimum LR.',
+    )
+    group.add_argument(
+        '--apply-wd-to-norm',
+        action='store_true',
+        help='Apply weight decay to all identified normalization weights.',
+    )
+    group.add_argument(
+        '--muon-update-rms',
+        type=float,
+        default=None,
+        help='Exact post-NS RMS per matrix/head; requires duplicated mode.',
+    )
+    group.add_argument('--sinkhorn-momentum', type=float, default=0.95)
+    group.add_argument(
+        '--sinkhorn-no-nesterov', action='store_false', dest='sinkhorn_nesterov', default=True
+    )
+    group.add_argument(
+        '--sinkhorn-num-normalization-steps',
+        type=int,
+        default=11,
+        help='Positive odd number of alternating row/column normalizations.',
+    )
+    group.add_argument('--sinkhorn-zero-row-threshold', type=float, default=1e-3)
+    group.add_argument('--sinkhorn-eps', type=float, default=1e-20)
+    group.add_argument('--sinkhorn-extra-scale-factor', type=float, default=0.18)
+    group.add_argument(
+        '--sinkhorn-balance-mode',
+        choices=['global', 'local'],
+        default='global',
+        help='Global logical-table statistics or approximate shard-local balancing.',
+    )
     group.add_argument('--lion-beta1', type=float, default=0.95,
                        help='First beta coefficient for Lion optimizer '
                        '(used in sign update). Default: 0.95.')

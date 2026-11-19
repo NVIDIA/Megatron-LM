@@ -264,6 +264,12 @@ class OptimizerConfig:
     muon_split_qkv: bool = True
     """Whether to split QKV parameters for Muon optimizer."""
 
+    muon_split_qkv_per_head: bool = False
+    """Whether to orthogonalize each Q, gate, K, and V head independently. Requires
+    ``muon_split_qkv``. Uniform head sizes use the batched Newton-Schulz implementation
+    and require Emerging-Optimizers 0.3.0 or newer. By default, Muon orthogonalizes the
+    Q, gate, K, and V projection matrices separately."""
+
     muon_nesterov: bool = False
     """Whether to use Nesterov-style momentum in the internal SGD."""
 
@@ -285,7 +291,9 @@ class OptimizerConfig:
     each shard independently, which makes the update rule depend on the parallelism config;
     "duplicated" and "distributed" both orthogonalize the whole matrix, so results do not
     change as TP changes. "auto" select between duplicated and distributed mode per-weight for
-    dense weights. "layer_sharded" uses LayerShardedMuon instead of TensorParallelMuon:
+    dense weights. For QKV weights, ``distributed`` applies only to projection splits with
+    complete local query groups and no GTP; other QKV layouts fall back to non-TP NS with a
+    warning. "layer_sharded" uses LayerShardedMuon instead of TensorParallelMuon:
     each 2D weight is assigned one NS home rank in the (GTP_remat x TP) domain — i.e. the
     GTP domain — all_to_all stages over the gtp_remat and tp groups assemble the complete
     (P, Q) momentum on the home, the exact same full-matrix Newton-Schulz as duplicated
@@ -321,6 +329,45 @@ class OptimizerConfig:
     muon_scalar_optimizer: str = 'adam'
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
     One of 'adam' or 'lion'. Defaults to 'adam'."""
+
+    embedding_optimizer: Optional[str] = None
+    """Token embedding optimizer override: 'adam' or 'sinkhorn'; None keeps existing routing."""
+
+    output_layer_optimizer: Optional[str] = None
+    """Prediction-head optimizer override: 'adam' or 'sinkhorn'."""
+
+    engram_optimizer: Optional[str] = None
+    """Engram table optimizer override, independently of its projections and norms."""
+
+    engram_lr_multiplier: float = 1.0
+    """Learning-rate multiplier for Engram tables only, including warmup and minimum LR."""
+
+    apply_wd_to_norm: bool = False
+    """Apply the run's weight decay to all identified normalization weights."""
+
+    muon_update_rms: Optional[float] = None
+    """Optional exact post-NS RMS target per logical matrix/head; requires duplicated mode."""
+
+    sinkhorn_momentum: float = 0.95
+    """EMA momentum for Sinkhorn table updates."""
+
+    sinkhorn_nesterov: bool = True
+    """Enable Nesterov EMA for Sinkhorn updates."""
+
+    sinkhorn_num_normalization_steps: int = 11
+    """Positive odd count of individual alternating row/column normalization steps."""
+
+    sinkhorn_zero_row_threshold: float = 1e-3
+    """Mask rows at or below this fraction of their logical table's mean initial row norm."""
+
+    sinkhorn_eps: float = 1e-20
+    """FP32 norm-denominator stabilization constant."""
+
+    sinkhorn_extra_scale_factor: float = 0.18
+    """Scale the unit-row-RMS balanced direction once, outside the learning-rate scheduler."""
+
+    sinkhorn_balance_mode: str = "global"
+    """'global' uses table-wide row-shard statistics; 'local' is topology-dependent approximation."""
 
     # Lion.
     lion_beta1: float = 0.95
@@ -424,7 +471,34 @@ class OptimizerConfig:
 
     def __post_init__(self):
         """Check the validity of the config."""
+        import math
 
+        overrides = (self.embedding_optimizer, self.output_layer_optimizer, self.engram_optimizer)
+        if any(value is not None for value in overrides):
+            if self.optimizer != "muon":
+                raise ValueError("Table optimizer overrides currently require optimizer='muon'")
+            if any(value not in (None, "adam", "sinkhorn") for value in overrides):
+                raise ValueError("Table optimizer overrides must be adam or sinkhorn")
+        if not math.isfinite(self.engram_lr_multiplier) or self.engram_lr_multiplier <= 0:
+            raise ValueError("engram_lr_multiplier must be positive and finite")
+        if self.muon_update_rms is not None:
+            if not math.isfinite(self.muon_update_rms) or self.muon_update_rms <= 0:
+                raise ValueError("muon_update_rms must be positive and finite")
+            if self.muon_tp_mode != "duplicated" or self.muon_extra_scale_factor != 1.0:
+                raise ValueError("Exact Muon RMS requires duplicated mode and extra_scale_factor=1")
+        if "sinkhorn" in overrides:
+            if self.sinkhorn_balance_mode not in ("global", "local"):
+                raise ValueError("Sinkhorn balance mode must be global or local")
+            if self.use_distributed_optimizer:
+                raise ValueError(
+                    "Use LayerWise for local Sinkhorn, not byte-sharded DistributedOptimizer"
+                )
+            if self.use_layer_wise_distributed_optimizer and self.sinkhorn_balance_mode == "global":
+                raise ValueError(
+                    "Global Sinkhorn with DP-sharded optimizer state requires future matrix-aware backend support"
+                )
+            if self.optimizer_cpu_offload or self.optimizer_cuda_graph:
+                raise ValueError("Sinkhorn CPU offload and optimizer CUDA graphs are not supported")
         # The following condition is used to avoid repetition in distrib_optimizer.py.
         # This is because in distrib_optimizer.py, the process to handle parameters are
         # different for different training precision settings. FP8 cases require different

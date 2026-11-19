@@ -2,10 +2,11 @@
 
 This composition uses main's HybridModel, MoE, distributed optimizer and packed CP
 path. Each logical block is `VE`: CSA2 attention followed by MoE. It does not
-include vision, DSpark, FP4 QAT or a Sinkhorn optimizer. The fused attention uses
-main's 512-dimensional KV path, with BF16 or MXFP8 index selection, H32/H64 and D128. MXFP8 selection
-requires SM100 or later and the cuDNN backend; indexer supervision retains its
-original BF16/FP32 path.
+include vision, DSpark or FP4 QAT. The opt-in [optimizer prototype](optimizer.md)
+adds the mixed Muon/Sinkhorn/AdamW setup, with backend limits described separately.
+The fused attention uses main's 512-dimensional KV path, with BF16 or MXFP8 index
+selection, H32/H64 and D128. MXFP8 selection requires SM100 or later and the cuDNN
+backend; indexer supervision retains its original BF16/FP32 path.
 
 A small GPU smoke configuration (requires the normal Megatron CI container,
 FlashMLA and cuDNN Frontend):
@@ -46,8 +47,9 @@ IDs**. `map.pt` must contain the int64 tensor produced from the exact released
 tokenizer by `build_compressed_token_map`; an identity map is not a substitute.
 The table counts must match the released distinct-prime layout.
 
-For PP/VPP, insert `|` at explicit stage/chunk boundaries. The builder creates
-one typed pipeline control group per replica and reuses it for virtual chunks.
+For PP/VPP, insert `|` at explicit stage/chunk boundaries. The builder uses the
+shared-state planned pipeline payload API; it does not create a separate typed
+pipeline control group.
 Packed batches are staged before P2P; ordinary CP1 batches remain lazy. CP uses
 `--attention-cp-layout contiguous --linear-cp-layout contiguous` and an existing
 SFT packed loader, `--dataloader-inter-document-masking`, or static varlen

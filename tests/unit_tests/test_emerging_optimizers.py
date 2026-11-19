@@ -31,7 +31,9 @@ from tests.unit_tests.test_utilities import Utils
 
 if HAVE_EMERGING_OPTIMIZERS:
     from emerging_optimizers.scalar_optimizers import Lion
-    from emerging_optimizers.soap import SOAP
+
+    # Resolve the moved legacy SOAP API through Megatron's compatibility import.
+    SOAP = eo_mod.SOAP
 
     from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
 else:

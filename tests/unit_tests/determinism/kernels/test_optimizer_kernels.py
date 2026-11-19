@@ -9,8 +9,13 @@ whole trajectory even when the model kernels are deterministic.
 import pytest
 import torch
 
+from megatron.core.ops.optimizers.sinkhorn import balance_row_shards
 from megatron.core.optimizer import Adam
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32, get_grad_norm_fp32
+from megatron.core.optimizer.emerging_optimizers import TensorParallelMuon
+from megatron.core.optimizer.sinkhorn import SinkhornOptimizer
+from megatron.core.tensor_parallel.layers import copy_tensor_model_parallel_attributes
+from megatron.core.transformer.attention import QKVLayout
 from megatron.training.tensor_metrics.definitions import L2NormMetric, _fused_l2_norm_impl
 from tests.unit_tests.determinism.kernels.harness import (
     assert_replays_bit_exact,
@@ -99,6 +104,58 @@ def test_tensor_metric_l2_replays(monkeypatch, dtype):
         contention=True,
         what=f"L2NormMetric.contribution_batch ({dtype})",
     )
+
+
+def test_sinkhorn_and_whole_head_updates_replay():
+    """Replay the actual momentum/NS/balancing paths and copied master metadata."""
+    from emerging_optimizers.orthogonalized_optimizers.sinkhorn_utils import sinkhorn_balance
+
+    seeded()
+    grad = torch.randn(2048, 64, device="cuda")
+    # Include a locally wide shard so the distributed-statistics adapter executes
+    # even without a multi-rank communicator, plus the upstream complete-table path.
+    for rows in (32, 2048):
+        assert_replays_bit_exact(
+            lambda x: balance_row_shards(
+                x, global_rows=2048, group=None, upstream_balance=sinkhorn_balance, local=True
+            ),
+            (grad[:rows],),
+            replays=3,
+            backward=False,
+            contention=True,
+            what="Sinkhorn axes",
+        )
+    source = torch.nn.Parameter(torch.zeros_like(grad))
+    source.qkv_layout = QKVLayout.from_mla_head_components(8, (256,))
+    source.is_qkv = True
+    source.qkv_split_shapes = [256] * 8
+    source.qkv_split_heads_are_complete = True
+    source.sinkhorn_table_ranges = ((0, 1024), (1024, 2048))
+    source.sinkhorn_row_start = 0
+    source.sinkhorn_group = None
+
+    def update():
+        p = torch.nn.Parameter(torch.zeros_like(grad))
+        copy_tensor_model_parallel_attributes(p, source)
+        muon = TensorParallelMuon(
+            [p],
+            split_qkv=True,
+            split_qkv_per_head=True,
+            is_qkv_fn=lambda p: p.is_qkv,
+            update_rms=0.18,
+        )
+        orth = muon.orthogonalize(p, grad)
+        opt = SinkhornOptimizer([p])
+        p.grad = grad.clone()
+        opt.step()
+        return orth, p.detach().clone(), opt.state[p]["momentum_buffer"].clone()
+
+    reference = update()
+    for _ in range(3):
+        with RacingStreams():
+            actual = update()
+        torch.cuda.synchronize()
+        assert all(bytes_equal(a, b) for a, b in zip(reference, actual))
 
 
 def test_fused_adam_step_replays():
