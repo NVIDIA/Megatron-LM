@@ -30,12 +30,12 @@ def test_schedule_uses_layer_quantization_context():
     layer.get_inner_quantization_context.assert_called_once_with()
 
 
-@pytest.mark.parametrize("layer_type", [("*", "E"), "M", None])
-def test_hybrid_schedule_runs_without_a_transformer_context_hook(layer_type):
+@pytest.mark.parametrize("layer_config", [(object(), object()), object(), None])
+def test_hybrid_schedule_runs_without_a_transformer_context_hook(layer_config):
     """The common scheduler must dispatch to the hybrid quantization hook."""
     plan = HybridStackSchedulePlan.__new__(HybridStackSchedulePlan)
     plan.layer = SimpleNamespace()
-    plan.layer_type = layer_type
+    plan.layer_config = layer_config
     plan.recompute_segment = None
     visited = []
     for name in (
@@ -71,7 +71,7 @@ def test_hybrid_schedule_preserves_plain_layer_quantization_context(layer_cls):
     layer.get_inner_quantization_context.return_value = expected_context
     plan = HybridStackSchedulePlan.__new__(HybridStackSchedulePlan)
     plan.layer = layer
-    plan.layer_type = None
+    plan.layer_config = None
 
     assert plan.get_low_precision_context() is expected_context
     layer.get_inner_quantization_context.assert_called_once_with()

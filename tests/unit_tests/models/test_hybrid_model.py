@@ -712,12 +712,14 @@ class TestHybridModel:
             def __init__(self):
                 super().__init__()
                 self.mtp_input_mask = None
+                self.inference_context = None
 
             def prepare_cp_layout(self, **kwargs):
                 return SimpleNamespace(**kwargs)
 
             def forward(self, **kwargs):
                 self.mtp_input_mask = kwargs["mtp_input_mask"]
+                self.inference_context = kwargs["inference_params"]
                 hidden_states = kwargs["hidden_states"]
                 return torch.cat((hidden_states, hidden_states), dim=0)
 
@@ -746,6 +748,7 @@ class TestHybridModel:
         labels = input_ids.clone()
         loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
         mtp_input_mask = input_ids != 2
+        inference_context = StaticInferenceContext(micro_batch_size, sequence_length)
 
         output = self.model(
             input_ids=input_ids,
@@ -754,10 +757,12 @@ class TestHybridModel:
             labels=labels,
             loss_mask=loss_mask,
             mtp_input_mask=mtp_input_mask,
+            inference_context=inference_context,
         )
 
         assert output.shape == labels.shape
         assert self.model.mtp.mtp_input_mask is mtp_input_mask
+        assert self.model.mtp.inference_context is inference_context
         assert captured_loss_args["mtp_input_mask"] is mtp_input_mask
         assert captured_loss_args["metric_avg_group"] is self.model.pg_collection.dp_cp
 

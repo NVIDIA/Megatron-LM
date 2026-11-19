@@ -86,7 +86,9 @@ Use groups with MoE expert-parallel communication overlap
 (`--overlap-moe-expert-parallel-comm`). The overlap schedule interleaves one
 microbatch's MoE all-to-all with another microbatch's compute one logical layer
 at a time, so group each MoE layer with the layers that run before it, as in
-`[M*E]`.
+`[M*E]`. A flat config list schedules each supported built-in layer separately.
+Custom layers cannot use EP overlap because their forward and weight-gradient
+operations have no defined slots in the schedule.
 
 Groups have the following constraints:
 

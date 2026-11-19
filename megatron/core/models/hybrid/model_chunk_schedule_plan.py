@@ -22,15 +22,15 @@ class HybridStackSchedulePlan(TransformerLayerSchedulePlan):
     def __init__(self, layer, event, chunk_state, comp_stream, comm_stream, extra_args=None):
         if extra_args is None:
             extra_args = {}
-        self.layer_type = extra_args.get("layer_type", None)
+        self.layer_config = extra_args.get("layer_config")
         super().__init__(layer, event, chunk_state, comp_stream, comm_stream, extra_args)
 
     def _build_callable_nodes(self, event, comp_stream, comm_stream, extra_args):
-        if self.layer_type is None:
+        if self.layer_config is None:
             return super()._build_callable_nodes(event, comp_stream, comm_stream, extra_args)
 
         fwd_callables, bwd_dw_callable_map, is_moe, num_local_experts = (
-            build_hybrid_stack_callables(self.layer, layer_type=self.layer_type)
+            build_hybrid_stack_callables(self.layer, layer_config=self.layer_config)
         )
 
         extra_args["config"] = self.layer.config
@@ -80,7 +80,7 @@ class HybridStackSchedulePlan(TransformerLayerSchedulePlan):
 
     def get_low_precision_context(self):
         """Hybrid callables enter each physical layer's quantization context themselves."""
-        if self.layer_type is None and isinstance(
+        if self.layer_config is None and isinstance(
             self.layer, (TransformerLayer, MultiTokenPredictionLayer)
         ):
             return super().get_low_precision_context()
@@ -88,13 +88,12 @@ class HybridStackSchedulePlan(TransformerLayerSchedulePlan):
 
 
 class HybridStackModelChunkSchedulePlan(TransformerModelChunkSchedulePlan):
-    """Pass each HybridStack entry's layer type to its per-layer schedule plan."""
+    """Pass each HybridStack entry's config to its per-layer schedule plan."""
 
     LAYER_SCHEDULE_PLAN_CLASS = HybridStackSchedulePlan
 
     def _extra_args_for_layer(self, module, layer_idx, num_layers):
         extra_args = super()._extra_args_for_layer(module, layer_idx, num_layers)
-        extra_args["layer_type"] = (
-            module.layer_type_list[layer_idx] if isinstance(module, HybridStack) else None
-        )
+        if isinstance(module, HybridStack):
+            extra_args["layer_config"] = module.layer_config_list[layer_idx]
         return extra_args

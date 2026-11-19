@@ -1691,7 +1691,7 @@ class TestHybridBlock:
         block = self.get_attention_moe_block("[*E]")
 
         forward_callables, bwd_dw_callable_map, is_moe, num_local_experts = (
-            build_hybrid_stack_callables(block.layers[0], layer_type=block.layer_type_list[0])
+            build_hybrid_stack_callables(block.layers[0])
         )
 
         pre_dispatch, dispatch, experts, combine, mtp_post_process = forward_callables

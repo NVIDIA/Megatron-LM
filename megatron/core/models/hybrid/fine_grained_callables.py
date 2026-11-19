@@ -27,9 +27,8 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.hybrid.hybrid_block import HybridStack
-from megatron.core.models.hybrid.hybrid_layer_allocation import LayerPatternItem
-from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
-from megatron.core.models.hybrid.hybrid_layer_allocation import is_layer_group
+from megatron.core.models.hybrid.hybrid_layer_allocation import LayerConfigItem, is_layer_group
+from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.pipeline_parallel.utils import (
     ScheduleNode,
     StageDispatchBwdGrad,
@@ -37,6 +36,14 @@ from megatron.core.pipeline_parallel.utils import (
 )
 from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.transformer.transformer_layer import make_viewless_tensor
+
+_ATTENTION_CONFIG_TYPES = (
+    layer_utils.AttentionLayerConfig,
+    layer_utils.DSALayerConfig,
+    layer_utils.MLALayerConfig,
+    layer_utils.GDNLayerConfig,
+    layer_utils.KDALayerConfig,
+)
 
 
 class _MoEBackwardDWWrapper:
@@ -90,22 +97,31 @@ def _get_inner_quant_context(layer):
     return nullcontext()
 
 
-def _as_hybrid_layers(layer, layer_type: Optional[LayerPatternItem]):
-    """Return ``(layer_type, layer)`` pairs for a hybrid logical layer."""
+def _split_hybrid_layers_for_overlap(layer, layer_config: Optional[LayerConfigItem]):
     if isinstance(layer, HybridStack):
-        return list(zip(layer.layer_type_list, layer.layers))
-    assert layer_type is not None, "Hybrid layer scheduling requires the layer type symbol."
-    return [(layer_type, layer)]
+        configs = layer.layer_config_list if layer_config is None else layer_config
+        layers = layer.layers
+    else:
+        configs = (layer.config if layer_config is None else layer_config,)
+        layers = (layer,)
 
-
-def _split_hybrid_layers_for_overlap(layer, layer_type: Optional[LayerPatternItem]):
-    layer_items = _as_hybrid_layers(layer, layer_type)
-    if any(is_layer_group(item_type) for item_type, _ in layer_items):
-        raise ValueError("Nested HybridStack groups are not supported in overlap scheduling.")
+    layer_items = []
+    for config, item_layer in zip(configs, layers, strict=True):
+        if is_layer_group(config):
+            raise ValueError("Nested HybridStack groups are not supported in overlap scheduling.")
+        if layer_utils.get_custom_layer_type(config) is not None:
+            raise ValueError(
+                "Custom hybrid layers do not support overlap_moe_expert_parallel_comm."
+            )
+        config_type = type(config)
+        if config_type is layer_utils.CSALayerConfig:
+            symbol = layer_utils.get_layer_symbol_from_config(config)
+            raise ValueError(f"HybridStack overlap does not support layer type '{symbol}'.")
+        layer_items.append((config_type, item_layer))
 
     terminal_idx = None
     for idx, (item_type, _) in enumerate(layer_items):
-        if item_type in (LayerSymbols.MLP, LayerSymbols.MOE):
+        if item_type in (layer_utils.MLPLayerConfig, layer_utils.MoELayerConfig):
             terminal_idx = idx
             break
 
@@ -115,14 +131,14 @@ def _split_hybrid_layers_for_overlap(layer, layer_type: Optional[LayerPatternIte
     terminal_type = layer_items[terminal_idx][0] if terminal_idx is not None else None
     terminal_layer = layer_items[terminal_idx][1] if terminal_idx is not None else None
     pre_layers = layer_items[:terminal_idx] if terminal_idx is not None else layer_items
-    is_moe = terminal_type == LayerSymbols.MOE
+    is_moe = terminal_type is layer_utils.MoELayerConfig
     num_local_experts = terminal_layer.mlp.num_local_experts if is_moe else None
     return pre_layers, terminal_type, terminal_layer, is_moe, num_local_experts
 
 
-def get_hybrid_stack_moe_metadata(layer, layer_type: Optional[LayerPatternItem] = None):
+def get_hybrid_stack_moe_metadata(layer, layer_config: Optional[LayerConfigItem] = None):
     """Return ``(is_moe, num_local_experts)`` for one HybridStack schedule layer."""
-    _, _, _, is_moe, num_local_experts = _split_hybrid_layers_for_overlap(layer, layer_type)
+    _, _, _, is_moe, num_local_experts = _split_hybrid_layers_for_overlap(layer, layer_config)
     return is_moe, num_local_experts
 
 
@@ -249,7 +265,7 @@ def _run_moe_combine(layer, node: ScheduleNode, output: Tensor):
     return _maybe_apply_final_norm(node, output)
 
 
-def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] = None):
+def build_hybrid_stack_callables(layer, layer_config: Optional[LayerConfigItem] = None):
     """Create fine-grained callables for one logical HybridStack layer.
 
     A logical layer may be a bracketed nested ``HybridStack`` (for example ``[M*E]``)
@@ -257,25 +273,19 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
     pre-dispatch compute -> dispatch -> MLP/experts -> combine.
     """
     pre_layers, terminal_type, terminal_layer, is_moe, num_local_experts = (
-        _split_hybrid_layers_for_overlap(layer, layer_type)
+        _split_hybrid_layers_for_overlap(layer, layer_config)
     )
 
     def pre_dispatch_computation(node: ScheduleNode, hidden_states: Tensor):
         for item_type, item_layer in pre_layers:
             with _get_inner_quant_context(item_layer):
-                if item_type == LayerSymbols.MAMBA:
+                if item_type is layer_utils.MambaLayerConfig:
                     hidden_states = item_layer(
                         hidden_states,
                         attention_mask=node.chunk_state.attention_mask,
                         packed_seq_params=node.chunk_state.packed_seq_params,
                     )
-                elif item_type in (
-                    LayerSymbols.ATTENTION,
-                    LayerSymbols.DS_ATTENTION,
-                    LayerSymbols.MLA,
-                    LayerSymbols.GDN,
-                    LayerSymbols.KDA,
-                ):
+                elif item_type in _ATTENTION_CONFIG_TYPES:
                     # Use _forward_attention rather than __call__: an attention half-layer has
                     # mlp=IdentityOp / mlp_bda=IdentityFuncOp by default, and TransformerLayer's
                     # __call__ would route through _forward_mlp + mlp_bda, double-applying the
@@ -306,14 +316,14 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
                     )
                 else:
                     raise ValueError(
-                        f"HybridStack overlap does not support layer type '{item_type}' before "
+                        f"HybridStack overlap does not support layer type '{item_type.__name__}' before "
                         "the terminal MLP/MoE layer."
                     )
 
             if isinstance(hidden_states, tuple):
                 hidden_states = hidden_states[0]
 
-        if terminal_type == LayerSymbols.MOE:
+        if terminal_type is layer_utils.MoELayerConfig:
             with _get_inner_quant_context(terminal_layer):
                 return _run_moe_preprocess(terminal_layer, node, hidden_states)
 
@@ -346,13 +356,13 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
         return dispatched_tokens
 
     def mlp(node: ScheduleNode, hidden_states: Tensor):
-        if terminal_type == LayerSymbols.MLP:
+        if terminal_type is layer_utils.MLPLayerConfig:
             with _get_inner_quant_context(terminal_layer):
                 hidden_states = terminal_layer._forward_mlp(
                     hidden_states, padding_mask=node.chunk_state.padding_mask
                 )
             return _maybe_apply_final_norm(node, hidden_states)
-        if terminal_type == LayerSymbols.MOE:
+        if terminal_type is layer_utils.MoELayerConfig:
             with _get_inner_quant_context(terminal_layer):
                 return _run_moe_experts(terminal_layer, node, hidden_states)
         return hidden_states
@@ -367,19 +377,13 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
     backward_dw = {}
     pre_bwd_dw = []
     for item_type, item_layer in pre_layers:
-        if item_type in (
-            LayerSymbols.ATTENTION,
-            LayerSymbols.DS_ATTENTION,
-            LayerSymbols.MLA,
-            LayerSymbols.GDN,
-            LayerSymbols.KDA,
-        ):
+        if item_type in _ATTENTION_CONFIG_TYPES:
             # TransformerLayer-backed pre-layers go through the standard
             # _BackwardDWWrapper which coordinates attn / shared-expert wgrad
             # with cuda-graph replay scopes.
             item_layer.init_backward_dw_wrapper()
             pre_bwd_dw.append(item_layer.backward_dw_wrapper)
-        elif item_type == LayerSymbols.MAMBA:
+        elif item_type is layer_utils.MambaLayerConfig:
             # MambaLayer is not a TransformerLayer, so init_backward_dw_wrapper
             # would assert. MambaLayer.backward_dw delegates to its mixer, which
             # in turn calls backward_dw on the in_proj / out_proj linears. The
@@ -400,7 +404,7 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
         if pre_dispatch_dw.submodules:
             pre_bwd_dw.append(pre_dispatch_dw)
         backward_dw["mlp"] = _MoEBackwardDWWrapper(terminal_layer.mlp, routed_experts=True)
-    elif terminal_type == LayerSymbols.MLP:
+    elif terminal_type is layer_utils.MLPLayerConfig:
         backward_dw["mlp"] = terminal_layer.mlp
 
     if pre_bwd_dw:

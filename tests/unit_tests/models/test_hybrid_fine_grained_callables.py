@@ -15,6 +15,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
@@ -33,7 +34,7 @@ def cpu_streams(monkeypatch):
     return streams
 
 
-def _config(**kwargs):
+def _config(symbol=Symbols.MOE, **kwargs):
     values = dict(
         fp8=None,
         fp4=None,
@@ -47,7 +48,11 @@ def _config(**kwargs):
         bias_dropout_fusion=False,
     )
     values.update(kwargs)
-    return SimpleNamespace(**values)
+    config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=2)
+    config = Symbols.LAYER_CONFIG_MAP[symbol].from_config(config)
+    for name, value in values.items():
+        setattr(config, name, value)
+    return config
 
 
 def _moe_layer(config, *, shared=False):
@@ -120,7 +125,7 @@ def test_delayed_wgrad_hooks_belong_to_the_slot_that_computes_them(cpu_streams, 
         mlp.fc1_latent_proj = Expert("down")
         mlp.fc2_latent_proj = Expert("up")
     mlp.backward_dw = partial(MoELayer.backward_dw, mlp)
-    _, backward_dw, _, _ = hybrid_callables.build_hybrid_stack_callables(layer, Symbols.MOE)
+    _, backward_dw, _, _ = hybrid_callables.build_hybrid_stack_callables(layer)
 
     def run_wgrad(modules):
         node = SimpleNamespace(
@@ -164,14 +169,14 @@ def test_attention_half_layer_forward_and_wgrad_are_scheduled(symbol):
     """All attention symbols, including MLA '+', preserve their forward and backward work."""
     backward_dw_wrapper = Mock()
     layer = SimpleNamespace(
-        config=_config(),
+        config=_config(symbol),
         _forward_attention=Mock(
             side_effect=lambda hidden_states, **kwargs: (hidden_states.sin(), None)
         ),
         backward_dw_wrapper=backward_dw_wrapper,
         init_backward_dw_wrapper=Mock(),
     )
-    forward, backward_dw, is_moe, _ = hybrid_callables.build_hybrid_stack_callables(layer, symbol)
+    forward, backward_dw, is_moe, _ = hybrid_callables.build_hybrid_stack_callables(layer)
     node = SimpleNamespace(chunk_state=_chunk_state(), is_mtp=False, is_last_layer=False)
     hidden_states = torch.tensor([0.2, 0.4], requires_grad=True)
     output = forward[0](node, hidden_states)
@@ -189,14 +194,14 @@ def test_attention_half_layer_forward_and_wgrad_are_scheduled(symbol):
 def test_mamba_pre_layer_wgrad_requires_a_mixer_that_defers_it(delay_wgrad_compute, mamba_mixer):
     """A mixer without delayed wgrad must fail when built, not skip its weight gradients."""
     mixer = MambaMixer.__new__(MambaMixer) if mamba_mixer else SimpleNamespace()
-    layer = SimpleNamespace(config=_config(delay_wgrad_compute=delay_wgrad_compute), mixer=mixer)
+    layer = SimpleNamespace(
+        config=_config(Symbols.MAMBA, delay_wgrad_compute=delay_wgrad_compute), mixer=mixer
+    )
     if delay_wgrad_compute and not mamba_mixer:
         with pytest.raises(ValueError, match="SimpleNamespace mixer"):
-            hybrid_callables.build_hybrid_stack_callables(layer, Symbols.MAMBA)
+            hybrid_callables.build_hybrid_stack_callables(layer)
     else:
-        _, backward_dw, is_moe, _ = hybrid_callables.build_hybrid_stack_callables(
-            layer, Symbols.MAMBA
-        )
+        _, backward_dw, is_moe, _ = hybrid_callables.build_hybrid_stack_callables(layer)
         assert backward_dw["pre_dispatch_computation"] == [layer]
         assert not is_moe
 
@@ -234,7 +239,7 @@ def test_ncclep_probabilities_do_not_reconnect_schedule_graphs(cpu_streams, zero
         tokens * manager.dispatched_probs,
         None,
     )
-    forward, _, _, _ = hybrid_callables.build_hybrid_stack_callables(layer, Symbols.MOE)
+    forward, _, _, _ = hybrid_callables.build_hybrid_stack_callables(layer)
 
     def preprocess(node, hidden_states):
         manager.token_probs = hidden_states.square()

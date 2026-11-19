@@ -637,6 +637,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         Hash-routed MoE layers and wide residuals are rejected by TransformerConfig.
         """
+        if self._has_custom_layers:
+            # Custom layers define their own forward and have no schedule-slot or wgrad contract.
+            raise ValueError(
+                "Custom hybrid layers do not support overlap_moe_expert_parallel_comm."
+            )
         if self.config.cuda_graph_impl != "none":
             raise ValueError(
                 "overlap_moe_expert_parallel_comm with HybridModel does not support CUDA graphs "
@@ -890,7 +895,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         decoder_input=None,
         attention_mask=None,
         padding_mask=None,
-        inference_params=None,
         packed_seq_params=None,
         sequence_len_offset=None,
         runtime_gather_output=None,
@@ -966,7 +970,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 hidden_states=mtp_inputs.hidden_states,
                 mhc_multistream=mtp_inputs.mhc_multistream,
                 attention_mask=attention_mask,
-                inference_params=inference_params,
+                inference_params=inference_context,
                 rotary_pos_emb=(
                     None
                     if self.hybrid_layer_config_list is not None and self._mtp_uses_mla
@@ -1147,19 +1151,17 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         attention_mask: Tensor,
         decoder_input: Tensor = None,
         labels: Tensor = None,
-        inference_context: BaseInferenceContext = None,
+        *,
         packed_seq_params: PackedSeqParams = None,
         extra_block_kwargs: dict = None,
         runtime_gather_output: Optional[bool] = None,
-        inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
-        *,
         mtp_input_mask: Optional[Tensor] = None,
         output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
     ):
-        """Build a combined-1F1B plan with one schedule entry per logical decoder layer."""
+        """Build a combined-1F1B training plan with one entry per logical decoder layer."""
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
         if self.config.moe_paged_stash:
@@ -1372,7 +1374,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             decoder_input=decoder_input,
             attention_mask=attention_mask,
             padding_mask=padding_mask,
-            inference_params=inference_params,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
             runtime_gather_output=runtime_gather_output,

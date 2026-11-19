@@ -453,8 +453,11 @@ class ScheduleNode:
 
 
 class AbstractSchedulePlan(ABC):
-    """To use combined 1f1b, model must implement build_schedule_plan while take the same
-    signature as model forward but return an instance of AbstractSchedulePlan"""
+    """A combined-1F1B plan for a model chunk.
+
+    The model's ``build_schedule_plan`` accepts the forward inputs used by its training
+    step and returns an instance of this class.
+    """
 
     @staticmethod
     @abstractmethod

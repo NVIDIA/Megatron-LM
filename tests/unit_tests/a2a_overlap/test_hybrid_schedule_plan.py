@@ -22,6 +22,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.a2a_overlap.utils import DummyState
+from tests.unit_tests.models.hybrid.external_layer import ExternalGainConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -44,6 +45,7 @@ def _overlap_model_stub(**config_overrides):
     config.update(config_overrides)
     model = torch.nn.Module()
     model.config = SimpleNamespace(**config)
+    model._has_custom_layers = False
     model.decoder = _hybrid_stack_stub()
     return model
 
@@ -126,9 +128,38 @@ def test_hybrid_ep_overlap_rejects_unsupported_features(config_overrides, messag
         HybridModel._validate_ep_overlap_support(_overlap_model_stub(**config_overrides))
 
 
-@pytest.mark.parametrize("pattern, num_layers", [("[M-][*E]", 4), ("[+E]", 2)])
-def test_grouped_overlap_matches_eager_outputs_and_gradients(pattern, num_layers):
-    """Compare per-token loss and gradients through the full grouped 1F1B schedule."""
+def test_hybrid_ep_overlap_rejects_custom_layers_at_construction():
+    """An external layer can override forward without implementing the overlap slots."""
+    if Utils.world_size < 2:
+        pytest.skip("Expert-parallel overlap requires at least two ranks")
+    Utils.initialize_model_parallel(expert_model_parallel_size=2)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = MLATransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            bf16=True,
+            num_moe_experts=4,
+            expert_model_parallel_size=2,
+            moe_token_dispatcher_type="alltoall",
+            overlap_moe_expert_parallel_comm=True,
+        )
+        with pytest.raises(ValueError, match="Custom hybrid layers.*overlap_moe"):
+            HybridModel(
+                config=config,
+                hybrid_layer_config_list=[ExternalGainConfig.from_config(config)],
+                vocab_size=32,
+                max_sequence_length=8,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("pattern, num_layers", [("[M-][*E]", 4), ("[+E]", 2), ("*E", 2)])
+def test_grouped_overlap_matches_eager_outputs_and_gradients(pattern, num_layers, monkeypatch):
+    """Compare the grouped-pattern and flat config-list 1F1B paths with eager training."""
     if Utils.world_size < 2:
         pytest.skip("Expert-parallel overlap requires at least two ranks")
     Utils.initialize_model_parallel(expert_model_parallel_size=2)
@@ -160,9 +191,14 @@ def test_grouped_overlap_matches_eager_outputs_and_gradients(pattern, num_layers
             qk_pos_emb_head_dim=32,
             v_head_dim=64,
         )
+        layers = (
+            {"hybrid_layer_pattern": pattern}
+            if "[" in pattern
+            else {"hybrid_layer_config_list": validate_segment_layers(pattern, config)}
+        )
         model = HybridModel(
             config=config,
-            hybrid_layer_pattern=pattern,
+            **layers,
             vocab_size=128,
             max_sequence_length=16,
             pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
@@ -189,6 +225,8 @@ def test_grouped_overlap_matches_eager_outputs_and_gradients(pattern, num_layers
         }
         model.zero_grad(set_to_none=True)
 
+        # Planning each microbatch must not reconstruct the legacy full-stack symbol list.
+        monkeypatch.delattr(HybridStack, "layer_type_list")
         set_streams()
         outputs = []
         previous = None
@@ -286,7 +324,7 @@ def test_packed_moe_overlap_routes_per_sample_like_eager():
                     state,
                     get_comp_stream,
                     get_comm_stream,
-                    extra_args={"layer_type": block.layer_type_list[0], "is_last_layer": True},
+                    extra_args={"layer_config": block.layer_config_list[0], "is_last_layer": True},
                 )
             )
 
