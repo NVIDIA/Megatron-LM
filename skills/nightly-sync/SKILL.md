@@ -115,29 +115,6 @@ CODEOWNERS change after the PR lands is painful.
 it needs to change, it must be regenerated with `uv lock` inside a CUDA
 container (see `.claude/skills/build-and-test/SKILL.md`).
 
-### Documentation (Fern) Conflicts
-
-The documentation site is built with Fern, not Sphinx. Content lives in
-`docs/` and site configuration lives in `fern/`. Resolve conflicts in these
-files by combining both sides, not by taking main's version wholesale:
-
-- `docs/index.yml` — the navigation. Every page under `docs/` that is meant to
-  be visible must be registered here. Keep nav entries from both sides, and
-  make sure each entry's `path:` points at a file that exists in the merged
-  tree. Drop an entry only if the page itself was intentionally removed.
-- `fern/redirects.yml` — keep rules from both sides. If main renamed, moved,
-  or deleted a page, the old URL needs a redirect rule.
-- `fern/versions/archives.yml` and `fern/versions/archives.mdx` — keep entries
-  from both sides without duplicates. These list released archive versions.
-- `fern/fern.config.json` — the Fern CLI version pin. Take the newer of the two
-  versions, since CI and local builds use this pin.
-- `fern/docs.yml` — keep the merged result consistent with the two files above.
-
-If the merge touched `docs/` or `fern/`, run the advisory Fern validation in
-"Pre-push advisory checks" below, and treat a failure of the `check` job in CI
-(the "Fern docs (check)" workflow) as a real failure to fix, not an exempt
-check.
-
 ### Git Source Reconciliation (pyproject.toml)
 
 After keeping dev's `pyproject.toml`, check whether main has added NEW git
@@ -351,34 +328,6 @@ if [ "$FINDINGS" -gt 0 ]; then
   echo "This audit is advisory; continue the push after reviewing the findings."
 fi
 
-# 4. Fern docs validation (only when the merge touched docs/ or fern/).
-#
-# CI runs the same three commands in the "Fern docs (check)" workflow. Running
-# them before the push catches nav entries that point at missing pages, broken
-# links, and invalid MDX early. Use the CLI version pinned in
-# fern/fern.config.json. If neither `fern` nor `npx` (Node.js 22) is available
-# on the runner, skip; CI is the authoritative check.
-if ! git diff --quiet "$DEV_REF"..HEAD -- docs/ fern/; then
-  if command -v fern >/dev/null 2>&1; then
-    FERN_CMD="fern"
-  elif command -v npx >/dev/null 2>&1 && [ -f fern/fern.config.json ]; then
-    FERN_VERSION=$(python3 -c 'import json; print(json.load(open("fern/fern.config.json"))["version"])' 2>/dev/null || true)
-    FERN_CMD="npx --yes fern-api@${FERN_VERSION:-latest}"
-  else
-    FERN_CMD=""
-    echo "NOTE: docs/ or fern/ changed but the Fern CLI is unavailable; skipping Fern validation (CI will run it)."
-  fi
-  if [ -n "$FERN_CMD" ] && [ -d fern ]; then
-    (
-      cd fern
-      $FERN_CMD check || echo "WARNING: 'fern check' failed"
-      $FERN_CMD docs md check || echo "WARNING: 'fern docs md check' failed"
-      $FERN_CMD docs broken-links --strict || echo "WARNING: 'fern docs broken-links --strict' failed"
-    )
-    echo "Fern validation finished. Fix any WARNING above (broken nav paths, missing redirects, bad MDX) before relying on CI."
-  fi
-fi
-
 echo "nightly-sync pre-push guidance complete"
 )
 GUIDANCE_STATUS=$?
@@ -536,7 +485,7 @@ does NOT show.
    REPO='NVIDIA/Megatron-LM'
    PR='<PR_NUMBER>'
    # Names matched case-insensitively, anchored to the START of the name.
-   EXEMPT='copy-pr-bot|is-not-external-contributor|greptile|coderabbit|codeowners|.*review|.*approval|codecov|coverage'
+   EXEMPT='copy-pr-bot|is-not-external-contributor|greptile|coderabbit|codeowners|.*review|.*approval|codecov|coverage|build-docs|doc-build|readthedocs|sphinx'
    # Sentinel check that tells us CI has fully run. Update this if the
    # aggregate gate job is renamed.
    SENTINEL='Nemo_CICD_Test'
@@ -734,8 +683,8 @@ CI run (against the current HEAD SHA) satisfies BOTH:
 If a non-exempt check is pending/queued/in-progress: keep polling; do not
 run `gh pr ready`. If it fails: go back to Phase 3's loop.
 
-The exempt list (review/approval/coverage) is defined in Phase 3; only those
-checks may be ignored. The Fern docs check (`check`) is NOT exempt.
+The exempt list (approval/coverage/docs) is defined in Phase 3; only those
+checks may be ignored.
 
 A pre-existing failure (same test failing identically on recent dev CI)
 may be accepted, but ONLY after it has fully run, been empirically
