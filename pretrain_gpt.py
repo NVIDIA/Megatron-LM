@@ -62,7 +62,10 @@ from megatron.training.argument_utils import (  # noqa: F401  (core_gpt_dataset_
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.datasets.providers import build_gpt_datasets, is_dataset_built_on_rank
 from megatron.training.global_vars import get_run_config, set_run_config
-from megatron.training.training import update_seqlen_stats_from_cu_seqlens
+from megatron.training.training import (
+    ssa_flops_selected_pairs_topk,
+    update_seqlen_stats_from_cu_seqlens,
+)
 from megatron.training.utils import is_first_or_last_pipeline_stage
 from model_provider import model_provider
 
@@ -380,7 +383,12 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                     cu_seqlens_padded = cu_seqlens_padded.squeeze(0)
                 # Use real (unpadded) cu_seqlens to feed the FLOPs accounting: varlen
                 # attention only computes work for real tokens within each chunk.
-                update_seqlen_stats_from_cu_seqlens(cu_seqlens)
+                update_seqlen_stats_from_cu_seqlens(
+                    cu_seqlens,
+                    sparse_attention_topk=ssa_flops_selected_pairs_topk(
+                        get_run_config().model.transformer
+                    ),
+                )
                 cu_seqlens_for_params = (
                     cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
                 )  # TODO(asolergi-nv): Currently there is a bug forcing cu_seqlens to be cu_seqlens_padded

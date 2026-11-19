@@ -79,7 +79,7 @@ def test_evaluate_weights_valid_tokens_across_batches_ranks_and_iterations(
         mock.patch.object(
             training_mod,
             "wrap_data_iterator",
-            side_effect=[(iter([]), count, 0, 0) for count in counts],
+            side_effect=[(iter([]), count, 0, 0, None) for count in counts],
         ),
         mock.patch.object(torch, "tensor", side_effect=cpu_tensor),
         mock.patch.object(torch.distributed, "all_reduce", side_effect=reduce) as all_reduce,

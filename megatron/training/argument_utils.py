@@ -492,6 +492,11 @@ def core_transformer_config_from_args(args, config_class=None):
                     f"got {variant!r} for pattern {pattern!r}."
                 )
             kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
+        elif variant == 'ssa' and Symbols.DS_ATTENTION in pattern:
+            raise ValueError(
+                "Simplified sparse attention replaces '*' attention layers and cannot "
+                "be combined with MLA DSA 'D' layers."
+            )
         elif variant is None and Symbols.DS_ATTENTION in pattern:
             kw_args['experimental_attention_variant'] = 'dsa'
 
@@ -1093,6 +1098,10 @@ def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> D
     kwargs["blend"] = blend
     kwargs["blend_per_split"] = blend_per_split
     kwargs["sequences_per_dataset"] = sequences_per_dataset
+    # Simplified sparse attention needs real document ends beside the padded storage offsets.
+    kwargs["preserve_logical_seqlens"] = (
+        getattr(args, "experimental_attention_variant", None) == "ssa"
+    )
     if standalone:
         kwargs.update(_container_written_fields_from_args(args))
     if family == "fim":

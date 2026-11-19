@@ -13,6 +13,7 @@ These tests pin both code paths and the accumulator math.
 """
 
 from copy import deepcopy
+from itertools import accumulate
 from types import SimpleNamespace
 
 import pytest
@@ -27,14 +28,39 @@ from megatron.training.models import GPTModelConfig, HybridModelConfig
 from megatron.training.training import (
     consume_seqlen_stats_in_iteration,
     num_floating_point_operations,
+    set_seqlen_stats_in_iteration,
+    ssa_flops_selected_pairs_topk,
     update_seqlen_stats_from_cu_seqlens,
 )
+
+
+def _causal_topk_pairs(lengths, topk):
+    """Brute force: position ``p`` of each sequence selects ``min(p + 1, topk)`` keys."""
+    return sum(min(p + 1, topk) for length in lengths for p in range(length))
+
+
+def _packed_flops_stats(micro_batches, topk):
+    """Drain one iteration of packed micro-batches (lists of real lengths) to FLOPs kwargs."""
+    _reset_seqlen_accumulator()
+    for lengths in micro_batches:
+        cu_seqlens = torch.tensor([0, *accumulate(lengths)], dtype=torch.int32)
+        update_seqlen_stats_from_cu_seqlens(cu_seqlens, sparse_attention_topk=topk)
+    total_real_tokens, seqlen_squared_sum, sparse_attention_pairs = (
+        consume_seqlen_stats_in_iteration()
+    )
+    return dict(
+        total_real_tokens_in_batch=total_real_tokens,
+        seqlen_squared_sum_in_batch=seqlen_squared_sum,
+        sparse_attention_pairs_in_batch=sparse_attention_pairs,
+    )
 
 
 def _reset_seqlen_accumulator():
     """Tear down the per-iteration accumulator between tests."""
     training_module._seqlen_stats_in_iteration = None
     training_module._seqlen_stats_active = False
+    training_module._seqlen_stats_are_global = False
+    training_module._seqlen_stats_has_selected_pairs = False
 
 
 def _make_gpt_config(
@@ -448,7 +474,7 @@ class TestAccumulator:
         update_seqlen_stats_from_cu_seqlens(cu)
         expected_sum = 100 + 150 + 150
         expected_sum_sq = 100**2 + 150**2 + 150**2
-        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        total_real_tokens, seqlen_squared_sum, _ = consume_seqlen_stats_in_iteration()
         assert total_real_tokens == expected_sum
         assert seqlen_squared_sum == expected_sum_sq
 
@@ -457,7 +483,7 @@ class TestAccumulator:
         cu2 = torch.tensor([0, 50, 250], dtype=torch.int32)  # sum=250, sum^2=42500
         update_seqlen_stats_from_cu_seqlens(cu1)
         update_seqlen_stats_from_cu_seqlens(cu2)
-        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        total_real_tokens, seqlen_squared_sum, _ = consume_seqlen_stats_in_iteration()
         assert total_real_tokens == 200 + 250
         assert seqlen_squared_sum == 20000 + 42500
 
@@ -466,14 +492,14 @@ class TestAccumulator:
         update_seqlen_stats_from_cu_seqlens(cu)
         _ = consume_seqlen_stats_in_iteration()
         # After draining, next consume must report BSHD (no work seen) by
-        # returning ``(None, None)`` so ``num_floating_point_operations`` takes
+        # returning ``(None, None, None)`` so ``num_floating_point_operations`` takes
         # the closed-form defaults.
-        assert consume_seqlen_stats_in_iteration() == (None, None)
+        assert consume_seqlen_stats_in_iteration() == (None, None, None)
 
     def test_no_updates_returns_none(self):
         """BSHD path: never calling update must NOT issue a collective. The
-        flag stays ``False`` and consume returns ``(None, None)``."""
-        assert consume_seqlen_stats_in_iteration() == (None, None)
+        flag stays ``False`` and consume returns ``(None, None, None)``."""
+        assert consume_seqlen_stats_in_iteration() == (None, None, None)
         # Flag stayed False -> the GPU tensor was never even allocated.
         assert training_module._seqlen_stats_in_iteration is None
         assert training_module._seqlen_stats_active is False
@@ -481,13 +507,13 @@ class TestAccumulator:
     def test_update_none_cu_seqlens_is_noop(self):
         update_seqlen_stats_from_cu_seqlens(None)
         # Still BSHD (no real update happened).
-        assert consume_seqlen_stats_in_iteration() == (None, None)
+        assert consume_seqlen_stats_in_iteration() == (None, None, None)
         assert training_module._seqlen_stats_active is False
 
     def test_update_single_entry_cu_seqlens_is_noop(self):
         """``cu_seqlens.numel() < 2`` (no real chunks) must be ignored."""
         update_seqlen_stats_from_cu_seqlens(torch.tensor([0], dtype=torch.int32))
-        assert consume_seqlen_stats_in_iteration() == (None, None)
+        assert consume_seqlen_stats_in_iteration() == (None, None, None)
         assert training_module._seqlen_stats_active is False
 
     def test_bshd_equivalent_when_chunks_fill_seq_length(self):
@@ -498,7 +524,7 @@ class TestAccumulator:
         for _ in range(batch_size):
             cu = torch.tensor([0, s], dtype=torch.int32)
             update_seqlen_stats_from_cu_seqlens(cu)
-        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        total_real_tokens, seqlen_squared_sum, _ = consume_seqlen_stats_in_iteration()
         assert total_real_tokens == batch_size * s
         assert seqlen_squared_sum == batch_size * s * s
 
@@ -510,7 +536,7 @@ class TestAccumulator:
         # cu_padded would be [0, 128, 400] in production (chunk pad + end pad),
         # but the accumulator must only see ``cu_real``.
         update_seqlen_stats_from_cu_seqlens(cu_real)
-        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        total_real_tokens, seqlen_squared_sum, _ = consume_seqlen_stats_in_iteration()
         # Real token count, NOT 400 (padded slot size).
         assert total_real_tokens == 100 + 200
         assert seqlen_squared_sum == 100**2 + 200**2
@@ -526,14 +552,60 @@ class TestAccumulator:
         tensor = training_module._seqlen_stats_in_iteration
         assert tensor is not None
         assert tensor.is_cuda
-        assert tensor.shape == (2,)  # [sum_L, sum_L_sq]
+        assert tensor.shape == (3,)  # [sum_L, sum_L_sq, sparse_attention_pairs]
         assert training_module._seqlen_stats_active is True
         # Drain.
         _ = consume_seqlen_stats_in_iteration()
         # Tensor stays allocated for reuse, but the flag flips back to False.
         assert training_module._seqlen_stats_active is False
         assert training_module._seqlen_stats_in_iteration is not None
-        assert training_module._seqlen_stats_in_iteration.tolist() == [0.0, 0.0]
+        assert training_module._seqlen_stats_in_iteration.tolist() == [0.0, 0.0, 0.0]
+
+
+class TestSelectedPairAccumulator:
+    """The causal top-k pair stat for simplified sparse attention's packed FLOPs."""
+
+    def setup_method(self, method):
+        _reset_seqlen_accumulator()
+
+    def teardown_method(self, method):
+        _reset_seqlen_accumulator()
+
+    @pytest.mark.parametrize(
+        "cu_seqlens,topk",
+        [
+            ([0, 1, 3, 2051, 6146], 2048),  # Shorter, equal and longer than top-k.
+            ([0, 1, 3, 2051, 6146], 1),
+            ([0, 1, 3, 2051, 6146], 8192),  # Top-k longer than every sequence.
+            ([0, 5, 5, 9], 3),  # Zero-length sequence.
+        ],
+    )
+    def test_selected_pairs_match_per_token_enumeration(self, cu_seqlens, topk):
+        lengths = [end - start for start, end in zip(cu_seqlens, cu_seqlens[1:])]
+        update_seqlen_stats_from_cu_seqlens(
+            torch.tensor(cu_seqlens, dtype=torch.int32), sparse_attention_topk=topk
+        )
+        _, _, sparse_attention_pairs = consume_seqlen_stats_in_iteration()
+        assert sparse_attention_pairs == _causal_topk_pairs(lengths, topk)
+
+    def test_selected_pairs_for_long_documents(self):
+        # 1 + 3 + 2048 * 2049 / 2 + (4095 * 2048 - 2048 * 2047 / 2)
+        stats = _packed_flops_stats([[1, 2, 2048, 4095]], topk=2048)
+        assert stats["sparse_attention_pairs_in_batch"] == 8388612
+
+    def test_selected_pairs_accumulate_and_reset(self):
+        stats = _packed_flops_stats([[2, 7], [4]], topk=3)
+        assert stats["sparse_attention_pairs_in_batch"] == _causal_topk_pairs([2, 7, 4], 3)
+        # The next iteration without top-k reports no selected-pair stat.
+        update_seqlen_stats_from_cu_seqlens(torch.tensor([0, 4], dtype=torch.int32))
+        assert consume_seqlen_stats_in_iteration() == (4, 16, None)
+
+    def test_scheduler_seeds_selected_pairs(self):
+        """The sequence-packing scheduler seeds global stats, including the pair count."""
+        set_seqlen_stats_in_iteration(13, 69, _causal_topk_pairs([2, 7, 4], 3))
+        assert consume_seqlen_stats_in_iteration() == (13, 69, 30)
+        set_seqlen_stats_in_iteration(13, 69)
+        assert consume_seqlen_stats_in_iteration() == (13, 69, None)
 
 
 class TestAccumulatorDistributed:
@@ -570,7 +642,7 @@ class TestAccumulatorDistributed:
 
         per_rank_sum = 100 + 200
         per_rank_sum_sq = 100**2 + 200**2
-        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        total_real_tokens, seqlen_squared_sum, _ = consume_seqlen_stats_in_iteration()
         assert total_real_tokens == per_rank_sum * Utils.world_size
         assert seqlen_squared_sum == per_rank_sum_sq * Utils.world_size
 
@@ -589,13 +661,13 @@ class TestAccumulatorDistributed:
 
         # All TP ranks updated the same value; after world all_reduce we get
         # TP * (per_rank) and divide by TP -> per_rank.
-        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        total_real_tokens, seqlen_squared_sum, _ = consume_seqlen_stats_in_iteration()
         assert total_real_tokens == 100 + 200
         assert seqlen_squared_sum == 100**2 + 200**2
 
     def test_bshd_path_skips_collective(self):
         """If no rank ever calls ``update_*``, ``consume_*`` must return
-        ``(None, None)`` *without* issuing any collective. A spy on
+        ``(None, None, None)`` *without* issuing any collective. A spy on
         ``all_reduce`` catches a regression that would otherwise hang in
         production when one rank is in THD mode and another in BSHD (the
         current contract assumes all ranks agree)."""
@@ -620,7 +692,7 @@ class TestAccumulatorDistributed:
         finally:
             torch.distributed.all_reduce = original_all_reduce
 
-        assert result == (None, None)
+        assert result == (None, None, None)
         assert calls == [], "consume must not issue all_reduce when no update happened"
 
 
@@ -692,14 +764,23 @@ class TestAccumulatorTopology:
         len_a = 100 * (dp_rank + 1)
         len_b = 200 * (dp_rank + 1)
         cu = torch.tensor([0, len_a, len_a + len_b], dtype=torch.int32, device='cuda')
-        update_seqlen_stats_from_cu_seqlens(cu)
+        update_seqlen_stats_from_cu_seqlens(cu, sparse_attention_topk=150)
 
         # Closed-form expected: sum over DP groups of (len_a + len_b) and
         # (len_a^2 + len_b^2). With len_a = 100*(r+1), len_b = 200*(r+1) -->
         # sum_L per DP = 300*(r+1), sum_L_sq per DP = 50000*(r+1)^2.
         expected_total_tokens = sum(300 * (r + 1) for r in range(dp_size))
         expected_sum_sq = sum(50000 * (r + 1) ** 2 for r in range(dp_size))
-        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        expected_pairs = sum(
+            _causal_topk_pairs([100 * (r + 1), 200 * (r + 1)], 150) for r in range(dp_size)
+        )
+        total_real_tokens, seqlen_squared_sum, sparse_attention_pairs = (
+            consume_seqlen_stats_in_iteration()
+        )
+        assert sparse_attention_pairs == pytest.approx(expected_pairs), (
+            f"topology tp={tp} cp={cp} pp={pp} dp={dp_size}: "
+            f"got sparse_attention_pairs={sparse_attention_pairs}, expected {expected_pairs}"
+        )
         assert total_real_tokens == pytest.approx(expected_total_tokens), (
             f"topology tp={tp} cp={cp} pp={pp} dp={dp_size}: "
             f"got total_real_tokens={total_real_tokens}, expected {expected_total_tokens}"
@@ -1516,3 +1597,137 @@ class TestDSAKPool:
             )
             == 0
         )
+
+
+class TestSimplifiedSparseAttentionFlops:
+    """SSA replaces dense core attention with top-k sparse attention plus its indexer."""
+
+    @staticmethod
+    def _configs(hybrid, *, topk=512, loss_coeff=0.1, seq_length=1024):
+        make = _make_hybrid_config if hybrid else _make_gpt_config
+        dense = make(num_layers=4, hidden_size=256, num_attention_heads=16, seq_length=seq_length)
+        dense.transformer.num_query_groups = 1
+        dense.transformer.kv_channels = 256
+        ssa = deepcopy(dense)
+        ssa.transformer.experimental_attention_variant = "ssa"
+        ssa.transformer.dsa_indexer_topk = topk
+        ssa.transformer.dsa_indexer_loss_coeff = loss_coeff
+        return dense, ssa
+
+    @staticmethod
+    def _attention_work(batch_size, seq_length, topk, loss_coeff):
+        """Per-layer SSA core and indexer FLOPs, counted pair by pair."""
+        hidden, query_dim, indexer_dim = 256, 16 * 256, 128
+        positions = range(seq_length)
+        causal_pairs = batch_size * sum(i + 1 for i in positions)
+        selected_pairs = batch_size * sum(min(i + 1, topk) for i in positions)
+        tokens = batch_size * seq_length
+        train_indexer = loss_coeff > 0
+        return (
+            12 * selected_pairs * query_dim
+            + 4 * tokens * hidden * indexer_dim * (1 + train_indexer)
+            + 2 * causal_pairs * indexer_dim
+            + 4 * selected_pairs * indexer_dim * train_indexer
+        )
+
+    @pytest.mark.parametrize("hybrid", [False, True])
+    @pytest.mark.parametrize("topk,seq_length", [(512, 1024), (2048, 1024)])
+    def test_sparse_core_replaces_dense_core(self, hybrid, topk, seq_length):
+        dense, ssa = self._configs(hybrid, topk=topk, seq_length=seq_length)
+        batch_size = 2
+        # Removing the dense L^2 term leaves the shared projections, MLP and logits.
+        dense_without_core = num_floating_point_operations(
+            dense, batch_size, sequence_length=seq_length, seqlen_squared_sum_in_batch=0
+        )
+        ssa_flops = num_floating_point_operations(ssa, batch_size, sequence_length=seq_length)
+        attention_layers = 2 if hybrid else 4
+        expected = attention_layers * self._attention_work(batch_size, seq_length, topk, 0.1)
+        assert ssa_flops - dense_without_core == pytest.approx(expected, rel=1e-12)
+
+    @pytest.mark.parametrize("hybrid", [False, True])
+    def test_indexer_only_counts_frozen_forward_dense_teacher_and_full_support_kl(self, hybrid):
+        dense, ssa = self._configs(hybrid)
+        ssa.transformer.ssa_train_indexer_only = True
+        batch_size, seq_length = 2, 1024
+        dense_without_core = num_floating_point_operations(
+            dense, batch_size, sequence_length=seq_length, seqlen_squared_sum_in_batch=0
+        )
+        causal_pairs = batch_size * sum(i + 1 for i in range(seq_length))
+        tokens = batch_size * seq_length
+        attention_layers = 2 if hybrid else 4
+        # Frozen backbone forward only; dense teacher QK/PV forward; indexer projections
+        # forward and weight gradients; indexer QK, dQ and dK over every causal key.
+        expected = dense_without_core / 3 + attention_layers * (
+            4 * causal_pairs * 16 * 256 + 8 * tokens * 256 * 128 + 6 * causal_pairs * 128
+        )
+        actual = num_floating_point_operations(ssa, batch_size, sequence_length=seq_length)
+        assert actual == pytest.approx(expected, rel=1e-9)
+
+    @pytest.mark.parametrize("hybrid", [False, True])
+    def test_zero_coefficient_removes_indexer_training(self, hybrid):
+        _, trained = self._configs(hybrid, loss_coeff=0.1)
+        _, frozen = self._configs(hybrid, loss_coeff=0.0)
+        batch_size = 2
+        difference = num_floating_point_operations(
+            trained, batch_size, sequence_length=1024
+        ) - num_floating_point_operations(frozen, batch_size, sequence_length=1024)
+        attention_layers = 2 if hybrid else 4
+        expected = attention_layers * (
+            self._attention_work(batch_size, 1024, 512, 0.1)
+            - self._attention_work(batch_size, 1024, 512, 0.0)
+        )
+        assert difference == pytest.approx(expected, rel=1e-12)
+
+    @staticmethod
+    def _packed_attention_work(lengths, topk, loss_coeff=0.1):
+        """Per-layer SSA core and indexer FLOPs for packed sequences, pair by pair."""
+        hidden, query_dim, indexer_dim = 256, 16 * 256, 128
+        causal_pairs = sum(i + 1 for length in lengths for i in range(length))
+        selected_pairs = _causal_topk_pairs(lengths, topk)
+        tokens = sum(lengths)
+        train_indexer = loss_coeff > 0
+        return (
+            12 * selected_pairs * query_dim
+            + 4 * tokens * hidden * indexer_dim * (1 + train_indexer)
+            + 2 * causal_pairs * indexer_dim
+            + 4 * selected_pairs * indexer_dim * train_indexer
+        )
+
+    @pytest.mark.parametrize("hybrid", [False, True])
+    @pytest.mark.parametrize("topk", [1, 3, 8])
+    def test_packed_sequences_select_within_each_sequence(self, hybrid, topk):
+        # Sequences shorter and longer than top-k.
+        dense, ssa = self._configs(hybrid, topk=topk, seq_length=16)
+        lengths = [1, 2, 5]
+        stats = _packed_flops_stats([lengths], ssa_flops_selected_pairs_topk(ssa.transformer))
+        dense_without_core = num_floating_point_operations(
+            dense,
+            1,
+            sequence_length=16,
+            total_real_tokens_in_batch=sum(lengths),
+            seqlen_squared_sum_in_batch=0,
+        )
+        attention_layers = 2 if hybrid else 4
+        expected = attention_layers * self._packed_attention_work(lengths, topk)
+        actual = num_floating_point_operations(ssa, 1, sequence_length=16, **stats)
+        assert actual - dense_without_core == pytest.approx(expected, rel=1e-12)
+
+    @pytest.mark.parametrize("hybrid", [False, True])
+    @pytest.mark.parametrize("topk", [512, 2048])
+    def test_full_length_packed_sequences_match_unpacked(self, hybrid, topk):
+        _, ssa = self._configs(hybrid, topk=topk, seq_length=1024)
+        stats = _packed_flops_stats([[1024], [1024]], topk)
+        assert num_floating_point_operations(
+            ssa, 2, sequence_length=1024, **stats
+        ) == num_floating_point_operations(ssa, 2, sequence_length=1024)
+
+    @pytest.mark.parametrize("hybrid", [False, True])
+    def test_indexer_only_training_ignores_selected_pairs(self, hybrid):
+        _, ssa = self._configs(hybrid)
+        ssa.transformer.ssa_train_indexer_only = True
+        assert ssa_flops_selected_pairs_topk(ssa.transformer) is None
+        stats = _packed_flops_stats([[100, 200, 500]], topk=512)
+        without_pairs = dict(stats, sparse_attention_pairs_in_batch=None)
+        assert num_floating_point_operations(
+            ssa, 1, sequence_length=1024, **stats
+        ) == num_floating_point_operations(ssa, 1, sequence_length=1024, **without_pairs)

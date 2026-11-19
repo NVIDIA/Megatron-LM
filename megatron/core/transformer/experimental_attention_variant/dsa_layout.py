@@ -165,16 +165,25 @@ def build_zigzag_cp_local_positions(
 def build_zigzag_allgather_cp_key_reorder(
     sq: int, cp_size: int, device: torch.device
 ) -> torch.Tensor:
-    """Build gathered-KV reorder index for non-packed zigzag allgather CP."""
-    global_seq_len = sq * cp_size
-    gathered_key_positions = torch.cat(
-        [
-            build_zigzag_cp_local_positions(global_seq_len, cp_size, rank, device)
-            for rank in range(cp_size)
-        ],
-        dim=0,
-    )
-    return torch.argsort(gathered_key_positions)
+    """Restore globally ordered keys from rank-major, non-packed zigzag CP shards.
+
+    Each rank contributes its front chunk followed by its mirrored back chunk.
+    Invert this chunk permutation directly, without constructing and sorting
+    every rank's token positions.
+    """
+    if cp_size < 1 or sq < 0:
+        raise ValueError("Zigzag CP requires a positive CP size and nonnegative local rows")
+    if cp_size == 1:
+        return torch.arange(sq, device=device, dtype=torch.int64)
+    if sq % 2:
+        raise ValueError("Zigzag CP requires even local rows for CP > 1")
+
+    half = sq // 2
+    global_chunks = torch.arange(2 * cp_size, device=device, dtype=torch.int64)
+    source_ranks = torch.minimum(global_chunks, 2 * cp_size - 1 - global_chunks)
+    source_starts = source_ranks * sq + (global_chunks >= cp_size).to(torch.int64) * half
+    offsets = torch.arange(half, device=device, dtype=torch.int64)
+    return (source_starts[:, None] + offsets[None, :]).reshape(-1)
 
 
 def get_cp_positions_from_layout(
@@ -305,6 +314,108 @@ def build_packed_allgather_cp_local_positions(
     return segment_starts.index_select(0, segment_ids) + segment_offsets
 
 
+def _build_complete_packed_cp_positions_and_reorder(
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    *,
+    cp_size: int,
+    cp_rank: int,
+    device: torch.device,
+    local_output_size: int,
+    key_local_output_size: int,
+    global_output_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Construct complete packed-CP positions and inverse gather order in linear work.
+
+    The caller proves that the cumulative lengths describe every physical row.  Each
+    document is split into ``2 * cp_size`` equal chunks. Rank ``r`` owns chunk ``r``
+    followed by mirrored chunk ``2 * cp_size - r - 1``.  Mapping local/global row
+    ordinals through those chunks directly avoids materializing every rank's position
+    vector and sorting the concatenation.
+    """
+    cu_q = cu_seqlens_q.to(device=device, dtype=torch.int64).contiguous()
+    cu_k = cu_seqlens_kv.to(device=device, dtype=torch.int64).contiguous()
+    q_starts = cu_q[:-1]
+    q_lengths = cu_q[1:] - q_starts
+    k_starts = cu_k[:-1]
+    k_ends = cu_k[1:]
+    k_lengths = k_ends - k_starts
+    chunk_divisor = 2 * cp_size
+
+    if device.type == "cpu":
+        for name, lengths in (("query", q_lengths), ("key", k_lengths)):
+            bad_lengths = lengths[(lengths > 0) & (lengths % chunk_divisor != 0)]
+            if bad_lengths.numel() > 0:
+                raise ValueError(
+                    f"Packed DSA CP expects each nonempty {name} length to be divisible "
+                    f"by {chunk_divisor}, got {int(bad_lengths[0].item())}"
+                )
+        expected_query_rows = int((q_lengths // cp_size).sum().item())
+        expected_key_rows = int((k_lengths // cp_size).sum().item())
+        if expected_query_rows != local_output_size:
+            raise RuntimeError(
+                "Packed DSA CP query row count disagrees with complete cu_seqlens: "
+                f"got {local_output_size}, expected {expected_query_rows}"
+            )
+        if expected_key_rows != key_local_output_size:
+            raise RuntimeError(
+                "Packed DSA CP local key row count disagrees with complete cu_seqlens: "
+                f"got {key_local_output_size}, expected {expected_key_rows}"
+            )
+        if expected_key_rows * cp_size != global_output_size:
+            raise RuntimeError(
+                "Packed DSA CP global key row count disagrees with complete cu_seqlens: "
+                f"got {global_output_size}, expected {expected_key_rows * cp_size}"
+            )
+
+    if local_output_size == 0:
+        query_positions = torch.empty(0, dtype=torch.int64, device=device)
+    else:
+        q_local_lengths = q_lengths // cp_size
+        q_local_ends = q_local_lengths.cumsum(dim=0)
+        q_local_starts = q_local_ends - q_local_lengths
+        q_rows = torch.arange(local_output_size, dtype=torch.int64, device=device)
+        q_sequence = torch.searchsorted(q_local_ends, q_rows, right=True)
+        q_within_sequence = q_rows - q_local_starts.index_select(0, q_sequence)
+        q_half = (q_local_lengths // 2).index_select(0, q_sequence)
+        q_sequence_start = q_starts.index_select(0, q_sequence)
+        q_sequence_length = q_lengths.index_select(0, q_sequence)
+        q_is_front = q_within_sequence < q_half
+        query_positions = torch.where(
+            q_is_front,
+            q_sequence_start + cp_rank * q_half + q_within_sequence,
+            q_sequence_start
+            + q_sequence_length
+            - (cp_rank + 1) * q_half
+            + (q_within_sequence - q_half),
+        )
+
+    if global_output_size == 0:
+        key_reorder_idx = torch.empty(0, dtype=torch.int64, device=device)
+    else:
+        key_positions = torch.arange(global_output_size, dtype=torch.int64, device=device)
+        key_positions = key_positions + cu_k[0]
+        key_sequence = torch.searchsorted(k_ends, key_positions, right=True)
+        key_sequence_start = k_starts.index_select(0, key_sequence)
+        key_sequence_length = k_lengths.index_select(0, key_sequence)
+        key_within_sequence = key_positions - key_sequence_start
+        key_half = key_sequence_length // chunk_divisor
+        key_chunk = torch.div(key_within_sequence, key_half, rounding_mode="floor")
+        key_rank = torch.where(key_chunk < cp_size, key_chunk, chunk_divisor - key_chunk - 1)
+        key_within_chunk = key_within_sequence - key_chunk * key_half
+        key_local_lengths = k_lengths // cp_size
+        key_local_starts = key_local_lengths.cumsum(dim=0) - key_local_lengths
+        key_local_document_start = key_local_starts.index_select(0, key_sequence)
+        key_local_offset = torch.where(
+            key_chunk < cp_size, key_within_chunk, key_half + key_within_chunk
+        )
+        key_reorder_idx = (
+            key_rank * key_local_output_size + key_local_document_start + key_local_offset
+        )
+
+    return query_positions.contiguous(), key_reorder_idx.contiguous()
+
+
 def build_packed_allgather_cp_query_positions_and_key_reorder(
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_kv: torch.Tensor,
@@ -326,6 +437,28 @@ def build_packed_allgather_cp_query_positions_and_key_reorder(
     This helper returns the permutation that restores those gathered KV tensors
     to global packed order, matching the Slime GLM5 implementation semantics.
     """
+    if key_local_output_size is None:
+        key_local_output_size = local_output_size
+    complete_layout = (
+        cp_size > 1
+        and query_cu_seqlens_cover_output
+        and key_cu_seqlens_cover_output
+        and local_output_size is not None
+        and key_local_output_size is not None
+        and global_output_size is not None
+    )
+    if complete_layout:
+        return _build_complete_packed_cp_positions_and_reorder(
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            device=device,
+            local_output_size=local_output_size,
+            key_local_output_size=key_local_output_size,
+            global_output_size=global_output_size,
+        )
+
     query_positions = build_packed_allgather_cp_local_positions(
         cu_seqlens_q,
         cp_size,
@@ -334,8 +467,6 @@ def build_packed_allgather_cp_query_positions_and_key_reorder(
         output_size=local_output_size,
         cu_seqlens_cover_output=query_cu_seqlens_cover_output,
     )
-    if key_local_output_size is None:
-        key_local_output_size = local_output_size
     gathered_key_positions = [
         build_packed_allgather_cp_local_positions(
             cu_seqlens_kv,

@@ -25,6 +25,7 @@ from megatron.core import mpu
 from megatron.core.context_parallel import ContextParallelBatch, get_batches_on_this_cp_rank
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.enums import ModelType
+from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.parallel_state import get_context_parallel_group
@@ -58,7 +59,10 @@ from megatron.training.argument_utils import (  # noqa: F401  (core_gpt_dataset_
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.datasets.providers import build_gpt_datasets, is_dataset_built_on_rank
 from megatron.training.global_vars import get_run_config, set_run_config
-from megatron.training.training import update_seqlen_stats_from_cu_seqlens
+from megatron.training.training import (
+    ssa_flops_selected_pairs_topk,
+    update_seqlen_stats_from_cu_seqlens,
+)
 from megatron.training.utils import is_first_or_last_pipeline_stage
 from model_provider import model_provider
 
@@ -213,6 +217,12 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
             else None
         ),
         tokens_per_sample=args.seq_length,
+        local_token_alignment=(
+            get_fp8_align_size(cfg.model.transformer.fp8_recipe)
+            if cfg.model.transformer.fp8
+            else 1
+        ),
+        preserve_logical_seqlens=cfg.model.transformer.experimental_attention_variant == "ssa",
     )
 
 
@@ -345,7 +355,12 @@ def forward_step(data_iterator, model: HybridModel):
         packed_seq_params = cp_batch.get_packed_seq_params()
         padding_mask = batch.get("padding_mask")
         if cu_seqlens is not None:
-            update_seqlen_stats_from_cu_seqlens(cu_seqlens.squeeze(0))
+            update_seqlen_stats_from_cu_seqlens(
+                cu_seqlens.squeeze(0),
+                sparse_attention_topk=ssa_flops_selected_pairs_topk(
+                    get_run_config().model.transformer
+                ),
+            )
 
         # Offline logits KD: record this microbatch's global (un-CP-sharded)
         # document boundaries so the saver can persist them alongside the

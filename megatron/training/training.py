@@ -256,15 +256,18 @@ stimer = StragglerDetector()
 #   index 0 -> ``sum_i(L_i)``   (total real tokens; used for token-linear FLOPs:
 #                               projections, MLP, MoE, MTP, logits)
 #   index 1 -> ``sum_i(L_i**2)`` (used for core-attention FLOPs)
+#   index 2 -> ``sum_i(L_i * k_i - k_i * (k_i - 1) / 2)`` with ``k_i = min(topk, L_i)``
+#              (causal top-k pairs, used for simplified sparse attention FLOPs)
 # Lives on GPU as fp64 so per-micro-batch updates run as fused kernels with
 # no host sync; the only host sync happens once at ``consume`` time after a
-# single 2-element all-reduce. ``_seqlen_stats_active`` flips to ``True`` the
+# single 3-element all-reduce. ``_seqlen_stats_active`` flips to ``True`` the
 # first time an update lands this iteration and is the gate that decides
 # whether ``consume_*`` issues a collective at all -- unpacked BSHD runs
 # never call ``update_*`` so the flag stays ``False`` and no collective fires.
 _seqlen_stats_in_iteration: Optional[torch.Tensor] = None
 _seqlen_stats_active: bool = False
 _seqlen_stats_are_global: bool = False
+_seqlen_stats_has_selected_pairs: bool = False
 
 # Only report memory for first 3 checkpoint saves.
 num_checkpoints_memory_reported = 0
@@ -717,8 +720,11 @@ def print_datetime(string, override_timestamp=None):
     print_rank_0(f'[{string}] datetime: {time_str} ')
 
 
-def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
-    """Add ``sum(L_i)`` and ``sum(L_i ** 2)`` from one micro-batch's REAL ``cu_seqlens``.
+def update_seqlen_stats_from_cu_seqlens(cu_seqlens, sparse_attention_topk: Optional[int] = None):
+    """Add one micro-batch's packed-sequence FLOP stats from its REAL ``cu_seqlens``.
+
+    Adds ``sum(L_i)`` and ``sum(L_i ** 2)``, plus the causal top-k pair count when
+    ``sparse_attention_topk`` is given.
 
     Args:
         cu_seqlens: 1-D ``int32`` tensor of cumulative REAL (unpadded) sequence
@@ -726,6 +732,10 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
             ``cu_seqlens`` rather than ``cu_seqlens_padded`` so the FLOPs
             metric reports useful work only, not work on CP-alignment or
             end-of-sequence padding tokens.
+        sparse_attention_topk: Keys selected per query by causal top-k sparse
+            attention. When given, also add the per-sequence selected-pair
+            count ``sum_i(L_i * k_i - k_i * (k_i - 1) / 2)`` with
+            ``k_i = min(topk, L_i)``.
 
     Every rank in the same data-parallel group sees the same ``cu_seqlens`` (it is
     broadcast across TP/CP/PP). The per-micro-batch reduction stays on device --
@@ -735,6 +745,7 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     flag at ``False`` and pay zero collective cost.
     """
     global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
+    global _seqlen_stats_has_selected_pairs
     if cu_seqlens is None or cu_seqlens.numel() < 2:
         return
     # Pin the accumulator to the current CUDA device when available so the
@@ -746,49 +757,65 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
             if torch.cuda.is_available()
             else cu_seqlens.device
         )
-        _seqlen_stats_in_iteration = torch.zeros(2, dtype=torch.float64, device=device)
+        _seqlen_stats_in_iteration = torch.zeros(3, dtype=torch.float64, device=device)
     seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(
         device=_seqlen_stats_in_iteration.device, dtype=torch.float64
     )
     _seqlen_stats_in_iteration[0] += seqlens.sum()
     _seqlen_stats_in_iteration[1] += (seqlens * seqlens).sum()
+    if sparse_attention_topk is not None:
+        k = seqlens.clamp(max=sparse_attention_topk)
+        _seqlen_stats_in_iteration[2] += (seqlens * k - k * (k - 1) / 2).sum()
+        _seqlen_stats_has_selected_pairs = True
     _seqlen_stats_active = True
     _seqlen_stats_are_global = False
 
 
-def set_seqlen_stats_in_iteration(total_real_tokens, seqlen_squared_sum):
-    """Seed per-iteration THD FLOPs stats that were already computed globally."""
+def set_seqlen_stats_in_iteration(
+    total_real_tokens, seqlen_squared_sum, sparse_attention_pairs: Optional[float] = None
+):
+    """Seed per-iteration THD FLOPs stats that were already computed globally.
+
+    ``sparse_attention_pairs`` is the global causal top-k pair count, or ``None`` when the
+    selected pairs are not counted.
+    """
     global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
+    global _seqlen_stats_has_selected_pairs
     if total_real_tokens is None or seqlen_squared_sum is None:
         return
     if _seqlen_stats_in_iteration is None:
         device = torch.device(f'cuda:{torch.cuda.current_device()}') if torch.cuda.is_available() else 'cpu'
-        _seqlen_stats_in_iteration = torch.zeros(2, dtype=torch.float64, device=device)
+        _seqlen_stats_in_iteration = torch.zeros(3, dtype=torch.float64, device=device)
     _seqlen_stats_in_iteration[0] = float(total_real_tokens)
     _seqlen_stats_in_iteration[1] = float(seqlen_squared_sum)
+    _seqlen_stats_in_iteration[2] = float(sparse_attention_pairs or 0.0)
+    _seqlen_stats_has_selected_pairs = sparse_attention_pairs is not None
     _seqlen_stats_active = True
     _seqlen_stats_are_global = True
 
 
-def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float]]:
+def consume_seqlen_stats_in_iteration() -> (
+    Tuple[Optional[float], Optional[float], Optional[float]]
+):
     """Read, reset and globally reduce the per-iteration packed-sequence stats.
 
     Returns:
-        ``(total_real_tokens, seqlen_squared_sum)`` summed across the whole
-        global batch (all DP ranks combined) for packed (THD) iterations.
-        Both are ``None`` if no update happened this iteration -- the BSHD
-        path -- so the caller forwards them straight to
+        ``(total_real_tokens, seqlen_squared_sum, sparse_attention_pairs)``
+        summed across the whole global batch (all DP ranks combined) for
+        packed (THD) iterations. All are ``None`` if no update happened this
+        iteration -- the BSHD path -- so the caller forwards them straight to
         ``num_floating_point_operations`` and takes its closed-form
         ``batch_size * seq_length`` / ``batch_size * seq_length ** 2`` defaults
-        without paying for a collective.
+        without paying for a collective. ``sparse_attention_pairs`` is also
+        ``None`` when no update passed ``sparse_attention_topk``.
 
         ``sum(L_i)`` and ``sum(L_i ** 2)`` are mathematically independent (you
         cannot derive one from the other), so both must be tracked. Computing
         them in tandem costs essentially nothing: the per-micro-batch updates
-        fuse onto one device tensor and consume issues a single 2-element
+        fuse onto one device tensor and consume issues a single 3-element
         all-reduce.
 
-    Sync cost: exactly ONE all-reduce of a 2-element ``float64`` tensor and ONE
+    Sync cost: exactly ONE all-reduce of a 3-element ``float64`` tensor and ONE
     host sync (``tolist()``). Skipped entirely when the flag is ``False``.
 
     All ranks within one DP group accumulated identical values (``cu_seqlens`` is
@@ -796,10 +823,11 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
     factor of ``TP * CP * PP``, which we divide out.
     """
     global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
+    global _seqlen_stats_has_selected_pairs
     if not _seqlen_stats_active:
         # BSHD path: never allocated the tensor; tell the caller to use the
         # closed-form defaults.
-        return None, None
+        return None, None, None
     t = _seqlen_stats_in_iteration
     if _seqlen_stats_are_global:
         dedup = 1
@@ -813,14 +841,32 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
         # No model-parallel state -> treat as a single rank, no reduction.
         # This is the standalone unit-test path; production always initializes mpu.
         dedup = 1
-    # Single host sync drains both stats at once.
-    total_real_tokens, seqlen_squared_sum = t.tolist()
+    # Single host sync drains every stat at once.
+    total_real_tokens, seqlen_squared_sum, sparse_attention_pairs = t.tolist()
+    sparse_attention_pairs = (
+        sparse_attention_pairs / dedup if _seqlen_stats_has_selected_pairs else None
+    )
     # Reset for the next iteration. Keep the tensor allocated so subsequent
     # iterations reuse it without reallocating.
     t.zero_()
     _seqlen_stats_active = False
     _seqlen_stats_are_global = False
-    return total_real_tokens / dedup, seqlen_squared_sum / dedup
+    _seqlen_stats_has_selected_pairs = False
+    return total_real_tokens / dedup, seqlen_squared_sum / dedup, sparse_attention_pairs
+
+
+def ssa_flops_selected_pairs_topk(transformer_cfg) -> Optional[int]:
+    """Top-k for the packed selected-pair FLOP stat; ``None`` when selection is not counted.
+
+    Simplified sparse attention counts selected pairs in joint training only; indexer-only
+    training attends densely.
+    """
+    if (
+        getattr(transformer_cfg, "experimental_attention_variant", None) == "ssa"
+        and not transformer_cfg.ssa_train_indexer_only
+    ):
+        return transformer_cfg.dsa_indexer_topk
+    return None
 
 
 def _dsv4_attention_flops(transformer_cfg, layer_counts, total_tokens, seqlen_squared_sum):
@@ -850,6 +896,7 @@ def num_floating_point_operations(
     sequence_length,
     seqlen_squared_sum_in_batch=None,
     total_real_tokens_in_batch=None,
+    sparse_attention_pairs_in_batch=None,
 ):
     """Compute the number of floating-point operations for one global batch.
 
@@ -875,6 +922,11 @@ def num_floating_point_operations(
             than ``batch_size * llm_seq_length`` whenever the dataloader added
             CP-alignment padding or end-of-sequence padding, so neither kind of
             padding shows up in the reported FLOPs.
+        sparse_attention_pairs_in_batch: Causal top-k query-key pairs,
+            ``sum_i(L_i * k_i - k_i * (k_i - 1) / 2)`` with ``k_i = min(topk, L_i)``,
+            across all REAL sub-sequences in the global batch. Drives simplified
+            sparse attention's selected-pair FLOPs. When ``None``, sequences are
+            taken at the length-weighted mean length.
     """
     from megatron.core.transformer.attention import SelfAttention
     from megatron.core.transformer.mlp import MLP
@@ -909,6 +961,36 @@ def num_floating_point_operations(
             legacy_config if config is None else config,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+        )
+
+    using_ssa = transformer_cfg.experimental_attention_variant == "ssa"
+    # Indexer-only training (SSA phase 1) runs the frozen backbone forward only.
+    backbone_passes = 1 if using_ssa and transformer_cfg.ssa_train_indexer_only else 3
+
+    def ssa_indexer_flops(num_layers):
+        from megatron.core.transformer.experimental_attention_variant import (
+            simplified_sparse_attention as ssa_layers,
+        )
+
+        # The detached indexer has loss-dependent backward costs, unlike the layer's x3.
+        return num_layers * ssa_layers.SimplifiedSparseIndexer.estimate_flops(
+            transformer_cfg,
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+            include_backward=True,
+            selected_pairs_in_batch=sparse_attention_pairs_in_batch,
+        )
+
+    def ssa_attention_flops(config):
+        from megatron.core.transformer.experimental_attention_variant import (
+            simplified_sparse_attention as ssa_layers,
+        )
+
+        return ssa_layers.SimplifiedSparseAttention.estimate_flops(
+            config,
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+            selected_pairs_in_batch=sparse_attention_pairs_in_batch,
         )
 
     def indexer_flops(
@@ -982,8 +1064,13 @@ def num_floating_point_operations(
         attention_config = copy.copy(legacy_config)
         attention_config.attention_output_gate = False
         forward = 0
+        expanded = 0
         if counts[Symbols.ATTENTION]:
-            forward += counts[Symbols.ATTENTION] * estimate(SelfAttention, attention_config)
+            if using_ssa:
+                forward += counts[Symbols.ATTENTION] * ssa_attention_flops(attention_config)
+                expanded += ssa_indexer_flops(counts[Symbols.ATTENTION])
+            else:
+                forward += counts[Symbols.ATTENTION] * estimate(SelfAttention, attention_config)
         if counts[Symbols.MLP]:
             forward += counts[Symbols.MLP] * estimate(MLP)
         if counts[Symbols.MOE]:
@@ -1010,7 +1097,6 @@ def num_floating_point_operations(
                 else GatedDeltaNet
             )
             forward += counts[Symbols.GDN] * estimate(gdn_type)
-        expanded = 0
         if counts[Symbols.DS_ATTENTION]:
             from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
 
@@ -1037,7 +1123,7 @@ def num_floating_point_operations(
             * vocab_size
             * (1 + mtp_depths)
         )
-        return 3 * forward + expanded
+        return backbone_passes * forward + expanded
 
     def transformer_flops():
         """Count layer executions and model-level work using Core's forward estimates."""
@@ -1138,6 +1224,9 @@ def num_floating_point_operations(
                 mtp_num_layers=mtp_num_layers,
                 mtp_use_repeated_layer=transformer_cfg.mtp_use_repeated_layer,
             )
+        elif using_ssa:
+            attention_type = None
+            expanded = ssa_indexer_flops(num_standard_attention_layers)
         else:
             attention_type = (
                 MLASelfAttention if transformer_cfg.multi_latent_attention else SelfAttention
@@ -1148,7 +1237,9 @@ def num_floating_point_operations(
         if num_moe_layers:
             forward += num_moe_layers * estimate(MoELayer)
         if num_standard_attention_layers:
-            forward += num_standard_attention_layers * estimate(attention_type)
+            forward += num_standard_attention_layers * (
+                ssa_attention_flops(legacy_config) if using_ssa else estimate(attention_type)
+            )
         # MTP norms/projections and output heads belong to the model, not individual layers.
         hidden_size = transformer_cfg.hidden_size
         forward += (
@@ -1159,7 +1250,7 @@ def num_floating_point_operations(
                 + hidden_size * vocab_size * (1 + mtp_num_layers)
             )
         )
-        return 3 * forward + expanded
+        return backbone_passes * forward + expanded
 
     # Keep legacy non-SiLU GLU accounting unchanged.
     legacy_config = copy.copy(transformer_cfg)
@@ -2201,13 +2292,43 @@ def _freeze_base_model_for_mtp(model_list):
     return model_list
 
 
-def _add_model_freeze_pre_wrap_hook(model_config, *, freeze_all_layers, freeze_base_model_for_mtp):
+def freeze_backbone_for_ssa_indexer(model_list):
+    """Freeze everything but simplified sparse attention indexers, including router bias updates.
+
+    Phase 1 of simplified sparse attention trains only the indexers against a frozen dense
+    teacher. A pipeline stage may hold no indexer; only a model without any is rejected.
+    """
+    local_indexer_params = 0
+    for model_module in model_list:
+        for name, param in model_module.named_parameters():
+            is_indexer = name.startswith("indexer.") or ".indexer." in name
+            param.requires_grad_(is_indexer)
+            local_indexer_params += int(is_indexer)
+        for module in model_module.modules():
+            if hasattr(module, "frozen_expert_bias"):
+                module.frozen_expert_bias = True
+
+    indexer_params = local_indexer_params
+    if torch.distributed.is_initialized():
+        count = torch.tensor(indexer_params, dtype=torch.int64, device=torch.cuda.current_device())
+        torch.distributed.all_reduce(count)
+        indexer_params = count.item()
+    if indexer_params == 0:
+        raise RuntimeError("ssa_train_indexer_only found no simplified sparse attention indexer.")
+    return model_list
+
+
+def _add_model_freeze_pre_wrap_hook(
+    model_config, *, freeze_all_layers, freeze_base_model_for_mtp, ssa_train_indexer_only=False
+):
     """Install the requested freeze hook before a config-built model is wrapped."""
     freeze_hook = None
     if freeze_all_layers:
         freeze_hook = _freeze_all_model_chunks
     elif freeze_base_model_for_mtp:
         freeze_hook = _freeze_base_model_for_mtp
+    elif ssa_train_indexer_only:
+        freeze_hook = freeze_backbone_for_ssa_indexer
 
     if freeze_hook is not None and freeze_hook not in model_config.pre_wrap_hooks:
         model_config.pre_wrap_hooks.append(freeze_hook)
@@ -2308,6 +2429,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         _freeze_all_model_chunks(model)
     elif config.freeze_base_model_for_mtp:
         _freeze_base_model_for_mtp(model)
+    elif config.ssa_train_indexer_only:
+        freeze_backbone_for_ssa_indexer(model)
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
@@ -2528,6 +2651,7 @@ def setup_model_and_optimizer(
                 model_config,
                 freeze_all_layers=args.freeze_all_layers,
                 freeze_base_model_for_mtp=cfg.model.transformer.freeze_base_model_for_mtp,
+                ssa_train_indexer_only=cfg.model.transformer.ssa_train_indexer_only,
             )
 
             return builder.build_distributed_models(
@@ -3097,15 +3221,18 @@ def train_step(
                     scheduled_num_microbatches,
                     total_real_tokens_in_batch,
                     seqlen_squared_sum_in_batch,
+                    sparse_attention_pairs_in_batch,
                 ) = wrap_data_iterator(
                     data_iterator,
                     config,
                     get_num_microbatches(),
                     pg_collection=get_attr_wrapped_model(model[0], "pg_collection"),
+                    sparse_attention_topk=ssa_flops_selected_pairs_topk(config),
                 )
                 set_seqlen_stats_in_iteration(
                     total_real_tokens_in_batch,
                     seqlen_squared_sum_in_batch,
+                    sparse_attention_pairs_in_batch,
                 )
                 has_wrapped_data_iterator = True
                 rerun_data_iterator = packed_data_iterator
@@ -3370,9 +3497,27 @@ def train_step(
 
 
 def _get_indexer_logging_layer_counts(model_config) -> tuple[int, int | None]:
-    """Return tracker slots and active CSA indexer modules for loss logging."""
+    """Return tracker slots and active CSA or SSA indexer modules for loss logging."""
     transformer_cfg = model_config.transformer
     tracker_layers = transformer_cfg.num_layers + (transformer_cfg.mtp_num_layers or 0)
+    using_ssa = getattr(transformer_cfg, "experimental_attention_variant", None) == "ssa"
+    if using_ssa and is_hybrid_model(model_config):
+        # Only the attention layers of a hybrid stack own a simplified sparse indexer.
+        from megatron.core.models.hybrid.hybrid_layer_allocation import (
+            Symbols,
+            parse_hybrid_pattern,
+        )
+
+        parsed_pattern = parse_hybrid_pattern(model_config.hybrid_layer_pattern)
+        mtp_pattern = parsed_pattern.mtp_pattern or ""
+        tracker_layers = transformer_cfg.num_layers + len(mtp_pattern)
+        mtp_indexer_repeats = (
+            1 if transformer_cfg.mtp_use_repeated_layer else parsed_pattern.mtp_num_depths
+        )
+        indexer_layers = (parsed_pattern.main_pattern or "").count(Symbols.ATTENTION) + (
+            mtp_pattern.count(Symbols.ATTENTION) * mtp_indexer_repeats
+        )
+        return tracker_layers, indexer_layers
     if transformer_cfg.csa_compress_ratios is None:
         return tracker_layers, None
 
@@ -5095,9 +5240,11 @@ def train(
         # from token-linear work. Returns ``(None, None)`` for unpacked BSHD
         # runs (no collective issued), letting ``num_floating_point_operations``
         # fall back to its closed-form defaults.
-        total_real_tokens_in_batch, seqlen_squared_sum_in_batch = (
-            consume_seqlen_stats_in_iteration()
-        )
+        (
+            total_real_tokens_in_batch,
+            seqlen_squared_sum_in_batch,
+            sparse_attention_pairs_in_batch,
+        ) = consume_seqlen_stats_in_iteration()
         packed_sequence_stats = None
         if getattr(args, 'log_packed_sequence_stats', False):
             packed_sequence_stats = consume_packed_sequence_stats_in_iteration()
@@ -5107,6 +5254,7 @@ def train(
             sequence_length=args.decoder_seq_length if args.decoder_seq_length is not None else args.seq_length,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
+            sparse_attention_pairs_in_batch=sparse_attention_pairs_in_batch,
         )
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
         train_state.num_floating_point_operations_so_far += num_floating_point_operations_in_batch
@@ -5460,7 +5608,7 @@ def evaluate(
 
             if getattr(config, "sequence_packing_scheduler", None) is not None:
                 try:
-                    (packed_data_iterator, scheduled_eval_num_microbatches, _, _) = (
+                    (packed_data_iterator, scheduled_eval_num_microbatches, _, _, _) = (
                         wrap_data_iterator(
                             data_iterator,
                             config,

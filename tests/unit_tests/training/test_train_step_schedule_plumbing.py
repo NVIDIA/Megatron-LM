@@ -84,14 +84,36 @@ def test_train_step_returns_scheduled_microbatch_count():
     packed_iterator = iter([1, 2, 3])
     with (
         mock.patch.object(
-            training_mod, 'wrap_data_iterator', return_value=(packed_iterator, 3, 60, 1200)
-        ),
+            training_mod, 'wrap_data_iterator', return_value=(packed_iterator, 3, 60, 1200, None)
+        ) as wrap,
         mock.patch.object(training_mod, 'get_attr_wrapped_model', return_value=object()),
-        mock.patch.object(training_mod, 'set_seqlen_stats_in_iteration'),
+        mock.patch.object(training_mod, 'set_seqlen_stats_in_iteration') as set_stats,
     ):
         captured = _run(config=SimpleNamespace(sequence_packing_scheduler='default_dynamic_cp'))
     assert captured['num_microbatches'] == captured['returned_num_microbatches'] == 3
     assert captured['data_iterator'] is packed_iterator
+    assert wrap.call_args.kwargs['sparse_attention_topk'] is None
+    set_stats.assert_called_once_with(60, 1200, None)
+
+
+def test_train_step_seeds_scheduled_sparse_attention_pairs():
+    """Joint SSA training asks the scheduler for the global top-k pair count and seeds it."""
+    config = SimpleNamespace(
+        sequence_packing_scheduler='dp_balanced',
+        experimental_attention_variant='ssa',
+        ssa_train_indexer_only=False,
+        dsa_indexer_topk=4,
+    )
+    with (
+        mock.patch.object(
+            training_mod, 'wrap_data_iterator', return_value=(iter([1]), 1, 60, 1200, 210)
+        ) as wrap,
+        mock.patch.object(training_mod, 'get_attr_wrapped_model', return_value=object()),
+        mock.patch.object(training_mod, 'set_seqlen_stats_in_iteration') as set_stats,
+    ):
+        _run(config=config)
+    assert wrap.call_args.kwargs['sparse_attention_topk'] == 4
+    set_stats.assert_called_once_with(60, 1200, 210)
 
 
 def test_train_step_forwards_schedule_plumbing():

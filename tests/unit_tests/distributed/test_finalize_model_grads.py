@@ -224,10 +224,11 @@ class TestUpdateRouterQBBeta:
         assert router.qb_beta_count.item() == 0
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_update_router_qb_beta_skips_eval(self):
+    @pytest.mark.parametrize("skip", ["eval", "frozen_expert_bias"])
+    def test_update_router_qb_beta_skips_eval_and_frozen(self, skip):
         config, moe_layer = self._build_moe_layer(ema=0.0)
         router = moe_layer.router
-        # Non-zero prior + non-uniform accumulator, so a broken eval guard would visibly
+        # Non-zero prior + non-uniform accumulator, so a broken guard would visibly
         # change qb_beta (a uniform accumulator re-centers to zero and hides the bug).
         router.qb_beta.copy_(torch.ones_like(router.qb_beta))
         router.qb_beta_accum.copy_(
@@ -235,11 +236,14 @@ class TestUpdateRouterQBBeta:
         )
         router.qb_beta_count.fill_(1)
         before = router.qb_beta.clone()
-        router.eval()
+        if skip == "eval":
+            router.eval()
+        else:
+            router.frozen_expert_bias = True
 
         _update_router_qb_beta([moe_layer], config, dp_cp_group=dist.group.WORLD)
 
-        # Eval-mode modules are skipped, so qb_beta is unchanged.
+        # Eval-mode and frozen-bias routers are skipped, so qb_beta is unchanged.
         torch.testing.assert_close(router.qb_beta, before)
 
 

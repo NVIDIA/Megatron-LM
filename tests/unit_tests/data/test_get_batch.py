@@ -20,6 +20,9 @@ from megatron.core.context_parallel.utils import (
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.experimental_attention_variant.simplified_sparse_attention_cudnn import (
+    build_attention_layout,
+)
 from megatron.core.utils import (
     _get_batch_on_this_cp_rank_per_sequence_balancing,
     _resolve_dynamic_cp_group_for_batch,
@@ -718,6 +721,104 @@ def test_get_batch_on_this_cp_rank_per_sequence_balancing(cp_size, seq_length):
         assert torch.equal(result['cu_seqlens'], cu_seqlens)
         assert torch.equal(result['max_seqlen'], max_seqlen)
         assert torch.equal(result['dataset_id'], dataset_id)
+
+
+@pytest.mark.parametrize(
+    "cp_rank,expected_indices", [(0, [0, 1, 2, 3, 12, 13, 14, 15]), (1, [4, 5, 6, 7, 8, 9, 10, 11])]
+)
+def test_zigzag_cp_batch_partitions_llava_tensors(cp_rank, expected_indices):
+    tokens = torch.arange(32).view(2, 16)
+    source = {
+        "combined_embeddings": torch.stack((tokens, tokens + 100), dim=-1),
+        "new_labels": tokens + 1,
+        "new_loss_mask": tokens.float() / 32,
+    }
+
+    with (
+        patch("torch.distributed.get_world_size", return_value=2),
+        patch("torch.distributed.get_rank", return_value=cp_rank),
+    ):
+        result = _get_batch_on_this_cp_rank_per_sequence_balancing(
+            dict(source), cp_group=MagicMock()
+        )
+
+    for key, value in source.items():
+        assert torch.equal(result[key], value[:, expected_indices])
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("cp_rank", [0, 1])
+def test_zigzag_cp_batch_preserves_blended_dataset_metadata(packed, cp_rank):
+    # BlendedDataset adds a scalar dataset_id to each native GPT sample;
+    # default_collate gives that metadata a batch dimension but no sequence axis.
+    tokens = torch.arange(16)
+    sample = {
+        "dataset_id": 7,
+        "tokens": tokens,
+        "labels": tokens + 1,
+        "loss_mask": torch.ones(16),
+        "position_ids": tokens,
+        "decoder_input": torch.stack((tokens, tokens + 20), dim=-1),
+        "mtp_input_mask": tokens.remainder(2).bool(),
+    }
+    # A real row excluded from LM loss must remain an attention row.
+    sample["loss_mask"][2] = 0
+    if packed:
+        sample["cu_seqlens"] = torch.tensor([0, 6, 16], dtype=torch.int32)
+        sample["max_seqlen"] = torch.tensor(10, dtype=torch.int32)
+    batch = torch.utils.data.default_collate([sample])
+    source = dict(batch)
+    if not packed:
+        batch["attention_mask"] = torch.arange(16).view(1, 1, 16, 1)
+
+    with (
+        patch("torch.distributed.get_world_size", return_value=2),
+        patch("torch.distributed.get_rank", return_value=cp_rank),
+    ):
+        cp_batch = get_batches_on_this_cp_rank(
+            batch,
+            boundary_layout="zigzag",
+            dynamic_cp=False,
+            cp_group=MagicMock(),
+            use_per_sequence_balancing=True,
+            tokens_per_sample=16,
+        )
+
+    result = cp_batch.get_batch()
+    assert result["dataset_id"] is source["dataset_id"]
+    assert result["dataset_id"].shape == (1,)
+    if packed:
+        # Each document is padded to 2 * CP rows before its front/back chunks split.
+        expected_indices = (
+            [0, 1, -1, -1, 6, 7, 8, 15, -1, -1]
+            if cp_rank == 0
+            else [2, 3, 4, 5, 9, 10, 11, 12, 13, 14]
+        )
+    else:
+        expected_indices = (
+            list(range(4)) + list(range(12, 16)) if cp_rank == 0 else list(range(4, 12))
+        )
+    indices = torch.tensor(expected_indices)
+    padding = indices < 0
+    for key in ("tokens", "labels", "loss_mask", "position_ids", "decoder_input", "mtp_input_mask"):
+        expected = source[key].index_select(1, indices.clamp_min(0))
+        padding_shape = (1, -1, *((1,) * (expected.ndim - 2)))
+        expected = expected.masked_fill(padding.view(padding_shape), 0)
+        torch.testing.assert_close(result[key], expected)
+    assert "padding_mask" not in result
+    if packed:
+        params = cp_batch.get_packed_seq_params()
+        torch.testing.assert_close(params.cu_seqlens_q, torch.tensor([0, 6, 16], dtype=torch.int32))
+        torch.testing.assert_close(
+            params.cu_seqlens_q_padded, torch.tensor([0, 8, 20], dtype=torch.int32)
+        )
+        group = SimpleNamespace(size=lambda: 2, rank=lambda: cp_rank)
+        with patch("torch.distributed.all_reduce"):
+            layout = build_attention_layout(torch.empty(indices.numel(), 16, 256), params, group)
+        torch.testing.assert_close(layout.query_valid, ~padding)
+    else:
+        assert cp_batch.get_packed_seq_params() is None
+        torch.testing.assert_close(result["attention_mask"], indices.view(1, 1, -1, 1))
 
 
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
@@ -1740,6 +1841,94 @@ def test_inter_document_masking_multi_mbs_batch(tp_size, micro_batch_size, seq_l
     assert max_seqlen.numel() == 1
 
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("tp_size,cp_size,pp_size", [(2, 1, 1), (1, 2, 1), (2, 1, 2), (1, 1, 4)])
+def test_native_packed_lengths_survive_tp_and_metadata_only_pipeline_stages(
+    tp_size, cp_size, pp_size, monkeypatch
+):
+    """Distinct logical/physical boundaries reach every rank without a new token mask."""
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size < tp_size * cp_size * pp_size:
+        pytest.skip("Not enough ranks for the requested parallelism configuration")
+    args = initialize_test_environment(
+        tp_size=tp_size,
+        pp_size=pp_size,
+        cp_size=cp_size,
+        seq_length=8,
+        micro_batch_size=2,
+        global_batch_size=2 * world_size // (tp_size * cp_size * pp_size),
+    )
+    args.dataloader_inter_document_masking = True
+    transformer = pretrain_hybrid.get_run_config().model.transformer
+    monkeypatch.setattr(transformer, "linear_cp_layout", "contiguous")
+    monkeypatch.setattr(transformer, "attention_cp_layout", "zigzag")
+    monkeypatch.setattr(transformer, "experimental_attention_variant", "ssa")
+    try:
+        iterator = None
+        if mpu.get_tensor_model_parallel_rank() == 0:
+            tokens = torch.arange(16).view(2, 8)
+            padding = torch.tensor(
+                [
+                    [False, False, False, True, False, False, True, True],
+                    [False, True, False, False, False, True, True, True],
+                ]
+            )
+            loss_mask = (~padding).float()
+            loss_mask[0, 1] = 0  # A real image/prompt row, not storage padding.
+            iterator = iter(
+                [
+                    {
+                        "tokens": tokens,
+                        "labels": tokens,
+                        "position_ids": tokens,
+                        "loss_mask": loss_mask,
+                        "cu_seqlens": torch.tensor([[0, 3, 5, 5], [0, 1, 4, 4]], dtype=torch.int32),
+                        "cu_seqlens_padded": torch.tensor(
+                            [[0, 4, 8, 8], [0, 2, 8, 8]], dtype=torch.int32
+                        ),
+                        "max_seqlen": torch.tensor([4, 6], dtype=torch.int32),
+                    }
+                ]
+            )
+        result = get_batch(iterator)
+        batch = result.get_batch()
+        packed = result.get_packed_seq_params("zigzag" if cp_size > 1 else None)
+        assert batch["cu_seqlens"].tolist() == [[0, 3, 5, 6, 9]]
+        assert batch["cu_seqlens_padded"].tolist() == [[0, 4, 8, 10, 16]]
+        assert "padding_mask" not in batch
+        assert packed.cu_seqlens_q.tolist() == [0, 3, 5, 6, 9]
+        assert packed.cu_seqlens_q_padded.tolist() == (
+            [0, 4, 8, 10, 16] if cp_size == 1 else [0, 4, 8, 12, 20]
+        )
+        cp_group = mpu.get_context_parallel_group()
+        valid = build_attention_layout(
+            torch.empty(packed.total_tokens // cp_size, 16, 256, device="cuda"), packed, cp_group
+        ).query_valid
+        if cp_size == 1:
+            assert valid.tolist() == [
+                True,
+                True,
+                True,
+                False,
+                True,
+                True,
+                False,
+                False,
+                True,
+                False,
+                True,
+                True,
+                True,
+                False,
+                False,
+                False,
+            ]
+        count = valid.sum()
+        torch.distributed.all_reduce(count, group=mpu.get_context_parallel_group())
+        assert count.item() == 9
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("script", [pretrain_gpt, pretrain_hybrid], ids=["gpt", "hybrid"])

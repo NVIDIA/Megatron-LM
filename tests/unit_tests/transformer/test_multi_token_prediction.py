@@ -951,7 +951,8 @@ class TestMultiTokenPredictionLayer:
         assert rolled_shapes[0][0] == expected_metadata_batch
 
     @pytest.mark.parametrize("cp", [1, 2])
-    def test_get_embeddings_rolls_packed_ids_and_validity_together(self, cp):
+    @pytest.mark.parametrize("padded", [False, True])
+    def test_get_embeddings_rolls_packed_ids_and_validity_together(self, cp, padded):
         """Packed CP rolling keeps token IDs and their validity exactly aligned."""
         torch.manual_seed(_SEED)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=cp, use_te=cp > 1)
@@ -990,9 +991,29 @@ class TestMultiTokenPredictionLayer:
             cu_seqlens = torch.tensor([0, 8, 20], dtype=torch.int32).cuda()
             max_seqlen = 6
 
+        cu_seqlens_padded = cu_seqlens if padded else None
+        if padded:
+            # Padding intentionally contains nonzero IDs, so a physical-boundary
+            # roll cannot pass by relying on the producer to zero storage rows.
+            if cp == 1:
+                cu_seqlens = torch.tensor([0, 2, 3], dtype=torch.int32, device="cuda")
+                expected_ids = torch.tensor([[2, 0, 0, 0, 0]], device="cuda")
+            else:
+                cu_seqlens = torch.tensor([0, 5, 14], dtype=torch.int32, device="cuda")
+                expected_ids = torch.tensor(
+                    (
+                        [[2, 3, 0, 0, 12, 13, 14, 0, 0, 0]]
+                        if cp_rank == 0
+                        else [[4, 5, 0, 0, 15, 16, 17, 18, 19, 0]]
+                    ),
+                    device="cuda",
+                )
+
         packed_seq_params = PackedSeqParams(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
             qkv_format='thd',

@@ -6,6 +6,7 @@ WORLD_SIZE=1 LOCAL_RANK=0 python -m pytest tests/unit_tests/models/mimo/test_mim
 
 import math
 import os
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -30,6 +31,7 @@ from megatron.core.models.mimo.config.role import (
     RankRole,
 )
 from megatron.core.models.mimo.model.base import MimoModel
+from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
 from megatron.core.models.mimo.submodules.audio import AudioModalitySubmodules
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.models.vision.clip_vit_model import CLIPViTModel
@@ -489,28 +491,38 @@ class TestMimoModel:
         mimo_model = self._make_vlm()
         assert mimo_model.partition_adapter is not None
 
-    def test_forward_with_packed_sequence_metadata(self):
+    @pytest.mark.parametrize("ssa", [False, True])
+    def test_forward_with_packed_sequence_metadata(self, ssa):
         """Canonical MIMO metadata builds the language model's THD parameters."""
         from megatron.core.packed_seq_params import PackedSeqParams
 
         mimo_model = self._make_vlm()
-        input_ids = self._make_input_ids()
-        position_ids = self._make_position_ids()
+        mimo_model.language_model.config.experimental_attention_variant = "ssa" if ssa else None
+        mimo_model.partition_adapter.cfg = replace(
+            mimo_model.partition_adapter.cfg, pad_packed_documents=ssa
+        )
+        input_ids = self._make_input_ids().reshape(1, -1)
+        position_ids = self._make_position_ids().reshape(1, -1)
 
         cu_seqlens = torch.tensor(
             [[0, self.seq_len, 2 * self.seq_len]], dtype=torch.int32, device=self.device
         )
         max_seqlen = torch.tensor([self.seq_len], dtype=torch.int32, device=self.device)
+        logical_cu_seqlens = cu_seqlens.clone()
+        logical_cu_seqlens[:, 1:] -= 1
         text_emb = torch.zeros(self.batch_size * self.seq_len, self.hidden_size, device=self.device)
         combined_emb = torch.zeros(
-            self.seq_len, self.batch_size, self.hidden_size, device=self.device
+            self.seq_len * self.batch_size, 1, self.hidden_size, device=self.device
         )
 
         captured = {}
 
         def capture_lm_forward(*args, **kwargs):
             captured['packed_seq_params'] = kwargs.get('packed_seq_params')
-            return torch.zeros(self.batch_size, self.seq_len, self.vocab_size, device=self.device)
+            assert 'padding_mask' not in kwargs
+            return torch.zeros(
+                1, self.batch_size * self.seq_len, self.vocab_size, device=self.device
+            )
 
         with (
             patch.object(mimo_model, 'get_text_embeddings', return_value=text_emb),
@@ -523,7 +535,8 @@ class TestMimoModel:
                 input_ids=input_ids,
                 position_ids=position_ids,
                 modality_inputs=None,
-                cu_seqlens=cu_seqlens,
+                cu_seqlens=logical_cu_seqlens,
+                cu_seqlens_padded=cu_seqlens,
                 max_seqlen=max_seqlen,
             )
 
@@ -532,8 +545,14 @@ class TestMimoModel:
         assert packed_seq_params.qkv_format == 'thd'
         assert packed_seq_params.cu_seqlens_q.dtype == torch.int32
         assert packed_seq_params.cu_seqlens_kv.dtype == torch.int32
-        torch.testing.assert_close(packed_seq_params.cu_seqlens_q, cu_seqlens.squeeze(0))
         assert packed_seq_params.max_seqlen_q == self.seq_len
+        if ssa:
+            torch.testing.assert_close(
+                packed_seq_params.cu_seqlens_q, logical_cu_seqlens.squeeze(0)
+            )
+            torch.testing.assert_close(packed_seq_params.cu_seqlens_q_padded, cu_seqlens.squeeze(0))
+        else:
+            torch.testing.assert_close(packed_seq_params.cu_seqlens_q, cu_seqlens.squeeze(0))
 
     def test_forward_with_partition_adapter(self):
         """MTP token metadata must use the same CP-local sequence as hidden states.

@@ -91,7 +91,7 @@ def test_packed_schedule_pipeline_cp_and_hybrid_sp(dynamic_cp, cp_size, hybrid):
                     }
                 )
             iterator = iter(samples)
-        iterator, count, _, _ = wrap_data_iterator(iterator, config, 4, pg_collection=pg)
+        iterator, count, *_ = wrap_data_iterator(iterator, config, 4, pg_collection=pg)
         assert count > 0
         for _ in range(count):
             result = get_batch_on_this_rank_for_sequence_packing(
@@ -198,7 +198,7 @@ def test_static_packing_default_zigzag_matches_tuple_path():
                         'cu_seqlens': torch.tensor([0, length], dtype=torch.int32, device='cuda'),
                     }
                 )
-            iterator, count, _, _ = wrap_data_iterator(
+            iterator, count, *_ = wrap_data_iterator(
                 iter(samples), config, len(samples), pg_collection=pg
             )
             return iterator, count

@@ -77,6 +77,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     inter_document_masking: bool = False
     """When True, return cu_seqlens marking document boundaries within each sample so
     that attention is restricted to individual documents."""
+    preserve_logical_seqlens: bool = False
+    """Keep real document lengths separate from padded storage boundaries."""
+
     sft_mock_dataset_config_json: Optional[str] = None
     """JSON string (or path to a JSON file) configuring the mock SFT dataset's
     sequence-length distribution. Two modes:
@@ -340,13 +343,21 @@ class GPTDataset(MegatronDataset):
             loss_mask = torch.zeros_like(loss_mask)
 
         if self.config.inter_document_masking:
-            # document_lengths come from _query_document_sample_shuffle_indices
-            # which fetches sequence_length + add_extra_token_to_sequence tokens
-            # total. The extra token is appended to the last document part (used
-            # to produce the shifted labels), so subtract it before computing
-            # cu_seqlens which should index into the sequence_length-sized tokens
-            # tensor.
-            if self.config.add_extra_token_to_sequence:
+            # Fetched document lengths include the optional extra label token.
+            # Cumulative lengths must describe only rows in the input tensor.
+            if self.config.preserve_logical_seqlens:
+                # Clip at the input extent: in a short sample the shifted label
+                # token is padding, so its last real token remains an input.
+                document_lengths = numpy.diff(
+                    numpy.minimum(numpy.cumsum([0] + document_lengths), tokens.numel())
+                ).tolist()
+                document_lengths = [length for length in document_lengths if length > 0]
+                if not document_lengths:
+                    document_lengths = [0]
+                logical_cu_seqlens = torch.tensor(
+                    numpy.cumsum([0] + document_lengths), dtype=torch.int32
+                )
+            elif self.config.add_extra_token_to_sequence:
                 document_lengths[-1] -= 1
                 if document_lengths[-1] == 0:
                     document_lengths.pop()
@@ -387,6 +398,10 @@ class GPTDataset(MegatronDataset):
                 "cu_seqlens": padded_cu_seqlens,
                 "max_seqlen": max_seqlen,
             }
+            if self.config.preserve_logical_seqlens:
+                result["cu_seqlens_padded"] = padded_cu_seqlens
+                result["cu_seqlens"] = torch.full_like(padded_cu_seqlens, logical_cu_seqlens[-1])
+                result["cu_seqlens"][: logical_cu_seqlens.numel()] = logical_cu_seqlens
         elif self.config.create_attention_mask:
             result = {
                 "tokens": tokens,

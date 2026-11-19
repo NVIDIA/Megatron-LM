@@ -15,6 +15,7 @@ from megatron.core.context_parallel import (
     CPLayout,
     get_batches_on_this_cp_rank,
 )
+from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import get_context_parallel_group, get_tensor_model_parallel_group
 from megatron.core.utils import get_pg_size
@@ -34,6 +35,10 @@ class PartitionConfig:
     cp_group: Optional[ProcessGroup] = None
     tp_group: Optional[ProcessGroup] = None
     tp_cp_group: Optional[ProcessGroup] = None
+    local_token_alignment: int = 1
+    # SSA needs per-document CP padding when the input loader has not aligned it.
+    # Other attention implementations retain their existing producer contract.
+    pad_packed_documents: bool = False
 
     @classmethod
     def from_mp_config(
@@ -69,6 +74,10 @@ class PartitionConfig:
             cp_group=cp_group,
             tp_group=tp_group,
             tp_cp_group=tp_cp_group,
+            local_token_alignment=(
+                get_fp8_align_size(mp.fp8_recipe) if getattr(mp, "fp8", None) else 1
+            ),
+            pad_packed_documents=getattr(mp, "experimental_attention_variant", None) == "ssa",
         )
 
 
@@ -98,9 +107,10 @@ class PartitionAdapter:
         layout and the second view follows the attention/MTP layout.
         """
         self._validate_sequence_length(embeddings, is_packed=cu_seqlens is not None)
+        batch_first_embeddings = self.cfg.use_cp or cu_seqlens is not None
 
         is_multiaxis_position_ids = (
-            self.cfg.use_cp and position_ids is not None and position_ids.dim() == 3
+            batch_first_embeddings and position_ids is not None and position_ids.dim() == 3
         )
         position_metadata = (
             position_ids.movedim(0, -1).contiguous() if is_multiaxis_position_ids else position_ids
@@ -113,7 +123,7 @@ class PartitionAdapter:
             "mtp_input_mask": mtp_input_mask,
             "decoder_input": (
                 embeddings.transpose(0, 1).contiguous()
-                if self.cfg.use_cp and embeddings is not None
+                if batch_first_embeddings and embeddings is not None
                 else embeddings
             ),
             "cu_seqlens": cu_seqlens,
@@ -134,6 +144,9 @@ class PartitionAdapter:
             tp_group=self.cfg.tp_group,
             tp_cp_group=self.cfg.tp_cp_group,
             tokens_per_sample=self.cfg.max_seq_len,
+            use_per_sequence_balancing=(cu_seqlens is not None and self.cfg.pad_packed_documents),
+            local_token_alignment=self.cfg.local_token_alignment,
+            preserve_logical_seqlens=(cu_seqlens is not None and self.cfg.pad_packed_documents),
         )
 
         if is_multiaxis_position_ids:
@@ -148,7 +161,7 @@ class PartitionAdapter:
         # between layouts after each layer instead. Drop these references before model forward.
         for layout_batch in cp_batch.batches_by_layout.values():
             layout_batch.pop("decoder_input", None)
-        if self.cfg.use_cp and local_embeddings is not None:
+        if batch_first_embeddings and local_embeddings is not None:
             local_embeddings = local_embeddings.transpose(0, 1).contiguous()
         if self.cfg.seq_parallel and local_embeddings is not None:
             local_embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
