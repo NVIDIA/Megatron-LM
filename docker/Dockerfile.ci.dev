@@ -49,7 +49,7 @@ EOF
 # pins its Python, PyTorch, CUDA, compiler, and CPU architecture; BuildKit also keys
 # this stage on the source revision, GPU target, and helper.
 FROM base AS mok-wheel
-ARG MOK_COMMIT=7a8cfb7fdd96a1cfba506caf4756c6c86073399a
+ARG MOK_COMMIT=ee7bdaba515fd3d557105d71809ec74cd523d5a1
 # Include both GPU architectures supported by the pinned MoK source by default.
 ARG MOK_ARCH=ALL
 RUN --mount=type=bind,source=docker/common/install_mok.sh,target=/opt/install_mok.sh \
