@@ -507,9 +507,14 @@ def test_layer_wise_param_norm_counts_owners_before_param_sync(
             p.numel() * (1 if getattr(p, "allreduce", True) else expert_parallel_size)
             for p in model.parameters()
         )
-        model = DistributedDataParallel(
-            model.config, DistributedDataParallelConfig(overlap_param_gather=True), model
-        )
+        from megatron.training.training import wrap_model_chunks_with_ddp
+
+        model = wrap_model_chunks_with_ddp(
+            [model],
+            model.config,
+            DistributedDataParallelConfig(overlap_param_gather=True),
+            use_layer_wise_distributed_optimizer=True,
+        )[0]
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         optimizer = get_megatron_optimizer(
             OptimizerConfig(
@@ -523,8 +528,14 @@ def test_layer_wise_param_norm_counts_owners_before_param_sync(
             use_gloo_process_groups=False,
             pg_collection=pg_collection,
         )
-        assert isinstance(optimizer, LayerWiseDistributedOptimizer)
-        assert optimizer.overlap_param_gather
+        # The chain pairs the LayerWise optimizer with a sibling DistributedOptimizer.
+        layer_wise_optimizers = [
+            sub_optimizer
+            for sub_optimizer in optimizer.chained_optimizers
+            if isinstance(sub_optimizer, LayerWiseDistributedOptimizer)
+        ]
+        assert len(layer_wise_optimizers) == 1
+        assert layer_wise_optimizers[0].overlap_param_gather
         params = list(model.parameters())
         assert all(getattr(p, "main_param_sharded", False) for p in params)
         assert common_utils.calc_params_l2_norm(model) == pytest.approx(math.sqrt(expected_numel))
