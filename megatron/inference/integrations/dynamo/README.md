@@ -158,14 +158,28 @@ On a failed deployment attempt:
 
    ```bash
    python -m megatron.inference.integrations.dynamo.handoff_recovery \
-     --coordinator-address tcp://prefill-0:5000 \
-     --coordinator-address tcp://prefill-1:5000 \
+     --coordinator-address-file /run/secrets/prefill-0.coordinator \
+     --coordinator-address-file /run/secrets/prefill-1.coordinator \
      --confirm-terminated-owner <old-launch-attempt-id>
    ```
 
+   Source coordinators only accept peers that present their launch secret, so a
+   bare `tcp://host:port` is refused and the command times out. Each source's
+   complete *authenticated launch address* (`tcp://host:port#auth=<secret>`) is
+   required, and it is a credential. Launch every source (prefill) adapter with
+   `--coordinator-address-file <path>` on storage the supervisor controls, such
+   as a secret volume or tmpfs. The adapter writes its address there after
+   readiness, atomically and readable only by its owner, and rewrites it when
+   it restarts with a new secret. The supervisor keeps these files for the
+   deployment's lifetime so they are available when a decode worker fails; do not
+   recover addresses from logs, which never contain the secret. Pass them with
+   `--coordinator-address-file`; `--coordinator-address` also accepts the full
+   address but exposes the secret in the process list.
+
    Controllers can also await `confirm_terminated(address, owner)` from that
-   module. Retry unreachable sources. The operation is idempotent and fences
-   delayed claims by the terminated attempt, even at sources it never used.
+   module, passing the authenticated address. Retry unreachable sources. The
+   operation is idempotent and fences delayed claims by the terminated attempt,
+   even at sources it never used.
    A source engine's control connection failing does not discard ownership or
    acknowledge cleanup; retry after connectivity is restored.
    Run it only on the trusted control network; it accepts the supervisor's

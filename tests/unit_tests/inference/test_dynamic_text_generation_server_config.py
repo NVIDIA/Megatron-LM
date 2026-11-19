@@ -217,6 +217,86 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
     assert server._SERVER_PROCESSES[0].started is True
 
 
+def _patch_replica_launch(monkeypatch):
+    """Record the byte budget each launched replica receives, without starting processes."""
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
+        text_generation_server as server,
+    )
+
+    budgets = []
+
+    class FakeProcess:
+        pid = 1
+
+        def __init__(self, *, target, args, daemon) -> None:
+            *_, replica_budget, self._ready_conn = args
+            budgets.append(replica_budget)
+            self.sentinel = os.pipe()[0]
+
+        def start(self):
+            # Report the replica as listening so start_text_gen_server returns.
+            self._ready_conn.send(True)
+            self._ready_conn.close()
+
+    class FakeProcessContext:
+        Process = FakeProcess
+
+    monkeypatch.setattr(server, "_SERVER_PROCESSES", [])
+    monkeypatch.setattr(server, "_SERVER_PROCESS_CONTEXT", FakeProcessContext())
+    return server, budgets
+
+
+def _start(server, **kwargs):
+    return server.start_text_gen_server(
+        coordinator_addr="tcp://coord:5555",
+        tokenizer=object(),
+        rank=0,
+        server_port=5000,
+        hostname="127.0.0.1",
+        **kwargs,
+    )
+
+
+def test_inflight_byte_budget_is_split_across_replicas(monkeypatch):
+    server, budgets = _patch_replica_launch(monkeypatch)
+
+    _start(server, num_replicas=4, max_inflight_bytes=2**34)
+
+    # The budget is per rank, so the host-wide total is unchanged by replica count.
+    assert budgets == [2**32] * 4
+    assert sum(budgets) == 2**34
+
+
+@pytest.mark.parametrize("num_replicas", [1, 4, 16, 17, 32, 64])
+def test_default_budget_starts_for_every_replica_count(monkeypatch, num_replicas):
+    """The launcher picks max(DP size, 4) replicas, so no replica count may be refused."""
+    server, budgets = _patch_replica_launch(monkeypatch)
+
+    _start(server, num_replicas=num_replicas)
+
+    assert len(budgets) == num_replicas
+    # Every replica can still accept a maximum-size request ...
+    assert min(budgets) >= 2**30
+    # ... and the aggregate stays bounded: 16 GiB, or one maximum-size request per replica
+    # once there are more than 16 replicas.
+    assert sum(budgets) <= max(2**34, num_replicas * 2**30)
+    assert len(set(budgets)) == 1
+
+
+def test_inflight_byte_budget_must_fit_a_max_size_request_per_replica(monkeypatch):
+    server, budgets = _patch_replica_launch(monkeypatch)
+
+    with pytest.raises(ValueError, match="max_inflight_bytes"):
+        _start(server, num_replicas=4, max_inflight_bytes=3 * 2**30)
+    with pytest.raises(ValueError, match="num_replicas"):
+        _start(server, num_replicas=0, max_inflight_bytes=2**34)
+    assert budgets == []
+
+    # Exactly one maximum-size request per replica is allowed.
+    _start(server, num_replicas=4, max_inflight_bytes=4 * 2**30)
+    assert budgets == [2**30] * 4
+
+
 @pytest.mark.asyncio
 async def test_frontend_process_exposes_sampling_config_and_stops_client(monkeypatch):
     from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (

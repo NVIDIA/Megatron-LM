@@ -7,12 +7,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import msgpack
 import zmq
 import zmq.asyncio
 
+from megatron.core.inference.data_parallel_inference_coordinator.auth import (
+    present_credentials,
+    split_authenticated_address,
+)
 from megatron.core.inference.headers import Headers
 
 
@@ -20,7 +25,8 @@ from megatron.core.inference.headers import Headers
 class HandoffRelease:
     """Source identity retained until its release has been acknowledged."""
 
-    coordinator_addr: str
+    # Carries the coordinator's launch secret: kept out of repr so logging a release is safe.
+    coordinator_addr: str = field(repr=False)
     coordinator_instance_id: str
     request_id: int
 
@@ -49,7 +55,9 @@ async def confirm_terminated(address: str, owner: str, timeout: float = 30.0) ->
         raise ValueError("A unique handoff owner is required")
     context = zmq.asyncio.Context()
     socket = context.socket(zmq.DEALER)
-    socket.connect(address)
+    endpoint, auth_token = split_authenticated_address(address)
+    present_credentials(socket, auth_token)
+    socket.connect(endpoint)
     try:
         async with asyncio.timeout(timeout):
             await socket.send(msgpack.packb([Headers.CONNECT.value]))
@@ -69,20 +77,39 @@ async def confirm_terminated(address: str, owner: str, timeout: float = 30.0) ->
 def main() -> None:
     """Expose the supervisor hook without a database or a persistent volume."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--coordinator-address", action="append", required=True)
+    parser.add_argument(
+        "--coordinator-address-file",
+        action="append",
+        default=[],
+        help=(
+            "File holding one source coordinator's authenticated launch address, as written by "
+            "the adapter's --coordinator-address-file. Preferred: the address is a credential."
+        ),
+    )
+    parser.add_argument(
+        "--coordinator-address",
+        action="append",
+        default=[],
+        help=(
+            "A source coordinator's complete authenticated launch address. It contains the "
+            "launch secret and is visible in the process list; prefer --coordinator-address-file."
+        ),
+    )
     parser.add_argument(
         "--confirm-terminated-owner",
         required=True,
         help="Attest that this attempt's adapter and ALL decode ranks exited and cannot restart.",
     )
     args = parser.parse_args()
+    addresses = args.coordinator_address + [
+        Path(path).read_text().strip() for path in args.coordinator_address_file
+    ]
+    if not addresses or not all(addresses):
+        parser.error("at least one non-empty --coordinator-address-file or --coordinator-address")
 
     async def release_all():
         await asyncio.gather(
-            *(
-                confirm_terminated(address, args.confirm_terminated_owner)
-                for address in args.coordinator_address
-            )
+            *(confirm_terminated(address, args.confirm_terminated_owner) for address in addresses)
         )
 
     asyncio.run(release_all())

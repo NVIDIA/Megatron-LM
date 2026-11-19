@@ -37,6 +37,7 @@ class Config:
     endpoint_types: str = "chat,completions"
     handoff_owner: str | None = None
     streaming_interval: int = 1
+    coordinator_address_file: str | None = None
 
 
 def _split_argv(argv: list[str]) -> tuple[list[str], list[str]]:
@@ -93,6 +94,15 @@ def parse_args(argv: list[str] | None = None) -> Config:
         "--worker-id-file",
         default=None,
         help="Write this worker's assigned Dynamo identity as JSON after engine readiness.",
+    )
+    parser.add_argument(
+        "--coordinator-address-file",
+        default=None,
+        help=(
+            "Write this worker's authenticated coordinator launch address after engine readiness, "
+            "readable only by its owner. The address contains the coordinator's secret: a "
+            "deployment supervisor keeps it to run the handoff_recovery hook against this source."
+        ),
     )
     parser.add_argument("--megatron-root", default=str(Path(__file__).resolve().parents[4]))
     parser.add_argument("--drain-timeout", type=float, default=30.0)
@@ -177,4 +187,5 @@ def parse_args(argv: list[str] | None = None) -> Config:
         endpoint_types=args.endpoint_types,
         handoff_owner=args.handoff_owner,
         streaming_interval=args.streaming_interval,
+        coordinator_address_file=args.coordinator_address_file,
     )

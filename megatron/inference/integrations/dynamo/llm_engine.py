@@ -58,6 +58,25 @@ _HEALTH_CHECK_TIMEOUT = 5.0
 _RELEASE_TIMEOUT = 5.0
 
 
+def _write_private_file(path: Path, text: str) -> None:
+    """Atomically write ``text`` to ``path``, readable only by the current user.
+
+    The file is created with its final permissions, never briefly world-readable, because it
+    holds a credential (the authenticated coordinator address).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.unlink(missing_ok=True)  # never inherit the permissions of a stale file
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write(text)
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
 class InferenceRequestRejected(InferenceRequestError, ValueError):
     """A non-transient admission error, mapped to HTTP 400 by Dynamo."""
 
@@ -258,6 +277,11 @@ class MegatronLLMEngine(LLMEngine):
             temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
             temporary.write_text(json.dumps(identity, sort_keys=True) + "\n")
             os.replace(temporary, path)
+
+        if self.config.coordinator_address_file is not None:
+            _write_private_file(
+                Path(self.config.coordinator_address_file), endpoint.coordinator_address + "\n"
+            )
 
         capabilities = endpoint.capabilities
         return EngineConfig(

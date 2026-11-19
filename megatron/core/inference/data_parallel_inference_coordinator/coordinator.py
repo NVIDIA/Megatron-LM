@@ -31,6 +31,12 @@ from megatron.core.inference.routing import select_engine
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import detokenize_tokens
 
+from .auth import (
+    authenticated_address,
+    generate_auth_token,
+    require_authentication,
+    start_server_authentication,
+)
 from .handlers import HANDLERS
 from .state import CoordinatorState
 
@@ -126,6 +132,7 @@ class DataParallelInferenceCoordinator:
         hostname: str | None = None,
         disaggregated: bool = False,
         initial_state: CoordinatorState = CoordinatorState.RUNNING,
+        auth_token: bytes | None = None,
     ):
         """
         Initializes the inference coordinator.
@@ -158,6 +165,8 @@ class DataParallelInferenceCoordinator:
                 RUNNING by default; SUSPENDED when the engines are constructed without weights.
                 It must match the engines' start state: RESUME is honored only from SUSPENDED,
                 so engines built suspended behind a RUNNING coordinator never resume.
+            auth_token (bytes, optional): Secret every peer must present to connect. A random
+                one is generated if omitted and returned to the launcher as part of the address.
         """
         assert HAVE_ZMQ, (
             "please install the pyzmq library to use DataParallelInferenceCoordinator\n"
@@ -173,6 +182,11 @@ class DataParallelInferenceCoordinator:
         self.data_parallel_size = data_parallel_size
         self.context = zmq.Context()
 
+        # The socket is reachable over the network: refuse every peer that does not
+        # present the launch-time secret, before any of its messages are delivered.
+        self.auth_token = auth_token or generate_auth_token()
+        self._authenticator = start_server_authentication(self.context, self.auth_token)
+
         # This is the central router socket
         # 1. data parallel ranks connect to this socket to register themselves
         # 2. Users connect to this socket and submit their requests. We transmit them to
@@ -184,6 +198,7 @@ class DataParallelInferenceCoordinator:
         local_ip = hostname or socket.gethostname()
 
         self.router_socket = self.context.socket(zmq.ROUTER)
+        require_authentication(self.router_socket)
         # Raise error if the other side of the connection has dropped.
         self.router_socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
         is_bound = False
@@ -207,7 +222,7 @@ class DataParallelInferenceCoordinator:
         self.addr = self.router_socket.getsockopt_string(zmq.LAST_ENDPOINT)
 
         # Send the address to the parent process.
-        self.pipe_connection.send(self.addr)
+        self.pipe_connection.send(authenticated_address(self.addr, self.auth_token))
         self.pipe_connection.close()
 
         logging.info("Inference Coordinator: waiting for connections from data parallel ranks...")
@@ -795,6 +810,7 @@ class DataParallelInferenceCoordinator:
         hostname: str | None = None,
         disaggregated: bool = False,
         initial_state: CoordinatorState = CoordinatorState.RUNNING,
+        auth_token: bytes | None = None,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -843,6 +859,7 @@ class DataParallelInferenceCoordinator:
             hostname=hostname,
             disaggregated=disaggregated,
             initial_state=initial_state,
+            auth_token=auth_token,
         )
         ready_event.set()
         try:
@@ -866,4 +883,5 @@ class DataParallelInferenceCoordinator:
             with open(self.schedule_output_path, "w") as f:
                 json.dump(schedule_data, f, indent=2)
         self.router_socket.close()
+        self._authenticator.stop()
         self.context.term()

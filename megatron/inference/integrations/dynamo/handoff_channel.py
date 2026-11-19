@@ -14,6 +14,10 @@ import msgpack
 import zmq
 import zmq.asyncio
 
+from megatron.core.inference.data_parallel_inference_coordinator.auth import (
+    present_credentials,
+    split_authenticated_address,
+)
 from megatron.core.inference.headers import Headers
 
 
@@ -45,11 +49,15 @@ class HandoffChannel:
     """
 
     def __init__(self, context: zmq.asyncio.Context, address: str) -> None:
-        self.address = address
+        # ``address`` may carry the coordinator's launch secret. Keep only the endpoint, so the
+        # credential never reaches an error message.
+        endpoint, auth_token = split_authenticated_address(address)
+        self.address = endpoint
         self.socket = context.socket(zmq.DEALER)
         self.socket.setsockopt(zmq.SNDHWM, 0)
         self.socket.setsockopt(zmq.RCVHWM, 0)
-        self.socket.connect(address)
+        present_credentials(self.socket, auth_token)
+        self.socket.connect(endpoint)
         self._pending: dict[tuple, deque[asyncio.Future]] = {}
         self._instance_id: str | None = None
         self._handshake: asyncio.Task | None = None

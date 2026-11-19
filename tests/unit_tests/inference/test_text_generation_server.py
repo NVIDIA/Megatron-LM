@@ -13,10 +13,34 @@ from megatron.core.inference.config import MediaPromptSpec, MultimodalPromptConf
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
     text_generation_server,
 )
+from megatron.core.inference.text_generation_server.endpoints.completions import (
+    _validate_debug_filename,
+)
 
 
 def test_frontend_processes_use_spawn_context():
     assert text_generation_server._SERVER_PROCESS_CONTEXT.get_start_method() == "spawn"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "../../../../tmp/megatron_pwned",
+        "../escape",
+        "/tmp/absolute",
+        "nested/path",
+        "",
+        "x" * 129,
+        None,
+    ],
+)
+def test_completions_rejects_unsafe_debug_filename(value):
+    with pytest.raises(ValueError):
+        _validate_debug_filename(value)
+
+
+def test_completions_accepts_safe_debug_filename():
+    assert _validate_debug_filename("request-42.debug") == "request-42.debug"
 
 
 @pytest.mark.asyncio

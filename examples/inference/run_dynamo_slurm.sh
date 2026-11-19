@@ -178,7 +178,7 @@ if [[ -n "$handoff_owner" ]]; then
     # have exited. The allocation controller must attest to that separately.
     echo "After confirming this attempt's parent and ALL decode ranks have exited:" >&2
     printf '%q ' "$python_executable" -m megatron.inference.integrations.dynamo.handoff_recovery \
-        --coordinator-address '<each-prefill-coordinator>' \
+        --coordinator-address-file '<each-prefill-coordinator-address-file>' \
         --confirm-terminated-owner "$handoff_owner" >&2
     echo >&2
 fi
