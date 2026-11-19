@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from itertools import accumulate
 from math import ceil, lcm, log2
 from typing import Dict, List, Literal, Optional, Sequence, Tuple, TypeVar
 
@@ -7,7 +8,7 @@ import torch
 
 from megatron.core.context_parallel.groups import get_valid_dynamic_context_parallel_group_sizes
 from megatron.core.extensions.transformer_engine import get_thd_partitioned_indices
-from megatron.core.packed_seq_params import _pad_cu_seqlens, resolve_thd_tail_padding_policy
+from megatron.core.packed_seq_params import resolve_thd_tail_padding_policy
 from megatron.core.rerun_state_machine import RerunDataIterator
 
 _DYNAMIC_CP_WORKLOAD_CAP_DELTA = 0.05
@@ -149,7 +150,14 @@ def _pad_packed_graph_metadata(batch: Dict, max_num_seqs: Optional[int]) -> None
     batch["max_seqlen"] = batch["cu_seqlens_padded"][-1].to(torch.int32)
 
 
-def pad_packed_batch_before_cp_slice(batch: Dict, config, cp_size: int, tp_size: int) -> None:
+def _host_to_device(values: List[int], like: torch.Tensor) -> torch.Tensor:
+    """Copy host boundaries to ``like``'s dtype and device without a stream synchronization."""
+    return torch.tensor(values, dtype=like.dtype).to(like.device, non_blocking=True)
+
+
+def pad_packed_batch_before_cp_slice(
+    batch: Dict, config, cp_size: int, tp_size: int
+) -> Optional[List[int]]:
     """Pad global THD data and metadata before constructing any CP layout.
 
     Preserve compact logical boundaries and existing physical gaps. Align each
@@ -168,17 +176,33 @@ def pad_packed_batch_before_cp_slice(batch: Dict, config, cp_size: int, tp_size:
     ``cuda_graph_thd_max_packed_sequences`` instead fixes the metadata shapes by
     repeating the final offsets up to that capacity + 1 entries. Its dummy tail has
     zero logical length, and ``max_seqlen`` is the global padded length.
+
+    This runs once per microbatch on the host path before every training step, so the
+    boundaries (a few integers) are read to the host in one copy and the padded layout is
+    planned there. Token-like tensors are gathered on device only when a physical sequence
+    moves; when every sequence is already aligned and contiguous they are only extended by
+    the tail.
+
+    Returns:
+        The padded ``cu_seqlens_padded`` as a host list, or ``None`` when padding is disabled.
     """
     alignment, enabled = get_packed_sequence_alignment(config, tp_size)
     graph_metadata_capacity = getattr(config, "cuda_graph_thd_max_packed_sequences", None)
     if not enabled:
         _pad_packed_graph_metadata(batch, graph_metadata_capacity)
-        return
+        return None
     logical = batch['cu_seqlens']
     physical = batch['cu_seqlens_padded']
-    lengths = physical.diff()
-    padded_lengths = get_packed_sequence_length(lengths, cp_size, pad_sequences=True)
-    global_length = int(padded_lengths.sum().item())
+    if logical.dtype == physical.dtype and logical.device == physical.device:
+        boundaries = torch.cat((logical, physical)).tolist()
+        logical_host, physical_host = boundaries[: logical.numel()], boundaries[logical.numel() :]
+    else:
+        logical_host, physical_host = logical.tolist(), physical.tolist()
+    lengths_host = [end - start for start, end in zip(physical_host, physical_host[1:])]
+    padded_lengths_host = [
+        get_packed_sequence_length(length, cp_size, pad_sequences=True) for length in lengths_host
+    ]
+    global_length = sum(padded_lengths_host)
     local_length = (global_length + cp_size - 1) // cp_size
     limit = getattr(config, 'max_seqlen_per_dp_cp_rank', None)
     graph_impl = getattr(config, 'cuda_graph_impl', None)
@@ -197,45 +221,89 @@ def pad_packed_batch_before_cp_slice(batch: Dict, config, cp_size: int, tp_size:
             f"max_seqlen_per_dp_cp_rank={limit}; increase the limit or reduce packing."
         )
 
-    padded_boundaries = torch.cat((physical[:1], padded_lengths.cumsum(0, dtype=physical.dtype)))
-    positions = torch.arange(global_length, device=physical.device)
-    seq_ids = torch.searchsorted(padded_boundaries[1:], positions, right=True)
-    offsets = positions - padded_boundaries[seq_ids]
-    source_indices = physical[seq_ids] + offsets
-    within_source = offsets < lengths[seq_ids]
-    source_indices = source_indices.clamp(max=int(physical[-1].item()) - 1).long()
+    padded_host = physical_host[:1] + list(accumulate(padded_lengths_host))
+    # When the padded layout equals the physical one, position p reads source row p and every
+    # row is inside its sequence, so the gather and mask below are the identity.
+    identity = padded_host == physical_host
+    source_indices = within_source = None
+    if not identity:
+        padded_boundaries = _host_to_device(padded_host, physical)
+        lengths = physical.diff()
+        positions = torch.arange(global_length, device=physical.device)
+        seq_ids = torch.searchsorted(padded_boundaries[1:], positions, right=True)
+        offsets = positions - padded_boundaries[seq_ids]
+        source_indices = physical[seq_ids] + offsets
+        within_source = offsets < lengths[seq_ids]
+        source_indices = source_indices.clamp(max=physical_host[-1] - 1).long()
     tail = target * cp_size - global_length
     for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask'):
         tensor = batch.get(key)
         if tensor is None:
             continue
         fill = key == 'padding_mask'
-        padded = tensor.index_select(0, source_indices).masked_fill(~within_source, fill)
+        if identity:
+            # A prefix view: callers pass freshly built tensors and nothing writes to them later.
+            if tensor.size(0) < global_length:
+                raise IndexError(
+                    f"{key} has {tensor.size(0)} rows; cu_seqlens_padded needs {global_length}."
+                )
+            padded = tensor[:global_length]
+        else:
+            padded = tensor.index_select(0, source_indices).masked_fill(~within_source, fill)
         batch[key] = torch.cat((padded, tensor.new_full((tail,), fill))) if tail else padded
 
+    new_logical_host = logical_host
     if tail and resolve_thd_tail_padding_policy(config) == 'extend_last':
         # Keep the logical boundaries; the final physical sequence absorbs the tail.
-        padded_boundaries = padded_boundaries.clone()
-        padded_boundaries[-1] += tail
+        padded_host = padded_host[:-1] + [padded_host[-1] + tail]
     elif tail:
         logical_tail = tail if graph_metadata_capacity is None else 0
-        logical = torch.cat((logical, logical[-1:] + logical_tail))
-        padded_boundaries = torch.cat((padded_boundaries, padded_boundaries[-1:] + tail))
+        new_logical_host = logical_host + [logical_host[-1] + logical_tail] if logical_host else []
+        padded_host = padded_host + [padded_host[-1] + tail] if padded_host else []
     max_num_seqs = getattr(config, 'thd_max_packed_sequences', None)
     if max_num_seqs is not None:
         # Repeating the final boundary adds zero-length sequences, so the static
         # cu_seqlens buffers keep one shape for every pack.
-        logical = _pad_cu_seqlens(logical, max_num_seqs + 1)
-        padded_boundaries = _pad_cu_seqlens(padded_boundaries, max_num_seqs + 1)
-    batch['cu_seqlens'] = logical
-    batch['cu_seqlens_padded'] = padded_boundaries
-    if static_tokens or max_num_seqs is not None:
-        batch['max_seqlen'] = torch.tensor(
-            target * cp_size, dtype=torch.int32, device=padded_boundaries.device
+        new_logical_host = _pad_host_cu_seqlens(new_logical_host, max_num_seqs + 1)
+        padded_host = _pad_host_cu_seqlens(padded_host, max_num_seqs + 1)
+    if graph_metadata_capacity is not None:
+        # The host form of _pad_packed_graph_metadata: fixed metadata shapes whose dummy
+        # tail has zero logical length.
+        entries = graph_metadata_capacity + 1
+        if len(padded_host) > entries or len(new_logical_host) > entries:
+            raise ValueError("Packed documents exceed cuda_graph_thd_max_packed_sequences.")
+        logical_pad = entries - len(new_logical_host)
+        new_logical_host = new_logical_host + new_logical_host[-1:] * logical_pad
+        padded_host = padded_host + padded_host[-1:] * (entries - len(padded_host))
+    if new_logical_host != logical_host:
+        batch['cu_seqlens'] = _host_to_device(new_logical_host, logical)
+    batch['cu_seqlens_padded'] = _host_to_device(padded_host, physical)
+    if graph_metadata_capacity is not None:
+        # A stable upper bound is needed by TE capture even when document lengths vary.
+        batch['max_seqlen'] = torch.tensor(padded_host[-1], dtype=torch.int32).to(
+            physical.device, non_blocking=True
+        )
+    elif static_tokens or max_num_seqs is not None:
+        batch['max_seqlen'] = torch.tensor(target * cp_size, dtype=torch.int32).to(
+            physical.device, non_blocking=True
         )
     else:
-        batch['max_seqlen'] = padded_boundaries.diff().max().to(torch.int32)
-    _pad_packed_graph_metadata(batch, graph_metadata_capacity)
+        batch['max_seqlen'] = batch['cu_seqlens_padded'].diff().max().to(torch.int32)
+    return padded_host
+
+
+def _pad_host_cu_seqlens(cu_seqlens: List[int], target_entries: int) -> List[int]:
+    """Host-list form of ``_pad_cu_seqlens``: repeat the final boundary to ``target_entries``."""
+    actual_entries = len(cu_seqlens)
+    assert actual_entries <= target_entries, (
+        f"Actual num_seqs ({actual_entries - 1}) exceeds thd_max_packed_sequences "
+        f"({target_entries - 1}). Increase --thd-max-packed-sequences, decrease "
+        f"--max-seqlen-per-dp-cp-rank, or filter shorter samples upstream so "
+        f"the packing scheduler stops earlier."
+    )
+    if actual_entries == target_entries:
+        return cu_seqlens
+    return cu_seqlens + [cu_seqlens[-1]] * (target_entries - actual_entries)
 
 
 def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.Tensor]]:
@@ -399,6 +467,7 @@ def _pack_sequences(
     original_lengths: torch.Tensor,
     local_cp_size: Optional[torch.Tensor],
     dev: torch.device,
+    zigzag_cp_min_chunk_size: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """Pack multiple samples into a single packed sample."""
 
@@ -428,6 +497,10 @@ def _pack_sequences(
     new_sample["cu_seqlens"] = cu_seqlens
     if local_cp_size is not None:
         new_sample["local_cp_size"] = local_cp_size
+    if zigzag_cp_min_chunk_size is not None:
+        new_sample["zigzag_cp_min_chunk_size"] = torch.tensor(
+            zigzag_cp_min_chunk_size, dtype=torch.int32, device=dev
+        )
 
     return new_sample
 
@@ -485,7 +558,12 @@ def create_data_iterator(
     ):
         vpp_size = config.virtual_pipeline_model_parallel_size
         if tp_group.rank() == 0:
-            metadata_keys = ["max_seqlen", "cu_seqlens", "cu_seqlens_padded"]
+            metadata_keys = [
+                "max_seqlen",
+                "cu_seqlens",
+                "cu_seqlens_padded",
+                "zigzag_cp_min_chunk_size",
+            ]
             if is_dynamic_cp:
                 metadata_keys.append("local_cp_size")
             new_data_iterator = []
@@ -597,27 +675,38 @@ def reroute_samples_to_dcp_ranks(
     for key in data_keys:
         rank_numels, max_rank_numel, sample_slices = layouts[key in _REROUTE_SCALAR_KEYS]
 
-        local_tensor = (
-            torch.cat(
-                [
-                    sample[key]
-                    .to(
-                        device=torch.cuda.current_device(),
-                        non_blocking=True,
-                        dtype=torch.int64 if key in _REROUTE_SCALAR_KEYS else sample[key].dtype,
-                    )
-                    .reshape(-1)
-                    for sample in batch
-                ],
-                dim=0,
-            )
-            if batch
-            else torch.empty(
-                0,
-                device=torch.cuda.current_device(),
-                dtype=torch.float32 if key == 'loss_mask' else torch.int64,
-            )
+        scalars = (
+            [sample[key].reshape(-1) for sample in batch] if key in _REROUTE_SCALAR_KEYS else None
         )
+        if scalars and len({(s.dtype, s.device) for s in scalars}) == 1:
+            # A rank holds every sample of its DP rank (the whole global batch when DP is 1), so
+            # per-sample copies and int64 casts of these one-element fields grow with the batch:
+            # concatenate them where they are, then move and cast them once.
+            local_tensor = torch.cat(scalars).to(
+                device=torch.cuda.current_device(), dtype=torch.int64, non_blocking=True
+            )
+        else:
+            local_tensor = (
+                torch.cat(
+                    [
+                        sample[key]
+                        .to(
+                            device=torch.cuda.current_device(),
+                            non_blocking=True,
+                            dtype=torch.int64 if key in _REROUTE_SCALAR_KEYS else sample[key].dtype,
+                        )
+                        .reshape(-1)
+                        for sample in batch
+                    ],
+                    dim=0,
+                )
+                if batch
+                else torch.empty(
+                    0,
+                    device=torch.cuda.current_device(),
+                    dtype=torch.float32 if key == 'loss_mask' else torch.int64,
+                )
+            )
         assert (
             local_tensor.numel() == rank_numels[dp_rank]
         ), f"Packed {key} has {local_tensor.numel()} elements, expected {rank_numels[dp_rank]}."
@@ -647,8 +736,15 @@ def build_packed_microbatches(
     dcp_rank: int,
     dev: torch.device,
     is_dynamic_cp: bool = False,
+    global_id_seqlens: Optional[List[Tuple[int, int]]] = None,
 ) -> List[Dict[str, torch.Tensor]]:
-    """Build this rank's packed samples and attach its runtime CP size."""
+    """Build this rank's packed samples and attach its runtime CP size.
+
+    When ``global_id_seqlens`` (a host mapping from global sample ID to its physical
+    padded length) is given, each packed sample also carries the minimum zigzag
+    half-chunk size, computed without a model-forward D2H copy; zero means the
+    physical lengths do not admit one-hop certification.
+    """
     num_micro_batches = len(sample_id_groups)
     seg_starts: List[int] = [0]
     original_lens_tensors = []
@@ -662,17 +758,22 @@ def build_packed_microbatches(
         for i in range(num_micro_batches)
     ]
 
-    local_cp_sizes = None
-    if is_dynamic_cp:
-        local_cp_sizes = []
+    # Effective CP size per microbatch: the number of DPxCP ranks sharing this
+    # rank's representative sample. Dynamic CP and the zigzag certificate need it.
+    effective_cp_sizes: List[int] = []
+    if is_dynamic_cp or global_id_seqlens is not None:
         for i in range(num_micro_batches):
             sample_ids_this_rank = sample_id_groups[i][dcp_rank]
-            assert sample_ids_this_rank, "Dynamic CP must assign at least one sample to every rank"
+            assert sample_ids_this_rank, "Packing must assign at least one sample to every rank"
             representative_id = sample_ids_this_rank[0]
-            local_cp_sizes.append(
+            effective_cp_sizes.append(
                 sum(representative_id in rank_ids for rank_ids in sample_id_groups[i])
             )
-        local_cp_sizes = torch.tensor(local_cp_sizes, dtype=torch.int32, device=dev)
+    local_cp_sizes = None
+    if is_dynamic_cp:
+        local_cp_sizes = torch.tensor(effective_cp_sizes, dtype=torch.int32, device=dev)
+
+    padded_length_by_id = dict(global_id_seqlens) if global_id_seqlens is not None else None
 
     for i in range(num_micro_batches):
         samples = grouped_samples[i]
@@ -689,7 +790,24 @@ def build_packed_microbatches(
         lens_padded = padded_lens_all_gpu[seg_starts[i] : seg_starts[i + 1]]
         lens_original = original_lens_all_gpu[seg_starts[i] : seg_starts[i + 1]]
         local_cp_size = local_cp_sizes[i] if is_dynamic_cp else None
-        new_sample = _pack_sequences(samples, lens_padded, lens_original, local_cp_size, dev)
+        zigzag_cp_min_chunk_size = None
+        if padded_length_by_id is not None:
+            divisor = 2 * effective_cp_sizes[i]
+            padded_lengths_host = [
+                padded_length_by_id[sample_id] for sample_id in sample_id_groups[i][dcp_rank]
+            ]
+            if any(length % divisor != 0 for length in padded_lengths_host):
+                zigzag_cp_min_chunk_size = 0
+            else:
+                zigzag_cp_min_chunk_size = min(length // divisor for length in padded_lengths_host)
+        new_sample = _pack_sequences(
+            samples,
+            lens_padded,
+            lens_original,
+            local_cp_size,
+            dev,
+            zigzag_cp_min_chunk_size=zigzag_cp_min_chunk_size,
+        )
         new_samples.append(new_sample)
 
     return new_samples
@@ -882,7 +1000,30 @@ def next_dynamic_cp_group_packing_aware(
         sample_ids_per_gpu[rank].append(sample_id)
 
     leftovers: List[Tuple[int, int]] = []
-    for sample_id, seq_len in sample_seqlens[1:]:
+    # Exact early exit. A sample is placed either by adding it to a group it still fits in
+    # or by forming a new group on free ranks. Samples are sorted longest first, so once no
+    # rank is free and the shortest sample fits no group, no later sample can be placed and
+    # the rest become leftovers in order, as the full scan would make them. The state only
+    # changes on a placement, so the check only reruns after one. A sample's per-rank cost
+    # is its (CP-padded) length over the group size, never below seq_len / size, so the
+    # unpadded check stays exact with pad_sequences. Non-positive lengths keep the full scan.
+    shortest_seq_len = sample_seqlens[-1][1]
+    placed = True
+    for index in range(1, len(sample_seqlens)):
+        if (
+            placed
+            and shortest_seq_len > 0
+            and None not in gpu_group_id
+            and all(
+                packing_sequence_len[group_id] + shortest_seq_len / size > max_seq_len_per_rank
+                for group_id, size in group_size.items()
+            )
+        ):
+            leftovers.extend((sample_id, seq_len) for sample_id, seq_len in sample_seqlens[index:])
+            break
+        placed = False
+
+        sample_id, seq_len = sample_seqlens[index]
         min_needed = cp_min_fn(seq_len)
         best = None
 
@@ -927,6 +1068,7 @@ def next_dynamic_cp_group_packing_aware(
             leftovers.append((sample_id, seq_len))
             continue
 
+        placed = True
         _, selected_cp_size, action, group_id, chosen_members = best
         per_gpu_cost = workload(seq_len, selected_cp_size)
         if action == "add":

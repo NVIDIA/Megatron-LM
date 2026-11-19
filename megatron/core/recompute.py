@@ -194,6 +194,14 @@ def checkpointed_forward(
                     hidden_states = cp_layout_state.finalize_layer(index, hidden_states)
             return hidden_states, context
 
+        if getattr(self.config, "dsa_indexer_reuse_checkpoint_topk", False):
+            from megatron.core.transformer.experimental_attention_variant.dsa import (
+                dsa_checkpoint_phase_wrapper,
+            )
+
+            # DSA layers reuse their first call's top-k in this checkpoint's replay.
+            custom_forward = dsa_checkpoint_phase_wrapper(custom_forward)
+
         if dsa_index_share_carrier_scope is None:
             return custom_forward
 

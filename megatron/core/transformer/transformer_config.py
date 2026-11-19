@@ -66,6 +66,56 @@ except ImportError:
     HAVE_PACKAGING = False
 
 
+def _validate_dsa_index_share_pipeline_layout(
+    layout: PipelineParallelLayerLayout, num_layers: int, topk_freq: int, skip_topk_offset: int
+) -> None:
+    """Reject a pipeline layout whose model chunks would start on a DSA index-sharing layer.
+
+    With ``dsa_indexer_topk_freq > 1`` a skip layer reuses the top-k of the most recent
+    computing layer through the index-share holders of one model chunk's forward, so that
+    computing layer must run earlier in the same (PP rank, VPP stage) chunk. The model
+    builders check each local chunk once the model is built; this checks every chunk of the
+    layout at configuration time, so an invalid PP or VPP layout fails on every rank alike
+    and without a GPU.
+
+    Decoder layers are numbered 1..``num_layers`` in the layout's execution order (VPP stage
+    major, then PP rank) and MTP layers continue from ``num_layers + 1``. Within a chunk the
+    numbers are consecutive, so a chunk is valid exactly when its first DSA layer computes
+    its own top-k: every later skip layer of the chunk then finds its source inside the chunk.
+    """
+    # Lazy import: the DSA module imports this one.
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        is_dsa_skip_topk_layer,
+        source_dsa_compute_layer,
+    )
+
+    next_decoder_layer = 1
+    for vp_stage in range(layout.virtual_pipeline_model_parallel_size):
+        for pp_rank in range(layout.pipeline_model_parallel_size):
+            chunk = layout.layout[pp_rank][vp_stage]
+            num_decoder_layers = chunk.count(LayerType.decoder)
+            if num_decoder_layers > 0:
+                first_layer = next_decoder_layer
+                next_decoder_layer += num_decoder_layers
+            elif LayerType.mtp in chunk:
+                first_layer = num_layers + 1
+            else:
+                continue
+            if not is_dsa_skip_topk_layer(first_layer, skip_topk_offset, topk_freq):
+                continue
+            source_layer = source_dsa_compute_layer(first_layer, skip_topk_offset, topk_freq)
+            kind = "decoder" if num_decoder_layers > 0 else "MTP"
+            raise ValueError(
+                f"pipeline_model_parallel_layout {layout!r} is invalid for DSA top-k sharing: "
+                f"the chunk at PP rank {pp_rank}, VPP stage {vp_stage} starts on {kind} layer "
+                f"{first_layer}, which reuses the top-k of layer {source_layer} from an earlier "
+                "chunk. Cross-layer top-k sharing does not cross PP/VPP chunk boundaries, so "
+                "every chunk must start on a layer that computes its own top-k "
+                f"(dsa_indexer_topk_freq={topk_freq}, "
+                f"dsa_indexer_skip_topk_offset={skip_topk_offset})."
+            )
+
+
 @dataclass
 @experimental_api
 class TransformerConfig(ModelParallelConfig):
@@ -123,6 +173,11 @@ class TransformerConfig(ModelParallelConfig):
 
     keep_mtp_in_bf16: bool = False
     """Keep MTP layers out of FP8 and FP4 quantization contexts."""
+
+    mtp_repeated_layer_shared_components: Optional[List[str]] = None
+    """Components obtained by the first repeated MTP layer invocation and reused by later ones.
+    Currently supported components are "latent_kv" and "sparse_attention_index". None or an
+    empty list disables repeated-layer sharing."""
 
     mtp_detach_heads: bool = False
     """If True, detach MTP head inputs from the main model graph.
@@ -445,11 +500,12 @@ class TransformerConfig(ModelParallelConfig):
     """Number of top-k tokens to select in DSA indexer."""
 
     dsa_indexer_topk_freq: int = 1
-    """Frequency of DSA indexer top-k computation across layers.
-    A value greater than 1 enables cross-layer top-k sharing."""
+    """Frequency of DSA indexer top-k computation across globally numbered Transformer and MTP
+    layers. A value greater than 1 enables cross-layer top-k sharing. This does not control
+    sharing across repeated MTP layer invocations; use mtp_repeated_layer_shared_components."""
 
     dsa_indexer_skip_topk_offset: int = 0
-    """Layer offset for DSA cross-layer top-k sharing."""
+    """Global layer-number offset for DSA cross-layer top-k sharing."""
     dsa_fwd_use_dense_attn: bool = False
     """Whether DSA min-memory backends use dense GQA attention forward for indexer warmup."""
 
@@ -460,14 +516,200 @@ class TransformerConfig(ModelParallelConfig):
     """Coefficient for the DSA indexer KL divergence loss.
     Set to 0 to disable indexer loss; in that mode the non-differentiable indexer projections are
     frozen and excluded from gradient/optimizer bookkeeping.
+    With KPool selection (``dsa_indexer_kpool > 1``), a positive coefficient trains the whole
+    KPool indexer, its pool gate and slot bias included, with a sparse pool-level KL over the
+    selected pools; it requires ``dsa_indexer_use_sparse_loss=True``. Unset or 0 keeps the KPool
+    selector frozen.
     """
 
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
-    top-k indices."""
+    top-k indices. KPool selection trains only with the sparse loss, computed over the selected
+    pools: the teacher is the main attention's probability mass of each selected pool (the
+    query-local tail counts in each head's normalizer, not in the target), summed over heads and
+    L1-normalized; the student is the selector's own pool score."""
+
+    dsa_indexer_reuse_checkpoint_topk: bool = False
+    """Whether a recomputed DSA layer reuses the top-k selected by its checkpoint's first call.
+
+    The first call of a checkpointed top-k-computing layer runs without grad and skips the
+    indexer loss, so its replay reruns the dense indexer and top-k only to recover the
+    selected scores for that loss. When enabled, the first call also keeps the selected fp32
+    scores, ``[batch, sequence, dsa_indexer_topk]`` per computing layer per in-flight
+    microbatch, and the replay computes the sparse indexer loss from them. With a frozen
+    indexer (``dsa_indexer_loss_coeff`` <= 0 or unset) the replay needs no scores and none
+    are kept: it reuses the top-k selection that the first call published for cross-layer
+    sharing, and skips the indexer projections, the dense scoring and the top-k. Requires
+    ``dsa_kernel_backend='cudnn'``, the fused DSA kernels and cross-layer top-k sharing
+    (``dsa_indexer_topk_freq > 1``), plus the sparse indexer loss when the indexer loss is
+    on. Not supported with KPool selection (``dsa_indexer_kpool > 1``, frozen or trainable),
+    nor for a frozen indexer whose projections are quantized with ``fp8_recipe`` 'delayed' or
+    'custom' or ``fp4_recipe`` 'custom'. Has no effect without full or ``core_attn``
+    recompute."""
+
+    dsa_indexer_skip_masked_score_fill: bool = True
+    """Whether the cuDNN packed-THD DSA indexer scorer may skip its ``-inf`` score prefill.
+
+    cuDNN frontend fills the whole dense indexer score buffer (up to tens of GiB per call
+    at 1M context) with ``-inf`` before every scorer launch, although the kernel writes
+    every column that a top-k reads. When the installed frontend names a ``clean_logits``
+    parameter on ``indexer_forward_wrapper`` and ships the top-k out-of-bounds-lane guard
+    (cuDNN frontend >= 1.29), the general packed THD scorer passes ``clean_logits=False``
+    and clamps every reader to the kernel's per-row column limit. Other scorer paths, and
+    frontends without the switch, keep the prefill. Disable for A/B comparisons."""
+
+    dsa_indexer_topk_backend: Literal["cudnn", "deepselect"] = "cudnn"
+    """Kernel of the non-deterministic DSA indexer top-k on the cuDNN fused DSA path.
+
+    ``'cudnn'`` runs the cuDNN frontend radix top-k in row chunks whose scratch fits
+    ``dsa_cudnn_topk_scratch_gib``.
+    ``'deepselect'`` selects every row in one DeepSelect launch with no scratch, using the
+    tuned ``ds_tune`` build if it imports, else upstream ``deep_select``. On GB300 (CUDA
+    graph) ``ds_tune`` took 5.90 ms against 14.34 ms per 1M-token CP64 rank-0 call
+    (16384 x 1048576 scores) and 0.43 ms against 0.57 ms at 128K (4096 x 131072; cuDNN with
+    an 8 GiB top-k scratch budget), ``deep_select`` 7.94 ms at 1M; both are slower than cuDNN
+    on narrow rows. It applies only where DeepSelect
+    is installed, validated and fast
+    (SM 10.3: the sm_100a kernels for GB200 have not run on a GPU, so SM 10.0 keeps cuDNN with
+    a warning; FP32 or BF16 scores starting 16-byte aligned with a row stride that is a
+    multiple of 1024 bytes, row width to below 2**23 and from 65536 for FP32 ``ds_tune``
+    (81920 for calls of more than 4096 rows), 16384 for BF16 ``ds_tune`` or 524288 for
+    ``deep_select``, a compiled config for the score dtype and top-k <= 4096 and top-k a
+    multiple of 8, of 16 for BF16); every other call, and deterministic mode, keeps the cuDNN
+    top-k, and the choice is logged once per reason and score dtype.
+    BF16 scores (``ds_tune`` config ``h_t256_o2_b2_2k_d3``: 4.20 against 6.08 ms for FP32 at
+    1M, 0.337 against 0.469 ms at 128K) have their own width threshold: on GB300 ``ds_tune``
+    BF16 was 1.70-2.69x faster than cuDNN's BF16 radix top-k at every measured width
+    16384..131072 and row count 2048..16384 (top-k 2048; the threshold is applied to every row
+    count and top-k), narrower BF16 rows (not measured) keep cuDNN, and ``deep_select`` (not
+    timed on BF16) keeps 524288; selected values keep the scores' dtype.
+    ``ds_tune`` is built against one torch version and does not import under another, which
+    also falls back with one warning: check for the "DSA indexer top-k uses DeepSelect" log
+    line. Selected sets equal cuDNN's except for which equal scores fill the last slots. A
+    query row longer than top-k that sees a NaN score selects its first top-k in-row columns
+    with NaN scores, so with the sparse indexer loss (selected scores kept) it ends with
+    ``topk_length`` 0 and attends to no key, and without it attends to those first columns;
+    cuDNN keeps top-k - 1 real keys there. Requires ``dsa_kernel_backend='cudnn'``. KPool
+    selection (``dsa_indexer_kpool > 1``) runs this top-k only with
+    ``dsa_indexer_kpool_scorer_backend='cudnn'`` (over pools instead of tokens)."""
+
+    dsa_cudnn_topk_scratch_gib: float = 2.0
+    """Per-launch scratch budget, in GiB, of the cuDNN radix top-k of the DSA indexer.
+
+    Each cuDNN top-k launch allocates a transient int32 scratch of ``rows x 2 x cols`` (twice
+    the FP32 scores of its rows), and the indexer runs the top-k in row chunks sized to this
+    budget, at least one 32-byte-aligned row group per launch (at most 8 rows of FP32 or 16 of
+    BF16 scores). The frontend also limits a launch to 2**31 scratch elements (8 GiB), so
+    budgets above 8 GiB give no larger launches. Larger budgets give fewer, fuller launches on
+    long rows: on GB300 (cuDNN frontend 1.31, top-k 2048, CUDA graph) 8 GiB took the 1M-token
+    CP64 rank-0 call (16384 x 1048576 scores) from 21.05 ms (64 launches of 256 rows at 2 GiB)
+    to 14.26 ms (16 launches of 1024 rows), and runs all 4096 rows of the 128K CP32 rank-0 call
+    in one launch (0.593 to 0.566 ms). Budgets above 2 GiB only change the executors that hand
+    the top-k a whole score buffer: the general packed THD scorer (cuDNN scores or DeepGEMM
+    logits) and the dense indexer loss (loss on, ``dsa_indexer_use_sparse_loss=False``). The
+    plain causal, unfused bounds and single-sequence packed CP executors score in chunks of at
+    most 1 GiB of FP32 scores, whose top-k needs at most 2 GiB of scratch, so the default
+    already runs each chunk in one launch there. The cost is transient memory, eagerly and
+    inside CUDA graph memory pools: every call takes up to min(budget, twice its FP32 score
+    buffer), so a budget above the default costs more on every whole-buffer call whose FP32
+    scores exceed 1 GiB, e.g. 8 GiB instead of 2 GiB for a 32K-token CP1 packed THD call with
+    4 GiB of scores. The scratch is sized as for FP32 scores, which over-estimates BF16 ones.
+    Applies with ``dsa_kernel_backend='cudnn'`` to every cuDNN top-k of the DSA indexer; the
+    DeepSelect top-k (``dsa_indexer_topk_backend``) needs no scratch, and the ``dsv4_hybrid``
+    CSA paths size their own."""
+
+    dsa_indexer_scorer_backend: Literal["cudnn", "deepgemm"] = "cudnn"
+    """Kernel of the DSA indexer's MXFP8 selection scorer (``dsa_indexer_precision='mxfp8'``).
+
+    ``'cudnn'`` runs the cuDNN frontend MXFP8 dense scorer. ``'deepgemm'`` runs DeepGEMM's
+    ``fp8_fp4_mqa_logits`` on the general packed THD path (any CP size): TE MXFP8 Q and
+    original K, per-row key ranges ``[starts, starts + length)``, BF16 logits of half the
+    FP32 size, read in place by DeepSelect's BF16 top-k (``dsa_indexer_topk_backend=
+    'deepselect'``, the intended pairing) or by cuDNN's BF16 radix top-k on narrower rows or
+    with ``'cudnn'``. Per 1M-token CP64 rank-0 call (16384 x 1048576 scores) on GB300 (CUDA
+    graph): 28.8 ms against 43.0 ms for the cuDNN MXFP8 scorer and 58.1 ms for BF16 (both with
+    DeepSelect FP32); 1.04 / 1.84 / 2.38 ms at 128K CP32. Paired with ``'cudnn'`` it keeps
+    little of that at wide rows: cuDNN's BF16 radix top-k is slower than its FP32 one there
+    (22.75 against 14.44 ms at the 1M CP64 rank-0 call, frontend 1.31 binary with an 8 GiB top-k
+    scratch budget; DeepSelect BF16 took 4.2 ms).
+    Calls of more query rows than one DeepGEMM call takes (116208 with 32 heads, 58104 with 64)
+    are split by rows. Its recall matches the cuDNN MXFP8 scorer's within 0.1 percentage points,
+    and the two selections overlap 99.2 percent (MXFP8 itself cost 2-4 percentage points of
+    recall@2048 against BF16 on untrained-indexer inputs, so this is experimental).
+    The indexer loss never uses DeepGEMM's values: as for any MXFP8 scorer
+    (``dsa_indexer_precision='mxfp8'``), the selected keys' scores are recomputed in FP32
+    from the BF16 indexer Q/K/weights, so this option changes only which keys are selected,
+    and a call that falls back to the cuDNN MXFP8 scorer feeds the loss the same way (the
+    87.3-nat KL saturation described there applies to both).
+    It needs a ``deep_gemm >= 2.8.1`` build importable under the running torch (imported at the
+    first call), SM 10.3, cuDNN frontend >= 1.29 (the radix top-k out-of-bounds lane guard,
+    since DeepGEMM leaves the logits past each row's length unwritten), 32 or 64 indexer
+    heads of dim 128, BF16 weights and Transformer Engine MXFP8. Without them, on SM 10.0
+    (not validated yet), under ``torch.use_deterministic_algorithms`` or when DeepGEMM's JIT
+    warm-up fails (not a CUDA out-of-memory error, which propagates), a call falls back to
+    the cuDNN MXFP8 scorer, logged once per reason: check for the "DSA indexer scorer uses
+    DeepGEMM" line. A fallback scores in FP32, so its score buffer is twice DeepGEMM's BF16
+    one (64 against 32 GiB per 1M CP64 rank-0 call); memory budgeted for DeepGEMM may not
+    hold it. Requires ``dsa_indexer_precision='mxfp8'`` (and with it every MXFP8
+    requirement) and is not available with ``deterministic_mode``. Kernels JIT-compile at the
+    first eager call per device and head count: set ``DG_JIT_CACHE_DIR`` to a persistent
+    directory shared by all ranks and run at least one eager step before CUDA graph capture
+    (capturing a cold kernel raises). A process runs DeepGEMM on one device, the first that
+    calls it (its JIT keeps one kernel handle per process); a call on another device falls
+    back. Ties: BF16 logits tie far more often than FP32 scores; which tied keys fill the
+    last slots is unspecified. A layer recomputed without
+    ``dsa_indexer_reuse_checkpoint_topk`` selects again in its replay, which must repeat the
+    first call's choice. On GB300 (cuDNN frontend 1.31) DeepSelect BF16 repeats bitwise but
+    cuDNN's BF16 radix top-k picks other tied keys on a repeat, and it takes every call
+    DeepSelect declines (all calls with ``dsa_indexer_topk_backend='cudnn'``, the narrow ones
+    with ``'deepselect'``). So full recompute and selective ``core_attn`` recompute (the
+    recomputes that replay the indexer) require ``dsa_indexer_reuse_checkpoint_topk``, with the
+    indexer loss on or frozen (a config error otherwise): the replay's selection feeds the
+    recomputed attention, whose gradients must match the first call's output; selective
+    recompute of other modules (e.g. ``layernorm``) does not replay the indexer.
+    NaN: a NaN in an indexer Q or K row can make the affected logits NaN; a query row longer
+    than the top-k that sees a NaN logit then selects its first top-k keys under DeepSelect,
+    while cuDNN's radix top-k ranks a positive NaN above every number (one slot per NaN key)
+    and a negative one below; with the indexer loss on, every selected slot whose logit is
+    not finite is dropped, as for the cuDNN scorers. A per-rank fallback (one node without
+    the build) under tensor parallelism would select different keys on different TP ranks;
+    install the build on every node."""
 
     dsa_indexer_precision: Literal["bf16", "mxfp8"] = "bf16"
-    """Precision used only by the fused compact DSA indexer forward and Top-K."""
+    """Precision of the DSA indexer scorer that produces the scores for Top-K selection.
+
+    ``dsv4_hybrid`` uses it for the fused compact CSA indexer forward and Top-K. For
+    ``dsa`` with ``dsa_kernel_backend='cudnn'``, ``'mxfp8'`` quantizes the indexer Q and K
+    (E4M3 with E8M0 1x32 scales) for the cuDNN dense scorer on the general packed THD path;
+    it needs SM100+, cuDNN frontend >= 1.29, ``dsa_indexer_head_dim=128``, 32 or 64 indexer
+    heads, BF16 indexer weights, the sparse indexer loss and the fused DSA kernels
+    (``attention_backend`` other than unfused). Other DSA scorer paths, and any layer that
+    would fall back to the BF16 PyTorch reference indexer, raise. Weights and the indexer
+    loss/backward stay BF16, and MXFP8 decides only which keys are selected: with the
+    indexer loss on, the selected keys' scores that feed the sparse KL (and that
+    ``dsa_indexer_reuse_checkpoint_topk`` keeps for the checkpoint replay) are recomputed
+    in FP32 from the BF16 indexer Q/K/weights (cuDNN
+    ``sparse_indexer_score_recompute_wrapper``), so given the selection the KL gradient is
+    the BF16 path's. That is one sparse recompute per loss-on scorer call, estimated (not
+    measured) at about 1.5-3 ms per 1M-token CP64 rank-0 call (16384 x 1048576 scores) and
+    0.1-0.5 ms per 128K-token CP32 rank-0 call (4096 x 131072); frozen-indexer and
+    selection-only calls keep only indices and never recompute.
+    The KL value equals the BF16 path's too, except that a selected key whose indexer
+    probability underflows FLT_MIN (a logit more than 87.3 below the row's log-sum-exp over
+    the selection, which exceeds the row's maximum by up to ln(top-k): from about 79.7 below
+    the maximum at top-k 2048) contributes at most about 87.3 nats where the BF16 path's term
+    keeps growing.
+    The recompute follows this compute precision only, not the scorer kernel
+    (``dsa_indexer_scorer_backend``, including its fallback) or the dtype of its scores;
+    ``'bf16'`` keeps the BF16 scorer's own FP32 scores (a scorer computing in BF16 with BF16
+    scores would keep its values too), and ``dsv4_hybrid`` keeps its own indexer-loss
+    semantics. ``'mxfp8'`` cannot be combined with KPool selection
+    (``dsa_indexer_kpool > 1``), which bypasses the dense scorer; use
+    ``dsa_indexer_kpool_use_quantization`` for quantized KPool scoring instead.
+    ``dsa_indexer_qk_proj_use_quantization`` only picks the precision context of the indexer
+    Q/K projection GEMMs, whose BF16 outputs the MXFP8 scorer then quantizes itself, so the
+    two are independent. The DSA MXFP8 scale storage is allocated per scorer call, so
+    ``dsa_compact_indexer_workspace_sharing`` (CSA only) does not apply to it."""
 
     dsa_compact_indexer_workspace_sharing: bool = True
     """Under CUDA graphs the fused compact DSA indexer keeps a persistent workspace per static
@@ -517,6 +759,16 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_scoring_relu: bool = True
     """Whether DSA indexer should apply ReLU to q@k scores before weighting."""
+
+    dsa_indexer_hf_scoring: bool = False
+    """Use the KPool scoring order of the Hugging Face reference indexer for
+    zai-org/GLM-5.3-Flash (transformers v5.16.1, Glm5NextTextIndexer): upcast projected
+    head weights before scaling, scale FP32 q@k before ReLU, and reduce heads with FP32
+    matmul. Compression rounding and score-input quantization remain independent options.
+    This is the arithmetic of the default PyTorch KPool scorer; with
+    ``dsa_indexer_kpool_scorer_backend='cudnn'`` the cuDNN kernel scores from the BF16
+    projection and drops the uniform scale, which selects the same pools up to ties.
+    """
 
     dsa_indexer_qk_proj_use_quantization: bool = True
     """Whether indexer query/key projections use the enclosing FP8/FP4 context.
@@ -594,12 +846,30 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_kpool: int = 1
     """Number of keys per softmax-weighted indexer pool; 1 keeps per-token selection.
-    When greater than one, ``dsa_indexer_topk`` must be divisible by this value.
+    When greater than one, ``dsa_indexer_topk`` must be divisible by this value. The KPool
+    selector is frozen unless ``dsa_indexer_loss_coeff > 0``, which trains it with the sparse
+    pool-level indexer loss (``dsa_indexer_use_sparse_loss=True``). A trainable KPool indexer
+    rejects FP8 KPool scoring, ``cuda_graph_impl='full_iteration'``, full recompute and
+    selective ``core_attn`` recompute; at runtime it rejects explicit attention masks,
+    CP-local lengths that are not a multiple of ``2 * dsa_indexer_kpool`` and, for packed THD
+    with context parallelism, packs whose padded documents are not multiples of
+    ``2 * cp_size * dsa_indexer_kpool`` or that lack the host boundaries of the prebuilt CP
+    routes. Not supported with ``dsa_indexer_mode='simplified'`` or
+    ``dsa_indexer_reuse_checkpoint_topk``.
     """
 
     dsa_indexer_kpool_use_quantization: bool = False
     """Quantize KPool scoring inputs to E4M3 with power-of-two scales after Hadamard
-    rotation. This does not change projection parameter or GEMM precision.
+    rotation. This does not change projection parameter or GEMM precision. Frozen KPool
+    selectors only: the E4M3 round trip has no training gradient.
+    """
+
+    dsa_indexer_kpool_key_dtype_compression: bool = False
+    """Cast pool probabilities to the key dtype before multiplication and reduction.
+    This matches the compression arithmetic of the Hugging Face reference indexer
+    (transformers v5.16.1, Glm5NextTextIndexer.get_pooled_states). False preserves
+    FP32 weighted reduction from the upstream KPool implementation. Score-input
+    quantization is independent of this compression precision choice.
     """
 
     dsa_indexer_kpool_always_select_tail: bool = True
@@ -607,6 +877,37 @@ class TransformerConfig(ModelParallelConfig):
     This widens the output to ``dsa_indexer_topk + dsa_indexer_kpool - 1``; unused slots are -1.
     Set to False for fixed-width pool-only selection. Only applies when
     ``dsa_indexer_kpool > 1``.
+    """
+
+    dsa_indexer_kpool_scorer_backend: Literal["torch", "cudnn"] = "torch"
+    """How the KPool selector (frozen or trainable) scores pools and picks its top-k inside
+    DSAttention. A trainable indexer's loss recomputes the scores of the selected pools in
+    PyTorch, whichever backend selected them.
+
+    ``'torch'`` scores every query row against every pooled key with PyTorch in FP32 and
+    query chunks, then masks and selects (the reference path).
+    ``'cudnn'`` scores the pooled keys with the cuDNN fused DSA indexer kernel at ratio
+    ``dsa_indexer_kpool``, whose causal rule (row at token position ``p`` sees pools
+    ``[0, (p + 1) // dsa_indexer_kpool)``) is KPool's, and selects with the indexer top-k
+    of ``dsa_indexer_topk_backend``. The kernel sums scores from the BF16 q, pooled keys and
+    head weights (with ``dsa_indexer_hf_scoring``, the BF16 projection; the HF uniform scale
+    does not change the selection), accumulating in another order than the FP32 PyTorch
+    scorer, so a row can swap pools whose scores tie at the selection boundary; the
+    selected pools come in the top-k kernel's order rather than by score. It needs
+    ``dsa_kernel_backend='cudnn'``, fused DSA kernels (``attention_backend`` not
+    ``unfused``), ReLU scoring, no FP8 KPool scoring and BF16 head weights (no
+    ``dsa_indexer_weights_proj_output_dtype='fp32'`` without HF scoring). It applies to
+    causal layouts without an attention mask whose query positions are known: non-packed
+    input without CP or with allgather CP in zigzag order (query positions not taken from
+    ``position_ids``, which DSAttention reads only under CP or for a TP sequence-parallel
+    local query), and packed THD, where each row is scored against its own document's pools:
+    without CP from the pack's device boundaries when the query rows are the whole pack (also
+    inside a CUDA graph capture), under CP from the host boundaries of the prebuilt CP routes
+    (outside a capture). Other calls keep ``'torch'``, logged once per reason, as do
+    off-pool-grid query chunks on a cuDNN frontend without ``q_causal_offsets`` (before
+    1.26).
+    On GB300 at the 1M CP64 rank shape (16,384 rows x 262,144 pools) one selection took
+    about 22 ms against 893 ms for ``'torch'``.
     """
 
     ####################
@@ -1550,6 +1851,18 @@ class TransformerConfig(ModelParallelConfig):
     attention_cp_layout: CPLayout = "zigzag"
     """CP layout for softmax-attention layers."""
 
+    #############################
+    # Pipeline Parallel Prewarm
+    #############################
+    pipeline_model_parallel_prewarm: bool = False
+    """Initialize lazy kernels concurrently across pipeline stages before training.
+
+    Each PP rank runs one synthetic eager forward/backward pass for every transformer layer in
+    its local PP/VPP model chunks. The passes do not use pipeline P2P communication, so pipeline
+    stages can initialize their local kernels concurrently. This does not capture or replay CUDA
+    Graphs and can be used independently of ``cuda_graph_impl``.
+    """
+
     ##################
     # Cuda Graphs
     ##################
@@ -1680,6 +1993,17 @@ class TransformerConfig(ModelParallelConfig):
     replay can cover iterations whose real packed microbatch count changes at a fixed source
     global batch size. Increasing the source global batch size with step_batch_size_schedule
     after capture is rejected rather than retaining an unbounded number of graph instances."""
+
+    cuda_graph_static_dynamic_cp: bool = False
+    """Allow dynamic CP with a full-iteration graph only through the static-certificate path.
+
+    This is an explicit fail-closed opt-in, not general dynamic-CP CUDA Graph support. The
+    dynamic scheduler still runs eagerly before every iteration, while each realized
+    microbatch slot must retain the captured microbatch count, effective CP size, process-group
+    identity and rank membership, partition mode, and (for CP>1) exact packed boundaries and
+    route-defining geometry. Any mismatch is rejected before replay. This option is only valid
+    for the full-iteration CUDA Graph implementation; layer/chunk implementations reject it.
+    """
 
     ####################
     # Hyper-Connection Configuration
@@ -2569,6 +2893,13 @@ class TransformerConfig(ModelParallelConfig):
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
+        # Full-iteration capture cannot include the per-step pipeline shape handshake. Enable
+        # the shared fixed-shape packed-P2P path before the base config validates its static
+        # token-capacity, padding, and sequence-parallel divisibility requirements.
+        if self.cuda_graph_impl == "full_iteration" and (
+            self.sequence_packing_scheduler is not None or self.dynamic_context_parallel
+        ):
+            self.pipeline_p2p_fixed_shape = True
         super().__post_init__()
         # Dynamic CP can assign a multi-rank group even when configured CP is one.
         has_context_parallelism = self.context_parallel_size > 1 or self.dynamic_context_parallel
@@ -2978,7 +3309,8 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "dsa_indexer_weights_proj_output_dtype='fp32' is not supported by "
                 "dsa_kernel_backend='cudnn' for per-token DSA, which requires a BF16 indexer "
-                "weights tensor. KPool selection bypasses the cuDNN top-k path; use KPool or "
+                "weights tensor. The default KPool scorer (dsa_indexer_kpool > 1, "
+                "dsa_indexer_kpool_scorer_backend='torch') does not use it; use KPool or "
                 "dsa_kernel_backend='tilelang'/'none'."
             )
 
@@ -3015,6 +3347,44 @@ class TransformerConfig(ModelParallelConfig):
                     f"csa_compress_ratios={self.csa_compress_ratios}). Without one the "
                     "flag would only add per-microbatch prebuild work."
                 )
+
+        shared_components = self.mtp_repeated_layer_shared_components
+        if shared_components is not None and not isinstance(shared_components, list):
+            raise ValueError("mtp_repeated_layer_shared_components must be a list or None.")
+        if shared_components is not None:
+            allowed_components = {"latent_kv", "sparse_attention_index"}
+            if any(not isinstance(component, str) for component in shared_components):
+                raise ValueError(
+                    "mtp_repeated_layer_shared_components entries must be strings; supported "
+                    "components are 'latent_kv' and 'sparse_attention_index'."
+                )
+            if len(shared_components) != len(set(shared_components)):
+                raise ValueError(
+                    "mtp_repeated_layer_shared_components must not contain duplicate components."
+                )
+            unknown_components = set(shared_components) - allowed_components
+            if unknown_components:
+                raise ValueError(
+                    "Unsupported mtp_repeated_layer_shared_components "
+                    f"{sorted(unknown_components)}; supported components are "
+                    f"{sorted(allowed_components)}."
+                )
+
+        if shared_components:
+            if self.experimental_attention_variant != "dsa":
+                raise ValueError(
+                    "mtp_repeated_layer_shared_components currently requires "
+                    "experimental_attention_variant='dsa'."
+                )
+            if not self.mtp_use_repeated_layer:
+                raise ValueError(
+                    "mtp_repeated_layer_shared_components requires mtp_use_repeated_layer=True."
+                )
+            if self.mtp_num_layers is None or self.mtp_num_layers <= 1:
+                raise ValueError(
+                    "mtp_repeated_layer_shared_components requires mtp_num_layers > 1."
+                )
+
         if is_gated_delta_net_variant(self.experimental_attention_variant):
             if not self.is_hybrid_model:
                 assert (
@@ -3121,6 +3491,41 @@ class TransformerConfig(ModelParallelConfig):
                 f"{linear_head_parallel_size=} for {self.linear_cp_mode=} "
                 f"and {self.experimental_attention_variant=}."
             )
+        if self.dsa_indexer_topk_backend not in ("cudnn", "deepselect"):
+            raise ValueError(
+                "dsa_indexer_topk_backend must be 'cudnn' or 'deepselect', "
+                f"got {self.dsa_indexer_topk_backend!r}."
+            )
+        if self.dsa_indexer_topk_backend == "deepselect" and (
+            self.experimental_attention_variant != "dsa" or self.dsa_kernel_backend != "cudnn"
+        ):
+            raise ValueError(
+                "dsa_indexer_topk_backend='deepselect' replaces the top-k of the cuDNN fused DSA "
+                "indexer and requires experimental_attention_variant='dsa' with "
+                f"dsa_kernel_backend='cudnn', got {self.experimental_attention_variant!r} and "
+                f"{self.dsa_kernel_backend!r}."
+            )
+        if not (
+            math.isfinite(self.dsa_cudnn_topk_scratch_gib) and self.dsa_cudnn_topk_scratch_gib > 0
+        ):
+            raise ValueError(
+                "dsa_cudnn_topk_scratch_gib must be a positive number of GiB, "
+                f"got {self.dsa_cudnn_topk_scratch_gib!r}."
+            )
+        if self.dsa_indexer_scorer_backend not in ("cudnn", "deepgemm"):
+            raise ValueError(
+                "dsa_indexer_scorer_backend must be 'cudnn' or 'deepgemm', "
+                f"got {self.dsa_indexer_scorer_backend!r}."
+            )
+        if self.dsa_indexer_scorer_backend == "deepgemm" and (
+            self.experimental_attention_variant != "dsa" or self.dsa_kernel_backend != "cudnn"
+        ):
+            raise ValueError(
+                "dsa_indexer_scorer_backend='deepgemm' replaces the MXFP8 scorer of the cuDNN "
+                "fused DSA indexer and requires experimental_attention_variant='dsa' with "
+                f"dsa_kernel_backend='cudnn', got {self.experimental_attention_variant!r} and "
+                f"{self.dsa_kernel_backend!r}."
+            )
         if self.experimental_attention_variant == "dsa":
             _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
             if self.add_bias_linear:
@@ -3132,11 +3537,139 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     f"dsa_indexer_topk_freq must be positive, got {self.dsa_indexer_topk_freq}."
                 )
+            if self.dsa_indexer_precision not in ("bf16", "mxfp8"):
+                raise ValueError(
+                    "dsa_indexer_precision must be 'bf16' or 'mxfp8', "
+                    f"got {self.dsa_indexer_precision!r}."
+                )
+            if self.dsa_indexer_precision == "mxfp8":
+                # Static requirements of the cuDNN MXFP8 dense indexer scorer. The SM100+
+                # device and the installed frontend's MXFP8 API are checked at the first
+                # scorer call, since config validation can run without a GPU.
+                from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+                    use_fused_dsa_kernels,
+                )
+
+                if self.dsa_kernel_backend != "cudnn":
+                    raise ValueError(
+                        "dsa_indexer_precision='mxfp8' for DSA requires "
+                        f"dsa_kernel_backend='cudnn', got {self.dsa_kernel_backend!r}."
+                    )
+                if not use_fused_dsa_kernels(self):
+                    raise ValueError(
+                        "dsa_indexer_precision='mxfp8' for DSA requires the fused DSA kernels "
+                        "(attention_backend != unfused); the unfused path scores the indexer "
+                        "in BF16 only."
+                    )
+                if self.dsa_indexer_head_dim != 128 or self.dsa_indexer_n_heads not in (32, 64):
+                    raise ValueError(
+                        "dsa_indexer_precision='mxfp8' for DSA requires dsa_indexer_head_dim=128 "
+                        "and dsa_indexer_n_heads of 32 or 64, got "
+                        f"head_dim={self.dsa_indexer_head_dim}, "
+                        f"n_heads={self.dsa_indexer_n_heads}."
+                    )
+                if not self.dsa_indexer_use_sparse_loss:
+                    raise ValueError(
+                        "dsa_indexer_precision='mxfp8' for DSA supports only the sparse "
+                        "indexer loss; set dsa_indexer_use_sparse_loss=True."
+                    )
+                if self.dsa_indexer_weights_proj_output_dtype != "bf16":
+                    raise ValueError(
+                        "dsa_indexer_precision='mxfp8' for DSA requires BF16 indexer weights; "
+                        "set dsa_indexer_weights_proj_output_dtype='bf16'."
+                    )
+                if self.dsa_indexer_kpool > 1:
+                    raise ValueError(
+                        "dsa_indexer_precision='mxfp8' for DSA is the per-token cuDNN dense "
+                        "scorer; KPool selection (dsa_indexer_kpool > 1) bypasses it. Use "
+                        "dsa_indexer_kpool_use_quantization for quantized KPool scoring."
+                    )
+            if self.dsa_indexer_scorer_backend == "deepgemm":
+                if self.dsa_indexer_precision != "mxfp8":
+                    raise ValueError(
+                        "dsa_indexer_scorer_backend='deepgemm' is the MXFP8 selection scorer; "
+                        "set dsa_indexer_precision='mxfp8', got "
+                        f"{self.dsa_indexer_precision!r}."
+                    )
+                if self.deterministic_mode:
+                    raise ValueError(
+                        "dsa_indexer_scorer_backend='deepgemm' does not support "
+                        "deterministic_mode: BF16 logits and DeepSelect do not keep the "
+                        "lowest-index ties of the deterministic top-k; use "
+                        "dsa_indexer_scorer_backend='cudnn'."
+                    )
             if self.dsa_indexer_skip_topk_offset < 0:
                 raise ValueError(
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
                     f"{self.dsa_indexer_skip_topk_offset}."
                 )
+            if self.dsa_indexer_reuse_checkpoint_topk:
+                from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+                    use_fused_dsa_kernels,
+                )
+
+                if self.dsa_kernel_backend != "cudnn":
+                    raise ValueError(
+                        "dsa_indexer_reuse_checkpoint_topk requires dsa_kernel_backend='cudnn', "
+                        f"got {self.dsa_kernel_backend!r}."
+                    )
+                if not use_fused_dsa_kernels(self):
+                    raise ValueError(
+                        "dsa_indexer_reuse_checkpoint_topk requires the fused DSA kernels "
+                        "(attention_backend != unfused); otherwise the replay always reruns the "
+                        "dense indexer."
+                    )
+                if self.overlap_moe_expert_parallel_comm and self.recompute_granularity == "full":
+                    raise ValueError(
+                        "dsa_indexer_reuse_checkpoint_topk does not support full recompute with "
+                        "overlap_moe_expert_parallel_comm: that schedule replays layers without "
+                        "the DSA checkpoint phase wrapper, so no top-k can be reused."
+                    )
+                indexer_loss_on = (self.dsa_indexer_loss_coeff or 0.0) > 0
+                if indexer_loss_on and not self.dsa_indexer_use_sparse_loss:
+                    raise ValueError(
+                        "dsa_indexer_reuse_checkpoint_topk with the indexer loss on "
+                        "(dsa_indexer_loss_coeff > 0) requires the sparse indexer loss: set "
+                        "dsa_indexer_use_sparse_loss=True, or dsa_indexer_loss_coeff=0 for a "
+                        "frozen indexer."
+                    )
+                # KPool never reuses a checkpoint's top-k, with the loss on or off.
+                if self.dsa_indexer_kpool > 1:
+                    raise ValueError(
+                        "dsa_indexer_reuse_checkpoint_topk does not support KPool selection "
+                        f"(dsa_indexer_kpool > 1), got dsa_indexer_kpool={self.dsa_indexer_kpool}."
+                    )
+                # TE keeps a per-module recompute stash for delayed scaling, which a custom
+                # recipe (FP8 or FP4) can also carry.
+                stateful_recipe = None
+                if self.fp8 and self.fp8_recipe in ("delayed", "custom"):
+                    stateful_recipe = f"fp8_recipe='{Fp8Recipe(self.fp8_recipe).value}'"
+                elif self.fp4 and self.fp4_recipe == "custom":
+                    stateful_recipe = "fp4_recipe='custom'"
+                if (
+                    not indexer_loss_on
+                    and stateful_recipe is not None
+                    and (
+                        self.dsa_indexer_qk_proj_use_quantization
+                        or self.dsa_indexer_weights_proj_use_quantization
+                    )
+                ):
+                    raise ValueError(
+                        "dsa_indexer_reuse_checkpoint_topk with a frozen indexer "
+                        "(dsa_indexer_loss_coeff <= 0) does not support quantized indexer "
+                        f"projections with {stateful_recipe}: the replay skips those "
+                        "projections, so Transformer Engine's delayed-scaling recompute stash "
+                        "of their first call is never consumed. Use a recipe without delayed "
+                        "scaling (e.g. mxfp8), or disable "
+                        "dsa_indexer_qk_proj_use_quantization and "
+                        "dsa_indexer_weights_proj_use_quantization."
+                    )
+                if self.dsa_indexer_topk_freq <= 1:
+                    raise ValueError(
+                        "dsa_indexer_reuse_checkpoint_topk reuses top-k through cross-layer "
+                        "sharing and requires dsa_indexer_topk_freq > 1, got "
+                        f"{self.dsa_indexer_topk_freq}."
+                    )
             if has_context_parallelism:
                 cp_comm_types = (
                     self.cp_comm_type
@@ -3155,6 +3688,15 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     f"dsa_indexer_kpool must be positive, got {self.dsa_indexer_kpool}."
                 )
+            if self.dsa_indexer_hf_scoring and (
+                self.dsa_indexer_kpool <= 1
+                or self.dsa_indexer_weights_proj_output_dtype != "bf16"
+                or not self.dsa_indexer_scoring_relu
+            ):
+                raise ValueError(
+                    "dsa_indexer_hf_scoring requires KPool > 1, BF16 projection output "
+                    "and ReLU scoring."
+                )
             if self.dsa_indexer_kpool > 1:
                 if self.dsa_indexer_topk is None:
                     raise ValueError(
@@ -3171,11 +3713,78 @@ class TransformerConfig(ModelParallelConfig):
                         " by dsa_indexer_kpool for pool selection; "
                         f"got topk={self.dsa_indexer_topk}, kpool={self.dsa_indexer_kpool}."
                     )
-            if self.dsa_indexer_kpool > 1 and (self.dsa_indexer_loss_coeff or 0.0) > 0:
+            if self.dsa_indexer_kpool > 1 and self.dsa_indexer_mode == "simplified":
+                # The simplified (GQA) indexer has no pool code; without this rule a KPool
+                # config with a frozen indexer would be accepted and KPool silently ignored.
                 raise ValueError(
-                    "DSA indexer loss is not supported with kpool selection; set "
-                    "dsa_indexer_loss_coeff=0 or dsa_indexer_kpool=1."
+                    "dsa_indexer_mode='simplified' does not support KPool selection "
+                    "(dsa_indexer_kpool > 1): the simplified indexer has no pool compression, "
+                    "so the pools would be silently ignored; got "
+                    f"dsa_indexer_kpool={self.dsa_indexer_kpool}."
                 )
+            if self.dsa_indexer_kpool > 1 and (self.dsa_indexer_loss_coeff or 0.0) > 0:
+                # A positive coefficient trains the KPool indexer with the sparse pool-level
+                # loss. The remaining trainable-KPool rules (full_iteration CUDA graphs and
+                # recompute that replays the selection) are checked once those options are
+                # final, below.
+                if not self.dsa_indexer_use_sparse_loss:
+                    raise ValueError(
+                        "DSA indexer loss is not supported with kpool selection unless it is "
+                        "the sparse pool-level loss: set dsa_indexer_use_sparse_loss=True to "
+                        "train the KPool indexer, dsa_indexer_loss_coeff=0 to keep it frozen, "
+                        "or dsa_indexer_kpool=1."
+                    )
+                if self.dsa_indexer_kpool_use_quantization:
+                    raise ValueError(
+                        "A trainable KPool indexer (dsa_indexer_kpool > 1 with "
+                        "dsa_indexer_loss_coeff > 0) does not support FP8 KPool scoring "
+                        "(dsa_indexer_kpool_use_quantization): its E4M3 round trip has no "
+                        "defined training gradient."
+                    )
+            if self.dsa_indexer_kpool_scorer_backend not in ("torch", "cudnn"):
+                raise ValueError(
+                    "dsa_indexer_kpool_scorer_backend must be 'torch' or 'cudnn', "
+                    f"got {self.dsa_indexer_kpool_scorer_backend!r}."
+                )
+            if self.dsa_indexer_kpool_scorer_backend == "cudnn":
+                if self.dsa_indexer_kpool <= 1:
+                    raise ValueError(
+                        "dsa_indexer_kpool_scorer_backend='cudnn' applies only to KPool "
+                        f"selection (dsa_indexer_kpool > 1), got {self.dsa_indexer_kpool}."
+                    )
+                if self.dsa_kernel_backend != "cudnn":
+                    raise ValueError(
+                        "dsa_indexer_kpool_scorer_backend='cudnn' needs "
+                        f"dsa_kernel_backend='cudnn', got {self.dsa_kernel_backend!r}."
+                    )
+                if not self.dsa_indexer_scoring_relu:
+                    raise ValueError(
+                        "dsa_indexer_kpool_scorer_backend='cudnn' needs ReLU scoring "
+                        "(dsa_indexer_scoring_relu=True), as the cuDNN indexer kernel does."
+                    )
+                from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+                    use_fused_dsa_kernels,
+                )
+
+                if not use_fused_dsa_kernels(self):
+                    raise ValueError(
+                        "dsa_indexer_kpool_scorer_backend='cudnn' needs the fused DSA kernels; "
+                        "attention_backend='unfused' disables them."
+                    )
+                if self.dsa_indexer_kpool_use_quantization:
+                    raise ValueError(
+                        "dsa_indexer_kpool_scorer_backend='cudnn' scores BF16 inputs and does "
+                        "not support FP8 KPool scoring (dsa_indexer_kpool_use_quantization)."
+                    )
+                if (
+                    self.dsa_indexer_weights_proj_output_dtype == "fp32"
+                    and not self.dsa_indexer_hf_scoring
+                ):
+                    raise ValueError(
+                        "dsa_indexer_kpool_scorer_backend='cudnn' needs BF16 indexer head "
+                        "weights; dsa_indexer_weights_proj_output_dtype='fp32' would be rounded "
+                        "to BF16. Use dsa_indexer_weights_proj_output_dtype='bf16'."
+                    )
         elif self.experimental_attention_variant == "dsv4_hybrid":
             if self.dsa_indexer_precision not in ("bf16", "mxfp8"):
                 raise ValueError(
@@ -4283,6 +4892,15 @@ class TransformerConfig(ModelParallelConfig):
             is_kda_variant = isinstance(self, KDALayerConfig) or (
                 self.experimental_attention_variant == "kda"
             )
+            if (
+                "latent_kv" in (self.mtp_repeated_layer_shared_components or [])
+                and "core_attn" in self.recompute_modules
+            ):
+                raise ValueError(
+                    "mtp_repeated_layer_shared_components containing latent_kv does not support "
+                    "selective core_attn recompute. Use full recompute, select mla_up_proj "
+                    "instead, or disable latent_kv sharing."
+                )
             if len(self.recompute_modules) > 0:
                 allowed_modules = {
                     "core_attn",
@@ -4397,6 +5015,65 @@ class TransformerConfig(ModelParallelConfig):
             self.recompute_granularity = "selective"
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
+
+        # DeepGEMM's BF16 logits under activation recompute, checked once the recompute options
+        # above are final. A checkpoint replay that runs the DSA indexer again selects again,
+        # and its selection feeds the recomputed sparse attention, whose backward gives the
+        # gradients (and, with the indexer loss on, that loss). cuDNN's BF16 radix top-k, which
+        # takes every call DeepSelect declines (all calls with dsa_indexer_topk_backend='cudnn',
+        # the narrow ones with 'deepselect'), does not repeat its choice among tied BF16 logits
+        # (measured on GB300 with cuDNN frontend 1.31), so a replay could use other keys than
+        # the first call, whose output the forward already used. This holds for a frozen
+        # indexer as well: its replay without the reuse reruns the dense indexer and top-k.
+        if (
+            self.dsa_indexer_scorer_backend == "deepgemm"
+            and not self.dsa_indexer_reuse_checkpoint_topk
+        ):
+            replay = None
+            if self.recompute_granularity == "full":
+                replay = "recompute_granularity='full'"
+            elif self.recompute_granularity == "selective" and "core_attn" in (
+                self.recompute_modules or []
+            ):
+                replay = "selective recompute of 'core_attn'"
+            if replay is not None:
+                raise ValueError(
+                    f"dsa_indexer_scorer_backend='deepgemm' with {replay} requires "
+                    "dsa_indexer_reuse_checkpoint_topk=True, with the indexer loss on or "
+                    "frozen: the checkpoint replay would select the top-k again from BF16 "
+                    "logits, and cuDNN's BF16 radix top-k (every call DeepSelect declines) does "
+                    "not repeat its choice among tied keys, so the replay could recompute the "
+                    "attention (its gradients, and the indexer loss when it is on) on other keys "
+                    "than the first call, whose output the forward used. Set "
+                    "dsa_indexer_reuse_checkpoint_topk=True (with dsa_indexer_topk_freq > 1), "
+                    "use a recompute that does not replay core attention (e.g. selective "
+                    "'layernorm'), or dsa_indexer_scorer_backend='cudnn'."
+                )
+
+        # A trainable KPool indexer under activation recompute, checked once the recompute
+        # options above are final. A checkpoint replay of the DSA layer selects its pools
+        # again, and the cuDNN top-k does not repeat its choice among tied scores (nor need
+        # the PyTorch top-k after any rounding change), so the replayed sparse attention and
+        # indexer loss could use other pools than the first call, whose output the forward
+        # used. KPool has no checkpoint top-k reuse, so reject the replaying recomputes.
+        if self.dsa_indexer_kpool > 1 and (self.dsa_indexer_loss_coeff or 0.0) > 0:
+            replay = None
+            if self.recompute_granularity == "full":
+                replay = "recompute_granularity='full'"
+            elif self.recompute_granularity == "selective" and "core_attn" in (
+                self.recompute_modules or []
+            ):
+                replay = "selective recompute of 'core_attn'"
+            if replay is not None:
+                raise ValueError(
+                    "A trainable KPool indexer (dsa_indexer_kpool > 1 with "
+                    f"dsa_indexer_loss_coeff > 0) does not support {replay}: the checkpoint "
+                    "replay would select the pools again, and the cuDNN top-k does not repeat "
+                    "its choice among tied scores, so the replayed sparse attention and "
+                    "indexer loss could use other pools than the first call, whose output the "
+                    "forward used. Use a recompute that does not replay core attention (e.g. "
+                    "selective 'mla_up_proj' or 'mhc')."
+                )
 
         # Validation for "mhc" in recompute_modules
         if self.recompute_granularity == "selective" and "mhc" in self.recompute_modules:
@@ -4779,6 +5456,13 @@ class TransformerConfig(ModelParallelConfig):
                 # The base config cannot see layout-derived standalone MTP. Warn once when this
                 # post-layout transition makes the fixed-shape flag a no-op.
                 self._warn_if_pipeline_p2p_fixed_shape_has_no_effect()
+            if self.experimental_attention_variant == "dsa" and self.dsa_indexer_topk_freq > 1:
+                _validate_dsa_index_share_pipeline_layout(
+                    self.pipeline_model_parallel_layout,
+                    num_layers=self.num_layers,
+                    topk_freq=self.dsa_indexer_topk_freq,
+                    skip_topk_offset=self.dsa_indexer_skip_topk_offset,
+                )
 
         # Uneven PP
         elif (
@@ -5327,6 +6011,19 @@ class TransformerConfig(ModelParallelConfig):
                 )
                 self.cuda_graph_impl = "transformer_engine"
 
+        if self.cuda_graph_static_dynamic_cp:
+            assert self.cuda_graph_impl == "full_iteration", (
+                "--cuda-graph-static-dynamic-cp is only valid with "
+                "cuda_graph_impl='full_iteration'."
+            )
+            assert (
+                self.dynamic_context_parallel
+            ), "--cuda-graph-static-dynamic-cp requires --dynamic-context-parallel."
+            assert self.sequence_packing_scheduler == 'default_dynamic_cp', (
+                "--cuda-graph-static-dynamic-cp requires "
+                "sequence_packing_scheduler='default_dynamic_cp'."
+            )
+
         if self.dynamic_context_parallel:
             # Captured graphs bake in static communicators, so they cannot follow the
             # per-microbatch CP group that dynamic context parallelism selects at runtime.
@@ -5352,8 +6049,10 @@ class TransformerConfig(ModelParallelConfig):
                 context_parallel_size=self.context_parallel_size,
                 cuda_graph_impl=self.cuda_graph_impl,
             )
+            # Full-iteration graphs validate dynamic CP with the THD checks below, which
+            # accept it only through the explicit cuda_graph_static_dynamic_cp certificate.
             assert (
-                self.cuda_graph_impl == "none" or packed_dsa_cp_cuda_graphs
+                self.cuda_graph_impl in ("none", "full_iteration") or packed_dsa_cp_cuda_graphs
             ), "Dynamic context parallelism not supported with CUDA Graph"
             assert (
                 self.calculate_per_token_loss
@@ -5477,6 +6176,17 @@ class TransformerConfig(ModelParallelConfig):
         assert not (
             self.cuda_graph_impl == "full_iteration" and self.cuda_graph_modules
         ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
+
+        if (
+            self.cuda_graph_impl == "full_iteration"
+            and self.dsa_indexer_kpool > 1
+            and (self.dsa_indexer_loss_coeff or 0.0) > 0
+        ):
+            # The trainable KPool loss path has no full-iteration capture test yet.
+            raise ValueError(
+                "A trainable KPool indexer (dsa_indexer_kpool > 1 with dsa_indexer_loss_coeff "
+                "> 0) does not support cuda_graph_impl='full_iteration'."
+            )
 
         if (
             self.mlp_chunks_for_training > 1
@@ -5809,6 +6519,16 @@ class TransformerConfig(ModelParallelConfig):
                 f"cuda_graph_impl={self.cuda_graph_impl!r}, "
                 f"cuda_graph_modules={self.cuda_graph_modules!r})."
             )
+        if (
+            self.mtp_repeated_layer_shared_components
+            and graph_captures_attention
+            and self.cuda_graph_impl != "full_iteration"
+        ):
+            raise ValueError(
+                "mtp_repeated_layer_shared_components does not support per-layer CUDA graph "
+                "scopes that capture attention. Use a MoE-only scope or a full-iteration graph "
+                "that contains the complete MTP producer-consumer chain."
+            )
 
         assert not (
             self.moe_shortcut_connection
@@ -5821,6 +6541,11 @@ class TransformerConfig(ModelParallelConfig):
             "moe_shortcut_connection supports CUDA graphs only with "
             "cuda_graph_impl='local' and inference_cuda_graph_scope='block'."
         )
+
+        if self.pipeline_model_parallel_prewarm:
+            assert (
+                self.pipeline_model_parallel_size > 1
+            ), "pipeline_model_parallel_prewarm requires pipeline_model_parallel_size > 1."
 
         if self.cuda_graph_impl != "none":
 
@@ -5912,6 +6637,13 @@ class TransformerConfig(ModelParallelConfig):
                 assert self.cuda_graph_warmup_steps >= 2, (
                     "Transformer Engine whole-MoE CUDA graphs with paged stash require at least "
                     "2 cuda_graph_warmup_steps to record the pipeline schedule before capture."
+                )
+
+            if self.cuda_graph_impl == "full_iteration" and self.moe_paged_stash:
+                assert self.cuda_graph_warmup_steps >= 2, (
+                    "Full-iteration CUDA graphs with paged stash require at least two eager "
+                    "warmup steps to discover the stash schedule and allocate its buffers "
+                    "before capture."
                 )
 
             if self.recompute_granularity:
@@ -6706,11 +7438,19 @@ class TransformerConfig(ModelParallelConfig):
                     "('alltoall', 'flex'), "
                     f"got '{self.moe_token_dispatcher_type}'"
                 )
+                # THD full-iteration CUDA graphs need no runtime equalization: every rank's
+                # packed tokens are padded to the static max_seqlen_per_dp_cp_rank capacity
+                # (validated below; the static batch preparation asserts it for every
+                # microbatch, and the eager THD path pads to it whenever a CUDA graph is
+                # configured), so all dispatcher ranks see equal token counts. The padding
+                # option would add a host-synchronizing all-reduce to every dispatch inside
+                # the captured iteration.
                 if (
                     self.moe_megakernel_backend is None
                     and self.moe_token_dispatcher_type == "flex"
                     and self.moe_flex_dispatcher_backend == "hybridep"
                     and not self.moe_hybridep_pad_variable_tokens
+                    and self.cuda_graph_impl != "full_iteration"
                 ):
                     raise ValueError(
                         "sequence_packing with HybridEP requires "
@@ -6737,6 +7477,45 @@ class TransformerConfig(ModelParallelConfig):
                 "or --pad-packed-seq-alignment equal to max_seqlen_per_dp_cp_rank "
                 f"({self.max_seqlen_per_dp_cp_rank}), got {self.pad_packed_seq_alignment}."
             )
+            if self.cuda_graph_impl == "full_iteration":
+                # The full-iteration graph captures the whole forward_backward_func,
+                # so the entire batch path must satisfy the THD static-input
+                # contract: fixed per-rank token capacity, fixed cu_seqlens width,
+                # a fixed num_microbatches per step, and a static CP topology.
+                assert self.sequence_packing_scheduler is not None, (
+                    "THD full-iteration CUDA graph is only supported with a "
+                    "sequence packing scheduler."
+                )
+                if self.dynamic_context_parallel:
+                    assert self.cuda_graph_static_dynamic_cp, (
+                        "THD full-iteration CUDA graph with dynamic context parallelism "
+                        "requires --cuda-graph-static-dynamic-cp. This explicit opt-in "
+                        "enables per-slot realized-schedule certification; it does not "
+                        "permit the schedule topology to change after capture."
+                    )
+                assert self.max_seqlen_per_dp_cp_rank is not None, (
+                    "THD full-iteration CUDA graph requires --max-seqlen-per-dp-cp-rank "
+                    "to define the static per-rank token capacity."
+                )
+                assert (
+                    self.thd_max_packed_sequences is not None and self.thd_max_packed_sequences > 0
+                ), (
+                    "THD full-iteration CUDA graph requires a positive "
+                    "--thd-max-packed-sequences to define the static cu_seqlens width."
+                )
+                assert not self.mtp_standalone, (
+                    "THD full-iteration CUDA graph does not support standalone MTP: "
+                    "its PP shape handshake is not graph-capturable."
+                )
+                if self.context_parallel_size > 1 or self.dynamic_context_parallel:
+                    assert self.cuda_graph_warmup_steps > 0, (
+                        "THD full-iteration CUDA graph with context parallelism requires "
+                        "cuda_graph_warmup_steps > 0 so consumers can materialize "
+                        "host-derived device layout caches before graph capture."
+                    )
+                assert (
+                    self.pipeline_p2p_fixed_shape
+                ), "THD full-iteration CUDA graph requires fixed-shape pipeline communication."
 
         # 'extend_last' THD tail padding with context parallelism requires the
         # global metadata to be extended before CP slicing, which only the
