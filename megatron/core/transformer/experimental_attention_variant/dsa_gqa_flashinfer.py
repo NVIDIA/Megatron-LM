@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import functools
 from dataclasses import dataclass
-from typing import Dict, Sequence
+from typing import Dict, Optional, Sequence
 
 import numpy as np
 import torch
@@ -72,10 +72,8 @@ TILE_ROWS = 128
 # top-k tie slots. A row the threshold misses is repaired exactly inside the select launch.
 SAMPLES, PAGES = 3, 2
 SELECTOR = {512: (39, 4608), 1024: (60, 6144), 2048: (96, 9216)}
-# gvr_2's top-k launches one grid row per input row, and a grid's y dimension holds at most
-# 65535. A prefill plan pads a tile per request, so a large request budget exceeds that; select
-# in slabs of rows instead, as FlashInfer's own prefill top-k does.
-TOPK_ROW_SLAB = 32768
+# gvr_2's top-k launches one grid row per input row, and a grid's y dimension holds at most 65535.
+MAX_TOPK_ROWS = 65535
 # NVFP4 index keys of the 128-dim indexer: packed E2M1 bytes and E4M3 scales (one per 16 values)
 # per key; a 64-key cache page holds its keys' bytes, then their scales.
 INDEX_KEY_DTYPES = ("bf16", "nvfp4")
@@ -151,19 +149,53 @@ class StepPlan:
     request_rows: torch.Tensor  # [prefill requests] block-table row of each prefill request
     sample_ends: torch.Tensor  # [prefill requests] sampled keys of each prefill request
     batch_starts: torch.Tensor  # [tiles * 128 / group + 1] first step row of each group
+    compact_rows: torch.Tensor  # [padded rows] tiled index of each live prefill row (pad: 0)
+    compact_ends: torch.Tensor  # [padded rows] causal key count of each compact row (pad: 0)
+    compact_ordinals: torch.Tensor  # [padded rows] prefill request ordinal of each compact row
+    tiled_compact: torch.Tensor  # [tiles * 128] compact index of each tiled row (pad: padded rows)
     max_context: int  # bound on every row length (the graph's bound under CUDA graphs)
     page_table: torch.Tensor  # [requests, pages] FlashInfer's 64-key pages (fill_page_table)
 
 
-def plan_sizes(padded_rows: int, padded_requests: int, decode_only: bool) -> Dict[str, int]:
-    """Static plan sizes for a padded batch: decode-path rows, prefill tiles and requests."""
+def plan_sizes(
+    padded_rows: int,
+    padded_requests: int,
+    decode_only: bool,
+    padded_prefill_requests: Optional[int] = None,
+) -> Dict[str, int]:
+    """Static plan sizes for a padded batch: decode-path rows, prefill tiles and requests.
+
+    Only requests that take the tile path can leave a partial tile, so the tiles beyond the
+    rows' own are bounded by ``padded_prefill_requests`` (the batch's padded prefill request
+    count; ``padded_requests`` when not given). Leading decode requests take the decode path.
+    """
     if decode_only:
-        return {"decode_rows": padded_rows, "tiles": 0, "prefill_requests": 0}
+        return {"decode_rows": padded_rows, "tiles": 0, "prefill_requests": 0, "compact_rows": 0}
+    prefill = padded_requests if padded_prefill_requests is None else padded_prefill_requests
     return {
         "decode_rows": min(padded_rows, padded_requests),
-        "tiles": -(-padded_rows // TILE_ROWS) + padded_requests,
-        "prefill_requests": padded_requests,
+        "tiles": -(-padded_rows // TILE_ROWS) + prefill,
+        "prefill_requests": prefill,
+        # The per-row sample kernels run on the live prefill rows, at most the padded rows,
+        # rather than on every tiled row.
+        "compact_rows": padded_rows,
     }
+
+
+def check_plan_rows(max_tokens: int) -> None:
+    """Reject a token budget whose per-row top-k exceeds one gvr_2 launch.
+
+    The sample and decode top-k run on at most ``max_tokens`` real rows plus one empty row,
+    however many requests the batch admits (the request-tiled layout is used only by the
+    threshold select, whose grid has no such limit).
+    """
+    rows = max_tokens + 1
+    if rows > MAX_TOPK_ROWS:
+        raise ValueError(
+            f"The FlashInfer DSA backend selects top-k over up to {rows} rows at "
+            f"max_tokens={max_tokens}, above its limit of {MAX_TOPK_ROWS}. Lower max_tokens, "
+            f"or use dsa_backend='triton'."
+        )
 
 
 def build_step_plan(
@@ -174,6 +206,7 @@ def build_step_plan(
     padded_requests: int,
     decode_only: bool,
     heads: int,
+    padded_prefill_requests: Optional[int] = None,
 ) -> Dict[str, np.ndarray]:
     """The plan arrays (int32, CPU) of a step whose request ``i`` adds ``query_lengths[i]`` rows,
     in order, the last at key ``kv_lengths[i] - 1``; sizes depend only on the padded batch.
@@ -181,7 +214,7 @@ def build_step_plan(
     The leading single-token requests whose rows are among the first ``decode_rows`` rows take
     the decode path; every other request's rows go into prefill tiles.
     """
-    sizes = plan_sizes(padded_rows, padded_requests, decode_only)
+    sizes = plan_sizes(padded_rows, padded_requests, decode_only, padded_prefill_requests)
     group = union_group(heads)
     q_len = np.asarray(query_lengths, dtype=np.int64)
     kv_len = np.asarray(kv_lengths, dtype=np.int64)
@@ -240,6 +273,19 @@ def build_step_plan(
     batch_starts = np.empty(len(ends) + 1, np.int32)
     batch_starts[:-1] = np.where(live_groups, group_rows[:, 0], previous)
     batch_starts[-1] = carried[-1] if len(carried) else first
+    # The live tiled rows in order, for the per-row sample kernels; padding tiled rows map to
+    # the one past the last compact row, which is empty.
+    compact = sizes["compact_rows"]
+    live_flat = np.flatnonzero(query_rows.ravel() >= 0)
+    assert len(live_flat) <= compact
+    compact_rows = np.zeros(compact, np.int32)
+    compact_rows[: len(live_flat)] = live_flat
+    compact_ends = np.zeros(compact, np.int32)
+    compact_ends[: len(live_flat)] = row_ends.ravel()[live_flat]
+    compact_ordinals = np.zeros(compact, np.int32)
+    compact_ordinals[: len(live_flat)] = tile_ordinals[live_flat // TILE_ROWS]
+    tiled_compact = np.full(tiles * TILE_ROWS, compact, np.int32)
+    tiled_compact[live_flat] = np.arange(len(live_flat))
     return {
         "decode_requests": decode_requests,
         "decode_lengths": decode_lengths,
@@ -250,6 +296,10 @@ def build_step_plan(
         "request_rows": request_rows,
         "sample_ends": sample_ends,
         "batch_starts": batch_starts,
+        "compact_rows": compact_rows,
+        "compact_ends": compact_ends,
+        "compact_ordinals": compact_ordinals,
+        "tiled_compact": tiled_compact,
     }
 
 
@@ -267,6 +317,13 @@ if HAVE_FLASHINFER_DSA:
         return cute.recast_tensor(words, cutlass.Uint32).load()
 
     _union_mask_mod.__vec_size__ = 128
+
+
+@functools.cache
+def _arrivals(device_index: int, tiles: int) -> torch.Tensor:
+    """indexer_threshold_select's arrival counts for up to ``tiles`` query tiles (zeroed once,
+    left zeroed by every call), for plans beyond the default count."""
+    return torch.zeros(tiles, dtype=torch.int32, device=torch.device("cuda", device_index))
 
 
 @functools.cache
@@ -368,23 +425,6 @@ def write_nvfp4_index_keys(
     return packed_query, query_scales
 
 
-def _top_k_rows(scores, lengths, out, workspace, top_k):
-    """Each row's ``top_k`` largest of its first ``lengths[row]`` scores (gvr_2), in slabs of
-    at most ``TOPK_ROW_SLAB`` rows. Rows are independent, so slabbing doesn't change the result."""
-    for start in range(0, scores.size(0), TOPK_ROW_SLAB):
-        end = start + TOPK_ROW_SLAB
-        run_varlen(
-            scores[start:end],
-            None,
-            lengths[start:end],
-            out[start:end],
-            next_n=1,
-            max_seq_len=scores.size(1),
-            workspace=workspace,
-            top_k=top_k,
-        )
-
-
 def _token_core(query, keys, requests, table, key_rows, value_rows, out, index_topk, scale, heads):
     """Each row of `query` attends to its selected key positions `keys` (-1: none) of request
     `requests[row]` with trtllm-gen token-sparse attention (page size 1)."""
@@ -476,7 +516,8 @@ def flashinfer_sparse_attention(
         rank, capacity = SELECTOR[index_topk]
         tiles = plan.num_tiles
         tiled = tiles * TILE_ROWS
-        assert tiles <= arrivals.numel()
+        if tiles > arrivals.numel():
+            arrivals = _arrivals(device.index, 1 << (tiles - 1).bit_length())
         query_rows = plan.query_rows
         live_rows = query_rows.clamp(min=0).long()
         packed = index_query[live_rows] * (query_rows >= 0).to(index_query.dtype)[:, None]
@@ -510,25 +551,51 @@ def flashinfer_sparse_attention(
         sample_table = torch.arange(
             num_requests * sample_cap // FI_PAGE, dtype=torch.int32, device=device
         ).view(num_requests, -1)
-        sample_row_ends = (plan.row_ends // (PAGES * FI_PAGE) * SAMPLES).to(torch.int32)
-        sample_scores = torch.empty(tiled, sample_cap, device=device)
+        # The sample kernels work per row, so they run on the live rows only (compacted, plus
+        # one empty row that every padding tiled row reads), which bounds their rows by the
+        # step's tokens rather than by its tiles.
+        compact = plan.compact_rows.long()
+        compact_query = torch.cat((packed[compact], packed.new_zeros(1, packed.size(1))))
+        compact_scales = None
+        if nvfp4:
+            compact_scales = torch.cat(
+                (packed_scales[compact], packed_scales.new_zeros(1, packed_scales.size(1)))
+            )
+        compact_ends = torch.cat((plan.compact_ends, plan.compact_ends.new_zeros(1)))
+        sample_row_ends = (compact_ends // (PAGES * FI_PAGE) * SAMPLES).to(torch.int32)
+        compact_rows = compact_ends.numel()
+        sample_scores = torch.empty(compact_rows, sample_cap, device=device)
         indexer_scores(
-            packed,
+            compact_query,
             sample_keys.view(-1, FI_PAGE, pages.size(-1)),
             sample_table,
-            sample_row_ends.view(-1, 8).amax(1),
-            requests=plan.tile_ordinals.repeat_interleave(TILE_ROWS // 8),
+            sample_row_ends,
+            requests=torch.cat((plan.compact_ordinals, plan.compact_ordinals.new_zeros(1))),
             scores=sample_scores,
-            query_scales=packed_scales,
+            query_scales=compact_scales,
             key_scales=(
                 None if sample_scales is None else sample_scales.view(-1, FI_PAGE, NVFP4_SCALES)
             ),
         )
-        sample_top = torch.empty(tiled, rank, dtype=torch.int32, device=device)
-        _top_k_rows(sample_scores, sample_row_ends, sample_top, topk_ws, rank)
-        thresholds = torch.empty(tiled, device=device)
-        counters = torch.empty(tiled, 2, dtype=torch.int32, device=device)
-        thresholds_from_sample(sample_scores, sample_top, thresholds=thresholds, counters=counters)
+        sample_top = torch.empty(compact_rows, rank, dtype=torch.int32, device=device)
+        run_varlen(
+            sample_scores,
+            None,
+            sample_row_ends,
+            sample_top,
+            next_n=1,
+            max_seq_len=sample_cap,
+            workspace=topk_ws,
+            top_k=rank,
+        )
+        compact_thresholds = torch.empty(compact_rows, device=device)
+        compact_counters = torch.empty(compact_rows, 2, dtype=torch.int32, device=device)
+        thresholds_from_sample(
+            sample_scores, sample_top, thresholds=compact_thresholds, counters=compact_counters
+        )
+        tiled_compact = plan.tiled_compact.long()
+        thresholds = compact_thresholds[tiled_compact]
+        counters = compact_counters[tiled_compact].contiguous()
         # Candidates and ties of every row in one sweep, repaired exactly inside the launch.
         ranges = torch.empty(2, tiled, dtype=torch.int32, device=device)
         slots = index_topk + capacity
@@ -597,7 +664,16 @@ def flashinfer_sparse_attention(
             key_scales=key_scales,
         )
         topk = torch.empty(decode_rows, index_topk, device=device, dtype=torch.int32)
-        _top_k_rows(scores, plan.decode_lengths, topk, topk_ws, index_topk)
+        run_varlen(
+            scores,
+            None,
+            plan.decode_lengths,
+            topk,
+            next_n=1,
+            max_seq_len=width,
+            workspace=topk_ws,
+            top_k=index_topk,
+        )
         if deterministic:
             # gvr_2 returns the selected keys in an order that varies between runs, and
             # attention sums in that order; sorting (descending, so -1 padding stays last)

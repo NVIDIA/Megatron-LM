@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from typing import Sequence
+from typing import Optional, Sequence
 
 import torch
 
@@ -35,6 +35,7 @@ class FlashInferDSAMetadata(MetadataBase):
         from megatron.core.transformer.experimental_attention_variant import dsa_gqa_flashinfer
 
         dsa_gqa_flashinfer.require_flashinfer_dsa()
+        dsa_gqa_flashinfer.check_plan_rows(max_tokens)
         self._fi = dsa_gqa_flashinfer
         self.block_size_tokens = block_size_tokens
         self.max_sequence_length = max_sequence_length
@@ -52,6 +53,10 @@ class FlashInferDSAMetadata(MetadataBase):
             "request_rows": max_requests,
             "sample_ends": max_requests,
             "batch_starts": tiled // dsa_gqa_flashinfer.union_group(query_heads) + 1,
+            "compact_rows": max_tokens,
+            "compact_ends": max_tokens,
+            "compact_ordinals": max_tokens,
+            "tiled_compact": tiled,
         }
         total = sum(self._capacity.values())
         self._cpu_buf = torch.zeros(total, dtype=torch.int32, pin_memory=True)
@@ -79,9 +84,11 @@ class FlashInferDSAMetadata(MetadataBase):
         padded_tokens: int,
         padded_requests: int,
         decode_only: bool,
+        padded_prefill_requests: Optional[int] = None,
     ) -> None:
         """Build the step's plan on the CPU for requests that add ``query_lengths[i]`` tokens,
-        the last at key ``kv_lengths[i] - 1``."""
+        the last at key ``kv_lengths[i] - 1``. ``padded_prefill_requests`` bounds the requests
+        that take the prefill tiles (all ``padded_requests`` when not given)."""
         arrays = self._fi.build_step_plan(
             query_lengths,
             kv_lengths,
@@ -89,12 +96,15 @@ class FlashInferDSAMetadata(MetadataBase):
             padded_requests=padded_requests,
             decode_only=decode_only,
             heads=self.query_heads,
+            padded_prefill_requests=padded_prefill_requests,
         )
         for name, values in arrays.items():
             assert values.size <= self._capacity[name], name
             self._cpu_views[name][: values.size] = torch.from_numpy(values)
             self._lengths[name] = values.size
-        self._sizes = self._fi.plan_sizes(padded_tokens, padded_requests, decode_only)
+        self._sizes = self._fi.plan_sizes(
+            padded_tokens, padded_requests, decode_only, padded_prefill_requests
+        )
         self._page_rows = padded_requests
 
     def transfer(self, block_table: torch.Tensor, non_blocking: bool) -> None:

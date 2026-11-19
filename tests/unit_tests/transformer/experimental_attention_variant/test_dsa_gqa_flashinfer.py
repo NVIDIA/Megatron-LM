@@ -23,8 +23,6 @@ NUM_HEADS = 16
 HEAD_DIM = 256
 INDEX_DIM = 128
 TOPK = 512
-# The threshold-sample rank of TOPK, the sample top-k a prefill step runs over every tile row.
-SELECTOR_RANK = dsa_gqa_flashinfer.SELECTOR[TOPK][0]
 
 
 def _config(**overrides) -> TransformerConfig:
@@ -146,7 +144,7 @@ def test_flashinfer_step_plan():
         heads=NUM_HEADS,
     )
     sizes = dsa_gqa_flashinfer.plan_sizes(400, 8, False)
-    assert sizes == {"decode_rows": 8, "tiles": 4 + 8, "prefill_requests": 8}
+    assert sizes == {"decode_rows": 8, "tiles": 4 + 8, "prefill_requests": 8, "compact_rows": 400}
     assert plan["decode_lengths"].tolist() == [50, 9000] + [0] * 6
     assert plan["decode_requests"][:2].tolist() == [0, 1]
     assert len(plan["query_rows"]) == 12 * 128 and len(plan["batch_starts"]) == 12 * 16 + 1
@@ -159,11 +157,38 @@ def test_flashinfer_step_plan():
     starts = plan["batch_starts"]
     assert (np.diff(starts) >= 0).all() and starts[0] == 2 and starts[-1] == 303
     assert plan["sample_ends"][:2].tolist() == [1300 // 128 * 3, 77 // 128 * 3]
+    # The sample kernels' compact rows: the 301 live tiled rows in order, then padding that
+    # every padding tiled row maps past.
+    live = np.flatnonzero(plan["query_rows"] >= 0)
+    assert plan["compact_rows"][:301].tolist() == live.tolist()
+    assert plan["compact_ends"][:301].tolist() == ends.tolist()
+    assert plan["compact_ordinals"][:301].tolist() == [0] * 300 + [1]
+    assert (plan["compact_ends"][301:] == 0).all() and len(plan["compact_rows"]) == 400
+    assert plan["tiled_compact"][live].tolist() == list(range(301))
+    assert (np.delete(plan["tiled_compact"], live) == 400).all()
     decode_plan = dsa_gqa_flashinfer.build_step_plan(
         [1] * 3, [10, 20, 30], padded_rows=4, padded_requests=4, decode_only=True, heads=NUM_HEADS
     )
     assert decode_plan["decode_lengths"].tolist() == [10, 20, 30, 0]
     assert decode_plan["query_rows"].size == 0
+    assert decode_plan["compact_rows"].size == 0
+
+
+def test_flashinfer_compact_rows_are_bounded_by_tokens():
+    """Many small prefills tile far more rows than they hold; the per-row sample kernels run on
+    at most the padded rows however many requests the batch admits."""
+    lengths = [2] * 1024
+    plan = dsa_gqa_flashinfer.build_step_plan(
+        lengths,
+        [100] * 1024,
+        padded_rows=2048,
+        padded_requests=1024,
+        decode_only=False,
+        heads=NUM_HEADS,
+    )
+    assert len(plan["query_rows"]) == (16 + 1024) * 128 > 65535
+    assert len(plan["compact_rows"]) == 2048
+    assert (plan["compact_ends"] > 0).sum() == 2048
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -177,23 +202,16 @@ def test_fill_page_table():
     assert (pages[:, 8:] == -7).all() and (pages[2] == -7).all()
 
 
-@requires_flashinfer_dsa
-def test_top_k_rows_past_one_launch():
-    """Top-k over more rows than one gvr_2 launch holds (65535), as a prefill plan with a large
-    request budget has, matches torch.topk on every row."""
-    device = torch.device("cuda", torch.cuda.current_device())
-    # The sample width of a 196608-token context: wide rows take gvr_2's row-per-grid-row engines.
-    rows, width, top_k = 65536 + 128, 4608, SELECTOR_RANK
-    scores = torch.randn(rows, width, device=device)
-    lengths = torch.full((rows,), width, dtype=torch.int32, device=device)
-    out = torch.empty(rows, top_k, dtype=torch.int32, device=device)
-    workspace = torch.zeros(
-        dsa_gqa_flashinfer.workspace_bytes() // 4, dtype=torch.int32, device=device
-    )
-    dsa_gqa_flashinfer._top_k_rows(scores, lengths, out, workspace, top_k)
-    # Compare the selected scores, not indices: rows tied at the k-th score may pick either key.
-    selected = scores.gather(1, out.long()).sort(dim=1, descending=True).values
-    assert torch.equal(selected, scores.topk(top_k, dim=1).values)
+@pytest.mark.parametrize(
+    "max_tokens, ok", [(8192, True), (32768, True), (65534, True), (65535, False)]
+)
+def test_check_plan_rows(max_tokens, ok):
+    """The top-k rows are bounded by the token budget alone, whatever the request budget."""
+    if ok:
+        dsa_gqa_flashinfer.check_plan_rows(max_tokens)
+    else:
+        with pytest.raises(ValueError, match="Lower max_tokens"):
+            dsa_gqa_flashinfer.check_plan_rows(max_tokens)
 
 
 def _rows_of(query_lengths, kv_lengths):
@@ -233,8 +251,11 @@ def _reference_rows(
 
 @requires_flashinfer_dsa
 @pytest.mark.parametrize("index_key_dtype", INDEX_KEY_DTYPES)
-@pytest.mark.parametrize("decode_only", [True, False])
-def test_flashinfer_replays_in_cuda_graph(decode_only, index_key_dtype):
+@pytest.mark.parametrize(
+    "decode_only, padded_prefill",
+    [(True, None), (False, None), (False, 2), pytest.param(False, "many", id="many-prefills")],
+)
+def test_flashinfer_replays_in_cuda_graph(decode_only, padded_prefill, index_key_dtype):
     """A captured layer, replayed for new batches of one padded size (new keys, queries, tables
     and lengths, plan buffers refilled in place), matches an exact PyTorch reference, and
     padding rows stay zero. With NVFP4 index keys the captured region also quantizes the keys
@@ -246,6 +267,12 @@ def test_flashinfer_replays_in_cuda_graph(decode_only, index_key_dtype):
     if decode_only:
         padded_rows = padded_requests = 4
         batches = [([1, 1, 1], [700, 9000, 2600]), ([1, 1, 1, 1], [9000, 513, 4000, 1])]
+    elif padded_prefill == "many":
+        # Hundreds of short prefills: their tiles hold over 65,535 rows, more than one sample
+        # top-k launch takes, while the compacted per-row kernels see only the 640 rows.
+        padded_prefill, bound = None, 2048
+        padded_rows, padded_requests = 640, 520
+        batches = [([2] * 320, [600] * 160 + [2048] * 160), ([1, 1] + [3] * 200, [900] * 202)]
     else:
         padded_rows, padded_requests = 640, 4
         batches = [([1, 1, 300, 37], [700, 9000, 3000, 37]), ([1, 520], [8000, 9000])]
@@ -262,7 +289,7 @@ def test_flashinfer_replays_in_cuda_graph(decode_only, index_key_dtype):
     table = torch.zeros(padded_requests, max_pages, device=device, dtype=torch.int32)
     query = torch.zeros(padded_rows, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
     index_query = torch.zeros(padded_rows, INDEX_DIM, device=device, dtype=torch.bfloat16)
-    sizes = dsa_gqa_flashinfer.plan_sizes(padded_rows, padded_requests, decode_only)
+    sizes = dsa_gqa_flashinfer.plan_sizes(padded_rows, padded_requests, decode_only, padded_prefill)
     empty = dsa_gqa_flashinfer.build_step_plan(
         [1],
         [1],
@@ -270,6 +297,7 @@ def test_flashinfer_replays_in_cuda_graph(decode_only, index_key_dtype):
         padded_requests=padded_requests,
         decode_only=decode_only,
         heads=NUM_HEADS,
+        padded_prefill_requests=padded_prefill,
     )
     buffers = {
         name: torch.zeros(len(v), device=device, dtype=torch.int32) for name, v in empty.items()
@@ -296,6 +324,7 @@ def test_flashinfer_replays_in_cuda_graph(decode_only, index_key_dtype):
             padded_requests=padded_requests,
             decode_only=decode_only,
             heads=NUM_HEADS,
+            padded_prefill_requests=padded_prefill,
         )
         for name, values_np in arrays.items():
             buffers[name].copy_(torch.from_numpy(values_np))

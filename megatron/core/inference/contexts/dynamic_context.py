@@ -3226,6 +3226,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             extra = {}
             if isinstance(self.dsa_metadata, DSAMetadata):
                 extra["num_decode_requests"] = attn_dimensions.decode_req_count
+            else:
+                # Only prefill requests can take the FlashInfer plan's prefill tiles, so size them
+                # by the graph's padded prefill count (the step's own when eager), not every request.
+                extra["padded_prefill_requests"] = (
+                    self.padded_batch_dimensions.prefill_req_count
+                    if self.using_cuda_graph_this_step()
+                    else attn_dimensions.prefill_req_count
+                )
             self.dsa_metadata.update(
                 self._cpu_mha_query_lengths[:real_bs].tolist(),
                 self._cpu_mha_kv_seq_lengths[:real_bs].tolist(),
