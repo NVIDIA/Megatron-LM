@@ -64,6 +64,15 @@ def _te_do_not_offload(tensor):
     )
 
 
+def _covers_whole_storage(tensor: torch.Tensor) -> bool:
+    """Return whether a contiguous tensor spans every byte of its underlying storage."""
+    return (
+        tensor.is_contiguous()
+        and tensor.storage_offset() == 0
+        and tensor.numel() * tensor.element_size() == tensor.untyped_storage().nbytes()
+    )
+
+
 def print_offload_summary_table(
     total_offload_bytes: Dict[str, int],
     local_duplicate_summary: Optional[Dict[str, Tuple[int, int]]] = None,
@@ -668,6 +677,18 @@ class PipelineOffloadManager:
         """Total offloaded bytes collected after warmup."""
         return self._offload_summary_total_bytes
 
+    @property
+    def offload_summary_duplicate_bytes(self) -> Dict[str, int]:
+        """Redundant bytes per group inside ``offload_summary_bytes``.
+
+        Bytes of a storage copied to CPU more than once within one group (two
+        autograd aliases of the same tensor, or overlapping whole-storage views).
+        They are still transferred, but free GPU memory only once, so
+        ``offload_summary_bytes[name] - offload_summary_duplicate_bytes.get(name, 0)``
+        is the per-group GPU saving. Only groups with duplicates are listed.
+        """
+        return self._offload_summary_duplicate_bytes
+
     def flush(self):
         """Flush all staged chunks to the backward queue in reverse order."""
         # Ensure all virtual pipeline stages have the same number of chunks
@@ -772,6 +793,9 @@ class PipelineOffloadManager:
         # Dump the offload information
         total_tensor_count = {}
         total_offload_bytes = {}
+        # Redundant bytes inside total_offload_bytes, over the same chunks, so a
+        # consumer can reduce the summary to one copy per storage.
+        duplicate_offload_bytes = {}
         for chunk in self._cached_chunks_forward:
             for group in chunk.offload_groups:
                 debug_rank(f"chunk {chunk} group {group} offload {group.offload}")
@@ -782,15 +806,22 @@ class PipelineOffloadManager:
                     if group._name not in total_offload_bytes:
                         total_offload_bytes[group._name] = 0
                     total_offload_bytes[group._name] += group.total_offload_bytes
+                    if group.duplicate_storage_bytes > 0:
+                        duplicate_offload_bytes[group._name] = (
+                            duplicate_offload_bytes.get(group._name, 0)
+                            + group.duplicate_storage_bytes
+                        )
             # Stop statistics at the first backward chunk after which 1F1B is running,
             # where the memory cost will not increase anymore.
             if chunk is self._cached_chunks_backward[0]:
                 break
         debug_rank(f"total_tensor_count {total_tensor_count}")
         debug_rank(f"total_offload_bytes {total_offload_bytes}")
+        debug_rank(f"duplicate_offload_bytes {duplicate_offload_bytes}")
         # Cache summary for downstream consumers (e.g., unit tests).
         self._offload_summary_bytes = dict(total_offload_bytes)
         self._offload_summary_total_bytes = int(sum(total_offload_bytes.values()))
+        self._offload_summary_duplicate_bytes = dict(duplicate_offload_bytes)
         print_offload_summary_table(
             total_offload_bytes,
             {name: tuple(summary) for name, summary in local_duplicate_summary.items()},
@@ -1047,16 +1078,26 @@ class ChunkOffloadHandler:
                 return (tensor.size(), tensor.stride(), tensor.storage_offset())
         return None
 
-    @_otel_trace_fn('activation_offload', 'megatron.activation.reload')
-    def reload(self, state, non_blocking=None, stream=None):
-        """Reload."""
-        debug_rank("------reload")
-        dev, cpu_backup, use_cpu_pool, view_meta = state
-        if non_blocking is None:
-            non_blocking = cpu_backup.is_pinned()
-        gpu_tensor = torch.empty(
+    @staticmethod
+    def _allocate_reload_buffer(state):
+        """An empty GPU buffer for an offloaded ``state``, allocated on the current stream."""
+        dev, cpu_backup, _, _ = state
+        return torch.empty(
             cpu_backup.size(), dtype=cpu_backup.dtype, layout=cpu_backup.layout, device=dev
         )
+
+    @_otel_trace_fn('activation_offload', 'megatron.activation.reload')
+    def reload(self, state, non_blocking=None, stream=None, *, destination=None):
+        """Copy an offloaded ``state`` back to the GPU on the current stream.
+
+        ``destination`` is the buffer to copy into; when ``None`` it is allocated on the
+        current stream. ``stream`` is the one the pinned source is released against.
+        """
+        debug_rank("------reload")
+        dev, cpu_backup, use_cpu_pool, view_meta = state
+        gpu_tensor = self._allocate_reload_buffer(state) if destination is None else destination
+        if non_blocking is None:
+            non_blocking = cpu_backup.is_pinned()
         gpu_tensor.copy_(cpu_backup, non_blocking=non_blocking)
         if use_cpu_pool:
             self.cpu_tensor_pool.free(cpu_backup, stream=stream)
@@ -1251,7 +1292,13 @@ class ChunkOffloadHandler:
             if not self.tensor_need_offloading_checker(tensor):
                 continue
             storage = tensor.untyped_storage()
-            full_storage = self._get_offload_view_meta(tensor) is not None
+            # A strided view routed through the whole-storage path and a contiguous
+            # tensor spanning its whole storage both copy every storage byte, so any
+            # further copy from that storage within the group is redundant (e.g. two
+            # autograd aliases of one hidden_states saved by two linears).
+            full_storage = self._get_offload_view_meta(tensor) is not None or _covers_whole_storage(
+                tensor
+            )
             num_bytes = storage.nbytes() if full_storage else tensor.numel() * tensor.element_size()
             group.update_offload_info(num_bytes)
             record = storage_records[(tensor.device, storage.data_ptr(), storage.nbytes())]
@@ -1287,7 +1334,16 @@ class ChunkOffloadHandler:
         return len(count_modules)
 
     def bulk_reload_group(self):
-        """Bulk reload group."""
+        """Reload the next offloaded group: allocate the GPU buffers on the current
+        (consumer) stream, copy into them on the H2D stream.
+
+        The buffer's allocation stream decides which allocator pool it returns to when
+        the backward frees it. Allocated on the H2D stream, those blocks could only be reused
+        by later reloads; allocated on the consumer stream, they recirculate like any other
+        activation. Stream order: the H2D stream waits for the consumer stream (a fresh block
+        may still be in use there) and, outside CUDA-graph capture, for the group's offload
+        event; the consumer waits for the group's reload event before its first use.
+        """
         debug_rank("----bulk_reload_group")
         group_to_reload = self._groups_to_reload[-1]
         # GPU-resident or already-consumed groups still occupy a reload slot.
@@ -1299,16 +1355,24 @@ class ChunkOffloadHandler:
             return
         nvtx_msg = "activation reloading " + group_to_reload._name
         nvtx_range_push(nvtx_msg)
+        consumer_stream = torch.cuda.current_stream()
+        staged = [
+            (tensor_tag, state, self._allocate_reload_buffer(state))
+            for tensor_tag, state in group_to_reload._tensors.items()
+            if isinstance(state, tuple)  # only tensors that were offloaded
+        ]
+        self.h2d_stream.wait_stream(consumer_stream)
+        if not is_graph_capturing():
+            # The offload event is recorded outside the graph; under capture the H2D stream is
+            # already ordered behind the capturing stream (on_group_start_backward).
+            group_to_reload.wait_offload_event(self.h2d_stream)
         with torch.cuda.stream(self.h2d_stream):
-            # Wait for offload to complete before reloading
-            if not is_graph_capturing():
-                group_to_reload.wait_offload_event(self.h2d_stream)
-            for tensor_tag, state in group_to_reload._tensors.items():
-                # Only reload if tensor was offloaded (stored as tuple)
-                if isinstance(state, tuple):
-                    recovered_tensor = self.reload(state, stream=self.h2d_stream)
-                    debug_rank(f"----recovered_tensor {recovered_tensor.shape}")
-                    group_to_reload.push_tensor(tensor_tag, recovered_tensor)
+            for tensor_tag, state, gpu_tensor in staged:
+                recovered_tensor = self.reload(
+                    state, stream=self.h2d_stream, destination=gpu_tensor
+                )
+                debug_rank(f"----recovered_tensor {recovered_tensor.shape}")
+                group_to_reload.push_tensor(tensor_tag, recovered_tensor)
             group_to_reload.record_reload_event(self.h2d_stream)
         group_to_reload._reload_graph_task_id = _capturing_graph_task_id()
         self._groups_to_reload.pop()

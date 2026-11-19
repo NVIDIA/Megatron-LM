@@ -70,7 +70,13 @@ from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
-from megatron.core.utils import get_pg_rank, get_pg_size, nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import (
+    ensure_params_ready,
+    get_pg_rank,
+    get_pg_size,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 
 
 def _build_csa_submodule(spec, *args, **kwargs):
@@ -1311,6 +1317,9 @@ class Compressor(MegatronModule):
         ``pre_compacted_hidden`` keeps the fallback's high-dimensional input
         shared across the two compressors as well.
         """
+        # Called directly by the attention, not through __call__, so this module's forward
+        # pre-hook never publishes ape.
+        ensure_params_ready([self.ape])
         linears = (self.linear_wkv, self.linear_wgate)
         # Deferred wgrad stores one GEMM per backward_dw call. FSDP can likewise
         # request a single overwrite of main_grad. Preserve their single-call

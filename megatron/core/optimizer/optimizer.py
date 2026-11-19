@@ -305,12 +305,16 @@ def _is_separate_grad_norm_group(grad_norm_group: Optional[str]) -> bool:
 
 def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tensor) -> None:
     """Copy optimizer-relevant metadata when creating param views/copies."""
+    if hasattr(source, "muon_matrix_shape"):
+        destination.muon_matrix_shape = source.muon_matrix_shape
     if hasattr(source, 'allreduce'):
         destination.allreduce = source.allreduce
     if hasattr(source, 'shared'):
         destination.shared = source.shared
     if hasattr(source, GRAD_NORM_GROUP_ATTR):
         setattr(destination, GRAD_NORM_GROUP_ATTR, getattr(source, GRAD_NORM_GROUP_ATTR))
+    if hasattr(source, "is_word_embedding_parameter"):
+        destination.is_word_embedding_parameter = source.is_word_embedding_parameter
 
 
 class MegatronOptimizer(ABC):
@@ -1201,6 +1205,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if timers is not None:
             timers('optimizer-inner-step').stop()
 
+        if not self.is_stub_optimizer:
+            self._post_optimizer_step()
+
         # Update params from main params.
         if timers is not None:
             timers('optimizer-copy-main-to-model-params', log_level=1).start(
@@ -1225,6 +1232,10 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-copy-main-to-model-params').stop()
 
         return True
+
+    def _post_optimizer_step(self) -> None:
+        """Apply transforms to updated main parameters before staging model copies."""
+        pass
 
     @torch.no_grad()
     def step(self):

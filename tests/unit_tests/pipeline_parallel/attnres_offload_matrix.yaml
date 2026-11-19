@@ -1,0 +1,50 @@
+# Requested K3 AttnRes/MTP acceptance targets; not a passing-support declaration.
+# Apply each ARGS mapping to the same K3 model and base training recipe.
+# linear_qkv in the request is the qkv_linear offload selector in MCore.
+nonfused:
+  ENV_VARS:
+    NVTE_CPU_OFFLOAD_V1: "1"
+  ARGS:
+    use_transformer_engine_op_fuser: false
+    use_te_activation_func: false
+    recompute_granularity: selective
+    recompute_modules:
+      - gdn
+      - mla_up_proj
+      - layernorm
+      - moe_latent_proj
+      - shared_experts
+      - moe_act
+    fine_grained_activation_offloading: true
+    offload_modules:
+      - mlp_norm
+      - expert_fc1
+      - moe_act
+      - attn_proj
+      - qkv_linear
+      - core_attn
+    activation_offload_fraction: 1.0
+fused:
+  ENV_VARS:
+    NVTE_CPU_OFFLOAD_V1: "1"
+    NVTE_CUTEDSL_FUSED_GROUPED_MLP: "1"
+  ARGS:
+    use_transformer_engine_op_fuser: true
+    # The fused stack creates ScaledSiTUGLU itself. This does not authorize a
+    # fallback to native GroupedMLP: the test must assert the fused path is used.
+    use_te_activation_func: false
+    recompute_granularity: selective
+    recompute_modules:
+      - gdn
+      - mla_up_proj
+      - layernorm
+      - moe_latent_proj
+      - shared_experts
+    fine_grained_activation_offloading: true
+    offload_modules:
+      - mlp_norm
+      - fused_group_mlp
+      - attn_proj
+      - qkv_linear
+      - core_attn
+    activation_offload_fraction: 1.0

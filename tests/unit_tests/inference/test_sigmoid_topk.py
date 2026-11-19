@@ -5,7 +5,8 @@
 Expert indices must match the compiled inference router bit for bit. Probabilities
 match bitwise for top-k below eight; for larger top-k the compiled path sums the k
 scores in another order, so they may differ in the last bit. Batch-invariant mode
-retains its existing behavior.
+routes through topk_routing_with_score_function, which runs the kernel with a
+batch-invariant launch (see tests/unit_tests/transformer/moe/test_moe_batch_invariant_router.py).
 """
 
 import pytest
@@ -322,7 +323,7 @@ class TestInferenceRouterUsesKernel:
                 _assert_matches_compiled(probs, indices, ref_probs, ref_indices, case=kind)
 
     @pytest.mark.parametrize("num_experts,topk,scaling_factor", MODEL_ROUTING_CONFIGS)
-    def test_batch_invariant_mode_preserves_uncompiled_routing(
+    def test_batch_invariant_mode_uses_batch_invariant_routing(
         self, monkeypatch, num_experts, topk, scaling_factor
     ):
         router = self._router(
@@ -333,22 +334,17 @@ class TestInferenceRouterUsesKernel:
         hidden = torch.randn(2, 1, 256, device="cuda", dtype=torch.bfloat16)
 
         def unexpected_routing(*args, **kwargs):
-            pytest.fail("Batch-invariant routing must keep the uncompiled reference path")
+            pytest.fail("Batch-invariant routing must not use the opt-in or compiled paths")
 
         monkeypatch.setattr(router_module, "sigmoid_topk_routing", unexpected_routing)
         monkeypatch.setattr(router, "_compiled_topk_routing", unexpected_routing)
         with set_batch_invariant_mode(True), InferenceMode.active(), torch.inference_mode():
             logits = router.gating(hidden).squeeze(1)
             assert not router._uses_sigmoid_topk_kernel(logits, None)
-            ref_probs, ref_indices = router_module.topk_routing_with_score_function(
-                logits,
-                topk,
-                scaling_factor=scaling_factor,
-                score_function="sigmoid",
-                expert_bias=router.expert_bias,
-                dense_output=True,
-            )
             probs, indices = router(hidden)
+        ref_probs, ref_indices = sigmoid_topk_routing(
+            logits, router.expert_bias, topk, scaling_factor, batch_invariant=True
+        )
         assert torch.equal(indices, ref_indices)
         assert torch.equal(probs.view(torch.int32), ref_probs.view(torch.int32))
 

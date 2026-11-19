@@ -371,6 +371,34 @@ class RotaryEmbedding(nn.Module):
         else:
             if transformer is not None and transformer.input_tensor is not None:
                 rotary_seq_len = transformer.input_tensor.size(0)
+                if getattr(transformer_config, 'enable_attention_residuals', False) and not getattr(
+                    transformer, 'pre_process', False
+                ):
+                    # With attention residuals, non-first stages receive the
+                    # depth-source payload: [num_slices * s, b, h]. Divide the
+                    # slice count back out to recover the true sequence length.
+                    # Under interleaved VPP every payload is padded to the same
+                    # uniform width; otherwise the width is per-rank.
+                    if transformer_config.virtual_pipeline_model_parallel_size is not None:
+                        from megatron.core.transformer.attention_residual import (
+                            attn_res_uniform_payload_slices,
+                        )
+
+                        num_slices = attn_res_uniform_payload_slices(transformer_config)
+                    else:
+                        from megatron.core import parallel_state
+                        from megatron.core.transformer.attention_residual import (
+                            attn_res_payload_slices_for_pp_rank,
+                        )
+
+                        num_slices = attn_res_payload_slices_for_pp_rank(
+                            transformer_config, parallel_state.get_pipeline_model_parallel_rank()
+                        )
+                    assert rotary_seq_len % num_slices == 0, (
+                        f"attention residual payload length {rotary_seq_len} is not "
+                        f"divisible by the expected slice count {num_slices}"
+                    )
+                    rotary_seq_len //= num_slices
             else:
                 rotary_seq_len = transformer_input.size(0)
 
@@ -492,12 +520,8 @@ class MultimodalRotaryEmbedding(nn.Module):
         if self.seq_len_interpolation_factor is not None:
             seq *= 1 / self.seq_len_interpolation_factor
 
-        # shape (3, bs, dim, 1)
-        inv_freq_expanded = self.inv_freq[None, None, :, None].expand(3, seq.shape[1], -1, 1)
-        # shape (3, bs, 1, seq_length)
-        seq_expanded = seq[:, :, None, :].float()
         # shape (3, bs, seq_length, dim)
-        freqs = (inv_freq_expanded @ seq_expanded).transpose(2, 3)
+        freqs = seq[..., None].float() * self.inv_freq
 
         if cp_group is None:
             cp_group = self.cp_group
@@ -536,6 +560,8 @@ class MultimodalRotaryEmbedding(nn.Module):
 
         # shape (seq_length, bs, 1, 2 * dim)
         emb = emb[..., None, :].transpose(0, 1).contiguous()
+        # For packed THD, skip CP slicing here; _apply_rotary_pos_emb_thd owns CP position
+        # mapping (same gate as RotaryEmbedding).
         if cp_group is not None and cp_group.size() > 1 and not packed_seq:
             # slice rotary_pos_emb along sequence dimension and select the parition of the current
             # CP rank

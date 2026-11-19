@@ -78,7 +78,7 @@ if [[ "$ENVIRONMENT" != "lts" && "$ENVIRONMENT" != "dev" ]]; then
     usage
 fi
 
-if [[ "$UNIT_TESTMON_MODE" != "full" && "$UNIT_TESTMON_MODE" != "enforce" && "$UNIT_TESTMON_MODE" != "baseline" ]]; then
+if [[ "$UNIT_TESTMON_MODE" != "full" && "$UNIT_TESTMON_MODE" != "enforce" && "$UNIT_TESTMON_MODE" != "preselected" && "$UNIT_TESTMON_MODE" != "baseline" ]]; then
     echo "Error: invalid Testmon mode: $UNIT_TESTMON_MODE"
     usage
 fi
@@ -145,6 +145,12 @@ MASTER_PORT=${MASTER_PORT:-29500}
 NUM_NODES=${NUM_NODES:-${SLURM_NNODES:-1}}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID:-0}}
+# Nodes can share the checkout. Keep their coverage inputs and combined files
+# separate so one node cannot consume or overwrite another node's results.
+export COVERAGE_FILE=${COVERAGE_FILE:-.coverage}
+if [[ "$NUM_NODES" -gt 1 ]]; then
+    COVERAGE_FILE="${COVERAGE_FILE}.node${NODE_RANK}"
+fi
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE
     --nnodes $NUM_NODES
@@ -182,7 +188,7 @@ run_full_tests() {
         echo "Running prod test suite."
         CMD=$(echo uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
             -m coverage run \
-            --data-file=.coverage.unit_tests \
+            --data-file=${COVERAGE_FILE}.unit_tests \
             --source=megatron/core \
             -m pytest \
             -vs \
@@ -305,7 +311,7 @@ run_selected_phase() {
     if [[ "$phase" == "prod" ]]; then
         command+=(
             -m coverage run
-            --data-file=.coverage.unit_tests
+            --data-file=${COVERAGE_FILE}.unit_tests
             --source=megatron/core
             -m pytest
             -vs
@@ -337,18 +343,29 @@ run_selected_phase() {
 run_enforced_tests() {
     local target prod_count experimental_count mandatory_count
     target=$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')
-    if ! rm -rf -- "$UNIT_TESTMON_CACHE_DIR/.testmon-work" \
-        || ! run_testmon_phase select prod \
+    if [[ "${UNIT_TESTMON_MODE:-enforce}" == "preselected" ]]; then
+        # Consume the CPU decision without running selection again on GPU.
+        if ! uv run --no-sync python tests/unit_tests/testmon_selector.py prepare \
+                --plan "$UNIT_TESTMON_CACHE_DIR/plan.json" --cache-dir "$UNIT_TESTMON_CACHE_DIR" \
+                --bucket "$BUCKET" --platform "dgx_$PLATFORM" \
+                --source-sha "$(git rev-parse HEAD)"; then
+            write_testmon_summary "CPU selection plan is unavailable or invalid"
+            return 1
+        fi
+    else
+        rm -rf -- "$UNIT_TESTMON_CACHE_DIR/.testmon-work"
+        if ! run_testmon_phase select prod \
             -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target" \
-        || ! merge_rank_selections prod \
-        || ! apply_mandatory_tests prod \
-        || ! run_testmon_phase select experimental \
-            -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "$target" \
-        || ! merge_rank_selections experimental \
-        || ! apply_mandatory_tests experimental; then
-        write_testmon_summary "full fallback: Testmon selection failed"
-        run_full_tests
-        return
+            || ! merge_rank_selections prod \
+            || ! apply_mandatory_tests prod \
+            || ! run_testmon_phase select experimental \
+                -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "$target" \
+            || ! merge_rank_selections experimental \
+            || ! apply_mandatory_tests experimental; then
+            write_testmon_summary "full fallback: Testmon selection failed"
+            run_full_tests
+            return
+        fi
     fi
 
     prod_count=$(wc -l < "$UNIT_TESTMON_CACHE_DIR/.testmon-work/prod/selected-tests")
@@ -358,14 +375,15 @@ run_enforced_tests() {
         run_selected_phase prod
         run_selected_phase experimental
     done
-    if ! compgen -G '.coverage.unit_tests*' > /dev/null; then
+    if ! compgen -G "${COVERAGE_FILE}.unit_tests*" > /dev/null; then
         # Keep the downstream coverage aggregation valid when Testmon selects
         # only experimental tests (or no tests) for this bucket.
         uv run --no-sync python -c '
+import os
 from pathlib import Path
 from coverage import CoverageData
 
-data = CoverageData(basename=".coverage.unit_tests")
+data = CoverageData(basename=os.environ["COVERAGE_FILE"] + ".unit_tests")
 data.add_lines({str(Path("megatron/core/__init__.py").resolve()): []})
 data.write()
 '
@@ -381,7 +399,7 @@ full)
 baseline)
     run_baseline_tests
     ;;
-enforce)
+enforce|preselected)
     run_enforced_tests
     ;;
 esac

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Sample Generate"""
 
@@ -31,7 +31,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.inference.utils import get_model_builder
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import get_model, print_rank_0
-from megatron.training.global_vars import set_run_config
+from megatron.training.global_vars import get_run_config, set_run_config
 
 try:
     from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
@@ -128,15 +128,13 @@ def main(model_type: str = "gpt"):
             'exit_on_missing_checkpoint': True,
         },
     )
-    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    cfg = inference_cfg_container_from_args(args)
     set_run_config(cfg)
     initialize_megatron()
     args = get_args()
     if args.num_layers_per_virtual_pipeline_stage is not None:
         print("Interleaved pipeline schedule is not yet supported for text generation.")
         exit()
-    print_rank_0("WARNING: Forcing exit_on_missing_checkpoint to True for text " "generation.")
-    args.exit_on_missing_checkpoint = True
 
     # Set up model and load checkpoint
     load_context = nullcontext()
@@ -158,7 +156,11 @@ def main(model_type: str = "gpt"):
                 pg_collection=pg_collection, wrap_with_ddp=False
             )
 
-    if args.load is not None:
+    checkpoint = get_run_config().checkpoint
+    if checkpoint.load is not None:
+        # Text generation must not start from random weights (the entry point also passes the
+        # flag through args_defaults).
+        checkpoint.exit_on_missing_checkpoint = True
         _ = load_checkpoint(model, None, None, strict=False)
 
     assert len(model) == 1, "Above condition should have caught this"

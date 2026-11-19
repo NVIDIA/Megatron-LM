@@ -20,6 +20,8 @@
 """
 
 import contextlib
+from functools import partial
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -34,8 +36,12 @@ from megatron.core.fusions.fused_row_copy import contiguous_rows
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa_teacher_lse import (
     fused_csa_teacher_lse,
 )
-from megatron.core.transformer.hyper_connection import native_h_aggregate_into
+from megatron.core.transformer.hyper_connection import (
+    HyperConnectionModule,
+    native_h_aggregate_into,
+)
 from megatron.core.transformer.moe.moe_utils import pad_routing_map
+from megatron.core.utils import PARAM_READY_CALLBACK_ATTR
 from tests.unit_tests.determinism.kernels.harness import (
     assert_replays_bit_exact,
     bytes_equal,
@@ -181,6 +187,71 @@ def test_dsa_kpool_chunked_selection_replays(monkeypatch):
         backward=False,
         contention=True,
         what="DSA KPool chunked selection",
+    )
+
+
+@pytest.mark.parametrize("with_attention_mask", [False, True])
+def test_dsa_index_share_support_replays_across_forward_scopes(with_attention_mask):
+    """Interleaved forwards must replay their own indices and optional lengths bit for bit."""
+    from megatron.core.transformer.enums import AttnMaskType
+    from megatron.core.transformer.experimental_attention_variant import dsa
+
+    seeded()
+    config = SimpleNamespace(
+        dsa_indexer_topk=8, dsa_indexer_topk_freq=4, dsa_indexer_skip_topk_offset=1, kv_channels=16
+    )
+    attention = dsa.DSAttention(
+        config=config,
+        submodules=dsa.DSAttentionSubmodules(indexer=object()),
+        layer_number=2,
+        attn_mask_type=AttnMaskType.causal,
+        attention_type="self",
+        softmax_scale=1.0,
+        pg_collection=SimpleNamespace(),
+    )
+    attention_mask = torch.empty(1, device="cuda") if with_attention_mask else None
+    # Distinct candidate sets and lengths make cross-forward contamination visible.
+    supports = (
+        torch.arange(8, device="cuda", dtype=torch.int64).reshape(1, 2, 4),
+        torch.arange(8, 16, device="cuda", dtype=torch.int64).reshape(1, 2, 4),
+    )
+    lengths = (
+        torch.tensor([[1, 3]], device="cuda", dtype=torch.int32),
+        torch.tensor([[2, 4]], device="cuda", dtype=torch.int32),
+    )
+
+    def run():
+        carriers = (dsa._DSAIndexShareCarrier(), dsa._DSAIndexShareCarrier())
+        # F1 -> F2 -> replay F1 -> replay F2, sharing the same mask/config fallback.
+        for carrier, indices, valid_length in zip(carriers, supports, lengths):
+            with dsa._dsa_index_share_carrier_scope(carrier):
+                attention._get_index_share_topk_holder(None, attention_mask)[1] = indices
+                attention._get_index_share_topk_length_holder(None, attention_mask)[
+                    1
+                ] = valid_length
+
+        replayed = []
+        for carrier, indices, valid_length in zip(carriers, supports, lengths):
+            with dsa._dsa_index_share_carrier_scope(carrier):
+                actual_indices = attention._get_index_share_topk_holder(None, attention_mask)[1]
+                actual_length = attention._get_index_share_topk_length_holder(None, attention_mask)[
+                    1
+                ]
+                assert bytes_equal(actual_indices, indices)
+                assert bytes_equal(actual_length, valid_length)
+                replayed.extend((actual_indices.clone(), actual_length.clone()))
+
+        # Leaving the scope must restore the fallback without attaching holders to it.
+        fallback = attention_mask if attention_mask is not None else config
+        assert attention._get_index_share_carrier(None, attention_mask) is fallback
+        for owner in (config, attention_mask):
+            if owner is not None:
+                assert not hasattr(owner, dsa.DSAttention._HOLDER_ATTR)
+                assert not hasattr(owner, dsa.DSAttention._LENGTH_HOLDER_ATTR)
+        return tuple(replayed)
+
+    assert_replays_bit_exact(
+        run, (), backward=False, contention=True, what="DSA per-forward index-share support"
     )
 
 
@@ -603,6 +674,43 @@ def test_mhc_proj_rms_compute_h_replays_fwd_bwd(backend):
         (x, weight, alpha_pre, alpha_post, alpha_res, bias),
         replays=3,
         what=f"mhc proj_rms_compute_h[{backend}]",
+    )
+
+    def run_mapping(x, weight, alpha_pre, alpha_post, alpha_res, bias):
+        ready = False
+
+        def publish_weight():
+            nonlocal ready
+            ready = True
+
+        def projection(*args):
+            assert ready, "mapping projection must wait before reading the weight"
+            return fused_mhc_kernels.fused_proj_rms_compute_h(*args, backend=backend)
+
+        setattr(weight, PARAM_READY_CALLBACK_ATTR, publish_weight)
+        module = SimpleNamespace(
+            n=n,
+            hidden_size=C,
+            mapping_proj=SimpleNamespace(weight=weight),
+            alpha_pre=alpha_pre,
+            alpha_post=alpha_post,
+            alpha_res=alpha_res,
+            bias=bias,
+            norm_eps=1e-6,
+            compute_h_eps=1e-6,
+            sinkhorn_iterations=20,
+            sinkhorn_eps=1e-6,
+            _proj_rms_compute_h_op=projection,
+            _sinkhorn_op=partial(fused_mhc_kernels.fused_sinkhorn, backend=backend),
+            config=SimpleNamespace(mhc_keep_mappings_in_fp32=False),
+        )
+        return HyperConnectionModule.compute_mappings(module, x.view(S, B, n * C))
+
+    assert_replays_bit_exact(
+        run_mapping,
+        (x, weight, alpha_pre, alpha_post, alpha_res, bias),
+        contention=True,
+        what=f"mhc mappings with parameter readiness[{backend}]",
     )
 
 
