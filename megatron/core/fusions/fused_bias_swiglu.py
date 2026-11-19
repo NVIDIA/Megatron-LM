@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch._subclasses.fake_tensor import unset_fake_temporarily
 
 from megatron.core.jit import jit_fuser
+from megatron.core.ops.linear.bias_grad import bias_with_main_grad
 from megatron.core.utils import nvtx_decorator
 
 
@@ -468,6 +469,8 @@ def bias_swiglu_impl(
     clamp_value=None,
     gate_clamp_scale: Optional[float] = None,
     linear_clamp_scale: Optional[float] = None,
+    *,
+    gradient_accumulation_fusion: bool = False,
 ):
     """Implementation of biased SwiGLU that handles different input shapes.
 
@@ -489,6 +492,7 @@ def bias_swiglu_impl(
             becomes ``s_g * tanh(x / s_g) * sigmoid(x)``, bounded by ``s_g``.
         linear_clamp_scale (Optional[float]): If set, also soft-clamp the linear half, bounding
             the output by ``gate_clamp_scale * linear_clamp_scale``. Requires ``gate_clamp_scale``.
+        gradient_accumulation_fusion: Allow direct FP32 accumulation of the bias gradient.
 
     Returns:
         torch.Tensor: Result of biased SwiGLU activation.
@@ -502,6 +506,8 @@ def bias_swiglu_impl(
     assert gate_clamp_scale is None or clamp_value is None
     input = input.view(-1, ori_shape[-1])
     if bias is not None:
+        if gradient_accumulation_fusion:
+            bias = bias_with_main_grad(bias, input.shape)
         output = BiasSwiGLUFunction.apply(
             input,
             bias,

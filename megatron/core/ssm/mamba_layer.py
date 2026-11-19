@@ -19,6 +19,7 @@ except ImportError:
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
+from megatron.core.fusions.fused_bias_dropout import configure_bias_dropout_add
 from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
@@ -141,7 +142,9 @@ class MambaLayer(TECudaGraphMambaLayerMixin, GraphableMegatronModule, TwoStageAt
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
-        self.mamba_bda = build_module(submodules.mamba_bda)
+        self.mamba_bda = configure_bias_dropout_add(
+            build_module(submodules.mamba_bda), self.config.gradient_accumulation_fusion
+        )
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
     def create_mcore_cudagraph_manager(self, config):

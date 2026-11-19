@@ -318,6 +318,7 @@ class MLP(MegatronModule):
                         self.config.activation_func_fp8_input_store,
                         self.config.glu_linear_offset,
                         self.config.activation_func_clamp_value,
+                        gradient_accumulation_fusion=self.config.gradient_accumulation_fusion,
                     )
                 else:
                     raise ValueError(
@@ -327,11 +328,17 @@ class MLP(MegatronModule):
                 if self.activation_func == F.gelu:
                     if self.config.gated_linear_unit:
                         intermediate_parallel = bias_geglu_impl(
-                            intermediate_parallel, bias_parallel
+                            intermediate_parallel,
+                            bias_parallel,
+                            gradient_accumulation_fusion=self.config.gradient_accumulation_fusion,
                         )
                     else:
                         assert self.config.add_bias_linear is True
-                        intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
+                        intermediate_parallel = bias_gelu_impl(
+                            intermediate_parallel,
+                            bias_parallel,
+                            gradient_accumulation_fusion=self.config.gradient_accumulation_fusion,
+                        )
                 elif self.activation_func == F.silu and self.config.gated_linear_unit:
                     intermediate_parallel = bias_swiglu_impl(
                         intermediate_parallel,
@@ -343,6 +350,7 @@ class MLP(MegatronModule):
                         self.config.activation_func_clamp_value,
                         gate_clamp_scale=self.config.activation_func_tanh_clamp_scale,
                         linear_clamp_scale=self.config.activation_func_tanh_clamp_scale_linear,
+                        gradient_accumulation_fusion=self.config.gradient_accumulation_fusion,
                     )
                 else:
                     raise ValueError("Only support fusion of gelu and swiglu")

@@ -32,6 +32,7 @@ from megatron.core.ops.loss.cross_entropy import (
 from megatron.core.ops.norm import fused_layer_norm
 from megatron.core.tensor_parallel.layers import (
     ColumnParallelLinear,
+    LinearWithGradAccumulationAndAsyncCommunication,
     RowParallelLinear,
     VocabParallelEmbedding,
 )
@@ -47,6 +48,29 @@ from tests.unit_tests.determinism.kernels.harness import (
     seeded,
 )
 from tests.unit_tests.test_utilities import Utils
+
+
+def test_fp32_bias_accumulation_replays():
+    """Direct FP32 bias accumulation must replay exactly for fixed inputs."""
+    x = torch.randn(4, 129, 32, device="cuda", dtype=torch.bfloat16)
+    dy = torch.randn_like(x)
+    weight = torch.nn.Parameter(torch.randn(32, 32, device="cuda", dtype=torch.bfloat16))
+    bias = torch.nn.Parameter(torch.zeros(32, device="cuda", dtype=torch.bfloat16))
+
+    def run():
+        weight.grad = bias.grad = None
+        weight.main_grad = torch.zeros_like(weight, dtype=torch.float32)
+        bias.main_grad = torch.zeros_like(bias, dtype=torch.float32)
+        bias.grad_added_to_main_grad = False
+        # Defer weight gradients so this replay exercises bias independently.
+        LinearWithGradAccumulationAndAsyncCommunication.apply(
+            x, weight, bias, True, False, False, [], 0, None, 1, None
+        ).backward(dy)
+        return bias.main_grad.clone()
+
+    with deterministic_algorithms(True):
+        assert_replays_bit_exact(run, (), backward=False, replays=3, what="FP32 bias accumulation")
+
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 

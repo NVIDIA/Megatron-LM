@@ -28,6 +28,7 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.enums import Fp8Recipe
+from megatron.core.fusions.fused_bias_dropout import configure_bias_dropout_add
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.ops.norm.torch_norm import LayerNormBuilder
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -450,7 +451,9 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
         )
 
         # [Module 3: BiasDropoutFusion]
-        self.self_attn_bda = build_module(submodules.self_attn_bda)
+        self.self_attn_bda = configure_bias_dropout_add(
+            build_module(submodules.self_attn_bda), self.config.gradient_accumulation_fusion
+        )
 
         # [Module 4: Post SelfAttention] Optional Layernorm after self-attn
         self.pre_cross_attn_layernorm = submodules.pre_cross_attn_layernorm(
@@ -472,7 +475,10 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
         )
 
         # [Module 6: BiasDropoutFusion]
-        self.cross_attn_bda = build_module(submodules.cross_attn_bda, config=self.config)
+        self.cross_attn_bda = configure_bias_dropout_add(
+            build_module(submodules.cross_attn_bda, config=self.config),
+            self.config.gradient_accumulation_fusion,
+        )
 
         # [Module 7: Pre MLP] Optional Layernorm before MLP
         self.pre_mlp_layernorm = submodules.pre_mlp_layernorm(
@@ -516,7 +522,9 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
             self.mlp.set_layer_number(self.layer_number)
 
         # [Module 9: BiasDropoutFusion]
-        self.mlp_bda = build_module(submodules.mlp_bda)
+        self.mlp_bda = configure_bias_dropout_add(
+            build_module(submodules.mlp_bda), self.config.gradient_accumulation_fusion
+        )
 
         self.is_moe_layer = isinstance(self.mlp, MoELayer)
 

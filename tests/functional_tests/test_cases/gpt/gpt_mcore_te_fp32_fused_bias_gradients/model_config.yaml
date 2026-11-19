@@ -1,0 +1,58 @@
+ENV_VARS:
+  SKIP_PYTEST: 0
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  NCCL_ALGO: Ring
+  CUBLAS_WORKSPACE_CONFIG: :4096:8
+MODEL_ENV_VARS:
+  MODEL_ARGS:
+    GPUS_PER_NODE: 2
+  MODEL_ARGS_2:
+    GPUS_PER_NODE: 2
+TEST_TYPE: checkpoint-consistency
+MODE: pretraining
+BASE_MODEL_ARGS: &BASE_MODEL_ARGS
+  --num-layers: 2
+  --hidden-size: 128
+  --ffn-hidden-size: 512
+  --num-attention-heads: 4
+  --seq-length: 128
+  --max-position-embeddings: 128
+  --micro-batch-size: 1
+  --global-batch-size: 4
+  --tensor-model-parallel-size: 1
+  --pipeline-model-parallel-size: 1
+  --transformer-impl: transformer_engine
+  --tokenizer-type: NullTokenizer
+  --vocab-size: 1024
+  --mock-data: true
+  --split: 949,50,1
+  --no-create-attention-mask-in-dataloader: true
+  # GPT defaults enable linear bias, GeLU/BDA fusion, and fused accumulation.
+  --bf16: true
+  --accumulate-allreduce-grads-in-fp32: true
+  --use-distributed-optimizer: true
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.1
+  --deterministic-mode: true
+  --seed: 1234
+  --train-iters: 1
+  --eval-iters: 0
+  --eval-interval: 1000
+  --lr: 0.0003
+  --lr-decay-style: constant
+  --adam-beta1: 0.0
+  --adam-beta2: 0.0
+  --clip-grad: 0.0
+  --log-interval: 1
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --save-interval: 1
+  --ckpt-format: torch_dist
+  --dist-ckpt-optim-fully-reshardable: true
+MODEL_ARGS:
+  <<: *BASE_MODEL_ARGS
+MODEL_ARGS_2:
+  <<: *BASE_MODEL_ARGS
+  --overlap-grad-reduce: true
+LAUNCHER: ft_launcher

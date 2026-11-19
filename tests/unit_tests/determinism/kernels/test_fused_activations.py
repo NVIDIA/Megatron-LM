@@ -21,6 +21,7 @@ from megatron.core import activations, parallel_state
 from megatron.core.fusions.fused_bias_dropout import (
     bias_dropout_add_fused_inference,
     bias_dropout_add_fused_train,
+    get_bias_dropout_add,
 )
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
@@ -114,6 +115,54 @@ def test_mlp_activation_fusions_replay_bit_exactly(case):
     seeded()
     fn, inputs = GATED_CASES[case]()
     assert_replays_bit_exact(fn, inputs, replays=3, what=case)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["bda", "bda_fp32_residual", "bias_gelu", "bias_swiglu", "bias_geglu", "weighted_quick_geglu"],
+)
+def test_fused_bias_fp32_main_grad_replays(case: str) -> None:
+    """Replay the FP32 buffer itself, because the fused bias leaf gradient is zero."""
+    seeded()
+    x = _act((2048, 256), grad=False)
+    bias = torch.nn.Parameter(_act((256,), grad=False))
+    bias.grad_added_to_main_grad = False
+    bda = get_bias_dropout_add(training=True, fused=True, gradient_accumulation_fusion=True)
+    residual_dtype = torch.float32 if case == "bda_fp32_residual" else DTYPE
+    residual = _act(x.shape, dtype=residual_dtype, grad=False)
+    weights = _weights(x.shape[0]).detach()
+    output_width = x.shape[-1] if case in {"bda", "bda_fp32_residual", "bias_gelu"} else 128
+    dy = _act((x.shape[0], output_width), grad=False)
+
+    def run() -> torch.Tensor:
+        bias.grad = None
+        bias.main_grad = torch.zeros_like(bias, dtype=torch.float32)
+        if case.startswith("bda"):
+            out = bda((x, bias), residual, 0.1)
+        elif case == "weighted_quick_geglu":
+            out = weighted_bias_quick_geglu_impl(
+                x, bias, weights, gradient_accumulation_fusion=True
+            )
+        else:
+            activation = {
+                "bias_gelu": bias_gelu_impl,
+                "bias_swiglu": bias_swiglu_impl,
+                "bias_geglu": bias_geglu_impl,
+            }[case]
+            out = activation(x, bias, gradient_accumulation_fusion=True)
+        out.backward(dy.to(out.dtype))
+        assert bias.grad is not None and torch.count_nonzero(bias.grad) == 0
+        assert torch.count_nonzero(bias.main_grad) > 0
+        return bias.main_grad
+
+    assert_replays_bit_exact(
+        run,
+        (),
+        backward=False,
+        contention=True,
+        restore_rng=case.startswith("bda"),
+        what=f"{case} FP32 main_grad",
+    )
 
 
 @pytest.mark.skipif(
