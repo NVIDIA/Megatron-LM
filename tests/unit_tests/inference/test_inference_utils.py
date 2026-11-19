@@ -1,5 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import asyncio
+import signal
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -149,3 +153,123 @@ class TestInferenceUtils:
         with pytest.raises(RuntimeError, match="flashinfer-jit-cache") as excinfo:
             check_flashinfer_jit_cache_installed()
         assert expected in str(excinfo.value)
+
+
+class _TimedEvent:
+    """A fake CUDA event, complete once its deadline passed."""
+
+    def __init__(self, delay_s):
+        self.deadline = time.perf_counter() + delay_s
+
+    def query(self):
+        return time.perf_counter() >= self.deadline
+
+
+@pytest.fixture
+def device_waiter(monkeypatch):
+    """A waiter on SIGALRM: `setitimer` is the device, raising the signal with no GIL taken."""
+    monkeypatch.setattr(inference_utils, "GPU_WAKE_SIGNAL", signal.SIGALRM)
+    loop = asyncio.new_event_loop()
+    waiter = inference_utils.DeviceWaiter(loop)
+
+    def wait(delay_s):
+        future = loop.create_future()
+        waiter._pending.append((_TimedEvent(delay_s), future))
+        signal.setitimer(signal.ITIMER_REAL, delay_s)
+        return future
+
+    waiter.wait = wait
+    yield waiter
+    waiter.close()
+    loop.close()
+
+
+def test_device_waiter_resolves_on_an_idle_and_on_a_busy_loop(device_waiter):
+    async def burner(stop):
+        while not stop.is_set():
+            end = time.perf_counter() + 500e-6
+            while time.perf_counter() < end:
+                pass
+            await asyncio.sleep(0)
+
+    async def main():
+        first, second = device_waiter.wait(0.002), device_waiter.wait(0.004)
+        await second  # the loop sleeps in select; the pipe wakes it; both resolve in order
+        assert first.done() and not device_waiter._pending
+        stop, t0 = asyncio.Event(), time.perf_counter()
+        task = asyncio.ensure_future(burner(stop))
+        await device_waiter.wait(0.002)  # the handler runs between the burner's bytecodes
+        stop.set()
+        await task
+        assert time.perf_counter() - t0 < 0.05
+
+    device_waiter._loop.run_until_complete(main())
+
+
+def test_device_waiter_wakes_the_awaiting_task_ahead_of_the_ready_queue(device_waiter):
+    order, resolve = [], device_waiter._resolve_completed
+
+    def recording_resolve():
+        had_pending = bool(device_waiter._pending)
+        resolve()
+        if had_pending and not device_waiter._pending:
+            order.append("resolved")
+
+    device_waiter._resolve_completed = recording_resolve
+
+    async def chatter(i, stop):
+        while not stop.is_set():
+            order.append(i)
+            end = time.perf_counter() + 200e-6
+            while time.perf_counter() < end:
+                pass
+            await asyncio.sleep(0)
+
+    async def main():
+        stop = asyncio.Event()
+        tasks = [asyncio.ensure_future(chatter(i, stop)) for i in range(20)]
+        await device_waiter.wait(0.002)
+        order.append("woken")
+        stop.set()
+        for task in tasks:
+            await task
+
+    device_waiter._loop.run_until_complete(main())
+    between = order[order.index("resolved") + 1 : order.index("woken")]
+    assert len(between) <= 1  # at most the turn the signal interrupted, none of the queued ones
+
+
+def test_device_waiter_submit_takes_a_recorded_event(device_waiter):
+    waited = []  # the CUDA half stood in for: the wait stream records, the timer is the wake
+    device_waiter._cudart = object()
+    device_waiter._wait_stream = SimpleNamespace(wait_event=waited.append)
+    device_waiter._launch_wake = lambda stream: signal.setitimer(signal.ITIMER_REAL, 0.002)
+
+    async def main():
+        assert device_waiter.submit(_TimedEvent(0)).done() and not waited  # complete: no wake
+        event = _TimedEvent(0.002)
+        pending = device_waiter.submit(event)
+        assert waited == [event] and not pending.done()
+        await pending
+
+    device_waiter._loop.run_until_complete(main())
+
+
+def test_device_waiter_close_main_thread_and_no_cuda(device_waiter):
+    pending = device_waiter.wait(10.0)
+    device_waiter.close()
+    device_waiter.close()  # idempotent
+    assert pending.cancelled() and signal.getsignal(signal.SIGALRM) is signal.SIG_DFL
+    errors = []
+    thread = threading.Thread(
+        target=lambda: errors.append(
+            pytest.raises(RuntimeError, inference_utils.DeviceWaiter, device_waiter._loop)
+        )
+    )
+    thread.start()
+    thread.join()
+    assert len(errors) == 1
+    if not torch.cuda.is_available():
+        waiter = inference_utils.DeviceWaiter(device_waiter._loop)
+        assert waiter.submit().done()
+        waiter.close()
