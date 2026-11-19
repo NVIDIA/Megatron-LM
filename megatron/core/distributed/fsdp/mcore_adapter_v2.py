@@ -399,8 +399,17 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 f"(got {mtp_number_layers})."
             )
 
+        model = unwrap_model(module)
+        if config.overlap_moe_expert_parallel_comm and getattr(
+            model, "share_embeddings_and_output_weights", False
+        ):
+            # Use the model-wide flag so every PP rank rejects before FSDP setup.
+            raise ValueError(
+                "MFSDP v2 with MoE EP overlap does not currently support tied embedding and "
+                "output weights. Set share_embeddings_and_output_weights=False."
+            )
+
         if config.pipeline_model_parallel_size > 1 and mtp_number_layers > 0:
-            model = unwrap_model(module)
             if getattr(model, "share_embeddings_and_output_weights", False):
                 # Check global topology, rather than rank-local mtp_process, so
                 # every PP rank rejects before constructing FSDP collective state.

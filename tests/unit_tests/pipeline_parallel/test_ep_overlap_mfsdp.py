@@ -53,9 +53,47 @@ from tests.unit_tests.test_utilities import Utils
 pytestmark = pytest.mark.mfsdp
 
 
+@pytest.mark.parametrize("pipeline_size", [1, 2])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_rejects_tied_weights_with_ep_overlap_before_sharding(pipeline_size, wrapped):
+    """Reject tied weights on every pipeline stage before constructing FSDP state."""
+    config = TransformerConfig(
+        num_layers=4,
+        hidden_size=16,
+        num_attention_heads=4,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
+        num_moe_experts=4,
+        expert_model_parallel_size=2,
+        moe_token_dispatcher_type="alltoall",
+        overlap_moe_expert_parallel_comm=True,
+        pipeline_model_parallel_size=pipeline_size,
+        virtual_pipeline_model_parallel_size=2 if pipeline_size > 1 else None,
+        gradient_accumulation_fusion=False,
+    )
+    model = nn.Linear(16, 16)
+    model.share_embeddings_and_output_weights = True
+    if wrapped:
+        model = Float16Module(config, model)
+
+    # No usable process group: validation must reject before building a mesh.
+    with pytest.raises(ValueError, match="MoE EP overlap.*tied"):
+        FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=model,
+            pg_collection=SimpleNamespace(dp_cp=None),
+        )
+
+
 @pytest.mark.parametrize("delay_wgrad", [False, True])
 def test_ep_overlap_mtp(distributed_setup, monkeypatch, delay_wgrad):
-    """Reduce every trainable weight once per backward, including tied and MTP uses."""
+    """Reduce every trainable weight once per backward, including repeated MTP head uses."""
     setup = distributed_setup
     if setup.world_size < 2 or setup.world_size % 2:
         pytest.skip("EP=2 requires an even world size of at least two.")
@@ -95,7 +133,7 @@ def test_ep_overlap_mtp(distributed_setup, monkeypatch, delay_wgrad):
             mtp_block_spec=get_gpt_mtp_block_spec(config, decoder_spec.layer_specs[-1], True),
             vocab_size=128,
             max_sequence_length=16,
-            share_embeddings_and_output_weights=True,
+            share_embeddings_and_output_weights=False,
             position_embedding_type="rope",
             pg_collection=pg_collection,
         ).cuda()
@@ -177,37 +215,15 @@ def test_ep_overlap_mtp(distributed_setup, monkeypatch, delay_wgrad):
         destroy_model_parallel()
 
 
-@pytest.mark.parametrize("tied", [False, True])
-def test_train_validate_train_reshards_and_matches_dense(distributed_setup, tied):
-    """Train/eval preserve dense updates, including externally supplied tied weights."""
+def test_train_validate_train_reshards_and_matches_dense(distributed_setup):
+    """Train/eval preserve dense updates and release gathered weights."""
     setup = distributed_setup
     torch.manual_seed(0)
-
-    class OutputHead(nn.Module):
-        def forward(self, inputs, weight):
-            return torch.nn.functional.linear(inputs, weight)
-
-    class TiedModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.share_embeddings_and_output_weights = True
-            self.embedding = nn.Module()
-            self.embedding.word_embeddings = nn.Embedding(16, 16)
-            self.layer = nn.Linear(16, 16)
-            self.output_layer = OutputHead()
-
-        def forward(self, inputs):
-            return self.output_layer(
-                self.layer(inputs), weight=self.embedding.word_embeddings.weight
-            )
-
-    reference = (TiedModel() if tied else nn.Sequential(nn.Linear(16, 16), nn.Linear(16, 16))).to(
-        setup.device
-    )
+    reference = nn.Sequential(nn.Linear(16, 16), nn.Linear(16, 16)).to(setup.device)
     model = copy.deepcopy(reference)
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
     placements = Placements([0], [Shard(0)], [Shard(0)], [Shard(0)])
-    units = (model.layer if tied else model[1], model)
+    units = (model[1], model)
     with fully_shard_context(
         FsdpContext(
             device=setup.device, runtime_policy=RuntimePolicy(caller_managed_grad_sync=True)
@@ -329,7 +345,7 @@ def test_schedule_finishes_shared_and_nested_units_once(repeated, wrapped):
     assert root.unsharded
     assert releases == {"shared": 2 if repeated else 1, "expert": 2 if repeated else 1, "other": 1}
 
-    # The tied root weight receives contributions before and after layer backward.
+    # The root weight receives contributions before and after layer backward.
     (root.weight * 2).backward()
     if repeated:
         shared(torch.tensor(5.0)).backward()

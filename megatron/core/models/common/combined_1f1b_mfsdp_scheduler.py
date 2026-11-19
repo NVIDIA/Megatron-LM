@@ -3,24 +3,16 @@
 from torch import nn
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
-    get_containing_parameter_group,
-)
 
 
-def _make_unshard_forward_hook(owner: FsdpModule, weight_module: nn.Module | None = None):
-    """Create a forward pre-hook that unshards the owning FSDP module before the submodule
-    forward."""
+def _make_unshard_forward_hook(owner: FsdpModule):
+    """Unshard the owning FSDP unit before the submodule forward."""
 
     def hook(submodule, _args, _kwargs):
         if owner.is_root():
             context = owner.context
             context.allgather_stream.wait_stream(context.current_stream())
         owner.unshard()
-        if weight_module is not None:
-            # The caller may have passed the sharded embedding weight before this hook runs.
-            _kwargs["weight"] = weight_module.weight
-            return _args, _kwargs
 
     return hook
 
@@ -59,14 +51,7 @@ def reshard_fsdp_modules(module: nn.Module) -> None:
 def register_combined_1f1b_hooks(module: FsdpModule) -> None:
     """Install demand-gather and evaluation-release hooks for the EP schedule."""
 
-    tied_outputs: dict[nn.Module, nn.Module] = {}
-
     def register_hooks(submodule, owner):
-        if getattr(submodule, "share_embeddings_and_output_weights", False):
-            embedding = getattr(submodule, "embedding", None)
-            output_layer = getattr(submodule, "output_layer", None)
-            if embedding is not None and output_layer is not None:
-                tied_outputs[output_layer] = embedding.word_embeddings
         if isinstance(submodule, FsdpModule):
             owner = submodule  # BEFORE registering: an FSDP unit owns itself
         if len(list(submodule.parameters(recurse=False))) > 0:
@@ -74,17 +59,6 @@ def register_combined_1f1b_hooks(module: FsdpModule) -> None:
                 _make_unshard_forward_hook(owner), prepend=True, with_kwargs=True
             )
             submodule.register_full_backward_pre_hook(_make_unshard_backward_hook(owner))
-        elif submodule in tied_outputs:
-            weight_module = tied_outputs[submodule]
-            group = get_containing_parameter_group(weight_module.weight)
-            weight_owner = group._owning_module() if group is not None else None
-            if weight_owner is not None:
-                submodule.register_forward_pre_hook(
-                    _make_unshard_forward_hook(weight_owner, weight_module),
-                    prepend=True,
-                    with_kwargs=True,
-                )
-                submodule.register_full_backward_pre_hook(_make_unshard_backward_hook(weight_owner))
         for child in submodule.children():
             register_hooks(child, owner)
 
@@ -105,8 +79,8 @@ def register_fsdp_schedule_hooks(model: nn.Module, layer_plans) -> tuple[FsdpMod
         2. Visit layers in forward order and assign each unit once, so shared
            units finish at their last backward use (after delayed wgrad).
         3. Return the remaining units for completion after pre-process backward.
-           These are typically root units owning embeddings, tied/untied output
-           heads, final normalization, and MTP projections/norms.
+           These are typically root units owning embeddings, output heads,
+           final normalization, and MTP projections/norms.
     """
     remaining = dict.fromkeys(unit for unit in model.modules() if isinstance(unit, FsdpModule))
     if not remaining:
