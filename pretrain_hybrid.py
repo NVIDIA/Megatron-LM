@@ -96,6 +96,12 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
     args = get_args()
     cfg = get_run_config()
 
+    if getattr(cfg.model.transformer, "dsv4_version", "v4") == "v4.1":
+        from megatron.core.pipeline_parallel.pipeline_payload import PipelineDataIterator
+
+        if isinstance(data_iterator, PipelineDataIterator):
+            return next(data_iterator)
+
     if cfg.model.transformer.sequence_packing_scheduler is not None:
         if pg_collection is None:
             # Compatibility for direct entrypoint callers; Core receives explicit groups.
@@ -335,6 +341,10 @@ def forward_step(data_iterator, model: HybridModel):
         cp_batch = get_batch(
             data_iterator, vp_stage, pg_collection=get_attr_wrapped_model(model, "pg_collection")
         )
+        if getattr(get_args(), "dsv4_version", "v4") == "v4.1":
+            from megatron.training.datasets.v41_pipeline import normalize_v41_batch
+
+            cp_batch = normalize_v41_batch(cp_batch)
         batch = cp_batch.get_batch()
         attention_mask = batch.get("attention_mask")
         cu_seqlens = batch.get("cu_seqlens")
@@ -378,6 +388,22 @@ def forward_step(data_iterator, model: HybridModel):
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model)
+
+
+def _prepare_pipeline_inputs(iterator, model, num_microbatches, *, forward_only=False):
+    """Plan typed V4.1 payloads before the existing schedule posts receives."""
+    if getattr(get_args(), "dsv4_version", "v4") != "v4.1":
+        return iterator
+    from megatron.training.datasets.v41_pipeline import prepare_v41_pipeline_inputs
+
+    return prepare_v41_pipeline_inputs(
+        iterator, model, num_microbatches, args=get_args(),
+        get_batch=partial(get_batch, pg_collection=get_attr_wrapped_model(model, "pg_collection")),
+        forward_only=forward_only,
+    )
+
+
+forward_step.prepare_pipeline_inputs = _prepare_pipeline_inputs
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):

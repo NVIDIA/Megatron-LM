@@ -904,6 +904,14 @@ def num_floating_point_operations(
     if total_real_tokens_in_batch is None:
         total_real_tokens_in_batch = batch_size * llm_seq_length
 
+    if getattr(transformer_cfg, "dsv4_version", "v4") == "v4.1":
+        from megatron.training.models.deepseek_v41 import estimate_v41_training_flops
+
+        return estimate_v41_training_flops(
+            transformer_cfg, vocab_size, total_real_tokens_in_batch,
+            seqlen_squared_sum_in_batch,
+        )
+
     def estimate(layer_type, config=None):
         return layer_type.estimate_flops(
             legacy_config if config is None else config,
@@ -3373,6 +3381,8 @@ def _get_indexer_logging_layer_counts(model_config) -> tuple[int, int | None]:
     """Return tracker slots and active CSA indexer modules for loss logging."""
     transformer_cfg = model_config.transformer
     tracker_layers = transformer_cfg.num_layers + (transformer_cfg.mtp_num_layers or 0)
+    if getattr(transformer_cfg, "dsv4_version", "v4") == "v4.1":
+        return tracker_layers, len(transformer_cfg.csa2_index_source_layers)
     if transformer_cfg.csa_compress_ratios is None:
         return tracker_layers, None
 
