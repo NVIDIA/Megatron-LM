@@ -588,9 +588,18 @@ def test_training_scratch_grows_an_undersized_buffer(dtype):
 
 
 @requires_tp4
-@pytest.mark.parametrize("tp,peer_tp,hidden,mtp_layers", [(4, 2, 4096, 1), (2, 4, 2048, None)])
+@pytest.mark.parametrize(
+    "tp,peer_tp,hidden,mtp_layers,batch_invariant,fuse_tp",
+    [
+        pytest.param(4, 2, 4096, 1, True, False, id="bi-mtp"),
+        pytest.param(2, 4, 2048, None, True, False, id="bi-multiple-shards"),
+        pytest.param(4, None, 4096, None, True, False, id="bi-default-peer"),
+        pytest.param(4, None, 4096, None, False, False, id="regular"),
+        pytest.param(4, None, 4096, 1, False, True, id="regular-fused-mtp"),
+    ],
+)
 def test_inference_scratch_covers_max_tokens_and_preserves_existing_graphs(
-    tp, peer_tp, hidden, mtp_layers
+    tp, peer_tp, hidden, mtp_layers, batch_invariant, fuse_tp
 ):
     """A small captured step and >512MiB eager prefill use valid inference-owned pools."""
     Utils.initialize_model_parallel(tp, 1)
@@ -603,12 +612,13 @@ def test_inference_scratch_covers_max_tokens_and_preserves_existing_graphs(
             tensor_model_parallel_size=tp,
             sequence_parallel=True,
             params_dtype=torch.bfloat16,
-            batch_invariant_mode=True,
+            batch_invariant_mode=batch_invariant,
             batch_invariant_peer_tp_size=peer_tp,
             transformer_impl="inference_optimized",
             normalization="RMSNorm",
             add_bias_linear=False,
             mtp_num_layers=mtp_layers,
+            inference_fuse_tp_communication=fuse_tp,
             attention_backend=AttnBackend.flash,
             flash_attention_version=4,
             attention_dropout=0.0,
@@ -629,19 +639,33 @@ def test_inference_scratch_covers_max_tokens_and_preserves_existing_graphs(
             .eval()
         )
         layer.weight.data.fill_(1)
+        if fuse_tp:
+            layer._set_next_layer_norm_weights(
+                torch.ones(hidden, device="cuda", dtype=cfg.params_dtype)
+            )
+
+        def forward(x):
+            if fuse_tp:
+                layer._set_residual(
+                    torch.zeros(
+                        (x.shape[0] // tp, 1, hidden), device="cuda", dtype=cfg.params_dtype
+                    )
+                )
+            return layer(x)
+
         small = torch.full(
             (256, 1, 256 // tp), group.rank() + 1, device="cuda", dtype=cfg.params_dtype
         )
         SymmetricMemoryManager.get_buffer("tp", process_group=group, size_mb=8)
-        with set_batch_invariant_mode(True, backend="te_native"), torch.no_grad():
+        with set_batch_invariant_mode(batch_invariant, backend="te_native"), torch.no_grad():
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
-                layer(small)
+                forward(small)
             torch.cuda.current_stream().wait_stream(stream)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                captured, _ = layer(small)
+                captured, _ = forward(small)
             graph.replay()
             expected = (256 // tp) * sum(range(1, tp + 1))
             assert (captured == expected).all()
@@ -661,7 +685,7 @@ def test_inference_scratch_covers_max_tokens_and_preserves_existing_graphs(
                 ),
             )
             buf = SymmetricMemoryManager.get_buffer("tp")
-            required = cfg.batch_invariant_tp_shards // tp * context.max_tokens * hidden * 2
+            required = (cfg.batch_invariant_tp_shards or tp) // tp * context.max_tokens * hidden * 2
             assert required > (512 << 20)
             assert buf.symm_buffer.numel() >= required
             if mtp_layers:
@@ -674,13 +698,25 @@ def test_inference_scratch_covers_max_tokens_and_preserves_existing_graphs(
                 device="cuda",
                 dtype=cfg.params_dtype,
             )
-            with mock.patch.object(
-                inference_layers,
-                "ordered_reduce_scatter_shards",
-                side_effect=AssertionError("unexpected inference fallback"),
+            with (
+                mock.patch.object(
+                    inference_layers,
+                    "ordered_reduce_scatter_shards",
+                    side_effect=AssertionError("unexpected ordered inference fallback"),
+                ),
+                mock.patch.object(
+                    inference_layers,
+                    "reduce_scatter_along_first_dim",
+                    side_effect=AssertionError("unexpected inference NCCL fallback"),
+                ),
             ):
-                result, _ = layer(large)
+                result, _ = forward(large)
             assert (result == 2 * expected).all()
+            if fuse_tp:
+                normalized = buf.maybe_get_tensor(
+                    (context.max_tokens, 1, hidden), cfg.params_dtype
+                )["tensor"]
+                assert (normalized == 1).all()
             if mtp_layers:
                 projection = (
                     inference_layers.InferenceColumnParallelLinear(
@@ -718,6 +754,43 @@ def test_inference_scratch_covers_max_tokens_and_preserves_existing_graphs(
             assert not any(
                 key.startswith("tp_ordered_training:") for key in SymmetricMemoryManager._buffers
             )
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier()
+        SymmetricMemoryManager.destroy()
+        Utils.destroy_model_parallel()
+
+
+@requires_tp4
+def test_inference_scratch_not_reserved_with_disabled_tp_kernels():
+    """Disabling symmetric TP kernels must not reserve their unused scratch pool."""
+    Utils.initialize_model_parallel(TP, 1)
+    try:
+        cfg = TransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=8,
+            tensor_model_parallel_size=TP,
+            sequence_parallel=True,
+            params_dtype=torch.bfloat16,
+            transformer_impl="inference_optimized",
+            normalization="RMSNorm",
+            add_bias_linear=False,
+            inference_disable_triton_nvls_kernels=True,
+        )
+        DynamicInferenceContext(
+            model_config=cfg,
+            inference_config=InferenceConfig(
+                max_tokens=256,
+                max_requests=4,
+                max_sequence_length=256,
+                num_cuda_graphs=2,
+                buffer_size_gb=0.01,
+                block_size_tokens=128,
+                unified_memory_level=0,
+            ),
+        )
+        assert not SymmetricMemoryManager.is_initialized("tp")
     finally:
         torch.cuda.synchronize()
         dist.barrier()
