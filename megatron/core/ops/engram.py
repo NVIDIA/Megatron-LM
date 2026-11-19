@@ -65,12 +65,14 @@ try:
     from cutlass.cutlass_dsl import dsl_user_op
     from nccl.core.device.cute.runtime import make_fake_dev_comm, make_fake_window
     from nccl.core.interop import torch as nccl_torch
-except ImportError as exc:
+except (ImportError, OSError, RuntimeError) as exc:
     # The Engram package reaches this module through megatron.core.ops._backends.require, which
-    # names what is missing; this marker handles direct imports in CI.
+    # names what is missing; this marker handles direct imports in CI. A library that is
+    # installed but fails to load counts as missing, as in require: NCCL4Py without the NCCL
+    # device bitcode raises a RuntimeError from its import.
     raise ImportError(
-        "UnavailableError: the Engram device transport needs nvidia-cutlass-dsl, nccl4py and "
-        f"cuda-python ({exc})"
+        "UnavailableError: the Engram device transport needs nvidia-cutlass-dsl, nccl4py with "
+        f"the NCCL device bitcode, and cuda-python ({exc})"
     ) from exc
 
 from megatron.core.ops._backends import installed_version
@@ -87,8 +89,10 @@ def check_runtime() -> None:
 
     The NCCL device bitcode (``$NCCL_HOME/lib/libnccl_device.bc``) is linked into every CuTe
     kernel, so the runtime, the NCCL4Py headers and the bitcode must be the same NCCL version.
-    This checks the runtime against the headers only; a missing or mismatched bitcode fails
-    when :meth:`EngramDeviceTransport.initialize` compiles the kernels, on every rank alike.
+    This checks the runtime against the headers only. A mismatched bitcode fails when
+    :meth:`EngramDeviceTransport.initialize` compiles the kernels, on every rank alike; a
+    missing one fails there too, or already at the import of this module when NCCL4Py loads
+    the bitcode with its device API.
     """
     cute_dsl = installed_version("cutlass", dist="nvidia-cutlass-dsl")
     if cute_dsl is None or cute_dsl < Version(MIN_CUTE_DSL_VERSION):

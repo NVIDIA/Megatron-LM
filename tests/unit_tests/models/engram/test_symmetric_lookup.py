@@ -18,6 +18,7 @@ aborts instead and the failure is reported.
 """
 
 import ast
+import importlib
 import math
 import os
 import socket
@@ -687,6 +688,30 @@ def test_selector_fails_before_allocation_without_triton(monkeypatch):
     assert error.value.name == "triton"
     # The row writer is checked with the transport, before any table exists.
     assert requested == ["megatron.core.ops.engram", "megatron.core.ops.engram_row_accumulation"]
+
+
+@pytest.mark.parametrize(
+    "module, library",
+    [
+        ("megatron.core.ops.engram", "cutlass"),
+        ("megatron.core.ops.engram_row_accumulation", "triton"),
+    ],
+)
+def test_a_library_that_fails_to_load_counts_as_missing(monkeypatch, module, library):
+    """A library that raises while it loads is reported like a missing one. NCCL4Py without
+    the NCCL device bitcode does: its import raises a RuntimeError."""
+
+    class Broken:
+        def find_spec(self, name, path=None, target=None):
+            if name == library:
+                raise RuntimeError("simulated missing NCCL device bitcode")
+            return None
+
+    for name in (module, library):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    monkeypatch.setattr(sys, "meta_path", [Broken(), *sys.meta_path])
+    with pytest.raises(ImportError, match="UnavailableError.*simulated missing"):
+        importlib.import_module(module)
 
 
 def test_selector_binds_the_symmetric_lookup(monkeypatch):

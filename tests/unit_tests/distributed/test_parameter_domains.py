@@ -62,7 +62,7 @@ from megatron.core.process_groups_config import (
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import check_param_hashes_across_dp_replicas, get_pg_rank
 from tests.unit_tests.dist_checkpointing import TempNamedDir
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, release_process_groups
 
 _DOMAIN = 'table'
 # The rows split evenly over 1, 2, 4 or 8 shards. With four or eight ranks, every rank holds
@@ -77,6 +77,13 @@ _NO_CLIP = 1.0e9
 _DP_RESHARDABLE = {'distrib_optim_sharding_type': 'dp_reshardable'}
 # Replica groups spanning dp_cp (rows not sharded), of two ranks, or of one rank.
 _REPLICA_IDS = ['replicas_dp_cp', 'replicas_2', 'replicas_1']
+
+
+@pytest.fixture(autouse=True)
+def _release_process_groups():
+    """Almost every case communicates on the groups it sets up; see release_process_groups."""
+    with release_process_groups():
+        yield
 
 
 def _require_ranks() -> None:

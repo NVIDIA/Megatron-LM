@@ -33,13 +33,20 @@ from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOpt
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import get_pg_rank, get_pg_size
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, release_process_groups
 
 # The layer-wise optimizer tests do not run on the LTS image (as in test_layer_wise_optimizer.py).
 _skip_on_lts = pytest.mark.skipif(
     Version(os.getenv('NVIDIA_PYTORCH_VERSION', "24.01")) <= Version("25.05"),
     reason="Skip layer-wise optimizer for LTS test",
 )
+
+
+@pytest.fixture(autouse=True)
+def _release_process_groups():
+    """Every case steps an optimizer over its groups; see release_process_groups."""
+    with release_process_groups():
+        yield
 
 
 class _MatrixOnlyModel(nn.Module):

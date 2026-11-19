@@ -20,9 +20,10 @@ from torch import Tensor
 try:
     import triton
     import triton.language as tl
-except ImportError as exc:
+except (ImportError, OSError, RuntimeError) as exc:
     # The Engram package reaches this module through megatron.core.ops._backends.require, which
-    # names what is missing; this marker handles direct imports in CI.
+    # names what is missing; this marker handles direct imports in CI. A Triton that is
+    # installed but fails to load counts as missing, as in require.
     raise ImportError(
         f"UnavailableError: the Engram row accumulation needs Triton ({exc})"
     ) from exc

@@ -27,11 +27,9 @@ from megatron.core.models.engram.symmetric_lookup import EngramExchangePlan
 from megatron.core.ops._backends import require
 from tests.unit_tests.test_utilities import Utils
 
-pytest.importorskip("cutlass", exc_type=ImportError)
-pytest.importorskip("nccl.core.device.cute", exc_type=ImportError)
 try:
-    # Any other missing or broken piece of the stack (cuda.core, cuda.bindings, NCCL4Py
-    # interop, a CuTe DSL that fails to load) skips the module instead of failing collection.
+    # A piece of the stack that is missing or fails to load (CuTe DSL, NCCL4Py or its device
+    # bitcode, cuda.core, cuda.bindings) skips the module instead of failing collection.
     engram = require("megatron.core.ops.engram", needed_by="Engram symmetric lookup")
 except ImportError as exc:
     pytest.skip(str(exc), allow_module_level=True)

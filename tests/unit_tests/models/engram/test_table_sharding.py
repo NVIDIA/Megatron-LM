@@ -1062,8 +1062,9 @@ def _distributed():
         else:
             dist.init_process_group("gloo")
     rank = dist.get_rank()
-    if not _GROUPS:
-        _GROUPS.update(_mpu_groups(rank, ep=EP_SIZE))
+    # Built for every case: the groups of the previous one were destroyed with it (conftest.py).
+    _GROUPS.clear()
+    _GROUPS.update(_mpu_groups(rank, ep=EP_SIZE))
     device = (
         torch.device("cuda", torch.cuda.current_device())
         if torch.cuda.is_available()

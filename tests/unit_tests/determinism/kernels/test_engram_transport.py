@@ -49,7 +49,6 @@ def _row_group_or_skip():
 @pytest.mark.skipif(not _IS_BLACKWELL, reason="NCCL device transport needs Blackwell")
 def test_engram_device_exchange_replays():
     """Striped transfers reuse both slots under competing stream work, byte for byte."""
-    pytest.importorskip("nccl.core.device.cute", exc_type=ImportError)
     group = _row_group_or_skip()
     from megatron.core.ops.engram import EngramDeviceTransport, create_unique_id
 
