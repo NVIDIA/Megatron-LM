@@ -4242,8 +4242,8 @@ class TextGenerationController(MTPControllerMixin):
         Args:
             sampling_params (SamplingParams): The sampling parameters.
             request_ids (List[int]): The request IDs.
-            request (List[InferenceRequest]): The requests.
-            stream (List[AsyncStream]): The streams over which to send tokens.
+            requests (List[InferenceRequest]): The requests.
+            streams (List[AsyncStream]): The streams over which to send tokens.
             generation_started (List[bool]): Whether the decode step has started.
             is_generation_done (List[bool]): Whether generation has completed.
             tokens (torch.Tensor): The tokens for this request.

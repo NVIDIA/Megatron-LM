@@ -1430,7 +1430,7 @@ def get_updated_expert_bias(
     Args:
         tokens_per_expert (torch.Tensor): The number of tokens assigned to each expert.
         expert_bias (torch.Tensor): The bias for each expert.
-        expert_bias_udpate_rate (float): The update rate for the expert bias.
+        expert_bias_update_rate (float): The update rate for the expert bias.
         tp_dp_cp_group (torch.distributed.ProcessGroup, optional): The group spanning the tensor,
             data, and context parallel ranks that share the router expert-bias update.
 

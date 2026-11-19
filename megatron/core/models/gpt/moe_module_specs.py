@@ -46,7 +46,6 @@ def get_moe_module_spec(
         use_te: Whether to use Transformer Engine.
         num_experts: Number of experts.
         moe_grouped_gemm: Whether to use grouped GEMM.
-        moe_use_legacy_grouped_gemm: Whether to use legacy grouped GEMM.
     """
     backend = get_backend("transformer_engine" if use_te else "local")
     return get_moe_module_spec_for_backend(

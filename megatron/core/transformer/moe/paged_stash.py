@@ -190,7 +190,6 @@ class PagedTensor:
             tensor: The tensor to store
             num_tokens_tensor: Scalar tensor containing actual number of tokens
             vp_stage: Virtual pipeline stage
-            layer_name: Name of the layer
             max_num_tokens: Maximum number of tokens
             hidden_size: Hidden size
             page_size: Number of tokens per page
