@@ -29,7 +29,6 @@ from emerging_optimizers.orthogonalized_optimizers.muon import Muon
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.angular_muown import (
     FsdpAngularMuOwn,
-    angular_multiplier,
 )
 
 ANGULAR_KWARGS = dict(
@@ -39,6 +38,18 @@ ANGULAR_KWARGS = dict(
     angular_warmup_steps=1,
     angular_horizon_steps=4,
 )
+# A flatter start (r = 2) and a longer warmup, so that kappa_t stays 1 for two steps.
+PLATEAU_ANGULAR_KWARGS = dict(ANGULAR_KWARGS, angular_plateau_degree=2.0, angular_warmup_steps=2)
+
+
+def _reference_angular_multiplier(
+    t: int, *, warmup_steps: int, horizon_steps: int, decay_scale, decay_degree, plateau_degree
+) -> float:
+    """kappa_t = (1 + C * u**r) ** (-p / r) with u = (t - t_w) / T, and 1 during warmup."""
+    if t <= warmup_steps:
+        return 1.0
+    u = (t - warmup_steps) / horizon_steps
+    return (1 + decay_scale * u**plateau_degree) ** (-decay_degree / plateau_degree)
 
 
 class ReferenceAngularMuOwn(Muon):
@@ -103,7 +114,7 @@ class ReferenceAngularMuOwn(Muon):
                     kwargs = {k: val for k, val in group.items() if k != "params"}
                     O = self.orthogonalize(p, M_tilde, **kwargs)
 
-                kappa = angular_multiplier(t, **self.schedule)
+                kappa = _reference_angular_multiplier(t, **self.schedule)
                 U_plus = U - lr * kappa * O
                 U_new = U_plus / U_plus.norm(dim=1, keepdim=True)
 
@@ -150,22 +161,6 @@ def _train(
     return torch.stack(losses)
 
 
-def test_angular_multiplier():
-    """The angular multiplier follows (1 + C * u**r) ** (-p / r) after warmup."""
-    schedule = dict(
-        warmup_steps=10, horizon_steps=100, decay_scale=8.9, decay_degree=1.0, plateau_degree=1.0
-    )
-    assert angular_multiplier(1, **schedule) == 1.0
-    assert angular_multiplier(10, **schedule) == 1.0
-    assert angular_multiplier(110, **schedule) == pytest.approx(1 / 9.9)
-    assert angular_multiplier(60, **schedule) == pytest.approx(1 / (1 + 8.9 * 0.5))
-    plateau = dict(schedule, plateau_degree=2.0)
-    assert angular_multiplier(110, **plateau) == pytest.approx(9.9 ** (-0.5))
-    assert angular_multiplier(20, **plateau) == pytest.approx((1 + 8.9 * 0.01) ** (-0.5))
-    for disabled in (dict(decay_scale=0.0), dict(decay_degree=0.0), dict(horizon_steps=0)):
-        assert angular_multiplier(110, **dict(schedule, **disabled)) == 1.0
-
-
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -184,7 +179,12 @@ def test_angular_muown_rejects_invalid_options(kwargs):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("nesterov", [False, True], ids=["momentum", "nesterov"])
 @pytest.mark.parametrize("weight_decay", [0.0, 0.1], ids=["no_wd", "wd"])
-def test_angular_muown_matches_reference(distributed_setup, dtype, nesterov, weight_decay):
+@pytest.mark.parametrize(
+    "angular_kwargs", [ANGULAR_KWARGS, PLATEAU_ANGULAR_KWARGS], ids=["decay", "plateau"]
+)
+def test_angular_muown_matches_reference(
+    distributed_setup, dtype, nesterov, weight_decay, angular_kwargs
+):
     """FSDP and unsharded AngularMuOwn should produce the same losses and weights."""
     world_size = distributed_setup.world_size
     if world_size < 2 or world_size % 2:
@@ -218,7 +218,7 @@ def test_angular_muown_matches_reference(distributed_setup, dtype, nesterov, wei
         row_scale_betas=(0.9, 0.95),
         row_scale_eps=1e-8,
         weight_decay_mult=1.0,
-        **ANGULAR_KWARGS,
+        **angular_kwargs,
     )
     excluded_names = ["block2.3.weight", "block2.3.bias"]
     muon_names = [name for name in params if name not in excluded_names]
@@ -239,7 +239,7 @@ def test_angular_muown_matches_reference(distributed_setup, dtype, nesterov, wei
 
     # The decay is active by the last step, which uses kappa_t of step 6.
     assert optimizer.last_angular_multiplier == pytest.approx(
-        angular_multiplier(len(inputs), **reference_optimizer.schedule)
+        _reference_angular_multiplier(len(inputs), **reference_optimizer.schedule)
     )
     assert all(group["muown_step"] == len(inputs) for group in optimizer.param_groups)
     # MFSDP shards packed buffers unevenly, so compare each rank's local rows with the
@@ -292,8 +292,15 @@ def test_angular_muown_zero_gradient_step(distributed_setup):
         )
     params = [p for name, p in model.named_parameters() if not name.startswith("block2.3")]
     before = [p.to_local().clone() for p in params]
-    optimizer = FsdpAngularMuOwn(params, lr=0.05, weight_decay=0.0, **ANGULAR_KWARGS)
+    # T = 0 disables the angular decay, so kappa_t = 1 after warmup too.
+    optimizer = FsdpAngularMuOwn(
+        params,
+        lr=0.05,
+        weight_decay=0.0,
+        **dict(ANGULAR_KWARGS, angular_warmup_steps=0, angular_horizon_steps=0),
+    )
     init_optimizer_state(optimizer)
+    assert optimizer.last_angular_multiplier == 1.0
     for param, expected in zip(params, before, strict=True):
         torch.testing.assert_close(param.to_local(), expected, rtol=1e-6, atol=1e-7)
         state = optimizer.state[param]

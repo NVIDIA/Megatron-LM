@@ -10,7 +10,6 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.angular_muown import (
     FsdpAngularMuOwn,
-    angular_multiplier,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.muon import FsdpMuon
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
@@ -244,14 +243,12 @@ def test_mcore_angular_muown(distributed_setup, pg_collection) -> None:
     values = _train(model, optimizer, inputs)
     assert torch.isfinite(values).all()
     assert all(group["muown_step"] == len(inputs) for group in muon_optimizer.param_groups)
+    # kappa_t = (1 + C * u**r) ** (-p / r) at the last step, with u = (5 - 1) / 4 = 1.
     assert muon_optimizer.last_angular_multiplier == pytest.approx(
-        angular_multiplier(
-            len(inputs),
-            warmup_steps=1,
-            horizon_steps=4,
-            decay_scale=optimizer_config.muown_angular_decay_scale,
-            decay_degree=optimizer_config.muown_angular_decay_degree,
-            plateau_degree=optimizer_config.muown_angular_plateau_degree,
+        (1 + optimizer_config.muown_angular_decay_scale)
+        ** (
+            -optimizer_config.muown_angular_decay_degree
+            / optimizer_config.muown_angular_plateau_degree
         )
     )
     for param, state in muon_optimizer.state.items():
