@@ -526,6 +526,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "bit-identical outputs; SSM replay runs the real SSM autotuners through runtime "
         "pinning, with autotune caching on and off.",
     ),
+    KernelEntry(
+        name="triton_block_pointer_compat",
+        sources=("docker/common/triton_block_ptr_compat.py",),
+        tests=(K + "test_triton_block_ptr_compat.py",),
+        kind="dispatch",
+        notes="CI-installed tl.make_block_ptr/advance/load/store adapter. The image's actual "
+        "lowering is exercised by strided, boundary-masked, transposed and 3-D copy replay, "
+        "including FP8 padding, and by H100/Blackwell offline compilation.",
+    ),
     # ---------------------------------------------------------------- SSM
     KernelEntry(
         name="ssm_causal_conv1d",
@@ -754,11 +763,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/inference/test_ep_invariant_ordered_rsv.py",
             "tests/unit_tests/inference/test_moe_dispatching_and_routing.py",
             K + "test_inference_kernels.py",
+            "tests/unit_tests/transformer/moe/test_moe_batch_invariant.py",
         ),
         kind="triton",
         training_path=False,
         notes="Batch-invariant paths replay bit-exactly; the atomic default unpermute is the negative control. "
-        "ordered_reduce_scatter_v (multi-rank) is not replayed here.",
+        "Ordinary vLLM MoE also covers parallel alignment, tiled slot reduction, and decode/prefill hints. "
+        "ordered_reduce_scatter_v (multi-rank) is not replayed here. The BF16 expert GEMM "
+        "(torch grouped_mm) is checked row-invariant in test_moe_batch_invariant.py.",
     ),
     KernelEntry(
         name="batch_invariant_kernels",
@@ -767,7 +779,6 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_inference_kernels.py",
             K + "test_te_wrappers.py",
             "tests/unit_tests/transformer/test_te_layers_batch_invariant.py",
-            "tests/unit_tests/inference/test_batch_invariant_deepgemm_stride.py",
         ),
         kind="triton",
     ),
