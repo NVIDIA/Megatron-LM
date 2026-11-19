@@ -1,8 +1,7 @@
 # Manual release convergence run. Select scope=release explicitly; this is
 # intentionally outside PR, nightly, and weekly suites.
-# DATA_BLEND must match the existing DSv3 GB200 release baseline.
-# Keep artifacts_dir and assets_dir stable across resumed job windows so both
-# DTensor checkpoints and the full TensorBoard trajectory survive retriggers.
+# Fetch the baseline data blend from the internal convergence recipes.
+# RUN_NAME identifies persistent checkpoints and TensorBoard logs across windows.
 type: basic
 format_version: 1
 maintainers: [mcore]
@@ -16,24 +15,58 @@ spec:
   n_repeat: 1
   time_limit_override: 14400
   platforms: dgx_gb200
+  script_setup: |
+    set -euo pipefail
+    unset https_proxy
+    umask 077
+    printf '%s\n' "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" >> "$HOME/.netrc"
+    trap 'rm -f "$HOME/.netrc"; unset RO_API_TOKEN' EXIT
+
+    cd /opt/megatron-lm
+    git fetch "$MCORE_REPO" "$MCORE_MR_COMMIT"
+    git checkout --detach FETCH_HEAD
+
+    mkdir -p /opt/megatron-convergence-recipes
+    cd /opt/megatron-convergence-recipes
+    git init
+    git fetch https://gitlab-master.nvidia.com/ADLR/megatron-lm-convergence-tests.git 1cfddce6ea97ea9607aa2419972bf8d98be32bcc
+    git checkout --detach FETCH_HEAD
+    rm -f "$HOME/.netrc"
+    unset RO_API_TOKEN
   script: |-
     set -euo pipefail
     cd /opt/megatron-lm
-    : "${{DATA_BLEND:?Set DATA_BLEND to the DSv3 release baseline blend}}"
+    : "${{RUN_NAME:?Set a stable RUN_NAME for this release run}}"
+    # Read only the data blend from the pinned internal baseline recipe.
+    DATA_BLEND=$(python - <<'PYCODE'
+    import json
+    from pathlib import Path
+    import yaml
+    path = Path('/opt/megatron-convergence-recipes/deepseekv3_flex_tp1pp4emp16etp1cp1_release_gb200_optimized.yaml')
+    script = yaml.safe_load(path.read_text())['spec']['script']
+    line = next(line for line in script.splitlines() if line.strip().startswith('"DATA_BLEND='))
+    blend = '[' + line.split('[', 1)[1].rsplit(']', 1)[0] + ']'
+    blend = blend.replace('\\${{{{DATA_PATH}}}}', '/mnt/nmt4/tokens-shuffle')
+    if '$' in blend:
+        raise ValueError('Unresolved variable in baseline data blend')
+    print(json.dumps(blend))
+    PYCODE
+    )
+    PERSISTENT_DIR=/lustre/fsw/coreai_dlalgo_mcore/$RUN_NAME/{model}/{test_case}
     : "${{WANDB_EXPERIMENT:?Set a stable WANDB_EXPERIMENT for this release run}}"
-    : "${{WANDB_SAVE_PATH:={assets_dir}/wandb}}"
+    : "${{WANDB_SAVE_PATH:=$PERSISTENT_DIR/wandb}}"
     export DATA_BLEND WANDB_EXPERIMENT WANDB_SAVE_PATH
     export GPUS_PER_NODE={gpus}
 
     # Resume only this variant's DTensor checkpoints, never the baseline's
     # distributed-optimizer checkpoints. One trajectory spans all windows.
     ARGUMENTS=(
-        "DATA_PATH=/mnt/artifacts"
-        "DATA_CACHE_PATH={artifacts_dir}/data-cache"
+        "DATA_PATH=/mnt/nmt4/tokens-shuffle"
+        "DATA_CACHE_PATH=$PERSISTENT_DIR/data-cache"
         "OUTPUT_PATH={assets_dir}"
-        "TENSORBOARD_PATH={assets_dir}/tensorboard"
-        "CHECKPOINT_SAVE_PATH={artifacts_dir}/checkpoints"
-        "CHECKPOINT_LOAD_PATH={artifacts_dir}/checkpoints"
+        "TENSORBOARD_PATH=$PERSISTENT_DIR/tensorboard"
+        "CHECKPOINT_SAVE_PATH=$PERSISTENT_DIR/checkpoints"
+        "CHECKPOINT_LOAD_PATH=$PERSISTENT_DIR/checkpoints"
         "TRAINING_SCRIPT_PATH=pretrain_gpt.py"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
         "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/mixtral/deepseekv3_proxy_flex_tp2pp2emp16etp1cp1_gb_200_release/golden_values_dev_dgx_gb200.json"
