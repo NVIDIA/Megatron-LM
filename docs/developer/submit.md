@@ -14,14 +14,15 @@ draft.
 
 ## Step 1: Mark PR as "Ready for Review"
 
-1. Work on your draft and request Autobot approval in a PR comment. Use `/review-approve`
-   for a findings-only follow-up or `/review-approve reset=true` for a full review. If you're
-   outside `mcore-engineers`, ask a member to post the command for you. For a fork,
+1. If you're outside `mcore-engineers`, your PR is automatically exempt from Autobot approval.
+   Click **Ready for review** when you want engineering feedback.
+2. If you're a team member, work on your draft and request Autobot approval in a PR comment.
+   Use `/review-approve` for a findings-only follow-up or `/review-approve reset=true` for a full review. For a fork,
    a maintainer may need to run `/ok to test` for the latest commit first.
-2. Address the findings and request another review. Once Autobot approves the current commit,
+   Address the findings and request another review. Once Autobot approves the current commit,
    click **Ready for review**. To use the exemption, apply `skip-bot-approval` before clicking.
-3. Without approval or the label, automation will return the PR to draft. On a successful
-   transition, the review groups for your changed files will review the PR.
+   Without approval or the label, automation will return a member's PR to draft.
+3. On a successful transition, the review groups for your changed files will review the PR.
 
 :warning: Only mark as ready once all merge-conflicts are resolved and the CI is passing.
 Final Review might get declined if these requirements are not fulfilled.

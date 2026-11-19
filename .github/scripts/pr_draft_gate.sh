@@ -4,7 +4,7 @@
 set -euo pipefail
 
 # shellcheck disable=SC2016
-gh api graphql --paginate -F owner="${GITHUB_REPOSITORY%/*}" -F repo="${GITHUB_REPOSITORY#*/}" \
+decision=$(gh api graphql --paginate -F owner="${GITHUB_REPOSITORY%/*}" -F repo="${GITHUB_REPOSITORY#*/}" \
     -F number="$PR_NUMBER" -f query='
     query($owner: String!, $repo: String!, $number: Int!, $endCursor: String) {
       repository(owner: $owner, name: $repo) {
@@ -32,4 +32,16 @@ gh api graphql --paginate -F owner="${GITHUB_REPOSITORY%/*}" -F repo="${GITHUB_R
         if $pr.timelineItems.totalCount == 0 then "draft" else "ignore" end
       elif any($pages[].labels.nodes[]; .name == "skip-bot-approval") then "ready"
       elif $review.state == "APPROVED" and $review.commit.oid == $pr.headRefOid then "ready"
-      else "draft" end'
+      else "draft" end')
+
+if [[ "$PR_ACTION" != ready_for_review || "$decision" != draft ]]; then
+    echo "$decision"
+    exit 0
+fi
+
+team_pages=$(GH_TOKEN="${MEMBERS_TOKEN:?}" gh api --paginate \
+    "orgs/${GITHUB_REPOSITORY%/*}/teams/mcore-engineers/members?per_page=100")
+jq -ser --argjson author_id "${PR_AUTHOR_ID:?}" '
+    if length == 0 or any(.[]; type != "array") then error("Missing team membership data")
+    elif any(.[][]; .id == $author_id) then "draft"
+    else "ready" end' <<< "$team_pages"

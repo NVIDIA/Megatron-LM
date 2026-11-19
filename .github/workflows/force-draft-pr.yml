@@ -34,6 +34,8 @@ jobs:
         if: github.event.action == 'ready_for_review' || !github.event.pull_request.draft
         env:
           GH_TOKEN: ${{ github.token }}
+          MEMBERS_TOKEN: ${{ secrets.PAT }}
+          PR_AUTHOR_ID: ${{ github.event.pull_request.user.id }}
         run: |
           decision=$(bash .github/scripts/pr_draft_gate.sh)
           echo "decision=$decision" | tee -a "$GITHUB_OUTPUT"

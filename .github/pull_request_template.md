@@ -45,11 +45,12 @@ All PRs start as **draft**. If you open a non-draft PR, it will be automatically
 
 #### Step 1: Mark PR as "Ready for Review"
 
-1. While in draft, request Autobot approval with `/review-approve` (findings-only follow-up)
-   or `/review-approve reset=true` (full review). If you're outside `mcore-engineers`,
-   ask a member to post the command for you.
-2. Click **Ready for review** once Autobot approves the latest commit or you have added the
-   `skip-bot-approval` label. Without either, automation will return the PR to draft.
+1. If you're outside `mcore-engineers`, you're automatically exempt from Autobot approval.
+   Click **Ready for review** when you want engineering feedback.
+2. If you're a team member, request Autobot approval in draft with `/review-approve`
+   (findings-only follow-up) or `/review-approve reset=true` (full review).
+   Mark the PR ready once Autobot approves the latest commit or you have added
+   `skip-bot-approval`. Without either, automation will return your PR to draft.
 3. Review groups are requested based on your changes.
    - Some PRs may jump straight to step 2. This is determined by `.github/CODEOWNERS`.
 
