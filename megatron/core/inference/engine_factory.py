@@ -4,7 +4,7 @@
 
 from typing import Any
 
-from megatron.core.inference.config import InferenceConfig
+from megatron.core.inference.config import InferenceConfig, mtp_layer_types_from_model
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.disaggregation.coordinator_setup import (
     configure_prebuilt_disagg_engine,
@@ -67,6 +67,10 @@ def build_dynamic_inference_engine(
     inference_config.reserve_recurrent_state_dummy_slot = (
         engine_cls.requires_recurrent_state_dummy_slot
     )
+    if inference_config.mtp_layer_type_list is None:
+        # The context reads None as a non-hybrid head, one attention layer by construction, and
+        # gives it the MTP draft KV plane. A hybrid head's layers come from the model's pattern.
+        inference_config.mtp_layer_type_list = mtp_layer_types_from_model(model)
     context = DynamicInferenceContext(model.config, inference_config)
     inference_wrapped_model = inference_wrapper_cls(model, context)
     controller = TextGenerationController(

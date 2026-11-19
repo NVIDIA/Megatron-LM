@@ -11,6 +11,7 @@ import torch
 
 import megatron.core.inference.engine_factory as factory_module
 from megatron.core.inference.config import InferenceConfig
+from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.disaggregation.engine import (
     DisaggDynamicInferenceEngine,
     StateHandoffDynamicInferenceEngine,
@@ -148,3 +149,44 @@ def test_disaggregation_rejects_disabled_prefix_caching(mock_pipeline):
             tokenizer="tokenizer",
             inference_config=config,
         )
+
+
+@pytest.mark.parametrize(
+    "mtp_pattern, given, expected, draft_kv_plane",
+    [
+        ("M", None, ["M"], False),
+        ("**-", None, ["*", "*", "-"], False),
+        ("*-", None, ["*", "-"], True),
+        ("M", ["*", "-"], ["*", "-"], True),
+        (None, None, None, True),
+    ],
+    ids=["recurrent-head", "two-attention-head", "attention-head", "explicit-list", "non-hybrid"],
+)
+def test_mtp_layer_types_default_to_the_models_head(
+    mock_pipeline, mtp_pattern, given, expected, draft_kv_plane
+):
+    """A hybrid MTP head's layer types come from the model unless the config names them.
+
+    Left None, the context treats the head as one attention layer and gives a repeated head the
+    draft KV plane; a recurrent or two-attention head would then run through it.
+    """
+    config = InferenceConfig(num_speculative_tokens=2, mtp_layer_type_list=given)
+    model_config = SimpleNamespace(mtp_num_layers=1, mtp_use_repeated_layer=True)
+    model = SimpleNamespace(config=model_config)
+    if mtp_pattern is not None:
+        model.mtp_pattern = mtp_pattern
+
+    factory_module.build_dynamic_inference_engine(
+        model=model,
+        tokenizer="tokenizer",
+        inference_config=config,
+        inference_wrapper_cls=MagicMock(),
+    )
+
+    assert config.mtp_layer_type_list == expected
+    assert (
+        DynamicInferenceContext.should_enable_mtp_kv_cache(
+            model_config, config.mtp_layer_type_list, config.num_speculative_tokens
+        )
+        is draft_kv_plane
+    )
