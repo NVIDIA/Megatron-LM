@@ -22,6 +22,11 @@ from torch import nn
 from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.ops._backends import require
+from megatron.core.ops.attention.csa.compressor_projection import (
+    compact_cp_projection,
+    cp_projection_maps,
+)
+from megatron.core.ops.attention.csa.cudnn_pooling import get_cudnn_r2_pool
 from megatron.core.ops.attention.csa.output_rope import OutputRopeParams
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -64,9 +69,9 @@ from .csa_utils.csa2_context_parallel import (
 from .csa_utils.csa2_indexer import (
     CSA2IndexerInputs,
     fused_candidate_topk,
+    fused_compact_topk,
     fused_csa2_indexer_loss,
     fused_csa2_indexer_sparse_attn,
-    fused_mxfp8_topk,
     prepare_csa2_indexer_inputs,
 )
 from .csa_utils.fused_sparse_attention import (
@@ -77,12 +82,32 @@ from .csa_utils.fused_sparse_attention import (
 from .csa_utils.packed_sparse_attention import csa_sparse_attn as packed_csa_sparse_attn
 from .csa_utils.packed_sparse_attention import get_flash_mla_topk_alignment
 from .csa_utils.thd_utils import (
+    SPARSE_PAD_ZERO,
     CSA2THDCompressionLayout,
     CSA2THDLayout,
     build_csa2_thd_layout,
     get_thd_token_metadata,
     get_window_topk_idxs_thd,
+    zero_padding_rows_,
 )
+
+
+def _zero_padding_rows(invalid: torch.Tensor, *tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """Zero THD padding rows out of place (``invalid`` broadcasts over each tensor)."""
+    return tuple(t.masked_fill(invalid, 0) for t in tensors)
+
+
+def _zero_padding_rows_inplace(
+    valid_rows: torch.Tensor, *tensors: torch.Tensor
+) -> tuple[torch.Tensor, ...]:
+    """Zero THD padding rows (``valid_rows`` flags dim 0).
+
+    With MCORE_CSA2_SPARSE_PAD_ZERO (the default) and contiguous tensors, only those rows
+    are written, in place; otherwise each tensor is masked out of place.
+    """
+    if SPARSE_PAD_ZERO and all(t.is_contiguous() for t in tensors):
+        return zero_padding_rows_(~valid_rows, *tensors)
+    return tuple(t.masked_fill(~valid_rows.view(-1, *[1] * (t.ndim - 1)), 0) for t in tensors)
 
 
 @dataclass
@@ -317,6 +342,22 @@ def select_candidate_blocks_thd(
     )
 
 
+def _weight_requires_single_cp_projection(weight: nn.Parameter) -> bool:
+    """Detect wgrad overwrite contracts before FSDP's first pre-forward hook."""
+    if getattr(weight, "overwrite_main_grad", False):
+        return True
+    fsdp = getattr(weight, "_megatron_fsdp_model", None)
+    if fsdp is None:
+        return False
+    strategy = getattr(fsdp, "data_parallel_sharding_strategy", "no_shard")
+    if strategy == "no_shard":
+        return False
+    return getattr(fsdp, "enable_fine_grained_param_gather_hook", False) or strategy in (
+        "optim",
+        "optim_grads",
+    )
+
+
 class CSA2Compressor(MegatronModule):
     """Produce pre-RoPE global latents from complete, non-overlapping token groups."""
 
@@ -333,6 +374,9 @@ class CSA2Compressor(MegatronModule):
         self.compress_ratio = compress_ratio
         self.tp_group = pg_collection.tp
         self.use_fused_compressor = use_fused_dsa_kernels(config)
+        self._fused_r2_pool = (
+            get_cudnn_r2_pool() if compress_ratio == 2 and self.use_fused_compressor else None
+        )
         linear_kwargs = dict(
             config=config,
             init_method=config.init_method,
@@ -394,7 +438,9 @@ class CSA2Compressor(MegatronModule):
             if thd_layout.cp_size > 1:
                 if boundary_hidden is None:
                     raise ValueError("CSA2 CP compression requires the DSv4 left boundary")
-                return self._forward_thd_cp(x, boundary_hidden, thd_layout)
+                return self._forward_thd_cp(
+                    x, boundary_hidden, thd_layout, input_is_sanitized=input_is_sanitized
+                )
             return self._forward_thd(
                 x,
                 thd_layout.for_compression(self.compress_ratio),
@@ -410,8 +456,15 @@ class CSA2Compressor(MegatronModule):
             gate = self.linear_wgate(x)[0] if self.linear_wgate is not None else None
         return latent, gate
 
-    @torch.compile
     def _pool_r2(self, latent, gate, dtype, valid_groups=None):
+        if self._fused_r2_pool is not None:
+            pooled = self._fused_r2_pool(latent, gate, dtype, valid_groups)
+            if pooled is not None:
+                return pooled
+        return self._pool_r2_native(latent, gate, dtype, valid_groups)
+
+    @torch.compile
+    def _pool_r2_native(self, latent, gate, dtype, valid_groups=None):
         """Pool non-overlapping pairs in FP32, with one final activation cast."""
         shape = (latent.shape[0] // 2, 2, *latent.shape[1:])
         pooled = (latent.float().reshape(shape) * gate.float().reshape(shape).softmax(1)).sum(1)
@@ -450,33 +503,92 @@ class CSA2Compressor(MegatronModule):
             latent = self.norm(latent)
         return latent.masked_fill(~layout.valid_groups[:, None, None], 0)
 
-    def _forward_thd_cp(self, x, boundary_hidden, token_layout):
-        """Compress DSv4's compact local/halo groups before any K communication."""
+    def _cp_requires_single_projection(self):
+        """Deferred or overwriting wgrad cannot consume two calls to one Linear."""
+        return self.config.delay_wgrad_compute or any(
+            _weight_requires_single_cp_projection(linear.weight)
+            for linear in (self.linear_wkv, self.linear_wgate)
+            if linear is not None
+        )
+
+    def _forward_thd_cp(self, x, boundary_hidden, token_layout, *, input_is_sanitized=False):
+        """Project original local/halo storage before compacting narrow KV/gate.
+
+        Reuse the caller's sanitized local hidden rather than saving a separate
+        hidden-size compact allocation. Both
+        projections share the source/inverse maps and the small sanitized halo.
+        """
         if boundary_hidden.ndim != x.ndim or boundary_hidden.shape[1:] != x.shape[1:]:
             raise ValueError("CSA2 compressor boundary must match local hidden dimensions")
         layout = build_csa2_cp_compression_layout(
             token_layout, self.compress_ratio, boundary_hidden.shape[0]
         )
-        if self.use_fused_compressor and x.is_cuda and x.dtype == torch.bfloat16:
-            inputs, *_ = cp_utils.prepare_cp_compressor_input(
-                x,
-                boundary_hidden,
-                token_layout.cu_seqlens_padded,
-                token_layout.global_start,
-                token_layout.cp_size,
-                self.compress_ratio,
+        if self._cp_requires_single_projection():
+            # FSDP may set overwrite_main_grad only inside Linear's pre-forward
+            # hook; inspect wrapping state above, before splitting the GEMMs.
+            latent = self._forward_thd_cp_single_projection(
+                x, boundary_hidden, token_layout, layout
             )
-            # DSv4 compaction follows physical lengths; remove logical padding
-            # before either Linear so NaN padding cannot affect weight gradients.
-            inputs = inputs.masked_fill(
-                ~layout.local.valid_groups.repeat_interleave(self.compress_ratio)[:, None, None], 0
-            )
-            latent, gate = self._project(inputs)
-            if self.compress_ratio == 2:
-                latent = self._pool_r2(latent, gate, x.dtype, layout.local.valid_groups)
         else:
-            latent = self._forward_thd_grouped(torch.cat((boundary_hidden, x)), layout.local)
+            halo_rows = self.compress_ratio
+            sources, inverse = cp_projection_maps(
+                layout.local.source_indices,
+                layout.local.valid_groups,
+                boundary_hidden.shape[0],
+                halo_rows,
+                x.shape[0],
+            )
+            local = x
+            if not input_is_sanitized:
+                # Standalone calls may contain NaN padding. Attention forwards
+                # pass their already sanitized storage without another copy.
+                local = local.masked_fill((inverse[halo_rows:] < 0)[:, None, None], 0)
+            halo = boundary_hidden[-halo_rows:].masked_fill(
+                (inverse[:halo_rows] < 0)[:, None, None], 0
+            )
+            projections = []
+            with get_fp8_disabled_context(self.config):
+                for linear in (self.linear_wkv, self.linear_wgate):
+                    if linear is None:
+                        continue
+                    cache_setting = getattr(linear, "disable_parameter_transpose_cache", None)
+                    if cache_setting is not None:
+                        # TELinear then passes is_first_microbatch=None. Both
+                        # backwards must accumulate, including microbatch one.
+                        linear.disable_parameter_transpose_cache = True
+                    try:
+                        local_projected, _ = linear(local)
+                        halo_projected, _ = linear(halo)
+                    finally:
+                        if cache_setting is not None:
+                            linear.disable_parameter_transpose_cache = cache_setting
+                    projections.append(
+                        compact_cp_projection(local_projected, halo_projected, sources, inverse)
+                    )
+            latent = projections[0]
+            if self.compress_ratio == 2:
+                latent = self._pool_r2(latent, projections[1], x.dtype, layout.local.valid_groups)
         return self._normalize_thd(latent.to(x.dtype), layout.local), layout
+
+    def _forward_thd_cp_single_projection(self, x, boundary_hidden, token_layout, layout):
+        """Preserve a single wgrad GEMM for delayed/overwrite-only contracts."""
+        inputs, *_ = cp_utils.prepare_cp_compressor_input(
+            x,
+            boundary_hidden,
+            token_layout.cu_seqlens_padded,
+            token_layout.global_start,
+            token_layout.cp_size,
+            self.compress_ratio,
+        )
+        # Physical compaction includes logical padding; clear it before Linear
+        # so a zero output gradient cannot multiply a saved NaN input in wgrad.
+        inputs = inputs.masked_fill(
+            ~layout.local.valid_groups.repeat_interleave(self.compress_ratio)[:, None, None], 0
+        )
+        latent, gate = self._project(inputs)
+        if self.compress_ratio == 2:
+            latent = self._pool_r2(latent, gate, x.dtype, layout.local.valid_groups)
+        return latent
 
     def _forward_thd_projected(self, x, layout, cu_seqlens_padded, *, input_is_sanitized):
         """Project token-order inputs before gathering the smaller KV/gate tensors."""
@@ -624,11 +736,7 @@ class CSA2Indexer(MegatronModule):
         # An incomplete first compression group produces no key rows.
         k = self.k_norm(k) if k.shape[0] else k * self.k_norm.weight
         key_dtype = k.dtype
-        rotary_dtype = torch.float32 if self.precision == "bf16" else None
-        # Fused RoPE keeps BF16 I/O and promotes arithmetic with FP32 tables.
-        # The unfused PyTorch path still needs FP32 inputs for one final cast.
-        if self.precision == "bf16" and not self.config.apply_rope_fusion:
-            k = k.float()
+        # Match V4's activation-dtype tables independently of scorer precision.
         if thd_layout is not None:
             return apply_csa2_thd_rope(
                 k,
@@ -636,7 +744,6 @@ class CSA2Indexer(MegatronModule):
                 self.config,
                 thd_layout,
                 cp_group if cp_group is not None else self.cp_group,
-                rotary_dtype=rotary_dtype,
             ).to(key_dtype)
         pos_dim = self.config.qk_pos_emb_head_dim
         return _apply_rope(
@@ -649,7 +756,6 @@ class CSA2Indexer(MegatronModule):
             ratio=self.compress_ratio,
             cp_group=self.cp_group,
             inplace=False,
-            rotary_dtype=rotary_dtype,
         ).to(key_dtype)
 
     def _project_inputs(
@@ -690,9 +796,6 @@ class CSA2Indexer(MegatronModule):
         q, _ = self.linear_wq_b(qr)
         q = q.reshape(*q.shape[:-1], self.n_heads, self.head_dim)
         query_dtype = q.dtype
-        rotary_dtype = torch.float32 if self.precision == "bf16" else None
-        if self.precision == "bf16" and not self.config.apply_rope_fusion:
-            q = q.float()
         if thd_layout is not None:
             if indexer_k.shape[:2] != (compressed_layout.capacity, 1):
                 raise ValueError("CSA2 shared indexer keys must match the THD compression layout.")
@@ -703,7 +806,6 @@ class CSA2Indexer(MegatronModule):
                 self.config,
                 thd_layout,
                 cp_group if cp_group is not None else self.cp_group,
-                rotary_dtype=rotary_dtype,
             )
             with get_fp8_disabled_context(self.config):
                 weights, _ = self.linear_weights_proj(x)
@@ -717,7 +819,6 @@ class CSA2Indexer(MegatronModule):
             config=self.config,
             rotary_seq_len=q.shape[0],
             cp_group=self.cp_group,
-            rotary_dtype=rotary_dtype,
         )
         with get_fp8_disabled_context(self.config):
             weights, _ = self.linear_weights_proj(x)
@@ -813,15 +914,10 @@ class CSA2Indexer(MegatronModule):
 
     @torch.no_grad()
     def _fused_topk(self, inputs: CSA2IndexerInputs) -> torch.Tensor:
-        """Select physical packed indices with compact MXFP8 or bounded BF16 scoring."""
+        """Select physical packed indices with the shared BF16/MXFP8 compact scorer."""
         if inputs.candidates is not None:
             return fused_candidate_topk(inputs, self.topk, self.precision)
-        if self.precision == "mxfp8":
-            return fused_mxfp8_topk(inputs, self.topk)
-        indices, _ = fused_candidate_blocks(
-            inputs, topk_blocks=0, block_size=1, precision=self.precision, token_topk=self.topk
-        )
-        return indices
+        return fused_compact_topk(inputs, self.topk, self.precision)
 
     @torch.no_grad()
     def _candidate_blocks(
@@ -1132,16 +1228,10 @@ class CompressedSparseAttention2(MegatronModule):
                     # The indexer's linear backward retains this same latent,
                     # including when its input was detached from the compressor.
                     inplace=False,
-                    rotary_dtype=torch.float32,
                 )
             else:
                 state.global_kv = apply_csa2_thd_rope(
-                    latent,
-                    self.rotary_pos_emb,
-                    self.config,
-                    local_layout,
-                    cp_group,
-                    rotary_dtype=torch.float32,
+                    latent, self.rotary_pos_emb, self.config, local_layout, cp_group
                 )
             if cp_layout is not None:
                 # One autograd edge per shared tensor: reduce-scatter runs after
@@ -1580,7 +1670,7 @@ class CompressedSparseAttention2(MegatronModule):
         _, _, boundary_valid = get_thd_token_metadata(
             layout.cu_seqlens, layout.cu_seqlens_padded, boundary_rows
         )
-        boundary_kv = boundary_kv.masked_fill(~boundary_valid[:, None, None], 0)
+        (boundary_kv,) = _zero_padding_rows(~boundary_valid[:, None, None], boundary_kv)
         local = torch.cat((boundary_kv, key), dim=0).squeeze(1)
         window = None
         if not self.use_fused_kernels or query.shape[0] == 0:
@@ -1675,10 +1765,10 @@ class CompressedSparseAttention2(MegatronModule):
                     "CSA2 THD hidden states and query latents must have shape [T, 1, dim]."
                 )
             invalid = ~thd_layout.valid_tokens[:, None, None]
-            query = query.masked_fill(invalid, 0)
-            key = key.masked_fill(invalid, 0)
-            x = x.masked_fill(invalid, 0)
-            qr = qr.masked_fill(invalid, 0)
+            # Query and key are the large ones. x and qr also feed the indexer and the
+            # compressor; keep them out of place.
+            query, key = _zero_padding_rows_inplace(thd_layout.valid_tokens, query, key)
+            x, qr = _zero_padding_rows(invalid, x, qr)
         elif thd_layout is not None:
             raise ValueError("CSA2 THD layout requires packed sequence metadata.")
         elif query.ndim != 4 or query.shape[0] == 0:
@@ -1738,7 +1828,7 @@ class CompressedSparseAttention2(MegatronModule):
                 query, local, indices, x, qr, csa2_state, use_indexer_loss, out_rope
             )
         if is_thd and (out_rope is None or not self.use_fused_kernels or seq_len == 0):
-            output = output.masked_fill(~thd_layout.valid_tokens[:, None], 0)
+            (output,) = _zero_padding_rows_inplace(thd_layout.valid_tokens, output)
         if indexer_loss is not None:
             # The tracker averages microbatches, so report a token mean in either
             # reduction mode. Backward still receives the raw sum in per-token mode.

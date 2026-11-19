@@ -12,6 +12,7 @@ from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_
 
 from . import packed_layout
 from .packed_sparse_attention import indexer_topk
+from .thd_utils import metadata_checks_enabled
 
 
 def _thd_cp_position_ids(
@@ -365,13 +366,14 @@ def validate_packed_inputs(packed_seq_params, config, cp_group):
                 "Packed DSv4 cumulative lengths must be matching int32 tensors on one device."
             )
 
-    if q.data_ptr() != kv.data_ptr():
+    # Device-side value checks are opt-in (MCORE_CSA2_DEVICE_CHECKS, see thd_utils).
+    if metadata_checks_enabled(q.device) and q.data_ptr() != kv.data_ptr():
         torch._assert_async((q == kv).all(), "DSv4 packed CSA supports self attention only.")
     padded_q = packed_seq_params.cu_seqlens_q_padded
     padded_kv = packed_seq_params.cu_seqlens_kv_padded
     physical_q = q if padded_q is None else padded_q
     physical_kv = kv if padded_kv is None else padded_kv
-    if physical_q.data_ptr() != physical_kv.data_ptr():
+    if metadata_checks_enabled(q.device) and physical_q.data_ptr() != physical_kv.data_ptr():
         torch._assert_async(
             (physical_q == physical_kv).all(),
             "Packed CSA requires matching physical Q/KV document boundaries.",
