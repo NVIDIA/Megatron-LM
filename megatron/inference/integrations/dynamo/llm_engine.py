@@ -776,7 +776,6 @@ class MegatronLLMEngine(LLMEngine):
             try:
                 client.pause_engines()
                 client.stop_engines()
-                client.shutdown_coordinator()
             except Exception:
                 logger.exception("Graceful Megatron coordinator shutdown failed")
 

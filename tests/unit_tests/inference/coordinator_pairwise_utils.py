@@ -4,10 +4,9 @@
 
 import asyncio
 import copy
-import queue
+import multiprocessing
 import threading
 from contextlib import asynccontextmanager
-from types import SimpleNamespace
 
 import msgpack
 import torch
@@ -51,19 +50,21 @@ class CoordinatorThread:
     def __init__(self, dp_size, tokenizer, *, setup=None, **options):
         self.events = []
         self.errors = []
-        self.addresses = queue.Queue()
+        # The spawner's end of the startup pipe; closing it tells the coordinator to exit.
+        self.pipe, pipe_child = multiprocessing.Pipe()
         self.ready = threading.Event()
         self.coordinator = None
         self.thread = threading.Thread(
-            target=self._run, args=(dp_size, tokenizer, setup, options), daemon=True
+            target=self._run, args=(dp_size, tokenizer, setup, options, pipe_child), daemon=True
         )
         self.thread.start()
-        self.address = self.addresses.get(timeout=30)
+        assert self.pipe.poll(30), "coordinator thread did not publish its address"
+        self.address = self.pipe.recv()
 
-    def _run(self, dp_size, tokenizer, setup, options):
+    def _run(self, dp_size, tokenizer, setup, options, pipe_child):
         try:
             coordinator = DataParallelInferenceCoordinator(
-                pipe_connection=SimpleNamespace(send=self.addresses.put, close=lambda: None),
+                pipe_connection=pipe_child,
                 data_parallel_size=dp_size,
                 tokenizer=tokenizer,
                 max_requests=8,
@@ -98,6 +99,7 @@ class CoordinatorThread:
         except BaseException as error:
             self.errors.append(error)
         finally:
+            pipe_child.close()
             if self.coordinator is not None:
                 self.coordinator.router_socket.disable_monitor()
                 self.coordinator.stop()
@@ -272,8 +274,7 @@ class RoutedModel:
             await asyncio.wait_for(self.engine.engine_loop_task, timeout=60)
         await self.barrier()
         if self.rank == 0 and self.service is not None:
-            if self.clients:
-                self.clients[0].shutdown_coordinator()
+            self.service.pipe.close()
             await asyncio.to_thread(self.service.thread.join, 30)
             assert not self.service.thread.is_alive()
             assert not self.service.errors, self.service.errors

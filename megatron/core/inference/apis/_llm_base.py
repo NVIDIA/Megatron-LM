@@ -209,7 +209,6 @@ class _CoordinatorRuntime:
         # Happy path: client open -> graceful protocol shutdown.
         if self._client is not None:
             try:
-                self._client.shutdown_coordinator()
                 self._client.stop()
             finally:
                 self._client = None
