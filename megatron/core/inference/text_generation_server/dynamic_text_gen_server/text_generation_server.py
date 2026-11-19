@@ -30,6 +30,8 @@ logger = logging.getLogger(__name__)
 
 # Per-request payload limit, enforced by Quart.
 _MAX_REQUEST_CONTENT_SIZE = 2**30
+# Default per-rank budget for in-flight request payload bytes (see start_text_gen_server).
+_DEFAULT_MAX_INFLIGHT_BYTES = 2**34
 
 # Global reference to manage the background server processes
 _SERVER_PROCESSES: List[mp.Process] = []
@@ -59,7 +61,9 @@ class _InflightHTTPLimit:
 
     - ``max_inflight_requests``: the number of requests being handled at once.
     - ``max_inflight_bytes``: the payload bytes (prompt JSON, base64 media) those
-      requests have received so far, counted as they arrive.
+      requests have received so far, counted as they arrive. These are raw
+      bytes; actual memory is a multiple of them (buffered body, parsed JSON,
+      decoded media, tokenized prompt), so size the budget with that in mind.
 
     A request arriving while either total is at its limit gets 503. A request is
     aborted mid-upload with 413 once its individual payload exceeds
@@ -73,7 +77,7 @@ class _InflightHTTPLimit:
         max_inflight_requests: int,
         max_inflight_bytes: int,
         max_request_content_size: int,
-    ):
+    ) -> None:
         self.app = app
         self.max_request_content_size = max_request_content_size
         self.max_inflight_requests = max_inflight_requests
@@ -165,7 +169,7 @@ async def _run_text_gen_server(
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
     max_inflight_requests: int = 16384,
-    max_inflight_bytes: int = 2**34,
+    max_inflight_bytes: int = _DEFAULT_MAX_INFLIGHT_BYTES,
     ready_conn: Optional[mp_connection.Connection] = None,
 ):
     """
@@ -295,7 +299,7 @@ def _server_process_worker(
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
     max_inflight_requests: int = 16384,
-    max_inflight_bytes: int = 2**34,
+    max_inflight_bytes: int = _DEFAULT_MAX_INFLIGHT_BYTES,
     ready_conn: Optional[mp_connection.Connection] = None,
 ):
     """Synchronous worker function that sets up a new event loop for the separate process."""
@@ -386,7 +390,7 @@ def start_text_gen_server(
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
     max_inflight_requests: int = 16384,
-    max_inflight_bytes: int = 2**34,
+    max_inflight_bytes: Optional[int] = None,
 ) -> Optional[str]:
     """Start the text generation server and wait until every replica is listening.
 
@@ -412,9 +416,29 @@ def start_text_gen_server(
             template string. None falls back to the tokenizer's own template.
         max_inflight_requests: Per replica, the most HTTP requests handled at
             once. Requests beyond it get 503.
-        max_inflight_bytes: Per replica, the most request payload bytes held at
-            once. The 16 GiB default is sized for DGX hosts; lower it on hosts
-            with less memory.
+        max_inflight_bytes: Per rank (i.e. per host process group), the most
+            request payload bytes held at once. It is split evenly across the
+            ``num_replicas`` replicas, so each replica enforces
+            ``max_inflight_bytes // num_replicas`` and the host-wide total stays
+            at ``max_inflight_bytes`` regardless of replica count. Each share must
+            be at least the per-request limit (1 GiB) so a replica can still
+            accept a maximum-size request, hence
+            ``max_inflight_bytes >= num_replicas * 1 GiB``. When omitted it
+            defaults to ``max(16 GiB, num_replicas * 1 GiB)``: 16 GiB for up to 16
+            replicas, and one maximum-size request per replica beyond that, so
+            launches that were valid before this limit existed still start. An
+            explicit value that cannot give every replica 1 GiB is rejected.
+            Shares are static and
+            connections are not spread perfectly evenly across replicas, so one
+            replica can reach its share while others sit idle.
+            This counts raw payload bytes only, which understates memory use: the
+            body is buffered, the JSON is parsed into Python objects, base64
+            media is decoded and the prompt is tokenized, so a request can cost
+            a few times its size. Size the budget well below available host
+            memory accordingly. The 16 GiB default is sized for DGX hosts; lower
+            it on hosts with less memory. This bounds the front-end's memory and
+            concurrency; it is not DDoS protection, which belongs in front of the
+            server.
 
     Returns:
         The base URL this rank serves on, or None if the server was already
@@ -432,10 +456,19 @@ def start_text_gen_server(
 
     if max_inflight_requests < 1:
         raise ValueError(f"max_inflight_requests must be >= 1, got {max_inflight_requests}")
-    if max_inflight_bytes < _MAX_REQUEST_CONTENT_SIZE:
+    if num_replicas < 1:
+        raise ValueError(f"num_replicas must be >= 1, got {num_replicas}")
+    if max_inflight_bytes is None:
+        max_inflight_bytes = max(
+            _DEFAULT_MAX_INFLIGHT_BYTES, num_replicas * _MAX_REQUEST_CONTENT_SIZE
+        )
+    # The budget is per rank; each replica enforces an equal share of it.
+    replica_inflight_bytes = max_inflight_bytes // num_replicas
+    if replica_inflight_bytes < _MAX_REQUEST_CONTENT_SIZE:
         raise ValueError(
-            f"max_inflight_bytes must be >= {_MAX_REQUEST_CONTENT_SIZE} (the per-request limit), "
-            f"got {max_inflight_bytes}"
+            f"max_inflight_bytes is split across {num_replicas} replicas and each share must be "
+            f">= {_MAX_REQUEST_CONTENT_SIZE} (the per-request limit), so it must be >= "
+            f"{num_replicas * _MAX_REQUEST_CONTENT_SIZE}; got {max_inflight_bytes}"
         )
 
     if sock is not None:
@@ -472,7 +505,7 @@ def start_text_gen_server(
                 block_size_tokens,
                 prefix_caching_coordinator_policy,
                 max_inflight_requests,
-                max_inflight_bytes,
+                replica_inflight_bytes,
                 ready_writer,
             ),
             daemon=True,

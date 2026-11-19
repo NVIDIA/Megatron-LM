@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
@@ -131,7 +131,8 @@ class InferenceEngineCapabilities:
 class InferenceEngineEndpoint:
     """Address and capabilities of an already-running inference engine."""
 
-    coordinator_address: str
+    # Carries the coordinator's launch secret: kept out of repr so logging an endpoint is safe.
+    coordinator_address: str = field(repr=False)
     capabilities: InferenceEngineCapabilities
 
     def __post_init__(self) -> None:

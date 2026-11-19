@@ -10,6 +10,10 @@ import torch
 
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.config import routes_on_prefix
+from megatron.core.inference.data_parallel_inference_coordinator.auth import (
+    present_credentials,
+    split_authenticated_address,
+)
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     compute_block_hashes_batched,
@@ -79,6 +83,7 @@ class InferenceClient:
         deserialize: bool = False,
         block_size_tokens: Optional[int] = None,
         prefix_caching_coordinator_policy=None,
+        auth_token: bytes | None = None,
     ):
         """
         Initializes the InferenceClient.
@@ -94,6 +99,9 @@ class InferenceClient:
                 the engine never cached. None leaves hashing to the coordinator.
             prefix_caching_coordinator_policy: The coordinator's routing policy,
                 which decides whether anyone reads the hashes at all.
+            auth_token (Optional[bytes]): Secret the coordinator requires of its
+                peers. Normally carried by ``inference_coordinator_address``
+                (see ``data_parallel_inference_coordinator.auth``); this overrides it.
         """
         assert (
             HAVE_ZMQ
@@ -101,6 +109,9 @@ class InferenceClient:
         assert (
             HAVE_MSGPACK
         ), "please install the messagepack library to use InferenceClient - pip install msgpack"
+        inference_coordinator_address, address_auth_token = split_authenticated_address(
+            inference_coordinator_address
+        )
         self.context = zmq.Context()
         socket = self.context.socket(zmq.DEALER)
 
@@ -108,6 +119,7 @@ class InferenceClient:
         socket.setsockopt(zmq.SNDHWM, 0)
         socket.setsockopt(zmq.RCVHWM, 0)
 
+        present_credentials(socket, auth_token or address_auth_token)
         socket.connect(inference_coordinator_address)
 
         self._loop = None
