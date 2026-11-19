@@ -798,6 +798,9 @@ class CheckpointConfig:
     `_extra_state` are persisted, preserving the previous behavior. Older checkpoints load
     unchanged either way."""
 
+    save_rng_state_per_dp_rank: bool = False
+    """Save distinct RNG states for data-parallel ranks whose runtime RNG streams can diverge."""
+
     @property
     def use_dist_ckpt(self) -> bool:
         """Whether ``ckpt_format`` names a distributed checkpoint (everything but ``torch``).

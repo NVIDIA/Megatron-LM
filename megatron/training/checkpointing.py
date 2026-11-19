@@ -13,6 +13,7 @@ import sys
 import threading
 import types
 from argparse import Namespace
+from dataclasses import replace
 from datetime import datetime
 from enum import Enum, auto
 from logging import DEBUG, getLogger
@@ -2834,6 +2835,7 @@ def load_checkpoint(
     dp_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
     checkpoint_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_cp_gtp_remat: Optional[torch.distributed.ProcessGroup] = None,
     rng_state_key_prefix: str = '',
     model_sharded_state_dict_modifier: Optional[Callable[[Dict], None]] = None,
     *,
@@ -3087,6 +3089,8 @@ def load_checkpoint(
             run_tp_pp, ckpt_tp_pp
         )
 
+        load_dp_rng_states = _checkpoint_has_per_dp_rng_states(cfg.checkpoint)
+
         # Determine if RNG state will be loaded
         # world_size must match too: the rng shard key includes dp_cp, so a DP rescale leaves this
         # rank with no shard to load.
@@ -3121,6 +3125,13 @@ def load_checkpoint(
             sharded_sd_metadata = _build_sharded_state_dict_metadata(
                 dp_cp_group=dp_cp_group, ckpt_format=load_format
             )
+            checkpoint_name = get_checkpoint_name(load_dir, iteration, release)
+            gen_sd_rng_state = _align_rng_state_sharded_metadata(gen_sd_rng_state, checkpoint_name)
+            if gen_sd_rng_state is None:
+                ignore_rng_state = True
+                print_rank_0(
+                    "RNG state cannot be restored for this DP/CP layout; using freshly initialized RNG state"
+                )
         else:
             sharded_sd_metadata = dist_checkpointing.load_content_metadata(
                 preloaded_state_dict=state_dict
@@ -3318,7 +3329,9 @@ def load_checkpoint(
         load_kwargs['sharded_state_dict'] = sharded_state_dict
     elif load_format == 'fsdp_dtensor':
         reader = FileSystemReader(_get_load_checkpoint_path(load_dir, checkpoint))
+        load_dp_rng_states = cfg.checkpoint.save_rng_state_per_dp_rank or cfg.rng.data_parallel_random_init
         try:
+            load_dp_rng_states = _checkpoint_has_per_dp_rng_states(cfg)
             state_dict_metadata = reader.read_metadata().state_dict_metadata
         except FileNotFoundError:
             state_dict_metadata = {}
@@ -3744,23 +3757,14 @@ def load_checkpoint(
                         else mpu.get_pipeline_model_parallel_rank()
                     )
                     if f'({pp_rank}, {tp_rank})' in state_dict['rng_state']:
-                        rng_state = state_dict['rng_state'][f'({pp_rank}, {tp_rank})']
+                        rng_state_list = state_dict['rng_state'][f'({pp_rank}, {tp_rank})']
                     else:
                         print_rank_0('WARNING: RNG state not found for current TP/PP rank')
-                        rng_state = next(iter(state_dict['rng_state'].values()))
+                        rng_state_list = next(iter(state_dict['rng_state'].values()))
+                    rng_state = _select_rng_state(rng_state_list, load_dp_rng_states, dp_cp_gtp_remat, dp_cp_group)
                 else:
-                    rng_state = state_dict['rng_state']
-
-                # access rng_state for data parallel rank
-                if cfg.rng.data_parallel_random_init:
-                    dp_rank = (
-                        get_pg_rank(dp_group)
-                        if dp_group is not None
-                        else mpu.get_data_parallel_rank()
-                    )
-                    rng_state = rng_state[dp_rank]
-                else:
-                    rng_state = rng_state[0]
+                    rng_state_list = state_dict['rng_state']
+                    rng_state = _select_rng_state(rng_state_list, load_dp_rng_states, dp_cp_gtp_remat, dp_cp_group)
                 random.setstate(rng_state['random_rng_state'])
                 np.random.set_state(rng_state['np_rng_state'])
                 torch.set_rng_state(rng_state['torch_rng_state'])
@@ -3859,3 +3863,110 @@ def _to_dtensor(wrapped_model, model_state_dict):
             new_model_sd[k] = torch.distributed.tensor.distribute_tensor(v, device_mesh)
 
     return new_model_sd
+
+
+def _select_rng_state(
+    rng_state_list: list[dict[str, Any]],
+    per_dp_rank: bool,
+    dp_cp_gtp_remat: Optional[torch.distributed.ProcessGroup],
+    dp_cp: Optional[torch.distributed.ProcessGroup],
+) -> dict[str, Any]:
+    """Select the RNG state matching the saved checkpoint layout."""
+    return rng_state_list[_checkpoint_dp_cp_group(dp_cp_gtp_remat, dp_cp).rank() if per_dp_rank else 0]
+
+
+def _checkpoint_dp_cp_group(
+    dp_cp_gtp_remat: Optional[torch.distributed.ProcessGroup],
+    dp_cp: Optional[torch.distributed.ProcessGroup],
+) -> torch.distributed.ProcessGroup:
+    """Return the DP x CP group that sharded-checkpoint ``replica_id`` must be derived from.
+
+    ``pg_collection.dp_cp`` deliberately EXCLUDES the GTP weight-rematerialization axis -- it is
+    the *replicate* group, used for gradient all-reduce and optimizer-state sharding. Checkpoint
+    ``replica_id`` needs the opposite: the gtp_remat-INCLUSIVE ``dp_cp_gtp_remat`` group. A tensor
+    that is not GTP-sharded (a norm weight, a bias, an ``_extra_state`` blob) is held identically
+    by every gtp_remat peer, and with the excluded group those peers all report the same DP rank,
+    so each of them claims to be the main replica of the same shard. Distributed checkpointing then
+    rejects the save/load with::
+
+        CheckpointingException: Invalid sharding pattern validation. Errors: Invalid access
+          pattern for ShardedTensor(key='decoder.final_layernorm.weight', ...)
+
+    Megatron-LM's own training loop applies exactly this override before building the sharded
+    state dict (see ``megatron/training/training.py``); Megatron-Bridge has its own checkpoint
+    entrypoints and needs it too.
+
+    ``dp_cp_gtp_remat`` is absent on older Megatron-Core revisions and is the same group as
+    ``dp_cp`` whenever GTP is inactive, so the fallback is a no-op in both cases.
+    """
+    return dp_cp_gtp_remat or dp_cp
+
+
+def _checkpoint_has_per_dp_rng_states(run_config: dict[str, Any]) -> bool:
+    """Return whether a checkpoint stores one RNG state per DP/CP rank."""
+    return run_config.get("checkpoint", {}).get("save_rng_state_per_dp_rank", False) or run_config.get("rng", {}).get(
+        "data_parallel_random_init", False
+    )
+
+
+def _align_rng_state_sharded_metadata(rng_state: ShardedObject, checkpoint_name: str) -> ShardedObject | None:
+    """Align RNG load metadata with the layout stored in a torch-dist checkpoint.
+
+    Newer MCore checkpoints shard RNG state across PP, TP, and DP/CP, while
+    older checkpoints encode DP as a replica ID. Keep the generated metadata
+    when its exact key exists; otherwise adopt a unique stored layout whose
+    PP/TP prefix matches this rank. Return ``None`` for new DP/CP ranks or when
+    shrinking the DP/CP world. A smaller world cannot request every saved RNG
+    shard required by checkpoint access validation; keep fresh RNG in that case.
+    """
+    checkpoint_path: str | Path
+    if MultiStorageClientFeature.is_enabled():
+        checkpoint_path = checkpoint_name
+        has_metadata = file_exists(join_paths(checkpoint_name, ".metadata"))
+    else:
+        checkpoint_path = Path(checkpoint_name)
+        has_metadata = (checkpoint_path / ".metadata").is_file()
+    if not has_metadata:
+        return rng_state
+
+    sharded_metadata = TorchDistLoadShardedStrategy().load_sharded_metadata(checkpoint_path)
+    return _match_rng_state_metadata(rng_state, sharded_metadata)
+
+
+def _match_rng_state_metadata(
+    rng_state: ShardedObject, sharded_metadata: dict[str, ShardedObject]
+) -> ShardedObject | None:
+    """Match current or legacy RNG coordinates without substituting another data rank."""
+    if rng_state.unique_key in sharded_metadata:
+        return rng_state
+    dp_rank = rng_state.global_offset[2] if len(rng_state.global_offset) == 3 else rng_state.replica_id
+    candidates = [
+        metadata
+        for metadata in sharded_metadata.values()
+        if isinstance(metadata, ShardedObject)
+        and metadata.key == rng_state.key
+        and metadata.global_offset[:2] == rng_state.global_offset[:2]
+        and metadata.replica_id == 0
+        and len(metadata.global_offset) in (2, 3)
+    ]
+    if len(rng_state.global_shape) == 3 and any(
+        len(metadata.global_shape) == 3 and metadata.global_shape[2] > rng_state.global_shape[2]
+        for metadata in candidates
+    ):
+        return None
+    matches = [
+        metadata for metadata in candidates if len(metadata.global_offset) == 2 or metadata.global_offset[2] == dp_rank
+    ]
+    if len(matches) != 1:
+        if candidates and all(
+            len(metadata.global_shape) == 3 and dp_rank >= metadata.global_shape[2] for metadata in candidates
+        ):
+            return None
+        return rng_state
+    stored = matches[0]
+    return replace(
+        rng_state,
+        global_shape=stored.global_shape,
+        global_offset=stored.global_offset,
+        replica_id=dp_rank if len(stored.global_offset) == 2 else 0,
+    )
