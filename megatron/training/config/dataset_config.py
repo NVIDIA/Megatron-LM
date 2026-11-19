@@ -66,34 +66,6 @@ CONTAINER_WRITTEN_FIELDS = (
 )
 
 
-def upgrade_legacy_dataset_section(section: dict) -> dict:
-    """Upgrade saved SFT configs to SFTDatasetConfig for backward compatibility.
-
-    Older SFT checkpoints used GPTDatasetConfig. Preserve every field, including
-    unknown keys for strict deserialization to reject; only update the class.
-    """
-    dataset = section.get("dataset")
-    if not isinstance(dataset, dict) or dataset.get("_target_") != (
-        f"{GPTDatasetConfig.__module__}.{GPTDatasetConfig.__qualname__}"
-    ):
-        return section
-    selected = section.get("dataset_type")
-    if isinstance(selected, dict):
-        selected = selected.get("_target_")
-    if not any(
-        selected is cls or selected == f"{cls.__module__}.{cls.__qualname__}"
-        for cls in (SFTDataset, MockSFTDataset)
-    ):
-        return section
-    return {
-        **section,
-        "dataset": {
-            **dataset,
-            "_target_": f"{SFTDatasetConfig.__module__}.{SFTDatasetConfig.__qualname__}",
-        },
-    }
-
-
 @dataclass(kw_only=True)
 class DataloaderConfig:
     """Settings for building torch DataLoaders on top of a dataset."""
@@ -260,6 +232,35 @@ class DataConfig:
     """The dataset class the builder instantiates (``GPTDataset``, ``MockGPTDataset``,
     ``GPTFIMDataset``, ``SFTDataset``, ``MockSFTDataset``, ``VarlenDataset``, ``MockVarlenDataset``).
     Resolved at ``finalize()`` when unset. In YAML: ``{_target_: <module>.<class>, _call_: false}``."""
+
+    @staticmethod
+    def upgrade_cfg_dict(section: dict) -> dict:
+        """Upgrade a saved section before deserialization (``sanitize_dataclass_config`` hook).
+
+        Older SFT checkpoints saved a ``GPTDatasetConfig`` with an SFT ``dataset_type``; it is
+        restored as ``SFTDatasetConfig`` with every field, unknown keys included, for strict
+        deserialization to check.
+        """
+        dataset = section.get("dataset")
+        if not isinstance(dataset, dict) or dataset.get("_target_") != (
+            f"{GPTDatasetConfig.__module__}.{GPTDatasetConfig.__qualname__}"
+        ):
+            return section
+        selected = section.get("dataset_type")
+        if isinstance(selected, dict):
+            selected = selected.get("_target_")
+        if not any(
+            selected is cls or selected == f"{cls.__module__}.{cls.__qualname__}"
+            for cls in (SFTDataset, MockSFTDataset)
+        ):
+            return section
+        return {
+            **section,
+            "dataset": {
+                **dataset,
+                "_target_": f"{SFTDatasetConfig.__module__}.{SFTDatasetConfig.__qualname__}",
+            },
+        }
 
     def validate(self) -> None:
         """Check the loader settings and the class / config agreement; no mutation.

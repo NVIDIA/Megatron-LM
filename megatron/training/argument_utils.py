@@ -843,11 +843,19 @@ def model_config_from_args(
         return hybrid_config_from_args(args, model_config_cls=model_config_cls)
     if issubclass(model_config_cls, BertModelConfig):
         return bert_config_from_args(args, model_config_cls=model_config_cls)
+    if issubclass(model_config_cls, T5ModelConfig):
+        return t5_config_from_args(args, model_config_cls=model_config_cls)
+    if issubclass(model_config_cls, LLaVAModelConfig):
+        return llava_config_from_args(args, model_config_cls=model_config_cls)
+    return model_config_cls(**_model_config_kwargs_from_args(args, model_config_cls))
+
+
+def t5_config_from_args(
+    args: Namespace, model_config_cls: type[T5ModelConfig] = T5ModelConfig
+) -> T5ModelConfig:
+    """Resolve the T5 execution width from the encoder and decoder widths at the CLI boundary."""
     kwargs = _model_config_kwargs_from_args(args, model_config_cls)
-    if (
-        issubclass(model_config_cls, T5ModelConfig)
-        and getattr(args, "max_seq_length_per_sample", None) is None
-    ):
+    if getattr(args, "max_seq_length_per_sample", None) is None:
         lengths = [
             length
             for length in (args.encoder_seq_length, args.decoder_seq_length)
@@ -855,13 +863,19 @@ def model_config_from_args(
         ]
         if lengths:
             kwargs["transformer"].max_seq_length_per_sample = max(lengths)
+    return model_config_cls(**kwargs)
+
+
+def llava_config_from_args(
+    args: Namespace, model_config_cls: type[LLaVAModelConfig] = LLaVAModelConfig
+) -> LLaVAModelConfig:
+    """Legacy VLM launchers name the language execution width --decoder-seq-length."""
+    kwargs = _model_config_kwargs_from_args(args, model_config_cls)
     if (
-        issubclass(model_config_cls, LLaVAModelConfig)
-        and getattr(args, "max_seq_length_per_sample", None) is None
+        getattr(args, "max_seq_length_per_sample", None) is None
+        and args.decoder_seq_length is not None
     ):
-        # Legacy VLM launchers name the language execution width --decoder-seq-length.
-        if args.decoder_seq_length is not None:
-            kwargs["transformer"].max_seq_length_per_sample = args.decoder_seq_length
+        kwargs["transformer"].max_seq_length_per_sample = args.decoder_seq_length
     return model_config_cls(**kwargs)
 
 
