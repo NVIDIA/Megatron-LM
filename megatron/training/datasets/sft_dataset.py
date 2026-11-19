@@ -121,14 +121,18 @@ class SFTDataset(MegatronDataset):
         merged_conversations = self.dataset[int(self.indices[idx % len(self.indices)])]
         split_conversations = self._split_conversations(merged_conversations)
 
-        def extend_with_padding(tokens, targets, positions, pad_len):
+        def extend_with_padding(tokens, targets, positions, is_pad, pad_len):
             tokens.extend([pad] * pad_len)
             targets.extend([pad] * pad_len)
             positions.extend(range(positions[-1]+1, positions[-1]+1+pad_len))
+            is_pad.extend([True] * pad_len)
 
         pack_tokens = []
         pack_targets = []
         pack_positions = []
+        # Padding is masked by position: the pad id can also be a real token id, e.g. EOS
+        # when the tokenizer has no pad token.
+        pack_is_pad = []
         cu_seqlens = [0]
         eod = tokenizer.eod
         pad = tokenizer.pad
@@ -145,6 +149,7 @@ class SFTDataset(MegatronDataset):
 
             pack_tokens.extend(tokens_list)
             pack_targets.extend(targets_list)
+            pack_is_pad.extend([False] * len(tokens_list))
 
             assert not self.config.reset_position_ids
             pack_positions.extend(range(len(tokens_list)))
@@ -153,7 +158,7 @@ class SFTDataset(MegatronDataset):
             mod_token_count = len(pack_tokens) % pad_granularity
             if mod_token_count != 0:
                 pad_len = pad_granularity - mod_token_count
-                extend_with_padding(pack_tokens, pack_targets, pack_positions, pad_len)
+                extend_with_padding(pack_tokens, pack_targets, pack_positions, pack_is_pad, pad_len)
 
             # TODO(duncan): Consider also padding to multiple of number of tokens here. This might
             # be needed for efficiency (and potentially set via command-line argument).
@@ -166,8 +171,10 @@ class SFTDataset(MegatronDataset):
                 max_body = pack_length
                 pack_tokens = pack_tokens[:max_body]
                 pack_targets = pack_targets[:max_body]
+                pack_is_pad = pack_is_pad[:max_body]
                 pack_tokens.append(pad)
                 pack_targets.append(pad)
+                pack_is_pad.append(True)
                 pack_positions = pack_positions[:pack_length+1]
                 # Note len({pack_tokens, pack_targets, pack_positions}) should be pack_length + 1
                 cu_seqlens[-1] = len(pack_tokens) - 1
@@ -176,13 +183,14 @@ class SFTDataset(MegatronDataset):
         # Handle any necessary padding
         if len(pack_tokens) < pack_length + 1:  # +1 here to account for later alignment
             pad_len = pack_length + 1 - len(pack_tokens)
-            extend_with_padding(pack_tokens, pack_targets, pack_positions, pad_len)
+            extend_with_padding(pack_tokens, pack_targets, pack_positions, pack_is_pad, pad_len)
             # Note len({pack_tokens, pack_targets, pack_positions}) should be pack_length + 1
             cu_seqlens[-1] = len(pack_tokens) - 1
 
         assert len(pack_tokens) == pack_length + 1
         assert len(pack_targets) == pack_length + 1
         assert len(pack_positions) == pack_length + 1
+        assert len(pack_is_pad) == pack_length + 1
 
         # Align and convert to tensors
         input_ids    = torch.tensor(pack_tokens[:-1],  dtype=torch.int64)
@@ -191,7 +199,7 @@ class SFTDataset(MegatronDataset):
 
         # Loss mask.
         loss_mask = torch.ones(pack_length, dtype=torch.float32)
-        loss_mask[labels == pad] = 0.0  # Mask paddings
+        loss_mask[torch.tensor(pack_is_pad[1:])] = 0.0  # Mask paddings by position
         loss_mask[labels == IGNORE_INDEX] = 0.0  # mask prompts
 
         # TODO(duncan): Optionally create an attention mask
@@ -335,10 +343,11 @@ class MockSFTDataset(SFTDataset):
 
         tokens = self.dataset[int(self.indices[idx % len(self.indices)])]
 
-        def extend_with_padding(tokens, targets, positions, pad_len):
+        def extend_with_padding(tokens, targets, positions, is_pad, pad_len):
             tokens.extend([pad] * pad_len)
             targets.extend([pad] * pad_len)
             positions.extend(range(positions[-1] + 1, positions[-1] + 1 + pad_len))
+            is_pad.extend([True] * pad_len)
 
         # Convert tokens to list and add EOD
         tokens_list = tokens.tolist()
@@ -349,6 +358,7 @@ class MockSFTDataset(SFTDataset):
         pack_tokens = list(tokens_list)
         pack_targets = list(targets_list)
         pack_positions = list(range(len(tokens_list)))
+        pack_is_pad = [False] * len(tokens_list)  # Padding is masked by position
         cu_seqlens = [0]
 
         # Pad to padding_divisor alignment
@@ -356,7 +366,7 @@ class MockSFTDataset(SFTDataset):
             mod_token_count = len(pack_tokens) % self.padding_divisor
             if mod_token_count != 0:
                 pad_len = self.padding_divisor - mod_token_count
-                extend_with_padding(pack_tokens, pack_targets, pack_positions, pad_len)
+                extend_with_padding(pack_tokens, pack_targets, pack_positions, pack_is_pad, pad_len)
 
         # Record padded boundary after padding
         cu_seqlens.append(len(pack_tokens))
@@ -366,20 +376,23 @@ class MockSFTDataset(SFTDataset):
             max_body = pack_length - 1
             pack_tokens = pack_tokens[:max_body]
             pack_targets = pack_targets[:max_body]
+            pack_is_pad = pack_is_pad[:max_body]
             pack_tokens.extend([eod, pad])
             pack_targets.extend([eod, pad])
+            pack_is_pad.extend([False, True])
             pack_positions = pack_positions[:pack_length + 1]
             cu_seqlens[-1] = len(pack_tokens) - 1
 
         # Handle any necessary padding
         if len(pack_tokens) < pack_length + 1:  # +1 here to account for later alignment
             pad_len = pack_length + 1 - len(pack_tokens)
-            extend_with_padding(pack_tokens, pack_targets, pack_positions, pad_len)
+            extend_with_padding(pack_tokens, pack_targets, pack_positions, pack_is_pad, pad_len)
             cu_seqlens[-1] = len(pack_tokens) - 1
 
         assert len(pack_tokens) == pack_length + 1
         assert len(pack_targets) == pack_length + 1
         assert len(pack_positions) == pack_length + 1
+        assert len(pack_is_pad) == pack_length + 1
 
         # Align and convert to tensors
         input_ids = torch.tensor(pack_tokens[:-1], dtype=torch.int64)
@@ -388,7 +401,7 @@ class MockSFTDataset(SFTDataset):
 
         # Loss mask
         loss_mask = torch.ones(pack_length, dtype=torch.float32)
-        loss_mask[labels == pad] = 0.0
+        loss_mask[torch.tensor(pack_is_pad[1:])] = 0.0
         loss_mask[labels == IGNORE_INDEX] = 0.0
 
         assert len(cu_seqlens) >= 2
