@@ -269,14 +269,11 @@ def _apply_boundary(
     replay = ReplayInterval() if replay is None else replay
     options = (num_streams, replay, uses, consumers, epsilon, len(updates))
     flat = _Boundary.apply(options, *inputs)
-    position = 1
-    for use in uses:
-        for fmt in use:
-            if fmt == "mxfp8":
-                # TE caches requires_grad when it creates the quantized reader, before autograd
-                # attaches this seam: refresh it, or the consumer would skip its input gradient.
-                flat[position].requires_grad_(True)
-            position += 1
+    for fmt, tensor in zip((fmt for use in uses for fmt in use), flat[1:]):
+        if fmt == "mxfp8":
+            # TE caches requires_grad when it creates the quantized reader, before autograd
+            # attaches this seam: refresh it, or the consumer would skip its input gradient.
+            tensor.requires_grad_(True)
     return _regroup(uses, flat)
 
 
@@ -343,10 +340,9 @@ def shortcut_add_wide_residual_write_read_rmsnorm_quant(pending, read, gamma, **
     (default BF16): "mxfp8" emits it directly from FP32 as rowwise MXFP8, or a tuple of two
     consumers' formats (e.g. ("bf16", "mxfp8"), "both" for short) returns one output per consumer
     in that order, for the caller to hand each its tensor; their gradients are summed by the
-    backward kernel. In
-    training an MXFP8 reader's ``mxfp8_consumers`` entry declares the TELinears that take it (each
-    once per graph; views of the whole reader are allowed): their backward shares one columnwise
-    operand replayed by this write's interval. ``replay`` (a ReplayInterval, training only) is the
-    checkpoint-replay interval to record into.
+    backward kernel. In training an MXFP8 reader's ``mxfp8_consumers`` entry declares the
+    TELinears that take it (each once per graph; views of the whole reader are allowed): their
+    backward shares one columnwise operand replayed by this write's interval. ``replay`` (a
+    ReplayInterval, training only) is the checkpoint-replay interval to record into.
     """
     return _apply_boundary(pending, (read,), (gamma,), **options)

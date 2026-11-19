@@ -110,7 +110,7 @@ def backward(
     reusing any given in ``columns``; ``on_columns_ready`` receives them before the fused kernel
     launches, so dependent weight GEMMs overlap it. ``config`` may set an explicit grid (tests).
     """
-    n, streams, updates = saved.reader_count, saved.num_streams, saved.update_count
+    n, streams, updates = len(saved.gammas), saved.num_streams, saved.update_count
     m, h = saved.update.shape
     validate_num_streams(streams)
     if m <= 0 or m % 32 or h < 32 or h > 16384 or h % 32:

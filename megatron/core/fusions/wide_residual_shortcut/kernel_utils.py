@@ -40,11 +40,6 @@ class SavedWrite:
     has_retention: bool = True
     update_count: int = 1
 
-    @property
-    def reader_count(self):
-        """Number of readers produced by this write."""
-        return len(self.gammas)
-
 
 def validate_num_streams(num_streams):
     """Validate the residual stream count (1-6)."""

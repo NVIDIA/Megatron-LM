@@ -77,19 +77,19 @@ class ReplayInterval:
                 previous._replay()
 
     def _take(self, entries, index):
-        """Hand out one replayed entry once; a missing one (not yet replayed, or a retained
+        """Hand out ``entries()[index]`` once; a missing one (not yet replayed, or a retained
         graph's second backward) replays the interval again, bit-exactly."""
-        if getattr(self, entries) is None or getattr(self, entries)[index] is None:
+        if self.ready is None or entries()[index] is None:  # ``_replay`` sets all three
             with torch.no_grad():
                 self._replay()
-        value, getattr(self, entries)[index] = getattr(self, entries)[index], None
+        value, entries()[index] = entries()[index], None
         stream = torch.cuda.current_stream(self.checkpoint.device)
         stream.wait_event(self.ready)
         return value, stream
 
     def take_previous(self, index):
         """Write ``index``'s input residual."""
-        previous, stream = self._take("predecessors", index)
+        previous, stream = self._take(lambda: self.predecessors, index)
         previous.record_stream(stream)
         return previous
 
@@ -100,12 +100,7 @@ class ReplayInterval:
         requested = (requested,) if isinstance(requested, bool) else tuple(requested)
         if reader >= len(requested) or not requested[reader]:
             raise RuntimeError("this replayed write did not record this reader's MXFP8 columns")
-        if self.columns is None or self.columns[index][reader] is None:
-            with torch.no_grad():
-                self._replay()
-        column, self.columns[index][reader] = self.columns[index][reader], None
-        stream = torch.cuda.current_stream(self.checkpoint.device)
-        stream.wait_event(self.ready)
+        column, stream = self._take(lambda: self.columns[index], reader)
         column._columnwise_data.record_stream(stream)
         column._columnwise_scale_inv.record_stream(stream)
         return column
