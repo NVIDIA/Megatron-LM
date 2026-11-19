@@ -1,0 +1,49 @@
+# Manual release convergence run. Select scope=release explicitly; this is
+# intentionally outside PR, nightly, and weekly suites.
+# DATA_BLEND must match the existing DSv3 GB200 release baseline.
+# Keep artifacts_dir and assets_dir stable across resumed job windows so both
+# DTensor checkpoints and the full TensorBoard trajectory survive retriggers.
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: "{test_case}_{environment}_{platforms}"
+  model: mixtral
+  build: mcore-pyt-{environment}
+  nodes: 8
+  gpus: 4
+  n_repeat: 1
+  time_limit_override: 14400
+  platforms: dgx_gb200
+  script: |-
+    set -euo pipefail
+    cd /opt/megatron-lm
+    : "${{DATA_BLEND:?Set DATA_BLEND to the DSv3 release baseline blend}}"
+    : "${{WANDB_EXPERIMENT:?Set a stable WANDB_EXPERIMENT for this release run}}"
+    : "${{WANDB_SAVE_PATH:={assets_dir}/wandb}}"
+    export DATA_BLEND WANDB_EXPERIMENT WANDB_SAVE_PATH
+    export GPUS_PER_NODE={gpus}
+
+    # Resume only this variant's DTensor checkpoints, never the baseline's
+    # distributed-optimizer checkpoints. One trajectory spans all windows.
+    ARGUMENTS=(
+        "DATA_PATH=/mnt/artifacts"
+        "DATA_CACHE_PATH={artifacts_dir}/data-cache"
+        "OUTPUT_PATH={assets_dir}"
+        "TENSORBOARD_PATH={assets_dir}/tensorboard"
+        "CHECKPOINT_SAVE_PATH={artifacts_dir}/checkpoints"
+        "CHECKPOINT_LOAD_PATH={artifacts_dir}/checkpoints"
+        "TRAINING_SCRIPT_PATH=pretrain_gpt.py"
+        "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
+        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/mixtral/deepseekv3_proxy_flex_tp2pp2emp16etp1cp1_gb_200_release/golden_values_dev_dgx_gb200.json"
+        "N_REPEAT=1"
+    )
+    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh "${{ARGUMENTS[@]}}"
+
+products:
+  - test_case: [deepseekv3_proxy_mfsdp_v2_tp1pp1ep8_gb200_release]
+    products:
+      - environment: [dev]
+        scope: [release]
+        platforms: [dgx_gb200]
