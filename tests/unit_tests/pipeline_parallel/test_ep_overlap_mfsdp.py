@@ -17,8 +17,8 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    GradientFinalizationMode,
     Placements,
-    RuntimePolicy,
     SchedulePolicy,
     fully_shard,
     fully_shard_context,
@@ -226,7 +226,7 @@ def test_train_validate_train_reshards_and_matches_dense(distributed_setup):
     units = (model[1], model)
     with fully_shard_context(
         FsdpContext(
-            device=setup.device, runtime_policy=RuntimePolicy(caller_managed_grad_sync=True)
+            device=setup.device, gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER
         )
     ):
         for unit in units:

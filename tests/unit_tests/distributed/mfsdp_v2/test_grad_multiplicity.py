@@ -16,7 +16,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     GradientFinalizationMode,
     Placements,
     SchedulePolicy,
-    finalize_gradients,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
@@ -40,13 +39,12 @@ def _sharded_unit(setup, model):
 
 def _graph_task(model, inputs, node):
     """Materialize one unit for an independently executed forward/backward node."""
-    with model.context.finalize_gradients(mode=GradientFinalizationMode.REDUCE_OUTER):
-        model.context.allgather_stream.wait_stream(model.context.current_stream())
-        model.unshard()
-        consumer = model if node is None else model[node]
-        loss = consumer(inputs).square().mean()
-        loss.backward()
-        model.reshard()
+    model.context.allgather_stream.wait_stream(model.context.current_stream())
+    model.unshard()
+    consumer = model if node is None else model[node]
+    loss = consumer(inputs).square().mean()
+    loss.backward()
+    model.reshard()
     return loss.detach()
 
 
@@ -82,7 +80,12 @@ def test_gradients_and_updates_match_baseline(distributed_setup, nodes):
         baseline_optimizer.zero_grad()
         # The scheduler closes each window after all of its GraphTasks finish.
         for microbatch in range(2):
-            with finalize_gradients(model.context, enabled=microbatch == 1):
+            mode = (
+                GradientFinalizationMode.REDUCE_OUTER
+                if microbatch == 1
+                else GradientFinalizationMode.SKIP_OUTER
+            )
+            with model.context.finalize_gradients(mode=mode):
                 for node in nodes:
                     inputs = torch.randn(4, 16, device=setup.device)
                     consumer = baseline if node is None else baseline[node]
