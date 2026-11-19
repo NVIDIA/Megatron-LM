@@ -2,9 +2,9 @@
 
 """Tensor contracts for extra state crossing existing execution boundaries.
 
-The model declares ordered fields for each execution region. Activations belong
-to a single forward; the same contract is used for checkpoint, graph and pipeline
-boundaries without encoding any attention architecture.
+The model declares the ordered fields each execution region reads and writes.
+Activations belong to a single forward; the same contract is used for checkpoint,
+graph and pipeline boundaries without encoding any attention architecture.
 """
 
 from dataclasses import dataclass
@@ -107,3 +107,92 @@ class TensorSchema:
         """Restore a fresh mapping, retaining explicit absent slots."""
         values = iter(self.detach_ineligible(tensors))
         return {field.key: next(values) if field.present else None for field in self.fields}
+
+
+@dataclass(frozen=True)
+class StateAccess:
+    """The keys one layer reads before it runs and writes when it finishes.
+
+    A key in both replaces the value the layer read; values never change in place.
+    """
+
+    reads: tuple[str, ...] = ()
+    writes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        for keys in (self.reads, self.writes):
+            if not isinstance(keys, tuple) or not all(isinstance(k, str) and k for k in keys):
+                raise ValueError("A state access names its keys with a tuple of strings")
+            if len(set(keys)) != len(keys):
+                raise ValueError("A state access names a key twice")
+
+
+class StateDataflow:
+    """Live keys at each layer boundary, derived from every layer's reads and writes.
+
+    Boundary ``b`` precedes layer ``b``; boundary ``len(layers)`` follows the last
+    layer. ``inputs`` exist before layer 0 and ``outputs`` are consumed after the
+    last layer. A value retires after its last reader, so a layer that only reads a
+    key never republishes it, and a key crosses a boundary only while a later layer
+    still reads it. Every value must be read, or be one of the ``outputs``.
+    """
+
+    def __init__(
+        self,
+        layers: Sequence[StateAccess],
+        *,
+        inputs: Sequence[str] = (),
+        outputs: Sequence[str] = (),
+    ) -> None:
+        self.layers, self.inputs, self.outputs = tuple(layers), tuple(inputs), tuple(outputs)
+        if len(set(self.inputs)) != len(self.inputs) or len(set(self.outputs)) != len(self.outputs):
+            raise ValueError("State dataflow inputs and outputs must be unique")
+        order = list(self.inputs)
+        # Per key: the layer that wrote its current value (-1 for an input) and the
+        # value's last reader so far. Each finished value is held at boundaries (start, end].
+        current = {key: [-1, None] for key in self.inputs}
+        spans = []
+
+        def finish(key, start, end):
+            if end is None:
+                origin = "Input" if start < 0 else f"Layer {start}'s write of"
+                raise ValueError(f"{origin} {key!r} is never read and is not an output")
+            spans.append((key, start, end))
+
+        for index, access in enumerate(self.layers):
+            for key in access.reads:
+                if key not in current:
+                    raise ValueError(f"Layer {index} reads {key!r} before any layer writes it")
+                current[key][1] = index
+            for key in access.writes:
+                if key in current:
+                    finish(key, *current[key])
+                else:
+                    order.append(key)
+                current[key] = [index, None]
+        missing = [key for key in self.outputs if key not in current]
+        if missing:
+            raise ValueError(f"State dataflow outputs {missing} are never written")
+        for key, (start, end) in current.items():
+            finish(key, start, len(self.layers) if key in self.outputs else end)
+        rank = {key: i for i, key in enumerate(order)}
+        self._live = tuple(
+            tuple(sorted((k for k, start, end in spans if start < b <= end), key=rank.get))
+            for b in range(len(self.layers) + 1)
+        )
+
+    def live(self, boundary: int) -> tuple[str, ...]:
+        """Keys held before layer ``boundary``, e.g. the state a pipeline boundary carries."""
+        if not 0 <= boundary < len(self._live):
+            raise ValueError(f"Boundary {boundary} is outside this dataflow")
+        return self._live[boundary]
+
+    def retired_after(self, layer: int) -> tuple[str, ...]:
+        """Keys whose last reader is ``layer``."""
+        following = set(self.live(layer + 1))
+        return tuple(key for key in self.live(layer) if key not in following)
+
+    def retire(self, layer: int, state: Mapping[str, Tensor | None]) -> dict[str, Tensor | None]:
+        """Return a fresh mapping without the keys ``layer`` read last; others remain."""
+        retired = set(self.retired_after(layer))
+        return {key: value for key, value in state.items() if key not in retired}

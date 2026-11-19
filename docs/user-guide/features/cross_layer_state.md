@@ -9,7 +9,7 @@ Packed (THD) batches cross pipeline boundaries through per-microbatch plans, who
 shapes may vary. The CP helpers convert dense sequence shards; packed CP layout
 conversion remains model-owned.
 
-## Declare the inputs and outputs of a region
+## Declare what a region reads and writes
 
 `TensorField` declares a stable key, concrete shape, dtype, CP layout, gradient
 eligibility, and presence. APIs take an ordered tuple (or list) of fields with
@@ -27,7 +27,8 @@ nondifferentiable are detached explicitly. No tensor is otherwise cloned or
 detached merely because another layer reads it.
 
 A region implements `forward(hidden, state) -> (hidden, state)`. Wrap it in
-`StatefulModule` to expose a tensor-only execution boundary:
+`StatefulModule` with the fields it reads and the fields it writes to expose a
+tensor-only execution boundary. A key in both replaces the value read:
 
 ```python
 import torch
@@ -45,11 +46,37 @@ class MemoryRegion(nn.Module):
         return projected + state["memory"], {"memory": projected}
 
 field = TensorField("memory", (128, 2, 64), torch.float32, "contiguous", True)
-region = StatefulModule(MemoryRegion(64), (field,), (field,))
+region = StatefulModule(MemoryRegion(64), reads=(field,), writes=(field,))
 hidden = torch.randn(128, 2, 64, device="cuda", requires_grad=True)
 state = {"memory": torch.zeros_like(hidden)}
 hidden, state = region.run(hidden, state, recompute=True)
 ```
+
+Only the fields a region reads enter it, and only the fields it writes leave it.
+A field the region only reads stays in the caller's mapping: it is never an output
+of the region's checkpoint or CUDA graph, so a layer that merely uses a field
+another layer produced does not republish it.
+
+Which layer reads and writes which key is fixed by the model architecture, so
+declare it once with `StateDataflow`, separately from the fields' shapes:
+
+```python
+from megatron.core.transformer.state_boundary import StateAccess, StateDataflow
+
+layers = [StateAccess()] * 10
+layers[2] = StateAccess(writes=("kv2", "ids"))
+layers[5] = StateAccess(reads=("kv2", "ids"), writes=("kv5",))
+layers[7] = StateAccess(reads=("kv2", "ids"))
+layers[8] = StateAccess(reads=("kv5",))
+flow = StateDataflow(layers)
+flow.live(6)           # ("kv2", "ids", "kv5"): the state held before layer 6
+flow.retired_after(7)  # ("kv2", "ids"): layer 7 is their last reader
+```
+
+`inputs=` names keys that exist before the first layer and `outputs=` keys the
+model consumes after the last one. Construction rejects a read with no earlier
+writer and a value that nothing reads. Use one key per producer, as above, rather
+than reusing a key for an unrelated value.
 
 The model owns the state mapping between regions, and each region call returns a
 fresh mapping. Three rules keep that mapping correct under pipelining,
@@ -57,13 +84,13 @@ recomputation and CUDA graphs:
 
 - Keep one mapping per microbatch, created at model entry. It cannot be a module
   attribute, because 1F1B and VPP schedules keep several microbatches in flight.
-- Change it only through a region's declared outputs. A write inside a recomputed
+- Change it only through a region's declared writes. A write inside a recomputed
   region would run twice, and a CUDA graph replay does not run the Python code
   that would make it. Modules must not retain activations or mutate shared
   tensors in place.
-- Drop fields after their last use, or the mapping keeps them alive for the whole
-  forward. A region retires the declared inputs it does not list as outputs;
-  unrelated fields belonging to other components remain in the caller's state.
+- Drop fields after their last reader, or the mapping keeps them alive for the
+  whole forward: `state = flow.retire(layer, state)` after each layer removes the
+  keys that layer read last. Unrelated fields belonging to other components remain.
 
 Use namespaced keys when composing independent components.
 
@@ -75,7 +102,8 @@ an already registered module need not replace that module in the model tree.
 
 ## Recomputation and CUDA graphs
 
-`region.run(..., recompute=True)` checkpoints explicit input tensors and rebuilds
+`region.run(..., recompute=True)` checkpoints the hidden tensor and the fields the
+region reads, and rebuilds
 the mapping on replay. It preserves PyTorch's default RNG and Megatron's
 model-parallel RNG, supports parameter gradients even when input tensors are
 frozen, and preserves absent versus explicitly zero gradients. Quantized regions
@@ -117,12 +145,14 @@ Warmup and capture preserve existing parameter gradients, fused `main_grad`
 buffers and registered buffers (e.g. router statistics), and suppress MCore DDP
 reductions during capture. CUDA graph creation must be serialized within a process.
 
-Every differentiable captured output must participate in one backward
-invocation; outputs declared nondifferentiable need no gradient. An unused output
-must be omitted from that capture profile; silently turning a missing gradient
-into a numeric zero would change optimizer and auxiliary-loss behavior. For the
-same reason, an input the region does not read gets no gradient, as in eager
-execution. Full recomputation inside capture is rejected.
+Every differentiable captured output (the hidden activation and the region's
+writes) must participate in one backward invocation; writes declared
+nondifferentiable need no gradient. An unused write must be omitted from that
+capture profile; silently turning a missing gradient into a numeric zero would
+change optimizer and auxiliary-loss behavior. Fields the region only reads are
+graph inputs, not outputs, so they need no gradient from this slot's backward.
+A read field the region does not use gets no gradient, as in eager execution.
+Full recomputation inside capture is rejected.
 
 For a skipped or failed iteration, first drain communication and stop scheduling
 work, then call `graphs.abort()` and discard its outputs. The slots can be reused;
@@ -163,7 +193,8 @@ ownership, packed positions, and TP/SP-specific layout rules.
 
 Stages opt into the existing ordinary or interleaved 1F1B scheduler by exposing
 `pipeline_payload_factory = TensorStatePayload`. A nonterminal stage returns
-`TensorStatePayload.from_state(hidden, state, fields, hidden_field=..., boundary_id=..., metadata=...)`.
+`TensorStatePayload.from_state(hidden, state, fields, hidden_field=..., boundary_id=..., metadata=...)`,
+whose fields are those of `flow.live(boundary)`, the keys a later layer still reads.
 `hidden_field` declares the hidden activation's key, CP layout and gradient
 eligibility, and defaults to a differentiable `__hidden__` field with the
 `strided` layout. Its successor receives that object through the normal `set_input_tensor` hook
@@ -221,6 +252,7 @@ uv run python -m torch.distributed.run --standalone --nproc-per-node=4 \
 
 The four-rank cases compare CP2 x PP2/VPP against the same unpartitioned layer
 chain, including model gradients, with eager execution, recomputation, and both
-graph backends. The determinism cases check that eager, checkpointed and graphed
+graph backends. Their first layer writes the shared fields and every later layer
+only reads them, so pipeline payloads follow `flow.live`. The determinism cases check that eager, checkpointed and graphed
 replays and the CP layout/gather gradients are bit-exact across runs. Porting a particular model's state declarations and numerical
 operations remains separate from this general feature.

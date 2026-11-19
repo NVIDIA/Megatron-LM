@@ -68,10 +68,7 @@ def test_fused_te_graph_preserves_ddp_gradients_and_distributed_optimizer(
         fields = (TensorField("memory", (4, 2, 16), torch.float32, "contiguous", True),)
         models = [
             DistributedDataParallel(
-                config,
-                ddp_config,
-                StatefulModule(Region(), output_fields=fields),
-                pg_collection=groups,
+                config, ddp_config, StatefulModule(Region(), writes=fields), pg_collection=groups
             )
             for _ in range(2)
         ]

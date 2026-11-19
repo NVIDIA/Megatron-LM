@@ -22,7 +22,7 @@ from megatron.core.pipeline_parallel.schedules import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import ModelType
-from megatron.core.transformer.state_boundary import TensorField
+from megatron.core.transformer.state_boundary import StateAccess, StateDataflow, TensorField
 from megatron.core.transformer.stateful_module import StatefulGraphs, StatefulModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -36,6 +36,17 @@ FIELDS = (
     TensorField("memory", (8, 2), torch.float32, "contiguous", True),
     TensorField("ids", (8,), torch.int64, "contiguous", False),
 )
+_BY_KEY = {field.key: field for field in FIELDS}
+
+
+def _fields(keys):
+    return tuple(_BY_KEY[key] for key in keys)
+
+
+def _dataflow(total):
+    """The first layer writes both fields; every later layer only reads them."""
+    keys = tuple(_BY_KEY)
+    return StateDataflow((StateAccess(writes=keys), *[StateAccess(reads=keys)] * (total - 1)))
 
 
 class _Region(nn.Module):
@@ -66,8 +77,11 @@ class _Stage(nn.Module):
         super().__init__()
         self.config, self.index, self.total = config, index, total
         self.mode, self.microbatches = mode, microbatches
+        self.flow = _dataflow(total)
+        access = self.flow.layers[index]
+        # Later stages only read, so graphs capture no state output for them.
         self.region = StatefulModule(
-            _Region(index, cp), () if index == 0 else FIELDS, () if index == total - 1 else FIELDS
+            _Region(index, cp), _fields(access.reads), _fields(access.writes)
         )
         self.input_tensor, self.iteration = None, 0
         self.graphs = None
@@ -96,18 +110,24 @@ class _Stage(nn.Module):
         else:
             hidden, state = self.graphs.run(hidden, state, slot=self.iteration % self.microbatches)
         self.iteration += 1
+        state = self.flow.retire(self.index, state)
         if self.index == self.total - 1:
             return hidden.square().mean()
         return TensorStatePayload.from_state(
-            hidden, state, FIELDS, hidden_field=HIDDEN, boundary_id=f"after:{self.index}"
+            hidden,
+            state,
+            _fields(self.flow.live(self.index + 1)),
+            hidden_field=HIDDEN,
+            boundary_id=f"after:{self.index}",
         )
 
 
 def _plan(stage, count):
-    """Every boundary carries the hidden activation plus both shared fields."""
+    """Each boundary carries the hidden activation plus the fields later layers read."""
 
     def boundary(index):
-        return PipelinePayloadSpec((HIDDEN, *FIELDS), boundary_id=f"after:{index}")
+        fields = _fields(stage.flow.live(index + 1))
+        return PipelinePayloadSpec((HIDDEN, *fields), boundary_id=f"after:{index}")
 
     first, last = stage.index == 0, stage.index == stage.total - 1
     return PipelinePayloadPlan(

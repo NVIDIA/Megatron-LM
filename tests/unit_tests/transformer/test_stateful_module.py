@@ -12,7 +12,7 @@ from torch import nn
 from megatron.core.pipeline_parallel.pipeline_payload import TensorStatePayload
 from megatron.core.tensor_parallel import random as rng
 from megatron.core.transformer import stateful_module
-from megatron.core.transformer.state_boundary import TensorField
+from megatron.core.transformer.state_boundary import StateAccess, StateDataflow, TensorField
 from megatron.core.transformer.stateful_module import StatefulGraphs, StatefulModule
 
 
@@ -83,8 +83,8 @@ def _loss(hidden, state, activity):
 @pytest.mark.parametrize("input_grad", [False, True])
 def test_checkpoint_preserves_parameter_only_and_absent_gradients(activity, input_grad):
     eager, replay = _Branches(), _Branches()
-    a = StatefulModule(eager, output_fields=_fields())
-    b = StatefulModule(replay, output_fields=_fields())
+    a = StatefulModule(eager, writes=_fields())
+    b = StatefulModule(replay, writes=_fields())
     x = torch.randn(4, 1, 8, device="cuda", requires_grad=input_grad)
     y = x.detach().clone().requires_grad_(input_grad)
     h1, s1 = a.run(x, {})
@@ -107,8 +107,9 @@ def test_checkpoint_preserves_parameter_only_and_absent_gradients(activity, inpu
 
 @pytest.mark.parametrize("recompute", [False, True])
 def test_two_pending_forwards_accumulate_shared_producer_gradients(recompute):
-    producer = StatefulModule(_Branches(), output_fields=_fields())
-    consumer = StatefulModule(_Consumer(), _fields(), _fields())
+    producer = StatefulModule(_Branches(), writes=_fields())
+    # A reader leaves the producer's tensors in the caller's mapping for the next reader.
+    consumer = StatefulModule(_Consumer(), reads=_fields())
     reference_producer, reference_consumer = deepcopy(producer), deepcopy(consumer)
     pending, expected = [], []
     for _ in range(2):
@@ -166,7 +167,7 @@ def test_checkpoint_replays_model_parallel_rng_and_restores_tracker(
 
     tracker.add(rng._MODEL_PARALLEL_RNG_TRACKER_NAME, 91)
     initial = snapshot(tracker.get_states())
-    region = StatefulModule(_RngRegion(), output_fields=(_fields()[0],))
+    region = StatefulModule(_RngRegion(), writes=(_fields()[0],))
     x = torch.ones(4, 1, 8, device="cuda", requires_grad=True)
     y = x.detach().clone().requires_grad_()
     h1, s1 = region.run(x, {})
@@ -190,7 +191,7 @@ def test_checkpoint_replays_model_parallel_rng_and_restores_tracker(
 def test_real_graph_slots_preserve_two_outstanding_microbatches(backend, dtype):
     if backend == "transformer_engine":
         pytest.importorskip("transformer_engine.pytorch")
-    reference = StatefulModule(_Branches(dtype), output_fields=_fields(dtype))
+    reference = StatefulModule(_Branches(dtype), writes=_fields(dtype))
     actual = deepcopy(reference)
     sample = torch.randn(4, 1, 8, device="cuda", dtype=dtype, requires_grad=True)
     graphs = StatefulGraphs(actual, sample, {}, slots=2, backend=backend)
@@ -222,7 +223,7 @@ def test_real_graph_slots_preserve_two_outstanding_microbatches(backend, dtype):
 
 
 def test_graph_rejects_changed_profile_and_unused_differentiable_output():
-    region = StatefulModule(_Branches(), output_fields=_fields())
+    region = StatefulModule(_Branches(), writes=_fields())
     x = torch.randn(4, 1, 8, device="cuda", requires_grad=True)
     graphs = StatefulGraphs(region, x, {})
     with pytest.raises(ValueError, match="profile"):
@@ -273,7 +274,7 @@ def test_graph_float_output_without_gradient_needs_no_backward(backend):
     if backend == "transformer_engine":
         pytest.importorskip("transformer_engine.pytorch")
     norm = TensorField("norm", (4, 1, 1), torch.float32, "contiguous", False)
-    reference = StatefulModule(_Ignores(), output_fields=(norm,))
+    reference = StatefulModule(_Ignores(), writes=(norm,))
     region = deepcopy(reference)
     sample = torch.randn(4, 1, 8, device="cuda", requires_grad=True)
     graphs = StatefulGraphs(region, sample, {}, backend=backend)
@@ -300,7 +301,7 @@ def test_graph_slot_reuse_accumulates_parameter_gradients(backend):
     """A .grad must not keep the static buffer that the slot's next backward rewrites."""
     if backend == "transformer_engine":
         pytest.importorskip("transformer_engine.pytorch")
-    reference = StatefulModule(_Branches(), output_fields=_fields())
+    reference = StatefulModule(_Branches(), writes=_fields())
     region = deepcopy(reference)
     sample = torch.randn(4, 1, 8, device="cuda", requires_grad=True)
     graphs = StatefulGraphs(region, sample, {}, backend=backend)
@@ -323,7 +324,7 @@ def test_te_graph_rejects_legacy_rng_before_capture_and_recovers(te_rng_tracker)
     from transformer_engine.pytorch import graph as te_graph
     from transformer_engine.pytorch.distributed import get_all_rng_states, set_all_rng_states
 
-    region = StatefulModule(_Branches(), output_fields=_fields())
+    region = StatefulModule(_Branches(), writes=_fields())
     sample = torch.randn(4, 1, 8, device="cuda", requires_grad=True)
     original_call = StatefulModule.__call__
     registered = get_all_rng_states()
@@ -371,17 +372,133 @@ def test_schema_payload_roundtrip_preserves_aliases_and_optional_fields():
         StatefulModule(nn.Identity(), [fields[0], fields[0]])
 
 
-def test_last_consumer_retires_inputs_without_dropping_another_components_state():
-    producer = StatefulModule(_Branches(), output_fields=_fields())
-    consumer = StatefulModule(_Consumer(), _fields())
+def test_dataflow_follows_each_value_from_its_writer_to_its_last_reader():
+    layers = [StateAccess()] * 10
+    layers[2] = StateAccess(writes=("kv2", "ids"))
+    layers[5] = StateAccess(reads=("kv2", "ids"), writes=("kv5",))
+    layers[7] = StateAccess(reads=("kv2", "ids"))
+    layers[8] = StateAccess(reads=("kv5",))
+    flow = StateDataflow(layers)
+    shared = ("kv2", "ids")
+    assert [flow.live(b) for b in range(11)] == [
+        *[()] * 3,
+        *[shared] * 3,
+        *[(*shared, "kv5")] * 2,
+        ("kv5",),
+        *[()] * 2,
+    ]
+    assert flow.retired_after(5) == () and flow.retired_after(6) == ()
+    assert flow.retired_after(7) == shared and flow.retired_after(8) == ("kv5",)
+
+    # Reading and writing a key replaces it; inputs and outputs bracket the layers.
+    flow = StateDataflow(
+        (
+            StateAccess(reads=("mix",), writes=("mix",)),
+            StateAccess(reads=("mix", "tokens"), writes=("mix", "loss")),
+        ),
+        inputs=("tokens", "mix"),
+        outputs=("mix", "loss"),
+    )
+    assert [flow.live(b) for b in range(3)] == [("tokens", "mix")] * 2 + [("mix", "loss")]
+    assert flow.retired_after(0) == () and flow.retired_after(1) == ("tokens",)
+
+
+@pytest.mark.parametrize(
+    "layers, options, message",
+    [
+        ((StateAccess(reads=("kv",)),), {}, "Layer 0 reads 'kv' before"),
+        ((StateAccess(writes=("kv",)),), {}, "Layer 0's write of 'kv' is never read"),
+        (
+            (StateAccess(writes=("kv",)), StateAccess(writes=("kv",)), StateAccess(reads=("kv",))),
+            {},
+            "Layer 0's write of 'kv' is never read",
+        ),
+        ((StateAccess(),), {"inputs": ("tokens",)}, "Input 'tokens' is never read"),
+        ((StateAccess(),), {"outputs": ("loss",)}, "never written"),
+        ((StateAccess(),), {"inputs": ("a", "a")}, "unique"),
+    ],
+)
+def test_dataflow_rejects_unordered_or_unused_values(layers, options, message):
+    with pytest.raises(ValueError, match=message):
+        StateDataflow(layers, **options)
+
+
+def test_state_access_and_boundary_validation():
+    with pytest.raises(ValueError, match="twice"):
+        StateAccess(reads=("kv", "kv"))
+    with pytest.raises(ValueError, match="tuple of strings"):
+        StateAccess(writes=["kv"])
+    with pytest.raises(ValueError, match="outside"):
+        StateDataflow((StateAccess(),)).live(2)
+
+
+def test_reader_keeps_fields_until_the_dataflow_retires_them():
+    flow = StateDataflow(
+        (
+            StateAccess(writes=("memory", "ids")),
+            StateAccess(reads=("memory",)),
+            StateAccess(reads=("memory", "ids")),
+        )
+    )
+    producer = StatefulModule(_Branches(), writes=_fields()[:2])
+    reader = StatefulModule(_Consumer(), reads=_fields()[:1])
+    last = StatefulModule(_Consumer(), reads=_fields()[:2])
     x = torch.randn(4, 1, 8, device="cuda", requires_grad=True)
     peer = torch.ones(1, device="cuda")
     hidden, state = producer.run(x, {"peer/metadata": peer})
-    output, remaining = consumer.run(hidden, state, recompute=True)
+    state = flow.retire(0, state)
+    memory = state["memory"]
+    hidden, state = reader.run(hidden, state, recompute=True)
+    # A reader does not republish: the producer's tensor itself stays in the mapping.
+    assert state["memory"] is memory
+    state = flow.retire(1, state)
+    assert set(state) == {"memory", "ids", "peer/metadata"}
+    output, remaining = last.run(hidden, state, recompute=True)
+    remaining = flow.retire(2, remaining)
     assert set(remaining) == {"peer/metadata"} and remaining["peer/metadata"] is peer
-    assert "memory" in state  # The caller's snapshot is not mutated.
+    assert "memory" in state  # The caller's mapping is not mutated.
     output.sum().backward()
     assert producer.module.side.grad is not None
+
+
+@pytest.mark.usefixtures("te_rng_tracker")
+@pytest.mark.parametrize("backend", ["torch", "transformer_engine"])
+def test_graphed_readers_leave_a_shared_field_outside_their_captures(backend):
+    """Two graphed readers of one field match eager without capturing it as an output."""
+    if backend == "transformer_engine":
+        pytest.importorskip("transformer_engine.pytorch")
+    fields = _fields()[:1]
+    producer = StatefulModule(_Branches(), writes=fields)
+    readers = [StatefulModule(_Consumer(), reads=fields) for _ in range(2)]
+    reference = deepcopy([producer, *readers])
+    sample = torch.randn(4, 1, 8, device="cuda", requires_grad=True)
+    sample_state = {"memory": torch.randn_like(sample, requires_grad=True)}
+    graphs = [StatefulGraphs(r, sample, sample_state, backend=backend) for r in readers]
+    try:
+        for _ in range(2):
+            x = torch.randn_like(sample, requires_grad=True)
+            y = x.detach().clone().requires_grad_()
+            hidden, state = producer.run(x, {})
+            memory = state["memory"]
+            for graph in graphs:
+                hidden, state = graph.run(hidden, state)
+                # A captured output would be a new tensor backed by the slot's buffers.
+                assert state["memory"] is memory
+            expected, ref_state = reference[0].run(y, {})
+            for region in reference[1:]:
+                expected, ref_state = region.run(expected, ref_state)
+            torch.testing.assert_close(hidden, expected)
+            # The field gets gradients from both readers; nothing else consumes it.
+            hidden.square().sum().backward()
+            expected.square().sum().backward()
+            torch.testing.assert_close(x.grad, y.grad)
+        for actual, expected_region in zip([producer, *readers], reference):
+            for p, q in zip(actual.parameters(), expected_region.parameters()):
+                torch.testing.assert_close(p.grad, q.grad)
+        del hidden, state, memory, expected, ref_state
+    finally:
+        for graph in graphs:
+            graph.close()
 
 
 @pytest.mark.usefixtures("te_rng_tracker")
@@ -408,7 +525,7 @@ def test_graph_with_real_te_normalized_projection_and_shared_output(backend, dty
             return output, {"memory": normalized}
 
     fields = (TensorField("memory", (4, 2, 16), dtype, "contiguous", True),)
-    actual = StatefulModule(Region(), output_fields=fields)
+    actual = StatefulModule(Region(), writes=fields)
     expected = deepcopy(actual)
     x = torch.randn(4, 2, 16, device="cuda", dtype=dtype, requires_grad=True)
     y = x.detach().clone().requires_grad_()
@@ -430,7 +547,7 @@ def test_graph_with_real_te_normalized_projection_and_shared_output(backend, dty
 @pytest.mark.parametrize("backend", ["torch", "transformer_engine"])
 @pytest.mark.parametrize("mode", ["no_grad", "frozen"])
 def test_graph_outputs_survive_forward_only_slot_reuse(backend, mode):
-    region = StatefulModule(_Branches(), output_fields=_fields())
+    region = StatefulModule(_Branches(), writes=_fields())
     if mode == "frozen":
         region.requires_grad_(False)
     sample = torch.ones(4, 1, 8, device="cuda", requires_grad=mode != "frozen")
@@ -461,7 +578,7 @@ def test_graph_outputs_survive_forward_only_slot_reuse(backend, mode):
 @pytest.mark.usefixtures("te_rng_tracker")
 @pytest.mark.parametrize("backend", ["torch", "transformer_engine"])
 def test_abort_rejects_old_backward_without_retiring_new_invocation(backend):
-    region = StatefulModule(_Branches(), output_fields=_fields())
+    region = StatefulModule(_Branches(), writes=_fields())
     sample = torch.ones(4, 1, 8, device="cuda", requires_grad=True)
     graphs = StatefulGraphs(region, sample, {}, backend=backend)
     old, old_state = graphs.run(sample, {})
@@ -479,7 +596,7 @@ def test_abort_rejects_old_backward_without_retiring_new_invocation(backend):
 
 @pytest.mark.parametrize("debug_checks", [False, True])
 def test_graph_rejects_a_changed_training_mode(debug_checks):
-    region = StatefulModule(_Branches(), output_fields=_fields())
+    region = StatefulModule(_Branches(), writes=_fields())
     sample = torch.ones(4, 1, 8, device="cuda", requires_grad=True)
     graphs = StatefulGraphs(region, sample, {}, debug_checks=debug_checks)
     # model.eval() reaches the registered module, never the graphs' slot wrappers.
@@ -523,7 +640,7 @@ def test_capture_failure_restores_process_settings(backend):
 
 
 def test_recompute_uses_checkpoint_fn_and_rejects_default_checkpoint_under_fp8(monkeypatch):
-    region = StatefulModule(_Branches(), output_fields=_fields())
+    region = StatefulModule(_Branches(), writes=_fields())
     x = torch.ones(4, 1, 8, device="cuda", requires_grad=True)
     calls = []
 

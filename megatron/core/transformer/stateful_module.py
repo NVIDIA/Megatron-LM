@@ -3,9 +3,10 @@
 """Tensor-only execution boundaries for modules sharing differentiable state.
 
 A region implements ``forward(hidden, state) -> (hidden, state)``. State is a
-fresh mapping for each invocation. Only declared fields cross the region; model
-code owns their meaning, while eager, checkpoint and graph execution use the
-same tensor signature. The module never retains a forward's state mapping.
+fresh mapping for each invocation. Only the fields a region reads enter it, and
+only the fields it writes leave it; model code owns their meaning, while eager,
+checkpoint and graph execution use the same tensor signature. The module never
+retains a forward's state mapping.
 """
 
 import gc
@@ -25,31 +26,34 @@ from megatron.core.transformer.state_boundary import TensorField, TensorSchema
 class StatefulModule(nn.Module):
     """Expose a stateful region as a tuple of ordinary autograd tensors.
 
-    Schemas describe one shape/layout profile. A caller can construct another
-    adapter over the same module for a different profile without copying weights.
-    Input and output fields can differ, including relayed inputs and absent slots.
-    Names shared between independent components must have an explicit owner.
+    ``reads`` enter the region and ``writes`` leave it; a key in both replaces the
+    value read. A field the region only reads stays in the caller's mapping and is
+    never an output of its checkpoint or graph; the caller retires it after its last
+    reader (see ``StateDataflow``). Fields describe one shape/layout profile. A
+    caller can construct another adapter over the same module for a different
+    profile without copying weights. Names shared between independent components
+    must have an explicit owner.
     """
 
     def __init__(
         self,
         module: nn.Module,
-        input_fields: Sequence[TensorField] = (),
-        output_fields: Sequence[TensorField] = (),
+        reads: Sequence[TensorField] = (),
+        writes: Sequence[TensorField] = (),
     ) -> None:
         super().__init__()
         self.module = module
         self.training = module.training
-        self.inputs = TensorSchema(tuple(input_fields))
-        self.outputs = TensorSchema(tuple(output_fields))
+        self.reads = TensorSchema(tuple(reads))
+        self.writes = TensorSchema(tuple(writes))
 
     def forward(self, hidden: Tensor, *values: Tensor) -> tuple[Tensor, ...]:
         """Run from explicit tensors, rebuilding state on checkpoint replay/capture."""
-        state = self.inputs.unpack(values)
+        state = self.reads.unpack(values)
         output, state = self.module(hidden, state)
         if not isinstance(output, Tensor):
             raise TypeError("Stateful regions must return one hidden tensor and a state mapping")
-        return (output, *self.outputs.pack(state))
+        return (output, *self.writes.pack(state))
 
     def run(
         self,
@@ -64,7 +68,7 @@ class StatefulModule(nn.Module):
         ``checkpoint_fn(region, *tensors)`` replaces the default non-reentrant
         checkpoint, e.g. with an FP8-aware ``te_checkpoint`` for quantized regions.
         """
-        args = (hidden, *self.inputs.pack(state))
+        args = (hidden, *self.reads.pack(state))
         if recompute and torch.is_grad_enabled():
             if hidden.is_cuda and torch.cuda.is_current_stream_capturing():
                 raise ValueError("Stateful full recomputation cannot be nested in CUDA capture")
@@ -81,11 +85,9 @@ class StatefulModule(nn.Module):
         return self.restore_result(result, state)
 
     def restore_result(self, result, state):
-        """Publish live outputs and retire consumed inputs, preserving unrelated components."""
+        """Publish the writes into a fresh mapping; read and unrelated fields remain."""
         updated = dict(state)
-        for field in self.inputs.fields:
-            updated.pop(field.key, None)
-        updated.update(self.outputs.unpack(result[1:]))
+        updated.update(self.writes.unpack(result[1:]))
         return result[0], updated
 
 
@@ -177,7 +179,8 @@ class _GraphOutputs(torch.autograd.Function):
         if any(active and grad is None for active, grad in zip(ctx.active, grads)):
             raise RuntimeError(
                 "Every differentiable captured output must participate in backward; "
-                "use a separate output schema/capture profile for an unused state branch"
+                "declare a field the region only reads in reads, not writes, and "
+                "capture a separate profile for an unused state branch"
             )
         # Releasing before the nested captured backward runs would let a new
         # microbatch overwrite its buffers. Retire the slot at engine completion.
@@ -199,7 +202,7 @@ class StatefulGraphs:
 
     Each slot has its own graph memory pool and retains no caller state mapping.
     Graphs share model parameters. Input shapes, dtype, strides, gradient activity
-    and training mode match capture; all differentiable outputs must be consumed.
+    and training mode match capture; all differentiable writes must be consumed.
     State fields whose backward activity can change require distinct capture profiles.
     """
 
@@ -248,10 +251,10 @@ class StatefulGraphs:
         # so every replay compares the live module tree with the captured mode.
         self._modules = tuple(region.module.modules())
         self._modes = tuple(module.training for module in self._modules)
-        samples = (hidden, *region.inputs.pack(state))
+        samples = (hidden, *region.reads.pack(state))
         self._signature = tuple(self._tensor_signature(t) for t in samples)
         # Backends mark every floating replay output differentiable; the schema decides.
-        self._eligible = (True, *(f.differentiable for f in region.outputs.packed_fields))
+        self._eligible = (True, *(f.differentiable for f in region.writes.packed_fields))
         self._busy = [False] * slots
         self._generation = [0] * slots
         self._fused_grad_params = []
@@ -267,7 +270,7 @@ class StatefulGraphs:
             for hook, module in self._manual_forward_hooks:
                 hook(module)
         for _ in range(slots):
-            wrapper = StatefulModule(region.module, region.inputs.fields, region.outputs.fields)
+            wrapper = StatefulModule(region.module, region.reads.fields, region.writes.fields)
             wrapper.training = region.training
             self._wrappers.append(wrapper)
             args = tuple(t.detach().clone().requires_grad_(t.requires_grad) for t in samples)
@@ -426,14 +429,14 @@ class StatefulGraphs:
     def run(
         self, hidden: Tensor, state: Mapping[str, Tensor | None], *, slot: int = 0
     ) -> tuple[Tensor, dict[str, Tensor | None]]:
-        """Replay one reserved slot and publish its side outputs into a fresh mapping."""
+        """Replay one reserved slot and publish its writes into a fresh mapping."""
         if not 0 <= slot < len(self._callables) or self._busy[slot]:
             raise RuntimeError("Graph slot is invalid or still belongs to an outstanding backward")
         if tuple(module.training for module in self._modules) != self._modes:
             raise ValueError("Stateful graph training mode differs from capture")
         if self.debug_checks:
             self.validate_module()
-        args = (hidden, *self.region.inputs.pack(state))
+        args = (hidden, *self.region.reads.pack(state))
         if tuple(self._tensor_signature(t) for t in args) != self._signature:
             raise ValueError("Stateful graph input profile differs from capture")
         if self._recorded[slot]:
