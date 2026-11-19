@@ -21,6 +21,7 @@ from megatron.core.distributed.torch_fully_sharded_data_parallel_config import (
 )
 from megatron.core.msc_utils import maybe_msc
 from megatron.core.num_microbatches_calculator import (
+    StepBatchsizeNumMicroBatchesCalculator,
     get_current_global_batch_size,
     update_num_microbatches,
 )
@@ -414,8 +415,38 @@ class PretrainConfigContainer(ConfigContainerBase):
         # scheduler (get_optimizer_param_scheduler) is what requires one.
         if self.train.train_iters is None and self.train.train_samples is None:
             return
+        # Iteration-based training with a step batch size schedule.
+        if self.train.train_iters and self.train.step_batch_size_schedule is not None:
+            if self.scheduler.lr_decay_iters is None:
+                self.scheduler.lr_decay_iters = self.train.train_iters
+            # Each step advances the scheduler by the scheduled global batch size, so convert
+            # iteration counts into the samples the schedule consumes over those iterations.
+            # finalize() runs before the global calculator exists, so walk a private one.
+            calculator = _build_step_batch_size_calculator(self.train)
+            self.scheduler.lr_decay_steps = _get_samples_for_iterations(
+                calculator, self.scheduler.lr_decay_iters
+            )
+            self.scheduler.wd_incr_steps = _get_samples_for_iterations(
+                calculator, self.train.train_iters
+            )
+            self.scheduler.wsd_decay_steps = None
+            if self.scheduler.lr_wsd_decay_iters is not None:
+                # The WSD anneal covers the last lr_wsd_decay_iters iterations of the decay.
+                anneal_start_samples = _get_samples_for_iterations(
+                    calculator, self.scheduler.lr_decay_iters - self.scheduler.lr_wsd_decay_iters
+                )
+                self.scheduler.wsd_decay_steps = (
+                    self.scheduler.lr_decay_steps - anneal_start_samples
+                )
+            if self.scheduler.lr_warmup_fraction is not None:
+                lr_warmup_iters = self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_iters
+            else:
+                lr_warmup_iters = self.scheduler.lr_warmup_iters
+            self.scheduler.lr_warmup_steps = _get_samples_for_iterations(
+                calculator, lr_warmup_iters
+            )
         # Iteration-based training.
-        if self.train.train_iters:
+        elif self.train.train_iters:
             if self.scheduler.lr_decay_iters is None:
                 self.scheduler.lr_decay_iters = self.train.train_iters
             self.scheduler.lr_decay_steps = self.scheduler.lr_decay_iters * self.train.global_batch_size
@@ -851,6 +882,51 @@ class PretrainConfigContainer(ConfigContainerBase):
         if self.rl.requires_grad_buffer_offload:
             self.ddp.grad_buffer_offload = True
         self.ddp.finalize()
+
+
+def _build_step_batch_size_calculator(
+    train: TrainingConfig,
+) -> StepBatchsizeNumMicroBatchesCalculator:
+    """Build a private calculator for ``train.step_batch_size_schedule``.
+
+    ``finalize()`` runs before ``initialize_training_runtime_services`` creates the global
+    calculator. This one takes the same inputs.
+    """
+    from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
+
+    # Imported lazily: megatron.training imports megatron.training.config.
+    from megatron.training import get_args
+
+    args = get_args()
+    return StepBatchsizeNumMicroBatchesCalculator(
+        micro_batch_size=train.micro_batch_size,
+        data_parallel_size=get_batch_parallel_size(args),
+        decrease_batch_size_if_needed=train.decrease_batch_size_if_needed,
+        # Rank 0 logs the schedule. The global calculator does that at startup.
+        rank=-1,
+        schedule=train.step_batch_size_schedule,
+        seq_length=args.seq_length,
+    )
+
+
+def _get_samples_for_iterations(
+    calculator: StepBatchsizeNumMicroBatchesCalculator, num_iterations: float
+) -> float:
+    """Return the samples consumed by the first ``num_iterations`` training iterations.
+
+    Walks ``calculator`` the way the training loop advances the global one. The fractional
+    part of ``num_iterations`` uses the next iteration's batch and a negative count uses the
+    first batch, so a one-entry schedule gives ``num_iterations * global_batch_size``.
+    """
+    full_iterations = max(int(num_iterations), 0)
+    consumed_samples = 0
+    for _ in range(full_iterations):
+        calculator.update(consumed_samples, consistency_check=False)
+        consumed_samples += calculator.get_current_global_batch_size()
+    calculator.update(consumed_samples, consistency_check=False)
+    next_batch_size = calculator.get_current_global_batch_size()
+    consumed_samples += (num_iterations - full_iterations) * next_batch_size
+    return consumed_samples
 
 
 def update_train_iters(train: TrainingConfig) -> None:
