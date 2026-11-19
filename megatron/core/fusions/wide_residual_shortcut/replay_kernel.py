@@ -264,8 +264,7 @@ def _column_inputs(checkpoint, tapes, requested, columns):
         ):
             raise ValueError("column entries must match requested transitions and readers")
     buffers = tuple(operand_buffers(per_tape, columnwise=True) for per_tape in columns)
-    data = tuple(tuple(d) for d, _ in buffers)
-    scales = tuple(tuple(q) for _, q in buffers)
+    data, scales = zip(*buffers)  # per tape, per reader
     for needs, ds, qs in zip(requested, data, scales):
         for need, d, q in zip(needs, ds, qs):
             if need and (
@@ -292,7 +291,7 @@ def _launch_columns(checkpoint, tapes, outputs, data, scales, requested, termina
     m, h = tapes[0].update.shape
     readers = tuple(tuple(r for r, need in enumerate(needs) if need) for needs in requested)
     first, flat = [], []  # per tape its first emitted operand; (tape, reader) per operand
-    for tape, (index, emitted) in zip(tapes, enumerate(readers)):
+    for index, emitted in enumerate(readers):
         first.append(len(flat))
         flat.extend((index, r) for r in emitted)
     vector, threads, warps, maxnreg, ahead = _MX_SCHEDULES[checkpoint.dtype]
