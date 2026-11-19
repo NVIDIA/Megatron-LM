@@ -53,6 +53,7 @@ from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelpe
 from megatron.core.utils import get_pg_size
 from megatron.rl import rl_utils, training_setup
 from megatron.rl.agent.api import Rollout, RolloutGroup, TokenRollout
+from megatron.rl.config import add_rl_args, unset_rl_run_config
 from megatron.rl.inference import ReturnsRaw
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 from megatron.training.argument_utils import (
@@ -61,7 +62,14 @@ from megatron.training.argument_utils import (
 )
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.callbacks import CallbackContext
-from megatron.training.config import RLConfig
+from megatron.training.config import (
+    AlgorithmConfigContainer,
+    CheckpointConfig,
+    InferenceConfigContainer,
+    InferenceSetupConfig,
+    RLConfig,
+    RootConfigContainer,
+)
 from megatron.training.config.training_config import TokenizerConfig
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from megatron.training.state import TrainState
@@ -73,19 +81,37 @@ SEQ = 4
 VOCAB = 768
 
 
+def _rl_run_config(args, pretrain):
+    """The root container of a colocated RL run whose engine shares the training model."""
+    return RootConfigContainer(
+        training=pretrain,
+        inference=InferenceConfigContainer(
+            model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
+        ),
+        algorithm=AlgorithmConfigContainer(rl=_default_config_from_args(RLConfig, args)),
+    )
+
+
 def test_disagg_refit_reads_migrated_rl_config(monkeypatch):
-    """Refit uses RLConfig while shard layout remains a launch argument."""
+    """Refit reads the RL section and the shard layout of the rollout deployment."""
     rl_config = RLConfig(refit_method="nccl", refit_execution_batch_bytes=4096)
-    monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=rl_config))
-    args = SimpleNamespace(inference_shards="tp=1,role=prefill+tp=1,role=decode", world_size=2)
+    monkeypatch.setattr(rl_utils, "get_rl_config", lambda: rl_config)
+    args = SimpleNamespace(world_size=2)
+    shards = "tp=1,role=prefill+tp=1,role=decode"
+    deployment = SimpleNamespace(inference=SimpleNamespace(inference_shards=shards))
     model, inference_model = object(), object()
     with (
         patch.object(rl_utils, "disagg_refit_pools", return_value=(2, 1)) as pools,
         patch.object(rl_utils, "prepare_swap_model_weights") as prepare,
         patch.object(rl_utils, "swap_model_weights") as swap,
     ):
-        assert rl_utils.refit_inference_model(model, inference_model, args) == 2
-    pools.assert_called_once_with(args.inference_shards, args.world_size)
+        assert (
+            rl_utils.refit_inference_model(
+                model, inference_model, args, inference_container=deployment
+            )
+            == 2
+        )
+    pools.assert_called_once_with(shards, args.world_size)
     prepare.assert_called_once_with(
         src_model=model,
         target_model=inference_model,
@@ -121,13 +147,15 @@ def test_setup_callback(monkeypatch, skip_train, rollout_only, optimizer):
     calls = []
     args = SimpleNamespace()
     run_config = SimpleNamespace(validation=SimpleNamespace(skip_train=skip_train))
+    rl_config = SimpleNamespace(rl_rollout_only=rollout_only)
     monkeypatch.setattr(training_setup, "get_args", lambda: args)
     monkeypatch.setattr(training_setup, "get_run_config", lambda: run_config)
+    monkeypatch.setattr(training_setup, "get_rl_config", lambda: rl_config)
     monkeypatch.setattr(training_setup, "get_model_config", lambda chunk: f"config({chunk})")
     monkeypatch.setattr(training_setup.mpu, "get_data_parallel_world_size", lambda: 4)
     monkeypatch.setattr(
         training_setup,
-        "build_rl_inference_model",
+        "build_rollout_inference_model",
         lambda *a: calls.append(("inference", a)) or "inference_model",
     )
     monkeypatch.setattr(
@@ -140,15 +168,19 @@ def test_setup_callback(monkeypatch, skip_train, rollout_only, optimizer):
         "reinitialize_grpo_microbatch_calculator",
         lambda *a: calls.append(("mb", a)),
     )
-    cfg = RLConfig(rl_rollout_only=rollout_only)
-    callback = training_setup.RLSetupCallback(cfg, model_provider="provider", model_type="type")
+    deployment = InferenceConfigContainer(
+        model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
+    )
+    callback = training_setup.RLSetupCallback(
+        deployment, model_provider="provider", model_type="type"
+    )
 
     callback.on_data_init_start(
         CallbackContext(model=["chunk"], optimizer=optimizer, checkpointing_context={"ckpt": 1})
     )
 
     loop_runs = not skip_train
-    expected = [("inference", (cfg, args, "config(chunk)", "provider", "type"))]
+    expected = [("inference", (deployment, args, "config(chunk)", "provider", "type"))]
     if loop_runs:
         expected += [
             ("ref", (["chunk"], {"ckpt": 1}, args), {"rollout_only": rollout_only}),
@@ -198,6 +230,7 @@ def test_next_rollout_iterator_forwards_the_grpo_schedule(
         ref_state_dict={"ref": 1},
         rl_config=rl_config,
         train_config=SimpleNamespace(global_batch_size=12),
+        inference_container="deployment",
     )
 
     assert result == "iterator"
@@ -212,6 +245,7 @@ def test_next_rollout_iterator_forwards_the_grpo_schedule(
         buffered_rollouts="buffer",
         is_correction=correction,
         optimizer_is_on_cpu=offload,
+        inference_container="deployment",
     )
     assert empty_cache.called is (optimizer is None)
 
@@ -233,7 +267,11 @@ def test_evaluate_rollouts_refits_before_scoring(monkeypatch, separate):
         lambda core, *, to_cpu: calls.append(("prefetch", core, to_cpu)),
     )
     monkeypatch.setattr(
-        rl_utils, "refit_inference_model", lambda m, im, a: calls.append(("refit", m, im, a))
+        rl_utils,
+        "refit_inference_model",
+        lambda m, im, a, *, inference_container: calls.append(
+            ("refit", m, im, a, inference_container)
+        ),
     )
 
     def evaluate(*args, **kwargs):
@@ -246,18 +284,23 @@ def test_evaluate_rollouts_refits_before_scoring(monkeypatch, separate):
         model=["train"],
         inference_model=["inf"] if separate else None,
         optimizer="optimizer",
+        inference_container="deployment",
         prefix="iteration 3 on validation set",
         iteration=3,
         verbose=True,
         write_to_tensorboard=False,
     )
 
-    eval_kwargs = {"write_to_tensorboard": False, "training_model": ["train"] if separate else None}
+    eval_kwargs = {
+        "write_to_tensorboard": False,
+        "training_model": ["train"] if separate else None,
+        "inference_container": "deployment",
+    }
     if separate:
         assert calls == [
             ("unwrap", "inf"),
             ("prefetch", inf_core, False),
-            ("refit", ["train"], ["inf"], "args"),
+            ("refit", ["train"], ["inf"], "args", "deployment"),
             ("eval", (["inf"], "optimizer", 3), eval_kwargs),
         ]
     else:
@@ -521,6 +564,7 @@ class TestRLUtils:
     def create_test_args(self, **kwargs):
         destroy_global_vars()
         destroy_num_microbatches_calculator()
+        unset_rl_run_config()
 
         args = parse_args(ignore_unknown_args=True)
         args.num_layers = 8
@@ -537,9 +581,9 @@ class TestRLUtils:
             setattr(args, key, value)
 
         args = validate_args(args)
-        cfg = pretrain_cfg_container_from_args(args)
-        cfg.tokenizer = TokenizerConfig(vocab_size=VOCAB)
-        set_global_variables(args, cfg, build_tokenizer=False)
+        pretrain = pretrain_cfg_container_from_args(args)
+        pretrain.tokenizer = TokenizerConfig(vocab_size=VOCAB)
+        set_global_variables(args, _rl_run_config(args, pretrain), build_tokenizer=False)
         return args
 
     @pytest.mark.parametrize(
@@ -591,8 +635,8 @@ class TestRLUtils:
         assert cfg.rl_submission_granularity == "B"
         assert cfg.rl_consumption_granularity == "B"
         assert cfg.rl_generation_lag == 0
-        # The derived lag lives on the section; validate_args leaves the parsed flag untouched.
-        assert args.rl_generation_lag is None
+        # The derived lag lives on the section; RL flags are not on the global parser.
+        assert not hasattr(args, "rl_generation_lag")
         assert not hasattr(args, "grpo_samples_per_iteration")
         assert not hasattr(args, "rl_parallel_generation_tasks")
 
@@ -697,7 +741,7 @@ class TestRLUtils:
         monkeypatch.setattr(rl_utils, "get_asyncio_loop", lambda: loop)
         monkeypatch.setattr(rl_utils, "get_args", lambda: SimpleNamespace())
         monkeypatch.setattr(rl_utils, "get_train_state", lambda: train_state)
-        monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=RLConfig()))
+        monkeypatch.setattr(rl_utils, "get_rl_config", lambda: RLConfig())
         monkeypatch.setattr(
             rl_utils, "get_nvtx_range", lambda: lambda *args, **kwargs: nullcontext()
         )
@@ -717,6 +761,7 @@ class TestRLUtils:
                     n_prompts=n_prompts,
                     samples_per_group=1,
                     run_inference=not skip,
+                    inference_container=MagicMock(),
                 )
             assert rollouts == fake_groups
             assert fresh_ledger == {}
@@ -781,16 +826,17 @@ class TestRLUtils:
             rl_offload_optimizer_during_inference=True,
             rl_training_cuda_graphs=False,
         )
-        cfg = pretrain_cfg_container_from_args(args)
-        assert not cfg.ddp.grad_buffer_offload
-        cfg.rl.rl_offload_optimizer_during_inference = False
-        cfg.validate()
-        assert not cfg.ddp.grad_buffer_offload
-        cfg.rl.rl_offload_optimizer_during_inference = True
-        cfg.validate()
-        assert not cfg.ddp.grad_buffer_offload
-        cfg.finalize()
-        assert cfg.ddp.grad_buffer_offload
+        pretrain = pretrain_cfg_container_from_args(args)
+        rl_run = _rl_run_config(args, pretrain)
+        assert not pretrain.ddp.grad_buffer_offload
+        rl_run.algorithm.rl.rl_offload_optimizer_during_inference = False
+        rl_run.validate()
+        assert not pretrain.ddp.grad_buffer_offload
+        rl_run.algorithm.rl.rl_offload_optimizer_during_inference = True
+        rl_run.validate()
+        assert not pretrain.ddp.grad_buffer_offload
+        rl_run.finalize()
+        assert pretrain.ddp.grad_buffer_offload
 
     def test_rl_optimizer_offload_rejects_mxfp8_grad_buffer_aliasing(self):
         args = self.create_test_args(
@@ -802,12 +848,13 @@ class TestRLUtils:
             fp8="hybrid",
             fp8_recipe="mxfp8",
         )
-        cfg = pretrain_cfg_container_from_args(args)
+        pretrain = pretrain_cfg_container_from_args(args)
         # Global setup validates the config, so introduce the invalid combination afterward.
-        cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag = True
+        pretrain.optimizer.reuse_grad_buf_for_mxfp8_param_ag = True
+        rl_run = _rl_run_config(args, pretrain)
         with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
-            cfg.validate()
-        assert not cfg.ddp.grad_buffer_offload
+            rl_run.validate()
+        assert not pretrain.ddp.grad_buffer_offload
 
     @pytest.mark.parametrize(
         "flag", ["--rl-submission-granularity", "--rl-consumption-granularity"]
@@ -815,7 +862,7 @@ class TestRLUtils:
     def test_rl_granularity_choices_reject_unknown_value(self, monkeypatch, flag):
         monkeypatch.setattr("sys.argv", ["test", flag, "X"])
         with pytest.raises(SystemExit):
-            parse_args(ignore_unknown_args=False)
+            parse_args(extra_args_provider=add_rl_args, ignore_unknown_args=False)
 
     def _patch_rl_inference_mode_deps(self, monkeypatch, args, rl_config, *, iteration=0):
         interface = MagicMock()
@@ -826,7 +873,7 @@ class TestRLUtils:
 
         monkeypatch.setattr(rl_utils, "get_args", lambda: args)
         monkeypatch.setattr(rl_utils, "get_train_state", lambda: train_state)
-        monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=rl_config))
+        monkeypatch.setattr(rl_utils, "get_rl_config", lambda: rl_config)
         monkeypatch.setattr(rl_utils, "get_asyncio_loop", lambda: loop)
         monkeypatch.setattr(
             rl_utils, "get_nvtx_range", lambda: (lambda *args, **kwargs: nullcontext())
@@ -917,7 +964,12 @@ class TestRLUtils:
         optimizer = MagicMock() if has_optimizer else None
         training_refs = cached_embedding_refs()
         with rl_utils.megatron_rl_inference_mode(
-            model, optimizer, "local", False, training_model=training_model
+            model,
+            optimizer,
+            "local",
+            False,
+            training_model=training_model,
+            inference_container=MagicMock(),
         ) as result:
             assert result is interface
             assert all(ref() is None for ref in training_refs)
@@ -975,7 +1027,7 @@ class TestRLUtils:
 
         monkeypatch.setattr(rl_utils, "get_args", lambda: args)
         monkeypatch.setattr(rl_utils, "get_train_state", lambda: train_state)
-        monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=rl_config))
+        monkeypatch.setattr(rl_utils, "get_rl_config", lambda: rl_config)
         monkeypatch.setattr(
             rl_utils, "megatron_rl_inference_mode", lambda *_a, **_k: nullcontext(MagicMock())
         )
@@ -997,7 +1049,11 @@ class TestRLUtils:
         )
 
         rl_utils.evaluate_and_print_results_rl(
-            model=[MagicMock()], optimizer=MagicMock(), iteration=7, write_to_tensorboard=False
+            model=[MagicMock()],
+            optimizer=MagicMock(),
+            iteration=7,
+            write_to_tensorboard=False,
+            inference_container=MagicMock(),
         )
 
         if do_train:
@@ -1045,7 +1101,7 @@ class TestRLUtils:
         layer_config = config if share_config else SimpleNamespace(flash_decode=True)
         model = DummyLogprobsModel(config, layer_config)
         monkeypatch.setattr(rl_utils, "get_args", lambda: SimpleNamespace(fp16=False, bf16=False))
-        monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=RLConfig()))
+        monkeypatch.setattr(rl_utils, "get_rl_config", lambda: RLConfig())
         monkeypatch.setattr(
             rl_utils, "get_nvtx_range", lambda: (lambda *args, **kwargs: nullcontext())
         )
@@ -1376,9 +1432,13 @@ class TestRLUtils:
         monkeypatch.setattr(train_rl, "is_pipeline_last_stage", lambda: True)
         monkeypatch.setattr(train_rl, "get_logprobs", lambda *a, **k: values)
         monkeypatch.setattr(train_rl, "calculate_grpo_loss", lambda **k: (values,) * 6)
-        run_config.rl.rl_use_sequence_packing = packing
+        # The loss function reads the rerun flags through the pretrain run config (the fixture);
+        # forward_step reads the RL section through the root container.
         run_config.rerun_state_machine.check_for_nan_in_loss = False
         monkeypatch.setattr(train_rl, "get_args", SimpleNamespace)
+        monkeypatch.setattr(
+            train_rl, "get_rl_config", lambda: RLConfig(rl_use_sequence_packing=packing)
+        )
         if packing:
             seq_indices = [11, 12, 13, 14, 15]
             monkeypatch.setattr(

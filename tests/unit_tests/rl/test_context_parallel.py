@@ -9,9 +9,21 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.rl import rl_utils
+from megatron.rl.config import unset_rl_run_config
 from megatron.rl.sequence_packing_utils import SequencePacker, create_packed_seq_params_for_bin
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.argument_utils import (
+    _default_config_from_args,
+    pretrain_cfg_container_from_args,
+)
 from megatron.training.arguments import parse_args, validate_args
+from megatron.training.config import (
+    AlgorithmConfigContainer,
+    CheckpointConfig,
+    InferenceConfigContainer,
+    InferenceSetupConfig,
+    RLConfig,
+    RootConfigContainer,
+)
 from megatron.training.config.training_config import TokenizerConfig
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from tests.unit_tests.test_utilities import Utils
@@ -46,6 +58,7 @@ class PositionWiseModel:
 def _set_minimal_args():
     destroy_global_vars()
     destroy_num_microbatches_calculator()
+    unset_rl_run_config()
     args = parse_args(ignore_unknown_args=True)
     args.num_layers = 8
     args.num_attention_heads = 8
@@ -55,9 +68,19 @@ def _set_minimal_args():
     args.micro_batch_size = 1
     args.wandb_project = None
     args = validate_args(args)
-    cfg = pretrain_cfg_container_from_args(args)
-    cfg.tokenizer = TokenizerConfig(vocab_size=VOCAB)
-    set_global_variables(args, cfg, build_tokenizer=False)
+    pretrain = pretrain_cfg_container_from_args(args)
+    pretrain.tokenizer = TokenizerConfig(vocab_size=VOCAB)
+    set_global_variables(
+        args,
+        RootConfigContainer(
+            training=pretrain,
+            inference=InferenceConfigContainer(
+                model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
+            ),
+            algorithm=AlgorithmConfigContainer(rl=_default_config_from_args(RLConfig, args)),
+        ),
+        build_tokenizer=False,
+    )
 
 
 @pytest.fixture
@@ -71,6 +94,7 @@ def initialize_context_parallel(request, monkeypatch):
     yield request.param
     Utils.destroy_model_parallel()
     destroy_global_vars()
+    unset_rl_run_config()
     destroy_num_microbatches_calculator()
 
 

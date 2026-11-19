@@ -268,7 +268,8 @@ def _prepare(monkeypatch, extra, overrides, entry_point="gpt"):
     cfg.validation.multiple_validation_sets = args.multiple_validation_sets
     monkeypatch.setattr(container_module, "safe_get_world_size", lambda: _world_size_for(args))
     tokenizer = build_tokenizer(args)
-    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)
+    global_vars.set_run_config(cfg)
     monkeypatch.setattr(global_vars, "_GLOBAL_TOKENIZER", tokenizer)
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
     monkeypatch.setattr(training, "get_args", lambda: args)
@@ -443,7 +444,8 @@ def test_mock_data_next_to_a_file_backed_source_is_rejected(monkeypatch, corpus,
     extra, overrides = corpus[case]
     legacy_factory, legacy_class = LEGACY_BUILD[entry_point]
     args = _validated(extra, overrides)
-    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", pretrain_cfg_container_from_args(args))
+    monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)
+    global_vars.set_run_config(pretrain_cfg_container_from_args(args))
     legacy_config = legacy_factory(args)
     assert legacy_config.mock is False
     assert legacy_config.blend is not None or legacy_config.blend_per_split is not None
@@ -539,9 +541,8 @@ class TestProvidersBuildMockDatasets:
         there would leave the other rank waiting)."""
         extra, overrides = corpus["mock_data_args_file"]
         args = _validated(extra, overrides)
-        monkeypatch.setattr(
-            global_vars, "_GLOBAL_RUN_CONFIG", pretrain_cfg_container_from_args(args)
-        )
+        monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)
+        global_vars.set_run_config(pretrain_cfg_container_from_args(args))
         legacy_config = legacy.legacy_gpt_dataset_config(args)
         legacy_class = legacy.legacy_gpt_dataset_class(args)[0]
         assert legacy_class is MockGPTDataset and legacy_config.mock is False
@@ -589,18 +590,17 @@ def test_shared_rank_predicate_reads_the_registered_model_config(monkeypatch):
     """Dataset placement uses the model config, without requiring legacy arguments."""
     rule_calls = []
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
-    monkeypatch.setattr(
-        global_vars,
-        "_GLOBAL_RUN_CONFIG",
-        SimpleNamespace(
-            model=SimpleNamespace(
-                transformer=SimpleNamespace(
-                    sequence_packing_scheduler="dp_balanced",
-                    pipeline_model_parallel_layout="layout",
-                    mtp_num_layers=2,
-                )
+    run_config = SimpleNamespace(
+        model=SimpleNamespace(
+            transformer=SimpleNamespace(
+                sequence_packing_scheduler="dp_balanced",
+                pipeline_model_parallel_layout="layout",
+                mtp_num_layers=2,
             )
-        ),
+        )
+    )
+    monkeypatch.setattr(
+        global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", SimpleNamespace(run_config=run_config)
     )
     monkeypatch.setattr(
         providers,

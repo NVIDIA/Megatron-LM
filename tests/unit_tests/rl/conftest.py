@@ -1,0 +1,12 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+import pytest
+
+from megatron.rl.config import unset_rl_run_config
+
+
+@pytest.fixture(autouse=True)
+def reset_rl_run_config():
+    """The run's root container is a process global; never leak it."""
+    yield
+    unset_rl_run_config()

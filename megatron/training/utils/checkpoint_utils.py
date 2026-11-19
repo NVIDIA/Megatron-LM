@@ -17,6 +17,7 @@ except ImportError:
 
 from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
 from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.training.config.container import RootConfigContainer
 from megatron.training.config.instantiate_utils import (
     _DISALLOWED_CANONICAL_TARGETS,
     InstantiationException,
@@ -260,6 +261,17 @@ def _sanitize_run_config_object(obj: Any) -> Any:
     if isinstance(obj, list):
         return [_sanitize_run_config_object(item) for item in obj]
     return obj
+
+
+def run_config_sections(run_config: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Return the run config's sections from a checkpoint's saved configuration."""
+    if isinstance(run_config, dict) and str(run_config.get("_target_", "")).endswith(
+        "." + RootConfigContainer.__qualname__
+    ):
+        # A root container: the sections of the member the saving process ran on.
+        member = RootConfigContainer.run_config_member(run_config)
+        return None if member is None else run_config[member]
+    return run_config
 
 
 def apply_run_config_backward_compat(config_dict: dict[str, Any]) -> dict[str, Any]:

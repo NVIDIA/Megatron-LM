@@ -3,7 +3,7 @@
 
 import copy
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -11,10 +11,12 @@ from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import TransformerConfig
 from megatron.training import global_vars
 from megatron.training.config import (
+    AlgorithmConfigContainer,
     CheckpointConfig,
     InferenceConfigContainer,
     InferenceSetupConfig,
     RLConfig,
+    RootConfigContainer,
 )
 from megatron.training.models import (
     BertModelConfig,
@@ -53,13 +55,29 @@ def test_validation_is_read_only_and_finalization_runs_once(
         else run_config
     )
     cfg.model = model
+    rl_run = None
     if not inference:
         cfg.train.micro_batch_size = 1
         cfg.train.global_batch_size = 8
-        cfg.rl = RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
+        # The root container checks the RL section and applies its DDP layout. The
+        # deployment shares the training model and the run's RNG section, as the entry point's.
+        rl_run = RootConfigContainer(
+            training=cfg,
+            inference=InferenceConfigContainer(
+                model=cfg.model,
+                checkpoint=CheckpointConfig(),
+                inference=InferenceSetupConfig(),
+                rng=cfg.rng,
+            ),
+            algorithm=AlgorithmConfigContainer(
+                rl=RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
+            ),
+        )
     before = copy.deepcopy(cfg.to_dict())
     for _ in range(2):
         cfg.validate()
+        if rl_run is not None:
+            rl_run.validate()
         assert cfg.to_dict() == before
         assert not cfg._finalized
 
@@ -68,18 +86,21 @@ def test_validation_is_read_only_and_finalization_runs_once(
     monkeypatch.setattr(cfg.rng, "finalize_model_config", rng_finalize)
     model_finalize = Mock(wraps=model.finalize)
     monkeypatch.setattr(model, "finalize", model_finalize)
+    if rl_run is not None:
+        rl_run.finalize()
+        assert cfg.ddp.grad_buffer_offload
     cfg.finalize()
     assert cfg._finalized
     assert cfg.rng.te_rng_tracker is (transformer_impl == "transformer_engine")
     assert transformer.use_te_rng_tracker is cfg.rng.te_rng_tracker
-    if not inference:
-        assert cfg.ddp.grad_buffer_offload
     after = copy.deepcopy(cfg.to_dict())
     cfg.validate()
     cfg.finalize()
     assert cfg.to_dict() == after
-    rng_finalize.assert_called_once_with(model)
-    model_finalize.assert_called_once_with()
+    # The deployment's finalize runs the RNG finalizer on the shared model first; the pretrain
+    # container's finalize runs it again with the same result.
+    assert rng_finalize.call_args_list == [call(model)] * (1 if rl_run is None else 2)
+    assert model_finalize.call_args_list == [call()] * (1 if rl_run is None else 2)
     assert "_finalized" not in after
     assert copy.deepcopy(cfg)._finalized
 
@@ -193,7 +214,15 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
     run_config.model = GPTModelConfig(transformer=transformer, vocab_size=128, seq_length=16)
     run_config.train.micro_batch_size = 1
     run_config.train.global_batch_size = 8
-    run_config.rl = RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
+    rl_run = RootConfigContainer(
+        training=run_config,
+        inference=InferenceConfigContainer(
+            model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
+        ),
+        algorithm=AlgorithmConfigContainer(
+            rl=RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
+        ),
+    )
     if invalid_policy == "ddp_offload":
         transformer.fp8 = "hybrid"
         run_config.ddp.fp8_param_gather = True
@@ -209,7 +238,12 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
         monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 2)
         error, message = AssertionError, "Make sure the number of model chunks"
     before = copy.deepcopy(run_config.to_dict())
-    for check in (run_config.validate, run_config.validate, run_config.finalize):
+    if invalid_policy == "ddp_offload":
+        # The RL rule lives on the root container, not on the pretrain container.
+        checks = [lambda: rl_run.validate(), lambda: rl_run.validate(), lambda: rl_run.finalize()]
+    else:
+        checks = [run_config.validate, run_config.validate, run_config.finalize]
+    for check in checks:
         with pytest.raises(error, match=message):
             check()
         assert run_config.to_dict() == before
@@ -227,7 +261,7 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
         run_config.optimizer.reuse_grad_buf_for_mxfp8_param_ag = False
     else:
         transformer.virtual_pipeline_model_parallel_size = 2
-    run_config.finalize()
+    rl_run.finalize()
     assert run_config._finalized
     assert run_config.ddp.grad_buffer_offload
     assert run_config.rng.te_rng_tracker

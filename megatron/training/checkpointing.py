@@ -66,8 +66,17 @@ from megatron.training.argument_utils import (
     checkpoint_config_from_args,
     project_checkpoint_policy,
 )
-from megatron.training.config import CheckpointConfig, PretrainConfigContainer, TokenizerConfig
-from megatron.training.global_vars import get_run_config, get_tokenizer, get_train_state
+from megatron.training.config import (
+    CheckpointConfig,
+    PretrainConfigContainer,
+    TokenizerConfig,
+)
+from megatron.training.global_vars import (
+    get_root_config_container,
+    get_run_config,
+    get_tokenizer,
+    get_train_state,
+)
 from megatron.training.utils.checkpoint_utils import (
     file_exists,
     get_checkpoint_train_state_filename,
@@ -218,16 +227,17 @@ def _checkpoint_dir(checkpoint_name: str, ckpt_type) -> str:
 def _read_checkpoint_run_config(state_dict, checkpoint_name, ckpt_type) -> Optional[dict]:
     """The run config saved with a checkpoint: the common payload of a local checkpoint, the YAML
     sidecar of every other kind. None for checkpoints written before it was saved."""
-    if ckpt_type == CheckpointType.LOCAL:
-        return state_dict.get('run_config')
     from megatron.training.utils.checkpoint_utils import (
         get_checkpoint_run_config_filename,
         read_run_config,
+        run_config_sections,
     )
 
+    if ckpt_type == CheckpointType.LOCAL:
+        return run_config_sections(state_dict.get('run_config'))
     config_filename = get_checkpoint_run_config_filename(_checkpoint_dir(checkpoint_name, ckpt_type))
     if maybe_msc.os.path.exists(config_filename):
-        return read_run_config(config_filename)
+        return run_config_sections(read_run_config(config_filename))
     return None
 
 
@@ -1155,8 +1165,10 @@ def save_checkpoint(
                 f'rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt '
             )
             if ckpt_type == CheckpointType.LOCAL:
-                # Local checkpoints have no YAML sidecar; persist the full run config here.
-                state_dict['run_config'] = get_run_config().to_dict(checkpoint=save_policy)
+                # Local checkpoints have no YAML sidecar; persist the root config container here.
+                state_dict['run_config'] = get_root_config_container().to_dict(
+                    checkpoint=save_policy
+                )
                 try:
                     from megatron.core.dist_checkpointing.tensor_aware_state_dict import (
                         MCoreTensorAwareStateDict,
@@ -1301,7 +1313,7 @@ def save_checkpoint(
                 # unit tests that do not create a config container.
                 # in the future, run_config.to_yaml() should always run.
                 try:
-                    run_config = get_run_config()
+                    run_config = get_root_config_container()
                 except AssertionError as e:
                     if str(e) != 'run config is not initialized.':
                         raise

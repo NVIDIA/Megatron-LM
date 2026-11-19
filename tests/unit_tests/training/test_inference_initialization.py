@@ -213,7 +213,8 @@ def test_inference_distributed_initialization_without_training_fields(
     args = parser.parse_args([])
     args.rank = 0
     cfg = inference_cfg_container_from_args(args, build_model_config=False)
-    monkeypatch.setattr(global_vars, '_GLOBAL_RUN_CONFIG', cfg)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)
+    global_vars.set_run_config(cfg)
     for name in (
         "micro_batch_size",
         "global_batch_size",
@@ -226,7 +227,8 @@ def test_inference_distributed_initialization_without_training_fields(
     ):
         delattr(args, name)
     cfg = inference_cfg_container_from_args(args, build_model_config=False)
-    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)
+    global_vars.set_run_config(cfg)
     monkeypatch.setattr(initialize, "get_args", lambda: args)
     monkeypatch.setattr(initialize, "initialize_runtime_services", Mock())
     monkeypatch.setattr(initialize, "setup_logging", Mock())
@@ -255,7 +257,8 @@ def test_inference_distributed_initialization_without_training_fields(
 def test_inference_rejects_training_tp_overlap_before_initialization(monkeypatch, run_config):
     args = Namespace(tp_comm_overlap=True)
     cfg = inference_cfg_container_from_args(args, build_model_config=False)
-    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)
+    global_vars.set_run_config(cfg)
     monkeypatch.setattr(initialize, "get_args", lambda: args)
     distributed = Mock()
     monkeypatch.setattr(initialize, "_initialize_distributed", distributed)

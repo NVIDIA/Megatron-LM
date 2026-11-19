@@ -194,7 +194,7 @@ class TestModelOptStartupDetection:
         from megatron.post_training.utils import maybe_enable_modelopt
         from megatron.training import global_vars
 
-        monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
+        monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)
         monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
         directory = mock.MagicMock()
         directory.__truediv__.return_value.is_dir.return_value = True
@@ -222,7 +222,7 @@ class TestModelOptStartupDetection:
         from megatron.training import global_vars
 
         args = Namespace(load="/synthetic/modelopt", ckpt_format="torch")
-        monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
+        monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)
         monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
         calls = []
 
