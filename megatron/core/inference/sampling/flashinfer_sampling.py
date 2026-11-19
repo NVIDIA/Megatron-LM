@@ -52,16 +52,20 @@ class FlashInferSampling(Sampling):
         active_request_count = context.total_request_count - context.paused_request_count
         return context.active_request_metadata["is_greedy"][:active_request_count]
 
-    @staticmethod
-    def _one_hot_greedy_rows_(log_probs: Tensor, logits: Tensor, greedy_rows: Tensor) -> None:
-        """In place: each greedy row's distribution is one-hot on its lowest-index argmax.
+    def _one_hot_greedy_rows(
+        self, log_probs: Tensor, logits: Tensor, greedy_rows: Tensor, context
+    ) -> Tensor:
+        """Make each greedy row's distribution one-hot on its lowest-index argmax, in place.
 
-        Masked writes into `log_probs`, so no second `[rows, vocab]` tensor is materialized.
+        Greedy rows sample that token. Masked writes into `log_probs`, so no second
+        `[rows, vocab]` tensor is materialized; a batch without greedy rows is left as is.
         """
+        if not bool(self._greedy_requests(context).any()):
+            return log_probs
         token = logits.argmax(dim=-1, keepdim=True)
-        greedy_rows = greedy_rows.unsqueeze(1)
+        greedy_rows = (greedy_rows != 0).unsqueeze(1)
         kept = log_probs.gather(1, token).masked_fill_(greedy_rows, 0.0)
-        log_probs.masked_fill_(greedy_rows, float("-inf")).scatter_(1, token, kept)
+        return log_probs.masked_fill_(greedy_rows, float("-inf")).scatter_(1, token, kept)
 
     def sample_kernel(
         self,
@@ -210,26 +214,25 @@ class FlashInferSampling(Sampling):
         # Batch-level no-op check.
         no_top_k_batch, no_top_p_batch = context.active_sampling_filter_flags()
         if no_top_k_batch and no_top_p_batch:
-            log_probs = torch.log_softmax(scaled, dim=-1)
-        else:
-            # Sentinel / no-op values disable filtering:
-            # top_k=vocab_size keeps all tokens, top_p=1.0 keeps the full probability mass.
-            no_top_k = is_no_op_top_k(top_k) | (top_k >= self._vocab_size)
-            no_top_p = is_no_op_top_p(top_p)
-            top_k_safe = top_k.masked_fill(no_top_k, self._vocab_size)
-            top_p_safe = top_p.masked_fill(no_top_p, 1.0)
-
-            probs = torch.softmax(scaled, dim=-1)
-            # Renormalize to the kept set (top-k first, then top-p) to match
-            renormed = flashinfer.sampling.top_k_renorm_probs(probs, top_k_safe)
-            renormed = flashinfer.sampling.top_p_renorm_probs(renormed, top_p_safe)
-            # Unfiltered rows of a mixed batch bypass the renorm rounding entirely.
-            log_probs = torch.where(
-                (no_top_k & no_top_p).unsqueeze(1),
-                torch.log_softmax(scaled, dim=-1),
-                torch.log(renormed),
+            return self._one_hot_greedy_rows(
+                torch.log_softmax(scaled, dim=-1), logits, greedy_rows, context
             )
-        # Greedy rows sample their lowest-index argmax, so their distribution is one-hot on it.
-        if bool(self._greedy_requests(context).any()):
-            self._one_hot_greedy_rows_(log_probs, logits, greedy_rows != 0)
-        return log_probs
+
+        # Sentinel / no-op values disable filtering:
+        # top_k=vocab_size keeps all tokens, top_p=1.0 keeps the full probability mass.
+        no_top_k = is_no_op_top_k(top_k) | (top_k >= self._vocab_size)
+        no_top_p = is_no_op_top_p(top_p)
+        top_k_safe = top_k.masked_fill(no_top_k, self._vocab_size)
+        top_p_safe = top_p.masked_fill(no_top_p, 1.0)
+
+        probs = torch.softmax(scaled, dim=-1)
+        # Renormalize to the kept set (top-k first, then top-p) to match
+        renormed = flashinfer.sampling.top_k_renorm_probs(probs, top_k_safe)
+        renormed = flashinfer.sampling.top_p_renorm_probs(renormed, top_p_safe)
+        # Unfiltered rows of a mixed batch bypass the renorm rounding entirely.
+        log_probs = torch.where(
+            (no_top_k & no_top_p).unsqueeze(1),
+            torch.log_softmax(scaled, dim=-1),
+            torch.log(renormed),
+        )
+        return self._one_hot_greedy_rows(log_probs, logits, greedy_rows, context)
