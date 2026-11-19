@@ -218,11 +218,11 @@ def test_static_cp_splits_a_single_packed_group_across_dp_ranks():
 def test_wrap_iterator_enables_padding_aware_capacity(
     monkeypatch, no_global_process_groups, scheduler_type, alignment
 ):
-    def run(scheduler, *args):
+    def run(scheduler, *args, **kwargs):
         assert scheduler.pad_sequences == (alignment is not None)
         expected_capacity = 2048 if alignment == 32 else 2050
         assert scheduler.max_seqlen_per_dp_cp_rank == expected_capacity
-        return None, 0, 0, 0
+        return None, 0, 0, 0, None
 
     monkeypatch.setattr(DpBalancedScheduler, 'run', run)
     monkeypatch.setattr(torch.cuda, 'current_device', lambda: torch.device('cpu'))
@@ -257,10 +257,10 @@ def test_static_packing_spans_gtp_remat_peers(monkeypatch, no_global_process_gro
         pp=_group(1),
     )
 
-    def run(scheduler, iterator, count, dp_group, tp_group, pp_group, dp_cp_group, *args):
+    def run(scheduler, iterator, count, dp_group, tp_group, pp_group, dp_cp_group, *args, **kwargs):
         assert (scheduler.dp_size, scheduler.cp_size) == (4, 2)
         assert (dp_group, dp_cp_group) == (pg.dp_gtp_remat, pg.dp_cp_gtp_remat)
-        return None, 0, 0, 0
+        return None, 0, 0, 0, None
 
     monkeypatch.setattr(DpBalancedScheduler, 'run', run)
     monkeypatch.setattr(torch.cuda, 'current_device', lambda: torch.device('cpu'))
@@ -440,14 +440,14 @@ def test_dynamic_scheduler_uses_only_supplied_group_sizes(
         dynamic_cp={size: _group(size) for size in cp_sizes},
     )
 
-    def run(scheduler, iterator, count, dp_group, tp_group, pp_group, dp_cp_group, *args):
+    def run(scheduler, iterator, count, dp_group, tp_group, pp_group, dp_cp_group, *args, **kwargs):
         assert scheduler.cp_group_sizes == cp_sizes
         assert (dp_group, tp_group, pp_group, dp_cp_group) == (pg.dp, pg.tp, pg.pp, pg.dp_cp)
         batches = scheduler.get_groups_and_subsamples(list(enumerate([16] * 12)))
         for batch in batches:
             for ids in batch:
                 assert batch.count(ids) in cp_sizes
-        return iterator, len(batches), 192, 3072
+        return iterator, len(batches), 192, 3072, None
 
     monkeypatch.setattr(DefaultDynamicCPScheduler, "run", run)
     result = data_schedule.wrap_data_iterator(None, _dynamic_config(min_cp_size), 1, pg)
@@ -636,19 +636,23 @@ def test_scheduler_runs_on_every_pipeline_stage_from_dataset_placement(
         ]
 
         scheduler = DpBalancedScheduler(32, 1, 1, None if vp_size is None else pp_size)
-        data_iterator, num_microbatches, real_tokens, real_token_squares = scheduler.run(
-            iterators[0] if vp_size is None else iterators,
-            len(real_lengths),
-            _group(1),
-            _group(1),
-            _group(pp_size, pp_rank),
-            _group(1),
-            torch.device("cpu"),
-            config,
+        data_iterator, num_microbatches, real_tokens, real_token_squares, selected_pairs = (
+            scheduler.run(
+                iterators[0] if vp_size is None else iterators,
+                len(real_lengths),
+                _group(1),
+                _group(1),
+                _group(pp_size, pp_rank),
+                _group(1),
+                torch.device("cpu"),
+                config,
+                sparse_attention_topk=8,
+            )
         )
         scheduled_counts.append(num_microbatches)
         assert real_tokens == sum(real_lengths)
         assert real_token_squares == sum(length * length for length in real_lengths)
+        assert selected_pairs == sum(_selected_pairs(length, 8) for length in real_lengths)
 
         stage_iterators = [data_iterator] if vp_size is None else data_iterator
         for vp_stage, stage_iterator in enumerate(stage_iterators):
@@ -663,25 +667,35 @@ def test_scheduler_runs_on_every_pipeline_stage_from_dataset_placement(
     assert len(set(scheduled_counts)) == 1
 
 
-def test_real_seqlen_stats_cover_every_dp_rank(monkeypatch):
+def _selected_pairs(length, topk):
+    """Causal top-k pairs of one sequence: query ``i`` selects ``min(i + 1, topk)`` keys."""
+    return sum(min(i + 1, topk) for i in range(length))
+
+
+@pytest.mark.parametrize("topk", [None, 8])
+def test_real_seqlen_stats_cover_every_dp_rank(monkeypatch, topk):
     """Each DP rank holds different sub-samples, and the statistics count all of them once."""
     local_lengths, peer_lengths = [5, 13, 8], [30, 2]
     dp_group = _group(2)
     reduced_groups = []
 
+    def stats(lengths):
+        values = [sum(lengths), sum(length * length for length in lengths)]
+        if topk is not None:
+            values.append(sum(_selected_pairs(length, topk) for length in lengths))
+        return values
+
     def all_reduce(tensor, op=torch.distributed.ReduceOp.SUM, group=None):
-        # Add the real lengths of the other DP rank.
+        # Add the real-length statistics of the other DP rank.
         reduced_groups.append(group)
-        tensor += torch.tensor(
-            [sum(peer_lengths), sum(length * length for length in peer_lengths)], dtype=tensor.dtype
-        )
+        tensor += torch.tensor(stats(peer_lengths), dtype=tensor.dtype)
 
     monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
-    real_tokens, real_token_squares = get_global_real_seqlen_stats(
-        _unpacked_samples(local_lengths), dp_group, torch.device("cpu")
+    real_tokens, real_token_squares, selected_pairs = get_global_real_seqlen_stats(
+        _unpacked_samples(local_lengths), dp_group, torch.device("cpu"), topk
     )
 
-    lengths = local_lengths + peer_lengths
-    assert real_tokens == sum(lengths)
-    assert real_token_squares == sum(length * length for length in lengths)
+    expected = stats(local_lengths + peer_lengths)
+    assert [real_tokens, real_token_squares] == expected[:2]
+    assert selected_pairs == (None if topk is None else expected[2])
     assert len(reduced_groups) == 1 and reduced_groups[0] is dp_group

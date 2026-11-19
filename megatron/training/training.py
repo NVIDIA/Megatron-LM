@@ -771,9 +771,16 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens, sparse_attention_topk: Optio
     _seqlen_stats_are_global = False
 
 
-def set_seqlen_stats_in_iteration(total_real_tokens, seqlen_squared_sum):
-    """Seed per-iteration THD FLOPs stats that were already computed globally."""
+def set_seqlen_stats_in_iteration(
+    total_real_tokens, seqlen_squared_sum, sparse_attention_pairs: Optional[float] = None
+):
+    """Seed per-iteration THD FLOPs stats that were already computed globally.
+
+    ``sparse_attention_pairs`` is the global causal top-k pair count, or ``None`` when the
+    selected pairs are not counted.
+    """
     global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
+    global _seqlen_stats_has_selected_pairs
     if total_real_tokens is None or seqlen_squared_sum is None:
         return
     if _seqlen_stats_in_iteration is None:
@@ -781,7 +788,8 @@ def set_seqlen_stats_in_iteration(total_real_tokens, seqlen_squared_sum):
         _seqlen_stats_in_iteration = torch.zeros(3, dtype=torch.float64, device=device)
     _seqlen_stats_in_iteration[0] = float(total_real_tokens)
     _seqlen_stats_in_iteration[1] = float(seqlen_squared_sum)
-    _seqlen_stats_in_iteration[2] = 0.0
+    _seqlen_stats_in_iteration[2] = float(sparse_attention_pairs or 0.0)
+    _seqlen_stats_has_selected_pairs = sparse_attention_pairs is not None
     _seqlen_stats_active = True
     _seqlen_stats_are_global = True
 
@@ -3213,15 +3221,18 @@ def train_step(
                     scheduled_num_microbatches,
                     total_real_tokens_in_batch,
                     seqlen_squared_sum_in_batch,
+                    sparse_attention_pairs_in_batch,
                 ) = wrap_data_iterator(
                     data_iterator,
                     config,
                     get_num_microbatches(),
                     pg_collection=get_attr_wrapped_model(model[0], "pg_collection"),
+                    sparse_attention_topk=ssa_flops_selected_pairs_topk(config),
                 )
                 set_seqlen_stats_in_iteration(
                     total_real_tokens_in_batch,
                     seqlen_squared_sum_in_batch,
+                    sparse_attention_pairs_in_batch,
                 )
                 has_wrapped_data_iterator = True
                 rerun_data_iterator = packed_data_iterator
@@ -5597,7 +5608,7 @@ def evaluate(
 
             if getattr(config, "sequence_packing_scheduler", None) is not None:
                 try:
-                    (packed_data_iterator, scheduled_eval_num_microbatches, _, _) = (
+                    (packed_data_iterator, scheduled_eval_num_microbatches, _, _, _) = (
                         wrap_data_iterator(
                             data_iterator,
                             config,

@@ -64,7 +64,7 @@ def test_evaluate_stops_cleanly_when_packed_iterator_runs_out(monkeypatch, compl
     config = SimpleNamespace(sequence_packing_scheduler="dp_balanced")
     timers = mock.MagicMock()
     # Scheduling raises StopIteration once the finite validation iterator is exhausted.
-    schedules = [(iter([]), 1, 0, 0)] * completed_steps + [StopIteration]
+    schedules = [(iter([]), 1, 0, 0, None)] * completed_steps + [StopIteration]
     forward_backward = mock.Mock(return_value=[])
     with (
         mock.patch.object(training_mod, "get_args", return_value=args),

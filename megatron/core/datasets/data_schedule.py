@@ -128,6 +128,7 @@ class BasePackingScheduler:
         dp_cp_group,
         dev,
         config,
+        sparse_attention_topk: Optional[int] = None,
     ):
         """
         Run the scheduler and return the new data_iterator.
@@ -141,12 +142,16 @@ class BasePackingScheduler:
             dp_cp_group: Data parallel + context parallel process group.
             dev: CUDA device.
             config: Model parallel config.
+            sparse_attention_topk: Keys selected per query by causal top-k sparse attention;
+                when given, the selected (query, key) pairs are counted for FLOPs.
 
         Returns:
             new_data_iterator: The new data iterator (or list for VPP).
             num_micro_batches: Number of micro batches after scheduling.
             seqlen_sum_this_global_batch: Total tokens for FLOPs calculation.
             seqlen_squared_sum_this_global_batch: Sum of squared seqlens for FLOPs.
+            sparse_attention_pairs_this_global_batch: Selected top-k pairs for FLOPs, or
+                ``None`` without ``sparse_attention_topk``.
         """
         raise NotImplementedError
 
@@ -240,6 +245,7 @@ class DpBalancedScheduler(BasePackingScheduler):
         dp_cp_group,
         dev: torch.device,
         config,
+        sparse_attention_topk: Optional[int] = None,
     ):
         """
         Run the complete scheduling pipeline.
@@ -259,12 +265,16 @@ class DpBalancedScheduler(BasePackingScheduler):
             dp_cp_group: Data parallel + context parallel process group.
             dev: CUDA device.
             config: Model parallel config.
+            sparse_attention_topk: Keys selected per query by causal top-k sparse attention;
+                when given, the selected (query, key) pairs are counted for FLOPs.
 
         Returns:
             new_data_iterator: The new data iterator (or list for VPP).
             num_micro_batches: Number of micro batches after scheduling.
             seqlen_sum_this_global_batch: Total real (unpadded) tokens for FLOPs calculation.
             seqlen_squared_sum_this_global_batch: Sum of squared real seqlens for FLOPs.
+            sparse_attention_pairs_this_global_batch: Selected top-k pairs over real seqlens
+                for FLOPs, or ``None`` without ``sparse_attention_topk``.
         """
 
         is_first_pp = pp_group.rank() == 0
@@ -382,29 +392,35 @@ class DpBalancedScheduler(BasePackingScheduler):
 
             # Step 6: Calculate FLOPs info from real tokens. Padded lengths only size
             # the schedule and the packed buffers.
-            seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch = (
-                get_global_real_seqlen_stats(batch, dp_group, dev)
-            )
+            (
+                seqlen_sum_this_global_batch,
+                seqlen_squared_sum_this_global_batch,
+                sparse_attention_pairs_this_global_batch,
+            ) = get_global_real_seqlen_stats(batch, dp_group, dev, sparse_attention_topk)
         else:
             (
                 new_samples,
                 num_micro_batches,
                 seqlen_sum_this_global_batch,
                 seqlen_squared_sum_this_global_batch,
-            ) = (None, None, None, None)
+                sparse_attention_pairs_this_global_batch,
+            ) = (None, None, None, None, None)
 
-        # Broadcast the schedule shape and FLOPs metadata inside each TP group.
+        # Broadcast the schedule shape and FLOPs metadata inside each TP group. Every rank
+        # knows whether selected pairs are counted, so only then do they join the broadcast.
+        scalars = [
+            num_micro_batches,
+            seqlen_sum_this_global_batch,
+            seqlen_squared_sum_this_global_batch,
+        ]
+        if sparse_attention_topk is not None:
+            scalars.append(sparse_attention_pairs_this_global_batch)
+        scalars = broadcast_scalars(scalars, tp_group, dev)
         num_micro_batches, seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch = (
-            broadcast_scalars(
-                [
-                    num_micro_batches,
-                    seqlen_sum_this_global_batch,
-                    seqlen_squared_sum_this_global_batch,
-                ],
-                tp_group,
-                dev,
-            )
+            scalars[:3]
         )
+        if sparse_attention_topk is not None:
+            sparse_attention_pairs_this_global_batch = scalars[3]
         num_micro_batches = int(num_micro_batches)
 
         # Build an independent iterator for each VPP stage so rerun/rewind state
@@ -422,6 +438,7 @@ class DpBalancedScheduler(BasePackingScheduler):
             num_micro_batches,
             seqlen_sum_this_global_batch,
             seqlen_squared_sum_this_global_batch,
+            sparse_attention_pairs_this_global_batch,
         )
 
 
@@ -496,7 +513,11 @@ scheduler_map: Dict[PackingSchedulerEnum, Type[BasePackingScheduler]] = {
 
 
 def wrap_data_iterator(
-    data_iterator, config, num_microbatches, pg_collection: ProcessGroupCollection
+    data_iterator,
+    config,
+    num_microbatches,
+    pg_collection: ProcessGroupCollection,
+    sparse_attention_topk: Optional[int] = None,
 ):
     """
     A wrapper function that wraps around an existing data_iterator
@@ -506,6 +527,12 @@ def wrap_data_iterator(
         data_iterator: The original data_iterator to wrap around
         config: The config object containing the max_seqlen_per_dp_cp_rank
         pg_collection: Caller-owned process groups; must define dp_cp, dp, tp, and pp.
+        sparse_attention_topk: Keys selected per query by causal top-k sparse attention;
+            when given, the selected (query, key) pairs are counted for FLOPs.
+
+    Returns:
+        ``(data_iterator, num_micro_batches, seqlen_sum, seqlen_squared_sum, selected_pairs)``
+        for the global batch; ``selected_pairs`` is ``None`` without ``sparse_attention_topk``.
     """
 
     # GTP_remat peers consume distinct samples, so packing must span them like the rest of DP.
@@ -563,20 +590,16 @@ def wrap_data_iterator(
         **scheduler_kwargs,
     )
 
-    (
-        new_data_iterator,
-        num_micro_batches,
-        seqlen_sum_this_global_batch,
-        seqlen_squared_sum_this_global_batch,
-    ) = scheduler.run(
-        data_iterator, num_microbatches, dp_group, tp_group, pp_group, dp_cp_group, dev, config
-    )
-
-    return (
-        new_data_iterator,
-        num_micro_batches,
-        seqlen_sum_this_global_batch,
-        seqlen_squared_sum_this_global_batch,
+    return scheduler.run(
+        data_iterator,
+        num_microbatches,
+        dp_group,
+        tp_group,
+        pp_group,
+        dp_cp_group,
+        dev,
+        config,
+        sparse_attention_topk=sparse_attention_topk,
     )
 
 

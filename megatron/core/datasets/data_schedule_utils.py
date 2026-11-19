@@ -647,27 +647,38 @@ def get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
     return batch, global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered
 
 
-def get_global_real_seqlen_stats(batch, dp_group, dev) -> Tuple[float, float]:
+def get_global_real_seqlen_stats(
+    batch, dp_group, dev, sparse_attention_topk: Optional[int] = None
+) -> Tuple[float, float, Optional[float]]:
     """Sum the real (unpadded) sub-sample lengths of the global batch and their squares.
 
     Args:
         batch: This DP rank's sub-samples as returned by :func:`get_batch_and_global_seqlens`.
         dp_group: The DP group whose padded lengths were gathered for scheduling.
         dev: Device for the reduction.
+        sparse_attention_topk: Keys selected per query by causal top-k sparse attention.
+            When given, also count the selected (query, key) pairs.
 
     Returns:
-        ``(sum_i L_i, sum_i L_i**2)`` over the real lengths ``L_i`` of every sub-sample in
-        ``dp_group``, as expected by ``num_floating_point_operations``.
+        ``(sum_i L_i, sum_i L_i**2, selected_pairs)`` over the real lengths ``L_i`` of every
+        sub-sample in ``dp_group``, as expected by ``num_floating_point_operations``.
+        ``selected_pairs`` is ``sum_i(L_i * k_i - k_i * (k_i - 1) / 2)`` with
+        ``k_i = min(sparse_attention_topk, L_i)``, or ``None`` without a top-k.
     """
     seqlens = [sample["original_seq_len"].reshape(-1) for sample in batch]
     seqlens = (torch.cat(seqlens) if seqlens else torch.zeros(0)).to(
         device=dev, dtype=torch.float64
     )
-    stats = torch.stack((seqlens.sum(), seqlens.square().sum()))
+    stats = [seqlens.sum(), seqlens.square().sum()]
+    if sparse_attention_topk is not None:
+        topk = seqlens.clamp(max=sparse_attention_topk)
+        stats.append((seqlens * topk - topk * (topk - 1) / 2).sum())
+    stats = torch.stack(stats)
     if dp_group.size() > 1:
         torch.distributed.all_reduce(stats, group=dp_group)
-    seqlen_sum, seqlen_squared_sum = stats.tolist()
-    return seqlen_sum, seqlen_squared_sum
+    stats = stats.tolist()
+    selected_pairs = stats[2] if sparse_attention_topk is not None else None
+    return stats[0], stats[1], selected_pairs
 
 
 # =============================================================================

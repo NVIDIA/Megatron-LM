@@ -28,6 +28,7 @@ from megatron.training.models import GPTModelConfig, HybridModelConfig
 from megatron.training.training import (
     consume_seqlen_stats_in_iteration,
     num_floating_point_operations,
+    set_seqlen_stats_in_iteration,
     ssa_flops_selected_pairs_topk,
     update_seqlen_stats_from_cu_seqlens,
 )
@@ -58,6 +59,7 @@ def _reset_seqlen_accumulator():
     """Tear down the per-iteration accumulator between tests."""
     training_module._seqlen_stats_in_iteration = None
     training_module._seqlen_stats_active = False
+    training_module._seqlen_stats_are_global = False
     training_module._seqlen_stats_has_selected_pairs = False
 
 
@@ -597,6 +599,13 @@ class TestSelectedPairAccumulator:
         # The next iteration without top-k reports no selected-pair stat.
         update_seqlen_stats_from_cu_seqlens(torch.tensor([0, 4], dtype=torch.int32))
         assert consume_seqlen_stats_in_iteration() == (4, 16, None)
+
+    def test_scheduler_seeds_selected_pairs(self):
+        """The sequence-packing scheduler seeds global stats, including the pair count."""
+        set_seqlen_stats_in_iteration(13, 69, _causal_topk_pairs([2, 7, 4], 3))
+        assert consume_seqlen_stats_in_iteration() == (13, 69, 30)
+        set_seqlen_stats_in_iteration(13, 69)
+        assert consume_seqlen_stats_in_iteration() == (13, 69, None)
 
 
 class TestAccumulatorDistributed:
