@@ -31,12 +31,7 @@ from megatron.core.inference.routing import select_engine
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import detokenize_tokens
 
-from .auth import (
-    authenticated_address,
-    generate_auth_token,
-    require_authentication,
-    start_server_authentication,
-)
+from .auth import authenticated_address, require_authentication, start_server_authentication
 from .handlers import HANDLERS
 from .state import CoordinatorState
 
@@ -165,8 +160,9 @@ class DataParallelInferenceCoordinator:
                 RUNNING by default; SUSPENDED when the engines are constructed without weights.
                 It must match the engines' start state: RESUME is honored only from SUSPENDED,
                 so engines built suspended behind a RUNNING coordinator never resume.
-            auth_token (bytes, optional): Secret every peer must present to connect. A random
-                one is generated if omitted and returned to the launcher as part of the address.
+            auth_token (bytes, optional): Secret every peer must present to connect, returned
+                to the launcher as part of the address. If omitted, the coordinator does not
+                authenticate its peers.
         """
         assert HAVE_ZMQ, (
             "please install the pyzmq library to use DataParallelInferenceCoordinator\n"
@@ -182,10 +178,14 @@ class DataParallelInferenceCoordinator:
         self.data_parallel_size = data_parallel_size
         self.context = zmq.Context()
 
-        # The socket is reachable over the network: refuse every peer that does not
-        # present the launch-time secret, before any of its messages are delivered.
-        self.auth_token = auth_token or generate_auth_token()
-        self._authenticator = start_server_authentication(self.context, self.auth_token)
+        # The socket is reachable over the network. When a secret is configured, refuse every
+        # peer that does not present it before any of its messages are delivered.
+        self.auth_token = auth_token
+        self._authenticator = (
+            start_server_authentication(self.context, auth_token)
+            if auth_token is not None
+            else None
+        )
 
         # This is the central router socket
         # 1. data parallel ranks connect to this socket to register themselves
@@ -198,7 +198,8 @@ class DataParallelInferenceCoordinator:
         local_ip = hostname or socket.gethostname()
 
         self.router_socket = self.context.socket(zmq.ROUTER)
-        require_authentication(self.router_socket)
+        if auth_token is not None:
+            require_authentication(self.router_socket)
         # Raise error if the other side of the connection has dropped.
         self.router_socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
         is_bound = False
@@ -222,7 +223,9 @@ class DataParallelInferenceCoordinator:
         self.addr = self.router_socket.getsockopt_string(zmq.LAST_ENDPOINT)
 
         # Send the address to the parent process.
-        self.pipe_connection.send(authenticated_address(self.addr, self.auth_token))
+        self.pipe_connection.send(
+            authenticated_address(self.addr, auth_token) if auth_token is not None else self.addr
+        )
         self.pipe_connection.close()
 
         logging.info("Inference Coordinator: waiting for connections from data parallel ranks...")
@@ -839,6 +842,8 @@ class DataParallelInferenceCoordinator:
             max_requests (int): Max concurrent requests per rank.
             initial_state (CoordinatorState): State the control-signal machine starts in.
                 RUNNING by default; SUSPENDED when the engines are constructed without weights.
+            auth_token (bytes, optional): Secret every peer must present to connect. If omitted,
+                the coordinator does not authenticate its peers.
         """
         coordinator = cls(
             pipe_connection,
@@ -883,5 +888,6 @@ class DataParallelInferenceCoordinator:
             with open(self.schedule_output_path, "w") as f:
                 json.dump(schedule_data, f, indent=2)
         self.router_socket.close()
-        self._authenticator.stop()
+        if self._authenticator is not None:
+            self._authenticator.stop()
         self.context.term()

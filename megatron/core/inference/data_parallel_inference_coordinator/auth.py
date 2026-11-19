@@ -3,7 +3,9 @@
 """Transport-level authentication for the inference coordinator's ZMQ socket.
 
 The coordinator's ROUTER socket is reachable over TCP, so every peer is untrusted
-until proven otherwise. Authentication happens in ZeroMQ itself, using the PLAIN
+until proven otherwise. Authentication is opt-in
+(``InferenceConfig.authenticate_coordinator``); without it the coordinator accepts any
+peer that can reach its port. When enabled, it happens in ZeroMQ itself, using the PLAIN
 mechanism with a ZAP handler: a peer that does not present the coordinator's
 launch-time secret is refused during the connection handshake and none of its
 messages ever reach the coordinator. The wire protocol is unchanged, and no
@@ -14,8 +16,8 @@ on an untrusted network needs a secure transport (e.g. a VPN or TLS tunnel).
 
 The secret travels with the coordinator address, as ``<endpoint>#auth=<hex>``,
 so existing code that passes the address around keeps working. Only the code
-that opens the socket needs to split it. Treat the address as a credential: do
-not log it.
+that opens the socket needs to split it. Without authentication the address is
+a plain endpoint. Treat an authenticated address as a credential: do not log it.
 """
 
 import secrets
@@ -88,7 +90,7 @@ def present_credentials(socket: "zmq.Socket", auth_token: Optional[bytes]) -> No
     """Make ``socket`` authenticate to a coordinator with ``auth_token``.
 
     Must be called before the socket connects. A missing token leaves the socket
-    unauthenticated, which a coordinator will refuse.
+    unauthenticated, which a coordinator that requires authentication will refuse.
     """
     if auth_token is None:
         return

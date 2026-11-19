@@ -867,6 +867,16 @@ class InferenceConfig:
     performance variability for MoEs.
     """
 
+    authenticate_coordinator: bool = False
+    """Whether the inference coordinator that this engine launches requires its peers to
+    authenticate. If True, the coordinator generates a random secret at launch and refuses
+    every peer that does not present it. The secret is returned as part of the coordinator
+    address (see `data_parallel_inference_coordinator.auth`), so every component that connects
+    must be given that full address and treat it as a credential. Authentication does not
+    encrypt traffic. Off by default, which leaves the coordinator open to anyone who can reach
+    its port: only leave it off on a trusted network.
+    """
+
     ep_consensus_interval: int = 20
     """How many steps to skip between EP-consensus all-reduces when the engine
     has pending work. Consensus is always run immediately when there is no

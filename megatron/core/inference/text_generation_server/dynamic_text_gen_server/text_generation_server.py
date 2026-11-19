@@ -416,29 +416,11 @@ def start_text_gen_server(
             template string. None falls back to the tokenizer's own template.
         max_inflight_requests: Per replica, the most HTTP requests handled at
             once. Requests beyond it get 503.
-        max_inflight_bytes: Per rank (i.e. per host process group), the most
-            request payload bytes held at once. It is split evenly across the
-            ``num_replicas`` replicas, so each replica enforces
-            ``max_inflight_bytes // num_replicas`` and the host-wide total stays
-            at ``max_inflight_bytes`` regardless of replica count. Each share must
-            be at least the per-request limit (1 GiB) so a replica can still
-            accept a maximum-size request, hence
-            ``max_inflight_bytes >= num_replicas * 1 GiB``. When omitted it
-            defaults to ``max(16 GiB, num_replicas * 1 GiB)``: 16 GiB for up to 16
-            replicas, and one maximum-size request per replica beyond that, so
-            launches that were valid before this limit existed still start. An
-            explicit value that cannot give every replica 1 GiB is rejected.
-            Shares are static and
-            connections are not spread perfectly evenly across replicas, so one
-            replica can reach its share while others sit idle.
-            This counts raw payload bytes only, which understates memory use: the
-            body is buffered, the JSON is parsed into Python objects, base64
-            media is decoded and the prompt is tokenized, so a request can cost
-            a few times its size. Size the budget well below available host
-            memory accordingly. The 16 GiB default is sized for DGX hosts; lower
-            it on hosts with less memory. This bounds the front-end's memory and
-            concurrency; it is not DDoS protection, which belongs in front of the
-            server.
+        max_inflight_bytes: Per rank, the most request payload bytes held at once,
+            split evenly across replicas. Each share must be at least 1 GiB (the
+            per-request limit), otherwise ``ValueError``. Defaults to
+            ``max(16 GiB, num_replicas * 1 GiB)``. Counts raw bytes, so actual
+            memory use is a few times higher; lower it on small hosts.
 
     Returns:
         The base URL this rank serves on, or None if the server was already
