@@ -98,7 +98,7 @@ HAVE_GDP_DEPS = HAVE_FLA and HAVE_MAMBA_DEPS
 # training/prefill path (`causal_conv1d_fn(seq_idx=...)`, added in 1.4.0).
 _PACKING_OK, _PACKING_REASON = check_fla_sequence_packing_support()
 
-pytestmark = [pytest.mark.internal]
+pytestmark = [pytest.mark.internal, pytest.mark.launch_on_gb200]
 
 # Everything the model-level classes need; the kernel classes below want only a GPU.
 requires_gdp_model = [
@@ -209,6 +209,7 @@ class _FakeSSM(SSMDynamicInferenceMixin):
         batch_indices,
         intermediate_conv_state=None,
         intermediate_ssm_state=None,
+        replay_context=None,
     ):
         self.decode_inputs.append((zxBCdt.clone(), batch_indices.clone()))
         return zxBCdt[..., :2]

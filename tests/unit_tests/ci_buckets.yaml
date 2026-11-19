@@ -2,7 +2,7 @@
 #
 # Logical CI buckets retain main's membership and collection order across test
 # directory moves. IDs match the recipes; they are not filesystem selectors.
-# This mapping preserves the groups at main 928ce7ce256b734f00f1c81ddd3a8958d6b61ebf.
+# This mapping preserves the groups at main 43a2ef6d35a0188a4f0601a5ce5e569d2c011562.
 # Keep related new tests in the appropriate existing group. Unassigned files run
 # in the catch-all bucket; platform markers and exclusions still apply.
 # Legacy suites resolve their historical directory selectors without this file.
@@ -68,6 +68,7 @@ h100:
   - tests/unit_tests/core/pipeline_parallel/test_schedule_node_autograd_boundary.py
   - tests/unit_tests/core/pipeline_parallel/test_schedules.py
   tests/unit_tests/models/**/*.py:
+  - tests/unit_tests/core/models/hybrid/test_external_layer.py
   - tests/unit_tests/core/models/hybrid/test_layer_utils.py
   - tests/unit_tests/core/models/mimo/test_encoder_wrapper_compatibility.py
   - tests/unit_tests/core/models/mimo/test_mimo_1f1b_schedule.py
@@ -101,6 +102,7 @@ h100:
   - tests/unit_tests/core/models/test_bert_model.py
   - tests/unit_tests/core/models/test_clip_vit_model.py
   - tests/unit_tests/core/models/test_dsa_gpt_mamba_equivalence.py
+  - tests/unit_tests/core/models/test_encoder_registry.py
   - tests/unit_tests/core/models/test_experimental_attention_variant_module_specs.py
   - tests/unit_tests/core/models/test_fastconformer_model.py
   - tests/unit_tests/core/models/test_gpt_model.py
@@ -134,6 +136,7 @@ h100:
   tests/unit_tests/data/**/*.py:
   - tests/unit_tests/core/datasets/test_bin_reader.py
   - tests/unit_tests/core/datasets/test_builder.py
+  - tests/unit_tests/training/datasets/test_data_loader_multiprocessing.py
   - tests/unit_tests/training/datasets/test_data_samplers.py
   - tests/unit_tests/test_explicit_assistant_loss.py
   - tests/unit_tests/core/datasets/test_fim_dataset.py
@@ -153,6 +156,7 @@ h100:
   - tests/unit_tests/test_preprocess_data.py
   - tests/unit_tests/test_preprocess_data_fast.py
   - tests/unit_tests/test_preprocess_mmdata.py
+  - tests/unit_tests/test_preprocess_multiprocessing.py
   - tests/unit_tests/training/datasets/test_varlen_dataset.py
   tests/unit_tests/dist_checkpointing/test_optimizer.py:
   - tests/unit_tests/core/dist_checkpointing/test_optimizer.py
@@ -166,6 +170,7 @@ h100:
   - tests/unit_tests/core/dist_checkpointing/test_fp8.py
   - tests/unit_tests/core/dist_checkpointing/test_fully_parallel.py
   - tests/unit_tests/core/dist_checkpointing/test_global_metadata_reuse.py
+  - tests/unit_tests/core/dist_checkpointing/test_global_plan_validation.py
   - tests/unit_tests/core/dist_checkpointing/test_integrity.py
   - tests/unit_tests/core/dist_checkpointing/test_layer_wise_optimizer.py
   - tests/unit_tests/core/dist_checkpointing/test_local.py
@@ -189,6 +194,7 @@ h100:
   - tests/unit_tests/core/dist_checkpointing/test_bert_model.py
   - tests/unit_tests/core/dist_checkpointing/test_gpt_hybrid_interop.py
   - tests/unit_tests/core/dist_checkpointing/test_gpt_model.py
+  - tests/unit_tests/core/dist_checkpointing/test_gtp_swiglu_layout.py
   - tests/unit_tests/core/dist_checkpointing/test_hash_router.py
   - tests/unit_tests/core/dist_checkpointing/test_mamba.py
   - tests/unit_tests/core/dist_checkpointing/test_mlp_glu.py
@@ -202,6 +208,7 @@ h100:
   - tests/unit_tests/core/transformer/experimental_attention_variant/test_absorbed_mla.py
   - tests/unit_tests/core/transformer/experimental_attention_variant/test_attention_variant_csa.py
   - tests/unit_tests/core/transformer/experimental_attention_variant/test_attention_variant_dsa.py
+  - tests/unit_tests/core/transformer/experimental_attention_variant/test_csa_deterministic_indexer.py
   - tests/unit_tests/core/transformer/experimental_attention_variant/test_csa_fused_sparse_attention.py
   - tests/unit_tests/core/transformer/experimental_attention_variant/test_dsa_backend_tp_sp_parity.py
   - tests/unit_tests/core/transformer/experimental_attention_variant/test_dsa_gqa_inference.py
@@ -232,7 +239,9 @@ h100:
   - tests/unit_tests/core/transformer/test_mhc_projection_recompute.py
   - tests/unit_tests/core/transformer/test_mlp.py
   - tests/unit_tests/core/transformer/test_module.py
+  - tests/unit_tests/core/transformer/test_mtp_cp_loss_normalization.py
   - tests/unit_tests/core/transformer/test_mtp_graph_logging.py
+  - tests/unit_tests/core/transformer/test_mtp_kl_loss.py
   - tests/unit_tests/core/transformer/test_mup.py
   - tests/unit_tests/core/transformer/test_quantization_config.py
   - tests/unit_tests/core/transformer/test_relative_attention.py
@@ -246,6 +255,7 @@ h100:
   - tests/unit_tests/core/transformer/test_spec_utils.py
   - tests/unit_tests/core/transformer/test_streamwise_residual_ops.py
   - tests/unit_tests/core/transformer/test_submodule_callables.py
+  - tests/unit_tests/core/transformer/test_te_cuda_graph_mixins.py
   - tests/unit_tests/core/transformer/test_te_fused_mlp_with_grouped_linear_spec.py
   - tests/unit_tests/core/transformer/test_te_layers_batch_invariant.py
   - tests/unit_tests/core/transformer/test_thd_correctness.py
@@ -295,6 +305,7 @@ h100:
   - tests/unit_tests/core/inference/engines/test_prefix_caching_cuda_graphs.py
   - tests/unit_tests/core/inference/engines/test_request_finalization.py
   - tests/unit_tests/core/inference/engines/test_shortcut_moe_cuda_graph_e2e.py
+  - tests/unit_tests/core/inference/engines/test_shortcut_moe_overlap_tp.py
   - tests/unit_tests/core/inference/engines/test_static_engine.py
   tests/unit_tests/inference/engines/test_dynamic_engine.py:
   - tests/unit_tests/core/inference/engines/test_dynamic_engine.py
@@ -312,12 +323,14 @@ h100:
   - tests/unit_tests/core/inference/contexts/attention_context/test_mha_metadata.py
   - tests/unit_tests/core/inference/contexts/attention_context/test_tensor_ops.py
   - tests/unit_tests/core/inference/contexts/test_dynamic_context.py
+  - tests/unit_tests/core/inference/contexts/test_dynamic_context_mamba_replay.py
   - tests/unit_tests/core/inference/contexts/test_dynamic_context_mtp_kv_cache.py
   - tests/unit_tests/core/inference/contexts/test_dynamic_prefix_caching.py
   - tests/unit_tests/core/inference/contexts/test_fused_kv_append_kernel.py
   - tests/unit_tests/core/inference/contexts/test_gpu_view.py
   - tests/unit_tests/core/inference/contexts/test_kv_block_allocator.py
   - tests/unit_tests/core/inference/contexts/test_kv_event_publication.py
+  - tests/unit_tests/core/inference/contexts/test_mamba_replay_metadata.py
   - tests/unit_tests/core/inference/contexts/test_routing_metadata.py
   - tests/unit_tests/inference/integrations/dynamo/test_handoff_recovery.py
   - tests/unit_tests/inference/integrations/dynamo/test_launcher.py
@@ -332,7 +345,6 @@ h100:
   - tests/unit_tests/test_async_sched_output_metrics.py
   - tests/unit_tests/core/inference/test_async_stream.py
   - tests/unit_tests/core/inference/test_batch_dimension_utils.py
-  - tests/unit_tests/core/inference/test_batch_invariant_deepgemm_stride.py
   - tests/unit_tests/core/inference/test_batch_invariant_live_rows.py
   - tests/unit_tests/core/inference/test_batch_invariant_nvls.py
   - tests/unit_tests/core/inference/test_chat_completions.py
@@ -358,6 +370,7 @@ h100:
   - tests/unit_tests/core/inference/test_endpoints_common.py
   - tests/unit_tests/core/inference/test_engine_endpoint.py
   - tests/unit_tests/core/inference/test_engine_factory.py
+  - tests/unit_tests/core/inference/test_ep_invariant_ordered_rsv.py
   - tests/unit_tests/core/inference/test_flash_decode.py
   - tests/unit_tests/core/inference/test_flashinfer_mxfp8.py
   - tests/unit_tests/core/inference/test_flashinfer_nvfp4.py
@@ -382,6 +395,7 @@ h100:
   - tests/unit_tests/core/inference/test_mxfp8_utils.py
   - tests/unit_tests/core/inference/test_nccl_transfer_backend.py
   - tests/unit_tests/core/inference/test_openai_streaming.py
+  - tests/unit_tests/core/inference/test_pool_int64_offsets.py
   - tests/unit_tests/core/inference/test_request_seed_sampling.py
   - tests/unit_tests/core/inference/test_scheduler.py
   - tests/unit_tests/core/inference/test_sigmoid_topk.py
@@ -444,6 +458,8 @@ h100:
   - tests/unit_tests/core/ssm/test_gdp_dynamic_inference.py
   tests/unit_tests/ssm/test_gdn_gated_output_norm_fusion.py:
   - tests/unit_tests/core/ssm/test_gdn_gated_output_norm_fusion.py
+  tests/unit_tests/ssm/test_kda.py:
+  - tests/unit_tests/core/ssm/test_kda.py
   tests/unit_tests/ssm/**/*.py:
   - tests/unit_tests/core/ssm/ops/common/test_causal_conv1d_triton.py
   - tests/unit_tests/core/ssm/ops/common/test_causal_conv1d_varlen.py
@@ -451,6 +467,7 @@ h100:
   - tests/unit_tests/core/ssm/ops/gdp/test_fused_recurrent_intermediate.py
   - tests/unit_tests/core/ssm/ops/gdp/test_prefill_prepare.py
   - tests/unit_tests/core/ssm/ops/mamba2/test_batch_invariant_decode.py
+  - tests/unit_tests/core/ssm/ops/mamba2/test_mamba_ssm_replay.py
   - tests/unit_tests/core/ssm/ops/mamba2/test_selective_state_update.py
   - tests/unit_tests/core/ssm/ops/mamba2/test_ssd_bmm.py
   - tests/unit_tests/core/ssm/ops/mamba2/test_ssd_chunk_scan.py
@@ -471,7 +488,6 @@ h100:
   - tests/unit_tests/core/ssm/test_gdp_triton_projection_no_copy.py
   - tests/unit_tests/core/ssm/test_hybrid_block.py
   - tests/unit_tests/core/ssm/test_hybrid_layer_allocation.py
-  - tests/unit_tests/core/ssm/test_kda.py
   - tests/unit_tests/core/ssm/test_kda_gate_precision.py
   - tests/unit_tests/core/ssm/test_mamba_context_parallel.py
   - tests/unit_tests/core/ssm/test_mamba_layer.py
@@ -495,6 +511,7 @@ h100:
   - tests/unit_tests/core/transformer/moe/test_moe_batch_invariant.py
   - tests/unit_tests/core/transformer/moe/test_moe_batch_invariant_router.py
   - tests/unit_tests/core/transformer/moe/test_moe_batch_invariant_unpermute.py
+  - tests/unit_tests/core/transformer/moe/test_moe_ep_invariant_combine.py
   - tests/unit_tests/core/transformer/moe/test_moe_layer.py
   - tests/unit_tests/core/transformer/moe/test_moe_layer_discrepancy.py
   - tests/unit_tests/core/transformer/moe/test_moe_recompute_memory.py
@@ -523,10 +540,12 @@ h100:
   tests/unit_tests/distributed/mfsdp_v1/**/*.py:
   - tests/unit_tests/core/distributed/mfsdp_v1/test_mcore_fully_sharded_data_parallel.py
   - tests/unit_tests/core/distributed/mfsdp_v1/test_mcore_tensor_parallelism_detect.py
+  - tests/unit_tests/core/distributed/mfsdp_v1/test_mfsdp_expert_gradient_scaling.py
   - tests/unit_tests/core/distributed/mfsdp_v1/test_mfsdp_fused_mla_checkpoint.py
   - tests/unit_tests/core/distributed/mfsdp_v1/test_mfsdp_hybrid_sharding.py
   - tests/unit_tests/core/distributed/mfsdp_v1/test_mfsdp_mixed_precision_policy.py
   - tests/unit_tests/core/distributed/mfsdp_v1/test_mfsdp_nonuniform_sharding.py
+  - tests/unit_tests/core/distributed/mfsdp_v1/test_mfsdp_param_attributes.py
   - tests/unit_tests/core/distributed/mfsdp_v1/test_mfsdp_parameter_grouping.py
   - tests/unit_tests/core/distributed/mfsdp_v1/test_mfsdp_uneven_dtensor.py
   tests/unit_tests/distributed/mfsdp_v2/**/*.py:
@@ -537,6 +556,7 @@ h100:
   - tests/unit_tests/core/distributed/mfsdp_v2/test_dbuffer.py
   - tests/unit_tests/core/distributed/mfsdp_v2/test_execution_order.py
   - tests/unit_tests/core/distributed/mfsdp_v2/test_expert_parallel.py
+  - tests/unit_tests/core/distributed/mfsdp_v2/test_fsdp_unit_collector.py
   - tests/unit_tests/core/distributed/mfsdp_v2/test_fully_shard.py
   - tests/unit_tests/core/distributed/mfsdp_v2/test_gather_scatter.py
   - tests/unit_tests/core/distributed/mfsdp_v2/test_grad_multiplicity.py
@@ -545,6 +565,7 @@ h100:
   - tests/unit_tests/core/distributed/mfsdp_v2/test_mcore_cuda_graph.py
   - tests/unit_tests/core/distributed/mfsdp_v2/test_mcore_dense.py
   - tests/unit_tests/core/distributed/mfsdp_v2/test_mcore_hybrid.py
+  - tests/unit_tests/core/distributed/mfsdp_v2/test_mcore_mhc.py
   - tests/unit_tests/core/distributed/mfsdp_v2/test_mcore_moe.py
   - tests/unit_tests/core/distributed/mfsdp_v2/test_memory.py
   - tests/unit_tests/core/distributed/mfsdp_v2/test_muon.py
@@ -561,6 +582,7 @@ h100:
   - tests/unit_tests/core/pipeline_parallel/test_cuda_graphed_schedule_chunk_1f1b.py
   - tests/unit_tests/core/pipeline_parallel/test_delay_wgrad_compute.py
   - tests/unit_tests/core/pipeline_parallel/test_fsdp_1f1b_overlap.py
+  - tests/unit_tests/core/pipeline_parallel/test_mfsdp_v2_1f1b_cuda_graph.py
   - tests/unit_tests/core/pipeline_parallel/test_schedule_chunk_1f1b.py
   - tests/unit_tests/core/pipeline_parallel/test_schedule_layer_1f1b.py
   - tests/unit_tests/core/pipeline_parallel/test_schedule_quantization_context.py
@@ -586,6 +608,7 @@ h100:
   - tests/unit_tests/core/tensor_parallel/test_gtp_muon_dcp.py
   - tests/unit_tests/core/tensor_parallel/test_gtp_muon_qkv.py
   - tests/unit_tests/core/tensor_parallel/test_gtp_partial_cg.py
+  - tests/unit_tests/core/tensor_parallel/test_gtp_pipeline_prefetch.py
   - tests/unit_tests/core/tensor_parallel/test_gtp_prefetch_registration.py
   - tests/unit_tests/core/tensor_parallel/test_gtp_recompute_chain.py
   - tests/unit_tests/core/tensor_parallel/test_gtp_symmetric_memory.py
@@ -614,6 +637,7 @@ h100:
   - tests/unit_tests/core/determinism/kernels/test_mla_device_placement.py
   - tests/unit_tests/core/determinism/kernels/test_moe_kernels.py
   - tests/unit_tests/core/determinism/kernels/test_mok_kernels.py
+  - tests/unit_tests/core/determinism/kernels/test_mtp_kl_loss.py
   - tests/unit_tests/core/determinism/kernels/test_optimizer_kernels.py
   - tests/unit_tests/core/determinism/kernels/test_request_seed_sampling.py
   - tests/unit_tests/core/determinism/kernels/test_runtime_cp_attention.py
@@ -621,6 +645,7 @@ h100:
   - tests/unit_tests/core/determinism/kernels/test_streamwise_residual_ops.py
   - tests/unit_tests/core/determinism/kernels/test_te_wrappers.py
   - tests/unit_tests/core/determinism/kernels/test_tensor_parallel_kernels.py
+  - tests/unit_tests/core/determinism/kernels/test_triton_block_ptr_compat.py
   tests/unit_tests/**/*.py:
   - tests/unit_tests/core/context_parallel/test_layout.py
   - tests/unit_tests/training/test_autotune_cache_env.py
@@ -738,6 +763,7 @@ h100:
   - tests/unit_tests/core/test_parallel_state.py
   - tests/unit_tests/core/test_parameter_names.py
   - tests/unit_tests/test_perf_baseline_comparison.py
+  - tests/unit_tests/core/test_process_group_fallback.py
   - tests/unit_tests/core/test_process_groups_config.py
   - tests/unit_tests/test_rank_log_setup.py
   - tests/unit_tests/core/test_rank_utils.py
@@ -834,6 +860,8 @@ h100:
   tests/unit_tests/transformer/test_multi_token_prediction.py:
   - tests/unit_tests/core/transformer/test_multi_token_prediction.py
 gb200:
+  tests/unit_tests/transformer/test_cuda_graphs.py:
+  - tests/unit_tests/core/transformer/test_cuda_graphs.py
   tests/unit_tests/context_parallel/runtime/**/*.py:
   - tests/unit_tests/core/context_parallel/test_activation_replay.py
   - tests/unit_tests/core/context_parallel/test_batch_metadata.py
@@ -869,6 +897,8 @@ gb200:
   - tests/unit_tests/core/determinism/kernels/test_inference_kernels.py
   - tests/unit_tests/core/determinism/kernels/test_moe_kernels.py
   - tests/unit_tests/core/determinism/kernels/test_te_wrappers.py
+  - tests/unit_tests/core/determinism/kernels/test_triton_block_ptr_compat.py
+  - tests/unit_tests/core/dist_checkpointing/test_optimizer.py
   - tests/unit_tests/core/distributed/mfsdp_v2/test_gradient_accumulation.py
   - tests/unit_tests/core/distributed/mfsdp_v2/test_mcore_dense.py
   - tests/unit_tests/core/distributed/mfsdp_v2/test_quantization.py
@@ -886,6 +916,7 @@ gb200:
   - tests/unit_tests/core/test_fp8_param.py
   - tests/unit_tests/training/test_glu_checkpoint_loading_numerics.py
   - tests/unit_tests/training/test_glu_checkpointing.py
+  - tests/unit_tests/core/transformer/experimental_attention_variant/test_csa_deterministic_indexer.py
   - tests/unit_tests/core/transformer/experimental_attention_variant/test_dsa_indexer_weights_proj_precision.py
   - tests/unit_tests/core/transformer/experimental_attention_variant/test_dsv4_packed_cp.py
   - tests/unit_tests/core/transformer/moe/test_grouped_mlp.py
@@ -897,7 +928,6 @@ gb200:
   - tests/unit_tests/core/transformer/moe/test_token_dispatcher.py
   - tests/unit_tests/core/transformer/moe/test_virtual_experts.py
   - tests/unit_tests/core/transformer/test_activation_recompute_numerics.py
-  - tests/unit_tests/core/transformer/test_cuda_graphs.py
   - tests/unit_tests/core/transformer/test_module.py
   - tests/unit_tests/core/transformer/test_multi_latent_attention.py
   - tests/unit_tests/core/transformer/test_te_fused_mlp_with_grouped_linear_spec.py
@@ -914,3 +944,5 @@ gb200:
   - tests/unit_tests/core/tensor_parallel/test_gtp_fp8_param_gather.py
   - tests/unit_tests/core/tensor_parallel/test_gtp_grouped_mlp_precision.py
   - tests/unit_tests/core/tensor_parallel/test_moe_egtp.py
+  tests/unit_tests/ssm/test_gdp_dynamic_inference.py:
+  - tests/unit_tests/core/ssm/test_gdp_dynamic_inference.py

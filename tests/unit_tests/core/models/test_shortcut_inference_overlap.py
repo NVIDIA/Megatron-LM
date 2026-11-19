@@ -72,6 +72,36 @@ def test_overlap_rejects_unsupported_execution_before_dispatch(monkeypatch, fail
     assert not calls
 
 
+@pytest.mark.parametrize("tp_size", [1, 2])
+@pytest.mark.parametrize("inference_modules", [True, False])
+def test_overlap_setup_requires_collective_free_moe_modules_at_tp(
+    monkeypatch, tp_size, inference_modules
+):
+    """At TP>1 the shortcut stream may only run modules that issue no TP collectives."""
+
+    class Router:
+        pass
+
+    class Experts:
+        pass
+
+    monkeypatch.setattr(torch.cuda, "Event", lambda: object())
+    monkeypatch.setattr(shortcut_module, "get_pg_size", lambda group: tp_size)
+    if inference_modules:
+        monkeypatch.setattr(shortcut_module, "InferenceTopKRouter", Router)
+        monkeypatch.setattr(shortcut_module, "InferenceGroupedMLP", Experts)
+    config = _shortcut_config()
+    block = ShortcutMoEBlock(_FakeCompute(config), _FakeMoE(config), overlap_a2a=False)
+    block.moe_layer.mlp.router = Router()
+    block.moe_layer.mlp.experts = Experts()
+    if tp_size > 1 and not inference_modules:
+        with pytest.raises(RuntimeError, match="issue no TP-group collectives"):
+            block.setup_inference_overlap()
+    else:
+        block.setup_inference_overlap()
+    assert block.route_ready_event is not None
+
+
 @pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("predecessor", ["gdp", "attention"])

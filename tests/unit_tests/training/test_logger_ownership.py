@@ -60,7 +60,7 @@ def test_cli_aliases_and_native_config_match(run_config):
 def test_normalization_does_not_alias_or_mutate_args(monkeypatch, inference):
     from megatron.core.distributed import DistributedDataParallelConfig
     from megatron.core.optimizer import OptimizerConfig
-    from megatron.training import argument_utils, training
+    from megatron.training import argument_utils
 
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
@@ -68,7 +68,7 @@ def test_normalization_does_not_alias_or_mutate_args(monkeypatch, inference):
     args.modules_to_filter = ['module']
     args.log_interval = 7
     monkeypatch.setattr(
-        training,
+        argument_utils,
         'get_megatron_ddp_config',
         lambda args, *, use_torch_fsdp2: DistributedDataParallelConfig(),
     )
