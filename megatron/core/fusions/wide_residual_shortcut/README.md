@@ -10,14 +10,16 @@ parameters, RMSNorm, 2-6 streams, a shared expert in shortcut blocks, no dropout
 at most 65536 local tokens per call, 16384 above hidden 4096, a GB300 for training, ...) are
 listed in the `moe_shortcut_wide_residual_norm_fusion` docstring.
 
-| boundary | updates | readers | kernel |
+Every seam is one `fused_seam` call:
+
+| boundary | updates | readers | notes |
 |---|--:|--:|---|
-| compute → MoE inside a block | 1 | 1 | `shortcut_add_wide_residual_write_read_rmsnorm_quant`, no shared update |
-| lone layer → lone layer (M → -, - → M) | 1 | 1 | `shortcut_add_wide_residual_write_read_rmsnorm_quant`, no shared update |
-| block → lone layer ([* E] → M) | 2 (routed + shared) | 1 | `shortcut_add_wide_residual_write_read_rmsnorm_quant` |
-| block → block (shortcut add) | 2 (routed + shared) | 2 | `shortcut_add_..._two_reader_rmsnorm_quant` |
-| lone layer → block (M → [* E]) | 1 | 2 | `shortcut_add_..._two_reader_rmsnorm_quant`, no shared update |
-| into a standalone MoE layer (M → E) | 1 | 1 | `shortcut_add_wide_residual_write_read_rmsnorm_quant`, BF16 read |
+| compute → MoE inside a block | 1 | 1 | no shared update |
+| lone layer → lone layer (M → -, - → M) | 1 | 1 | no shared update |
+| block → lone layer ([* E] → M) | 2 (routed + shared) | 1 | |
+| block → block (shortcut add) | 2 (routed + shared) | 2 | |
+| lone layer → block (M → [* E]) | 1 | 2 | no shared update |
+| into a standalone MoE layer (M → E) | 1 | 1 | BF16 read |
 
 A standalone MoE layer (outside a shortcut block, or every MoE layer without
 `--moe-shortcut-connection`) takes its read whole: one BF16 tensor for its router, shared expert
@@ -28,9 +30,13 @@ A write that the next seam applies is passed forward as a `PendingWideResidualWr
 shared MoE outputs (the shortcut add, whose BF16 sum is rounded before the write) or a lone
 layer's single update.
 
+This package knows tensors, formats and kernel limits, not Megatron modules: the seam modules,
+their linking and the per-layer precision live in `megatron/core/transformer/wide_residual.py`.
+
 Modules:
 
-- `api.py`: the seam functions and their autograd function (all state is call-local).
+- `api.py`: the seam op `fused_seam`, its autograd function and its call-time checks
+  (`check_mxfp8_call`).
 - `forward_kernel.py`: the forward kernel and its GB300 schedule selection (sweep-fit decision
   trees for training and prefill, a decode tree with CTA clusters for short rows, a fixed schedule
   in batch-invariant mode); inference launches save nothing for backward.
@@ -40,13 +46,12 @@ Modules:
   interval (one write per interval, or N with `--residual-stream-recompute-num-layers N`). An
   interval keeps only its input residual and the writes' tapes; it is replayed bit-exactly once,
   before its backward GEMMs (in the next interval's first seam's backward, or from a hook on the
-  stack's output), rebuilding the freed residuals and filling its MXFP8 readers' column slots.
-  Forwards and backwards alternate on one stream (fusion rejects PP, overlapped EP communication
-  and full recompute), so the replay needs no events; retained-graph backward is unsupported.
-- MXFP8 handoff: the stack fixes each read's formats at link time from the per-layer precision
-  its forward uses; an MXFP8 consumer TELinear (hooked in
-  `megatron/core/transformer/wide_residual.py`) unpacks its read's replayed columnwise operand
-  for its weight-gradient GEMM (TE runs its GEMMs unchanged).
+  stack's output), rebuilding the freed residuals and filling its MXFP8 readers' column slots,
+  which consumer TE Linears unpack for their weight-gradient GEMMs (`install_columns`; TE runs
+  its GEMMs unchanged). Forwards and backwards alternate on one stream (fusion rejects PP,
+  overlapped EP communication and full recompute), so the replay needs no events;
+  retained-graph backward is unsupported. The seam modules open intervals and the stack's last
+  write closes the last one (`wide_residual.link_residual_seams`).
 
 Residual writes are bit-identical across schedules and to replay; reader outputs differ by at
 most one BF16 ulp between schedules. Tests: `tests/unit_tests/fusions/test_wide_residual_shortcut.py`

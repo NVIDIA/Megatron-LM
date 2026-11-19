@@ -8,7 +8,8 @@ every seam's input residual bit-exactly and fills its readers' ``ColumnSlot``s w
 columnwise MXFP8 operands their consumers' weight-gradient GEMMs unpack. It runs before any
 backward GEMM of the interval: in the backward of the next interval's first seam, or for a
 stack's last interval with column slots in a gradient hook on the stack's output
-(``replay_before``); a seam's own backward replays it at the latest.
+(``replay_before``); a seam's own backward replays it at the latest. TE Linears consuming an
+MXFP8 read unpack its slot (``install_columns``). The caller decides where intervals start.
 
 Fusion admits only schedules whose forwards and backwards alternate on one stream (no pipeline
 parallelism, overlapped expert-parallel communication or full recompute), so the replay needs no
@@ -84,21 +85,29 @@ class ReplayInterval:
         return previous
 
 
-class ReplayChain:
-    """One fused stack's open interval during its forward (forwards and backwards alternate)."""
+def install_columns(output, operand, slot) -> None:
+    """After a TE Linear's forward (with grad) on a read's MXFP8 ``operand``: its backward
+    unpacks ``slot``'s replayed columnwise operand in place of the saved rowwise one (TE's own
+    save slot only; a scope-wide saved-tensor hook would detach the saved weight and lose GTP
+    metadata). TE's backward, including weight-gradient accumulation and distributed-weight
+    finalization, runs unchanged."""
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
 
-    def __init__(self):
-        self.open = None
+    if not FP8GlobalStateManager.is_fp8_enabled():
+        raise RuntimeError("an MXFP8 consumer of a fused read ran outside its FP8 context")
 
-    def interval(self, starts: bool) -> ReplayInterval:
-        """The interval a seam records into: a new one where an interval starts."""
-        if starts:
-            self.open = ReplayInterval(self.open)
-        elif self.open is None:
-            raise RuntimeError("a replayed seam has no open replay interval")
-        return self.open
+    def unpack(size):
+        if slot.columns is None:
+            raise RuntimeError("a fused read's replay did not run before its consumer's backward")
+        return slot.columns.view(size)
 
-    def close(self, output):
-        """End the forward at the stack's ``output``: its last interval replays before it."""
-        interval, self.open = self.open, None
-        return output if interval is None else interval.replay_before(output)
+    node = (output[0] if isinstance(output, tuple) else output).grad_fn
+    key = operand._rowwise_data.untyped_storage()._cdata
+    matched = 0
+    for value, saved in zip(node.saved_tensors, node._raw_saved_tensors):
+        data = getattr(value, "_rowwise_data", None)
+        if data is not None and data.untyped_storage()._cdata == key:
+            saved.register_hooks(torch.Tensor.size, unpack)
+            matched += 1
+    if matched != 1:
+        raise RuntimeError("TE did not save exactly one shortcut MXFP8 activation")

@@ -24,15 +24,14 @@ from megatron.core.fusions.wide_residual_shortcut import (
     PendingWideResidualWrites,
     backward_kernel,
     forward_kernel,
+    fused_seam,
     kernel_utils,
     replay_kernel,
-    shortcut_add_wide_residual_write_read_rmsnorm_quant,
-    shortcut_add_wide_residual_write_two_reader_rmsnorm_quant,
 )
 from megatron.core.fusions.wide_residual_shortcut.residual_replay import (
     ColumnSlot,
-    ReplayChain,
     ReplayInterval,
+    install_columns,
 )
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
@@ -116,36 +115,33 @@ def mx_inputs(m, h, readers, updates=None):
 
 
 def run(raw, streams=3, epsilon=1e-5, **options):
-    """Call the public seam function matching the reader count (one or two updates)."""
+    """Call the seam op (one or two updates and readers); with gradients it records into a new
+    one-write interval unless ``interval`` is given."""
     residual, updates, controllers, gammas = raw
     options.update(num_streams=streams, epsilon=epsilon)
+    if torch.is_grad_enabled():
+        options.setdefault("interval", ReplayInterval())
     shared = updates[1] if len(updates) == 2 else None
     pending = PendingWideResidualWrites(residual, updates[0], shared, *controllers[:2])
-    if len(gammas) == 1:
-        return shortcut_add_wide_residual_write_read_rmsnorm_quant(
-            pending, controllers[2], gammas[0], **options
-        )
-    return shortcut_add_wide_residual_write_two_reader_rmsnorm_quant(
-        pending, controllers[2:], gammas, **options
-    )
+    return fused_seam(pending, tuple(controllers[2:]), tuple(gammas), **options)
 
 
-def handoff(outputs, replay=None):
+def handoff(outputs, interval=None):
     """Seam options for reader ``outputs`` as the stack wires them: a ColumnSlot per MXFP8 read,
-    recorded into ``replay`` (default: a new interval), which ``consume`` replays before its
+    recorded into ``interval`` (default: a new one), which ``consume`` replays before its
     consumer's backward."""
-    replay = ReplayInterval() if replay is None else replay
+    interval = ReplayInterval() if interval is None else interval
     slots = []
     for fmt in outputs:
         uses = ("bf16", "mxfp8") if fmt == "both" else (fmt,) if isinstance(fmt, str) else fmt
         slots.append(ColumnSlot() if "mxfp8" in uses else None)
         if slots[-1] is not None:
-            slots[-1].interval = replay  # the trigger ``consume`` registers
-    return dict(outputs=tuple(outputs), columns=tuple(slots), replay=replay)
+            slots[-1].interval = interval  # the trigger ``consume`` registers
+    return dict(outputs=tuple(outputs), columns=tuple(slots), interval=interval)
 
 
-def boundary(raw, *, mxfp8_handoff=True, replay=None):
-    return run(raw, 3, **handoff(formats(len(raw[3]), mxfp8_handoff), replay))
+def boundary(raw, *, mxfp8_handoff=True, interval=None):
+    return run(raw, 3, **handoff(formats(len(raw[3]), mxfp8_handoff), interval))
 
 
 def invoke(raw, quantized=False):
@@ -872,7 +868,6 @@ def test_replay_matches_saved_states(ops, interval, dtype, streams, hidden, rete
         leaves = [v if v is None else v.detach().clone().requires_grad_() for v in original]
         values = iter(leaves[1:])
         current, outputs, states, inputs, storages, intervals = leaves[0], [], [], [], [], []
-        chain = ReplayChain()  # as a fused stack replays
         for op in ops:
             readers, updates = _OPS[op]
             us = [next(values) for _ in range(updates)]
@@ -880,10 +875,10 @@ def test_replay_matches_saved_states(ops, interval, dtype, streams, hidden, rete
             gammas = [next(values) for _ in range(readers)]
             if readers:
                 options = {}
-                if replay:  # every N seams start an interval
-                    options["replay"] = chain.interval(len(inputs) % interval == 0)
-                    if options["replay"] not in intervals:
-                        intervals.append(options["replay"])
+                if replay:  # every N seams start an interval, as a fused stack's reads do
+                    if len(inputs) % interval == 0:
+                        intervals.append(ReplayInterval(intervals[-1] if intervals else None))
+                    options["interval"] = intervals[-1]
                 inputs.append(current.detach().clone())
                 storages.append(StorageWeakRef(current.untyped_storage()))
                 current, *ys = run((current, us, controllers, gammas), streams, **options)
@@ -898,7 +893,6 @@ def test_replay_matches_saved_states(ops, interval, dtype, streams, hidden, rete
                     retention_max_forget=0.1,
                 )
             states.append(current.detach().clone())
-        current = chain.close(current)
         # Replay frees the seams' intermediate input residuals; without it the seams keep them.
         assert any(storage.expired() for storage in storages) == replay
         loss = current.float().square().mean() + sum(y.float().square().mean() for y in outputs)
@@ -980,7 +974,7 @@ def consume(layer, q):
         y = layer(q)[0] if isinstance(layer, TELinear) else layer(q)
         slot = column_slot(q)
         if slot is not None and torch.is_grad_enabled():
-            wide_residual.install_columns(y, q, slot)
+            install_columns(y, q, slot)
             slot.interval.replay_before(y)
     return y
 
@@ -1101,9 +1095,9 @@ def test_multiple_live_calls_and_replay(replay):
     raw = mx_inputs(8192, 4096, 1)
     layer = linear(4096, mcore=True)
     interval = ReplayInterval() if replay else None
-    first = boundary(raw, replay=interval)
+    first = boundary(raw, interval=interval)
     y0 = consume(layer, first[1])
-    second = boundary((first[0], *raw[1:]), replay=interval)
+    second = boundary((first[0], *raw[1:]), interval=interval)
     y1 = consume(layer, second[1])
     outputs = (y0, y1, second[0])
     torch.autograd.backward(outputs, tuple(torch.ones_like(t) for t in outputs))
@@ -1490,20 +1484,16 @@ def test_direct_mxfp8_consumer_selection(monkeypatch, eligible):
 
     seen = []
     monkeypatch.setattr(wide_residual, "check_mxfp8_call", lambda tensor: None)
-    monkeypatch.setattr(
-        wide_residual,
-        "shortcut_add_wide_residual_write_read_rmsnorm_quant",
-        lambda *a, **k: seen.append(k),
-    )
+    monkeypatch.setattr(wide_residual, "fused_seam", lambda *a, **k: seen.append(k))
     only.num_streams, only.eps, only.weight = 3, 1e-5, None
     only.read_map = lambda return_logits: None
-    only.replay_chain, only.starts_replay = ReplayChain(), True
+    only.previous_read, only.starts_replay = None, True
     pending = PendingWideResidualWrites(None, None, None, None, None)
     with torch.enable_grad():
         wide_residual.WriteReadNorm.apply_write(only, pending)
     (options,) = seen
     (slot,) = options["columns"]
     assert options["outputs"] == (only.consumer_formats,)
-    assert options["replay"] is only.replay_chain.open
+    assert isinstance(options["interval"], ReplayInterval) and options["interval"] is only.interval
     assert (slot is not None) == eligible
     assert only.columns_slot is None if slot is None else only.columns_slot() is slot

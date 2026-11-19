@@ -20,10 +20,11 @@ from megatron.core.fusions.wide_residual_shortcut import (
     forward_kernel,
     kernel_utils,
 )
+from megatron.core.fusions.wide_residual_shortcut.api import check_mxfp8_call
 from megatron.core.fusions.wide_residual_shortcut.replay_kernel import replay_interval
 from megatron.core.fusions.wide_residual_shortcut.residual_replay import ReplayInterval
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.transformer.wide_residual import check_mxfp8_call, mxfp8_linear_eligible
+from megatron.core.transformer.wide_residual import mxfp8_linear_eligible
 from tests.unit_tests.determinism.kernels.harness import seeded
 from tests.unit_tests.fusions.test_wide_residual_shortcut import (
     BF16,
