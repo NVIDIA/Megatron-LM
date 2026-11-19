@@ -704,6 +704,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         inference_context: BaseInferenceContext = None,
         runtime_gather_output: Optional[bool] = None,
         *,
+        forward_context=None,
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
         mtp_input_mask: Optional[Tensor] = None,
@@ -908,6 +909,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
                 input_ids=hash_input_ids,
+                **({"forward_context": forward_context} if forward_context is not None else {}),
             )
         if isinstance(decoder_output, tuple):
             hidden_states, mhc_multistream = decoder_output

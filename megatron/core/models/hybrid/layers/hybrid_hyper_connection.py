@@ -16,7 +16,7 @@ from megatron.core.transformer.module import (
     MegatronModule,
     convert_module_to_dtype_except_fp32_marked,
 )
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import CrossLayerState, TransformerLayer
 
 
 class HyperConnectionHybridLayer(MegatronModule):
@@ -62,6 +62,7 @@ class HyperConnectionHybridLayer(MegatronModule):
         packed_sequence_cp_metadata: Optional[PackedSequenceCPMetadata],
         padding_mask: Optional[Tensor],
         input_ids: Optional[Tensor] = None,
+        cross_layer_state: CrossLayerState | None = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         if layer_utils.get_custom_layer_type(getattr(self.inner_layer, "config", None)) is not None:
             output = layer_utils.invoke_custom_layer(
@@ -77,6 +78,11 @@ class HyperConnectionHybridLayer(MegatronModule):
         if isinstance(self.inner_layer, TransformerLayer):
             output = self.inner_layer(
                 hidden_states,
+                **(
+                    {"cross_layer_state": cross_layer_state}
+                    if cross_layer_state is not None
+                    else {}
+                ),
                 attention_mask=attention_mask,
                 inference_context=inference_context,
                 rotary_pos_emb=rotary_pos_emb,
@@ -114,6 +120,7 @@ class HyperConnectionHybridLayer(MegatronModule):
         padding_mask: Optional[Tensor],
         input_ids: Optional[Tensor] = None,
         mhc_recompute_manager=None,
+        cross_layer_state: CrossLayerState | None = None,
     ) -> Optional[Tuple[Tuple[Tensor, Optional[Tensor]], Optional[Tensor], float, bool]]:
         """Return a raw branch output for split Hybrid TransformerLayer instances.
 
@@ -145,6 +152,11 @@ class HyperConnectionHybridLayer(MegatronModule):
                     inference_context=inference_context,
                     rotary_pos_emb=rotary_pos_emb,
                     packed_seq_params=packed_seq_params,
+                    **(
+                        {"cross_layer_state": cross_layer_state}
+                        if cross_layer_state is not None
+                        else {}
+                    ),
                     sequence_len_offset=sequence_len_offset,
                     mhc_recompute_manager=mhc_recompute_manager,
                 )
@@ -185,6 +197,7 @@ class HyperConnectionHybridLayer(MegatronModule):
         packed_sequence_cp_metadata: Optional[PackedSequenceCPMetadata] = None,
         mhc_recompute_manager=None,
         input_ids: Optional[Tensor] = None,
+        cross_layer_state: CrossLayerState | None = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Run the wrapped hybrid layer through one layer-boundary mHC update."""
         aggregated, h_res, h_post, residual = self.hyper_connection(
@@ -200,6 +213,7 @@ class HyperConnectionHybridLayer(MegatronModule):
             padding_mask,
             input_ids,
             mhc_recompute_manager,
+            cross_layer_state=cross_layer_state,
         )
 
         if fast_path_result is None:
@@ -213,6 +227,7 @@ class HyperConnectionHybridLayer(MegatronModule):
                 packed_sequence_cp_metadata,
                 padding_mask,
                 input_ids,
+                cross_layer_state=cross_layer_state,
             )
             if self.config.fp32_residual_connection and aggregated.dtype != layer_output.dtype:
                 aggregated = aggregated.to(layer_output.dtype)
