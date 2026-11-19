@@ -8,7 +8,7 @@ import torch
 from megatron.core.inference.sampling.torch_sampling import TorchSampling
 
 
-def _make_context(temperature, top_k, top_p, *, paused_request_count=0):
+def _make_context(temperature, top_k, top_p, *, is_greedy=None, paused_request_count=0):
     """Minimal stand-in for `DynamicInferenceContext` covering the fields
     `log_probs_kernel` reads: `total_request_count`, `paused_request_count`,
     and `active_request_metadata`."""
@@ -16,7 +16,14 @@ def _make_context(temperature, top_k, top_p, *, paused_request_count=0):
     return SimpleNamespace(
         total_request_count=num_requests + paused_request_count,
         paused_request_count=paused_request_count,
-        active_request_metadata={"temperature": temperature, "top_k": top_k, "top_p": top_p},
+        active_request_metadata={
+            "temperature": temperature,
+            "top_k": top_k,
+            "top_p": top_p,
+            "is_greedy": (
+                torch.zeros(num_requests, dtype=torch.bool) if is_greedy is None else is_greedy
+            ),
+        },
     )
 
 
@@ -89,6 +96,7 @@ def test_uniform_top_one_sampling_with_speculative_row_mapping():
         torch.tensor([0.5, 1.0, 2.0]),
         torch.ones(request_count, dtype=torch.long),
         torch.zeros(request_count),
+        is_greedy=torch.ones(request_count, dtype=torch.bool),
     )
     sampling = TorchSampling(rng=torch.Generator(), vocab_size=257)
     logits = torch.randn(12, 257, device="cuda", dtype=torch.bfloat16)

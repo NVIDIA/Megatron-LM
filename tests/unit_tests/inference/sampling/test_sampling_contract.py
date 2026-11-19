@@ -3,8 +3,10 @@
 """The sampling contract both backends implement, checked against an fp64 reference.
 
 * Top-k and top-p together: top-p applies to the renormalized top-k set (top-k first).
-* Greedy (`top_k == 1`, which temperature 0 maps to): the lowest-index argmax on every row, in
-  all-greedy and mixed batches, with or without a top-p; its processed log-probs are one-hot.
+* Greedy (`is_greedy`, which temperature 0 and top_k=1 set): the lowest-index argmax of the
+  logits as given, on every row, in all-greedy and mixed batches, whatever its filters; its
+  processed log-probs are one-hot. Its sampling metadata is neutral, so it never changes the
+  kernel the other rows sample with.
 * A top-k at or above the vocabulary filters nothing: the engine admits it as no top-k.
 """
 
@@ -67,17 +69,36 @@ def _reference_probs(logits_row, temperature, top_k, top_p):
     return torch.zeros_like(x).index_put_((kept,), probs)
 
 
-def _context(temperature, top_k, top_p):
-    """Stand-in dynamic context: CPU metadata, its GPU view, and the real filter flags."""
+SAMPLING_COLUMNS = ("temperature", "top_k", "top_p", "is_greedy")
+
+
+def _sampling_row(params):
+    """The sampling metadata a dynamic context tracks for a request with these params."""
+    request = DynamicInferenceRequest(
+        request_id=0, prompt="", prompt_tokens=torch.tensor([1]), sampling_params=params
+    )
+    names = [name for name, _ in request.get_metadata_types()]
+    return dict(zip(names, request.tracked_metadata))
+
+
+def _context(groups):
+    """Stand-in dynamic context for `(SamplingParams, count)` groups of requests, in order: the
+    CPU sampling metadata the real context tracks, its GPU view, and the real filter flags."""
+    dtypes = dict(DynamicInferenceRequest.get_metadata_types())
+    rows = []
+    for params, count in groups:
+        params.termination_id = 0
+        rows += [_sampling_row(params)] * count
     metadata = {
-        "temperature": torch.tensor(temperature, dtype=torch.float32),
-        "top_k": torch.tensor(top_k, dtype=torch.int32),
-        "top_p": torch.tensor(top_p, dtype=torch.float32),
+        name: torch.tensor([row[name] for row in rows], dtype=dtypes[name])
+        for name in SAMPLING_COLUMNS
     }
+    gpu_view = {name: value.to(DEVICE) for name, value in metadata.items()}
+    gpu_view["is_greedy"] = gpu_view["is_greedy"].to(torch.int32)
     context = SimpleNamespace(
         active_request_metadata=metadata,
-        gpu_view=SimpleNamespace(**{key: value.to(DEVICE) for key, value in metadata.items()}),
-        total_request_count=len(temperature),
+        gpu_view=SimpleNamespace(**gpu_view),
+        total_request_count=len(rows),
         paused_request_count=0,
         config=SimpleNamespace(num_speculative_tokens=0),
     )
@@ -110,9 +131,7 @@ def test_top_k_and_top_p_sample_from_reference_support(backend, top_k, top_p):
     plain, filtered = 64, 256
     logits = _fixed_rows(plain + filtered)
     context = _context(
-        [1.0] * (plain + filtered),
-        [0] * plain + [top_k] * filtered,
-        [0.0] * plain + [top_p] * filtered,
+        [(SamplingParams(), plain), (SamplingParams(top_k=top_k, top_p=top_p), filtered)]
     )
     sampler = _sampler(backend, VOCAB)
     reference = _reference_probs(logits[0], 1.0, top_k, top_p)
@@ -135,34 +154,90 @@ def _tied_rows(rows, tie):
     return row.to(torch.bfloat16).to(DEVICE).expand(rows, -1).contiguous()
 
 
+# The ways a request asks for greedy decoding: `temperature=0`; `do_sample: false` with a
+# model-card top-p (`top_k=1, top_p=0.9`); and the flag itself, next to a sampled temperature.
+GREEDY = {
+    "temperature-0": dict(temperature=0.0),
+    "do-sample-false": dict(top_k=1, top_p=0.9),
+    "is-greedy": dict(is_greedy=True, temperature=0.7, top_p=0.9),
+}
+
+
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("mixed", [False, True], ids=["all-greedy", "mixed"])
-@pytest.mark.parametrize("greedy_top_p", [0.0, 0.9], ids=["temperature-0", "do-sample-false"])
+@pytest.mark.parametrize("greedy", list(GREEDY.values()), ids=list(GREEDY))
 @pytest.mark.parametrize("tie", [False, True], ids=["strict-max", "tied-max"])
-def test_greedy_rows_take_lowest_tied_index(backend, mixed, greedy_top_p, tie):
+def test_greedy_rows_take_lowest_tied_index(backend, mixed, greedy, tie):
     """Greedy rows return the lowest-index maximum on every batch row, not a draw among ties.
 
-    `temperature=0` arrives as `top_k=1, top_p=0`; `do_sample: false` with a model-card top-p
-    as `top_k=1, top_p=0.9`. A mixed batch adds one top-p row, which routes FlashInfer to its
-    joint kernel.
+    A mixed batch adds one top-p row, which routes FlashInfer to its top-p kernel.
     """
-    greedy = 1024
-    rows = greedy + int(mixed)
-    temperature, top_k, top_p = [0.0] * rows, [1] * rows, [greedy_top_p] * rows
+    greedy_rows = 1024
+    groups = [(SamplingParams(**greedy), greedy_rows)]
     if mixed:
-        temperature[-1], top_k[-1], top_p[-1] = 1.0, 0, 0.9
-    context = _context(temperature, top_k, top_p)
-    logits = _tied_rows(rows, tie)
+        groups.append((SamplingParams(top_p=0.9), 1))
+    context = _context(groups)
+    logits = _tied_rows(greedy_rows + int(mixed), tie)
     sampler = _sampler(backend, logits.shape[1])
 
     tokens = _sample(sampler, logits, context)
-    assert torch.equal(tokens[:greedy], torch.full((greedy,), 7))
+    assert torch.equal(tokens[:greedy_rows], torch.full((greedy_rows,), 7))
 
     # The processed distribution of a greedy row is one-hot on the token it samples.
-    log_probs = sampler.log_probs_kernel(logits.float(), context)[:greedy]
+    log_probs = sampler.log_probs_kernel(logits.float(), context)[:greedy_rows]
     one_hot = torch.full_like(log_probs[0], float("-inf"))
     one_hot[7] = 0.0
     assert torch.equal(log_probs, one_hot.expand_as(log_probs))
+
+
+@pytest.mark.skipif(
+    not (HAVE_FLASHINFER and torch.cuda.is_available()),
+    reason="FlashInfer sampling needs FlashInfer and CUDA",
+)
+@pytest.mark.parametrize("greedy", list(GREEDY.values()), ids=list(GREEDY))
+def test_greedy_rows_leave_the_other_rows_kernel_alone(greedy):
+    """Greedy rows change neither the FlashInfer kernel nor the draws of the rows that sample.
+
+    Their filters never reach the batch's filter flags, so plain rows next to greedy rows sample
+    and score exactly as next to plain rows; the greedy rows still take their argmax.
+    """
+    sampled = 64
+    logits = _fixed_rows(2 * sampled)
+
+    def serve(neighbours):
+        context = _context([(SamplingParams(), sampled), (neighbours, sampled)])
+        sampler = _sampler("flashinfer", VOCAB)
+        tokens = _sample(sampler, logits, context)
+        return tokens, sampler.log_probs_kernel(logits.float(), context).cpu()
+
+    plain_tokens, plain_log_probs = serve(SamplingParams())
+    assert len(set(plain_tokens[:sampled].tolist())) > 1, "the plain rows must draw"
+    tokens, log_probs = serve(SamplingParams(**greedy))
+    assert torch.equal(tokens[:sampled], plain_tokens[:sampled])
+    assert torch.equal(log_probs[:sampled], plain_log_probs[:sampled])
+    assert torch.equal(tokens[sampled:], torch.zeros(sampled, dtype=tokens.dtype))
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("top_p", [0.0, 0.9])
+def test_greedy_ignores_a_temperature_that_would_tie_its_maximum(backend, top_p):
+    """A greedy row's token and one-hot log-probs come from its logits as given.
+
+    Dividing the two logits below by the request's temperature 1.5 rounds them into an fp32
+    tie, whose lowest index is not the argmax.
+    """
+    grid = 1.5 + torch.arange(16, dtype=torch.float32) * 2**-23
+    scaled = grid / 1.5
+    first = int((scaled[1:] == scaled[:-1]).nonzero()[0])
+    logits = grid[first : first + 2].unsqueeze(0).to(DEVICE)
+    assert logits[0, 1] > logits[0, 0]
+    assert torch.equal(*(logits / 1.5)[0])
+
+    context = _context([(SamplingParams(temperature=1.5, top_k=1, top_p=top_p), 1)])
+    sampler = _sampler(backend, 2)
+    assert _sample(sampler, logits, context).tolist() == [1]
+    log_probs = sampler.log_probs_kernel(logits, context).cpu()
+    assert torch.equal(log_probs, torch.tensor([[float("-inf"), 0.0]]))
 
 
 @pytest.mark.parametrize(

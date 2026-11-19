@@ -59,7 +59,7 @@ def test_request_noise_replays_and_preserves_logical_coordinates():
 def test_uniform_greedy_rows_ignore_request_seeds():
     """An all-greedy batch takes per-row argmax, seeded or not, and never draws from the RNG.
 
-    Top-1 then top-p keeps the argmax, so a greedy row's top-p does not matter either.
+    Only `is_greedy` decides: the rows' temperature, top-k and top-p do not matter.
     """
     count = 4
     context = SimpleNamespace(
@@ -69,8 +69,9 @@ def test_uniform_greedy_rows_ignore_request_seeds():
         active_request_metadata={
             "seed": torch.tensor([7, -1, (1 << 63) - 1, 0], dtype=torch.int64),
             "temperature": torch.tensor([0.5, 1.0, 2.0, 1.0]),
-            "top_k": torch.ones(count, dtype=torch.int32),
+            "top_k": torch.tensor([1, 0, 50, 1], dtype=torch.int32),
             "top_p": torch.tensor([0.0, 0.9, 0.0, 0.5]),
+            "is_greedy": torch.ones(count, dtype=torch.bool),
         },
         get_active_sequence_lengths=lambda: torch.tensor([3, 5, 8, 13]),
     )
@@ -110,6 +111,7 @@ def test_seeded_top_k_top_p_rows_replay_and_ignore_batch_layout():
                 "temperature": torch.full((len(rows),), 0.7),
                 "top_k": torch.full((len(rows),), 50, dtype=torch.int32),
                 "top_p": torch.full((len(rows),), 0.9),
+                "is_greedy": torch.zeros(len(rows), dtype=torch.bool),
             },
             get_active_sequence_lengths=lambda: torch.full((len(rows),), 19),
         )

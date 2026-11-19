@@ -36,6 +36,7 @@ def context(seeds, positions, temperatures=None):
             "temperature": torch.tensor(temperatures or [1.0] * n),
             "top_k": torch.zeros(n, dtype=torch.int32),
             "top_p": torch.zeros(n),
+            "is_greedy": torch.zeros(n, dtype=torch.bool),
         },
         get_active_sequence_lengths=lambda: torch.tensor(positions),
     )

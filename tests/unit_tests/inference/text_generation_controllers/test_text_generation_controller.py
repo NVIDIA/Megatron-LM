@@ -287,6 +287,26 @@ class TextGenerationControllerTestBase:
         return sampled_per_step
 
 
+def _tracked_sampling_columns(params):
+    """The sampling metadata columns a dynamic context tracks for requests with these params."""
+    rows = []
+    for sampling_params in params:
+        request = DynamicInferenceRequest(
+            request_id=0,
+            prompt="",
+            prompt_tokens=torch.tensor([1]),
+            sampling_params=copy.copy(sampling_params),
+        )
+        request.sampling_params.termination_id = -1
+        names = [name for name, _ in request.get_metadata_types()]
+        rows.append(dict(zip(names, request.tracked_metadata)))
+    dtypes = dict(DynamicInferenceRequest.get_metadata_types())
+    return {
+        label: torch.tensor([row[label] for row in rows], dtype=dtypes[label])
+        for label in ("temperature", "top_k", "top_p", "is_greedy")
+    }
+
+
 def _make_async_sched_context(total_request_count=2, paused_request_count=0):
     metadata_len = max(total_request_count, 1)
     request_metadata = {
@@ -297,6 +317,7 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
         "top_n_logprobs": torch.zeros(metadata_len, dtype=torch.int64),
         "skip_prompt_log_probs": torch.zeros(metadata_len, dtype=torch.bool),
         "termination_id": torch.full((metadata_len,), 99, dtype=torch.int64),
+        "is_greedy": torch.ones(metadata_len, dtype=torch.bool),
     }
     context = SimpleNamespace(
         config=SimpleNamespace(
@@ -322,6 +343,7 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
             temperature=request_metadata["temperature"].clone(),
             top_k=request_metadata["top_k"].to(torch.int32).clone(),
             top_p=request_metadata["top_p"].clone(),
+            is_greedy=request_metadata["is_greedy"].to(torch.int32).clone(),
             active_request_last_token_idxs=torch.arange(metadata_len, dtype=torch.int32),
             request_query_lengths=torch.ones(metadata_len, dtype=torch.int32),
             token_to_input_ids=torch.arange(32, dtype=torch.int64),
@@ -598,18 +620,16 @@ def test_async_sched_forward_compaction(enable_cuda_graph, survivor_idxs, expect
     context.active_request_metadata["temperature"].copy_(torch.tensor([0.1, 0.2, 0.3, 0.4]))
     context.active_request_metadata["top_k"].copy_(torch.tensor([1, 2, 3, 4]))
     context.active_request_metadata["top_p"].copy_(torch.tensor([0.5, 0.6, 0.7, 0.8]))
+    context.active_request_metadata["is_greedy"].copy_(torch.tensor([True, False, False, True]))
     context.gpu_view.temperature.copy_(context.active_request_metadata["temperature"])
     context.gpu_view.top_k.copy_(context.active_request_metadata["top_k"])
     context.gpu_view.top_p.copy_(context.active_request_metadata["top_p"])
+    context.gpu_view.is_greedy.copy_(context.active_request_metadata["is_greedy"])
+    sampling_labels = ("temperature", "top_k", "top_p", "is_greedy")
     original_cpu_metadata = {
-        label: context.active_request_metadata[label].clone()
-        for label in ("temperature", "top_k", "top_p")
+        label: context.active_request_metadata[label].clone() for label in sampling_labels
     }
-    gpu_metadata = {
-        "temperature": context.gpu_view.temperature,
-        "top_k": context.gpu_view.top_k,
-        "top_p": context.gpu_view.top_p,
-    }
+    gpu_metadata = {label: getattr(context.gpu_view, label) for label in sampling_labels}
     original_gpu_metadata = {label: metadata.clone() for label, metadata in gpu_metadata.items()}
     controller = _make_async_sched_controller(context)
     controller._enable_cuda_graph = enable_cuda_graph
@@ -629,7 +649,7 @@ def test_async_sched_forward_compaction(enable_cuda_graph, survivor_idxs, expect
 
     if not expected_compaction:
         assert torch.equal(controller._all_logits_cuda, logits)
-        for label in ("temperature", "top_k", "top_p"):
+        for label in sampling_labels:
             assert torch.equal(context.active_request_metadata[label], original_cpu_metadata[label])
             assert torch.equal(gpu_metadata[label], original_gpu_metadata[label])
         return
@@ -643,7 +663,7 @@ def test_async_sched_forward_compaction(enable_cuda_graph, survivor_idxs, expect
     else:
         assert torch.equal(controller._all_logits_cuda, expected_logits)
     survivor_count = survivor_idxs.numel()
-    for label in ("temperature", "top_k", "top_p"):
+    for label in sampling_labels:
         assert torch.equal(
             context.active_request_metadata[label][:survivor_count],
             original_cpu_metadata[label][survivor_idxs],
@@ -1750,6 +1770,8 @@ def test_async_overlap_seed_uses_pending_logits_positions():
     context.config.num_speculative_tokens = 0
     context.active_request_metadata["seed"] = torch.tensor([91, 92, 93])
     context.active_request_metadata["top_k"].zero_()
+    context.active_request_metadata["is_greedy"].zero_()
+    context.gpu_view.is_greedy.zero_()
     context.get_active_sequence_lengths = lambda: (
         context.request_kv_length_offsets + context.request_query_lengths
     )
@@ -2608,19 +2630,22 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             )
         assert str(aerror.value) == 'top-k is larger than logit size.'
 
-        # top_p >= 1.0 is a no-op filter: identity on logits, legal alongside top-k;
-        # temperature=0 sharpens toward argmax instead of dividing into inf/NaN.
+        # top_p >= 1.0 is a no-op filter: identity on logits, legal alongside top-k.
         cpu_logits = torch.randn(4, 32)
         assert torch.equal(
             TorchSampling.filter_logits(cpu_logits, temperature=1.0, top_k=0, top_p=1.0), cpu_logits
         )
+        # Greedy decoding takes no temperature, so none divides by zero: the filter rejects a
+        # zero temperature, and a temperature-0 request is greedy and samples the argmax.
         for top_k, top_p in ((4, 0.0), (0, 0.9)):
-            filtered = TorchSampling.filter_logits(
-                cpu_logits, temperature=0.0, top_k=top_k, top_p=top_p
+            with pytest.raises(AssertionError, match="temperature must be positive"):
+                TorchSampling.filter_logits(cpu_logits, temperature=0.0, top_k=top_k, top_p=top_p)
+            greedy_params = SamplingParams(temperature=0.0, top_k=top_k, top_p=top_p)
+            assert greedy_params.is_greedy
+            greedy = self.text_generation_controller.sample_from_logits(
+                cpu_logits, greedy_params, self.vocab_size
             )
-            kept = filtered[filtered != float('-inf')]
-            assert torch.isfinite(kept).all()
-            assert torch.equal(filtered.argmax(dim=-1), cpu_logits.argmax(dim=-1))
+            assert torch.equal(greedy, cpu_logits.argmax(dim=-1))
         sampled = TorchSampling.sample_from_logits(
             cpu_logits, temperature=1.0, top_k=8, top_p=1.0, generator=torch.Generator()
         )
@@ -2726,13 +2751,13 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             for idx in indices:
                 rev_sampling_dict[idx] = sampling_params
 
-        # Prepare metadata for sample bookkeeping.
+        # Prepare metadata for sample bookkeeping, as the context tracks it: a greedy request's
+        # sampling columns are neutral, with `is_greedy` set.
+        for label, values in _tracked_sampling_columns(rev_sampling_dict).items():
+            context.active_request_metadata[label][:batch_size].copy_(values)
         temp_values = torch.Tensor([s.temperature for s in rev_sampling_dict])
         top_k_values = torch.Tensor([s.top_k for s in rev_sampling_dict]).to(torch.int32)
         top_p_values = torch.Tensor([s.top_p for s in rev_sampling_dict])
-        context.active_request_metadata["temperature"][:batch_size].copy_(temp_values)
-        context.active_request_metadata["top_k"][:batch_size].copy_(top_k_values)
-        context.active_request_metadata["top_p"][:batch_size].copy_(top_p_values)
 
         context.padded_active_token_count = batch_size
         context.request_query_lengths = torch.ones(batch_size, dtype=torch.int32, device='cuda')
@@ -2801,11 +2826,12 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         small_count, large_count = 2, 5
         assert large_count < capacity
 
-        # Non-speculative sample over a small active batch. top_k == 1 makes the torch
+        # Non-speculative sample over a small active batch. Greedy requests make the torch
         # backend short-circuit to argmax, so the sampled token is deterministic.
         context.active_request_metadata["temperature"][:small_count].fill_(1.0)
         context.active_request_metadata["top_k"][:small_count].fill_(1)
         context.active_request_metadata["top_p"][:small_count].fill_(0.0)
+        context.active_request_metadata["is_greedy"][:small_count].fill_(True)
         context.padded_active_token_count = small_count
         context.request_query_lengths = torch.ones(small_count, dtype=torch.int32, device="cuda")
         context.paused_request_count = 0
@@ -2830,6 +2856,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         context.active_request_metadata["temperature"][:large_count].fill_(1.0)
         context.active_request_metadata["top_k"][:large_count].fill_(1)
         context.active_request_metadata["top_p"][:large_count].fill_(0.0)
+        context.active_request_metadata["is_greedy"][:large_count].fill_(True)
         large_expected = torch.tensor([0, 1, 2, 3, 4], device="cuda")
         large_logits = torch.zeros(1, large_count, self.vocab_size, device="cuda")
         for row, col in enumerate(large_expected.tolist()):

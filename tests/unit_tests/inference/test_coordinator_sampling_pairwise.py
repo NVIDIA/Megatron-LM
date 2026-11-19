@@ -229,7 +229,12 @@ async def test_routed_bos_stop_after_metadata_compaction(monkeypatch, keep, skip
 
         def observe(logits, n, context, **kwargs):
             ids = context.request_ids[: context.total_request_count].tolist()
-            samples.append((ids, context.active_request_metadata["top_k"][: len(ids)].tolist()))
+            metadata = context.active_request_metadata
+            # A greedy request's sampling columns are neutral: it shows as (top_k 0, greedy).
+            rows = zip(
+                metadata["top_k"][: len(ids)].tolist(), metadata["is_greedy"][: len(ids)].tolist()
+            )
+            samples.append((ids, list(rows)))
             return sample(logits, n, context, **kwargs)
 
         monkeypatch.setattr(sampler, "sample_kernel", observe)
@@ -253,6 +258,6 @@ async def test_routed_bos_stop_after_metadata_compaction(monkeypatch, keep, skip
         for key in ("prompt_log_probs", "prompt_top_n_logprobs"):
             assert target[key] == direct[key]
         assert await h.sync.all_reduce_max(
-            ([first, last], [4, 1]) in samples, ([last], [1]) in samples
+            ([first, last], [(4, False), (0, True)]) in samples, ([last], [(0, True)]) in samples
         ) == (1, 1)
         h.assert_retired()

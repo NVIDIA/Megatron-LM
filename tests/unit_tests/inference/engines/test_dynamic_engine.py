@@ -78,7 +78,7 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
 )
 from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling.torch_sampling import TorchSampling
-from megatron.core.inference.sampling_params import MIN_SAMPLING_TEMPERATURE, SamplingParams
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -4374,7 +4374,8 @@ def _sampling_support(temperature: float, top_k: int, top_p: float) -> set:
     """Token ids of the fp64 top-k-then-top-p distribution over the fixed sampling logits."""
     logits = torch.full((DynamicEngineTestConfig.vocab_size,), -30.0, dtype=torch.float64)
     logits[: len(_SAMPLING_LOGITS)] = torch.tensor(_SAMPLING_LOGITS, dtype=torch.float64)
-    logits /= max(temperature, MIN_SAMPLING_TEMPERATURE)
+    if temperature > 0:  # A greedy request (temperature 0) arrives as top_k=1: the argmax.
+        logits /= temperature
     order = torch.argsort(logits, descending=True, stable=True)
     kept = order[:top_k] if top_k > 0 else order
     probs = torch.softmax(logits[kept], dim=-1)

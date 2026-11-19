@@ -45,8 +45,8 @@ class ContextGPUView:
         tok_int64_bytes = max_tokens * 8  # 3 fields of int64 = 8 bytes/elem
         tok_int32_bytes = max_tokens * 4  # 3 fields of int32 = 4 bytes/elem
         # Request-level fields are all 4 bytes wide. 3 int32 (in_prefill_status,
-        # query_lengths, kv_length_offsets) + 1 int32 (top_k) + 2 float32
-        # (temperature, top_p) + 1 int32 (active_request_last_token_idxs) = 7 fields.
+        # query_lengths, kv_length_offsets) + 2 int32 (top_k, is_greedy) + 2 float32
+        # (temperature, top_p) + 1 int32 (active_request_last_token_idxs) = 8 fields.
         req_4byte_bytes = max_requests * 4
         # Scalar: real (unpadded) token count for the current step. Used by
         # MoE routing to mask out CUDA-graph padding tokens.
@@ -81,7 +81,7 @@ class ContextGPUView:
         pre_mamba_bytes = (
             3 * tok_int64_bytes
             + 3 * tok_int32_bytes
-            + 7 * req_4byte_bytes
+            + 8 * req_4byte_bytes
             + real_token_count_bytes
             + mha_query_lengths_bytes
             + mha_cu_query_seq_lengths_bytes
@@ -179,12 +179,16 @@ class ContextGPUView:
         off += req_4byte_bytes
         # Sampling parameters (consumed by FlashInfer sampling).
         # Mirror the active slice of `active_request_metadata[{label}]`;
-        # padded slots get neutral defaults from `pad_active_slices` (T=1.0, top_k=0, top_p=0.0).
+        # padded slots get neutral defaults from `pad_active_slices` (T=1.0, top_k=0, top_p=0.0,
+        # is_greedy=0). A greedy request's sampling columns hold the same neutral values.
         self.temperature = self._buf[off : off + req_4byte_bytes].view(torch.float32)
         off += req_4byte_bytes
         self.top_k = self._buf[off : off + req_4byte_bytes].view(torch.int32)
         off += req_4byte_bytes
         self.top_p = self._buf[off : off + req_4byte_bytes].view(torch.float32)
+        off += req_4byte_bytes
+        # Nonzero for a request that decodes greedily (its lowest-index argmax).
+        self.is_greedy = self._buf[off : off + req_4byte_bytes].view(torch.int32)
         off += req_4byte_bytes
         # Per-request last-token row indices (consumed by sampling kernels as `gather_indices`).
         # The CPU side of this slot IS `context.active_request_last_token_idxs`,

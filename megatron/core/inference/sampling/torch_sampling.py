@@ -7,11 +7,7 @@ import torch
 from torch import Tensor
 
 from megatron.core.inference.sampling.base import Sampling
-from megatron.core.inference.sampling_params import (
-    MIN_SAMPLING_TEMPERATURE,
-    is_no_op_top_k,
-    is_no_op_top_p,
-)
+from megatron.core.inference.sampling_params import is_no_op_top_k, is_no_op_top_p
 
 # Triton is only required for request-local seeded draws.
 try:
@@ -23,7 +19,8 @@ except ImportError:
 class TorchSampling(Sampling):
     """Sampling via a bucketed Gumbel-max (exponential-race) draw.
 
-    Groups requests into unique buckets by `(temperature, top_k, top_p)` for separate launches.
+    Groups requests into unique buckets by `(temperature, top_k, top_p, is_greedy)` for separate
+    launches. Greedy requests take their lowest-index argmax.
     """
 
     def __init__(self, rng: torch.Generator, vocab_size: int) -> None:
@@ -31,16 +28,19 @@ class TorchSampling(Sampling):
         self._vocab_size = vocab_size
 
     @staticmethod
-    def _modify_logits_for_top_k_filtering(logits: Tensor, top_k: int) -> None:
-        """In-place: set logits outside the top-k set to -inf.
+    def _greedy_logits(logits: Tensor) -> Tensor:
+        """fp32 logits of greedy decoding: 0 at the lowest-index argmax, -inf elsewhere.
 
-        Top-1 is greedy and keeps only the lowest-index maximum, the token `torch.argmax` picks.
+        The argmax is of the logits as given, the token `torch.argmax` samples. No temperature
+        applies: dividing by one first could round two distinct logits into a tie.
         """
-        if top_k == 1:
-            filter_ = torch.ones_like(logits, dtype=torch.bool)
-            filter_.scatter_(-1, logits.argmax(dim=-1, keepdim=True), False)
-        else:
-            filter_ = logits < torch.topk(logits, top_k)[0][..., -1, None]
+        greedy = torch.full_like(logits, float("-inf"), dtype=torch.float32)
+        return greedy.scatter_(-1, logits.argmax(dim=-1, keepdim=True), 0.0)
+
+    @staticmethod
+    def _modify_logits_for_top_k_filtering(logits: Tensor, top_k: int) -> None:
+        """In-place: set logits outside the top-k set to -inf."""
+        filter_ = logits < torch.topk(logits, top_k)[0][..., -1, None]
         logits.masked_fill_(filter_, float("-Inf"))
 
     @staticmethod
@@ -70,16 +70,21 @@ class TorchSampling(Sampling):
         """Temperature-scale then top-k/top-p filter logits; filtered entries become -inf.
 
         Scaling runs in fp32 whatever the logits' dtype. With both filters active, top-p
-        applies to the renormalized top-k set (FlashInfer's `top_k_first` order).
+        applies to the renormalized top-k set (FlashInfer's `top_k_first` order). Top-1 keeps
+        only the lowest-index argmax of the unscaled logits, the token `sample_from_logits`
+        returns. The temperature must be positive: greedy decoding takes no temperature.
 
         Returns a new fp32 tensor (input unmodified). Shared by `sample_from_logits` and
         `log_probs_kernel` so sampling and processed log-probs apply the same filter.
         """
+        if top_k == 1:
+            return TorchSampling._greedy_logits(last_token_logits)
+        assert temperature > 0, f"temperature must be positive, got {temperature}"
         # An fp32 copy: .div_() and the filters below modify in-place, and dividing bf16 logits
         # in bf16 would round the scaled logits, and so the distribution, to bf16 precision.
         last_token_logits = last_token_logits.to(torch.float32, copy=True)
         if temperature != 1.0:
-            last_token_logits.div_(max(temperature, MIN_SAMPLING_TEMPERATURE))
+            last_token_logits.div_(temperature)
         if not is_no_op_top_k(top_k):
             assert top_k <= last_token_logits.size(1), "top-k is larger than logit size."
             if vocab_size:
@@ -173,8 +178,9 @@ class TorchSampling(Sampling):
     ) -> Tensor:
         """Per-row log-probs of the temperature, top-k/top-p sampling distribution.
 
-        Buckets rows by identical (temperature, top_k, top_p) and reuses `filter_logits`
-        (the same filter as `sample_from_logits`) so log-probs match how this backend samples.
+        Buckets rows by identical (temperature, top_k, top_p, is_greedy) and reuses
+        `filter_logits` (the same filter as `sample_from_logits`) so log-probs match how this
+        backend samples. A greedy row's distribution is one-hot on its argmax.
 
         Args:
             logits (Tensor): Raw logits with shape `[num_rows, vocab_size]`.
@@ -187,21 +193,16 @@ class TorchSampling(Sampling):
         """
         active_request_count = context.total_request_count - context.paused_request_count
         metadata = context.active_request_metadata
-        if token_to_request_index is None:
-            temperature = metadata["temperature"][:active_request_count]
-            top_k = metadata["top_k"][:active_request_count]
-            top_p = metadata["top_p"][:active_request_count]
-        else:
+        columns = [
+            metadata[label][:active_request_count]
+            for label in ("temperature", "top_k", "top_p", "is_greedy")
+        ]
+        if token_to_request_index is not None:
             assert not token_to_request_index.is_cuda
-            temperature = metadata["temperature"][:active_request_count][token_to_request_index]
-            top_k = metadata["top_k"][:active_request_count][token_to_request_index]
-            top_p = metadata["top_p"][:active_request_count][token_to_request_index]
+            columns = [column[token_to_request_index] for column in columns]
 
-        temps = temperature.tolist()
-        top_ks = top_k.tolist()
-        top_ps = top_p.tolist()
         buckets: dict = defaultdict(list)
-        for row, key in enumerate(zip(temps, top_ks, top_ps)):
+        for row, key in enumerate(zip(*(column.tolist() for column in columns))):
             buckets[key].append(row)
 
         # fp32: `torch.log_softmax(..., dtype=torch.float32)` below is computed in
@@ -209,8 +210,11 @@ class TorchSampling(Sampling):
         # allocating this buffer in `logits.dtype` would silently downcast the result
         # back on assignment and defeat that precision fix.
         log_probs = torch.empty_like(logits, dtype=torch.float32)
-        for (t, k, p), rows in buckets.items():
+        for (t, k, p, greedy), rows in buckets.items():
             idx = torch.tensor(rows, device=logits.device, dtype=torch.long)
+            if greedy:
+                log_probs[idx] = TorchSampling._greedy_logits(logits[idx])
+                continue
             filtered = TorchSampling.filter_logits(
                 logits[idx], float(t), int(k), float(p), vocab_size=self._vocab_size
             )
@@ -239,8 +243,8 @@ class TorchSampling(Sampling):
             n: Number of rows to sample.
             context: The active DynamicInferenceContext.
             no_top_k, no_top_p: Batch-level dispatch flags (part of the shared kernel
-                contract). `no_top_k` only gates the all-greedy argmax shortcut; the exact
-                per-bucket sort otherwise handles any top-k / top-p combination.
+                contract). Unused: the exact per-bucket sort handles any top-k / top-p
+                combination.
             gather_indices: When set, sample from `logits[gather_indices[:n], :]`.
             token_to_request_index: When set, the loop dispatches per-token rather than
                 per-request (used by the speculative path).
@@ -253,21 +257,17 @@ class TorchSampling(Sampling):
         Returns:
             Sampled token IDs in `output`, or a newly allocated tensor when it is not provided.
         """
-        del eager, cache_key
+        del no_top_k, no_top_p, eager, cache_key
 
-        # Group active requests into sampling buckets by (temperature, top_k, top_p).
+        # Group active requests into sampling buckets by (temperature, top_k, top_p, is_greedy).
         active_request_count = context.total_request_count - context.paused_request_count
         md = context.active_request_metadata
 
-        # With top-k=1 for every request, every row uses argmax regardless of
-        # temperature, top-p or its request mapping. Avoid building GPU bucket indices,
-        # torch.isin masks, and the scatter that otherwise serialize this eager
-        # sampling path once for the base logits and once per MTP depth.
-        if (
-            active_request_count > 0
-            and not no_top_k
-            and bool((md["top_k"][:active_request_count] == 1).all())
-        ):
+        # With every request greedy, every row uses argmax regardless of its request
+        # mapping. Avoid building GPU bucket indices, torch.isin masks, and the scatter
+        # that otherwise serialize this eager sampling path once for the base logits and
+        # once per MTP depth.
+        if active_request_count > 0 and bool(md["is_greedy"][:active_request_count].all()):
             selected_logits = (
                 logits[gather_indices[:n], :] if gather_indices is not None else logits[:n, :]
             )
@@ -297,11 +297,14 @@ class TorchSampling(Sampling):
             row_seeds = [seed if seed >= 0 else None for seed in seeds]
 
         bucket_map: dict = defaultdict(list)
-        temp = md["temperature"][:active_request_count].tolist()
-        top_k = md["top_k"][:active_request_count].tolist()
-        top_p = md["top_p"][:active_request_count].tolist()
-        for request_index, (t, k, p) in enumerate(zip(temp, top_k, top_p)):
-            bucket_map[(t, k, p)].append(request_index)
+        keys = zip(
+            *(
+                md[label][:active_request_count].tolist()
+                for label in ("temperature", "top_k", "top_p", "is_greedy")
+            )
+        )
+        for request_index, key in enumerate(keys):
+            bucket_map[key].append(request_index)
 
         buckets: List[Tuple] = [(indices, *params) for params, indices in bucket_map.items()]
         bucket_index_tensors: List[Tensor] = [
@@ -315,11 +318,15 @@ class TorchSampling(Sampling):
             output = torch.empty(n, device=logits.device, dtype=torch.int64)
         token_list = []
         indices_list = []
-        for idx_tensor, (indices, temp, top_k, top_p) in zip(bucket_index_tensors, buckets):
+        for idx_tensor, (indices, temp, top_k, top_p, greedy) in zip(bucket_index_tensors, buckets):
             if token_to_request_index is None:
                 row_indices = idx_tensor
             else:
                 row_indices = torch.where(torch.isin(token_to_request_index, idx_tensor))[0]
+            if greedy:
+                token_list.append(torch.argmax(logits[row_indices, :], dim=-1))
+                indices_list.append(row_indices)
+                continue
             token_list.append(
                 TorchSampling.sample_from_logits(
                     logits[row_indices, :],

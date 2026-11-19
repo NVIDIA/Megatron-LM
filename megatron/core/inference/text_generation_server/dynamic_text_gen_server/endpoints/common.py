@@ -124,7 +124,7 @@ def generation_config_sampling_defaults(tokenizer):
         # bool is an int subclass; reject it explicitly.
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             defaults[key] = value
-    # Greedy decoding is expressed here as top_k=1, matching the temperature==0 path.
+    # Greedy decoding is expressed here as top_k=1, from which SamplingParams derives is_greedy.
     if gen_cfg.get("do_sample") is False:
         defaults["top_k"] = 1
     return defaults
