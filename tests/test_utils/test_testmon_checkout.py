@@ -141,19 +141,53 @@ def test_conflict_preserves_checkout_and_metadata(repository, capsys):
 def test_baseline_lookup_excludes_build_only_forks_and_retries(monkeypatch):
     candidate = {
         "event": "schedule",
+        "status": "completed",
+        "conclusion": "failure",
         "head_repository": {"full_name": checkout.REPOSITORY},
         "run_attempt": 1,
-        "id": 123,
-        "head_sha": "a" * 40,
+        "id": 124,
+        "head_sha": "b" * 40,
     }
     candidates = [
-        {**candidate, "event": "push"},
-        {**candidate, "run_attempt": 2},
-        {**candidate, "head_repository": {"full_name": "fork/Megatron-LM"}},
+        {**candidate, "id": 130, "event": "push"},
+        {**candidate, "id": 129, "run_attempt": 2},
+        {**candidate, "id": 128, "head_repository": {"full_name": "fork/Megatron-LM"}},
+        {**candidate, "id": 127, "status": "in_progress", "conclusion": None},
+        {**candidate, "id": 126, "conclusion": "cancelled"},
+        {**candidate, "id": 125, "conclusion": "success"},  # No published caches.
         candidate,
+        {**candidate, "conclusion": "success", "id": 123, "head_sha": "a" * 40},
     ]
-    monkeypatch.setattr(checkout, "run", lambda *args: json.dumps({"workflow_runs": candidates}))
+    keys = [
+        f"unit-testmon-v1-main-dgx_h100-0123456789abcdef-{run_id}-1"
+        for run_id in (130, 129, 128, 127, 126, 124, 123)
+    ]
+    # A later attempt's cache cannot stand in for a first-attempt generation.
+    keys.append("unit-testmon-v1-main-dgx_h100-0123456789abcdef-125-2")
+
+    def api(*args):
+        if "/actions/caches?" in args[-1]:
+            assert "ref=refs/heads/main&key=unit-testmon-v1-main-" in args[-1]
+            assert "--paginate" in args
+            return "\n".join(keys).encode()
+        # Model GitHub's status filter: a successful bucket can belong to a failed run.
+        filtered = candidates
+        if "status=success" in args[-1]:
+            filtered = [item for item in candidates if item["conclusion"] == "success"]
+        elif "status=completed" in args[-1]:
+            filtered = [item for item in candidates if item["status"] == "completed"]
+        # The eligible producers are beyond the first page.
+        if "--paginate" not in args:
+            filtered = filtered[:5]
+        return "\n".join(json.dumps(item) for item in filtered).encode()
+
+    monkeypatch.setattr(checkout, "run", api)
+    assert checkout.latest_baseline() == ("b" * 40, "124-1")
+    keys.remove("unit-testmon-v1-main-dgx_h100-0123456789abcdef-124-1")
     assert checkout.latest_baseline() == ("a" * 40, "123-1")
     candidates.pop()
-    with pytest.raises(ValueError, match="No successful first-attempt"):
+    with pytest.raises(ValueError, match="No completed first-attempt"):
+        checkout.latest_baseline()
+    keys.clear()
+    with pytest.raises(ValueError, match="with published caches"):
         checkout.latest_baseline()

@@ -45,24 +45,53 @@ def sha(value: object) -> str:
 
 
 def latest_baseline() -> tuple[str, str]:
-    """Find a successful trusted main producer with a common cache generation."""
-    response = json.loads(
+    """Find the newest completed trusted main producer with published caches."""
+    keys = (
         run(
             "gh",
             "api",
-            f"repos/{REPOSITORY}/actions/workflows/populate-build-cache.yml/"
-            "runs?branch=main&status=success&per_page=100",
+            "--paginate",
+            "--jq",
+            ".actions_caches[].key",
+            f"repos/{REPOSITORY}/actions/caches?ref=refs/heads/main"
+            "&key=unit-testmon-v1-main-&per_page=100",
         )
+        .decode()
+        .splitlines()
     )
-    for candidate in response["workflow_runs"]:
-        # Retried runs can publish different generations for different buckets.
-        if (
-            candidate["event"] in {"schedule", "workflow_dispatch"}
-            and candidate["head_repository"]["full_name"] == REPOSITORY
-            and candidate["run_attempt"] == 1
-        ):
-            return sha(candidate["head_sha"]), f'{candidate["id"]}-1'
-    raise ValueError("No successful first-attempt main Testmon baseline found")
+    generations = {
+        match[1]
+        for key in keys
+        if (match := re.fullmatch(r"unit-testmon-v1-main-.+-([1-9][0-9]*-1)", key))
+    }
+    if generations:
+        records = (
+            run(
+                "gh",
+                "api",
+                "--paginate",
+                "--jq",
+                ".workflow_runs[] | @json",
+                f"repos/{REPOSITORY}/actions/workflows/populate-build-cache.yml/"
+                "runs?branch=main&status=completed&per_page=100",
+            )
+            .decode()
+            .splitlines()
+        )
+        for record in records:
+            candidate = json.loads(record)
+            # Passing buckets can publish caches even when other buckets fail.
+            # Retried runs can publish different generations for different buckets.
+            generation = f'{candidate["id"]}-1'
+            if (
+                candidate["event"] in {"schedule", "workflow_dispatch"}
+                and candidate["conclusion"] in {"success", "failure"}
+                and candidate["head_repository"]["full_name"] == REPOSITORY
+                and candidate["run_attempt"] == 1
+                and generation in generations
+            ):
+                return sha(candidate["head_sha"]), generation
+    raise ValueError("No completed first-attempt main Testmon baseline with published caches found")
 
 
 def outputs(manifest: dict[str, str]) -> None:
