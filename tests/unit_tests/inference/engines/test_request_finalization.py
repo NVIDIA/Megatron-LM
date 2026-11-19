@@ -59,7 +59,7 @@ async def test_finalization_precedes_reuse_but_publication_waits_for_bookkeeping
     controller.num_speculative_tokens = 2 if mtp else 0
     controller.tokenizer = SimpleNamespace(detokenize=lambda ids: str(ids[0]))
     controller._compact_async_sched_forward = mock.Mock()
-    controller._synchronize_async_sched_event = mock.Mock()
+    controller._await_async_sched_event = mock.AsyncMock()
 
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.controller = controller
@@ -161,7 +161,9 @@ async def test_finalization_precedes_reuse_but_publication_waits_for_bookkeeping
             if path == "overlap"
             else controller._run_async_sched_update_requests
         )
-        method(sample_result, context.get_active_sequence_lengths() + 1, finalize_requests=finalize)
+        await method(
+            sample_result, context.get_active_sequence_lengths() + 1, finalize_requests=finalize
+        )
 
     assert not future.done()
     active, finished = engine.post_process_requests(

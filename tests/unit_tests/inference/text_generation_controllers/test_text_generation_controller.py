@@ -431,6 +431,7 @@ def _make_async_sched_controller(context=None, model_config=None):
     controller._async_sched_routing_copy_stream = None
     controller._async_sched_routing_buffer_slots = []
     controller._async_sched_routing_buffer_index = -1
+    controller._device_waiter = None
     return controller
 
 
@@ -507,6 +508,63 @@ def test_legacy_step_reports_matching_decode_only_state(num_prefill_requests, ex
 
     assert result.decode_only == DecodeOnly(consumed=expected, launched=expected)
     assert result.output["sample"].tolist() == [2]
+
+
+def test_legacy_step_awaits_its_forward_after_queuing_the_sampling():
+    """Submit right after the forward, queue the sampling, await, then the bookkeeping."""
+    context = _make_async_sched_context(total_request_count=1)
+    context.config.async_sched_mode = AsyncScheduleMode.LEGACY
+    context.num_prefill_requests, context.num_decode_requests = 0, 1
+    context.kv_block_allocator = SimpleNamespace(
+        routing_replay=SimpleNamespace(scatter_routing_to_blocks=mock.Mock())
+    )
+    controller = _make_async_sched_controller(context)
+    order = []
+    controller._dynamic_step_context_init = mock.Mock(
+        return_value=(torch.tensor([1]), torch.tensor([0]), None)
+    )
+    controller._dynamic_step_forward_logits = mock.Mock(
+        side_effect=lambda *a: order.append("forward")
+    )
+    controller._router_record_bookkeeping = mock.Mock(return_value=None)
+    controller._dynamic_step_log_probs_bookkeeping = mock.Mock(return_value=(False, False))
+    controller._dynamic_step_sample_logits = mock.Mock(side_effect=lambda: order.append("sample"))
+    controller._dynamic_step_context_bookkeeping = mock.Mock(
+        side_effect=lambda **kw: (order.append("bookkeeping"), {"sample": torch.tensor([2])})[1]
+    )
+
+    async def main():
+        gpu_done = asyncio.get_running_loop().create_future()
+        controller.submit_device_wait = lambda: (order.append("submit"), gpu_done)[1]
+        step = asyncio.ensure_future(controller._run_legacy_step())
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert order == ["forward", "submit", "sample"] and not step.done()
+        gpu_done.set_result(None)
+        return await step
+
+    tracer = "megatron.core.inference.text_generation_controllers.text_generation_controller.get_moe_router_tracer"
+    with mock.patch(tracer, return_value=None):
+        result = asyncio.run(main())
+    assert order == ["forward", "submit", "sample", "bookkeeping"]
+    assert result.output["sample"].tolist() == [2]
+
+
+def test_await_async_sched_event_goes_through_the_waiter():
+    controller = _make_async_sched_controller()
+    order = []
+
+    async def main():
+        gpu_done = asyncio.get_running_loop().create_future()
+        controller.submit_device_wait = lambda event: (order.append(event), gpu_done)[1]
+        await controller._await_async_sched_event(None)
+        waiting = asyncio.ensure_future(controller._await_async_sched_event("sample"))
+        await asyncio.sleep(0)
+        assert order == ["sample"] and not waiting.done()
+        gpu_done.set_result(None)
+        await waiting
+
+    asyncio.run(main())
 
 
 @pytest.mark.parametrize("total_request_count", [0, 2])
@@ -689,12 +747,12 @@ def test_publish_async_sched_routing_uses_saved_compacted_layout():
         cpu_ready_event="routing-ready",
         row_indices=torch.tensor([2, 0]),
     )
-    controller._synchronize_async_sched_event = mock.Mock()
+    controller._await_async_sched_event = mock.AsyncMock()
     controller._publish_router_recording = mock.Mock()
 
-    controller._publish_async_sched_routing(routing_record)
+    asyncio.run(controller._publish_async_sched_routing(routing_record))
 
-    controller._synchronize_async_sched_event.assert_called_once_with("routing-ready")
+    controller._await_async_sched_event.assert_called_once_with("routing-ready")
     routing_indices, block_ids, positions = controller._publish_router_recording.call_args.args
     assert routing_indices.dtype == np.int16
     assert routing_indices[:, 0, 0].tolist() == [4, 0]
@@ -981,9 +1039,14 @@ def test_capture_async_sched_routing_alternates_banks_with_delayed_copy(discard)
     if discard:
         controller._async_sched_forward.clear()
     else:
-        controller._publish_async_sched_routing(
-            controller._async_sched_forward.take_routing_record()
-        )
+
+        async def publish():
+            await controller._publish_async_sched_routing(
+                controller._async_sched_forward.take_routing_record()
+            )
+            controller.release_device_waiter()
+
+        asyncio.run(publish())
     assert not first_slot.in_use
     assert first_slot.cpu_ready_event is first_event
 
@@ -1291,14 +1354,18 @@ def test_select_async_sched_accepted_routing_rows_keeps_prefill_and_accepted_dra
 
 
 @pytest.mark.internal
-def test_synchronize_async_sched_event_handles_cuda_event_and_none():
+def test_await_async_sched_event_handles_cuda_event_and_none():
     controller = _make_async_sched_controller()
     event = torch.cuda.Event()
     event.record(torch.cuda.current_stream())
-    controller._synchronize_async_sched_event(event)
-    controller._synchronize_async_sched_event(None)
 
-    assert isinstance(event, torch.cuda.Event)
+    async def main():
+        await controller._await_async_sched_event(event)
+        await controller._await_async_sched_event(None)
+        controller.release_device_waiter()
+
+    asyncio.run(main())
+    assert event.query()
 
 
 @pytest.mark.internal
@@ -1436,8 +1503,10 @@ def test_async_bookkeeping_retains_finished_handoff_state():
         routing_record=None,
     )
 
-    result = controller._run_async_sched_update_requests(
-        sample_result, resolved_sequence_lengths=torch.tensor([3, 3])
+    result = asyncio.run(
+        controller._run_async_sched_update_requests(
+            sample_result, resolved_sequence_lengths=torch.tensor([3, 3])
+        )
     )
 
     assert result.finished_handoff_block_ids == {11: [10, 11]}
@@ -1540,7 +1609,7 @@ def test_run_async_sched_resolve_compacts_without_forward_sync(
     controller = _make_async_sched_controller(context)
     context.kv_block_allocator.routing_replay.has_data.return_value = True
     context.request_to_kv_block_ids = torch.tensor([[40], [41], [42]])
-    controller._synchronize_async_sched_event = mock.Mock()
+    controller._await_async_sched_event = mock.AsyncMock()
     controller._get_stop_word_finished_ids_callback = mock.Mock(return_value=stop_word_finished_ids)
 
     expected_mask = (sample_tokens != context.request_metadata["termination_id"]).byte()
@@ -1561,13 +1630,15 @@ def test_run_async_sched_resolve_compacts_without_forward_sync(
         accepted_tokens_cpu_view=None,
         routing_record=None,
     )
-    result = controller._run_async_sched_resolve(
-        sample_result, context.get_active_sequence_lengths() + 1
+    result = asyncio.run(
+        controller._run_async_sched_resolve(
+            sample_result, context.get_active_sequence_lengths() + 1
+        )
     )
 
     assert torch.equal(result.sampled_tokens_cpu, sample_tokens)
     assert not hasattr(result, "compaction_done_event")
-    controller._synchronize_async_sched_event.assert_not_called()
+    controller._await_async_sched_event.assert_not_called()
     assert torch.equal(result.survivor_idxs, expected_survivor_idxs)
     assert result.finished_routing_block_ids == expected_finished_routing_block_ids
     controller._compact_async_sched_forward.assert_called_once_with(expected_survivor_idxs)
@@ -1590,7 +1661,7 @@ def test_async_sched_step_overlap_order():
     )
     call_order = []
 
-    controller._synchronize_async_sched_event = mock.Mock(
+    controller._await_async_sched_event = mock.AsyncMock(
         side_effect=lambda event: call_order.append(f"wait:{event}")
     )
     controller._run_async_sched_prepare = mock.Mock(
@@ -1629,7 +1700,7 @@ def test_async_sched_step_overlap_order():
     controller._run_async_sched_forward = mock.Mock(
         side_effect=lambda *_: call_order.append("forward")
     )
-    controller._run_async_sched_resolve = mock.Mock(
+    controller._run_async_sched_resolve = mock.AsyncMock(
         side_effect=lambda *_, **_kwargs: call_order.append("resolve")
         or SimpleNamespace(
             sampled_tokens_cpu=sampled_tokens_cpu,
@@ -1719,7 +1790,7 @@ def test_async_sched_step_wires_sampling_through_resolution(
         return_value=(input_ids_gpu_view, position_ids_gpu_view)
     )
     controller._run_async_sched_publish_bookkeeping = mock.Mock(return_value=None)
-    controller._synchronize_async_sched_event = mock.Mock()
+    controller._await_async_sched_event = mock.AsyncMock()
 
     def run_forward(*_args):
         controller._async_sched_forward.set_pending(None)
@@ -1810,7 +1881,7 @@ def test_async_sched_step_yields_after_resolution_outside_inference_mode():
     )
     controller._run_async_sched_publish_bookkeeping = mock.Mock(return_value=None)
     controller._run_async_sched_forward = mock.Mock(return_value=None)
-    controller._run_async_sched_resolve = mock.Mock(
+    controller._run_async_sched_resolve = mock.AsyncMock(
         return_value=SimpleNamespace(
             sampled_tokens_cpu=sampled_tokens,
             accepted_tokens_cpu=None,
@@ -1859,7 +1930,7 @@ def test_async_sched_initial_no_overlap_step_launches_primer_only():
     controller._run_async_sched_forward_primer = mock.Mock(
         side_effect=lambda: call_order.append("primer") or (True, "bookkeeping")
     )
-    controller._synchronize_async_sched_event = mock.Mock(
+    controller._await_async_sched_event = mock.AsyncMock(
         side_effect=lambda event: call_order.append(f"wait:{event}")
     )
 
@@ -1922,8 +1993,10 @@ def test_run_async_sched_update_requests_preserves_pre_update_output():
 
     context.update_requests.side_effect = update_requests
 
-    result = controller._run_async_sched_update_requests(
-        sample_result, resolved_sequence_lengths=torch.tensor([4, 4])
+    result = asyncio.run(
+        controller._run_async_sched_update_requests(
+            sample_result, resolved_sequence_lengths=torch.tensor([4, 4])
+        )
     )
 
     assert result.active_request_ids.tolist() == [11, 12]
@@ -1976,7 +2049,7 @@ def test_async_sched_no_overlap_updates_before_admission(
     position_ids = torch.empty(1, dtype=torch.int64)
     call_order = []
 
-    controller._synchronize_async_sched_event = mock.Mock(
+    controller._await_async_sched_event = mock.AsyncMock(
         side_effect=lambda event: call_order.append(f"wait:{event}")
     )
     controller._run_async_sched_sample = mock.Mock(
@@ -1988,7 +2061,7 @@ def test_async_sched_no_overlap_updates_before_admission(
         context.num_prefill_requests = launched_prefill_requests
         return request_result
 
-    controller._run_async_sched_update_requests = mock.Mock(side_effect=update_request_state)
+    controller._run_async_sched_update_requests = mock.AsyncMock(side_effect=update_request_state)
     log_probs_gpu_result = object()
     log_probs_transfer = SimpleNamespace(cpu_ready_event="log_probs")
     controller._run_async_sched_log_probs = mock.Mock(
@@ -2082,14 +2155,14 @@ def test_async_sched_no_overlap_finishes_with_matching_ep_base_forward():
         log_probs_result=None,
     )
     controller._run_async_sched_sample = mock.Mock(return_value=sample_result)
-    controller._synchronize_async_sched_event = mock.Mock()
+    controller._await_async_sched_event = mock.AsyncMock()
 
     def update_last_request(*_args, **_kwargs):
         context.total_request_count = 0
         context.active_token_count = 0
         return request_result
 
-    controller._run_async_sched_update_requests = mock.Mock(side_effect=update_last_request)
+    controller._run_async_sched_update_requests = mock.AsyncMock(side_effect=update_last_request)
     controller._run_dummy_async_sched_base_step = mock.Mock()
     controller._run_async_sched_forward = mock.Mock()
 
@@ -2143,7 +2216,7 @@ def test_async_sched_mtp_overlap_step_order():
     controller._run_async_sched_sample_mtp = mock.Mock(
         side_effect=lambda: call_order.append("sample_mtp") or sample_result
     )
-    controller._run_async_sched_mtp_rewind = mock.Mock(
+    controller._run_async_sched_mtp_rewind = mock.AsyncMock(
         side_effect=lambda *_args, **_kwargs: call_order.append("rewind")
     )
     log_probs_gpu_result = object()
@@ -2170,11 +2243,11 @@ def test_async_sched_mtp_overlap_step_order():
     controller._run_async_sched_forward = mock.Mock(
         side_effect=lambda *_: call_order.append("forward")
     )
-    controller._synchronize_async_sched_event = mock.Mock(
+    controller._await_async_sched_event = mock.AsyncMock(
         side_effect=lambda event: call_order.append(f"wait:{event}")
     )
     context.commit_sampled_tokens = mock.Mock(side_effect=lambda *_: call_order.append("commit"))
-    controller._run_async_sched_resolve = mock.Mock(
+    controller._run_async_sched_resolve = mock.AsyncMock(
         side_effect=lambda *_, **_kwargs: call_order.append("resolve") or resolve_result
     )
 
@@ -2563,14 +2636,16 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         assert alloc.get_allocatable_count() == 0
 
         sampled_tokens = torch.tensor([90, 91, 92], dtype=torch.int64)
-        request_result = controller._run_async_sched_update_requests(
-            SimpleNamespace(
-                sampled_tokens_cpu_view=sampled_tokens,
-                sampled_mtp_tokens_cpu_view=None,
-                accepted_tokens_cpu_view=None,
-                routing_record=None,
-            ),
-            resolved_sequence_lengths=torch.tensor([4, 4, 4]),
+        request_result = asyncio.run(
+            controller._run_async_sched_update_requests(
+                SimpleNamespace(
+                    sampled_tokens_cpu_view=sampled_tokens,
+                    sampled_mtp_tokens_cpu_view=None,
+                    accepted_tokens_cpu_view=None,
+                    routing_record=None,
+                ),
+                resolved_sequence_lengths=torch.tensor([4, 4, 4]),
+            )
         )
 
         assert request_result.evict_request_ids.tolist() == [10]

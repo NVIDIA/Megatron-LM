@@ -2548,7 +2548,7 @@ def test_shutdown_exits_custom_gc_mode_once():
     engine.gc_mode = "freeze"
     engine._in_custom_gc_mode = True
     engine._gc_freeze_pending = True
-    engine.controller = types.SimpleNamespace(_overlap_gc=False)
+    engine.controller = types.SimpleNamespace(_overlap_gc=False, release_device_waiter=lambda: None)
 
     with mock.patch.object(gc, "unfreeze") as unfreeze, mock.patch.object(gc, "collect"):
         asyncio.run(engine.shutdown())
