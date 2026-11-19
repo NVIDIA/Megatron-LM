@@ -2479,17 +2479,13 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
 
         q_idx_bshd, k_idx_bsd, w_bsh = _sbhd_to_bshd_indexer_inputs(q_indexer, k_indexer, weights)
         if cli_target_accumulator is not None:
+            from megatron.core.ops.attention.dsa.cli_scores import cli_selected_indexer_logits
+
             topk_indices_cmp = cli_target_accumulator.topk_indices
             topk_length_cmp = (topk_indices_cmp >= 0).sum(dim=-1, dtype=torch.int32)
-            selected_predict = _cudnn_dsa.sparse_indexer_score_recompute_wrapper(
-                q_idx_bshd,
-                k_idx_bsd,
-                w_bsh,
-                topk_indices_cmp,
-                qhead_per_kv_head=q_idx_bshd.size(2),
-                topk_length=topk_length_cmp,
-            )["predict"]
-            indexer_score_payload = selected_predict.clamp_min(_CLIP_PROB_MIN).log()
+            indexer_score_payload = cli_selected_indexer_logits(
+                q_idx_bshd, k_idx_bsd, w_bsh, topk_indices_cmp, topk_length_cmp
+            )
         else:
             topk_indices_cmp, topk_length_cmp, indexer_score_payload = _indexer_topk_bshd(
                 q_idx_bshd,

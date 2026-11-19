@@ -30,7 +30,7 @@ class DSACrossLayerIndexerState:
         self.topk_length = None
 
 
-def get_dsa_cross_layer_state_holder(carrier: object) -> dict[int, list[DSACrossLayerIndexerState]]:
+def get_dsa_cross_layer_state_holder(carrier: object) -> dict[int, DSACrossLayerIndexerState]:
     """Return CLI state on the caller's existing per-forward IndexShare carrier."""
     holder = getattr(carrier, _HOLDER_ATTR, None)
     if holder is None:

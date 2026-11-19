@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-# Run from the repository root in the standard Megatron GPU development container.
+# Run from the repository root with the SM90 dependencies in the CLI feature guide.
 # Uses synthetic data, multiple microbatches, and checkpoint/resume; no golden values are fabricated.
 set -euo pipefail
 
@@ -14,6 +14,7 @@ common=(
     --multi-latent-attention --q-lora-rank 128 --kv-lora-rank 512
     --qk-head-dim 128 --qk-pos-emb-head-dim 64 --v-head-dim 128
     --experimental-attention-variant dsa --disable-bias-linear
+    --no-rope-fusion --no-dsa-indexer-rotate-activation
     --dsa-kernel-backend cudnn --dsa-indexer-n-heads 32 --dsa-indexer-head-dim 128
     --dsa-indexer-topk 256 --dsa-indexer-topk-freq 2 --dsa-indexer-skip-topk-offset 1
     --dsa-indexer-use-sparse-loss --dsa-indexer-loss-coeff 0.001
@@ -25,12 +26,12 @@ common=(
     --transformer-impl transformer_engine --no-gradient-accumulation-fusion
     --mock-data --tokenizer-type NullTokenizer --vocab-size 1024
     --lr 0.0001 --min-lr 0.00001 --lr-decay-iters 4
-    --log-interval 1 --eval-iters 0 --save-interval 2
+    --log-interval 1 --eval-iters 0 --save-interval 2 --train-iters 4
     --save "${smoke_dir}/checkpoint" --load "${smoke_dir}/checkpoint"
 )
 
 python -m torch.distributed.run --nproc-per-node 1 pretrain_gpt.py \
-    "${common[@]}" --train-iters 2 2>&1 | tee "${smoke_dir}/initial.log"
+    "${common[@]}" --exit-interval 2 2>&1 | tee "${smoke_dir}/initial.log"
 python -m torch.distributed.run --nproc-per-node 1 pretrain_gpt.py \
-    "${common[@]}" --train-iters 4 2>&1 | tee "${smoke_dir}/resume.log"
+    "${common[@]}" 2>&1 | tee "${smoke_dir}/resume.log"
 printf 'CLI smoke logs and checkpoints: %s\n' "${smoke_dir}"

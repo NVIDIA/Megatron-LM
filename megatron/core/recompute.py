@@ -60,7 +60,10 @@ def checkpointed_forward(
     dsa_index_share_carrier = None
     dsa_index_share_carrier_scope = None
     if (
-        packed_seq_params is None
+        (
+            packed_seq_params is None
+            or getattr(self.config, "dsa_indexer_cross_layer_distillation", False)
+        )
         and getattr(self.config, "experimental_attention_variant", None) == "dsa"
         and (getattr(self.config, "dsa_indexer_topk_freq", 1) or 1) > 1
     ):

@@ -60,7 +60,7 @@ except ImportError:
 
 
 class _DSAIndexShareCarrier:
-    """Per-forward DSA index-share carrier for non-packed activation recompute."""
+    """Per-forward DSA index-share carrier for activation recompute."""
 
 
 _CURRENT_DSA_INDEX_SHARE_CARRIER: ContextVar[Optional[object]] = ContextVar(
@@ -70,7 +70,7 @@ _CURRENT_DSA_INDEX_SHARE_CARRIER: ContextVar[Optional[object]] = ContextVar(
 
 @contextmanager
 def _dsa_index_share_carrier_scope(carrier: object) -> Iterator[None]:
-    """Expose one non-packed forward's index-share carrier to its checkpoint closures."""
+    """Expose one forward's index-share carrier to its checkpoint closures."""
     token = _CURRENT_DSA_INDEX_SHARE_CARRIER.set(carrier)
     try:
         yield
@@ -3042,11 +3042,14 @@ class DSAttention(MegatronModule):
         self, packed_seq_params: Optional[PackedSeqParams], attention_mask: Optional[torch.Tensor]
     ) -> object:
         """Return the object that carries DSA top-k sharing state for this forward."""
+        carrier = _CURRENT_DSA_INDEX_SHARE_CARRIER.get()
+        if carrier is not None and (
+            packed_seq_params is None
+            or getattr(self.config, "dsa_indexer_cross_layer_distillation", False)
+        ):
+            return carrier
         if packed_seq_params is not None:
             return packed_seq_params
-        carrier = _CURRENT_DSA_INDEX_SHARE_CARRIER.get()
-        if carrier is not None:
-            return carrier
         return attention_mask if attention_mask is not None else self.config
 
     def _get_index_share_topk_holder(
@@ -3440,6 +3443,13 @@ class DSAttention(MegatronModule):
             cp_group if cp_size > 1 and not self.config.calculate_per_token_loss else None
         )
 
+        cross_layer_state_holder = None
+        if defer_cross_layer_gradients:
+            carrier = _CURRENT_DSA_INDEX_SHARE_CARRIER.get()
+            if carrier is None:
+                raise RuntimeError("DSA CLI training requires a per-forward checkpoint carrier.")
+            cross_layer_state_holder = get_dsa_cross_layer_state_holder(carrier)
+
         topk_holder = (
             self._get_index_share_topk_holder(packed_seq_params, attention_mask)
             if self.index_share
@@ -3448,13 +3458,6 @@ class DSAttention(MegatronModule):
         topk_length_holder = (
             self._get_index_share_topk_length_holder(packed_seq_params, attention_mask)
             if self.index_share
-            else None
-        )
-        cross_layer_state_holder = (
-            get_dsa_cross_layer_state_holder(
-                self._get_index_share_carrier(packed_seq_params, attention_mask)
-            )
-            if self.cross_layer_distillation
             else None
         )
         topk_indices = None
@@ -3471,13 +3474,12 @@ class DSAttention(MegatronModule):
             assert topk_holder is not None
             if defer_cross_layer_gradients and torch.is_grad_enabled():
                 assert cross_layer_state_holder is not None
-                owner_queue = cross_layer_state_holder.get(self.source_layer)
-                if not isinstance(owner_queue, list) or not owner_queue:
+                deferred_owner_state = cross_layer_state_holder.get(self.source_layer)
+                if deferred_owner_state is None:
                     raise RuntimeError(
-                        "Deferred DSA CLI requires queued owner state from layer "
+                        "Deferred DSA CLI requires checkpointed owner state from layer "
                         f"{self.source_layer} while recomputing layer {self.layer_number}."
                     )
-                deferred_owner_state = owner_queue[0]
                 topk_indices = deferred_owner_state.topk_indices
                 topk_length = deferred_owner_state.topk_length
                 if topk_indices is None:
@@ -3544,34 +3546,26 @@ class DSAttention(MegatronModule):
                     weights = weights[row_start:row_end].contiguous()
             if defer_cross_layer_gradients and not torch.is_grad_enabled():
                 assert cross_layer_state_holder is not None
-                owner_queue = cross_layer_state_holder.setdefault(self.layer_number, [])
-                if not isinstance(owner_queue, list):
+                if self.layer_number in cross_layer_state_holder:
                     raise RuntimeError(
-                        "Deferred DSA CLI cannot share a carrier with differentiable CLI state."
+                        f"DSA CLI owner layer {self.layer_number} ran twice in one forward."
                     )
                 deferred_owner_state = DSACrossLayerIndexerState()
-                owner_queue.append(deferred_owner_state)
+                cross_layer_state_holder[self.layer_number] = deferred_owner_state
 
         def finalize_deferred_cross_layer_state(output: torch.Tensor) -> torch.Tensor:
             if not inject_deferred_cross_layer_grads:
                 return output
             assert cross_layer_state_holder is not None
-            owner_queue = cross_layer_state_holder.get(self.layer_number)
-            if not isinstance(owner_queue, list) or not owner_queue:
-                raise RuntimeError(
-                    "Deferred DSA CLI requires owner state from the checkpoint no-grad forward "
-                    f"for layer {self.layer_number}, but it was not found."
-                )
-            owner_state = owner_queue[0]
+            owner_state = cross_layer_state_holder.pop(self.layer_number)
             if owner_state.deferred_cli_target is not None:
                 raise RuntimeError(
                     "Deferred DSA CLI owner target accumulator was not consumed by the "
                     "owner indexer backward."
                 )
             owner_state.release_forward_values()
-            owner_queue.pop(0)
-            if not owner_queue:
-                cross_layer_state_holder.pop(self.layer_number, None)
+            topk_holder.pop(self.layer_number, None)
+            topk_length_holder.pop(self.layer_number, None)
             return output
 
         def compute_indexer_loss_with_reference_path():
@@ -3690,13 +3684,12 @@ class DSAttention(MegatronModule):
         cli_owner_accumulator = None
         if inject_deferred_cross_layer_grads:
             assert cross_layer_state_holder is not None
-            owner_queue = cross_layer_state_holder.get(self.layer_number)
-            if not isinstance(owner_queue, list) or not owner_queue:
+            cli_owner_state = cross_layer_state_holder.get(self.layer_number)
+            if cli_owner_state is None:
                 raise RuntimeError(
-                    "DSA CLI owner-backward fusion could not find the queued owner state for "
+                    "DSA CLI owner-backward fusion could not find the checkpointed state for "
                     f"layer {self.layer_number}."
                 )
-            cli_owner_state = owner_queue[0]
             cli_owner_accumulator = cli_owner_state.deferred_cli_target
             if cli_owner_accumulator is None:
                 raise RuntimeError(

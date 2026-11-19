@@ -2111,6 +2111,12 @@ class TransformerConfig(ModelParallelConfig):
                 "dsa_kernel_backend='tilelang'/'none'."
             )
 
+        if self.dsa_indexer_cross_layer_distillation:
+            if self.experimental_attention_variant != "dsa":
+                raise ValueError("Cross-layer indexer distillation requires the DSA variant.")
+            if self.mtp_num_layers:
+                raise ValueError("DSA cross-layer distillation does not support MTP.")
+
         if is_gated_delta_net_variant(self.experimental_attention_variant):
             if self.deterministic_mode and self.gdn_kernel_backend != "torch":
                 raise ValueError(
@@ -2178,8 +2184,7 @@ class TransformerConfig(ModelParallelConfig):
                     f"{self.dsa_indexer_cross_layer_distillation_chunk_size}."
                 )
             if self.dsa_indexer_cross_layer_distillation and (
-                self.experimental_attention_variant != "dsa"
-                or self.recompute_granularity != "full"
+                self.recompute_granularity != "full"
                 or self.recompute_method != "uniform"
                 or self.recompute_num_layers != 1
                 or not self.dsa_indexer_use_sparse_loss
@@ -2195,8 +2200,11 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError(
                         "Sparse DSA CLI currently requires tensor_model_parallel_size=1"
                     )
-                if self.dsa_indexer_topk is None or self.dsa_indexer_topk % 256:
-                    raise ValueError("Sparse DSA CLI requires a positive Top-K divisible by 256")
+                topk = self.dsa_indexer_topk
+                if topk is None or not 0 < topk <= 2048 or topk % 256:
+                    raise ValueError(
+                        "Sparse DSA CLI requires Top-K between 256 and 2048 in steps of 256."
+                    )
                 if self.deterministic_mode:
                     raise ValueError(
                         "Sparse DSA CLI indexer backward does not support deterministic_mode"

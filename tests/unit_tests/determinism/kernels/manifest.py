@@ -109,6 +109,13 @@ R = "tests/unit_tests/context_parallel/runtime/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
+        name="dsa_cli_selected_indexer_logits",
+        sources=("megatron/core/ops/attention/dsa/cli_scores.py",),
+        tests=(K + "test_dsa_cli.py",),
+        kind="triton",
+        notes="Fixed-slot logits replay and compare with independently gathered FP32 scores.",
+    ),
+    KernelEntry(
         name="dsa_cli_target_accumulation",
         sources=("megatron/core/ops/attention/dsa/cli_target.py",),
         tests=(K + "test_dsa_cli.py",),

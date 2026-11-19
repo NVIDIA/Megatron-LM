@@ -162,6 +162,11 @@ class HybridStack(MegatronModule):
             )
             layer_config_list = validate_segment_layers(segment, config)
 
+        if config.dsa_indexer_cross_layer_distillation or any(
+            layer_config.dsa_indexer_cross_layer_distillation for layer_config in layer_config_list
+        ):
+            raise ValueError("DSA cross-layer distillation does not support hybrid layer layouts.")
+
         for layer_config in layer_config_list:
             if layer_utils.get_custom_layer_type(layer_config) is None:
                 segment = layer_utils.get_layer_symbol_from_config(layer_config)

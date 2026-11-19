@@ -104,10 +104,10 @@ would not reconstruct that scalar loss without the individual entropy terms.
    statistics, performs the grouped indexer backward, and releases the saved
    selection and accumulation state.
 
-Attaching state to the per-forward carrier separates microbatches. The owner
-checks that exactly the expected number of reuse teachers has arrived. This
-makes missing/incorrect scheduling fail explicitly instead of silently dropping
-teachers or carrying a previous forward's state into another loss.
+Each checkpoint closure retains its forward's carrier, even when multiple
+forwards receive the same packed sequence metadata. This allows backward in
+either order. The owner checks that exactly the expected number of reuse
+teachers has arrived.
 
 The initial implementation requires full uniform recomputation with **one layer
 per chunk**. That order makes reuse teachers available before owner recomputation.
@@ -117,11 +117,11 @@ different state/gradient schedule, not just relaxing the configuration guard.
 
 ### Re-score the original selection
 
-Owner recomputation scores the saved Top-K slots instead of selecting a fresh
-Top-K. This preserves the correspondence between accumulated teacher values and
-tokens even when scores tie or selection order changes, while avoiding another
-global Top-K selection. It is a correctness requirement as well as a computation
-saving: a target cannot be reused with a different selected-token ordering.
+Owner recomputation scores only the saved Top-K slots. This preserves the
+teacher's token order, including ties, and avoids another global selection.
+A Triton kernel gathers selected keys and produces FP32 logits in that order.
+Masked log-softmax then preserves the KL contribution
+of valid tokens whose probabilities would underflow in FP32.
 
 ## Why not the alternatives?
 
@@ -138,7 +138,8 @@ all alternatives. A different backend or recomputation strategy may justify a
 different implementation; it must preserve token alignment, masking, loss
 scaling and microbatch state isolation.
 
-A matched-Top-K SM90 microbenchmark (128K global sequence, 16K local queries,
+A matched-Top-K SM90 microbenchmark of the earlier cuDNN score recompute path
+(128K global sequence, 16K local queries,
 Top-K 2048, sharing frequency 4, BF16, chunk size 4096) measured an incremental
 3.165 +/- 0.196 ms per timed attention/indexer group, approximately 0.32%, and
 0.25 GiB additional peak allocated memory. Both arms perform the same Top-K
@@ -165,11 +166,10 @@ Add these options to an otherwise working absorbed-MLA DSA training configuratio
 --recompute-num-layers 1
 ```
 
-CLI needs TileLang and a cuDNN Frontend build containing PR #2556, whose
-`DSA.sparse_attention_backward_wrapper` accepts `return_cli_target` and
-`cli_target_head_count`. The initial path rejects configurations where the
-required teacher output cannot be produced; ordinary DSA keeps its existing
-backend behavior when CLI is disabled.
+CLI requires TileLang, Triton, and the teacher output in cuDNN Frontend
+[1.33.0](https://github.com/NVIDIA/cudnn-frontend/releases/tag/v1.33.0) or later.
+`DSA.sparse_attention_backward_wrapper` must expose `return_cli_target` and
+`cli_target_head_count`. FlashMLA must be built with SM90 support.
 
 ## When not to enable this path
 
@@ -178,8 +178,10 @@ backend behavior when CLI is disabled.
   LSE set to positive infinity so they contribute zero probability.
 - TP=1 and microbatch size 1 are required. Absorbed latent V dimension is 512 and
   QK dimension is 512 or 576, following the existing sparse-attention path.
-- Selection must be flat and Top-K positive and divisible by 256. Dense warm-up,
-  pooled selection and cross-depth MTP distillation are outside this implementation.
+- Selection must be flat with Top-K in increments of 256 up to 2048. The SM90
+  sparse attention score recompute limit is 2176 physical slots.
+- CLI supports the GPT DSA stack. Hybrid layer layouts, MTP, dense warm-up,
+  and pooled selection are unsupported.
 - Recompute must be full/uniform with one layer per chunk. Each pipeline stage
   must begin on a computing layer, and groups cannot cross stage boundaries.
 - `deterministic_mode` is unsupported: target replay checks do not establish
@@ -195,18 +197,30 @@ multi-step integration check of the exact configuration being deployed.
 
 ## Validation
 
-Run the focused tests in the standard GPU development container:
+In an SM90 development environment with CUDA PyTorch, Transformer Engine, and
+the normal Megatron training dependencies, install the released Frontend and
+build the FlashMLA revision pinned in `uv.lock`. The standard image's FlashMLA
+build disables SM90. These commands assume pip build tools including Ninja.
 
 ```bash
-uv run python -m torch.distributed.run --nproc-per-node 1 -m pytest -q \
-  tests/unit_tests/ops/test_dsa_cli.py \
-  tests/unit_tests/determinism/kernels/test_dsa_cli.py \
-  tests/unit_tests/transformer/experimental_attention_variant/test_dsa_native_parity.py
+python -m pip install 'nvidia-cudnn-frontend==1.33.0' 'nvidia-cutlass-dsl==4.8.1' 'tilelang==0.1.12'
+git clone https://github.com/deepseek-ai/FlashMLA.git /tmp/FlashMLA-cli
+git -C /tmp/FlashMLA-cli checkout b7643bd54521f563b839b98289b5cd048c062ba2
+git -C /tmp/FlashMLA-cli submodule update --init --recursive
+env -u FLASH_MLA_DISABLE_SM90 FLASH_MLA_DISABLE_SM100=1 \
+  python -m pip install --no-build-isolation --no-deps --force-reinstall /tmp/FlashMLA-cli
 ```
 
-Coverage includes independent summed-KL gradients, target normalization/masks,
-original-index reuse, per-forward state and replay. Also run the existing DSA
-regressions; qualify multi-step/microbatch and checkpoint/resume behavior before
-claiming those production layouts. Record the exact source revisions, GPU
-architecture, software versions and recompute/parallel settings. Requalification
-is required when rebasing changes those integration paths.
+Run the focused tests, including teacher replay, from the Megatron checkout.
+
+```bash
+python -m torch.distributed.run --standalone --nproc-per-node 1 -m pytest -q -rs \
+  tests/unit_tests/ops/test_dsa_cli.py \
+  tests/unit_tests/determinism/kernels/test_dsa_cli.py
+bash tests/functional_tests/test_cases/gpt/gpt_dsa_cli_sm90/run_smoke.sh
+```
+
+The SM90 tests should run without skips. They cover reverse-order backward with
+shared packed metadata, summed KL under probability underflow, masking, and
+bit-exact replay. The synthetic smoke test saves at iteration 2 and resumes to
+iteration 4 with the same scheduler configuration.

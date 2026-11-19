@@ -8,6 +8,37 @@ import torch
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact
 
 
+@pytest.mark.parametrize("heads,width", [(32, 256), (64, 2048)])
+def test_cli_selected_logits_replay_and_match_reference(heads, width):
+    pytest.importorskip("triton")
+    from megatron.core.ops.attention.dsa.cli_scores import cli_selected_indexer_logits
+
+    torch.manual_seed(73)
+    q = torch.randn(1, 3, heads, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, width, 128, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(1, 3, heads, device="cuda", dtype=torch.bfloat16)
+    indices = torch.stack([torch.randperm(width, device="cuda") for _ in range(3)])[None]
+    indices = indices.to(torch.int32)
+    indices[:, 1, -1] = -1
+    lengths = torch.tensor([[width, width - 3, 0]], device="cuda", dtype=torch.int32)
+    gathered = k[0, indices[0].clamp_min(0).long()].float()
+    logits = (
+        torch.einsum("qhd,qkd->qhk", q[0].float(), gathered).relu() * w[0, :, :, None].float()
+    ).sum(1)[None]
+    valid = (torch.arange(width, device="cuda") < lengths[..., None]) & (indices >= 0)
+    logits.masked_fill_(~valid, 0)
+    actual = cli_selected_indexer_logits(q, k, w, indices, lengths)
+    torch.testing.assert_close(actual, logits, atol=2e-4, rtol=2e-5)
+    assert_replays_bit_exact(
+        cli_selected_indexer_logits,
+        (q, k, w, indices, lengths),
+        backward=False,
+        replays=3,
+        contention=True,
+        what="DSA CLI selected indexer logits",
+    )
+
+
 def test_cli_target_accumulation_replays():
     pytest.importorskip("tilelang")
     from megatron.core.ops.attention.dsa.cli_target import accumulate_cli_attention_target
