@@ -308,3 +308,59 @@ def test_cp_accepted_only_when_one():
         InferenceShardSpec(tp=1, cp=2)
     with pytest.raises(ValueError):
         parse_inference_shards_spec("tp=1,cp=2", world_size=1)
+
+
+@pytest.mark.parametrize(("shard_tp", "shard_expt_tp"), [(8, 1), (1, 2), (2, 4)])
+def test_model_builder_rederives_weight_shards_for_shard(monkeypatch, shard_tp, shard_expt_tp):
+    """A shard's weight / sequence shard counts follow its own TP / expert TP, not the global ones.
+
+    The global args are TP 4 / expert TP 1 with sequence parallelism and no GTP, so their weight-
+    and sequence-shard counts are 4 and the expert weight-shard count 1. A shard with a larger TP
+    (a TP8 decode shard next to a TP4 prefill shard) must not keep 4, or its config fails
+    "tensor_parallel_num_weight_shards (4) must be >= tensor_model_parallel_size (8)" (and the
+    same for the sequence shards); a smaller one must not keep 4 either, which would imply a GTP
+    factor.
+    """
+    from argparse import Namespace
+
+    from megatron.inference import utils
+
+    sizes = {"tp": shard_tp, "pp": 1, "cp": 1, "ep": 4, "expt_tp": shard_expt_tp}
+    pg = SimpleNamespace(**{name: name for name in sizes})
+    monkeypatch.setattr(utils, "get_pg_size", lambda group: sizes[group])
+    seen = {}
+
+    def config_from_args(args, **kwargs):
+        seen["args"] = args
+        return SimpleNamespace(vocab_size=128)
+
+    monkeypatch.setattr(utils, "gpt_config_from_args", config_from_args)
+    monkeypatch.setattr(utils, "GPTModelBuilder", lambda config: config)
+
+    args = Namespace(
+        model_provider="gpt",
+        tensor_model_parallel_size=4,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        expert_model_parallel_size=4,
+        expert_tensor_parallel_size=1,
+        sequence_parallel=True,
+        tensor_parallel_num_weight_shards=4,
+        gtp_weight_remat_size=1,
+        tensor_parallel_num_sequence_shards=4,
+        gtp_remat_num_sequence_shards=1,
+        expert_tensor_parallel_num_weight_shards=1,
+        expert_gtp_weight_remat_size=1,
+    )
+    utils.get_model_builder(args, SimpleNamespace(padded_vocab_size=128), pg_collection=pg)
+
+    shard_args = seen["args"]
+    assert shard_args.tensor_model_parallel_size == shard_tp
+    assert shard_args.tensor_parallel_num_weight_shards == shard_tp
+    assert shard_args.tensor_parallel_num_sequence_shards == shard_tp
+    assert shard_args.expert_tensor_parallel_size == shard_expt_tp
+    assert shard_args.expert_tensor_parallel_num_weight_shards == shard_expt_tp
+    # The global args are untouched.
+    assert args.tensor_parallel_num_weight_shards == 4
+    assert args.tensor_parallel_num_sequence_shards == 4
+    assert args.expert_tensor_parallel_num_weight_shards == 1

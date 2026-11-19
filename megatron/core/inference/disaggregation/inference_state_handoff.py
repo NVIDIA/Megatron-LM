@@ -533,7 +533,7 @@ class InferenceStateHandoffMixin:
             plans.append(agent.prepare_push_blocks({"tp_metas": peer_metas}, slots))
         handles = [self._kv_transfer_agent.start_prepared(plans)]
         self._pending_kv_pushes.append((request_id, handles))
-        logging.info(
+        logging.debug(
             "DISAGG_PREFILL_PUSH request_id=%d blocks=%d ssm=%d",
             request_id,
             len(block_ids) - cached_prefix_blocks,
@@ -759,7 +759,7 @@ class InferenceStateHandoffMixin:
             "block_ids": block_ids,
             "kv_meta": kv_meta,
         }
-        logging.info(
+        logging.debug(
             "DISAGG_PREFILL_HANDOFF request_id=%d pinned_blocks=%d ssm_blocks=%d",
             rid,
             len(block_ids),
@@ -781,7 +781,7 @@ class InferenceStateHandoffMixin:
             return
         released = self._release_pinned_handoff_blocks(block_ids or [])
         self._release_pinned_handoff_ssm_slot(ssm_slot)
-        logging.info(
+        logging.debug(
             "DISAGG_PREFILL_RELEASE request_id=%d released_blocks=%d ssm=%d",
             request_id,
             released,
