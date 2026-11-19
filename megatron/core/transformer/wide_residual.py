@@ -893,9 +893,10 @@ def _unfused_error(layer) -> ValueError:
     )
 
 
-def link_residual_seams(layers) -> None:
+def link_residual_seams(layers) -> tuple:
     """Check and wire a fused stack's residual seams (``layers``: physical layers in order, after
-    shortcut grouping, whose blocks have linked their own MoE and shortcut reads).
+    shortcut grouping, whose blocks have linked their own MoE and shortcut reads); returns the
+    stack's fused reads.
 
     The fused spec makes every write but the last a DeferredWrite and every read but the first a
     WriteReadNorm. Each deferred write is linked to the next layer's fused read, and each read not
@@ -935,3 +936,4 @@ def link_residual_seams(layers) -> None:
             read.link_consumer(successor.mlp, successor.layer_number)  # never quantizes
         else:
             read.link_consumer(_input_projection(successor), successor.layer_number)
+    return tuple(read for read, _ in connections[1:])
