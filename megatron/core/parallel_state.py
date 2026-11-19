@@ -833,7 +833,7 @@ def initialize_model_parallel(
 
         create_all_gather_group (bool, default = False):
             Create separate dense and, when EP > 1, expert all-gather communicators
-            over the weight-replica ranks. Include them in the returned collection.
+            over the inner shard ranks. Include them in the returned collection.
             This creates communicators; parameter-gather overlap is configured separately.
 
     Returns:
@@ -1788,8 +1788,10 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
     """
     Helper function to create all-gather process groups for AG/RS overlap.
 
-    Creates separate communicators with the same ranks as data parallel groups
-    to enable overlapping all-gather operations with reduce-scatter operations.
+    Creates separate communicators with the same ordered ranks as the inner data
+    parallel shard groups, including CP for dense parameters. With one optimizer
+    instance these are the full data parallel groups. This enables overlapping
+    all-gather operations with reduce-scatter operations, including basic HSDP.
     Prefer initialize_model_parallel(create_all_gather_group=True) for standard bootstrap
     and retain its returned collection. This helper always creates new, caller-owned groups;
     do not call it again to retrieve groups already created by the initializer.
@@ -1827,15 +1829,22 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
     # Reconstructing it from CP and GTP sizes would count shared ranks twice.
     dp_cp_ag_group = None
     assert _WEIGHT_REPLICA_RANK_SETS is not None
-    for ranks_with_cp in _WEIGHT_REPLICA_RANK_SETS:
-        group_with_cp_ag = create_group(
-            ranks_with_cp,
-            timeout=timeout,
-            pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs or {}),
-            group_desc='DATA_PARALLEL_GROUP_WITH_CP_AG',
-        )
-        if rank in ranks_with_cp:
-            dp_cp_ag_group = group_with_cp_ag
+    inner_dp_size = get_data_parallel_group(
+        with_context_parallel=True, with_gtp_remat=False, partial_data_parallel=True
+    ).size()
+    for replica_ranks in _WEIGHT_REPLICA_RANK_SETS:
+        # Match initialize_model_parallel's contiguous inner-DP partition. Enumerate
+        # every group on every rank to preserve collective group-creation order.
+        for start in range(0, len(replica_ranks), inner_dp_size):
+            shard_ranks = replica_ranks[start : start + inner_dp_size]
+            group_with_cp_ag = create_group(
+                shard_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs or {}),
+                group_desc='DATA_PARALLEL_GROUP_WITH_CP_AG',
+            )
+            if rank in shard_ranks:
+                dp_cp_ag_group = group_with_cp_ag
 
     # Create expert DP all-gather group if requested
     expt_dp_ag_group = None
@@ -1855,15 +1864,20 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
             rank_offset=0,
         )
 
+        inner_expert_dp_size = get_expert_data_parallel_group(
+            with_gtp_remat=False, partial_expert_data_parallel=True
+        ).size()
         for expert_dp_ranks in expert_rank_gen.get_ranks('dp'):
-            expert_dp_ag = create_group(
-                expert_dp_ranks,
-                timeout=timeout,
-                pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs or {}),
-                group_desc='EXPERT_DATA_PARALLEL_GROUP_AG',
-            )
-            if rank in expert_dp_ranks:
-                expt_dp_ag_group = expert_dp_ag
+            for start in range(0, len(expert_dp_ranks), inner_expert_dp_size):
+                shard_ranks = expert_dp_ranks[start : start + inner_expert_dp_size]
+                expert_dp_ag = create_group(
+                    shard_ranks,
+                    timeout=timeout,
+                    pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs or {}),
+                    group_desc='EXPERT_DATA_PARALLEL_GROUP_AG',
+                )
+                if rank in shard_ranks:
+                    expt_dp_ag_group = expert_dp_ag
 
     return dp_cp_ag_group, expt_dp_ag_group
 

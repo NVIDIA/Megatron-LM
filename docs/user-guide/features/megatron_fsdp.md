@@ -202,9 +202,10 @@ The setting has moved from `DistributedDataParallelConfig` to
 `ddp.create_all_gather_group` to use `dist.create_all_gather_group`; the DDP field
 has been removed. The command-line option keeps the same spelling.
 
-Megatron-FSDP v1 does not support separate AG groups with basic HSDP
-(`outer_dp_sharding_strategy='no_shard'`). Keep `dist.create_all_gather_group=False`
-for that configuration; supplying custom AG groups is also rejected.
+With multiple distributed optimizer instances, Core creates separate AG groups
+over the inner shard ranks for dense and expert parameters. This also supports
+basic HSDP (`outer_dp_sharding_strategy='no_shard'`). Custom AG groups must match
+the corresponding shard group's ordered ranks.
 
 ### 🤖 Megatron-Core
 
