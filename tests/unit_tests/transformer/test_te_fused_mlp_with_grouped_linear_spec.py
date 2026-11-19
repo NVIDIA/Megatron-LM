@@ -80,12 +80,18 @@ def _patch_fake_te_ops(monkeypatch):
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
+    class FakeScaledClampedQGeGLU:
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
     fake_ops = SimpleNamespace(
         Sequential=FakeSequential,
         LayerNorm=FakeNorm,
         RMSNorm=FakeNorm,
         GroupedLinear=FakeGroupedLinear,
         ScaledSwiGLU=FakeScaledSwiGLU,
+        ScaledClampedQGeGLU=FakeScaledClampedQGeGLU,
     )
     monkeypatch.setattr(te_ext.te.pytorch, "LayerNormLinear", FakeLayerNormLinear, raising=False)
     monkeypatch.setattr(te_ext.te.pytorch, "Linear", FakeLinear, raising=False)
@@ -101,12 +107,14 @@ def _patch_fake_te_ops(monkeypatch):
         Linear=FakeLinear,
         GroupedLinear=FakeGroupedLinear,
         ScaledSwiGLU=FakeScaledSwiGLU,
+        ScaledClampedQGeGLU=FakeScaledClampedQGeGLU,
     )
 
 
-def _make_fake_grouped_mlp(fake_te, normalization="LayerNorm"):
+def _make_fake_grouped_mlp(fake_te, normalization="LayerNorm", **config_overrides):
     module = TEFusedMLPWithGroupedLinear.__new__(TEFusedMLPWithGroupedLinear)
     torch.nn.Module.__init__(module)
+    module.config = _make_config(**config_overrides)
 
     fc1 = fake_te.LayerNormLinear()
     fc1.normalization = normalization
@@ -228,6 +236,20 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
         assert fc2_op.kwargs["accumulate_into_main_grad"] is False
         assert fc2_op.kwargs["split_alignment"] == 256
         assert fc2_op.weight0 is module.linear_fc2.weight
+
+    def test_make_fused_impl_builds_clamped_activation(self, monkeypatch):
+        fake_te = _patch_fake_te_ops(monkeypatch)
+        module = _make_fake_grouped_mlp(fake_te, num_moe_experts=4, activation_func_clamp_value=7.0)
+
+        fused_impl = TEFusedMLPWithGroupedLinear._make_fused_impl(module)
+
+        assert isinstance(fused_impl[1], fake_te.ScaledClampedQGeGLU)
+        assert fused_impl[1].kwargs == {
+            "glu_interleave_size": 32,
+            "alpha": 1.0,
+            "limit": 7.0,
+            "glu_linear_offset": 0.0,
+        }
 
     @pytest.mark.parametrize(("bad_attr", "match"), [("linear_fc1", "FC1"), ("linear_fc2", "FC2")])
     def test_make_fused_impl_validates_te_linear_types(self, monkeypatch, bad_attr, match):
@@ -470,6 +492,13 @@ class TestTEFusedMLPWithGroupedLinearSpec:
         config = _make_config()
         mlp = TEFusedMLPWithGroupedLinear(config, _make_submodules())
         assert isinstance(mlp, TEFusedMLPWithGroupedLinear)
+
+    def test_rejects_situ_glu(self):
+        config = _make_config(
+            activation_func_tanh_clamp_scale=4.0, activation_func_tanh_clamp_scale_linear=25.0
+        )
+        with pytest.raises(ValueError, match="activation_func_tanh_clamp_scale"):
+            TEFusedMLPWithGroupedLinear(config, _make_submodules())
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
