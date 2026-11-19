@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""B1 paired analysis: balanced-block baseline-vs-patch comparison per workload.
+"""Paired analysis: balanced-block baseline-vs-patch comparison per workload.
 
-Input layout (produced by run_b1_paired.sh):
+Input layout (see "Paired runs" in README.md):
     <root>/<run-id>/<config-tag>-<APPA|PAAP>/<position>-<tree>/rank*.jsonl
 
 Each block is a balanced four-arm sequence (baseline, patch, patch, baseline) or its mirror,
 with every arm a separate process on the identical logical workload. For each workload the
-analysis takes the geometric mean of the two same-tree arms, then the log ratio, exactly as
-the skill's scoring definition requires:
+analysis takes the geometric mean of the two same-tree arms, then the log ratio:
 
     d = log(patch / baseline)      (step time; lower is better)
     step-time change % = 100 * (exp(d) - 1)
@@ -96,7 +95,7 @@ def main() -> int:
         lines.append(s)
         print(s)
 
-    emit("# B1 — paired baseline-vs-patch comparison (balanced blocks)")
+    emit("# Paired baseline-vs-patch comparison (balanced blocks)")
     emit()
     emit(f"run: `{args.run_dir}`")
     emit(f"reference tree: `{args.reference}`")

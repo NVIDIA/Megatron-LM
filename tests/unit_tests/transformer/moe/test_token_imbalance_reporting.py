@@ -250,3 +250,18 @@ def test_instrumentation_reports_measured_slowdown_and_unpaired_workloads(tmp_pa
     assert "1.0000 (1) | 2.0000 (1) | +100.000%" in report
     assert report.count("unpaired setting") == 2
     assert "co-tenant" not in report and "NOT measurably slower" not in report
+
+
+@pytest.mark.parametrize("problem", ["missing", "duplicate"])
+def test_report_marks_jobs_without_every_rank_once(tmp_path, problem):
+    job = tmp_path / "base-main/cfg"
+    write_job(job, [1, 3])
+    if problem == "missing":
+        (job / "rank1.jsonl").unlink()
+    else:
+        rank0 = job / "rank0.jsonl"
+        rank0.write_text(rank0.read_text() * 2)
+    report = run_report("report.py", tmp_path)
+    assert f"| base-main/cfg | 1 | **FAIL** | {WORKLOAD} |" in report
+    section1 = report.split("## 2.")[0]
+    assert "| base-main/cfg |" not in section1

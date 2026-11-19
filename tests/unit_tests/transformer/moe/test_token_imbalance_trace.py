@@ -358,3 +358,35 @@ def test_rejects_dtype_outside_the_schema_even_when_manifest_matches(workdir, na
     manifest_path.write_text(json.dumps(manifest))
     with pytest.raises(TraceValidationError, match=rf"{names[0]} dtype .* != schema"):
         load_trace(directory)
+
+
+def test_rejects_manifest_without_workload_id(workdir):
+    d = _copy(workdir, "noworkload")
+    m = json.loads((d / "manifest.json").read_text())
+    m.pop("workload_id")
+    (d / "manifest.json").write_text(json.dumps(m))
+    with pytest.raises(TraceValidationError, match="missing required field"):
+        load_trace(d)
+
+
+def test_rejects_tensor_entry_without_metadata(workdir):
+    d = _copy(workdir, "nometa")
+    m = json.loads((d / "manifest.json").read_text())
+    m["tensors"]["gates"].pop("sha256")
+    (d / "manifest.json").write_text(json.dumps(m))
+    with pytest.raises(TraceValidationError, match="needs file, sha256, shape and dtype"):
+        load_trace(d)
+
+
+def test_rejects_one_dimensional_expert_ids(workdir):
+    d = _copy(workdir, "flat")
+    m = json.loads((d / "manifest.json").read_text())
+    meta = m["tensors"]["expert_ids"]
+    path = d / meta["file"]
+    flat = torch.load(path, weights_only=True).flatten().contiguous()
+    torch.save(flat, path)
+    meta["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    meta["shape"] = list(flat.shape)
+    (d / "manifest.json").write_text(json.dumps(m))
+    with pytest.raises(TraceValidationError, match=r"expert_ids must be \[T, K>=1\]"):
+        load_trace(d)

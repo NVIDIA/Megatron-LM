@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""B1 trace v1: a persisted, checksummed logical routing workload.
+"""Trace v1: a persisted, checksummed logical routing workload.
 
-Design rules taken from the B1 contract:
+Design rules:
 
   * The trace fixes the LOGICAL routing only (token ids, expert ids, gates). It never
     prescribes a physical plan, so the same trace can be executed by different dispatchers,
     placements or EP/ETP layouts.
   * ``schema_version``, dtypes, shapes, per-file checksums, expert-id range, top-k
     distinctness and gate finiteness/sum are all validated on load. A validation failure
-    exits; nothing is silently truncated, reordered or padded.
+    raises ``TraceValidationError``; nothing is silently truncated, reordered or padded.
   * Loading refuses arbitrary pickle: tensors are stored with ``torch.save`` and read back
     with ``weights_only=True``, which only reconstructs plain tensors and primitive
     containers.
@@ -25,9 +25,9 @@ Format (one directory per trace):
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -35,7 +35,6 @@ from typing import Any
 import torch
 
 SCHEMA_VERSION = 1
-PRODUCER = "b1_benchmark.py/trace-v1"
 TENSOR_DTYPES = {
     "token_ids": torch.int64,
     "gates": torch.float32,
@@ -164,15 +163,12 @@ def load_trace(trace_dir: Path) -> tuple[TraceManifest, dict[str, torch.Tensor]]
         raise TraceValidationError(
             f"unsupported schema_version {raw.get('schema_version')!r}, expected {SCHEMA_VERSION}"
         )
-    for key in (
-        "seed",
-        "logical_num_tokens",
-        "num_experts",
-        "topk",
-        "world_size",
-        "workload_checksum",
-        "tensors",
-    ):
+    required = [
+        f.name
+        for f in dataclasses.fields(TraceManifest)
+        if f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING
+    ]
+    for key in (*required, "tensors"):
         if key not in raw:
             raise TraceValidationError(f"manifest is missing required field {key!r}")
 
@@ -183,6 +179,10 @@ def load_trace(trace_dir: Path) -> tuple[TraceManifest, dict[str, torch.Tensor]]
         meta = raw["tensors"].get(name)
         if meta is None:
             raise TraceValidationError(f"manifest does not list tensor {name!r}")
+        if not isinstance(meta, dict) or not {"file", "sha256", "shape", "dtype"} <= meta.keys():
+            raise TraceValidationError(
+                f"manifest entry for {name!r} needs file, sha256, shape and dtype"
+            )
         p = trace_dir / meta["file"]
         if not p.is_file():
             raise TraceValidationError(f"missing tensor file {p}")
@@ -216,6 +216,8 @@ def _validate_semantics(man: TraceManifest, tensors: dict[str, torch.Tensor]) ->
     ids = tensors["expert_ids"]
     gates = tensors["gates"]
     src = tensors["source_rank"]
+    if ids.dim() != 2 or ids.shape[1] == 0:
+        raise TraceValidationError(f"expert_ids must be [T, K>=1], got {list(ids.shape)}")
     T, K = ids.shape
 
     if man.topk != K:
@@ -264,9 +266,6 @@ def _validate_semantics(man: TraceManifest, tensors: dict[str, torch.Tensor]) ->
 
     if int(src.min()) < 0 or int(src.max()) >= man.world_size:
         raise TraceValidationError(f"source_rank out of range for world_size {man.world_size}")
-    counts = torch.bincount(src, minlength=man.world_size)
-    if int(counts.sum()) != T:
-        raise TraceValidationError("source_rank does not account for every token")
 
     if not torch.equal(tensors["token_ids"], ids):
         raise TraceValidationError("token_ids and expert_ids disagree")

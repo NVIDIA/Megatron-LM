@@ -17,8 +17,14 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "benchmarks/moe/token_imbalance"))
 import arms as A  # noqa: E402
 from arm_adapter import canonical_routes, numerical_error  # noqa: E402
-from backend_adapter import UNVERIFIED, probe_environment  # noqa: E402
-from compare_arms import parse_args, spread  # noqa: E402
+from backend_adapter import (  # noqa: E402
+    SUPPORTED,
+    UNSUPPORTED,
+    UNVERIFIED,
+    StandardAlltoAllAdapter,
+    probe_environment,
+)
+from compare_arms import _build_summary, _compare_numerics, parse_args, spread  # noqa: E402
 
 GEOMETRY = A.Geometry(ep=4, experts=16, topk=4, tokens=256, hidden=256, ffn=512)
 ALL_OK = {
@@ -192,3 +198,42 @@ def test_spread_summarizes_median_and_range():
 def test_fixed_workloads_leave_unexercised_capabilities_unverified():
     capability = probe_environment()
     assert capability.zero_token_rows == capability.variable_topk == UNVERIFIED
+
+
+def test_capability_uses_the_run_expert_count():
+    capability = StandardAlltoAllAdapter().capability(6)
+    assert capability.ep_sizes["ep=2"] == SUPPORTED
+    assert capability.ep_sizes["ep=4"] == UNSUPPORTED
+    assert capability.grouped_gemm == UNSUPPORTED
+    assert capability.etp["etp>1"] == UNSUPPORTED
+
+
+def _summary_status(numerics_by_rank, samples=None, reference="hybridep"):
+    samples = samples or {("hybridep", "W0_balanced"): [1.0], ("moonep", "W0_balanced"): [2.0]}
+    summary = _build_summary({}, samples, numerics_by_rank, reference, len(numerics_by_rank))
+    return {(r["backend"], r["workload"]): r["numerics"] for r in summary["results"]}
+
+
+def test_summary_numerics_status_needs_every_rank():
+    key = ("moonep", "W0_balanced")
+    assert _summary_status([{key: True}, {key: True}])[key] == "PASS"
+    assert _summary_status([{key: True}, {key: False}])[key] == "FAIL"
+    assert _summary_status([{key: True}, {}])[key] == "NOT_COMPARED"
+    assert _summary_status([{}, {}])[("hybridep", "W0_balanced")] == "REFERENCE"
+
+
+def test_compare_numerics_flags_out_of_tolerance_arms():
+    good = {"out": torch.ones(4)}
+    values = {
+        "hybridep": [good, good],
+        "moonep": [good, {"out": torch.zeros(4)}],
+        "alltoall": [good],
+    }
+    rows, status = _compare_numerics(values, "hybridep")
+    assert status == {"moonep": False, "alltoall": True}
+    assert [(name, step, passed) for name, step, _, passed in rows] == [
+        ("moonep", 0, True),
+        ("moonep", 1, False),
+        ("alltoall", 0, True),
+    ]
+    assert _compare_numerics({"moonep": [good]}, "hybridep") == ([], {})

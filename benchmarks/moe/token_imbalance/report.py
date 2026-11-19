@@ -49,13 +49,14 @@ def load(root: Path) -> dict[str, dict[str, dict]]:
         for r in rows:
             wl = r["workload_id"]
             cur = out[cfg].get(wl)
-            entry = cur or {"median_ms": 0.0, "rank": 0, "status": "OK", "checks": {}}
+            entry = cur or {"median_ms": 0.0, "ranks": [], "status": "OK", "checks": {}}
             if r.get("median_ms") and r["median_ms"] > entry["median_ms"]:
                 entry["median_ms"] = r["median_ms"]
             if r.get("status") != "OK":
                 entry["status"] = r["status"]
             c = r.get("correctness") or {}
-            entry["rank"] = max(entry["rank"], r.get("rank", 0))
+            entry["ranks"].append(r.get("rank"))
+            entry["world_size"] = r.get("world_size")
             # these are top-level fields on the arm record, not part of `correctness`
             for k in ("expert_imbalance", "expert_cv") + RANK_LEVEL_FIELDS:
                 v = r.get(k)
@@ -67,6 +68,15 @@ def load(root: Path) -> dict[str, dict[str, dict]]:
                 if isinstance(v, bool):
                     entry["checks"][k] = entry["checks"].get(k, True) and v
             out[cfg][wl] = entry
+    # A job is complete only with every rank exactly once: a crashed rank or a rerun appended
+    # to the same rank*.jsonl must not produce a normal-looking row.
+    for by_workload in out.values():
+        for entry in by_workload.values():
+            world, ranks = entry.get("world_size"), entry.pop("ranks")
+            complete = isinstance(world, int) and len(ranks) == world
+            if not complete or set(ranks) != set(range(world)):
+                entry["status"] = "INVALID (missing or duplicate ranks)"
+                entry["median_ms"] = 0.0
     return out
 
 
@@ -87,7 +97,7 @@ def main() -> int:
         lines.append(s)
         print(s)
 
-    emit("# B1 - MoE token-imbalance benchmark: measured results")
+    emit("# MoE token-imbalance benchmark: measured results")
     emit()
     emit(f"results root: `{args.results_root}`")
     emit("metric aggregation: worst rank (max) of the per-arm median step time")

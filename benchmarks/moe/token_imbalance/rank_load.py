@@ -79,28 +79,11 @@ def hot_rank_persistence(per_step_loads: Sequence[Sequence[int]]) -> float | Non
     return same / (len(hot) - 1)
 
 
-def rank_load_summary(loads: Sequence[int]) -> dict[str, Any]:
-    return {
-        "rank_loads": [int(c) for c in loads],
-        "maxvio": maxvio(loads),
-        "concentration": concentration(loads),
-    }
-
-
 # --------------------------------------------------------------------------------------
 # rank-target workloads: constructed for a given layout
 # --------------------------------------------------------------------------------------
 
 RANK_TARGET_WORKLOADS = ("R0_balanced", "R1_hot_rank_spread", "R2_hot_rank_concentrated")
-
-RANK_TARGET_NOTES = {
-    "R0_balanced": "every EP rank receives the same load (maxvio 1, concentration 0)",
-    "R1_hot_rank_spread": "one rank at the target maxvio; the remaining load spread evenly over "
-    "every other rank",
-    "R2_hot_rank_concentrated": "same busiest-rank load as R1, but the remaining load sits at "
-    "the mean on as few ranks as possible, leaving the rest empty: equal maxvio, higher "
-    "concentration (needs EP >= 3 to differ from R1)",
-}
 
 SCHEDULES = ("static", "rotate", "random")
 

@@ -77,19 +77,6 @@ TRACE_WORKLOADS = (
 
 WORKLOADS = TRACE_WORKLOADS + RL.RANK_TARGET_WORKLOADS
 
-WORKLOAD_NOTES = {
-    "W0_balanced": "round-robin distinct top-k; every expert and destination rank equal",
-    "W1_hot_expert_set": "a contiguous hot block of E/4 experts takes 3/4 of the rows",
-    "W3_spread_hot_experts": "W1 with its experts relabeled so the hot block is strided across "
-    "the expert range: identical per-expert heat, different placement",
-    "W4_random_balanced": "uniform random distinct top-k: balanced in expectation, with the "
-    "sampling fluctuation W0's exact round-robin does not have",
-    "W5_zero_expert_rank": "half the experts never selected; owner ranks receive nothing",
-    "W6_rotating_hotspot": "W1's hot block moves by its own width every 3 steps",
-    "W7_burst": "3 steady steps, 1 burst step, then recovery (period 4)",
-    **RL.RANK_TARGET_NOTES,
-}
-
 # Smallest --steps at which a per-step trace workload is actually exercised.
 _TRACE_MIN_STEPS = {"W6_rotating_hotspot": 4, "W7_burst": 5}
 
@@ -150,7 +137,7 @@ def routing_for_step(
 
     trace_replay (W*) workloads are seeded by (workload, seed, step) alone and do not depend on
     `ep_size`, so one logical workload is comparable across execution methods and layouts;
-    `test_workload.py` asserts that. rank_target (R*) workloads are built FOR `ep_size`, so
+    `test_token_imbalance_workload.py` asserts that. rank_target (R*) workloads are built FOR `ep_size`, so
     they depend on it by design.
     """
     if is_rank_target(workload):
@@ -413,14 +400,22 @@ class ArmResult:
 # --------------------------------------------------------------------------------------
 
 
+# Combine sums up to `topk` identical BF16 copies of a row, so every partial sum is
+# `j * v` with `j <= topk`. Each value the oracle feeds it stays within 256 grid units,
+# and every integer up to 256 is exact in BF16, so any top-k up to 256 is exact.
+MAX_ORACLE_TOPK = 256
+
+
 def _roundtrip_sentinels(
     tokens: int, hidden_size: int, topk: int, rank: int
 ) -> Iterator[torch.Tensor]:
     """Encode the rank in each row sum and token bits in the order of column pairs."""
     target = (topk + rank) * 1024
     pairs = hidden_size // 2
-    if not pairs or topk <= 0 or topk & (topk - 1):
-        raise ValueError("round-trip oracle needs a power-of-two topk and at least two columns")
+    if not pairs or not 1 <= topk <= MAX_ORACLE_TOPK:
+        raise ValueError(
+            f"round-trip oracle needs 1 <= topk <= {MAX_ORACLE_TOPK} and at least two columns"
+        )
 
     lift, remainder = divmod(target, hidden_size)
     row = torch.full((hidden_size,), lift, dtype=torch.int32)
@@ -428,7 +423,11 @@ def _roundtrip_sentinels(
     row[: 2 * pairs : 2] += 1
     row[1 : 2 * pairs : 2] -= 1
     assert int(row.sum()) == target, "integer row sum mismatch"
-    assert int(row.abs().max()) < 255, "value leaves the bf16-exact grid"
+    if int(row.abs().max()) >= 255:
+        raise ValueError(
+            f"hidden size {hidden_size} is too narrow for topk {topk} on rank {rank}: "
+            "sentinel values leave the bf16-exact grid"
+        )
     row = (row.float() / 1024).to(torch.bfloat16)
 
     token_ids = torch.arange(tokens)
@@ -456,8 +455,9 @@ def _combine_probes(hidden: torch.Tensor, topk: int, world_size: int) -> Iterato
         return
 
     # A BF16 accumulator can round an intermediate sum even when the final result is
-    # representable. Check each signed bit plane independently using the same power-of-two
-    # additions as the combine-factor probe. Together the planes encode the original rows.
+    # representable. Check each signed bit plane independently: a plane holds one power of
+    # two per entry, so its partial sums `j * 2**bit` stay exact for any j <= 256.
+    # Together the planes encode the original rows.
     grid = (hidden.float() * 1024).to(torch.int16)
     for bit in range(8):
         component = (grid.abs() & (1 << bit)) * grid.sign()
@@ -500,7 +500,7 @@ def _any_rank_failed(failed: bool, device: torch.device) -> bool:
     return bool(flag.item())
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--mode", choices=("dispatch_only", "moe_fwd_bwd", "training_step"), default="dispatch_only"
@@ -513,12 +513,6 @@ def main() -> int:
     ap.add_argument("--hidden-size", type=int, default=512)
     ap.add_argument("--ffn-hidden-size", type=int, default=1024)
     ap.add_argument("--tokens", type=int, default=128, help="per-rank source tokens")
-    ap.add_argument(
-        "--min-tokens",
-        type=int,
-        default=0,
-        help="override the permute geometry precondition (default: topk)",
-    )
     ap.add_argument(
         "--steps",
         type=int,
@@ -573,30 +567,69 @@ def main() -> int:
         default=None,
         help="write the backend capability probe result to this path",
     )
-    args = ap.parse_args()
+    return ap
 
-    geom_min = args.min_tokens or args.topk
-    if args.tokens < geom_min:
-        print(
-            f"ERROR: --tokens {args.tokens} < required geometry minimum {geom_min} "
-            f"(the argsort permute needs num_experts*num_tokens >= tokens*topk slots)",
-            file=sys.stderr,
+
+def validate_args(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
+    """Check every argument that can be checked before NCCL init.
+
+    Returns the workloads and their checksums. Raises ValueError with the message to print.
+    """
+    if args.tokens < 1 or not 1 <= args.topk <= args.num_experts:
+        raise ValueError(
+            f"need --tokens >= 1 and 1 <= --topk <= --num-experts "
+            f"(got {args.tokens}, {args.topk}, {args.num_experts})"
         )
-        return 2
+    if args.topk > MAX_ORACLE_TOPK:
+        raise ValueError(f"the round-trip oracle needs --topk <= {MAX_ORACLE_TOPK}")
+    # With the identity expert every expert-TP rank holds a full copy, so combine would
+    # measure topk * etp and every workload would fail the combine-factor check.
+    # MoELayer rejects TP > 1 in training mode without sequence parallelism.
+    if args.etp != 1 or (args.tp != 1 and args.mode != "dispatch_only"):
+        raise ValueError(
+            "benchmark.py needs --etp 1, and --tp 1 in the model modes "
+            "(MoELayer rejects TP > 1 without sequence parallelism)"
+        )
+    # The highest rank has the largest sentinel row sum; if it fits, every rank fits.
+    next(_roundtrip_sentinels(args.tokens, args.hidden_size, args.topk, args.ep * args.tp - 1))
+    if args.instrument == "counters" and args.mode != "dispatch_only":
+        raise ValueError("--instrument counters only counts calls in --mode dispatch_only")
     workloads = args.workloads.split(",")
+    checksums: dict[str, str] = {}
     for workload in workloads:
         if workload not in WORKLOADS:
-            print(f"ERROR: unknown workload {workload}", file=sys.stderr)
-            return 2
+            raise ValueError(f"unknown workload {workload}")
         need = min_steps(workload, args.schedule, args.schedule_period)
         if args.steps < need:
-            print(
-                f"ERROR: {workload} (schedule {args.schedule}) needs --steps >= {need} to be "
+            raise ValueError(
+                f"{workload} (schedule {args.schedule}) needs --steps >= {need} to be "
                 f"exercised; with --steps {args.steps} every iteration would replay only "
-                f"the first {args.steps} step(s)",
-                file=sys.stderr,
+                f"the first {args.steps} step(s)"
             )
-            return 2
+        # Building the routing on CPU surfaces workload-specific geometry limits here,
+        # before any process group exists.
+        checksums[workload] = workload_fingerprint(
+            workload,
+            args.num_experts,
+            args.topk,
+            args.tokens,
+            args.steps,
+            args.seed,
+            args.ep,
+            hot_maxvio=args.hot_maxvio,
+            schedule=args.schedule,
+            period=args.schedule_period,
+        )
+    return workloads, checksums
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        workloads, checksums = validate_args(args)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
 
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
@@ -621,9 +654,9 @@ def main() -> int:
     from backend_adapter import StandardAlltoAllAdapter, report_capability
 
     adapter = StandardAlltoAllAdapter()
-    cap = adapter.capability()
+    cap = adapter.capability(args.num_experts)
     if rank == 0:
-        print("[B1] backend capability probe:\n" + report_capability(cap), flush=True)
+        print("[token-imbalance] backend capability probe:\n" + report_capability(cap), flush=True)
         if args.capability_json:
             Path(args.capability_json).parent.mkdir(parents=True, exist_ok=True)
             Path(args.capability_json).write_text(
@@ -793,6 +826,7 @@ def main() -> int:
     )
 
     def run_arm(rec: ArmResult, workload: str, checksum: str) -> None:
+        counters.update(dict.fromkeys(counters, 0))
         steps = args.steps
         per_step = [
             routing_for_step(
@@ -831,7 +865,9 @@ def main() -> int:
                         producer_commit=args.base_sha,
                     )
                     corr["trace_dir"] = str(Path(args.write_trace) / workload)
-                    print(f"[B1] wrote {steps} trace step(s) for {workload}", flush=True)
+                    print(
+                        f"[token-imbalance] wrote {steps} trace step(s) for {workload}", flush=True
+                    )
                 except Exception as exc:
                     error = exc
             if _any_rank_failed(error is not None, dev):
@@ -892,8 +928,6 @@ def main() -> int:
         #
         # The dispatcher sums the raw expert outputs. Measure that factor before using
         # it to construct the exact reference for each rank- and token-specific sentinel.
-        if args.topk <= 0 or args.topk & (args.topk - 1):
-            raise _WorkloadError("round-trip oracle needs a power-of-two topk")
         ones_full = [
             probs_matrix_from_gates(
                 ids, torch.full_like(g, 1.0 / args.topk), args.num_experts, torch.bfloat16
@@ -988,7 +1022,8 @@ def main() -> int:
             if args.mode == "training_step":
                 torch.nn.utils.clip_grad_norm_(layer.parameters(), 1.0)
                 step_holder["opt"].step()
-            step_holder["last_loss"] = float(loss.detach())
+            # Keep the tensor: converting it here would sync inside the timed window.
+            step_holder["last_loss"] = loss.detach()
 
         def dispatch_step(s: int) -> None:
             count("permute_calls")
@@ -1057,6 +1092,7 @@ def main() -> int:
 
         if model_mode:
             last_loss = step_holder.get("last_loss")
+            last_loss = None if last_loss is None else float(last_loss)
             corr["model_step_ran"] = last_loss is not None
             corr["model_step_loss_finite"] = (
                 last_loss is not None and math.isfinite(last_loss) and abs(last_loss) < 1e6
@@ -1102,16 +1138,7 @@ def main() -> int:
     failures = 0
     for workload in workloads:
         rank_target = is_rank_target(workload)
-        checksum = workload_fingerprint(
-            workload,
-            args.num_experts,
-            args.topk,
-            args.tokens,
-            args.steps,
-            args.seed,
-            args.ep,
-            **route_kwargs,
-        )
+        checksum = checksums[workload]
         rec = ArmResult(
             workload_id=workload,
             workload_checksum=checksum,
@@ -1160,7 +1187,7 @@ def main() -> int:
     if rank == 0:
         ok = len(results) - failures
         print(
-            f"[B1] run_id={args.run_id} mode={args.mode} ep={args.ep} world={world} "
+            f"[token-imbalance] run_id={args.run_id} mode={args.mode} ep={args.ep} world={world} "
             f"arms={len(results)} ok={ok} -> {out_dir}"
         )
     torch.distributed.destroy_process_group()

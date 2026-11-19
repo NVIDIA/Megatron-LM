@@ -49,7 +49,7 @@ def test_generator_is_deterministic_and_layout_independent(workload):
 
     This is what lets one logical trace be compared across execution methods, so it is
     asserted for every trace_replay workload rather than assumed. rank_target workloads are
-    built for a layout and are tested in test_rank_load.py instead.
+    built for a layout and are tested in test_token_imbalance_rank_load.py instead.
     """
     a_ids, a_gates = B.routing_for_step(workload, NUM_EXPERTS, 2, TOKENS, 0, 99, 1)
     b_ids, b_gates = B.routing_for_step(workload, NUM_EXPERTS, 2, TOKENS, 0, 99, 1)
@@ -205,7 +205,15 @@ def test_retired_workload_ids_are_rejected():
 
 @pytest.mark.parametrize(
     "tokens,hidden_size,topk",
-    [(128, 512, 2), (2048, 2048, 2), (257, 16, 1), (128, 512, 8), (16, 512, 64)],
+    [
+        (128, 512, 2),
+        (2048, 2048, 2),
+        (257, 16, 1),
+        (128, 512, 8),
+        (16, 512, 64),
+        (128, 512, 3),
+        (128, 128, 6),
+    ],
 )
 def test_roundtrip_sentinels_distinguish_tokens_and_source_ranks(tokens, hidden_size, topk):
     source = list(B._roundtrip_sentinels(tokens, hidden_size, topk, rank=0))
@@ -232,9 +240,50 @@ def test_roundtrip_sentinels_distinguish_tokens_and_source_ranks(tokens, hidden_
     assert any(not torch.equal(hidden[wrong_order] * topk, hidden * topk) for hidden in source)
 
 
-def test_oracle_rejects_non_power_of_two_topk():
-    with pytest.raises(ValueError, match="power-of-two"):
-        list(B._roundtrip_sentinels(128, 512, 3, rank=0))
+@pytest.mark.parametrize("topk", [0, B.MAX_ORACLE_TOPK + 1])
+def test_oracle_rejects_topk_outside_its_exact_range(topk):
+    with pytest.raises(ValueError, match="1 <= topk <= 256"):
+        list(B._roundtrip_sentinels(128, 4096, topk, rank=0))
+
+
+def test_oracle_rejects_a_hidden_size_too_narrow_for_topk():
+    with pytest.raises(ValueError, match="too narrow"):
+        list(B._roundtrip_sentinels(128, 16, 8, rank=0))
+
+
+def _args(*argv):
+    return B.build_parser().parse_args(["--out", "unused", *argv])
+
+
+def test_validate_args_accepts_a_minimal_run():
+    workloads, checksums = B.validate_args(
+        _args("--tokens", "1", "--topk", "2", "--workloads", "W0_balanced")
+    )
+    assert workloads == ["W0_balanced"] and set(checksums) == {"W0_balanced"}
+
+
+@pytest.mark.parametrize(
+    "argv, message",
+    [
+        (("--topk", "16", "--num-experts", "8"), "--topk <= --num-experts"),
+        (("--tokens", "0"), "--tokens >= 1"),
+        (("--topk", "5", "--workloads", "W5_zero_expert_rank"), "exceeds candidate pool"),
+        (("--ep", "2", "--hot-maxvio", "3", "--workloads", "R1_hot_rank_spread"), "hot_maxvio"),
+        (("--etp", "2"), "--etp 1"),
+        (("--tp", "2", "--mode", "moe_fwd_bwd"), "--tp 1"),
+        (("--mode", "moe_fwd_bwd", "--instrument", "counters"), "dispatch_only"),
+        (("--hidden-size", "16", "--topk", "8"), "too narrow"),
+        (("--workloads", "W9_unknown"), "unknown workload"),
+    ],
+)
+def test_validate_args_rejects_impossible_geometry_before_init(argv, message):
+    with pytest.raises(ValueError, match=message):
+        B.validate_args(_args(*argv))
+
+
+def test_main_reports_invalid_arguments_without_starting_nccl(capsys):
+    assert B.main(["--out", "unused", "--etp", "2"]) == 2
+    assert "ERROR: benchmark.py needs --etp 1" in capsys.readouterr().err
 
 
 def _check_rank_local_failure(rank, rendezvous):

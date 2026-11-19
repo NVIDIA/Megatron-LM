@@ -242,7 +242,7 @@ torchrun --standalone --nproc_per_node=4 compare_arms.py \
 
 ## Capability probe
 
-`backend_adapter.py` reports what the all-to-all backend of `benchmark.py` supports **here**, from imports and measurement,
+`backend_adapter.py` reports what the all-to-all backend of `benchmark.py` supports **here**, from imports,
 never from documentation. Unknown items are reported as `UNVERIFIED`. The expert computation
 is a per-expert loop in every mode (`moe_grouped_gemm=False`), so absolute step times are
 **not** comparable with a grouped-GEMM run, though comparisons between workloads at one
@@ -273,5 +273,38 @@ straggler is the point of a token-imbalance benchmark; averaging would hide it.
 * **`strong` vs `weak` scaling is not a recorded field.** Increasing EP at fixed per-rank tokens
   increases the total token count, so results across EP widths are weak-scaling comparisons and
   must not be read as "EP=N is faster".
+* `benchmark.py` accepts only `--etp 1`, and `--tp` other than 1 only in `dispatch_only`
+  mode; `--counters` is accepted only in `dispatch_only` mode. Other combinations are
+  rejected before the process group is initialized.
 * Absolute latencies carry the noise of the node they were taken on. Use the paired-run
-  protocol for comparisons; a single arm is not a result.
+  protocol below for comparisons; a single arm is not a result.
+
+## Paired runs
+
+A baseline-vs-patch comparison of `benchmark.py` runs each configuration in two balanced
+blocks of four separate jobs: `APPA` (baseline, patch, patch, baseline) and its mirror `PAAP`.
+Every job runs the same workloads and flags and only the source tree differs. Write the jobs
+as
+
+```
+<root>/<run-id>/<config>-<APPA|PAAP>/<position>-<tree>/rank*.jsonl
+```
+
+where `<position>` is 0-3 in run order and `<tree>` names the checkout (the baseline tree is
+`base-main` by default; `--reference` changes it). Then
+
+```bash
+# per-arm table over every job under the root (worst rank, invalid arms kept and marked)
+python summarize.py --results-root <root> --out table.md
+
+# per-workload paired effect for one run: geometric mean of the two same-tree jobs per block,
+# then 100 * (exp(log(patch / baseline)) - 1); each block and the leave-one-out values are printed
+python analyze_paired.py <root>/<run-id> --out paired.md
+```
+
+A block whose jobs are missing, out of order, failing, or on a different base SHA or workload
+checksum is reported as `INVALID` and left out of the aggregate.
+
+In `compare_arms.py`'s `summary.json`, every result carries a `numerics` status. Only rows
+marked `PASS` or `REFERENCE` are comparable; `FAIL` missed the BF16 tolerance gate on some
+rank and `NOT_COMPARED` had no reference values for that workload.

@@ -139,6 +139,60 @@ def _run_step(adapter, hidden, indices, upstream, *, learning_rate, collect, gro
     return result
 
 
+def _compare_numerics(values, reference):
+    """Compare every arm's first-pass values with the reference arm's, step by step.
+
+    Returns ``(rows, status)``: one ``(arm, step, errors, passed)`` row per compared step, and
+    for each arm whether all of its steps passed. Arms with no comparable step are absent.
+    """
+    rows, status = [], {}
+    if reference not in values:
+        return rows, status
+    for name, per_step in values.items():
+        if name == reference:
+            continue
+        for step, (actual, expected) in enumerate(zip(per_step, values[reference])):
+            if actual.keys() != expected.keys():
+                errors = {"fields": "result fields differ"}
+                passed = False
+            else:
+                errors = {k: numerical_error(actual[k], expected[k]) for k in actual}
+                passed = all(
+                    e["relative_l2"] <= TOLERANCE["relative_l2"]
+                    and e["relative_peak"] <= TOLERANCE["relative_peak"]
+                    for e in errors.values()
+                )
+            rows.append((name, step, errors, passed))
+            status[name] = status.get(name, True) and passed
+    return rows, status
+
+
+def numerics_status(key, numerics_by_rank, reference, world):
+    """PASS/FAIL only when every rank compared ``(arm, workload)``; each rank sees its own data."""
+    if key[0] == reference:
+        return "REFERENCE"
+    seen = [by_key[key] for by_key in numerics_by_rank if key in by_key]
+    if len(seen) != world:
+        return "NOT_COMPARED"
+    return "PASS" if all(seen) else "FAIL"
+
+
+def _build_summary(run_info, samples, numerics_by_rank, reference, world):
+    """summary.json content: worst-rank spread and the numerics status of every result."""
+    return {
+        "run": run_info,
+        "results": [
+            {
+                "backend": arm,
+                "workload": workload,
+                "numerics": numerics_status((arm, workload), numerics_by_rank, reference, world),
+                "worst_rank": spread(times),
+            }
+            for (arm, workload), times in sorted(samples.items())
+        ],
+    }
+
+
 def main(argv=None):
     """Run every available arm on every workload and write per-rank JSONL plus a summary."""
     args = parse_args(argv)
@@ -209,6 +263,7 @@ def main(argv=None):
         (args.out / "run.json").write_text(json.dumps(run_info, indent=2))
         print(json.dumps({"availability": table}, indent=2), flush=True)
     samples = {}
+    numerics = {}  # (arm, workload) -> this rank's numerics verdict
     failed = False
     path = args.out / f"rank{rank}.jsonl"
     try:
@@ -329,55 +384,40 @@ def main(argv=None):
                         samples.pop((arm.name, workload), None)
                     adapter.close()
                 # Numerics against the reference arm, from the first measured pass.
-                if reference in values:
-                    for name, per_step in values.items():
-                        if name == reference:
-                            continue
-                        for step, (actual, expected) in enumerate(zip(per_step, values[reference])):
-                            if actual.keys() != expected.keys():
-                                errors = {"fields": "result fields differ"}
-                                passed = False
-                            else:
-                                errors = {
-                                    k: numerical_error(actual[k], expected[k]) for k in actual
-                                }
-                                passed = all(
-                                    e["relative_l2"] <= TOLERANCE["relative_l2"]
-                                    and e["relative_peak"] <= TOLERANCE["relative_peak"]
-                                    for e in errors.values()
-                                )
-                            failed |= not passed
-                            stream.write(
-                                json.dumps(
-                                    {
-                                        "numerics": True,
-                                        "backend": name,
-                                        "reference": reference,
-                                        "workload": workload,
-                                        "step": step,
-                                        "rank": rank,
-                                        "errors": errors,
-                                        "numerical_pass": passed,
-                                        "tolerance": TOLERANCE,
-                                    }
-                                )
-                                + "\n"
-                            )
+                rows, status = _compare_numerics(values, reference)
+                for name, step, errors, passed in rows:
+                    failed |= not passed
+                    stream.write(
+                        json.dumps(
+                            {
+                                "numerics": True,
+                                "backend": name,
+                                "reference": reference,
+                                "workload": workload,
+                                "step": step,
+                                "rank": rank,
+                                "errors": errors,
+                                "numerical_pass": passed,
+                                "tolerance": TOLERANCE,
+                            }
+                        )
+                        + "\n"
+                    )
+                for name, passed in status.items():
+                    numerics[(name, workload)] = passed
                 del values, initial
-        summary = {
-            "run": run_info,
-            "results": [
-                {"backend": arm, "workload": workload, "worst_rank": spread(times)}
-                for (arm, workload), times in sorted(samples.items())
-            ],
-        }
+        # Every rank reaches this point once, after the last workload.
+        numerics_by_rank = [None] * world
+        torch.distributed.all_gather_object(numerics_by_rank, numerics)
+        summary = _build_summary(run_info, samples, numerics_by_rank, reference, world)
         if rank == 0:
             (args.out / "summary.json").write_text(json.dumps(summary, indent=2))
             for item in summary["results"]:
                 s = item["worst_rank"]
                 print(
                     f"{item['workload']:28s} {item['backend']:20s} n={s['n']:3d} "
-                    f"median={s['median_ms']:.3f} p10={s['p10_ms']:.3f} p90={s['p90_ms']:.3f}",
+                    f"median={s['median_ms']:.3f} p10={s['p10_ms']:.3f} p90={s['p90_ms']:.3f} "
+                    f"numerics={item['numerics']}",
                     flush=True,
                 )
         flag = torch.tensor(int(failed), device="cuda")

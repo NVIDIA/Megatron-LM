@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""B1 summarizer: per-arm metrics and the baseline-vs-patch speed table.
+"""Summarizer: per-arm metrics and the baseline-vs-patch speed table.
 
 Reads the per-rank JSONL emitted by benchmark.py and never mixes runs that disagree on
-base SHA, dtype, workload checksum, mode, or configuration. Failing arms are kept in the
+base SHA, workload checksum, mode, or configuration. Failing arms are kept in the
 output marked with their status; they are never silently dropped or averaged in.
 
 Rank aggregation: an arm is one distributed job, so its step time is the WORST rank
@@ -36,7 +36,6 @@ CONFIG_FIELDS = (
     "num_experts",
     "tp",
     "etp",
-    "dtype",
     "backend",
     "experiment",
     "warmup_iters",
@@ -194,7 +193,7 @@ def main() -> int:
         lines.append(s)
         print(s)
 
-    emit("# B1 — MoE token-imbalance benchmark: baseline vs patch")
+    emit("# MoE token-imbalance benchmark: baseline vs patch")
     emit()
     shas = sorted({a.ranks[0].get("base_sha") or "?" for a in arms})
     emit(f"base SHA(s): {', '.join(shas)}")

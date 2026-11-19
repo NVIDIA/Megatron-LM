@@ -81,8 +81,8 @@ class ArmAdapter:
             "te_op_fuser": self.config_kwargs["use_transformer_engine_op_fuser"],
             "recompute": "NOT_EXERCISED",
             "cuda_graph": "NOT_EXERCISED",
-            "variable_topk": "UNSUPPORTED",
-            "zero_source_tokens": "UNSUPPORTED",
+            "variable_topk": "NOT_EXERCISED",
+            "zero_source_tokens": "NOT_EXERCISED",
         }
 
     def build(self, pg_collection, seed=1234):

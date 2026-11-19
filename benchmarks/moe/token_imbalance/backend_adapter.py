@@ -1,33 +1,22 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""B1 backend adapter layer.
+"""Capability report for the all-to-all backend that ``benchmark.py`` drives.
 
-A backend adapter carries exactly five things and nothing more (B1 contract, section 9):
+``standard_alltoall`` is the repository's existing ``MoEAlltoAllTokenDispatcher``.
+``probe_environment`` reports what that backend supports on this node: precision, EP and
+ETP sizes, zero-token rows, recompute, CUDA graphs and grouped GEMM. Anything the benchmark
+does not exercise is reported as ``UNVERIFIED`` rather than assumed.
 
-    capability()  -> what this backend supports on this node
-    build()       -> construct the model / dispatcher and load consistent weights
-    run_workload()-> execute one logical workload and return metrics + correctness
-    name          -> stable identifier recorded in every result row
-    close()       -> release resources
-
-It is deliberately NOT a scheduler framework. A capability check must report precision,
-EP/ETP, zero-token support, recompute, graph and hardware dependencies; anything unknown is
-reported as such rather than assumed.
-
-This adapter is ``standard_alltoall``, the repository's existing ``MoEAlltoAllTokenDispatcher``,
-as driven by ``benchmark.py``. The MoE-layer arms (HybridEP, MoonEP virtual experts and the
-MoEScheduler planners) live in ``arms.py`` and ``arm_adapter.py`` and are compared by
-``compare_arms.py`` on the same logical workloads.
+The MoE-layer arms (HybridEP, MoonEP virtual experts and the MoEScheduler planners) live in
+``arms.py`` and ``arm_adapter.py`` and are compared by ``compare_arms.py`` on the same
+logical workloads.
 """
 
 from __future__ import annotations
 
 import sys
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Protocol
-
-import torch
+from typing import Any
 
 SUPPORTED = "SUPPORTED"
 UNSUPPORTED = "UNSUPPORTED"
@@ -53,41 +42,20 @@ class Capability:
         return dict(self.__dict__)
 
 
-class BackendAdapter(Protocol):
-    name: str
-
-    def capability(self) -> Capability: ...
-
-    def build(self, **kwargs: Any) -> Any: ...
-
-    def run_workload(self, *args: Any, **kwargs: Any) -> Any: ...
-
-    def close(self) -> None: ...
-
-
 def probe_environment(num_experts: int = 8) -> Capability:
     """Capability probe for the standard all-to-all backend on this node.
 
-    Everything probed by import or by inspection; nothing claimed from documentation.
+    Everything comes from the benchmark's own configuration and from divisibility;
+    nothing is claimed from documentation.
     """
     cap = Capability(backend="standard_alltoall")
 
     cap.precision["bf16"] = SUPPORTED  # the benchmark runs bf16 end to end
 
-    try:
-        import transformer_engine  # noqa: F401
-
-        cap.grouped_gemm = SUPPORTED
-        cap.precision["fp8"] = UNVERIFIED
-        cap.notes.append("transformer_engine importable; grouped GEMM available")
-    except Exception:
-        cap.grouped_gemm = UNSUPPORTED
-        cap.precision["fp8"] = UNSUPPORTED
-        cap.notes.append(
-            "transformer_engine is not installed, so the expert computation is a per-expert "
-            "loop rather than TE grouped GEMM. Absolute step times are not comparable with a "
-            "TE-enabled node; baseline/patch comparisons on this node remain valid."
-        )
+    # benchmark.py always builds its experts with moe_grouped_gemm=False.
+    cap.grouped_gemm = UNSUPPORTED
+    cap.precision["fp8"] = UNVERIFIED
+    cap.notes.append("experts run as a per-expert loop (moe_grouped_gemm=False) in every mode")
 
     # EP sizes are constrained by divisibility, not by preference
     for ep in (1, 2, 4, 8):
@@ -97,7 +65,9 @@ def probe_environment(num_experts: int = 8) -> Capability:
         else:
             cap.ep_sizes[key] = UNSUPPORTED
     cap.etp["etp=1"] = SUPPORTED
-    cap.etp["etp>1"] = UNVERIFIED  # no ETP run was performed, so this is not a claim
+    # benchmark.py rejects --etp > 1: with the identity expert, combine would measure
+    # topk * etp and fail the round-trip oracle.
+    cap.etp["etp>1"] = UNSUPPORTED
 
     # W5 exercises empty destinations with nonempty sources; every workload uses fixed top-k.
     cap.recompute = UNVERIFIED  # not exercised by the benchmark
@@ -107,32 +77,12 @@ def probe_environment(num_experts: int = 8) -> Capability:
 
 @dataclass
 class StandardAlltoAllAdapter:
-    """The repository's existing all-to-all dispatcher, driven directly.
-
-    ``build`` is supplied by the caller because the benchmark owns the process-group and
-    weight setup; the adapter's job is to name the backend, describe its capability, and
-    dispatch execution to it so future backends can be added without touching the harness.
-    """
+    """Names the repository's existing all-to-all dispatcher and reports its capability."""
 
     name: str = "standard_alltoall"
-    _dispatcher: Any = None
-    _inner: Any = None
 
-    def capability(self) -> Capability:
-        return probe_environment()
-
-    def bind(self, dispatcher: Any, inner: Any) -> None:
-        self._dispatcher = dispatcher
-        self._inner = inner
-
-    def run_workload(self, **kwargs: Any) -> Any:
-        if self._inner is None:
-            raise RuntimeError("adapter.bind() must be called before run_workload()")
-        return self._inner(**kwargs)
-
-    def close(self) -> None:
-        self._dispatcher = None
-        self._inner = None
+    def capability(self, num_experts: int = 8) -> Capability:
+        return probe_environment(num_experts)
 
 
 def report_capability(cap: Capability) -> str:
