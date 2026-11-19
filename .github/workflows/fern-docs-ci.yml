@@ -23,7 +23,10 @@ on:
   merge_group:
     types: [checks_requested]
   push:
-    branches: [main]
+    branches:
+      - main
+      - 'pull-request/[0-9]+'
+      - 'deploy-release/*'
   workflow_dispatch: {}
   workflow_call: {}
 

@@ -19,7 +19,7 @@ fern docs broken-links --strict
 
 | Workflow | Trigger and behavior |
 | --- | --- |
-| `fern-docs-ci.yml` | Every PR, merge-queue groups, pushes to `main`, manual runs, and calls from production. Checks configuration, MDX, and broken links. |
+| `fern-docs-ci.yml` | Every PR, merge-queue groups, pushes to `main` and to `pull-request/*` and `deploy-release/*` branches, manual runs, and calls from production. Checks configuration, MDX, and broken links. |
 | `fern-docs-preview-request.yml` | Docs changes pushed by the existing synchronization process to `pull-request/<number>`. Runs the project's pinned preflight without Fern credentials. |
 | `fern-docs-preview.yml` | After a successful preview-request run on a synchronized PR branch. Validates the revision, waits for `fern-preview` approval, then updates a stable preview and one bot comment, including for fork PRs. |
 | `fern-docs-staging.yml` | Docs changes on `main`, or manual runs on `main`. Updates the shared `megatron-lm-staging` preview and links it in the run summary. |
@@ -90,7 +90,7 @@ can run. The existing test-queue approval is not used: it skips docs-only PRs.
   and contents write on the fork. The workflow uses separate installation tokens,
   pushes only to that fork, and creates signed, signed-off draft PRs.
 
-Verify the published release archive URL in the generated PR before merging.
-After merging, publish the updated site with a `docs/v*` tag or manual dispatch.
-The existing engineering release pipeline remains responsible for publishing the
-versioned developer guide referenced by that archive link.
+Merge an archive-link PR once the versioned guide is available at the archive
+URL. The engineering release workflow can publish that guide for a pre-Fern
+release. After merging the archive link, update the Fern site with a `docs/v*`
+tag or manual dispatch.
