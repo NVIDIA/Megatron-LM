@@ -220,16 +220,53 @@ def _mxfp8_quantize_into():
 
 
 def _mxfp8_quantize_rows():
-    from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize_rows
+    from megatron.core.inference.quantization import mxfp8_quantize as q
 
-    x = torch.empty(2976, 672, device="cuda", dtype=torch.bfloat16)
-    valid_rows = _dev_scalar(744)
+    # The public mxfp8_quantize_rows allocates its scales with torch.zeros, a kernel that would
+    # order the producer before the rows kernel and hide a missing wait, so launch the kernel
+    # directly; reset zeroes the scales before the producer runs.
+    rows, cols, live_rows = 2976, 672, 744
+    x = torch.empty(rows, cols, device="cuda", dtype=torch.bfloat16)
+    root = x[:live_rows]  # rows at or beyond the live count are never read
+    valid_rows = _dev_scalar(live_rows)
+    data = torch.empty(rows, cols, device="cuda", dtype=torch.float8_e4m3fn)
+    scale_cols = cols // q.MXFP8_BLOCK_SIZE
+    n_col_blocks = triton.cdiv(scale_cols, q.MXFP8_SCALE_COL_BLOCK)
+    scale = torch.empty(
+        triton.cdiv(rows, q.MXFP8_SCALE_ROW_BLOCK)
+        * q.MXFP8_SCALE_ROW_BLOCK
+        * n_col_blocks
+        * q.MXFP8_SCALE_COL_BLOCK,
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    block_k = triton.next_power_of_2(cols)
+    num_programs = min(rows, 4096)
 
     def call():
-        data, scale = mxfp8_quantize_rows(x, valid_rows)
-        return [data[:744], scale]
+        q._mxfp8_quant_swizzle_rows_kernel[(num_programs,)](
+            data,
+            scale,
+            x,
+            valid_rows,
+            cols,
+            n_col_blocks,
+            REAL_GROUPS=scale_cols,
+            BLOCK_K=block_k,
+            BLOCK_GROUPS=block_k // q.MXFP8_BLOCK_SIZE,
+            NUM_PROGRAMS=num_programs,
+            **triton_pdl.pdl_kwargs(),
+        )
+        # Data rows at or beyond the live count stay uninitialized; all scales are compared.
+        return [data[:live_rows], scale]
 
-    return dict(call=call, root=x, make_input=lambda i: seeded_randn(x, i, 3.0))
+    return dict(
+        call=call,
+        root=root,
+        make_input=lambda i: seeded_randn(root, i, 3.0),
+        outputs=(data,),
+        reset=scale.zero_,
+    )
 
 
 def _append_key_value_cache():

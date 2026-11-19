@@ -41,7 +41,7 @@ except ImportError:  # no Triton at all: the kernels importing this are not buil
 
 __all__ = ["HAVE_PDL", "gdc_wait", "pdl_kwargs"]
 
-# Static (Triton, environment, device) conditions, resolved on first use.
+# Process-wide (Triton, environment) conditions, resolved on first use.
 _enabled = None
 
 
@@ -57,6 +57,8 @@ def pdl_kwargs() -> dict:
             and os.environ.get("MCORE_INFERENCE_TRITON_PDL", "1") != "0"
             and torch.cuda.is_available()
             and torch.version.hip is None
-            and torch.cuda.get_device_capability()[0] >= 9
         )
-    return {"USE_PDL": True, "launch_pdl": True} if _enabled else {}
+    # The capability is checked per call: a process may drive GPUs of different generations.
+    if _enabled and torch.cuda.get_device_capability()[0] >= 9:
+        return {"USE_PDL": True, "launch_pdl": True}
+    return {}
