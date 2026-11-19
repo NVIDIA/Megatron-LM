@@ -6,8 +6,8 @@ import torch
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
-from megatron.core.optimizer.main_params_rounding import (
-    copy_main_to_model_param_,
+from megatron.core.optimizer.stochastic_rounding import (
+    copy_with_rounding_,
     stochastic_round_to_bf16_,
 )
 from megatron.core.transformer import TransformerConfig
@@ -61,22 +61,22 @@ class TestStochasticRounding:
             assert torch.isfinite(y[7:]).all() and (y[7:] >= 0).all()
 
     def test_deterministic_seeded_and_chunk_invariant(self, monkeypatch):
-        from megatron.core.optimizer import main_params_rounding
+        from megatron.core.optimizer import stochastic_rounding
 
         x = torch.randn(3_000_001, device="cuda")
         a, b = _round(x, seed=7), _round(x, seed=7)
         assert torch.equal(a, b)
         assert not torch.equal(a, _round(x, seed=8))
         # Small chunks and a CPU-resident source must give the same result as one shot.
-        monkeypatch.setattr(main_params_rounding, "_CHUNK", 1 << 16)
+        monkeypatch.setattr(stochastic_rounding, "_CHUNK", 1 << 16)
         dst = torch.empty_like(x, dtype=torch.bfloat16)
-        copy_main_to_model_param_(dst, x.cpu(), "stochastic", seed=7)
+        copy_with_rounding_(dst, x.cpu(), "stochastic", seed=7)
         assert torch.equal(dst.float(), a)
 
     def test_nearest_is_plain_copy(self):
         x = torch.randn(4097, device="cuda")
         dst = torch.empty_like(x, dtype=torch.bfloat16)
-        copy_main_to_model_param_(dst, x, "nearest")
+        copy_with_rounding_(dst, x, "nearest")
         assert torch.equal(dst, x.bfloat16())
 
 
