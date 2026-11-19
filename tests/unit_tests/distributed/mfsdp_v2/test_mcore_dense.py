@@ -13,6 +13,7 @@ from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
 import megatron.core.distributed.fsdp.mcore_adapter_v2 as mcore_adapter_v2
 from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
@@ -37,6 +38,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.training.models.dist_utils import _ddp_wrap
 from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
     run_forward_backward_on_microbatches,
 )
@@ -419,6 +421,41 @@ def test_unpadded_shards_pack_parameter_groups_without_padding(process_group_col
             ),
             pg_collection=process_group_collection,
         )
+
+
+def test_modelbuilder_wrap_matches_unsharded_losses(process_group_collection, distributed_setup):
+    """ModelBuilder constructs an MFSDP context completed by the training schedule."""
+    device = distributed_setup.device
+    config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=4)
+    torch.manual_seed(1234)
+    baseline = torch.nn.Linear(16, 16).to(device)
+    layer = torch.nn.Linear(16, 16).to(device)
+    layer.load_state_dict(baseline.state_dict())
+    layer.config = config
+    layer.pre_process = False
+    layer.share_embeddings_and_output_weights = False
+    ddp_config = DistributedDataParallelConfig(
+        use_megatron_fsdp=True,
+        megatron_fsdp_version=2,
+        data_parallel_sharding_strategy="optim_grads_params",
+    )
+    inputs = torch.randn(4, 16, device=device)
+    expected = run_forward_backward_on_microbatches(
+        baseline, lambda: baseline(inputs).square().mean(), num_microbatches=2
+    )
+    [model] = _ddp_wrap(
+        [layer],
+        False,
+        ddp_config,
+        False,
+        use_megatron_fsdp=True,
+        pg_collection=process_group_collection,
+    )
+    actual = run_forward_backward_on_microbatches(
+        model, lambda: model(inputs).square().mean(), num_microbatches=2
+    )
+    finalize_model_grads([model], pg_collection=process_group_collection)
+    torch.testing.assert_close(actual, expected)
 
 
 def test_joins_shared_context(process_group_collection, distributed_setup):
