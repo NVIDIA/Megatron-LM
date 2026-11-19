@@ -281,6 +281,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # Join the caller's ambient context when one is active (VPP chunks); otherwise
         # open and finalize our own. MCore's finalize_model_grads() owns the wait
         # after the schedule completes, including delayed wgrad and custom 1F1B work.
+        # Execution also ends at that boundary, even for a single pipeline stage.
         active_context = current_fully_shard_context()
         prefetch_order = self.prefetch_order_for(config)
         if active_context is None:
@@ -290,10 +291,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER,
                     runtime_policy=RuntimePolicy(
                         prefetch_order=prefetch_order,
-                        autograd_completes_execution=not (
-                            config.pipeline_model_parallel_size > 1
-                            or config.virtual_pipeline_model_parallel_size is not None
-                        ),
+                        autograd_completes_execution=False,
                         use_symmetric_memory=ddp_config.nccl_ub,
                         overlap_outer_communication=ddp_config.overlap_outer_communication,
                     ),
@@ -308,11 +306,12 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     "Ordinary PP/VPP MFSDP v2 schedules require "
                     "RuntimePolicy(prefetch_order=PrefetchOrder.RECORDED)."
                 )
-            if (
-                prefetch_order is PrefetchOrder.RECORDED
-                and active_context.autograd_completes_execution
-            ):
-                raise ValueError("Ordinary PP/VPP requires autograd_completes_execution=False.")
+            if active_context.autograd_completes_execution:
+                raise ValueError(
+                    "The MCore adapter requires autograd_completes_execution=False because "
+                    "the caller completes execution through finalize_model_grads() after all "
+                    "microbatch backwards in the schedule."
+                )
             construction_context = nullcontext(active_context)
         with construction_context:
             collector = FsdpUnitCollector(fsdp_unit_modules)
