@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import json
+import os
 import signal
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional
@@ -315,7 +317,7 @@ class SchedulerConfig:
 
 @dataclass(kw_only=True)
 class LoggerConfig:
-    """Configuration settings for logging, including TensorBoard and WandB."""
+    """Configuration settings for TensorBoard, W&B, MLflow and Comet logging."""
 
     log_interval: int = 100
     """Report loss and timing interval."""
@@ -404,10 +406,10 @@ class LoggerConfig:
     """Enable world size logging to tensorboard."""
 
     wandb_project: str | None = None
-    """The wandb project name. Ignore wandb by default."""
+    """W&B project name. Falls back to WANDB_PROJECT; no project disables W&B."""
 
     wandb_exp_name: str | None = None
-    """The wandb experiment name."""
+    """W&B run display name. Falls back to WANDB_NAME."""
 
     wandb_save_dir: str | None = None
     """Path to save the wandb results locally."""
@@ -416,10 +418,50 @@ class LoggerConfig:
     """The wandb entity name. It is useful when there are multiple sub-projects in a project."""
 
     wandb_run_id: str | None = None
-    """The wandb run id, which is what a relaunch resumes. Defaults to the experiment
-    name with any character wandb rejects in a run id replaced by '-'. Set it explicitly
+    """The wandb run id, which is what a relaunch resumes. Falls back to WANDB_RUN_ID,
+    then the experiment name with any character wandb rejects in a run id replaced by '-'.
+    Set it explicitly
     when two runs would otherwise derive the same id, or to resume a run whose
     experiment name has since changed."""
+
+    wandb_resume: Literal["allow", "must", "never", "auto"] | None = None
+    """W&B resume policy. Falls back to WANDB_RESUME, then allow."""
+
+    mlflow_experiment: str | None = None
+    """MLflow experiment name. Falls back to MLFLOW_EXPERIMENT_NAME."""
+
+    mlflow_experiment_id: str | None = None
+    """Existing experiment ID; falls back to MLFLOW_EXPERIMENT_ID. Explicit name or ID
+    overrides both environment selectors."""
+
+    mlflow_run_name: str | None = None
+    """Display name for the MLflow run. Falls back to MLFLOW_RUN_NAME."""
+
+    mlflow_tracking_uri: str | None = None
+    """MLflow tracking URI. Unset uses the SDK's environment/configuration."""
+
+    mlflow_run_id: str | None = None
+    """Existing MLflow run ID to resume; otherwise start a new run."""
+
+    mlflow_tags: dict[str, str] | None = field(
+        default=None, metadata={"argparse_meta": {"type": json.loads}}
+    )
+    """MLflow run tags; pass a JSON object on the CLI."""
+
+    mlflow_description: str | None = None
+    """Description for a new MLflow run."""
+
+    comet_project: str | None = None
+    """Comet project name. Unset disables Comet logging; use COMET_API_KEY for credentials."""
+
+    comet_experiment_name: str | None = None
+    """Display name for the Comet experiment."""
+
+    comet_workspace: str | None = None
+    """Comet workspace. Unset uses the SDK's environment/configuration."""
+
+    comet_tags: list[str] | None = None
+    """Tags added to the Comet experiment."""
 
     logging_level: int | None = None
     """Set default logging level"""
@@ -502,10 +544,57 @@ class LoggerConfig:
     Equivalent to MEGATRON_OTEL_SPAN_GROUPS env var.
     """
 
+    def _environment_defaults(self) -> dict[str, str | None]:
+        """Read effective settings without changing the recipe or importing tracking SDKs."""
+        settings = {}
+        for name, variable in (
+            ("wandb_project", "WANDB_PROJECT"),
+            ("wandb_exp_name", "WANDB_NAME"),
+            ("wandb_entity", "WANDB_ENTITY"),
+            ("wandb_run_id", "WANDB_RUN_ID"),
+            ("wandb_save_dir", "WANDB_DIR"),
+            ("wandb_resume", "WANDB_RESUME"),
+            ("mlflow_run_name", "MLFLOW_RUN_NAME"),
+        ):
+            value = getattr(self, name)
+            settings[name] = value if value is not None else os.environ.get(variable) or None
+
+        # Name and ID select the same experiment. Never mix an explicit selection
+        # with a launcher's potentially unrelated environment selection.
+        experiment_name, experiment_id = self.mlflow_experiment, self.mlflow_experiment_id
+        if experiment_name is None and experiment_id is None:
+            experiment_name = os.environ.get("MLFLOW_EXPERIMENT_NAME") or None
+            experiment_id = os.environ.get("MLFLOW_EXPERIMENT_ID") or None
+        settings["mlflow_experiment"] = experiment_name
+        settings["mlflow_experiment_id"] = experiment_id
+        return settings
+
+    def finalize(self) -> None:
+        """Store environment defaults before runtime services and config logging start."""
+        for name, value in self._environment_defaults().items():
+            setattr(self, name, value)
+
     def validate(self) -> None:
         """Check logging requirements shared by CLI and native configurations."""
+        settings = self._environment_defaults()
+        mlflow_enabled = settings["mlflow_experiment"] or settings["mlflow_experiment_id"]
         if self.log_memory_interval is not None:
             assert self.log_memory_interval % self.log_interval == 0
+        if settings["wandb_resume"] not in (None, "allow", "must", "never", "auto"):
+            raise ValueError("logger.wandb_resume / WANDB_RESUME must be allow, must, never, or auto.")
+        if mlflow_enabled and not settings["mlflow_run_name"]:
+            raise ValueError("Set logger.mlflow_run_name when enabling MLflow logging.")
+        if self.comet_project and not self.comet_experiment_name:
+            raise ValueError("Set logger.comet_experiment_name when enabling Comet logging.")
+        if self.mlflow_run_id and not mlflow_enabled:
+            raise ValueError(
+                "Set logger.mlflow_experiment or mlflow_experiment_id when resuming an MLflow run."
+            )
+        if self.mlflow_tags is not None and (
+            not isinstance(self.mlflow_tags, dict)
+            or any(not isinstance(k, str) or not isinstance(v, str) for k, v in self.mlflow_tags.items())
+        ):
+            raise ValueError("logger.mlflow_tags must be a mapping of strings to strings.")
 
 
 @dataclass(kw_only=True)

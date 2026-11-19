@@ -42,7 +42,6 @@ except ImportError:
 import yaml
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
-from wandb import wandb_run
 
 from megatron.core import mpu
 from megatron.core.distributed import DistributedDataParallel
@@ -122,12 +121,13 @@ from megatron.rl.server.inference.inference_interface_server import InferenceInt
 from megatron.rl.types import KNOWN_ROLLOUT_STATUSES
 from megatron.training.global_vars import (
     get_args,
+    get_experiment_writer,
     get_run_config,
     get_tensorboard_writer,
     get_tokenizer,
     get_train_state,
-    get_wandb_writer,
 )
+from megatron.training.logging.experiment_writer import ExperimentWriter
 from megatron.training.utils import get_ltor_masks_and_position_ids, get_nvtx_range, print_rank_0
 
 if HAVE_TORCH_MEMORY_SAVER:
@@ -1730,8 +1730,8 @@ def _bounded_artifact_key(key, limit=100):
     return f'{key[: limit - 9]}_{digest}'
 
 
-def prep_wandb_metrics(
-        wandb_writer: wandb_run.Run,
+def prep_experiment_metrics(
+        experiment_writer: ExperimentWriter | None,
         traj_lens: List[List[int]],
         turn_lens: List[List[int]],
         rewards: List[List[float]],
@@ -1748,13 +1748,13 @@ def prep_wandb_metrics(
         tokenizer: MegatronTokenizer | None = None,
     ):
 
-    """Make a wandb-parseable dictionary of metrics for logging.
+    """Prepare scalar metrics and optional tables and plots for experiment logging.
 
     Zero-turn rollouts are empty-trajectory placeholders for failed episodes.
     Their rewards are excluded from GRPO group normalization; the stats reflect this.
 
     Args:
-        wandb_writer: Wandb run to log to.
+        experiment_writer: Optional shared writer for tables and plots; scalars do not require it.
         traj_lens: Grouped list of trajectory lengths.
         turn_lens: Grouped list of turn lengths.
         rewards: Grouped list of rewards.
@@ -1770,6 +1770,11 @@ def prep_wandb_metrics(
         example_group: A list of rollouts of one group to log examples of trajectories.
         tokenizer: Tokenizer to untokenize trajectories for logging.
     """
+    media_writer = (
+        experiment_writer
+        if experiment_writer is not None and experiment_writer.supports_media
+        else None
+    )
     # Zero-turn rollouts are failure placeholders.
     real_mask = [[nt > 0 for nt in g] for g in num_turns]
     total_rollouts = sum(len(g) for g in num_turns)
@@ -1795,13 +1800,13 @@ def prep_wandb_metrics(
             count / total_rollouts if total_rollouts else 0.0
         )
     reason_counts = Counter(r for g in failure_reasons for r in g if r)
-    rollout_metrics['failure_reason_table'] = wandb_writer.Table(
+    rollout_metrics['failure_reason_table'] = (media_writer.table(
         columns=['failure_reason', 'count', 'rate'],
         data=[
             [reason, count, count / total_rollouts if total_rollouts else 0.0]
             for reason, count in sorted(reason_counts.items())
         ],
-    )
+    ) if media_writer is not None else None)
 
     # All-empty wave: every episode failed and was dropped (nothing to aggregate),
     # or every surviving rollout is a zero-turn placeholder (rewards exist but the
@@ -1813,10 +1818,10 @@ def prep_wandb_metrics(
         or not any(keep for g in real_mask for keep in g)
     ):
         logger.warning(
-            "prep_wandb_metrics: empty wave (0 usable rollouts); "
+            "prep_experiment_metrics: empty wave (0 usable rollouts); "
             "skipping rollout metrics this iteration."
         )
-        return rollout_metrics
+        return {name: value for name, value in rollout_metrics.items() if value is not None}
 
     def _real(grouped):
         """Grouped per-rollout entries with placeholder (zero-turn) rollouts removed."""
@@ -1833,10 +1838,10 @@ def prep_wandb_metrics(
     num_turns_real = _real(num_turns)
 
     # Mirror calculate_grpo_advantages: group means/stds over real rollouts only.
-    group_table = wandb_writer.Table(
+    group_table = (media_writer.table(
         columns=['group_means', 'group_stds'],
         data=[[np.mean(g) if g else 0.0, np.std(g) if g else 0.0] for g in rewards_real],
-    )
+    ) if media_writer is not None else None)
 
     flat_rewards = [r for g in rewards for r in g]
     flat_traj_lens = [l for g in traj_lens for l in g]
@@ -1905,24 +1910,24 @@ def prep_wandb_metrics(
     ]
 
     metrics = {
-            'group_means_hist': wandb_writer.plot.histogram(
+            'group_means_hist': (media_writer.histogram(
                 group_table, 'group_means', 'Group Means'
-            ),
-            'group_stds_hist': wandb_writer.plot.histogram(
+            ) if media_writer is not None else None),
+            'group_stds_hist': (media_writer.histogram(
                 group_table, 'group_stds', 'Group STDs'
-            ),
-            'rewards_hist': wandb_writer.plot.histogram(
-                wandb_writer.Table(
+            ) if media_writer is not None else None),
+            'rewards_hist': (media_writer.histogram(
+                media_writer.table(
                     columns=['reward'], data=[[r] for g in rewards for r in g]
                 ),
                 'reward', 'All Rewards'
-            ),
-            'advantages_hist': wandb_writer.plot.histogram(
-                wandb_writer.Table(
+            ) if media_writer is not None else None),
+            'advantages_hist': (media_writer.histogram(
+                media_writer.table(
                     columns=['advantages'], data=[[x] for x in advantages]
                 ),
                 'advantages', 'Advantages'
-            ),
+            ) if media_writer is not None else None),
             # Group-level length/turn stats skip groups with all failed rollouts.
             'mean_turn_length': np.mean([np.mean(g) for g in turn_lens if g]),
             'mean_turn_length_std': np.mean([np.std(g) for g in turn_lens if g]),
@@ -1946,7 +1951,7 @@ def prep_wandb_metrics(
     # Staleness/eviction telemetry: joined rollouts only; skip when nothing joined.
     if joined:
         metrics |= {
-            'rollout_table': wandb_writer.Table(
+            'rollout_table': (media_writer.table(
                 columns=[
                     'reward', 'traj_length', 'num_evictions',
                     'policy_staleness', 'kv_staleness',
@@ -1969,13 +1974,13 @@ def prep_wandb_metrics(
                     rollout_kv_staleness_std,
                     joined_statuses,
                 )),
-            ),
+            ) if media_writer is not None else None),
             # NOTE: rows are not individual tokens, but instead compressed data.
             # The same information is contained, but it takes less space.
-            'per_token_table': wandb_writer.Table(
+            'per_token_table': (media_writer.table(
                 columns=['rollout', 'policy_staleness', 'kv_staleness', 'token_count'],
                 data=per_token_staleness_rows,
-            ),
+            ) if media_writer is not None else None),
             'mean_policy_staleness': np.mean(rollout_policy_staleness),
             'max_policy_staleness': max(rollout_policy_staleness),
             'min_policy_staleness': min(rollout_policy_staleness),
@@ -1991,30 +1996,30 @@ def prep_wandb_metrics(
             'total_eviction_count': sum(joined_num_evictions),
             'max_num_evictions': max(joined_num_evictions),
             'mean_completion_gap': np.mean([current_iteration - s for g in completed_epochs for s in g]),
-            'rollout_avg_policy_staleness_hist': wandb_writer.plot.histogram(
-                wandb_writer.Table(
+            'rollout_avg_policy_staleness_hist': (media_writer.histogram(
+                media_writer.table(
                     columns=['staleness'], data=[[s] for s in rollout_policy_avg_staleness]
                 ),
                 'staleness', 'Per-Rollout Token-Weighted Avg Policy Staleness'
-            ),
-            'rollout_avg_kv_staleness_hist': wandb_writer.plot.histogram(
-                wandb_writer.Table(
+            ) if media_writer is not None else None),
+            'rollout_avg_kv_staleness_hist': (media_writer.histogram(
+                media_writer.table(
                     columns=['staleness'], data=[[s] for s in rollout_kv_avg_staleness]
                 ),
                 'staleness', 'Per-Rollout Token-Weighted Avg KV Cache Staleness'
-            ),
+            ) if media_writer is not None else None),
         }
 
 
 
-    if example_group:
+    if example_group and media_writer is not None:
         if tokenizer is None:
             raise ValueError("If you provide an example group to log, you need to provide a tokenizer too.")
         # Each turn in a trajectory is a cumulative sequence (prompt + all turns so far), so
         # one row per rollout: the final turn already contains the whole conversation.
-        metrics['rollouts'] = wandb_writer.Table(
+        metrics['rollouts'] = (media_writer.table(
             columns=['Trajectories', 'Tokens', 'Rewards'],
-            rows=[
+            data=[
                 [
                     tokenizer.detokenize(r.trajectory[-1])
                     if isinstance(r, TokenRollout)
@@ -2024,12 +2029,12 @@ def prep_wandb_metrics(
                 ]
                 for r in example_group if r.trajectory
             ],
-        )
-    return metrics
+        ) if media_writer is not None else None)
+    return {name: value for name, value in metrics.items() if value is not None}
 
 
 def _collect_rollout_pipeline_metrics() -> dict:
-    """Snapshot pipeline instrumentation into wandb-loggable scalars.
+    """Snapshot pipeline instrumentation into experiment logging scalars.
 
     Reads the RolloutPipeline held by get_rollout_generator: queue sizes, gate state,
     per-stage dwell times, and rate counters, plus per-env group counters.
@@ -2152,13 +2157,13 @@ def maybe_log_training_metrics(
         example_groups: A dict with values as list of rollouts of one group to log examples of trajectories. Keys are env names.
     """
 
-    wandb_writer = get_wandb_writer()
+    experiment_writer = get_experiment_writer()
     tb_writer = get_tensorboard_writer()
     if tb_writer:
         tb_writer.add_scalar('mean_reward', np.mean([np.mean(g) for g in group_stats.rewards]), current_iteration)
 
     # Pipeline instrumentation lives on rank 0 (the only rank that drives
-    # rollout generation), while the wandb writer lives on the last rank.
+    # rollout generation), while the experiment writer lives on the last rank.
     # Collect on rank 0 and broadcast so the writer rank can log it. This is
     # a collective, so it must run on every rank before the early return.
     pipeline_metrics = _collect_rollout_pipeline_metrics()
@@ -2167,7 +2172,7 @@ def maybe_log_training_metrics(
         dist.broadcast_object_list(payload, src=0)
         pipeline_metrics = payload[0]
 
-    if not wandb_writer:
+    if not experiment_writer:
         return
 
     # We log these metrics for the aggregated data, no split per env.
@@ -2195,7 +2200,7 @@ def maybe_log_training_metrics(
     rollout_statuses = group_stats.rollout_statuses
     failure_reasons = group_stats.failure_reasons
 
-    metrics = metrics | prep_wandb_metrics(wandb_writer=wandb_writer,
+    metrics = metrics | prep_experiment_metrics(experiment_writer=experiment_writer,
         traj_lens=traj_lens, turn_lens=turn_lens, rewards=rewards, num_turns=num_turns, advantages=advantages,
         policy_epoch_segments=policy_epoch_segments,
         kv_cache_epoch_segments=kv_cache_epoch_segments, completed_epochs=completed_epochs,
@@ -2217,7 +2222,7 @@ def maybe_log_training_metrics(
             end = st + group_rollout_counts[i]
             env_advantages.extend(advantages[st:end])
 
-        env_metrics = prep_wandb_metrics(wandb_writer=wandb_writer, traj_lens=env_stats(traj_lens, env_idx),
+        env_metrics = prep_experiment_metrics(experiment_writer=experiment_writer, traj_lens=env_stats(traj_lens, env_idx),
             turn_lens=env_stats(turn_lens, env_idx),
             rewards=env_stats(rewards, env_idx),
             num_turns=env_stats(num_turns, env_idx),
@@ -2253,7 +2258,11 @@ def maybe_log_training_metrics(
     # and broadcast above.
     metrics.update(pipeline_metrics)
 
-    wandb_writer.log(metrics, step=current_iteration)
+    # The shared writer dispatches scalars and optional media to supported backends.
+    scalar_metrics = {k: v for k, v in metrics.items() if isinstance(v, (int, float, bool, np.number))}
+    experiment_writer.log(scalar_metrics, step=current_iteration)
+    media_metrics = {k: v for k, v in metrics.items() if k not in scalar_metrics}
+    experiment_writer.log_media(media_metrics, step=current_iteration)
 
 
 PAD_ROW = None
@@ -3033,20 +3042,9 @@ def evaluate_and_print_results_rl(
                 if tb_writer:
                     for k, v in eval_metrics.items():
                         tb_writer.add_scalar(k, v, iteration)
-            wandb_writer = get_wandb_writer()
-            if wandb_writer:
-                if train_state.do_train:
-                    wandb_writer.log(eval_metrics, step=iteration)
-                else:
-                    # Without a training loop the eval may target an arbitrary (older) checkpoint,
-                    # breaking wandb step monotonicity.
-                    wandb_writer.define_metric('eval_only/*', step_metric='eval_checkpoint_iter')
-                    wandb_writer.log(
-                        {
-                            'eval_checkpoint_iter': iteration,
-                            **{f'eval_only/{k}': v for k, v in eval_metrics.items()},
-                        }
-                    )
+            experiment_writer = get_experiment_writer()
+            if experiment_writer:
+                experiment_writer.log_evaluation(eval_metrics, iteration, standalone=not train_state.do_train)
             logger.info(
                 "Evaluation results:"
                 + "".join([f"\n\t{k}: {v:0.4f}" for k, v in eval_metrics.items()])

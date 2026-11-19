@@ -76,7 +76,7 @@ def inline_profiler(monkeypatch, run_config):
     monkeypatch.setattr(training, "should_disable_forward_pre_hook", lambda *_: False)
     monkeypatch.setattr(training, "_otel_managed_span", lambda *a, **kw: nullcontext())
     for name in (
-        "write_args_to_tensorboard",
+        "write_config_to_tensorboard",
         "print_datetime",
         "_end_otel_startup_span",
         "_start_otel_train_span",
@@ -477,7 +477,7 @@ def test_training_log_memory_snapshot_without_profiling_args(
     monkeypatch.setattr(training, "get_timers", lambda: timers)
     for getter in (
         "get_tensorboard_writer",
-        "get_wandb_writer",
+        "get_experiment_writer",
         "get_one_logger",
         "get_energy_monitor",
         "get_telemetry",

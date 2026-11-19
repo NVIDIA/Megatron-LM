@@ -44,7 +44,7 @@ def test_deferred_bootstrap_resolves_detected_model(monkeypatch, family, padded_
         "core_transformer_config_from_args",
         lambda args: TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4),
     )
-    for name in ("_set_wandb_writer", "_set_telemetry"):
+    for name in ("_set_experiment_writer", "_set_telemetry"):
         monkeypatch.setattr(global_vars, name, lambda *args, **kwargs: None)
 
     def initialize_without_tokenizer(*, build_tokenizer):

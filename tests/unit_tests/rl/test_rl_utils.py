@@ -989,7 +989,7 @@ class TestRLUtils:
         monkeypatch.setattr(
             rl_utils, "EvaluationRequest", lambda **kwargs: SimpleNamespace(**kwargs)
         )
-        monkeypatch.setattr(rl_utils, "get_wandb_writer", lambda: wandb_writer)
+        monkeypatch.setattr(rl_utils, "get_experiment_writer", lambda: wandb_writer)
         monkeypatch.setattr(rl_utils, "lang_rl_log_dir", None)
         monkeypatch.setattr(rl_utils.dist, "get_rank", lambda: 0)
         monkeypatch.setattr(
@@ -1000,16 +1000,9 @@ class TestRLUtils:
             model=[MagicMock()], optimizer=MagicMock(), iteration=7, write_to_tensorboard=False
         )
 
-        if do_train:
-            wandb_writer.log.assert_called_once_with({"env_eval_mean_reward": 0.75}, step=7)
-            wandb_writer.define_metric.assert_not_called()
-        else:
-            wandb_writer.define_metric.assert_called_once_with(
-                "eval_only/*", step_metric="eval_checkpoint_iter"
-            )
-            wandb_writer.log.assert_called_once_with(
-                {"eval_checkpoint_iter": 7, "eval_only/env_eval_mean_reward": 0.75}
-            )
+        wandb_writer.log_evaluation.assert_called_once_with(
+            {"env_eval_mean_reward": 0.75}, 7, standalone=not do_train
+        )
 
     @pytest.mark.parametrize("template_dtype", [torch.float32, torch.bfloat16])
     def test_align_unpacked_inference_logprobs_rides_in_float32(self, template_dtype):
@@ -2458,7 +2451,7 @@ class TestRLUtils:
     @pytest.mark.parametrize(
         "inject_placeholders", [False, True], ids=["clean", "with_placeholders"]
     )
-    def test_prep_wandb_metrics(self, initialize_model_parallel, inject_placeholders):
+    def test_prep_experiment_metrics(self, initialize_model_parallel, inject_placeholders):
         # This tests the computation and makes us fail noisily if
         # inputs assumptions are changed, e.g. we expect rewards to come in groups (list[list[int]]).
         traj_lens = [[3, 3], [1, 2]]
@@ -2511,8 +2504,8 @@ class TestRLUtils:
             completed_epochs.append([])
             # advantages stay [0, 1]: prep treats them as an opaque flat vector
             # (production pins placeholder entries to 0.0; alignment is not prep's concern).
-        writer = MagicMock()
-        metrics = rl_utils.prep_wandb_metrics(
+        writer = MagicMock(spec=rl_utils.ExperimentWriter)
+        metrics = rl_utils.prep_experiment_metrics(
             writer,
             traj_lens,
             turn_lens,
@@ -2527,6 +2520,28 @@ class TestRLUtils:
             rollout_statuses=rollout_statuses,
             failure_reasons=failure_reasons,
         )
+        scalar_writer = MagicMock(spec=rl_utils.ExperimentWriter)
+        scalar_writer.supports_media = False
+        scalar_metrics = rl_utils.prep_experiment_metrics(
+            scalar_writer,
+            traj_lens,
+            turn_lens,
+            rewards,
+            num_turns,
+            advantages,
+            policy_epoch_segments=policy_epoch_segments,
+            kv_cache_epoch_segments=kv_cache_epoch_segments,
+            completed_epochs=completed_epochs,
+            num_evictions=num_evictions,
+            current_iteration=current_iteration,
+            rollout_statuses=rollout_statuses,
+            failure_reasons=failure_reasons,
+        )
+        assert scalar_metrics == {
+            key: value
+            for key, value in metrics.items()
+            if isinstance(value, (int, float, bool, np.number))
+        }
         assert metrics["failed_rollouts/count"] == (4 if inject_placeholders else 0)
         assert metrics["failed_rollouts/ratio"] == (0.5 if inject_placeholders else 0.0)
         assert metrics["rollout/count"] == (8 if inject_placeholders else 4)
@@ -2546,7 +2561,7 @@ class TestRLUtils:
         assert "failure_reason_table" in metrics
         reason_table_calls = [
             c
-            for c in writer.Table.call_args_list
+            for c in writer.table.call_args_list
             if c.kwargs.get("columns") == ["failure_reason", "count", "rate"]
         ]
         assert len(reason_table_calls) == 1
@@ -2561,7 +2576,7 @@ class TestRLUtils:
         # rows for all-placeholder groups.
         group_table_calls = [
             c
-            for c in writer.Table.call_args_list
+            for c in writer.table.call_args_list
             if c.kwargs.get("columns") == ["group_means", "group_stds"]
         ]
         assert len(group_table_calls) == 1
@@ -2573,7 +2588,7 @@ class TestRLUtils:
         # The rollout table lists real rollouts only, in either case.
         rollout_table_calls = [
             c
-            for c in writer.Table.call_args_list
+            for c in writer.table.call_args_list
             if c.kwargs.get("columns", [None])[:2] == ["reward", "traj_length"]
         ]
         assert len(rollout_table_calls) == 1
@@ -2617,8 +2632,8 @@ class TestRLUtils:
 
         # Case where every episode has failed: the wave still reports the failure
         # counters (now status series + reason table) and skips the rollout tables.
-        writer = MagicMock()
-        metrics = rl_utils.prep_wandb_metrics(
+        writer = MagicMock(spec=rl_utils.ExperimentWriter)
+        metrics = rl_utils.prep_experiment_metrics(
             writer,
             traj_lens=[],
             turn_lens=[],
@@ -2638,13 +2653,13 @@ class TestRLUtils:
         assert metrics['rollout/placeholder_count'] == 0
         assert metrics['rollout/placeholder_rate'] == 0.0
         assert 'rollout_table' not in metrics and 'mean_reward' not in metrics
-        assert [c.kwargs['data'] for c in writer.Table.call_args_list] == [[]]
+        assert [c.kwargs['data'] for c in writer.table.call_args_list] == [[]]
 
         # All-placeholder wave: rewards exist (placeholders carry 0.0) but every
         # rollout is a zero-turn pad, so the masked stats have nothing to reduce
         # over; the guard must still report the failure counters.
-        writer = MagicMock()
-        metrics = rl_utils.prep_wandb_metrics(
+        writer = MagicMock(spec=rl_utils.ExperimentWriter)
+        metrics = rl_utils.prep_experiment_metrics(
             writer,
             traj_lens=[[0, 0]],
             turn_lens=[[]],
@@ -2667,7 +2682,7 @@ class TestRLUtils:
         assert 'rollout_table' not in metrics and 'mean_reward' not in metrics
         reason_calls = [
             c
-            for c in writer.Table.call_args_list
+            for c in writer.table.call_args_list
             if c.kwargs.get("columns") == ["failure_reason", "count", "rate"]
         ]
         assert len(reason_calls) == 1
@@ -2718,7 +2733,7 @@ class TestRLUtils:
         )
 
         # Per-rollout lists keep the placeholder entries: alignment with rewards
-        # and num_turns is what lets prep_wandb_metrics mask them downstream.
+        # and num_turns is what lets prep_experiment_metrics mask them downstream.
         # Placeholders join no records, so their epoch rows are empty.
         assert stats.num_turns == [[1, 1, 0], [0, 0, 0]]
         seg = rl_utils.EpochSegment
@@ -2746,8 +2761,8 @@ class TestRLUtils:
         ]
 
         # End to end: the placeholder rows never reach the staleness metrics.
-        writer = MagicMock()
-        metrics = rl_utils.prep_wandb_metrics(
+        writer = MagicMock(spec=rl_utils.ExperimentWriter)
+        metrics = rl_utils.prep_experiment_metrics(
             writer,
             stats.traj_lens,
             stats.turn_lens,
@@ -2773,7 +2788,7 @@ class TestRLUtils:
         assert np.isclose(metrics["mean_reward"], 1 / 3)
         group_rows = [
             c
-            for c in writer.Table.call_args_list
+            for c in writer.table.call_args_list
             if c.kwargs.get("columns") == ["group_means", "group_stds"]
         ][0].kwargs["data"]
         assert group_rows == [[1.0, 0.0], [0.0, 0.0]]
@@ -2789,7 +2804,7 @@ class TestRLUtils:
         )
         reason_rows = [
             c
-            for c in writer.Table.call_args_list
+            for c in writer.table.call_args_list
             if c.kwargs.get("columns") == ["failure_reason", "count", "rate"]
         ][0].kwargs["data"]
         assert reason_rows == [["http_500", 1, 1 / 6], ["judge_unparseable", 1, 1 / 6]]
@@ -2798,7 +2813,7 @@ class TestRLUtils:
         """compute_group_stats joins finished-request records to rollouts by each
         turn's completion id: records pop exactly once (identical token content
         joins independently, text rollouts join nothing) and an unknown id is a
-        hard error. Downstream, prep_wandb_metrics filters staleness/eviction
+        hard error. Downstream, prep_experiment_metrics filters staleness/eviction
         telemetry to joined rollouts and emits none when nothing joined."""
         eod = MockTokenizer().eod
 
@@ -2863,8 +2878,8 @@ class TestRLUtils:
         # empty epoch rows; staleness/eviction telemetry filters them out while
         # keeping the rollout table row-aligned.
         seg = rl_utils.EpochSegment
-        writer = MagicMock()
-        metrics = rl_utils.prep_wandb_metrics(
+        writer = MagicMock(spec=rl_utils.ExperimentWriter)
+        metrics = rl_utils.prep_experiment_metrics(
             writer,
             traj_lens=[[3, 7]],
             turn_lens=[[3, 7]],
@@ -2883,7 +2898,7 @@ class TestRLUtils:
         assert metrics["total_eviction_count"] == 2
         assert metrics["max_num_evictions"] == 2
         rollout_table = next(
-            c for c in writer.Table.call_args_list if "traj_length" in c.kwargs.get("columns", [])
+            c for c in writer.table.call_args_list if "traj_length" in c.kwargs.get("columns", [])
         )
         (row,) = rollout_table.kwargs["data"]
         assert dict(zip(rollout_table.kwargs["columns"], row)) == {
@@ -2902,7 +2917,7 @@ class TestRLUtils:
         }
 
         # A window where nothing joined emits no staleness/eviction metrics at all.
-        metrics = rl_utils.prep_wandb_metrics(
+        metrics = rl_utils.prep_experiment_metrics(
             MagicMock(),
             traj_lens=[[3]],
             turn_lens=[[3]],
@@ -2967,8 +2982,8 @@ class TestRLUtils:
         assert stats.policy_epoch_segments == [[[seg(1, 9), seg(5, 1)]]]
         assert stats.kv_cache_epoch_segments == [[[seg(5, 10)]]]
 
-        writer = MagicMock()
-        metrics = rl_utils.prep_wandb_metrics(
+        writer = MagicMock(spec=rl_utils.ExperimentWriter)
+        metrics = rl_utils.prep_experiment_metrics(
             writer,
             stats.traj_lens,
             stats.turn_lens,
@@ -2984,7 +2999,7 @@ class TestRLUtils:
         # First/last-token scalars: a segment's first/last epoch is its first/last token's.
         assert metrics["max_policy_staleness"] == 5  # 6 - 1
         assert metrics["min_policy_last_token_staleness"] == 1  # 6 - 5
-        tables = [c.kwargs for c in writer.Table.call_args_list]
+        tables = [c.kwargs for c in writer.table.call_args_list]
         # per_token_table rows are (rollout, policy, kv, token_count) runs merged
         # over positions; 'rollout' indexes rollout_table's rows.
         assert [t["data"] for t in tables if "token_count" in t.get("columns", [])] == [

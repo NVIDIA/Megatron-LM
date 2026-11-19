@@ -149,7 +149,7 @@ def test_runtime_services_initialize_training_only_when_requested(
     monkeypatch.setattr(global_vars, "set_experimental_flag", experimental)
     monkeypatch.setattr(global_vars, "disable_jit_fuser", jit)
     services = {}
-    for name in ("_build_tokenizer", "_set_wandb_writer", "_set_telemetry"):
+    for name in ("_build_tokenizer", "_set_experiment_writer", "_set_telemetry"):
         services[name] = Mock()
         monkeypatch.setattr(global_vars, name, services[name])
     training_services = Mock()
@@ -171,7 +171,7 @@ def test_runtime_services_initialize_training_only_when_requested(
     )
 
     assert services["_build_tokenizer"].call_count == int(build_tokenizer)
-    services["_set_wandb_writer"].assert_called_once_with(args)
+    services["_set_experiment_writer"].assert_called_once_with(args)
     services["_set_telemetry"].assert_called_once_with(
         args, include_training=training_kwargs.get("training", False)
     )
