@@ -32,7 +32,6 @@ from megatron.core.transformer import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.core.tuning import AutotunePolicy
 from megatron.training.config import (
-    CachedLogitsConfig,
     CheckpointConfig,
     DataConfig,
     DataloaderConfig,
@@ -42,6 +41,7 @@ from megatron.training.config import (
     InferenceConfigContainer,
     InferenceSetupConfig,
     LoggerConfig,
+    LogitsLoadConfig,
     LogitsSaveConfig,
     MultiModalTokenizerConfig,
     OfflineDistillationConfig,
@@ -1224,7 +1224,7 @@ def offline_distillation_config_from_args(args: Namespace) -> OfflineDistillatio
             dtype=args.logits_save_dtype,
         )
     if getattr(args, "logits_load_dir", None) is not None:
-        student_load = CachedLogitsConfig(
+        student_load = LogitsLoadConfig(
             directory=args.logits_load_dir,
             loss_alpha=args.logits_load_kd_loss_alpha,
             decode_threads=args.logits_load_decode_threads,

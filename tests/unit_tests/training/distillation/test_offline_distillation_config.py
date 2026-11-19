@@ -10,8 +10,8 @@ import pytest
 from megatron.training.argument_utils import offline_distillation_config_from_args
 from megatron.training.arguments import _add_logits_distillation_args
 from megatron.training.config import (
-    CachedLogitsConfig,
     CheckpointConfig,
+    LogitsLoadConfig,
     LogitsSaveConfig,
     OfflineDistillationConfig,
     TrainingConfig,
@@ -50,7 +50,7 @@ def test_cli_and_native_config_round_trip(phase):
         )
     else:
         native = OfflineDistillationConfig(
-            student_load=CachedLogitsConfig(
+            student_load=LogitsLoadConfig(
                 directory="/cache",
                 loss_alpha=0.7,
                 decode_threads=2,
@@ -80,7 +80,7 @@ def test_cli_and_native_config_round_trip(phase):
 def test_exactly_one_phase_is_required(both):
     cfg = OfflineDistillationConfig(
         teacher_save=LogitsSaveConfig(directory="/out") if both else None,
-        student_load=CachedLogitsConfig(directory="/in") if both else None,
+        student_load=LogitsLoadConfig(directory="/in") if both else None,
     )
     with pytest.raises(ValueError, match="exactly one"):
         cfg.validate()
@@ -100,9 +100,9 @@ def test_cli_rejects_both_phases_and_disables_kd_without_either():
         (LogitsSaveConfig(directory="/cache", top_p=0), "top_p"),
         (LogitsSaveConfig(directory="/cache", top_k=2, min_k=3), "min_k"),
         (LogitsSaveConfig(directory="/cache", dtype="int8"), "dtype"),
-        (CachedLogitsConfig(directory="/cache", loss_alpha=1.1), "loss_alpha"),
-        (CachedLogitsConfig(directory="/cache", decode_threads=0), "decode_threads"),
-        (CachedLogitsConfig(directory="/cache", msc_prefetch_depth=-1), "prefetch"),
+        (LogitsLoadConfig(directory="/cache", loss_alpha=1.1), "loss_alpha"),
+        (LogitsLoadConfig(directory="/cache", decode_threads=0), "decode_threads"),
+        (LogitsLoadConfig(directory="/cache", msc_prefetch_depth=-1), "prefetch"),
     ],
 )
 def test_invalid_cache_settings_fail_before_runtime(config, message):
@@ -118,7 +118,7 @@ def test_batch_schedules_are_rejected(phase, schedule):
             phase: (
                 LogitsSaveConfig(directory="/cache")
                 if phase == "teacher_save"
-                else CachedLogitsConfig(directory="/cache")
+                else LogitsLoadConfig(directory="/cache")
             )
         }
     )
@@ -143,7 +143,7 @@ def test_saving_requires_the_async_checkpoint_worker(async_save, persistent):
 
 
 def test_cached_and_online_student_losses_are_exclusive():
-    cfg = OfflineDistillationConfig(student_load=CachedLogitsConfig(directory="/cache"))
+    cfg = OfflineDistillationConfig(student_load=LogitsLoadConfig(directory="/cache"))
     with pytest.raises(ValueError, match="online ModelOpt"):
         cfg.validate_run(
             train=TrainingConfig(), checkpoint=CheckpointConfig(), distillation=object()

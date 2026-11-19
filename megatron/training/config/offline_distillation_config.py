@@ -44,7 +44,7 @@ class LogitsSaveConfig:
 
 
 @dataclass(kw_only=True)
-class CachedLogitsConfig:
+class LogitsLoadConfig:
     """Student-side cache reading and offline KD loss."""
 
     directory: str
@@ -84,7 +84,7 @@ class OfflineDistillationConfig:
     teacher_save: LogitsSaveConfig | None = None
     """Produce a teacher cache. Mutually exclusive with student_load."""
 
-    student_load: CachedLogitsConfig | None = None
+    student_load: LogitsLoadConfig | None = None
     """Train against a teacher cache. Mutually exclusive with teacher_save."""
 
     def validate(self) -> None:
