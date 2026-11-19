@@ -13,6 +13,7 @@ import tempfile
 from pathlib import Path
 
 REPOSITORY = "NVIDIA/Megatron-LM"
+BASELINE_REF = "refs/heads/main"
 
 
 def run(
@@ -45,24 +46,41 @@ def sha(value: object) -> str:
 
 
 def latest_baseline() -> tuple[str, str]:
-    """Find a successful trusted main producer with a common cache generation."""
-    response = json.loads(
-        run(
-            "gh",
-            "api",
-            f"repos/{REPOSITORY}/actions/workflows/populate-build-cache.yml/"
-            "runs?branch=main&status=success&per_page=100",
+    """Find the most recently published trusted generation within ten cache pages."""
+    seen = set()
+    for page in range(1, 11):
+        response = json.loads(
+            run(
+                "gh",
+                "api",
+                f"repos/{REPOSITORY}/actions/caches?ref={BASELINE_REF}"
+                "&key=unit-testmon-v1-main-&sort=created_at&direction=desc"
+                f"&per_page=100&page={page}",
+            )
         )
-    )
-    for candidate in response["workflow_runs"]:
-        # Retried runs can publish different generations for different buckets.
-        if (
-            candidate["event"] in {"schedule", "workflow_dispatch"}
-            and candidate["head_repository"]["full_name"] == REPOSITORY
-            and candidate["run_attempt"] == 1
-        ):
-            return sha(candidate["head_sha"]), f'{candidate["id"]}-1'
-    raise ValueError("No successful first-attempt main Testmon baseline found")
+        caches = response["actions_caches"]
+        for cache in caches:
+            match = re.fullmatch(r"unit-testmon-v1-main-.+-([1-9][0-9]*)-1", cache["key"])
+            if not match or match[1] in seen:
+                continue
+            run_id = match[1]
+            seen.add(run_id)
+            candidate = json.loads(run("gh", "api", f"repos/{REPOSITORY}/actions/runs/{run_id}"))
+            # Passing buckets can publish caches even when other buckets fail.
+            # Retried runs can publish different generations for different buckets.
+            if (
+                candidate["path"] == ".github/workflows/populate-build-cache.yml"
+                and candidate["head_branch"] == "main"
+                and candidate["event"] in {"schedule", "workflow_dispatch"}
+                and candidate["status"] == "completed"
+                and candidate["conclusion"] in {"success", "failure"}
+                and candidate["head_repository"]["full_name"] == REPOSITORY
+                and candidate["run_attempt"] == 1
+            ):
+                return sha(candidate["head_sha"]), f"{run_id}-1"
+        if len(caches) < 100:
+            break
+    raise ValueError("No trusted main Testmon baseline with published caches found within 10 pages")
 
 
 def outputs(manifest: dict[str, str]) -> None:
@@ -94,7 +112,14 @@ def prepare(args: argparse.Namespace) -> None:
         metadata = json.loads(original_metadata)
         if metadata["tested_sha"] != original:
             raise ValueError("PR files metadata does not match the original tested commit")
-        source, generation = latest_baseline()
+        try:
+            source, generation = latest_baseline()
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+            # Do not let an unpinned restore bypass bounded baseline discovery.
+            if os.environ.get("GITHUB_OUTPUT"):
+                with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
+                    stream.write("force_full=true\n")
+            raise
         git("fetch", "--no-tags", "origin", source)
         merge_base = git("merge-base", base, head)
         patch = run("git", "diff", "--binary", "--full-index", "--no-ext-diff", merge_base, head)

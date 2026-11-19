@@ -1090,6 +1090,41 @@ def test_gpu_reselection_respects_full_run_guards(
         == expected_mode
     )
 
+    callers = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())["jobs"]
+    eligibility = callers["configure"]["outputs"]["unit_testmon_eligible"]
+    eligibility = eligibility.removeprefix("${{").removesuffix("}}")
+    eligibility = eligibility.replace("&&", "and").replace("||", "or")
+    eligibility = eligibility.replace("prepare-testmon-checkout", "prepare_testmon_checkout")
+    for force_full in ("", "true"):
+        steps = SimpleNamespace(
+            configure=SimpleNamespace(
+                outputs=SimpleNamespace(
+                    unit_testmon_eligible="true" if requested_mode == "enforce" else "false"
+                )
+            ),
+            prepare_testmon_checkout=SimpleNamespace(
+                outputs=SimpleNamespace(force_full=force_full)
+            ),
+        )
+        eligible = eval(eligibility, {"__builtins__": {}}, {"steps": steps})
+        needs = SimpleNamespace(
+            configure=SimpleNamespace(
+                outputs=SimpleNamespace(unit_testmon_eligible=str(eligible).lower())
+            )
+        )
+        for job in ("cicd-unit-tests-latest", "cicd-unit-tests-latest-gb200"):
+            caller_mode = callers[job]["with"]["unit_testmon_mode"]
+            caller_mode = caller_mode.removeprefix("${{").removesuffix("}}")
+            caller_mode = caller_mode.replace("&&", "and").replace("||", "or")
+            selected_mode = eval(caller_mode, {"__builtins__": {}}, {"needs": needs})
+            assert selected_mode == ("full" if force_full else requested_mode)
+            inputs = SimpleNamespace(
+                unit_testmon_mode=selected_mode, unit_testmon_target_branch=target_branch
+            )
+            assert eval(expression, {"__builtins__": {}}, {"inputs": inputs, "matrix": matrix}) == (
+                "full" if force_full else expected_mode
+            )
+
 
 @pytest.mark.parametrize(
     "scenario",
