@@ -823,7 +823,12 @@ def _build_tensor_reshard_specs(
         for metadata in src_meta_list:
             mesh = _tensor_mesh(metadata)
             src_groups.setdefault(mesh, {})[metadata.owner_rank] = metadata
-        error = _validate_native_mesh_metadata(resolved_name, "destination", dst_mesh, dst_by_rank)
+        # Validate the same packed representation used for native transfers;
+        # validating raw destination metadata rejects supported GLU strides.
+        packed_dst_by_rank = {r: _strided_as_packed(m) for r, m in dst_by_rank.items()}
+        error = _validate_native_mesh_metadata(
+            resolved_name, "destination", dst_mesh, packed_dst_by_rank
+        )
         if error is not None:
             return None, error
         dst_metadata = dst_by_rank[dst_mesh[0]]
@@ -844,7 +849,7 @@ def _build_tensor_reshard_specs(
         ):
             return None, f"{resolved_name}: mixed strided/plain TP layouts are unsupported"
         src_by_rank = {r: _strided_as_packed(m) for r, m in src_groups[src_mesh].items()}
-        dst_by_rank = {r: _strided_as_packed(m) for r, m in dst_by_rank.items()}
+        dst_by_rank = packed_dst_by_rank
         dst_metadata = dst_by_rank[dst_mesh[0]]
 
         error = _validate_native_mesh_metadata(resolved_name, "source", src_mesh, src_by_rank)

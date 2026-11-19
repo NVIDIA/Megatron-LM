@@ -59,3 +59,50 @@ def test_stacked_expert_writeback_replays(adjacent, dtype):
     )
     actual = next(iter(outputs.values()))
     assert torch.equal(actual.contiguous().view(torch.uint8), source.contiguous().view(torch.uint8))
+
+
+@pytest.mark.parametrize("convert_all", [False, True])
+def test_transformed_expert_writeback_without_parameters_replays(convert_all):
+    """Missing converted parameters preserve slice order under stream contention."""
+    names = ("weight0", "weight1")
+    converted = frozenset(names if convert_all else {names[1]})
+    spec = TensorReshardSpec(
+        resolved_name="weight[experts]",
+        src_ranks=(0,),
+        dst_ranks=(1,),
+        global_shape=(2, 8, 16),
+        src_local_shape=(2, 8, 16),
+        dst_local_shape=(2, 8, 16),
+        dtype=torch.bfloat16,
+        src_shard_dim=0,
+        dst_shard_dim=0,
+        src_stack_names=names,
+        dst_stack_names=names,
+    )
+    source = torch.arange(256, device="cuda", dtype=torch.bfloat16).view(2, 8, 16)
+
+    def transfer(value):
+        destinations = {name: torch.empty_like(value[0]) for name in names if name not in converted}
+        buffers = {name: torch.empty_like(value[0]) for name in converted}
+
+        class Transform:
+            def prepare_recv(self, name, dst_slice):
+                return [buffers[name]]
+
+            def finalize_recv(self, name, dst_slice, recv_buffers):
+                pass
+
+        local = NCCLM2NCopyService._local_stacked_tensor(
+            spec, 1, {}, destinations, converted, allocation_device=value.device
+        )
+        local.dst.copy_(value)
+        NCCLM2NCopyService._scatter_stacked(local, Transform())
+        return torch.stack(
+            [buffers[name] if name in converted else destinations[name] for name in names]
+        )
+
+    outputs, _ = assert_replays_bit_exact(
+        transfer, (source,), backward=False, contention=True, what="converted expert writeback"
+    )
+    actual = next(iter(outputs.values()))
+    assert torch.equal(actual.view(torch.uint8), source.view(torch.uint8))

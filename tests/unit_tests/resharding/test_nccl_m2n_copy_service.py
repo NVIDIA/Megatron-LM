@@ -808,7 +808,10 @@ def test_adjacent_stack_view_and_staging_scatter():
     assert direct.dst_scatter is None and direct.dst.data_ptr() == storage.data_ptr()
 
 
-def test_stacked_experts_feed_receiver_side_transform():
+@pytest.mark.parametrize(
+    "remove_parameters,convert_all", [(False, False), (True, False), (True, True)]
+)
+def test_stacked_experts_feed_receiver_side_transform(remove_parameters, convert_all):
     """Transformed experts go through prepare_recv/finalize_recv; the rest are copied."""
 
     class _RecordingTransform:
@@ -842,8 +845,19 @@ def test_stacked_experts_feed_receiver_side_transform():
     storage = torch.full((12,), -1.0)
     dst_params = {"w0": storage[0:6].view(2, 3), "w1": storage[6:12].view(2, 3)}
     assert _adjacent_stack_view(list(dst_params.values())) is not None
-    transform = _RecordingTransform({"w1"})
-    local = NCCLM2NCopyService._local_stacked_tensor(spec, 1, {}, dst_params, frozenset({"w1"}))
+    converted = frozenset(dst_params if convert_all else {"w1"})
+    transform = _RecordingTransform(converted)
+    if remove_parameters:
+        for name in converted:
+            del dst_params[name]
+    local = NCCLM2NCopyService._local_stacked_tensor(
+        spec,
+        1,
+        {},
+        dst_params,
+        converted,
+        **({"allocation_device": torch.device("cpu")} if convert_all else {}),
+    )
     # A transformed family is always staged, even when the parameters are adjacent.
     assert local.dst.data_ptr() != storage.data_ptr()
     received = torch.arange(12, dtype=torch.float32).view(2, 2, 3)
@@ -851,26 +865,32 @@ def test_stacked_experts_feed_receiver_side_transform():
 
     NCCLM2NCopyService._scatter_stacked(local, transform)
 
-    assert torch.equal(dst_params["w0"], received[0])
-    assert torch.equal(dst_params["w1"], torch.full((2, 3), -1.0))
-    assert set(transform.finalized) == {"w1"}
-    assert torch.equal(transform.finalized["w1"], received[1])
+    assert set(transform.finalized) == converted
+    for index, name in enumerate(spec.dst_stack_names):
+        if name in converted:
+            assert torch.equal(transform.finalized[name], received[index])
+            if remove_parameters:
+                assert name not in dst_params
+            else:
+                assert torch.equal(dst_params[name], torch.full((2, 3), -1.0))
+        else:
+            assert torch.equal(dst_params[name], received[index])
 
 
 @pytest.mark.skipif(
     not _has_nccl_m2n_python_package(),
     reason="install NVIDIA/nccl-extensions and NCCL4Py to run the M2N integration test",
 )
-@pytest.mark.parametrize("source_count", [1, 2])
+@pytest.mark.parametrize("source_count,convert_all", [(1, False), (2, False), (2, True)])
 @pytest.mark.usefixtures("nccl_m2n_host_proxy")
 @pytest.mark.launch_on_gb200
 def test_nccl_m2n_stacked_experts_match_per_expert_and_nccl_with_mxfp8(
-    monkeypatch: pytest.MonkeyPatch, source_count: int
+    monkeypatch: pytest.MonkeyPatch, source_count: int, convert_all: bool
 ):
     """Planner-built expert stacks, per-expert M2N and NCCL send/recv agree bitwise.
 
-    Half of the destination experts go through the receiver-side MXFP8 transform and
-    half stay BF16, so the stacked path exercises both writebacks in one call.
+    Mixed and entirely converted families exercise missing BF16 parameters and
+    receiver-side MXFP8 conversion alongside ordinary expert writebacks.
     """
     Utils.initialize_distributed()
     if torch.cuda.get_device_properties(torch.cuda.current_device()).major < 10:
@@ -899,11 +919,13 @@ def test_nccl_m2n_stacked_experts_match_per_expert_and_nccl_with_mxfp8(
         return values.to(device="cuda", dtype=torch.bfloat16)
 
     backend = resolve_mxfp8_backend("torch")
-    converted = {local_names[1]}
+    converted = set(local_names) if convert_all else {local_names[1]}
 
     def destination_state():
         tensors = {
-            name: torch.zeros(shape, dtype=torch.bfloat16, device="cuda") for name in local_names
+            name: torch.zeros(shape, dtype=torch.bfloat16, device="cuda")
+            for name in local_names
+            if name not in converted
         }
         buffers = {
             name: MXFP8Tensor.from_bf16(
@@ -969,8 +991,8 @@ def test_nccl_m2n_stacked_experts_match_per_expert_and_nccl_with_mxfp8(
                     local_ok &= torch.equal(
                         buffers[name].scale.view(torch.uint8), expected.scale.view(torch.uint8)
                     )
-                    # The BF16 parameter of a converted expert is not written.
-                    local_ok &= not tensors[name].any().item()
+                    # Production MXFP8 conversion removes the BF16 parameter.
+                    local_ok &= name not in tensors
                 else:
                     local_ok &= torch.equal(tensors[name], expected_bf16)
     status = torch.tensor(int(local_ok), dtype=torch.int32, device="cuda")

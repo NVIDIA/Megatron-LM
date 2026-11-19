@@ -74,7 +74,9 @@ class _LocalTransfer:
     # Expert-stacked destination staged in a temporary: per-expert parameters
     # that receive ``dst.unbind(0)`` after the native call, their names, and the
     # names that go through the receiver-side transform instead.
-    dst_scatter: list[torch.Tensor] | None = None
+    # Transformed experts have no destination parameter after MXFP8 conversion.
+    # Keep a None entry so names and received slices retain the same ordering.
+    dst_scatter: list[torch.Tensor | None] | None = None
     dst_scatter_names: tuple[str, ...] | None = None
     dst_transformed: frozenset[str] = frozenset()
 
@@ -489,6 +491,8 @@ class NCCLM2NCopyService(CopyService):
         src_tensors: Mapping[str, torch.Tensor],
         dst_tensors: Mapping[str, torch.Tensor],
         transformed: frozenset[str] = frozenset(),
+        *,
+        allocation_device: torch.device | None = None,
     ) -> _LocalTransfer:
         """Stage this rank's experts of one family as one ``[k, *shape]`` tensor.
 
@@ -515,21 +519,30 @@ class NCCLM2NCopyService(CopyService):
                 )
         if rank in spec.dst_ranks:
             names = spec.dst_stack_names
-            if names is None or any(name not in dst_tensors for name in names):
+            if names is None or any(
+                name not in dst_tensors for name in names if name not in transformed
+            ):
                 raise RuntimeError(
                     f"NCCL M2N destination expert tensors for {spec.resolved_name} are unavailable "
                     f"on rank {rank}"
                 )
-            experts = [dst_tensors[name].detach() for name in names]
+            experts = [
+                None if name in transformed else dst_tensors[name].detach() for name in names
+            ]
+            plain_experts = [tensor for tensor in experts if tensor is not None]
             if any(
-                tuple(t.shape) != spec.dst_local_shape[1:] or t.dtype != spec.dtype for t in experts
+                tuple(t.shape) != spec.dst_local_shape[1:] or t.dtype != spec.dtype
+                for t in plain_experts
             ):
                 raise RuntimeError(
                     f"NCCL M2N destination expert metadata changed for {spec.resolved_name}"
                 )
-            dst = None if transformed else _adjacent_stack_view(experts)
+            dst = None if transformed else _adjacent_stack_view(plain_experts)
             if dst is None:
-                dst = torch.empty(spec.dst_local_shape, dtype=spec.dtype, device=experts[0].device)
+                device = plain_experts[0].device if plain_experts else allocation_device
+                if device is None:
+                    raise RuntimeError("NCCL M2N transformed expert staging requires a device")
+                dst = torch.empty(spec.dst_local_shape, dtype=spec.dtype, device=device)
                 return _LocalTransfer(
                     src=src,
                     dst=dst,
@@ -570,7 +583,12 @@ class NCCLM2NCopyService(CopyService):
                     if transform.should_transform(name)
                 )
             local = self._local_stacked_tensor(
-                first_spec, self.rank, src_tensors, dst_tensors, transformed
+                first_spec,
+                self.rank,
+                src_tensors,
+                dst_tensors,
+                transformed,
+                allocation_device=self._device,
             )
             self._handle.reshard(
                 channel.comm,
@@ -678,12 +696,15 @@ class NCCLM2NCopyService(CopyService):
         assert local.dst is not None and local.dst_scatter is not None
         received = list(local.dst.unbind(0))
         if not local.dst_transformed:
-            torch._foreach_copy_(local.dst_scatter, received)
+            params = [param for param in local.dst_scatter if param is not None]
+            assert len(params) == len(received)
+            torch._foreach_copy_(params, received)
             return
         assert transform is not None and local.dst_scatter_names is not None
         params, values = [], []
         for name, param, value in zip(local.dst_scatter_names, local.dst_scatter, received):
             if name not in local.dst_transformed:
+                assert param is not None
                 params.append(param)
                 values.append(value)
                 continue
