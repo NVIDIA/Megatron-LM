@@ -823,6 +823,9 @@ class TextDetokenizer:
     def text_length(self):
         return len(self.text)
 
+    def finish(self):
+        return ""
+
 
 def build_streaming_app(path, client, monkeypatch, **config):
     """`build_app` with the endpoint's incremental detokenizer replaced by `TextDetokenizer`."""
