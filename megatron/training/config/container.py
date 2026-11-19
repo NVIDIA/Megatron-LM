@@ -65,6 +65,13 @@ from megatron.training.models.distillation import DistillationConfig, validate_d
 T = TypeVar("T", bound="ConfigContainerBase")
 logger = logging.getLogger(__name__)
 
+_FROZEN_OPTIMIZER_FLAGS = (
+    "use_distributed_optimizer",
+    "overlap_param_gather",
+    "overlap_param_gather_with_optimizer_step",
+)
+
+
 @dataclass(kw_only=True)
 class ConfigContainerBase:
     """
@@ -457,8 +464,14 @@ class PretrainConfigContainer(ConfigContainerBase):
         if getattr(self.model, "transformer", None) is None:
             raise ValueError("Training requires model.transformer to be configured")
         optimizer = self._optimizer_with_model_precision()
-        # Validate effective precision without modifying either config or finalizing early.
-        ConfigContainerBase.validate(replace(self, optimizer=optimizer))
+        if self.train.freeze_all_layers:
+            # Resolve aliases on the private copy first: Muon derives its layer-wise path
+            # from use_distributed_optimizer, which the frozen policy then disables.
+            optimizer.finalize_optimizer_config()
+            optimizer = replace(optimizer, **dict.fromkeys(_FROZEN_OPTIMIZER_FLAGS, False))
+        # Every optimizer check sees the policy that will run; the live config stays unchanged.
+        effective = replace(self, optimizer=optimizer)
+        ConfigContainerBase.validate(effective)
         # Config-only topology checks also run when validating a recipe off-cluster.
         # Launch world-size checks remain in the runtime parallel-size helpers.
         transformer = self.model.transformer
@@ -486,7 +499,7 @@ class PretrainConfigContainer(ConfigContainerBase):
                 raise ValueError("GTP sequence sharding uses Megatron DDP, not FSDP")
             if self.dist.use_tp_pp_dp_mapping:
                 raise ValueError("GTP sequence sharding does not support TP-PP-DP mapping")
-        self._validate_checkpoint()
+        effective._validate_checkpoint()
         if self.fault_tolerance.enable_ft_package and not self.checkpoint.save:
             raise ValueError("checkpointing save dir must be set to enable fault tolerance")
         self._validate_distillation()
@@ -501,7 +514,7 @@ class PretrainConfigContainer(ConfigContainerBase):
         if self.train.freeze_all_layers and transformer.freeze_base_model_for_mtp:
             raise ValueError("freeze_all_layers cannot be combined with freeze_base_model_for_mtp.")
         global_batch_size, _, _ = self._resolve_batch_sizes()
-        self._validate_ddp_config()
+        effective._validate_ddp_config()
         self._validate_rl_config(global_batch_size)
         optimizer.validate_run(
             ddp_config=self.ddp,
@@ -796,15 +809,7 @@ class PretrainConfigContainer(ConfigContainerBase):
                 )
                 self.ddp.fp4_param_gather = False
         if self.train.freeze_all_layers:
-            enabled = [
-                name
-                for name in (
-                    "use_distributed_optimizer",
-                    "overlap_param_gather",
-                    "overlap_param_gather_with_optimizer_step",
-                )
-                if getattr(self.optimizer, name)
-            ]
+            enabled = [name for name in _FROZEN_OPTIMIZER_FLAGS if getattr(self.optimizer, name)]
             if enabled:
                 logger.warning(
                     "train.freeze_all_layers: disabling incompatible optimizer settings %s.",

@@ -82,6 +82,10 @@ Batch sizes stay in `train`, dataset and packing settings in `data`, and progres
 fixed global batch size (no ramp-up or step batch-size schedule) and a configured
 `data.dataset`. Freezing is an independent training setting: `teacher_save` can also
 capture logits during active training when `train.freeze_all_layers` is false.
+Frozen runs disable distributed-optimizer and parameter-gather overlap flags before
+checking their prerequisites, so a teacher dump can reuse those settings from a
+training recipe. Validation checks a temporary copy; finalization updates the run
+config and warns about settings it disables.
 
 The existing `--logits-save-*`, `--logits-load-*`, and `--freeze-all-layers` CLI flags
 remain supported. They populate these config sections once; the saver, reader, and loss
