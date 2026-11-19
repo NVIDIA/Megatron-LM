@@ -6,7 +6,7 @@ from typing import Literal, Optional
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.bert.bert_lm_head import BertLMHead
@@ -117,6 +117,8 @@ class BertModel(LanguageModule):
                 max_sequence_length=self.max_sequence_length,
                 position_embedding_type=position_embedding_type,
                 num_tokentypes=num_tokentypes,
+                tp_group=self.tp_group,
+                pg_collection=self.pg_collection,
             )
 
         if self.position_embedding_type == 'rope':
@@ -136,6 +138,7 @@ class BertModel(LanguageModule):
             pre_process=self.pre_process,
             post_process=self.post_process,
             vp_stage=vp_stage,
+            pg_collection=self.pg_collection,
         )
 
         # Output
@@ -156,6 +159,8 @@ class BertModel(LanguageModule):
                 skip_bias_add=False,
                 gather_output=not self.parallel_output,
                 skip_weight_param_allocation=pre_process and share_embeddings_and_output_weights,
+                tp_group=self.tp_group,
+                pg_collection=self.pg_collection,
             )
 
             self.binary_head = None
@@ -166,7 +171,11 @@ class BertModel(LanguageModule):
                 )
 
                 self.pooler = Pooler(
-                    config.hidden_size, config.init_method, config, config.sequence_parallel
+                    config.hidden_size,
+                    config.init_method,
+                    config,
+                    config.sequence_parallel,
+                    tp_group=self.tp_group,
                 )
 
         if self.pre_process or self.post_process:
@@ -329,17 +338,12 @@ class BertModel(LanguageModule):
 
         extended_attention_mask = self.bert_extended_attention_mask(attention_mask)
 
-        if parallel_state.is_pipeline_first_stage():
-            input_ids = input_ids
-            position_ids = self.bert_position_ids(input_ids)
-        else:
-            position_ids = None
-            input_ids = None
-
         # Encoder embedding.
         if self.pre_process:
             encoder_input = self.embedding(
-                input_ids=input_ids, position_ids=position_ids, tokentype_ids=tokentype_ids
+                input_ids=input_ids,
+                position_ids=self.bert_position_ids(input_ids),
+                tokentype_ids=tokentype_ids,
             )
         else:
             # intermediate stage of pipeline

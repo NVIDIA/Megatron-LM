@@ -22,6 +22,49 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
 
 
+@pytest.mark.internal
+@pytest.mark.skipif(Utils.world_size % 4 != 0, reason="Requires a 2 x 2 parallel grid")
+@torch.no_grad()
+def test_bert_loss_with_custom_tensor_parallel_group():
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=2)
+    try:
+        groups = ProcessGroupCollection.use_mpu_process_groups()
+        # Use the orthogonal two-rank group for tensor parallelism, with both ranks on one stage.
+        groups.tp, groups.pp = groups.pp, groups.cp
+        groups.embd = None
+        model_parallel_cuda_manual_seed(123, tp_rank=groups.tp.rank())
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=2,
+            tensor_model_parallel_size=2,
+            sequence_parallel=True,
+            use_cpu_initialization=True,
+            attention_backend=AttnBackend.local,
+        )
+        model = BertModel(
+            config=config,
+            num_tokentypes=0,
+            transformer_layer_spec=bert_layer_local_spec,
+            vocab_size=4,
+            max_sequence_length=2,
+            pg_collection=groups,
+        ).cuda()
+        assert model.embedding.word_embeddings.tp_group is groups.tp
+        assert model.encoder.layers[0].self_attention.tp_group is groups.tp
+        assert model.pooler.tp_group is groups.tp
+
+        # Give the output shards distinct logits, independent of the encoder's hidden states.
+        dense_logits = torch.arange(4, dtype=torch.float32, device='cuda')
+        model.output_layer.weight.zero_()
+        model.output_layer.bias.copy_(dense_logits.chunk(2)[model.output_layer.tp_group.rank()])
+        tokens = torch.tensor([[0, 3]], device='cuda')
+        loss, _ = model(tokens, torch.ones_like(tokens), lm_labels=tokens)
+        torch.testing.assert_close(loss, -dense_logits.log_softmax(dim=0)[tokens])
+    finally:
+        Utils.destroy_model_parallel()
+
+
 class TestBertModel:
 
     def setup_method(self, method):
