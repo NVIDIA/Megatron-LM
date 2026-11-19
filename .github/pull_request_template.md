@@ -45,8 +45,11 @@ All PRs start as **draft**. If you open a non-draft PR, it will be automatically
 
 #### Step 1: Mark PR as "Ready for Review"
 
-1. When your PR is ready, click **Ready for Review**.
-2. An oncall reviewer is auto-assigned and expert reviewers are notified based on your changes.
+1. While in draft, request Autobot approval with `/review-approve` (findings-only follow-up)
+   or `/review-approve reset=true` (full review).
+2. Click **Ready for review** once Autobot approves the latest commit or you have added the
+   `skip-bot-approval` label. Without either, automation will return the PR to draft.
+3. Review groups are requested based on your changes.
    - Some PRs may jump straight to step 2. This is determined by `.github/CODEOWNERS`.
 
 :warning: Only mark as ready once merge-conflicts are resolved and the CI is passing.

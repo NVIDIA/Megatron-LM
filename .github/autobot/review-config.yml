@@ -8,4 +8,11 @@ auto-review:
 approval:
   enabled: true
   eligible_teams:
-    - ci
+    # GitHub includes child-team members in their parent's membership.
+    - mcore-reviewers
+    - mcore-engineers
+    - mcore-oncall-rotation
+    - mcore-automation
+    - mcore-leadership
+    - mcore-mlperf
+    - mcore-product
