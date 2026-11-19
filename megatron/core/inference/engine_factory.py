@@ -4,7 +4,7 @@
 
 from typing import Any
 
-from megatron.core.inference.config import InferenceConfig
+from megatron.core.inference.config import InferenceConfig, layer_types_from_model
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.disaggregation.coordinator_setup import (
     configure_prebuilt_disagg_engine,
@@ -67,6 +67,10 @@ def build_dynamic_inference_engine(
     inference_config.reserve_recurrent_state_dummy_slot = (
         engine_cls.requires_recurrent_state_dummy_slot
     )
+    # A hybrid model's KV cache gets planes for its attention layers only, which the context
+    # reads from the layer types.
+    if inference_config.layer_type_list is None:
+        inference_config.layer_type_list = layer_types_from_model(model)
     context = DynamicInferenceContext(model.config, inference_config)
     inference_wrapped_model = inference_wrapper_cls(model, context)
     controller = TextGenerationController(

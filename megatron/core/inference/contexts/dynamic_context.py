@@ -2,7 +2,6 @@
 
 import logging
 import math
-import operator
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -35,10 +34,7 @@ from megatron.core.inference.unified_memory import (
 )
 from megatron.core.inference.utils import device_memory_summary, tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
-from megatron.core.models.hybrid.hybrid_layer_allocation import (
-    Symbols,
-    get_layer_maps_from_layer_type_list,
-)
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.ssm.ops.gdp.metadata import max_gdp_chunk_counts
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.moe.token_dispatcher_inference import (
@@ -565,23 +561,31 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     "batch_invariant_mode requires FP32 Mamba SSM states so state-passing "
                     "boundaries are not rounded between decode chunks."
                 )
+        else:
+            self.mamba_conv_states_shape, self.mamba_ssm_states_shape = (None, None)
 
-            # Mamba and GDN use the same slot-indexed recurrent-state cache contract. Build
-            # one map in global layer order; independently generated per-symbol maps both
-            # start at zero and would alias if they were simply unioned.
-            attention_layer_map, dsa_layer_map = operator.itemgetter(
-                Symbols.ATTENTION, Symbols.DS_ATTENTION
-            )(get_layer_maps_from_layer_type_list(mamba_inference_state_config.layer_type_list))
+        layer_type_list = inference_config.layer_type_list
+        if layer_type_list is None and self.is_hybrid_model:
+            layer_type_list = mamba_inference_state_config.layer_type_list
+        if layer_type_list is not None:
+            # A hybrid model gives cache space only to the layers that use it. Attention, DSA
+            # and MLA layers share the paged KV cache, and Mamba and GDN layers share the
+            # slot-indexed recurrent-state cache. Build one map per cache in global layer order;
+            # independently generated per-symbol maps all start at zero and would alias if they
+            # were simply unioned. Hybrid patterns reject standard attention alongside the MLA
+            # family, so all KV-cache layers take one buffer layout (MLA latents or per-head
+            # keys and values).
+            kv_layer_map = {}
             recurrent_layer_map = {}
-            for global_layer_idx, layer_type in enumerate(
-                mamba_inference_state_config.layer_type_list
-            ):
-                if layer_type in (Symbols.MAMBA, Symbols.GDN):
+            for global_layer_idx, layer_type in enumerate(layer_type_list):
+                if layer_type in Symbols.KV_CACHE_LAYERS:
+                    kv_layer_map[global_layer_idx] = len(kv_layer_map)
+                elif layer_type in Symbols.RECURRENT_STATE_LAYERS:
                     recurrent_layer_map[global_layer_idx] = len(recurrent_layer_map)
 
-            self.num_attention_layers = len(attention_layer_map) + len(dsa_layer_map)
+            self.num_attention_layers = len(kv_layer_map)
             self.num_mamba_layers = len(recurrent_layer_map)
-            self.layer_map = attention_layer_map | dsa_layer_map | recurrent_layer_map
+            self.layer_map = kv_layer_map | recurrent_layer_map
         else:
             # The layer map is the identity function for pure Transformer models.
             # Use the same per-PP-rank layer count as TransformerBlock (handles
@@ -604,7 +608,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 model_config, vp_stage=None, pp_rank=pp_rank
             )
             self.num_mamba_layers = 0
-            self.mamba_conv_states_shape, self.mamba_ssm_states_shape = (None, None)
             self.layer_map = {i: i for i in range(self.num_attention_layers)}
 
         self.max_tokens = inference_config.max_tokens or self.DEFAULT_MAX_TOKENS
@@ -640,10 +643,18 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         self._mtp_initialize_kv_cache(model_config, inference_config.mtp_layer_type_list)
 
-        if self.num_attention_layers == 0:
+        has_local_kv_layers = self.num_attention_layers > 0
+        if not has_local_kv_layers and pp_size == 1:
             raise NotImplementedError(
                 f"Using `DynamicInferenceContext` with no attention is not supported."
             )
+        # A pipeline stage can hold no KV-cache layer while other stages do, as stage 1 of the
+        # hybrid pattern `*|-` does. Its buffer keeps one placeholder plane that no layer maps
+        # to, so it sizes its cache and joins the pipeline collective below like the other
+        # stages; that collective rejects a model with no KV-cache layer on any stage. The
+        # placeholder is not a layer: `num_attention_layers` stays 0, so readers that sum it
+        # across stages, such as the disaggregated KV handoff, count only planes a layer uses.
+        self.num_kv_cache_planes = max(self.num_attention_layers, 1)
 
         # Block size tokens, bytes.
         kv_dtype_size_bytes = model_config.params_dtype.itemsize
@@ -653,7 +664,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.kv_reduced_dim = model_config.kv_lora_rank + model_config.qk_pos_emb_head_dim
             self.block_size_bytes = (
                 kv_dtype_size_bytes
-                * self.num_attention_layers
+                * self.num_kv_cache_planes
                 * self.block_size_tokens
                 * self.kv_reduced_dim
             )
@@ -661,7 +672,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.block_size_bytes = (
                 kv_dtype_size_bytes
                 * 2  # key, value
-                * self.num_attention_layers
+                * self.num_kv_cache_planes
                 * self.block_size_tokens
                 * self.num_attention_heads_per_partition
                 * self.hidden_size_per_attention_head
@@ -669,7 +680,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if self.cache_dsa_indexer_keys:
             self.block_size_bytes += (
                 kv_dtype_size_bytes
-                * self.num_attention_layers
+                * self.num_kv_cache_planes
                 * self.block_size_tokens
                 * self.dsa_indexer_head_dim
             )
@@ -827,13 +838,20 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # pipeline stages have different layer allocations. Non-uniform block counts
         # can lead to some ranks pausing requests earlier than other ranks
         # (i.e., divergence in the scheduling behavior). The same collective reports
-        # whether every stage holds recurrent (Mamba/GDN) layers; the MIN of the
-        # negated flag is the negated MAX.
+        # whether every and whether any stage holds recurrent (Mamba/GDN) layers, and
+        # whether any stage holds KV-cache layers; the MIN of a negated flag is the
+        # negated MAX.
         self.pipeline_has_recurrent_layers = self.is_hybrid_model
         if pp_size > 1:
             has_recurrent_layers = int(self.is_hybrid_model)
             block_count_tensor = torch.tensor(
-                (block_count, paused_block_count, has_recurrent_layers, -has_recurrent_layers),
+                (
+                    block_count,
+                    paused_block_count,
+                    has_recurrent_layers,
+                    -has_recurrent_layers,
+                    -int(has_local_kv_layers),
+                ),
                 dtype=torch.int32,
                 device=torch.cuda.current_device(),
             )
@@ -846,6 +864,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             paused_block_count = block_count_tensor[1].item()
             all_stages_recurrent = block_count_tensor[2].item() == 1
             self.pipeline_has_recurrent_layers = block_count_tensor[3].item() == -1
+            # Every stage sees the same flag, so all of them raise here together.
+            if block_count_tensor[4].item() == 0:
+                raise NotImplementedError(
+                    "Using `DynamicInferenceContext` with no attention is not supported."
+                )
 
             # Every stage must skip the same prompt tokens on a prefix-cache hit. With a
             # Mamba cache budget, a recurrent stage skips only the blocks whose Mamba
@@ -1243,7 +1266,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if self.cache_mla_latent:
             self.memory_buffer = torch.empty(
                 (
-                    self.num_attention_layers,
+                    self.num_kv_cache_planes,
                     self.kv_block_allocator.pool_size,
                     self.block_size_tokens,
                     self.kv_reduced_dim,
@@ -1255,7 +1278,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.memory_buffer = torch.empty(
                 (
                     2,  # key and value
-                    self.num_attention_layers,
+                    self.num_kv_cache_planes,
                     self.kv_block_allocator.pool_size,
                     self.block_size_tokens,
                     self.num_attention_heads_per_partition,
@@ -1267,7 +1290,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if self.cache_dsa_indexer_keys:
             self.dsa_memory_buffer = torch.empty(
                 (
-                    self.num_attention_layers,
+                    self.num_kv_cache_planes,
                     self.kv_block_allocator.pool_size,
                     self.block_size_tokens,
                     self.dsa_indexer_head_dim,

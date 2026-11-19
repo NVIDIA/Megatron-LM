@@ -431,3 +431,80 @@ def test_nixl_begin_pull_blocks_returns_pollable_handle(monkeypatch):
     assert backend._agent.polls == 0
     assert handle.poll() is False
     assert handle.poll() is True
+
+
+def test_nixl_pull_skips_a_pipeline_stage_without_kv_layers(monkeypatch):
+    """Stage 1 of the hybrid pattern `*|-` holds no KV-cache layer but keeps one placeholder
+    plane, so its metadata pairs `num_outer=2` with an empty layer range. A PP=1 decode reads
+    only stage 0's layer, and a decode stage without KV-cache layers reads nothing."""
+    from megatron.core.inference.disaggregation.transfer_backends import nixl as nixl_mod
+
+    class FakeAgent:
+        def __init__(self, name, config):
+            self.name = name
+            self.read_peers = []
+
+        def get_agent_metadata(self):
+            return self.name.encode()
+
+        def register_memory(self, tensor):
+            return ("reg", tuple(tensor.shape))
+
+        def add_remote_agent(self, metadata):
+            return metadata.decode()
+
+        def get_xfer_descs(self, tuples, mem_type):
+            return tuples
+
+        def initialize_xfer(self, op, local_desc, remote_desc, peer_id):
+            assert op == "READ"
+            self.read_peers.append(peer_id)
+            return (local_desc, remote_desc)
+
+        def transfer(self, xfer):
+            pass
+
+        def check_xfer_state(self, xfer):
+            return "DONE"
+
+    monkeypatch.setattr(nixl_mod, "_HAVE_NIXL", True)
+    monkeypatch.setattr(nixl_mod, "nixl_agent", FakeAgent)
+    monkeypatch.setattr(nixl_mod, "nixl_agent_config", lambda **_: object())
+
+    def backend(name, global_rank, pp_size, pp_rank, layer_start, layer_end):
+        # One plane of [K/V, plane, blocks, tokens, heads, head dim]; a placeholder on a stage
+        # whose layer range is empty.
+        return nixl_mod.NixlTransferBackend(
+            name,
+            torch.zeros(2, 1, 3, 4, 1, 2),
+            expected_num_blocks=3,
+            tp_size=1,
+            tp_rank=0,
+            num_kv_heads_global=1,
+            heads_per_partition=1,
+            head_dim=2,
+            tokens_per_block=4,
+            global_rank=global_rank,
+            pp_size=pp_size,
+            pp_rank=pp_rank,
+            num_layers_global=1,
+            layer_start=layer_start,
+            layer_end=layer_end,
+        )
+
+    prefill_stages = [backend("prefill-0", 0, 2, 0, 0, 1), backend("prefill-1", 1, 2, 1, 1, 1)]
+    peer_meta = {
+        "pp_metas": [
+            {"tp_metas": [stage.export_meta()], "block_ids": [1]} for stage in prefill_stages
+        ]
+    }
+
+    decode = backend("decode", 2, 1, 0, 0, 1)
+    decode.begin_pull_blocks(peer_meta, [1], [2]).wait()
+    assert decode._agent.read_peers == ["prefill-0"]
+
+    decode_stage_without_kv_layers = backend("decode-1", 3, 2, 1, 1, 1)
+    handle = decode_stage_without_kv_layers.begin_pull_blocks(peer_meta, [1], [2])
+    handle.wait()
+    assert handle.poll() is True
+    assert decode_stage_without_kv_layers._agent.read_peers == []

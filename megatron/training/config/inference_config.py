@@ -387,6 +387,7 @@ class InferenceSetupConfig:
             MediaCacheCoordinatorPolicy,
             PrefixCachingCoordinatorPolicy,
             PrefixCachingEvictionPolicy,
+            layer_types_from_model,
             mtp_layer_types_from_model,
         )
         from megatron.core.inference.shards_spec import spec_declares_disaggregation
@@ -451,6 +452,7 @@ class InferenceSetupConfig:
             static_kv_memory_pointers=self.static_kv_memory_pointers,
             max_sequence_length=max_sequence_length,
             mamba_inference_state_config=mamba_inference_state_config,
+            layer_type_list=layer_types_from_model(model),
             mtp_layer_type_list=mtp_layer_types_from_model(model),
             pg_collection=pg_collection,
             use_flashinfer_fused_rope=self.use_flashinfer_fused_rope,

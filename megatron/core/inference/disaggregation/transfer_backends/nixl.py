@@ -565,7 +565,10 @@ class NixlTransferBackend:
                     self._validate_peer(meta, blocks, dst_block_ids)
                     if meta.get("heads_per_partition") != layout.local_num_heads():
                         raise ValueError("peer heads_per_partition does not match its KV layout")
-                    if int(meta["num_outer"]) % layout.local_num_layers():
+                    # A pipeline stage without KV-cache layers owns no layer and sources no
+                    # transfer, though its buffer keeps one placeholder plane.
+                    peer_num_layers = layout.local_num_layers()
+                    if peer_num_layers and int(meta["num_outer"]) % peer_num_layers:
                         raise ValueError("peer num_outer is not divisible by its local layer count")
                     if layout.global_rank in peers_by_rank:
                         raise ValueError(
@@ -576,7 +579,9 @@ class NixlTransferBackend:
                 if not sources:
                     raise ValueError("KV handoff contains no source peer metadata")
 
-                local_planes = self._num_outer // self._layout.local_num_layers()
+                # A destination stage without KV-cache layers receives no transfer.
+                local_num_layers = self._layout.local_num_layers()
+                local_planes = self._num_outer // local_num_layers if local_num_layers else 0
                 for transfer in plan_kv_reshard(sources, [self._layout]):
                     meta, blocks, source_layout = peers_by_rank[transfer.src_rank]
                     source_planes = int(meta["num_outer"]) // source_layout.local_num_layers()

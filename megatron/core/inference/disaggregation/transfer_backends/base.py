@@ -188,10 +188,12 @@ def compute_buffer_geometry(
                 "heads_per_partition does not match the canonical KV layout: "
                 f"{heads_per_partition} vs {layout.local_num_heads()}"
             )
-        if num_outer % layout.local_num_layers() != 0:
+        # A pipeline stage without KV-cache layers owns an empty layer range and takes part
+        # in no transfer, though its buffer keeps one placeholder plane.
+        local_num_layers = layout.local_num_layers()
+        if local_num_layers and num_outer % local_num_layers != 0:
             raise ValueError(
-                f"num_outer={num_outer} is not divisible by local layers="
-                f"{layout.local_num_layers()}"
+                f"num_outer={num_outer} is not divisible by local layers={local_num_layers}"
             )
     if layout is not None and ssm_layout is not None:
         raise ValueError("a transfer backend cannot have both KV and SSM layouts")
