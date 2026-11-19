@@ -231,9 +231,9 @@ def _worker_gtp_blockwise(rank, world_size, port):
 
 
 def _worker_padded_distributed_parity(
-    rank, world_size, port, tp_size, gtp_remat_size, logical_m, partition_dim
+    rank, world_size, port, tp_size, gtp_remat_size, logical_m, partition_dim, padding_value
 ):
-    """Padded distributed NS must match unpadded full-matrix NS and Muon scaling."""
+    """Reject bad padded momentum on every NS participant without changing the input."""
     _init_model_parallel(tp_size, gtp_remat_size)
     try:
         pgc = ProcessGroupCollection.use_mpu_process_groups()
@@ -278,8 +278,33 @@ def _worker_padded_distributed_parity(
         local.is_gtp_weight_remat = True
         local.pad_length = pad_length
 
-        out = opt.scaled_orthogonalize_fn_with_gtp_remat(local, local, pgc.tp, partition_dim)
+        # Keep the parameter and NS input separate: padding can be corrupt in optimizer
+        # state even when both the parameter and freshly computed gradient are clean.
+        momentum = local.clone()
+        logical_rows = logical_m // ts if partition_dim == 0 else logical_m
+        local_valid_rows = min(shard_rows, max(0, logical_rows - gr * shard_rows))
+        # Poison only one rank so clean GTP/TP peers must learn about its failure.
+        if rank == world_size - 1:
+            momentum[local_valid_rows:].fill_(padding_value)
+        original_momentum = momentum.clone()
+
+        if padding_value != 0:
+
+            def unexpected_ns(*args, **kwargs):
+                raise AssertionError("Bad padding reached a momentum gather or Newton-Schulz")
+
+            opt.scaled_orthogonalize_fn = unexpected_ns
+            opt._all_gather_tensor = unexpected_ns
+            with pytest.raises(
+                ValueError, match="Nonzero padding in distributed GTP Muon momentum"
+            ):
+                opt.scaled_orthogonalize_fn_with_gtp_remat(local, momentum, pgc.tp, partition_dim)
+            torch.testing.assert_close(momentum, original_momentum, atol=0, rtol=0, equal_nan=True)
+            return
+
+        out = opt.scaled_orthogonalize_fn_with_gtp_remat(local, momentum, pgc.tp, partition_dim)
         torch.testing.assert_close(out, expected, atol=_ATOL, rtol=_RTOL)
+        torch.testing.assert_close(momentum, original_momentum, atol=0, rtol=0)
     finally:
         ps.destroy_model_parallel()
         ps.initialize_model_parallel()
@@ -312,15 +337,30 @@ class TestGTPMuonDistributedNS:
         _run_distributed(_worker_gtp_blockwise, world_size)
 
     @pytest.mark.parametrize(
+        "padding_value",
+        [
+            pytest.param(0.0, id="zero"),
+            pytest.param(7.0, id="nonzero"),
+            pytest.param(1e-30, id="tiny-nonzero"),
+            pytest.param(float("nan"), id="nan"),
+            pytest.param(float("inf"), id="positive-inf"),
+            pytest.param(float("-inf"), id="negative-inf"),
+        ],
+    )
+    @pytest.mark.parametrize(
         "tp_size,gtp_remat_size,logical_m,partition_dim",
         [
             pytest.param(1, 8, 126, None, id="gtp-only"),
             pytest.param(1, 8, 62, None, id="gtp-only-padding-spans-shards"),
-            pytest.param(2, 4, 126, 1, id="row-parallel"),
-            pytest.param(4, 2, 124, 0, id="column-parallel"),
+            pytest.param(2, 4, 126, 1, id="row-parallel-larger-gtp"),
+            pytest.param(4, 2, 126, 1, id="row-parallel-larger-tp"),
+            pytest.param(2, 4, 124, 0, id="column-parallel-larger-gtp"),
+            pytest.param(4, 2, 124, 0, id="column-parallel-larger-tp"),
         ],
     )
-    def test_padded_distributed_parity(self, tp_size, gtp_remat_size, logical_m, partition_dim):
+    def test_padded_distributed_parity(
+        self, tp_size, gtp_remat_size, logical_m, partition_dim, padding_value
+    ):
         world_size = tp_size * gtp_remat_size
         # The eight ranks may span multiple nodes, so validate the initialized distributed
         # world rather than requiring all eight CUDA devices to be visible on each host.
@@ -331,4 +371,5 @@ class TestGTPMuonDistributedNS:
             gtp_remat_size,
             logical_m,
             partition_dim,
+            padding_value,
         )
