@@ -77,10 +77,7 @@ def test_overlap_rejects_unsupported_execution_before_dispatch(monkeypatch, fail
 def test_overlap_setup_requires_collective_free_moe_modules_at_tp(
     monkeypatch, tp_size, inference_modules
 ):
-    """At TP>1 the shortcut stream may only run modules that issue no TP collectives."""
-
-    class Router:
-        pass
+    """At TP>1 the shortcut stream may only run experts that issue no TP collectives."""
 
     class Experts:
         pass
@@ -88,11 +85,9 @@ def test_overlap_setup_requires_collective_free_moe_modules_at_tp(
     monkeypatch.setattr(torch.cuda, "Event", lambda: object())
     monkeypatch.setattr(shortcut_module, "get_pg_size", lambda group: tp_size)
     if inference_modules:
-        monkeypatch.setattr(shortcut_module, "InferenceTopKRouter", Router)
         monkeypatch.setattr(shortcut_module, "InferenceGroupedMLP", Experts)
     config = _shortcut_config()
     block = ShortcutMoEBlock(_FakeCompute(config), _FakeMoE(config), overlap_a2a=False)
-    block.moe_layer.mlp.router = Router()
     block.moe_layer.mlp.experts = Experts()
     if tp_size > 1 and not inference_modules:
         with pytest.raises(RuntimeError, match="issue no TP-group collectives"):
@@ -228,3 +223,84 @@ def test_overlap_graph_replay_preserves_inputs_and_updates_live_cache_once(
             torch.testing.assert_close(updates, live_rows)
             torch.testing.assert_close(hidden, saved_hidden, atol=0, rtol=0)
             torch.testing.assert_close(padding, saved_padding)
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_overlap_keeps_every_collective_on_the_calling_stream(monkeypatch):
+    """Dispatch and combine spin-wait on EP peers, so they must share one stream with every other
+    collective; only the routed experts' local compute may run on the shortcut stream."""
+    config = _shortcut_config()
+    config.transformer_impl = "inference_optimized"
+    config.mlp_chunks_for_prefill = 1
+    context = SimpleNamespace(
+        config=SimpleNamespace(inference_shortcut_moe_overlap=True),
+        is_dynamic_batching=lambda: True,
+        is_decode_only=lambda: True,
+        num_speculative_tokens=0,
+    )
+
+    class Dispatcher:
+        pass
+
+    class Compute(_FakeCompute):
+        def forward(self, hidden_states, **kwargs):
+            return record("mixer", hidden_states + 1)
+
+    monkeypatch.setattr(shortcut_module, "MambaLayer", Compute)
+    monkeypatch.setattr(shortcut_module, "NVLSAllGatherVDispatcher", Dispatcher)
+    block = ShortcutMoEBlock(Compute(config), _FakeMoE(config), overlap_a2a=False).eval().cuda()
+    block.setup_inference_overlap()
+    block.moe_layer.mlp.token_dispatcher = Dispatcher()
+    side = torch.cuda.Stream()
+    monkeypatch.setattr(ShortcutMoEBlock, "_parallel_stream", side)
+    monkeypatch.setattr(block, "_read_shortcut_hidden", lambda hidden, **kwargs: hidden)
+    streams = {}
+
+    def record(name, value):
+        streams[name] = torch.cuda.current_stream()
+        return value
+
+    monkeypatch.setattr(
+        block,
+        "_moe_router_preprocess",
+        lambda shortcut_hidden, **kwargs: record(
+            "router", (shortcut_hidden, torch.ones_like(shortcut_hidden))
+        ),
+    )
+    monkeypatch.setattr(
+        block, "_launch_dispatch", lambda h, p, *, async_op=False: record("dispatch", (h, p))
+    )
+    monkeypatch.setattr(
+        block, "_launch_combine", lambda out, *, async_op=False: record("combine", out)
+    )
+    block.moe_layer.mlp.routed_experts_compute = lambda h, p: record("experts", (h + p, None))
+    monkeypatch.setattr(
+        block,
+        "_moe_shared_experts",
+        lambda hidden_states, **kwargs: record(
+            "shared", (hidden_states, None, hidden_states, None)
+        ),
+    )
+    monkeypatch.setattr(
+        block,
+        "_postprocess",
+        lambda combined_output, shared_expert_output, *args, **kwargs: combined_output
+        + shared_expert_output,
+    )
+    main = torch.cuda.Stream()
+    with torch.inference_mode(), InferenceMode.active(), torch.cuda.stream(main):
+        block(
+            hidden_states=torch.ones(4, 1, config.hidden_size, device="cuda"),
+            attention_mask=None,
+            inference_context=context,
+            rotary_pos_emb=None,
+            sequence_len_offset=None,
+            packed_seq_params=None,
+            padding_mask=None,
+            quant_context_factory=lambda *args: nullcontext(),
+        )
+    torch.cuda.synchronize()
+    for name in ("router", "dispatch", "mixer", "shared", "combine"):
+        assert streams[name] == main, name
+    assert streams["experts"] == side
