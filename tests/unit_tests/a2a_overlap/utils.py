@@ -425,25 +425,13 @@ def get_valid_fp8_flags():
     from megatron.core.enums import Fp8Recipe
     from megatron.training.utils import get_device_arch_version
 
-    fp8_types = ["e4m3", "hybrid"]
-    recipes = []
+    valid_flags = [None]
     arch = get_device_arch_version()
 
-    if is_te_min_version("2.3.0.dev0"):
-        recipes.append(Fp8Recipe.tensorwise)  # Hopper + Blackwell
-
     if is_te_min_version("2.4.0.dev0") and arch == 9:
-        recipes.append(Fp8Recipe.blockwise)  # Hopper only
+        valid_flags.append(("e4m3", Fp8Recipe.blockwise))  # Hopper only
 
     if is_te_min_version("2.3.0.dev0") and arch >= 10:
-        recipes.append(Fp8Recipe.mxfp8)  # Blackwell only
-
-    valid_flags = []
-    for fp8_type in fp8_types:
-        for recipe in recipes:
-            if fp8_type == "hybrid" and recipe == Fp8Recipe.mxfp8:
-                continue
-            valid_flags.append((fp8_type, recipe))
-    valid_flags.append(None)
+        valid_flags.append(("e4m3", Fp8Recipe.mxfp8))  # Blackwell only
 
     return valid_flags

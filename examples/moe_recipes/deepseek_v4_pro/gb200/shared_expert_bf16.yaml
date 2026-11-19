@@ -1,0 +1,14 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# MoK uses BF16 shared experts with MXFP8 routed experts.
+configs:
+  shared_bf16:
+    transformer_engine_config_type: TEQuantizationParams
+    training_recipe:
+      fp8_quantization_recipe: null
+      fp8_param: false
+matchers:
+  shared_experts:
+    config: shared_bf16
+    type: glob
+    pattern: '*shared_experts*'
+    enabled: true

@@ -735,6 +735,17 @@ class NativeCompressedSparseAttention(nn.Module):
         return output, indexer_loss
 
 
+class NativeBatchedLinear(nn.Module):
+    """Independent PyTorch reference for a batch of linear projections."""
+
+    def __init__(self, num_gemms: int, in_features: int, out_features: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(num_gemms, out_features, in_features))
+
+    def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        return torch.einsum("...gd,grd->...gr", input_, self.weight)
+
+
 class NativeDSv4HybridAttention(nn.Module):
     def __init__(self, config: MLATransformerConfig, compress_ratio: int):
         super().__init__()
@@ -766,8 +777,8 @@ class NativeDSv4HybridAttention(nn.Module):
         self.kv_layernorm = nn.RMSNorm(config.v_head_dim, eps=config.attention_latent_norm_epsilon)
         self.core_attention = NativeCompressedSparseAttention(config, compress_ratio)
         group_in = (config.num_attention_heads * config.v_head_dim) // config.o_groups
-        self.linear_o_group_proj = nn.Parameter(
-            torch.empty(config.o_groups * config.o_lora_rank, group_in)
+        self.linear_o_group_proj = NativeBatchedLinear(
+            config.o_groups, group_in, config.o_lora_rank
         )
         self.linear_proj = nn.Linear(
             config.o_groups * config.o_lora_rank, config.hidden_size, bias=False
@@ -804,8 +815,7 @@ class NativeDSv4HybridAttention(nn.Module):
         core_out = core_out.view(sq, batch_size, -1)
 
         core_out = core_out.view(sq, batch_size, self.config.o_groups, -1)
-        wo_a = self.linear_o_group_proj.view(self.config.o_groups, self.config.o_lora_rank, -1)
-        core_out = torch.einsum("...gd,grd->...gr", core_out, wo_a)
+        core_out = self.linear_o_group_proj(core_out)
         core_out = core_out.reshape(sq, batch_size, -1)
         return self.linear_proj(core_out), indexer_loss
 
@@ -831,15 +841,34 @@ def _assert_similarity(a: torch.Tensor, b: torch.Tensor, label: str, eps: float)
     assert tensor_sim > 1 - eps, f"{label}: tensor_sim={tensor_sim:.10f}, eps={eps}"
 
 
+def _real_param_view_for_native(
+    name: str, real_tensor: torch.Tensor, native_tensor: torch.Tensor
+) -> torch.Tensor:
+    """Match the legacy grouped-output weight layout to the native reference."""
+    if real_tensor.shape == native_tensor.shape:
+        return real_tensor
+
+    # TE BatchedLinear owns a 3D weight, while the torch.einsum fallback keeps
+    # the legacy checkpoint-compatible 2D layout and reshapes it in forward.
+    assert (
+        name == "linear_o_group_proj.weight" and real_tensor.numel() == native_tensor.numel()
+    ), f"Shape mismatch for {name}: native={native_tensor.shape}, real={real_tensor.shape}"
+    return real_tensor.reshape_as(native_tensor)
+
+
 def _copy_real_params_to_native(real_layer: nn.Module, native_layer: nn.Module):
     real_params = dict(real_layer.named_parameters())
     for name, native_param in native_layer.named_parameters():
-        assert name in real_params, f"Missing real parameter for native parameter {name}"
-        real_param = real_params[name]
-        assert (
-            native_param.shape == real_param.shape
-        ), f"Shape mismatch for {name}: native={native_param.shape}, real={real_param.shape}"
-        native_param.data = real_param.data.to(
+        real_name = name
+        if name == "linear_o_group_proj.weight" and name not in real_params:
+            # Older TE versions take the einsum fallback, whose weight remains a
+            # parameter directly on DSv4HybridAttention for checkpoint compatibility.
+            real_name = "linear_o_group_proj"
+        assert real_name in real_params, f"Missing real parameter for native parameter {name}"
+        real_param = real_params[real_name]
+        real_params[name] = real_param
+        real_param_data = _real_param_view_for_native(name, real_param.data, native_param.data)
+        native_param.data = real_param_data.to(
             device=native_param.device, dtype=real_param.dtype
         ).clone()
     return real_params
@@ -1029,7 +1058,7 @@ class TestDSv4HybridNativeParity:
         hidden_states_native = hidden_states.detach().clone().requires_grad_(True)
         grad = torch.randn_like(hidden_states)
 
-        real_out, _ = real_layer(hidden_states=hidden_states, attention_mask=None)
+        real_out, _ = real_layer(hidden_states, attention_mask=None)
         native_out, native_indexer_loss = native_layer(hidden_states_native, pg_collection)
         _assert_similarity(real_out.detach(), native_out.detach(), "mxfp8-indexer:out", eps=5e-3)
 
@@ -1144,7 +1173,7 @@ class TestDSv4HybridNativeParity:
             hidden_states_native = hidden_states.detach().clone().requires_grad_(True)
             grad = torch.randn_like(hidden_states)
 
-            real_out, _ = real_layer(hidden_states=hidden_states, attention_mask=None)
+            real_out, _ = real_layer(hidden_states, attention_mask=None)
             native_out, native_indexer_loss = native_layer(hidden_states_native, pg_collection)
             assert native_q_rms_norm_eps == [config.layernorm_epsilon]
 
@@ -1173,8 +1202,9 @@ class TestDSv4HybridNativeParity:
                 continue
             assert native_param.grad is not None, f"Missing native grad for {name}"
             assert real_param.grad is not None, f"Missing real grad for {name}"
+            real_grad = _real_param_view_for_native(name, real_param.grad, native_param.grad)
             _assert_similarity(
-                real_param.grad,
+                real_grad,
                 native_param.grad,
                 f"{backend}-{variant}-{compress_ratio}-{seqlen}:param_grad:{name}",
                 eps=bwd_eps,
@@ -1255,9 +1285,7 @@ class TestDSv4HybridNativeParity:
             grad = torch.randn_like(hidden_states)
 
             packed = _make_thd_packed_seq_params([seqlen])
-            real_out, _ = real_layer(
-                hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed
-            )
+            real_out, _ = real_layer(hidden_states, attention_mask=None, packed_seq_params=packed)
             native_out, native_indexer_loss = native_layer(hidden_states_native, pg_collection)
 
             _assert_similarity(
@@ -1285,8 +1313,9 @@ class TestDSv4HybridNativeParity:
                 continue
             assert native_param.grad is not None, f"Missing native grad for {name}"
             assert real_param.grad is not None, f"Missing real grad for {name}"
+            real_grad = _real_param_view_for_native(name, real_param.grad, native_param.grad)
             _assert_similarity(
-                real_param.grad,
+                real_grad,
                 native_param.grad,
                 f"thd-{backend}-{variant}-{compress_ratio}-{seqlen}:param_grad:{name}",
                 eps=bwd_eps,
@@ -1368,9 +1397,7 @@ class TestDSv4HybridNativeParity:
 
         # ---- Real packed-sequence (THD) run ----------------------------------
         packed = _make_thd_packed_seq_params(seg_lens)
-        real_out, _ = real_layer(
-            hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed
-        )
+        real_out, _ = real_layer(hidden_states, attention_mask=None, packed_seq_params=packed)
 
         # ---- Native oracle: each segment as an independent B=1 sequence ------
         # Slicing the single ``hidden_states_native`` leaf keeps every segment's
@@ -1417,8 +1444,9 @@ class TestDSv4HybridNativeParity:
                 continue
             assert native_param.grad is not None, f"Missing native grad for {name}"
             assert real_param.grad is not None, f"Missing real grad for {name}"
+            real_grad = _real_param_view_for_native(name, real_param.grad, native_param.grad)
             _assert_similarity(
-                real_param.grad,
+                real_grad,
                 native_param.grad,
                 f"thd-multiseg-{backend}-{variant}-{compress_ratio}-{seg_label}:param_grad:{name}",
                 eps=bwd_eps,
@@ -1498,7 +1526,7 @@ class TestDSv4HybridNativeParity:
         hidden_unpadded = hidden_states.detach().clone().requires_grad_(True)
         packed_unpadded = _make_thd_packed_seq_params(seg_lens)
         out_unpadded, _ = real_layer(
-            hidden_states=hidden_unpadded, attention_mask=None, packed_seq_params=packed_unpadded
+            hidden_unpadded, attention_mask=None, packed_seq_params=packed_unpadded
         )
         grad_unpadded = torch.randn_like(out_unpadded)
         out_unpadded.backward(grad_unpadded)
@@ -1572,7 +1600,7 @@ class TestDSv4HybridNativeParity:
         )
 
         out_padded, _ = real_layer(
-            hidden_states=hidden_padded, attention_mask=None, packed_seq_params=packed_padded
+            hidden_padded, attention_mask=None, packed_seq_params=packed_padded
         )
         # Build grad for padded buffer: scatter unpadded grad into real positions.
         grad_padded = torch.zeros_like(out_padded)

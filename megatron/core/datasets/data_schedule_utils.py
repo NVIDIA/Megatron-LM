@@ -134,6 +134,21 @@ def get_packed_sequence_length(
     return seq_len + (-seq_len % alignment)
 
 
+def _pad_packed_graph_metadata(batch: Dict, max_num_seqs: Optional[int]) -> None:
+    """Fix metadata shapes without treating physical padding as real tokens."""
+    if max_num_seqs is None:
+        return
+    for key in ("cu_seqlens", "cu_seqlens_padded"):
+        offsets = batch[key]
+        remaining = max_num_seqs + 1 - offsets.numel()
+        if remaining < 0:
+            raise ValueError("Packed documents exceed cuda_graph_thd_max_packed_sequences.")
+        if remaining:
+            batch[key] = torch.cat((offsets, offsets[-1:].expand(remaining)))
+    # A stable upper bound is needed by TE capture even when document lengths vary.
+    batch["max_seqlen"] = batch["cu_seqlens_padded"][-1].to(torch.int32)
+
+
 def pad_packed_batch_before_cp_slice(batch: Dict, config, cp_size: int, tp_size: int) -> None:
     """Pad global THD data and metadata before constructing any CP layout.
 
@@ -149,9 +164,15 @@ def pad_packed_batch_before_cp_slice(batch: Dict, config, cp_size: int, tp_size:
     both boundary tensors to ``thd_max_packed_sequences + 1`` entries. Either
     setting also fixes ``max_seqlen`` to the global padded length, so every pack
     presents the same graph inputs.
+
+    ``cuda_graph_thd_max_packed_sequences`` instead fixes the metadata shapes by
+    repeating the final offsets up to that capacity + 1 entries. Its dummy tail has
+    zero logical length, and ``max_seqlen`` is the global padded length.
     """
     alignment, enabled = get_packed_sequence_alignment(config, tp_size)
+    graph_metadata_capacity = getattr(config, "cuda_graph_thd_max_packed_sequences", None)
     if not enabled:
+        _pad_packed_graph_metadata(batch, graph_metadata_capacity)
         return
     logical = batch['cu_seqlens']
     physical = batch['cu_seqlens_padded']
@@ -197,7 +218,8 @@ def pad_packed_batch_before_cp_slice(batch: Dict, config, cp_size: int, tp_size:
         padded_boundaries = padded_boundaries.clone()
         padded_boundaries[-1] += tail
     elif tail:
-        logical = torch.cat((logical, logical[-1:] + tail))
+        logical_tail = tail if graph_metadata_capacity is None else 0
+        logical = torch.cat((logical, logical[-1:] + logical_tail))
         padded_boundaries = torch.cat((padded_boundaries, padded_boundaries[-1:] + tail))
     max_num_seqs = getattr(config, 'thd_max_packed_sequences', None)
     if max_num_seqs is not None:
@@ -213,6 +235,7 @@ def pad_packed_batch_before_cp_slice(batch: Dict, config, cp_size: int, tp_size:
         )
     else:
         batch['max_seqlen'] = padded_boundaries.diff().max().to(torch.int32)
+    _pad_packed_graph_metadata(batch, graph_metadata_capacity)
 
 
 def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.Tensor]]:
@@ -701,8 +724,8 @@ def get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
             rank.
         seqlens_gathered (List[int]): Padded sequence length of every sub-sample in the
             DP group, indexed by global ID (``seqlens_gathered[gid]`` equals
-            ``global_id_seqlens[gid][1]``). Handy for global-batch token counts such as
-            the FLOPs accounting.
+            ``global_id_seqlens[gid][1]``). These lengths size the schedule; FLOPs
+            accounting counts real tokens with :func:`get_global_real_seqlen_stats`.
     """
 
     batch_list = [next(data_iterator) for _ in range(num_microbatches)]
@@ -734,12 +757,35 @@ def get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
     return batch, global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered
 
 
+def get_global_real_seqlen_stats(batch, dp_group, dev) -> Tuple[float, float]:
+    """Sum the real (unpadded) sub-sample lengths of the global batch and their squares.
+
+    Args:
+        batch: This DP rank's sub-samples as returned by :func:`get_batch_and_global_seqlens`.
+        dp_group: The DP group whose padded lengths were gathered for scheduling.
+        dev: Device for the reduction.
+
+    Returns:
+        ``(sum_i L_i, sum_i L_i**2)`` over the real lengths ``L_i`` of every sub-sample in
+        ``dp_group``, as expected by ``num_floating_point_operations``.
+    """
+    seqlens = [sample["original_seq_len"].reshape(-1) for sample in batch]
+    seqlens = (torch.cat(seqlens) if seqlens else torch.zeros(0)).to(
+        device=dev, dtype=torch.float64
+    )
+    stats = torch.stack((seqlens.sum(), seqlens.square().sum()))
+    if dp_group.size() > 1:
+        torch.distributed.all_reduce(stats, group=dp_group)
+    seqlen_sum, seqlen_squared_sum = stats.tolist()
+    return seqlen_sum, seqlen_squared_sum
+
+
 # =============================================================================
 # Dynamic CP scheduling algorithms (used by DefaultDynamicCPScheduler)
 # =============================================================================
 
 
-def next_hdp_group_packing_aware(
+def next_dynamic_cp_group_packing_aware(
     sample_seqlens: List[Tuple[int, int]],
     total_gpus: int,
     max_seq_len_per_rank: int,

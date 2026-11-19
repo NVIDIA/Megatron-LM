@@ -573,6 +573,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             pre_process=self.pre_process,
             layer_config_list=layer_config_list,
             pp_layer_offset=layer_offset,
+            vp_stage=self.vp_stage,
             post_process=self.post_process,
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,
@@ -980,11 +981,18 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 cp_layout_plan=cp_layout_plan,
                 input_ids=hash_input_ids,
             )
+        # With MTP the outer HybridStack may return one auxiliary value: mHC's
+        # pre-contraction multi-stream tensor or AttnRes's complete trunk source
+        # tuple. The modes are mutually exclusive, so disambiguate by config.
+        mhc_multistream = None
+        attn_res_sources = None
         if isinstance(decoder_output, tuple):
-            hidden_states, mhc_multistream = decoder_output
+            if self.config.enable_attention_residuals:
+                hidden_states, attn_res_sources = decoder_output
+            else:
+                hidden_states, mhc_multistream = decoder_output
         else:
             hidden_states = decoder_output
-            mhc_multistream = None
 
         output_weight = None
         if self.share_embeddings_and_output_weights:
@@ -1013,12 +1021,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 hidden_states=hidden_states,
                 decoder_input=decoder_input if use_precomputed_mtp_embeddings else None,
                 mhc_multistream=mhc_multistream,
+                attn_res_sources=attn_res_sources,
                 labels=labels,
                 loss_mask=loss_mask,
+                padding_mask=padding_mask,
                 mtp_input_mask=mtp_input_mask,
                 packed_seq_params=packed_seq_params,
                 cp_batch=cp_batch,
-                padding_mask=padding_mask,
             )
             if mtp_inputs.decoder_input is None:
                 assert mtp_inputs.input_ids is not None and mtp_inputs.position_ids is not None, (
@@ -1063,6 +1072,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 position_ids=mtp_inputs.position_ids,
                 hidden_states=mtp_inputs.hidden_states,
                 mhc_multistream=mtp_inputs.mhc_multistream,
+                attn_res_sources=mtp_inputs.attn_res_sources,
                 attention_mask=attention_mask,
                 inference_params=inference_params,
                 rotary_pos_emb=(
@@ -1074,8 +1084,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 sequence_roll_context=sequence_roll_context,
                 embedding=self.embedding,
                 decoder_input=mtp_inputs.decoder_input,
-                mtp_input_mask=mtp_inputs.mtp_input_mask,
                 padding_mask=mtp_inputs.padding_mask,
+                mtp_input_mask=mtp_inputs.mtp_input_mask,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
             )
@@ -1187,10 +1197,25 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 labels=labels,
             )
 
+        # Inference consumes logits in fp32: emit them so when the head can, upcast otherwise.
+        emit_fp32 = in_inference_mode and self.lm_head_can_emit_fp32
         logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            hidden_states,
+            weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+            output_dtype=torch.float32 if emit_fp32 else None,
         )
+        # Apply MuP output scaling to logits
         logits = self._scale_logits(logits)
+        if in_inference_mode:
+            logits = logits.float()
+        # Dynamic inference under CUDA graphs: write the logits into the controller's
+        # persistent buffer and return a view of it, so no graph pins its own copy.
+        logits_buffer = getattr(inference_context, "logits_output_buffer", None)
+        if logits_buffer is not None:
+            buffer_rows = logits_buffer[0, : logits.shape[0]]
+            buffer_rows.copy_(logits.squeeze(1))
+            logits = buffer_rows.unsqueeze(1)
         gather_output = (
             self.output_layer.gather_output
             if runtime_gather_output is None

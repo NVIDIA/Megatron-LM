@@ -345,6 +345,15 @@ def _stage_param_to_bf16(p: torch.Tensor) -> torch.Tensor:
     """
     main_param = getattr(p, "main_param", None)
     if main_param is not None:
+        if not main_param.is_cuda:
+            # A CPU-bound master here means chunked optimizer-state offload has already
+            # started (or not yet finished) moving it; its pinned buffer may be an in-flight
+            # D2H/H2D target, so staging from it would silently gather stale weights.
+            raise RuntimeError(
+                "fp8 param-gather staging found a CPU-resident fp32 master; restore the "
+                "optimizer masters (ensure_master_weights_for_param_sync) before dispatching "
+                "a LayerWise parameter all-gather under chunked optimizer-state offload"
+            )
         return main_param.detach().to(torch.bfloat16)
     if is_float8tensor(p):
         return dequantize_fp8_tensor(p).detach().to(torch.bfloat16)
@@ -850,6 +859,12 @@ if HAVE_TE:
                 fp8_format=fp8_format,
                 override_linear_precision=(False, False, not config.fp8_wgrad),
             )
+
+        # Set recipe attrs
+        if fp8_recipe is not None and config.fp8_recipe_attrs is not None:
+            for key, val in config.fp8_recipe_attrs.items():
+                setattr(fp8_recipe, key, val)
+
         return fp8_recipe
 
     def get_fp8_recipe_for_a2a(a2a_dtype: str):

@@ -1,5 +1,6 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
 import pytest
@@ -7,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from megatron.core import fp8_utils
+from megatron.core.transformer import TransformerConfig
 from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.test_utilities import Utils
 
@@ -46,6 +48,44 @@ def test_get_fp8_disabled_context_uses_disabled_te_context(is_init, config_value
 
     assert result is disabled_context
     te_context.assert_called_once_with(enabled=False)
+
+
+def _dummy_quantizer_factory(*args, **kwargs):
+    return None
+
+
+@pytest.mark.skipif(not fp8_utils.HAVE_TE, reason="Transformer Engine required")
+def test_fp8_model_init_uses_custom_recipe_attrs(monkeypatch):
+    if not hasattr(fp8_utils.transformer_engine.common.recipe, "CustomRecipe"):
+        pytest.skip("CustomRecipe requires newer Transformer Engine")
+
+    captured = {}
+
+    def fake_fp8_model_init(enabled=False, recipe=None, **kwargs):
+        captured["enabled"] = enabled
+        captured["recipe"] = recipe
+        captured["kwargs"] = kwargs
+        return nullcontext()
+
+    monkeypatch.setattr(fp8_utils.transformer_engine.pytorch, "fp8_model_init", fake_fp8_model_init)
+
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=64,
+        num_attention_heads=4,
+        fp8="e4m3",
+        fp8_param=True,
+        fp8_recipe="custom",
+        fp8_quantizer_factory="tests.unit_tests.test_fp8_utils._dummy_quantizer_factory",
+        fp8_recipe_attrs={"_test_recipe_flag": "set"},
+    )
+
+    with fp8_utils.get_fp8_context(config, is_init=True):
+        pass
+
+    assert captured["enabled"] is True
+    assert isinstance(captured["recipe"], fp8_utils.transformer_engine.common.recipe.CustomRecipe)
+    assert captured["recipe"]._test_recipe_flag == "set"
 
 
 class MockTELinear(nn.Module):
@@ -231,3 +271,20 @@ class TestCopyTensorsToQuantizedParams:
     def test_empty_input(self):
         """No params is a no-op rather than an error."""
         fp8_utils.copy_tensors_to_quantized_params([], [])
+
+
+def test_stage_param_to_bf16_rejects_cpu_master():
+    """fp8 param-gather staging must fail loudly on a CPU-bound (offloaded) fp32 master.
+
+    Chunked optimizer-state offload rebinds selected masters to pinned CPU buffers whose
+    D2H copies may still be in flight; silently staging from them gathers stale weights.
+    """
+    param = torch.nn.Parameter(torch.zeros(4, 4, dtype=torch.bfloat16), requires_grad=False)
+    param.main_param = torch.zeros(4, 4, dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="CPU-resident fp32 master"):
+        fp8_utils._stage_param_to_bf16(param)
+    if torch.cuda.is_available():
+        param.main_param = torch.ones(4, 4, dtype=torch.float32, device="cuda")
+        staged = fp8_utils._stage_param_to_bf16(param)
+        assert staged.dtype == torch.bfloat16 and staged.is_cuda
+        assert torch.equal(staged, torch.ones_like(staged))

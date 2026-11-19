@@ -111,7 +111,7 @@ class TestDSv4HybridHashMoEIntegration:
             0, self.config.actual_vocab_size, (batch_size, seq_len), device="cuda"
         )
 
-        output, context = layer(hidden_states=hidden, attention_mask=None, input_ids=input_ids)
+        output, context = layer(hidden, attention_mask=None, input_ids=input_ids)
         loss = output.float().square().mean()
         loss.backward()
 
@@ -147,13 +147,13 @@ class TestDSv4HybridHashMoEIntegration:
             seq_len, batch_size, self.config.hidden_size, dtype=torch.bfloat16, device="cuda"
         )
         with pytest.raises(AssertionError, match="input_ids is required for hash-based routing"):
-            hash_layer(hidden_states=hidden, attention_mask=None)
+            hash_layer(hidden, attention_mask=None)
 
         hca_layer = _build_dsv4_moe_layer(self.config, layer_number=2, pg_collection=self.pg).cuda()
         assert hca_layer.self_attention.core_attention.compress_ratio == 128
         assert hca_layer.mlp.router.is_hash_layer is False
 
-        output, context = hca_layer(hidden_states=hidden, attention_mask=None)
+        output, context = hca_layer(hidden, attention_mask=None)
 
         assert context is None
         assert output.shape == hidden.shape

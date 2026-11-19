@@ -35,7 +35,7 @@ def _build_shared_experts(
 def get_moe_module_spec(
     use_te: Optional[bool] = True,
     num_experts: Optional[int] = None,
-    moe_grouped_gemm: Optional[bool] = False,
+    moe_grouped_gemm: Optional[bool] = True,
 ) -> MlpBuilder:
     """Helper function to get module spec for MoE.
 
@@ -56,7 +56,7 @@ def get_moe_module_spec(
 def get_moe_module_spec_for_backend(
     backend: BackendSpecProvider,
     num_experts: Optional[int] = None,
-    moe_grouped_gemm: Optional[bool] = False,
+    moe_grouped_gemm: Optional[bool] = True,
     use_te_activation_func: bool = False,
 ) -> MlpBuilder:
     """Helper function to get module spec for MoE"""

@@ -1043,7 +1043,7 @@ def test_generated_mock_tokens_stay_within_tokenizer_vocab(
     low_level_dataset = dataset_cls.build_low_level_dataset("", config)
     tokens = low_level_dataset[0]
 
-    assert tokens.size == 19
+    assert tokens.size == 20
     assert tokens.min() >= 1
     assert tokens.max() < tokenizer.vocab_size
     assert tokens[:9].tolist() == [1, 2, 3, 4, 5, 6, 7, 1, 2]
@@ -1316,10 +1316,22 @@ def test_sbhd_get_batch_returns_dataset_padding_mask(monkeypatch):
         pad_packed_seq_alignment=None,
         pipeline_model_parallel_layout=None,
         mtp_num_layers=0,
+        # Fields main's get_batch now reads from the normalized TransformerConfig.
+        sequence_packing_scheduler=None,
+        context_parallel_size=1,
+        dynamic_context_parallel=False,
+        pipeline_model_parallel_size=2,
     )
 
     monkeypatch.setattr(pretrain_gpt, "get_args", lambda: args)
-    monkeypatch.setattr(pretrain_gpt, "core_transformer_config_from_args", lambda _: config)
+    # NOTE(nightly-sync 2026-11-12): main's d8ef5cca9 made get_batch read the normalized
+    # TransformerConfig from get_run_config() instead of core_transformer_config_from_args, so
+    # stub the run config, as test_get_batch.py does for the hybrid entrypoint.
+    monkeypatch.setattr(
+        pretrain_gpt,
+        "get_run_config",
+        lambda: SimpleNamespace(model=SimpleNamespace(transformer=config)),
+    )
     # Exercise an intermediate PP stage: it must not take the legacy early return.
     monkeypatch.setattr(pretrain_gpt, "is_first_or_last_pipeline_stage", lambda _: False)
     # Merged pretrain_gpt carries main's aliased import, so patch the alias.
@@ -1360,14 +1372,34 @@ def test_sbhd_dataset_is_built_on_intermediate_pipeline_stage(monkeypatch):
         use_varlen_dataset=True, varlen_sbhd_validation=True, sequence_packing_scheduler=None
     )
     monkeypatch.setattr(pretrain_gpt, "get_args", lambda: args)
-    monkeypatch.setattr(
-        pretrain_gpt, "core_transformer_config_from_args", lambda _: SimpleNamespace()
-    )
     monkeypatch.setattr(pretrain_gpt.mpu, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(pretrain_gpt, "is_first_or_last_pipeline_stage", lambda _: False)
     # Merged pretrain_gpt carries main's aliased import, so patch the alias. The restored
     # varlen-SBHD disjunct should short-circuit before this is consulted at all.
     monkeypatch.setattr(pretrain_gpt, "mtp_on_this_rank_func", lambda *args, **kwargs: False)
+    # NOTE(nightly-sync 2026-11-03): main (831aa66d4) moved is_dataset_built_on_rank into
+    # megatron.training.datasets.providers, which pretrain_gpt re-exports. It reads the arguments
+    # and the transformer config at call time from global_vars, so patch those too.
+    from megatron.training import global_vars
+
+    monkeypatch.setattr(global_vars, "get_args", lambda: args)
+    # NOTE(nightly-sync 2026-11-12): main now reads the placement inputs from
+    # get_run_config().model.transformer instead of core_transformer_config_from_args (which
+    # pretrain_gpt no longer imports). Stub a placement that would otherwise keep the dataset
+    # off this intermediate stage, so only the varlen-SBHD disjunct can return True.
+    monkeypatch.setattr(
+        global_vars,
+        "get_run_config",
+        lambda: SimpleNamespace(
+            model=SimpleNamespace(
+                transformer=SimpleNamespace(
+                    sequence_packing_scheduler=None,
+                    pipeline_model_parallel_layout=None,
+                    mtp_num_layers=0,
+                )
+            )
+        ),
+    )
 
     assert pretrain_gpt.is_dataset_built_on_rank() is True
 
@@ -1393,11 +1425,11 @@ def test_mock_getitem_truncates_long_sample():
     tok = _FakeTokenizer(eod=0, pad=None)
     ds = _make_mock_varlen([np.arange(1, 10, dtype=np.int64)], _make_config(tok, seq_length=4))
     out = ds[0]
-    # Keeps sequence_length - 1 ids plus EOD, then applies the next-token shift.
-    assert out["tokens"].tolist() == [1, 2, 3]
-    assert out["labels"].tolist() == [2, 3, 0]
-    assert out["loss_mask"].tolist() == [1.0, 1.0, 1.0]
-    assert int(out["original_seq_len"].item()) == int(out["padded_seq_len"].item()) == 3
+    # Keeps sequence_length content ids plus EOD before the next-token shift.
+    assert out["tokens"].tolist() == [1, 2, 3, 4]
+    assert out["labels"].tolist() == [2, 3, 4, 0]
+    assert out["loss_mask"].tolist() == [1.0, 1.0, 1.0, 1.0]
+    assert int(out["original_seq_len"].item()) == int(out["padded_seq_len"].item()) == 4
 
 
 # ----------------------------------------------------------------------------
@@ -1505,7 +1537,19 @@ def _loader_args(*, use_varlen, sbhd, scheduler, mbs, dynamic_cp=False, gbs=None
     )
 
 
-def test_sbhd_validation_dataloader_uses_default_collate(run_config):
+@pytest.fixture
+def loader_model_config(run_config):
+    from megatron.core.transformer import TransformerConfig
+    from megatron.training.models import GPTModelConfig
+
+    run_config.model = GPTModelConfig(
+        transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+        seq_length=64,
+    )
+    return run_config.model.transformer
+
+
+def test_sbhd_validation_dataloader_uses_default_collate(run_config, loader_model_config):
     from megatron.core import parallel_state
     from megatron.training.datasets.data_samplers import build_pretraining_data_loader
     from megatron.training.global_vars import destroy_global_vars, set_args
@@ -1539,13 +1583,14 @@ def test_sbhd_validation_dataloader_uses_default_collate(run_config):
         Utils.destroy_model_parallel()
 
 
-def test_thd_dataloader_uses_identity_collate(run_config):
+def test_thd_dataloader_uses_identity_collate(run_config, loader_model_config):
     from megatron.core import parallel_state
     from megatron.training.datasets.data_samplers import build_pretraining_data_loader
     from megatron.training.global_vars import destroy_global_vars, set_args
     from tests.unit_tests.test_utilities import Utils
 
     Utils.initialize_model_parallel(1, 1)
+    loader_model_config.sequence_packing_scheduler = "dp_balanced"
     try:
         tok = _FakeTokenizer(eod=0, pad=7)
         mbs = 2
@@ -1570,13 +1615,17 @@ def test_thd_dataloader_uses_identity_collate(run_config):
         Utils.destroy_model_parallel()
 
 
-def test_dcp_dataloader_yields_microbatches_for_scheduler(run_config):
+def test_dcp_dataloader_yields_microbatches_for_scheduler(run_config, loader_model_config):
     from megatron.core import parallel_state
     from megatron.training.datasets.data_samplers import build_pretraining_data_loader
     from megatron.training.global_vars import destroy_global_vars, set_args
     from tests.unit_tests.test_utilities import Utils
 
     Utils.initialize_model_parallel(1, 1)
+    # NOTE(nightly-sync 2026-11-12): main's d8ef5cca9 made the loader read the scheduler and
+    # dynamic-CP settings from the run's model config, so set them there as main's tests do.
+    loader_model_config.dynamic_context_parallel = True
+    loader_model_config.sequence_packing_scheduler = "default_dynamic_cp"
     try:
         tok = _FakeTokenizer(eod=0, pad=7)
         mbs = 2
@@ -1613,13 +1662,14 @@ def test_dcp_dataloader_yields_microbatches_for_scheduler(run_config):
         Utils.destroy_model_parallel()
 
 
-def test_packing_scheduler_dataloader_yields_microbatches(run_config):
+def test_packing_scheduler_dataloader_yields_microbatches(run_config, loader_model_config):
     from megatron.core import parallel_state
     from megatron.training.datasets.data_samplers import build_pretraining_data_loader
     from megatron.training.global_vars import destroy_global_vars, set_args
     from tests.unit_tests.test_utilities import Utils
 
     Utils.initialize_model_parallel(1, 1)
+    loader_model_config.sequence_packing_scheduler = "dp_balanced"
     try:
         tok = _FakeTokenizer(eod=0, pad=7)
         mbs = 2
@@ -1713,7 +1763,18 @@ def test_packing_scheduler_dataloader_prefetches_next_global_batch(
 def test_datasets_provider_selects_dataset_type(
     monkeypatch, entrypoint, sft, use_varlen_dataset, mock_data, expected_type, expected_packed
 ):
-    """GPT and Hybrid pretraining select the same dataset type for each data mode."""
+    """GPT and Hybrid pretraining select the same dataset type for each data mode.
+
+    Both scripts' providers delegate to ``providers.build_gpt_datasets`` (main #8341), which hands
+    the builder the dataset class ``cfg.data`` resolved from the legacy family flags, together with
+    the packed-sequence flag for that class.
+    """
+    from megatron.core.datasets import gpt_dataset
+    from megatron.training import argument_utils, global_vars
+    from megatron.training import utils as training_utils
+    from megatron.training.config import dataset_config
+    from megatron.training.datasets import providers, sft_dataset
+
     module = importlib.import_module(entrypoint)
     args = SimpleNamespace(
         sft=sft,
@@ -1722,20 +1783,39 @@ def test_datasets_provider_selects_dataset_type(
         varlen_sbhd_validation=False,
         fim_data=False,
     )
+    family = argument_utils.requested_dataset_family(args)
+    dataset = SimpleNamespace(
+        tokenizer=object(), varlen_sbhd_validation=args.varlen_sbhd_validation
+    )
+    data = SimpleNamespace(
+        dataset=dataset,
+        dataset_type=dataset_config.dataset_type_from_family(family, mock=mock_data),
+    )
+    data.builder_inputs = lambda: dataset_config.DataConfig.builder_inputs(data)
     built = {}
 
     class _RecordingBuilder:
         def __init__(self, dataset_type, num_samples, is_built_on_rank, config):
-            built.update(dataset_type=dataset_type, is_built_on_rank=is_built_on_rank)
+            built.update(
+                dataset_type=dataset_type, is_built_on_rank=is_built_on_rank, config=config
+            )
 
         def build(self):
             return "train", "valid", "test"
 
-    monkeypatch.setattr(module, "get_args", lambda: args)
-    monkeypatch.setattr(module, "core_gpt_dataset_config_from_args", lambda _: None)
-    monkeypatch.setattr(module, "BlendedMegatronDatasetBuilder", _RecordingBuilder)
-    monkeypatch.setattr(module, "print_rank_0", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(global_vars, "get_run_config", lambda: SimpleNamespace(data=data))
+    monkeypatch.setattr(providers, "BlendedMegatronDatasetBuilder", _RecordingBuilder)
+    monkeypatch.setattr(training_utils, "print_rank_0", lambda *_args, **_kwargs: None)
 
+    expected_classes = {
+        "MockSFTDataset": MockSFTDataset,
+        "SFTDataset": sft_dataset.SFTDataset,
+        "MockVarlenDataset": MockVarlenDataset,
+        "VarlenDataset": VarlenDataset,
+        "MockGPTDataset": gpt_dataset.MockGPTDataset,
+        "GPTDataset": gpt_dataset.GPTDataset,
+    }
     assert module.train_valid_test_datasets_provider([1, 1, 1]) == ("train", "valid", "test")
-    assert built["dataset_type"] is getattr(module, expected_type)
+    assert built["dataset_type"] is expected_classes[expected_type]
+    assert built["config"] is dataset
     assert built["is_built_on_rank"].keywords["is_packed_sequence"] is expected_packed

@@ -13,11 +13,14 @@ from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
 )
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer.emerging_optimizers import HAVE_EMERGING_OPTIMIZERS
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import HAVE_FLA_KDA, KimiDeltaAttention
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
 from tests.unit_tests.transformer.test_multi_latent_attention import (
@@ -31,12 +34,19 @@ _KDA_INPUT_GRAD_ATOL = 3.2e-2
 _KDA_INPUT_GRAD_RELATIVE_L2 = 5e-3
 
 
+def _assert_bias_disabled(module):
+    bias = getattr(module, "bias", None)
+    assert bias is None or bias.numel() == 0
+
+
 def _make_config(
     tp_size: int = 1,
     cp_size: int = 1,
     sequence_parallel: bool = False,
     params_dtype: torch.dtype = torch.bfloat16,
     linear_cp_mode: str = "headwise",
+    f_lora_rank: int | None = None,
+    gate_lora_rank: int | None = None,
 ) -> TransformerConfig:
     return TransformerConfig(
         hidden_size=128,
@@ -49,6 +59,8 @@ def _make_config(
         linear_value_head_dim=32,
         linear_num_key_heads=4,
         linear_num_value_heads=4,
+        kda_f_lora_rank=f_lora_rank,
+        kda_gate_lora_rank=gate_lora_rank,
         kda_safe_gate=True,
         kda_lower_bound=-5.0,
         normalization="RMSNorm",
@@ -110,6 +122,12 @@ def test_kda_config_rejects_unsupported_head_layouts():
     with pytest.raises(ValueError, match="equal key and value head dimensions"):
         replace(_make_config(), linear_value_head_dim=64)
 
+    with pytest.raises(ValueError, match="kda_f_lora_rank"):
+        replace(_make_config(), kda_f_lora_rank=0)
+
+    with pytest.raises(ValueError, match="kda_gate_lora_rank"):
+        replace(_make_config(), kda_gate_lora_rank=-1)
+
     with pytest.raises(ValueError, match="must be either 'headwise' or 'chunkwise'"):
         _make_config(linear_cp_mode="tokenwise")
 
@@ -154,16 +172,100 @@ def test_kda_rejects_invalid_packed_boundaries():
 
 @pytest.mark.internal
 @pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
-def test_kda_forward_backward():
+@pytest.mark.skipif(
+    not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers package is not installed."
+)
+@pytest.mark.parametrize(
+    ("f_lora_rank", "gate_lora_rank", "local_projection_count", "local_head_count"),
+    [(None, None, 5, 10), (16, 12, 3, 6)],
+    ids=["legacy-fused", "kimi-low-rank"],
+)
+def test_kda_per_head_muon_uses_rank_major_projection_layout(
+    f_lora_rank, gate_lora_rank, local_projection_count, local_head_count
+):
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=2, pipeline_model_parallel_size=1, context_parallel_size=1
+    )
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = _make_config(tp_size=2, f_lora_rank=f_lora_rank, gate_lora_rank=gate_lora_rank)
+        kda = _build_kda(config)
+        assert kda.beta_proj.weight.shape == (config.linear_num_key_heads, config.hidden_size)
+        assert not getattr(kda.beta_proj.weight, "tensor_model_parallel", False)
+        assert not getattr(kda.beta_proj.weight, "sequence_parallel", False)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        optimizer = get_megatron_optimizer(
+            config=OptimizerConfig(
+                optimizer="muon",
+                lr=0.01,
+                use_distributed_optimizer=False,
+                muon_split_qkv=True,
+                muon_split_qkv_per_head=True,
+                muon_tp_mode="blockwise",
+            ),
+            model_chunks=[kda],
+            use_gloo_process_groups=False,
+            pg_collection=pg_collection,
+        )
+
+        weight = kda.in_proj.weight
+        layout = weight.qkv_layout
+        assert optimizer is not None
+        assert layout.num_groups == 2
+        assert len(layout.projection_split_shapes) == local_projection_count
+        assert layout.projection_split_shapes == tuple(kda.in_proj_split_sections)
+        assert layout.per_head_split_shapes == (config.linear_key_head_dim,) * local_head_count
+        assert weight.is_qkv
+        assert weight.qkv_split_shapes == [config.linear_key_head_dim] * local_head_count
+        assert weight.qkv_split_shapes_global == [config.linear_key_head_dim] * (
+            local_head_count * layout.num_groups
+        )
+        assert weight.qkv_split_heads_are_complete
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.parametrize(
+    ("f_lora_rank", "gate_lora_rank"),
+    [(None, None), (16, None), (8, 12), (None, 12)],
+    ids=[
+        "legacy-fused",
+        "low-rank-f-full-rank-gate",
+        "low-rank-f-low-rank-gate",
+        "full-rank-f-low-rank-gate",
+    ],
+)
+def test_kda_forward_backward(f_lora_rank, gate_lora_rank):
     Utils.initialize_distributed()
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1
     )
     try:
         model_parallel_cuda_manual_seed(123)
-        config = _make_config()
+        config = replace(
+            _make_config(f_lora_rank=f_lora_rank, gate_lora_rank=gate_lora_rank),
+            activation_func=F.gelu,
+            gated_linear_unit=True,
+        )
         kda = _build_kda(config)
-        assert kda.in_proj_split_names == ["query", "key", "value", "g", "gate"]
+        kda.set_for_recompute_input_layernorm()
+        # Only projections consuming the input-layernorm output must retain that input.
+        direct_inputs = {"in_proj", "beta_proj", "f_proj", "f_a_proj", "g_proj", "g_a_proj"}
+        for name, module in kda.named_children():
+            if name.endswith("_proj"):
+                assert module.save_original_input == (name in direct_inputs), name
+        assert kda.act_fn is F.silu
+        assert kda.activation == "silu"
+        legacy_fused = f_lora_rank is None and gate_lora_rank is None
+        assert kda.use_legacy_fused_projections == legacy_fused
+        if legacy_fused:
+            assert kda.in_proj_split_names == ["query", "key", "value", "g", "gate"]
+            assert kda.in_proj_dim == 3 * kda.qk_dim + 2 * kda.v_dim
+        else:
+            assert kda.in_proj_split_names == ["query", "key", "value"]
+            assert kda.in_proj_dim == 2 * kda.qk_dim + kda.v_dim
         assert kda.A_log.dtype == torch.float32
         assert kda.dt_bias.dtype == torch.float32
         assert getattr(kda.A_log, "keep_in_fp32", False)
@@ -175,6 +277,64 @@ def test_kda_forward_backward():
             dtype=torch.bfloat16,
             requires_grad=True,
         )
+        state_keys = set(kda.state_dict())
+        separate_projection_prefixes = (
+            "f_proj.",
+            "f_a_proj.",
+            "f_b_proj.",
+            "g_proj.",
+            "g_a_proj.",
+            "g_b_proj.",
+        )
+        separate_projection_keys = {
+            key for key in state_keys if key.startswith(separate_projection_prefixes)
+        }
+        if legacy_fused:
+            assert not separate_projection_keys
+            assert kda.in_proj.weight.shape == (3 * kda.qk_dim + 2 * kda.v_dim, config.hidden_size)
+        else:
+            projection_input = hidden_states.detach()
+            if f_lora_rank is None:
+                assert "f_proj.weight" in state_keys
+                _assert_bias_disabled(kda.f_proj)
+                f_actual, _ = kda.f_proj(projection_input)
+                f_expected = F.linear(projection_input, kda.f_proj.weight)
+            else:
+                assert kda.f_a_proj.weight.shape == (f_lora_rank, config.hidden_size)
+                assert kda.f_b_proj.weight.shape == (kda.qk_dim, f_lora_rank)
+                _assert_bias_disabled(kda.f_a_proj)
+                _assert_bias_disabled(kda.f_b_proj)
+                f_latent, _ = kda.f_a_proj(projection_input)
+                f_actual, _ = kda.f_b_proj(f_latent)
+                f_expected = F.linear(
+                    F.linear(projection_input, kda.f_a_proj.weight), kda.f_b_proj.weight
+                )
+            torch.testing.assert_close(f_actual, f_expected, atol=1e-2, rtol=1e-2)
+
+        gate_weight_keys = {
+            key
+            for key in state_keys
+            if key.startswith(("g_proj.", "g_a_proj.", "g_b_proj.")) and key.endswith(".weight")
+        }
+        if legacy_fused:
+            assert not gate_weight_keys
+        elif gate_lora_rank is None:
+            assert gate_weight_keys == {"g_proj.weight"}
+            _assert_bias_disabled(kda.g_proj)
+            gate_actual, _ = kda.g_proj(projection_input)
+            gate_expected = F.linear(projection_input, kda.g_proj.weight)
+            torch.testing.assert_close(gate_actual, gate_expected, atol=1e-2, rtol=1e-2)
+        else:
+            assert gate_weight_keys == {"g_a_proj.weight", "g_b_proj.weight"}
+            _assert_bias_disabled(kda.g_a_proj)
+            _assert_bias_disabled(kda.g_b_proj)
+            gate_latent, _ = kda.g_a_proj(projection_input)
+            gate_actual, _ = kda.g_b_proj(gate_latent)
+            gate_expected = F.linear(
+                F.linear(projection_input, kda.g_a_proj.weight), kda.g_b_proj.weight
+            )
+            torch.testing.assert_close(gate_actual, gate_expected, atol=1e-2, rtol=1e-2)
+
         output, bias = kda(hidden_states, None)
         assert bias is None
         assert output.shape == hidden_states.shape
@@ -191,11 +351,110 @@ def test_kda_forward_backward():
 
 @pytest.mark.internal
 @pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+def test_kda_input_layernorm_recompute_fp8_sequence_parallel():
+    Utils.initialize_model_parallel(2, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = replace(
+            _make_config(tp_size=2, sequence_parallel=True, f_lora_rank=16, gate_lora_rank=16),
+            fp8="e4m3",
+            fp8_recipe="tensorwise",
+            recompute_granularity="selective",
+            recompute_modules=["layernorm"],
+        )
+        layer = TransformerLayer(config, hybrid_stack_spec.submodules.kda_layer.submodules)
+        assert layer.recompute_input_layernorm
+        kda = layer.self_attention
+        assert kda.in_proj.save_original_input
+        assert kda.f_a_proj.save_original_input
+        assert kda.g_a_proj.save_original_input
+        # SP beta consumes the same sequence-sharded layernorm output as in_proj.
+        assert kda.beta_proj.save_original_input
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.parametrize(
+    ("f_lora_rank", "gate_lora_rank"),
+    [(None, None), (16, None)],
+    ids=["legacy-fused", "kimi-low-rank-f"],
+)
+def test_kda_sequence_parallel_beta_matches_replicated_input(f_lora_rank, gate_lora_rank):
+    """Under TP + SP beta_proj runs on the sequence shard and all-to-alls its output into the
+    head-parallel layout. The layer output and the TP-summed gradient of the replicated beta
+    weight must match the same layer fed the full (replicated) sequence without SP."""
+    Utils.initialize_distributed()
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=2, pipeline_model_parallel_size=1, context_parallel_size=1
+    )
+    try:
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        tp_rank, tp_size = tp_group.rank(), tp_group.size()
+        hidden_size = _make_config().hidden_size
+        full_input = torch.randn(
+            (32, 2, hidden_size), device=torch.cuda.current_device(), dtype=torch.bfloat16
+        )
+        torch.distributed.broadcast(
+            full_input, src=torch.distributed.get_global_rank(tp_group, 0), group=tp_group
+        )
+
+        outputs, beta_weight_grads = {}, {}
+        reference_state = None
+        for sequence_parallel in (False, True):
+            torch.manual_seed(123)
+            model_parallel_cuda_manual_seed(123)
+            config = _make_config(
+                tp_size=tp_size,
+                sequence_parallel=sequence_parallel,
+                f_lora_rank=f_lora_rank,
+                gate_lora_rank=gate_lora_rank,
+            )
+            kda = _build_kda(config)
+            if reference_state is None:
+                reference_state = {
+                    name: tensor.detach().clone() for name, tensor in kda.state_dict().items()
+                }
+            else:
+                # Same TP sharding in both modes: reuse the replicated-input module's weights.
+                kda.load_state_dict(reference_state)
+            weight = kda.beta_proj.weight
+            assert getattr(weight, "sequence_parallel", False) == sequence_parallel
+            assert not getattr(weight, "tensor_model_parallel", False)
+            local_input = full_input
+            if sequence_parallel:
+                local_input = full_input.chunk(tp_size, dim=0)[tp_rank]
+            local_input = local_input.clone().requires_grad_(True)
+            output, bias = kda(local_input, None)
+            assert bias is None
+            output.float().sum().backward()
+            grad = weight.grad.detach().float().clone()
+            if sequence_parallel:
+                # Each rank holds the contribution of its own tokens; the sequence-parallel
+                # parameter-gradient all-reduce completes it.
+                torch.distributed.all_reduce(grad, group=tp_group)
+                output_shards = [torch.empty_like(output) for _ in range(tp_size)]
+                torch.distributed.all_gather(output_shards, output.detach(), group=tp_group)
+                output = torch.cat(output_shards, dim=0)
+            outputs[sequence_parallel] = output.detach().float()
+            beta_weight_grads[sequence_parallel] = grad
+
+        torch.testing.assert_close(outputs[True], outputs[False], atol=1e-2, rtol=1e-2)
+        grad_diff = torch.linalg.vector_norm(beta_weight_grads[True] - beta_weight_grads[False])
+        grad_norm = torch.linalg.vector_norm(beta_weight_grads[False]).clamp_min(1e-12)
+        assert grad_diff / grad_norm < 1e-2, (grad_diff / grad_norm).item()
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
 def test_kda_gate_parameters_remain_fp32_after_model_cast():
     Utils.initialize_model_parallel(1, 1)
     try:
         model_parallel_cuda_manual_seed(123)
-        config = _make_config(params_dtype=torch.float32)
+        config = _make_config(params_dtype=torch.float32, f_lora_rank=16)
         kda = _build_kda(config)
         config.bf16 = True
         wrapped = Float16Module(config=config, module=kda)
@@ -203,6 +462,9 @@ def test_kda_gate_parameters_remain_fp32_after_model_cast():
         assert wrapped.module.beta_proj.weight.dtype == torch.bfloat16
         assert wrapped.module.A_log.dtype == torch.float32
         assert wrapped.module.dt_bias.dtype == torch.float32
+        assert wrapped.module.f_a_proj.weight.dtype == torch.bfloat16
+        assert wrapped.module.f_b_proj.weight.dtype == torch.bfloat16
+        assert wrapped.module.g_proj.weight.dtype == torch.bfloat16
     finally:
         Utils.destroy_model_parallel()
 
@@ -239,6 +501,14 @@ def test_kda_packed_matches_unpacked_cp1():
 @pytest.mark.parametrize("recompute_module", ["gdn_norm_out", "gdn"])
 def test_kda_selective_recompute(recompute_module):
     Utils.initialize_model_parallel(1, 1)
+    # The bitwise checks below need both forwards to run the same code. The checkpointed "gdn"
+    # forward is the only no-grad call of the torch.compile'd GDN/KDA helpers in this module, so
+    # it needs new Dynamo cache entries; the preceding tests (TP, sequence-parallel, low-rank and
+    # legacy projections) already fill the per-function recompile limit of the shared
+    # _prepare_input_for_gated_delta_rule, and a call past that limit silently runs eagerly,
+    # which differs from the compiled base forward at the BF16 ULP level. Start from an empty
+    # compile cache so both passes compile.
+    torch._dynamo.reset()
     try:
 
         def run(module, hidden_states):
@@ -392,20 +662,30 @@ def test_kda_cp2_packed_with_physical_padding_matches_cp1():
 
 
 @pytest.mark.parametrize(
-    ("sequence_packing", "tp", "sp", "cp", "linear_cp_mode"),
+    ("sequence_packing", "tp", "sp", "cp", "linear_cp_mode", "f_lora_rank", "gate_lora_rank"),
     [
-        (False, 2, True, 1, "headwise"),
-        (True, 1, False, 2, "headwise"),
-        (True, 2, True, 2, "headwise"),
-        (True, 1, False, 2, "chunkwise"),
-        (True, 2, True, 2, "chunkwise"),
+        (False, 2, True, 1, "headwise", None, None),
+        (True, 1, False, 2, "headwise", 8, 12),
+        (True, 2, True, 2, "headwise", 16, None),
+        (True, 1, False, 2, "chunkwise", None, 12),
+        (True, 2, True, 2, "chunkwise", 8, 12),
     ],
 )
 @pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
 def test_parallel_kda_correctness(
-    tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, linear_cp_mode, run_config
+    tmp_path_dist_ckpt,
+    sequence_packing,
+    tp,
+    sp,
+    cp,
+    linear_cp_mode,
+    f_lora_rank,
+    gate_lora_rank,
+    run_config,
 ):
-    config = _make_config(linear_cp_mode=linear_cp_mode)
+    config = _make_config(
+        linear_cp_mode=linear_cp_mode, f_lora_rank=f_lora_rank, gate_lora_rank=gate_lora_rank
+    )
     _test_parallel_attention_correctness(
         transformer_config=config,
         transformer_layer_spec=hybrid_stack_spec.submodules.kda_layer,

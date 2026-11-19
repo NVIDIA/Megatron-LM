@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""GDN output RMSNorm/SiLU fusion preserving intermediate activation rounding."""
+"""GDN/KDA output RMSNorm fusion preserving intermediate activation rounding."""
 
 import torch
 import triton
@@ -44,8 +44,9 @@ def gated_norm_fwd(
     EPS: tl.constexpr,
     ZERO_CENTERED: tl.constexpr,
     BT: tl.constexpr,
+    GATE_ACTIVATION: tl.constexpr,
 ):
-    """Apply output RMSNorm and SiLU gating."""
+    """Apply output RMSNorm and SiLU or sigmoid gating."""
     row = tl.program_id(0) * BT + tl.arange(0, BT)
     d = tl.arange(0, D)
     off = row[:, None] * D + d[None, :]
@@ -68,7 +69,10 @@ def gated_norm_fwd(
     )
     goff = grow[:, None] + d[None, :] * GATE_STRIDES[3]
     gv = tl.load(gate + goff, row[:, None] < ROWS, 0).to(tl.float32)
-    result = norm * (gv * tl.sigmoid(gv))
+    if GATE_ACTIVATION == "sigmoid":
+        result = norm * tl.sigmoid(gv)
+    else:
+        result = norm * (gv * tl.sigmoid(gv))
     tl.store(out + off, result, row[:, None] < ROWS)
     tl.store(rstd + row, inv, row < ROWS)
 
@@ -93,8 +97,9 @@ def gated_norm_bwd(
     GATE_FLAT_TOKENS: tl.constexpr,
     ZERO_CENTERED: tl.constexpr,
     BT: tl.constexpr,
+    GATE_ACTIVATION: tl.constexpr,
 ):
-    """Differentiate output RMSNorm and SiLU gating."""
+    """Differentiate output RMSNorm and SiLU or sigmoid gating."""
     tile = tl.program_id(0)
     row = tile * BT + tl.arange(0, BT)
     d = tl.arange(0, D)
@@ -120,8 +125,12 @@ def gated_norm_bwd(
     goff = grow[:, None] + d[None, :] * GATE_STRIDES[3]
     gv = tl.load(gate + goff, row[:, None] < ROWS, 0).to(tl.float32)
     sig = tl.sigmoid(gv)
-    grad_norm = (grad * (gv * sig)).to(x.dtype.element_ty).to(tl.float32)
-    grad_gate = (grad * norm) * (sig * (1 + gv * (1 - sig)))
+    if GATE_ACTIVATION == "sigmoid":
+        grad_norm = (grad * sig).to(x.dtype.element_ty).to(tl.float32)
+        grad_gate = (grad * norm) * (sig * (1 - sig))
+    else:
+        grad_norm = (grad * (gv * sig)).to(x.dtype.element_ty).to(tl.float32)
+        grad_gate = (grad * norm) * (sig * (1 + gv * (1 - sig)))
     weighted_grad = grad_norm * w[None, :]
     dot = tl.sum(weighted_grad * xn, 1) / D
     grad_x = (weighted_grad - xn * dot[:, None]) * inv[:, None]
@@ -139,6 +148,7 @@ def forward_impl(
     zero_centered: bool = False,
     bt: int = 4,
     warps: int = 2,
+    gate_activation: str = "silu",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Normalize and gate [batch, sequence, head, dimension] tensor views."""
     batch, sequence, heads, d = x.shape
@@ -163,6 +173,7 @@ def forward_impl(
         EPS=eps,
         ZERO_CENTERED=zero_centered,
         BT=bt,
+        GATE_ACTIVATION=gate_activation,
         num_warps=warps,
         enable_fp_fusion=True,
     )
@@ -178,6 +189,7 @@ def backward_impl(
     zero_centered: bool = False,
     bt: int = 16,
     warps: int = 2,
+    gate_activation: str = "silu",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute activation, gate, and RMSNorm-weight gradients."""
     dy = dy.contiguous()
@@ -206,6 +218,7 @@ def backward_impl(
         GATE_FLAT_TOKENS=batch == 1 or gate_strides[0] == sequence * gate_strides[1],
         ZERO_CENTERED=zero_centered,
         BT=bt,
+        GATE_ACTIVATION=gate_activation,
         num_warps=warps,
         enable_fp_fusion=True,
     )
@@ -216,18 +229,24 @@ class _FusedGatedNorm(torch.autograd.Function):
     """First-order autograd for fused output gating."""
 
     @staticmethod
-    def forward(ctx, x, gate, weight, eps, zero_centered):
+    def forward(ctx, x, gate, weight, eps, zero_centered, gate_activation):
         """Save activations and inverse norms for backward."""
-        out, rstd = forward_impl(x, gate, weight, eps, zero_centered)
+        out, rstd = forward_impl(
+            x, gate, weight, eps, zero_centered, gate_activation=gate_activation
+        )
         ctx.save_for_backward(x, gate, weight, rstd)
         ctx.zero_centered = zero_centered
+        ctx.gate_activation = gate_activation
         return out
 
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, dy):
         """Return activation, gate, and norm-weight gradients."""
-        return (*backward_impl(*ctx.saved_tensors, dy, ctx.zero_centered), None, None)
+        gradients = backward_impl(
+            *ctx.saved_tensors, dy, ctx.zero_centered, gate_activation=ctx.gate_activation
+        )
+        return (*gradients, None, None, None)
 
 
 @torch.compiler.disable
@@ -237,13 +256,22 @@ def fused_gated_norm(
     weight: torch.Tensor,
     eps: float,
     zero_centered: bool = False,
+    gate_activation: str = "silu",
 ) -> torch.Tensor:
-    """Run fused RMSNorm/SiLU gating with first-order autograd support."""
-    return _FusedGatedNorm.apply(x, gate, weight, eps, zero_centered)
+    """Run fused RMSNorm with SiLU (GDN) or sigmoid (KDA) gating.
+
+    The RMSNorm result and its incoming gradient round to the activation dtype,
+    matching the unfused materialization boundaries. Supports first-order autograd.
+    """
+    if gate_activation not in ("silu", "sigmoid"):
+        raise ValueError("gate_activation must be 'silu' or 'sigmoid'.")
+    return _FusedGatedNorm.apply(x, gate, weight, eps, zero_centered, gate_activation)
 
 
-def validate_gated_norm(module: torch.nn.Module, x: torch.Tensor, gate: torch.Tensor) -> None:
-    """Reject unsupported GDN output fusion configurations and layouts.
+def validate_gated_norm(
+    module: torch.nn.Module, x: torch.Tensor, gate: torch.Tensor, gate_activation: str = "silu"
+) -> None:
+    """Reject unsupported GDN-family output fusion configurations and layouts.
 
     Called on every fused module forward, including output-norm recomputation.
     These checks inspect host-side metadata only and do not synchronize CUDA.
@@ -251,7 +279,7 @@ def validate_gated_norm(module: torch.nn.Module, x: torch.Tensor, gate: torch.Te
     prefix = "gdn_gated_output_norm_fusion requires "
     if module.config.deterministic_mode:
         raise ValueError(prefix + "deterministic_mode=False.")
-    if module.activation not in ("silu", "swish"):
+    if gate_activation == "silu" and module.activation not in ("silu", "swish"):
         raise ValueError(prefix + "SiLU/Swish activation.")
     if type(module.out_norm).__name__ != "RMSNorm":
         raise ValueError(prefix + "an RMSNorm output normalization module.")

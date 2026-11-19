@@ -1824,6 +1824,10 @@ class TestGraphDynamicRouteMetadataArena:
             cuda_graph_modules=[],
             fine_grained_activation_offloading=False,
             delay_offload_until_cuda_graph=False,
+            # TransformerConfig derives graph dynamic packs from the dp_balanced scheduler.
+            # This single-chunk schedule is PP=1, so TE slot selection keeps modulo reuse.
+            sequence_packing_scheduler="dp_balanced",
+            pipeline_model_parallel_size=1,
             dsa_cp_balance_indexer_graph_dynamic_packs=True,
             context_parallel_size=2,
             max_seqlen_per_dp_cp_rank=8,

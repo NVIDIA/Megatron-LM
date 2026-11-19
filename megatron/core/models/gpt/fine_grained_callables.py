@@ -402,9 +402,12 @@ class TransformerLayerNode(ScheduleNode):
 
         Under full recompute only each segment's input survives the forward->backward
         gap; the same node is later re-run with grad enabled to rebuild its state.
+        ``_output_edges`` are the backward roots recorded by ``ScheduleNode.forward``;
+        ``output`` is retained only for scheduled tensor release.
         """
         self.inputs = None
         self.output = None
+        self._output_edges = None
         self.detached = tuple()
         self.before_detached = tuple()
 
@@ -660,7 +663,6 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 padding_mask: Optional[Tensor] = None,
             ):
                 attention_kwargs = dict(
-                    hidden_states=hidden_states,
                     attention_mask=attention_mask,
                     rotary_pos_emb=rotary_pos_emb,
                     rotary_pos_cos=rotary_pos_cos,
@@ -671,7 +673,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 )
                 if is_hyper_connection_layer:
                     attention_kwargs["mhc_recompute_manager"] = mhc_recompute_manager
-                hidden_states, _ = layer._forward_attention(**attention_kwargs)
+                hidden_states, _ = layer._forward_attention(hidden_states, **attention_kwargs)
                 if not isinstance(layer.mlp, MoELayer):
                     return hidden_states, None, None, None
                 if is_mhc_layer:
@@ -738,7 +740,6 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 return hidden_states, local_tokens, probs, shared_expert_output
 
         forward_kwargs = dict(
-            hidden_states=hidden_states,
             attention_mask=node.chunk_state.attention_mask,
             rotary_pos_emb=node.chunk_state.rotary_pos_emb,
             rotary_pos_cos=node.chunk_state.rotary_pos_cos,
@@ -764,7 +765,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # while on SBHD TE reads only the keys it captured and ignores the
             # rest, so leaving it in kwargs is safe on both layouts.
             forward_kwargs["padding_mask"] = node.chunk_state.padding_mask
-        forward_outputs = forward_func(**forward_kwargs)
+        forward_outputs = forward_func(hidden_states, **forward_kwargs)
         if is_mhc_layer:
             hidden_states, local_tokens, probs, shared_expert_output, mlp_h_res, mlp_hc_h_post = (
                 forward_outputs
@@ -1075,13 +1076,19 @@ def build_mtp_layer_callables(layer):
             hidden_states if layer.config.enable_hyper_connections else None
         )
         hidden_states = layer._postprocess(hidden_states)
-        node.chunk_state.mtp_hidden_states.append(hidden_states)
         if node.is_last_layer:
-            hidden_states = torch.cat(node.chunk_state.mtp_hidden_states, dim=0)
+            hidden_states = torch.cat(node.chunk_state.mtp_hidden_states + [hidden_states], dim=0)
             node.chunk_state.mtp_hidden_states = None
             node.chunk_state.mhc_multistream = None
-        elif pre_contraction_hidden_states is not None:
-            hidden_states = pre_contraction_hidden_states
+        else:
+            # This depth's output feeds both the next depth and the torch.cat in the last
+            # depth's mtp_post_process. Hand the cat a detached copy: otherwise the last
+            # depth's backward would run through this node's graph and free it before this
+            # node's own backward. ``node.detach`` keeps the loss-side gradient that lands
+            # on the copy and adds it back during this node's backward (main #8799).
+            node.chunk_state.mtp_hidden_states.append(node.detach(hidden_states))
+            if pre_contraction_hidden_states is not None:
+                hidden_states = pre_contraction_hidden_states
         return hidden_states
 
     def rng_context_wrapper(func, *args, **kwargs):

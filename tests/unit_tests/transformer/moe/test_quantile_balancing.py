@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import argparse
 import os
@@ -331,6 +331,98 @@ def test_qb_fused_atomic_matches_unfused_histogram():
     torch.testing.assert_close(fused_probs, unfused_probs)
     torch.testing.assert_close(fused_map, unfused_map)
     torch.testing.assert_close(fused_histogram, unfused_histogram)
+
+
+def test_qb_unfused_histogram_skips_padded_tokens():
+    torch.manual_seed(7)
+    logits = torch.randn(6, 5, dtype=torch.float32)
+    bias = torch.linspace(-0.1, 0.1, 5, dtype=torch.float32)
+    bounds = torch.tensor([-1.0, 1.0], dtype=torch.float32)
+    valid = torch.tensor([True, False, True, True, False, True])
+
+    masked_histogram = torch.zeros(5, 16, dtype=torch.int32)
+    masked_probs, masked_map = topk_routing_with_score_function(
+        logits,
+        topk=2,
+        score_function="sigmoid",
+        expert_bias=bias,
+        fused=False,
+        qb_histogram=masked_histogram,
+        qb_bin_bounds=bounds,
+        qb_valid_mask=valid,
+    )
+    # Reference: the histogram of the valid rows alone, routing of all rows unchanged.
+    valid_only_histogram = torch.zeros_like(masked_histogram)
+    topk_routing_with_score_function(
+        logits[valid],
+        topk=2,
+        score_function="sigmoid",
+        expert_bias=bias,
+        fused=False,
+        qb_histogram=valid_only_histogram,
+        qb_bin_bounds=bounds,
+    )
+    plain_probs, plain_map = topk_routing_with_score_function(
+        logits, topk=2, score_function="sigmoid", expert_bias=bias, fused=False
+    )
+
+    torch.testing.assert_close(masked_histogram, valid_only_histogram)
+    assert int(masked_histogram.sum()) == int(valid.sum()) * 5
+    torch.testing.assert_close(masked_probs, plain_probs)
+    torch.testing.assert_close(masked_map, plain_map)
+
+
+def test_qb_valid_mask_requires_histogram():
+    logits = torch.randn(4, 3, dtype=torch.float32)
+    with pytest.raises(ValueError, match="qb_valid_mask requires"):
+        topk_routing_with_score_function(
+            logits,
+            topk=1,
+            score_function="sigmoid",
+            expert_bias=torch.zeros(3),
+            fused=False,
+            qb_valid_mask=torch.ones(4, dtype=torch.bool),
+        )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not fused_topk_with_score_function_supports_qb,
+    reason="requires the Transformer Engine QB fused-router API",
+)
+def test_qb_fused_histogram_with_padding_matches_unfused():
+    torch.manual_seed(4321)
+    logits = torch.randn(41, 64, device="cuda", dtype=torch.float32)
+    bias = torch.linspace(-0.1, 0.1, 64, device="cuda", dtype=torch.float32)
+    bounds = torch.tensor([-1.1, 1.1], device="cuda", dtype=torch.float32)
+    valid = torch.rand(41, device="cuda") > 0.3
+    unfused_histogram = torch.zeros(64, 128, device="cuda", dtype=torch.int32)
+    fused_histogram = torch.zeros_like(unfused_histogram)
+
+    unfused_probs, unfused_map = topk_routing_with_score_function(
+        logits,
+        topk=8,
+        score_function="sigmoid",
+        expert_bias=bias,
+        fused=False,
+        qb_histogram=unfused_histogram,
+        qb_bin_bounds=bounds,
+        qb_valid_mask=valid,
+    )
+    fused_probs, fused_map = topk_routing_with_score_function(
+        logits,
+        topk=8,
+        score_function="sigmoid",
+        expert_bias=bias,
+        fused=True,
+        qb_histogram=fused_histogram,
+        qb_bin_bounds=bounds,
+        qb_valid_mask=valid,
+    )
+
+    torch.testing.assert_close(fused_probs, unfused_probs)
+    torch.testing.assert_close(fused_map, unfused_map)
+    torch.testing.assert_close(fused_histogram, unfused_histogram)
+    assert int(fused_histogram.sum()) == int(valid.sum()) * 64
 
 
 def test_qb_finalize_updates_once_and_reset_preserves_buffers():
