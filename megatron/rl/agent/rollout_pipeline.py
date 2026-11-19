@@ -467,6 +467,7 @@ class RolloutPipeline:
         finally:
             for worker in workers:
                 worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
             self.output_queue.shutdown()
 
     async def _assemble_worker(self) -> None:
