@@ -9,6 +9,10 @@ travels with the handoff metadata rather than through the KV/SSM transfer: after
 filtering it is mostly zeros, so a sparse (index, value) encoding is typically a few KB per
 request, and a dense encoding is bounded by `num_depths * vocab * 4` bytes. Values are fp32 and
 round-trip bit-exactly. Arrays are base64 strings so the payload survives msgpack and JSON.
+
+The handoff metadata also names the prefill engine's verification mode and draft sampling method.
+Greedy drafts (`mtp_draft_sample_method='greedy'`) have a one-hot q, so no q is sent: their
+rejection verification is exactly exact-match verification, which needs no draft distribution.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ import torch
 
 MTP_DRAFT_Q_KEY = "mtp_draft_q"
 MTP_VERIFICATION_KEY = "mtp_verification"
+MTP_DRAFT_SAMPLE_METHOD_KEY = "mtp_draft_sample_method"
 _VERSION = 1
 
 

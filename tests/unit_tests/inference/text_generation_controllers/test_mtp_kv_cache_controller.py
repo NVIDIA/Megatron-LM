@@ -118,6 +118,9 @@ def _make_context(
         request_kv_length_offsets=request_kv_length_offsets,
         request_ids=ids,
         request_to_kv_block_ids=request_to_kv_block_ids,
+        # Read by the draft sampler: all-greedy (top_k == 1) rows keep the plain sampler, which
+        # these tests stub, in every MTP verification mode and draft sampling method.
+        active_request_metadata={"top_k": torch.ones(MAX_REQUESTS, dtype=torch.int32)},
         gpu_view=gpu_view,
         _nvls_dispatcher=None,
         inference_cuda_graph_scope=InferenceCudaGraphScope.none,

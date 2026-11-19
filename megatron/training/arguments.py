@@ -2075,6 +2075,13 @@ def _add_inference_args(parser):
                        'and resample from max(0, p - q) on rejection. "exact_match" accepts a '
                        'draft only if it equals an independently sampled target token. Both are '
                        'identical for greedy requests.')
+    group.add_argument('--inference-mtp-draft-sample-method', type=str, default='greedy',
+                       choices=['greedy', 'probabilistic'],
+                       help='How MTP draft tokens are chosen. "greedy" drafts the argmax and '
+                       'treats the draft distribution as one-hot (accept with probability p(x)); '
+                       '"probabilistic" samples the draft from the filtered draft distribution q '
+                       'and, with --inference-mtp-verification rejection, keeps q to accept with '
+                       'probability min(1, p(x)/q(x)).')
     group.add_argument('--inference-dynamic-batching-prefix-caching',
                        dest='inference_dynamic_batching_enable_prefix_caching',
                        action=argparse.BooleanOptionalAction,

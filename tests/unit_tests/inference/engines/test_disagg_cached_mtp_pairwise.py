@@ -11,6 +11,7 @@ import torch.distributed as dist
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
 from megatron.core.inference.disaggregation.mtp_draft_handoff import (
     MTP_DRAFT_Q_KEY,
+    MTP_DRAFT_SAMPLE_METHOD_KEY,
     MTP_VERIFICATION_KEY,
     decode_mtp_draft_q,
 )
@@ -83,6 +84,7 @@ def test_cached_prefix_and_mtp_handoff(transport_world, mode):
                 if depth:
                     # Greedy requests keep exact-match verification: no draft q is sent.
                     assert metadata["kv_meta"][MTP_VERIFICATION_KEY] == "rejection"
+                    assert metadata["kv_meta"][MTP_DRAFT_SAMPLE_METHOD_KEY] == "greedy"
                     assert MTP_DRAFT_Q_KEY not in metadata["kv_meta"]
                 if mtp_kv:
                     slot = engine.context.mtp_kv_layer_slot
@@ -168,7 +170,7 @@ def test_sampled_mtp_handoff_verifies_first_drafts_with_transferred_q(transport_
     """A sampled import's first decode step verifies the prefill engine's drafts by rejection
     sampling, using the exact draft distributions q sent with the handoff."""
     depth = 2
-    config = disagg_config(num_speculative_tokens=depth)
+    config = disagg_config(num_speculative_tokens=depth, mtp_draft_sample_method="probabilistic")
     tokens = prompt(31)
     params = SamplingParams(temperature=1.0, top_p=0.9, termination_id=-1, num_tokens_to_generate=7)
     weights, _ = collocated_reference(config, tokens, params)
@@ -191,6 +193,7 @@ def test_sampled_mtp_handoff_verifies_first_drafts_with_transferred_q(transport_
             metadata, state = snapshot_source(engine, request)
             kv_meta = metadata["kv_meta"]
             assert kv_meta[MTP_VERIFICATION_KEY] == "rejection"
+            assert kv_meta[MTP_DRAFT_SAMPLE_METHOD_KEY] == "probabilistic"
             drafts = kv_meta["resume_tokens"][1:]
             row = controller._mtp_draft_row_of_request[101]
             q_ref = controller._mtp_draft_probs[:, row].cpu()

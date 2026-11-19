@@ -307,6 +307,9 @@ class TextGenerationController(MTPControllerMixin):
         self.extra_eos_token_id_set = self._build_extra_eos_token_id_set(tokenizer)
         self.num_speculative_tokens = inference_config.num_speculative_tokens
         self.mtp_verification = getattr(inference_config, "mtp_verification", "exact_match")
+        self.mtp_draft_sample_method = getattr(
+            inference_config, "mtp_draft_sample_method", "greedy"
+        )
 
         pg_collection = inference_config.pg_collection
         if pg_collection is not None:

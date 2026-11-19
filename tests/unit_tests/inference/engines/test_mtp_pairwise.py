@@ -1061,15 +1061,22 @@ class TestMTPPairwise(_DynamicEngineTestBase):
             assert set(state["after_resume_waiting_ids"]) == set(request_ids)
             assert state["suspended_bytes"] == 0
 
-    @pytest.mark.parametrize("mtp_verification", ["exact_match", "rejection"])
+    @pytest.mark.parametrize(
+        "mtp_verification,draft_method",
+        [("exact_match", "probabilistic"), ("rejection", "probabilistic"), ("rejection", "greedy")],
+    )
     @pytest.mark.parametrize("backend", ["torch", "flashinfer"])
     @torch.inference_mode()
-    def test_sampling_filters_are_reproducible_with_mtp(self, backend, mtp_verification):
-        """MTP proposals use the selected sampler and its temperature/k/p filters.
+    def test_sampling_filters_are_reproducible_with_mtp(
+        self, backend, mtp_verification, draft_method
+    ):
+        """MTP proposals follow the draft sampling method; targets use the selected sampler.
 
-        Under exact-match verification drafts come from the backend's `sample_kernel`; under
-        rejection sampling they are drawn from the backend's filtered `probs_kernel` (so the
-        stored q is exactly the draft distribution) and verified by its chain sampler.
+        Probabilistic drafts under exact-match verification come from the backend's
+        `sample_kernel`; under rejection sampling they are drawn from the backend's filtered
+        `probs_kernel` (so the stored q is exactly the draft distribution) and verified by its
+        chain sampler. Greedy drafts are the argmax, keep no q and verify by exact match (the
+        rejection rule for a one-hot q).
         """
         if backend == "flashinfer":
             pytest.importorskip("flashinfer")
@@ -1084,6 +1091,7 @@ class TestMTPPairwise(_DynamicEngineTestBase):
             config={
                 "sampling_backend": backend,
                 "mtp_verification": mtp_verification,
+                "mtp_draft_sample_method": draft_method,
                 "temperature": 0.8,
                 "top_k": 3 if backend == "torch" else 0,
                 "top_p": 0.95 if backend == "flashinfer" else 0.0,
@@ -1092,7 +1100,8 @@ class TestMTPPairwise(_DynamicEngineTestBase):
         first_env = _build_env(case, mtp_active=True)
         repeat_env = _build_env(case, mtp_active=True)
         _same_model_weights(first_env, repeat_env)
-        rejection = mtp_verification == "rejection"
+        rejection = mtp_verification == "rejection" and draft_method == "probabilistic"
+        sampled_drafts = mtp_verification == "exact_match"
         chain_calls = Counter()
         for env in (first_env, repeat_env):
             controller = env.engine.controller
@@ -1118,7 +1127,7 @@ class TestMTPPairwise(_DynamicEngineTestBase):
             assert session.runtime[f"{active_filter}-filter"] > 0
             assert session.runtime[f"{inactive_filter}-filter"] == 0
             assert session.runtime["mtp-serial-steps"] > 0
-            if not rejection:
+            if sampled_drafts:
                 assert session.runtime[f"mtp-local:sampling-backend:{backend}"] > 0
                 assert session.runtime["mtp-local:temperature-filter"] > 0
                 assert session.runtime[f"mtp-local:{active_filter}-filter"] > 0

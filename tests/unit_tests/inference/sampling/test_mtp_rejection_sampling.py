@@ -2,18 +2,21 @@
 
 """Tests for speculative (rejection) sampling verification of MTP drafts.
 
-Covers the chain speculative sampling primitive (torch reference and FlashInfer), and the
-controller glue (`MTPControllerMixin._sample_mtp_draft` / `_mtp_rejection_plan` /
-`_sample_speculative_verify_rows` / `_apply_mtp_rejection_sampling`) driven
-through the real exact-match verifier and `prepare_next_forward_pass` kernels.
+Covers the chain speculative sampling primitive (torch reference and FlashInfer), the controller
+glue (`MTPControllerMixin._sample_mtp_draft` / `_mtp_rejection_plan` /
+`_sample_speculative_verify_rows` / `_apply_mtp_rejection_sampling`) driven through the real
+exact-match verifier and `prepare_next_forward_pass` kernels, and the two draft sampling methods
+(`mtp_draft_sample_method`: greedy, the default, and probabilistic).
 """
 
+import argparse
 import math
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.disaggregation.mtp_draft_handoff import (
     decode_mtp_draft_q,
     encode_mtp_draft_q,
@@ -235,17 +238,18 @@ class _Ctx:
 class _Controller(MTPControllerMixin):
     _sample_from_logits_2d = TextGenerationController._sample_from_logits_2d
 
-    def __init__(self, ctx, sampling, num_spec, vocab, mode):
+    def __init__(self, ctx, sampling, num_spec, vocab, mode, draft_method="probabilistic"):
         self.inference_wrapped_model = SimpleNamespace(inference_context=ctx)
         self.num_speculative_tokens = num_spec
         self.num_mtp_depths = num_spec
         self.mtp_verification = mode
+        self.mtp_draft_sample_method = draft_method
         self._sampling = sampling
         n = ctx.total_request_count
         self._sampled_mtp_tokens_cuda = torch.empty(num_spec, n, dtype=torch.long, device=DEVICE)
         self._mtp_draft_probs = (
             torch.empty(num_spec, n, vocab, dtype=torch.float32, device=DEVICE)
-            if mode == "rejection"
+            if self._mtp_rejection_enabled()
             else None
         )
         self._mtp_draft_row_of_request = None
@@ -287,7 +291,7 @@ def _run_step(ctrl, ctx, draft_logits, target_logits, base_tokens, num_prefill=0
         [base_tokens[:num_decode, None], ctrl._sampled_mtp_tokens_cuda[:, :num_decode].T], dim=1
     ).reshape(-1)
     input_tokens = torch.cat([decode_inputs, base_tokens[num_decode:]])
-    plan = ctrl._mtp_rejection_plan(num_decode) if ctrl.mtp_verification == "rejection" else None
+    plan = ctrl._mtp_rejection_plan(num_decode) if ctrl._mtp_rejection_enabled() else None
     output = ctrl._sample_speculative_verify_rows(
         target_logits, None, num_decode, num_prefill, plan
     )
@@ -625,3 +629,138 @@ class TestControllerRejectionSampling:
         rates = {path: (acc >= 1).double().mean().item() for path, (_, acc) in stats.items()}
         sigma = math.sqrt(2 * alpha * (1 - alpha) / (n * rounds))
         assert abs(rates["imported"] - rates["collocated"]) < 5 * sigma + 1e-3, rates
+
+
+# ---------------------------------------------------------------------------
+# Draft sampling method: greedy (default, one-hot q) vs probabilistic
+# ---------------------------------------------------------------------------
+
+
+class TestGreedyDrafts:
+    """Greedy drafts: argmax of the draft logits, a one-hot q, acceptance p(argmax q)."""
+
+    @pytest.mark.parametrize("impl_name,impl", CHAIN_IMPLS)
+    def test_one_hot_chain_is_the_greedy_draft_rule(self, impl_name, impl):
+        """With a one-hot q at the argmax draft, chain rejection sampling accepts x_k with
+        probability p_k(x_k), resamples from p_k without x_k on rejection and stays exactly
+        target-distributed: the rule the exact-match verifier implements for those drafts."""
+        num_drafts, vocab, trials = 3, 8, 200_000
+        gen = torch.Generator(device=DEVICE).manual_seed(71)
+        p = _random_dist(num_drafts + 1, vocab, 1.5, gen)
+        q = _random_dist(num_drafts, vocab, 1.5, gen)
+        drafts = q.argmax(dim=-1).unsqueeze(0).expand(trials, -1).contiguous()
+        one_hot = torch.nn.functional.one_hot(drafts, vocab).float()
+        target = p.unsqueeze(0).expand(trials, -1, -1).contiguous()
+        out, num_acc = impl(one_hot, drafts, target, gen)
+
+        p_x = p[torch.arange(num_drafts), drafts[0]]
+        for k in range(1, num_drafts + 1):
+            expected = p_x[:k].prod().item()
+            rate = (num_acc >= k).double().mean().item()
+            sigma = math.sqrt(max(expected * (1 - expected), 1e-6) / trials)
+            assert abs(rate - expected) < 5 * sigma + 1e-4, (impl_name, k, rate, expected)
+        for depth in range(num_drafts + 1):
+            hist, n = _emitted_token_stats(out, num_acc, vocab, depth)
+            if n < 2000:
+                continue
+            assert _tv(hist, p[depth]) < _tv_tol(vocab, n), (impl_name, depth, n)
+            if depth < num_drafts:
+                # A rejected position never re-emits its draft.
+                rejected = (num_acc == depth) & (num_acc < num_drafts)
+                assert (out[rejected, depth] != drafts[0, depth]).all()
+
+    @pytest.mark.parametrize("backend", BACKENDS)
+    @pytest.mark.parametrize("mode", ["rejection", "exact_match"])
+    @pytest.mark.parametrize(
+        "params", [(1.0, 0, 0.0), (0.7, 0, 0.9), (1.3, 5, 0.0)], ids=["t1", "t0.7-p0.9", "t1.3-k5"]
+    )
+    def test_end_to_end_distribution_and_acceptance(self, backend, mode, params):
+        """Greedy drafts -> verification -> exact-match kernels: argmax drafts, no stored q, no
+        chain sampler, emitted tokens follow the filtered target p, acceptance p(argmax q)."""
+        temperature, top_k, top_p = params
+        num_spec, n, rounds = 2, 8192, 6
+        gen = torch.Generator(device=DEVICE).manual_seed(81)
+        target_row = _logits(num_spec + 1, 2.0, gen)
+        draft_row = _logits(num_spec, 2.0, gen)
+        p = _reference_probs(target_row, temperature, top_k, top_p, backend)
+        ctx = _Ctx([temperature] * n, [top_k] * n, [top_p] * n)
+        ctrl = _Controller(ctx, _make_sampling(backend, 82), num_spec, VOCAB, mode, "greedy")
+        assert ctrl._mtp_draft_probs is None and not ctrl._mtp_rejection_enabled()
+        ctrl._sampling.chain_speculative_sampling = None  # must not be reached
+        target_logits = target_row.repeat(n, 1)
+        draft_logits = draft_row.unsqueeze(1).expand(num_spec, n, VOCAB).contiguous()
+        base = torch.zeros(n, dtype=torch.long, device=DEVICE)
+        greedy_drafts = draft_row.argmax(dim=-1)
+
+        first, second, acc = [], [], []
+        for _ in range(rounds):
+            r = _run_step(ctrl, ctx, draft_logits, target_logits, base)
+            assert r.plan is None
+            assert torch.equal(ctrl._sampled_mtp_tokens_cuda[:, 0], greedy_drafts)
+            a = r.accepted_counts
+            drafts = r.accepted_tokens.clamp(min=0)
+            first.append(torch.where(a >= 1, drafts[:, 0], r.sampled))
+            second.append(torch.where(a >= 2, drafts[:, 1], r.sampled)[a >= 1])
+            acc.append(a)
+        first, second, acc = torch.cat(first), torch.cat(second), torch.cat(acc)
+
+        assert _tv(_hist(first, VOCAB), p[0]) < _tv_tol(VOCAB, first.numel())
+        assert _tv(_hist(second, VOCAB), p[1]) < _tv_tol(VOCAB, second.numel())
+        alpha = p[0, greedy_drafts[0]].item()
+        rate = (acc >= 1).double().mean().item()
+        sigma = math.sqrt(max(alpha * (1 - alpha), 1e-6) / acc.numel())
+        assert abs(rate - alpha) < 5 * sigma + 1e-3, (rate, alpha)
+        both = p[0, greedy_drafts[0]].item() * p[1, greedy_drafts[1]].item()
+        rate2 = (acc >= 2).double().mean().item()
+        sigma2 = math.sqrt(max(both * (1 - both), 1e-6) / acc.numel())
+        assert abs(rate2 - both) < 5 * sigma2 + 1e-3, (rate2, both)
+
+    @pytest.mark.parametrize("backend", BACKENDS)
+    def test_greedy_requests_identical_across_draft_methods(self, backend):
+        """An all-greedy (top_k == 1) batch produces bit-identical drafts and outputs in every
+        mode and draft sampling method."""
+        num_spec, n = 3, 64
+        gen = torch.Generator(device=DEVICE).manual_seed(91)
+        target_logits = _logits(n * (num_spec + 1), 3.0, gen)
+        draft_logits = _logits(num_spec * n, 3.0, gen).view(num_spec, n, VOCAB)
+        base = torch.randint(0, VOCAB, (n,), device=DEVICE, generator=gen)
+        results = {}
+        for mode, method in (
+            ("exact_match", "probabilistic"),
+            ("rejection", "probabilistic"),
+            ("rejection", "greedy"),
+            ("exact_match", "greedy"),
+        ):
+            ctx = _Ctx([1.0] * n, [1] * n, [0.0] * n)
+            ctrl = _Controller(ctx, _make_sampling(backend, 92), num_spec, VOCAB, mode, method)
+            results[(mode, method)] = _run_step(ctrl, ctx, draft_logits, target_logits, base)
+        reference = results[("exact_match", "probabilistic")]
+        for key, r in results.items():
+            assert torch.equal(r.output, reference.output), key
+            assert torch.equal(r.accepted_counts, reference.accepted_counts), key
+            assert torch.equal(r.sampled, reference.sampled), key
+
+
+class TestDraftSampleMethodConfig:
+
+    def test_default_matches_vllm_and_validates(self):
+        assert InferenceConfig().mtp_draft_sample_method == "greedy"
+        assert InferenceConfig().mtp_verification == "rejection"
+        InferenceConfig(mtp_draft_sample_method="probabilistic")
+        with pytest.raises(ValueError, match="mtp_draft_sample_method"):
+            InferenceConfig(mtp_draft_sample_method="argmax")
+
+    def test_cli_flag(self):
+        from megatron.training.arguments import _add_inference_args
+
+        parser = _add_inference_args(argparse.ArgumentParser())
+        assert parser.parse_args([]).inference_mtp_draft_sample_method == "greedy"
+        args = parser.parse_args(["--inference-mtp-draft-sample-method", "probabilistic"])
+        assert args.inference_mtp_draft_sample_method == "probabilistic"
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--inference-mtp-draft-sample-method", "argmax"])
+
+    def test_setup_config_forwards_the_method(self):
+        from megatron.training.config.inference_config import InferenceSetupConfig
+
+        assert InferenceSetupConfig().inference_mtp_draft_sample_method == "greedy"

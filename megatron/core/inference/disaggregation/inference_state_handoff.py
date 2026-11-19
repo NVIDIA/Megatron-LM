@@ -28,6 +28,7 @@ from megatron.core.inference.disaggregation.handoff_wire_protocol import (
 )
 from megatron.core.inference.disaggregation.mtp_draft_handoff import (
     MTP_DRAFT_Q_KEY,
+    MTP_DRAFT_SAMPLE_METHOD_KEY,
     MTP_VERIFICATION_KEY,
     decode_mtp_draft_q,
     encode_mtp_draft_q,
@@ -720,7 +721,8 @@ class InferenceStateHandoffMixin:
 
         Under rejection verification the decode engine needs the q each proposal in
         `resume_tokens[1:]` was sampled from to verify them by chain speculative sampling on the
-        imported request's first decode step. Greedy requests keep exact match and send nothing.
+        imported request's first decode step. Greedy requests and greedy-drafting engines
+        (one-hot q, verified by exact match) send nothing.
 
         Side: prefill engine, in the step whose draft loop produced the proposals.
         """
@@ -792,10 +794,7 @@ class InferenceStateHandoffMixin:
             # request-specific SSM metadata out of that shared object.
             kv_meta = dict(kv_meta)
         kv_meta["resume_tokens"] = prepared.resume_tokens
-        if self.context.num_speculative_tokens > 0:
-            kv_meta[MTP_VERIFICATION_KEY] = getattr(
-                self.controller, "mtp_verification", "exact_match"
-            )
+        kv_meta.update(self._mtp_handoff_modes())
         if prepared.mtp_draft_q is not None:
             kv_meta[MTP_DRAFT_Q_KEY] = prepared.mtp_draft_q
         if request.block_hash_salt is not None:
@@ -991,25 +990,48 @@ class InferenceStateHandoffMixin:
             )
         return future
 
+    def _mtp_handoff_modes(self) -> dict:
+        """The prefill engine's MTP verification mode and draft sampling method, for kv_meta.
+
+        Side: prefill engine. Empty without speculative decoding.
+        """
+        if self.context.num_speculative_tokens == 0:
+            return {}
+        return {
+            MTP_VERIFICATION_KEY: getattr(self.controller, "mtp_verification", "exact_match"),
+            MTP_DRAFT_SAMPLE_METHOD_KEY: getattr(
+                self.controller, "mtp_draft_sample_method", "greedy"
+            ),
+        }
+
     def _import_handoff_mtp_draft_q(
         self, request_id: int, kv_meta: dict, resume_tokens: list[int]
     ) -> torch.Tensor | None:
         """Validate and decode the draft distributions sent with a handoff, if usable here.
 
         Returns None (the imported request's first verification uses exact match) when this
-        engine does not verify by rejection sampling, the request is greedy or the prefill
-        engine verifies by exact match (no q sent). A mismatched verification mode is logged
-        once; a q that does not match the local MTP depth / vocabulary or the handoff's drafts
-        is rejected as an incompatible handoff.
+        engine does not verify by rejection sampling with a stored q (exact-match mode, or
+        greedy drafts), the request is greedy, or the prefill engine sent no q. Exact match is
+        precisely the rejection rule for greedy (one-hot) drafts, so a greedy-drafting prefill
+        loses nothing; a probabilistic prefill in exact-match mode is logged once, since its
+        first drafts then verify at exact-match acceptance. A q that does not match the local
+        MTP depth / vocabulary or the handoff's drafts is rejected as an incompatible handoff.
 
         Side: decode engine.
         """
         if self.context.num_speculative_tokens == 0 or not isinstance(kv_meta, dict):
             return None
+        shape_fn = getattr(self.controller, "mtp_draft_q_shape", None)
+        shape = shape_fn() if shape_fn is not None else None
+        if shape is None:
+            return None
         local_mode = getattr(self.controller, "mtp_verification", "exact_match")
         source_mode = kv_meta.get(MTP_VERIFICATION_KEY)
+        source_method = kv_meta.get(MTP_DRAFT_SAMPLE_METHOD_KEY)
         if source_mode is not None and source_mode != local_mode:
-            if not getattr(self, "_warned_mtp_verification_mismatch", False):
+            if source_method != "greedy" and not getattr(
+                self, "_warned_mtp_verification_mismatch", False
+            ):
                 logging.warning(
                     "Disaggregated prefill verifies MTP drafts by %r but this decode engine by "
                     "%r; imported requests' first drafts use exact-match verification",
@@ -1019,9 +1041,7 @@ class InferenceStateHandoffMixin:
                 self._warned_mtp_verification_mismatch = True
             return None
         payload = kv_meta.get(MTP_DRAFT_Q_KEY)
-        shape_fn = getattr(self.controller, "mtp_draft_q_shape", None)
-        shape = shape_fn() if shape_fn is not None else None
-        if payload is None or shape is None:
+        if payload is None:
             return None
         num_depths, vocab = shape
         try:

@@ -204,6 +204,10 @@ class InferenceSetupConfig:
     """How MTP draft tokens are verified: "rejection" (speculative rejection sampling) or
     "exact_match" (accept a draft only if it equals an independent target sample)."""
 
+    inference_mtp_draft_sample_method: Literal["greedy", "probabilistic"] = "greedy"
+    """How MTP draft tokens are chosen: "greedy" (argmax, one-hot draft distribution) or
+    "probabilistic" (sampled from the filtered draft distribution, kept for verification)."""
+
     # ---------------- Prefix caching ----------------
 
     inference_dynamic_batching_enable_prefix_caching: bool = False
@@ -498,6 +502,7 @@ class InferenceSetupConfig:
             mamba_replay_ssm=self.mamba_replay_ssm,
             mamba_replay_buffer_len=self.mamba_replay_buffer_len,
             mtp_verification=self.inference_mtp_verification,
+            mtp_draft_sample_method=self.inference_mtp_draft_sample_method,
             use_synchronous_zmq_collectives=self.inference_use_synchronous_zmq_collectives,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,
             offset_sampling_seed_by_dp_rank=self.offset_sampling_seed_by_dp_rank,

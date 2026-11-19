@@ -3754,14 +3754,18 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
     @pytest.mark.internal
     @pytest.mark.parametrize("backend", ["torch", "flashinfer"])
-    @pytest.mark.parametrize("mtp_verification", ["exact_match", "rejection"])
+    @pytest.mark.parametrize(
+        "mtp_verification,draft_method",
+        [("exact_match", "probabilistic"), ("rejection", "probabilistic"), ("rejection", "greedy")],
+    )
     def test_speculative_rejection_sampling_returns_target_logprobs(
-        self, backend: str, mtp_verification: str
+        self, backend: str, mtp_verification: str, draft_method: str
     ):
         """Draft -> verify -> log-probs with MTP rejection sampling on the real controller.
 
         Emitted tokens (accepted drafts, then the replacement / bonus token) must carry the
         TARGET model's log-probs, and the rejection path must consume the recorded drafts.
+        Greedy drafts are the argmax, allocate no q buffer and verify by exact match.
         """
         if backend == "flashinfer":
             pytest.importorskip("flashinfer")
@@ -3778,8 +3782,11 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
         ctrl = self.text_generation_controller
         ctrl.mtp_verification = mtp_verification
+        ctrl.mtp_draft_sample_method = draft_method
         ctrl._init_mtp_sampling_tensors()
-        assert (ctrl._mtp_draft_probs is not None) == (mtp_verification == "rejection")
+        rejection = mtp_verification == "rejection" and draft_method == "probabilistic"
+        assert (ctrl._mtp_draft_probs is not None) == rejection
+        assert ctrl._mtp_rejection_enabled() == rejection
 
         ctx = ctrl.inference_wrapped_model.inference_context
         ctx.total_request_count = n
@@ -3801,6 +3808,10 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             ctrl._sampled_mtp_tokens_cuda[depth, :n] = ctrl._sample_mtp_draft(
                 depth, draft_logits, n
             )
+            if draft_method == "greedy":
+                assert torch.equal(
+                    ctrl._sampled_mtp_tokens_cuda[depth, :n], draft_logits.argmax(dim=-1)
+                )
         ctrl._record_mtp_draft_rows(ctx, n)
         drafts = ctrl._sampled_mtp_tokens_cuda[:, :n].T.clone()
         base = torch.randint(0, self.vocab_size, (n, 1), device='cuda')
@@ -3818,12 +3829,12 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         ctrl._sampling.chain_speculative_sampling = chain_spy
         ctrl._dynamic_step_sample_logits_and_verify_tokens(input_ids)
-        assert len(chain_results) == (1 if mtp_verification == "rejection" else 0)
+        assert len(chain_results) == (1 if rejection else 0)
         assert ctrl._mtp_draft_row_of_request is None
 
         accepted = ctrl._accepted_token_counts_per_request[:n].tolist()
         sampled = ctrl._sampled_tokens_cuda[:n]
-        if mtp_verification == "rejection":
+        if rejection:
             chain_tokens, num_accepted = chain_results[0]
             assert num_accepted.tolist() == accepted
             assert torch.equal(sampled, chain_tokens.gather(1, num_accepted[:, None]).squeeze(1))

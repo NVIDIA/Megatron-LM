@@ -703,8 +703,20 @@ class InferenceConfig:
     normalize(max(0, p - q)), so per-position acceptance is sum_x min(p, q). "exact_match" samples
     the target independently and accepts a draft only if it equals that sample (acceptance
     sum_x p * q). Both emit target-distributed tokens and are identical for greedy (top_k=1)
-    requests. "rejection" keeps the draft logits of every depth (num_mtp_depths x max_requests x
-    vocab in params_dtype) for use at verification."""
+    requests. The q above is the draft distribution set by `mtp_draft_sample_method`; with greedy
+    drafts (one-hot q) both modes reduce to the same rule, accept with probability p(x) and
+    otherwise emit a target sample other than x."""
+
+    mtp_draft_sample_method: Literal['greedy', 'probabilistic'] = 'greedy'
+    """How each MTP depth chooses its draft token (the same choice as vLLM's
+    `draft_sample_method`, and the same default).
+
+    "greedy" drafts the argmax of the depth's logits and treats the draft distribution as one-hot:
+    a draft x is accepted with probability p(x), so per-position acceptance is p(argmax q). It
+    keeps no draft distributions. "probabilistic" samples the draft from the request's filtered
+    draft distribution q (temperature / top-k / top-p) and, under `mtp_verification='rejection'`,
+    keeps q for verification (num_mtp_depths x max_requests x vocab fp32), raising acceptance to
+    sum_x min(p, q). Greedy (top_k=1) requests draft the argmax either way."""
 
     enable_prefix_caching: bool = False
     """Whether to enable prefix caching for KV cache block sharing."""
@@ -1020,6 +1032,12 @@ class InferenceConfig:
             raise ValueError(
                 f"Unsupported mtp_verification {self.mtp_verification!r}. "
                 "Supported values: exact_match, rejection."
+            )
+
+        if self.mtp_draft_sample_method not in ("greedy", "probabilistic"):
+            raise ValueError(
+                f"Unsupported mtp_draft_sample_method {self.mtp_draft_sample_method!r}. "
+                "Supported values: greedy, probabilistic."
             )
 
         if self.sampling_backend == 'flashinfer':

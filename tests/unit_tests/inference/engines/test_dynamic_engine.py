@@ -1455,6 +1455,7 @@ class DynamicEngineTestConfig:
     use_flashinfer_fused_rope: Optional[bool] = None
     sampling_backend: str = 'torch'
     mtp_verification: str = 'rejection'
+    mtp_draft_sample_method: str = 'greedy'
     temperature: float = 1.0
     top_k: int = 0
     top_p: float = 0.0
@@ -1641,6 +1642,7 @@ class DynamicInferenceEngineTestBase:
                 mamba_replay_ssm=test_config.mamba_replay_ssm,
                 mamba_replay_buffer_len=test_config.mamba_replay_buffer_len,
                 mtp_verification=test_config.mtp_verification,
+                mtp_draft_sample_method=test_config.mtp_draft_sample_method,
                 sampling_backend=test_config.sampling_backend,
                 offset_sampling_seed_by_dp_rank=test_config.offset_sampling_seed_by_dp_rank,
                 async_sched_mode=test_config.async_sched_mode,

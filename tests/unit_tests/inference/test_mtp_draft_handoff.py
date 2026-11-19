@@ -14,6 +14,7 @@ from megatron.core.inference.disaggregation.inference_state_handoff import (
 )
 from megatron.core.inference.disaggregation.mtp_draft_handoff import (
     MTP_DRAFT_Q_KEY,
+    MTP_DRAFT_SAMPLE_METHOD_KEY,
     MTP_VERIFICATION_KEY,
     decode_mtp_draft_q,
     encode_mtp_draft_q,
@@ -78,11 +79,14 @@ def test_decode_rejects_a_draft_outside_its_q_support():
         decode_mtp_draft_q(payload, num_depths=2, vocab=64, drafts=[outside, drafts[1]])
 
 
-def _decode_engine(mode, shape=(2, 64), num_speculative_tokens=2):
+def _decode_engine(mode, shape=(2, 64), num_speculative_tokens=2, method="probabilistic"):
+    stores_q = mode == "rejection" and method == "probabilistic"
     return SimpleNamespace(
         context=SimpleNamespace(num_speculative_tokens=num_speculative_tokens),
         controller=SimpleNamespace(
-            mtp_verification=mode, mtp_draft_q_shape=lambda: shape if mode == "rejection" else None
+            mtp_verification=mode,
+            mtp_draft_sample_method=method,
+            mtp_draft_q_shape=lambda: shape if stores_q else None,
         ),
     )
 
@@ -113,3 +117,38 @@ def test_decode_import_rejects_a_q_for_a_different_mtp_depth():
     kv_meta = {MTP_VERIFICATION_KEY: "rejection", MTP_DRAFT_Q_KEY: encode_mtp_draft_q(q, drafts)}
     with pytest.raises(RuntimeError, match="Invalid MTP draft distributions"):
         _import(_decode_engine("rejection", shape=(2, 64)), kv_meta, [5, *drafts[:2]])
+
+
+def test_handoff_names_the_verification_mode_and_draft_method():
+    engine = _decode_engine("rejection", method="greedy")
+    modes = InferenceStateHandoffMixin._mtp_handoff_modes(engine)
+    assert modes == {MTP_VERIFICATION_KEY: "rejection", MTP_DRAFT_SAMPLE_METHOD_KEY: "greedy"}
+    without_mtp = _decode_engine("rejection", num_speculative_tokens=0)
+    assert InferenceStateHandoffMixin._mtp_handoff_modes(without_mtp) == {}
+
+
+def test_greedy_drafts_need_no_q_on_either_side():
+    q, drafts = _q(2, 64, support=4)
+    resume = [5, *drafts]
+    with_q = {
+        MTP_VERIFICATION_KEY: "rejection",
+        MTP_DRAFT_SAMPLE_METHOD_KEY: "probabilistic",
+        MTP_DRAFT_Q_KEY: encode_mtp_draft_q(q, drafts),
+    }
+    # A greedy-drafting decode verifies by exact match (the one-hot rejection rule): q unused.
+    assert _import(_decode_engine("rejection", method="greedy"), with_q, resume) is None
+    # A greedy-drafting prefill sends no q; exact match is exactly right for its drafts, so a
+    # probabilistic decode neither uses a q nor warns, even if the modes differ.
+    for source_mode in ("rejection", "exact_match"):
+        engine = _decode_engine("rejection")
+        greedy_source = {MTP_VERIFICATION_KEY: source_mode, MTP_DRAFT_SAMPLE_METHOD_KEY: "greedy"}
+        assert _import(engine, greedy_source, resume) is None
+        assert not getattr(engine, "_warned_mtp_verification_mismatch", False)
+    # A probabilistic exact-match prefill does lose acceptance on the first drafts: warned once.
+    engine = _decode_engine("rejection")
+    sampled_exact = {
+        MTP_VERIFICATION_KEY: "exact_match",
+        MTP_DRAFT_SAMPLE_METHOD_KEY: "probabilistic",
+    }
+    assert _import(engine, sampled_exact, resume) is None
+    assert engine._warned_mtp_verification_mismatch

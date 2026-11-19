@@ -170,11 +170,12 @@ class MTPControllerMixin:
         self._async_sched_accepted_counts_cpu_ready_event = torch.cuda.Event()
 
         if self._mtp_rejection_enabled() and self.num_mtp_depths > 0:
-            # Rejection sampling needs each depth's full draft distribution q at verification,
-            # one step later. Keep the filtered fp32 q the draft was sampled from (rather than
-            # the logits) so verification neither rebuilds q (a softmax + top-k/top-p renorm
-            # per draft row) nor can see a q that differs from the sampled one. Written and
-            # read eagerly outside every CUDA graph; static address, no host sync.
+            # Rejection sampling of probabilistic drafts needs each depth's full draft
+            # distribution q at verification, one step later. Keep the filtered fp32 q the draft
+            # was sampled from (rather than the logits) so verification neither rebuilds q (a
+            # softmax + top-k/top-p renorm per draft row) nor can see a q that differs from the
+            # sampled one. Written and read eagerly outside every CUDA graph; static address, no
+            # host sync. Greedy drafts keep nothing.
             self._mtp_draft_probs = torch.empty(
                 [self.num_mtp_depths, max_requests, self.vocab_size],
                 dtype=torch.float32,
@@ -188,22 +189,34 @@ class MTPControllerMixin:
                 self._mtp_draft_probs.numel() * 4 / 2**20,
             )
 
+    def _mtp_greedy_drafts(self) -> bool:
+        """Whether MTP drafts are the argmax of each depth's logits (one-hot draft distribution)."""
+        return getattr(self, "mtp_draft_sample_method", "greedy") == "greedy"
+
     def _mtp_rejection_enabled(self) -> bool:
-        """Whether MTP drafts are verified by rejection sampling (vs exact match)."""
+        """Whether MTP drafts are verified by the chain rejection sampler with a stored q.
+
+        Only probabilistic drafts need it. A greedy draft's q is one-hot, for which rejection
+        sampling (accept with probability p(x), otherwise emit a sample of p with x removed) is
+        exactly the exact-match verifier, so greedy drafts always take the exact-match path.
+        """
         return (
             bool(self.num_speculative_tokens)
             and getattr(self, "mtp_verification", "exact_match") == "rejection"
+            and not self._mtp_greedy_drafts()
         )
 
     def _sample_mtp_draft(self, depth: int, logits_2d: Tensor, num_rows: int) -> Tensor:
-        """Sample one draft depth, keeping its distribution for rejection-sampling verification.
+        """Choose one draft depth's tokens, keeping q for rejection-sampling verification.
 
-        Under exact-match verification this is the plain sampler. Under rejection sampling q is
-        the backend's filtered distribution (`probs_kernel`, the request's temperature / top-k /
-        top-p), stored in `_mtp_draft_probs[depth]`, and the draft is sampled from that stored q,
-        so verification uses exactly the distribution the draft was drawn from. Greedy
-        (top_k == 1) rows keep the plain argmax, so they are bit-identical to exact-match
-        decoding.
+        Greedy drafting (`mtp_draft_sample_method='greedy'`) returns the argmax; temperature
+        and top-k / top-p filtering do not change it, and nothing is stored. Probabilistic
+        drafting under exact-match verification is the plain sampler. Probabilistic drafting
+        under rejection sampling stores q, the backend's filtered distribution (`probs_kernel`,
+        the request's temperature / top-k / top-p), in `_mtp_draft_probs[depth]` and samples
+        the draft from that stored q, so verification uses exactly the distribution the draft
+        was drawn from. Greedy (top_k == 1) rows draft their argmax in every mode, and an
+        all-greedy batch keeps the plain sampler, so it is bit-identical across modes.
 
         Args:
             depth (int): Draft depth.
@@ -213,14 +226,17 @@ class MTPControllerMixin:
         Returns:
             Tensor: `[num_rows]` draft tokens.
         """
+        context = self.inference_wrapped_model.inference_context
+        # Pinned CPU metadata: no device sync. An all-greedy (top_k == 1) batch keeps the plain
+        # sampler in every mode, so its drafts are bit-identical across modes.
+        greedy = context.active_request_metadata["top_k"][:num_rows] == 1
+        if num_rows == 0 or bool(greedy.all()):
+            return self._sample_from_logits_2d(logits_2d)
+        if self._mtp_greedy_drafts():
+            return logits_2d.argmax(dim=-1)
         # getattr: controllers built without `_init_mtp_sampling_tensors` (tests) draft plainly.
         draft_probs_buf = getattr(self, "_mtp_draft_probs", None)
-        if draft_probs_buf is None or num_rows == 0:
-            return self._sample_from_logits_2d(logits_2d)
-        context = self.inference_wrapped_model.inference_context
-        # Pinned CPU metadata: no device sync.
-        greedy = context.active_request_metadata["top_k"][:num_rows] == 1
-        if bool(greedy.all()):
+        if draft_probs_buf is None:
             return self._sample_from_logits_2d(logits_2d)
 
         assert logits_2d.shape[-1] == draft_probs_buf.shape[-1], (
