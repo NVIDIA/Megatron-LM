@@ -1123,6 +1123,8 @@ def gpt_data_config_from_args(args: Namespace) -> DataConfig:
     kwargs["blend"] = blend
     kwargs["blend_per_split"] = blend_per_split
     kwargs["sequences_per_dataset"] = sequences_per_dataset
+    if family == "sft":
+        kwargs["sft_loss_log_mode"] = args.sft_loss_log_mode
     if family == "fim":
         kwargs.update(
             fim_rate=args.fim_rate,

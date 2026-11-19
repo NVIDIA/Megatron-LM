@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+import torch
 import yaml
 
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
@@ -35,6 +36,7 @@ from megatron.training.config.dataset_config import CONTAINER_WRITTEN_FIELDS
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.models import GPTModelConfig, LLaVAModelConfig, T5ModelConfig
+from tests.unit_tests.test_utilities import Utils
 
 MODEL_ARGV = (
     "--num-layers 2 --hidden-size 128 --num-attention-heads 8 --micro-batch-size 1 "
@@ -670,6 +672,7 @@ def test_dummy_train_step_reads_the_section_and_the_model_seams(monkeypatch):
         train=SimpleNamespace(micro_batch_size=3),
     )
     monkeypatch.setattr(training, "get_run_config", lambda: cfg)
+    monkeypatch.setattr(torch.distributed, "broadcast", lambda tensor, **kw: tensor.fill_(False))
 
     # A loader-only section (an entry point whose datasets come from its own callbacks): the
     # length is the model's per-sample maximum, resolved before startup,
@@ -679,7 +682,7 @@ def test_dummy_train_step_reads_the_section_and_the_model_seams(monkeypatch):
     kw = calls.pop()
     assert (kw["cp_size"], kw["pipeline_model_parallel_size"], kw["dynamic_cp"]) == (2, 4, False)
     assert kw["seq_length"] == 64 and kw["micro_batch_size"] == 3
-    assert kw["has_cu_seqlens"] is False and kw["create_attention_mask_in_dataloader"] is True
+    assert kw["has_cu_seqlens"] is False and kw["create_attention_mask_in_dataloader"] is False
 
     # A dataset section and a model section: the section's flags, the model's values and length.
     dataset = GPTDatasetConfig(
@@ -700,11 +703,66 @@ def test_dummy_train_step_reads_the_section_and_the_model_seams(monkeypatch):
     assert kw["has_cu_seqlens"] is True and kw["create_attention_mask_in_dataloader"] is False
 
 
+@pytest.mark.parametrize("with_mask", [False, True])
+def test_callback_dummy_step_agrees_on_mask_presence(monkeypatch, with_mask):
+    from megatron.training import training
+
+    if Utils.world_size < 2:
+        pytest.skip("Requires two TP ranks")
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+    try:
+        cfg = SimpleNamespace(
+            model=_layout(tensor_model_parallel_size=2, max_seq_length_per_sample=4),
+            data=DataConfig(),
+            train=SimpleNamespace(micro_batch_size=1),
+        )
+        monkeypatch.setattr(training, "get_run_config", lambda: cfg)
+        monkeypatch.setattr(training, "get_num_microbatches", lambda: 1)
+        machine = Mock()
+        machine.should_run_forward_backward.side_effect = [True, False]
+        monkeypatch.setattr(training, "get_rerun_state_machine", lambda: machine)
+        received = []
+        real_get_batch = training.get_batch_on_this_tp_rank
+
+        def capture_batch(batch, **kwargs):
+            batch = real_get_batch(batch, **kwargs)
+            received.append(batch)
+            return batch
+
+        monkeypatch.setattr(training, "get_batch_on_this_tp_rank", capture_batch)
+        batch = {
+            "tokens": torch.ones((1, 4), dtype=torch.int64),
+            "labels": torch.ones((1, 4), dtype=torch.int64),
+            "position_ids": torch.arange(4).view(1, 4),
+            "loss_mask": torch.ones((1, 4)),
+        }
+        if with_mask:
+            batch["attention_mask"] = torch.ones((1, 1, 4, 4), dtype=torch.bool)
+        training.dummy_train_step(iter([batch]))
+        assert torch.equal(received[0]["tokens"], batch["tokens"].cuda())
+        assert (received[0]["attention_mask"] is not None) is with_mask
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("mode", ["token-weighted", "microbatch"])
+def test_sft_loss_mode_is_config_owned(container_factory, mode):
+    _, cfg = container_factory(
+        ["--seq-length", "64", "--sft", "--mock-data", "--sft-loss-log-mode", mode], data=True
+    )
+    cfg.validate()
+    restored = PretrainConfigContainer.from_dict(cfg.to_dict())
+    assert restored.data.dataset.sft_loss_log_mode == mode
+    restored.data.dataset.sft_loss_log_mode = "invalid"
+    with pytest.raises(ValueError, match="sft_loss_log_mode"):
+        restored.validate()
+
+
 def test_microbatch_loss_reduction_is_keyed_on_the_sft_family(monkeypatch):
     """The reporting reductions of train_step, in _reduce_microbatch_losses: SFT averages over the
     trainable tokens of the global batch (or over the valid per-microbatch means in 'microbatch'
     mode, an all-masked microbatch excluded), the others keep the per-microbatch mean; the family
-    is the data section's, --sft-loss-log-mode stays a logging argument."""
+    and reporting policy are the data section's."""
     import torch
 
     from megatron.training import training
@@ -825,6 +883,29 @@ def test_sample_length_is_a_multiple_of_twice_the_cp_size(container_factory):
         cfg.validate()
     cfg.model = _layout(context_parallel_size=2)  # 60 % 4 == 0
     cfg.validate()
+
+
+@pytest.mark.parametrize("pack_length", [1025, 1032])
+def test_sft_dynamic_cp_pack_alignment(container_factory, monkeypatch, pack_length):
+    monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 4)
+    _, cfg = container_factory(["--seq-length", "1024", "--sft", "--mock-data"], data=True)
+    cfg.model = _layout(
+        dynamic_context_parallel=True,
+        min_dynamic_context_parallel_size=4,
+        sequence_packing_scheduler="default_dynamic_cp",
+        max_seq_length_per_sample=pack_length,
+        max_seqlen_per_dp_cp_rank=2048,
+    )
+    cfg.validate()
+    if pack_length == 1025:
+        before = cfg.to_dict()
+        with pytest.raises(ValueError, match="dynamic CP/SP padding alignment \\(8\\)"):
+            cfg.finalize()
+        assert cfg.to_dict() == before
+    else:
+        cfg.finalize()
+        assert cfg.data.dataset.packed_sequence_length == 1032
+        assert cfg.data.dataset.data_parallel_size == 4
 
 
 def test_packed_buffer_budget_is_checked_at_finalize(container_factory, monkeypatch):

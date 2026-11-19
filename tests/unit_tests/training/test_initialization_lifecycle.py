@@ -1095,6 +1095,7 @@ def test_vlm_consumers_reject_incompatible_model_config(
         (1, "sbhd", 32, 32, "local"),
     ],
 )
+@pytest.mark.parametrize("inference", [False, True])
 def test_llava_callback_consumes_its_model_config(
     monkeypatch,
     isolated_globals,
@@ -1104,6 +1105,7 @@ def test_llava_callback_consumes_its_model_config(
     decoder_length,
     expected_model_length,
     transformer_impl,
+    inference,
 ):
     import pretrain_vlm
     from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
@@ -1133,6 +1135,14 @@ def test_llava_callback_consumes_its_model_config(
     cfg.model.drop_vision_class_token = True
     cfg.model.freeze_language_model = True
     cfg.model.freeze_vision_model = True
+    if inference:
+        cfg = inference_cfg_container_from_args(args, cfg.model)
+        monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+    else:
+        cfg.train.micro_batch_size = 2
+        args.micro_batch_size = (
+            999  # Training must use the config; inference keeps its CLI adapter.
+        )
     monkeypatch.setattr(pretrain_vlm, "get_args", lambda: args)
     monkeypatch.setattr(pretrain_vlm, "get_num_image_embeddings", lambda *a, **kw: 4)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)

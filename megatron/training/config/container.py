@@ -870,6 +870,18 @@ class PretrainConfigContainer(ConfigContainerBase):
             # The world size is known here: data_parallel_size gets the agreement check the other
             # fields got at validation, before anything is written.
             data_parallel_size = self.get_data_parallel_size()
+            if self.data.is_sft() and transformer.dynamic_context_parallel:
+                # SFT pads each document to DP*CP alignment, then truncates to the pack
+                # width. That final width must preserve the same alignment.
+                divisor = 2 * data_parallel_size * transformer.context_parallel_size
+                if transformer.sequence_parallel:
+                    divisor *= transformer.tensor_model_parallel_size
+                pack_length = transformer.max_seq_length_per_sample or dataset.sequence_length
+                if pack_length % divisor:
+                    raise ValueError(
+                        f"SFT pack width ({pack_length}) must be divisible by the dynamic "
+                        f"CP/SP padding alignment ({divisor})"
+                    )
             if dataset.data_parallel_size not in (1, data_parallel_size):
                 raise ValueError(
                     f"data.dataset.data_parallel_size={dataset.data_parallel_size} disagrees with "

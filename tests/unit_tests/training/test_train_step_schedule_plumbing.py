@@ -37,7 +37,9 @@ class _RerunThroughOptimizer(_Rerun):
         return False, False, 0
 
 
-def _run(*, args_overrides=None, model=None, optimizer=None, config=None, **kwargs):
+def _run(
+    *, args_overrides=None, model=None, optimizer=None, config=None, distillation=None, **kwargs
+):
     args = SimpleNamespace(
         save_params_interval=None,
         save_activations_interval=None,
@@ -61,7 +63,10 @@ def _run(*, args_overrides=None, model=None, optimizer=None, config=None, **kwar
         mock.patch.object(training_mod, "get_timers", return_value=mock.MagicMock()),
         mock.patch.object(training_mod, "get_rerun_state_machine", return_value=_Rerun()),
         mock.patch.object(training_mod, "get_num_microbatches", return_value=1),
-        mock.patch.object(training_mod, "has_nvidia_modelopt", False),
+        mock.patch.object(training_mod, "has_nvidia_modelopt", distillation is not None),
+        mock.patch.object(
+            training_mod, "get_tensor_shapes_adjust_fn_for_distillation", distillation, create=True
+        ),
     ):
         result = training_mod.train_step(
             forward_step_func=lambda *a, **k: None,
@@ -111,6 +116,23 @@ def test_train_step_forwards_schedule_plumbing(run_config, encoder_decoder):
     assert captured["p2p_communicator"] is p2p and captured["pg_collection"] is pg
     assert captured["seq_length"] == 32
     assert "decoder_seq_length" not in captured
+
+
+def test_distillation_shape_kwargs_remain_compatible_with_core(run_config):
+    from megatron.core.pipeline_parallel.schedules import get_tensor_shapes
+
+    run_config.model.transformer.max_seq_length_per_sample = 32
+
+    def distillation(model, **kwargs):
+        assert get_tensor_shapes(
+            **kwargs,
+            config=run_config.model.transformer,
+            tp_group=mock.Mock(size=lambda: 1),
+            cp_group=mock.Mock(size=lambda: 1),
+        ) == [(32, 1, run_config.model.transformer.hidden_size)]
+        return None
+
+    _run(args_overrides={"modelopt_enabled": True}, distillation=distillation)
 
 
 def test_train_step_defaults_to_none():

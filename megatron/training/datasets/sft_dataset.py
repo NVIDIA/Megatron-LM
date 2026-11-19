@@ -5,7 +5,7 @@ import csv
 import math
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import numpy as np
 import torch
@@ -26,6 +26,16 @@ class SFTDatasetConfig(GPTDatasetConfig):
     """Physical output width, including alignment padding. The training container derives this
     from the model execution bound, falling back to ``sequence_length`` when unset.
     Both real and mock SFT retain their existing pack-level truncation behavior."""
+
+    sft_loss_log_mode: Literal["token-weighted", "microbatch"] = "token-weighted"
+    """Report loss over all trainable tokens or average valid per-microbatch losses.
+    This does not change gradient normalization."""
+
+    def validate_without_tokenizer(self) -> None:
+        """Validate SFT settings without requiring a tokenizer."""
+        super().validate_without_tokenizer()
+        if self.sft_loss_log_mode not in ("token-weighted", "microbatch"):
+            raise ValueError("sft_loss_log_mode must be 'token-weighted' or 'microbatch'")
 
 
 class SFTLowLevelDataset:

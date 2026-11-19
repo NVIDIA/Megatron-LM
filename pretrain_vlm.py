@@ -39,6 +39,7 @@ from megatron.training import (
 )
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
+from megatron.training.config.container import InferenceConfigContainer
 from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.models import LLaVAModelConfig
 from megatron.training.vocab_utils import model_vocab_size
@@ -192,8 +193,14 @@ def model_provider(
     if language_transformer_config.context_parallel_size > 1:
         if getattr(args, "use_packed_sequence", False) or mp_padding_needed > 0:
             # Use THD data format
+            # The shared inference CLI has no TrainingConfig.
+            micro_batch_size = (
+                args.micro_batch_size
+                if isinstance(cfg, InferenceConfigContainer)
+                else cfg.train.micro_batch_size
+            )
             language_max_sequence_length = (
-                cfg.model.transformer.max_seq_length_per_sample * args.micro_batch_size
+                cfg.model.transformer.max_seq_length_per_sample * micro_batch_size
             )
     model = LLaVAModel(
         language_transformer_config=language_transformer_config,

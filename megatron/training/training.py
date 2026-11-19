@@ -2861,7 +2861,7 @@ def dummy_train_step(data_iterator):
     # Data predicates and model parallelism describe the batch transfer.
     has_cu_seqlens = cfg.data.has_cu_seqlens()
     dataset = cfg.data.dataset
-    create_attention_mask = cfg.data.creates_attention_mask() if dataset is not None else True
+    create_attention_mask = cfg.data.creates_attention_mask() if dataset is not None else None
     dynamic_cp = cfg.model.transformer.dynamic_context_parallel
 
     BATCH_KEYS = [
@@ -2880,6 +2880,21 @@ def dummy_train_step(data_iterator):
                 batch = next(data_iterator)
                 for key in BATCH_KEYS:
                     batch[key] = batch[key].cuda(non_blocking=True) if key in batch and batch[key] is not None else None
+            if dataset is None:
+                # Callback datasets have no mask config. Agree on the source batch's
+                # mask presence before entering optional TP collectives. This metadata
+                # exchange is only needed on the skipped-iteration path.
+                mask_present = torch.tensor(
+                    batch.get("attention_mask") is not None,
+                    dtype=torch.bool,
+                    device=torch.cuda.current_device(),
+                )
+                torch.distributed.broadcast(
+                    mask_present,
+                    src=mpu.get_tensor_model_parallel_src_rank(),
+                    group=mpu.get_tensor_model_parallel_group(),
+                )
+                create_attention_mask = mask_present.item()
             batch = get_batch_on_this_tp_rank(
                 batch,
                 broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
@@ -3120,6 +3135,7 @@ def train_step(
                 model,
                 seq_length=sequence_length,
                 micro_batch_size=cfg.train.micro_batch_size,
+                decoder_seq_length=None,
             )
         else:
             adjust_tensor_shapes_fn = None
@@ -3366,7 +3382,8 @@ def train_step(
         loss_reduced = _reduce_microbatch_losses(
             losses_reduced,
             is_sft=cfg.data.is_sft(),
-            sft_loss_log_mode=args.sft_loss_log_mode,
+            # Plain/legacy GPT dataset configs have no SFT reporting override.
+            sft_loss_log_mode=getattr(cfg.data.dataset, "sft_loss_log_mode", "token-weighted"),
             group=dp_cp_group,
         )
         return (
@@ -3868,7 +3885,7 @@ def training_log(
             from megatron.core.telemetry.training_metrics import record_training_metrics
             _avg_loss = _otel_loss_snapshot
             _tokens_per_sec = (
-                batch_size * sequence_length / elapsed_time_per_iteration
+                batch_size * get_training_data_sequence_length(cfg) / elapsed_time_per_iteration
                 if elapsed_time_per_iteration > 0 else None
             )
             _mem_gb = torch.cuda.max_memory_allocated() / (1024 ** 3) if torch.cuda.is_available() else None
@@ -4576,7 +4593,7 @@ def train(
         iteration=iteration,
         consumed_train_samples=train_state.consumed_train_samples,
         train_samples=cfg.train.train_samples,
-        seq_length=sequence_length,
+        seq_length=get_training_data_sequence_length(cfg),
         train_iters=cfg.train.train_iters,
         save=cfg.checkpoint.save,
         async_save=cfg.checkpoint.async_save,
@@ -4719,7 +4736,7 @@ def train(
             'num_floating_point_operations_so_far': train_state.num_floating_point_operations_so_far,
             'consumed_train_samples': train_state.consumed_train_samples,
             'world_size': cfg.get_model_world_size(),
-            'seq_length': sequence_length,
+            'seq_length': get_training_data_sequence_length(cfg),
         }
 
     # Cache into one-logger for callback.
@@ -5467,6 +5484,7 @@ def evaluate(
             model,
             seq_length=sequence_length,
             micro_batch_size=eval_micro_batch_size,
+            decoder_seq_length=None,
         )
     else:
         adjust_tensor_shapes_fn = None
