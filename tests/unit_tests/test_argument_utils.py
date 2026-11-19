@@ -1495,7 +1495,8 @@ def test_optimizer_model_constraints_use_the_model_owner(native_model, valid, co
     args = _make_args(moe_grouped_gemm=True, moe_use_grouped_tensor=True)
     args.micro_batch_size = 1
     args.global_batch_size = 1
-    args.ckpt_format = "torch"
+    # The step-overlap path needs the torch format; the layer-wise optimizer rejects it.
+    args.ckpt_format = "torch" if constraint == "vpp" else "torch_dist"
     args.use_distributed_optimizer = True
     args.optimizer = "adam" if constraint == "vpp" else "muon"
     args.overlap_param_gather = constraint == "vpp"
@@ -1531,16 +1532,12 @@ def test_legacy_checkpoint_gloo_requirement_uses_effective_optimizer(monkeypatch
     args.use_distributed_optimizer = True
     args.use_gloo_process_groups = False
     args.ckpt_format = "torch"
-    args.use_layer_wise_param_layout = False
     with pytest.raises(AssertionError) if optimizer in ("adam", "sgd") else nullcontext():
         validate_args(args)
 
 
-@pytest.mark.parametrize("use_layer_wise_param_layout", [False, True])
 @pytest.mark.parametrize("optimizer", ["adam", "muon", "dist_muon"])
-def test_mem_efficient_reshardable_checkpoint_gloo_requirement(
-    monkeypatch, optimizer, use_layer_wise_param_layout
-):
+def test_mem_efficient_reshardable_checkpoint_gloo_requirement(monkeypatch, optimizer):
     """Every optimizer that builds a DistributedOptimizer needs Gloo for the mem-efficient
     fully reshardable format, including the one the layer-wise path builds for Muon."""
     args = _minimal_training_args(monkeypatch)
@@ -1550,13 +1547,7 @@ def test_mem_efficient_reshardable_checkpoint_gloo_requirement(
     args.ckpt_format = "torch_dist"
     args.dist_ckpt_optim_fully_reshardable = True
     args.distrib_optim_fully_reshardable_mem_efficient = True
-    args.use_layer_wise_param_layout = use_layer_wise_param_layout
-    builds_distributed_optimizer = optimizer == "adam" or use_layer_wise_param_layout
-    with (
-        pytest.raises(AssertionError, match="fully-reshardable-mem-efficient")
-        if builds_distributed_optimizer
-        else nullcontext()
-    ):
+    with pytest.raises(AssertionError, match="fully-reshardable-mem-efficient"):
         validate_args(args)
 
 

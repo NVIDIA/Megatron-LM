@@ -358,7 +358,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
         mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
-        use_layer_wise_param_layout: bool = True,
+        second_order_optimizer_grad_collective: str = "reduce-scatter",
     ) -> list[GPTModel]:
         """Build model stages and wrap for distributed training.
 
@@ -374,8 +374,8 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
             model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
-            use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-                controls whether to compute and supply a shard-aligned param layout to DDP.
+            second_order_optimizer_grad_collective: See
+                ``OptimizerConfig.second_order_optimizer_grad_collective``.
 
         Returns:
             List of model stages.
@@ -396,7 +396,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             composed_pre_wrap_hook,
             model_type,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
-            use_layer_wise_param_layout=use_layer_wise_param_layout,
+            second_order_optimizer_grad_collective=second_order_optimizer_grad_collective,
         )
 
         composed_post_wrap_hook = compose_hooks(self._model_config.post_wrap_hooks)

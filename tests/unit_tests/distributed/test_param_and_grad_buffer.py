@@ -2,6 +2,7 @@
 
 import contextlib
 import math
+from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
 
@@ -9,7 +10,11 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.distributed import (
+    DistributedDataParallel,
+    DistributedDataParallelConfig,
+    param_and_grad_buffer,
+)
 from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.transformer import TransformerConfig
@@ -1092,6 +1097,135 @@ def test_expert_parallel_params_get_separate_buffers(use_distributed_optimizer: 
     Utils.destroy_model_parallel()
 
 
+def _buffer_for_layout_test(param_dtype, layer_wise, num_optimizer_shards, ddp_config, group):
+    params = [torch.nn.Parameter(torch.zeros(4)) for _ in range(2)]
+    for param in params:
+        param.is_managed_by_layer_wise_optimizer = layer_wise
+    return SimpleNamespace(
+        params=params,
+        param_dtype=param_dtype,
+        ddp_config=ddp_config,
+        num_optimizer_shards=num_optimizer_shards,
+        data_parallel_group=group,
+        data_parallel_world_size=group.size(),
+        buckets=[
+            SimpleNamespace(
+                params_list=[param],
+                params_with_extra_main_grads=[],
+                grad_data=torch.arange(4, dtype=torch.float32),
+                gradient_scaling_factor=1.0,
+            )
+            for param in params
+        ],
+    )
+
+
+@pytest.mark.parametrize("compact_first", [True, False])
+@pytest.mark.parametrize("sharded_layer_wise", [True, False])
+def test_bucket_groups_keep_the_layout_of_their_buffer(
+    monkeypatch, compact_first, sharded_layer_wise
+):
+    """Shared config must not merge compact buffers with padded LayerWise or DistOpt buffers."""
+    # Group construction temporarily selects the FP32-accumulating reduce-scatter function.
+    monkeypatch.setattr(
+        param_and_grad_buffer,
+        "dist_reduce_scatter_func",
+        param_and_grad_buffer.dist_reduce_scatter_func,
+    )
+    ddp_config = DistributedDataParallelConfig(
+        use_distributed_optimizer=True, reduce_scatter_with_fp32_accumulation=True
+    )
+    group = SimpleNamespace(rank=lambda: 0, size=lambda: 1)
+    compact = _buffer_for_layout_test(torch.uint8, True, None, ddp_config, group)
+    sharded = _buffer_for_layout_test(torch.bfloat16, sharded_layer_wise, 1, ddp_config, group)
+    buffers = [compact, sharded] if compact_first else [sharded, compact]
+    bucket_groups = partition_buckets(buffers, reduce_scatter_with_fp32_accumulation=True)
+
+    assert sum(len(bucket_group.buckets) for bucket_group in bucket_groups) == 4
+    for bucket_group in bucket_groups:
+        (bucket,) = bucket_group.buckets
+        (param,) = bucket.params_list
+        assert bucket_group.ddp_config is ddp_config
+        if any(param is candidate for candidate in compact.params):
+            assert bucket_group.num_optimizer_shards is None
+        else:
+            assert bucket_group.num_optimizer_shards == 1
+
+
+@pytest.mark.parametrize(
+    ("num_optimizer_shards", "force_all_reduce", "expected_collective"),
+    [(None, False, "ar"), (1, False, "rs"), (2, False, "rs"), (2, True, "ar")],
+)
+def test_bucket_group_grad_collective_follows_layout(
+    num_optimizer_shards, force_all_reduce, expected_collective
+):
+    """Compact layouts all-reduce despite shared DistOpt config; one-shard layouts still use RS."""
+    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+    dp_size = num_optimizer_shards or 2
+    group = SimpleNamespace(rank=lambda: 0, size=lambda: dp_size)
+    buffer = _buffer_for_layout_test(torch.bfloat16, True, num_optimizer_shards, ddp_config, group)
+    bucket_group = partition_buckets([buffer])[0]
+    grad_data = bucket_group.buckets[0].grad_data
+    with (
+        mock.patch.object(torch.cuda, "current_stream"),
+        mock.patch.object(torch.distributed, "get_rank", return_value=0),
+        mock.patch.object(
+            param_and_grad_buffer,
+            "_coalescing_manager",
+            side_effect=lambda *a, **kw: contextlib.nullcontext(),
+        ),
+        mock.patch.object(param_and_grad_buffer, "dist_reduce_scatter_func") as reduce_scatter,
+        mock.patch.object(torch.distributed, "all_reduce") as all_reduce,
+    ):
+        bucket_group.start_grad_sync(force_all_reduce=force_all_reduce)
+
+    if expected_collective == "rs":
+        reduce_scatter.assert_called_once()
+        all_reduce.assert_not_called()
+        output, input_tensor = reduce_scatter.call_args.args
+        assert input_tensor is grad_data
+        assert output.numel() == grad_data.numel() // dp_size
+    else:
+        all_reduce.assert_called_once()
+        reduce_scatter.assert_not_called()
+        assert all_reduce.call_args.args[0] is grad_data
+
+
+@pytest.mark.parametrize(
+    ("num_optimizer_shards", "overlap", "reuse", "dispatch"),
+    [
+        (None, False, False, False),
+        (None, True, False, True),
+        (None, False, True, True),
+        (1, False, False, True),
+    ],
+)
+def test_bucket_group_param_sync_follows_layout(num_optimizer_shards, overlap, reuse, dispatch):
+    """Compact temporary gather stays optimizer-owned; overlap/reuse and sharded layouts dispatch."""
+    ddp_config = DistributedDataParallelConfig(
+        use_distributed_optimizer=True,
+        overlap_grad_reduce=overlap,
+        overlap_param_gather=overlap,
+        fp8_param_gather=reuse,
+        reuse_grad_buf_for_mxfp8_param_ag=reuse,
+    )
+    group = SimpleNamespace(rank=lambda: 0, size=lambda: 1)
+    buffer = _buffer_for_layout_test(torch.bfloat16, True, num_optimizer_shards, ddp_config, group)
+    bucket_group = partition_buckets([buffer])[0]
+    with (
+        mock.patch.object(bucket_group, "start_param_sync") as start_sync,
+        mock.patch.object(bucket_group, "_post_param_sync") as post_sync,
+    ):
+        DistributedDataParallel._start_bucket_group_param_sync(
+            SimpleNamespace(ddp_config=ddp_config), bucket_group, force_sync=True
+        )
+    if dispatch:
+        start_sync.assert_called_once_with(force_sync=True)
+    else:
+        start_sync.assert_not_called()
+    assert post_sync.call_count == int(dispatch and not overlap)
+
+
 class TestRegisterUbPoolHook:
     """The buffer hands its pool to each ``needs_nccl_mem`` param it remaps into param_data."""
 
@@ -1102,10 +1236,12 @@ class TestRegisterUbPoolHook:
         grad_buffer_offload=False,
         reuse_grad_buf=False,
         quantized=(),
+        compact_layer_wise=False,
     ):
         params = [torch.nn.Parameter(torch.randn(16, 16, dtype=torch.bfloat16)) for _ in range(3)]
         for param in params:
             param.register_ub_pool = mock.MagicMock()
+            param.is_managed_by_layer_wise_optimizer = compact_layer_wise
         params[0].needs_nccl_mem = True
         params[1].needs_nccl_mem = True
         params_with_names = [(param, f"p{i}") for i, param in enumerate(params)]
@@ -1121,7 +1257,7 @@ class TestRegisterUbPoolHook:
             reuse_grad_buf_for_mxfp8_param_ag=reuse_grad_buf,
         )
         param_layout = None
-        if use_distributed_optimizer:
+        if use_distributed_optimizer and not compact_layer_wise:
             param_layout = DistributedOptimizer._compute_per_buffer_param_layout(
                 params, None, 1, ddp_config, list(range(len(params)))
             )
@@ -1174,6 +1310,13 @@ class TestRegisterUbPoolHook:
     def test_no_hook_without_distributed_optimizer(self):
         buffer, params = self._make_buffer(use_distributed_optimizer=False)
         assert buffer.nccl_mem_pool is None and buffer.param_nccl_mem_pool is None
+        for param in params:
+            param.register_ub_pool.assert_not_called()
+
+    def test_compact_layout_keeps_parameter_storage_outside_the_pool(self):
+        buffer, params = self._make_buffer(compact_layer_wise=True)
+        assert buffer.ddp_config.use_distributed_optimizer
+        assert buffer.param_data is None and buffer.param_nccl_mem_pool is None
         for param in params:
             param.register_ub_pool.assert_not_called()
 

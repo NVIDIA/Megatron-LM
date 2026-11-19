@@ -1006,8 +1006,6 @@ def validate_args(args, defaults={}):
                     args.rank,
                 )
             args.use_distributed_optimizer = True
-        # Optimizer step MXFP8 buffer operation that is not relevant or supported for Megatron-FSDP.
-        args.reuse_grad_buf_for_mxfp8_param_ag = False
         if args.moe_single_grouped_weight or args.moe_single_grouped_bias:
             # Megatron-FSDP currently remaps module parameters through plain Tensor and TE
             # Float8Tensor/MXFP8Tensor storage paths. TE GroupedTensor parameters need their
@@ -1063,6 +1061,22 @@ def validate_args(args, defaults={}):
     if args.fsdp_manual_registration:
         assert args.use_megatron_fsdp, "FSDP manual registration is only supported with Megatron FSDP."
         assert args.nccl_ub, "FSDP manual registration is only supported with --nccl-ub argument."
+
+    # MXFP8 params cannot be mapped into DDP's param buffer (TE has no replace_raw_data for
+    # MXFP8Tensor), so their all-gather always goes through the grad buffer; FSDP keeps its own
+    # buffers. The flag is therefore derived rather than chosen.
+    if args.reuse_grad_buf_for_mxfp8_param_ag:
+        warn_rank_0(
+            '--reuse-grad-buf-for-mxfp8-param-ag is deprecated and ignored: the grad buffer is '
+            'reused for the MXFP8 parameter all-gather whenever --fp8-param-gather is set.',
+            args.rank,
+        )
+    args.reuse_grad_buf_for_mxfp8_param_ag = (
+        args.fp8 is not None
+        and args.fp8_recipe == 'mxfp8'
+        and args.fp8_param_gather
+        and not (args.use_megatron_fsdp or args.use_torch_fsdp2)
+    )
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -1387,14 +1401,6 @@ def validate_args(args, defaults={}):
                 "GTP + mxfp8 requires --fp8-param-gather (the optimizer maintains the fp8 shard; "
                 "GTP does not keep or re-quantize a bf16 weight)."
             )
-            # MXFP8 params cannot be mapped into the contiguous param buffer (TE's
-            # replace_raw_data does not support the MXFP8 tile-scaling layout), so the param
-            # all-gather must reuse the grad buffer instead.
-            assert getattr(args, 'reuse_grad_buf_for_mxfp8_param_ag', False), (
-                "GTP + mxfp8 + --fp8-param-gather requires --reuse-grad-buf-for-mxfp8-param-ag "
-                "(MXFP8 params keep their own quantized storage; mapping them into the param "
-                "buffer via replace_raw_data is unsupported)."
-            )
 
         for attr in ("gtp_remat_nccl_ub", "gtp_expert_remat_nccl_ub"):
             setattr(args, attr, normalize_gtp_nccl_ub(getattr(args, attr, None)))
@@ -1628,19 +1634,17 @@ def validate_args(args, defaults={}):
                     '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
 
         # Other optimizers (e.g. Muon) with the distributed optimizer take the layer-wise path,
-        # which builds a separate DistributedOptimizer for their non-matrix parameters unless
-        # --no-use-layer-wise-param-layout is set. Its memory-efficient fully reshardable save
-        # gathers over Gloo as well.
+        # which builds a separate DistributedOptimizer for their non-matrix parameters.
+        # Its memory-efficient fully reshardable save gathers over Gloo as well.
         if (
             args.optimizer not in ('sgd', 'adam')
             and (args.use_distributed_optimizer or args.optimizer == 'dist_muon')
-            and getattr(args, 'use_layer_wise_param_layout', True)
             and args.dist_ckpt_optim_fully_reshardable
         ):
             assert not args.distrib_optim_fully_reshardable_mem_efficient, (
                 '--distrib-optim-fully-reshardable-mem-efficient needs Gloo process groups for '
                 'the DistributedOptimizer of the layer-wise optimizer. Drop '
-                '--disable-gloo-process-groups or pass --no-use-layer-wise-param-layout.'
+                '--disable-gloo-process-groups.'
             )
 
     if args.fake_process_group:
@@ -2626,6 +2630,15 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-no-split-qkv', action='store_false', default=True,
                        dest='muon_split_qkv',
                        help='Whether to split QKV parameters for Muon optimizer')
+    group.add_argument('--muon-split-qkv-per-head', action='store_true',
+                       help='Orthogonalize each Q, gate, K and V head of split QKV weights on its '
+                       'own instead of each projection. Changes the update rule; requires QKV '
+                       'splitting and is not supported with --muon-tp-mode layer_sharded. Like '
+                       'the projection split, it applies only when every tensor-parallel rank '
+                       'holds whole query groups.')
+    group.add_argument('--muon-split-mla-qkv', action='store_true',
+                       help='Also split MLA query and key-value up-projections by head component '
+                       'for Muon. Off by default: they are orthogonalized as whole matrices.')
     group.add_argument('--muon-nesterov', action='store_true',
                        help='Whether to use Nesterov-style momentum in the internal SGD')
     group.add_argument('--muon-scale-mode', type=str, default='spectral',
@@ -2913,7 +2926,8 @@ def _add_mixed_precision_args(parser):
                        'requested dtype differs from the input dtype, Transformer Engine '
                        'general_gemm is used. By default, logits use the output-layer input dtype.')
     group.add_argument('--reuse-grad-buf-for-mxfp8-param-ag', action='store_true',
-                       help='If True, reuse the grad buffer for MXFP8 parameter all-gather.')
+                       help='Deprecated and ignored: the grad buffer is reused for the MXFP8 '
+                       'parameter all-gather whenever --fp8-param-gather is set.')
     group.add_argument('--mamba-training-ssm-states-dtype', type=str,
                        choices=['fp32', 'bf16'], default=None,
                        help='Dtype of the materialized inter-chunk SSM states in Mamba training')
@@ -3001,17 +3015,17 @@ def _add_distributed_args(parser):
     group.add_argument('--overlap-outer-communication', action='store_true',
                        help="Overlap outer-DP and inner-DP gradient reductions "
                             "with Megatron-FSDP v2.")
-    group.add_argument('--no-use-layer-wise-param-layout',
-                       action='store_false',
-                       dest='use_layer_wise_param_layout',
-                       help='Opt out of the precomputed LayerWise param layout. When set, '
-                       'falls back to the legacy LayerWise ping-pong path: all params '
-                       '(including non-Muon embeddings, biases, layernorm) live in a single '
-                       'LayerWise buffer and the optimizer uses the allgather_params() codepath. '
-                       'The default (precomputed layout) routes non-Muon params through a '
-                       'separate DistributedOptimizer with byte-level sharding, which is faster '
-                       'and uses less padding but produces different bf16 reduction ordering '
-                       'and so will not match legacy-path loss curves bit-for-bit.')
+    group.add_argument('--second-order-optimizer-grad-collective', type=str,
+                       default='reduce-scatter', choices=['reduce-scatter', 'all-reduce'],
+                       help='Data-parallel gradient collective for the parameters that a '
+                       'second-order optimizer with --use-distributed-optimizer (e.g. Muon) '
+                       'updates whole on one rank. reduce-scatter (default): those tensors '
+                       'stay whole inside padded, equal-size shards. all-reduce: no padding, '
+                       'twice the gradient traffic and an uneven all-gather of whole tensors; '
+                       'needed for blockwise FP8 params. Other parameters always use '
+                       'reduce-scatter, and torch_dist checkpoints load with either. The '
+                       'legacy layer-wise layout was removed; see '
+                       'docs/user-guide/features/dist_optimizer.md.')
     group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub',
                        help='Use the userbuffer registration for DP/FSDP communication buffers.'
                        'This option will reduce GPU SM usage for the DP/FSDP communication,'

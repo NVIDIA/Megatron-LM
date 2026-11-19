@@ -213,3 +213,42 @@ def test_mhc_bf16_parameter_state_round_trip(precision_aware):
         _check_parameter_state_round_trip(model, optimizer)
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("quantized_first", [True, False])
+def test_split_state_dict_reads_the_checkpoint_buffer(quantized_first):
+    """A checkpoint saved without FP8 parameter storage holds the matrix and the bias in one
+    BF16 buffer; loading with FP8 storage splits it into the current FP8 and BF16 buffers.
+    The source is read at its checkpoint index, also when the FP8 buffer now comes first."""
+    from types import SimpleNamespace
+
+    from megatron.core.optimizer.distrib_optimizer import _get_dtype_key
+
+    # Registration order: matrix (index 0) then bias (index 1), 64 elements each.
+    matrix = torch.zeros(8, 8, dtype=torch.bfloat16)
+    bias = torch.zeros(64, dtype=torch.bfloat16)
+    bf16_key, uint8_key = _get_dtype_key(torch.bfloat16), _get_dtype_key(torch.uint8)
+    fp8_buffer = SimpleNamespace(params=[matrix], param_indices=[0])
+    bf16_buffer = SimpleNamespace(params=[bias], param_indices=[1])
+    buffers = [fp8_buffer, bf16_buffer] if quantized_first else [bf16_buffer, fp8_buffer]
+    optimizer = SimpleNamespace(
+        buffers=buffers,
+        gbuf_ranges=[{uint8_key if b is fp8_buffer else bf16_key: None} for b in buffers],
+        optimizer_state_keys=('exp_avg', 'exp_avg_sq'),
+        _is_distopt_quantized_param=lambda param: param is matrix,
+    )
+    keys = ('param',) + optimizer.optimizer_state_keys
+    # The saved buffer lays params out in reverse registration order: bias, then matrix.
+    saved = {key: torch.arange(128, dtype=torch.float32) + 1000 * i for i, key in enumerate(keys)}
+    state_dict = {'buckets_coalesced': True, 0: {bf16_key: dict(saved)}}
+
+    DistributedOptimizer.split_state_dict_if_needed(optimizer, state_dict)
+
+    fp8_idx = 0 if quantized_first else 1
+    bf16_idx = 1 - fp8_idx
+    assert set(state_dict) == {'buckets_coalesced', fp8_idx, bf16_idx}
+    for key in keys:
+        torch.testing.assert_close(state_dict[fp8_idx][uint8_key][key], saved[key][64:])
+        torch.testing.assert_close(state_dict[bf16_idx][bf16_key][key], saved[key][:64])
+    assert state_dict[fp8_idx][uint8_key]['numel_unpadded'] == 64
+    assert state_dict[bf16_idx][bf16_key]['numel_unpadded'] == 64

@@ -680,9 +680,8 @@ def _build_sharded_state_dict_metadata(
 
     # ``use_layer_wise_distributed_optimizer`` shares the DistOpt sub-optimizer
     # for non-Muon params (embeddings, biases, layernorm, ...), so it needs the
-    # same sharding-type metadata even though the parser flips
-    # ``use_distributed_optimizer`` off in that mode. Inference containers have no
-    # optimizer section and only need the shared metadata below.
+    # same sharding-type metadata when selected through its own flag or a deprecated alias.
+    # Inference containers have no optimizer section and only need the shared metadata below.
     optimizer_cfg = getattr(cfg, 'optimizer', None)
     has_distributed_optimizer = optimizer_cfg is not None and (
         optimizer_cfg.use_distributed_optimizer
@@ -913,16 +912,6 @@ def save_checkpoint(
         ensure_directory_exists(optim_checkpoint_name)
         if not optimizer.is_stub_optimizer:
             optimizer.save_parameter_state(optim_checkpoint_name)
-
-    # LayerWiseDistributedOptimizer save optimizer state to file on different ranks
-    if can_save_optim and getattr(cfg.optimizer, 'use_layer_wise_distributed_optimizer', False) and save_format == 'torch':
-        dp_rank = mpu.get_data_parallel_rank()
-        optim_checkpoint_name = os.path.join(
-            os.path.dirname(checkpoint_name), f'layer_wise_optimizer_{dp_rank}.pt'
-        )
-        ensure_directory_exists(optim_checkpoint_name)
-        if not optimizer.is_stub_optimizer:
-            optimizer.save_state_dict_to_file(optim_checkpoint_name)
 
     async_save_request = None
     if checkpoint.async_save:
@@ -3594,16 +3583,6 @@ def load_checkpoint(
         try:
             # Load state dict.
             if (
-                getattr(cfg.optimizer, 'use_layer_wise_distributed_optimizer', False)
-                and load_format == 'torch'
-            ):
-                # LayerWiseDistributedOptimizer load optimizer state from file on different ranks
-                dp_rank = mpu.get_data_parallel_rank()
-                optim_checkpoint_name = os.path.join(
-                    os.path.dirname(checkpoint_name), f'layer_wise_optimizer_{dp_rank}.pt'
-                )
-                optimizer.load_state_dict_from_file(optim_checkpoint_name)
-            elif (
                 not skip_load_to_model_and_opt
                 and optimizer is not None
                 and not optimizer.is_stub_optimizer
