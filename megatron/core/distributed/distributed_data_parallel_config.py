@@ -104,9 +104,9 @@ class DistributedDataParallelConfig:
        perform the param all-gather in fp4."""
 
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
-    """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
-       set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True: MXFP8 params
-       cannot be mapped into the param buffer. The training CLI sets it automatically."""
+    """Stage MXFP8 parameter all-gathers in gradient storage. Enable only for the MXFP8
+    recipe with ``fp8_param_gather``. Compact LayerWise also receives into gradient storage
+    whenever ``overlap_param_gather`` is enabled, even if this field is False."""
 
     use_megatron_fsdp: bool = False
     """If true, use the FSDP code path for DDP."""

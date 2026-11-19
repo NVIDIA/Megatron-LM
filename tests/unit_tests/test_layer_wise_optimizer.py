@@ -668,6 +668,14 @@ class TestLayerWiseOptimizer:
         def finish():
             model.start_param_sync()
             for bucket_group in model.bucket_groups:
+                if bucket_group.num_optimizer_shards is None:
+                    # BF16 compact gather borrows grad storage even with MXFP8 reuse off.
+                    for bucket in bucket_group.buckets:
+                        grad_ptr = bucket.grad_data.untyped_storage().data_ptr()
+                        assert all(
+                            slot.untyped_storage().data_ptr() == grad_ptr
+                            for slot in bucket.layerwise_gather_list
+                        )
                 bucket_group.finish_param_sync(skip_next_bucket_dispatch=True)
 
         def forward_pre_hooks():

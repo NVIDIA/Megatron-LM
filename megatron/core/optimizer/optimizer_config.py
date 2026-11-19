@@ -230,9 +230,9 @@ class OptimizerConfig:
     """If true, train with bf16 mixed precision training. Defaults to False."""
 
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
-    """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
-       set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True. The training
-       CLI sets it for every MXFP8 run with --fp8-param-gather outside FSDP."""
+    """Enable MXFP8 grad-buffer staging. The training CLI sets this for the MXFP8 recipe
+    with ``--fp8-param-gather`` outside FSDP. Compact LayerWise also borrows gradient
+    storage when ``overlap_param_gather`` is enabled."""
 
     params_dtype: torch.dtype = torch.float32
     """dtype used when intializing the weights. Defaults to torch.float32."""

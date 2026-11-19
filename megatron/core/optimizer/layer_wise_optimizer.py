@@ -13,6 +13,7 @@ from torch._utils import _flatten_dense_tensors
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedStateDict
 from megatron.core.distributed.param_and_grad_buffer import (
+    _compact_param_gather_uses_grad_buffer,
     _compute_default_per_buffer_param_layout,
     _copy_back_layerwise_gather,
     _layerwise_gather_sources,
@@ -757,9 +758,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if self.param_layout == 'padded':
             self.layerwise_param_sync_via_bucket_group = True
         else:
-            # Compact layouts use bucket-group parameter sync for overlap or grad-buffer reuse.
-            self.layerwise_param_sync_via_bucket_group = (
-                self.overlap_param_gather or sync_config.reuse_grad_buf_for_mxfp8_param_ag
+            self.layerwise_param_sync_via_bucket_group = _compact_param_gather_uses_grad_buffer(
+                sync_config
             )
             if self.layerwise_param_sync_via_bucket_group:
                 # Overlap gathers from forward pre-hooks, synchronous MXFP8 reuse from the step.

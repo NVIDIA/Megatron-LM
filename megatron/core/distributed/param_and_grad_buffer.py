@@ -208,6 +208,15 @@ class _ParamAndGradBucket:
         ]
 
 
+def _compact_param_gather_uses_grad_buffer(config) -> bool:
+    """Whether a compact LayerWise all-gather receives into ``bucket.grad_data``.
+
+    Configuring overlap selects gradient storage for all supported dtypes, even when the
+    call is forced synchronous. With overlap off, only the MXFP8 setting selects it.
+    """
+    return config.overlap_param_gather or config.reuse_grad_buf_for_mxfp8_param_ag
+
+
 def _layerwise_gather_sources(
     params: List[torch.nn.Parameter], quantized: bool
 ) -> List[torch.Tensor]:
@@ -391,17 +400,14 @@ class _ParamAndGradBucketGroup:
     def param_sync_via_bucket_group(self) -> bool:
         """Whether this group gathers updated parameters through DDP.
 
-        Sharded layouts always gather here. Compact LayerWise layouts gather here for
-        overlap or grad-buffer reuse; otherwise their optimizer gathers synchronously.
+        Sharded layouts always gather here. Compact LayerWise gathers through DDP when
+        it borrows gradient storage and through its optimizer when it uses temporary tensors.
         Ordinary replicated DDP buffers do not require parameter synchronization.
         """
         if self.num_optimizer_shards is not None:
             return True
 
-        return (
-            self.ddp_config.overlap_param_gather
-            or self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
-        )
+        return _compact_param_gather_uses_grad_buffer(self.ddp_config)
 
     def reset(self):
         """
