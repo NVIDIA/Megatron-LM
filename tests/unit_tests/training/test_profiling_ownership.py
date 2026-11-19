@@ -75,14 +75,10 @@ def inline_profiler(monkeypatch, run_config):
     monkeypatch.setattr(training, "one_logger_utils", Mock())
     monkeypatch.setattr(training, "should_disable_forward_pre_hook", lambda *_: False)
     monkeypatch.setattr(training._otel, "managed_span", lambda *a, **kw: nullcontext())
-    for name in (
-        "write_args_to_tensorboard",
-        "print_datetime",
-        "_end_otel_startup_span",
-        "_start_otel_train_span",
-        "_maybe_reroot_otel_interval",
-    ):
+    for name in ("write_args_to_tensorboard", "print_datetime"):
         monkeypatch.setattr(training, name, Mock())
+    for name in ("end_training_startup", "prepare_training_loop", "start_training_loop_pass"):
+        monkeypatch.setattr(training._otel, name, Mock())
 
     class BeforeTrainStep(Exception):
         pass
