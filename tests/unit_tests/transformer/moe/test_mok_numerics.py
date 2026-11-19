@@ -90,16 +90,24 @@ class _MoKExperts(torch.nn.Module):
 
 
 @pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("backend", ["mok", "cutemok"])
 @pytest.mark.parametrize("gated", [False, True])
 @pytest.mark.parametrize("main_grad_dtype", [torch.float32, torch.bfloat16])
-def test_real_mok_ddp_numerics(gated, main_grad_dtype):
+def test_real_mok_ddp_numerics(gated, main_grad_dtype, backend):
     """Two microbatches, all weight buffers, no parameter mutation, and SGD refresh."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
         (10, 0),
         (10, 3),
     ):
         pytest.skip("MoK requires Blackwell SM100/SM103")
-    functional = pytest.importorskip("mok.functional")
+    from megatron.core.transformer.moe.megakernel.mok.package import clear_mok_caches
+
+    # The backward entry point the adapter calls, which the mutation control below wraps.
+    if backend == "cutemok":
+        backward_owner = pytest.importorskip("cudnn.moe_ep.cutemok")
+        backward_name = "cutemok_backward"
+    else:
+        backward_owner, backward_name = pytest.importorskip("mok.functional"), "backward"
     pytest.importorskip("transformer_engine.pytorch")
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
     from megatron.core.models.gpt.gpt_layer_specs import (
@@ -132,7 +140,7 @@ def test_real_mok_ddp_numerics(gated, main_grad_dtype):
             gated_linear_unit=True,
             activation_func=F.silu,
             gradient_accumulation_fusion=True,
-            moe_megakernel_backend="mok",
+            moe_megakernel_backend=backend,
             moe_shared_expert_gate=gated,
             add_bias_linear=False,
             bf16=True,
@@ -250,7 +258,7 @@ def test_real_mok_ddp_numerics(gated, main_grad_dtype):
                 wrong = ddp(x, probs)
             with pytest.raises(AssertionError, match="swapped gate/up"):
                 _assert_numerics(wrong, reference_updated, "swapped gate/up")
-            real_backward = functional.backward
+            real_backward = getattr(backward_owner, backward_name)
             for missing in ("experts.linear_fc1.weight0", "shared_experts.linear_fc2.weight"):
                 ddp.zero_grad_buffer()
                 _, _, _, expected_dw = _reference_backward(x, probs, reference_weights, upstream)
@@ -260,11 +268,11 @@ def test_real_mok_ddp_numerics(gated, main_grad_dtype):
                     parameters[missing].main_grad.zero_()
                     return result
 
-                with patch.object(functional, "backward", omit_write):
+                with patch.object(backward_owner, backward_name, omit_write):
                     ddp(x.requires_grad_(), probs.requires_grad_()).backward(upstream)
                 with pytest.raises(AssertionError, match=missing):
                     _assert_numerics(parameters[missing].main_grad, expected_dw[missing], missing)
     finally:
-        functional.clear_workspace_cache()
+        clear_mok_caches(backend)
         torch.backends.cuda.matmul.allow_tf32 = old_tf32
         Utils.destroy_model_parallel()

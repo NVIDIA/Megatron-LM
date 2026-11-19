@@ -984,6 +984,7 @@ class TestMoEModules:
         Utils.initialize_model_parallel(expert_model_parallel_size=ep)
         model_parallel_cuda_manual_seed(123)
 
+    @pytest.mark.parametrize("backend", ["mok", "cutemok"])
     @pytest.mark.parametrize(
         "tp,latent,shared,mxfp8,gated",
         [
@@ -994,15 +995,20 @@ class TestMoEModules:
             (1, None, 256, False, True),
         ],
     )
-    def test_mok_moe_layer_replays(self, tp, latent, shared, mxfp8, gated):
+    def test_mok_moe_layer_replays(self, tp, latent, shared, mxfp8, gated, backend):
         """Replay real routed-only SiTU and legacy fused SwiGLU, including MXFP8 and dP."""
         if not HAVE_TE or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
             pytest.skip("MOK requires Transformer Engine and SM100/SM103 GPUs")
         if Utils.world_size < 4 or Utils.world_size % 4:
             pytest.skip("MOK EP4 requires a world size divisible by four")
-        functional = pytest.importorskip("mok.functional")
-        if "situ_beta" not in inspect.signature(functional.forward).parameters:
-            pytest.skip("MOK build with routed-only and SiTU support is required")
+        from megatron.core.transformer.moe.megakernel.mok.package import clear_mok_caches
+
+        if backend == "cutemok":
+            pytest.importorskip("cudnn.moe_ep.cutemok")
+        else:
+            functional = pytest.importorskip("mok.functional")
+            if "situ_beta" not in inspect.signature(functional.forward).parameters:
+                pytest.skip("MOK build with routed-only and SiTU support is required")
         if mxfp8 and te_post_all_gather_processing is None:
             pytest.skip("MOK MXFP8 requires TE post_all_gather_processing support")
         Utils.initialize_model_parallel(
@@ -1036,7 +1042,7 @@ class TestMoEModules:
             fp8="e4m3" if mxfp8 else None,
             fp8_recipe="mxfp8",
             fp8_param=mxfp8,
-            moe_megakernel_backend="mok",
+            moe_megakernel_backend=backend,
             moe_megakernel_backend_config=dict(
                 shared_expert_mode="fused" if fused else "native",
                 fwd_num_comm_sms=2,
@@ -1109,7 +1115,7 @@ class TestMoEModules:
                 assert param.main_grad.dtype == torch.float32
         finally:
             handle.remove()
-            functional.clear_workspace_cache()
+            clear_mok_caches(backend)
 
     @pytest.mark.parametrize("dispatcher", ["allgather", "alltoall"])
     @pytest.mark.parametrize("balancing", ["aux_loss", "seq_aux_loss"])
