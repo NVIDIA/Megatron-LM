@@ -459,9 +459,9 @@ def _ordered_reduce_scatter_v_kernel(
     tree in rank order, (r0 + r1) + (r2 + r3), the top of the EP-invariant combine tree)."""
     pid = tl.program_id(axis=0)
 
-    ep_max_tokens = tl.load(ep_max_tokens_ptr)
-    if pid >= ep_max_tokens:
-        return
+    # Every CTA joins the barrier, whatever ep_max_tokens is: barrier participation must not
+    # depend on a device value nothing verifies is equal on every rank. CTAs with no rows
+    # to move skip only the copy loop below, which is bounded by local_tokens.
 
     symm_mem_sync(
         signal_pad_ptrs,
