@@ -87,6 +87,61 @@ def test_cli_topk_bounds(monkeypatch, topk):
             _make_cli_config(monkeypatch, dsa_indexer_topk=topk)
 
 
+@pytest.mark.parametrize(
+    "freq,offset,cli,owners",
+    [(2, 1, True, (1, 3)), (2, 1, False, (1, 3)), (2, 4, False, (1, 2, 3, 4))],
+)
+def test_dsa_index_share_checkpoint_shards_are_complete(monkeypatch, freq, offset, cli, owners):
+    from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
+    from megatron.core.dist_checkpointing.validation import validate_sharding_integrity
+    from megatron.core.transformer.transformer_block import TransformerBlock
+
+    config = _make_cli_config(
+        monkeypatch,
+        num_layers=4,
+        dsa_indexer_topk_freq=freq,
+        dsa_indexer_skip_topk_offset=offset,
+        dsa_indexer_cross_layer_distillation=cli,
+    )
+
+    class Layer:
+        def __init__(self, layer_number):
+            self.layer_number = layer_number
+
+        def sharded_state_dict(self, prefix, offsets, metadata):
+            if self.layer_number not in owners:
+                return {}
+            weights = prefix + "indexer.weight"
+            extra = prefix + "indexer._extra_state"
+            return {
+                weights: ShardedTensor.from_rank_offsets(
+                    weights, torch.ones(2, 2), *offsets, prepend_axis_num=len(offsets)
+                ),
+                extra: ShardedObject(
+                    extra,
+                    b"extra",
+                    tuple(count for _, _, count in offsets) or (1,),
+                    tuple(rank for _, rank, _ in offsets) or (0,),
+                ),
+            }
+
+    block = SimpleNamespace(
+        config=config,
+        layers=[Layer(i) for i in range(1, 5)],
+        vp_stage=None,
+        pg_collection=SimpleNamespace(pp=None),
+        named_children=lambda: (),
+    )
+    values = TransformerBlock.sharded_state_dict(block, prefix="decoder.").values()
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    validate_sharding_integrity([[item.without_data() for item in values]])
+    keys = {item.key for item in values if isinstance(item, ShardedTensor)}
+    if len(owners) < 4:
+        assert keys == {"decoder.layers.0.indexer.weight", "decoder.layers.2.indexer.weight"}
+    else:
+        assert keys == {"decoder.layers.indexer.weight"}
+
+
 def test_cli_state_is_per_forward_and_releases_tensors():
     first, second = SimpleNamespace(), SimpleNamespace()
     state = DSACrossLayerIndexerState(topk_indices=torch.ones(1), topk_length=torch.ones(1))

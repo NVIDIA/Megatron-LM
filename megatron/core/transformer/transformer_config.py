@@ -2216,6 +2216,12 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
                     f"{self.dsa_indexer_skip_topk_offset}."
                 )
+            if self.dsa_indexer_topk_freq > 1 and self.num_layers > max(
+                1, self.dsa_indexer_skip_topk_offset
+            ):
+                # Reuse layers have no indexer weights or Transformer Engine extra state.
+                # Store layers by global ID so every checkpoint key has complete shards.
+                self.hetereogenous_dist_checkpoint = True
             if self.dsa_indexer_kpool < 1:
                 raise ValueError(
                     f"dsa_indexer_kpool must be positive, got {self.dsa_indexer_kpool}."

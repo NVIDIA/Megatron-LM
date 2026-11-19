@@ -224,3 +224,7 @@ The SM90 tests should run without skips. They cover reverse-order backward with
 shared packed metadata, summed KL under probability underflow, masking, and
 bit-exact replay. The synthetic smoke test saves at iteration 2 and resumes to
 iteration 4 with the same scheduler configuration.
+
+When IndexShare omits indexers on reuse layers, distributed checkpoints store
+each layer under its global layer ID. The model and optimizer use this layout
+for both save and restore.
