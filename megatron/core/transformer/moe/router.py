@@ -29,7 +29,6 @@ from megatron.core.transformer.moe.moe_utils import (
     compute_normalized_router_scores,
     compute_routing_scores_for_aux_loss,
     fused_topk_with_aux_loss_scores,
-    fused_topk_with_aux_loss_scores_is_supported,
     fused_topk_with_score_function_supports_topk_indices,
     get_tokens_per_expert_and_token_count,
     mark_compact_route_probs,
@@ -1143,13 +1142,6 @@ class TopKRouter(Router):
             and (bsz == 1 or self.get_aux_loss_coeff("seq_aux_loss") == 0)
             and (self.expert_bias is None or self.expert_bias.dtype == torch.float32)
             and (not self.enable_expert_bias or self.local_tokens_per_expert.dtype == torch.int64)
-            and fused_topk_with_aux_loss_scores_is_supported(
-                config.num_moe_experts,
-                self.topk,
-                config.moe_router_num_groups,
-                config.moe_router_group_topk,
-                self.score_function,
-            )
         )
 
     def _fused_aux_scores_routing(
@@ -1159,7 +1151,11 @@ class TopKRouter(Router):
         bsz: int,
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
-        """Top-k routing, aux-loss scores and token counts in one TE kernel.
+        """Top-k routing, aux-loss scores and token counts in one TE call.
+
+        TE runs DeepSeek-V3 routing (sigmoid, 256 experts, top-8, optionally 8 groups with group
+        top-4) as a single kernel and composes other configurations from its separate router
+        kernels, with the same results.
 
         Produces what the moe_router_fusion + moe_router_aux_loss_fusion path produces, bit for
         bit, except that the probabilities are compact: [num_tokens, topk], aligned with the

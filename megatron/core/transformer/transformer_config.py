@@ -1201,10 +1201,11 @@ class TransformerConfig(ModelParallelConfig):
     bias) in one Transformer Engine kernel (``fused_topk_with_aux_loss_scores``), and hand the
     'deepep' / 'ncclep' flex dispatcher compact [num_tokens, topk] float32 probabilities instead
     of dense [num_tokens, num_experts] ones. Results are bitwise identical to
-    ``moe_router_fusion`` with ``moe_router_aux_loss_fusion``, which it requires. Used for
-    training steps whose router configuration TE supports (sigmoid scores, 256 experts, top-8,
-    optionally 8 groups with group top-4, as in DeepSeek-V3) without padding mask, token dropping
-    or router replay; all other calls take the unfused path."""
+    ``moe_router_fusion`` with ``moe_router_aux_loss_fusion``, which it requires. TE runs
+    DeepSeek-V3 routing (sigmoid scores, 256 experts, top-8, optionally 8 groups with group
+    top-4) as a single kernel in each direction and composes other router configurations from its
+    separate router kernels. Used for training steps without padding mask, token dropping or
+    router replay; all other calls take the unfused path."""
 
     moe_apply_probs_on_input: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""

@@ -1608,25 +1608,28 @@ class TestFusedAuxScoresRouter:
             config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
         ).cuda()
         router.set_layer_number(1)
-        with torch.no_grad():
-            router.expert_bias.copy_(0.02 * torch.randn_like(router.expert_bias))
+        if router.expert_bias is not None:
+            with torch.no_grad():
+                router.expert_bias.copy_(0.02 * torch.randn_like(router.expert_bias))
         return router
 
     def _run(self, router, hidden, grad_probs, fused):
         """One training forward/backward; returns the dispatcher-side per-route weights."""
         router.config.moe_router_fused_aux_scores = fused
         router.zero_grad(set_to_none=True)
-        router.local_tokens_per_expert.zero_()
+        if router.local_tokens_per_expert is not None:
+            router.local_tokens_per_expert.zero_()
         router.reset_global_aux_loss_tracker()
         x = hidden.detach().clone().requires_grad_(True)
         probs, routing_map = router(x)
-        assert routing_map.dtype == torch.int64 and routing_map.shape == (self.num_tokens, 8)
+        topk, num_experts = router.topk, router.config.num_moe_experts
+        assert routing_map.dtype == torch.int64 and routing_map.shape == (self.num_tokens, topk)
         assert is_compact_route_probs(probs) == fused
         if fused:
-            assert probs.shape == (self.num_tokens, 8) and probs.dtype == torch.float32
+            assert probs.shape == (self.num_tokens, topk) and probs.dtype == torch.float32
             route_probs = probs
         else:
-            assert probs.shape == (self.num_tokens, 256)
+            assert probs.shape == (self.num_tokens, num_experts)
             # What the deepep / ncclep managers do with full-width probs
             route_probs = probs.gather(1, routing_map).float()
         (route_probs * grad_probs).sum().backward()
@@ -1635,7 +1638,11 @@ class TestFusedAuxScoresRouter:
             routing_map,
             x.grad,
             router.weight.grad.clone(),
-            router.local_tokens_per_expert.clone(),
+            (
+                router.local_tokens_per_expert.clone()
+                if router.local_tokens_per_expert is not None
+                else None
+            ),
         )
 
     @pytest.mark.parametrize("backend", ["deepep", "ncclep"])
@@ -1666,6 +1673,37 @@ class TestFusedAuxScoresRouter:
         assert torch.equal(_float_bits(out[3]), _float_bits(ref[3]))
         assert torch.equal(out[4], ref[4])
 
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            dict(num_moe_experts=64, moe_router_num_groups=None, moe_router_group_topk=None),
+            dict(num_moe_experts=64, moe_router_num_groups=8, moe_router_group_topk=4),
+            dict(
+                num_moe_experts=64,
+                moe_router_topk=4,
+                moe_router_score_function="softmax",
+                moe_router_topk_scaling_factor=None,
+                moe_router_num_groups=None,
+                moe_router_group_topk=None,
+                moe_router_enable_expert_bias=False,
+            ),
+        ],
+        ids=["sigmoid_64e_top8", "sigmoid_64e_top8_grouped", "softmax_64e_top4"],
+    )
+    def test_matches_unfused_router_other_configs(self, overrides):
+        """Router configurations other than DeepSeek-V3 also take the fused path (TE composes
+        them from its separate kernels) and match the unfused router bit for bit."""
+        router = self._router(**overrides)
+        hidden = torch.randn(self.num_tokens, 1, 64, device="cuda", dtype=torch.bfloat16)
+        grad_probs = torch.randn(self.num_tokens, router.topk, device="cuda")
+        ref = self._run(router, hidden, grad_probs, fused=False)
+        out = self._run(router, hidden, grad_probs, fused=True)
+        assert torch.equal(_float_bits(out[0]), _float_bits(ref[0]))
+        assert torch.equal(out[1], ref[1])
+        assert torch.equal(_float_bits(out[2]), _float_bits(ref[2]))
+        assert torch.equal(_float_bits(out[3]), _float_bits(ref[3]))
+        assert (out[4] is None and ref[4] is None) or torch.equal(out[4], ref[4])
+
     def test_aux_loss_metric_matches_unfused_router(self):
         router = self._router()
         hidden = torch.randn(self.num_tokens, 1, 64, device="cuda", dtype=torch.bfloat16)
@@ -1680,12 +1718,10 @@ class TestFusedAuxScoresRouter:
         assert torch.equal(values[0], values[1])
 
     @pytest.mark.parametrize(
-        "case", ["padding_mask", "bsz2_seq_aux_loss", "eval", "no_grad", "experts", "alltoall"]
+        "case", ["padding_mask", "bsz2_seq_aux_loss", "eval", "no_grad", "alltoall"]
     )
     def test_falls_back_to_unfused_path(self, case):
         overrides = {}
-        if case == "experts":
-            overrides = dict(num_moe_experts=64)
         if case == "alltoall":
             # 'ncclep' requires the flex dispatcher; deepep is a no-op setting under alltoall.
             overrides = dict(

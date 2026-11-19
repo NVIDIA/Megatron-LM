@@ -57,11 +57,9 @@ if HAVE_TE:
     try:  # Transformer Engine with the single-pass router; re-exported for the router.
         from transformer_engine.pytorch.router import (  # pylint: disable=unused-import
             fused_topk_with_aux_loss_scores,
-            fused_topk_with_aux_loss_scores_is_supported,
         )
     except ImportError:
         fused_topk_with_aux_loss_scores = None
-        fused_topk_with_aux_loss_scores_is_supported = None
 else:
     (
         fused_compute_score_for_moe_aux_loss,
@@ -78,7 +76,6 @@ else:
     ) = (None, None, None, None, None, None, None, None, False, None, None)
     fused_topk_with_score_function_supports_qb = False
     fused_topk_with_aux_loss_scores = None
-    fused_topk_with_aux_loss_scores_is_supported = None
 
 
 def switch_load_balancing_loss_func(
