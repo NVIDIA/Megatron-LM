@@ -68,7 +68,7 @@ A student run instead uses:
 offline_distillation:
   _target_: megatron.training.config.offline_distillation_config.OfflineDistillationConfig
   student_load:
-    _target_: megatron.training.config.offline_distillation_config.CachedLogitsConfig
+    _target_: megatron.training.config.offline_distillation_config.LogitsLoadConfig
     directory: /teacher-cache
     loss_alpha: 1.0
     decode_threads: 4

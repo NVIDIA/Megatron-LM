@@ -8,10 +8,10 @@ import pytest
 import yaml
 
 from megatron.training.config import (
-    CachedLogitsConfig,
     CheckpointConfig,
     InferenceConfigContainer,
     InferenceSetupConfig,
+    LogitsLoadConfig,
     LogitsSaveConfig,
     OfflineDistillationConfig,
     PretrainConfigContainer,
@@ -30,7 +30,7 @@ def _container():
 def test_offline_distillation_survives_a_training_run_round_trip(run_config, saving):
     run_config.offline_distillation = OfflineDistillationConfig(
         teacher_save=LogitsSaveConfig(directory="/out", top_k=32) if saving else None,
-        student_load=None if saving else CachedLogitsConfig(directory="/in", loss_alpha=0.5),
+        student_load=None if saving else LogitsLoadConfig(directory="/in", loss_alpha=0.5),
     )
     run_config.train.freeze_all_layers = saving
     restored = PretrainConfigContainer.from_dict(run_config.to_dict())
