@@ -91,6 +91,6 @@ can run. The existing test-queue approval is not used: it skips docs-only PRs.
   pushes only to that fork, and creates signed, signed-off draft PRs.
 
 Merge an archive-link PR once the versioned guide is available at the archive
-URL. The engineering release workflow can publish that guide for a pre-Fern
-release. After merging the archive link, update the Fern site with a `docs/v*`
-tag or manual dispatch.
+URL. For a pre-Fern release, select `publish-docs` when running the engineering
+release workflow to build its Sphinx archive. After merging the archive link,
+update the Fern site with a `docs/v*` tag or manual dispatch.

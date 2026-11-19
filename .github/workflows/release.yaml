@@ -43,9 +43,9 @@ on:
         default: true
         type: boolean
       publish-docs:
-        description: Build a pre-Fern release's Sphinx archive and publish it outside dry runs.
+        description: Build the Sphinx archive for a pre-Fern release SHA and publish it outside dry runs.
         required: false
-        default: true
+        default: false
         type: boolean
       version-bump-branch:
         description: Branch for version bump
@@ -73,10 +73,6 @@ concurrency:
 jobs:
   validate-inputs:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      has-sphinx-docs: ${{ steps.docs-format.outputs.has-sphinx-docs }}
     steps:
       - name: Validate release-ref is a commit SHA
         env:
@@ -85,23 +81,6 @@ jobs:
           if ! echo "$RELEASE_REF" | grep -qE '^[0-9a-f]{40}$'; then
             echo "::error::release-ref must be a full 40-character commit SHA, not a branch name."
             exit 1
-          fi
-
-      - name: Check out the selected release's docs configuration
-        if: github.event_name == 'workflow_dispatch' && inputs.publish-docs
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          ref: ${{ inputs.release-ref }}
-          sparse-checkout: docs/conf.py
-          sparse-checkout-cone-mode: false
-          persist-credentials: false
-
-      - name: Detect legacy Sphinx docs
-        if: github.event_name == 'workflow_dispatch' && inputs.publish-docs
-        id: docs-format
-        run: |
-          if [[ -f docs/conf.py ]]; then
-            echo "has-sphinx-docs=true" >> "$GITHUB_OUTPUT"
           fi
 
   pre-flight:
@@ -153,7 +132,7 @@ jobs:
     secrets: inherit  # pragma: allowlist secret
 
   finalize:
-    needs: [validate-inputs, bump, build-test-publish-wheels]
+    needs: [bump, build-test-publish-wheels]
     if: |
       github.repository == 'NVIDIA/Megatron-LM'
       && (success() || !failure())
@@ -170,8 +149,7 @@ jobs:
       gh-release-tag-prefix: core_
       gh-release-use-changelog-builder: ${{ inputs.generate-changelog || false }}
       gh-release-from-tag: ${{ inputs.gh-release-from-tag || '' }}
-      # Fern validation and publishing have their own workflows.
-      publish-docs: ${{ needs.validate-inputs.outputs.has-sphinx-docs == 'true' }}
+      publish-docs: ${{ github.event_name == 'workflow_dispatch' && inputs.publish-docs }}
       docs-target-path: megatron-core/developer-guide
       publish-as-latest: true
       run-on-version-tag-only: ${{ github.ref_name != 'main' }}
