@@ -15,6 +15,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from transformers import WhisperConfig, WhisperModel
 
+from examples.mimo.model_providers.mock import model_provider_mock_vlm_single_encoder
 from megatron.core import parallel_state
 from megatron.core.context_parallel import ContextParallelBatch
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -154,6 +155,29 @@ def get_vlm_mimo_model(
         special_token_ids=special_token_ids,
     )
     return MimoModel(mimo_config)
+
+
+@pytest.mark.skipif(Utils.world_size % 2 != 0, reason="requires pairs of TP ranks")
+def test_mock_projector_keeps_images_on_the_supplied_tp_group(request):
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+    request.addfinalizer(Utils.destroy_model_parallel)
+    model_parallel_cuda_manual_seed(123)
+    groups = ProcessGroupCollection.use_mpu_process_groups()
+    image_value = groups.tp.rank() + 1
+    # Each rank processes a different image on its own singleton TP group.
+    groups.tp = groups.tp_cp = groups.cp
+    model = model_provider_mock_vlm_single_encoder(pg_collection=groups).cuda()
+    tower = model.modality_submodules["images"]
+    projector = tower.input_projections[0]
+    with torch.no_grad():
+        projector.encoder.linear_fc1.weight.fill_(1)
+        projector.encoder.linear_fc2.weight.fill_(1)
+        features = torch.full((1, 1, 128), float(image_value), device="cuda")
+        result = projector(features)
+    # The bias-free MLP sums over both widths. GELU is the identity at 128 and 256.
+    expected = image_value * features.size(-1) * projector.config.ffn_hidden_size
+    torch.testing.assert_close(result, torch.full_like(result, expected))
+    assert tower.encoders["clip_encoder"].decoder.pg_collection is groups
 
 
 class TestMimoModel:

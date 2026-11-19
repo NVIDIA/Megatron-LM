@@ -54,6 +54,7 @@ def model_provider_mock_vlm_single_encoder(
             "patch_dim": 16,
             "img_h": 224,
             "img_w": 224,
+            "pg_collection": pg_collection,
         },
     )
 
@@ -65,6 +66,7 @@ def model_provider_mock_vlm_single_encoder(
             "submodules": get_mock_projection_layer_spec().submodules,
             "projector_type": "mlp",
             "input_size": 128,
+            "pg_collection": pg_collection,
         },
     )
 

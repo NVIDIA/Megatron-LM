@@ -96,6 +96,7 @@ def model_provider_llava_vlm(
             "submodules": get_llava_projection_layer_spec().submodules,
             "projector_type": "mlp",
             "input_size": 1024,
+            "pg_collection": pg_collection,
         },
     )
 
