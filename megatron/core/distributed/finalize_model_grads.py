@@ -735,9 +735,7 @@ def finalize_model_grads(
 
     # All local MFSDP chunks share one context and have finished backward.
     if isinstance(model[0], FullyShardedDataParallelV2):
-        context = model[0].module.context
-        if not context.autograd_completes_execution:
-            context.post_backward()
+        model[0].module.context.post_backward()
 
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:

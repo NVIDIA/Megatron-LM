@@ -17,6 +17,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataPa
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     GradientFinalizationMode,
+    RuntimePolicy,
     fully_shard_context,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
@@ -273,6 +274,7 @@ def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(process_grou
     assert (
         wrapped.module.context.gradient_finalization_mode is GradientFinalizationMode.REDUCE_OUTER
     )
+    assert not wrapped.module.context.autograd_completes_execution
     assert isinstance(wrapped.module, FsdpModule)
 
     parameters = dict(wrapped.module.named_parameters())
@@ -420,10 +422,15 @@ def test_unpadded_shards_pack_parameter_groups_without_padding(process_group_col
 
 
 def test_joins_shared_context(process_group_collection, distributed_setup):
-    """The adapter joins a context without construction-time gradient-sync settings."""
+    """The adapter joins a context whose execution is completed by the schedule."""
     config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=4)
     layer = torch.nn.Linear(16, 16, device=distributed_setup.device)
-    with fully_shard_context(FsdpContext(device=distributed_setup.device)) as context:
+    with fully_shard_context(
+        FsdpContext(
+            device=distributed_setup.device,
+            runtime_policy=RuntimePolicy(autograd_completes_execution=False),
+        )
+    ) as context:
         model = FullyShardedDataParallel(
             config=config,
             ddp_config=DistributedDataParallelConfig(
