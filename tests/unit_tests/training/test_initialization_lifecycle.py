@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from megatron.core.distributed import TorchFullyShardedDataParallelConfig
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer import TransformerConfig
 from megatron.training import arguments, global_vars, initialize
@@ -206,10 +207,16 @@ def test_tp_user_buffers_use_config_and_explicit_batch_shape(
     initialize_ub.assert_called_once_with(**expected)
 
 
-def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_config):
+@pytest.mark.parametrize("dist_ag", [False, True])
+@pytest.mark.parametrize("ag_source", ["config", "cli"])
+def test_distributed_initialization_prefers_config_to_args(
+    monkeypatch, run_config, dist_ag, ag_source
+):
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
-    args = parser.parse_args([])
+    # Explicit config wins over opposite CLI values; CLI-derived config reaches bootstrap.
+    cli_ag = dist_ag if ag_source == "cli" else not dist_ag
+    args = parser.parse_args(["--create-all-gather-group"] if cli_ag else [])
     args.rank, args.world_size = 0, 999
     # These topology values are normally resolved by validate_args.
     args.gtp_weight_remat_size = args.expert_gtp_weight_remat_size = 1
@@ -229,14 +236,22 @@ def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_conf
         high_priority_stream_groups=["tp"],
         use_tp_pp_dp_mapping=True,
         nccl_communicator_config_path="owned.yaml",
+        create_all_gather_group=dist_ag,
     )
+    if ag_source == "cli":
+        run_config.dist.create_all_gather_group = _default_config_from_args(
+            DistributedInitConfig, args
+        ).create_all_gather_group
     monkeypatch.setattr(initialize, "get_args", lambda: args)
     monkeypatch.setattr(initialize, "print_rank_0", Mock())
     monkeypatch.setattr(initialize.torch.cuda, "device_count", lambda: 2)
     set_device = Mock()
     monkeypatch.setattr(initialize.torch.cuda, "set_device", set_device)
     monkeypatch.setattr(initialize.torch.distributed, "is_initialized", lambda: False)
-    init_pg, init_mpu = Mock(), Mock()
+    pg_collection = ProcessGroupCollection()
+    pg_collection.dp_cp_ag = object() if dist_ag else None
+    pg_collection.expt_dp_ag = None
+    init_pg, init_mpu = Mock(), Mock(return_value=pg_collection)
     monkeypatch.setattr(initialize.torch.distributed, "init_process_group", init_pg)
     monkeypatch.setattr(initialize.inprocess_restart, "maybe_force_nccl_backend_init", Mock())
     monkeypatch.setattr(initialize.mpu, "model_parallel_is_initialized", lambda: False)
@@ -251,7 +266,8 @@ def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_conf
         monkeypatch.delenv(name, raising=False)
     store = object()
 
-    initialize._initialize_distributed(None, None, store)
+    result = initialize._initialize_distributed(None, None, store)
+    assert result is pg_collection
 
     set_device.assert_called_once_with(1)
     init_pg.assert_called_once_with(
@@ -263,6 +279,7 @@ def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_conf
     assert kwargs["order"] == "tp-cp-ep-pp-dp"
     assert kwargs["high_priority_stream_groups"] == ["tp"]
     assert kwargs["use_sharp"] is True
+    assert kwargs["create_all_gather_group"] is dist_ag
     assert kwargs["gtp_remat_num_sequence_shards"] == 1
     assert kwargs["sharp_enabled_group"] == "dp_replica"
     assert kwargs["create_gloo_process_groups"] is False
@@ -840,6 +857,41 @@ def test_native_gtp_sequence_sharding_validates_cross_config_inputs(
         setattr(owner, name, value)
     with pytest.raises(ValueError, match=error):
         run_config.validate()
+
+
+@pytest.mark.parametrize(
+    "wrap_with_ddp, retained_collection", [(False, False), (True, False), (True, True)]
+)
+def test_get_model_requires_retained_ag_groups_only_for_wrapped_models(
+    monkeypatch, run_config, wrap_with_ddp, retained_collection
+):
+    from megatron.training import training
+
+    run_config.dist.create_all_gather_group = True
+    monkeypatch.setattr(training, "get_args", lambda: Namespace())
+    monkeypatch.setattr(training, "has_nvidia_modelopt", False)
+    groups = ProcessGroupCollection()
+    if retained_collection:
+        groups.dp_cp_ag = object()
+    monkeypatch.setattr(ProcessGroupCollection, "use_mpu_process_groups", Mock(return_value=groups))
+
+    class ReachedModelProvider(Exception):
+        pass
+
+    provider = Mock(side_effect=ReachedModelProvider)
+    missing_training_groups = wrap_with_ddp and not retained_collection
+    error = RuntimeError if missing_training_groups else ReachedModelProvider
+    match = "Attach the returned AG handles" if missing_training_groups else None
+    with pytest.raises(error, match=match):
+        training.get_model(
+            provider,
+            wrap_with_ddp=wrap_with_ddp,
+            pg_collection=groups if retained_collection else None,
+        )
+    if missing_training_groups:
+        provider.assert_not_called()
+    else:
+        assert provider.call_args.kwargs["pg_collection"] is groups
 
 
 def test_callback_upcycling_uses_temporary_dense_config(monkeypatch, run_config):

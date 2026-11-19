@@ -359,13 +359,14 @@ class Utils:
             torch.distributed.barrier()
         ps.destroy_model_parallel()
         Utils.initialize_distributed()
-        ps.initialize_model_parallel(
+        ag_groups = ps.initialize_model_parallel(
             tensor_model_parallel_size,
             pipeline_model_parallel_size,
             virtual_pipeline_model_parallel_size,
             **kwargs,
         )
         Utils.inited = True
+        return ag_groups
 
     @staticmethod
     def pretrain_config_from_global_args(args: Namespace, model_class: Literal["gpt", "hybrid"]):

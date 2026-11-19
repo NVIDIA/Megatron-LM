@@ -684,6 +684,21 @@ class FSDPDistributedIndex:
                     "process groups or sub-meshes."
                 )
 
+        if self.use_hybrid_fsdp and not self.hsdp_outer_dp_shard:
+            for ag_group, shard_group in (
+                (self.fsdp_group_ag, self.fsdp_group),
+                (self.expt_fsdp_group_ag, self.expt_fsdp_group),
+            ):
+                if (
+                    ag_group is not None
+                    and shard_group is not None
+                    and torch.distributed.get_process_group_ranks(ag_group)
+                    != torch.distributed.get_process_group_ranks(shard_group)
+                ):
+                    raise ValueError(
+                        "Basic HSDP requires AG groups to match the inner shard group's ordered ranks."
+                    )
+
     def get_submesh(
         self, mesh_dim_names: str | Sequence[str], is_expert_parallel: bool = False
     ) -> DeviceMesh:

@@ -35,9 +35,6 @@ class DistributedDataParallelConfig:
     PP stage will independently launch as needed.
     """
 
-    create_all_gather_group: bool = False
-    """Create separate data-parallel process groups for parameter all-gathers."""
-
     gtp_remat_reduce_scatter_with_fp32_accumulation: bool = False
     """Accumulate the GTP weight-rematerialization reduce-scatter in FP32."""
 

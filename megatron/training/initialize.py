@@ -88,8 +88,8 @@ def initialize_megatron(
     `training` enables training rerun, checkpoint workers, autoresume and dataset
     compilation in addition to the shared distributed execution and RNG setup.
     `build_tokenizer` is False for workloads that provide their own tokenization.
-    Returns a function to finalize distributed env initialization
-    (optionally, only when cfg.dist.lazy_mpu_init == True)
+    Returns the initialized ProcessGroupCollection, or a callback returning it for lazy
+    initialization. Returns None when model-parallel setup is skipped or unavailable.
     """
     if not allow_no_cuda:
         # Make sure cuda is available.
@@ -164,7 +164,7 @@ def initialize_megatron(
         cfg = get_run_config()
         args = get_args()
         # Pytorch distributed.
-        _initialize_distributed(
+        pg_collection = _initialize_distributed(
             get_embedding_ranks,
             get_position_embedding_ranks,
             store,
@@ -216,6 +216,7 @@ def initialize_megatron(
             from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 
             MoEAuxLossAutoScaler.set_loss_scale(torch.ones(1, device=torch.cuda.current_device()))
+        return pg_collection
 
     if skip_mpu_initialization:
         return None
@@ -233,7 +234,7 @@ def initialize_megatron(
         return finish_mpu_init
     else:
         # Megatron's MPU is the master. Complete initialization right away.
-        finish_mpu_init()
+        pg_collection = finish_mpu_init()
 
         # Autoresume.
         if training:
@@ -264,8 +265,7 @@ def initialize_megatron(
                 tp_comm_overlap_cfg=tp_comm_overlap_cfg,
             )
 
-        # No continuation function
-        return None
+        return pg_collection
 
 
 def _compile_dependencies():
@@ -472,6 +472,10 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
     # (skipped when caller owns model-parallel setup)
     if device_count > 0 and not skip_model_parallel_init:
         if mpu.model_parallel_is_initialized():
+            if cfg.dist.create_all_gather_group:
+                raise RuntimeError(
+                    "Retain the collection from the first initialization and skip model-parallel init when reusing AG groups."
+                )
             print("model parallel is already initialized")
         else:
             if model_config.gtp_weight_remat_size > 1 or model_config.expert_gtp_weight_remat_size > 1:
@@ -485,12 +489,13 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             # Dense grid: world_size must be divisible by
             # TP * PP * (runtime_CP / gtp_remat_num_sequence_shards) * GTP_remat.
             # Expert grid: world_size must be divisible by ETP * EP * PP * EGTP_remat.
-            mpu.initialize_model_parallel(
+            pg_collection = mpu.initialize_model_parallel(
                 model_config.tensor_model_parallel_size,
                 model_config.pipeline_model_parallel_size,
                 model_config.virtual_pipeline_model_parallel_size,
                 pipeline_model_parallel_comm_backend=model_config.pipeline_model_parallel_comm_backend,
                 use_sharp=cfg.dist.use_sharp,
+                create_all_gather_group=cfg.dist.create_all_gather_group,
                 gtp_remat_size=model_config.gtp_weight_remat_size,
                 expert_gtp_remat_size=model_config.expert_gtp_weight_remat_size,
                 gtp_remat_num_sequence_shards=model_config.gtp_remat_num_sequence_shards,
@@ -523,6 +528,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 f"> initialized pipeline model parallel with size "
                 f"{mpu.get_pipeline_model_parallel_world_size()}"
             )
+            return pg_collection
 
 
 def _init_autoresume():
