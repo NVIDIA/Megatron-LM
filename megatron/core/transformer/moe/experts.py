@@ -1767,6 +1767,31 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self.register_buffer('_fc2_weight', _fc2_weight, persistent=False)
         self._uses_mxfp8_weights = False
 
+    def build_inference_weights(self) -> None:
+        """Build expert stacks once, preserving source storage until copies finish."""
+        if not InferenceMode.is_active():
+            raise RuntimeError("Expert weight preparation requires InferenceMode")
+        if self._concatenated_weights_built:
+            return
+        # The build rebinds parameter storage. Its copies may run on a different
+        # stream from checkpoint loading, so protect both MXFP8 data and scales.
+        for linear_name, _ in self._EXPERT_WEIGHT_GROUPS:
+            for i in range(self.num_local_experts):
+                weight = getattr(getattr(self, linear_name), f"weight{i}")
+                mxfp8 = self._unwrap_mxfp8_weight(weight)
+                tensors = (mxfp8.data, mxfp8.scale) if mxfp8 is not None else (weight,)
+                for tensor in tensors:
+                    if tensor.is_cuda:
+                        tensor.record_stream(torch.cuda.current_stream(tensor.device))
+        self._build_flashinfer_clamp_limit(self.linear_fc1.weight0.device)
+        if InferenceGroupedMLP._expert_weights_use_mxfp8(self):
+            self._build_concatenated_mxfp8_weights()
+        else:
+            self._build_concatenated_weights()
+            if self._nvfp4_recipe is not None:
+                self._build_flashinfer_nvfp4_weights()
+        self._concatenated_weights_built = True
+
     def _flashinfer_forward(self, hidden_states, routing_map, probs):
         """FlashInfer fused MoE kernel for CUDA-graphed inference iterations."""
         assert HAVE_FLASHINFER, "flashinfer-python is required for FlashInfer forward path."
@@ -1933,15 +1958,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
         # Lazily build concatenated weights on first forward (after checkpoint load)
-        if not self._concatenated_weights_built:
-            self._build_flashinfer_clamp_limit(permuted_local_hidden_states.device)
-            if InferenceGroupedMLP._expert_weights_use_mxfp8(self):
-                self._build_concatenated_mxfp8_weights()
-            else:
-                self._build_concatenated_weights()
-                if self._nvfp4_recipe is not None:
-                    self._build_flashinfer_nvfp4_weights()
-            self._concatenated_weights_built = True
+        self.build_inference_weights()
 
         if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
             assert routing_map is not None, "routing_map is required for FlashInfer forward pass."
