@@ -131,7 +131,8 @@ class InferenceEngineCapabilities:
 class InferenceEngineEndpoint:
     """Address and capabilities of an already-running inference engine."""
 
-    # Carries the coordinator's launch secret: kept out of repr so logging an endpoint is safe.
+    # Carries the coordinator's launch secret when it authenticates: kept out of repr so logging an
+    # endpoint is safe.
     coordinator_address: str = field(repr=False)
     capabilities: InferenceEngineCapabilities
 

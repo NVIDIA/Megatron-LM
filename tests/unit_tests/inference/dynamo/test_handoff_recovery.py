@@ -39,10 +39,7 @@ from megatron.inference.integrations.dynamo.handoff_recovery import (
     HandoffRelease,
     confirm_terminated,
 )
-from megatron.inference.integrations.dynamo.llm_engine import (
-    MegatronLLMEngine,
-    _write_private_file,
-)
+from megatron.inference.integrations.dynamo.llm_engine import MegatronLLMEngine, _write_private_file
 from tests.unit_tests.inference.dynamo.test_llm_engine import _config, _Context, _endpoint
 from tests.unit_tests.inference.test_disagg_handoff_lifecycle import _HandoffHarness
 
@@ -330,9 +327,7 @@ def test_recovery_cli_reads_authenticated_addresses_from_files(tmp_path, monkeyp
 
 
 def test_recovery_cli_requires_a_source_address(monkeypatch):
-    monkeypatch.setattr(
-        sys, "argv", ["handoff_recovery", "--confirm-terminated-owner", "old"]
-    )
+    monkeypatch.setattr(sys, "argv", ["handoff_recovery", "--confirm-terminated-owner", "old"])
     with pytest.raises(SystemExit):
         handoff_recovery.main()
 

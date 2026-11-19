@@ -266,6 +266,12 @@ class InferenceSetupConfig:
     """Use synchronous ZMQ collectives for inference. Helps in reducing performance variability for
     MoEs."""
 
+    inference_authenticate_coordinator: bool = False
+    """Require every peer of the inference coordinator to present a secret generated at launch.
+    The secret is carried by the coordinator address, which then must be treated as a credential.
+    Does not encrypt traffic. Off by default, which leaves the coordinator port open to anyone who
+    can reach it."""
+
     inference_shards: str | None = None
     """Partition the world using comma-separated ``key=value`` fields per shard, with
     shards separated by ``+`` or ``;``. Keys are ``tp``, ``pp``, ``ep``, ``expt_tp``,
@@ -494,6 +500,7 @@ class InferenceSetupConfig:
             mamba_replay_ssm=self.mamba_replay_ssm,
             mamba_replay_buffer_len=self.mamba_replay_buffer_len,
             use_synchronous_zmq_collectives=self.inference_use_synchronous_zmq_collectives,
+            authenticate_coordinator=self.inference_authenticate_coordinator,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,
             offset_sampling_seed_by_dp_rank=self.offset_sampling_seed_by_dp_rank,
             async_sched_mode=AsyncScheduleMode(self.inference_dynamic_batching_async_sched_mode),

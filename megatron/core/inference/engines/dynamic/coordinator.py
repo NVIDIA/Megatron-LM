@@ -16,6 +16,7 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
 )
 from megatron.core.inference.data_parallel_inference_coordinator.auth import (
     authenticated_address,
+    generate_auth_token,
     present_credentials,
     split_authenticated_address,
 )
@@ -185,15 +186,18 @@ class CoordinatorMixin:
                 If None, defaults to `socket.gethostname()`. Should be set to a routable
                 address in multi-node settings where gethostname() may return 127.0.0.1.
             coordinator_auth_token (bytes | None): The secret of an externally launched
-                coordinator (``launch_inference_coordinator=False``). Only the data-parallel
-                source rank needs to supply it: it is broadcast to the rest of the group, and
-                every rank that opens a socket to the coordinator then presents it. Ignored when
-                this method launches the coordinator, which generates its own secret.
+                coordinator (``launch_inference_coordinator=False``) that authenticates its
+                peers. Only the data-parallel source rank needs to supply it: it is broadcast to
+                the rest of the group, and every rank that opens a socket to the coordinator then
+                presents it. None connects without credentials. Ignored when this method
+                launches the coordinator: whether that one authenticates is decided by
+                ``InferenceConfig.authenticate_coordinator``.
 
         Returns:
             inference_coordinator_addresss (str): The network address of the central
                 `InferenceCoordinator`, which may not have the same port as what the user requested
-                with `inference_coordinator_port`. It carries the coordinator's secret
+                with `inference_coordinator_port`. If the coordinator authenticates its peers
+                (``InferenceConfig.authenticate_coordinator``), the address carries its secret
                 (see ``data_parallel_inference_coordinator.auth``): treat it as a credential
                 and do not log it.
         """
@@ -246,6 +250,9 @@ class CoordinatorMixin:
         else:
             spawn_coordinator = launch_inference_coordinator and self.is_dp_coordinator
         if spawn_coordinator:
+            coordinator_auth_token = (
+                generate_auth_token() if self.authenticate_coordinator else None
+            )
             spawn_context = multiprocessing.get_context('spawn')
             deterministic_mode = torch.are_deterministic_algorithms_enabled()
             dp_pipe, dp_process_pipe = spawn_context.Pipe()
@@ -281,12 +288,12 @@ class CoordinatorMixin:
                     "hostname": hostname,
                     "disaggregated": disagg_config is not None,
                     "initial_state": coordinator_initial_state,
+                    "auth_token": coordinator_auth_token,
                 },
             )
             self.inference_coordinator_process.start()
             await await_process_call(dp_pipe.poll, self.inference_coordinator_process)
-            # The coordinator generates the secret its peers must present and returns it
-            # with the address.
+            # The address carries the secret that peers must present, if there is one.
             dp_addr, coordinator_auth_token = split_authenticated_address(dp_pipe.recv())
             dp_pipe.close()
 
@@ -312,28 +319,19 @@ class CoordinatorMixin:
             )
             dp_addr, coordinator_auth_token = bcast
 
-        # Broadcast the coordinator address and secret to the data-parallel group.
-        bcast = [dp_addr, coordinator_auth_token]
-        torch.distributed.broadcast_object_list(bcast, src=dp_src, group=dp_group)
-        dp_addr, coordinator_auth_token = bcast
-
         # Find available ports for MP and bind to them.
         if self.is_mp_coordinator:
-            # Only the DP source rank is handed the secret of an external coordinator; the
-            # broadcast above distributes it. Require it where a socket is actually opened,
-            # before binding anything.
-            if coordinator_auth_token is None:
-                raise ValueError(
-                    "coordinator_auth_token is required to connect to an externally "
-                    "launched inference coordinator"
-                )
             mp_req_sock = dp_replica_mp_request_broadcast.create_publisher(self.zmq_context)
             mp_req_sock.bind_to_random_port(f"tcp://{local_ip}")
             mp_req_addr = mp_req_sock.getsockopt_string(zmq.LAST_ENDPOINT)
         else:
             mp_req_addr = None
 
-        # Broadcast the model-parallel publisher address.
+        # Broadcast addresses and the coordinator secret to respective ranks. Only the
+        # data-parallel source rank is handed the secret of an external coordinator.
+        bcast = [dp_addr, coordinator_auth_token]
+        torch.distributed.broadcast_object_list(bcast, src=dp_src, group=dp_group)
+        dp_addr, coordinator_auth_token = bcast
         bcast = [mp_req_addr]
         torch.distributed.broadcast_object_list(bcast, src=mp_src, group=mp_group)
         [mp_req_addr] = bcast

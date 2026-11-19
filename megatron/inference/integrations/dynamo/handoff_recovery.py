@@ -25,7 +25,8 @@ from megatron.core.inference.headers import Headers
 class HandoffRelease:
     """Source identity retained until its release has been acknowledged."""
 
-    # Carries the coordinator's launch secret: kept out of repr so logging a release is safe.
+    # Carries the coordinator's launch secret when it authenticates: kept out of repr so logging a
+    # release is safe.
     coordinator_addr: str = field(repr=False)
     coordinator_instance_id: str
     request_id: int
@@ -82,8 +83,9 @@ def main() -> None:
         action="append",
         default=[],
         help=(
-            "File holding one source coordinator's authenticated launch address, as written by "
-            "the adapter's --coordinator-address-file. Preferred: the address is a credential."
+            "File holding one source coordinator's launch address, as written by the adapter's "
+            "--coordinator-address-file. Preferred: with authentication enabled the address is "
+            "a credential."
         ),
     )
     parser.add_argument(
@@ -91,8 +93,9 @@ def main() -> None:
         action="append",
         default=[],
         help=(
-            "A source coordinator's complete authenticated launch address. It contains the "
-            "launch secret and is visible in the process list; prefer --coordinator-address-file."
+            "A source coordinator's complete launch address. With authentication enabled it "
+            "contains the launch secret and is visible in the process list; prefer "
+            "--coordinator-address-file."
         ),
     )
     parser.add_argument(

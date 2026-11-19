@@ -230,6 +230,7 @@ class DynamicInferenceEngine(
         self.unified_memory_level = inference_config.unified_memory_level
         start_suspended = inference_config.start_suspended
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
+        self.authenticate_coordinator = inference_config.authenticate_coordinator
         self.ep_consensus_interval = inference_config.ep_consensus_interval
         self.gc_mode = inference_config.gc_mode
         self.vision_embedding_cache_max_bytes = int(

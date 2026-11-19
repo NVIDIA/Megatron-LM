@@ -134,6 +134,7 @@ class DummyEngine(DynamicInferenceEngine):
         self.received_stop: bool = False
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.rank = torch.distributed.get_rank()
+        self.authenticate_coordinator = False
 
     def add_request(
         self,

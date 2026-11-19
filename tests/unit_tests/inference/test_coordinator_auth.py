@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.data_parallel_inference_coordinator.auth import (
     authenticated_address,
     generate_auth_token,
@@ -14,6 +15,11 @@ from megatron.core.inference.data_parallel_inference_coordinator.auth import (
 from megatron.core.inference.inference_client import InferenceClient
 
 ENDPOINT = "tcp://127.0.0.1:5555"
+
+
+def test_authentication_is_opt_in():
+    assert InferenceConfig().authenticate_coordinator is False
+    assert InferenceConfig(authenticate_coordinator=True).authenticate_coordinator is True
 
 
 def test_address_round_trips_the_secret():

@@ -99,9 +99,10 @@ def parse_args(argv: list[str] | None = None) -> Config:
         "--coordinator-address-file",
         default=None,
         help=(
-            "Write this worker's authenticated coordinator launch address after engine readiness, "
-            "readable only by its owner. The address contains the coordinator's secret: a "
-            "deployment supervisor keeps it to run the handoff_recovery hook against this source."
+            "Write this worker's coordinator launch address after engine readiness, readable only "
+            "by its owner. With --inference-authenticate-coordinator the address contains the "
+            "coordinator's secret, which a deployment supervisor needs to run the "
+            "handoff_recovery hook against this source."
         ),
     )
     parser.add_argument("--megatron-root", default=str(Path(__file__).resolve().parents[4]))
