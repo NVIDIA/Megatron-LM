@@ -15,7 +15,13 @@ from megatron.core.transformer.module import MegatronModule
 
 from .copy_services.base import CopyService
 from .transforms import ReshardTransform, _ensure_sendable
-from .utils import ReshardPlan, TransferOp, get_refit_tensor_dict
+from .utils import (
+    ReshardPlan,
+    TransferOp,
+    get_refit_tensor_dict,
+    invalidate_refit_tensor_cache,
+    named_persistent_buffers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +77,156 @@ def _requires_bf16_staging(param: torch.Tensor) -> bool:
     # Ordinary params retain the existing MXFP8 path. GTP also accepts TE's
     # generic quantized tensor type, which includes native NVFP4 weights.
     return is_mxfp8tensor(param) or (is_gtp and is_float8tensor(param))
+
+
+def _collect_source_buffer_dtypes(
+    plan: ReshardPlan, src_module: torch.nn.Module | None
+) -> dict[int, torch.dtype]:
+    """Map local send tasks for persistent buffers to their source dtype."""
+    if src_module is None:
+        return {}
+    source_buffers = {name: buf.dtype for name, _, _, buf in named_persistent_buffers(src_module)}
+    return {
+        op.task_id: source_buffers[op.param_name]
+        for op in plan.send_ops
+        if op.task_id is not None and op.param_name in source_buffers
+    }
+
+
+def _collect_destination_receive_info(
+    plan: ReshardPlan,
+    dst_module: torch.nn.Module | None,
+    transform: Optional[ReshardTransform] = None,
+) -> dict[int, tuple[bool, torch.dtype, str]]:
+    """Map local recv tasks to their canonical destination dtype."""
+    dst_tensors = get_refit_tensor_dict(dst_module) if dst_module is not None else {}
+    destination_buffers = (
+        {name for name, _, _, _ in named_persistent_buffers(dst_module)}
+        if dst_module is not None
+        else set()
+    )
+    local_receives: dict[int, tuple[bool, torch.dtype, str]] = {}
+    for op in plan.recv_ops:
+        transformed = transform is not None and transform.should_transform(op.param_name)
+        if op.task_id is None or transformed:
+            continue
+        dst_tensor = dst_tensors.get(op.param_name)
+        if dst_tensor is None:
+            continue
+        receive_dtype = torch.bfloat16 if _requires_bf16_staging(dst_tensor) else dst_tensor.dtype
+        local_receives[op.task_id] = (
+            op.param_name in destination_buffers,
+            receive_dtype,
+            op.param_name,
+        )
+    return local_receives
+
+
+def _resolve_refit_dtypes(gathered) -> dict[int, torch.dtype]:
+    """Resolve each transfer task's dtype from all ranks."""
+    source_dtype_info, destination_dtype_info = zip(*gathered)
+    source_buffer_dtypes: dict[int, torch.dtype] = {}
+    for rank_dtypes in source_dtype_info:
+        for task_id, dtype in rank_dtypes.items():
+            previous = source_buffer_dtypes.setdefault(task_id, dtype)
+            if previous != dtype:
+                # Safeguard for improper tasks / plans.
+                raise ValueError(f"Source task {task_id} has conflicting buffer dtypes.")
+
+    task_dtypes: dict[int, torch.dtype] = {}
+    for rank_receives in destination_dtype_info:
+        rank_buffer_dtypes: dict[str, torch.dtype] = {}
+        for task_id, (is_buffer, receive_dtype, param_name) in rank_receives.items():
+            if is_buffer:
+                # For buffers, use the source dtype for the destination dtype.
+                receive_dtype = source_buffer_dtypes.get(task_id, receive_dtype)
+                previous_buffer_dtype = rank_buffer_dtypes.setdefault(param_name, receive_dtype)
+                if previous_buffer_dtype != receive_dtype:
+                    # Validate N-to-1 sends globally so every participating rank
+                    # fails before any destination buffer is modified.
+                    raise ValueError(f"Source shards disagree on buffer dtype for {param_name}.")
+            # Track the destination dtype by task for source dtype casting.
+            previous = task_dtypes.setdefault(task_id, receive_dtype)
+            if previous != receive_dtype:
+                # Safeguard for improper tasks / plans.
+                raise ValueError(
+                    f"Receive task {task_id} has conflicting wire dtypes across ranks."
+                )
+
+    return task_dtypes
+
+
+def _apply_wire_dtypes(plan: ReshardPlan, task_dtypes: dict[int, torch.dtype]) -> None:
+    """
+    Attach each destination's resolved receive dtype to local sends.
+    Used to map source and destination model dtype disparities.
+    """
+    for op in plan.send_ops:
+        op.wire_dtype = task_dtypes.get(op.task_id)
+
+
+def _apply_buffer_dtypes(
+    plan: ReshardPlan, dst_module: torch.nn.Module | None, task_dtypes: dict[int, torch.dtype]
+) -> None:
+    """Apply resolved dtypes to local destination buffers."""
+    if dst_module is None:
+        return
+    destination_buffers = {name for name, _, _, _ in named_persistent_buffers(dst_module)}
+    buffer_dtypes: dict[str, torch.dtype] = {}
+    for op in plan.recv_ops:
+        if op.param_name not in destination_buffers:
+            continue
+        receive_dtype = task_dtypes.get(op.task_id)
+        if receive_dtype is None:
+            continue
+        buffer_dtypes[op.param_name] = receive_dtype
+
+    invalidated = False
+    for full_name, sub, buf_name, dst_buf in named_persistent_buffers(dst_module):
+        expected = buffer_dtypes.get(full_name)
+        if expected is not None and dst_buf.dtype != expected:
+            # Cast destination buffer dtype to expected source dtype.
+            sub._buffers[buf_name] = dst_buf.to(expected)
+            invalidated = True
+    if invalidated:
+        invalidate_refit_tensor_cache(dst_module)
+
+
+def _prepare_refit_dtypes(
+    plan: ReshardPlan,
+    src_module: torch.nn.Module | None,
+    dst_module: torch.nn.Module | None,
+    group=None,
+    transform: Optional[ReshardTransform] = None,
+) -> None:
+    """
+    Synchronize the reshard dtype for model parameters and buffers between
+    the source and destination models.
+
+    Source parameters are cast to the destination parameter dtype, while
+    destination buffers are cast to source buffer dtypes. (Except for
+    quantized parameters that are staged and communicated unquantized.)
+    Custom transforms manage their own wire format.
+    """
+    # Collect source and destination dtype information for reshard.
+    local_dtype_info = (
+        _collect_source_buffer_dtypes(plan, src_module),
+        _collect_destination_receive_info(plan, dst_module, transform),
+    )
+
+    # Synchronize dtype information across all reshard ranks.
+    if group is None and not dist.is_initialized():
+        gathered = [local_dtype_info]
+    else:
+        world_size = group.size() if group is not None else dist.get_world_size()
+        gathered = [None] * world_size
+        dist.all_gather_object(gathered, local_dtype_info, group=group)
+    task_dtypes = _resolve_refit_dtypes(gathered)
+
+    # Cast destination buffers to source dtypes.
+    _apply_buffer_dtypes(plan, dst_module, task_dtypes)
+    # Set reshard dtype to the destination dtype.
+    _apply_wire_dtypes(plan, task_dtypes)
 
 
 def _get_quantized_accumulator(pending: dict[int, tuple], dst_param: torch.Tensor) -> torch.Tensor:
@@ -211,6 +367,10 @@ def _execute_batch(
                 torch.cuda.current_stream().wait_event(ev)
             sendable = get_sendable(op.param_name, src_param)
             src_view = sendable[op.my_slice]
+            if op.wire_dtype is not None and src_view.dtype != op.wire_dtype:
+                # Cast source to destination dtype to bridge dtype disparities
+                # between the source and destination tensors.
+                src_view = src_view.to(op.wire_dtype)
             if not src_view.is_contiguous():
                 src_view = src_view.contiguous()
             service.submit_send(src_view, op.peer_rank, task_id=op.task_id)
@@ -332,14 +492,14 @@ def execute_reshard_plan(
     transform's prepare_send / prepare_recv / finalize_recv methods instead
     of the default slice-and-copy logic.
     """
-    service.set_plan(plan, transform=transform)
-
     # Extract parameters and persistent buffers from models if present.
     # Persistent buffers carry training state (e.g. MoE router expert_bias)
     # and must be refit alongside parameters.  Cached on each module so the
     # named_modules() walk happens once per model, not per refit.
+    _prepare_refit_dtypes(plan, src_module, dst_module, group=group, transform=transform)
     src_params = get_refit_tensor_dict(src_module) if src_module is not None else {}
     dst_params = get_refit_tensor_dict(dst_module) if dst_module is not None else {}
+    service.set_plan(plan, transform=transform)
 
     if service.execute_plan(plan, src_params, dst_params, transform=transform):
         logger.info("Executing native reshard plan")

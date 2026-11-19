@@ -180,6 +180,8 @@ _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = None
 # Partial Data parallel group information with context parallel combined.
 _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = None
 _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
+# Aliases _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP when the instance counts match.
+_INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = None
 
 # combined parallel group of TP and CP
 _TENSOR_AND_CONTEXT_PARALLEL_GROUP = None
@@ -683,6 +685,7 @@ def initialize_model_parallel(
     dynamic_context_parallel: bool = False,
     min_dynamic_context_parallel_size: int = 1,
     gtp_remat_num_sequence_shards: int = 1,
+    expert_num_distributed_optimizer_instances: Optional[int] = None,
     create_all_gather_group: bool = False,
 ) -> "ProcessGroupCollection":
     """Initialize model data parallel groups.
@@ -831,6 +834,10 @@ def initialize_model_parallel(
             By default (None), it is enabled from dp group.
             Available options (choose one): [dp, dp_replica]
 
+        expert_num_distributed_optimizer_instances (int, default = None):
+            Same as ``num_distributed_optimizer_instances``, for the expert data-parallel
+            domain. Defaults to ``num_distributed_optimizer_instances``.
+
         create_all_gather_group (bool, default = False):
             Create separate dense and, when EP > 1, expert all-gather communicators
             over the inner shard ranks. Include them in the returned collection.
@@ -843,6 +850,7 @@ def initialize_model_parallel(
         components. Ordinary groups still use the existing single-grid MPU bootstrap;
         no AG handles are stored in MPU globals. Callers may ignore the return value,
         but it is no longer None.
+
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -860,6 +868,9 @@ def initialize_model_parallel(
     with a total of 16 GPUs, rank 0 to 7 belong to the first box and
     ranks 8 to 15 belong to the second box.
     """
+    if expert_num_distributed_optimizer_instances is None:
+        expert_num_distributed_optimizer_instances = num_distributed_optimizer_instances
+
     # NCCL restricts IB SHARP usage to a single communicator group—the first one created
     # with NCCL_COLLNET_ENABLE=1. After this group is created, NCCL_COLLNET_ENABLE must be
     # set to 0 for subsequent groups.
@@ -875,8 +886,8 @@ def initialize_model_parallel(
             assert sharp_enabled_group in ["dp", "dp_replica"], "Invalid sharp_enabled_group"
             if sharp_enabled_group == "dp_replica":
                 assert (
-                    num_distributed_optimizer_instances > 1
-                ), "dp_replica group requires num_distributed_optimizer_instances > 1"
+                    expert_num_distributed_optimizer_instances > 1
+                ), "dp_replica group requires expert_num_distributed_optimizer_instances > 1"
     else:
         assert (
             sharp_enabled_group is None
@@ -899,7 +910,7 @@ def initialize_model_parallel(
     # assume one instance when GTP_remat/EGTP is active.
     assert not (
         (gtp_remat_size > 1 or expert_gtp_remat_size > 1)
-        and num_distributed_optimizer_instances > 1
+        and max(num_distributed_optimizer_instances, expert_num_distributed_optimizer_instances) > 1
     ), "GTP_remat with num_distributed_optimizer_instances > 1 is not yet supported."
 
     # Resolve weight placement separately from token ownership. Only bootstrap sees
@@ -1633,10 +1644,10 @@ def initialize_model_parallel(
     ), "Inter partial expert data group is already initialized"
 
     assert (
-        expert_data_parallel_size % num_distributed_optimizer_instances == 0
+        expert_data_parallel_size % expert_num_distributed_optimizer_instances == 0
     ), "Expert data parallel size should be divisible by partial DistOpt shard factor"
     intra_partial_expert_data_parallel_size = (
-        expert_data_parallel_size // num_distributed_optimizer_instances
+        expert_data_parallel_size // expert_num_distributed_optimizer_instances
     )
 
     # Gloo only on the non-EGTP path (EGTP + Gloo out of scope; the EGTP optimizer uses DCP).
@@ -1659,7 +1670,7 @@ def initialize_model_parallel(
             _EXPERT_DATA_PARALLEL_GROUP = group
             _EXPERT_DATA_PARALLEL_GROUP_GLOO = group_gloo
 
-        if num_distributed_optimizer_instances > 1:
+        if expert_num_distributed_optimizer_instances > 1:
             # Create groups for Partial DistOpt, one for intra-partial DP domain
             # Another for inter-partial DP domain
 
@@ -1669,7 +1680,10 @@ def initialize_model_parallel(
             hierarchical_groups, hierarchical_groups_gloo = create_hierarchical_groups(
                 rank,
                 ranks,
-                [intra_partial_expert_data_parallel_size, num_distributed_optimizer_instances],
+                [
+                    intra_partial_expert_data_parallel_size,
+                    expert_num_distributed_optimizer_instances,
+                ],
                 create_gloo_process_groups=create_gloo_process_groups,
                 pg_options=[
                     get_nccl_options("intra_ep_dp", nccl_comm_cfgs),
@@ -1722,6 +1736,23 @@ def initialize_model_parallel(
         )
 
     ### End of expert related parallel groups initialization
+
+    # Dense inter-instance group: the expert one when the counts match, else built from dense ranks.
+    global _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
+    if num_distributed_optimizer_instances == expert_num_distributed_optimizer_instances:
+        _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
+    elif num_distributed_optimizer_instances > 1:
+        for ranks_with_cp in weight_replica_rank_sets:
+            for offset in range(intra_partial_data_parallel_size):
+                inter_ranks = ranks_with_cp[offset::intra_partial_data_parallel_size]
+                group = create_group(
+                    inter_ranks,
+                    timeout=timeout,
+                    pg_options=get_nccl_options("inter_ep_dp", nccl_comm_cfgs),
+                    group_desc="INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP",
+                )
+                if rank in inter_ranks:
+                    _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = group
 
     # build the intra distributed optimizer instance group
     global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
@@ -3022,21 +3053,23 @@ def get_intra_distributed_optimizer_instance_group(check_initialized=True):
     return _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
 
 
-def get_inter_distributed_optimizer_instance_group(check_initialized=True):
-    """Get the group spanning the different distributed optimizer instances.
-    Attention and MLP/Expert share same inter-instance group, so only built
-    inter_partial_expert_data_parallel_group, and return it at here.
+def get_inter_distributed_optimizer_instance_group(check_initialized=True, expert=False):
+    """Get the group spanning the different distributed optimizer instances, for the dense
+    (default) or expert parameters. Both are the same group when their instance counts match.
 
     Deprecated: reads the global parallel state. Use the caller-provided
-    pg_collection.inter_dist_opt group. See docs/developer/parallel-state-deprecation.md for
-    migration details and optional-group handling.
+    pg_collection.inter_dist_opt (dense) or pg_collection.inter_expt_dist_opt (expert) group.
+    See docs/developer/parallel-state-deprecation.md for migration details and optional-group
+    handling.
     """
+    group = (
+        _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
+        if expert
+        else _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
+    )
     if check_initialized:
-        assert _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is not None, (
-            "Attention and MLP/Expert share same inter distributed optimize instance group, "
-            "which has not been initialized"
-        )
-    return _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
+        assert group is not None, "Inter distributed optimizer instance group is not initialized"
+    return group
 
 
 ### End of expert-related functions region
@@ -3273,6 +3306,9 @@ def destroy_model_parallel():
     global _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
     # End of expert parallelism destroy.
+
+    global _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
+    _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = None
 
     global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
     _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
