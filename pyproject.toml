@@ -108,7 +108,7 @@ dev = [
     "Pillow>=13.0.0",
     "flashinfer-python>=0.7.2,<0.8.0",
     "flash-attn-4[cu13]==4.0.0b27",
-    "nvidia-cudnn-frontend[cutedsl]==1.32.0",
+    "nvidia-cudnn-frontend[cutedsl]==1.33.0",
     "wget",
     "onnxscript",
     "fastapi~=0.50",                                    # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
