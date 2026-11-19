@@ -276,7 +276,36 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
         use_syrk: bool = False,
+        expert_ns_batch_size: int = 1,
     ) -> None:
+        self._expert_ns_batch = None
+        self._expert_ns_replay = None
+        if expert_ns_batch_size not in (1, 32):
+            raise ValueError("expert_ns_batch_size supports only 1 (disabled) or 32")
+        self.expert_ns_batch_size = expert_ns_batch_size
+        if expert_ns_batch_size > 1:
+            if (
+                type(self) is not TensorParallelMuon
+                or tp_mode != "duplicated"
+                or use_syrk
+                or num_ns_steps != 16
+                or nesterov
+                or fp32_matmul_prec != "medium"
+                or not use_decoupled_weight_decay
+                or coefficient_type != "polar_express"
+                or scale_mode != "spectral"
+                or extra_scale_factor != 0.2
+                or pg_collection is None
+                or pg_collection.expt_tp.size() != 1
+                or pg_collection.expt_gtp_remat.size() != 1
+            ):
+                raise ValueError("Unsupported duplicated-mode expert Muon batching recipe")
+            if not is_emerging_optimizers_min_version("0.3.0"):
+                raise ValueError("Expert batching requires emerging-optimizers >= 0.3.0")
+            from megatron.core.optimizer.muon_expert_batching import new_expert_replay
+
+            self._expert_ns_replay = new_expert_replay()
+
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
         if use_syrk and not is_emerging_optimizers_min_version(_SYRK_MIN_EO_VERSION):
@@ -351,6 +380,24 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             fp32_matmul_prec=fp32_matmul_prec,
             scaled_orthogonalize_fn=scaled_orthogonalize_fn,
         )
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Keep native EMA, decay and updates; batch only qualified expert NS."""
+        if self.expert_ns_batch_size == 1:
+            return super().step(closure)
+        if closure is not None or self._expert_ns_batch is not None:
+            raise RuntimeError("Expert batching rejects closures and reentrant steps")
+        from megatron.core.optimizer.muon_expert_batching import ExpertMuonBatch
+
+        batch = ExpertMuonBatch(self, self._expert_ns_replay, self.expert_ns_batch_size)
+        self._expert_ns_batch = batch
+        try:
+            result = super().step(closure)
+            batch.finish()
+            return result
+        finally:
+            self._expert_ns_batch = None
 
     @staticmethod
     def _all_gather_tensor(t, group, dim):
@@ -614,6 +661,10 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         Returns:
             The orthogonalized gradient tensor.
         """
+        if self._expert_ns_batch is not None:
+            result = self._expert_ns_batch.consume(p, grad)
+            if result is not None:
+                return result
         # TODO(deyuf): switch to group
         if self.pg_collection:
             tp_group = (
