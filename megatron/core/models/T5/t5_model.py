@@ -136,14 +136,9 @@ class T5Model(LanguageModule):
             the decoder will only be created on a subset of the pipeline ranks.
 
         pg_collection (ProcessGroupCollection, optional): Process groups for the model and
-            its submodules, checked by LanguageModule. Omitting it is deprecated: LanguageModule
-            warns and resolves the global parallel_state groups without checking them, and the
-            embedding, blocks and LM head are built on that same collection. In a supplied
-            collection, an `embd` of NON_GROUP_MEMBER raises ValueError on every stage, and an
-            omitted `embd` field is treated as None with a FutureWarning. After the parent
-            constructor, a supplied collection whose `embd` group is None raises ValueError
-            when embeddings are tied, pipeline_model_parallel_size > 1, and this stage has
-            pre_process or post_process set.
+            its submodules. Omitting it emits a FutureWarning and uses the global parallel_state
+            groups. When embeddings are tied across pipeline stages, the embedding and output
+            stages must participate in the resolved `embd` group.
     """
 
     def __init__(
@@ -171,17 +166,15 @@ class T5Model(LanguageModule):
         pg_collection: ProcessGroupCollection = None,
     ):
 
-        super(T5Model, self).__init__(config=config, pg_collection=pg_collection)
-        if (
-            pg_collection is not None
-            and share_embeddings_and_output_weights
-            and config.pipeline_model_parallel_size > 1
-            and (pre_process or post_process)
-            and self.embd_group is None
-        ):
-            raise ValueError(
-                "T5Model tied pipeline embedding/output stages require a usable embd group"
-            )
+        super().__init__(
+            config=config,
+            pg_collection=pg_collection,
+            require_embedding_group=(
+                share_embeddings_and_output_weights
+                and config.pipeline_model_parallel_size > 1
+                and (pre_process or post_process)
+            ),
+        )
         # LanguageModule resolves an omitted collection; build the submodules on the same groups.
         pg_collection = self.pg_collection
 

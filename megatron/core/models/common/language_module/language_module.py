@@ -82,23 +82,27 @@ class LanguageModule(MegatronModule):
             With tied output weights or MTP across distributed pipeline ranks, a stage holding
             the word embeddings or a copy of them needs a usable ``embd`` group once distributed
             is initialized; ``embd=None`` there also warns until 0.23 (T5 raises already).
+        require_embedding_group (bool): Require this stage to participate in the resolved
+            embedding group, including when the collection is omitted.
     """
 
     def __init__(
-        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
+        self,
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        *,
+        require_embedding_group: bool = False,
     ) -> None:
         super().__init__(config=config)
-        # Checks that need the subclass's stage layout run later, on a caller's collection only.
         self._pg_collection_supplied = pg_collection is not None
         if pg_collection is None:
             # The global grid is only a compatibility default: a model built on independent grids
             # (vision encoder + LLM, GTP, MIMO) would get the wrong groups from it. The deprecated
-            # path keeps main's behavior, so only a caller's collection is validated below.
+            # path skips the collection-wide checks applied to a caller's collection.
             warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         else:
             _validate_supplied_collection(type(self).__name__, pg_collection)
-        set_attention_backend(self.config)
         self.pg_collection = pg_collection
         self.cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp
@@ -106,6 +110,15 @@ class LanguageModule(MegatronModule):
         # A collection without an embd field is deprecated and treated as embd=None, whatever
         # object carries the groups.
         self.embd_group = getattr(pg_collection, 'embd', None)
+        if require_embedding_group and self.embd_group in (
+            None,
+            torch.distributed.GroupMember.NON_GROUP_MEMBER,
+        ):
+            raise ValueError(
+                f"{type(self).__name__} tied pipeline embedding/output stages "
+                "require a usable embd group"
+            )
+        set_attention_backend(self.config)
         self.vp_stage = None
         self.vp_size = self.config.virtual_pipeline_model_parallel_size
         # Choose the cross entropy implementation once, here, rather than on every forward.
