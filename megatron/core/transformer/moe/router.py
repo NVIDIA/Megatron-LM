@@ -783,9 +783,8 @@ class TopKRouter(Router):
         ):
             # Launch the all-reduce now; finish_deferred_global_aux_loss, called on the MoE layer
             # output after combine, has the layer's backward wait for it and compute the loss.
-            assert (
-                self._pending_global_aux_loss is None
-            ), "the previous deferred global aux loss was not finished"
+            if self._pending_global_aux_loss is not None:
+                raise RuntimeError("the previous deferred global aux loss was not finished")
             local_tokens_per_expert = routing_map.sum(dim=0)
             if self._deferred_local_tokens_per_expert is None:
                 self._deferred_local_tokens_per_expert = torch.zeros_like(local_tokens_per_expert)

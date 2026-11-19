@@ -1211,8 +1211,9 @@ class TransformerConfig(ModelParallelConfig):
     that run route through combine in one call and are not being captured into a CUDA graph;
     other paths (e.g. ``overlap_moe_expert_parallel_comm``) keep the synchronous all-reduce.
     Recomputation that includes the router (full recompute, or the ``moe`` recompute module)
-    runs the first forward without grad, so it keeps the synchronous all-reduce, and the overlap
-    is limited to the recomputed layer; the gain is largest when the router is not recomputed.
+    runs the first forward without grad, which computes no aux loss; the recomputed forward
+    launches the all-reduce and the same layer's backward waits for it, so the overlap is limited
+    to the recomputed layer. The gain is largest when the router is not recomputed.
     """
 
     moe_apply_probs_on_input: bool = False
@@ -3076,6 +3077,12 @@ class TransformerConfig(ModelParallelConfig):
             if "global_aux_loss" not in load_balancing_types:
                 raise ValueError(
                     "moe_router_defer_global_aux_loss requires the global_aux_loss load balancing"
+                )
+            if self.overlap_moe_expert_parallel_comm or self.moe_megakernel_backend is not None:
+                warnings.warn(
+                    "moe_router_defer_global_aux_loss has no effect with "
+                    "overlap_moe_expert_parallel_comm or moe_megakernel_backend; the global aux "
+                    "loss all-reduce stays synchronous"
                 )
 
         if self.moe_pad_expert_input_to_capacity:

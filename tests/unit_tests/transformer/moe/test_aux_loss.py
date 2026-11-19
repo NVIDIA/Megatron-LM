@@ -1025,8 +1025,8 @@ class TestDeferredGlobalAuxLoss:
         )
         moe_layer = container.moe_layer
         router = moe_layer.router
-        # A repeated MTP layer keeps waiting after combine; mtp_num_layers stays None so the loss
-        # is not rescaled.
+        # A repeated MTP layer runs the same router once per MTP depth; each call finishes its own
+        # deferred loss. mtp_num_layers stays None so the loss is not rescaled.
         router.is_mtp_layer = mtp_repeated
         moe_layer.config.mtp_use_repeated_layer = mtp_repeated
         assert moe_layer.config is router.config
@@ -1089,10 +1089,8 @@ class TestDeferredGlobalAuxLoss:
             assert torch.equal(reference["tokens_per_expert"], deferred["tokens_per_expert"])
             for name in ("outputs", "losses", "input_grads"):
                 for ref, out in zip(reference[name], deferred[name]):
-                    torch.testing.assert_close(ref, out, rtol=1e-5, atol=1e-7)
-            torch.testing.assert_close(
-                reference["router_grad"], deferred["router_grad"], rtol=1e-5, atol=1e-7
-            )
+                    assert torch.equal(ref, out), name
+            assert torch.equal(reference["router_grad"], deferred["router_grad"])
 
             # No-grad and eval forwards keep the synchronous path.
             pending_at_finish.clear()

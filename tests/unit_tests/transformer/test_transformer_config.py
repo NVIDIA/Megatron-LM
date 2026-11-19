@@ -768,3 +768,20 @@ def test_moe_router_defer_global_aux_loss_requires_global_aux_loss(load_balancin
             ),
             moe_router_defer_global_aux_loss=True,
         )
+
+
+def test_moe_router_defer_global_aux_loss_warns_when_unused():
+    with pytest.warns(UserWarning, match="moe_router_defer_global_aux_loss has no effect"):
+        TransformerConfig(
+            num_layers=2,
+            hidden_size=16,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            bf16=True,
+            expert_model_parallel_size=2,
+            moe_token_dispatcher_type="alltoall",
+            overlap_moe_expert_parallel_comm=True,
+            moe_router_load_balancing_type="global_aux_loss",
+            moe_aux_loss_coeff=1e-2,
+            moe_router_defer_global_aux_loss=True,
+        )
