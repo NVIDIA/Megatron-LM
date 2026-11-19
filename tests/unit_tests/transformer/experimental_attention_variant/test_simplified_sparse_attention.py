@@ -190,14 +190,15 @@ def test_bind_dense_teacher_requires_indexer_kl_and_flash_attention_4(monkeypatc
 
     bind = simplified_sparse_attention_cudnn.bind_cudnn_sparse_attention
     ops = SimpleNamespace(
-        simplified_sparse_attention=object(), SimplifiedSparseAttentionMetadata=object
+        simplified_sparse_attention_forward=object(), SimplifiedSparseAttentionMetadata=object
     )
     monkeypatch.setitem(sys.modules, "cudnn", SimpleNamespace(__version__="1.33.0"))
     monkeypatch.setitem(sys.modules, "cudnn.ops", ops)
     assert bind().dense_attention is None and bind().dense_indexer_kl is None
-    with pytest.raises(ImportError, match="cudnn.ops.dense_indexer_kl"):
+    assert bind().sparse_attention is ops.simplified_sparse_attention_forward
+    with pytest.raises(ImportError, match="cudnn.ops.dense_indexer_kl_forward"):
         bind(dense_teacher=True)
-    ops.dense_indexer_kl = object()
+    ops.dense_indexer_kl_forward = object()
     monkeypatch.setattr(attention, "HAVE_FA4", False)
     with pytest.raises(ImportError, match="flash-attn-4"):
         bind(dense_teacher=True)
@@ -206,7 +207,7 @@ def test_bind_dense_teacher_requires_indexer_kl_and_flash_attention_4(monkeypatc
     monkeypatch.setattr(attention, "flash_attn4_varlen_func", flash_attention)
     kernels = bind(dense_teacher=True)
     assert kernels.dense_attention is flash_attention
-    assert kernels.dense_indexer_kl is ops.dense_indexer_kl
+    assert kernels.dense_indexer_kl is ops.dense_indexer_kl_forward
 
 
 @pytest.mark.parametrize("coefficient", [0.0, 0.03])

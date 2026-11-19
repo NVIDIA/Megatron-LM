@@ -33,9 +33,9 @@ def bind_cudnn_sparse_attention(*, dense_teacher: bool = False) -> CudnnSparseAt
     The kernels ship in ``nvidia-cudnn-frontend`` 1.33 and newer and require CuTe DSL 4.8.
     ``dense_teacher`` additionally binds the dense indexer objective and FlashAttention-4.
     """
-    symbols = ["simplified_sparse_attention", "SimplifiedSparseAttentionMetadata"]
+    symbols = ["simplified_sparse_attention_forward", "SimplifiedSparseAttentionMetadata"]
     if dense_teacher:
-        symbols.append("dense_indexer_kl")
+        symbols.append("dense_indexer_kl_forward")
     ops = require(
         "cudnn.ops", *symbols, dist="nvidia-cudnn-frontend", needed_by="Simplified sparse attention"
     )
@@ -50,10 +50,10 @@ def bind_cudnn_sparse_attention(*, dense_teacher: bool = False) -> CudnnSparseAt
             )
         dense_attention = attention.flash_attn4_varlen_func
     return CudnnSparseAttentionKernels(
-        sparse_attention=ops.simplified_sparse_attention,
+        sparse_attention=ops.simplified_sparse_attention_forward,
         row_metadata=ops.SimplifiedSparseAttentionMetadata,
         dense_attention=dense_attention,
-        dense_indexer_kl=ops.dense_indexer_kl if dense_teacher else None,
+        dense_indexer_kl=ops.dense_indexer_kl_forward if dense_teacher else None,
     )
 
 
