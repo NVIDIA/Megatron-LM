@@ -184,14 +184,14 @@ class TestPartialCudaGraphedA2AOverlap:
         return input_ids, labels, position_ids, attention_mask, loss_mask
 
     def _run_1f1b_helper(self, gpt_model, optimizer, data, num_iters, cuda_graph_warmup_steps):
+        from megatron.core.extensions.te_cuda_graphs import set_te_cuda_graph_current_microbatch
         from megatron.core.models.common.model_chunk_schedule_plan import (
             TransformerModelChunkSchedulePlan,
         )
-        from megatron.core.pipeline_parallel.schedules import set_current_microbatch
 
         schedule_plans = []
         losses = []
-        set_current_microbatch(gpt_model[0], 1)
+        set_te_cuda_graph_current_microbatch(gpt_model[0], 1)
 
         gpt_model[0].zero_grad_buffer()
         optimizer.zero_grad()
