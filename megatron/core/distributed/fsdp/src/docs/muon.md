@@ -133,6 +133,26 @@ This removes optimizer-step matrix communication. Forward/backward should
 MFSDP already provides the [layouts](../megatron_fsdp/experimental/placement.py)
 and [collectives](../megatron_fsdp/experimental/dbuffer.py) for this.
 
+## AngularMuOwn
+
+[`FsdpAngularMuOwn`](../megatron_fsdp/experimental/angular_muown.py)
+([arXiv:2606.23637](https://arxiv.org/abs/2606.23637)) writes each row as
+`W_i = g_i U_i`, with an Adam-updated signed scale `g_i` and a unit direction
+`U_i`. Only Newton–Schulz needs whole matrices; all other work is per row, and
+every placement above keeps rows intact on one rank. The subclass therefore
+reuses `FsdpMuon`'s gather, Newton–Schulz, and scatter unchanged and replaces
+the local work on both sides:
+
+1. Before the gather: recover `U = W / g`, split the gradient into the radial
+   part `d = <G, U>` and the direction gradient `g (G - d U)`, update Adam's
+   moments of `g` and the raw-sum momentum, and write the (Nesterov) momentum
+   as the Newton–Schulz input.
+2. After the scatter: rotate `U <- rownorm(U - lr kappa_t O)`, take the Adam
+   step on `g` with decoupled decay, and rewrite `W = g U`.
+
+The row states (`row_scale` and its two Adam moments) are `(m, 1)` DTensors
+sharded like their parameters, so they add no communication.
+
 ## Tradeoffs
 
 - **Gather/scatter favors forward/backward** through more balanced sharding.

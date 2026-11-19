@@ -2436,6 +2436,19 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     return model
 
 
+def _resolve_muown_angular_schedule(cfg) -> None:
+    """Default AngularMuOwn's angular warmup and horizon to the LR warmup and training length.
+
+    The scheduler counts samples, so the LR warmup is converted back to iterations.
+    """
+    optim_cfg = cfg.optimizer
+    if optim_cfg.muown_angular_horizon_iters is None:
+        optim_cfg.muown_angular_horizon_iters = cfg.train.train_iters or 0
+    if optim_cfg.muown_angular_warmup_iters is None:
+        warmup_samples = cfg.scheduler.lr_warmup_steps or 0
+        optim_cfg.muown_angular_warmup_iters = int(warmup_samples // cfg.train.global_batch_size)
+
+
 def get_optimizer_param_scheduler(optimizer):
     """Build the learning rate scheduler."""
     cfg = get_run_config()
@@ -2626,6 +2639,8 @@ def setup_model_and_optimizer(
         optim_cfg = cfg.optimizer
         optim_cfg_overrides = get_standard_config_overrides(optim_cfg)
         optim_cfg.timers = timers
+        if optim_cfg.muon_use_muown:
+            _resolve_muown_angular_schedule(cfg)
         if cfg.model.transformer.use_mup:
             model_config_source = (
                 unwrapped_model[0] if isinstance(unwrapped_model, list) else unwrapped_model
