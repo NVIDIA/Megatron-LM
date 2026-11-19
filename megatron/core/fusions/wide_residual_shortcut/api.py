@@ -1,8 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Model-facing fused shortcut seams; GPU imports are lazy.
+"""The fused seam op (``fused_seam``); GPU imports are lazy.
 
 Training (a qualified GB300) differentiates the seam, including pruned residual/reader
-gradients; no-grad calls bypass autograd and save nothing for backward.
+gradients, and records it into a ReplayInterval; no-grad calls bypass autograd and save nothing
+for backward. The op knows tensors, formats and kernel limits, not the modules calling it.
 """
 
 from dataclasses import dataclass, replace
@@ -18,7 +19,7 @@ from .residual_replay import ReplayInterval
 # consumer, in its format, so each consumer's gradient reaches the backward kernel separately
 # (summed there). In training an MXFP8 reader's ColumnSlot receives its columnwise operand from
 # the replay, and its consumers' weight-gradient GEMMs unpack it from TE's saved slot
-# (wide_residual.install_columns).
+# (residual_replay.install_columns).
 
 
 def validate_input(residual, hidden_size, num_streams, *, inference=False):
@@ -47,7 +48,7 @@ class _Boundary(torch.autograd.Function):
     @staticmethod
     def forward(ctx, options, residual, *values):
         """Run the seam; ``ctx`` None is an inference call without autograd state."""
-        streams, replay, uses, slots, epsilon, update_count = options
+        streams, replay, uses, slots, epsilon, update_count, batch_invariant = options
         formats = tuple(_kernel_format(use) for use in uses)
         from .forward_kernel import forward
 
@@ -73,6 +74,7 @@ class _Boundary(torch.autograd.Function):
             num_streams=streams,
             epsilon=epsilon,
             inference=ctx is None,
+            batch_invariant=batch_invariant,
         )
         outputs = tuple(
             (
@@ -176,12 +178,59 @@ def _trains_on(device_index: int) -> bool:
     return qualified_device(torch.cuda.get_device_properties(device_index))
 
 
-def _apply_boundary(
-    p, reads, gammas, *, num_streams, outputs=None, columns=None, epsilon=1.0e-5, replay=None
+def check_mxfp8_call(tensor) -> None:
+    """For a seam emitting an MXFP8 reader: raise unless an FP8 context is active and the kernel
+    takes this token count. Precision never changes per call: training shapes are fixed for a run
+    (the tuned set), and inference rows must be divisible by 32, as TE's MXFP8 GEMM requires too
+    (Megatron's inference pads to 64)."""
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+    from .kernel_utils import SHAPES
+
+    if not FP8GlobalStateManager.is_fp8_enabled():
+        raise RuntimeError("an MXFP8 layer's fused seam ran outside its FP8 context")
+    rows, hidden = tensor.numel() // tensor.shape[-1], tensor.shape[-1]
+    training = torch.is_grad_enabled()
+    if (rows, hidden) not in SHAPES if training else rows % 32:
+        raise ValueError(
+            f"the MXFP8 seam handoff does not support {rows} tokens at hidden size {hidden} in "
+            + (
+                "training (supported: multiples of 1024 from 2048 tokens, up to 16384 above "
+                "hidden 4096)"
+                if training
+                else "inference (rows must be divisible by 32)"
+            )
+        )
+
+
+def fused_seam(
+    pending,
+    reads,
+    gammas,
+    *,
+    num_streams,
+    outputs=None,
+    columns=None,
+    interval=None,
+    epsilon=1.0e-5,
+    batch_invariant=False,
 ):
-    """In training the write records into ``replay`` (a ReplayInterval; None: its own one-write
-    interval), which keeps or replays its input residual and fills its MXFP8 readers' column
-    slots (``columns``: one ColumnSlot per MXFP8 reader, None per BF16 one)."""
+    """Write ``pending`` and emit one or two following read/RMSNorms in one kernel; returns
+    ``(residual, *readers)``.
+
+    ``reads``/``gammas`` hold each reader's read logits and RMSNorm weight. ``outputs`` gives
+    each reader's format (default BF16): "mxfp8" emits it directly from FP32 as rowwise MXFP8, or
+    a tuple of two consumers' formats (e.g. ("bf16", "mxfp8"), "both" for short) returns one
+    output per consumer in that order, for the caller to hand each its tensor; their gradients
+    are summed by the backward kernel. With gradients the write records into ``interval`` (a
+    ReplayInterval), and each MXFP8 reader's ``columns`` entry is a ColumnSlot that the interval's
+    replay fills with its columnwise operand, for its consumers' weight-gradient GEMMs; the
+    interval must replay before them. ``batch_invariant`` (inference) fixes the schedule across
+    batch sizes.
+    """
+    if not 1 <= len(reads) == len(gammas) <= 2:
+        raise ValueError("a seam has one or two readers, each with read logits and a norm weight")
+    p = pending
     updates = (p.routed,) if p.shared is None else (p.routed, p.shared)
     inputs = (p.residual, *updates, p.write, p.retain, *reads, *gammas)
     uses = tuple(
@@ -189,22 +238,21 @@ def _apply_boundary(
     )
     formats = tuple(_kernel_format(use) for use in uses)
     slots = (None,) * len(reads) if columns is None else tuple(columns)
-    if not len(formats) == len(slots) == len(reads):
+    if len(formats) != len(reads) or len(slots) != len(reads):
         raise ValueError("a seam takes one output format and column slot per reader")
+    options = (num_streams, interval, uses, slots, epsilon, len(updates), batch_invariant)
     if not torch.is_grad_enabled():
-        options = (num_streams, None, uses, slots, epsilon, len(updates))
         return _regroup(uses, _Boundary.forward(None, options, *inputs))
     if any((fmt == "bf16") != (slot is None) for fmt, slot in zip(formats, slots)):
         raise ValueError("in training an MXFP8 seam reader (and only one) requires a ColumnSlot")
+    if not isinstance(interval, ReplayInterval):
+        raise ValueError("a seam with gradients records into a ReplayInterval")
     if p.residual.is_cuda and not _trains_on(p.residual.device.index):
         # Fail at the first seam rather than after a whole forward pass.
         raise ValueError(
             "training through the fused shortcut seams requires a qualified GB300 (the fused "
             f"backward is GB300-only); got {torch.cuda.get_device_name(p.residual.device)}"
         )
-    # Without checkpoint replay, the seam is a one-write interval keeping its input residual.
-    replay = ReplayInterval() if replay is None else replay
-    options = (num_streams, replay, uses, slots, epsilon, len(updates))
     flat = _Boundary.apply(options, *inputs)
     for fmt, tensor in zip((fmt for use in uses for fmt in use), flat[1:]):
         if fmt == "mxfp8":
@@ -255,30 +303,3 @@ class PendingWideResidualWrites:
     shared: torch.Tensor | None
     write: torch.Tensor
     retain: torch.Tensor | None
-
-
-def shortcut_add_wide_residual_write_two_reader_rmsnorm_quant(pending, reads, gammas, **options):
-    """Write a pending update and emit the next block's two independent read/RMSNorms.
-
-    Options match ``shortcut_add_wide_residual_write_read_rmsnorm_quant``, per reader.
-    """
-    if len(reads) != 2 or len(gammas) != 2:
-        raise ValueError(
-            "the two-reader seam requires two read controllers and two RMSNorm weights"
-        )
-    return _apply_boundary(pending, reads, gammas, **options)
-
-
-def shortcut_add_wide_residual_write_read_rmsnorm_quant(pending, read, gamma, **options):
-    """Write a pending update and emit one following read/RMSNorm.
-
-    Keyword options: ``num_streams`` (required), ``epsilon`` (RMSNorm, default 1e-5),
-    ``outputs``, ``columns`` and ``replay``. ``outputs`` gives each reader's format
-    (default BF16): "mxfp8" emits it directly from FP32 as rowwise MXFP8, or a tuple of two
-    consumers' formats (e.g. ("bf16", "mxfp8"), "both" for short) returns one output per consumer
-    in that order, for the caller to hand each its tensor; their gradients are summed by the
-    backward kernel. In training each MXFP8 reader's ``columns`` entry is a ColumnSlot that this
-    write's interval fills with its columnwise operand, for its consumers' weight-gradient GEMMs
-    (``replay``, a ReplayInterval, is the interval to record into; it must replay before them).
-    """
-    return _apply_boundary(pending, (read,), (gamma,), **options)

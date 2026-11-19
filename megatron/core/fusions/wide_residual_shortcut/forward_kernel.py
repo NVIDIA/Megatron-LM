@@ -326,6 +326,7 @@ def forward(
     num_streams=3,
     epsilon=1.0e-5,
     inference=False,
+    batch_invariant=False,
 ):
     """Write the current residual and one or two RMSNorm readers of it.
 
@@ -335,6 +336,8 @@ def forward(
     logits). ``outputs`` gives each reader's format (``OUTPUT_FORMATS``, default BF16), whatever
     the residual dtype: ``"mxfp8"`` is rowwise MXFP8 and ``"both"`` emits BF16 and MXFP8 from the
     same normalized values.
+
+    ``batch_invariant`` (inference) schedules every batch size like the smallest one.
 
     Returns ``(current residual, SavedWrite or None in inference, reader operands)``: per reader a
     BF16 tensor, an MXFP8 tensor, or with ``"both"`` an ``(MXFP8, BF16)`` pair.
@@ -362,13 +365,7 @@ def forward(
         _tensor(controller, controller.shape, controller.dtype, device, "controller")
     for gamma in gammas:
         _tensor(gamma, (h,), torch.bfloat16, device, "gamma")
-    rows = m
-    if inference:
-        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-            is_batch_invariant_mode_enabled,
-        )
-
-        rows = _BATCH_INVARIANT_ROWS if is_batch_invariant_mode_enabled() else m
+    rows = _BATCH_INVARIANT_ROWS if inference and batch_invariant else m
     config = choose_forward_config(
         rows,
         h,

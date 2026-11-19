@@ -10,11 +10,14 @@ import torch.nn.functional as F
 import transformer_engine as te
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
-from megatron.core.fusions.wide_residual_shortcut import forward_kernel, replay_kernel
-from megatron.core.fusions.wide_residual_shortcut.residual_replay import ColumnSlot
+from megatron.core.fusions.wide_residual_shortcut import (
+    ColumnSlot,
+    check_mxfp8_call,
+    forward_kernel,
+    replay_kernel,
+)
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.models.hybrid import hybrid_block
 from megatron.core.models.hybrid import hybrid_layer_specs as specs
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -1267,7 +1270,7 @@ def test_fusion_spec_links_every_seam(monkeypatch):
 
     with monkeypatch.context() as patch:
         # As under MXFP8 on a GB300: every layer MXFP8, a TELinear eligible (never the router).
-        patch.setattr(hybrid_block, "runs_mxfp8", lambda config, layer: True)
+        patch.setattr(wide_residual, "runs_mxfp8", lambda config, layer: True)
         patch.setattr(
             wide_residual, "mxfp8_linear_eligible", lambda linear: isinstance(linear, TELinear)
         )
@@ -1342,16 +1345,16 @@ def test_mxfp8_handoff_never_falls_back(monkeypatch):
     rows = lambda m, h=3072: torch.empty(m, h, device="cuda", dtype=torch.bfloat16)
     monkeypatch.setattr(FP8GlobalStateManager, "is_fp8_enabled", lambda: True)
     with torch.enable_grad():
-        wide_residual.check_mxfp8_call(rows(2048))
+        check_mxfp8_call(rows(2048))
         with pytest.raises(ValueError, match="1024 tokens .* in training"):
-            wide_residual.check_mxfp8_call(rows(1024))
+            check_mxfp8_call(rows(1024))
     with torch.no_grad():
-        wide_residual.check_mxfp8_call(rows(64))
+        check_mxfp8_call(rows(64))
         with pytest.raises(ValueError, match="33 tokens .* in inference"):
-            wide_residual.check_mxfp8_call(rows(33))
+            check_mxfp8_call(rows(33))
     monkeypatch.setattr(FP8GlobalStateManager, "is_fp8_enabled", lambda: False)
     with pytest.raises(RuntimeError, match="outside its FP8 context"):
-        wide_residual.check_mxfp8_call(rows(64))
+        check_mxfp8_call(rows(64))
 
 
 @pytest.mark.usefixtures("model_parallel")
