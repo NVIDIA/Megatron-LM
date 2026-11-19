@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from contextlib import nullcontext
 from typing import Any, Callable, List, Optional
 
 import torch
@@ -197,7 +198,7 @@ class TransformerLayerSchedulePlan:
     moe_combine = None
     mtp_post_process = None
 
-    def __init__(self, layer, event, chunk_state, comp_stream, comm_stream, extra_args={}):
+    def __init__(self, layer, event, chunk_state, comp_stream, comm_stream, extra_args=None):
         """Initializes a transformer layer schedule plan.
 
         Args:
@@ -215,6 +216,9 @@ class TransformerLayerSchedulePlan:
         """
         from megatron.core.models.common.utils import LayerState
 
+        if extra_args is None:
+            extra_args = {}
+        self._hybrid_layer_config = extra_args.get("hybrid_layer_config")
         self.config = layer.config
         self.layer_state = LayerState()
         self.chunk_state = chunk_state
@@ -266,8 +270,17 @@ class TransformerLayerSchedulePlan:
         from megatron.core.models.common.utils import TransformerLayerNode
         from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
 
-        fwd_callables, bwd_dw_callable_map = build_layer_callables(self.layer)
-        is_moe, num_local_experts = get_layer_moe_metadata(self.layer)
+        if self._hybrid_layer_config is not None:
+            from megatron.core.models.hybrid.fine_grained_callables import (
+                build_hybrid_stack_callables,
+            )
+
+            fwd_callables, bwd_dw_callable_map, is_moe, num_local_experts = (
+                build_hybrid_stack_callables(self.layer, self._hybrid_layer_config)
+            )
+        else:
+            fwd_callables, bwd_dw_callable_map = build_layer_callables(self.layer)
+            is_moe, num_local_experts = get_layer_moe_metadata(self.layer)
 
         is_mtp = isinstance(self.layer, MultiTokenPredictionLayer)
 
@@ -420,7 +433,9 @@ class TransformerLayerSchedulePlan:
             self.layer_state.__dict__.clear()
 
     def get_low_precision_context(self):
-        """Get the low-precision context for the transformer layer."""
+        """Hybrid callables enter the quantization context of each physical layer."""
+        if self._hybrid_layer_config is not None:
+            return nullcontext()
         return self.layer.get_inner_quantization_context()
 
     @staticmethod
@@ -530,8 +545,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
     └── post_process: PostProcessNode
 
     Subclasses can swap the per-layer schedule plan by overriding the
-    ``LAYER_SCHEDULE_PLAN_CLASS`` class attribute (e.g. HybridStack uses a
-    layer plan that understands grouped/inferred layer types). They can also
+    ``LAYER_SCHEDULE_PLAN_CLASS`` class attribute. They can also
     swap the pre/post-process node classes via ``PRE_PROCESS_NODE_CLASS`` /
     ``POST_PROCESS_NODE_CLASS`` so each model owns its own embedding / output
     layer node implementations.
@@ -742,12 +756,16 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             self._transformer_layers.append(layer_plan)
 
     def _extra_args_for_layer(self, module, layer_idx, num_layers):
-        """Per-layer ``extra_args`` dict passed to the layer plan constructor.
+        """Identify the layer's position and its config when owned by a HybridStack."""
+        from megatron.core.models.hybrid.hybrid_block import HybridStack
 
-        Subclasses extend this hook to thread additional metadata (e.g. hybrid
-        layer-type symbols) without overriding ``_build_layer_schedule_plan``.
-        """
-        return {"is_first_layer": layer_idx == 0, "is_last_layer": layer_idx == num_layers - 1}
+        extra_args = {
+            "is_first_layer": layer_idx == 0,
+            "is_last_layer": layer_idx == num_layers - 1,
+        }
+        if isinstance(module, HybridStack):
+            extra_args["hybrid_layer_config"] = module.layer_config_list[layer_idx]
+        return extra_args
 
     @property
     def event(self):

@@ -1167,9 +1167,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if self.config.moe_paged_stash:
             self.preprocess_for_paged_stash()
 
-        from .model_chunk_schedule_plan import HybridStackModelChunkSchedulePlan
+        from megatron.core.models.common.model_chunk_schedule_plan import (
+            TransformerModelChunkSchedulePlan,
+        )
 
-        return HybridStackModelChunkSchedulePlan(
+        return TransformerModelChunkSchedulePlan(
             self,
             input_ids,
             position_ids,

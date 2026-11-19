@@ -8,9 +8,6 @@ from functools import partial
 import torch
 
 from megatron.core import tensor_parallel
-from megatron.core.models.common.transformer_layer_callables import (
-    build_transformer_layer_callables,
-)
 from megatron.core.models.hybrid.fine_grained_callables import (
     build_hybrid_stack_callables,
     get_hybrid_stack_moe_metadata,
@@ -184,6 +181,10 @@ def build_layer_callables(layer):
         forward_funcs, backward_dw, _, _ = build_hybrid_stack_callables(layer)
         return forward_funcs, backward_dw
     if isinstance(layer, TransformerLayer):
+        from megatron.core.models.gpt.fine_grained_callables import (
+            build_transformer_layer_callables,
+        )
+
         return build_transformer_layer_callables(layer)
 
     raise ValueError(f"Unsupported layer type: {type(layer)}")

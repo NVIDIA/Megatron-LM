@@ -235,7 +235,9 @@ class TransformerLayerNode(ScheduleNode):
         is_moe = extra_args.get("is_moe", False)
         num_local_experts = extra_args.get("num_local_experts", None)
         free_input = self._resolve_free_input(name, is_moe, config, num_local_experts)
-        self.delay_wgrad_compute = extra_args.get("delay_wgrad_compute", False)
+        self.delay_wgrad_compute = (
+            extra_args.get("delay_wgrad_compute", False) and bwd_dw_callables is not None
+        )
 
         super().__init__(
             weak_method(self.forward_impl),

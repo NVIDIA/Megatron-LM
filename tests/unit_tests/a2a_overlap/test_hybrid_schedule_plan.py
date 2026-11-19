@@ -14,7 +14,6 @@ from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.models.hybrid.model_chunk_schedule_plan import HybridStackSchedulePlan
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import get_comm_stream, get_comp_stream, set_streams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -318,13 +317,16 @@ def test_packed_moe_overlap_routes_per_sample_like_eager():
             state.model = SimpleNamespace(decoder=block)
             state.packed_seq_params = packed_seq_params
             plans.append(
-                HybridStackSchedulePlan(
+                TransformerLayerSchedulePlan(
                     block.layers[0],
                     torch.cuda.Event(),
                     state,
                     get_comp_stream,
                     get_comm_stream,
-                    extra_args={"layer_config": block.layer_config_list[0], "is_last_layer": True},
+                    extra_args={
+                        "hybrid_layer_config": block.layer_config_list[0],
+                        "is_last_layer": True,
+                    },
                 )
             )
 

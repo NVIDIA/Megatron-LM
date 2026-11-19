@@ -9,20 +9,22 @@ import torch
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.models.common.model_chunk_schedule_plan import TransformerLayerSchedulePlan
-from megatron.core.models.hybrid.model_chunk_schedule_plan import HybridStackSchedulePlan
 from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
-def _schedule_plan(layer):
+def _schedule_plan(layer, *, hybrid_layer_config=None):
     plan = TransformerLayerSchedulePlan.__new__(TransformerLayerSchedulePlan)
     plan.layer = layer
+    plan._hybrid_layer_config = hybrid_layer_config
     return plan
 
 
-def test_schedule_uses_layer_quantization_context():
+@pytest.mark.parametrize("layer_cls", [TransformerLayer, MultiTokenPredictionLayer])
+def test_schedule_uses_layer_quantization_context(layer_cls):
     expected_context = nullcontext()
-    layer = SimpleNamespace(get_inner_quantization_context=Mock(return_value=expected_context))
+    layer = Mock(spec=layer_cls)
+    layer.get_inner_quantization_context.return_value = expected_context
 
     context = _schedule_plan(layer).get_low_precision_context()
 
@@ -30,12 +32,9 @@ def test_schedule_uses_layer_quantization_context():
     layer.get_inner_quantization_context.assert_called_once_with()
 
 
-@pytest.mark.parametrize("layer_config", [(object(), object()), object(), None])
-def test_hybrid_schedule_runs_without_a_transformer_context_hook(layer_config):
-    """The common scheduler must dispatch to the hybrid quantization hook."""
-    plan = HybridStackSchedulePlan.__new__(HybridStackSchedulePlan)
-    plan.layer = SimpleNamespace()
-    plan.layer_config = layer_config
+def test_hybrid_schedule_runs_without_a_transformer_context_hook():
+    """Hybrid callables manage quantization within each schedule slot."""
+    plan = _schedule_plan(SimpleNamespace(), hybrid_layer_config=object())
     plan.recompute_segment = None
     visited = []
     for name in (
@@ -62,19 +61,6 @@ def test_hybrid_schedule_runs_without_a_transformer_context_hook(layer_config):
         "moe_combine",
         "mtp_post_process",
     ]
-
-
-@pytest.mark.parametrize("layer_cls", [TransformerLayer, MultiTokenPredictionLayer])
-def test_hybrid_schedule_preserves_plain_layer_quantization_context(layer_cls):
-    expected_context = nullcontext()
-    layer = Mock(spec=layer_cls)
-    layer.get_inner_quantization_context.return_value = expected_context
-    plan = HybridStackSchedulePlan.__new__(HybridStackSchedulePlan)
-    plan.layer = layer
-    plan.layer_config = None
-
-    assert plan.get_low_precision_context() is expected_context
-    layer.get_inner_quantization_context.assert_called_once_with()
 
 
 def test_transformer_layer_uses_fp4_context():
