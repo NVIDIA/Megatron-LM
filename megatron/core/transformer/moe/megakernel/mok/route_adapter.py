@@ -41,7 +41,8 @@ def _routing_map_to_indices_kernel(
     topk_block_size: tl.constexpr,
 ):
     """Compact one dense routing-map row and gather its router probabilities."""
-    token_idx = tl.program_id(0)
+    # int64: the row offset token_idx * num_experts can pass 2^31.
+    token_idx = tl.program_id(0).to(tl.int64)
     expert_offsets = tl.arange(0, num_experts_block_size)
     expert_mask = expert_offsets < num_experts
     row_offset = token_idx * num_experts
@@ -74,7 +75,8 @@ def _routing_map_to_indices_backward_kernel(
     topk_block_size: tl.constexpr,
 ):
     """Scatter compact router-weight gradients back into the dense probability row."""
-    token_idx = tl.program_id(0)
+    # int64: the row offset token_idx * num_experts can pass 2^31.
+    token_idx = tl.program_id(0).to(tl.int64)
     expert_offsets = tl.arange(0, num_experts_block_size)
     expert_mask = expert_offsets < num_experts
     grad_probs_row_offset = token_idx * num_experts

@@ -117,6 +117,8 @@ def _make_context(
         request_to_kv_block_ids=request_to_kv_block_ids,
         gpu_view=gpu_view,
         _nvls_dispatcher=None,
+        # No NCCL EP dispatcher, so the phase's dispatch-path republish leaves it untouched.
+        _nccl_ep_dispatcher=False,
         inference_cuda_graph_scope=InferenceCudaGraphScope.none,
         mtp_decoder_hidden_states=None,
         setup_prefill_calls=[],
@@ -124,6 +126,10 @@ def _make_context(
     )
 
     context._mtp_forward_phase = MethodType(MTPContextMixin._mtp_forward_phase, context)
+    # The real selector, which the phase calls when it restores the step's CUDA-graph flag.
+    context._select_nccl_ep_dispatch_path = MethodType(
+        DynamicInferenceContext._select_nccl_ep_dispatch_path, context
+    )
     # The real lookup, so a chunked id with no active row behaves as it does in the engine.
     context.get_index_of_chunked_prefill_request = MethodType(
         DynamicInferenceContext.get_index_of_chunked_prefill_request, context
