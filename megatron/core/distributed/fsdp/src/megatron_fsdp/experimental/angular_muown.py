@@ -111,19 +111,34 @@ class FsdpAngularMuOwn(FsdpMuon):
             raise ValueError("row_scale_eps must be non-negative and norm_eps positive.")
         super().__init__(*args, **kwargs)
 
+        # C in kappa_t = (1 + C * u^r)^(-p / r).
         self.angular_decay_scale = angular_decay_scale
+        # p in kappa_t = (1 + C * u^r)^(-p / r).
         self.angular_decay_degree = angular_decay_degree
+        # r in kappa_t = (1 + C * u^r)^(-p / r).
         self.angular_plateau_degree = angular_plateau_degree
+        # t_w in u = (t - t_w) / T; kappa_t = 1 while t <= t_w.
         self.angular_warmup_steps = angular_warmup_steps
+        # T in u = (t - t_w) / T.
         self.angular_horizon_steps = angular_horizon_steps
+        # (beta1, beta2) in m_g <- beta1 * m_g + (1 - beta1) * d,
+        #                   v_g <- beta2 * v_g + (1 - beta2) * d^2,
+        # and in m_hat = m_g / (1 - beta1^t), v_hat = v_g / (1 - beta2^t).
         self.row_scale_betas = row_scale_betas
+        # eps in g <- g - lr * m_hat / (sqrt(v_hat) + eps).
         self.row_scale_eps = row_scale_eps
+        # eps_norm in U = W / copysign(max(|g|, eps_norm), g) and rho_den = max(||U+_i||, eps_norm).
         self.norm_eps = norm_eps
+        # mult in lambda' = weight_decay * mult, used in g <- (1 - lr * lambda') * g.
         self.weight_decay_mult = weight_decay_mult
-        # The most recent kappa_t, for logging.
+        # kappa_t of the most recent step, for logging only; no formula reads it.
         self.last_angular_multiplier = 1.0
+        # muown_step = t - 1, the completed steps of each group. Step t uses t = muown_step + 1 in
+        # u = (t - t_w) / T and in the bias corrections 1 - beta1^t and 1 - beta2^t.
         for group in self.param_groups:
             group.setdefault("muown_step", 0)
+        # Groups with gradients in the current step; step() adds 1 to their muown_step at its end.
+        # Bookkeeping only; no formula reads it.
         self._active_group_indices: set[int] = set()
 
     @torch.no_grad()
