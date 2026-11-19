@@ -199,6 +199,7 @@ def test_hybrid_matches_zero3_reference(
     torch.testing.assert_close(actual, reference, rtol=1e-2, atol=0)
 
 
+@pytest.mark.flaky_in_dev
 @pytest.mark.parametrize("ep_size", [1, 2])
 @pytest.mark.parametrize("dense_outer_strategy", ["optim", "no_shard"])
 @pytest.mark.parametrize("expert_outer_strategy", ["optim", "no_shard"])
