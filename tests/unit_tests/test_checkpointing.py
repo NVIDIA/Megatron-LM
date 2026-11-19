@@ -2105,7 +2105,8 @@ def test_the_frozen_layer_load_is_weights_only_at_any_data_position(
     """--freeze-all-layers loads the model weights-only and resumes the data position from the
     run's own progress tracker: the classification is recorded on the train state, the position
     stays the load's own business, and the namespace receives neither."""
-    args = _loader_args(freeze_all_layers=True)
+    args = _loader_args()
+    run_config.train.freeze_all_layers = True
     train_state = TrainState()
     monkeypatch.setattr(checkpointing, "get_train_state", lambda: train_state)
     run_config.checkpoint.load = "/frozen"

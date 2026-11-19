@@ -2213,7 +2213,7 @@ def _add_model_freeze_pre_wrap_hook(model_config, *, freeze_all_layers, freeze_b
         model_config.pre_wrap_hooks.append(freeze_hook)
 
 
-def _forward_backward_grad_context(args):
+def _forward_backward_grad_context(train_config):
     """Grad context for a train step's forward/backward pass.
 
     Returns a tuple of (grad_context, forward_only).
@@ -2222,8 +2222,10 @@ def _forward_backward_grad_context(args):
     autograd graph. Otherwise returns a no-op context.
     forward_only is True when all layers are frozen, False otherwise.
     """
-    grad_context = torch.no_grad() if getattr(args, "freeze_all_layers", False) else nullcontext()
-    forward_only = getattr(args, "freeze_all_layers", False)
+    grad_context = (
+        torch.no_grad() if getattr(train_config, "freeze_all_layers", False) else nullcontext()
+    )
+    forward_only = getattr(train_config, "freeze_all_layers", False)
     return grad_context, forward_only
 
 
@@ -2290,7 +2292,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             model.model_type = model_type
         return model
 
-
     if config.init_model_with_meta_device:
         with torch.device('meta'):
             model = build_model()
@@ -2301,7 +2302,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         model = [model]
 
     # For rare operations like post-training logits saving
-    if args.freeze_all_layers:
+    if getattr(getattr(cfg, "train", None), "freeze_all_layers", False):
         _freeze_all_model_chunks(model)
     elif config.freeze_base_model_for_mtp:
         _freeze_base_model_for_mtp(model)
@@ -2519,7 +2520,7 @@ def setup_model_and_optimizer(
             # gradient storage for parameters that remain trainable (matching get_model behavior).
             _add_model_freeze_pre_wrap_hook(
                 model_config,
-                freeze_all_layers=args.freeze_all_layers,
+                freeze_all_layers=cfg.train.freeze_all_layers,
                 freeze_base_model_for_mtp=cfg.model.transformer.freeze_base_model_for_mtp,
             )
 
@@ -2615,19 +2616,29 @@ def setup_model_and_optimizer(
             cuda_graph_impl=cfg.model.transformer.cuda_graph_impl,
         )
 
-    if args.logits_save_dir is not None and mpu.is_pipeline_last_stage():
+    offline_kd = cfg.offline_distillation
+    if (
+        offline_kd is not None
+        and offline_kd.teacher_save is not None
+        and mpu.is_pipeline_last_stage()
+    ):
         from megatron.training.distillation import LogitsSaverHooks
 
+        save = offline_kd.teacher_save
         logits_saver = LogitsSaverHooks(
-            save_dir=args.logits_save_dir,
-            k=args.logits_save_top_k,
-            p=args.logits_save_top_p,
-            min_k=args.logits_save_top_p_min_k,
-            save_dtype=args.logits_save_dtype,
+            save_dir=save.directory,
+            k=save.top_k,
+            p=save.top_p,
+            min_k=save.min_k,
+            save_dtype=save.dtype,
         )
         logits_saver.attach_hooks(unwrapped_model[-1])
 
-    if args.logits_load_dir is not None and mpu.is_pipeline_last_stage():
+    if (
+        offline_kd is not None
+        and offline_kd.student_load is not None
+        and mpu.is_pipeline_last_stage()
+    ):
         from megatron.training.distillation import StudentLogitsCapture
 
         student_logits_capture = StudentLogitsCapture()
@@ -2870,7 +2881,9 @@ def dummy_train_step(data_iterator):
     cfg = get_run_config()
     args = get_args()
     tp_rank = mpu.get_tensor_model_parallel_rank()
-    has_cu_seqlens = getattr(args, 'sft', False) or getattr(args, 'dataloader_inter_document_masking', False)
+    from megatron.training.distillation.utils import is_packed_sequence_run
+
+    has_cu_seqlens = is_packed_sequence_run(cfg.data)
     dynamic_cp = cfg.model.transformer.dynamic_context_parallel
 
     BATCH_KEYS = [
@@ -3139,7 +3152,7 @@ def train_step(
             enable_tokens_per_expert_logging(model, checkpoint.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, checkpoint.save)
-        grad_context, forward_only = _forward_backward_grad_context(args)
+        grad_context, forward_only = _forward_backward_grad_context(cfg.train)
         _fb_cm = (
             span_cm("megatron.train.iteration.forward_backward", tracer=_otel_step_tracer, num_microbatches=scheduled_num_microbatches)
             if _otel_sg_enabled('forward_backward') and _otel_step_tracer is not None else nullcontext()
@@ -3533,7 +3546,7 @@ def training_log(
     learning_rate: float | None = reduce_max_stat_across_model_parallel_group(
         learning_rate, group=_lr_mp_group
     )
-    if learning_rate is None and args.freeze_all_layers:
+    if learning_rate is None and cfg.train.freeze_all_layers:
         learning_rate = 0.0
     # Tensorboard values.
     if writer and (iteration % cfg.logger.tensorboard_log_interval == 0):
@@ -5266,7 +5279,10 @@ def train(
         # uncaught exception there would otherwise stall silently (both future
         # logits and regular checkpoint saves for that rank) rather than
         # surfacing until a much later blocking checkpoint finalize hangs.
-        if args.logits_save_dir is not None:
+        if (
+            cfg.offline_distillation is not None
+            and cfg.offline_distillation.teacher_save is not None
+        ):
             from megatron.training.distillation import check_logits_saver_failure
 
             check_logits_saver_failure()
