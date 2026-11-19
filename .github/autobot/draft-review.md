@@ -1,5 +1,5 @@
 <!-- megatron-lm-draft-review -->
-Keep this PR in draft while you work. Request an Autobot review in a PR comment and address any findings.
+Keep this PR in draft while you work. Members of Megatron-LM teams can request an Autobot review in a PR comment. If you're outside those teams, ask a team member to post the command for you.
 
 - `/review-approve` requests a findings-only follow-up.
 - `/review-approve reset=true` requests a full review.
