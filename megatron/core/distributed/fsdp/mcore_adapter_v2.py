@@ -284,6 +284,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # Execution also ends at that boundary, even for a single pipeline stage.
         active_context = current_fully_shard_context()
         prefetch_order = self.prefetch_order_for(config)
+        if config.mtp_use_repeated_layer and config.overlap_moe_expert_parallel_comm:
+            raise ValueError(
+                "Shared MTP requires recorded FSDP execution order and ordinary module hooks "
+                "rather than combined 1F1B."
+            )
         if active_context is None:
             construction_context = fully_shard_context(
                 FsdpContext(
@@ -303,7 +308,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 and active_context.prefetch_order is not PrefetchOrder.RECORDED
             ):
                 raise ValueError(
-                    "Ordinary PP/VPP MFSDP v2 schedules require "
+                    "Ordinary PP/VPP and shared MTP MFSDP v2 schedules require "
                     "RuntimePolicy(prefetch_order=PrefetchOrder.RECORDED)."
                 )
             if active_context.autograd_completes_execution:
@@ -334,10 +339,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
     @staticmethod
     def prefetch_order_for(config: TransformerConfig) -> "PrefetchOrder":
-        """Record ordinary pipeline schedules; combined 1F1B gathers only on demand."""
+        """Record ordinary pipeline schedules and repeated shared-MTP execution."""
         if not config.overlap_moe_expert_parallel_comm and (
             config.pipeline_model_parallel_size > 1
             or config.virtual_pipeline_model_parallel_size is not None
+            or config.mtp_use_repeated_layer
         ):
             return PrefetchOrder.RECORDED
         return PrefetchOrder.REGISTRATION
