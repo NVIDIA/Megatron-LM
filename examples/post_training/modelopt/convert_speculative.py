@@ -1,8 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-"""Convert a GPTModel."""
+"""Attach a speculative-decoding draft module (EAGLE3) to a Megatron-Core checkpoint."""
 import functools
-import inspect
 import json
 import os
 import sys
@@ -12,7 +11,6 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 
 import modelopt.torch.speculative as mtsp
 import torch
-from modelopt.torch.export import import_mcore_gpt_from_hf
 
 from megatron.core import mpu
 from megatron.core.enums import ModelType
@@ -22,9 +20,9 @@ from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.utils import report_current_memory_info, to_empty_if_meta
 from megatron.training import get_args
+from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
-from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.global_vars import set_run_config
 from megatron.training.initialize import initialize_megatron
 from megatron.training.utils import print_rank_0
@@ -40,20 +38,14 @@ def add_convert_args(parser):
     """Add additional arguments for ModelOpt checkpoint convertion."""
     group = parser.add_argument_group(title='ModelOpt MCore checkpoint convertion')
     group.add_argument(
-        "--pretrained-model-path",
-        type=str,
-        default=None,
-        help="Deprecated: Hugging Face pretrained model. Use Megatron-Bridge to import checkpoints.",
-    )
-    group.add_argument(
         "--extra-model-path", type=str, default=None, help="Extra module weights to load"
     )
     group.add_argument(
         '--algorithm',
         type=str,
-        choices=["eagle3", "None"],
-        default="None",
-        help='Chosing between different speculative decoding algorithms. Default is None.',
+        choices=["eagle3"],
+        default="eagle3",
+        help='Speculative decoding algorithm of the draft module to attach.',
     )
     group.add_argument(
         "--eagle-config",
@@ -94,6 +86,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 def check_arguments():
     """Checking user arguments."""
     args = get_args()
+    if args.load is None:
+        raise ValueError(
+            "--load is required. Import Hugging Face checkpoints with Megatron-Bridge first."
+        )
     if args.num_layers_per_virtual_pipeline_stage is not None:
         print_rank_0("Interleaved pipeline schedule is not yet supported for text generation.")
         exit()
@@ -140,32 +136,7 @@ if __name__ == "__main__":
 
     unwrapped_model = unwrap_model(model)[0]
 
-    if args.pretrained_model_path is not None:
-        warnings.warn(
-            "Importing Hugging Face checkpoints with --pretrained-model-path is deprecated. "
-            "Use Megatron-Bridge to create a Megatron-Core checkpoint, then load it with --load. "
-            "For Hugging Face quantization workflows, see "
-            "https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/examples/quantization.",
-            FutureWarning,
-            stacklevel=2,
-        )
-        import_dtype = torch.float16 if args.fp16 else torch.bfloat16
-        unwrapped_model = unwrap_model(model)[0]
-        workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
-        print_rank_0(
-            "Import model from Hugging Face checkpoint in dtype {}.".format(str(import_dtype))
-        )
-        import_kwargs = {
-            "dtype": import_dtype,
-            "moe_router_dtype": args.moe_router_dtype,
-        }
-        if "trust_remote_code" in inspect.signature(import_mcore_gpt_from_hf).parameters:
-            import_kwargs.update({"trust_remote_code": cfg.tokenizer.trust_remote_code})
-        import_mcore_gpt_from_hf(
-            unwrapped_model, args.pretrained_model_path, workspace_dir, **import_kwargs
-        )
-    elif args.load is not None:
-        load_checkpoint(model, None, None)
+    load_checkpoint(model, None, None)
 
     if args.algorithm == "eagle3":
         mtsp_config = ALGO_TO_CONFIG[args.algorithm]

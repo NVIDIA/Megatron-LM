@@ -86,6 +86,18 @@ class TransformerConfig(ModelParallelConfig):
     which serves as an additional training objective.
     """
 
+    mtp_ce_loss_weight: float = 1.0
+    """Nonnegative weight of the MTP cross-entropy objective."""
+
+    mtp_kl_loss_weight: float = 0.0
+    """Nonnegative weight of training-only KL(main-model teacher || MTP student)."""
+
+    mtp_kd_logit_temperature: float = 1.0
+    """Positive temperature for the teacher and student MTP distillation distributions."""
+
+    mtp_kd_loss_scale: Optional[float] = None
+    """KL multiplier before mtp_kl_loss_weight. None uses mtp_kd_logit_temperature squared."""
+
     mtp_normalize_loss_by_main_tokens: bool = False
     """Normalize summed MTP losses with the global main-loss token count.
 
@@ -1522,8 +1534,10 @@ class TransformerConfig(ModelParallelConfig):
     enabled: "te_native" (default: keep the native cuBLASLt kernels and obtain
     invariance via workspace starvation — lowest overhead, no extra
     dependencies, and the configuration verified bitwise-identical to the TE
-    training forward), "deepgemm" (DeepGEMM bf16 kernels), or "triton"
-    (persistent Triton matmul; any dtype)."""
+    training forward) or "triton" (persistent Triton matmul for dense GEMMs, any
+    dtype; grouped expert GEMMs stay native under the same workspace starvation).
+    "deepgemm" is deprecated: it is accepted with a DeprecationWarning and runs
+    as "te_native"."""
 
     batch_invariant_collective: Literal["ordered", "multimem"] = "ordered"
     """Cross-rank EP combine collective under batch_invariant_mode. "ordered"
@@ -1893,6 +1907,17 @@ class TransformerConfig(ModelParallelConfig):
         """
         super().__post_init__()
         self._validate_cp_layouts()
+
+        for name in ("mtp_ce_loss_weight", "mtp_kl_loss_weight"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+        if not math.isfinite(self.mtp_kd_logit_temperature) or self.mtp_kd_logit_temperature <= 0:
+            raise ValueError("MTP KD temperature must be finite and positive")
+        if self.mtp_kd_loss_scale is not None and (
+            not math.isfinite(self.mtp_kd_loss_scale) or self.mtp_kd_loss_scale < 0
+        ):
+            raise ValueError("MTP KD loss scale must be finite and nonnegative")
 
         if self.attn_logit_softcapping is not None and not (
             math.isfinite(self.attn_logit_softcapping) and self.attn_logit_softcapping > 0
@@ -4959,8 +4984,11 @@ class TransformerConfig(ModelParallelConfig):
         if self.batch_invariant_mode:
             from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
                 _BATCH_INVARIANT_BACKENDS,
+                _resolve_backend,
             )
 
+            # "deepgemm" is deprecated: warn and run as "te_native".
+            self.batch_invariant_backend = _resolve_backend(self.batch_invariant_backend)
             # argparse validates via the Literal annotation; guard here too so
             # programmatic TransformerConfig construction fails at build time
             # rather than inside enable_batch_invariant_mode() after model init.
@@ -5017,51 +5045,33 @@ class TransformerConfig(ModelParallelConfig):
                 self.attention_dropout == 0.0
             ), "Batch invariant mode does not support attention dropout"
             if (self.num_moe_experts or 0) > 0:
-                from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-                    HAVE_DEEPGEMM_BF16,
-                )
-
                 if self.transformer_impl != "inference_optimized":
                     assert self.moe_token_dispatcher_type == "alltoall", (
                         "Batch-invariant MoE training requires "
                         "moe_token_dispatcher_type='alltoall'."
                     )
-                    if self.batch_invariant_backend == "te_native":
-                        # Import lazily: the TE extension imports TransformerConfig.
-                        from megatron.core.extensions.transformer_engine import (
-                            TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
-                        )
+                    # Both backends run TE's native grouped GEMMs for the experts.
+                    # Import lazily: the TE extension imports TransformerConfig.
+                    from megatron.core.extensions.transformer_engine import (
+                        TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
+                    )
 
-                        assert (
-                            not self.use_transformer_engine_op_fuser
-                        ), "Batch-invariant training does not support TE op fuser."
-                        assert self.moe_use_grouped_tensor or not bool(
-                            int(os.getenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", "0"))
-                        ), (
-                            "Enable device-metadata GEMM with moe_use_grouped_tensor=True, "
-                            "not just NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM, so expert "
-                            "padding uses the required "
-                            f"{TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT}-row alignment."
-                        )
+                    assert (
+                        not self.use_transformer_engine_op_fuser
+                    ), "Batch-invariant training does not support TE op fuser."
+                    assert self.moe_use_grouped_tensor or not bool(
+                        int(os.getenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", "0"))
+                    ), (
+                        "Enable device-metadata GEMM with moe_use_grouped_tensor=True, "
+                        "not just NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM, so expert "
+                        "padding uses the required "
+                        f"{TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT}-row alignment."
+                    )
                 mxfp8_params_enabled = (
                     bool(self.fp8)
                     and self.fp8_recipe == Fp8Recipe.mxfp8
                     and self.fp8_param
                     and not self.fp4
-                )
-                # DeepGEMM is used by the "deepgemm"/"triton" backends, and by
-                # the torch inference path for BF16 experts. MXFP8 experts use
-                # torch scaled_grouped_mm directly and do not need DeepGEMM.
-                needs_deepgemm = self.batch_invariant_backend in ("deepgemm", "triton") or (
-                    self.transformer_impl == "inference_optimized"
-                    and self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH
-                    and not mxfp8_params_enabled
-                )
-                assert not needs_deepgemm or HAVE_DEEPGEMM_BF16, (
-                    "batch_invariant_mode=True with MoE requires DeepGEMM with bf16 "
-                    "grouped-GEMM bindings (m_grouped_bf16_gemm_nt_contiguous) for "
-                    "this backend combination. "
-                    "Install via `uv pip install -e .[batch_invariant]`."
                 )
                 squared_relu_or_swiglu = (
                     not self.gated_linear_unit and self.activation_func == squared_relu

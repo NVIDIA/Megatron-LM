@@ -705,20 +705,21 @@ def _register_default_prefetch_chains(models):
 
     Dense operators (including both Mamba projections) share a chain. Routed-expert
     FC1/FC2 projections have separate chains, with each local-expert group indivisible.
-    Different process groups must never be linked. Capture boundaries are resolved later.
+    Different process groups and independently scheduled virtual pipeline chunks must never
+    be linked or share gather storage. Capture boundaries are resolved later.
     """
     weights = {}
-    for model in models:
+    for model_index, model in enumerate(models):
         for name, weight in model.named_parameters():
             if is_gtp_param(weight):
-                weights.setdefault(id(weight), (name, weight))
+                weights.setdefault(id(weight), (model_index, name, weight))
     used_names = {
         weight._gtp_prefetch_chain_name
-        for _, weight in weights.values()
+        for _, _, weight in weights.values()
         if hasattr(weight, "_gtp_prefetch_chain_name")
     }
     defaults = defaultdict(list)
-    for name, weight in weights.values():
+    for model_index, name, weight in weights.values():
         if hasattr(weight, "_gtp_prefetch_chain_name") or weight.prefetch_initialized:
             continue
         role = "dense"
@@ -731,8 +732,8 @@ def _register_default_prefetch_chains(models):
                 role = "expert_fc1"
             elif ".linear_fc2." in f".{name}":
                 role = "expert_fc2"
-        defaults[(role, id(weight.group))].append(weight)
-    for (role, _), members in defaults.items():
+        defaults[(model_index, role, id(weight.group))].append(weight)
+    for (_, role, _), members in defaults.items():
         name = f"default_{role}"
         suffix = 0
         while name in used_names:
@@ -749,7 +750,8 @@ def classify_gtp_remat_chains(
     Register default prefetch chains and finalize their captured/eager boundaries.
 
     Explicit registrations take precedence. All other eligible weights use the same
-    registration API, with dense, expert-FC1 and expert-FC2 defaults per process group.
+    registration API, with dense, expert-FC1 and expert-FC2 defaults per process group
+    and model chunk.
     Must be called once AFTER model build + DDP wrap and before the first forward (which
     lazily builds chain links).
     """
@@ -3219,7 +3221,8 @@ def reset_gtp_state():
 
     These class-level dicts survive model teardown, so a GTP model rebuilt in-process would
     inherit stale last_weight pointers / flushed link tables. Call once before the per-chunk
-    classify_gtp_chains loop (never inside it — chains span chunks). No-op on a fresh process.
+    classify_gtp_chains loop; resetting inside it would discard earlier chunks' runtime state.
+    No-op on a fresh process.
     """
     _PREFETCH_CHAIN_METADATA.clear()
     _PREFETCH_CHAIN_METADATA.update(_DEFAULT_PREFETCH_CHAIN_METADATA)
