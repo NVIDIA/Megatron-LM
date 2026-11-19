@@ -7,7 +7,8 @@ from megatron.core.optimizer.optimizer_config import OptimizerConfig, ParamKey, 
 
 
 def test_layer_sharded_muon_tp_mode_requirements():
-    """muon_tp_mode='layer_sharded' needs muon, the layer-wise path and no split-QKV."""
+    """muon_tp_mode='layer_sharded' needs muon, the layer-wise path, and no split-QKV or
+    the per-head one; the per-head split is rejected with every other mode."""
     ok = dict(optimizer='muon', use_layer_wise_distributed_optimizer=True, muon_split_qkv=False)
     OptimizerConfig(muon_tp_mode='layer_sharded', **ok).validate()
     # dist_muon is the deprecated alias for muon + the layer-wise path.
@@ -30,6 +31,13 @@ def test_layer_sharded_muon_tp_mode_requirements():
         ).validate()
     with pytest.raises(ValueError, match="split-QKV"):
         OptimizerConfig(muon_tp_mode='layer_sharded', **{**ok, 'muon_split_qkv': True}).validate()
+    per_head = {**ok, 'muon_split_qkv': True, 'muon_split_qkv_per_head': True}
+    OptimizerConfig(muon_tp_mode='layer_sharded', **per_head).validate()
+    with pytest.raises(ValueError, match="cannot be combined with muon_split_qkv=False"):
+        OptimizerConfig(muon_tp_mode='layer_sharded', muon_split_qkv_per_head=True, **ok).validate()
+    for mode in ('duplicated', 'distributed', 'blockwise', 'auto'):
+        with pytest.raises(ValueError, match="'layer_sharded' only"):
+            OptimizerConfig(muon_tp_mode=mode, **per_head).validate()
 
 
 @pytest.mark.parametrize("optimizer", ["adam", "adaptive_muon"])

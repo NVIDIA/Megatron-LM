@@ -579,6 +579,18 @@ def test_muon_entry_dispatches_on_layer_sharding_flag():
     assert eo_mod._muon_config_to_cls(_dispatch_cfg(False)) is eo_mod.TensorParallelMuon
 
 
+def test_layer_sharded_muon_receives_the_qkv_split_options():
+    """The split-QKV settings reach LayerShardedMuon through the registry."""
+    cfg = OptimizerConfig(
+        optimizer='muon',
+        use_layer_wise_distributed_optimizer=True,
+        muon_tp_mode='layer_sharded',
+        muon_split_qkv_per_head=True,
+    )
+    kwargs = eo_mod._muon_registry_config_to_kwargs(cfg, [_DispatchChunk()], pg_collection=None)
+    assert kwargs["split_qkv"] and kwargs["split_qkv_per_head"]
+
+
 def test_muon_entry_registered_with_dispatcher():
     """The registry wires the dispatcher to 'muon' and leaves adaptive_muon alone."""
     muon_entry = eo_mod._EMERGING_OPTIMIZERS["muon"]

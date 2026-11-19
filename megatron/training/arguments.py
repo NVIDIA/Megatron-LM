@@ -2626,6 +2626,11 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-no-split-qkv', action='store_false', default=True,
                        dest='muon_split_qkv',
                        help='Whether to split QKV parameters for Muon optimizer')
+    group.add_argument('--muon-split-qkv-per-head', action='store_true',
+                       help='With --muon-tp-mode layer_sharded, orthogonalize every attention '
+                       'head of a split QKV weight on its own instead of every projection '
+                       '(a different update rule; the other modes reject it). See '
+                       'OptimizerConfig.muon_split_qkv_per_head.')
     group.add_argument('--muon-nesterov', action='store_true',
                        help='Whether to use Nesterov-style momentum in the internal SGD')
     group.add_argument('--muon-scale-mode', type=str, default='spectral',
@@ -2654,8 +2659,8 @@ def _add_regularization_args(parser):
                        'dense weights; layer_sharded assigns each 2D weight one NS home '
                        'rank in the (gtp_remat x tp) domain and routes the shards there '
                        'with all_to_all (same math as duplicated, no redundant NS); '
-                       'requires --use-distributed-optimizer and --muon-no-split-qkv. See '
-                       'OptimizerConfig.muon_tp_mode.')
+                       'requires --use-distributed-optimizer and --muon-no-split-qkv or '
+                       '--muon-split-qkv-per-head. See OptimizerConfig.muon_tp_mode.')
     group.add_argument('--muon-ns-batch-size', type=int, default=1,
                        help='Max number of same-shape matrices fused into one batched '
                        'Newton-Schulz on an NS home under --muon-tp-mode layer_sharded. '
