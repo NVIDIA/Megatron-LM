@@ -131,6 +131,9 @@ def _slice_merged_segments(segments, attr: str, start: int, end: int) -> list:
 class CoordinatorMixin:
     """ZMQ coordinator transport and EP/world consensus for `DynamicInferenceEngine`."""
 
+    # Set only on the rank that spawns the coordinator process.
+    inference_coordinator_process: Optional[multiprocessing.process.BaseProcess] = None
+
     @internal_api
     async def start_listening_to_data_parallel_coordinator(
         self,
@@ -271,9 +274,10 @@ class CoordinatorMixin:
                 },
             )
             self.inference_coordinator_process.start()
+            dp_process_pipe.close()
             await await_process_call(dp_pipe.poll, self.inference_coordinator_process)
             dp_addr = dp_pipe.recv()
-            dp_pipe.close()
+            self._coordinator_pipe = dp_pipe
 
             # Check if the port number is not inference_coordinator_port
             actual_port = int(dp_addr.rsplit(":", 1)[-1])
