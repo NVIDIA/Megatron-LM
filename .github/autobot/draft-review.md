@@ -8,7 +8,7 @@ If you’re outside `mcore-engineers`, ask a member to post the command. To skip
 
 ```mermaid
 flowchart LR
-    D[Draft] -->|Mark ready| G{Approved or exempt?}
+    D[Draft] -->|Mark ready| G{Approved or label-exempt?}
     G -->|Yes| R[Team review]
     G -->|No| D
 ```
