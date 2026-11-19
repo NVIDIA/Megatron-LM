@@ -250,19 +250,6 @@ def test_dsa_kpool_rejects_simplified_indexer(loss):
         )
 
 
-def test_dsa_kpool_direct_validation_rejects_simplified_indexer():
-    """Configs built without TransformerConfig validation hit the same rule."""
-    from types import SimpleNamespace
-
-    from megatron.core.transformer.experimental_attention_variant.dsa import (
-        _validate_dsa_kpool_config,
-    )
-
-    config = SimpleNamespace(dsa_indexer_kpool=4, dsa_indexer_topk=8, dsa_indexer_mode="simplified")
-    with pytest.raises(ValueError, match="dsa_indexer_mode='simplified' does not support KPool"):
-        _validate_dsa_kpool_config(config)
-
-
 def test_dsa_kpool_cudnn_accepts_unquantized_fp32_weights_projection():
     config = _make_dsa_kpool_config(
         dsa_indexer_kpool=4,
