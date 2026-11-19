@@ -25,6 +25,18 @@ The conversion package shares Bridge's Python namespace. **Do not install the
 separate `megatron-bridge` distribution into the same environment.** Use a clean
 environment with the MLM checkout or wheel as the package owner.
 
+## Upstream reference
+
+The initial port uses the per-file Bridge revisions recorded in the source headers.
+The conversion fixes called out in review were cross-checked against Bridge main
+[`b57951ad292e43209f1cc7d4b5500768365a20ac`](https://github.com/NVIDIA-NeMo/Megatron-Bridge/commit/b57951ad292e43209f1cc7d4b5500768365a20ac):
+dense Nemotron config export (#6817), FP8 import scales (#6882), RoPE config export
+(#6883), reused-tensor caching (#6837), grouped-expert CPU staging (#6948), mixed
+wildcards (#6884), and later-pipeline-stage padding masks (#6881).
+MLM already contains #9333, which replaces Bridge #6868's temporary CUDA-graph
+RoPE workaround. This remains a selected-model port, not a copy of the whole
+Bridge repository.
+
 ## Environment
 
 Use MLM's GPU development environment with Transformer Engine and the SSM/Gated

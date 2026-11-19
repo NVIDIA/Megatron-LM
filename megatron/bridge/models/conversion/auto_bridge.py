@@ -568,23 +568,20 @@ class AutoBridge(Generic[MegatronModelT]):
         from megatron.bridge.models.conversion.checkpoint import (
             get_hf_source_from_model_config,
             load_model_config,
+            resolve_checkpoint_path,
         )
-        from megatron.bridge.models.conversion.utils import conform_config_to_reference
+        from megatron.bridge.models.conversion.utils import (
+            carry_rope_into_rope_parameters,
+            conform_config_to_reference,
+        )
         from megatron.training.config.instantiate_utils import target_allowlist
 
         checkpoint_path = Path(megatron_path)
         if not checkpoint_path.exists():
             raise FileNotFoundError(f"Megatron checkpoint not found: {checkpoint_path}")
 
-        # Look for configuration files to determine the model type
+        checkpoint_path = resolve_checkpoint_path(checkpoint_path)
         run_config = checkpoint_path / "run_config.yaml"
-        if not run_config.exists():
-            iter_dirs = [
-                d for d in checkpoint_path.iterdir() if d.is_dir() and d.name.startswith("iter_")
-            ]
-            if iter_dirs:
-                latest_iter = max(iter_dirs, key=lambda d: int(d.name.replace("iter_", "")))
-                run_config = latest_iter / "run_config.yaml"
 
         if not run_config.exists():
             raise FileNotFoundError(
@@ -614,7 +611,10 @@ class AutoBridge(Generic[MegatronModelT]):
         # 2. Translate Megatron config -> HF, conforming to reference config
         bridge = cls.from_hf_config(hf_cfg)
         megatron_hf_cfg_dict = bridge._model_bridge.megatron_to_hf_config(megatron_cfg)
-        megatron_hf_cfg_dict = conform_config_to_reference(megatron_hf_cfg_dict, hf_cfg.to_dict())
+        megatron_hf_cfg_dict = carry_rope_into_rope_parameters(
+            megatron_hf_cfg_dict,
+            conform_config_to_reference(megatron_hf_cfg_dict, hf_cfg.to_dict()),
+        )
         megatron_hf_cfg_dict = _drop_readonly_config_properties(megatron_hf_cfg_dict, type(hf_cfg))
         # 3. Build final bridge from the synthesized config
         synthesized_config = type(hf_cfg)(**megatron_hf_cfg_dict)

@@ -46,10 +46,7 @@ from megatron.bridge.models.conversion.param_mapping import (
     ReplicatedMapping,
 )
 from megatron.bridge.models.conversion.utils import moe_experts_stored_packed
-from megatron.bridge.models.qwen.modeling_qwen35.hybrid import (
-    qwen35_hf_layer_config,
-    qwen35_hybrid_mappings,
-)
+from megatron.bridge.models.qwen.modeling_qwen35.hybrid import qwen35_hybrid_mappings
 from megatron.bridge.models.qwen.qwen35_bridge import Qwen35Bridge, Qwen35MoEBridge
 from megatron.bridge.models.qwen_vl.modeling_qwen35.hybrid_model import (
     Qwen35VLHybridModel,
@@ -103,6 +100,26 @@ def _qwen35_vl_config_kwargs(
         bias_activation_fusion=True,
         autocast_dtype=None,
     )
+
+
+def _qwen35_vl_hf_config(model_config, text_config, bridge_class):
+    """Keep language overrides inside the HF multimodal config's text_config."""
+    return {
+        "architectures": [bridge_class.SOURCE_NAME],
+        "model_type": bridge_class.MODEL_TYPE,
+        "text_config": text_config,
+        "vision_config": model_config.vision_config.to_dict(),
+        "tie_word_embeddings": model_config.share_embeddings_and_output_weights,
+        **{
+            name: getattr(model_config, name)
+            for name in (
+                "image_token_id",
+                "video_token_id",
+                "vision_start_token_id",
+                "vision_end_token_id",
+            )
+        },
+    }
 
 
 def _get_vision_mappings():
@@ -231,11 +248,10 @@ class Qwen35VLMoEBridge(MegatronModelBridge):
 
     @classmethod
     def megatron_to_hf_config(cls, model_config) -> dict:
-        """Preserve the HF language block count when exporting a Hybrid config."""
-        config = super().megatron_to_hf_config(model_config)
-        if getattr(model_config, "hybrid_layer_pattern", None):
-            config.update(qwen35_hf_layer_config(model_config.hybrid_layer_pattern))
-        return config
+        """Export the language and vision configs in their HF namespaces."""
+        return _qwen35_vl_hf_config(
+            model_config, Qwen35MoEBridge.megatron_to_hf_config(model_config), cls
+        )
 
     def mapping_registry(self) -> MegatronMappingRegistry:
         """
@@ -343,11 +359,10 @@ class Qwen35VLBridge(MegatronModelBridge):
 
     @classmethod
     def megatron_to_hf_config(cls, model_config) -> dict:
-        """Preserve the HF language block count when exporting a Hybrid config."""
-        config = super().megatron_to_hf_config(model_config)
-        if getattr(model_config, "hybrid_layer_pattern", None):
-            config.update(qwen35_hf_layer_config(model_config.hybrid_layer_pattern))
-        return config
+        """Export the language and vision configs in their HF namespaces."""
+        return _qwen35_vl_hf_config(
+            model_config, Qwen35Bridge.megatron_to_hf_config(model_config), cls
+        )
 
     def mapping_registry(self) -> MegatronMappingRegistry:
         """

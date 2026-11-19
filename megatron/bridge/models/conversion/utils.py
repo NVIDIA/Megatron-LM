@@ -14,6 +14,7 @@
 
 # Adapted from https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/53c20f81cb575f19af34ff0ae1749fb13b07999b/src/megatron/bridge/models/conversion/utils.py
 # Source license: Apache-2.0.
+# Follow-up fixes from https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/b57951ad292e43209f1cc7d4b5500768365a20ac/src/megatron/bridge/models/conversion/utils.py
 
 import copy
 import functools
@@ -440,6 +441,82 @@ def conform_config_to_reference(
         if key not in filtered_config_dict:
             filtered_config_dict[key] = value
     return filtered_config_dict
+
+
+# RoPE parameters that describe the model, not a scaling method; kept when the RoPE type changes.
+_MODEL_ROPE_PARAMETERS = frozenset(
+    {"rope_theta", "partial_rotary_factor", "mrope_section", "mrope_interleaved"}
+)
+
+
+def carry_rope_into_rope_parameters(
+    hf_config_dict: dict[str, object], conformed_dict: dict[str, object]
+) -> dict[str, object]:
+    """Carry the legacy RoPE keys of ``hf_config_dict`` into the ``rope_parameters`` of ``conformed_dict``.
+
+    ``megatron_to_hf_config`` emits ``rope_theta``, ``partial_rotary_factor`` and ``rope_scaling``, but
+    transformers 5 configs keep their RoPE settings in ``rope_parameters`` (``partial_rotary_factor`` only there
+    since transformers 5.20). :func:`conform_config_to_reference` therefore drops these keys and backfills the
+    reference model's ``rope_parameters``, and an explicit ``rope_parameters`` overrides the legacy keyword
+    arguments in the config constructor. This writes the Megatron-side values into the reference's flat
+    ``rope_parameters`` where they differ, reading a missing ``partial_rotary_factor`` as 1.0. A scaling of a
+    different type replaces the reference's scaling entries, so a bridge reports a model without scaling as
+    ``{"rope_type": "default"}``. Where the reference keeps ``partial_rotary_factor`` as a top-level key and
+    not in ``rope_parameters``, the projection has already carried it. Equal values are left as the reference
+    has them, so an unchanged model keeps the reference's ``rope_parameters`` exactly. Nested
+    ``rope_parameters`` (one dict per attention type) and configs without them are returned unchanged.
+
+    Args:
+        hf_config_dict: HF config dict emitted by ``megatron_to_hf_config``, before conforming.
+        conformed_dict: The same dict after :func:`conform_config_to_reference`.
+
+    Returns:
+        ``conformed_dict``, with ``rope_parameters`` replaced when the Megatron side sets RoPE values.
+    """
+    # VLMs keep the language settings under text_config (or llm_config).
+    for key in ("text_config", "llm_config"):
+        if isinstance(hf_config_dict.get(key), dict) and isinstance(conformed_dict.get(key), dict):
+            nested = carry_rope_into_rope_parameters(hf_config_dict[key], conformed_dict[key])
+            if nested is not conformed_dict[key]:
+                conformed_dict = {**conformed_dict, key: nested}
+    rope_parameters = conformed_dict.get("rope_parameters")
+    if not isinstance(rope_parameters, dict) or "rope_theta" not in rope_parameters:
+        return conformed_dict
+    rope_theta = hf_config_dict.get("rope_theta")
+    partial_rotary_factor = hf_config_dict.get("partial_rotary_factor")
+    rope_scaling = hf_config_dict.get("rope_scaling")
+    if rope_theta is None and partial_rotary_factor is None and not isinstance(rope_scaling, dict):
+        return conformed_dict
+
+    carried = dict(rope_parameters)
+    if isinstance(rope_scaling, dict) and rope_scaling:
+        scaling = {
+            "rope_type" if key == "type" else key: value for key, value in rope_scaling.items()
+        }
+        if scaling.get("rope_type", carried.get("rope_type")) != carried.get("rope_type"):
+            carried = {
+                key: value for key, value in carried.items() if key in _MODEL_ROPE_PARAMETERS
+            }
+            carried.update(scaling)
+        else:
+            carried.update(
+                {
+                    key: value
+                    for key, value in scaling.items()
+                    if key in carried and carried[key] != value
+                }
+            )
+    if rope_theta is not None and carried["rope_theta"] != rope_theta:
+        carried["rope_theta"] = rope_theta
+    if (
+        partial_rotary_factor is not None
+        and ("partial_rotary_factor" in carried or "partial_rotary_factor" not in conformed_dict)
+        and carried.get("partial_rotary_factor", 1.0) != partial_rotary_factor
+    ):
+        carried["partial_rotary_factor"] = partial_rotary_factor
+    if carried == rope_parameters:
+        return conformed_dict
+    return {**conformed_dict, "rope_parameters": carried}
 
 
 def persistent_buffers(model: torch.nn.Module) -> Iterable[Tuple[str, torch.Tensor]]:

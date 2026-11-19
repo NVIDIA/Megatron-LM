@@ -14,6 +14,7 @@
 
 # Adapted from https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/53c20f81cb575f19af34ff0ae1749fb13b07999b/src/megatron/bridge/models/conversion/param_mapping.py
 # Source license: Apache-2.0.
+# Follow-up fixes from https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/b57951ad292e43209f1cc7d4b5500768365a20ac/src/megatron/bridge/models/conversion/param_mapping.py
 
 import json
 import re
@@ -526,7 +527,10 @@ class MegatronParamMapping(ABC, Generic[WeightType]):
         """Resolve wildcard patterns with captured values.
 
         Handles both ** (any characters) and * (digits) wildcards in order.
-        ** patterns are processed before * patterns to avoid conflicts.
+        ** patterns are processed before * patterns to avoid conflicts, so
+        ``captures`` must list every ** value first and every * value second,
+        each in text order. ``MegatronMappingRegistry`` reorders regex groups
+        into this order before calling ``resolve()``.
         """
         resolved_megatron_param = self.megatron_param
         capture_index = 0

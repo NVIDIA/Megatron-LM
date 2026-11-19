@@ -13,6 +13,7 @@
 # limitations under the License.
 # Adapted from https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/53c20f81cb575f19af34ff0ae1749fb13b07999b/tests/unit_tests/models/test_mapping_registry.py
 # Source license: Apache-2.0.
+# Follow-up fixes from https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/b57951ad292e43209f1cc7d4b5500768365a20ac/tests/unit_tests/models/test_mapping_registry.py
 
 from types import SimpleNamespace
 
@@ -20,6 +21,90 @@ import pytest
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.param_mapping import AutoMapping, DirectMapping, QKVMapping
+
+
+class TestMixedWildcards:
+    def test_single_wildcard_before_double_wildcard(self):
+        """A `*` that precedes a `**` keeps its own capture in both directions."""
+        mapping = DirectMapping(
+            megatron_param="decoder.layers.*.blocks.**.weight",
+            hf_param="model.layers.*.blocks.**.weight",
+        )
+        bridge = MegatronMappingRegistry(mapping)
+
+        result = bridge.megatron_to_hf_lookup("decoder.layers.3.blocks.7.weight")
+        assert result is not None
+        assert result.megatron_param == "decoder.layers.3.blocks.7.weight"
+        assert result.hf_param == "model.layers.3.blocks.7.weight"
+
+        result = bridge.megatron_to_hf_lookup("decoder.layers.3.blocks.attn.q.weight")
+        assert result is not None
+        assert result.megatron_param == "decoder.layers.3.blocks.attn.q.weight"
+        assert result.hf_param == "model.layers.3.blocks.attn.q.weight"
+
+        result = bridge.hf_to_megatron_lookup("model.layers.3.blocks.7.weight")
+        assert result is not None
+        assert result.megatron_param == "decoder.layers.3.blocks.7.weight"
+        assert result.hf_param == "model.layers.3.blocks.7.weight"
+
+    def test_mixed_wildcards_every_name_resolves_to_itself(self):
+        """Every name in a grid round-trips to itself, including off-diagonal ones."""
+        mapping = DirectMapping(
+            megatron_param="decoder.layers.*.blocks.**.weight",
+            hf_param="model.layers.*.blocks.**.weight",
+        )
+        bridge = MegatronMappingRegistry(mapping)
+
+        for layer in range(4):
+            for block in range(4):
+                megatron_name = f"decoder.layers.{layer}.blocks.{block}.weight"
+                hf_name = f"model.layers.{layer}.blocks.{block}.weight"
+                forward = bridge.megatron_to_hf_lookup(megatron_name)
+                reverse = bridge.hf_to_megatron_lookup(hf_name)
+                assert (forward.megatron_param, forward.hf_param) == (megatron_name, hf_name)
+                assert (reverse.megatron_param, reverse.hf_param) == (megatron_name, hf_name)
+
+    def test_mixed_wildcards_in_different_text_orders(self):
+        """Wildcards are matched by kind when the two sides list them in different orders."""
+        mapping = DirectMapping(
+            megatron_param="decoder.layers.*.mtp.**.weight", hf_param="model.mtp.**.layers.*.weight"
+        )
+        bridge = MegatronMappingRegistry(mapping)
+
+        result = bridge.megatron_to_hf_lookup("decoder.layers.2.mtp.proj.weight")
+        assert result is not None
+        assert result.megatron_param == "decoder.layers.2.mtp.proj.weight"
+        assert result.hf_param == "model.mtp.proj.layers.2.weight"
+
+        result = bridge.hf_to_megatron_lookup("model.mtp.proj.layers.2.weight")
+        assert result is not None
+        assert result.megatron_param == "decoder.layers.2.mtp.proj.weight"
+        assert result.hf_param == "model.mtp.proj.layers.2.weight"
+
+    def test_mixed_wildcards_with_dict_destination(self):
+        """Dict-valued hf params resolve mixed wildcards for every key."""
+        mapping = QKVMapping(
+            megatron_param="decoder.layers.*.experts.**.linear_qkv.weight",
+            q="model.layers.*.experts.**.q_proj.weight",
+            k="model.layers.*.experts.**.k_proj.weight",
+            v="model.layers.*.experts.**.v_proj.weight",
+        )
+        bridge = MegatronMappingRegistry(mapping)
+        expected_hf = {
+            "q": "model.layers.1.experts.5.q_proj.weight",
+            "k": "model.layers.1.experts.5.k_proj.weight",
+            "v": "model.layers.1.experts.5.v_proj.weight",
+        }
+
+        result = bridge.megatron_to_hf_lookup("decoder.layers.1.experts.5.linear_qkv.weight")
+        assert result is not None
+        assert result.megatron_param == "decoder.layers.1.experts.5.linear_qkv.weight"
+        assert result.hf_param == expected_hf
+
+        result = bridge.hf_to_megatron_lookup("model.layers.1.experts.5.k_proj.weight")
+        assert result is not None
+        assert result.megatron_param == "decoder.layers.1.experts.5.linear_qkv.weight"
+        assert result.hf_param == expected_hf
 
 
 class TestMegatronMappingRegistry:

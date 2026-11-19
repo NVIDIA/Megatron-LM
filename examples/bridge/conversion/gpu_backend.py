@@ -35,6 +35,7 @@ from utils import (
 )
 
 from megatron.bridge import AutoBridge
+from megatron.bridge.models.conversion.checkpoint import resolve_checkpoint_path
 from megatron.bridge.models.decorators import torchrun_main
 from megatron.bridge.models.hf_pretrained.utils import is_safe_repo
 from megatron.training.models.base import ModelConfig
@@ -120,22 +121,8 @@ def _maybe_restore_pipeline_layout(
     The config adopts the checkpoint's MTP layer count because export builds the model from the
     checkpoint config, so a restored or regenerated layout must place the MTP layers that model has.
     """
-    checkpoint_path = Path(megatron_path)
-    iteration_paths = [path for path in checkpoint_path.glob("iter_*") if path.is_dir()]
-
-    def _iteration_number(path: Path) -> int:
-        try:
-            return int(path.name.removeprefix("iter_"))
-        except ValueError:
-            return -1
-
-    config_root = (
-        max(iteration_paths, key=_iteration_number) if iteration_paths else checkpoint_path
-    )
+    config_root = resolve_checkpoint_path(megatron_path)
     config_path = config_root / "run_config.yaml"
-    root_config_path = checkpoint_path / "run_config.yaml"
-    if not config_path.exists() and root_config_path.exists():
-        config_path = root_config_path
     if config_path.exists():
         with config_path.open() as config_file:
             config = yaml.safe_load(config_file) or {}
@@ -422,8 +409,7 @@ def export_checkpoint(
     }
     if isinstance(resolved_pipeline_layout, list):
         model_parallel_overrides["pipeline_model_parallel_layout"] = resolved_pipeline_layout
-        # load_megatron_model drops the '|' stage boundaries from the checkpoint's hybrid layer pattern,
-        # so pass the segments that match this layout; HybridModel allocates pipeline stages from them.
+        # Keep the Hybrid stage boundaries paired with the restored or regenerated layout.
         if isinstance(resolved_hybrid_layer_pattern, str) and "|" in resolved_hybrid_layer_pattern:
             model_parallel_overrides["hybrid_layer_pattern"] = resolved_hybrid_layer_pattern
 

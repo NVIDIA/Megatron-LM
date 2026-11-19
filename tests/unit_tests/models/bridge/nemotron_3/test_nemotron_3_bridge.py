@@ -13,6 +13,7 @@
 # limitations under the License.
 # Adapted from https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/53c20f81cb575f19af34ff0ae1749fb13b07999b/tests/unit_tests/models/nemotronh/test_nemotron_h_bridge.py
 # Source license: Apache-2.0.
+# Follow-up fixes from https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/b57951ad292e43209f1cc7d4b5500768365a20ac/tests/unit_tests/models/nemotronh/test_nemotron_h_bridge.py
 
 import dataclasses
 import tempfile
@@ -25,9 +26,11 @@ import torch
 from transformers.configuration_utils import PretrainedConfig
 
 from megatron.bridge.models import AutoBridge
+from megatron.bridge.models.conversion.auto_bridge import _drop_readonly_config_properties
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 from megatron.bridge.models.conversion.param_mapping import AutoMapping, QKVMapping
 from megatron.bridge.models.conversion.quant_mapping import AmaxFanoutMapping, AmaxMapping
+from megatron.bridge.models.conversion.utils import conform_config_to_reference
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.hybrid import BridgeHybridModelConfig
 from megatron.bridge.models.nemotron_3.nemotron_3_bridge import (
@@ -682,6 +685,48 @@ class TestNemotron3BridgeMegatronToHFConfig:
 
 
 class TestAutoBridgeIntegration:
+    def test_megatron_to_hf_config_dense_checkpoint_builds_hf_config(self):
+        """A dense model_config without MoE sizes yields a constructible HF config with reference MoE sizes."""
+        from transformers import NemotronHConfig
+
+        reference = NemotronHConfig().to_dict()
+        model_config = SimpleNamespace(
+            num_moe_experts=None,
+            moe_ffn_hidden_size=None,
+            moe_shared_expert_intermediate_size=None,
+            moe_router_topk_scaling_factor=None,
+        )
+
+        hf_cfg = Nemotron3Bridge.megatron_to_hf_config(model_config)
+        config_dict = _drop_readonly_config_properties(
+            conform_config_to_reference(hf_cfg, reference), NemotronHConfig
+        )
+        config = NemotronHConfig(**config_dict)
+
+        assert config.n_routed_experts == reference["n_routed_experts"]
+        assert config.moe_intermediate_size == reference["moe_intermediate_size"]
+        assert (
+            config.moe_shared_expert_intermediate_size
+            == reference["moe_shared_expert_intermediate_size"]
+        )
+        assert config.routed_scaling_factor == reference["routed_scaling_factor"]
+
+    def test_megatron_to_hf_config_keeps_moe_sizes(self):
+        """MoE sizes set on the model_config are exported unchanged."""
+        model_config = SimpleNamespace(
+            num_moe_experts=16,
+            moe_ffn_hidden_size=512,
+            moe_shared_expert_intermediate_size=1024,
+            moe_router_topk_scaling_factor=2.5,
+        )
+
+        hf_cfg = Nemotron3Bridge.megatron_to_hf_config(model_config)
+
+        assert hf_cfg["n_routed_experts"] == 16
+        assert hf_cfg["moe_intermediate_size"] == 512
+        assert hf_cfg["moe_shared_expert_intermediate_size"] == 1024
+        assert hf_cfg["routed_scaling_factor"] == 2.5
+
     """Integration tests for AutoBridge with current NemotronH models."""
 
     @pytest.fixture

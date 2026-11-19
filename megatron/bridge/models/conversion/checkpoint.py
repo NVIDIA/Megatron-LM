@@ -203,15 +203,30 @@ def load_megatron_model(
     )
 
     saved_topology = _get_checkpoint_weight_topology(config)
-    for name, value in (mp_overrides or {}).items():
-        if not hasattr(config.transformer, name):
-            raise ValueError(f"Unknown transformer override: {name}")
-        setattr(config.transformer, name, value)
+    saved_pp = config.transformer.pipeline_model_parallel_size
+    overrides = mp_overrides or {}
+    for name, value in overrides.items():
+        if not hasattr(config, name):
+            raise ValueError(f"Unknown model override: {name}")
+        setattr(config, name, value)
+    pp_changed = config.pipeline_model_parallel_size != saved_pp
+    clear_layout = (pp_changed and "pipeline_model_parallel_layout" not in overrides) or (
+        config.pipeline_model_parallel_size == 1
+        and config.virtual_pipeline_model_parallel_size is None
+    )
+    if clear_layout:
+        config.pipeline_model_parallel_layout = None
+    if (pp_changed or clear_layout) and "hybrid_layer_pattern" not in overrides:
+        pattern = getattr(config, "hybrid_layer_pattern", None)
+        if isinstance(pattern, str):
+            config.hybrid_layer_pattern = pattern.replace("|", "")
     _validate_checkpoint_weight_topology(
         saved=saved_topology, requested=_get_checkpoint_weight_topology(config)
     )
     config.transformer.perform_initialization = False
-    config.transformer.use_cpu_initialization = kwargs.pop("use_cpu_initialization", False)
+    config.transformer.use_cpu_initialization = kwargs.pop(
+        "use_cpu_initialization", dist.is_initialized() and dist.get_backend() == "gloo"
+    )
     kwargs.setdefault("wrap_with_ddp", False)
     models = bridge.get_model(config, load_weights=False, **kwargs)
     common = dist_checkpointing.load_common_state_dict(str(checkpoint))

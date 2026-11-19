@@ -1,5 +1,6 @@
 # Adapted from https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/0f06205924d4e19b0723aa8c33e34a1959ca17fe/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py
 # Source license: Apache-2.0.
+# Follow-up fixes from https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/b57951ad292e43209f1cc7d4b5500768365a20ac/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -77,6 +78,19 @@ def _select_sequence(
     if val is None:
         return None
     return val.index_select(seq_dim, index).contiguous()
+
+
+def _scatter_padding_mask_to_sequence_parallel_region(
+    padding_mask: torch.Tensor, *, tp_group: torch.distributed.ProcessGroup
+) -> torch.Tensor:
+    """Shard a batch-first MoE padding mask like sequence-parallel activations."""
+    return (
+        tensor_parallel.scatter_to_sequence_parallel_region(
+            padding_mask.transpose(0, 1).contiguous(), group=tp_group
+        )
+        .transpose(0, 1)
+        .contiguous()
+    )
 
 
 def _get_packed_seq_padding_mask(
@@ -709,6 +723,14 @@ class Qwen3VLModel(MegatronModule):
                         ),
                         seq_dim=1,
                     )
+                if not self.pre_process and self.config.sequence_parallel:
+                    # The first pipeline stage scatters the mask together with its
+                    # embeddings below. Later stages receive hidden states that are
+                    # already sequence-parallel, so the mask built here must match
+                    # that layout before the MoE routers consume it.
+                    padding_mask = _scatter_padding_mask_to_sequence_parallel_region(
+                        padding_mask, tp_group=self.pg_collection.tp
+                    )
         if self.language_model is not None:
             self.language_model.rotary_pos_emb.is_thd_format = False
 
@@ -905,12 +927,8 @@ class Qwen3VLModel(MegatronModule):
                 )
                 combined_embeddings = combined_embeddings.contiguous()
                 if padding_mask is not None:
-                    padding_mask = (
-                        tensor_parallel.scatter_to_sequence_parallel_region(
-                            padding_mask.transpose(0, 1).contiguous(), group=self.pg_collection.tp
-                        )
-                        .transpose(0, 1)
-                        .contiguous()
+                    padding_mask = _scatter_padding_mask_to_sequence_parallel_region(
+                        padding_mask, tp_group=self.pg_collection.tp
                     )
 
         else:

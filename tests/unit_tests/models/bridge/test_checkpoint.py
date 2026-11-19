@@ -1,6 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Exercise the conversion checkpoint envelope using real distributed checkpoint I/O."""
 
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -15,6 +17,32 @@ from megatron.bridge.models.transformer_config import TransformerConfig
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.mark.parametrize("release", [False, True])
+def test_auto_config_uses_tracker_not_newer_unpublished_directory(tmp_path_dist_ckpt, release):
+    from megatron.bridge import AutoBridge
+    from tests.unit_tests.models.bridge.qwen_vl.test_qwen35_vl_bridge import _qwen35_vl_config
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        reference = _qwen35_vl_config(moe=False)
+        config = AutoBridge.from_hf_config(reference).get_model_config()
+        config.vocab_size = 256
+        with TempNamedDir(tmp_path_dist_ckpt / "tracked-config") as directory:
+            directory = Path(directory)
+            save_megatron_model([SmallModel(config)], directory)
+            if torch.distributed.get_rank() == 0:
+                reference.save_pretrained(directory / "reference")
+                (directory / "iter_0000001").mkdir()
+                if release:
+                    (directory / "iter_0000000").rename(directory / "release")
+                    (directory / "latest_checkpointed_iteration.txt").write_text("release")
+            torch.distributed.barrier()
+            restored = AutoBridge.from_auto_config(str(directory), str(directory / "reference"))
+            assert restored.hf_pretrained.text_config.vocab_size == 256
+    finally:
+        Utils.destroy_model_parallel()
 
 
 class SmallModel(torch.nn.Module):

@@ -14,6 +14,7 @@
 
 # Adapted from https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/53c20f81cb575f19af34ff0ae1749fb13b07999b/src/megatron/bridge/models/conversion/model_bridge.py
 # Source license: Apache-2.0.
+# Follow-up fixes from https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/b57951ad292e43209f1cc7d4b5500768365a20ac/src/megatron/bridge/models/conversion/model_bridge.py
 
 import abc
 import contextlib
@@ -51,6 +52,7 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
 
 from megatron.bridge.models.common import ModelConfigOverrideMixin
+from megatron.bridge.models.conversion import quantization_utils
 from megatron.bridge.models.conversion.fp8_export import (
     FP8ExportLayout,
     detect_fp8_export_layout,
@@ -1268,6 +1270,25 @@ class MegatronModelBridge(MegatronQuantizationBridge, Generic[HFPreTrained, Mega
             hf_weights = {k: hf_state_dict[v] for k, v in hf_param.items()}
         return hf_weights
 
+    def _load_hf_weights(
+        self, hf_param: str | dict[str, str], hf_state_dict: Mapping[str, torch.Tensor]
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
+        """Load one task's HF tensors through :meth:`maybe_modify_loaded_hf_weight`.
+
+        FP8 weights that the hook leaves quantized but that have a ``<name>_scale_inv`` companion
+        (fine-grained FP8 checkpoints, ``quantization_config.quant_method == "fp8"``) are then
+        dequantized with the checkpoint's ``weight_block_size``, so a bridge without its own FP8
+        handling imports the real weights instead of the raw FP8 codes. Bridges that dequantize
+        in their hook return no FP8 tensors, so their results are unchanged.
+        """
+        hf_weights = self.maybe_modify_loaded_hf_weight(hf_param, hf_state_dict)
+        return quantization_utils.dequantize_fp8_scale_inv_weights(
+            hf_param,
+            hf_weights,
+            hf_state_dict,
+            block_size=quantization_utils.fp8_weight_block_size(getattr(self, "hf_config", None)),
+        )
+
     @staticmethod
     def get_hf_import_param_names(
         hf_param: str | dict[str, str], available_hf_param_names: set[str] | None = None
@@ -1648,9 +1669,7 @@ class MegatronModelBridge(MegatronQuantizationBridge, Generic[HFPreTrained, Mega
             if is_grouped and hf_param_key in _hf_import_cache:
                 hf_weights = _hf_import_cache[hf_param_key]
             else:
-                hf_weights = self.maybe_modify_loaded_hf_weight(
-                    task.mapping.hf_param, hf_state_dict
-                )
+                hf_weights = self._load_hf_weights(task.mapping.hf_param, hf_state_dict)
                 if is_grouped:
                     _hf_import_cache[hf_param_key] = hf_weights
 
@@ -1824,7 +1843,7 @@ class MegatronModelBridge(MegatronQuantizationBridge, Generic[HFPreTrained, Mega
             # None means megatron module not on current rank, skip if this task is not going to happen
             if task.megatron_module is None:
                 continue
-            hf_weights = self.maybe_modify_loaded_hf_weight(task.mapping.hf_param, hf_state_dict)
+            hf_weights = self._load_hf_weights(task.mapping.hf_param, hf_state_dict)
             converted_weights = self._convert_loaded_hf_weight(task, hf_weights)
             if converted_weights is not None:
                 converted_weights = _slice_gtp_weight(converted_weights, task.param_weight)
@@ -2006,6 +2025,11 @@ class MegatronModelBridge(MegatronQuantizationBridge, Generic[HFPreTrained, Mega
                 )
             # --- Grouped export path: accumulate per-expert weights, yield when complete ---
             if getattr(task.mapping, "is_grouped_export", False):
+                if cpu and task.export_hook is None:
+                    # Stage expert slices on CPU before buffering a full layer.
+                    converted_weights_dict = {
+                        name: weight.cpu() for name, weight in converted_weights_dict.items()
+                    }
                 merged_result = self._accumulate_grouped_export(
                     task,
                     converted_weights_dict,

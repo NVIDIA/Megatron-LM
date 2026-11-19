@@ -164,7 +164,3 @@ class Qwen35VLHybridModel(Qwen3VLModel):
     """Reuse Qwen vision encoding and modality insertion with a Hybrid language model."""
 
     language_model_class = Qwen35VLHybridLanguageModel
-
-    def _expose_language_model_for_cuda_graph_helper(self) -> None:
-        super()._expose_language_model_for_cuda_graph_helper()
-        self.position_embedding_type = "mrope"

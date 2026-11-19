@@ -552,14 +552,44 @@ def _qwen35_vl_config(*, moe: bool, tie_word_embeddings: bool = False, **text_ov
 
 class TestQwen35VLBridgeModelConfig:
     @pytest.mark.parametrize(("bridge_class", "moe"), _BRIDGE_CASES, ids=_BRIDGE_IDS)
+    def test_export_overrides_reference_language_config(self, bridge_class, moe):
+        from megatron.bridge.models.conversion.auto_bridge import _drop_readonly_config_properties
+        from megatron.bridge.models.conversion.utils import (
+            carry_rope_into_rope_parameters,
+            conform_config_to_reference,
+        )
+
+        reference = _qwen35_vl_config(moe=moe)
+        config = bridge_class().hf_config_to_model_config(reference)
+        # A pruned model with an extended vocabulary and no MTP must not inherit
+        # the original model's layer count, vocabulary size, or MTP head.
+        config.hybrid_layer_pattern = "G" + ("E" if moe else "-") + "*" + ("E" if moe else "-")
+        config.num_layers = 4
+        config.vocab_size = 256
+        config.mtp_num_layers = 0
+        config.rotary_base = 500000.0
+        exported = bridge_class.megatron_to_hf_config(config)
+        projected = carry_rope_into_rope_parameters(
+            exported, conform_config_to_reference(exported, reference.to_dict())
+        )
+        restored = type(reference)(**_drop_readonly_config_properties(projected, type(reference)))
+        assert restored.text_config.num_hidden_layers == 2
+        assert restored.text_config.vocab_size == 256
+        assert restored.text_config.mtp_num_hidden_layers == 0
+        assert restored.text_config.rope_parameters["rope_theta"] == 500000.0
+        assert restored.vision_config.to_dict() == reference.vision_config.to_dict()
+
+    @pytest.mark.parametrize(("bridge_class", "moe"), _BRIDGE_CASES, ids=_BRIDGE_IDS)
     def test_hybrid_export_preserves_language_blocks_and_attention_order(self, bridge_class, moe):
         hf_config = _qwen35_vl_config(moe=moe)
         config = bridge_class().hf_config_to_model_config(hf_config)
         config.finalize()
         exported = bridge_class.megatron_to_hf_config(config)
 
-        assert exported["num_hidden_layers"] == hf_config.text_config.num_hidden_layers
-        assert exported["layer_types"] == hf_config.text_config.layer_types
+        assert (
+            exported["text_config"]["num_hidden_layers"] == hf_config.text_config.num_hidden_layers
+        )
+        assert exported["text_config"]["layer_types"] == hf_config.text_config.layer_types
 
     @pytest.mark.parametrize("bridge_class", [Qwen35VLBridge, Qwen35VLMoEBridge])
     def test_conversion_uses_builder_config(self, bridge_class):
