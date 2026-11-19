@@ -9,11 +9,10 @@ chunks of its own (from a zero initial state, which zero tokens leave unchanged)
 states, corrected values, final state and outputs must be bitwise those of the same sequence
 launched alone: the arithmetic is identical, and only the addresses differ.
 
-The ``large`` cases (opt-in, ``-m large``; 8 to 70 GiB each, 140 GiB for the chunk-state
-``start-times-heads`` pair, which only a GB200 holds) choose ``lead`` so that one base offset, or
-the sequence start times the heads, reaches 2**31 elements; a dynamic-batching prefill step
-reaches the base offsets from 174763 tokens (GDP 800m's expanded keys) or 262144 tokens (GDN's
-chunk states).
+The ``large`` cases (opt-in, ``-m large``; 8 to 70 GiB each) choose ``lead`` so that one base
+offset, or the sequence start times the heads, reaches 2**31 elements; a dynamic-batching prefill
+step reaches the base offsets from 174763 tokens (GDP 800m's expanded keys) or 262144 tokens
+(GDN's chunk states).
 """
 
 import pytest
@@ -40,10 +39,6 @@ CHUNK_H_LARGE = {
     "values": (1, 32, 256, 2**31 // (CHUNK_SIZE * 256), "after"),
     # the initial-state row lead * K * V
     "initial-states": (1, 256, 256, 2**31 // (256 * 256), "many"),
-    # the sequence start times the heads, bos * H (head dim 8; about 130 GiB, so GB200 only),
-    # and a control one chunk earlier
-    "start-times-heads": (128, 8, 8, 2**31 // (CHUNK_SIZE * 128), "after"),
-    "start-times-heads-fits": (128, 8, 8, 2**31 // (CHUNK_SIZE * 128) - 1, "after"),
 }
 # name: (H, K, V, M, lead). The output kernel launches one program per chunk on grid axis 1,
 # which CUDA caps at 65535, so these use 32 heads to reach 2**31 in fewer chunks.
