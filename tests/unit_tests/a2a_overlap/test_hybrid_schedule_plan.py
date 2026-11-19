@@ -19,6 +19,7 @@ from megatron.core.pipeline_parallel.utils import get_comm_stream, get_comp_stre
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
+from megatron.core.transformer.moe.moe_utils import MoEAuxLossAutoScaler
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.a2a_overlap.utils import DummyState
 from tests.unit_tests.models.hybrid.external_layer import ExternalGainConfig
@@ -248,7 +249,7 @@ def test_grouped_overlap_matches_eager_outputs_and_gradients(pattern, num_layers
         Utils.destroy_model_parallel()
 
 
-def test_packed_moe_overlap_routes_per_sample_like_eager():
+def test_packed_moe_overlap_routes_per_sample_like_eager(monkeypatch):
     """A packed batch flattened to [mbs*s, 1, h] reaches the router per sample on both paths.
 
     The per-sample load-balancing loss reaches the router weight gradient, so routing the
@@ -256,6 +257,8 @@ def test_packed_moe_overlap_routes_per_sample_like_eager():
     """
     if Utils.world_size < 2:
         pytest.skip("Expert-parallel overlap requires at least two ranks")
+    # Direct backward initializes a scalar aux-loss scale outside the training loop.
+    monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", None)
     Utils.initialize_model_parallel(expert_model_parallel_size=2)
     try:
         model_parallel_cuda_manual_seed(123)
