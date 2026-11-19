@@ -58,12 +58,14 @@ from .global_plan_validation import validate_global_plan
 from .nvrx import has_nvrx_async_support, make_nvrx_async_request
 
 if TYPE_CHECKING:
+    from multistorageclient import StreamingWriterOptions
     from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest
     from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
         CheckpointMetadataCache,
     )
 else:
     CheckpointMetadataCache = Any
+    StreamingWriterOptions = Any
     AsyncRequest = Any
 
 HAVE_NVRX = has_nvrx_async_support()
@@ -743,6 +745,7 @@ class TorchDistSaveShardedStrategy:
         cached_metadata: bool = False,
         separation_hint: Optional[str] = None,
         cpu_shm_mode: bool = False,
+        writer_options: Optional[StreamingWriterOptions] = None,
     ):
         """Adds parameters specific to PyT Distributed format
         Args:
@@ -761,6 +764,9 @@ class TorchDistSaveShardedStrategy:
                 training process before handing off to the async worker. Avoids CUDA IPC /
                 NVLink fabric handles in the worker subprocess. Only applies with nvrx async
                 strategy.
+            writer_options (optional): `multistorageclient.StreamingWriterOptions` for the
+                checkpoint files, which then stream through a bounded multipart upload instead of
+                being buffered whole in host memory. Requires MSC to be enabled.
         """
         self.backend = backend
         self.version = version
@@ -788,6 +794,7 @@ class TorchDistSaveShardedStrategy:
 
         self.separation_hint = separation_hint
         self.cpu_shm_mode = cpu_shm_mode
+        self.writer_options = writer_options
 
         self.validated_loaded_metadata_reuse = False
 
@@ -811,7 +818,9 @@ class TorchDistSaveShardedStrategy:
         )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
 
-        writer = _get_filesystem_writer(checkpoint_dir, thread_count=self.thread_count)
+        writer = _get_filesystem_writer(
+            checkpoint_dir, thread_count=self.thread_count, writer_options=self.writer_options
+        )
 
         checkpoint.save(
             pyt_state_dict,
@@ -878,6 +887,16 @@ class TorchDistSaveShardedStrategy:
                         "use_cpu_shm_for_gpu_tensors. Update nvidia-resiliency-ext "
                         "to enable cpu_shm_mode."
                     )
+            if self.writer_options is not None:
+                if (
+                    "writer_options"
+                    not in inspect.signature(FileSystemWriterAsync.__init__).parameters
+                ):
+                    raise AssertionError(
+                        "Installed nvidia-resiliency-ext does not support writer_options. "
+                        "Update nvidia-resiliency-ext to stream checkpoint files."
+                    )
+                async_writer_kwargs["writer_options"] = self.writer_options
             state_dict_saver_kwargs["enable_cache"] = self.use_cached_ckpt_structure
             state_dict_saver_kwargs["metadata_cache"] = self._metadata_cache
 
@@ -932,11 +951,19 @@ class TorchDistSaveShardedStrategy:
 
 
 def _get_filesystem_writer(
-    checkpoint_dir: Union[str, Path], thread_count: int = 1
+    checkpoint_dir: Union[str, Path],
+    thread_count: int = 1,
+    writer_options: Optional[StreamingWriterOptions] = None,
 ) -> FileSystemWriter:
     if MultiStorageClientFeature.is_enabled():
         msc = MultiStorageClientFeature.import_package()
-        return msc.torch.MultiStorageFileSystemWriter(checkpoint_dir, thread_count=thread_count)
+        # Only pass writer_options when set, so MSC releases without it keep working.
+        kwargs = {} if writer_options is None else {"writer_options": writer_options}
+        return msc.torch.MultiStorageFileSystemWriter(
+            checkpoint_dir, thread_count=thread_count, **kwargs
+        )
+    if writer_options is not None:
+        raise CheckpointingException("writer_options requires the multi-storage client (MSC).")
 
     return FileSystemWriter(checkpoint_dir, thread_count=thread_count)
 
