@@ -7,6 +7,17 @@ from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
+@pytest.fixture(autouse=True)
+def fresh_mhc_compile_cache():
+    """Check the compiled mHC helpers, not an eager fallback left by earlier tests."""
+    # mHC's compute_h, Sinkhorn, aggregate and post-BDA helpers use torch.compile. If
+    # earlier tests in this process exhausted their default recompile budget, this test
+    # would compare the eager fallback against the reference instead of the compiled path.
+    torch.compiler.reset()
+    yield
+    torch.compiler.reset()
+
+
 @pytest.mark.parametrize("fp32_mixing", [False, True])
 @pytest.mark.parametrize("input_scale", [1.0, 0.001])
 def test_mhc_precision(fp32_mixing, input_scale):

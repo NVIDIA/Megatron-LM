@@ -452,12 +452,19 @@ def set_te_cuda_graph_current_microbatch(model, microbatch_id):
             if layer.config.cuda_graph_impl == "transformer_engine":
                 layer.te_cuda_graph_current_microbatch = microbatch_id
         if hasattr(model_with_decoder, 'mtp'):
+            # import here to avoid a circular import
+            from megatron.core.transformer.cuda_graphs import _get_mtp_te_layers
+
             for layer in model_with_decoder.mtp.layers:
                 assert hasattr(
                     layer, 'mtp_model_layer'
                 ), f"MTP layer {layer} must have 'mtp_model_layer' attribute"
                 if layer.mtp_model_layer.config.cuda_graph_impl == "transformer_engine":
                     layer.mtp_model_layer.te_cuda_graph_current_microbatch = microbatch_id
+                # Hybrid MTP stacks graph each of their layers separately.
+                for inner_layer in _get_mtp_te_layers(layer.mtp_model_layer):
+                    if inner_layer.config.cuda_graph_impl == "transformer_engine":
+                        inner_layer.te_cuda_graph_current_microbatch = microbatch_id
 
     # Also set current_microbatch on vision encoder layers so that
     # _te_cuda_graph_replay selects the correct graph index. Without this,

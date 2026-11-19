@@ -26,6 +26,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.transformer_layer_mixins import (
     TECudaGraphHyperConnectionTransformerLayerMixin,
+    _uses_mhc_attention_cuda_graph_split,
 )
 from megatron.core.typed_torch import apply_module
 
@@ -94,13 +95,24 @@ class HyperConnectionTransformerLayer(
             CudaGraphModule.moe_router,
             CudaGraphModule.moe_preprocess,
         }
+        if self.config.cuda_graph_impl == "transformer_engine":
+            # The TE path explicitly transports subclass MLP state across the
+            # router graph boundary; local graphs retain their existing limits.
+            unsupported_moe_cuda_graph_modules = {CudaGraphModule.moe}
         if self.is_moe_layer and unsupported_moe_cuda_graph_modules.intersection(
             self.config.cuda_graph_modules
         ):
             raise NotImplementedError(
-                "HyperConnectionTransformerLayer does not support MoE CUDA graph "
-                "scopes. Disable the moe, moe_router, and moe_preprocess CUDA graph modules "
-                "when combining mHC with a MoE MLP submodule."
+                "HyperConnectionTransformerLayer does not support the requested MoE CUDA graph "
+                "scopes. TE graphs support moe_router and moe_preprocess; local graphs require "
+                "disabling moe, moe_router, and moe_preprocess for mHC MoE layers."
+            )
+
+        if _uses_mhc_attention_cuda_graph_split(self.config) and not isinstance(
+            self.cross_attention, IdentityOp
+        ):
+            raise NotImplementedError(
+                "mhc_recompute_attn_cuda_graph_split does not support cross-attention."
             )
 
         # GraphableMegatronModule calls create_mcore_cudagraph_manager before the MLP is

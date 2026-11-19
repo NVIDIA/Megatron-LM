@@ -115,6 +115,31 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  # The mHC CUDA-graph tests build many parallel layouts. Each one adds NCCL
+  # communicators that live until the process exits, and a rank fails to create
+  # more than about 620 of them. The catch-all bucket is already close to that,
+  # so these files run in their own processes.
+  - test_case: [tests/unit_tests/models/test_hybrid_mhc_cuda_graph.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/transformer/test_mhc_full_iteration_training.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/transformer/test_mhc_te_pipeline_training.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/resharding/test_nccl_m2n_copy_service.py]
     products:
       - environment: [dev]

@@ -117,6 +117,18 @@ def _get_stack(
     )
 
 
+@pytest.fixture(autouse=True)
+def fresh_mhc_compile_cache():
+    """Run every case against freshly compiled mHC helpers, independent of test order."""
+    # mHC's compute_h, Sinkhorn, aggregate and post-BDA helpers use torch.compile. The
+    # precisions, recompute modes and grad/no-grad passes in this file exceed their
+    # default recompile budget, so later cases would silently run the eager fallback.
+    # Keep the default budget and share the cache between the arms of each case.
+    torch.compiler.reset()
+    yield
+    torch.compiler.reset()
+
+
 def test_mhc_mtp_requires_hybrid_contract():
     config = _get_config(num_layers=1, mtp_num_layers=1)
 
