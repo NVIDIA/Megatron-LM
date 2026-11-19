@@ -644,42 +644,43 @@ gated_delta_product_inference_stack_spec = ModuleSpec(
 
 
 def _get_wide_residual_hybrid_stack_spec(stack_spec: ModuleSpec) -> ModuleSpec:
-    """Build a static HybridStack spec whose layers explicitly own wide connections (their
-    submodules carry the default streamwise read and write connections)."""
+    """Build a static HybridStack spec whose layers explicitly own wide connections."""
 
     submodules = stack_spec.submodules
 
-    def layer_spec(
-        module: type, wide_submodules: type, spec: ModuleSpec | type | None
-    ) -> ModuleSpec | type | None:
+    def layer_spec(module: type, spec: ModuleSpec | type | None) -> ModuleSpec | type | None:
         if spec is None:
             return None
         if spec is IdentityOp:
             return spec
         if not isinstance(spec, ModuleSpec):
             raise TypeError(f"Expected a ModuleSpec or IdentityOp, got {spec!r}.")
+        wide_submodules = (
+            WideResidualMambaLayerSubmodules
+            if module is WideResidualMambaLayer
+            else WideResidualTransformerLayerSubmodules
+        )
         return replace(spec, module=module, submodules=wide_submodules.widen(spec.submodules))
-
-    mamba = partial(layer_spec, WideResidualMambaLayer, WideResidualMambaLayerSubmodules)
-    transformer = partial(
-        layer_spec, WideResidualTransformerLayer, WideResidualTransformerLayerSubmodules
-    )
 
     return replace(
         stack_spec,
         submodules=replace(
             submodules,
-            mamba_layer=mamba(submodules.mamba_layer),
-            gdn_layer=transformer(submodules.gdn_layer),
-            gdn2_layer=transformer(submodules.gdn2_layer),
-            attention_layer=transformer(submodules.attention_layer),
-            dsa_layer=transformer(submodules.dsa_layer),
-            csa_layer=transformer(submodules.csa_layer),
-            csa_qk_layernorm_layer=transformer(submodules.csa_qk_layernorm_layer),
-            mla_layer=transformer(submodules.mla_layer),
-            mla_fused_down_proj_layer=transformer(submodules.mla_fused_down_proj_layer),
-            mlp_layer=transformer(submodules.mlp_layer),
-            moe_layer=transformer(submodules.moe_layer),
+            mamba_layer=layer_spec(WideResidualMambaLayer, submodules.mamba_layer),
+            gdn_layer=layer_spec(WideResidualTransformerLayer, submodules.gdn_layer),
+            gdn2_layer=layer_spec(WideResidualTransformerLayer, submodules.gdn2_layer),
+            attention_layer=layer_spec(WideResidualTransformerLayer, submodules.attention_layer),
+            dsa_layer=layer_spec(WideResidualTransformerLayer, submodules.dsa_layer),
+            csa_layer=layer_spec(WideResidualTransformerLayer, submodules.csa_layer),
+            csa_qk_layernorm_layer=layer_spec(
+                WideResidualTransformerLayer, submodules.csa_qk_layernorm_layer
+            ),
+            mla_layer=layer_spec(WideResidualTransformerLayer, submodules.mla_layer),
+            mla_fused_down_proj_layer=layer_spec(
+                WideResidualTransformerLayer, submodules.mla_fused_down_proj_layer
+            ),
+            mlp_layer=layer_spec(WideResidualTransformerLayer, submodules.mlp_layer),
+            moe_layer=layer_spec(WideResidualTransformerLayer, submodules.moe_layer),
             # MTP consumes ordinary-width decoder readout and embedding activations. Keep its
             # complete layer selection static as well, but use the ordinary layer classes.
             mtp_stack_submodules=submodules,

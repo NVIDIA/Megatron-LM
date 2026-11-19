@@ -276,16 +276,12 @@ class ShortcutMoEBlock(MegatronModule):
                 read.link(seam_connections(compute_layer)[0])
 
         shortcut_norm_spec = TENorm
-        self.shortcut_pre_mlp_layernorm = (
-            IdentityOp()  # owned by the fused shortcut read
-            if self.fused_shortcut_read
-            else build_module(
-                shortcut_norm_spec,
-                config=self.config,
-                hidden_size=self.config.hidden_size,
-                eps=self.config.layernorm_epsilon,
-                has_residual=False,
-            )
+        self.shortcut_pre_mlp_layernorm = build_module(
+            IdentityOp if self.fused_shortcut_read else shortcut_norm_spec,  # owned by the read
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon,
+            has_residual=False,
         )
         self.shortcut_post_norm = (
             build_module(
@@ -322,14 +318,10 @@ class ShortcutMoEBlock(MegatronModule):
     def sharded_state_dict(self, prefix: str = "", sharded_offsets: tuple = (), metadata=None):
         """The block's sharded state, with fused parameters under their unfused keys."""
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
-        if self.sharded_state_dict_keys_map:
-            apply_prefix_mapping(
-                sharded_state_dict,
-                {
-                    f"{prefix}{k}": f"{prefix}{v}"
-                    for k, v in self.sharded_state_dict_keys_map.items()
-                },
-            )
+        keys_map = self.sharded_state_dict_keys_map
+        apply_prefix_mapping(
+            sharded_state_dict, {f"{prefix}{k}": f"{prefix}{v}" for k, v in keys_map.items()}
+        )
         return sharded_state_dict
 
     def _read_shortcut_hidden(

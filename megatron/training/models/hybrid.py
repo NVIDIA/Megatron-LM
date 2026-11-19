@@ -124,11 +124,7 @@ class HybridModelConfig(ModelConfig):
 
 
 def resolve_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:
-    """Return the configured stack spec, or the default one for the transformer config.
-
-    With moe_shortcut_wide_residual_norm_fusion, a built-in wide-residual stack is replaced by
-    its static shortcut-fusion counterpart (split input norms for the fused seam kernels).
-    """
+    """Return the configured stack spec, or the default one for the transformer config."""
     spec = _configured_hybrid_stack_spec(model_config)
     if model_config.transformer.moe_shortcut_wide_residual_norm_fusion:
         spec = shortcut_fusion_stack_spec(spec)
