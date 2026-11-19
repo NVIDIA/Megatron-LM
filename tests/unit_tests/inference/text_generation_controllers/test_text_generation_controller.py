@@ -2752,9 +2752,11 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
                 rev_sampling_dict[idx] = sampling_params
 
         # Prepare metadata for sample bookkeeping, as the context tracks it: a greedy request's
-        # sampling columns are neutral, with `is_greedy` set.
+        # sampling columns are neutral, with `is_greedy` set. FlashInfer reads the GPU view,
+        # which an engine step stages from the CPU metadata; this test samples directly.
         for label, values in _tracked_sampling_columns(rev_sampling_dict).items():
             context.active_request_metadata[label][:batch_size].copy_(values)
+            getattr(context.gpu_view, label)[:batch_size].copy_(values)
         temp_values = torch.Tensor([s.temperature for s in rev_sampling_dict])
         top_k_values = torch.Tensor([s.top_k for s in rev_sampling_dict]).to(torch.int32)
         top_p_values = torch.Tensor([s.top_p for s in rev_sampling_dict])

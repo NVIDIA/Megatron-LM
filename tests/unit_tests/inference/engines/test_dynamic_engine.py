@@ -5550,14 +5550,15 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             pytest.param(
                 {"temperature": 0.6, "top_p": 0.95, "top_k": 20}, (20, 0.95), id="top-k-top-p"
             ),
-            pytest.param({"do_sample": False, "top_p": 0.9}, (1, 0.9), id="do-sample-false-top-p"),
+            pytest.param({"do_sample": False, "top_p": 0.9}, (1, 0.0), id="do-sample-false-top-p"),
         ],
     )
     def test_generation_config_sampling_defaults_are_served(self, generation_config, filters):
         """A request that omits its filters gets the model card's, and the engine serves them.
 
         `/v1/completions` resolves Qwen-style `generation_config.json` defaults to both top-k and
-        top-p, and `do_sample: false` to top-k 1 next to a declared top-p.
+        top-p, and `do_sample: false` to top-k 1 next to a declared top-p: a greedy request, whose
+        top-p reads 0.0.
         """
         pytest.importorskip("quart")
         from tests.unit_tests.inference.test_endpoints_common import (

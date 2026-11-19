@@ -223,15 +223,15 @@ def test_greedy_rows_leave_the_other_rows_kernel_alone(greedy):
 def test_greedy_ignores_a_temperature_that_would_tie_its_maximum(backend, top_p):
     """A greedy row's token and one-hot log-probs come from its logits as given.
 
-    Dividing the two logits below by the request's temperature 1.5 rounds them into an fp32
-    tie, whose lowest index is not the argmax.
+    Dividing the two logits below by the request's temperature 1.5, as `filter_logits` scales
+    them on this device, rounds them into an fp32 tie whose lowest index is not the argmax.
+    (CUDA divides by a scalar as a multiply by its reciprocal, so the pair is found here.)
     """
-    grid = 1.5 + torch.arange(16, dtype=torch.float32) * 2**-23
+    grid = 1.5 + torch.arange(16, dtype=torch.float32, device=DEVICE) * 2**-23
     scaled = grid / 1.5
     first = int((scaled[1:] == scaled[:-1]).nonzero()[0])
-    logits = grid[first : first + 2].unsqueeze(0).to(DEVICE)
+    logits = grid[first : first + 2].unsqueeze(0)
     assert logits[0, 1] > logits[0, 0]
-    assert torch.equal(*(logits / 1.5)[0])
 
     context = _context([(SamplingParams(temperature=1.5, top_k=1, top_p=top_p), 1)])
     sampler = _sampler(backend, 2)
