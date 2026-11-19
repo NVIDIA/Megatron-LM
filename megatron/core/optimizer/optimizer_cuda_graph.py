@@ -11,6 +11,26 @@ from megatron.core.full_cuda_graph import get_graph_pool, get_shared_capture_str
 logger = logging.getLogger(__name__)
 
 
+def check_weight_decay_constant_for_optimizer_cuda_graph(optimizer, opt_param_scheduler):
+    """Reject a weight decay that changes over training under the optimizer CUDA graph.
+
+    The optimizers read ``weight_decay`` as a Python float, which a captured step replays at
+    its capture-time value. Checks every param group, since one can override the scheduler's
+    ``start_wd`` / ``end_wd``.
+    """
+    if opt_param_scheduler.wd_incr_style == 'constant':
+        return
+    for group in optimizer.param_groups:
+        start_wd = group.get('start_wd', opt_param_scheduler.start_wd)
+        end_wd = group.get('end_wd', opt_param_scheduler.end_wd)
+        if start_wd != end_wd:
+            raise ValueError(
+                "--optimizer-cuda-graph requires a constant weight decay, got "
+                f"--weight-decay-incr-style {opt_param_scheduler.wd_incr_style} from {start_wd} "
+                f"to {end_wd}."
+            )
+
+
 class OptimizerCudaGraphWrapper:
     """Wrapper class to enable FullIterationCUDAgraph."""
 

@@ -391,6 +391,7 @@ class LayerShardedMuon(TensorParallelMuon):
         pg_collection: ProcessGroupCollection | None = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
         store_param_remainders: bool = False,
+        capturable: bool = False,
     ) -> None:
         if not HAVE_EMERGING_OPTIMIZERS:
             raise ImportError(
@@ -441,6 +442,7 @@ class LayerShardedMuon(TensorParallelMuon):
             pg_collection=pg_collection,
             tp_mode=tp_mode,
             use_syrk=use_syrk,
+            capturable=capturable,
         )
         self.gtp_remat_group = gtp_remat_group
         self.tp_group = tp_group
@@ -469,6 +471,13 @@ class LayerShardedMuon(TensorParallelMuon):
         # ``param.decoupled_grad`` and every update rebuilds, updates and re-splits the main
         # value in one fused pass. id(param) -> remainder, set via set_param_remainders().
         self.store_param_remainders = store_param_remainders
+        if store_param_remainders and capturable:
+            # The remainder update is a fused kernel that takes the step sizes as Python
+            # scalars, so a captured step would replay the learning rate of the capture.
+            raise ValueError(
+                "LayerShardedMuon: store_param_remainders is not supported with a capturable "
+                "(optimizer CUDA graph) step."
+            )
         self._param_remainders: dict[int, torch.Tensor] = {}
         if store_param_remainders and (
             type(self).pre_weight_update_fn_inplace
@@ -574,7 +583,7 @@ class LayerShardedMuon(TensorParallelMuon):
         self._plans.clear()
 
     def _apply_update(
-        self, p: torch.Tensor, update: torch.Tensor, lr: float, weight_decay: float
+        self, p: torch.Tensor, update: torch.Tensor, lr: float | torch.Tensor, weight_decay: float
     ) -> None:
         """Apply one weight update through the base-class hook points.
 
@@ -587,7 +596,8 @@ class LayerShardedMuon(TensorParallelMuon):
         multiply-add in the promoted
         precision and downcasts once on store, so casting here first would give
         bf16 params different rounding on the layer-sharded paths than on the
-        fallback and than TensorParallelMuon's duplicated mode. TODO: forward
+        fallback and than TensorParallelMuon's duplicated mode. A tensor ``lr`` (capturable
+        mode) is read on the device. TODO: forward
         the ``weight_update_hook`` constructor parameter once the
         emerging-optimizers pin moves past EO #224.
 
@@ -615,7 +625,7 @@ class LayerShardedMuon(TensorParallelMuon):
             )
             return
         self.pre_weight_update_fn_inplace(p, update)
-        p.add_(update, alpha=-lr)
+        self._add_scaled_update(p, update, lr)
         self.post_weight_update_fn_inplace(p)
 
     def _run_ns(self, full_by_k: dict) -> dict:
