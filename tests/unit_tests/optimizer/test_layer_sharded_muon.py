@@ -13,7 +13,7 @@ Sections, in order:
   update, same full-matrix Newton-Schulz, same weight update); only the communication
   pattern differs. 1-D tests treat all ranks as one GTP_remat group and run at any world
   size; 2-D tests need exactly 4 ranks (TP 2 x GTP_remat 2). Batched Newton-Schulz, GTP
-  padding, the update hooks and the exchange-plan cache follow.
+  padding, split-QKV, the update hooks and the exchange-plan cache follow.
 
 Launch: torchrun --nproc-per-node=4 -m pytest tests/unit_tests/optimizer/test_layer_sharded_muon.py
 """
@@ -267,6 +267,12 @@ class TestValidateNsConfig:
             lsm._validate_ns_config(False, ns_batch_size=4)
         assert asked == [lsm._BATCHED_NS_MIN_EO_VERSION]
 
+    def test_per_head_split_has_the_batched_requirements(self, monkeypatch):
+        """The heads of a weight are one batched Newton-Schulz, also at ns_batch_size=1."""
+        monkeypatch.setattr(lsm, "is_emerging_optimizers_min_version", lambda v: False)
+        with pytest.raises(ValueError, match="batched Newton-Schulz"):
+            lsm._validate_ns_config(False, ns_batch_size=1, split_qkv_per_head=True)
+
     def test_unbatched_ns_needs_no_version_check(self, monkeypatch):
         """ns_batch_size=1 uses the 2-D API every release ships: no floor consulted."""
         monkeypatch.setattr(lsm, "is_emerging_optimizers_min_version", lambda v: False)
@@ -400,6 +406,20 @@ class TestConstructorGuards:
         p = torch.nn.Parameter(torch.randn(4, 4))
         with pytest.raises(ValueError, match="split-QKV"):
             LayerShardedMuon([p], lr=0.1, gtp_remat_group=None, split_qkv=True)
+
+    def test_per_head_split_requires_split_qkv(self):
+        p = torch.nn.Parameter(torch.randn(4, 4))
+        with pytest.raises(ValueError, match="cannot be combined with split_qkv=False"):
+            LayerShardedMuon([p], lr=0.1, gtp_remat_group=None, split_qkv_per_head=True)
+
+    def test_per_head_split_needs_ns_homes(self):
+        """Without homes step() falls back to the parent, which has no per-head rule."""
+        _require_batched_ns(2)
+        p = torch.nn.Parameter(torch.randn(16, 8))
+        p.is_qkv, p.qkv_split_shapes, p.grad = True, [8, 4, 4], torch.randn(16, 8)
+        opt = _muon([p], gtp_remat_group=None, **_QKV_KW)
+        with pytest.raises(RuntimeError, match="needs the NS homes"):
+            opt.step()
 
     def test_ns_batch_size_below_one_is_rejected(self):
         """ns_batch_size is validated like the parent's num_ns_steps, not clamped."""
@@ -997,6 +1017,164 @@ def test_padded_param_2d_two_stage_matches_reference(pd):
             f"padded 2-D parity mismatch (pd={pd}) on rank {r} step {step}: "
             f"max_diff={(p.data - ref_shard).abs().max().item():.2e}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Per-head split-QKV on the NS home
+# ---------------------------------------------------------------------------
+# A fused QKV weight of query groups [3 Q heads | K | V], tagged as the optimizer factory tags
+# it. The reference applies the rule to the complete matrix, written out here.
+
+_QKV_CASES = {"per_head": dict(), "per_head_pad": dict(pad=True), "per_head_nsb4": dict(ns_batch=4)}
+_QKV_KW = dict(
+    split_qkv=True, split_qkv_per_head=True, is_qkv_fn=lambda p: getattr(p, "is_qkv", False)
+)
+
+
+def _qkv_param(shard, head):
+    p = _gtp_param(shard)
+    p.is_qkv, p.qkv_split_shapes = True, [3 * head, head, head]
+    return p
+
+
+def _per_head_reference(x, head):
+    """Scaled per-head Newton-Schulz update of the complete matrix ``x``: one batched call
+    over its ``head``-row blocks, the kernel the optimizer runs."""
+    orth = newton_schulz(x.view(-1, head, x.size(1)), steps=5, coefficient_type="quintic")
+    return (orth * (max(head, x.size(1)) ** 0.5) * 1.0).view_as(x)
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("case", list(_QKV_CASES), ids=list(_QKV_CASES))
+def test_per_head_qkv_matches_reference(case):
+    """Two steps on two fused QKV weights; with 4 or 8 ranks the GTP_remat shards cut
+    through heads. Asserted separately: the Newton-Schulz input the optimizer assembles is
+    the complete input, bitwise, and the weights are the reference's, bitwise.
+
+    Cases: plain, GTP padding, and ns_batch_size > 1 with both weights on one home (heads
+    are batched per weight, never across weights).
+    """
+    c = _QKV_CASES[case]
+    _require_multi_rank()
+    _require_batched_ns(max(c.get("ns_batch", 1), 2))
+    S, r = dist.get_world_size(), dist.get_rank()
+    head, pad, lr, momentum = 4 * S, (S if c.get("pad") else 0), 1e-2, 0.95
+    homes = [0, 0 if "ns_batch" in c else S - 1]
+
+    torch.manual_seed(_SEED + 600)
+    full_w = [torch.randn(10 * head, 48) for _ in range(2)]  # two query groups, 40 rows per rank
+    step_grads = [[torch.randn_like(w) for w in full_w] for _ in range(2)]
+
+    def _shard(t):
+        return _padded_shard(t, S, r, pad)
+
+    params = [_qkv_param(_shard(w), head) for w in full_w]
+    for p in params:
+        if pad:
+            p.pad_length = pad
+    opt = _muon(params, gtp_remat_group=_world(), ns_batch_size=c.get("ns_batch", 1), **_QKV_KW)
+    opt.set_param_ns_homes({id(p): (h, 0) for p, h in zip(params, homes)})
+    ns_inputs, per_head = [], opt._orthogonalize_heads
+    opt._orthogonalize_heads = lambda x, rows: (ns_inputs.append(x.clone()), per_head(x, rows))[1]
+    mine = [i for i in range(2) if homes[i] == r]  # weights this rank splits
+
+    ref_w = [w.clone() for w in full_w]
+    ref_m = [torch.zeros_like(w) for w in full_w]
+    for step in range(2):
+        ns_inputs.clear()
+        for p, g in zip(params, step_grads[step]):
+            p.grad = _shard(g)
+        opt.step()
+        assert len(ns_inputs) == len(mine), f"{case}: rank {r} split {len(ns_inputs)} weights"
+        for i, g in enumerate(step_grads[step]):
+            ref_m[i].lerp_(g, 1 - momentum)
+            full_input = g.lerp(ref_m[i], momentum)
+            if i in mine:
+                assert torch.equal(
+                    ns_inputs[mine.index(i)], full_input
+                ), f"{case}: Newton-Schulz input of weight {i} on rank {r} at step {step}"
+            ref_w[i].add_(_per_head_reference(full_input, head), alpha=-lr)
+            assert torch.equal(params[i].data, _shard(ref_w[i])), (
+                f"{case}: weight {i} on rank {r} at step {step} differs, max_diff="
+                f"{(params[i].data - _shard(ref_w[i])).abs().max().item():.2e}"
+            )
+
+
+@pytest.mark.launch_on_gb200
+def test_per_head_qkv_2d_matches_reference():
+    """TP2 x GTP2, one query group per TP rank, GTP_remat shards cutting through heads: the
+    weight goes through both exchanges and its heads are one batch on the home. Bitwise
+    against the reference."""
+    _require_four_ranks("Requires exactly 4 ranks (TP=2 x GTP=2)")
+    _require_batched_ns(2)
+    tp_group, gtp_remat_group = _get_2d_groups()
+    r = dist.get_rank()
+    t, g = r % 2, r // 2
+    head, lr, momentum = 8, 1e-2, 0.95  # 40 TP-local rows, 20 per GTP_remat shard
+
+    torch.manual_seed(_SEED + 610)
+    w = torch.randn(10 * head, 48)
+    step_grads = [torch.randn_like(w) for _ in range(2)]
+    p = _mark_tp(_qkv_param(_shard_2d(w, 0, t, g), head), 0)
+    opt = _muon([p], gtp_remat_group=gtp_remat_group, tp_group=tp_group, **_QKV_KW)
+    opt.set_param_ns_homes({id(p): (1, 0)})
+
+    ref_w, ref_m = w.clone(), torch.zeros_like(w)
+    for step, grad in enumerate(step_grads):
+        p.grad = _shard_2d(grad, 0, t, g)
+        opt.step()
+        ref_m.lerp_(grad, 1 - momentum)
+        ref_w.add_(_per_head_reference(grad.lerp(ref_m, momentum), head), alpha=-lr)
+        assert torch.equal(p.data, _shard_2d(ref_w, 0, t, g)), (
+            f"rank {r} (t={t}, g={g}) at step {step} differs, "
+            f"max_diff={(p.data - _shard_2d(ref_w, 0, t, g)).abs().max().item():.2e}"
+        )
+
+
+@pytest.mark.parametrize("gate", [False, True], ids=["qkv", "gated"])
+def test_per_head_single_rank_domain_is_each_heads_newton_schulz(gate):
+    """Single-rank domain (the local path, no exchange): the weights are the batched
+    reference's bitwise, and the update is each head's own 2-D Newton-Schulz within 1e-4 of
+    the head's largest entry (fp32 here; measured on GB200: 2e-6 for this head shape, 2e-2
+    for [256, 10240] heads with bf16 matmul). With an attention output gate the query group
+    is [Q | gate | K | V]."""
+    _require_batched_ns(2)
+    torch.manual_seed(_SEED + 620)
+    head, lr = 8, 1e-2
+    shapes = [3 * head] * (2 if gate else 1) + [head, head]
+    w, g = torch.randn(2 * sum(shapes), 48), torch.randn(2 * sum(shapes), 48)
+    p = torch.nn.Parameter(w.clone())
+    p.is_qkv, p.qkv_split_shapes, p.grad = True, shapes, g.clone()
+    opt = _muon([p], gtp_remat_group=None, nesterov=False, **_QKV_KW)
+    opt.set_param_ns_homes({})
+    updates, per_head = [], opt._orthogonalize_heads
+    opt._orthogonalize_heads = lambda x, rows: (updates.append(per_head(x, rows)), updates[-1])[1]
+    opt.step()
+
+    m = torch.zeros_like(g).lerp_(g, 1 - 0.95)
+    assert torch.equal(p.data, w.clone().add_(_per_head_reference(m, head), alpha=-lr))
+    each = [newton_schulz(h, steps=5, coefficient_type="quintic") for h in m.split(head)]
+    each = torch.stack(each) * (max(head, 48) ** 0.5)
+    diff = (updates[0].view_as(each) - each).abs().flatten(1).amax(1)
+    assert (diff / each.abs().flatten(1).amax(1)).max() <= 1e-4
+
+
+def test_ns_cost_counts_the_heads_of_a_per_head_weight():
+    """The NS-home balancing weighs a per-head QKV weight by its heads: an [80, 64] weight
+    of two query groups of [3 Q heads | K | V], head size 8."""
+    _require_batched_ns(2)
+
+    def spec(opt, p):
+        return opt.param_shard_spec(p, gtp_remat_size=2, tp_size=1)
+
+    p = _qkv_param(torch.randn(40, 64), 8)  # one of two GTP_remat shards
+    assert spec(_muon([p], gtp_remat_group=None), p).ns_cost == 80 * 64 * 64
+    assert spec(_muon([p], gtp_remat_group=None, **_QKV_KW), p).ns_cost == 10 * (8 * 64 * 8)
+    # K and V must be one head of equal size, Q whole heads.
+    for bad in ([24, 12, 8], [24, 8, 12], [20, 8, 8]):
+        p.qkv_split_shapes = bad
+        with pytest.raises(ValueError, match="K and V must be one head"):
+            spec(_muon([p], gtp_remat_group=None, **_QKV_KW), p)
 
 
 # ---------------------------------------------------------------------------

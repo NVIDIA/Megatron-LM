@@ -73,11 +73,14 @@ _BATCHED_SYRK_MIN_EO_VERSION = "0.5.0a0"
 _SYRK_VALIDATED_SMS = ((8, 0), (9, 0), (10, 0), (10, 3))
 
 
-def _validate_ns_config(use_syrk: bool, ns_batch_size: int) -> None:
+def _validate_ns_config(
+    use_syrk: bool, ns_batch_size: int, split_qkv_per_head: bool = False
+) -> None:
     """Reject a Newton-Schulz configuration the installed stack cannot run.
 
     One place, one exception type (ValueError, like the parent's own gates) for every
-    "this install cannot do that" condition: batched Newton-Schulz needs an
+    "this install cannot do that" condition: batched Newton-Schulz (``ns_batch_size > 1``,
+    or the per-head QKV split, whose heads are one batch) needs an
     emerging-optimizers that accepts 3-D input, and SYRK needs Triton >= 3.4.0, an SM
     emerging-optimizers validated the kernel on, and for batched chunks the batched SYRK
     kernel. The Triton / SM conditions mirror the guard in emerging-optimizers'
@@ -89,11 +92,13 @@ def _validate_ns_config(use_syrk: bool, ns_batch_size: int) -> None:
     """
     if ns_batch_size < 1:
         raise ValueError(f"ns_batch_size must be at least 1, got {ns_batch_size}")
-    if ns_batch_size > 1 and not is_emerging_optimizers_min_version(_BATCHED_NS_MIN_EO_VERSION):
+    batched = ns_batch_size > 1 or split_qkv_per_head
+    if batched and not is_emerging_optimizers_min_version(_BATCHED_NS_MIN_EO_VERSION):
         raise ValueError(
-            "ns_batch_size > 1 (batched Newton-Schulz) requires emerging-optimizers >= "
-            f"{_BATCHED_NS_MIN_EO_VERSION}, but {get_emerging_optimizers_version()} is "
-            "installed; upgrade it or set ns_batch_size=1 (--muon-ns-batch-size 1)."
+            "ns_batch_size > 1 and split_qkv_per_head (batched Newton-Schulz) require "
+            f"emerging-optimizers >= {_BATCHED_NS_MIN_EO_VERSION}, but "
+            f"{get_emerging_optimizers_version()} is installed; upgrade it, or set "
+            "ns_batch_size=1 (--muon-ns-batch-size 1) and drop --muon-split-qkv-per-head."
         )
     if not use_syrk:
         return
@@ -110,12 +115,13 @@ def _validate_ns_config(use_syrk: bool, ns_batch_size: int) -> None:
             f"{_SYRK_VALIDATED_SMS}, this device is SM {sm_version}; drop use_syrk "
             "(--muon-use-syrk)."
         )
-    if ns_batch_size > 1 and not is_emerging_optimizers_min_version(_BATCHED_SYRK_MIN_EO_VERSION):
+    if batched and not is_emerging_optimizers_min_version(_BATCHED_SYRK_MIN_EO_VERSION):
         raise ValueError(
-            "use_syrk with ns_batch_size > 1 requires emerging-optimizers >= "
-            f"{_BATCHED_SYRK_MIN_EO_VERSION} (batched SYRK kernel), but "
+            "use_syrk with ns_batch_size > 1 or split_qkv_per_head requires emerging-optimizers "
+            f">= {_BATCHED_SYRK_MIN_EO_VERSION} (batched SYRK kernel), but "
             f"{get_emerging_optimizers_version()} is installed; upgrade it, set "
-            "ns_batch_size=1 (--muon-ns-batch-size 1), or drop use_syrk (--muon-use-syrk)."
+            "ns_batch_size=1 (--muon-ns-batch-size 1) without --muon-split-qkv-per-head, or "
+            "drop use_syrk (--muon-use-syrk)."
         )
 
 
@@ -189,16 +195,21 @@ class ParamShardSpec:
       (``is_gtp_param``) and the domain has a gtp_remat axis.
     - ``pad_length``: GTP alignment padding, trailing zero rows on the gtp-gathered
       TP-local dim 0 (0 when not GTP-sharded).
-    - ``full_shape``: shape of the matrix Newton-Schulz runs on (pad stripped).
+    - ``full_shape``: shape of the matrix the home assembles (pad stripped).
+    - ``head_rows``: rows of one attention head when this fused QKV weight is split per
+      head (see :class:`LayerShardedMuon`), else None.
     """
 
     tp_dim: int | None
     gtp_sharded: bool
     pad_length: int
     full_shape: tuple[int, ...]
+    head_rows: int | None = None
 
     @classmethod
-    def from_param(cls, p: torch.Tensor, gtp_remat_size: int, tp_size: int) -> "ParamShardSpec":
+    def from_param(
+        cls, p: torch.Tensor, gtp_remat_size: int, tp_size: int, head_rows: int | None = None
+    ) -> "ParamShardSpec":
         """Read ``p``'s sharding for a (gtp_remat, tp) domain of the given sizes.
 
         An axis of size 1 is absent from the domain, so its tag is ignored: with
@@ -235,7 +246,7 @@ class ParamShardSpec:
             elif tp_dim == 1:
                 cols *= tp_size
             full_shape = (rows, cols)
-        return cls(tp_dim, gtp_sharded, pad_length, full_shape)
+        return cls(tp_dim, gtp_sharded, pad_length, full_shape, head_rows)
 
     @property
     def sharding(self) -> ParamSharding:
@@ -246,12 +257,15 @@ class ParamShardSpec:
 
     @property
     def ns_cost(self) -> int:
-        """Newton-Schulz cost estimate on ``full_shape``, ~ max(M, N) * min(M, N)^2, the
-        weight NS-home balancing uses; non-2-D shapes count their elements."""
+        """Newton-Schulz cost estimate, ~ max(M, N) * min(M, N)^2 summed over the matrices
+        Newton-Schulz runs on (``full_shape``, or the heads of a QKV weight split per head),
+        the weight NS-home balancing uses; non-2-D shapes count their elements."""
         if len(self.full_shape) != 2:
             return math.prod(self.full_shape)
         m, n = self.full_shape
-        return m * n * min(m, n)
+        if self.head_rows is None:
+            return m * n * min(m, n)
+        return (m // self.head_rows) * self.head_rows * n * min(self.head_rows, n)
 
 
 @dataclasses.dataclass
@@ -274,6 +288,8 @@ class _GroupExchangePlan:
     stage1_routed_indices: list[int]  # k -> n: routed params whose g_home is this rank
     tp_exchanges: dict[int, tuple[list[int], dict[int, int]]]  # tp_dim -> (k's, j -> t_home)
     tp_complete: list[int]  # k: complete after stage 1 (no TP axis), skips stage 2
+    head_rows_replicated: dict[int, int]  # i -> head rows, per-head QKV weights of `replicated`
+    head_rows_stage1: dict[int, int]  # k -> head rows, per-head QKV weights of stage 1
     # a2a routing metadata per stage ("s1f", "s1b", ("s2f", pd), ("s2b", pd)), filled by
     # the route_* helpers on the first step.
     route_plans: dict = dataclasses.field(default_factory=dict)
@@ -345,8 +361,15 @@ class LayerShardedMuon(TensorParallelMuon):
             than two param groups or without CUDA. Requires the groups' domains to
             be disjoint; groups sharing a (gtp_remat, tp) domain are automatically
             serialized (NCCL forbids concurrent collectives on one communicator).
-        All other args: same as :class:`TensorParallelMuon`. In particular
-            ``split_qkv`` / ``is_qkv_fn`` / ``qkv_split_shapes``, ``tp_mode`` and
+        split_qkv_per_head: Split a fused QKV weight per attention head (requires
+            ``split_qkv``; the projection split is not implemented here). Per query group
+            the rows are ``[Q | gate | K | V]``: Q and the gate (present with an attention
+            output gate) are whole heads of ``kv_channels`` rows, K and V one head each.
+            Every head is its own Newton-Schulz matrix ``[kv_channels, hidden]``, scaled by
+            its own shape; all heads of a weight run as one batched Newton-Schulz
+            (emerging-optimizers >= 0.3.0) whatever ``ns_batch_size``. It needs the NS
+            homes: ``step()`` raises when ``set_param_ns_homes`` was never called.
+        All other args: same as :class:`TensorParallelMuon`. ``tp_mode`` and
             ``pg_collection`` only take effect on the path that delegates to the
             parent: the fallback taken before ``set_param_ns_homes`` is called,
             which runs the parent's TP-aware full-matrix Newton-Schulz. The layer-wise
@@ -389,6 +412,7 @@ class LayerShardedMuon(TensorParallelMuon):
         qkv_split_shapes: list[int] | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
+        split_qkv_per_head: bool = False,
     ) -> None:
         if not HAVE_EMERGING_OPTIMIZERS:
             raise ImportError(
@@ -402,22 +426,26 @@ class LayerShardedMuon(TensorParallelMuon):
                 "active in this class; tp_mode selects the mode for the delegated "
                 "(fallback/degenerate) paths only."
             )
-        if split_qkv:
-            # The layer-sharded exchange routes whole matrices to their NS homes
-            # and never goes through TensorParallelMuon.orthogonalize, where
-            # split-QKV is implemented — only the fallback and degenerate paths
-            # would split. Accepting split_qkv=True would make the update rule
-            # depend on whether param_ns_homes happens to be set; reject it at
-            # the class level rather than relying on validate_args alone.
+        if split_qkv and not split_qkv_per_head:
+            # The projection split lives in TensorParallelMuon.orthogonalize, which the
+            # layer-sharded exchange never calls: only the fallback and degenerate paths
+            # would apply it, and the update rule would depend on whether homes are set.
             raise ValueError(
-                "LayerShardedMuon does not implement split-QKV Newton-Schulz on the "
-                "layer-sharded path; pass split_qkv=False (--muon-no-split-qkv)."
+                "LayerShardedMuon splits a QKV weight per head only: pass "
+                "split_qkv_per_head=True (--muon-split-qkv-per-head) for the per-head "
+                "split-QKV, or split_qkv=False (--muon-no-split-qkv)."
+            )
+        if not split_qkv and split_qkv_per_head:
+            raise ValueError(
+                "LayerShardedMuon: split_qkv_per_head=True (--muon-split-qkv-per-head) is a "
+                "split-QKV rule and cannot be combined with split_qkv=False "
+                "(--muon-no-split-qkv)."
             )
         # Fail loudly on a Newton-Schulz configuration this stack cannot run (batched NS
         # floor, Triton/SM, batched SYRK kernel) before the parent's emerging-optimizers
         # version gate for use_syrk itself: no version upgrade fixes unfit hardware, so
         # that message must not be masked.
-        _validate_ns_config(use_syrk, ns_batch_size)
+        _validate_ns_config(use_syrk, ns_batch_size, split_qkv_per_head)
         # Explicit class call, matching the convention used by
         # TensorParallelAdaptiveMuon (see the comment in TensorParallelMuon.__init__).
         TensorParallelMuon.__init__(
@@ -442,6 +470,7 @@ class LayerShardedMuon(TensorParallelMuon):
         )
         self.gtp_remat_group = gtp_remat_group
         self.tp_group = tp_group
+        self.split_qkv_per_head = split_qkv_per_head
         self.ns_batch_size = ns_batch_size
         # The parent stores num_ns_steps and use_syrk (validated by _validate_ns_config) but
         # only captures these three in its scaled_orthogonalize_fn closure; _run_ns reads
@@ -523,7 +552,53 @@ class LayerShardedMuon(TensorParallelMuon):
         p.add_(update, alpha=-lr)
         self.post_weight_update_fn_inplace(p)
 
-    def _run_ns(self, full_by_k: dict) -> dict:
+    def _qkv_head_rows(self, p: torch.Tensor) -> int | None:
+        """Rows of one attention head of ``p`` when it is a fused QKV weight to split per
+        head, else None (whole-matrix Newton-Schulz).
+
+        The split-shape tag holds the rows of Q, (gate,) K and V of one query group. K and V
+        are one head each, so their size is the head's, and Q and the gate are whole heads.
+        """
+        if not (self.split_qkv_per_head and self.is_qkv_fn(p)):  # type: ignore[misc]
+            return None
+        shapes = getattr(p, "qkv_split_shapes", None) or self.qkv_split_shapes
+        if not shapes:
+            raise RuntimeError("Muon QKV split requested but qkv_split_shapes is not set")
+        head_rows = shapes[-1]
+        if shapes[-2] != head_rows or any(rows % head_rows for rows in shapes):
+            raise ValueError(
+                f"split_qkv_per_head: QKV weight {getattr(p, '_debug_name', '')} of shape "
+                f"{tuple(p.shape)} has split shapes {list(shapes)}; K and V must be one head "
+                "of equal size and Q (and the gate) whole heads of that size."
+            )
+        return head_rows
+
+    def param_shard_spec(
+        self, p: torch.Tensor, gtp_remat_size: int, tp_size: int
+    ) -> ParamShardSpec:
+        """``p``'s sharding in a (gtp_remat, tp) domain of the given sizes, with the head
+        size when this optimizer splits it per head."""
+        return ParamShardSpec.from_param(p, gtp_remat_size, tp_size, self._qkv_head_rows(p))
+
+    def _orthogonalize_heads(self, full: torch.Tensor, head_rows: int) -> torch.Tensor:
+        """The scaled per-head Newton-Schulz update of a complete fused QKV matrix.
+
+        Every ``head_rows``-row block is its own matrix, scaled by its own shape. All heads
+        of ``full`` run as ONE batched Newton-Schulz on a view of it, never pooled with
+        other weights and never chunked by ``ns_batch_size``: the bits of a head can depend
+        on the batch it is in, so the batch is the same wherever ``full`` is.
+        """
+        cols = full.size(-1)
+        orth = newton_schulz(
+            full.reshape(-1, head_rows, cols),
+            steps=self.num_ns_steps,
+            coefficient_type=self.coefficient_type,
+            use_syrk=self.use_syrk,
+        )
+        scale = get_muon_scale_factor(head_rows, cols, mode=self.scale_mode)
+        return orth.mul_(scale).mul_(self.extra_scale_factor).reshape(full.shape)
+
+    def _run_ns(self, full_by_k: dict, head_rows: dict | None = None) -> dict:
         """Full-matrix Newton-Schulz per home-owned matrix, batched by shape.
 
         Same-shape matrices are stacked into one batched NS: under MoE a home owns
@@ -532,17 +607,22 @@ class LayerShardedMuon(TensorParallelMuon):
         to bound the transient stack memory. A batch of one stays 2-D, so the
         unbatched numerics are preserved exactly whenever nothing is actually batched.
         """
-        return dict(self._iter_ns(full_by_k))
+        return dict(self._iter_ns(full_by_k, head_rows=head_rows))
 
     def _iter_ns(
-        self, full_by_k: dict, load: Callable = lambda t: t
+        self, full_by_k: dict, load: Callable = lambda t: t, head_rows: dict | None = None
     ) -> Iterator[tuple[int, torch.Tensor]]:
         """:meth:`_run_ns` one chunk at a time: yields ``(k, ns)`` as each chunk finishes,
         so a caller that consumes each result right away holds one chunk, not all.
-        ``load`` maps a value of ``full_by_k`` to its NS input when its chunk starts."""
+        ``load`` maps a value of ``full_by_k`` to its NS input when its chunk starts.
+        ``head_rows``: keys of per-head QKV weights -> head size; those run
+        :meth:`_orthogonalize_heads` first, one weight per call."""
         by_shape: dict = {}
         for k, full in full_by_k.items():
-            by_shape.setdefault(tuple(full.shape), []).append(k)
+            if head_rows and k in head_rows:
+                yield k, self._orthogonalize_heads(load(full), head_rows[k])
+            else:
+                by_shape.setdefault(tuple(full.shape), []).append(k)
 
         for ks in by_shape.values():
             for start in range(0, len(ks), self.ns_batch_size):
@@ -618,6 +698,15 @@ class LayerShardedMuon(TensorParallelMuon):
         # full-matrix Newton-Schulz per param (with the groups from pg_collection).
         # Mathematically correct, just redundant: every rank recomputes every matrix.
         if not self._homes_set:
+            if self.split_qkv_per_head:
+                # The fallback is the parent's step, which has no per-head rule.
+                raise RuntimeError(
+                    "LayerShardedMuon: split_qkv_per_head needs the NS homes, but "
+                    "set_param_ns_homes() was never called and the TensorParallelMuon "
+                    "fallback has no per-head rule. Build the optimizer with "
+                    "get_megatron_optimizer (its layer-wise distributed optimizer sets the "
+                    "homes) or call set_param_ns_homes() before step()."
+                )
             if not self._warned_no_homes:
                 self._warned_no_homes = True
                 log_single_rank(
@@ -670,7 +759,7 @@ class LayerShardedMuon(TensorParallelMuon):
         """Read every param's sharding once and assemble the routing tables."""
         gtp_remat_size = get_pg_size(gtp_remat_group)
         tp_size = get_pg_size(tp_group)
-        specs = [ParamShardSpec.from_param(p, gtp_remat_size, tp_size) for p in params]
+        specs = [self.param_shard_spec(p, gtp_remat_size, tp_size) for p in params]
         replicated = [i for i, s in enumerate(specs) if s.sharding is ParamSharding.REPLICATED]
         routed = [i for i, s in enumerate(specs) if s.sharding is not ParamSharding.REPLICATED]
 
@@ -724,6 +813,14 @@ class LayerShardedMuon(TensorParallelMuon):
             stage1_routed_indices=stage1_routed_indices,
             tp_exchanges=tp_exchanges,
             tp_complete=by_tp_dim[None],
+            head_rows_replicated={
+                i: specs[i].head_rows for i in replicated if specs[i].head_rows is not None
+            },
+            head_rows_stage1={
+                k: specs[routed[n]].head_rows
+                for k, n in enumerate(stage1_routed_indices)
+                if specs[routed[n]].head_rows is not None
+            },
         )
 
     def _step_groups(self, streams: list | None, ready: torch.cuda.Event | None) -> None:
@@ -769,7 +866,9 @@ class LayerShardedMuon(TensorParallelMuon):
             if plan.replicated:
                 with _phase("ns_replicated"), fp32_matmul_precision(self.fp32_matmul_prec):
                     replicated = {i: params[i] for i in plan.replicated}
-                    for i, ns_output in self._iter_ns(replicated, load=ns_input):
+                    for i, ns_output in self._iter_ns(
+                        replicated, load=ns_input, head_rows=plan.head_rows_replicated
+                    ):
                         self._apply_update(params[i], ns_output, lr)
                         del ns_output
             if not plan.routed:
@@ -849,11 +948,13 @@ class LayerShardedMuon(TensorParallelMuon):
                             k: v
                             for k, v in full_ns_inputs_by_stage1_index.items()
                             if k not in tp_complete_indices
-                        }
+                        },
+                        plan.head_rows_stage1,
                     )
                     ns_outputs_by_stage1_index.update(
                         self._run_ns(
-                            {k: full_ns_inputs_by_stage1_index[k] for k in plan.tp_complete}
+                            {k: full_ns_inputs_by_stage1_index[k] for k in plan.tp_complete},
+                            plan.head_rows_stage1,
                         )
                     )
 

@@ -759,8 +759,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         Each param group is matched to the domain it is sharded over, dense params over
         ``(gtp_remat, tp)`` and expert params over ``(expt_gtp_remat, expt_tp)``; every
-        param's sharding is read once (``ParamShardSpec.from_param``), the domain's params
-        are pooled so LPT balances all of them at once, and the ``(g_home, t_home)``
+        param's sharding is read once (``LayerShardedMuon.param_shard_spec``), the domain's
+        params are pooled so LPT balances all of them at once, and the ``(g_home, t_home)``
         assignments are pushed onto the ``LayerShardedMuon``.
 
         Params of a single-rank domain get no home; ``LayerShardedMuon.step`` runs plain
@@ -768,7 +768,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         collective: this code runs with rank-local inventory, which differs across
         pipeline and multimodal stages.
         """
-        from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon, ParamShardSpec
+        from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
 
         dense_axes = (getattr(pg_collection, 'gtp_remat', None), getattr(pg_collection, 'tp', None))
         expert_axes = (
@@ -800,9 +800,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 # Classifying here (not only in step()) surfaces a misconfiguration at
                 # optimizer construction instead of after data loading and the first
                 # forward/backward.
-                specs = [
-                    ParamShardSpec.from_param(p, gtp_remat_size, tp_size) for p in domain_params
-                ]
+                specs = [inner.param_shard_spec(p, gtp_remat_size, tp_size) for p in domain_params]
                 self._check_gtp_group_matches(domain_params, specs, gtp_remat_group)
                 homes = self._assign_ns_homes(domain_params, specs, gtp_remat_size, tp_size)
                 assignment.update(homes)
