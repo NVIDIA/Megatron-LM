@@ -1376,7 +1376,8 @@ def test_mxfp8_handoff_never_falls_back(monkeypatch):
 @pytest.mark.parametrize("training", [False, True])
 def test_deferred_writes_are_consumed_within_one_forward(training):
     """A deferred write goes only to an empty read and is taken exactly once; a forward leaves
-    every fused read empty (no residual or branch tensors held across forwards)."""
+    every fused read empty (no residual or branch tensors held across forwards), and a forward
+    after one that raised mid-seam does not see that forward's write."""
     model = _hybrid_model("M-*E-ME", hidden=256).train(training)
     reads = [m for m in model.modules() if isinstance(m, WriteReadNorm)]
     read = reads[0]
@@ -1390,6 +1391,7 @@ def test_deferred_writes_are_consumed_within_one_forward(training):
     tokens = 1024 if training else 64  # training seams need a multiple of 1024 tokens
     ids = torch.randint(0, 128, (1, tokens), device="cuda")
     positions = torch.arange(tokens, device="cuda")
+    model.decoder._fused_reads[-1].hand("left by a forward that raised after its hand-off")
     for _ in range(2):
         with torch.set_grad_enabled(training):
             out = model(ids, positions[None], None)

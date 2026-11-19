@@ -460,11 +460,12 @@ class HybridStack(MegatronModule):
                 )
                 for layer in self.layers
             ]
+        self._fused_reads = ()
         if self.config.moe_shortcut_wide_residual_norm_fusion and self.uses_wide_residual_stream:
             # Fused residual seams, after grouping (whose blocks link their own MoE and shortcut
             # reads): link each deferred write to the next physical layer's fused read and each
             # remaining read to its consumer.
-            link_residual_seams(
+            self._fused_reads = link_residual_seams(
                 [
                     sublayer
                     for layer in self.layers
@@ -664,6 +665,10 @@ class HybridStack(MegatronModule):
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        for read in self._fused_reads:
+            # A forward that raised between a deferred write's hand-off and this read's take
+            # left the write behind; the next forward starts without it.
+            read.pending = None
         if self._has_custom_layers and (inference_context is not None or InferenceMode.is_active()):
             raise ValueError("Custom hybrid layers do not support inference contexts yet.")
 

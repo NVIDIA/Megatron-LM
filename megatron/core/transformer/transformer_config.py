@@ -1590,6 +1590,10 @@ class TransformerConfig(ModelParallelConfig):
 
     ``None`` places all local layers in one block. This setting requires selective
     recomputation with ``"residual_stream"`` in ``recompute_modules``.
+
+    With ``moe_shortcut_wide_residual_norm_fusion`` the fused seams replay residuals
+    themselves instead: N is the number of seams per replay interval, ``None`` or 1 disables
+    replay, and ``"residual_stream"`` must not be in ``recompute_modules`` (it is rejected).
     """
 
     ####################
