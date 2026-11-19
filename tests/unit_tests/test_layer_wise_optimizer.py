@@ -261,7 +261,6 @@ def test_layerwise_offload_rejects_padded_param_layout(monkeypatch):
     model_chunk = SimpleNamespace(
         ddp_config=SimpleNamespace(
             use_distributed_optimizer=True,
-            param_sync_via_bucket_group=True,
             overlap_param_gather=False,
             reuse_grad_buf_for_mxfp8_param_ag=False,
         ),
@@ -649,6 +648,68 @@ class TestLayerWiseOptimizer:
         assert not torch.equal(model.module.scalar.weight, initial_weight)
         _assert_replicas_equal(model)
 
+    @pytest.mark.parametrize(
+        ('use_gloo_process_groups', 'missing_expert_gloo'),
+        [(False, False), (True, False), (True, True)],
+    )
+    def test_scalar_distributed_optimizer_uses_collection_gloo_group(
+        self, use_gloo_process_groups, missing_expert_gloo
+    ):
+        """Dense and expert scalar DistOpts use their own Gloo mirrors when requested."""
+        from megatron.training.training import wrap_model_chunks_with_ddp
+
+        model = wrap_model_chunks_with_ddp(
+            [ExpertModel().bfloat16().cuda()],
+            TransformerConfig(num_attention_heads=1, num_layers=1),
+            DistributedDataParallelConfig(),
+            use_layer_wise_distributed_optimizer=True,
+        )[0]
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        # Fresh groups over every rank (the dp_cp and expt_dp ranks here), distinct from the
+        # parallel_state Gloo groups, so the identity check shows where the group came from.
+        pg_collection.intra_dp_cp_gloo = torch.distributed.new_group(backend="gloo")
+        pg_collection.intra_expt_dp_gloo = (
+            None if missing_expert_gloo else torch.distributed.new_group(backend="gloo")
+        )
+        optimizer_config = OptimizerConfig(
+            optimizer='muon',
+            lr=0.01,
+            bf16=True,
+            muon_tp_mode="duplicated",
+            use_layer_wise_distributed_optimizer=True,
+        )
+
+        if missing_expert_gloo:
+            with pytest.raises(ValueError, match="requires pg_collection.intra_expt_dp_gloo"):
+                get_megatron_optimizer(
+                    optimizer_config,
+                    [model],
+                    pg_collection=pg_collection,
+                    use_gloo_process_groups=use_gloo_process_groups,
+                )
+            return
+
+        optimizer = get_megatron_optimizer(
+            optimizer_config,
+            [model],
+            pg_collection=pg_collection,
+            use_gloo_process_groups=use_gloo_process_groups,
+        )
+
+        dense_optimizer, expert_optimizer = [
+            sub_optimizer
+            for sub_optimizer in optimizer.chained_optimizers
+            if isinstance(sub_optimizer, DistributedOptimizer)
+        ]
+        assert dense_optimizer.data_parallel_group is pg_collection.dp_cp
+        assert expert_optimizer.data_parallel_group is pg_collection.expt_dp
+        assert dense_optimizer.data_parallel_group_gloo is (
+            pg_collection.intra_dp_cp_gloo if use_gloo_process_groups else None
+        )
+        assert expert_optimizer.data_parallel_group_gloo is (
+            pg_collection.intra_expt_dp_gloo if use_gloo_process_groups else None
+        )
+
     def test_get_grad_norm(self):
         """The grad norm matches the non-distributed reference."""
         model, optimizer, _ = _create()
@@ -823,7 +884,8 @@ class TestLayerWiseOptimizer:
                     buffer.params[0], 'is_managed_by_layer_wise_optimizer', False
                 )
                 # LayerWise buffers are unsharded and unpadded; only DistOpt has a param buffer.
-                assert buffer.ddp_config.use_distributed_optimizer != is_layer_wise
+                assert buffer.ddp_config is model.ddp_config
+                assert (buffer.num_optimizer_shards is None) == is_layer_wise
                 assert (buffer.param_data is None) == is_layer_wise
             for bucket_group in model.bucket_groups + model.expert_parallel_bucket_groups:
                 owners = {
@@ -834,7 +896,7 @@ class TestLayerWiseOptimizer:
                 assert len(owners) == 1, "A bucket group mixes LayerWise and DistOpt buckets"
                 if owners.pop():
                     # Without overlap the optimizer gathers the LayerWise params after its step.
-                    assert bucket_group.ddp_config.param_sync_via_bucket_group == overlap
+                    assert bucket_group.param_sync_via_bucket_group == overlap
         _assert_trains_like_reference(model, optimizer, steps=3)
 
     def test_all_reduce_training_replays_bit_exact(self):
@@ -924,6 +986,14 @@ class TestLayerWiseOptimizer:
         def finish():
             model.start_param_sync()
             for bucket_group in model.bucket_groups:
+                if bucket_group.num_optimizer_shards is None:
+                    # BF16 compact gather borrows grad storage even with MXFP8 reuse off.
+                    for bucket in bucket_group.buckets:
+                        grad_ptr = bucket.grad_data.untyped_storage().data_ptr()
+                        assert all(
+                            slot.untyped_storage().data_ptr() == grad_ptr
+                            for slot in bucket.layerwise_gather_list
+                        )
                 bucket_group.finish_param_sync(skip_next_bucket_dispatch=True)
 
         def forward_pre_hooks():

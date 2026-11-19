@@ -230,9 +230,9 @@ class OptimizerConfig:
     """If true, train with bf16 mixed precision training. Defaults to False."""
 
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
-    """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
-       set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True. The training
-       CLI sets it for every MXFP8 run with --fp8-param-gather outside FSDP."""
+    """Enable MXFP8 grad-buffer staging. The training CLI sets this for the MXFP8 recipe
+    with ``--fp8-param-gather`` outside FSDP. Compact LayerWise also borrows gradient
+    storage when ``overlap_param_gather`` is enabled."""
 
     params_dtype: torch.dtype = torch.float32
     """dtype used when intializing the weights. Defaults to torch.float32."""
@@ -424,9 +424,8 @@ class OptimizerConfig:
     use_layer_wise_distributed_optimizer: bool = False
     """Use :class:`LayerWiseDistributedOptimizer` for emerging optimizers (e.g. Muon).
     An emerging optimizer with ``use_distributed_optimizer=True`` resolves to this flag (see
-    :func:`resolve_layer_wise_distributed_optimizer`); the training arguments layer sets it and
-    resets ``use_distributed_optimizer`` to False so that the standard distributed-optimizer
-    path is not triggered."""
+    :func:`resolve_layer_wise_distributed_optimizer`). Finalization preserves the requested
+    ``use_distributed_optimizer`` value; the factory selects the wrapper by optimizer name."""
 
     second_order_optimizer_grad_collective: str = "reduce-scatter"
     """Data-parallel gradient collective for the parameters that a second-order optimizer with
@@ -846,9 +845,7 @@ class OptimizerConfig:
             )
 
         if self.overlap_param_gather:
-            # finalize_optimizer_config() may already have turned use_distributed_optimizer into
-            # use_layer_wise_distributed_optimizer (muon / dist_muon), which shares the same
-            # param-gather overlap, so accept either form.
+            # Explicit LayerWise selection and deprecated dist_* aliases also support overlap.
             assert (
                 self.use_distributed_optimizer
                 or self.uses_layer_wise_distributed_optimizer()
@@ -954,15 +951,15 @@ class OptimizerConfig:
             self.chunked_optimizer_state_offload = True
             self.offload_optimizer_states = False
 
-        # emerging optimizer check
-        if self.optimizer not in ('sgd', 'adam'):
-            if self.optimizer == 'dist_muon':
-                self.optimizer = 'muon'
-                self.use_layer_wise_distributed_optimizer = True
-
-            if self.use_distributed_optimizer:
-                self.use_layer_wise_distributed_optimizer = True
-                self.use_distributed_optimizer = False
+        # Resolve the optimizer name and LayerWise wrapper while preserving the requested
+        # distributed-optimizer setting. The factory routes emerging optimizers separately.
+        self.optimizer, self.use_layer_wise_distributed_optimizer = (
+            resolve_layer_wise_distributed_optimizer(
+                self.optimizer,
+                self.use_distributed_optimizer,
+                self.use_layer_wise_distributed_optimizer,
+            )
+        )
 
 
 # Backward-compatible aliases (deprecated; use OptimizerConfig directly).

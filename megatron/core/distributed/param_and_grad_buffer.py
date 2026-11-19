@@ -232,6 +232,15 @@ class _ParamAndGradBucket:
         ]
 
 
+def _compact_param_gather_uses_grad_buffer(config) -> bool:
+    """Whether a compact LayerWise all-gather receives into ``bucket.grad_data``.
+
+    Configuring overlap selects gradient storage for all supported dtypes, even when the
+    call is forced synchronous. With overlap off, only the MXFP8 setting selects it.
+    """
+    return config.overlap_param_gather or config.reuse_grad_buf_for_mxfp8_param_ag
+
+
 def _layerwise_gather_sources(
     params: List[torch.nn.Parameter], quantized: bool
 ) -> List[torch.Tensor]:
@@ -320,6 +329,7 @@ class _ParamAndGradBucketGroup:
         collective_group: intra_distributed_optimizer_instance_group if using distributed
             optimizer, data_parallel_group if not.
         collective_group_size: World size using the intra data-parallel group.
+        num_optimizer_shards: Shards in the buffer layout; None for replicated buffers.
     """
 
     def __init__(
@@ -328,18 +338,21 @@ class _ParamAndGradBucketGroup:
         ddp_config: DistributedDataParallelConfig,
         collective_group: torch.distributed.ProcessGroup,
         collective_group_size: int,
-    ):
+        *,
+        num_optimizer_shards: Optional[int],
+    ) -> None:
         self.buckets = buckets
         self.ddp_config = ddp_config
+        self.num_optimizer_shards = num_optimizer_shards
 
         # LayerWise parameter sync can use this collective group without the distributed
         # optimizer: asynchronously when overlap is enabled, or synchronously when MXFP8 reuses
         # grad_data as its BF16 all-gather transport.
-        if self.ddp_config.param_sync_via_bucket_group:
+        if self.param_sync_via_bucket_group:
             self.intra_distributed_optimizer_instance_group = collective_group
             self.intra_distributed_optimizer_instance_size = collective_group_size
             self.intra_distributed_optimizer_instance_rank = collective_group.rank()
-        if not self.ddp_config.use_distributed_optimizer:
+        if self.num_optimizer_shards is None:
             self.data_parallel_group = collective_group
 
         # State for bookkeeping: params is the set of parameters this bucket group is
@@ -367,13 +380,13 @@ class _ParamAndGradBucketGroup:
             ), "RS w/ FP32 accumulation not supported with num_distributed_optimizer_instances > 1"
 
         reduction_collective = (
-            "reduce-scatter" if self.ddp_config.use_distributed_optimizer else "all-reduce"
+            "reduce-scatter" if self.num_optimizer_shards is not None else "all-reduce"
         )
         log_single_rank(
             logger,
             logging.INFO,
             f"Using {reduction_collective} for gradient reductions because "
-            f"{self.ddp_config.use_distributed_optimizer=}",
+            f"{self.num_optimizer_shards=}",
         )
 
         global dist_reduce_scatter_func
@@ -422,6 +435,19 @@ class _ParamAndGradBucketGroup:
         self.cached_param_buffer_shard_list = [None] * len(self.buckets)
         self.cached_grad_buffer_shard_list = [None] * len(self.buckets)
 
+    @property
+    def param_sync_via_bucket_group(self) -> bool:
+        """Whether this group gathers updated parameters through DDP.
+
+        Sharded layouts always gather here. Compact LayerWise gathers through DDP when
+        it borrows gradient storage and through its optimizer when it uses temporary tensors.
+        Ordinary replicated DDP buffers do not require parameter synchronization.
+        """
+        if self.num_optimizer_shards is not None:
+            return True
+
+        return _compact_param_gather_uses_grad_buffer(self.ddp_config)
+
     def reset(self):
         """
         Reset metadata in bucket group in preparation for the next iteration of training.
@@ -437,7 +463,7 @@ class _ParamAndGradBucketGroup:
 
     def _post_param_sync(self):
         """Run post-processing after param all-gather completes."""
-        if not self.ddp_config.use_distributed_optimizer:
+        if self.num_optimizer_shards is None:
             # Compact LayerWise buffers have no param buffer: the variable-size gather landed in
             # grad_data, which is zeroed after the copy-back so that the next backward does not
             # accumulate into the gather payload.
@@ -552,7 +578,7 @@ class _ParamAndGradBucketGroup:
             force_sync (bool, optional): force synchronous collective regardless of
                 other settings if true.
         """
-        assert self.ddp_config.param_sync_via_bucket_group
+        assert self.param_sync_via_bucket_group
 
         if force_sync:
             if self.param_gather_handle is not None:
@@ -567,7 +593,7 @@ class _ParamAndGradBucketGroup:
 
         async_op = self.ddp_config.overlap_param_gather and not force_sync
 
-        if not self.ddp_config.use_distributed_optimizer:
+        if self.num_optimizer_shards is None:
             # Compact LayerWise buffers: every owner all-gathers its whole params.
             #
             # Each rank may own a different number of params per bucket, so
@@ -821,7 +847,7 @@ class _ParamAndGradBucketGroup:
         else:
             stream_context = nullcontext()
 
-        if self.ddp_config.use_distributed_optimizer:
+        if self.num_optimizer_shards is not None:
             communication_group = self.intra_distributed_optimizer_instance_group
         else:
             communication_group = self.data_parallel_group
@@ -830,7 +856,7 @@ class _ParamAndGradBucketGroup:
         grad_reduce_handle = None
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
             for idx, bucket in enumerate(self.buckets):
-                if self.ddp_config.use_distributed_optimizer and not force_all_reduce:
+                if self.num_optimizer_shards is not None and not force_all_reduce:
                     if self.cached_grad_buffer_shard_list[idx] is None:
                         self.cached_grad_buffer_shard_list[idx] = shard_buffer(
                             bucket.grad_data, self.intra_distributed_optimizer_instance_size
@@ -856,7 +882,7 @@ class _ParamAndGradBucketGroup:
 
         # With multiple DistOpt instances, we need to all-reduce across instances.
         if (
-            self.ddp_config.use_distributed_optimizer
+            self.num_optimizer_shards is not None
             and self.ddp_config.num_distributed_optimizer_instances > 1
         ):
             assert self.inter_distributed_optimizer_instance_group is not None
@@ -887,7 +913,7 @@ class _ParamAndGradBucketGroup:
             # fp32-accum RS needs the distributed optimizer; else fall through (all-reduce -> cm).
             if (
                 self.ddp_config.reduce_scatter_with_fp32_accumulation
-                and self.ddp_config.use_distributed_optimizer
+                and self.num_optimizer_shards is not None
                 and not force_all_reduce
             ):
                 assert (
@@ -1261,7 +1287,7 @@ class _ParamAndGradBuffer:
         assert self.numel_unpadded <= self.numel
         if self.has_nvfp4_params:
             assert self.nvfp4_packed_numel_unpadded <= self.nvfp4_packed_numel
-        if self.ddp_config.use_distributed_optimizer:
+        if self.num_optimizer_shards is not None:
             assert self.numel % self.data_parallel_world_size == 0
             if self.has_nvfp4_params:
                 assert self.nvfp4_packed_numel % self.data_parallel_world_size == 0
@@ -1274,7 +1300,7 @@ class _ParamAndGradBuffer:
         self.nccl_mem_pool: Optional["torch.cuda.MemPool"] = None
         self.param_nccl_mem_pool: Optional["torch.cuda.MemPool"] = None
         self.nccl_grad_pool_is_separate: bool = self.nccl_ub and self.ddp_config.grad_buffer_offload
-        uses_shared_param_grad_buffer = self.ddp_config.use_distributed_optimizer and any(
+        uses_shared_param_grad_buffer = self.num_optimizer_shards is not None and any(
             is_mxfp8tensor(p) or is_grouped_mxfp8tensor(p) for p in self.params
         )
         if self.ddp_config.grad_buffer_offload and uses_shared_param_grad_buffer:
@@ -1285,7 +1311,7 @@ class _ParamAndGradBuffer:
         disable_grad_cpu_backup = self.ddp_config.disable_grad_buffers_cpu_backup
         disable_param_cpu_backup = (
             self.ddp_config.disable_param_buffers_cpu_backup
-            and self.ddp_config.use_distributed_optimizer
+            and self.num_optimizer_shards is not None
         )
         if HAVE_TORCH_MEMORY_SAVER and (disable_grad_cpu_backup or disable_param_cpu_backup):
             if self.nccl_ub:
@@ -1378,7 +1404,7 @@ class _ParamAndGradBuffer:
                 with torch.cuda.use_mem_pool(self.nccl_mem_pool):
                     allocate_grad_buffer()
                 self._register_nccl_mem_pool(self.nccl_mem_pool)
-                if self.ddp_config.use_distributed_optimizer:
+                if self.num_optimizer_shards is not None:
                     try:
                         # Create the persistent parameter pool only after the replaceable gradient
                         # pool has registered successfully, so either failure can be rolled back.
@@ -1395,7 +1421,7 @@ class _ParamAndGradBuffer:
                         raise
             else:
                 with mem_alloc_context():
-                    if self.ddp_config.use_distributed_optimizer:
+                    if self.num_optimizer_shards is not None:
                         with param_alloc_context():
                             allocate_param_buffer()
                     with grad_alloc_context():
@@ -1651,12 +1677,12 @@ class _ParamAndGradBuffer:
         """
 
         def _pad_start_of_param(param_start_index: int) -> int:
-            if self.ddp_config.use_distributed_optimizer:
+            if self.num_optimizer_shards is not None:
                 return pad_param_start(param_start_index)
             return param_start_index
 
         def _pad_end_of_bucket(bucket_end_index: int) -> int:
-            if self.ddp_config.use_distributed_optimizer:
+            if self.num_optimizer_shards is not None:
                 return pad_bucket_end(
                     bucket_end_index,
                     self.data_parallel_world_size,
@@ -1771,7 +1797,7 @@ class _ParamAndGradBuffer:
         # Assert that indices are correctly padded (if needed), and that bucket
         # position is same as originally computed.
 
-        if self.ddp_config.use_distributed_optimizer:
+        if self.num_optimizer_shards is not None:
             assert start_index % self.data_parallel_world_size == 0
             assert end_index % self.data_parallel_world_size == 0
         assert (start_index, end_index) == self.bucket_indices[bucket_id]
@@ -1948,7 +1974,7 @@ def partition_buckets(
     overlap of communication kernels with computation kernels.
 
     A bucket group runs one set of collectives with one DDP config, so the buffers are first
-    partitioned by optimizer ownership (LayerWise-managed or not) and DDP config, and buckets of
+    partitioned by optimizer ownership (LayerWise-managed or not), layout and DDP config. Buckets of
     different partitions never share a group. Partitions with an fp8 buffer come first, as the
     fp8 buckets lead the grouping below; the others keep their buffer order.
 
@@ -1993,6 +2019,7 @@ def partition_buckets(
                 if getattr(partition[0].params[0], 'is_managed_by_layer_wise_optimizer', False)
                 == is_layer_wise
                 and partition[0].ddp_config == buffer.ddp_config
+                and partition[0].num_optimizer_shards == buffer.num_optimizer_shards
             ),
             None,
         )
@@ -2017,17 +2044,22 @@ def _group_buckets(
     force_single_bucket_group: bool,
     reduce_scatter_with_fp32_accumulation: bool,
 ) -> List[_ParamAndGradBucketGroup]:
-    """Group the buckets of buffers that share optimizer ownership and DDP config."""
+    """Group buckets whose buffers share optimizer ownership, layout and DDP config."""
     ddp_config = buffers[0].ddp_config
     data_parallel_group = buffers[0].data_parallel_group
     data_parallel_world_size = buffers[0].data_parallel_world_size
     for buffer in buffers:
         assert data_parallel_group == buffer.data_parallel_group
         assert data_parallel_world_size == buffer.data_parallel_world_size
+        assert buffers[0].num_optimizer_shards == buffer.num_optimizer_shards
 
     def new_group(buckets):
         return _ParamAndGradBucketGroup(
-            buckets, ddp_config, data_parallel_group, data_parallel_world_size
+            buckets,
+            ddp_config,
+            data_parallel_group,
+            data_parallel_world_size,
+            num_optimizer_shards=buffers[0].num_optimizer_shards,
         )
 
     # Case 1: Put all buckets into a single bucket group if force_single_bucket_group is True.

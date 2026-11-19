@@ -812,6 +812,7 @@ def _get_megatron_emerging_optimizer(
     config_overrides: Optional[Dict[ParamKey, Any]] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
     param_group_process_group: Optional[torch.distributed.ProcessGroup] = None,
+    use_gloo_process_groups: bool = True,
 ) -> MegatronOptimizer:
     """Build an emerging optimizer (e.g. Muon) for the given model chunks.
 
@@ -983,11 +984,8 @@ def _get_megatron_emerging_optimizer(
         for (opt_name, _), groups in grouped_param_groups.items()
         if groups
     ):
-        # ``setup_process_groups_for_optimizer`` rejects Gloo groups whenever
-        # an explicit ``pg_collection`` is supplied, so the only legal value
-        # here is False.
         distopt_process_groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
-            pg_collection, model_chunks, use_gloo_process_groups=False
+            pg_collection, model_chunks, use_gloo_process_groups=use_gloo_process_groups
         )
         # DistOpt should only manage non-LayerWise buffers (those holding
         # embeddings, biases, layernorm, etc.). Filter out the LayerWise
@@ -1050,13 +1048,26 @@ def _get_megatron_emerging_optimizer(
                 # Route non-emerging params (adam/lion) through a real DistributedOptimizer
                 # (byte-level sharding) instead of stuffing them inside LayerWise. Expert
                 # params shard over the expert data-parallel group, as in the standard
-                # (non-layer-wise) optimizer path. Gloo groups are off on this path.
+                # (non-layer-wise) optimizer path, including its Gloo checkpoint groups.
                 mp_group_name, dp_group_name = (
                     ('expt_tp_pp_with_egtp_remat_group', 'intra_expt_dp_group')
                     if is_expert
                     else ('mp_group', 'intra_dp_cp_group')
                 )
+                assert distopt_process_groups is not None
                 distopt_model_parallel_group = distopt_process_groups[mp_group_name]
+                distopt_data_parallel_group_gloo = distopt_process_groups[f'{dp_group_name}_gloo']
+                if (
+                    is_expert
+                    and use_gloo_process_groups
+                    and distopt_data_parallel_group_gloo is None
+                    and not ProcessGroupCollection.is_gtp_remat_active(distopt_process_groups)
+                ):
+                    raise ValueError(
+                        "use_gloo_process_groups=True requires pg_collection.intra_expt_dp_gloo "
+                        "for the expert parameters. Build the job with Gloo process groups or "
+                        "pass use_gloo_process_groups=False."
+                    )
                 fallback_config.use_distributed_optimizer = True
                 result = _get_megatron_optimizer_based_on_param_groups(
                     config=fallback_config,
@@ -1065,6 +1076,7 @@ def _get_megatron_emerging_optimizer(
                     per_model_buffers=distopt_per_model_buffers[is_expert],
                     model_parallel_group=distopt_model_parallel_group,
                     data_parallel_group=distopt_process_groups[dp_group_name],
+                    data_parallel_group_gloo=distopt_data_parallel_group_gloo,
                     data_parallel_group_idx=get_pg_rank(distopt_model_parallel_group),
                     intra_dist_opt_group=distopt_process_groups['intra_dist_opt_group'],
                     pg_collection=pg_collection,
@@ -1190,6 +1202,7 @@ def get_megatron_optimizer(
             config_overrides=config_overrides,
             pg_collection=pg_collection,
             param_group_process_group=param_group_process_group,
+            use_gloo_process_groups=use_gloo_process_groups,
         )
         _clear_high_precision_initializers(model_chunks)
         return optimizer

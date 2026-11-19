@@ -243,7 +243,7 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
         ("muon", False, True),
     ],
 )
-def test_finalization_resolves_layer_wise_ddp_flag(
+def test_finalization_preserves_distributed_optimizer_intent(
     monkeypatch,
     run_config,
     optimizer,
@@ -261,10 +261,9 @@ def test_finalization_resolves_layer_wise_ddp_flag(
 
     layer_wise = optimizer in ("muon", "dist_muon")
     assert run_config.optimizer.use_layer_wise_distributed_optimizer is layer_wise
-    assert run_config.optimizer.use_distributed_optimizer is (not layer_wise)
-    # Wrapping DDP with the LayerWise layout opts back into DistOpt buffers later;
-    # finalization leaves the flag off.
-    assert run_config.ddp.use_distributed_optimizer is (not layer_wise)
+    assert run_config.optimizer.use_distributed_optimizer is use_distributed_optimizer
+    # Both LayerWise layouts retain DistOpt buffers for their scalar sibling.
+    assert run_config.ddp.use_distributed_optimizer is (use_distributed_optimizer or layer_wise)
 
 
 @pytest.mark.parametrize(

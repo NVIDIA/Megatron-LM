@@ -90,6 +90,15 @@ def test_resolve_layer_wise_distributed_optimizer(optimizer, use_distopt, use_la
     assert (
         resolve_layer_wise_distributed_optimizer(optimizer, use_distopt, use_layer_wise) == expected
     )
+    config = OptimizerConfig(
+        optimizer=optimizer,
+        use_distributed_optimizer=use_distopt,
+        use_layer_wise_distributed_optimizer=use_layer_wise,
+    )
+    for _ in range(2):
+        config.finalize_optimizer_config()
+        assert config.use_distributed_optimizer is use_distopt
+        assert (config.optimizer, config.uses_layer_wise_distributed_optimizer()) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +112,7 @@ def test_resolve_layer_wise_distributed_optimizer(optimizer, use_distopt, use_la
 )
 def test_configure_ddp_for_layer_wise_optimizer(collective, layout):
     model = _model()
-    # The container clears use_distributed_optimizer for the layer-wise optimizer.
+    # Direct LayerWise selection also works with a default DDP config.
     ddp_config = DistributedDataParallelConfig()
     kwargs = {} if collective is None else {"second_order_optimizer_grad_collective": collective}
     fn = configure_ddp_for_layer_wise_optimizer(

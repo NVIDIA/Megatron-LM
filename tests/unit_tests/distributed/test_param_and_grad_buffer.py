@@ -1,7 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import contextlib
-import dataclasses
 import math
 from types import SimpleNamespace
 from typing import Optional
@@ -1132,6 +1131,9 @@ def test_shared_param_grad_buffer_requires_matching_cpu_backup_disable_flags():
                 param_to_name={param: "weight"},
                 gradient_scaling_factor=1.0,
                 param_indices=[0],
+                param_layout=DistributedOptimizer._compute_per_buffer_param_layout(
+                    [param], None, group.size(), ddp_config, [0]
+                ),
                 nccl_ub=False,
                 pg_collection=pg_collection,
             )
@@ -1186,46 +1188,130 @@ def test_cpu_backup_disable_flags_are_ignored_without_tms():
     assert buffer.grad_data.device.type == "cpu"
 
 
-@pytest.mark.parametrize("layer_wise_first", [True, False])
-def test_bucket_groups_keep_the_config_of_their_buffer(monkeypatch, layer_wise_first):
-    """An fp8 LayerWise buffer next to a DistOpt buffer with reduce_scatter_with_fp32_accumulation
-    (singleton groups): each bucket group runs with the DDP config of its own buffer, in either
-    buffer order. The compact LayerWise buffers all-reduce, the DistOpt ones reduce-scatter."""
-    # Building a group with reduce_scatter_with_fp32_accumulation swaps the module-level
-    # reduce-scatter function; keep the swap local to this test.
+def _buffer_for_layout_test(param_dtype, layer_wise, num_optimizer_shards, ddp_config, group):
+    params = [torch.nn.Parameter(torch.zeros(4)) for _ in range(2)]
+    for param in params:
+        param.is_managed_by_layer_wise_optimizer = layer_wise
+    return SimpleNamespace(
+        params=params,
+        param_dtype=param_dtype,
+        ddp_config=ddp_config,
+        num_optimizer_shards=num_optimizer_shards,
+        data_parallel_group=group,
+        data_parallel_world_size=group.size(),
+        buckets=[
+            SimpleNamespace(
+                params_list=[param],
+                params_with_extra_main_grads=[],
+                grad_data=torch.arange(4, dtype=torch.float32),
+                gradient_scaling_factor=1.0,
+            )
+            for param in params
+        ],
+    )
+
+
+@pytest.mark.parametrize("compact_first", [True, False])
+@pytest.mark.parametrize("sharded_layer_wise", [True, False])
+def test_bucket_groups_keep_the_layout_of_their_buffer(
+    monkeypatch, compact_first, sharded_layer_wise
+):
+    """Shared config must not merge compact buffers with padded LayerWise or DistOpt buffers."""
+    # Group construction temporarily selects the FP32-accumulating reduce-scatter function.
     monkeypatch.setattr(
         param_and_grad_buffer,
         "dist_reduce_scatter_func",
         param_and_grad_buffer.dist_reduce_scatter_func,
     )
-    distopt_config = DistributedDataParallelConfig(
+    ddp_config = DistributedDataParallelConfig(
         use_distributed_optimizer=True, reduce_scatter_with_fp32_accumulation=True
     )
-    layer_wise_config = dataclasses.replace(
-        distopt_config, use_distributed_optimizer=False, num_buckets=None
-    )
-
-    def fake_buffer(param_dtype, layer_wise, ddp_config):
-        params = [torch.nn.Parameter(torch.zeros(2)) for _ in range(2)]
-        for param in params:
-            param.is_managed_by_layer_wise_optimizer = layer_wise
-        return SimpleNamespace(
-            params=params,
-            param_dtype=param_dtype,
-            ddp_config=ddp_config,
-            data_parallel_group=SimpleNamespace(rank=lambda: 0),
-            data_parallel_world_size=1,
-            buckets=[SimpleNamespace(params_list=[param]) for param in params],
-        )
-
-    layer_wise = fake_buffer(torch.uint8, True, layer_wise_config)
-    distopt = fake_buffer(torch.bfloat16, False, distopt_config)
-    buffers = [layer_wise, distopt] if layer_wise_first else [distopt, layer_wise]
+    group = SimpleNamespace(rank=lambda: 0, size=lambda: 1)
+    compact = _buffer_for_layout_test(torch.uint8, True, None, ddp_config, group)
+    sharded = _buffer_for_layout_test(torch.bfloat16, sharded_layer_wise, 1, ddp_config, group)
+    buffers = [compact, sharded] if compact_first else [sharded, compact]
     bucket_groups = partition_buckets(buffers, reduce_scatter_with_fp32_accumulation=True)
 
     assert sum(len(bucket_group.buckets) for bucket_group in bucket_groups) == 4
     for bucket_group in bucket_groups:
         (bucket,) = bucket_group.buckets
         (param,) = bucket.params_list
-        expected = layer_wise_config if param.is_managed_by_layer_wise_optimizer else distopt_config
-        assert bucket_group.ddp_config == expected
+        assert bucket_group.ddp_config is ddp_config
+        if any(param is candidate for candidate in compact.params):
+            assert bucket_group.num_optimizer_shards is None
+        else:
+            assert bucket_group.num_optimizer_shards == 1
+
+
+@pytest.mark.parametrize(
+    ("num_optimizer_shards", "force_all_reduce", "expected_collective"),
+    [(None, False, "ar"), (1, False, "rs"), (2, False, "rs"), (2, True, "ar")],
+)
+def test_bucket_group_grad_collective_follows_layout(
+    num_optimizer_shards, force_all_reduce, expected_collective
+):
+    """Compact layouts all-reduce despite shared DistOpt config; one-shard layouts still use RS."""
+    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+    dp_size = num_optimizer_shards or 2
+    group = SimpleNamespace(rank=lambda: 0, size=lambda: dp_size)
+    buffer = _buffer_for_layout_test(torch.bfloat16, True, num_optimizer_shards, ddp_config, group)
+    bucket_group = partition_buckets([buffer])[0]
+    grad_data = bucket_group.buckets[0].grad_data
+    with (
+        mock.patch.object(torch.cuda, "current_stream"),
+        mock.patch.object(torch.distributed, "get_rank", return_value=0),
+        mock.patch.object(
+            param_and_grad_buffer,
+            "_coalescing_manager",
+            side_effect=lambda *a, **kw: contextlib.nullcontext(),
+        ),
+        mock.patch.object(param_and_grad_buffer, "dist_reduce_scatter_func") as reduce_scatter,
+        mock.patch.object(torch.distributed, "all_reduce") as all_reduce,
+    ):
+        bucket_group.start_grad_sync(force_all_reduce=force_all_reduce)
+
+    if expected_collective == "rs":
+        reduce_scatter.assert_called_once()
+        all_reduce.assert_not_called()
+        output, input_tensor = reduce_scatter.call_args.args
+        assert input_tensor is grad_data
+        assert output.numel() == grad_data.numel() // dp_size
+    else:
+        all_reduce.assert_called_once()
+        reduce_scatter.assert_not_called()
+        assert all_reduce.call_args.args[0] is grad_data
+
+
+@pytest.mark.parametrize(
+    ("num_optimizer_shards", "overlap", "reuse", "dispatch"),
+    [
+        (None, False, False, False),
+        (None, True, False, True),
+        (None, False, True, True),
+        (1, False, False, True),
+    ],
+)
+def test_bucket_group_param_sync_follows_layout(num_optimizer_shards, overlap, reuse, dispatch):
+    """Compact temporary gather stays optimizer-owned; overlap/reuse and sharded layouts dispatch."""
+    ddp_config = DistributedDataParallelConfig(
+        use_distributed_optimizer=True,
+        overlap_grad_reduce=overlap,
+        overlap_param_gather=overlap,
+        fp8_param_gather=reuse,
+        reuse_grad_buf_for_mxfp8_param_ag=reuse,
+    )
+    group = SimpleNamespace(rank=lambda: 0, size=lambda: 1)
+    buffer = _buffer_for_layout_test(torch.bfloat16, True, num_optimizer_shards, ddp_config, group)
+    bucket_group = partition_buckets([buffer])[0]
+    with (
+        mock.patch.object(bucket_group, "start_param_sync") as start_sync,
+        mock.patch.object(bucket_group, "_post_param_sync") as post_sync,
+    ):
+        DistributedDataParallel._start_bucket_group_param_sync(
+            SimpleNamespace(ddp_config=ddp_config), bucket_group, force_sync=True
+        )
+    if dispatch:
+        start_sync.assert_called_once_with(force_sync=True)
+    else:
+        start_sync.assert_not_called()
+    assert post_sync.call_count == int(dispatch and not overlap)

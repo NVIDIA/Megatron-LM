@@ -683,9 +683,8 @@ def _build_sharded_state_dict_metadata(
 
     # ``use_layer_wise_distributed_optimizer`` shares the DistOpt sub-optimizer
     # for non-Muon params (embeddings, biases, layernorm, ...), so it needs the
-    # same sharding-type metadata even though the parser flips
-    # ``use_distributed_optimizer`` off in that mode. Inference containers have no
-    # optimizer section and only need the shared metadata below.
+    # same sharding-type metadata when selected through its own flag or a deprecated alias.
+    # Inference containers have no optimizer section and only need the shared metadata below.
     optimizer_cfg = getattr(cfg, 'optimizer', None)
     has_distributed_optimizer = optimizer_cfg is not None and (
         optimizer_cfg.use_distributed_optimizer

@@ -18,6 +18,7 @@ from megatron.core.config import set_experimental_flag
 from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.model_parallel_config import _parse_pad_packed_seq_alignment
+from megatron.core.optimizer.optimizer_config import resolve_layer_wise_distributed_optimizer
 from megatron.core.quantization.utils import (
     kitchen_quantization_recipe_config,
     load_quantization_recipe,
@@ -1908,24 +1909,18 @@ def validate_args(args, defaults={}):
     if args.apply_query_key_layer_scaling:
         args.attention_softmax_in_fp32 = True
 
-    # emerging optimizer check
-    # Dev keeps resolving the effective LayerWise optimizer (including the deprecated dist_muon
-    # alias) on the legacy args namespace for args-based consumers. The rule is identical to
-    # OptimizerConfig.finalize_optimizer_config(), so the run config resolves to the same values.
-    args.use_layer_wise_distributed_optimizer = False
-    if args.optimizer not in ('sgd', 'adam'):
-        if args.optimizer == 'dist_muon':
-            warn_rank_0(
-                "optimizer='dist_muon' is deprecated. "
-                "Use --optimizer muon --use-distributed-optimizer instead."
-            )
-            args.optimizer = 'muon'
-            args.use_layer_wise_distributed_optimizer = True
-
-        if args.use_distributed_optimizer:
-            args.use_layer_wise_distributed_optimizer = True
-            args.use_distributed_optimizer = False
-    will_be_layer_wise = args.use_layer_wise_distributed_optimizer
+    # Keep the optimizer policy visible to legacy argument consumers and the run config.
+    if args.optimizer == 'dist_muon':
+        warn_rank_0(
+            "optimizer='dist_muon' is deprecated. "
+            "Use --optimizer muon --use-distributed-optimizer instead."
+        )
+    args.optimizer, will_be_layer_wise = resolve_layer_wise_distributed_optimizer(
+        args.optimizer,
+        args.use_distributed_optimizer,
+        getattr(args, 'use_layer_wise_distributed_optimizer', False),
+    )
+    args.use_layer_wise_distributed_optimizer = will_be_layer_wise
     if args.optimizer not in ('sgd', 'adam'):
         if (
             args.optimizer == 'muon'
@@ -1959,10 +1954,14 @@ def validate_args(args, defaults={}):
                 'torch format gathers the optimizer state through Gloo.'
             )
 
-            if args.dist_ckpt_optim_fully_reshardable:
-                assert (
-                    not args.distrib_optim_fully_reshardable_mem_efficient
-                ), '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
+        if (
+            args.dist_ckpt_optim_fully_reshardable
+            and (args.use_distributed_optimizer or will_be_layer_wise)
+        ):
+            # The scalar DistributedOptimizer in both LayerWise layouts also gathers over Gloo.
+            assert not args.distrib_optim_fully_reshardable_mem_efficient, (
+                '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
+            )
 
     if args.fake_process_group:
         assert (
