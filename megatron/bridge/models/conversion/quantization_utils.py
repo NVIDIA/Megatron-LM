@@ -30,6 +30,65 @@ def is_fp8_tensor(tensor: torch.Tensor) -> bool:
     return tensor.dtype in FP8_DTYPES
 
 
+def dequantize_fp8_blockwise(
+    weight: torch.Tensor,
+    scale_inv: torch.Tensor,
+    *,
+    block_size: int = FP8_BLOCK_SIZE,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Dequantize FP8 weights with one scale per 2D block.
+
+    DeepSeek-V3 stores linear weights as FP8 tensors with a separate ``*_scale_inv``
+    tensor. Each scale applies to one 128x128 weight block by default.
+
+    Args:
+        weight: FP8 weight of shape ``(rows, columns)``.
+        scale_inv: Per-block scales of shape ``(ceil(rows / block_size), ceil(columns / block_size))``.
+        block_size: Edge length of each square block.
+        dtype: Output dtype.
+
+    Returns:
+        The dequantized weight in ``dtype``.
+    """
+    M, N = weight.shape
+    w = weight.float()
+    out = torch.empty_like(w)
+    sM, sN = scale_inv.shape
+    for bi in range(sM):
+        for bj in range(sN):
+            r0, r1 = bi * block_size, min((bi + 1) * block_size, M)
+            c0, c1 = bj * block_size, min((bj + 1) * block_size, N)
+            out[r0:r1, c0:c1] = w[r0:r1, c0:c1] * scale_inv[bi, bj]
+    return out.to(dtype)
+
+
+def maybe_dequantize_fp8_blockwise(
+    weight: torch.Tensor,
+    scale_inv: torch.Tensor | None = None,
+    *,
+    block_size: int = FP8_BLOCK_SIZE,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Dequantize FP8 block-scaled weights, falling back to a plain cast.
+
+    Args:
+        weight: Weight that may be stored in an FP8 dtype.
+        scale_inv: Optional per-block scales for a 2D FP8 weight.
+        block_size: Edge length of each square block.
+        dtype: Output dtype for FP8 inputs.
+
+    Returns:
+        ``weight`` unchanged when it is not FP8; otherwise the dequantized weight, or a
+        plain cast when there is no scale to apply.
+    """
+    if not is_fp8_tensor(weight):
+        return weight
+    if weight.ndim == 2 and scale_inv is not None:
+        return dequantize_fp8_blockwise(weight, scale_inv, block_size=block_size, dtype=dtype)
+    return weight.float().to(dtype)
+
+
 def fp8_weight_block_size(hf_config: object) -> tuple[int, int] | None:
     """Return the ``quantization_config.weight_block_size`` an HF config declares, if any."""
     quantization_config = getattr(hf_config, "quantization_config", None)
