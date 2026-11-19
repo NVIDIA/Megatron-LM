@@ -3377,8 +3377,13 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
                 q_attn_det = query.detach()
                 k_attn_compressed_det = compressed_kv.detach()
             else:
-                q_attn_det = query.detach().permute(1, 0, 2, 3).contiguous()
-                k_attn_compressed_det = kv_full[kv_offset:].detach().permute(1, 0, 2).contiguous()
+                q_attn_det = query.detach().permute(1, 0, 2, 3)
+                k_attn_compressed_det = kv_full[kv_offset:].detach().permute(1, 0, 2)
+                # The sparse-loss score-recompute kernel accepts strided BSHD views (unit
+                # last-dim stride), so only the dense-loss path copies to [b, s] layout.
+                if not sparse_loss:
+                    q_attn_det = q_attn_det.contiguous()
+                    k_attn_compressed_det = k_attn_compressed_det.contiguous()
 
             if sparse_loss:
                 if is_thd:
