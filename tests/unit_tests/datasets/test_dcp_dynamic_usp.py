@@ -224,7 +224,7 @@ def test_bad_solver_section_or_run_shape_stops_start_up(tmp_path, changes, phras
 
 
 def test_stage2_obeys_the_sequence_limit_and_an_error_inside_it_never_loses_a_layout(tmp_path):
-    case = STAGE2['runtime']['cases'][1]  # the runtime's own result: four sequences per group
+    case = STAGE2['runtime']['cases'][0]  # the runtime's own result: four sequences per group
     on = {'stage2': {'enabled': True, 'keep_threshold': case['keep_threshold']}}
     usp, lengths = _planner(case, tmp_path, solver=on), dict(enumerate(case['lengths']))
     plan, stage1 = usp.plan(lengths), _planner(case, tmp_path).plan(lengths)

@@ -38,5 +38,5 @@
     "gdn_v2/features.py": "13b05b06f247acc4bacb09a7719196e335b24fa5161d386b99241ec4ffc40c6b",
     "geometry.py": "f10c2eec9429fa2b36ca57744515d8658e66734712968ea291c59e5c09259109"
   },
-  "source_snapshot": "qwen35-full35b-nocg-20261106/fixed-diagnostic-candidate-20261106"
+  "source_snapshot": "cost-model candidate of the full Qwen3.5-35B-A3B experiment of NVIDIA's DCP attention benchmark (unpublished); source_candidate_sha256 is the digest of its descriptor"
 }

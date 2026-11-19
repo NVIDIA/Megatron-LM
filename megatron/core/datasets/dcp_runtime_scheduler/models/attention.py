@@ -75,8 +75,8 @@ from .base import NVLINK_DOMAIN_SIZES
 GEOMETRIES = ((32, 4, 128), (64, 4, 128), (16, 2, 256), (32, 2, 256), (32, 8, 128), (64, 8, 128))
 # Raw bytes of the coefficient files; ORIGIN.json records the same digests.
 PARAMETERS_SHA256 = {
-    "gb200": "c2674f121c1c21dd54a7271ea85ecd80a36bd553784f219c06f5f2ceb00b4301",
-    "h100": "0954f3fdbe062acdf8324d18f6e836e16a9171a89f40a8e4f86152fb0299d7d4",
+    "gb200": "a943dd39f20ed91ef164d383528822df4aed9d494218970a4a30b5e9d4bbec4b",
+    "h100": "b715dd1f4853c240e46ec74dd46aeefd5f6a8d40dfeeef825bc67c4ef2453388",
 }
 # Largest ring and largest buffer of a rank (tokens) that are priced: far above what was
 # measured (128 members, 16384 tokens); they bound the time and memory of a call.

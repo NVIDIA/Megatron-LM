@@ -3,8 +3,6 @@
  "hardware": "gb200",
  "source": {
   "model": "NVIDIA's DCP attention benchmark (unpublished); times in ms",
-  "ring_frozen": "2026-10-27",
-  "causal_exported": "2026-11-09",
   "coefficient_files_sha256": {
    "forward_components": "9d5860203c4b0f53fd5c4d70284173e085675c84b854c8bbf0fec0313a4e390b",
    "backward_kernel": "82e0ed5c6c6a326f88b324754f621021c7654d745c4f0c87809f44d82739fffd",

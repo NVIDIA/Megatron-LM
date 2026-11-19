@@ -21,10 +21,10 @@
   "runtime_parameters_sha256": {
     "models/usp_calib_v1.json": "d25989552ab9700f07261231fa13d66672d98684435fff57838442ca12c19cd7",
     "models/qwen3_h100_p2p.json": "a031958b1a02cc523d4b0ab3163649f2f42532cd4e6daf6aa459768b99c0027e",
-    "models/attention_gb200.json": "c2674f121c1c21dd54a7271ea85ecd80a36bd553784f219c06f5f2ceb00b4301",
-    "models/attention_h100.json": "0954f3fdbe062acdf8324d18f6e836e16a9171a89f40a8e4f86152fb0299d7d4",
+    "models/attention_gb200.json": "a943dd39f20ed91ef164d383528822df4aed9d494218970a4a30b5e9d4bbec4b",
+    "models/attention_h100.json": "b715dd1f4853c240e46ec74dd46aeefd5f6a8d40dfeeef825bc67c4ef2453388",
     "models/full35b/parameters.json": "2b2e7a5adbcabed37ef5994a456af7b1d50c9ae0bfbe0ebfdc9005eb5d57e64d",
-    "models/full35b/manifest.json": "0824809fdbd6de5ee055c0db64b2bd6105829bf4a282e4aea3e0e08191f8247a"
+    "models/full35b/manifest.json": "53f8cbfa63b6179e818be0463cde7e78157779aea75f620a0929131593818a47"
   },
   "dynamic_usp": {
     "project": "DynamicUSP",
@@ -132,7 +132,7 @@
         "gb200": "models/attention_gb200.json",
         "h100": "models/attention_h100.json"
       },
-      "source": "Two time models of NVIDIA's DCP attention benchmark (unpublished). Ring terms: the component calibration of its simulation of the P2P context-parallel ring attention of Transformer Engine, rank by rank and step by step; coefficients frozen 2026-10-27. Causal block: its single-GPU calibration of a whole causal attention call, which its own record marks as not independently validated; exported 2026-11-09",
+      "source": "Two time models of NVIDIA's DCP attention benchmark (unpublished). Ring terms: the component calibration of its simulation of the P2P context-parallel ring attention of Transformer Engine, rank by rank and step by step. Causal block: its single-GPU calibration of a whole causal attention call, which its own record marks as not independently validated",
       "source_coefficient_files_sha256": {
         "gb200": {
           "forward_components": "9d5860203c4b0f53fd5c4d70284173e085675c84b854c8bbf0fec0313a4e390b",
@@ -168,7 +168,7 @@
     }
   },
   "full_qwen35": {
-    "source_snapshot": "qwen35-full35b-nocg-20261106/fixed-diagnostic-candidate-20261106",
+    "source_snapshot": "cost-model candidate of the full Qwen3.5-35B-A3B experiment of NVIDIA's DCP attention benchmark (unpublished); source_candidate_sha256 is the digest of its descriptor",
     "source_candidate_sha256": "a268249ab9c342db393d1be0f321f88891a7fa0545b52e23460c0c58c3c26284",
     "packaged_manifest": "models/full35b/manifest.json",
     "scope": "Full Qwen3.5-35B-A3B 40 decoder + 1 MTP; 30 GDN and 11 FA whole attention modules",
