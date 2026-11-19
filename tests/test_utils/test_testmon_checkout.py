@@ -119,7 +119,7 @@ def test_complete_pr_delta_excludes_newer_main_and_restores_bundle(
     assert github_output.read_text() == f"sha={tested}\nbaseline_sha={baseline}\ngeneration=123-1\n"
 
 
-def test_conflict_preserves_checkout_and_metadata(repository, capsys):
+def test_conflict_preserves_checkout_and_metadata(repository, capsys, monkeypatch):
     repo, _ = repository
     (repo / "model.py").write_text("different main implementation\n")
     base = commit(repo, "New main")
@@ -137,9 +137,30 @@ def test_conflict_preserves_checkout_and_metadata(repository, capsys):
     assert metadata_path.read_bytes() == original_metadata
     assert not Path(args.output_dir).exists()
 
+    # A bounded lookup miss or API error must disable the later unpinned restore.
+    github_output = repo.parent / "github-output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(github_output))
+    for error in (
+        ValueError("No baseline found within 10 pages"),
+        subprocess.CalledProcessError(1, ["gh", "api"], stderr=b"API unavailable"),
+    ):
+
+        def unavailable():
+            raise error
+
+        monkeypatch.setattr(checkout, "latest_baseline", unavailable)
+        github_output.unlink(missing_ok=True)
+        checkout.prepare(args)
+        assert github_output.read_text() == "force_full=true\n"
+        assert git(repo, "rev-parse", "HEAD") == head
+        assert metadata_path.read_bytes() == original_metadata
+        assert not Path(args.output_dir).exists()
+
 
 def test_baseline_lookup_excludes_build_only_forks_and_retries(monkeypatch):
     candidate = {
+        "path": ".github/workflows/populate-build-cache.yml",
+        "head_branch": "main",
         "event": "schedule",
         "status": "completed",
         "conclusion": "failure",
@@ -149,6 +170,8 @@ def test_baseline_lookup_excludes_build_only_forks_and_retries(monkeypatch):
         "head_sha": "b" * 40,
     }
     candidates = [
+        {**candidate, "id": 132, "path": ".github/workflows/other.yml"},
+        {**candidate, "id": 131, "head_branch": "dev"},
         {**candidate, "id": 130, "event": "push"},
         {**candidate, "id": 129, "run_attempt": 2},
         {**candidate, "id": 128, "head_repository": {"full_name": "fork/Megatron-LM"}},
@@ -156,38 +179,69 @@ def test_baseline_lookup_excludes_build_only_forks_and_retries(monkeypatch):
         {**candidate, "id": 126, "conclusion": "cancelled"},
         {**candidate, "id": 125, "conclusion": "success"},  # No published caches.
         candidate,
-        {**candidate, "conclusion": "success", "id": 123, "head_sha": "a" * 40},
+        {
+            **candidate,
+            "id": 123,
+            "event": "workflow_dispatch",
+            "conclusion": "success",
+            "head_sha": "a" * 40,
+        },
     ]
-    keys = [
-        f"unit-testmon-v1-main-dgx_h100-0123456789abcdef-{run_id}-1"
-        for run_id in (130, 129, 128, 127, 126, 124, 123)
-    ]
+    prefix = "unit-testmon-v1-main-dgx_h100-0123456789abcdef-"
+    rejected = [{"key": f"{prefix}{run_id}-1"} for run_id in range(132, 125, -1)]
     # A later attempt's cache cannot stand in for a first-attempt generation.
-    keys.append("unit-testmon-v1-main-dgx_h100-0123456789abcdef-125-2")
+    rejected.append({"key": prefix + "125-2"})
+    published = {"key": prefix + "124-1"}
+    pages = [rejected * 12 + rejected[:4], [published, {"key": prefix + "123-1"}]]
+    requested_pages = []
+    checked_runs = []
 
     def api(*args):
-        if "/actions/caches?" in args[-1]:
-            assert "ref=refs/heads/main&key=unit-testmon-v1-main-" in args[-1]
-            assert "--paginate" in args
-            return "\n".join(keys).encode()
-        # Model GitHub's status filter: a successful bucket can belong to a failed run.
-        filtered = candidates
-        if "status=success" in args[-1]:
-            filtered = [item for item in candidates if item["conclusion"] == "success"]
-        elif "status=completed" in args[-1]:
-            filtered = [item for item in candidates if item["status"] == "completed"]
-        # The eligible producers are beyond the first page.
-        if "--paginate" not in args:
-            filtered = filtered[:5]
-        return "\n".join(json.dumps(item) for item in filtered).encode()
+        endpoint = args[-1]
+        if "/actions/caches?" in endpoint:
+            assert "ref=refs/heads/main&key=unit-testmon-v1-main-" in endpoint
+            assert "sort=created_at&direction=desc&per_page=100" in endpoint
+            page = int(endpoint.rsplit("&page=", 1)[1])
+            requested_pages.append(page)
+            caches = pages[page - 1] if page <= len(pages) else []
+            return json.dumps({"actions_caches": caches}).encode()
+        run_id = int(endpoint.rsplit("/", 1)[1])
+        checked_runs.append(run_id)
+        return json.dumps(next(item for item in candidates if item["id"] == run_id)).encode()
 
     monkeypatch.setattr(checkout, "run", api)
     assert checkout.latest_baseline() == ("b" * 40, "124-1")
-    keys.remove("unit-testmon-v1-main-dgx_h100-0123456789abcdef-124-1")
+    assert requested_pages == [1, 2]
+    assert checked_runs == [132, 131, 130, 129, 128, 127, 126, 124]
+    pages[1].remove(published)
     assert checkout.latest_baseline() == ("a" * 40, "123-1")
-    candidates.pop()
-    with pytest.raises(ValueError, match="No completed first-attempt"):
+
+    # Stop immediately on a hit, without fetching the remaining pages.
+    pages.insert(0, [published])
+    requested_pages.clear()
+    checked_runs.clear()
+    assert checkout.latest_baseline() == ("b" * 40, "124-1")
+    assert requested_pages == [1]
+    assert checked_runs == [124]
+
+    # A cache on page eleven is outside the budget; duplicate keys need one verification.
+    pages = [[rejected[0]] * 100 for _ in range(10)] + [[published]]
+    requested_pages.clear()
+    checked_runs.clear()
+    with pytest.raises(ValueError, match="within 10 pages"):
         checkout.latest_baseline()
-    keys.clear()
+    assert requested_pages == list(range(1, 11))
+    assert checked_runs == [132]
+
+    pages[9][-1] = published
+    requested_pages.clear()
+    assert checkout.latest_baseline() == ("b" * 40, "124-1")
+    assert requested_pages == list(range(1, 11))
+
+    pages = []
+    requested_pages.clear()
+    checked_runs.clear()
     with pytest.raises(ValueError, match="with published caches"):
         checkout.latest_baseline()
+    assert requested_pages == [1]
+    assert checked_runs == []

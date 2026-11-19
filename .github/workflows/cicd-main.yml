@@ -219,7 +219,7 @@ jobs:
       cadence_bypass: ${{ steps.configure.outputs.cadence_bypass }}
       sha:            ${{ steps.resolve-sha.outputs.sha }}
       target_branch:  ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref }}
-      unit_testmon_eligible: ${{ steps.configure.outputs.unit_testmon_eligible }}
+      unit_testmon_eligible: ${{ steps.configure.outputs.unit_testmon_eligible == 'true' && steps.prepare-testmon-checkout.outputs.force_full != 'true' }}
       unit_test_pr_files_artifact_id: ${{ steps.upload-unit-test-pr-files.outcome == 'success' && steps.upload-unit-test-pr-files.outputs.artifact-id || '' }}
       unit_testmon_checkout_artifact_id: ${{ steps.prepare-testmon-checkout.outputs.sha != '' && steps.upload-unit-test-pr-files.outcome == 'success' && steps.upload-unit-test-pr-files.outputs.artifact-id || '' }}
       unit_testmon_sha: ${{ steps.prepare-testmon-checkout.outputs.sha }}
