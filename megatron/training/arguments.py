@@ -1136,7 +1136,9 @@ def validate_args(args, defaults={}):
     ):
         raise ValueError("MXFP8 with inference optimized layers requires FlashInfer >= 0.6.4")
 
-    if args.moe_megakernel_backend == "mok" and (args.use_megatron_fsdp or args.use_torch_fsdp2):
+    if args.moe_megakernel_backend in ("mok", "cutemok") and (
+        args.use_megatron_fsdp or args.use_torch_fsdp2
+    ):
         raise ValueError("MOK has not been validated with Megatron-FSDP or Torch FSDP2")
 
     if args.use_megatron_fsdp:

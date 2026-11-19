@@ -690,6 +690,29 @@ partial MoE CUDA Graph replay, MCore expert-input
 capacity padding, FC1 GLU-interleaved weights, or checkpoint conversion between physical weight
 layouts.
 
+#### CuTe MoK
+
+`moe_megakernel_backend: cutemok` runs the same MOK adapter on cuDNN frontend's CuTe MoK
+(`cudnn.moe_ep.cutemok`), added in
+[NVIDIA/cudnn-frontend#2767](https://github.com/NVIDIA/cudnn-frontend/pull/2767). CuTe MoK is an
+optimized CuTe DSL version of MOK, so it is expected to outperform the `mok` backend; MCore calls
+it through cuDNN frontend's public API (`cutemok_prepare` / `cutemok_forward` /
+`cutemok_backward`), shares one prepared plan among the layers of one configuration, and keeps
+everything else of the `mok` integration: the constraints and support table above,
+`shared_expert_mode`, main-grad accumulation and checkpointing.
+
+```bash
+--moe-megakernel-backend cutemok --moe-megakernel-backend-config '{"fwd_num_comm_sms": 40, "bwd_num_comm_sms": 28}'
+```
+
+The backend config is validated by `CuteMoKConfig`, which takes MOK's keys and CuTe MoK's own
+(for example `comm_tile_shape` and `gate_up_context`). CuTe MoK needs a cuDNN frontend that
+includes it (its `develop` branch since #2767), the cu13 build of CuTe DSL
+(`nvidia-cutlass-dsl[cu13]`) 4.8 or later, and PyTorch built for CUDA 13. If Transformer Engine's
+optional FlashAttention-4 and QuACK packages are installed, they must be versions built for that
+CuTe DSL (older ones fail to import under it). Unlike the table above, hidden and expert
+intermediate sizes need only be multiples of 128 (at least 256).
+
 
 ### GLU Checkpoint Layout
 

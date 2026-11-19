@@ -1181,8 +1181,10 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_megakernel_backend: Optional[str] = None
     """Optional backend that replaces MoE dispatch, expert computation, and combine.
-    Supported values: None and "mok". When set, the megakernel owns dispatch/combine;
-    moe_token_dispatcher_type and moe_flex_dispatcher_backend do not select its transport.
+    Supported values: None, "mok" (MOK through the standalone mok package) and "cutemok" (cuDNN
+    frontend's CuTe MoK, an optimized version of MOK; NVIDIA/cudnn-frontend#2767). When set, the
+    megakernel owns dispatch/combine; moe_token_dispatcher_type and moe_flex_dispatcher_backend do
+    not select its transport.
     """
 
     moe_megakernel_backend_config: Optional[dict] = None
@@ -4008,7 +4010,7 @@ class TransformerConfig(ModelParallelConfig):
             ), "moe_shortcut_parallel requires MoE to be enabled (num_moe_experts > 0)"
 
         if self.moe_virtual_expert_load_balance:
-            if self.moe_megakernel_backend == "mok":
+            if self.moe_megakernel_backend in ("mok", "cutemok"):
                 raise ValueError("MOK does not support MoonEP (moe_virtual_expert_load_balance)")
             MAX_VIRTUAL_EXPERT_EP_SIZE = 64
 
@@ -4118,16 +4120,16 @@ class TransformerConfig(ModelParallelConfig):
             self.moe_router_load_balancing_type = "quantile_balancing"
             self.moe_aux_loss_coeff = self.moe_aux_loss_coeff[0]
 
-        if self.moe_megakernel_backend not in (None, "mok"):
+        if self.moe_megakernel_backend not in (None, "mok", "cutemok"):
             raise ValueError(
-                "moe_megakernel_backend must be None or 'mok', got "
+                "moe_megakernel_backend must be None, 'mok' or 'cutemok', got "
                 f"{self.moe_megakernel_backend!r}"
             )
         if self.moe_megakernel_backend is None and self.moe_megakernel_backend_config:
             raise ValueError(
                 "moe_megakernel_backend_config requires moe_megakernel_backend to be set"
             )
-        if self.moe_megakernel_backend == "mok":
+        if self.moe_megakernel_backend in ("mok", "cutemok"):
             from megatron.core.transformer.moe.megakernel import megakernel_fuses_shared_expert
 
             fuse_shared = megakernel_fuses_shared_expert(self)
@@ -5622,7 +5624,7 @@ class TransformerConfig(ModelParallelConfig):
                 "or dispatch. Use attention-only capture or unchunked MoE execution."
             )
 
-        if self.moe_megakernel_backend == "mok":
+        if self.moe_megakernel_backend in ("mok", "cutemok"):
             if self.cuda_graph_impl in ("local", "transformer_engine"):
                 # Empty modules mean whole-layer capture here, not full_iteration.
                 # Per-layer replay needs per-microbatch ownership or recomputation
