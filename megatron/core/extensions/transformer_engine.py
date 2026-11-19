@@ -1,4 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Adapted from https://github.com/NVIDIA-NeMo/nv-mistralai-megatron/pull/797
+# Source revision: aeab73be76294f8930377aae1e853b4e930e8dd0
+# License: BSD-3-Clause; original NVIDIA notices retained (see LICENSE).
 from __future__ import annotations
 
 import copy
@@ -422,6 +425,16 @@ def _get_fp8_model_init_for_quant_params(qparams: TEQuantizationParams | None, t
         qrecipe = qparams.training_recipe
 
     return _get_fp8_model_init_for_quant_recipe(qrecipe)
+
+
+def _quantization_autocast_active() -> bool:
+    """Whether a quantization autocast surrounds the current call.
+
+    TE keeps a single autocast state for fp8 and fp4 and exposes it under the fp8 name, so
+    this covers both. Read it before entering a module's own quantization context: it is the
+    ambient state that a per-module ``quant_recipe`` overrides.
+    """
+    return FP8GlobalStateManager.is_fp8_enabled()
 
 
 def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):

@@ -1,4 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Adapted from https://github.com/NVIDIA-NeMo/nv-mistralai-megatron/pull/797
+# Source revision: aeab73be76294f8930377aae1e853b4e930e8dd0
+# License: BSD-3-Clause; original NVIDIA notices retained (see LICENSE).
 
 import logging
 import math
@@ -1774,7 +1777,10 @@ class TransformerConfig(ModelParallelConfig):
         exclusive in the config. Each GroupedMLP instance maps whichever is given onto its own
         path: a fused instance offloads the block input, an unfused instance offloads the fc1
         and activation inputs. So either spelling covers a model that mixes fused (quantized)
-        and unfused (e.g. bf16 MTP) experts.
+        and unfused experts. On the unfused path, BF16 FC1 invocations save the complete
+        original input before offload releases its storage, including per-module BF16
+        overrides under FP8/FP4 and runtime BF16 autocast policies. Storage with an
+        uncopied saved alias remains resident until that alias is no longer needed.
     "gdp_qkv": offload the input of the causal conv and QKV preparation in the
                GatedDeltaProduct mixer.
     "shortcut_post_norm": offload the input of the shortcut output normalization.
