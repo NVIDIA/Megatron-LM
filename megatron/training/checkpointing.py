@@ -83,7 +83,9 @@ from .ckpt.glu_checkpointing import (
     validate_glu_checkpoint_backend,
     validate_glu_optimizer_layout,
 )
+from .comet_utils import on_save_checkpoint_success as comet_on_save_checkpoint_success
 from .global_vars import get_args
+from .mlflow_utils import on_save_checkpoint_success as mlflow_on_save_checkpoint_success
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
 from .utils import append_to_progress_log, is_last_rank, print_rank_0, print_rank_last, warn_rank_0
 
@@ -1385,11 +1387,31 @@ def save_checkpoint(
         def onelogger_finalize_fn():
             on_save_checkpoint_success(productive_metrics, checkpoint.async_save)
 
+        def mlflow_finalize_fn() -> None:
+            if not cfg.logger.mlflow_log_artifacts:
+                return
+            mlflow_on_save_checkpoint_success(
+                checkpoint_name,
+                save_dir,
+                checkpoint_step,
+                mlflow_logger=state.mlflow_logger,
+            )
+
+        def comet_finalize_fn() -> None:
+            comet_on_save_checkpoint_success(
+                checkpoint_name,
+                save_dir,
+                checkpoint_step,
+                comet_logger=state.comet_logger,
+            )
+
         if checkpoint.async_save:
             assert async_save_request is not None
             async_save_request.add_finalize_fn(onelogger_finalize_fn)
         else:
             onelogger_finalize_fn()
+            mlflow_finalize_fn()
+            comet_finalize_fn()
 
     if checkpoint.async_save:
         # Schedule logits flush AFTER the checkpoint request so the persistent
