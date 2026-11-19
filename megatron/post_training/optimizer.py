@@ -10,28 +10,32 @@ from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 LSQ_SCALE_PARAM_NAMES = ("*_amax_pre", "*_amax_post")
 
 
-def get_lsq_config_overrides(args, *, base_lr: float | None) -> Dict[ParamKey, ParamGroupOverride]:
+def get_lsq_config_overrides(
+    lsq_scale_lr: float | None, *, base_lr: float | None
+) -> Dict[ParamKey, ParamGroupOverride]:
     """Optimizer overrides for scale-learning QAD (LSQ).
 
     Puts the learnable scale (amax) params in their own param group with
-    max_lr=--lsq-scale-lr. Returns no override when it equals the optimizer config's
+    max_lr=lsq_scale_lr. Returns no override when it equals the optimizer config's
     base_lr: the group would then match the default group on every field that identifies
     a group on checkpoint load, and the two would collide on resume.
     """
-    lsq_scale_lr = getattr(args, "lsq_scale_lr", None)
     if lsq_scale_lr is None or lsq_scale_lr == base_lr:
         return {}
     return {ParamKey(name=LSQ_SCALE_PARAM_NAMES): ParamGroupOverride(max_lr=lsq_scale_lr)}
 
 
-def install_lsq_optimizer_overrides():
+def install_lsq_optimizer_overrides(lsq_scale_lr: float):
     """Wrap megatron.training.training.get_standard_config_overrides to add LSQ overrides.
+
+    ``lsq_scale_lr`` comes from the model being built (``ModelTransformConfig.lsq_scale_lr``),
+    not from the run config, which may not hold that model (e.g. Flextron builds its own).
 
     setup_model_and_optimizer() looks the function up by module global at call time, so this
     takes effect if installed before the optimizer is built (it is called from the model
     builder, which runs inside get_model()). Same pattern as
     megatron/elastification/pretrain_hybrid_flex.py. Idempotent: the builder runs once per
-    model chunk (and again for a KD teacher).
+    model chunk.
     """
     import megatron.training.training as training
 
@@ -41,10 +45,9 @@ def install_lsq_optimizer_overrides():
 
     def get_standard_config_overrides(config):
         config_overrides = orig(config)
-        args = training.get_args()
         config_overrides = {
             **(config_overrides or {}),
-            **get_lsq_config_overrides(args, base_lr=config.lr),
+            **get_lsq_config_overrides(lsq_scale_lr, base_lr=config.lr),
         }
         return config_overrides
 

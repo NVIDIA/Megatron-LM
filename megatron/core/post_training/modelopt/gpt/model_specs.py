@@ -1,8 +1,17 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import logging
+
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_layer_specs,
+    get_gpt_layer_with_transformer_engine_spec,
+    get_mlp_module_spec,
+)
+from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
+    get_gpt_heterogeneous_layer_spec,
+)
 from megatron.core.ops.norm.torch_norm import L2Norm
 from megatron.core.post_training.modelopt.layers import (
     BlockwiseFP8WeightTransformerLayer,
@@ -30,6 +39,75 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
 )
+from megatron.core.utils import log_single_rank
+
+logger = logging.getLogger(__name__)
+
+
+def get_gpt_modelopt_layer_spec(
+    config: TransformerConfig,
+    local_core_attention: bool = False,
+    remap_te_layernorm: bool = False,
+    real_quant_cfg: str = "None",
+    use_default_te_spec: bool = False,
+    moe_grouped_gemm: bool = True,
+):
+    """Get the GPT decoder spec for ModelOpt quantization, distillation and export.
+
+    Heterogeneous configs always use the heterogeneous layer spec. Otherwise, when
+    use_default_te_spec=True, this returns the standard Transformer-Engine spec, whose MoE
+    experts use TEGroupedMLP iff moe_grouped_gemm=True; ModelOpt flows that operate on
+    per-expert linears (e.g. pruning) should pass moe_grouped_gemm=False. When
+    use_default_te_spec=False (default), this is the ModelOpt-local spec from
+    ``get_gpt_modelopt_spec``, with TEDotProductAttention forced under context parallelism.
+
+    Args:
+        config: model's transformer config
+        local_core_attention: whether to use local DotProductAttention
+            (only for use_default_te_spec=False)
+        remap_te_layernorm: whether to perform sharded state_dict prefix mapping
+            on layernorm (only for use_default_te_spec=False)
+        real_quant_cfg: Model Optimizer real quantization config
+            (only for use_default_te_spec=False)
+        use_default_te_spec: whether to use the default Transformer-Engine spec
+        moe_grouped_gemm: whether MoE experts use TEGroupedMLP via grouped GEMM
+            (only for use_default_te_spec=True)
+    """
+    if config.heterogeneous_block_specs:
+        return get_gpt_heterogeneous_layer_spec(
+            config=config, use_te=config.transformer_impl == "transformer_engine"
+        )
+    if use_default_te_spec:
+        return get_gpt_layer_with_transformer_engine_spec(
+            config.num_moe_experts,
+            moe_grouped_gemm,
+            config.qk_layernorm,
+            config.multi_latent_attention,
+            config.experimental_attention_variant,
+            qk_l2_norm=config.qk_l2_norm,
+        )
+    if config.context_parallel_size > 1:
+        log_single_rank(
+            logger, logging.WARNING, "context_parallel_size > 1! Force using TEDotProductAttention!"
+        )
+        local_core_attention = False
+    return get_gpt_modelopt_spec(
+        config=config,
+        local_core_attention=local_core_attention,
+        remap_te_layernorm=remap_te_layernorm,
+        real_quant_cfg=real_quant_cfg,
+    )
+
+
+def get_gpt_modelopt_mtp_layer_spec(config: TransformerConfig) -> ModuleSpec:
+    """Get the MTP layer spec for ModelOpt models.
+
+    MTP layers stay on the standard decoder spec, independently of the decoder's ModelOpt spec
+    and real quantization.
+    """
+    return get_gpt_decoder_layer_specs(
+        config, use_transformer_engine=config.transformer_impl == "transformer_engine"
+    )[-1]
 
 
 def get_gpt_modelopt_spec(

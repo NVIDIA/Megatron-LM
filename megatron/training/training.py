@@ -222,7 +222,7 @@ _TensorMetricObserverCallback = Callable[..., None]
 try:
     from modelopt.torch.distill.plugins.megatron import get_tensor_shapes_adjust_fn_for_distillation
 
-    from megatron.post_training.utils import maybe_enable_modelopt
+    from megatron.post_training.utils import is_distillation_model
 
     has_nvidia_modelopt = True
 except ImportError:
@@ -2252,9 +2252,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             if expt_dp_ag is not None:
                 print_rank_0(">   including expert parallelism AG group")
 
-    if has_nvidia_modelopt:
-        maybe_enable_modelopt(args, checkpoint=cfg.checkpoint)
-
     # Build model.
     def build_model():
         if (
@@ -2504,9 +2501,6 @@ def setup_model_and_optimizer(
     )
     wrap_with_ddp = build_optimizer
 
-    if has_nvidia_modelopt:
-        maybe_enable_modelopt(args, checkpoint=cfg.checkpoint)
-
     # A typed model config owns inputs without replacing an explicit application callback.
     use_model_builder = (
         model_provider_func is None and cfg_container is not None and isinstance(cfg.model, ModelConfig)
@@ -2520,7 +2514,6 @@ def setup_model_and_optimizer(
 
             model_config = cfg.model
             builder_cls = model_config.get_builder_cls()
-            builder = builder_cls(model_config)
 
             # Inject selective/all-layer freezing before wrapping so DDP/FSDP only allocates
             # gradient storage for parameters that remain trainable (matching get_model behavior).
@@ -2530,6 +2523,27 @@ def setup_model_and_optimizer(
                 freeze_base_model_for_mtp=cfg.model.transformer.freeze_base_model_for_mtp,
             )
 
+            # ModelOpt hooks surround the config's own hooks (including the freezes above):
+            # setup (state restore, QAD freeze, LSQ, TE-load) runs first, KD conversion last.
+            # They go on a copy, so cfg.model keeps only its own hooks across repeated builds.
+            # Only GPT/Hybrid configs have ModelOpt transformations.
+            transformations = getattr(model_config, "transformations", None)
+            if transformations is not None or cfg.distillation is not None:
+                from megatron.post_training.model_hooks import (
+                    distillation_hooks,
+                    modelopt_setup_hooks,
+                )
+
+                model_config = dataclasses.replace(
+                    model_config,
+                    pre_wrap_hooks=[
+                        *modelopt_setup_hooks(model_config, cfg.checkpoint),
+                        *model_config.pre_wrap_hooks,
+                        *distillation_hooks(model_config, cfg.distillation),
+                    ],
+                )
+
+            builder = builder_cls(model_config)
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
                 ddp_config=cfg.ddp,
@@ -2784,13 +2798,17 @@ def setup_model_and_optimizer(
         process_group=setup_dp_group,
     )
 
-    # [ModelOpt]: Load the teacher checkpoint for ModelOpt distillation if applicable.
+    # [ModelOpt]: Load the teacher checkpoint for distillation if applicable.
     # Import locally to prevent circular import: megatron.post_training.checkpointing
     # imports `get_args` from megatron.training at module scope.
     if has_nvidia_modelopt:
         from megatron.post_training.checkpointing import load_kd_teacher_checkpoint
 
-        load_kd_teacher_checkpoint(model)
+        load_kd_teacher_checkpoint(
+            model,
+            getattr(cfg_container, "distillation", None),
+            student_checkpoint=getattr(cfg_container, "checkpoint", None),
+        )
 
     # Validate that the world size can accommodate the current batch size.
     # This catches the case where GPUs were scaled up mid-training but the
@@ -3044,8 +3062,8 @@ def train_step(
             model_chunk.force_all_reduce = save_wgrads_in_this_iteration
         optimizer.zero_grad()
 
-        if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
-            # Distillation shape-adjust reads parallel_state; only for modelopt-enabled runs.
+        if has_nvidia_modelopt and is_distillation_model(model):
+            # Pipeline-parallel distillation stacks student and teacher tensors.
             adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
                 model,
                 seq_length=args.seq_length,
@@ -5432,7 +5450,7 @@ def evaluate(
             forward_backward_func,
         )
 
-    if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
+    if has_nvidia_modelopt and is_distillation_model(model):
         # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
         adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
             model,

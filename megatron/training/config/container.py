@@ -59,6 +59,7 @@ from megatron.training.models import (
     T5ModelConfig,
 )
 from megatron.training.models.base import ModelConfig
+from megatron.training.models.distillation import DistillationConfig, validate_distillation_student
 
 T = TypeVar("T", bound="ConfigContainerBase")
 logger = logging.getLogger(__name__)
@@ -300,6 +301,8 @@ class PretrainConfigContainer(ConfigContainerBase):
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
     fault_tolerance: FaultToleranceConfig = field(default_factory=FaultToleranceConfig)
+    distillation: DistillationConfig | None = None
+    """ModelOpt knowledge distillation (teacher and loss). ``None`` disables it."""
 
     def get_model_world_size(self) -> int:
         """Return ranks in the model grid, which may be a subset of the launch."""
@@ -482,6 +485,7 @@ class PretrainConfigContainer(ConfigContainerBase):
         self._validate_checkpoint()
         if self.fault_tolerance.enable_ft_package and not self.checkpoint.save:
             raise ValueError("checkpointing save dir must be set to enable fault tolerance")
+        self._validate_distillation()
         global_batch_size, _, _ = self._resolve_batch_sizes()
         self._validate_ddp_config()
         self._validate_rl_config(global_batch_size)
@@ -501,6 +505,18 @@ class PretrainConfigContainer(ConfigContainerBase):
             weight_decay=self.optimizer.weight_decay,
         )
         self._validate_data_section()
+
+    def _validate_distillation(self) -> None:
+        """Check distillation against the student model and training settings.
+
+        Runs after ``super().validate()``, so the teacher config is known to be resolved.
+        """
+        if self.distillation is None:
+            return
+        if self.model is not None:
+            validate_distillation_student(self.distillation, self.model)
+        if self.train.manual_gc:
+            raise ValueError("ModelOpt distillation is incompatible with manual_gc.")
 
     def _validate_checkpoint(self) -> None:
         """Check the checkpoint format and optimizer policy against the sections that own the
