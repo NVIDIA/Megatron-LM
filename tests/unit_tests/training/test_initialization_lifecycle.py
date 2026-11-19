@@ -1073,7 +1073,7 @@ def test_vlm_consumers_reject_incompatible_model_config(
     args = Namespace()
     monkeypatch.setattr(pretrain_vlm, "get_args", lambda: args)
     calls = {
-        "model": lambda: pretrain_vlm.model_provider(),
+        "model": lambda: pretrain_vlm.model_provider(mp_padding_needed=0),
         "dataset": lambda: pretrain_vlm.train_valid_test_datasets_provider([], sequence_length=16),
         "batch": lambda: pretrain_vlm.get_batch(None),
         "mimo_data": lambda: build_train_valid_test_data_loaders(args, None),

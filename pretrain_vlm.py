@@ -54,7 +54,8 @@ def model_provider(
     parallel_output=True,
     config=None,
     pg_collection=None,
-    mp_padding_needed=0,
+    *,
+    mp_padding_needed,
 ) -> LLaVAModel:
     """Builds the model.
 
@@ -68,6 +69,8 @@ def model_provider(
         add_decoder (bool): Construct the decoder module (used with pipeline parallelism). Defaults to True. When we use pipelining, the decoder
             will live on only a subset of the pipeline stages (specifically, every stage after the first one).
         parallel_output (bool): Enable model parallel output.
+        mp_padding_needed (int): Padding the model-parallel layout adds to the text + image width
+            (``resolve_vlm_sequence_lengths``); it has no safe default, so it is keyword-only.
 
     Returns:
         model (megatron.core.models.multimodal.llava_model.LLaVAModel): A multimodal model

@@ -26,10 +26,13 @@ def test_preprocessing_rejects_non_vision_model(monkeypatch, run_config, consume
     args = SimpleNamespace()
     monkeypatch.setattr(task_encoder, "get_args", lambda: args)
     monkeypatch.setattr(dataset_helpers, "get_args", lambda: args)
+    lengths = dict(sequence_length=None, packing_sequence_length=0)
     calls = {
         "tiling": lambda: create_image_tiling_strategy(args, run_config),
-        "task_encoder": MultiModalTaskEncoder,
-        "legacy_task_encoder": dataset_helpers.TaskEncoder,
+        "task_encoder": lambda: MultiModalTaskEncoder(**lengths),
+        "legacy_task_encoder": lambda: dataset_helpers.TaskEncoder(
+            image_token_budget=16, **lengths
+        ),
     }
     with pytest.raises(TypeError, match="Expected cfg.model.*got GPTModelConfig"):
         calls[consumer]()
@@ -75,7 +78,9 @@ def test_legacy_encoder_limits_targets_to_model_sequence_bound(
     )
     monkeypatch.setattr(dataset_helpers, "get_num_image_embeddings", lambda **kwargs: 1)
     monkeypatch.setattr(dataset_helpers, "ImageTransform", lambda *args, **kwargs: None)
-    encoder = dataset_helpers.TaskEncoder(image_token_budget=16)
+    encoder = dataset_helpers.TaskEncoder(
+        sequence_length=None, packing_sequence_length=0, image_token_budget=16
+    )
     assert not hasattr(encoder, "cfg")
     # A trainable next-token target is just outside the shorter execution window.
     result = encoder.target_has_trainable_tokens(

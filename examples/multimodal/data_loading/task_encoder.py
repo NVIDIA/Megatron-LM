@@ -12,7 +12,6 @@ from collections import defaultdict
 from functools import partial
 from typing import List, Literal, Tuple, TypedDict, Union
 
-from megatron.training.global_vars import get_run_config
 import numpy as np
 import torch
 from PIL import Image
@@ -333,9 +332,8 @@ class MultiModalTaskEncoder(
         is_val: bool = False,
         tiling_augment_prob: float = 0.4,
         *,
-        sequence_length=None,
-        packing_sequence_length=None,
-        image_token_budget=None,
+        sequence_length,
+        packing_sequence_length,
     ):
         super().__init__()
         self.is_val = is_val

@@ -9,7 +9,6 @@ import traceback
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
-from megatron.training.global_vars import get_run_config
 import numpy as np
 import torch
 from einops import rearrange
@@ -197,9 +196,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             structured_conversation.append(turn)
         return structured_conversation
 
-    def __init__(
-        self, *, sequence_length=None, packing_sequence_length=None, image_token_budget=None
-    ):
+    def __init__(self, *, sequence_length, packing_sequence_length, image_token_budget):
         super().__init__()
 
         self.args = get_args()
@@ -208,6 +205,11 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             raise TypeError(
                 "Expected cfg.model to be LLaVAModelConfig, "
                 f"got {type(cfg.model).__name__}"
+            )
+        if not image_token_budget:
+            raise ValueError(
+                "image_token_budget must be a positive token count (the entry points pass "
+                "--seq-length)"
             )
         # Workers retain serializable preprocessing inputs, not the runtime config.
         self.img_h = cfg.model.img_h

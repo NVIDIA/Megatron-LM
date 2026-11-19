@@ -51,9 +51,7 @@ def datasets_provider(
     args = get_args()
 
     length_inputs = dict(
-        sequence_length=sequence_length,
-        packing_sequence_length=packing_sequence_length,
-        image_token_budget=image_token_budget,
+        sequence_length=sequence_length, packing_sequence_length=packing_sequence_length
     )
     if task_encoder is not None:
         # MIMO supplies its own Energon encoder, including its sequence limits.
@@ -62,8 +60,8 @@ def datasets_provider(
         train_task_encoder = MultiModalTaskEncoder(**length_inputs)
         val_task_encoder = MultiModalTaskEncoder(is_val=True, **length_inputs)
     else:
-        train_task_encoder = TaskEncoder(**length_inputs)
-        val_task_encoder = TaskEncoder(**length_inputs)
+        train_task_encoder = TaskEncoder(image_token_budget=image_token_budget, **length_inputs)
+        val_task_encoder = TaskEncoder(image_token_budget=image_token_budget, **length_inputs)
 
     dname = args.data_path[0] if type(args.data_path) is list else args.data_path
     train_dataset = get_train_dataset(
@@ -141,6 +139,19 @@ def is_dataloader_rank(
     return is_first_rank
 
 
+def validate_length_inputs(args, *, sequence_length, packing_sequence_length):
+    """Check the encoder length inputs on every rank.
+
+    Only the loader ranks build the task encoders, so an error raised there would leave the other
+    ranks waiting in the first collective; the provider checks before its loader-rank early return.
+    """
+    packing = args.packing_buffer_size is not None and args.packing_buffer_size > 0
+    if packing and not (packing_sequence_length and packing_sequence_length > 0):
+        raise ValueError("--packing-buffer-size needs --packing-seq-length > 0")
+    if sequence_length and packing_sequence_length and sequence_length < packing_sequence_length:
+        raise ValueError("--dataloader-seq-length must be >= --packing-seq-length")
+
+
 def train_valid_test_dataloaders_provider(
     train_val_test_num_samples,
     task_encoder=None,
@@ -158,6 +169,11 @@ def train_valid_test_dataloaders_provider(
         raise ValueError(
             "--dataloader-prefetch-factor must be positive, "
             f"got {dataloader_prefetch_factor}"
+        )
+
+    if task_encoder is None:
+        validate_length_inputs(
+            args, sequence_length=sequence_length, packing_sequence_length=packing_sequence_length
         )
 
     # Dataloader is only on specific ranks.
