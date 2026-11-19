@@ -27,6 +27,7 @@ from megatron.training.models import GPTModelConfig, HybridModelConfig
 from megatron.training.training import (
     consume_seqlen_stats_in_iteration,
     num_floating_point_operations,
+    set_seqlen_stats_in_iteration,
     update_seqlen_stats_from_cu_seqlens,
 )
 
@@ -35,6 +36,7 @@ def _reset_seqlen_accumulator():
     """Tear down the per-iteration accumulator between tests."""
     training_module._seqlen_stats_in_iteration = None
     training_module._seqlen_stats_active = False
+    training_module._seqlen_stats_are_global = False
 
 
 def _make_gpt_config(
@@ -535,6 +537,16 @@ class TestAccumulator:
         assert training_module._seqlen_stats_in_iteration is not None
         assert training_module._seqlen_stats_in_iteration.tolist() == [0.0, 0.0]
 
+    def test_seeded_global_stats_ignore_microbatch_updates(self):
+        """The sequence-packing scheduler seeds global-batch stats before the
+        forward step runs; its per-micro-batch updates are already included."""
+        set_seqlen_stats_in_iteration(8, 34)
+        update_seqlen_stats_from_cu_seqlens(torch.tensor([0, 5, 8], dtype=torch.int32))
+        assert consume_seqlen_stats_in_iteration() == (8, 34)
+        # The next iteration without a seed accumulates micro-batches again.
+        update_seqlen_stats_from_cu_seqlens(torch.tensor([0, 5, 8], dtype=torch.int32))
+        assert consume_seqlen_stats_in_iteration() == (8, 34)
+
 
 class TestAccumulatorDistributed:
     """All-reduce + ``TP*CP*PP`` deduplication.
@@ -622,6 +634,43 @@ class TestAccumulatorDistributed:
 
         assert result == (None, None)
         assert calls == [], "consume must not issue all_reduce when no update happened"
+
+    def test_scheduler_seeded_stats_are_not_double_counted(self):
+        """With the sequence-packing scheduler, ``train_step`` seeds the global-batch
+        stats and the forward step still reports each micro-batch's ``cu_seqlens``.
+        The result must be the seeded global value, without an all-reduce."""
+        from tests.unit_tests.test_utilities import Utils
+
+        if Utils.world_size < 2:
+            pytest.skip("requires >= 2 ranks")
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+
+        # Every DP rank runs two micro-batches with chunks [100, 200] and [50].
+        global_tokens = (100 + 200 + 50) * Utils.world_size
+        global_squares = (100**2 + 200**2 + 50**2) * Utils.world_size
+        set_seqlen_stats_in_iteration(global_tokens, global_squares)
+        update_seqlen_stats_from_cu_seqlens(
+            torch.tensor([0, 100, 300], dtype=torch.int32, device='cuda')
+        )
+        update_seqlen_stats_from_cu_seqlens(torch.tensor([0, 50], dtype=torch.int32, device='cuda'))
+
+        original_all_reduce = torch.distributed.all_reduce
+        calls = []
+
+        def spy(tensor, *args, **kwargs):
+            calls.append(tensor)
+            return original_all_reduce(tensor, *args, **kwargs)
+
+        torch.distributed.all_reduce = spy
+        try:
+            result = consume_seqlen_stats_in_iteration()
+        finally:
+            torch.distributed.all_reduce = original_all_reduce
+
+        assert result == (global_tokens, global_squares)
+        assert calls == [], "seeded global stats must not be all-reduced again"
 
 
 # 8-GPU topology matrix. Each tuple is ``(tp, cp, pp)`` with ``dp = 8 / (tp*cp*pp)``.
