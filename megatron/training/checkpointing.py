@@ -33,7 +33,12 @@ from megatron.core import dist_checkpointing, mpu, tensor_parallel
 from megatron.core._rank_utils import safe_get_rank as get_rank_safe
 from megatron.core._rank_utils import safe_get_world_size
 from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
-from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
+from megatron.core.dist_checkpointing.mapping import (
+    LocalNonpersistentObject,
+    ShardedBase,
+    ShardedObject,
+)
+from megatron.core.dist_checkpointing.serialization import load_sharded_metadata
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
@@ -1991,6 +1996,30 @@ def _localize_redundant_extra_states(state_dict):
     dict_list_map_inplace(_maybe_localize, state_dict)
 
 
+def keep_new_ssa_indexers(sharded_state_dict: Dict, saved_keys) -> int:
+    """Keep the initialized simplified sparse attention indexer entries a checkpoint lacks.
+
+    Indexer-only (phase 1) training starts from a dense checkpoint, which has no indexer. Only
+    indexer entries absent from the checkpoint stay local; every other key still loads strictly.
+    Returns the number of entries kept.
+    """
+    kept = 0
+
+    def keep(value):
+        nonlocal kept
+        if (
+            isinstance(value, ShardedBase)
+            and (value.key.startswith("indexer.") or ".indexer." in value.key)
+            and value.key not in saved_keys
+        ):
+            kept += 1
+            return LocalNonpersistentObject(value.data)
+        return value
+
+    dict_list_map_inplace(keep, sharded_state_dict)
+    return kept
+
+
 def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
     state_dict = raw_state_dict.copy()
     handle_fp8_extra_state_case(state_dict['model'])
@@ -2635,7 +2664,19 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('mtp_num_layers', force=True)
     _set_arg('mtp_use_repeated_layer', force=True)
 
-    _set_arg('spec', force=True)
+    # Simplified sparse attention checkpoints carry the attention variant and indexer top-k.
+    # Indexer-only (phase 1) training from a dense checkpoint keeps the requested SSA spec, since
+    # the dense checkpoint's spec would build a model without indexers.
+    if getattr(checkpoint_args, 'experimental_attention_variant', None) == 'ssa':
+        _set_arg('experimental_attention_variant', force=True)
+        _set_arg('dsa_indexer_topk', force=True)
+    converting_dense_to_ssa = (
+        getattr(args, 'experimental_attention_variant', None) == 'ssa'
+        and getattr(args, 'ssa_train_indexer_only', False)
+        and getattr(checkpoint_args, 'experimental_attention_variant', None) is None
+    )
+    if not converting_dense_to_ssa:
+        _set_arg('spec', force=True)
 
     _set_arg('num_experts', force=True)
     _set_arg('mtp_num_layers', force=True)
@@ -3297,6 +3338,29 @@ def load_checkpoint(
             for model_key in ('model', *(f'model{i}' for i in range(len(model)))):
                 if model_key in load_kwargs['sharded_state_dict']:
                     model_sharded_state_dict_modifier(load_kwargs['sharded_state_dict'][model_key])
+        if getattr(args, 'ssa_train_indexer_only', False):
+            saved_keys = {entry.key for entry in load_sharded_metadata(checkpoint_name).values()}
+            new_indexers = sum(
+                keep_new_ssa_indexers(load_kwargs['sharded_state_dict'][model_key], saved_keys)
+                for model_key in ('model', *(f'model{i}' for i in range(len(model))))
+                if model_key in load_kwargs['sharded_state_dict']
+            )
+            if new_indexers and gen_sd_optim is not None:
+                raise RuntimeError(
+                    'Initializing simplified sparse attention indexers from a checkpoint without '
+                    'them needs a fresh optimizer: use --no-load-optim or --finetune.'
+                )
+        if (
+            gen_sd_optim is not None
+            and getattr(args, 'experimental_attention_variant', None) == 'ssa'
+            and getattr(ckpt_args, 'experimental_attention_variant', None) == 'ssa'
+            and getattr(ckpt_args, 'ssa_train_indexer_only', False) != args.ssa_train_indexer_only
+        ):
+            raise RuntimeError(
+                'The simplified sparse attention training phase (ssa_train_indexer_only) changed, '
+                'so the trainable parameters differ from the checkpoint optimizer state: use '
+                '--no-load-optim or --finetune.'
+            )
     elif load_format == 'torch_dcp':
         model_sd = model[0].state_dict()
         if tp_group is None and pp_group is None:
