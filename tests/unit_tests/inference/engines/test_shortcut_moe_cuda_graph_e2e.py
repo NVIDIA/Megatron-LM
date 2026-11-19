@@ -50,9 +50,7 @@ class TestShortcutMoECudaGraphE2E(_GDPGraphTest):
 
     PATTERN = "ME*"
     STACK_SPEC = wide_residual_gated_delta_product_inference_stack_spec
-
-    def _config_overrides(self):
-        return {"moe_shortcut_post_norm": True}
+    CONFIG = {"moe_shortcut_post_norm": True}
 
     def _create_model(self):
         torch.manual_seed(1234)
@@ -91,7 +89,7 @@ class TestShortcutMoECudaGraphE2E(_GDPGraphTest):
             attention_dropout=0.0,
             attention_backend=AttnBackend.flash,
             flash_attention_version=FLASH_ATTENTION_VERSION,
-            **self._config_overrides(),
+            **self.CONFIG,
         )
         model = HybridModel(
             config=config,
@@ -118,9 +116,7 @@ class TestFusedShortcutMoECudaGraphE2E(TestShortcutMoECudaGraphE2E):
 
     PATTERN = "M-ME*"
     STACK_SPEC = shortcut_fusion_stack_spec(wide_residual_gated_delta_product_inference_stack_spec)
-
-    def _config_overrides(self):
-        return {"moe_shortcut_wide_residual_norm_fusion": True, "hidden_dropout": 0.0}
+    CONFIG = {"moe_shortcut_wide_residual_norm_fusion": True, "hidden_dropout": 0.0}
 
     def _create_model(self):
         model = super()._create_model()

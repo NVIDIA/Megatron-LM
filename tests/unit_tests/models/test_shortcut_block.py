@@ -8,17 +8,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 import transformer_engine as te
+from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
-from megatron.core.fusions.wide_residual_shortcut import (
-    PendingWideResidualWrites,
-    forward_kernel,
-    kernel_utils,
-    replay_kernel,
-)
+from megatron.core.fusions.wide_residual_shortcut import forward_kernel, replay_kernel
+from megatron.core.fusions.wide_residual_shortcut.residual_replay import ReplayInterval
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid import hybrid_layer_specs as specs
-from megatron.core.models.hybrid import shortcut_block
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.shortcut_block import (
@@ -39,6 +35,7 @@ from megatron.core.transformer.wide_residual import (
 )
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from tests.unit_tests.determinism.kernels.harness import bytes_equal
+from tests.unit_tests.fusions.test_wide_residual_shortcut import REQUIRES_FUSED_BACKWARD, spy
 from tests.unit_tests.test_utilities import Utils
 
 # The shortcut-owned norms are Transformer Engine norms, which need a full TransformerConfig to
@@ -792,11 +789,6 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
 
 # ------------------------------------------- fused residual seams (moe_shortcut_wide_residual_norm_fusion)
 
-REQUIRES_FUSED_BACKWARD = pytest.mark.skipif(
-    not kernel_utils.qualified_device(torch.cuda.get_device_properties(0)),
-    reason="the fused shortcut backward runs only on a qualified GB300",
-)
-
 
 def _fused_config(**overrides):
     options = dict(
@@ -873,6 +865,11 @@ def _hybrid_model(pattern, mixer="mamba", hidden=3072, optimized=False, blocks=N
     fused = config.moe_shortcut_wide_residual_norm_fusion
     assert len(blocks) == expected and all(b.fuses_residual_seams == fused for b in blocks)
     return model.cuda()
+
+
+def _train_step(model, tokens):
+    ids = torch.randint(0, 128, (1, tokens), device="cuda")
+    model(ids, torch.arange(tokens, device="cuda")[None], None).float().square().mean().backward()
 
 
 @pytest.mark.usefixtures("model_parallel")
@@ -977,14 +974,14 @@ def _dynamic_prefill_decode(model):
 
 # (pattern, mixer, launches per step): a fused block's in-block seam writes one update; a seam
 # into a block applies the previous write with both block inputs (two updates after a block).
+# The long pattern has every seam kind: lone -> lone, lone -> block, block -> block, block -> lone.
+LONG_CASE = ("M-MMEMEM-M-", "mamba", [1, 1, 1, 1, 2, 1, 2, 1, 1, 1])
 INFERENCE_CASES = [
     ("MEME", "mamba", [1, 2, 1]),
     # A first MLP-only layer reads unfused and defers its write into the first block.
     ("-MEME", "mamba", [1, 1, 2, 1]),
     ("MEME", "gdp", [1, 2, 1]),
-    ("MMEME", "mamba", [1, 1, 2, 1]),
-    ("M-MMEMEM-M-", "mamba", [1, 1, 1, 1, 2, 1, 2, 1, 1, 1]),
-    ("M-MEMMEM-M-", "mamba", [1, 1, 1, 2, 1, 1, 2, 1, 1, 1]),
+    LONG_CASE,
     # A lone attention layer chains too: M -> * and * -> [ME] fuse.
     ("M*MEME", "mamba", [1, 1, 1, 2, 1]),
     # An attention compute layer inside a block; the lone Mamba write enters its two-reader seam.
@@ -997,7 +994,7 @@ INFERENCE_CASES = [
     "pattern,mixer,launches,dynamic,optimized,hidden,fp32_residual,shortcut",
     [(*case, False, False, 3072, True, True) for case in INFERENCE_CASES]
     + [("MEME", "mamba", [1, 2, 1], False, False, 256, True, True)]
-    + [("M-MMEMEM-M-", "mamba", INFERENCE_CASES[4][2], False, False, 3072, False, True)]
+    + [(*LONG_CASE, False, False, 3072, False, True)]
     + [
         # The last block's shortcut add fuses into the lone attention layer's read.
         (p + "*", mixer, [1, 2, 1, 2], True, optimized, 3072, True, True)
@@ -1019,12 +1016,8 @@ def test_fused_seams_inference_matches_unfused(
     model = _hybrid_model(pattern, mixer, hidden, optimized, **options).eval()
     twin = _unfused_twin(model, pattern, mixer, hidden, optimized, **options)
     execute = _dynamic_prefill_decode if dynamic else _static_prefill_decode
-    launch, calls = forward_kernel.forward, []  # each fused launch's update count
-    monkeypatch.setattr(
-        forward_kernel,
-        "forward",
-        lambda r, u, *a, **k: calls.append(len(u)) or launch(r, u, *a, **k),
-    )
+    calls = []  # each fused launch's update count
+    spy(monkeypatch, forward_kernel, "forward", lambda r, u, *a, **k: calls.append(len(u)))
     with torch.inference_mode(), InferenceMode.active():
         torch.manual_seed(1)
         fused = execute(model)
@@ -1062,16 +1055,9 @@ def test_fused_seams_training_matches_unfused(
     options |= {} if shortcut else NO_SHORTCUT
     model = _hybrid_model(pattern, mixer, **options).train()
     twin = _unfused_twin(model, pattern, mixer, **options)
-    launch, epsilons = forward_kernel.forward, set()
-    monkeypatch.setattr(
-        forward_kernel, "forward", lambda *a, **k: epsilons.add(k["epsilon"]) or launch(*a, **k)
-    )
-    replays, replay = [], replay_kernel.replay_interval
-    monkeypatch.setattr(
-        replay_kernel,
-        "replay_interval",
-        lambda *a, **k: replays.append(len(a[1])) or replay(*a, **k),
-    )
+    epsilons, replays = set(), []
+    spy(monkeypatch, forward_kernel, "forward", lambda *a, **k: epsilons.add(k["epsilon"]))
+    spy(monkeypatch, replay_kernel, "replay_interval", lambda *a, **k: replays.append(len(a[1])))
     norms = {
         n: m
         for n, m in model.decoder.named_modules()
@@ -1140,10 +1126,6 @@ def test_mxfp8_training_absorbs_every_read_quantization(monkeypatch, recompute_s
     expert): every linked consumer Linear takes its read as the seam's MXFP8 operand on every
     call, so TE quantizes no seam read, while the router reads BF16; each MXFP8 read's
     columnwise operand is taken from its replay once for all its consumers."""
-    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
-
-    from megatron.core.fusions.wide_residual_shortcut.residual_replay import ReplayInterval
-
     recompute = dict(recompute_granularity="selective", recompute_modules=["shared_experts"])
     options = dict(
         fp8="e4m3",
@@ -1163,16 +1145,10 @@ def test_mxfp8_training_absorbs_every_read_quantization(monkeypatch, recompute_s
             linear.register_forward_pre_hook(
                 lambda m, args: received.setdefault(m, []).append(type(args[0]))
             )
-    takes, take = [], ReplayInterval.take_columns
-    monkeypatch.setattr(
-        ReplayInterval,
-        "take_columns",
-        lambda self, index, reader=0: takes.append((id(self), index, reader))
-        or take(self, index, reader),
-    )
-    ids = torch.randint(0, 128, (1, 2048), device="cuda")
-    positions = torch.arange(2048, device="cuda")[None]
-    model(ids, positions, None).float().square().mean().backward()
+    takes = []
+    record = lambda self, index, reader=0: takes.append((id(self), index, reader))
+    spy(monkeypatch, ReplayInterval, "take_columns", record)
+    _train_step(model, 2048)
     consumers = {linear for read in reads for linear in read.mxfp8_linears}
     calls = 2 if recompute_shared_experts else 1  # a recomputed shared expert runs twice
     shared = {block.moe_layer.mlp.shared_experts.linear_fc1 for block in model.decoder.layers
@@ -1191,8 +1167,6 @@ def test_mxfp8_training_with_standalone_moe_layers():
     MLP read to its Linear as the seam's MXFP8 operand, while each MoE layer, consecutive ones
     included, takes its read as one BF16 tensor (its router, shared expert and dispatcher share
     it; its Linears quantize it themselves)."""
-    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
-
     options = dict(fp8="e4m3", fp8_recipe="mxfp8", residual_stream_recompute_num_layers=2)
     model = _hybrid_model("-*E-EE*E", hidden=2048, **options, **NO_SHORTCUT).train()
     reads = [m for m in model.decoder.modules() if isinstance(m, WriteReadNorm)]
@@ -1203,9 +1177,7 @@ def test_mxfp8_training_with_standalone_moe_layers():
         consumer.register_forward_pre_hook(
             lambda m, args: received.setdefault(m, set()).add(type(args[0]))
         )
-    ids = torch.randint(0, 128, (1, 2048), device="cuda")
-    positions = torch.arange(2048, device="cuda")[None]
-    model(ids, positions, None).float().square().mean().backward()
+    _train_step(model, 2048)
     assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
     for read in reads:
         expected = MXFP8Tensor if read.format == "mxfp8" else torch.Tensor
@@ -1290,39 +1262,39 @@ def test_fusion_spec_links_every_seam(monkeypatch):
         )
         model = _hybrid_model("M-*EME-", hidden=256)
         latent = _hybrid_model("-*E", hidden=256, moe_latent_size=64)
-    links = lambda read: [(module, quantizes) for module, quantizes in read.consumers]
     for block in (b for b in model.decoder.layers if isinstance(b, ShortcutMoEBlock)):
         compute, moe = block.compute_layer, block.moe_layer
         branch = compute.mixer if isinstance(compute, MambaLayer) else compute.self_attention
         projection = getattr(branch, "in_proj", None) or branch.linear_qkv
-        assert links(seam_connections(compute)[0]) == [(projection, True)]
+        assert seam_connections(compute)[0].consumers == [(projection, True)]
         fc1 = moe.mlp.shared_experts.linear_fc1
-        assert links(seam_connections(moe)[0]) == [(fc1, True)]
+        assert seam_connections(moe)[0].consumers == [(fc1, True)]
         # The router and the dispatcher: two BF16 consumers, each handed its own output.
         dispatcher = moe.mlp.token_dispatcher
-        assert links(block.shortcut_residual_read) == [(moe.mlp.router, False), (dispatcher, False)]
-        assert block.shortcut_residual_read.consumer_formats == ("bf16", "bf16")
-        assert block.shortcut_residual_read.seam_layer_number == compute.layer_number
+        shortcut = block.shortcut_residual_read
+        assert shortcut.consumers == [(moe.mlp.router, False), (dispatcher, False)]
+        assert shortcut.consumer_formats == ("bf16", "bf16")
+        assert shortcut.seam_layer_number == compute.layer_number
     plain = [layer for layer in model.decoder.layers if not isinstance(layer, ShortcutMoEBlock)]
     mlp_read = seam_connections(plain[1])[0]  # an MLP layer
-    assert links(mlp_read) == [(plain[1].mlp.linear_fc1, True)] and mlp_read.format == "mxfp8"
+    assert mlp_read.consumers == [(plain[1].mlp.linear_fc1, True)] and mlp_read.format == "mxfp8"
     block = latent.decoder.layers[-1]
-    mlp = block.moe_layer.mlp
-    assert links(block.shortcut_residual_read) == [(mlp.router, False), (mlp.fc1_latent_proj, True)]
-    assert block.shortcut_residual_read.format == "both"
+    mlp, shortcut = block.moe_layer.mlp, block.shortcut_residual_read
+    assert shortcut.consumers == [(mlp.router, False), (mlp.fc1_latent_proj, True)]
+    assert shortcut.format == "both"
     lone = _hybrid_model("-*EE-", hidden=256, blocks=1)
     lone_moe = lone.decoder.layers[2]  # the second E follows a block, not a compute layer
     assert not isinstance(lone_moe, ShortcutMoEBlock)
-    assert links(seam_connections(lone_moe)[0]) == [(lone_moe.mlp, False)]
+    assert seam_connections(lone_moe)[0].consumers == [(lone_moe.mlp, False)]
     mxfp8 = dict(fp8="e4m3", fp8_recipe="mxfp8")
     lone_mxfp8 = _hybrid_model("-*EE-", hidden=2048, blocks=1, **mxfp8).decoder.layers[2]
-    assert links(seam_connections(lone_mxfp8)[0]) == [(lone_mxfp8.mlp, False)]
+    assert seam_connections(lone_mxfp8)[0].consumers == [(lone_mxfp8.mlp, False)]
     standalone = _hybrid_model("M*EE-", hidden=256, **NO_SHORTCUT)
     for layer in standalone.decoder.layers[1:]:
         read = seam_connections(layer)[0]
         moe = getattr(layer, "mlp", None)
         if layer.layer_number in (3, 4):  # the two E layers
-            assert links(read) == [(moe, False)] and read.format == "bf16"
+            assert read.consumers == [(moe, False)] and read.format == "bf16"
         else:
             assert len(read.consumers) == 1 and read.consumers[0][0] is not moe
     layers = []
