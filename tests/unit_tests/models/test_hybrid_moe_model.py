@@ -131,6 +131,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "dsa_indexer_weights_proj_use_quantization": True,
     "dsa_kernel_backend": "none",
     "dsa_reset_indexer_on_load": False,
+    "dsv4_cp_zigzag": False,
     "embedding_init_method": {},
     "embedding_init_method_std": 0.014,
     "enable_autocast": False,

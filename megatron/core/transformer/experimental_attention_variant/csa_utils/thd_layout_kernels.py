@@ -777,6 +777,9 @@ if _CUTE_AVAILABLE:
         index_mode: cutlass.Constexpr,
         compressed_is_sequence_major: cutlass.Constexpr,
         has_unpadded_seqlens: cutlass.Constexpr,
+        segment_rows: cutlass.Int32,
+        second_global_start: cutlass.Int32,
+        halo_rows: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -789,7 +792,18 @@ if _CUTE_AVAILABLE:
             row = bidx
 
         if row < l_local:
-            global_q = global_start + row
+            # Local rows are one or two consecutive global segments. Contiguous CP passes
+            # segment_rows=l_local and halo_rows=d_window (one segment). Zigzag CP passes two
+            # segments whose left windows are stored as [halo_0 | halo_1] ahead of the
+            # local rows [segment_0 | segment_1].
+            segment = cutlass.Int32(0)
+            row_start = global_start
+            if row >= segment_rows:
+                segment = cutlass.Int32(1)
+                row_start = second_global_start
+            global_q = row_start + row - segment * segment_rows
+            halo_base = segment * d_window - (row_start - d_window)
+            local_base = halo_rows + segment * segment_rows - row_start
             seq_start_found = cutlass.Int32(-1)
             seq_comp_start = cutlass.Int32(0)
             seq_comp_len = cutlass.Int32(0)
@@ -874,10 +888,10 @@ if _CUTE_AVAILABLE:
                                 window_col = col - compressed_width
                                 if window_col < window_count:
                                     pos = window_start + window_col
-                                    if pos < global_start:
-                                        topk_value = pos - (global_start - d_window)
+                                    if pos < row_start:
+                                        topk_value = pos + halo_base
                                     else:
-                                        topk_value = d_window + pos - global_start
+                                        topk_value = pos + local_base
                         else:
                             comp_count = cutlass.Int32(0)
                             if ratio > 1 and compressed_width > 0:
@@ -889,10 +903,10 @@ if _CUTE_AVAILABLE:
                             length = window_count + comp_count
                             if col < window_count:
                                 pos = window_start + col
-                                if pos < global_start:
-                                    topk_value = pos - (global_start - d_window)
+                                if pos < row_start:
+                                    topk_value = pos + halo_base
                                 else:
-                                    topk_value = d_window + pos - global_start
+                                    topk_value = pos + local_base
                             elif col < length:
                                 seq_major_id = seq_comp_start + col - window_count
                                 if seq_major_id < seq_major_rows:
@@ -927,10 +941,10 @@ if _CUTE_AVAILABLE:
                     for window_col in range(window_size):
                         if window_col < window_count:
                             pos = window_start + window_col
-                            if pos < global_start:
-                                topk_idxs[row, write_col] = pos - (global_start - d_window)
+                            if pos < row_start:
+                                topk_idxs[row, write_col] = pos + halo_base
                             else:
-                                topk_idxs[row, write_col] = d_window + pos - global_start
+                                topk_idxs[row, write_col] = pos + local_base
                             write_col = write_col + 1
 
                     if ratio > 1 and compressed_width > 0:
@@ -977,6 +991,9 @@ if _CUTE_AVAILABLE:
         compressed_is_sequence_major: cutlass.Constexpr,
         has_unpadded_seqlens: cutlass.Constexpr,
         launch_work: cutlass.Int32,
+        segment_rows: cutlass.Int32,
+        second_global_start: cutlass.Int32,
+        halo_rows: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         _launch_named(
@@ -1006,6 +1023,9 @@ if _CUTE_AVAILABLE:
                 index_mode,
                 compressed_is_sequence_major,
                 has_unpadded_seqlens,
+                segment_rows,
+                second_global_start,
+                halo_rows,
             ),
             grid=(cute.ceil_div(launch_work, 128), 1, 1),
             block=(128, 1, 1),
@@ -1098,6 +1118,11 @@ class CPCompressorLayout(NamedTuple):
     neither the hidden states nor their concatenation is stored in this layout.
     The inverse map is injective, so backward needs no atomics or reductions.
     All tensor values are rebuilt on device for each pack, including graph replay.
+
+    A zigzag CP layout (``boundary_segments == 2``) describes a rank's two row segments
+    A and B: its source buffer is ``[halo_A[-d_comp:] | halo_B[-d_comp:] | A | B]``
+    (``boundary_rows == 2 * d_comp``), its compact groups are ``[A groups | B groups]``
+    and ``global_start`` is segment A's first row.
     """
 
     compact_to_source: torch.Tensor
@@ -1111,19 +1136,26 @@ class CPCompressorLayout(NamedTuple):
     boundary_rows: int
     global_start: int
     cp_size: int
+    boundary_segments: int = 1
 
 
-def build_cp_compressor_layout(
-    cu_seqlens: torch.Tensor, global_start: int, l_local: int, cp_size: int, ratio: int
-) -> CPCompressorLayout:
-    """Build CP compaction metadata without materializing any hidden-size rows."""
-    if ratio < 1 or l_local < 1 or cp_size < 1:
-        raise ValueError("ratio, l_local and cp_size must all be positive.")
-    _require_cute("DSv4 CP compressor layout requires CUDA tensors and CuTeDSL.", cu_seqlens)
+def _cp_compressor_capacity(l_local: int, ratio: int) -> Tuple[int, int]:
+    """Return ``(d_comp, c_cap)``: the compressor halo and the per-rank group capacity."""
     d_comp = 8 if ratio == 4 else ratio
     alignment = 32 // math.gcd(32, ratio)
     c_cap = max(1, (l_local + d_comp) // ratio)
     c_cap = ((c_cap + alignment - 1) // alignment) * alignment
+    return d_comp, c_cap
+
+
+def _compressor_row_maps(
+    cu_seqlens: torch.Tensor, global_start: int, l_local: int, ratio: int, d_comp: int, c_cap: int
+) -> Tuple[torch.Tensor, ...]:
+    """Launch the compaction row-map kernel for the rows ``[global_start, +l_local)``.
+
+    Returns ``(compact_to_source, source_to_compact, group_ids, position_ids, local_cu,
+    local_cuc, global_cuc)``; see ``CPCompressorLayout``.
+    """
     compact_len = c_cap * ratio
 
     def empty(rows):
@@ -1148,12 +1180,36 @@ def build_cp_compressor_layout(
         (cu_seqlens.shape[0] - 1, int(global_start), int(l_local), ratio, d_comp, compact_len),
         static_arg_indices=(3, 4),
     )
+    return (
+        compact_to_source,
+        source_to_compact,
+        group_ids,
+        position_ids,
+        local_cu,
+        local_cuc,
+        global_cuc,
+    )
+
+
+def _compressor_rank_rows(
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_compressed: torch.Tensor,
+    l_local: int,
+    cp_size: int,
+    ratio: int,
+    d_comp: int,
+    c_cap: int,
+) -> torch.Tensor:
+    """Launch the sequence-major to rank-major compressed-row map kernel.
+
+    Ranks hold consecutive ``l_local``-row intervals and ``c_cap`` compact groups each.
+    """
     seq_major_rows = l_local * cp_size // ratio
-    seq_to_rank_row = empty(seq_major_rows)
+    seq_to_rank_row = torch.empty(seq_major_rows, dtype=torch.int32, device=cu_seqlens.device)
     if seq_major_rows:
         _run_compiled_launch(
             _compressor_rank_row_launch,
-            (cu_seqlens, global_cuc, seq_to_rank_row),
+            (cu_seqlens, cu_seqlens_compressed, seq_to_rank_row),
             (
                 cu_seqlens.shape[0] - 1,
                 int(l_local),
@@ -1165,18 +1221,147 @@ def build_cp_compressor_layout(
             ),
             static_arg_indices=(3, 4),
         )
+    return seq_to_rank_row
+
+
+def build_cp_compressor_layout(
+    cu_seqlens: torch.Tensor, global_start: int, l_local: int, cp_size: int, ratio: int
+) -> CPCompressorLayout:
+    """Build CP compaction metadata without materializing any hidden-size rows."""
+    if ratio < 1 or l_local < 1 or cp_size < 1:
+        raise ValueError("ratio, l_local and cp_size must all be positive.")
+    _require_cute("DSv4 CP compressor layout requires CUDA tensors and CuTeDSL.", cu_seqlens)
+    d_comp, c_cap = _cp_compressor_capacity(l_local, ratio)
+    row_maps = _compressor_row_maps(cu_seqlens, global_start, l_local, ratio, d_comp, c_cap)
+    seq_to_rank_row = _compressor_rank_rows(
+        cu_seqlens, row_maps[6], l_local, cp_size, ratio, d_comp, c_cap
+    )
+    return CPCompressorLayout(*row_maps, seq_to_rank_row, d_comp, int(global_start), int(cp_size))
+
+
+def merge_cp_zigzag_compressor_maps(
+    segment_maps: Tuple[Tuple[torch.Tensor, ...], Tuple[torch.Tensor, ...]],
+    d_comp: int,
+    segment_rows: int,
+    c_cap: int,
+    ratio: int,
+) -> Tuple[torch.Tensor, ...]:
+    """Merge the compaction maps of a zigzag rank's two segments into one layout.
+
+    Each entry of ``segment_maps`` is ``(compact_to_source, source_to_compact, group_ids,
+    position_ids)`` for one segment, built as if the segment were a contiguous CP rank of
+    ``segment_rows`` rows: its source rows address ``[halo_s[-d_comp:] | segment_s]`` and its
+    compact groups ``[0, c_cap)``. The merged source buffer is ``[halo_A[-d_comp:] |
+    halo_B[-d_comp:] | A | B]``, so ``CompressorProjectionCompact`` sees one ``2 * d_comp``-row
+    boundary and one local block. The merged compact buffer is ``[A groups | B groups]``,
+    described as two pre-grouped local segments of ``c_cap`` groups each; padding groups
+    pool zero rows and are never indexed.
+
+    Returns ``(compact_to_source, source_to_compact, group_ids, position_ids, local_cu,
+    local_cuc)``. Pure tensor ops on device: no host synchronization.
+    """
+    if len(segment_maps) != 2:
+        raise ValueError(f"A zigzag CP rank has two segments, got {len(segment_maps)}.")
+    compact_len = c_cap * ratio
+    compact_to_source, halo_to_compact, local_to_compact = [], [], []
+    for segment, (segment_to_source, segment_to_compact, _, _) in enumerate(segment_maps):
+        if segment_to_source.shape != (compact_len,) or segment_to_compact.shape != (
+            segment_rows + d_comp,
+        ):
+            raise ValueError("Zigzag segment compressor maps do not match the segment geometry.")
+        merged_source = torch.where(
+            segment_to_source < d_comp,
+            segment_to_source + segment * d_comp,
+            segment_to_source + (d_comp + segment * segment_rows),
+        )
+        compact_to_source.append(
+            torch.where(segment_to_source < 0, segment_to_source, merged_source)
+        )
+        merged_compact = torch.where(
+            segment_to_compact < 0, segment_to_compact, segment_to_compact + segment * compact_len
+        )
+        halo_to_compact.append(merged_compact[:d_comp])
+        local_to_compact.append(merged_compact[d_comp:])
+    device = segment_maps[0][0].device
+    segment_ids = torch.arange(3, dtype=torch.int32, device=device)
+    return (
+        torch.cat(compact_to_source),
+        torch.cat(halo_to_compact + local_to_compact),
+        torch.cat([segment_map[2] for segment_map in segment_maps]),
+        torch.cat([segment_map[3] for segment_map in segment_maps]),
+        segment_ids * compact_len,
+        segment_ids * c_cap,
+    )
+
+
+def cp_zigzag_rank_rows(virtual_rank_rows: torch.Tensor, cp_size: int, c_cap: int) -> torch.Tensor:
+    """Remap a compressed-row map over ``2 * cp_size`` virtual ranks to zigzag ranks.
+
+    Virtual rank ``v`` holds chunk ``v`` with ``c_cap`` compact groups. Under zigzag CP, rank
+    ``r`` holds chunks ``r`` (segment A, compact slots ``[0, c_cap)``) and
+    ``2 * cp_size - 1 - r`` (segment B, slots ``[c_cap, 2 * c_cap)``), so the all-gathered
+    buffer has ``2 * c_cap`` rows per rank. Entries of -1 (padding) stay -1.
+    """
+    rows = virtual_rank_rows.clamp_min(0)
+    virtual_rank = torch.div(rows, c_cap, rounding_mode="floor")
+    slot = rows - virtual_rank * c_cap
+    second = virtual_rank >= cp_size
+    rank = torch.where(second, 2 * cp_size - 1 - virtual_rank, virtual_rank)
+    physical = rank * (2 * c_cap) + second.to(rows.dtype) * c_cap + slot
+    return torch.where(virtual_rank_rows >= 0, physical, virtual_rank_rows)
+
+
+def build_cp_zigzag_compressor_layout(
+    cu_seqlens: torch.Tensor,
+    segment_starts: Tuple[int, int],
+    segment_rows: int,
+    cp_size: int,
+    ratio: int,
+) -> CPCompressorLayout:
+    """Build the compressor layout of a zigzag CP rank's two row segments.
+
+    The zigzag partition is a contiguous partition over ``2 * cp_size`` virtual ranks of
+    ``segment_rows`` rows, with rank ``r`` hosting virtual ranks ``r`` and
+    ``2 * cp_size - 1 - r``. Each segment therefore reuses the contiguous row-map kernel,
+    the sequence-to-rank map reuses the contiguous kernel over the virtual ranks, and small
+    device-side remaps (``merge_cp_zigzag_compressor_maps``, ``cp_zigzag_rank_rows``) produce
+    the rank's merged layout. Every compression block is still pooled by exactly one owner
+    slot, from the same rows as under the contiguous partition.
+    """
+    segment_rows, cp_size, ratio = int(segment_rows), int(cp_size), int(ratio)
+    if ratio < 2 or segment_rows < 1 or cp_size < 1:
+        raise ValueError("Zigzag CP compression needs ratio > 1 and positive sizes.")
+    starts = tuple(int(start) for start in segment_starts)
+    if (
+        len(starts) != 2
+        or any(start % segment_rows != 0 for start in starts)
+        or starts[0] // segment_rows + starts[1] // segment_rows != 2 * cp_size - 1
+    ):
+        raise ValueError(
+            f"Segment starts {starts} are not the zigzag chunks of a {cp_size}-rank CP group "
+            f"with {segment_rows}-row chunks."
+        )
+    _require_cute("DSv4 zigzag CP compressor layout requires CUDA tensors and CuTeDSL.", cu_seqlens)
+    d_comp, c_cap = _cp_compressor_capacity(segment_rows, ratio)
+    segment_maps = [
+        _compressor_row_maps(cu_seqlens, start, segment_rows, ratio, d_comp, c_cap)
+        for start in starts
+    ]
+    cu_seqlens_compressed = segment_maps[0][6]
+    virtual_rank_rows = _compressor_rank_rows(
+        cu_seqlens, cu_seqlens_compressed, segment_rows, 2 * cp_size, ratio, d_comp, c_cap
+    )
+    merged = merge_cp_zigzag_compressor_maps(
+        tuple(segment_map[:4] for segment_map in segment_maps), d_comp, segment_rows, c_cap, ratio
+    )
     return CPCompressorLayout(
-        compact_to_source,
-        source_to_compact,
-        group_ids,
-        position_ids,
-        local_cu,
-        local_cuc,
-        global_cuc,
-        seq_to_rank_row,
-        d_comp,
-        int(global_start),
-        int(cp_size),
+        *merged,
+        cu_seqlens_compressed,
+        cp_zigzag_rank_rows(virtual_rank_rows, cp_size, c_cap),
+        2 * d_comp,
+        starts[0],
+        cp_size,
+        boundary_segments=2,
     )
 
 
@@ -1452,6 +1637,8 @@ def build_attention_indices(
     compressed_is_sequence_major: bool = False,
     cu_seqlens_unpadded: Optional[torch.Tensor] = None,
     output_alignment: int = 1,
+    segment_rows: Optional[int] = None,
+    second_global_start: Optional[int] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Build final sparse-attention and optional indexer-loss indices.
 
@@ -1466,7 +1653,8 @@ def build_attention_indices(
             optional sequence-major to rank-major physical-row mapping.
         for_indexer_loss: put compressed ids first and return their physical rows.
         compressed_base: first compressed row in the final KV buffer. Defaults
-            to ``d_window + l_local``, matching the context-parallel raw layout.
+            to ``d_window + l_local`` (``2 * d_window + l_local`` for two segments),
+            matching the context-parallel raw layout.
         compressed_rows: physical compressed-buffer capacity. Required whenever
             ``compressed_width`` is nonzero.
         compressed_is_sequence_major: compressed rows already use sequence-major
@@ -1475,6 +1663,11 @@ def build_attention_indices(
             describes CUDA-graph-padded rows.
         output_alignment: pad the final attention-index width to this multiple.
             The logical window/compressed widths and ``topk_length`` are unchanged.
+        segment_rows/second_global_start: zigzag CP only. The local rows are two
+            segments of ``segment_rows`` rows starting at global rows ``global_start``
+            and ``second_global_start``, and the raw KV buffer is
+            ``[halo_0 | halo_1 | segment_0 | segment_1]`` with ``d_window``-row halos.
+            Omit both for one consecutive segment (``[halo | local]``).
 
     Outputs:
         ``topk_idxs`` int32, shape ``(l_local, padded_width)`` where
@@ -1519,11 +1712,23 @@ def build_attention_indices(
     if seq_to_rank_row is None:
         seq_to_rank_row = torch.empty((1,), dtype=torch.int32, device=cu_seqlens.device)
 
+    if (segment_rows is None) != (second_global_start is None):
+        raise ValueError("segment_rows and second_global_start must be passed together.")
+    if segment_rows is None:
+        segment_rows, second_global_start, halo_rows = l_local, global_start, int(d_window)
+    else:
+        segment_rows, second_global_start = int(segment_rows), int(second_global_start)
+        if 2 * segment_rows != l_local:
+            raise ValueError(
+                f"Two {segment_rows}-row segments do not cover the {l_local} local rows."
+            )
+        halo_rows = 2 * int(d_window)
+
     if compressed_rows is None:
         compressed_rows = 0
     compressed_rows = int(compressed_rows)
     if compressed_base is None:
-        compressed_base = int(d_window) + int(l_local)
+        compressed_base = halo_rows + int(l_local)
     compressed_base = int(compressed_base)
 
     logical_width = int(window_size) + compressed_width
@@ -1580,6 +1785,9 @@ def build_attention_indices(
             compressed_is_sequence_major,
             has_unpadded_seqlens,
             launch_work,
+            segment_rows,
+            second_global_start,
+            halo_rows,
         ),
         static_arg_indices=(11, 12, 13),
     )

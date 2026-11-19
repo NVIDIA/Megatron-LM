@@ -80,6 +80,83 @@ def _compact_compressor_input(hidden, boundary, cu, global_start, ratio, halo, c
 _compiled_compactor = torch.compile(_compact_compressor_input, fullgraph=True)
 
 
+def compressor_row_maps_reference(cu_seqlens, global_start, l_local, ratio, d_comp, c_cap):
+    """Host oracle of the CP compaction row-map kernel (``thd_layout_kernels``).
+
+    Returns ``(compact_to_source, source_to_compact, group_ids, position_ids, local_cu,
+    local_cuc, global_cuc)`` exactly as ``thd_layout_kernels._compressor_row_maps`` emits them
+    for the rows ``[global_start, global_start + l_local)``. For tests only (host loops).
+    """
+    cu = [int(value) for value in cu_seqlens.tolist()]
+    compact_len = int(c_cap) * int(ratio)
+    rows = max(compact_len, int(l_local) + int(d_comp))
+    source_row = [-1] * rows
+    compact_row = [-1] * rows
+    group_id = [-1] * rows
+    local_cu, local_cuc, global_cuc = [0], [0], [0]
+    running_tokens = global_groups = 0
+    for seq_start, seq_end in zip(cu[:-1], cu[1:]):
+        local_end = min(seq_end, global_start + l_local)
+        first = (max(0, global_start - d_comp - seq_start) + ratio - 1) // ratio
+        count = 0
+        if seq_start < local_end and global_start < local_end:
+            count = max(0, (local_end - seq_start) // ratio - first)
+        tokens = count * ratio
+        first_token = seq_start + first * ratio
+        for offset in range(tokens):
+            group_id[running_tokens + offset] = first + offset // ratio
+            source_row[running_tokens + offset] = first_token + offset - global_start + d_comp
+            source = first_token + offset - (global_start - d_comp)
+            if 0 <= source < rows:
+                compact_row[source] = running_tokens + offset
+        running_tokens += tokens
+        global_groups += (seq_end - seq_start) // ratio
+        local_cu.append(running_tokens)
+        local_cuc.append(running_tokens // ratio)
+        global_cuc.append(global_groups)
+    group_ids = group_id[0:compact_len:ratio]
+
+    def tensor(values):
+        return torch.tensor(values, dtype=torch.int32, device=cu_seqlens.device)
+
+    return (
+        tensor(source_row[:compact_len]),
+        tensor(compact_row[: int(l_local) + int(d_comp)]),
+        tensor(group_ids),
+        tensor([group * ratio if group >= 0 else 0 for group in group_ids]),
+        tensor(local_cu),
+        tensor(local_cuc),
+        tensor(global_cuc),
+    )
+
+
+def compressor_rank_rows_reference(
+    cu_seqlens, cu_seqlens_compressed, l_local, cp_size, ratio, d_comp, c_cap
+):
+    """Host oracle of the sequence-major to rank-major compressed-row map kernel.
+
+    Matches ``thd_layout_kernels._compressor_rank_rows``: ranks hold consecutive
+    ``l_local``-row intervals with ``c_cap`` compact groups each. For tests only.
+    """
+    cu = [int(value) for value in cu_seqlens.tolist()]
+    cuc = [int(value) for value in cu_seqlens_compressed.tolist()]
+    n_seq = len(cu) - 1
+    rank_rows = []
+    for logical_row in range(int(l_local) * int(cp_size) // int(ratio)):
+        if logical_row >= cuc[n_seq]:
+            rank_rows.append(-1)
+            continue
+        seq_id = sum(1 for seq in range(n_seq) if logical_row >= cuc[seq + 1])
+        comp_id = logical_row - cuc[seq_id]
+        owner = (cu[seq_id] + (comp_id + 1) * ratio - 1) // l_local
+        owner = min(max(owner, 0), cp_size - 1)
+        rank_start = owner * l_local
+        first_seq_id = min(sum(1 for seq in range(n_seq) if rank_start >= cu[seq + 1]), n_seq - 1)
+        first_comp_id = (max(0, rank_start - d_comp - cu[first_seq_id]) + ratio - 1) // ratio
+        rank_rows.append(owner * c_cap + logical_row - (cuc[first_seq_id] + first_comp_id))
+    return torch.tensor(rank_rows, dtype=torch.int32, device=cu_seqlens.device)
+
+
 def compact_compressor_input(hidden, boundary, cu, global_start, ratio, halo, capacity, cp_size):
     """Gather packed groups with fused CUDA indexing/masking and an eager CPU oracle."""
     implementation = _compiled_compactor if hidden.is_cuda else _compact_compressor_input
@@ -101,10 +178,25 @@ def _build_attention_indices(
     compressed_rows=None,
     cu_seqlens_unpadded=None,
     output_alignment=1,
+    segment_rows=None,
+    second_global_start=None,
 ):
-    """Lower document-relative keys to physical KV rows, masking real/padded boundaries."""
+    """Lower document-relative keys to physical KV rows, masking real/padded boundaries.
+
+    ``segment_rows``/``second_global_start`` describe zigzag CP's two local row segments
+    (raw KV layout ``[halo_0 | halo_1 | segment_0 | segment_1]``), as in
+    ``thd_layout_kernels.build_attention_indices``.
+    """
     cu = cu_seqlens
-    rows = torch.arange(global_start, global_start + l_local, device=cu.device, dtype=torch.int32)
+    if segment_rows is None:
+        rows = torch.arange(
+            global_start, global_start + l_local, device=cu.device, dtype=torch.int32
+        )
+    else:
+        local = torch.arange(l_local, device=cu.device, dtype=torch.int32)
+        second = local >= segment_rows
+        row_starts = torch.where(second, second_global_start, global_start).int()
+        rows = row_starts + local - second.int() * segment_rows
     seq = (torch.bucketize(rows, cu, right=True) - 1).clamp_max(cu.numel() - 2)
     valid = (rows >= cu[seq]) & (rows < cu[seq + 1])
     if cu_seqlens_unpadded is not None:
@@ -114,10 +206,22 @@ def _build_attention_indices(
     window = torch.maximum(rows - window_size + 1, cu[seq])[:, None] + torch.arange(
         window_size, device=cu.device
     )
-    window = torch.where(
-        valid[:, None] & (window <= rows[:, None]), window - global_start + d_window, -1
-    )
-    compressed_base = d_window + l_local
+    if segment_rows is None:
+        window = torch.where(
+            valid[:, None] & (window <= rows[:, None]), window - global_start + d_window, -1
+        )
+        compressed_base = d_window + l_local
+    else:
+        segment = second.int()[:, None]
+        start = row_starts[:, None]
+        halo_ids = segment * d_window + window - (start - d_window)
+        local_ids = 2 * d_window + segment * segment_rows + window - start
+        window = torch.where(
+            valid[:, None] & (window <= rows[:, None]),
+            torch.where(window < start, halo_ids, local_ids),
+            -1,
+        )
+        compressed_base = 2 * d_window + l_local
     physical = torch.empty((l_local, 0), device=cu.device, dtype=torch.int32)
     if compressed_width:
         local_ids = compressed_topk
@@ -165,6 +269,8 @@ def build_attention_indices(
     compressed_rows=None,
     cu_seqlens_unpadded=None,
     output_alignment=1,
+    segment_rows=None,
+    second_global_start=None,
 ):
     """Lower document-relative keys without materializing each CUDA pointwise intermediate."""
     implementation = _compiled_attention_indices if cu_seqlens.is_cuda else _build_attention_indices
@@ -183,6 +289,8 @@ def build_attention_indices(
         compressed_rows=compressed_rows,
         cu_seqlens_unpadded=cu_seqlens_unpadded,
         output_alignment=output_alignment,
+        segment_rows=segment_rows,
+        second_global_start=second_global_start,
     )
 
 

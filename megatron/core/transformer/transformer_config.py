@@ -631,6 +631,14 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to use dense mode for compressed sparse attention. If True, the CSA indexer will be
     disabled."""
 
+    dsv4_cp_zigzag: bool = False
+    """Run DSv4 hybrid THD context parallelism on MCore's per-sequence zigzag partition
+    (cp_partition_mode='zigzag'): CP rank r holds chunks r and 2*CP-1-r of the sequence, which
+    balances causal attention work across ranks. Off (default) keeps the contiguous partition.
+    Supported for one sequence per pack, sliding-window and ratio-128 compressed layers without
+    a CSA indexer (no ratio-4 layers), static CP, delay_wgrad_compute=False and
+    cuda_graph_impl='none'; unsupported cases raise."""
+
     apply_dsa_kernel_fusion: Optional[bool] = None
     """Deprecated DSv4 fused-kernel switch. Use ``dsa_kernel_backend`` instead. For
     ``dsv4_hybrid`` only, True maps to ``cudnn`` and False maps to ``none``."""
@@ -2218,6 +2226,52 @@ class TransformerConfig(ModelParallelConfig):
                     setattr(new_config, attr, deepcopy(getattr(config, attr), memo))
         return new_config
 
+    def _validate_dsv4_cp_zigzag(self, has_context_parallelism: bool) -> None:
+        """Fail closed for dsv4_cp_zigzag outside the supported envelope."""
+        if not self.dsv4_cp_zigzag:
+            return
+        if self.experimental_attention_variant != "dsv4_hybrid":
+            raise ValueError(
+                "dsv4_cp_zigzag requires experimental_attention_variant='dsv4_hybrid'."
+            )
+        if (self.cp_partition_mode, self.attention_cp_layout, self.linear_cp_layout) != (
+            "zigzag",
+            "zigzag",
+            "zigzag",
+        ):
+            raise ValueError(
+                "dsv4_cp_zigzag requires cp_partition_mode, attention_cp_layout and "
+                "linear_cp_layout to be 'zigzag'; got "
+                f"{self.cp_partition_mode!r}, {self.attention_cp_layout!r} and "
+                f"{self.linear_cp_layout!r}."
+            )
+        if not has_context_parallelism:
+            return
+        unsupported = []
+        if self.dynamic_context_parallel:
+            unsupported.append("dynamic_context_parallel")
+        if self.sequence_packing_scheduler is not None:
+            unsupported.append(
+                f"sequence_packing_scheduler={self.sequence_packing_scheduler!r} "
+                "(packs several sequences)"
+            )
+        if self.thd_max_packed_sequences is not None and self.thd_max_packed_sequences > 1:
+            unsupported.append(f"thd_max_packed_sequences={self.thd_max_packed_sequences} (> 1)")
+        if 4 in (self.csa_compress_ratios or []):
+            unsupported.append("compress ratio 4 (CSA indexer layers)")
+        if self.dsa_cp_balance_indexer:
+            unsupported.append("dsa_cp_balance_indexer")
+        if self.delay_wgrad_compute:
+            unsupported.append("delay_wgrad_compute")
+        if self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph:
+            unsupported.append("CUDA graphs")
+        if unsupported:
+            raise ValueError(
+                "dsv4_cp_zigzag does not support " + ", ".join(unsupported) + " yet. It supports "
+                "one sequence per pack, ratio 0/128 layers without a CSA indexer, static CP, "
+                "no delayed weight gradients and no CUDA graphs."
+            )
+
     def _normalize_sync_compatibility_fields(self) -> None:
         """Normalize branch-compatible names before validating the shared configuration."""
         if self.linear_attention_type is not None:
@@ -2913,11 +2967,13 @@ class TransformerConfig(ModelParallelConfig):
                         "experimental_attention_variant='gdn2', which supports only headwise CP."
                     )
             elif self.cp_partition_mode == "zigzag":
-                if self.experimental_attention_variant == "dsv4_hybrid":
+                if self.experimental_attention_variant == "dsv4_hybrid" and not self.dsv4_cp_zigzag:
                     raise ValueError(
                         "DSv4 Hybrid with context parallelism requires "
-                        "cp_partition_mode='contiguous'."
+                        "cp_partition_mode='contiguous', or dsv4_cp_zigzag=True for the zigzag "
+                        "partition."
                     )
+        self._validate_dsv4_cp_zigzag(has_context_parallelism)
 
         if self.dsa_cp_balance_indexer and self.experimental_attention_variant != "dsv4_hybrid":
             # The flag is consumed only by the CSA indexer; on any other model the

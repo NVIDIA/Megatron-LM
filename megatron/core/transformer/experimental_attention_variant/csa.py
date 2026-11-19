@@ -1325,6 +1325,12 @@ class Compressor(MegatronModule):
         # request a single overwrite of main_grad. Preserve their single-call
         # contract instead of splitting a projection into two invocations.
         projected_kv_score = None
+        zigzag = layout.boundary_segments == 2
+        if zigzag and (pre_compacted_hidden is not None or self._cp_requires_single_projection()):
+            raise NotImplementedError(
+                "The zigzag CP compressor layout supports only the split projection path; "
+                "delay_wgrad_compute and FSDP-wrapped compressor weights are not supported."
+            )
         if pre_compacted_hidden is not None:
             x = pre_compacted_hidden
         elif self._cp_requires_single_projection():
@@ -1339,7 +1345,22 @@ class Compressor(MegatronModule):
         else:
             if boundary_hidden.shape[0] < layout.boundary_rows:
                 raise ValueError("CP boundary is shorter than the compressor halo.")
-            boundary = boundary_hidden[-layout.boundary_rows :]
+            if zigzag:
+                # boundary_hidden is [halo_A | halo_B]; the layout's source buffer
+                # starts with the last d_comp rows of each halo.
+                d_window = boundary_hidden.shape[0] // 2
+                d_comp = layout.boundary_rows // 2
+                if d_window == d_comp:
+                    boundary = boundary_hidden
+                else:
+                    boundary = torch.cat(
+                        (
+                            boundary_hidden[d_window - d_comp : d_window],
+                            boundary_hidden[2 * d_window - d_comp :],
+                        )
+                    )
+            else:
+                boundary = boundary_hidden[-layout.boundary_rows :]
             projections = []
             with get_fp8_disabled_context(self.config):
                 for linear in linears:
@@ -2025,7 +2046,10 @@ class _OutputInverseRope:
         sbhd_batch_size: Optional[int] = None,
         thd_cp_global_start: Optional[int] = None,
         thd_cp_rows: Optional[int] = None,
+        thd_cp_position_ids: Optional[torch.Tensor] = None,
     ):
+        if thd_cp_global_start is not None and thd_cp_position_ids is not None:
+            raise ValueError("Pass either thd_cp_global_start or thd_cp_position_ids, not both.")
         if attn.rotary_pos_emb is None:
             raise ValueError(
                 "CompressedSparseAttention needs rotary_pos_emb to undo the "
@@ -2038,8 +2062,10 @@ class _OutputInverseRope:
         self.cu_seqlens_q = cu_seqlens_q
         self.max_seqlen = rope_seqlen if packed_seq else None
         self.thd_cp_global_start = thd_cp_global_start
+        # Explicit per-row positions, for CP rows that are not one consecutive interval.
+        self.thd_cp_position_ids = thd_cp_position_ids
 
-        position_ids = None
+        position_ids = thd_cp_position_ids
         if thd_cp_global_start is not None:
             position_ids = cp_utils.thd_cp_position_ids(
                 cu_seqlens_q, thd_cp_global_start, thd_cp_rows
@@ -2073,7 +2099,12 @@ class _OutputInverseRope:
         Args:
             x: ``(sq, b, np, head_dim)`` for sbhd, ``(rows, np, head_dim)`` for thd.
         """
-        if self.thd_cp_global_start is not None:
+        if self.thd_cp_global_start is not None or self.thd_cp_position_ids is not None:
+            row_kwargs = (
+                {}
+                if self.thd_cp_position_ids is None
+                else {"position_ids": self.thd_cp_position_ids}
+            )
             if self.fused_params is not None:
                 return cp_utils.apply_thd_cp_local_rope_fused(
                     x,
@@ -2084,6 +2115,7 @@ class _OutputInverseRope:
                     self.cu_seqlens_q,
                     self.thd_cp_global_start,
                     inverse=True,
+                    **row_kwargs,
                 )
             return cp_utils.apply_thd_cp_local_rope_unfused(
                 x,
@@ -2094,6 +2126,7 @@ class _OutputInverseRope:
                 self.thd_cp_global_start,
                 self.config,
                 inverse=True,
+                **row_kwargs,
             )
 
         if self.fused_params is not None:
@@ -2909,11 +2942,16 @@ class CompressedSparseAttention(MegatronModule):
         qkv_format = packed_seq_params.qkv_format if packed_seq_params is not None else None
         if cp_size > 1 and qkv_format != 'thd':
             raise ValueError("CompressedSparseAttention with CP requires qkv_format='thd'.")
-        if cp_size > 1 and packed_seq_params.cp_partition_mode != "contiguous":
-            raise ValueError(
-                "CompressedSparseAttention requires cp_partition_mode='contiguous'. "
-                "CP partition conversion must be handled before entering CSA."
-            )
+        if cp_size > 1:
+            zigzag_opt_in = bool(getattr(self.config, "dsv4_cp_zigzag", False))
+            partition_mode = packed_seq_params.cp_partition_mode
+            if (partition_mode, zigzag_opt_in) not in (("contiguous", False), ("zigzag", True)):
+                raise ValueError(
+                    "CompressedSparseAttention requires cp_partition_mode='contiguous', or "
+                    "'zigzag' with dsv4_cp_zigzag=True; got "
+                    f"cp_partition_mode={partition_mode!r} with dsv4_cp_zigzag={zigzag_opt_in}. "
+                    "CP partition conversion must be handled before entering CSA."
+                )
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             if self.pg_collection.cp is not None and self.pg_collection.cp.size() > 1:
@@ -3467,18 +3505,46 @@ class CompressedSparseAttention(MegatronModule):
         max_seqlen_q = int(packed_seq_params.max_seqlen_q)
 
         # ---- Step 2: local CP rows, local KV, and boundary tensors ------------
-        global_start = cp_rank * l_local
-        # Self-attention only on this path, so the q cu_seqlens double as the kv
-        # ones and keep the CP row-to-position mapping self-consistent.
-        out_rope = _OutputInverseRope(
-            self,
-            x.dtype,
-            rope_seqlen=max_seqlen_q,
-            packed_seq=True,
-            cu_seqlens_q=cu_seqlens,
-            thd_cp_global_start=global_start,
-            thd_cp_rows=l_local,
-        )
+        # Zigzag CP (dsv4_cp_zigzag) holds two row segments, chunks r and 2*CP-1-r, with
+        # the raw KV layout [halo_A | halo_B | A | B]; contiguous CP holds one segment.
+        zigzag_layout = None
+        zigzag_index_kwargs = {}
+        if packed_seq_params.cp_partition_mode == "zigzag":
+            zigzag_layout = cp_utils.get_dsv4_zigzag_cp_layout(
+                packed_seq_params,
+                cu_seqlens,
+                cp_group,
+                l_local,
+                self.compress_ratio,
+                self.window_size,
+                self.config,
+            )
+            global_start = zigzag_layout.segment_starts[0]
+            zigzag_index_kwargs = dict(
+                segment_rows=zigzag_layout.segment_rows,
+                second_global_start=zigzag_layout.segment_starts[1],
+            )
+            out_rope = _OutputInverseRope(
+                self,
+                x.dtype,
+                rope_seqlen=max_seqlen_q,
+                packed_seq=True,
+                cu_seqlens_q=cu_seqlens,
+                thd_cp_position_ids=zigzag_layout.q_position_ids,
+            )
+        else:
+            global_start = cp_rank * l_local
+            # Self-attention only on this path, so the q cu_seqlens double as the kv
+            # ones and keep the CP row-to-position mapping self-consistent.
+            out_rope = _OutputInverseRope(
+                self,
+                x.dtype,
+                rope_seqlen=max_seqlen_q,
+                packed_seq=True,
+                cu_seqlens_q=cu_seqlens,
+                thd_cp_global_start=global_start,
+                thd_cp_rows=l_local,
+            )
         kv_local = key.squeeze(-2).squeeze(1)
         if boundary_hidden is None or boundary_kv is None:
             raise RuntimeError(
@@ -3486,7 +3552,16 @@ class CompressedSparseAttention(MegatronModule):
                 "the hidden-only boundary exchange and boundary KV projection path."
             )
         boundary_kv = boundary_kv.squeeze(-2).squeeze(1)
-        d_window = boundary_hidden.shape[0]
+        if zigzag_layout is None:
+            d_window = boundary_hidden.shape[0]
+        else:
+            d_window = zigzag_layout.d_window
+            if boundary_hidden.shape[0] != 2 * d_window or boundary_kv.shape[0] != 2 * d_window:
+                raise RuntimeError(
+                    "DSv4 zigzag CP expects two D_window halos: D_window="
+                    f"{d_window}, boundary_hidden rows={boundary_hidden.shape[0]}, "
+                    f"boundary_kv rows={boundary_kv.shape[0]}."
+                )
         # Window-only defaults; compression fills the rank-major KV buffer.
         compressed_kv_rank_major = kv_local.new_empty((0, kv_local.shape[-1]))
         cu_seqlens_compressed = None
@@ -3516,9 +3591,23 @@ class CompressedSparseAttention(MegatronModule):
             # Keep high-dimensional hidden states in their original storage.
             # Both compressors project first, then compact their narrow KV/gate
             # with these maps. Pooling, RoPE and gathered row ownership are unchanged.
-            compressor_layout = thd_layout_kernels.build_cp_compressor_layout(
-                cu_seqlens, global_start, l_local, cp_size, ratio
-            )
+            if zigzag_layout is None:
+                compressor_layout = thd_layout_kernels.build_cp_compressor_layout(
+                    cu_seqlens, global_start, l_local, cp_size, ratio
+                )
+            else:
+                if indexer is not None:
+                    raise NotImplementedError(
+                        "DSv4 zigzag CP does not support the CSA indexer yet; use "
+                        "cp_partition_mode='contiguous' for models with indexer layers."
+                    )
+                if self.compressor._cp_requires_single_projection():
+                    raise NotImplementedError(
+                        "DSv4 zigzag CP needs the split compressor projection; "
+                        "delay_wgrad_compute and FSDP-wrapped compressor weights are not "
+                        "supported with dsv4_cp_zigzag yet."
+                    )
+                compressor_layout = zigzag_layout.compressor_layout
             cu_seqlens_compressed = compressor_layout.cu_seqlens_compressed
             seq_to_rank_row = compressor_layout.seq_to_rank_row
             hidden_compact = None
@@ -3916,6 +4005,7 @@ class CompressedSparseAttention(MegatronModule):
                 compressed_rows=compressed_kv_rank_major.shape[0],
                 cu_seqlens_unpadded=cu_seqlens_q_unpadded,
                 output_alignment=(get_flash_mla_topk_alignment() if self.use_fused_kernels else 1),
+                **zigzag_index_kwargs,
             )
         )
         # Only the fused Functions can rotate in place; see :meth:`forward`.

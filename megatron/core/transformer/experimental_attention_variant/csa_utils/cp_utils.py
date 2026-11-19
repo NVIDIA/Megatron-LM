@@ -7,7 +7,7 @@ retained compaction kernel; ``csa.py`` calls final-index lowering directly.
 """
 
 import math
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -31,6 +31,23 @@ CPIndexerLayout = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 # =============================================================================
 
 
+def thd_global_rows_position_ids(
+    cu_seqlens_padded: torch.Tensor, global_rows: torch.Tensor
+) -> torch.Tensor:
+    """Map global packed rows to positions within their packed sequences.
+
+    Rows outside every sequence (for example the zero-filled left halo of CP rank 0) map to
+    position zero.
+    """
+    sequence_ids = torch.bucketize(
+        global_rows, cu_seqlens_padded[1:], out_int32=True, right=True
+    ).clamp_max(cu_seqlens_padded.shape[0] - 2)
+    sequence_starts = cu_seqlens_padded[sequence_ids]
+    sequence_ends = cu_seqlens_padded[sequence_ids + 1]
+    valid_rows = (global_rows >= sequence_starts) & (global_rows < sequence_ends)
+    return torch.where(valid_rows, global_rows - sequence_starts, 0)
+
+
 def thd_cp_position_ids(
     cu_seqlens_padded: torch.Tensor, global_start: int, local_rows: int
 ) -> torch.Tensor:
@@ -41,17 +58,27 @@ def thd_cp_position_ids(
         dtype=cu_seqlens_padded.dtype,
         device=cu_seqlens_padded.device,
     )
-    sequence_ids = torch.bucketize(
-        global_rows, cu_seqlens_padded[1:], out_int32=True, right=True
-    ).clamp_max(cu_seqlens_padded.shape[0] - 2)
-    sequence_starts = cu_seqlens_padded[sequence_ids]
-    sequence_ends = cu_seqlens_padded[sequence_ids + 1]
-    valid_rows = (global_rows >= sequence_starts) & (global_rows < sequence_ends)
-    return torch.where(valid_rows, global_rows - sequence_starts, 0)
+    return thd_global_rows_position_ids(cu_seqlens_padded, global_rows)
 
 
 # Retained for callers outside megatron.core that already use the private name.
 _thd_cp_position_ids = thd_cp_position_ids
+
+
+def _check_thd_cp_rope_rows(
+    x: torch.Tensor, global_start: Optional[int], position_ids: Optional[torch.Tensor]
+) -> None:
+    """Require exactly one THD CP row-to-position source for the local RoPE helpers."""
+    if (global_start is None) == (position_ids is None):
+        raise ValueError(
+            "THD CP local RoPE takes exactly one of global_start (a consecutive row interval) "
+            "and position_ids (explicit per-row positions)."
+        )
+    if position_ids is not None and position_ids.shape != (x.shape[0],):
+        raise ValueError(
+            f"THD CP local RoPE position_ids must have shape ({x.shape[0]},), "
+            f"got {tuple(position_ids.shape)}."
+        )
 
 
 def apply_thd_cp_local_rope_fused(
@@ -61,10 +88,17 @@ def apply_thd_cp_local_rope_fused(
     nope_dim: int,
     pos_dim: int,
     cu_seqlens_padded: torch.Tensor,
-    global_start: int,
+    global_start: Optional[int],
     inverse: bool = False,
+    position_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Apply fused non-interleaved RoPE to local THD CP rows."""
+    """Apply fused non-interleaved RoPE to local THD CP rows.
+
+    ``global_start`` describes one consecutive interval of global rows; the kernel derives the
+    positions from ``cu_seqlens_padded``. Pass ``global_start=None`` and ``position_ids``
+    (one position per row) for a non-consecutive row layout such as the zigzag partition.
+    """
+    _check_thd_cp_rope_rows(x, global_start, position_ids)
     squeezed_batch = x.ndim == 4 and x.shape[1] == 1
     squeezed_head = x.ndim == 2
     rope_input = x.squeeze(1) if squeezed_batch else x
@@ -72,6 +106,11 @@ def apply_thd_cp_local_rope_fused(
     if inverse:
         # The fused kernel is in-place, but sparse-attention backward needs its original output.
         rope_input = rope_input.clone()
+    row_kwargs = (
+        {"thd_global_start": global_start}
+        if position_ids is None
+        else {"position_ids": position_ids}
+    )
     output = fused_mla_rope_inplace(
         rope_input,
         cos,
@@ -81,7 +120,7 @@ def apply_thd_cp_local_rope_fused(
         cu_seqlens_q=cu_seqlens_padded,
         inverse=inverse,
         remove_interleaving=True,
-        thd_global_start=global_start,
+        **row_kwargs,
     )
     if squeezed_batch:
         return output.unsqueeze(1)
@@ -96,12 +135,20 @@ def apply_thd_cp_local_rope_unfused(
     nope_dim: int,
     pos_dim: int,
     cu_seqlens_padded: torch.Tensor,
-    global_start: int,
+    global_start: Optional[int],
     config,
     inverse: bool = False,
+    position_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Apply unfused RoPE to a consecutive interval of packed CP rows."""
-    position_ids = thd_cp_position_ids(cu_seqlens_padded, global_start, x.shape[0])
+    """Apply unfused RoPE to local THD CP rows.
+
+    ``global_start`` describes one consecutive interval of global rows. Pass
+    ``global_start=None`` and ``position_ids`` (one position per row) for a non-consecutive
+    row layout such as the zigzag partition.
+    """
+    _check_thd_cp_rope_rows(x, global_start, position_ids)
+    if position_ids is None:
+        position_ids = thd_cp_position_ids(cu_seqlens_padded, global_start, x.shape[0])
     freqs = torch.index_select(rotary_pos_emb, 0, position_ids.long())
 
     squeezed_batch = x.ndim == 4 and x.shape[1] == 1
@@ -198,6 +245,130 @@ class _LeftBoundaryExchange(torch.autograd.Function):
         return grad_input, None, None
 
 
+class _ZigzagBoundaryExchange(torch.autograd.Function):
+    """Exchange the two left-boundary windows of a zigzag CP rank.
+
+    Under the zigzag partition, rank ``r`` holds chunk ``r`` (segment A) followed by chunk
+    ``2 * CP - 1 - r`` (segment B), each ``segment_rows`` long. The window left of segment A is
+    the tail of rank ``r - 1``'s segment A (zeros on rank 0, where A starts the sequence); the
+    window left of segment B is the tail of rank ``r + 1``'s segment B, and on the last rank it
+    is the tail of its own segment A. The result is ``[halo_A | halo_B]``. Backward returns each
+    halo gradient to the rank that owns those rows; no row receives two gradients.
+    """
+
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor, d_window: int, cp_group: torch.distributed.ProcessGroup):
+        """Receive the ``(2 * d_window, ...)`` left windows of this rank's two segments."""
+        cp_size = cp_group.size()
+        cp_rank = cp_group.rank()
+        ctx.cp_group = cp_group
+        ctx.d_window = d_window
+        ctx.input_shape = tensor.shape
+        if tensor.shape[0] % 2 != 0 or tensor.shape[0] // 2 < d_window:
+            raise RuntimeError(
+                "DSv4 zigzag CP boundary exchange requires two equal segments of at least "
+                f"D_window rows: local_rows={tensor.shape[0]}, D_window={d_window}."
+            )
+        segment_rows = tensor.shape[0] // 2
+        boundary = tensor.new_zeros((2 * d_window,) + tuple(tensor.shape[1:]))
+        halo_a, halo_b = boundary[:d_window], boundary[d_window:]
+
+        ops = []
+        if cp_rank > 0:
+            ops.append(
+                dist.P2POp(
+                    dist.irecv, halo_a, dist.get_global_rank(cp_group, cp_rank - 1), cp_group
+                )
+            )
+            send_b_tail = tensor[2 * segment_rows - d_window :].contiguous()
+            ops.append(
+                dist.P2POp(
+                    dist.isend, send_b_tail, dist.get_global_rank(cp_group, cp_rank - 1), cp_group
+                )
+            )
+        if cp_rank + 1 < cp_size:
+            send_a_tail = tensor[segment_rows - d_window : segment_rows].contiguous()
+            ops.append(
+                dist.P2POp(
+                    dist.isend, send_a_tail, dist.get_global_rank(cp_group, cp_rank + 1), cp_group
+                )
+            )
+            ops.append(
+                dist.P2POp(
+                    dist.irecv, halo_b, dist.get_global_rank(cp_group, cp_rank + 1), cp_group
+                )
+            )
+        else:
+            # The last rank's segment B (chunk CP) directly follows its own segment A.
+            halo_b.copy_(tensor[segment_rows - d_window : segment_rows])
+        if ops:
+            for req in dist.batch_isend_irecv(ops):
+                req.wait()
+        return boundary
+
+    @staticmethod
+    def backward(ctx, grad_boundary: torch.Tensor):
+        """Send halo gradients back to the segment tails they were read from."""
+        cp_group = ctx.cp_group
+        cp_size = cp_group.size()
+        cp_rank = cp_group.rank()
+        d_window = ctx.d_window
+        segment_rows = ctx.input_shape[0] // 2
+        grad_input = grad_boundary.new_zeros(ctx.input_shape)
+        grad_a, grad_b = grad_boundary[:d_window], grad_boundary[d_window:]
+
+        ops = []
+        recv_a_tail = recv_b_tail = None
+        if cp_rank > 0:
+            ops.append(
+                dist.P2POp(
+                    dist.isend,
+                    grad_a.contiguous(),
+                    dist.get_global_rank(cp_group, cp_rank - 1),
+                    cp_group,
+                )
+            )
+            recv_b_tail = grad_boundary.new_empty(grad_b.shape)
+            ops.append(
+                dist.P2POp(
+                    dist.irecv, recv_b_tail, dist.get_global_rank(cp_group, cp_rank - 1), cp_group
+                )
+            )
+        if cp_rank + 1 < cp_size:
+            recv_a_tail = grad_boundary.new_empty(grad_a.shape)
+            ops.append(
+                dist.P2POp(
+                    dist.irecv, recv_a_tail, dist.get_global_rank(cp_group, cp_rank + 1), cp_group
+                )
+            )
+            ops.append(
+                dist.P2POp(
+                    dist.isend,
+                    grad_b.contiguous(),
+                    dist.get_global_rank(cp_group, cp_rank + 1),
+                    cp_group,
+                )
+            )
+        if ops:
+            for req in dist.batch_isend_irecv(ops):
+                req.wait()
+        if recv_a_tail is not None:
+            grad_input[segment_rows - d_window : segment_rows] = recv_a_tail
+        else:
+            # Last rank: its halo_B was a local copy of its own segment-A tail.
+            grad_input[segment_rows - d_window : segment_rows] = grad_b
+        if recv_b_tail is not None:
+            grad_input[2 * segment_rows - d_window :] = recv_b_tail
+        return grad_input, None, None
+
+
+def dsv4_cp_window_rows(compress_ratio: int, csa_window_size: int) -> int:
+    """Rows of left context a DSv4 CP segment needs: the sliding window or one compressor
+    window (8 rows for the overlapping ratio-4 compressor), whichever is larger."""
+    d_comp = 8 if compress_ratio == 4 else compress_ratio if compress_ratio > 1 else 0
+    return max(int(csa_window_size), d_comp)
+
+
 def exchange_cp_boundary_hidden(
     hidden_states: torch.Tensor,
     compress_ratio: int,
@@ -205,11 +376,189 @@ def exchange_cp_boundary_hidden(
     cp_group: torch.distributed.ProcessGroup,
 ) -> torch.Tensor:
     """Exchange hidden-state rows immediately left of this rank's token block."""
-    d_comp = 8 if compress_ratio == 4 else compress_ratio if compress_ratio > 1 else 0
-    d_window = max(int(csa_window_size), d_comp)
+    d_window = dsv4_cp_window_rows(compress_ratio, csa_window_size)
     hidden_flat = hidden_states.view(hidden_states.shape[0], -1)
     boundary_hidden = _LeftBoundaryExchange.apply(hidden_flat, d_window, cp_group)
     return boundary_hidden.reshape((d_window,) + tuple(hidden_states.shape[1:]))
+
+
+def exchange_cp_zigzag_boundary_hidden(
+    hidden_states: torch.Tensor,
+    compress_ratio: int,
+    csa_window_size: int,
+    cp_group: torch.distributed.ProcessGroup,
+) -> torch.Tensor:
+    """Exchange the hidden-state rows left of both segments of a zigzag CP rank.
+
+    Returns ``[halo_A | halo_B]`` with ``2 * D_window`` rows; see ``_ZigzagBoundaryExchange``.
+    """
+    d_window = dsv4_cp_window_rows(compress_ratio, csa_window_size)
+    hidden_flat = hidden_states.view(hidden_states.shape[0], -1)
+    boundary_hidden = _ZigzagBoundaryExchange.apply(hidden_flat, d_window, cp_group)
+    return boundary_hidden.reshape((2 * d_window,) + tuple(hidden_states.shape[1:]))
+
+
+# =============================================================================
+# Zigzag Partition Geometry
+# =============================================================================
+
+
+def thd_cp_zigzag_segments(
+    local_rows: int, cp_rank: int, cp_size: int
+) -> Tuple[int, Tuple[int, int]]:
+    """Return ``(segment_rows, (start_A, start_B))`` of a zigzag CP rank's two row segments.
+
+    The packed rows are cut into ``2 * cp_size`` chunks; rank ``r`` holds chunk ``r`` (segment
+    A) followed by chunk ``2 * cp_size - 1 - r`` (segment B). This is MCore's per-sequence
+    zigzag order for a pack holding a single sequence.
+    """
+    local_rows, cp_rank, cp_size = int(local_rows), int(cp_rank), int(cp_size)
+    if local_rows % 2 != 0:
+        raise ValueError(
+            f"Zigzag CP needs an even number of local rows (two equal chunks), got {local_rows}."
+        )
+    segment_rows = local_rows // 2
+    return segment_rows, (cp_rank * segment_rows, (2 * cp_size - 1 - cp_rank) * segment_rows)
+
+
+class DSv4ZigzagCpLayout(NamedTuple):
+    """Geometry of one zigzag CP rank for a DSv4 THD layer, shared by every layer of a microbatch.
+
+    ``q_position_ids`` gives the in-sequence position of each local row ``[A | B]``;
+    ``kv_position_ids`` those of ``[halo_A | halo_B | A | B]``, the rows that enter
+    ``linear_kv_proj``. ``compressor_layout`` is the merged two-segment compressor layout, or
+    None for window-only layers.
+    """
+
+    segment_rows: int
+    segment_starts: Tuple[int, int]
+    d_window: int
+    q_position_ids: torch.Tensor
+    kv_position_ids: torch.Tensor
+    compressor_layout: Optional[thd_layout_kernels.CPCompressorLayout]
+
+
+_ZIGZAG_LAYOUT_CACHE_ATTR = "_dsv4_zigzag_cp_layout_cache"
+
+
+def check_dsv4_zigzag_cp_pack(
+    cu_seqlens: torch.Tensor, local_rows: int, d_window: int, compress_ratio: int
+) -> int:
+    """Fail closed outside the supported zigzag envelope; return the segment rows.
+
+    Supported: one sequence per pack (MCore zigzags each sequence separately, so a pack with
+    several sequences has more than two segments per rank), two segments of at least
+    ``d_window`` rows (each halo then comes from a single peer) and, for compressed layers,
+    segments that are whole compression blocks. The ratio-4 compressor (overlapping windows,
+    CSA indexer) is not supported. All checks use shapes and host integers only.
+    """
+    if cu_seqlens.ndim != 1 or cu_seqlens.numel() != 2:
+        raise NotImplementedError(
+            "DSv4 zigzag CP (dsv4_cp_zigzag) supports one sequence per pack; got cumulative "
+            f"lengths of shape {tuple(cu_seqlens.shape)}. Pack one sequence per microbatch "
+            "(thd_max_packed_sequences=1) or use cp_partition_mode='contiguous'."
+        )
+    if int(compress_ratio) == 4:
+        raise NotImplementedError(
+            "DSv4 zigzag CP does not support the ratio-4 compressor and CSA indexer yet."
+        )
+    segment_rows = int(local_rows) // 2
+    if int(local_rows) % 2 != 0 or segment_rows < int(d_window):
+        raise ValueError(
+            "DSv4 zigzag CP needs two equal chunks of at least D_window rows per rank: "
+            f"local_rows={local_rows}, D_window={d_window}."
+        )
+    if int(compress_ratio) > 1 and segment_rows % int(compress_ratio) != 0:
+        raise ValueError(
+            "DSv4 zigzag CP needs chunks that are whole compression blocks: "
+            f"chunk_rows={segment_rows}, compress_ratio={compress_ratio}. Pad the sequence to "
+            "a multiple of 2 * CP * compress_ratio."
+        )
+    return segment_rows
+
+
+def build_dsv4_zigzag_cp_layout(
+    cu_seqlens: torch.Tensor,
+    cp_rank: int,
+    cp_size: int,
+    local_rows: int,
+    compress_ratio: int,
+    csa_window_size: int,
+) -> DSv4ZigzagCpLayout:
+    """Build a zigzag CP rank's row positions and compressor layout on device (no host sync)."""
+    d_window = dsv4_cp_window_rows(compress_ratio, csa_window_size)
+    check_dsv4_zigzag_cp_pack(cu_seqlens, local_rows, d_window, compress_ratio)
+    segment_rows, segment_starts = thd_cp_zigzag_segments(local_rows, cp_rank, cp_size)
+    # The zigzag rows assume the single sequence fills the whole pack.
+    torch._assert_async(
+        (cu_seqlens[0] == 0) & (cu_seqlens[-1] == int(local_rows) * int(cp_size)),
+        "DSv4 zigzag CP requires padded cumulative lengths [0, local_rows * cp_size].",
+    )
+
+    def rows(start, count):
+        return torch.arange(start, start + count, dtype=cu_seqlens.dtype, device=cu_seqlens.device)
+
+    q_rows = torch.cat([rows(start, segment_rows) for start in segment_starts])
+    halo_rows = torch.cat([rows(start - d_window, d_window) for start in segment_starts])
+    q_position_ids = thd_global_rows_position_ids(cu_seqlens, q_rows)
+    kv_position_ids = torch.cat(
+        (thd_global_rows_position_ids(cu_seqlens, halo_rows), q_position_ids)
+    )
+    compressor_layout = None
+    if int(compress_ratio) > 1:
+        compressor_layout = thd_layout_kernels.build_cp_zigzag_compressor_layout(
+            cu_seqlens, segment_starts, segment_rows, cp_size, int(compress_ratio)
+        )
+    return DSv4ZigzagCpLayout(
+        segment_rows, segment_starts, d_window, q_position_ids, kv_position_ids, compressor_layout
+    )
+
+
+def get_dsv4_zigzag_cp_layout(
+    packed_seq_params,
+    cu_seqlens: torch.Tensor,
+    cp_group: torch.distributed.ProcessGroup,
+    local_rows: int,
+    compress_ratio: int,
+    csa_window_size: int,
+    config,
+) -> DSv4ZigzagCpLayout:
+    """Return this microbatch's zigzag CP layout, built once and shared by its layers.
+
+    The layout is memoized on ``packed_seq_params``, which is built per microbatch. It is
+    never memoized while a CUDA graph is captured or when CUDA graphs are configured: a graph
+    must compute the layout from its own static ``cu_seqlens`` buffer.
+    """
+    cp_size, cp_rank = cp_group.size(), cp_group.rank()
+    capturing = cu_seqlens.is_cuda and torch.cuda.is_current_stream_capturing()
+    use_cache = (
+        packed_seq_params is not None
+        and not capturing
+        and getattr(config, "cuda_graph_impl", "none") == "none"
+    )
+    key = (
+        cu_seqlens.data_ptr(),
+        cp_size,
+        cp_rank,
+        int(local_rows),
+        int(compress_ratio),
+        int(csa_window_size),
+    )
+    cache = getattr(packed_seq_params, _ZIGZAG_LAYOUT_CACHE_ATTR, None) if use_cache else None
+    if cache is not None and key in cache:
+        return cache[key]
+    layout = build_dsv4_zigzag_cp_layout(
+        cu_seqlens, cp_rank, cp_size, local_rows, compress_ratio, csa_window_size
+    )
+    if use_cache:
+        if cache is None:
+            cache = {}
+            setattr(packed_seq_params, _ZIGZAG_LAYOUT_CACHE_ATTR, cache)
+        # Small index tensors shared by every layer: keep them out of activation offloading.
+        for tensor in (layout.q_position_ids, layout.kv_position_ids):
+            tensor._do_not_offload = True
+        cache[key] = layout
+    return layout
 
 
 # =============================================================================
@@ -573,8 +922,17 @@ def validate_packed_inputs(packed_seq_params, config, cp_group):
             raise ValueError(
                 "DSv4 currently supports static CP; runtime group transitions are unsupported."
             )
-    if cp_group.size() > 1 and config.attention_cp_layout != "contiguous":
-        raise ValueError("DSv4 packed CP requires attention_cp_layout='contiguous'.")
+    if (
+        cp_group.size() > 1
+        and config.attention_cp_layout != "contiguous"
+        and not (
+            config.attention_cp_layout == "zigzag" and getattr(config, "dsv4_cp_zigzag", False)
+        )
+    ):
+        raise ValueError(
+            "DSv4 packed CP requires attention_cp_layout='contiguous', or 'zigzag' with "
+            "dsv4_cp_zigzag=True."
+        )
     if packed_seq_params.max_seqlen_q is None or packed_seq_params.max_seqlen_kv is None:
         raise ValueError("Packed DSv4 requires host-known maximum query and KV sequence lengths.")
     q = packed_seq_params.cu_seqlens_q
