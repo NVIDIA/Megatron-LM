@@ -977,7 +977,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         assert layer.is_moe_layer
         assert (layer.self_attention_hyper_connection is None) == (stages == "mlp")
         assert not hasattr(layer, "cudagraph_manager")
-        assert layer.mlp_hyper_connection not in layer._get_submodules_under_cudagraphs()
+        assert not hasattr(layer, "te_cuda_graphs")
 
     @pytest.mark.parametrize(
         "cuda_graph_module",
@@ -1238,7 +1238,7 @@ class TestMHCWithCudaGraph:
         this method. If the shape is [s, b, C] instead of [s, b, n*C], the graph
         capture will produce a shape mismatch at the first hyper connection module.
         """
-        layer, config = self._create_mhc_layer()
+        layer, config = self._create_mhc_layer(cuda_graph_impl="transformer_engine")
         seq_length = 32
         micro_batch_size = 2
 
@@ -1262,7 +1262,8 @@ class TestMHCWithCudaGraph:
         graph replay, leading to stale parameter values.
         """
         layer, config = self._create_mhc_layer(
-            cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.mlp]
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.mlp],
         )
 
         submodules = layer._get_submodules_under_cudagraphs()
@@ -1277,7 +1278,7 @@ class TestMHCWithCudaGraph:
         For mHC layers, the input must be n-stream [s, b, n*C] and output must
         also be [s, b, n*C].
         """
-        layer, config = self._create_mhc_layer()
+        layer, config = self._create_mhc_layer(cuda_graph_impl="transformer_engine")
         layer.eval()
 
         seq_len = 8

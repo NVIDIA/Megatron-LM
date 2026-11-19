@@ -3,6 +3,8 @@
 # wires InferenceTopKRouter for correct [tokens, topk] routing format.
 
 ENV_VARS:
+  # This CI-managed DeepSeek checkpoint contains legacy TE extra state.
+  NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE: 1
   CUDA_DEVICE_MAX_CONNECTIONS: 1
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Ring
