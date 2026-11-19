@@ -1186,6 +1186,10 @@ def validate_args(args, defaults={}):
                 f"or equal to seq_length ({args.seq_length})."
         if args.decoder_seq_length is not None:
             assert args.max_position_embeddings >= args.decoder_seq_length
+        if args.max_seq_length_per_sample is not None:
+            assert args.max_position_embeddings >= args.max_seq_length_per_sample, \
+                f"max_position_embeddings ({args.max_position_embeddings}) must be greater than " \
+                f"or equal to max_seq_length_per_sample ({args.max_seq_length_per_sample})."
     elif args.max_position_embeddings < max(
         args.seq_length or 0, args.decoder_seq_length or 0, args.max_seq_length_per_sample or 0
     ):

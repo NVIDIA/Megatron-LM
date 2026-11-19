@@ -1104,18 +1104,6 @@ def gpt_data_config_from_args(args: Namespace) -> DataConfig:
         "sft": SFTDatasetConfig,
         "varlen": GPTDatasetConfig,
     }[family]
-    if family in ("sft", "varlen") and has_source:
-        # These dataset implementations rejected GPT mask/reset options in __getitem__.
-        # Report unsupported CLI options before dataset construction.
-        if (
-            args.reset_position_ids
-            or args.reset_attention_mask
-            or args.create_attention_mask_in_dataloader
-        ):
-            raise ValueError(
-                "SFT/Varlen datasets require --no-create-attention-mask-in-dataloader "
-                "and do not support --reset-position-ids or --reset-attention-mask"
-            )
     kwargs: dict[str, Any] = {
         field_name: deepcopy(getattr(args, source))
         for field_name, source in _DATASET_FIELD_SOURCES.items()

@@ -108,6 +108,20 @@ def test_bert_callback_validates_learned_position_capacity(run_config):
     assert run_config.to_dict() == before
 
 
+def test_llava_requires_the_language_execution_width():
+    """The resolved text + image + padding width is an input; the container never derives it
+    from the text-only dataset length."""
+    transformer = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
+    model = LLaVAModelConfig(transformer=transformer, seq_length=32)
+    with pytest.raises(ValueError, match="requires transformer.max_seq_length_per_sample"):
+        model.validate()
+    transformer.max_seq_length_per_sample = 64
+    with pytest.raises(ValueError, match="LLaVA position capacity"):
+        model.validate()
+    model.position_embedding_type = "rope"
+    model.validate()
+
+
 @pytest.mark.parametrize(
     "bound,capacity,error", [(33, 64, "alignment"), (64, 32, "position capacity"), (32, 64, None)]
 )
@@ -498,6 +512,9 @@ def test_serialization_starts_a_new_lifecycle(
     if isinstance(run_config.model, ModelConfig):
         # Preserve builder metadata without treating it as a constructor keyword.
         run_config.model.builder = "megatron.training.models.gpt.GPTModelBuilder"
+    if model_cls is LLaVAModelConfig:
+        # The application resolves the language execution width before building the container.
+        run_config.model.transformer.max_seq_length_per_sample = 16
     run_config.train.micro_batch_size = 1
     run_config.finalize()
     # Training attaches live objects to the transformer; checkpoint metadata must omit them.

@@ -227,9 +227,11 @@ def resolve_dataset_class(
         raise ValueError(
             f"{dataset_type.__name__} needs a data source (blend or blend_per_split); {hint}."
         )
-    if (config_family is not None and family != config_family) or (
-        family == "fim" and config_family != "fim"
-    ):
+    if family == "fim" and config_family != "fim":
+        raise ValueError(
+            f"{dataset_type.__name__} requires GPTFIMDatasetConfig, got {type(dataset).__name__}."
+        )
+    if config_family is not None and family != config_family:
         raise ValueError(
             f"{type(dataset).__name__} requires the {config_family} dataset family, "
             f"got {dataset_type.__name__}."
@@ -266,7 +268,9 @@ class DataConfig:
         split rules, the GPT booleans, the FIM rates and tokens) run here too, so a YAML or Python
         section fails at ``cfg.validate()``, before runtime initialization; the checks that need the
         tokenizer run in ``bind_tokenizer()`` and in the builder. Inter-document masking with the
-        dataloader attention mask is rejected here (the CLI normalizes the pair away).
+        dataloader attention mask is rejected here (the CLI normalizes the pair away), and so are
+        the GPT position / mask options for the real SFT and varlen datasets, which assert them per
+        sample.
         """
         self.dataloader.validate()
         if self.dataset is not None:
@@ -283,7 +287,18 @@ class DataConfig:
                     "(validate_args clears the flag for --dataloader-inter-document-masking; a "
                     "Python or YAML section sets it explicitly)."
                 )
-        resolve_dataset_class(self.dataset, self.dataset_type)
+        dataset_type = resolve_dataset_class(self.dataset, self.dataset_type)
+        if dataset_type in (SFTDataset, VarlenDataset) and (
+            self.dataset.reset_position_ids
+            or self.dataset.reset_attention_mask
+            or self.dataset.create_attention_mask
+        ):
+            raise ValueError(
+                f"{dataset_type.__name__} builds its own position ids and attention masks: "
+                "reset_position_ids, reset_attention_mask and create_attention_mask must be False "
+                "(--no-create-attention-mask-in-dataloader, without --reset-position-ids or "
+                "--reset-attention-mask)."
+            )
 
     def finalize(self) -> None:
         """Apply the loader defaults and commit the resolved dataset class (idempotent)."""

@@ -476,12 +476,12 @@ def test_online_dataset_cli_reports_unsupported_masks(family_flag, unsupported_f
     extra = [family_flag, *SOURCE, "--calculate-per-token-loss"]
     if unsupported_flag is not None:
         extra += ["--no-create-attention-mask-in-dataloader", unsupported_flag]
-    args = _validated(extra)
+    data = gpt_data_config_from_args(_validated(extra))
     with pytest.raises(
         ValueError,
         match="--no-create-attention-mask-in-dataloader.*--reset-position-ids.*--reset-attention-mask",
     ):
-        gpt_data_config_from_args(args)
+        data.validate()  # the real SFT / varlen datasets assert these per sample
 
 
 def test_the_run_execution_length_matches_fixed_dataset_rows(container_factory, monkeypatch):
@@ -853,6 +853,7 @@ def test_varlen_datasets_and_the_packing_scheduler(container_factory, monkeypatc
         varlen_sbhd_validation=True,
         reset_position_ids=False,
         reset_attention_mask=False,
+        create_attention_mask=False,
         eod_mask_loss=False,
     )
     cfg.data = DataConfig(dataset=sbhd, dataset_type=VarlenDataset, dataloader=cfg.data.dataloader)

@@ -297,9 +297,9 @@ def test_implicit_class_resolution():
         (_dataset(), GPTDataset, "select MockGPTDataset"),
         (_dataset(), VarlenDataset, "select MockVarlenDataset"),
         (_fim(blend=None, split=None), GPTFIMDataset, "no mock dataset for the fim family"),
-        (_dataset(blend=BLEND, split="1,1,1"), GPTFIMDataset, "requires"),
-        (_fim(), GPTDataset, "requires"),
-        (_fim(), SFTDataset, "requires"),
+        (_dataset(blend=BLEND, split="1,1,1"), GPTFIMDataset, "requires GPTFIMDatasetConfig"),
+        (_fim(), GPTDataset, "requires the fim dataset family"),
+        (_fim(), SFTDataset, "requires the fim dataset family"),
         (_dataset(GPTDatasetConfig, varlen_sbhd_validation=True), MockVarlenDataset, "requires real data"),
         (_dataset(), object, "must be one of the dataset classes"),
         (_dataset(), "GPTDataset", "must be one of the dataset classes"),
@@ -327,6 +327,30 @@ def test_selected_class_must_match_the_config(dataset, dataset_type, message):
 )
 def test_explicit_classes_accepted(dataset, dataset_type):
     assert resolve_dataset_class(dataset, dataset_type) is dataset_type
+
+
+@pytest.mark.parametrize(
+    ("dataset_type", "mock_type", "config_cls"),
+    [
+        (SFTDataset, MockSFTDataset, SFTDatasetConfig),
+        (VarlenDataset, MockVarlenDataset, GPTDatasetConfig),
+    ],
+)
+@pytest.mark.parametrize(
+    "option", ["reset_position_ids", "reset_attention_mask", "create_attention_mask"]
+)
+def test_sft_and_varlen_datasets_reject_the_gpt_position_and_mask_options(
+    dataset_type, mock_type, config_cls, option
+):
+    """They assert these per sample: the section reports them at validate(), for a Python
+    section and the CLI flags alike; the mock classes keep Megatron Core's defaults."""
+    dataset = _dataset(config_cls, blend=BLEND, split="1,1,1", create_attention_mask=False)
+    section = DataConfig(dataset=dataset, dataset_type=dataset_type)
+    section.validate()
+    setattr(dataset, option, True)
+    with pytest.raises(ValueError, match=f"{dataset_type.__name__}.*{option}"):
+        section.validate()
+    DataConfig(dataset=_dataset(config_cls), dataset_type=mock_type).validate()
 
 
 def test_varlen_sbhd_validation_excludes_dynamic_cp(tokenizer):
