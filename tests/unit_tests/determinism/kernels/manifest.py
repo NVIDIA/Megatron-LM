@@ -773,6 +773,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="triton",
         training_path=False,
         notes="Batch-invariant paths replay bit-exactly; the atomic default unpermute is the negative control. "
+        "Ordinary vLLM MoE also covers parallel alignment, tiled slot reduction, and decode/prefill hints. "
         "ordered_reduce_scatter_v (multi-rank) is not replayed here. The BF16 expert GEMM "
         "(torch grouped_mm) is checked row-invariant in test_moe_batch_invariant.py.",
     ),
