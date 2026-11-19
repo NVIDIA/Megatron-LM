@@ -1,21 +1,14 @@
 <!-- megatron-lm-draft-review -->
-Keep this PR in draft while you work. Members of Megatron-LM teams can request an Autobot review in a PR comment. If you're outside those teams, ask a team member to post the command for you.
+Request Autobot approval on the latest commit while in draft.
 
-- `/review-approve` requests a findings-only follow-up.
-- `/review-approve reset=true` requests a full review.
+- `/review-approve` — findings-only
+- `/review-approve reset=true` — full review
 
-Once Autobot approves the latest commit, click **Ready for review**. To use the exemption, add the `skip-bot-approval` label before clicking **Ready for review**. If your fork needs a CI mirror, ask a maintainer to run `/ok to test` for your latest commit first.
+If you’re outside `mcore-engineers`, ask a member to post the command. To skip approval, add `skip-bot-approval`.
 
 ```mermaid
-flowchart TD
-    Draft["Work on the draft"] --> Review["Request an Autobot review"]
-    Review -->|Changes requested| Draft
-    Review -->|Approved| Ready["Mark ready for review"]
-    Draft -->|Add skip-bot-approval| Ready
-    Draft -->|Mark ready early| Gate
-    Ready --> Gate{"Current commit approved by Autobot or exemption label present?"}
-    Gate -->|No| Draft
-    Gate -->|Yes| Teams["Review groups review the PR"]
+flowchart LR
+    D[Draft] -->|Mark ready| G{Approved or exempt?}
+    G -->|Yes| R[Team review]
+    G -->|No| D
 ```
-
-[Megatron-LM contribution guide](https://github.com/NVIDIA/Megatron-LM/blob/main/docs/developer/submit.md)

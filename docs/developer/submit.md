@@ -16,7 +16,7 @@ draft.
 
 1. Work on your draft and request Autobot approval in a PR comment. Use `/review-approve`
    for a findings-only follow-up or `/review-approve reset=true` for a full review. If you're
-   outside the Megatron-LM teams, ask a team member to post the command for you. For a fork,
+   outside `mcore-engineers`, ask a member to post the command for you. For a fork,
    a maintainer may need to run `/ok to test` for the latest commit first.
 2. Address the findings and request another review. Once Autobot approves the current commit,
    click **Ready for review**. To use the exemption, apply `skip-bot-approval` before clicking.
