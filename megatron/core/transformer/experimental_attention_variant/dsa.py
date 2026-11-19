@@ -1977,6 +1977,12 @@ def _validate_dsa_kpool_config(config: TransformerConfig) -> None:
             "dsa_indexer_topk must be divisible by dsa_indexer_kpool for pool selection; "
             f"got topk={index_topk}, kpool={pool_size}."
         )
+    if getattr(config, "dsa_indexer_mode", "standard") == "simplified":
+        raise ValueError(
+            "dsa_indexer_mode='simplified' does not support KPool selection "
+            "(dsa_indexer_kpool > 1): the simplified indexer has no pool compression, so the "
+            f"pools would be silently ignored; got dsa_indexer_kpool={pool_size}."
+        )
     if (getattr(config, "dsa_indexer_loss_coeff", None) or 0.0) > 0:
         raise ValueError(
             "DSA indexer loss is not supported with kpool selection; set "

@@ -3171,6 +3171,15 @@ class TransformerConfig(ModelParallelConfig):
                         " by dsa_indexer_kpool for pool selection; "
                         f"got topk={self.dsa_indexer_topk}, kpool={self.dsa_indexer_kpool}."
                     )
+            if self.dsa_indexer_kpool > 1 and self.dsa_indexer_mode == "simplified":
+                # The simplified (GQA) indexer has no pool code; without this rule a KPool
+                # config would be accepted and KPool silently ignored.
+                raise ValueError(
+                    "dsa_indexer_mode='simplified' does not support KPool selection "
+                    "(dsa_indexer_kpool > 1): the simplified indexer has no pool compression, "
+                    "so the pools would be silently ignored; got "
+                    f"dsa_indexer_kpool={self.dsa_indexer_kpool}."
+                )
             if self.dsa_indexer_kpool > 1 and (self.dsa_indexer_loss_coeff or 0.0) > 0:
                 raise ValueError(
                     "DSA indexer loss is not supported with kpool selection; set "
