@@ -818,6 +818,9 @@ def save_checkpoint(
     save_root = checkpoint.save if save is None else save
     save_format = checkpoint.ckpt_format if ckpt_format is None else ckpt_format
     verify_integrity = checkpoint.verify_integrity if verify_integrity is None else verify_integrity
+    # Integrity manifests exist only for torch_dist checkpoints; ``validate`` never mutates the
+    # config, so the default-on setting is narrowed here.
+    verify_integrity = verify_integrity and save_format == "torch_dist"
     save_policy = dict(save=save_root, ckpt_format=save_format, verify_integrity=verify_integrity)
 
     if checkpoint.async_save and not is_empty_async_queue():
@@ -2271,7 +2274,7 @@ def _load_global_dist_base_checkpoint(
         load_strategy,
         validate_access_integrity=checkpoint.ckpt_load_validate_sharding_integrity,
         strict=checkpoint.dist_ckpt_strictness,
-        verify_integrity=checkpoint.verify_integrity,
+        verify_integrity=checkpoint.verify_integrity and checkpoint.ckpt_format == "torch_dist",
         process_group=checkpoint_group,
     )
     return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
