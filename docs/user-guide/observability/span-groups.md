@@ -61,3 +61,30 @@ When telemetry or a group is disabled, its group-gated helpers do not create
 spans; the application body still executes normally. Keep expensive argument
 construction inside an explicit group check. Use detailed instrumentation for
 targeted profiling, not as a reason to change model computation.
+
+## Training and checkpoint span contracts
+
+| Operation | Span name | Group |
+| --- | --- | --- |
+| Attempted training iteration | `nv.dl.training.iteration` | `megatron.train` |
+| Forward/backward wrapper | `nv.dl.training.iteration.forward_backward` | `megatron.train` |
+| Optimizer update | `nv.dl.training.iteration.optimizer_step` | `megatron.train` |
+| Reporting interval | `nv.mlm.train.iteration_report` | `megatron.train` |
+| Parameter norm and ordinary logging | `nv.mlm.train.params_norm`, `nv.mlm.train.log` | `megatron.train` |
+| First executed iteration's pre-hook enablement | `nv.mlm.train.forward_pre_hook` | `megatron.train` |
+| Trainer-visible checkpoint save | `nv.dl.training.checkpoint.exposed_save` | `megatron.ckpt` |
+| Save operation | `nv.dl.training.checkpoint.save` | `megatron.ckpt` |
+| State dictionary and I/O dispatch | `nv.dl.training.checkpoint.save.state_dict`, `nv.dl.training.checkpoint.save.io_write` | `megatron.ckpt` |
+| Queue finalization cost | `nv.dl.training.checkpoint.save.finalize` | `megatron.ckpt` |
+| Checkpoint load and I/O | `nv.dl.training.checkpoint.load`, `nv.dl.training.checkpoint.load.io_read` | `megatron.ckpt` |
+| Checkpoint reporting and heartbeat | `nv.mlm.checkpoint.report_memory`, `nv.mlm.checkpoint.timers_log`, `nv.mlm.checkpoint.ft_heartbeat` | `megatron.ckpt` |
+| Evaluation and evaluation iteration | `nv.dl.training.evaluate`, `nv.dl.training.evaluate.step` | `megatron.eval` |
+| Periodic GPU sniff | `nv.dl.resiliency.gpu_sniff.periodic` | `megatron.job` |
+| CUDA graph capture | `nv.mcore.cuda_graph.capture` | `megatron.job` |
+| Explicit memory reclaim | `nv.mcore.memory.reclaim` | `megatron.train` or `megatron.ckpt` |
+
+`nv.dl.training.step` is the one-based training step. The first executed
+iteration of each run has `nv.dl.training.iteration.is_first=true`.
+`nv.dl.training.iteration.skipped` and
+`nv.dl.training.optimizer.update_successful` distinguish attempted work from a
+successful optimizer update.
