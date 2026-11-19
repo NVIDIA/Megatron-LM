@@ -38,6 +38,13 @@ class MegatronCheckpointLoaderLLaVA(MegatronCheckpointLoaderBase):
         queue: A multiprocessing.Queue (or similar) used to send out loaded tensors.
     """
 
+    def build_model_config(self):
+        """Select LLaVA rather than the converter's legacy GPT family label."""
+        from megatron.training.argument_utils import model_config_from_args
+        from megatron.training.models import LLaVAModelConfig
+
+        return model_config_from_args(self.margs, model_config_cls=LLaVAModelConfig)
+
     def build_sys_argv(self):
         """
         Construct a sys.argv list for Megatron's argument parser.

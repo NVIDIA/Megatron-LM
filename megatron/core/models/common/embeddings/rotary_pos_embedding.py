@@ -27,6 +27,7 @@ from megatron.core.models.common.embeddings.rope_utils import (  # for backward 
     apply_rotary_pos_emb,
     get_pos_emb_on_this_cp_rank,
 )
+from megatron.core.process_groups_config import warn_global_process_group_fallback
 from megatron.core.transformer.cuda_graphs import register_capture_constant
 from megatron.core.utils import deprecate_inference_params, internal_api
 
@@ -66,7 +67,8 @@ class RotaryEmbedding(nn.Module):
         use_cpu_initialization (bool, optional): If False, initialize the inv_freq directly
             on the GPU. Defaults to False
         cp_group (torch.distributed.ProcessGroup, optional): Process group for context parallel.
-            Defaults to None.
+            Omitting it is deprecated: the global context-parallel group is used and a
+            FutureWarning is emitted. It becomes required when the fallback is removed.
     """
 
     # Maximum number of ordinary cached entries shared across instances of this class.
@@ -101,11 +103,10 @@ class RotaryEmbedding(nn.Module):
         if rope_scaling:
             self.inv_freq = self._apply_scaling(self.inv_freq, factor=rope_scaling_factor)
 
-        self.cp_group = (
-            cp_group
-            if cp_group is not None
-            else parallel_state.get_context_parallel_group(check_initialized=False)
-        )
+        if cp_group is None:
+            warn_global_process_group_fallback(type(self).__name__, "cp_group")
+            cp_group = parallel_state.get_context_parallel_group(check_initialized=False)
+        self.cp_group = cp_group
 
     @classmethod
     def _remove_expired_cache_entries(cls, _owner: ReferenceType[RotaryEmbedding]) -> None:
@@ -432,16 +433,16 @@ class MultimodalRotaryEmbedding(nn.Module):
                 / dim
             )
         )
-        self.cp_group = (
-            cp_group
-            if cp_group is not None
-            else parallel_state.get_context_parallel_group(check_initialized=False)
-        )
+        if cp_group is None:
+            warn_global_process_group_fallback(type(self).__name__, "cp_group")
+            cp_group = parallel_state.get_context_parallel_group(check_initialized=False)
+        self.cp_group = cp_group
 
     def forward(
         self,
         position_ids: torch.Tensor,
         mrope_section: List[int],
+        packed_seq: bool = False,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> Tensor:
         """Forward pass of multimodal RoPE embedding.
@@ -450,6 +451,9 @@ class MultimodalRotaryEmbedding(nn.Module):
             position_ids (torch.Tensor): A postion_id tensor with shape [3, batchsize, seqlens]
             mrope_section (list[int]): Multimodal rope section is for channel dimension of temporal,
                 height and width in rope calculation.
+            packed_seq (bool, optional): Whether input uses packed THD sequences. When True, skip
+                the early CP slice so `_apply_rotary_pos_emb_thd` can index full-sequence positions
+                (same gate as RotaryEmbedding). Defaults to False.
             cp_group (torch.distributed.ProcessGroup, optional): Context parallel group.
                 Defaults to None.
 
@@ -461,12 +465,8 @@ class MultimodalRotaryEmbedding(nn.Module):
         if self.seq_len_interpolation_factor is not None:
             seq *= 1 / self.seq_len_interpolation_factor
 
-        # shape (3, bs, dim, 1)
-        inv_freq_expanded = self.inv_freq[None, None, :, None].expand(3, seq.shape[1], -1, 1)
-        # shape (3, bs, 1, seq_length)
-        seq_expanded = seq[:, :, None, :].float()
         # shape (3, bs, seq_length, dim)
-        freqs = (inv_freq_expanded @ seq_expanded).transpose(2, 3)
+        freqs = seq[..., None].float() * self.inv_freq
         # first part even vector components, second part odd vector components,
         #  2 * dim in dimension size
         if not self.rotary_interleaved:
@@ -486,7 +486,9 @@ class MultimodalRotaryEmbedding(nn.Module):
         emb = emb[..., None, :].transpose(0, 1).contiguous()
         if cp_group is None:
             cp_group = self.cp_group
-        if cp_group is not None and cp_group.size() > 1:
+        # For packed THD, skip CP slicing here; _apply_rotary_pos_emb_thd owns CP position
+        # mapping (same gate as RotaryEmbedding).
+        if cp_group is not None and cp_group.size() > 1 and not packed_seq:
             # slice rotary_pos_emb along sequence dimension and select the parition of the current
             # CP rank
             emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)

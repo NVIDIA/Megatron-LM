@@ -15,7 +15,6 @@ from megatron.core.inference.communication_utils import (
 from megatron.core.inference.config import MultimodalPromptConfig
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import deprecate_args, get_attr_wrapped_model, get_model_config
 
 DEPRECATED_ARGS = ["inference_wrapper_config", "pg_collection"]
@@ -66,10 +65,9 @@ class AbstractModelInferenceWrapper(abc.ABC):
         if configured_prompt_contract is not None:
             self.multimodal_prompt_config = configured_prompt_contract
 
-        # Get the inference pg_collection from the config if it exists; otherwise the training
-        # pg_collection might be used during RL
-        if (pg_collection := self.inference_context.config.pg_collection) is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        # Resolved once at the inference-config boundary; during RL this may be the training
+        # collection rather than an inference-specific one.
+        pg_collection = self.inference_context.config.resolve_pg_collection()
 
         self.tp_group = pg_collection.tp
         self.pp_group = pg_collection.pp
@@ -326,14 +324,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
         self.inference_context.increment_sequence_len_offset(seq_len)
 
-        logits = None
-        if is_pipeline_last_stage(self.pp_group):
-            logits = output_tensor
-
-            # Explicitly cast logits to expected dtype
-            logits = logits.to(self.config.params_dtype)
-
-        return logits
+        return output_tensor if is_pipeline_last_stage(self.pp_group) else None
 
     @torch.inference_mode()
     def run_one_forward_step(

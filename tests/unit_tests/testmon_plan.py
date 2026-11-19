@@ -69,7 +69,8 @@ def _bucket_files(
 
 
 def _select_phase(root: Path, database: Path, test_files: set[str]) -> set[str]:
-    from testmon.process_code import Module, blob_to_checksums, read_source_sha
+    from testmon.process_code import blob_to_checksums
+    from testmon.testmon_core import SourceTree
 
     with closing(
         sqlite3.connect(database.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
@@ -85,6 +86,8 @@ def _select_phase(root: Path, database: Path, test_files: set[str]) -> set[str]:
 
     known_files = {row[0].split("::", 1)[0] for row in fingerprints}
     selected = test_files - known_files
+    # Match Testmon's Git-aware baseline hashes, including Unicode source files.
+    source_tree = SourceTree(str(root))
     sources = {}
     for nodeid, duration, failed, filename, recorded_sha, fingerprint in fingerprints:
         if duration is None:
@@ -94,13 +97,9 @@ def _select_phase(root: Path, database: Path, test_files: set[str]) -> set[str]:
             selected.add(test_file)
             continue
         if filename not in sources:
-            path = root / filename
-            source, source_sha = read_source_sha(path)
-            checksums = (
-                set(Module(source_code=source, ext=path.suffix.lstrip(".")).method_checksums)
-                if source is not None
-                else set()
-            )
+            module = source_tree.get_file(filename)
+            source_sha = module.fs_fsha if module is not None else None
+            checksums = set(module.method_checksums) if module is not None else set()
             sources[filename] = (source_sha, checksums)
         source_sha, checksums = sources[filename]
         if filename == test_file and recorded_sha != source_sha:

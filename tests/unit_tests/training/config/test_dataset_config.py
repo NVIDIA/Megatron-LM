@@ -16,7 +16,6 @@ from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, Moc
 from megatron.core.datasets.gpt_fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.config import DataConfig, DataloaderConfig
-from megatron.training.config.container import ConfigContainerBase
 from megatron.training.config.dataset_config import (
     CONTAINER_WRITTEN_FIELDS,
     dataset_family_from_type,
@@ -26,7 +25,7 @@ from megatron.training.config.dataset_config import (
     resolve_dataset_class,
 )
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
-from megatron.training.config.utils import sanitize_dataclass_config
+from megatron.training.config.utils import sanitize_dataclass_config, serialize_value
 from megatron.training.config.yaml_utils import safe_yaml_representers
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
@@ -181,18 +180,17 @@ def test_fim_config_is_megatron_cores(tokenizer):
 
 
 def test_container_written_fields_are_the_layout_and_the_validation_flags():
-    """The seven fields other sections own (the deprecated hybrid_context_parallel alias among
-    them), left at Megatron Core's defaults until the container writes them; the seed is the
-    section's own setting, not one of them."""
+    """The six fields other sections own, left at Megatron Core's defaults until the container
+    writes them; the seed is the section's own setting, not one of them."""
     assert CONTAINER_WRITTEN_FIELDS == (
         "data_parallel_size", "context_parallel_size", "sequence_parallel_size",
-        "dynamic_context_parallel", "hybrid_context_parallel",
+        "dynamic_context_parallel",
         "multiple_validation_sets", "full_validation",
     )  # fmt: skip
     defaults = {f.name: f.default for f in fields(GPTDatasetConfig)}
     assert {name: defaults[name] for name in CONTAINER_WRITTEN_FIELDS} == {
         "data_parallel_size": 1, "context_parallel_size": None, "sequence_parallel_size": 0,
-        "dynamic_context_parallel": False, "hybrid_context_parallel": False,
+        "dynamic_context_parallel": False,
         "multiple_validation_sets": None, "full_validation": None,
     }  # fmt: skip
     assert "random_seed" not in CONTAINER_WRITTEN_FIELDS
@@ -242,7 +240,7 @@ def test_data_section_round_trips_through_yaml_with_the_class():
         dataloader=DataloaderConfig(num_workers=0),
         dataset_type=GPTDataset,
     )
-    as_dict = ConfigContainerBase._convert_value_to_dict(data)
+    as_dict = serialize_value(data)
     assert as_dict == data.to_cfg_dict()
     with safe_yaml_representers():
         text = yaml.safe_dump(as_dict, default_flow_style=False)
