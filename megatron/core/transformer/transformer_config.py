@@ -64,13 +64,15 @@ def _validate_shortcut_fusion_config(config):
     wr, interval = config.wide_residual, config.residual_stream_recompute_num_layers
     # Under MXFP8 each fused read hands reader zero to its consumer Linear directly as MXFP8.
     mxfp8 = bool(config.fp8) and config.fp8_recipe == "mxfp8"
+    # A shortcut block hands its MoE read to the shared expert's first Linear alone; a standalone
+    # MoE layer takes its read whole (BF16) for its router, shared expert and dispatcher.
+    blocks = config.moe_shortcut_connection
     recompute = set(config.recompute_modules or ()) & {
         "layernorm",
         "shortcut_pre_mlp_layernorm",
         "residual_stream",
     }
     unsupported = {
-        "moe_shortcut_connection=False": not config.moe_shortcut_connection,
         "wide_residual=None": wr is None,
         "wide_residual.num_streams outside [2, 6]": wr is not None and not 2 <= wr.num_streams <= 6,
         "hidden_size outside multiples of 32 up to 10240": (
@@ -83,7 +85,8 @@ def _validate_shortcut_fusion_config(config):
         "learned retention with retention_max_forget != 0.1": (
             wr is not None and wr.learned_retention and wr.retention_max_forget != 0.1
         ),
-        "no shared expert": not config.moe_shared_expert_intermediate_size,
+        "shortcut blocks without a shared expert": blocks
+        and not config.moe_shared_expert_intermediate_size,
         "hidden_dropout": config.hidden_dropout != 0,
         "add_bias_linear": config.add_bias_linear,
         "moe_shortcut_post_norm": config.moe_shortcut_post_norm,
@@ -115,10 +118,13 @@ def _validate_shortcut_fusion_config(config):
         "MXFP8 with tp_comm_overlap": mxfp8 and config.tp_comm_overlap,
         # An MXFP8 read's consumer takes the whole read once (its columns are shared, not sliced).
         "MXFP8 with mlp_chunks_for_training > 1": mxfp8 and config.mlp_chunks_for_training > 1,
-        # The MoE read goes straight to the shared expert's first Linear as MXFP8: neither a gate
-        # reading it in BF16 nor fused grouped shared experts (which quantize it) can take it.
-        "MXFP8 with moe_shared_expert_gate": mxfp8 and config.moe_shared_expert_gate,
-        "MXFP8 with use_grouped_gemm_for_shared_expert": mxfp8
+        # A block's MoE read goes straight to the shared expert's first Linear as MXFP8: neither
+        # a gate reading it in BF16 nor fused grouped shared experts (which quantize it) can take it.
+        "MXFP8 shortcut blocks with moe_shared_expert_gate": mxfp8
+        and blocks
+        and config.moe_shared_expert_gate,
+        "MXFP8 shortcut blocks with use_grouped_gemm_for_shared_expert": mxfp8
+        and blocks
         and config.use_grouped_gemm_for_shared_expert,
         # A fused block hands its unwritten MoE output to the next layer on the same stage.
         "pipeline_model_parallel_size > 1": config.pipeline_model_parallel_size != 1,
@@ -1549,7 +1555,9 @@ class TransformerConfig(ModelParallelConfig):
     moe_shortcut_wide_residual_norm_fusion: bool = False
     """Fuse each wide-residual write with the next layer's read and RMSNorm in one GB300 kernel
     (megatron/core/fusions/wide_residual_shortcut); HybridModel splits those norms out of their
-    projections. residual_stream_recompute_num_layers=N > 1 replays residuals bit-exactly."""
+    projections. With or without moe_shortcut_connection: a standalone MoE layer takes its fused
+    read whole, in BF16. residual_stream_recompute_num_layers=N > 1 replays residuals
+    bit-exactly."""
 
     wide_residual: Optional[WideResidualConfig] = None
     """Optional streamwise wide-residual architecture configuration.

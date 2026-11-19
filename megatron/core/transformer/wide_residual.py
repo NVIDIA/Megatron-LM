@@ -873,9 +873,10 @@ def link_residual_seams(layers) -> None:
     The fused spec makes every write but the last a DeferredWrite and every read but the first a
     WriteReadNorm. Each deferred write is linked to the next layer's fused read, and each read not
     yet linked to its consumer: a layer's input projection (MXFP8 when eligible), or for an MoE
-    layer outside a shortcut block the MoE layer itself (its read reaches the router, shared
-    expert and latent projection as one tensor, so it stays BF16, and MXFP8 is rejected). A layer
-    the spec could not fuse is rejected with its reason, and so is a one-layer stack.
+    layer outside a shortcut block the MoE layer itself. Its read reaches the router, shared
+    expert and dispatcher (or latent projection) as one BF16 tensor, so under MXFP8 its Linears
+    quantize it themselves, and autograd sums the three consumers' gradients. A layer the spec
+    could not fuse is rejected with its reason, and so is a one-layer stack.
     """
     from megatron.core.transformer.moe.moe_layer import MoELayer
 
@@ -903,13 +904,7 @@ def link_residual_seams(layers) -> None:
         write.link(read)
         if read.consumers:
             continue  # a shortcut block's MoE read, linked by its block
-        if not isinstance(getattr(successor, "mlp", None), MoELayer):
-            read.link_consumer(_input_projection(successor), successor.layer_number)
-        elif successor.config.fp8 and successor.config.fp8_recipe == "mxfp8":
-            raise ValueError(
-                "moe_shortcut_wide_residual_norm_fusion with MXFP8 does not support an MoE layer "
-                f"outside a shortcut block (layer {successor.layer_number}): its Linears would "
-                "quantize the fused read themselves"
-            )
+        if isinstance(getattr(successor, "mlp", None), MoELayer):
+            read.link_consumer(successor.mlp, successor.layer_number)  # never quantizes
         else:
-            read.link_consumer(successor.mlp, successor.layer_number)
+            read.link_consumer(_input_projection(successor), successor.layer_number)
