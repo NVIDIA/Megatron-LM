@@ -615,9 +615,9 @@ class WriteReadNorm(nn.Module):
         by the previous seam."""
         if self.replay_every is None or not (self.training and torch.is_grad_enabled()):
             return None
-        if self.starts_replay:  # linked to the interval whose last write this seam applies
-            return ReplayInterval(getattr(pending.residual, "_replay_interval", None))
         interval = getattr(pending.residual, "_replay_interval", None)
+        if self.starts_replay:  # linked to the interval whose last write this seam applies
+            return ReplayInterval(interval)
         if interval is None:
             raise RuntimeError("a replayed seam's input residual carries no replay interval")
         return interval

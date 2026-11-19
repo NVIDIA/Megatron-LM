@@ -34,10 +34,9 @@ class WideResidualMambaLayerSubmodules(MambaLayerSubmodules):
     residual_write: type = StreamwiseSigmoidWideResidualConnection
 
     @classmethod
-    def widen(cls, submodules: MambaLayerSubmodules, **connections):
-        """``submodules`` with these connections (the defaults for the others)."""
-        values = {f.name: getattr(submodules, f.name) for f in fields(submodules)}
-        return cls(**{**values, **connections})
+    def widen(cls, submodules: MambaLayerSubmodules):
+        """``submodules`` with the default wide-residual connections."""
+        return cls(**{f.name: getattr(submodules, f.name) for f in fields(submodules)})
 
 
 class WideResidualMambaLayer(MambaLayer):

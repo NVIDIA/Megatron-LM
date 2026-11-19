@@ -30,10 +30,9 @@ class WideResidualTransformerLayerSubmodules(TransformerLayerSubmodules):
     residual_write_mlp: type = StreamwiseSigmoidWideResidualConnection
 
     @classmethod
-    def widen(cls, submodules: TransformerLayerSubmodules, **connections):
-        """``submodules`` with these connections (the defaults for the others)."""
-        values = {f.name: getattr(submodules, f.name) for f in fields(submodules)}
-        return cls(**{**values, **connections})
+    def widen(cls, submodules: TransformerLayerSubmodules):
+        """``submodules`` with the default wide-residual connections."""
+        return cls(**{f.name: getattr(submodules, f.name) for f in fields(submodules)})
 
 
 class WideResidualTransformerLayer(TransformerLayer):
