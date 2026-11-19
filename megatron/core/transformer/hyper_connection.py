@@ -1,7 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 import math
+import os
 import warnings
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
@@ -13,7 +16,13 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 
-from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
+from megatron.core._rank_utils import log_single_rank
+from megatron.core.env_flags import FALSE_VALUES, TRUE_VALUES
+from megatron.core.tensor_parallel.random import (
+    CheckpointWithoutOutput,
+    CheckpointWithoutOutputManager,
+    _get_share_storage,
+)
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.residual_connection import (
     ResidualBranchOutput,
@@ -44,6 +53,9 @@ class SinglePassMHCState:
     """
 
     pre_mix: Tensor | None = None
+    # MCORE_MHC_SP_FAST: the next sublayer's aggregate, computed by the last BDA
+    # (fused_mhc_single_pass.NextAggregate); used only when its output is the next input.
+    next_aggregate: object | None = None
 
     def contract(
         self,
@@ -87,6 +99,15 @@ def _resolve_mhc_checkpoint(
         return CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(function, *args)
 
     return checkpoint_with_manager
+
+
+def get_mhc_aggregate(config: TransformerConfig) -> Callable[[Tensor, Tensor], Tensor] | None:
+    """Bind the configured fused aggregation for the stack's final contraction."""
+    if not config.use_fused_mhc:
+        return None
+    from megatron.core.fusions.fused_mhc_kernels import fused_h_aggregate
+
+    return partial(fused_h_aggregate, backend=config.mhc_fused_backend)
 
 
 def build_mhc_recompute_layer_plan(
@@ -257,6 +278,75 @@ class BroadcastTensorFused(torch.autograd.Function):
         return ctx.fused_add_3_fn(grad1, grad2, grad3), None
 
 
+def _parse_single_pass_fused_grad_add(value: Optional[str]) -> Optional[str]:
+    """Return the MCORE_MHC_SP_FUSED_GRAD_ADD mode: None (off), "exact" or "fp32".
+
+    Unset selects "exact". ``0``, ``false``, ``no`` and ``off`` turn the fused sum off;
+    ``1``, ``true``, ``yes``, ``on`` and ``exact`` select the bit-exact sum, and ``fp32`` the
+    FP32 one (the on and off spellings are those of ``env_flag``). Matching ignores case and
+    surrounding whitespace; any other value raises.
+    """
+    if value is None:
+        return "exact"
+    mode = value.strip().lower()
+    if mode in FALSE_VALUES:
+        return None
+    if mode in TRUE_VALUES or mode == "exact":
+        return "exact"
+    if mode == "fp32":
+        return "fp32"
+    raise ValueError(
+        f"Environment variable MCORE_MHC_SP_FUSED_GRAD_ADD={value!r} is not a mode; use exact "
+        "(or 1/true/yes/on), fp32 or 0/false/no/off, or unset it for exact."
+    )
+
+
+# MCORE_MHC_SP_FUSED_GRAD_ADD (read once at import). The single-pass forward reads each
+# sublayer's residual input in three places: the mappings, the aggregate and the
+# residual-mixing BDA, so autograd sums three full-size gradients with two sequential adds.
+# Unless it is off, BroadcastTensorFused splits the input of callers that take the residual
+# alias (return_residual=True), and one kernel sums the three gradients:
+#   exact (default): (residual + aggregate) + mappings, rounded after each add exactly as
+#                    autograd accumulates them in that arrival order (bit-identical gradients);
+#   fp32:            native_fused_add_3 (torch.compile), rounding the FP32 sum once (opt-in,
+#                    not bit-identical).
+_SINGLE_PASS_FUSED_GRAD_ADD = _parse_single_pass_fused_grad_add(
+    os.environ.get("MCORE_MHC_SP_FUSED_GRAD_ADD")
+)
+_SINGLE_PASS_FUSED_GRAD_ADD_LOGGED: set[str] = set()
+
+
+def _ordered_single_pass_grad_add_3(
+    add_3_sequential: Callable[[Tensor, Tensor, Tensor], Tensor],
+    grad_mappings: Tensor,
+    grad_aggregate: Tensor,
+    grad_residual: Tensor,
+) -> Tensor:
+    """Sum in the order autograd accumulates the unsplit single-pass residual's gradients.
+
+    The engine runs ready nodes latest-created first. The BDA ends the sublayer, so its residual
+    gradient arrives first; the aggregate's arrives after the branch backward; the mapping nodes
+    were created before the aggregate's checkpoint node, so their gradient arrives last.
+    """
+    return add_3_sequential(grad_residual, grad_aggregate, grad_mappings)
+
+
+def _single_pass_grad_add_3_op(mode: str) -> Callable[[Tensor, Tensor, Tensor], Tensor]:
+    """Return BroadcastTensorFused's combiner of (mappings, aggregate, residual) gradients."""
+    if mode not in _SINGLE_PASS_FUSED_GRAD_ADD_LOGGED:
+        _SINGLE_PASS_FUSED_GRAD_ADD_LOGGED.add(mode)
+        log_single_rank(
+            logging.getLogger(__name__),
+            logging.INFO,
+            f"[mHC] MCORE_MHC_SP_FUSED_GRAD_ADD={mode}: one fused sum per single-pass residual",
+        )
+    if mode == "fp32":
+        return native_fused_add_3
+    from megatron.core.fusions.fused_mhc_kernels import fused_add_3_sequential
+
+    return partial(_ordered_single_pass_grad_add_3, fused_add_3_sequential)
+
+
 @torch.compile
 def learned_output_contract(
     hidden_states: Tensor, head_fn: Tensor, base: Tensor, scale: Tensor, n: int, eps: float
@@ -272,6 +362,148 @@ def learned_output_contract(
     pre = torch.sigmoid(mixes * scale + base) + eps
     y = torch.sum(pre.unsqueeze(-1) * hidden_states.view(*hidden_states.shape[:-1], n, -1), dim=-2)
     return y.to(dtype)
+
+
+@torch.compile
+def _single_pass_projection_rms_forward(
+    hidden_states: Tensor, weight: Tensor, eps: float
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Compute FP32 mapping and epsilon-inside-sqrt RMS without saving the wide cast."""
+    x = hidden_states.float()
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        projected = F.linear(x, weight.float())
+        inv_rms = torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
+    return projected * inv_rms, projected, inv_rms
+
+
+@torch.compile
+def _single_pass_projection_rms_backward(
+    grad_output: Tensor,
+    hidden_states: Tensor,
+    weight: Optional[Tensor],
+    projected: Optional[Tensor],
+    inv_rms: Tensor,
+    need_hidden: bool,
+    need_weight: bool,
+) -> tuple[Optional[Tensor], Optional[Tensor]]:
+    """Recast original storage only in backward; merge both dX paths before rounding."""
+    x = hidden_states.float()
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        grad = grad_output.float()
+        grad_projected = grad * inv_rms
+        grad_hidden = None
+        if need_hidden:
+            grad_hidden = F.linear(grad_projected, weight.float().t())
+            grad_rms = (grad * projected).sum(-1, keepdim=True)
+            grad_mean = grad_rms * -0.5 * inv_rms.pow(3)
+            grad_square = grad_mean.expand_as(x) / x.shape[-1]
+            grad_hidden = (grad_hidden + grad_square * (2 * x)).to(hidden_states.dtype)
+        grad_weight = None
+        if need_weight:
+            grad_weight = (
+                grad_projected.reshape(-1, grad_projected.shape[-1])
+                .t()
+                .matmul(x.reshape(-1, x.shape[-1]))
+            )
+    return grad_hidden, grad_weight
+
+
+class _SinglePassProjectionRMS(torch.autograd.Function):
+    """Retain original activation storage and only narrow FP32 mapping statistics.
+
+    This boundary must stay outside the coefficient activation's compiled graph:
+    jointly partitioning forward/backward can otherwise retain the wide FP32
+    cast again. Saved tensors keep their original StorageImpl so checkpoint
+    output storage can be discarded and rebound before backward reads it.
+    """
+
+    @staticmethod
+    def forward(ctx, hidden_states: Tensor, weight: Tensor, eps: float) -> Tensor:
+        """Compute the projected mappings and RMS from the original residual storage."""
+        normalized, projected, inv_rms = _single_pass_projection_rms_forward(
+            hidden_states, weight, eps
+        )
+        ctx.need_hidden, ctx.need_weight = ctx.needs_input_grad[:2]
+        ctx.weight_dtype = weight.dtype
+        ctx.set_materialize_grads(False)
+        if ctx.need_hidden or ctx.need_weight:
+            ctx.save_for_backward(
+                hidden_states,
+                weight if ctx.need_hidden else None,
+                projected if ctx.need_hidden else None,
+                inv_rms,
+            )
+        return normalized
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad_output: Optional[Tensor]):
+        """Accumulate projection and normalization gradients into the residual."""
+        if grad_output is None:
+            return None, None, None
+        hidden_states, weight, projected, inv_rms = ctx.saved_tensors
+        grad_hidden, grad_weight = _single_pass_projection_rms_backward(
+            grad_output, hidden_states, weight, projected, inv_rms, ctx.need_hidden, ctx.need_weight
+        )
+        if grad_weight is not None:
+            grad_weight = grad_weight.to(ctx.weight_dtype)
+        return grad_hidden, grad_weight, None
+
+
+@torch.compile
+def _single_pass_coefficient_activations(
+    projected: Tensor,
+    alpha_pre: Tensor,
+    alpha_post: Tensor,
+    alpha_res: Tensor,
+    bias: Tensor,
+    n: int,
+    eps: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Apply the original coefficient activations to the narrow FP32 projection."""
+    pre = (projected[..., :n] * alpha_pre + bias[:n]).sigmoid()
+    post = (projected[..., n : 2 * n] * alpha_post + bias[n : 2 * n]).sigmoid()
+    residual = (projected[..., 2 * n :] * alpha_res + bias[2 * n :]).unflatten(-1, (n, n))
+    return pre + eps, 2 * post, residual
+
+
+class _SinglePassAggregateReplay(CheckpointWithoutOutput):
+    """MCORE_MHC_SP_FAST: drop the fused forward's aggregate and refill it at block replay.
+
+    It stands in for the default path's checkpointed aggregate in the mHC recompute manager:
+    the manager releases the output storage at the block end and calls ``_recompute`` in forward
+    order from the block's replay hook. The fused mapping Function owns the aggregate's
+    gradients, so the replay only restores the values the branch saved, with the same kernel
+    chain (bit-identical) and without an autograd node.
+    """
+
+    def __init__(self, manager, aggregated, hidden_states, pre_mix, n):
+        super().__init__(ckpt_manager=manager)
+        self.outputs = (aggregated,)
+        # The base class treats ctx None as "already recomputed".
+        self.ctx = True
+        self._replay = (hidden_states, pre_mix, n)
+        manager.add_checkpoint(self)
+
+    def _recompute(self, _):
+        if self._replay is None:
+            return
+        from megatron.core.fusions.fused_mhc_single_pass import sp_aggregate
+
+        hidden_states, pre_mix, n = self._replay
+        self._replay = None
+        s, b, width = hidden_states.shape
+        pre2d = None
+        if pre_mix is not None:
+            pre2d = pre_mix.detach().reshape(s * b, n)
+            if pre2d.dtype != torch.float32 or not pre2d.is_contiguous():
+                pre2d = pre2d.float().contiguous()
+        with torch.no_grad():
+            fresh = sp_aggregate(hidden_states.detach().view(s * b, width), pre2d, n)
+        output = self.outputs[0]
+        _get_share_storage()(output, fresh)
+        self.outputs = None
+        self.ctx = None
 
 
 # ============================================================================
@@ -298,6 +530,10 @@ class HyperConnectionModule(MegatronModule):
         config: TransformerConfig with hyper-connection fields
         layer_number: Current layer index for initialization
     """
+
+    # MCORE_MHC_SP_CUTILE_PROJ_RMS (fused_mhc_kernels.SINGLE_PASS_CUTILE_PROJ_RMS): set in
+    # __init__ when single-pass mappings use the cuTile split-K proj_rms_compute_h kernels.
+    _single_pass_cutile_proj_rms = False
 
     def __init__(self, config: TransformerConfig, layer_number: int):
         super().__init__(config)
@@ -369,11 +605,38 @@ class HyperConnectionModule(MegatronModule):
             self._h_aggregate_op = partial(fused_h_aggregate, backend=backend)
             self._h_post_bda_op = partial(fused_h_post_bda, backend=backend)
             self._proj_rms_compute_h_op = partial(fused_proj_rms_compute_h, backend=backend)
+            # The cuTile kernels build (tile_m, n) tiles, and cuTile tile dimensions must be powers
+            # of two; the backward tiles the n^2 + 2n mapping outputs in one tile of <= 256.
+            if (
+                self.single_pass
+                and self.n & (self.n - 1) == 0
+                and self.n * self.n + 2 * self.n <= 256
+            ):
+                from megatron.core.fusions.fused_mhc_kernels import (
+                    single_pass_cutile_proj_rms_enabled,
+                )
+
+                self._single_pass_cutile_proj_rms = single_pass_cutile_proj_rms_enabled(backend)
         else:
             self._sinkhorn_op = native_sinkhorn
             self._h_aggregate_op = native_h_aggregate
             self._h_post_bda_op = native_h_post_bda
             self._proj_rms_compute_h_op = None
+
+        # MCORE_MHC_SP_FUSED_GRAD_ADD: one fused sum of the single-pass residual's gradients.
+        self._single_pass_grad_add_3_op = (
+            _single_pass_grad_add_3_op(_SINGLE_PASS_FUSED_GRAD_ADD)
+            if self.single_pass and _SINGLE_PASS_FUSED_GRAD_ADD is not None
+            else None
+        )
+
+        # Fused single-pass Triton uses its shape and dtype check at the call site.
+        self._sp_fast = (
+            self.single_pass
+            and config.use_fused_mhc
+            and config.mhc_fused_backend in ("auto", "triton")
+        )
+        self._sp_fast_pending = None
 
         self._init_weights()
 
@@ -452,26 +715,84 @@ class HyperConnectionModule(MegatronModule):
         h_res = h[..., 2 * self.n :]
         return h_pre, h_post, h_res
 
-    @torch.compile
     def _single_pass_coefficients(self, hidden_states: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        """Fuse FP32 normalization and coefficient activations around the projection."""
-        x = hidden_states.float()
-        # V4.1 requires epsilon inside sqrt, including for zero/small inputs.
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            projected = F.linear(x, self.mapping_proj.weight.float())
-        projected = projected * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
-        pre = (projected[..., : self.n] * self.alpha_pre + self.bias[: self.n]).sigmoid()
-        post = (
-            projected[..., self.n : 2 * self.n] * self.alpha_post + self.bias[self.n : 2 * self.n]
-        ).sigmoid()
-        residual = (
-            projected[..., 2 * self.n :] * self.alpha_res + self.bias[2 * self.n :]
-        ).unflatten(-1, (self.n, self.n))
-        return pre + self.compute_h_eps, 2 * post, residual
+        """Keep the original input for backward instead of its wide FP32 cast."""
+        projected = _SinglePassProjectionRMS.apply(
+            hidden_states, self.mapping_proj.weight, self.norm_eps
+        )
+        return _single_pass_coefficient_activations(
+            projected,
+            self.alpha_pre,
+            self.alpha_post,
+            self.alpha_res,
+            self.bias,
+            self.n,
+            self.compute_h_eps,
+        )
+
+    def _single_pass_cutile_supports(self, hidden_states: Tensor) -> bool:
+        """Inputs the cuTile kernels tile exactly (128-token, 256-column multiples, aligned).
+
+        Only the split-K backward path (K = n * hidden >= 8192) is routed: in a 4-layer chain the
+        small-K backward kernel's alpha gradients were up to ~120x further from an FP32 reference
+        than the Inductor path's at K = 4096, while K = 8192 and the V4.1 K = 20480 match it.
+        """
+        weight = self.mapping_proj.weight
+        tokens = hidden_states.shape[0] * hidden_states.shape[1]
+        return (
+            hidden_states.is_cuda
+            and hidden_states.dtype in (torch.bfloat16, torch.float16, torch.float32)
+            and hidden_states.is_contiguous()
+            and tokens > 0
+            and tokens % 128 == 0
+            and hidden_states.shape[-1] % 256 == 0
+            and hidden_states.shape[-1] >= 8192
+            and hidden_states.data_ptr() % 16 == 0
+            and weight.dtype == torch.float32
+            and weight.is_contiguous()
+            and weight.data_ptr() % 16 == 0
+        )
+
+    def _single_pass_coefficients_cutile(
+        self, hidden_states: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """MCORE_MHC_SP_CUTILE_PROJ_RMS: _single_pass_coefficients on the cuTile split-K kernels.
+
+        Same formula and FP32 outputs (inv = rsqrt(mean(x^2) + eps), h_pre = sigmoid + eps,
+        h_post = 2 * sigmoid, raw residual logits). The kernels read the residual in its own
+        dtype (TF32 MMA, FP32 accumulation) instead of an FP32 copy, merge the projection and
+        RMS gradients in FP32 before one rounding to the residual dtype, and save a view of the
+        residual's storage, so checkpoint storage rebinding still reaches backward.
+        """
+        s, b, width = hidden_states.shape
+        n = self.n
+        pre, post, residual, _ = self._proj_rms_compute_h_op(
+            hidden_states.view(s * b, width),
+            self.mapping_proj.weight,
+            self.alpha_pre,
+            self.alpha_post,
+            self.alpha_res,
+            self.bias,
+            n,
+            self.norm_eps,
+            self.compute_h_eps,
+            eps_inside_sqrt=True,
+        )
+        return pre.view(s, b, n), post.view(s, b, n), residual.view(s, b, n, n)
 
     def _compute_single_pass_mappings(self, hidden_states: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """Predict FP32 coefficients, then apply the configured Sinkhorn kernel."""
-        pre, post, residual = self._single_pass_coefficients(hidden_states)
+        if self._single_pass_cutile_proj_rms and self._single_pass_cutile_supports(hidden_states):
+            pre, post, residual = self._single_pass_coefficients_cutile(hidden_states)
+        else:
+            if self._single_pass_cutile_proj_rms:
+                warnings.warn(
+                    f"MCORE_MHC_SP_CUTILE_PROJ_RMS: residual {tuple(hidden_states.shape)} "
+                    f"{hidden_states.dtype} is not tiled by the cuTile kernels; using the "
+                    "Inductor single-pass mapping",
+                    stacklevel=2,
+                )
+            pre, post, residual = self._single_pass_coefficients(hidden_states)
         residual = self._sinkhorn_op(residual, self.sinkhorn_iterations, self.sinkhorn_eps)
         return pre, post, residual
 
@@ -673,6 +994,9 @@ class HyperConnectionModule(MegatronModule):
         children so that gradient accumulation from the 3 consumers
         (compute_mappings, aggregate, fused_h_res_h_post_bda) is handled by a
         single fused add instead of PyTorch's default sequential accumulation.
+        The single-pass branch splits only with MCORE_MHC_SP_FUSED_GRAD_ADD on and
+        ``return_residual=True``; 3-tuple callers feed their own unsplit residual to the
+        BDA and keep autograd's accumulation.
 
         Args:
             hidden_states: [s, b, n*C] - n-stream hidden states
@@ -695,15 +1019,41 @@ class HyperConnectionModule(MegatronModule):
         if self.single_pass:
             if mhc_state is None:
                 raise ValueError("Single-pass mHC requires a forward-local SinglePassMHCState")
-            h_pre, h_post, h_res = self.compute_mappings(hidden_states)
+            if self._sp_fast and return_residual and checkpoint_fn is None:
+                from megatron.core.fusions.fused_mhc_single_pass import single_pass_fast_supports
+
+                if single_pass_fast_supports(hidden_states, self.n, self.mapping_proj.weight):
+                    return self._single_pass_fast_forward(
+                        hidden_states, mhc_recompute_manager, mhc_state
+                    )
+            hs_for_mappings = hs_for_aggregate = hs_for_residual = hidden_states
+            if (
+                self._single_pass_grad_add_3_op is not None
+                and return_residual
+                and torch.is_grad_enabled()
+                and hidden_states.requires_grad
+            ):
+                # One fused sum replaces autograd's two sequential full-size gradient adds. Only
+                # callers that take the residual alias split: a 3-tuple caller passes its own
+                # unsplit residual to the BDA, so the unused alias would get a zero-filled
+                # gradient and the BDA gradient an extra add (neither exact nor faster).
+                # Exact mode matches autograd only while these three are the input's only
+                # consumers, each alias feeds a single node, and the gradients arrive as BDA,
+                # aggregate, mappings (see _ordered_single_pass_grad_add_3). Another consumer
+                # or a reordering changes bits silently; MCORE_MHC_SP_FUSED_GRAD_ADD=0 restores
+                # autograd's own sum and is the first switch to flip when bisecting a mismatch.
+                hs_for_mappings, hs_for_aggregate, hs_for_residual = BroadcastTensorFused.apply(
+                    hidden_states, self._single_pass_grad_add_3_op
+                )
+            h_pre, h_post, h_res = self.compute_mappings(hs_for_mappings)
             previous = mhc_state.pre_mix
             if mhc_recompute_manager is not None or checkpoint_fn is not None:
                 checkpoint_fn = _resolve_mhc_checkpoint(mhc_recompute_manager, checkpoint_fn)
-                aggregated = checkpoint_fn(self._single_pass_aggregate, hidden_states, previous)
+                aggregated = checkpoint_fn(self._single_pass_aggregate, hs_for_aggregate, previous)
             else:
-                aggregated = self._single_pass_aggregate(hidden_states, previous)
+                aggregated = self._single_pass_aggregate(hs_for_aggregate, previous)
             mhc_state.pre_mix = h_pre
-            result = aggregated, h_res, h_post, hidden_states
+            result = aggregated, h_res, h_post, hs_for_residual
         elif mhc_recompute_manager is not None or checkpoint_fn is not None:
             result = self._forward_with_checkpoint(
                 hidden_states, mhc_recompute_manager, checkpoint_fn=checkpoint_fn
@@ -711,6 +1061,71 @@ class HyperConnectionModule(MegatronModule):
         else:
             result = self._forward_normal(hidden_states)
         return result if return_residual else result[:3]
+
+    def _single_pass_fast_forward(
+        self,
+        hidden_states: Tensor,
+        manager: Optional[CheckpointWithoutOutputManager],
+        mhc_state: SinglePassMHCState,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        """MCORE_MHC_SP_FAST: aggregate and mappings in one fused Function.
+
+        The residual input is not split: the BDA hands its residual gradient to this sublayer's
+        mapping backward through a stash, and that backward returns the input's whole gradient,
+        summed in the default exact order (BDA, aggregate, mappings). With selective mHC
+        recompute, the aggregate is dropped and replayed like the default checkpointed one.
+        """
+        from megatron.core.fusions.fused_mhc_single_pass import (
+            ResidualGradStash,
+            SinglePassPreFunction,
+        )
+
+        ensure_params_ready(
+            (self.mapping_proj.weight, self.alpha_pre, self.alpha_post, self.alpha_res, self.bias)
+        )
+        tracked = torch.is_grad_enabled() and hidden_states.requires_grad
+        stash = ResidualGradStash() if tracked else None
+        pre_mix = mhc_state.pre_mix
+        # The previous BDA computed this input's aggregate (under pre_mix) as it wrote the input.
+        holder, mhc_state.next_aggregate = mhc_state.next_aggregate, None
+        precomputed = holder.take(hidden_states) if holder is not None else None
+        aggregated, h_pre, h_post, h_res = SinglePassPreFunction.apply(
+            hidden_states,
+            pre_mix,
+            self.mapping_proj.weight,
+            self.alpha_pre,
+            self.alpha_post,
+            self.alpha_res,
+            self.bias,
+            self.n,
+            self.norm_eps,
+            self.compute_h_eps,
+            self.sinkhorn_eps,
+            self.sinkhorn_iterations,
+            stash,
+            precomputed,
+        )
+        if manager is not None:
+            from megatron.core.transformer.cuda_graphs import is_graph_warmup
+
+            if not is_graph_warmup():
+                _SinglePassAggregateReplay(manager, aggregated, hidden_states, pre_mix, self.n)
+        mhc_state.pre_mix = h_pre
+        self._sp_fast_pending = (stash, hidden_states, mhc_state)
+        return aggregated, h_res, h_post, hidden_states
+
+    def _single_pass_bda_fast(
+        self, h_res, original_residual, h_post, x, stash, next_agg=None
+    ) -> Tensor:
+        """MCORE_MHC_SP_FAST BDA: residual gradient to the stash when one is given, and the next
+        sublayer's aggregate into ``next_agg`` (first call only, not on checkpoint replay)."""
+        from megatron.core.fusions.fused_mhc_single_pass import SinglePassBDAFunction
+
+        if stash is not None:
+            stash.active = True
+        return SinglePassBDAFunction.apply(
+            h_res, original_residual, h_post, x, self.n, stash, next_agg
+        )
 
     def _single_pass_aggregate(self, hidden_states: Tensor, pre_mix: Tensor | None) -> Tensor:
         """Aggregate with an explicit predecessor, safe for checkpoint replay."""
@@ -874,6 +1289,55 @@ class HyperConnectionModule(MegatronModule):
         Returns:
             output: [s, b, n*C] - final output after all operations
         """
+        if self.single_pass:
+            pending, self._sp_fast_pending = self._sp_fast_pending, None
+            if (
+                pending is not None
+                and pending[1] is original_residual
+                and layer_output_with_bias[1] is None
+                and (not training or dropout_prob == 0.0)
+            ):
+                from megatron.core.fusions import fused_mhc_single_pass
+
+                mhc_state = pending[2]
+                h_pre = mhc_state.pre_mix
+                next_agg = (
+                    fused_mhc_single_pass.NextAggregate(h_pre.reshape(-1, self.n))
+                    if fused_mhc_single_pass.SINGLE_PASS_FAST_NEXT_AGG
+                    and h_pre is not None
+                    and h_pre.dtype == torch.float32
+                    and h_pre.is_contiguous()
+                    else None
+                )
+                fast_args = (
+                    h_res,
+                    original_residual,
+                    h_post,
+                    layer_output_with_bias[0],
+                    pending[0],
+                    next_agg,
+                )
+                if manager is None and checkpoint_fn is None:
+                    output = self._single_pass_bda_fast(*fast_args)
+                else:
+                    output = _resolve_mhc_checkpoint(manager, checkpoint_fn)(
+                        self._single_pass_bda_fast, *fast_args
+                    )
+                if next_agg is not None and next_agg.filled:
+                    next_agg.out = weakref.ref(output)
+                    mhc_state.next_aggregate = next_agg
+                return output
+            args = (
+                h_res,
+                original_residual,
+                h_post,
+                *layer_output_with_bias,
+                dropout_prob,
+                training,
+            )
+            if manager is None and checkpoint_fn is None:
+                return self._single_pass_bda(*args)
+            return _resolve_mhc_checkpoint(manager, checkpoint_fn)(self._single_pass_bda, *args)
         if manager is not None or checkpoint_fn is not None:
             return self._fused_h_res_h_post_bda_with_checkpoint(
                 h_res,
@@ -1100,7 +1564,7 @@ class HyperConnectionResidualConnection(ResidualConnection):
         # The owner chooses dtypes; the base validates any requested branch dtype.
         del fp32_residual_connection, branch_input_dtype
         return self._read_from_owner(
-            hidden_states, self._execution_context(execution_context), checkpoint_fn=None
+            hidden_states, self._execution_context(execution_context), recompute_context=None
         )
 
     def _read_from_owner(
@@ -1108,7 +1572,7 @@ class HyperConnectionResidualConnection(ResidualConnection):
         hidden_states: Tensor,
         execution_context: HyperConnectionExecutionContext,
         *,
-        checkpoint_fn: Callable[..., Tensor] | None,
+        recompute_context: ResidualStreamRecomputeContext | None,
     ) -> tuple[Tensor, ResidualConnectionState]:
         """Share owner invocation and state packing without choosing a replay policy."""
 
@@ -1117,6 +1581,17 @@ class HyperConnectionResidualConnection(ResidualConnection):
             if execution_context.mhc_state is not None
             else {}
         )
+        checkpoint_fn = None if recompute_context is None else recompute_context.checkpoint
+        if (
+            recompute_context is not None
+            and not self.use_input_residual
+            and isinstance(execution_context.owner, HyperConnectionModule)
+            and execution_context.owner._sp_fast
+        ):
+            # The fused owner registers its already-computed aggregate for replay with this
+            # manager. Wrapping it in a second checkpoint would recompute the projection.
+            carry["mhc_recompute_manager"] = recompute_context.manager
+            checkpoint_fn = None
         if self.use_input_residual:
             # Preserve the dedicated Transformer's residual path and three-output owner hooks.
             residual = hidden_states
@@ -1189,9 +1664,7 @@ class HyperConnectionResidualConnection(ResidualConnection):
         # and rebuilding the selected residual alias through the generic whole-read path.
         del fp32_residual_connection, branch_input_dtype
         return self._read_from_owner(
-            hidden_states,
-            self._execution_context(execution_context),
-            checkpoint_fn=context.checkpoint,
+            hidden_states, self._execution_context(execution_context), recompute_context=context
         )
 
     def _checkpoint_write(
