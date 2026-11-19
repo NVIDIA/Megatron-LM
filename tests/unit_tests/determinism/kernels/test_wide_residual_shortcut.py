@@ -9,7 +9,6 @@ order. Shared inputs, runners and the FP64 reference live in
 
 import itertools
 from contextlib import ExitStack
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -21,13 +20,12 @@ from megatron.core.fusions.wide_residual_shortcut import (
     forward_kernel,
     kernel_utils,
 )
-from megatron.core.fusions.wide_residual_shortcut.api import reader_for
 from megatron.core.fusions.wide_residual_shortcut.replay_kernel import replay_interval
 from megatron.core.fusions.wide_residual_shortcut.residual_replay import ReplayInterval
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.transformer.wide_residual import check_mxfp8_call, mxfp8_linear_eligible
 from tests.unit_tests.determinism.kernels.harness import seeded
-from tests.unit_tests.fusions.test_wide_residual_shortcut import (  # noqa: F401 (reader_work)
+from tests.unit_tests.fusions.test_wide_residual_shortcut import (
     BF16,
     F32,
     FLAGSHIPS,
@@ -44,6 +42,7 @@ from tests.unit_tests.fusions.test_wide_residual_shortcut import (  # noqa: F401
     backward_args,
     boundary,
     buffers,
+    column_slot,
     consume,
     folded_reader,
     fp64_backward,
@@ -57,7 +56,6 @@ from tests.unit_tests.fusions.test_wide_residual_shortcut import (  # noqa: F401
     offset_view,
     poison,
     poison_bytes,
-    reader_work,
     reference,
     reference_columns,
     replay_poisoned,
@@ -324,12 +322,11 @@ def test_graph_replay_restores_poisoned_outputs(monkeypatch, kind, case):
                 from transformer_engine.common.recipe import MXFP8BlockScaling
 
                 stack.enter_context(te.fp8_autocast(fp8_recipe=MXFP8BlockScaling()))
-                mxfp8_layer = SimpleNamespace(fp8="e4m3", fp8_recipe="mxfp8", hidden_size=hidden)
-                assert mxfp8_linear_eligible(layer, mxfp8_layer)
+                assert mxfp8_linear_eligible(layer)
                 check_mxfp8_call(raw[1][0])
-            actual = invoke(raw, quantized, layer)
+            actual = invoke(raw, quantized)
             assert all(not t.requires_grad and t.grad_fn is None for t in actual)
-            assert all(reader_for(t) is None for t in actual)
+            assert all(column_slot(t) is None for t in actual)
             assert actual[0].shape == (tokens, 1, 3 * hidden)
             all_bytes_equal(
                 (a.reshape(-1) for a in buffers(actual)), (b.reshape(-1) for b in taped)
@@ -339,7 +336,7 @@ def test_graph_replay_restores_poisoned_outputs(monkeypatch, kind, case):
                 assert torch.equal(result, consume(layer, operands[0].view(tokens, 1, hidden)))
                 assert not result.requires_grad and result.grad_fn is None
                 assert torch.count_nonzero(layer.weight.main_grad) == 0
-            execute = lambda: list(buffers(invoke(raw, quantized, layer)))
+            execute = lambda: list(buffers(invoke(raw, quantized)))
             graph_replay(
                 lambda: (lambda outputs: (outputs, outputs))(execute()),
                 [t.clone() for t in buffers(actual)],
@@ -595,29 +592,21 @@ def test_interval_replay_matches_emulated_writes(value, depth, retain, readers, 
 
 @mxfp8_test
 @pytest.mark.parametrize("readers", [1, 2])
-@pytest.mark.parametrize("other_stream", [False, True])
-def test_unpacked_columns_weight_gradient_is_deterministic(readers, other_stream):
-    """The consumer's backward unpacks the replayed columns once and publishes its weight
-    gradient once; every gradient bit repeats across runs, with the consumer on the same or
-    another stream."""
+def test_unpacked_columns_weight_gradient_is_deterministic(readers):
+    """The consumer's backward unpacks the replayed columns and publishes its weight gradient
+    once; every gradient bit repeats across runs."""
     expected = None
     for _ in range(3):
         raw = mx_inputs(2048, 2048, readers)
         layer = linear(2048, mcore=True)
-        out = boundary(raw, layer)
-        provider = reader_for(out[1])
-        consumer = torch.cuda.Stream() if other_stream else torch.cuda.current_stream()
-        consumer.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(consumer):
-            y = consume(layer, out[1])
-        torch.cuda.current_stream().wait_stream(consumer)
+        out = boundary(raw)
+        y = consume(layer, out[1])
         observed = []
         layer.weight.register_post_accumulate_grad_hook(
             lambda weight: observed.append(weight.main_grad.clone())
         )
         outputs = (y, out[0], *out[2:])
         torch.autograd.backward(outputs, tuple(torch.ones_like(t) for t in outputs))
-        assert provider.reconstructions == 1
         assert len(observed) == 1 and torch.equal(observed[0], layer.weight.main_grad)
         assert torch.count_nonzero(observed[0]) > 0
         actual = leaf_grads(raw, layer.weight.main_grad)

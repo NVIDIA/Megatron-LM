@@ -29,9 +29,9 @@ from megatron.core.fusions.wide_residual_shortcut import (
     shortcut_add_wide_residual_write_read_rmsnorm_quant,
     shortcut_add_wide_residual_write_two_reader_rmsnorm_quant,
 )
-from megatron.core.fusions.wide_residual_shortcut.api import Reader, reader_for
 from megatron.core.fusions.wide_residual_shortcut.residual_replay import (
-    ReplayHandle,
+    ColumnSlot,
+    ReplayChain,
     ReplayInterval,
 )
 from megatron.core.tensor_parallel.random import (
@@ -130,22 +130,30 @@ def run(raw, streams=3, epsilon=1e-5, **options):
     )
 
 
-def handoff(readers, quantized, consumer):
-    """Seam options: reader zero MXFP8 (``quantized``) for ``consumer`` (None: undeclared)."""
-    consumers = ((consumer,) if consumer is not None else (),) + ((),) * (readers - 1)
-    return dict(outputs=formats(readers, quantized), mxfp8_consumers=consumers)
+def handoff(outputs, replay=None):
+    """Seam options for reader ``outputs`` as the stack wires them: a ColumnSlot per MXFP8 read,
+    recorded into ``replay`` (default: a new interval), which ``consume`` replays before its
+    consumer's backward."""
+    replay = ReplayInterval() if replay is None else replay
+    slots = []
+    for fmt in outputs:
+        uses = ("bf16", "mxfp8") if fmt == "both" else (fmt,) if isinstance(fmt, str) else fmt
+        slots.append(ColumnSlot() if "mxfp8" in uses else None)
+        if slots[-1] is not None:
+            slots[-1].interval = replay  # the trigger ``consume`` registers
+    return dict(outputs=tuple(outputs), columns=tuple(slots), replay=replay)
 
 
-def boundary(raw, consumer=None, *, mxfp8_handoff=True, replay=None):
-    return run(raw, 3, replay=replay, **handoff(len(raw[3]), mxfp8_handoff, consumer))
+def boundary(raw, *, mxfp8_handoff=True, replay=None):
+    return run(raw, 3, **handoff(formats(len(raw[3]), mxfp8_handoff), replay))
 
 
-def invoke(raw, quantized=False, consumer=None):
-    """Run three streams with Megatron's [tokens, batch=1, hidden] layout."""
+def invoke(raw, quantized=False):
+    """Run three streams with Megatron's [tokens, batch=1, hidden] layout (no gradients)."""
     residual, updates, controls, gammas = raw
     m, h = updates[0].shape
     raw = residual.view(m, 1, 3 * h), tuple(t.view(m, 1, h) for t in updates), controls, gammas
-    return run(raw, 3, **handoff(len(gammas), quantized, consumer))
+    return run(raw, 3, outputs=formats(len(gammas), quantized))
 
 
 def formats(readers, quantized):
@@ -842,8 +850,8 @@ _OPS = {"A": (1, 1), "W": (2, 1), "R": (1, 2), "N": (0, 1), "M": (0, 1)}
 )  # fmt: skip
 def test_replay_matches_saved_states(ops, interval, dtype, streams, hidden, retention, pad):
     """Replay frees the seams' input residuals in forward, restores each bit for bit and
-    reproduces every gradient, also in a second backward of a retained graph on another stream,
-    and an ordinary backward releases its intervals."""
+    reproduces every gradient; backward leaves the intervals holding no tensor, and a retained
+    graph's second backward raises."""
     torch.manual_seed(853)
     m, size = 1024, streams + pad
     original = [torch.randn(m, streams * hidden, device="cuda", dtype=dtype)]
@@ -864,15 +872,18 @@ def test_replay_matches_saved_states(ops, interval, dtype, streams, hidden, rete
         leaves = [v if v is None else v.detach().clone().requires_grad_() for v in original]
         values = iter(leaves[1:])
         current, outputs, states, inputs, storages, intervals = leaves[0], [], [], [], [], []
+        chain = ReplayChain()  # as a fused stack replays
         for op in ops:
             readers, updates = _OPS[op]
             us = [next(values) for _ in range(updates)]
             controllers = [next(values) for _ in range(2 + readers)]
             gammas = [next(values) for _ in range(readers)]
             if readers:
-                if replay and len(inputs) % interval == 0:  # every N seams start an interval
-                    intervals.append(ReplayInterval())
-                options = {"replay": intervals[-1]} if replay else {}
+                options = {}
+                if replay:  # every N seams start an interval
+                    options["replay"] = chain.interval(len(inputs) % interval == 0)
+                    if options["replay"] not in intervals:
+                        intervals.append(options["replay"])
                 inputs.append(current.detach().clone())
                 storages.append(StorageWeakRef(current.untyped_storage()))
                 current, *ys = run((current, us, controllers, gammas), streams, **options)
@@ -887,30 +898,19 @@ def test_replay_matches_saved_states(ops, interval, dtype, streams, hidden, rete
                     retention_max_forget=0.1,
                 )
             states.append(current.detach().clone())
+        current = chain.close(current)
         # Replay frees the seams' intermediate input residuals; without it the seams keep them.
         assert any(storage.expired() for storage in storages) == replay
-        handles = [ReplayHandle(i, k) for i in intervals for k in range(len(i.tapes))]
-        # Each seam's input residual comes back bit for bit (handed out once; the backward
-        # below replays again).
-        taken = [handle.previous() for handle in reversed(handles)]
-        all_bytes_equal(taken, [x.view_as(t) for x, t in zip(reversed(inputs), taken)])
-        intervals = [weakref.ref(i) for i in intervals]
-        del handles, options  # the test holds no interval past forward
         loss = current.float().square().mean() + sum(y.float().square().mean() for y in outputs)
         leaves = [leaf for leaf in leaves if leaf is not None]
         first = torch.autograd.grad(loss, leaves, retain_graph=True, allow_unused=True)
-        # A retained graph's second backward replays again, here on another stream.
-        other = torch.cuda.Stream()
-        other.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(other):
-            second = torch.autograd.grad(loss, leaves, allow_unused=True)
-        torch.cuda.current_stream().wait_stream(other)
-        all_bytes_equal(first, second)
-        # The ordinary second backward releases the intervals (checkpoints and tapes) although
-        # the graph's nodes stay alive with its outputs.
-        gc.collect()
-        assert loss.grad_fn is not None
-        assert all(interval() is None for interval in intervals)
+        if replay:
+            # Each seam took its input residual, bit for bit (the gradients below match), and
+            # the intervals hold no tensor although the graph's nodes stay alive.
+            assert all(i.checkpoint is None and not i.tapes for i in intervals)
+            assert all(p is None for i in intervals for p in i.predecessors)
+        with pytest.raises(RuntimeError, match="retained graph"):
+            torch.autograd.grad(loss, leaves, allow_unused=True)
         return states + list(first)
 
     all_bytes_equal(execute(False), execute(True))
@@ -924,39 +924,23 @@ def test_replay_interval_records_one_connected_chain():
     chain = [torch.zeros(1, device="cuda")]
     for index in range(3):
         chain.append(chain[-1] + 1)
-        assert interval.record(chain[-2], chain[-1], saved=None).index == index
+        assert interval.record(chain[-2], chain[-1], None, ()) == index
     assert interval.checkpoint is chain[0]
     with pytest.raises(ValueError, match="one connected chain"):
-        interval.record(chain[0], chain[0] + 1, saved=None)
+        interval.record(chain[0], chain[0] + 1, None, ())
 
 
 # ---------------------------------------------------------------- MXFP8 handoff
 
 
-@pytest.fixture
-def reader_work(monkeypatch):
-    """Count each reader's columnwise-operand reconstructions without production counters."""
-    initialize = Reader.__init__
-
-    def initialize_reader(self, tensor, columns, consumers):
-        count = [0]  # not the Reader itself: a cycle would keep a Reader alive until collected
-
-        def counted():
-            count[0] += 1
-            return columns()
-
-        initialize(self, tensor, counted, consumers)
-        self._reconstructions = count
-
-    monkeypatch.setattr(Reader, "__init__", initialize_reader)
-    monkeypatch.setattr(
-        Reader, "reconstructions", property(lambda self: self._reconstructions[0]), raising=False
-    )
+mxfp8_test = QUALIFIED
 
 
-def mxfp8_test(function):
-    """Qualified GB300 MXFP8 test with reconstruction counters on every handoff reader."""
-    return QUALIFIED(pytest.mark.usefixtures("reader_work")(function))
+def column_slot(q):
+    """The ColumnSlot a seam pinned on its MXFP8 read (through views of it), else None."""
+    data = getattr(q, "_rowwise_data", None)
+    data = data if data is None or data._base is None else data._base
+    return getattr(data, "_shortcut_columns", None)
 
 
 def linear(h, *, mcore=False, bias=False):
@@ -989,11 +973,16 @@ def linear(h, *, mcore=False, bias=False):
 
 
 def consume(layer, q):
-    # As the stack wiring does for a seam's consumer.
-    with patch.object(wide_residual, "mxfp8_linear_eligible", lambda *args: True):
-        wide_residual.mxfp8_consumer(layer, None)
+    """Run ``layer`` on ``q`` under MXFP8, hooked as the stack hooks a read's MXFP8 consumer: its
+    backward unpacks the read's replayed columns, replayed first (as the stack's next seam or
+    output does)."""
     with te.fp8_autocast(enabled=True, fp8_recipe=MXFP8BlockScaling()):
-        return layer(q)[0] if isinstance(layer, TELinear) else layer(q)
+        y = layer(q)[0] if isinstance(layer, TELinear) else layer(q)
+        slot = column_slot(q)
+        if slot is not None and torch.is_grad_enabled():
+            wide_residual.install_columns(y, q, slot)
+            slot.interval.replay_before(y)
+    return y
 
 
 def leaf_grads(raw, *extra):
@@ -1049,20 +1038,11 @@ def test_fp32_bytes_and_te_weight_gradient(monkeypatch, m, h, readers):
     x = normalized_reader(saved, r)
     qref = mxfp8_quantizer()(x.detach()).to_dtype(BF16).requires_grad_(True)
     layer = linear(h)
-    out = boundary(raw, layer)
-    q, provider = out[1], reader_for(out[1])
+    out = boundary(raw)
+    q, slot = out[1], column_slot(out[1])
     assert q._columnwise_data is None
     assert torch.equal(q._rowwise_data, qref._rowwise_data)
     assert torch.equal(q._rowwise_scale_inv, qref._rowwise_scale_inv)
-    columns = provider.columns
-
-    def check_columns():
-        column = columns()
-        assert torch.equal(column._columnwise_data, qref._columnwise_data)
-        assert torch.equal(column._columnwise_scale_inv, qref._columnwise_scale_inv)
-        return column
-
-    provider.columns = check_columns
     if readers == 2:
         assert torch.equal(out[2], operands[1])
     dy = torch.randn(m, 128, device="cuda", dtype=BF16)
@@ -1070,15 +1050,15 @@ def test_fp32_bytes_and_te_weight_gradient(monkeypatch, m, h, readers):
     yref.backward(dy)
     wg = layer.weight.main_grad.clone()
     layer.weight.main_grad.zero_()
-    before = provider.reconstructions
     y = consume(layer, q)
     assert torch.equal(y, yref)
-    assert provider.reconstructions == before
+    assert slot.columns is None  # filled by the replay, in backward
     torch.autograd.backward(
         (y, out[0], *out[2:]),
         (dy, torch.zeros_like(out[0]), *(torch.zeros_like(value) for value in out[2:])),
     )
-    assert provider.reconstructions == before + 1
+    assert torch.equal(slot.columns._columnwise_data, qref._columnwise_data)
+    assert torch.equal(slot.columns._columnwise_scale_inv, qref._columnwise_scale_inv)
     assert torch.equal(layer.weight.main_grad, wg)
     assert r.grad is not None and torch.isfinite(r.grad).all()
 
@@ -1095,11 +1075,8 @@ def test_mcore_fused_backward_matches_independent_columns(m, h, readers):
         layer.weight.register_post_accumulate_grad_hook(
             lambda weight: observed_wgrad.append(weight.main_grad.clone())
         )
-        out = boundary(raw, layer)
-        provider = reader_for(out[1])
-        # TE's flatten/view path must preserve producer lookup.
-        q = out[1].view(1, m, h)
-        assert reader_for(q) is provider
+        out = boundary(raw)
+        q = out[1].view(1, m, h)  # Megatron's layout: the consumer takes a view of the read
         y = consume(layer, q if exclusive else reference_operand(out[1], raw).view(1, m, h))
         outputs = [y, *out[0:1], *out[2:]]
         torch.autograd.backward(outputs, [torch.randn_like(t) for t in outputs])
@@ -1107,7 +1084,6 @@ def test_mcore_fused_backward_matches_independent_columns(m, h, readers):
         assert torch.equal(observed_wgrad[0], layer.weight.main_grad)
         grads = leaf_grads(raw, layer.weight.main_grad, layer.bias.grad)
         records.append((y.detach().cpu(), [g.cpu() for g in grads]))
-        assert provider.reconstructions == int(exclusive)
         # Keeping outputs/grad_fn alive must not keep the row allocation alive.
         storage = StorageWeakRef(q._rowwise_data.untyped_storage())
         del q, out, y, outputs, raw, layer, grads
@@ -1125,25 +1101,22 @@ def test_multiple_live_calls_and_replay(replay):
     raw = mx_inputs(8192, 4096, 1)
     layer = linear(4096, mcore=True)
     interval = ReplayInterval() if replay else None
-    first = boundary(raw, layer, replay=interval)
+    first = boundary(raw, replay=interval)
     y0 = consume(layer, first[1])
-    second = boundary((first[0], *raw[1:]), layer, replay=interval)
+    second = boundary((first[0], *raw[1:]), replay=interval)
     y1 = consume(layer, second[1])
-    providers = [reader_for(first[1]), reader_for(second[1])]
     outputs = (y0, y1, second[0])
     torch.autograd.backward(outputs, tuple(torch.ones_like(t) for t in outputs))
-    assert all(p.reconstructions == 1 for p in providers)
-    assert torch.isfinite(raw[0].grad).all()
+    assert torch.isfinite(raw[0].grad).all() and torch.isfinite(layer.weight.main_grad).all()
 
 
 @mxfp8_test
-def test_handoff_rejects_invalid_consumers():
-    """Training needs a declared consumer, and only that Linear may consume the operand."""
-    with pytest.raises(ValueError, match="consumer"):
-        boundary(mx_inputs(1024, 4096, 1))
-    out = boundary(mx_inputs(2048, 2048, 1), linear(2048, mcore=True))
-    with pytest.raises(RuntimeError, match="declared Linear"):
-        consume(linear(2048, mcore=True), out[1])
+def test_handoff_rejects_missing_column_slots():
+    """In training an MXFP8 read needs a ColumnSlot, and a BF16 one takes none."""
+    raw = mx_inputs(2048, 2048, 1)
+    for outputs, columns in ((("mxfp8",), (None,)), (("bf16",), (ColumnSlot(),))):
+        with pytest.raises(ValueError, match="ColumnSlot"):
+            run(raw, 3, outputs=outputs, columns=columns)
 
 
 @mxfp8_test
@@ -1155,50 +1128,14 @@ def test_saved_weight_keeps_identity_and_metadata(native_fp8_weight):
     with te.fp8_model_init(enabled=native_fp8_weight, recipe=MXFP8BlockScaling()):
         layer = linear(4096)
     layer.weight.prefetch_identity = object()
-    out = boundary(raw, layer)
+    out = boundary(raw)
     y = consume(layer, out[1])
+    column_slot(out[1]).interval.replay()  # unpacking in forward needs the columns already
     weights = [t for t in y.grad_fn.saved_tensors if t is layer.weight]
     assert weights
     assert weights[0].prefetch_identity is layer.weight.prefetch_identity
     torch.autograd.backward((y, out[0]), (torch.ones_like(y), torch.ones_like(out[0])))
     assert torch.isfinite(layer.weight.main_grad).all()
-
-
-@mxfp8_test
-@pytest.mark.parametrize("side", ["carry", "consumer"])
-def test_other_stream_matches_ordinary_backward(side):
-    """A carry loss or the consumer on another stream keeps exact gradients and wgrad
-    lifetimes (freed consumer-stream allocations are reused immediately)."""
-    results = []
-    for exclusive in [False, True]:
-        raw = mx_inputs(8192, 4096, 1)
-        layer = linear(4096, mcore=True)
-        out = boundary(raw, layer)
-        operand = out[1] if exclusive else reference_operand(out[1], raw)
-        other = torch.cuda.Stream()
-        if side == "carry":
-            y = consume(layer, operand)
-            other.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(other):
-                carry_loss = out[0].square().sum()
-            torch.cuda.current_stream().wait_stream(other)
-            torch.autograd.backward((y, carry_loss), (torch.ones_like(y), None))
-        else:
-            other.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(other):
-                y = consume(layer, operand)
-            torch.cuda.current_stream().wait_stream(other)
-            torch.autograd.backward((y, out[0]), (torch.ones_like(y), torch.ones_like(out[0])))
-            # TE's weight-gradient GEMM must not read the columns after their reuse.
-            with torch.cuda.stream(other):
-                scratch = [
-                    torch.empty(8192, 128, device="cuda").fill_(float("nan")) for _ in range(8)
-                ]
-        torch.cuda.synchronize()
-        results.append([g.clone() for g in leaf_grads(raw, layer.weight.main_grad)])
-        provider = reader_for(out[1])
-        assert provider.reconstructions == int(exclusive)
-    all_bytes_equal(*results)
 
 
 @mxfp8_test
@@ -1241,9 +1178,9 @@ def test_checkpointed_handoff_publishes_one_weight_gradient(native_fp8_weight):
     operand in its inner graph and publishes one weight gradient, equal to the uncheckpointed
     one: the handoff never touches the GEMMs or their gradient readiness.
 
-    The last variant drops every reference to the seam's operand and Reader before backward and
-    stashes the checkpoint input through a detaching saved-tensor hook, as a model does: the
-    rebuild then consumes a detached alias, whose lookup must still find the Reader."""
+    The last variant drops every reference to the seam's operand before backward and stashes the
+    checkpoint input through a detaching saved-tensor hook, as a model does: the rebuild then
+    consumes a detached alias, which must still find its read's ColumnSlot."""
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
     model_parallel_cuda_manual_seed(123)
     try:
@@ -1257,8 +1194,7 @@ def test_checkpointed_handoff_publishes_one_weight_gradient(native_fp8_weight):
         for checkpointed, drop_operand in ((False, False), (True, False), (True, True)):
             observed.clear()
             layer.weight.main_grad.zero_()
-            current, q, router = boundary(mx_inputs(8192, 4096, 2), layer)
-            provider = reader_for(q)
+            current, q, router = boundary(mx_inputs(8192, 4096, 2))
             if checkpointed:
                 stash_hooks = (
                     torch.autograd.graph.saved_tensors_hooks(lambda t: t.detach(), lambda t: t)
@@ -1270,14 +1206,12 @@ def test_checkpointed_handoff_publishes_one_weight_gradient(native_fp8_weight):
                 loss = consume(layer, q).square().sum()
             if drop_operand:
                 # Only the checkpoint's detached alias remains; the rebuild must still find the
-                # Reader (otherwise TE's backward lacks the columnwise operand).
-                del q, provider
+                # ColumnSlot (otherwise TE's backward lacks the columnwise operand).
+                del q
                 gc.collect()
             torch.autograd.backward(
                 (loss, current, router), (None, torch.ones_like(current), torch.ones_like(router))
             )
-            if not drop_operand:
-                assert provider.reconstructions == 1
             assert len(observed) == 1
             assert torch.equal(observed[0], layer.weight.main_grad)
             assert torch.count_nonzero(observed[0]) > 0
@@ -1289,8 +1223,7 @@ def test_checkpointed_handoff_publishes_one_weight_gradient(native_fp8_weight):
 
 @QUALIFIED
 @pytest.mark.parametrize("checkpointed", [False, True])
-@pytest.mark.parametrize("other_stream", [False, True])
-def test_gtp_weight_gradient_matches_independent_columns(checkpointed, other_stream):
+def test_gtp_weight_gradient_matches_independent_columns(checkpointed):
     """A GTP consumer finalizes its own weight gradient from the replayed columns, also under
     a checkpoint, exactly as from independently encoded ones.
 
@@ -1320,18 +1253,14 @@ def test_gtp_weight_gradient_matches_independent_columns(checkpointed, other_str
             weight.main_grad = torch.zeros(weight.shape, device="cuda", dtype=F32)
             weight.grad_added_to_main_grad = False
             weight.zero_out_wgrad = True
-            current, q, router = boundary(raw, layer)
+            current, q, router = boundary(raw)
             if not handoff:
                 q = reference_operand(q, raw)
-            stream = torch.cuda.Stream() if other_stream else torch.cuda.current_stream()
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                if checkpointed:
-                    output, loss = checkpointed_loss(layer, q)
-                else:
-                    output = consume(layer, q)
-                    loss = output.square().sum()
-            torch.cuda.current_stream().wait_stream(stream)
+            if checkpointed:
+                output, loss = checkpointed_loss(layer, q)
+            else:
+                output = consume(layer, q)
+                loss = output.square().sum()
 
             torch.autograd.backward(
                 (loss, current, router), (None, torch.ones_like(current), torch.ones_like(router))
@@ -1422,8 +1351,8 @@ def test_reads_feed_every_declared_linear_from_one_column_take(monkeypatch, form
     spy(monkeypatch, kernel, "run", lambda *a, **k: k.get("warmup") or launches.append(1))
     spy(monkeypatch, ReplayInterval, "record", lambda i, *a, **k: intervals.append(weakref.ref(i)))
     spy(monkeypatch, backward_kernel, "backward", lambda s, p, dys, *a, **k: seam_dys.append(dys))
-    out = run(raw, 3, outputs=formats, mxfp8_consumers=tuple(consumers))
-    providers, results, extra, halves = [], [], [], []
+    out = run(raw, 3, **handoff(formats))
+    slots, results, extra, halves = [], [], [], []
     for reader, (fmt, linears) in enumerate(zip(formats, consumers)):
         read = out[1 + reader]
         assert isinstance(read, tuple) == (fmt == "both")
@@ -1435,21 +1364,20 @@ def test_reads_feed_every_declared_linear_from_one_column_take(monkeypatch, form
             plain.register_hook(lambda g, store=halves[-1][1]: store.__setitem__(0, g))
             read.register_hook(lambda g, store=halves[-1][1]: store.__setitem__(1, g))
         # Held weakly through the consumers' forwards, as a model holds it (not at all).
-        providers.append(weakref.ref(reader_for(read)))
+        slots.append(weakref.ref(column_slot(read)))
         # Megatron's [tokens, batch, hidden] layout: the consumer takes a view of the whole read.
         results.append([consume(layer, read.view(m, 1, h)).view(m, -1) for layer in linears])
     del read
-    providers = [provider() for provider in providers]  # kept by the consumers' saved slots
-    assert None not in providers and len(set(map(id, providers))) == len(formats)
-    assert all(p.reconstructions == 0 for p in providers) and not launches
+    slots = [slot() for slot in slots]  # kept by the consumers' saved slots
+    assert None not in slots and len(set(map(id, slots))) == len(formats)
+    assert all(slot.columns is None for slot in slots) and not launches
     outputs = [y for ys in results for y in ys] + extra
     grads = [dy for dys, *_ in reference for dy in dys] + [torch.randn_like(z) for z in extra]
     torch.autograd.backward(
         (*outputs, out[0]), (*grads, torch.zeros_like(out[0])), retain_graph=False
     )
-    # One replay launch emitted every read's columns; each read took them once for all consumers.
-    assert len(launches) == 1
-    assert [p.reconstructions for p in providers] == [1] * len(formats)
+    # One replay launch emitted every read's columns, shared by all of its consumers.
+    assert len(launches) == 1 and all(slot.columns is not None for slot in slots)
     for linears, ys, (dys, y_ref, wg_ref) in zip(consumers, results, reference):
         for layer, y, expected_y, expected_wg in zip(linears, ys, y_ref, wg_ref):
             assert torch.equal(y, expected_y)
@@ -1462,12 +1390,10 @@ def test_reads_feed_every_declared_linear_from_one_column_take(monkeypatch, form
         assert torch.equal(first, plain_grad.reshape(m, h))
         assert torch.equal(second, quantized_grad.reshape(m, h))
     assert raw[0].grad is not None and torch.isfinite(raw[0].grad).all()
-    # The last unpack released the shared columns, and once the caller drops the seam's outputs
-    # nothing keeps its replay interval alive past backward.
-    assert all(p._columns is None and p.hooked == 0 for p in providers)
-    del providers, out, results, outputs, extra, halves, plain
-    gc.collect()
-    assert len(intervals) == 1 and intervals[0]() is None
+    # Backward leaves the replay interval holding no tensor, although the graph outlives it.
+    (interval,) = (ref() for ref in intervals)
+    assert interval.checkpoint is None and not interval.tapes and not interval.slots
+    assert interval.predecessors == [None]
 
 
 @REQUIRES_FUSED_BACKWARD
@@ -1498,89 +1424,86 @@ def test_two_consumers_gradients_reach_the_kernel_separately(monkeypatch, dtype)
 
 @mxfp8_test
 def test_recomputed_consumer_and_retained_graph_backward():
-    """A consumer re-run in backward (reentrant checkpoint) takes the read as an ordinary input,
-    also on a retained graph's second backward (its columns retaken bit-exactly); a read consumed
-    with grad more often than declared raises instead of materializing its columns again."""
+    """A consumer re-run in backward (reentrant checkpoint) takes the read as an ordinary input and
+    unpacks its replayed columns; a retained graph's second backward raises."""
     m, h = 2048, 2048
     layer = linear(h, mcore=True)
     dy = torch.randn(m, 128, device="cuda", dtype=BF16)
+    consumer = lambda x: consume(layer, x)
     grads = []
-    for retained in (False, True):
-        out = run(mx_inputs(m, h, 1), 3, outputs=("mxfp8",), mxfp8_consumers=((layer,),))
-        y = torch.utils.checkpoint.checkpoint(
-            lambda x: consume(layer, x), out[1], use_reentrant=True
-        )
-        provider = reader_for(out[1])
-        for _ in range(1 + retained):
-            layer.weight.main_grad.zero_()
-            torch.autograd.backward((y, out[0]), (dy, torch.zeros_like(out[0])), retain_graph=T)
-            grads.append(layer.weight.main_grad.clone())
-        assert provider.reconstructions == 1 + retained
-    assert all(torch.equal(g, grads[0]) for g in grads[1:])
-    out = run(mx_inputs(m, h, 1), 3, outputs=("mxfp8",), mxfp8_consumers=((layer,),))
-    consume(layer, out[1])
-    with pytest.raises(RuntimeError, match="more often than declared"):
-        consume(layer, out[1])
+    for checkpointed in (False, True):
+        out = run(mx_inputs(m, h, 1), 3, **handoff(("mxfp8",)))
+        if checkpointed:
+            y = torch.utils.checkpoint.checkpoint(consumer, out[1], use_reentrant=True)
+        else:
+            y = consumer(out[1])
+        layer.weight.main_grad.zero_()
+        torch.autograd.backward((y, out[0]), (dy, torch.zeros_like(out[0])), retain_graph=T)
+        grads.append(layer.weight.main_grad.clone())
+        if checkpointed:  # TE re-runs inside the checkpoint: only the seam refuses
+            with pytest.raises(RuntimeError, match="retained graph"):
+                torch.autograd.backward((y, out[0]), (dy, torch.zeros_like(out[0])))
+    assert torch.equal(grads[0], grads[1])
 
 
 @pytest.mark.parametrize("eligible", [True, False])
 def test_direct_mxfp8_consumer_selection(monkeypatch, eligible):
-    """A fused read is linked to every consuming module once, at construction, which fixes its
-    format: MXFP8 if every consumer quantizes it (an eligible Linear whose layer and the read's
-    seam layer run in MXFP8), BF16 if none does, else both (also a checkpointed GDP projection or
-    a GTP Linear: TE's backward is untouched); an unlinked read cannot run."""
-    monkeypatch.setattr(wide_residual, "mxfp8_linear_eligible", lambda *args: eligible)
-    projection, router = torch.nn.Linear(4, 4), torch.nn.Linear(4, 4)
-    assert wide_residual.mxfp8_consumer(None, None) is None
-    assert wide_residual.mxfp8_consumer(projection, None) is (projection if eligible else None)
-    # A chosen consumer hands its saved operand over through one forward hook.
-    for _ in range(2):
-        wide_residual.mxfp8_consumer(projection, None)
-        assert len(projection._forward_hooks) == eligible and not projection._forward_pre_hooks
-    config = SimpleNamespace(
-        first_last_layers_bf16=True,
-        num_layers_at_start_in_bf16=1,
-        num_layers_at_end_in_bf16=1,
-        num_layers=4,
-    )
-
-    def read(seam_layer):
-        module = object.__new__(wide_residual.WriteReadNorm)
-        torch.nn.Module.__init__(module)
-        module.consumers, module.seam_layer_number, module.config = [], seam_layer, config
-        return module
-
-    unlinked = read(2)
-    with pytest.raises(RuntimeError, match="no linked consumer"):
-        unlinked.format
-    only = read(2)
-    assert only.link_consumer(projection, 2) == eligible
-    assert only.mxfp8_linears == ((projection,) if eligible else ())
-    assert only.format == ("mxfp8" if eligible else "bf16")
-    mixed = read(2)
+    """The stack fixes a fused read's formats once, from its consumers and the precision its
+    forward runs their layers and the read's seam layer in: MXFP8 if every consumer quantizes it
+    (an eligible Linear, both layers MXFP8), BF16 if none does, else both; each MXFP8 consumer is
+    hooked once, for one read. The seam then emits those formats, a ColumnSlot per MXFP8 read."""
     monkeypatch.setattr(
         wide_residual,
         "mxfp8_linear_eligible",
-        lambda linear, cfg: eligible and linear is projection,
+        lambda linear: eligible and hasattr(linear, "projection"),
     )
-    mixed.link_consumer(router, 3)  # e.g. the router: never quantizes
-    mixed.link_consumer(projection, 3)
+
+    def projection():
+        linear = torch.nn.Linear(4, 4)
+        linear.projection = True
+        return linear
+
+    layers = {n: SimpleNamespace(layer_number=n) for n in range(1, 5)}
+    runs_mxfp8 = lambda layer: layer.layer_number in (2, 3)  # BF16 first and last layers
+
+    def read(seam_layer, *consumers):
+        module = object.__new__(wide_residual.WriteReadNorm)
+        torch.nn.Module.__init__(module)
+        module.consumers, module.seam_layer = list(consumers), layers[seam_layer]
+        module.resolve_formats(runs_mxfp8)
+        return module
+
+    with pytest.raises(RuntimeError, match="one or two linked consumers"):
+        read(2)
+    linear = projection()
+    only = read(2, (linear, layers[2]))
+    assert only.format == ("mxfp8" if eligible else "bf16")
+    assert len(linear._forward_hooks) == eligible and not linear._forward_pre_hooks
+    with pytest.raises(RuntimeError, match="at most one") if eligible else nullcontext():
+        read(3, (linear, layers[3]))
+    mixed = read(3, (torch.nn.Linear(4, 4), layers[3]), (projection(), layers[3]))
     assert mixed.format == ("both" if eligible else "bf16")
     # A read emitted or consumed in a BF16 layer (here the first or last) stays BF16.
     for seam_layer, layer in [(1, 2), (2, 4)]:
-        bf16 = read(seam_layer)
-        assert not bf16.link_consumer(projection, layer) and bf16.format == "bf16"
+        bf16 = read(seam_layer, (projection(), layers[layer]))
+        assert bf16.format == "bf16"
 
     seen = []
     monkeypatch.setattr(wide_residual, "check_mxfp8_call", lambda tensor: None)
     monkeypatch.setattr(
         wide_residual,
         "shortcut_add_wide_residual_write_read_rmsnorm_quant",
-        lambda *a, **k: seen.append((k["outputs"], k["mxfp8_consumers"])),
+        lambda *a, **k: seen.append(k),
     )
     only.num_streams, only.eps, only.weight = 3, 1e-5, None
     only.read_map = lambda return_logits: None
-    only._replay_interval = lambda pending: None
+    only.replay_chain, only.starts_replay = ReplayChain(), True
     pending = PendingWideResidualWrites(None, None, None, None, None)
-    wide_residual.WriteReadNorm.apply_write(only, pending)
-    assert seen == [((only.consumer_formats,), (only.mxfp8_linears,))]
+    with torch.enable_grad():
+        wide_residual.WriteReadNorm.apply_write(only, pending)
+    (options,) = seen
+    (slot,) = options["columns"]
+    assert options["outputs"] == (only.consumer_formats,)
+    assert options["replay"] is only.replay_chain.open
+    assert (slot is not None) == eligible
+    assert only.columns_slot is None if slot is None else only.columns_slot() is slot

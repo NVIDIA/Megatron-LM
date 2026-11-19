@@ -39,11 +39,14 @@ Modules:
 - `residual_replay.py`, `replay_kernel.py`: every training seam records its write into a replay
   interval (one write per interval, or N with `--residual-stream-recompute-num-layers N`). An
   interval keeps only its input residual and the writes' tapes; it is replayed bit-exactly once,
-  before its backward GEMMs, rebuilding the freed residuals and reader zero's MXFP8 columns for
-  the consumers' weight gradients.
-- MXFP8 handoff: `api.py` registers each MXFP8 reader zero with its replayed columns; the
-  consumer TELinear (chosen and hooked in `megatron/core/transformer/wide_residual.py`) unpacks
-  that columnwise operand for its weight-gradient GEMM (TE runs its GEMMs unchanged).
+  before its backward GEMMs (in the next interval's first seam's backward, or from a hook on the
+  stack's output), rebuilding the freed residuals and filling its MXFP8 readers' column slots.
+  Forwards and backwards alternate on one stream (fusion rejects PP, overlapped EP communication
+  and full recompute), so the replay needs no events; retained-graph backward is unsupported.
+- MXFP8 handoff: the stack fixes each read's formats at link time from the per-layer precision
+  its forward uses; an MXFP8 consumer TELinear (hooked in
+  `megatron/core/transformer/wide_residual.py`) unpacks its read's replayed columnwise operand
+  for its weight-gradient GEMM (TE runs its GEMMs unchanged).
 
 Residual writes are bit-identical across schedules and to replay; reader outputs differ by at
 most one BF16 ulp between schedules. Tests: `tests/unit_tests/fusions/test_wide_residual_shortcut.py`
