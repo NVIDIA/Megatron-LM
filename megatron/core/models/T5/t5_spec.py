@@ -195,7 +195,7 @@ def get_t5_encoder_with_transformer_engine_block_spec(
     """T5 encoder block spec for Transformer Engine
 
     Args:
-      config (TransformerConfig): config, containing number of layers for encoder
+      num_layers (int): number of encoder layers
     """
 
     layer_spec = encoder_model_with_transformer_engine_default_spec()
@@ -211,7 +211,7 @@ def get_t5_decoder_with_transformer_engine_block_spec(
     """T5 decoder block spec for Transformer Engine
 
     Args:
-      config (TransformerConfig): config, containing number of layers for decoder
+      num_layers (int): number of decoder layers
     """
 
     layer_spec = decoder_model_with_transformer_engine_default_spec()
