@@ -361,9 +361,7 @@ class TestTraining:
         monkeypatch.setattr(training, "get_num_microbatches", lambda: 1)
         monkeypatch.setattr(training, "get_current_global_batch_size", lambda: 1)
         monkeypatch.setattr(training, "update_num_microbatches", Mock())
-        monkeypatch.setattr(
-            training, "get_checkpoint_manager", lambda: SimpleNamespace(load=load)
-        )
+        monkeypatch.setattr(training, "get_checkpoint_manager", lambda: SimpleNamespace(load=load))
         monkeypatch.setattr(training, "save_checkpoint", save)
 
         with pytest.raises(SystemExit):
