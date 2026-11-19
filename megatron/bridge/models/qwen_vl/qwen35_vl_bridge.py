@@ -102,7 +102,11 @@ def _qwen35_vl_config_kwargs(
     )
 
 
-def _qwen35_vl_hf_config(model_config, text_config, bridge_class):
+def _qwen35_vl_hf_config(
+    model_config: Qwen35VLModelConfig,
+    text_config: dict[str, Any],
+    bridge_class: type[MegatronModelBridge],
+) -> dict[str, Any]:
     """Keep language overrides inside the HF multimodal config's text_config."""
     return {
         "architectures": [bridge_class.SOURCE_NAME],

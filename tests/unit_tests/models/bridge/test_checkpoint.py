@@ -68,11 +68,23 @@ class SmallBuilder:
         return [SmallModel(config)]
 
 
-def test_native_weights_and_model_config_round_trip_without_training_args(tmp_path_dist_ckpt):
+@pytest.mark.parametrize(("saved_pp", "load_pp"), [(1, 1), (2, 2), (2, 1)])
+def test_native_weights_and_model_config_round_trip_without_training_args(
+    tmp_path_dist_ckpt, saved_pp, load_pp
+):
     Utils.initialize_model_parallel(1, 1)
     try:
         config = BridgeHybridModelConfig(
-            transformer=TransformerConfig(num_layers=2, hidden_size=16, num_attention_heads=2),
+            transformer=TransformerConfig(
+                num_layers=2,
+                hidden_size=16,
+                num_attention_heads=2,
+                pipeline_model_parallel_size=saved_pp,
+                pipeline_model_parallel_layout=(
+                    [["embedding", "decoder"], ["decoder", "loss"]] if saved_pp == 2 else None
+                ),
+            ),
+            hybrid_layer_pattern="*|*" if saved_pp == 2 else "**",
             vocab_size=128,
             seq_length=64,
         )
@@ -87,8 +99,18 @@ def test_native_weights_and_model_config_round_trip_without_training_args(tmp_pa
             assert type(restored_config) is type(config)
             assert restored_config.vocab_size == 128
             assert restored_config.seq_length == 64
-            [restored] = load_megatron_model(SmallBuilder(), directory)
+            overrides = {"pipeline_model_parallel_size": load_pp}
+            if saved_pp == load_pp == 2:
+                # The export launcher supplies both the outer pattern and the nested layout.
+                overrides["hybrid_layer_pattern"] = "*|*"
+                overrides["pipeline_model_parallel_layout"] = config.pipeline_model_parallel_layout
+            [restored] = load_megatron_model(SmallBuilder(), directory, mp_overrides=overrides)
             assert torch.equal(restored.weight, model.weight)
+            if load_pp == 1:
+                assert restored.model_config.pipeline_model_parallel_layout is None
+                assert restored.model_config.hybrid_layer_pattern == "**"
+            else:
+                assert restored.model_config.hybrid_layer_pattern == "*|*"
 
             # Publishing into an existing iteration must not replace a prior export.
             with pytest.raises(RuntimeError, match="FileExistsError"):

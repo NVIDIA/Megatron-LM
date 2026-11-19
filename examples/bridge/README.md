@@ -79,8 +79,10 @@ conversion CLI's explicit overwrite option is supplied.
 
 `convert.sh` wraps the workers with local/Slurm NeMo Run execution.
 Run `bash examples/bridge/conversion/convert.sh --help` for launcher options.
-The CPU conversion path is retained from Bridge but is not part of the GPU
-validation described here.
+The CPU conversion path is retained from Bridge, and Gloo loading requests CPU
+initialization. It is not yet fully CPU-only for Qwen3.5: MCore's Gated DeltaNet
+constructs some parameters directly on CUDA even with CPU initialization enabled.
+Use GPU conversion for these models; CPU-only conversion needs a separate Core fix.
 
 Native loading preserves saved topology unless the caller supplies explicit
 parallelism overrides. GTP checkpoints reject incompatible native topology
