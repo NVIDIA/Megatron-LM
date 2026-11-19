@@ -827,10 +827,15 @@ def model_parallel():
     Utils.destroy_model_parallel()
 
 
+# Overrides for a stack without shortcut blocks: every MoE layer is standalone.
+NO_SHORTCUT = dict(moe_shortcut_connection=False, moe_shortcut_parallel=False)
+
+
 def _hybrid_model(pattern, mixer="mamba", hidden=3072, optimized=False, blocks=None, **overrides):
     """A small fused HybridModel: M Mamba (GDP with mixer="gdp"), G GDN, * attention, E MoE,
-    - MLP-only."""
-    config = _fused_config(
+    - MLP-only. ``blocks`` is the expected shortcut-block count (every E's by default, none
+    without shortcut connections)."""
+    options = dict(
         num_layers=len(pattern.split("/")[0]),
         hidden_size=hidden,
         num_attention_heads=hidden // 64,
@@ -853,8 +858,8 @@ def _hybrid_model(pattern, mixer="mamba", hidden=3072, optimized=False, blocks=N
         activation_func=F.silu,
         moe_shortcut_parallel=True,
         transformer_impl="inference_optimized" if optimized else "transformer_engine",
-        **overrides,
     )
+    config = _fused_config(**(options | overrides))
     family = "gated_delta_product" if mixer == "gdp" else "hybrid"
     spec = getattr(specs, f"wide_residual_{family}{'_inference' * optimized}_stack_spec")
     if config.moe_shortcut_wide_residual_norm_fusion:
@@ -863,6 +868,7 @@ def _hybrid_model(pattern, mixer="mamba", hidden=3072, optimized=False, blocks=N
         config, spec, vocab_size=128, max_sequence_length=128, hybrid_layer_pattern=pattern
     )
     expected = pattern.split("/")[0].count("E") if blocks is None else blocks
+    expected = expected if config.moe_shortcut_connection else 0
     blocks = [b for b in model.decoder.layers if isinstance(b, ShortcutMoEBlock)]
     fused = config.moe_shortcut_wide_residual_norm_fusion
     assert len(blocks) == expected and all(b.fuses_residual_seams == fused for b in blocks)
@@ -988,28 +994,30 @@ INFERENCE_CASES = [
 
 @pytest.mark.usefixtures("model_parallel")
 @pytest.mark.parametrize(
-    "pattern,mixer,launches,dynamic,optimized,hidden,fp32_residual",
-    [(*case, False, False, 3072, True) for case in INFERENCE_CASES]
-    + [("MEME", "mamba", [1, 2, 1], False, False, 256, True)]
-    + [("M-MMEMEM-M-", "mamba", INFERENCE_CASES[4][2], False, False, 3072, False)]
+    "pattern,mixer,launches,dynamic,optimized,hidden,fp32_residual,shortcut",
+    [(*case, False, False, 3072, True, True) for case in INFERENCE_CASES]
+    + [("MEME", "mamba", [1, 2, 1], False, False, 256, True, True)]
+    + [("M-MMEMEM-M-", "mamba", INFERENCE_CASES[4][2], False, False, 3072, False, True)]
     + [
         # The last block's shortcut add fuses into the lone attention layer's read.
-        (p + "*", mixer, [1, 2, 1, 2], True, optimized, 3072, True)
+        (p + "*", mixer, [1, 2, 1, 2], True, optimized, 3072, True, True)
         for p, mixer in (("MEME", "mamba"), ("MEME", "gdp"), ("GEGE", "gdn"))
         for optimized in (False, True)
+    ]
+    # Standalone MoE layers (no shortcut blocks): one update per seam, consecutive E included.
+    + [
+        ("M*E-EEME", "mamba", [1] * 7, dynamic, dynamic, 3072, True, False)
+        for dynamic in (False, True)
     ],
 )
 def test_fused_seams_inference_matches_unfused(
-    monkeypatch, pattern, mixer, launches, dynamic, optimized, hidden, fp32_residual
+    monkeypatch, pattern, mixer, launches, dynamic, optimized, hidden, fp32_residual, shortcut
 ):
     """Prefill/decode (static or dynamic batching) runs one fused kernel per linked seam and
     matches the same model with every seam unfused within BF16 noise."""
-    model = _hybrid_model(
-        pattern, mixer, hidden, optimized, fp32_residual_connection=fp32_residual
-    ).eval()
-    twin = _unfused_twin(
-        model, pattern, mixer, hidden, optimized, fp32_residual_connection=fp32_residual
-    )
+    options = dict(fp32_residual_connection=fp32_residual, **({} if shortcut else NO_SHORTCUT))
+    model = _hybrid_model(pattern, mixer, hidden, optimized, **options).eval()
+    twin = _unfused_twin(model, pattern, mixer, hidden, optimized, **options)
     execute = _dynamic_prefill_decode if dynamic else _static_prefill_decode
     launch, calls = forward_kernel.forward, []  # each fused launch's update count
     monkeypatch.setattr(
@@ -1031,21 +1039,27 @@ def test_fused_seams_inference_matches_unfused(
 
 @pytest.mark.usefixtures("model_parallel")
 @pytest.mark.parametrize(
-    "pattern,mixer,fp32_residual,interval",
+    "pattern,mixer,fp32_residual,interval,shortcut",
     [
-        ("M-MMEMEM-M-", "mamba", True, 2),
-        ("M-MEMMEM-M-", "mamba", False, 4),
-        ("MEME", "gdp", True, 2),
-        ("*GE-*E", "gdn", True, 3),
+        ("M-MMEMEM-M-", "mamba", True, 2, True),
+        ("M-MEMMEM-M-", "mamba", False, 4, True),
+        ("MEME", "gdp", True, 2, True),
+        ("*GE-*E", "gdn", True, 3, True),
+        # Standalone MoE layers: each read feeds the router, shared expert and dispatcher.
+        ("M*E-EEME", "mamba", True, 2, False),
+        ("*EE-E*", "mamba", False, 3, False),
     ],
 )
 @REQUIRES_FUSED_BACKWARD
-def test_fused_seams_training_matches_unfused(monkeypatch, pattern, mixer, fp32_residual, interval):
+def test_fused_seams_training_matches_unfused(
+    monkeypatch, pattern, mixer, fp32_residual, interval, shortcut
+):
     """Training forward/backward through every fused seam matches the unfused model: outputs and
     parameter gradients within BF16 noise. The kernels apply each norm's epsilon and run its
     forward pre-hooks (DDP's overlapped parameter all-gather waits there), and checkpoint replay
     every ``interval`` layers reproduces outputs and gradients bit for bit."""
     options = dict(fp32_residual_connection=fp32_residual, layernorm_epsilon=1e-6)
+    options |= {} if shortcut else NO_SHORTCUT
     model = _hybrid_model(pattern, mixer, **options).train()
     twin = _unfused_twin(model, pattern, mixer, **options)
     launch, epsilons = forward_kernel.forward, set()
@@ -1170,6 +1184,34 @@ def test_mxfp8_training_absorbs_every_read_quantization(monkeypatch, recompute_s
     assert len(takes) == len(set(takes)) == 7
 
 
+@pytest.mark.usefixtures("model_parallel")
+@REQUIRES_FUSED_BACKWARD
+def test_mxfp8_training_with_standalone_moe_layers():
+    """Without shortcut blocks, MXFP8 training (with checkpoint replay) hands each attention and
+    MLP read to its Linear as the seam's MXFP8 operand, while each MoE layer, consecutive ones
+    included, takes its read as one BF16 tensor (its router, shared expert and dispatcher share
+    it; its Linears quantize it themselves)."""
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
+
+    options = dict(fp8="e4m3", fp8_recipe="mxfp8", residual_stream_recompute_num_layers=2)
+    model = _hybrid_model("-*E-EE*E", hidden=2048, **options, **NO_SHORTCUT).train()
+    reads = [m for m in model.decoder.modules() if isinstance(m, WriteReadNorm)]
+    assert sorted(read.format for read in reads) == ["bf16"] * 4 + ["mxfp8"] * 3
+    received = {}
+    for read in reads:
+        ((consumer, _),) = read.consumers
+        consumer.register_forward_pre_hook(
+            lambda m, args: received.setdefault(m, set()).add(type(args[0]))
+        )
+    ids = torch.randint(0, 128, (1, 2048), device="cuda")
+    positions = torch.arange(2048, device="cuda")[None]
+    model(ids, positions, None).float().square().mean().backward()
+    assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+    for read in reads:
+        expected = MXFP8Tensor if read.format == "mxfp8" else torch.Tensor
+        assert received[read.consumers[0][0]] == {expected}
+
+
 @pytest.mark.parametrize(
     "overrides,message",
     [
@@ -1188,12 +1230,13 @@ def test_mxfp8_training_absorbs_every_read_quantization(monkeypatch, recompute_s
         ),
         (
             {"fp8": "e4m3", "fp8_recipe": "mxfp8", "moe_shared_expert_gate": True},
-            "MXFP8 with moe_shared_expert_gate",
+            "MXFP8 shortcut blocks with moe_shared_expert_gate",
         ),
         (
             {"fp8": "e4m3", "fp8_recipe": "mxfp8", "use_grouped_gemm_for_shared_expert": True},
-            "MXFP8 with use_grouped_gemm_for_shared_expert",
+            "MXFP8 shortcut blocks with use_grouped_gemm_for_shared_expert",
         ),
+        ({"moe_shared_expert_intermediate_size": None}, "shortcut blocks without a shared expert"),
         (
             {
                 "cuda_graph_impl": "local",
@@ -1207,6 +1250,9 @@ def test_mxfp8_training_absorbs_every_read_quantization(monkeypatch, recompute_s
 def test_fusion_rejects_unsupported_config(overrides, message):
     with pytest.raises(ValueError, match=message):
         _fused_config(**overrides)
+    if "shortcut blocks" in message:
+        # A standalone MoE layer takes its read whole (BF16): no shortcut-block requirement.
+        _fused_config(**(overrides | NO_SHORTCUT | {"hidden_size": 2048}))
 
 
 @pytest.mark.usefixtures("model_parallel")
@@ -1233,8 +1279,8 @@ def test_fusion_spec_links_every_seam(monkeypatch):
     is fused. Each fused read is linked to its consumers: a layer's input projection (MXFP8 when
     eligible), a block's MoE read to the shared expert's fc1, its shortcut read to the router
     (BF16) and the latent projection (MXFP8: both formats); a lone MoE layer's read to the MoE
-    layer (BF16). Building rejects an unfused layer (with its reason), a one-layer stack, and a
-    lone MoE layer with MXFP8."""
+    layer (BF16, also under MXFP8 and without shortcut blocks). Building rejects an unfused layer
+    (with its reason) and a one-layer stack."""
     from megatron.core.extensions.transformer_engine import TELinear
 
     with monkeypatch.context() as patch:
@@ -1268,8 +1314,17 @@ def test_fusion_spec_links_every_seam(monkeypatch):
     lone_moe = lone.decoder.layers[2]  # the second E follows a block, not a compute layer
     assert not isinstance(lone_moe, ShortcutMoEBlock)
     assert links(seam_connections(lone_moe)[0]) == [(lone_moe.mlp, False)]
-    with pytest.raises(ValueError, match="MoE layer outside a shortcut block"):
-        _hybrid_model("-*EE-", hidden=2048, blocks=1, fp8="e4m3", fp8_recipe="mxfp8")
+    mxfp8 = dict(fp8="e4m3", fp8_recipe="mxfp8")
+    lone_mxfp8 = _hybrid_model("-*EE-", hidden=2048, blocks=1, **mxfp8).decoder.layers[2]
+    assert links(seam_connections(lone_mxfp8)[0]) == [(lone_mxfp8.mlp, False)]
+    standalone = _hybrid_model("M*EE-", hidden=256, **NO_SHORTCUT)
+    for layer in standalone.decoder.layers[1:]:
+        read = seam_connections(layer)[0]
+        moe = getattr(layer, "mlp", None)
+        if layer.layer_number in (3, 4):  # the two E layers
+            assert links(read) == [(moe, False)] and read.format == "bf16"
+        else:
+            assert len(read.consumers) == 1 and read.consumers[0][0] is not moe
     layers = []
     for layer in model.decoder.layers:
         is_block = isinstance(layer, ShortcutMoEBlock)
