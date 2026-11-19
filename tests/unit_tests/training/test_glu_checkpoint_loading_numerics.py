@@ -404,7 +404,7 @@ def _forward_with_fp32_intermediates(case, model, experts, monkeypatch):
     return output, losses
 
 
-def _assert_execution_plan(experts, *, fused):
+def _assert_execution_plan(experts, *, fused_op=None):
     """An op-fuser configuration flag alone does not prove the fused kernel ran."""
     (sequence,) = experts._fused_ops
     selected = [
@@ -413,12 +413,12 @@ def _assert_execution_plan(experts, *, fused):
         for op, indices in group._forward_ops
     ]
     expected = (
-        [("GroupedMLP_CuTeGEMMGLU", (0, 1, 2))]
-        if fused
+        [(fused_op, (0, 1, 2))]
+        if fused_op is not None
         else [("GroupedLinear", (0,)), ("ScaledSwiGLU", (1,)), ("GroupedLinear", (2,))]
     )
     assert selected == expected, (
-        f"Expected {expected}, got {selected}. Fused MXFP8 requires a GB200 container "
+        f"Expected {expected}, got {selected}. Fused grouped MLP requires a GB200 container "
         "with native TE/cuDNN grouped-MLP fusion support."
     )
 
@@ -463,7 +463,7 @@ def test_canonical_checkpoint_matches_interleaved_ddp(
         else:
             reference_output, reference_losses = _forward(moe_case, model, experts)
         if use_op_fuser:
-            _assert_execution_plan(experts, fused=False)
+            _assert_execution_plan(experts)
         del experts, model, optimizer, scheduler
 
         model, optimizer, scheduler, experts = _setup_model(
@@ -480,7 +480,12 @@ def test_canonical_checkpoint_matches_interleaved_ddp(
         _assert_parameters(experts, expected_runtime)
         actual_output, actual_losses = _forward(moe_case, model, experts)
         if use_op_fuser:
-            _assert_execution_plan(experts, fused=precision == "mxfp8")
+            fused_op = None
+            if precision == "mxfp8":
+                fused_op = "GroupedMLP_CuTeGEMMGLU"
+            elif numerics._bf16_grouped_mlp_fusion_supported():
+                fused_op = "GroupedMLP_CuTeGEMMGLUBf16"
+            _assert_execution_plan(experts, fused_op=fused_op)
         tolerance = 5e-3 if precision == "bf16" else 5e-2
         torch.testing.assert_close(actual_output, reference_output, rtol=tolerance, atol=tolerance)
         torch.testing.assert_close(actual_losses, reference_losses, rtol=tolerance, atol=tolerance)
