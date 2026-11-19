@@ -22,7 +22,7 @@ from tests.unit_tests.test_utilities import Utils
 @pytest.mark.parametrize("release", [False, True])
 def test_auto_config_uses_tracker_not_newer_unpublished_directory(tmp_path_dist_ckpt, release):
     from megatron.bridge import AutoBridge
-    from tests.unit_tests.models.bridge.qwen_vl.test_qwen35_vl_bridge import _qwen35_vl_config
+    from tests.unit_tests.bridge.qwen_vl.test_qwen35_vl_bridge import _qwen35_vl_config
 
     Utils.initialize_model_parallel(1, 1)
     try:

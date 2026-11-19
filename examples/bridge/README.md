@@ -118,12 +118,12 @@ PEFT training, or a unified end-to-end training entrypoint.
 
 ## Tests
 
-The migrated Bridge unit tests live under `tests/unit_tests/models/bridge`,
+The migrated Bridge unit tests live under `tests/unit_tests/bridge`,
 inside MLM's existing models CI bucket:
 
 ```bash
 uv run --no-sync python -m torch.distributed.run --standalone --nproc-per-node=1 \
-  -m pytest -q tests/unit_tests/models/bridge
+  -m pytest -q tests/unit_tests/bridge
 ```
 
 They cover config serialization and copying, dispatch, tensor mappings, Hybrid

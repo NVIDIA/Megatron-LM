@@ -8,7 +8,7 @@ from megatron.training.config.instantiate_utils import target_allowlist
 
 @pytest.fixture(autouse=True)
 def allow_test_config_targets():
-    prefix = "tests.unit_tests.models.bridge."
+    prefix = "tests.unit_tests.bridge."
     added = prefix not in target_allowlist.allowed_prefixes
     if added:
         target_allowlist.add_prefix(prefix)
