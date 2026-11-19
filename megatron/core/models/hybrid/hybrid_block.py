@@ -8,6 +8,7 @@
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
+from functools import partial
 from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -19,7 +20,7 @@ from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp4_utils import get_fp4_context
-from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fp8_utils import get_fp8_context, is_first_last_bf16_layer
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
@@ -67,6 +68,25 @@ from megatron.core.transformer.wide_residual import (
 )
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
+
+
+def _per_layer_fp8(config) -> bool:
+    """Whether the stack enters each layer's FP8 context itself (delayed scaling wraps the whole
+    pass in one context instead)."""
+    return bool(config.fp8) and config.fp8_recipe != Fp8Recipe.delayed
+
+
+def runs_mxfp8(stack_config, layer) -> bool:
+    """Whether ``HybridStack.forward`` runs ``layer`` under an MXFP8 autocast: the per-layer
+    context ``get_fp8_context`` builds from the layer's own config (fused reads fix their formats
+    with this at link time)."""
+    config = layer.config
+    return (
+        _per_layer_fp8(stack_config)
+        and bool(config.fp8)
+        and config.fp8_recipe == Fp8Recipe.mxfp8
+        and not is_first_last_bf16_layer(config, layer.layer_number - 1)
+    )
 
 
 @dataclass
@@ -460,12 +480,12 @@ class HybridStack(MegatronModule):
                 )
                 for layer in self.layers
             ]
-        self._fused_reads = ()
+        self._fused_reads, self._replay_chain = (), None
         if self.config.moe_shortcut_wide_residual_norm_fusion and self.uses_wide_residual_stream:
             # Fused residual seams, after grouping (whose blocks link their own MoE and shortcut
             # reads): link each deferred write to the next physical layer's fused read and each
-            # remaining read to its consumer.
-            self._fused_reads = link_residual_seams(
+            # remaining read to its consumer, in the formats this stack's forward runs them in.
+            self._fused_reads, self._replay_chain = link_residual_seams(
                 [
                     sublayer
                     for layer in self.layers
@@ -474,7 +494,8 @@ class HybridStack(MegatronModule):
                         if isinstance(layer, ShortcutMoEBlock)
                         else (layer,)
                     )
-                ]
+                ],
+                partial(runs_mxfp8, self.config),
             )
         self._residual_stream_atomic_layer_pairs = self._shortcut_layer_pairs()
         self._execution_layer_config_list = [
@@ -667,8 +688,10 @@ class HybridStack(MegatronModule):
         inference_context = deprecate_inference_params(inference_context, inference_params)
         for read in self._fused_reads:
             # A forward that raised between a deferred write's hand-off and this read's take
-            # left the write behind; the next forward starts without it.
+            # left the write behind (or a replay interval open); the next forward starts afresh.
             read.pending = None
+        if self._replay_chain is not None:
+            self._replay_chain.open = None
         if self._has_custom_layers and (inference_context is not None or InferenceMode.is_active()):
             raise ValueError("Custom hybrid layers do not support inference contexts yet.")
 
@@ -740,8 +763,8 @@ class HybridStack(MegatronModule):
         # if we are using other fp8 recipes, then the context manager enter&exit are free
         # we can wrap fp8_context within the for loop over layers, so that we can fine-grained
         # control which layer will be fp8 or bf16
-        use_outer_fp8_context = self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
-        use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
+        use_inner_fp8_context = _per_layer_fp8(self.config)
+        use_outer_fp8_context = self.config.fp8 and not use_inner_fp8_context
         use_fp4_context = self.config.fp4 is not None
         outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
 
@@ -957,6 +980,9 @@ class HybridStack(MegatronModule):
                         is_block_end=mhc_block_ends[layer_idx],
                     )
 
+        if self._replay_chain is not None:
+            # The stack's last replay interval replays before its readers' consumers' backward.
+            hidden_states = self._replay_chain.close(hidden_states)
         if self.residual_stream_readout is not None:
             hidden_states = apply_module(self.residual_stream_readout)(hidden_states)
 

@@ -258,20 +258,20 @@ class ShortcutMoEBlock(MegatronModule):
             # rejects the gate and grouped shared experts with MXFP8 fusion); the router and the
             # latent projection take the shortcut read, which the two-reader seam applying the
             # compute read's write emits in the compute layer's quantization context.
-            mlp, number = moe_layer.mlp, moe_layer.layer_number
+            mlp = moe_layer.mlp
             shared = mlp.shared_experts
             fc1 = shared.linear_fc1 if type(shared).forward is SharedExpertMLP.forward else shared
-            moe_layer.residual_read_mlp.link_consumer(fc1, number)
+            moe_layer.residual_read_mlp.link_consumer(fc1, moe_layer)
             if self.fused_shortcut_read:
                 read = self.shortcut_residual_read
-                read.seam_layer_number = compute_layer.layer_number
+                object.__setattr__(read, "seam_layer", compute_layer)
                 # Two consumers, so two outputs whose gradients the backward kernel sums: the
                 # router (BF16), then preprocess: the latent projection (MXFP8 when it quantizes)
                 # or, without one, the dispatcher (BF16).
-                read.link_consumer(mlp.router, number)
+                read.link_consumer(mlp.router, moe_layer)
                 read.link_consumer(
                     mlp.fc1_latent_proj if self.config.moe_latent_size else mlp.token_dispatcher,
-                    number,
+                    moe_layer,
                 )
                 read.link(seam_connections(compute_layer)[0])
 

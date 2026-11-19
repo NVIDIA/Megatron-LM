@@ -11,9 +11,10 @@ import transformer_engine as te
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
 from megatron.core.fusions.wide_residual_shortcut import forward_kernel, replay_kernel
-from megatron.core.fusions.wide_residual_shortcut.residual_replay import ReplayInterval
+from megatron.core.fusions.wide_residual_shortcut.residual_replay import ColumnSlot
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.models.hybrid import hybrid_block
 from megatron.core.models.hybrid import hybrid_layer_specs as specs
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -1125,7 +1126,7 @@ def test_mxfp8_training_absorbs_every_read_quantization(monkeypatch, recompute_s
     """MXFP8 training (latent projection, checkpoint replay, optionally a recomputed shared
     expert): every linked consumer Linear takes its read as the seam's MXFP8 operand on every
     call, so TE quantizes no seam read, while the router reads BF16; each MXFP8 read's
-    columnwise operand is taken from its replay once for all its consumers."""
+    ColumnSlot is filled by its interval's replay for all its consumers."""
     recompute = dict(recompute_granularity="selective", recompute_modules=["shared_experts"])
     options = dict(
         fp8="e4m3",
@@ -1139,25 +1140,30 @@ def test_mxfp8_training_absorbs_every_read_quantization(monkeypatch, recompute_s
     # Two attention qkv reads, the MLP read and each block's MoE read are MXFP8; each block's
     # router/latent shortcut read is both (no read falls back to BF16).
     assert sorted(read.format for read in reads) == ["both"] * 2 + ["mxfp8"] * 5
+    consumers = {
+        module
+        for read in reads
+        for (module, _), fmt in zip(read.consumers, read.consumer_formats)
+        if fmt == "mxfp8"
+    }
     received = {}
-    for read in reads:
-        for linear in read.mxfp8_linears:
-            linear.register_forward_pre_hook(
-                lambda m, args: received.setdefault(m, []).append(type(args[0]))
-            )
-    takes = []
-    record = lambda self, index, reader=0: takes.append((id(self), index, reader))
-    spy(monkeypatch, ReplayInterval, "take_columns", record)
+    for linear in consumers:
+        linear.register_forward_pre_hook(
+            lambda m, args: received.setdefault(m, []).append(type(args[0]))
+        )
+    slots = []
+    monkeypatch.setattr(
+        wide_residual, "ColumnSlot", lambda: slots.append(ColumnSlot()) or slots[-1]
+    )
     _train_step(model, 2048)
-    consumers = {linear for read in reads for linear in read.mxfp8_linears}
     calls = 2 if recompute_shared_experts else 1  # a recomputed shared expert runs twice
     shared = {block.moe_layer.mlp.shared_experts.linear_fc1 for block in model.decoder.layers
               if isinstance(block, ShortcutMoEBlock)}  # fmt: skip
     assert received.keys() == consumers
     for linear, types in received.items():
         assert types == [MXFP8Tensor] * (calls if linear in shared else 1), linear
-    # One take per MXFP8 read (seam, reader), shared by its consumers.
-    assert len(takes) == len(set(takes)) == 7
+    # One slot per MXFP8 read, filled by its replay for all of its consumers.
+    assert len(slots) == 7 and all(slot.columns is not None for slot in slots)
 
 
 @pytest.mark.usefixtures("model_parallel")
@@ -1255,10 +1261,15 @@ def test_fusion_spec_links_every_seam(monkeypatch):
     (with its reason) and a one-layer stack."""
     from megatron.core.extensions.transformer_engine import TELinear
 
+    def linked(read):
+        """``(module, takes it as MXFP8)`` per consumer, in link order."""
+        return [(m, f == "mxfp8") for (m, _), f in zip(read.consumers, read.consumer_formats)]
+
     with monkeypatch.context() as patch:
-        # Eligible as under MXFP8 on a GB300: a TELinear (never the router).
+        # As under MXFP8 on a GB300: every layer MXFP8, a TELinear eligible (never the router).
+        patch.setattr(hybrid_block, "runs_mxfp8", lambda config, layer: True)
         patch.setattr(
-            wide_residual, "mxfp8_linear_eligible", lambda linear, *a: isinstance(linear, TELinear)
+            wide_residual, "mxfp8_linear_eligible", lambda linear: isinstance(linear, TELinear)
         )
         model = _hybrid_model("M-*EME-", hidden=256)
         latent = _hybrid_model("-*E", hidden=256, moe_latent_size=64)
@@ -1266,35 +1277,34 @@ def test_fusion_spec_links_every_seam(monkeypatch):
         compute, moe = block.compute_layer, block.moe_layer
         branch = compute.mixer if isinstance(compute, MambaLayer) else compute.self_attention
         projection = getattr(branch, "in_proj", None) or branch.linear_qkv
-        assert seam_connections(compute)[0].consumers == [(projection, True)]
+        assert linked(seam_connections(compute)[0]) == [(projection, True)]
         fc1 = moe.mlp.shared_experts.linear_fc1
-        assert seam_connections(moe)[0].consumers == [(fc1, True)]
+        assert linked(seam_connections(moe)[0]) == [(fc1, True)]
         # The router and the dispatcher: two BF16 consumers, each handed its own output.
         dispatcher = moe.mlp.token_dispatcher
         shortcut = block.shortcut_residual_read
-        assert shortcut.consumers == [(moe.mlp.router, False), (dispatcher, False)]
-        assert shortcut.consumer_formats == ("bf16", "bf16")
-        assert shortcut.seam_layer_number == compute.layer_number
+        assert linked(shortcut) == [(moe.mlp.router, False), (dispatcher, False)]
+        assert shortcut.seam_layer is compute
     plain = [layer for layer in model.decoder.layers if not isinstance(layer, ShortcutMoEBlock)]
     mlp_read = seam_connections(plain[1])[0]  # an MLP layer
-    assert mlp_read.consumers == [(plain[1].mlp.linear_fc1, True)] and mlp_read.format == "mxfp8"
+    assert linked(mlp_read) == [(plain[1].mlp.linear_fc1, True)] and mlp_read.format == "mxfp8"
     block = latent.decoder.layers[-1]
     mlp, shortcut = block.moe_layer.mlp, block.shortcut_residual_read
-    assert shortcut.consumers == [(mlp.router, False), (mlp.fc1_latent_proj, True)]
+    assert linked(shortcut) == [(mlp.router, False), (mlp.fc1_latent_proj, True)]
     assert shortcut.format == "both"
     lone = _hybrid_model("-*EE-", hidden=256, blocks=1)
     lone_moe = lone.decoder.layers[2]  # the second E follows a block, not a compute layer
     assert not isinstance(lone_moe, ShortcutMoEBlock)
-    assert seam_connections(lone_moe)[0].consumers == [(lone_moe.mlp, False)]
+    assert linked(seam_connections(lone_moe)[0]) == [(lone_moe.mlp, False)]
     mxfp8 = dict(fp8="e4m3", fp8_recipe="mxfp8")
     lone_mxfp8 = _hybrid_model("-*EE-", hidden=2048, blocks=1, **mxfp8).decoder.layers[2]
-    assert seam_connections(lone_mxfp8)[0].consumers == [(lone_mxfp8.mlp, False)]
+    assert linked(seam_connections(lone_mxfp8)[0]) == [(lone_mxfp8.mlp, False)]
     standalone = _hybrid_model("M*EE-", hidden=256, **NO_SHORTCUT)
     for layer in standalone.decoder.layers[1:]:
         read = seam_connections(layer)[0]
         moe = getattr(layer, "mlp", None)
         if layer.layer_number in (3, 4):  # the two E layers
-            assert read.consumers == [(moe, False)] and read.format == "bf16"
+            assert linked(read) == [(moe, False)] and read.format == "bf16"
         else:
             assert len(read.consumers) == 1 and read.consumers[0][0] is not moe
     layers = []
