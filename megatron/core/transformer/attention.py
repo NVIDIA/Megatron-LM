@@ -1743,6 +1743,13 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
                 with core_attn_manager as query:
+                    if inference_context is not None:
+                        # K/V are now separate cache views, but Q can retain the
+                        # packed QKV strides. Materialize all three for TE's
+                        # separate-tensor layout, including partial cache batches.
+                        query = query.contiguous()
+                        key = key.contiguous()
+                        value = value.contiguous()
                     core_attn_out = apply_module(self.core_attention)(
                         query,
                         key,
