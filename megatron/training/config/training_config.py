@@ -54,6 +54,12 @@ class TrainingConfig:
     0=off, 1=moderate, 2=aggressive.
     """
 
+    moe_grouped_expert_buffers: bool = False
+    """Use shared BF16 expert output/input-gradient buffers with native TE grouped GEMMs.
+    Requires the pinned tuple-argument GroupedLinear ABI; incompatible TE versions fail
+    early. Installs a process-wide adapter through backward; single-threaded training only.
+    """
+
     check_weight_hash_across_dp_replicas_interval: int | None = None
     """Interval to check weight hashes are same across DP replicas. If not specified, weight hashes not checked."""
 
