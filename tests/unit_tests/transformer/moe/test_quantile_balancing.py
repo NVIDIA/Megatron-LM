@@ -20,6 +20,7 @@ from megatron.core.transformer.moe.moe_utils import (
     get_updated_expert_bias_with_quantile,
     topk_routing_with_score_function,
 )
+from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -155,7 +156,13 @@ def test_qb_rejects_active_expert_capacity():
         ({"moe_router_score_function": "softmax"}, "requires moe_router_score_function"),
         ({"moe_router_enable_expert_bias": True}, "do not also enable"),
         ({"moe_router_num_groups": 2, "moe_router_group_topk": 1}, "does not support group"),
-        ({"moe_enable_routing_replay": True}, "does not support routing replay"),
+        (
+            {
+                "moe_enable_routing_replay": True,
+                "moe_router_quantile_balancing_estimation_scope": "micro_batch",
+            },
+            "does not support routing replay",
+        ),
         ({"moe_expert_rank_capacity_factor": 1.0}, "expert-rank capacity requires"),
         ({"moe_router_qb_num_bins": 1}, "must be greater than one"),
     ],
@@ -164,6 +171,66 @@ def test_qb_rejects_incompatible_config(overrides, error_match):
     """Reject QB combinations that cannot produce the required K3 histogram."""
     with pytest.raises(ValueError, match=error_match):
         _config(**overrides)
+
+
+def test_qb_global_batch_accepts_routing_replay():
+    config = _config(moe_enable_routing_replay=True)
+    assert config.moe_enable_routing_replay
+
+
+def _replay_qb_inputs():
+    torch.manual_seed(0)
+    return dict(
+        logits=torch.randn(16, 4),
+        topk=1,
+        score_function="sigmoid",
+        expert_bias=torch.zeros(4),
+        qb_bin_bounds=torch.tensor([-1.0, 1.0], dtype=torch.float32),
+    )
+
+
+def test_qb_replay_dispatches_replayed_experts_but_histograms_own_cutoff():
+    """Replay picks the dispatched experts; the K3 histogram is unchanged by it."""
+    kwargs = _replay_qb_inputs()
+    ref_hist = torch.zeros(4, 8, dtype=torch.int32)
+    _, ref_map = topk_routing_with_score_function(**kwargs, qb_histogram=ref_hist)
+
+    replay = RouterReplay()
+    try:
+        target = (ref_map.int().argmax(dim=1, keepdim=True) + 1) % 4
+        replay.set_target_indices(target)
+        replay.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+        hist = torch.zeros(4, 8, dtype=torch.int32)
+        _, routing_map = topk_routing_with_score_function(
+            **kwargs, qb_histogram=hist, router_replay=replay
+        )
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+    assert torch.equal(routing_map.int().argmax(dim=1, keepdim=True), target)
+    assert torch.equal(hist, ref_hist)
+
+
+def test_qb_replay_record_matches_non_replay_routing():
+    kwargs = _replay_qb_inputs()
+    ref_hist = torch.zeros(4, 8, dtype=torch.int32)
+    ref_probs, ref_map = topk_routing_with_score_function(**kwargs, qb_histogram=ref_hist)
+
+    replay = RouterReplay()
+    try:
+        replay.set_router_replay_action(RouterReplayAction.RECORD)
+        hist = torch.zeros(4, 8, dtype=torch.int32)
+        probs, routing_map = topk_routing_with_score_function(
+            **kwargs, qb_histogram=hist, router_replay=replay
+        )
+        recorded = replay.get_recorded_indices()
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+    assert torch.equal(routing_map, ref_map)
+    torch.testing.assert_close(probs, ref_probs)
+    assert torch.equal(hist, ref_hist)
+    assert torch.equal(routing_map.int().argmax(dim=1, keepdim=True), recorded)
 
 
 def test_qb_histogram_recovery():
@@ -188,7 +255,7 @@ def test_qb_histogram_recovery():
         ({"use_pre_softmax": True}, "does not use pre-softmax"),
         ({"topk": 4}, "requires topk < num_experts"),
         ({"num_groups": 2}, "does not support group-limited routing"),
-        ({"router_replay": object()}, "does not support router replay"),
+        ({"router_replay": object(), "fused": True}, "needs the unfused router path"),
         ({"qb_histogram": torch.zeros(3, 8, dtype=torch.int32)}, "must have shape"),
         ({"qb_histogram": torch.zeros(4, 8, dtype=torch.int64)}, "dtype torch.int32"),
         ({"qb_bin_bounds": torch.zeros(2, dtype=torch.float64)}, "must be an FP32 tensor"),
