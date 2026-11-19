@@ -76,31 +76,13 @@ class _ForwardConfig(NamedTuple):
     VECTOR: int = 4
 
 
-# GB300 prefill configs (inference, 3 streams, rows >= 2048) from a paired sweep at 2K-16K rows.
-# Key: (hidden, readers, MXFP8 handoff).
-# fmt: off
-_FORWARD_CONFIGS = {
-    (3072, 1, False): _ForwardConfig(4096, 0, 1, False, 1, 16, 64, False),
-    (3072, 1, True): _ForwardConfig(4096, 2, 0, False, 0, 8, 128, True, LOADS_FIRST=True),
-    (3072, 2, False): _ForwardConfig(2048, 2, 1, True, 0, 8, 128, False, LOADS_FIRST=True),
-    (3072, 2, True): _ForwardConfig(2048, 2, 1, True, 0, 8, 128, False, LOADS_FIRST=True),
-    (4096, 1, False): _ForwardConfig(4096, 1, 1, False, 0, 8, 128, False),
-    (4096, 1, True): _ForwardConfig(4096, 4, 1, False, 0, 16, 64, True, LOADS_FIRST=True),
-    (4096, 2, False): _ForwardConfig(2048, 2, 1, True, 0, 8, 128, False, LOADS_FIRST=True),
-    (4096, 2, True): _ForwardConfig(2048, 2, 1, True, 0, 8, 128, False, LOADS_FIRST=True),
-    (10240, 1, False): _ForwardConfig(4096, 1, 0, False, 0, 16, 128, True, LOADS_FIRST=True),
-    (10240, 1, True): _ForwardConfig(4096, 2, 1, False, 0, 16, 128, True, LOADS_FIRST=True),
-    (10240, 2, False): _ForwardConfig(4096, 1, 0, False, 0, 16, 128, True, LOADS_FIRST=True),
-    (10240, 2, True): _ForwardConfig(4096, 4, 0, False, 0, 16, 128, True, LOADS_FIRST=True),
-}
-
-
 def _bf16_config(*fields, vector):
     return _ForwardConfig(*fields, LOADS_FIRST=True, VECTOR=vector)
 
 
-# GB300 inference configs for a BF16 residual stream (3 streams, from 512 rows), which needs
+# GB300 inference configs for a BF16 residual stream at 512-1024 rows (3 streams), which needs
 # more rows in flight. Key: (hidden, readers, updates, MXFP8 handoff).
+# fmt: off
 _FORWARD_CONFIGS_BF16 = {
     (3072, 1, 1, False): _bf16_config(4096, 1, 0, False, 0, 8, None, True, vector=4),
     (3072, 1, 1, True): _bf16_config(4096, 2, 0, False, 0, 8, 80, False, vector=4),
@@ -195,18 +177,41 @@ def _inference_config(m, h, streams, readers, mxfp8, updates):
     return _replicated(_ForwardConfig(*fields, LOADS_FIRST=True), replicas, readers, h)
 
 
-def _prefill_config(h, streams, readers):
-    """Prefill tree for rows >= 2048 (no row dependence in a 107-shape GB300 sweep)."""
-    half = (2048, 2, 1, True, 0, 8, 128, False)
-    if h <= 9728:
-        fields = (4096, 2, 0, True, 0, 8, 80, False) if streams <= 1 else half
-    elif h <= 15872:
-        fields = half if streams <= 1 else (4096, 2, 1, False, 0, 16, 128, True)
-    elif readers == 1:
-        fields = (4096, 4, 0, False, 0, 16, 128, True)
-    else:
+def _prefill_config(h, streams, readers, bf16_residual, outputs):
+    """Prefill decision tree (inference rows > 1024, hidden 2048-16384, 1-6 streams).
+
+    Prefill writes no tape for the backward, so it gets its own tree, fit like
+    ``_training_config`` to a cold-L2 GB300 sweep of 584 inference cells (hidden 2048-16384,
+    1-6 streams, 1.5K-16K rows, both residual dtypes, one and two readers with and without a
+    shortcut add, every output format) over 32 schedules. Mean slowdown 1.3% against the per-cell
+    best (the tables it replaced: 6.8%).
+    """
+    row_bytes = streams * h * (2 if bf16_residual else 4)
+    vector = 4
+    if row_bytes <= 24576:
+        if bf16_residual:
+            fields, vector = (1024, 2, 0, False, 0, 4, None, False), 8
+        else:
+            fields = (4096, 1, 0, True, 0, 8, None, True)
+    elif row_bytes <= 73728:
+        if h <= 6144:
+            if row_bytes <= 36864:
+                fields = (1024, 4, 1, True, 16, 8, 80, True)
+            else:
+                fields = (2048, 2, 1, True, 0, 8, 128, False)
+        elif readers == 1:
+            fields, vector = (2048, 2, 1, True, 0, 8, 128, False), 8
+        else:
+            fields, vector = (2048, 2, 2, True, 0, 8, 128, False), 8
+    elif h > 12288:
         fields = (4096, 2, 0, True, 0, 16, None, True)
-    return _ForwardConfig(*fields, LOADS_FIRST=True)
+    elif row_bytes <= 98304:
+        fields = (2048, 2, 1, True, 0, 8, 128, False)
+    elif "both" in outputs:
+        fields = (4096, 1, 0, False, 0, 16, 128, True)
+    else:
+        fields = (4096, 4, 0, False, 0, 16, 128, True)
+    return _ForwardConfig(*fields, LOADS_FIRST=True, VECTOR=vector)
 
 
 def _training_config(h, streams, readers, bf16_residual):
@@ -257,8 +262,10 @@ def choose_forward_config(
     """Choose the row-kernel schedule; ``updates`` None means one per reader and ``outputs`` (the
     readers' formats, ``OUTPUT_FORMATS``) None means BF16 readers."""
     outputs = ("bf16",) * readers if outputs is None else tuple(outputs)
-    if not inference and m >= 2048 and 2048 <= h <= 16384 and streams <= 6:
+    if 2048 <= h <= 16384 and not inference and m >= 2048:
         cfg = _training_config(h, streams, readers, bf16_residual)
+    elif 2048 <= h <= 16384 and inference and m > 1024:
+        cfg = _prefill_config(h, streams, readers, bf16_residual, outputs)
     else:
         # Otherwise schedules depend only on MXFP8 presence (reader zero's, where tuned).
         mxfp8 = any(f != "bf16" for f in outputs)
@@ -268,10 +275,12 @@ def choose_forward_config(
 
 
 def _choose(m, h, streams, readers, mxfp8, inference, updates, bf16_residual):
-    tuned = 3072 <= h <= 16384 and streams <= 6
-    if bf16_residual:
+    """Decode, short training rows and untuned widths (training and prefill rows otherwise take
+    ``_training_config`` and ``_prefill_config``)."""
+    tuned = 3072 <= h <= 16384
+    if inference and m >= 512 and bf16_residual and streams == 3:
         cfg = _FORWARD_CONFIGS_BF16.get((h, readers, updates or readers, mxfp8))
-        if streams == 3 and cfg is not None and m >= (512 if inference else 2048):
+        if cfg is not None:
             return cfg
     if inference and m <= 1024:
         if tuned:
@@ -283,10 +292,6 @@ def _choose(m, h, streams, readers, mxfp8, inference, updates, bf16_residual):
         else:
             profile = "pipelined" if readers == 1 else "wide"
     else:
-        if streams == 3 and m >= 2048 and (h, readers, mxfp8) in _FORWARD_CONFIGS:
-            return _FORWARD_CONFIGS[h, readers, mxfp8]
-        if m >= 2048 and tuned:
-            return _prefill_config(h, streams, readers)
         if h * streams <= 10240:
             profile = "compact" if h * streams <= 5120 else "paired"
         elif h <= 13312:

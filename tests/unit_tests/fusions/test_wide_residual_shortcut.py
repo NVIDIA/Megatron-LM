@@ -732,11 +732,10 @@ def test_reader_formats_store_one_normalization(dtype, readers, updates, inferen
 
 
 def test_config_tables():
-    """Training forwards follow one decision tree whatever the readers' formats or updates;
-    the Nano/Super/Ultra and BF16-stream tables serve prefill; cached backward grids; every
-    forward/backward config is valid; training owns one CTA per row."""
+    """Training and prefill forwards follow their decision trees; the BF16-stream table serves
+    512-1024-row inference; cached backward grids; every forward/backward config is valid;
+    training and prefill own one CTA per row."""
     choose = forward_kernel.choose_forward_config
-    table = forward_kernel._FORWARD_CONFIGS
     for (m, h), readers, mxfp8 in itertools.product(FLAGSHIPS, (1, 2), (F, T)):
         knobs = backward_kernel.get_backward_knobs(m, h, 3, readers)
         assert knobs.TARGET_CTAS == {3072: 456, 4096: 448, 10240: 440}[h]
@@ -747,20 +746,15 @@ def test_config_tables():
         assert (bf16.TARGET_CTAS, bf16.MAXNREG) == (four, 128 if readers == 1 else 168)
         second = backward_kernel.get_backward_knobs(m, h, 3, 2, second=True)
         assert (second.TARGET_CTAS, second.MAXNREG) == ({3072: 300, 4096: 304, 10240: 280}[h], 255)
-        outputs = formats(readers, mxfp8)
-        prefill = dict(outputs=outputs, inference=True)
-        for rows in (2048, m, m + 1024, 65536):
-            assert choose(rows, h, 3, readers, **prefill) is table[h, readers, mxfp8]
-        assert choose(1024, h, 3, readers, **prefill) is not table[h, readers, mxfp8]
-        assert choose(m, h, 2, readers, **prefill) is not table[h, readers, mxfp8]
     for (hidden, readers, updates, quantized), cfg in forward_kernel._FORWARD_CONFIGS_BF16.items():
         assert cfg.LOADS_FIRST and cfg.WIDTH >= cfg.VECTOR * 32 * cfg.NUM_WARPS
         assert not cfg.PAIRED_REDUCE or readers == 2
         outputs = formats(readers, quantized)
         options = dict(outputs=outputs, updates=updates, bf16_residual=True, inference=True)
         assert choose(512, hidden, 3, readers, **options) is cfg
-        assert choose(2048, hidden, 3, readers, **options) is cfg
-        assert choose(2048, hidden, 3, readers, **dict(options, bf16_residual=False)) is not cfg
+        assert choose(1024, hidden, 3, readers, **options) is cfg
+        assert choose(1025, hidden, 3, readers, **options) is not cfg  # prefill tree
+        assert choose(1024, hidden, 3, readers, **dict(options, bf16_residual=False)) is not cfg
     # Training (2048+ rows, hidden 2048-16384, 1-6 streams): the tree's schedule, independent
     # of the readers' output formats and of a shortcut add.
     for h, s, (n, u), bf16 in itertools.product(
@@ -769,9 +763,12 @@ def test_config_tables():
         tree = forward_kernel._training_config(h, s, n, bf16)
         tree = tree._replace(PAIRED_REDUCE=tree.PAIRED_REDUCE and n == 2)
         for outputs in itertools.product(forward_kernel.OUTPUT_FORMATS, repeat=n):
+            prefill = forward_kernel._prefill_config(h, s, n, bf16, outputs)
+            prefill = prefill._replace(PAIRED_REDUCE=prefill.PAIRED_REDUCE and n == 2)
             for rows in (2048, 8192, 65536):
                 options = dict(outputs=outputs, updates=u, bf16_residual=bf16)
                 assert choose(rows, h, s, n, **options) == tree
+                assert choose(rows - 1023, h, s, n, inference=True, **options) == prefill
         assert choose(1024, h, s, n, bf16_residual=bf16) != tree or h * s * (4 - 2 * bf16) <= 24576
     widths = (1, 31, 32, 48, 288, 1025, 2052, 3072, 3584, 4096, 5632, 9728, 10240, 13312)
     widths += (15872, 16384, 17408, 32768)

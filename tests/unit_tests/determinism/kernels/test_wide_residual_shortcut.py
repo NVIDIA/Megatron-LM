@@ -147,12 +147,24 @@ FORWARD = [
     for i, (m, h) in enumerate(((32, 32), (64, 96), (96, 288), (160, 18432)))
     for s, u, inf in [((1, 2, 4, 6)[i], 1 + i % 2, i % 2 == 0), ((6, 4, 2, 1)[i], 2 - i % 2, i < 2)]
 ] + [
-    # Every tuned prefill table entry: FP32 streams, and BF16 streams with BF16 logits.
-    pytest.param(2048, h, 3, n, n, T, q, T, F32, 1e-5, F, T, marks=QUALIFIED if q else ())
-    for h, n, q in sorted(forward_kernel._FORWARD_CONFIGS)
-] + [
-    pytest.param(2048, h, 3, n, u, T, q, T, BF16, 1e-5, F, T, marks=QUALIFIED if q else ())
+    # Every BF16-stream inference table entry (512-1024 rows) with BF16 logits.
+    pytest.param(1024, h, 3, n, u, T, q, T, BF16, 1e-5, F, T, marks=QUALIFIED if q else ())
     for h, n, u, q in sorted(forward_kernel._FORWARD_CONFIGS_BF16)
+] + [
+    # Every leaf of the prefill tree (inference rows > 1024).
+    pytest.param(m, h, s, len(o), u, T, o, T, d, 1e-5, F, T, marks=QUALIFIED)
+    for m, h, s, d, o, u in [
+        (2048, 3072, 3, BF16, ("mxfp8",), 1),  # <= 24 KB rows
+        (1056, 2048, 3, F32, ("bf16", "mxfp8"), 2),
+        (2048, 3072, 3, F32, ("both",), 1),  # <= 72 KB
+        (4096, 4096, 3, F32, ("mxfp8", "bf16"), 1),
+        (2048, 10240, 3, BF16, ("bf16",), 1),
+        (2048, 10240, 3, BF16, ("both", "mxfp8"), 2),
+        (2048, 16384, 3, F32, ("mxfp8", "mxfp8"), 1),  # wider than 12288
+        (2048, 8192, 3, F32, ("bf16", "bf16"), 2),  # <= 96 KB
+        (2048, 10240, 3, F32, ("both", "bf16"), 1),
+        (2048, 10240, 3, F32, ("mxfp8", "mxfp8"), 2),
+    ]
 ] + [
     # Every leaf of the training tree (residual row bytes, width, dtype, readers), with mixed
     # reader formats: one or both of BF16 and MXFP8.
