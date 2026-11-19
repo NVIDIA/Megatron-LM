@@ -27,6 +27,7 @@ from megatron.core.distributed import (
     TorchFullyShardedDataParallelConfig,
 )
 from megatron.core.optimizer import OptimizerConfig
+from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
@@ -1040,7 +1041,8 @@ def _container_written_fields_from_args(args: Namespace) -> dict[str, Any]:
     """What a standalone (container-less) dataset config takes from ``args`` for the fields the
     container writes otherwise (``CONTAINER_WRITTEN_FIELDS``: the layout, the validation flags)."""
     return {
-        "data_parallel_size": args.data_parallel_size,
+        # Dataset alignment covers all independent sample owners, including GTP peers.
+        "data_parallel_size": get_batch_parallel_size(args),
         "context_parallel_size": args.context_parallel_size,
         "sequence_parallel_size": args.tensor_model_parallel_size * int(bool(args.sequence_parallel)),
         "dynamic_context_parallel": args.dynamic_context_parallel,

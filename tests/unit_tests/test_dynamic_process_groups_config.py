@@ -73,7 +73,7 @@ def test_initialized_runtime_groups_are_available_in_collection(
     initialize_groups, world_size, tp_size, cp_size, min_cp_size, gtp_size, rank
 ):
     pgs = initialize_groups(world_size, tp_size, cp_size, min_cp_size, gtp_size, rank)
-    total_cp_size = world_size // (tp_size * gtp_size)
+    total_cp_size = world_size // tp_size
     expected_sizes = {
         size
         for size in get_valid_dynamic_context_parallel_group_sizes(total_cp_size)
@@ -81,8 +81,20 @@ def test_initialized_runtime_groups_are_available_in_collection(
     }
     assert set(pgs.dynamic_cp) == expected_sizes
     assert set(pgs.dynamic_tp_cp) == expected_sizes
-    assert pgs.dynamic_cp[total_cp_size] is pgs.dp_cp
+    assert pgs.dynamic_cp[total_cp_size] is pgs.dp_cp_gtp_remat
     assert pgs.cp.size() == cp_size
+
+    # Weight replicas and the optimizer retain a fixed GTP coordinate.
+    gtp_coordinate = rank // (tp_size * cp_size) % gtp_size
+    replica_ranks = [
+        r
+        for r in range(rank % tp_size, world_size, tp_size)
+        if r // (tp_size * cp_size) % gtp_size == gtp_coordinate
+    ]
+    assert pgs.dp_cp.ranks == replica_ranks
+    assert pgs.intra_dp_cp.ranks == replica_ranks
+    if gtp_size == 1:
+        assert pgs.dp_cp_gtp_remat is pgs.dp_cp
 
     for size in expected_sizes:
         cp_group = pgs.dynamic_cp[size]
@@ -91,7 +103,7 @@ def test_initialized_runtime_groups_are_available_in_collection(
         assert tp_cp_group.size() == tp_size * size
         assert cp_group.rank() >= 0
         assert tp_cp_group.rank() >= 0
-        assert set(cp_group.ranks).issubset(pgs.dp_cp.ranks)
+        assert set(cp_group.ranks).issubset(pgs.dp_cp_gtp_remat.ranks)
         assert set(cp_group.ranks).issubset(tp_cp_group.ranks)
         assert parallel_state.get_dynamic_data_context_parallel_groups(group_size=size) is cp_group
         assert (

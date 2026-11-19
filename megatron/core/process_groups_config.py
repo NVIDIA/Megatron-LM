@@ -98,7 +98,7 @@ class ProcessGroupCollection:
         embd: Embedding process group
         pos_embd: Position embedding process group
         cp: Context parallel process group
-        dynamic_cp: Runtime CP groups keyed by CP size; the full DPxCP domain and
+        dynamic_cp: Runtime CP groups keyed by CP size; the full DP x GTP x CP domain and
             the singleton CP-off group are included when initialized
         dynamic_tp_cp: TP x runtime-CP groups keyed by CP size (not TP x CP size)
         tp_cp: Tensor and context parallel group

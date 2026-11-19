@@ -718,7 +718,8 @@ class PretrainConfigContainer(ConfigContainerBase):
         if dataset is not None:
             # The world size is known here: data_parallel_size gets the agreement check the other
             # fields got at validation, before anything is written.
-            data_parallel_size = self.get_data_parallel_size()
+            # Dataset alignment follows independent sample owners, not weight replicas.
+            data_parallel_size = self.get_batch_parallel_size()
             if dataset.data_parallel_size not in (1, data_parallel_size):
                 raise ValueError(
                     f"data.dataset.data_parallel_size={dataset.data_parallel_size} disagrees with "
