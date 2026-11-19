@@ -3,6 +3,7 @@
 """Batch-invariant ordered TP reductions (megatron/core/ops/collectives/ordered_reduce.py)."""
 
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -11,10 +12,12 @@ import torch.distributed as dist
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TERowParallelLinear, _BITPForward
 from megatron.core.fp8_utils import get_fp8_context, prepare_model_for_fp8_inference
+from megatron.core.inference.config import InferenceConfig
+from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.ops.collectives import ordered_reduce as orr
 from megatron.core.ops.linear import ordered as orl
-from megatron.core.tensor_parallel import mappings
+from megatron.core.tensor_parallel import inference_layers, mappings
 from megatron.core.tensor_parallel.inference_layers import InferenceRowParallelLinear
 from megatron.core.tensor_parallel.layers import RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -557,10 +560,8 @@ def test_inference_row_linear_uses_only_inference_scratch():
 
 @requires_tp4
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_direct_gemm_falls_back_when_scratch_does_not_fit(dtype):
-    """A larger eager/captured input keeps the same bits through all-to-all."""
-    from transformer_engine.pytorch.cpp_extensions import general_gemm
-
+def test_training_scratch_grows_an_undersized_buffer(dtype):
+    """An undersized existing pool grows instead of routing the GEMM through all-to-all."""
     Utils.initialize_model_parallel(TP, 1)
     try:
         group = get_tensor_model_parallel_group_if_none(tp_group=None)
@@ -568,10 +569,155 @@ def test_direct_gemm_falls_back_when_scratch_does_not_fit(dtype):
         weight = _partials((512, 128), dtype, seed=52)
         key, _ = orl._training_buffer_spec(group, 2048 * 512 * x.element_size())
         SymmetricMemoryManager.get_buffer(key, process_group=group, size_mb=1)
-        out = orl.tp_shard_row_linear(x, weight, group, 1, True, use_te_gemm=True)
-        partial = general_gemm(weight, x, out_dtype=x.dtype)[0]
+        with mock.patch.object(
+            orl, "ordered_reduce_scatter_shards", side_effect=AssertionError("unexpected fallback")
+        ):
+            out = orl.tp_shard_row_linear(x, weight, group, 1, True, use_te_gemm=True)
+        assert (
+            SymmetricMemoryManager.get_buffer(key).symm_buffer.numel()
+            >= 2048 * 512 * x.element_size()
+        )
+        partial = orl.te_cpp_extensions.general_gemm(weight, x, out_dtype=x.dtype)[0]
         expected = orr.ordered_reduce_scatter(partial, group)
         assert torch.equal(_bits(out), _bits(expected))
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier()
+        SymmetricMemoryManager.destroy()
+        Utils.destroy_model_parallel()
+
+
+@requires_tp4
+@pytest.mark.parametrize("tp,peer_tp,hidden,mtp_layers", [(4, 2, 4096, 1), (2, 4, 2048, None)])
+def test_inference_scratch_covers_max_tokens_and_preserves_existing_graphs(
+    tp, peer_tp, hidden, mtp_layers
+):
+    """A small captured step and >512MiB eager prefill use valid inference-owned pools."""
+    Utils.initialize_model_parallel(tp, 1)
+    try:
+        group = get_tensor_model_parallel_group_if_none(tp_group=None)
+        cfg = TransformerConfig(
+            num_layers=1,
+            hidden_size=hidden,
+            num_attention_heads=8,
+            tensor_model_parallel_size=tp,
+            sequence_parallel=True,
+            params_dtype=torch.bfloat16,
+            batch_invariant_mode=True,
+            batch_invariant_peer_tp_size=peer_tp,
+            transformer_impl="inference_optimized",
+            normalization="RMSNorm",
+            add_bias_linear=False,
+            mtp_num_layers=mtp_layers,
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            attention_dropout=0.0,
+        )
+        layer = (
+            InferenceRowParallelLinear(
+                256,
+                hidden,
+                config=cfg,
+                init_method=init_method_normal(0.02),
+                bias=False,
+                input_is_parallel=True,
+                skip_bias_add=True,
+                is_expert=False,
+                tp_group=group,
+            )
+            .cuda()
+            .eval()
+        )
+        layer.weight.data.fill_(1)
+        small = torch.full(
+            (256, 1, 256 // tp), group.rank() + 1, device="cuda", dtype=cfg.params_dtype
+        )
+        SymmetricMemoryManager.get_buffer("tp", process_group=group, size_mb=8)
+        with set_batch_invariant_mode(True, backend="te_native"), torch.no_grad():
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                layer(small)
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured, _ = layer(small)
+            graph.replay()
+            expected = (256 // tp) * sum(range(1, tp + 1))
+            assert (captured == expected).all()
+            old = SymmetricMemoryManager.get_buffer("tp")
+            # The actual context must reserve its eager ceiling, not its small graph budget.
+            context = DynamicInferenceContext(
+                model_config=cfg,
+                inference_config=InferenceConfig(
+                    max_tokens=65792,
+                    max_requests=16,
+                    max_sequence_length=131072,
+                    cuda_graph_max_tokens=256,
+                    num_cuda_graphs=2,
+                    buffer_size_gb=0.5,
+                    block_size_tokens=128,
+                    unified_memory_level=0,
+                ),
+            )
+            buf = SymmetricMemoryManager.get_buffer("tp")
+            required = cfg.batch_invariant_tp_shards // tp * context.max_tokens * hidden * 2
+            assert required > (512 << 20)
+            assert buf.symm_buffer.numel() >= required
+            if mtp_layers:
+                assert buf.symm_buffer.numel() >= context.max_tokens * 2 * hidden * 2
+            assert buf is not old
+            address = buf.symm_buffer.data_ptr()
+            large = torch.full(
+                (context.max_tokens, 1, 256 // tp),
+                2 * (group.rank() + 1),
+                device="cuda",
+                dtype=cfg.params_dtype,
+            )
+            with mock.patch.object(
+                inference_layers,
+                "ordered_reduce_scatter_shards",
+                side_effect=AssertionError("unexpected inference fallback"),
+            ):
+                result, _ = layer(large)
+            assert (result == 2 * expected).all()
+            if mtp_layers:
+                projection = (
+                    inference_layers.InferenceColumnParallelLinear(
+                        2 * hidden,
+                        hidden,
+                        config=cfg,
+                        init_method=init_method_normal(0.02),
+                        gather_output=False,
+                        bias=False,
+                        skip_bias_add=True,
+                        is_expert=False,
+                        tp_group=group,
+                    )
+                    .cuda()
+                    .eval()
+                )
+                projection.set_barrier_before_all_gather(True)
+                projection.weight.data.fill_(1)
+                joined = torch.full(
+                    (context.max_tokens // tp, 1, 2 * hidden),
+                    0.25,
+                    device="cuda",
+                    dtype=cfg.params_dtype,
+                )
+                with mock.patch.object(
+                    inference_layers,
+                    "gather_along_first_dim",
+                    side_effect=AssertionError("unexpected MTP all-gather fallback"),
+                ):
+                    projected, _ = projection(joined)
+                assert (projected == hidden / 2).all()
+            assert SymmetricMemoryManager.get_buffer("tp").symm_buffer.data_ptr() == address
+            graph.replay()
+            assert (captured == expected).all()
+            assert not any(
+                key.startswith("tp_ordered_training:") for key in SymmetricMemoryManager._buffers
+            )
     finally:
         torch.cuda.synchronize()
         dist.barrier()

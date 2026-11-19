@@ -473,7 +473,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         it will revert to torch.dist (NCCL) reduce-scatter.
         """
         use_mxfp8 = isinstance(self.weight, MXFP8Tensor)
-        if self._bi_tp_local_shards > 1:
+        if self._bi_tp_local_shards > 1 or use_ordered_tp_reduce(self.tp_group, x.dtype):
             return self._matmul_shards_reduce(x, use_mxfp8)
         symm_mem_buffer_dims = list(x.size())
         if use_mxfp8:
@@ -482,9 +482,6 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         symm_mem_buffer_dims[-1] = self.weight.size(0)
         buf = SymmetricMemoryManager.get_buffer("tp", process_group=self.tp_group)
         symm_mem_buffer = buf.maybe_get_tensor(symm_mem_buffer_dims, dtype=x.dtype)
-
-        if use_ordered_tp_reduce(self.tp_group, x.dtype):
-            return self._matmul_ordered_reduce_scatter(x, symm_mem_buffer)
 
         # RS requires bf16 (hardware multimem reduce is bf16-only).
         # Check the matmul output shape: if it is NVLS-eligible, the RS output
@@ -539,46 +536,35 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         return x
 
     def _matmul_shards_reduce(self, x, use_mxfp8):
-        """batch_invariant_tp_shards with several shards per rank: the same bits as training.
+        """Compute canonical shard partials once and reduce them in global order.
 
-        One strided batched GEMM for this rank's shards, then the reduce-scatter (or, at
-        TP 1, the local fold) of the shard partials in global shard order. Called from
-        forward() at TP 1 and from _matmul_reduce_scatter otherwise, whenever this rank holds
-        several shards (``_bi_tp_local_shards > 1``).
+        One local partial keeps the native/quantized GEMM; several use a strided
+        batched GEMM. TP1 only folds its local partials.
         """
-        assert (
-            not use_mxfp8
-        ), "MXFP8 with several batch_invariant_tp_shards per rank is not built yet"
         c = self._bi_tp_local_shards
+        assert c == 1 or not use_mxfp8, "MXFP8 with multiple local TP shards is not supported"
+        out, handle = None, None
         if self.tp_size > 1 and self.triton_nvls_kernels_allowed:
             buf = SymmetricMemoryManager.get_buffer("tp", process_group=self.tp_group)
-            # The c shard partials of all rows; maybe_get_tensor returns no handle when they
-            # do not fit, and the NCCL path below gives the same bits.
             dims = [c, *x.shape[:-1], self.weight.size(0)]
+            if use_mxfp8:
+                del dims[2]  # mm_mxfp8 returns [tokens, hidden], without the batch axis.
             symm = buf.maybe_get_tensor(dims, dtype=x.dtype)
-            if symm["handle"] is not None:
-                # The GEMM writes the shard partials straight into the symmetric buffer; one
-                # kernel pulls the owned rows of every peer's partials and folds them.
-                parts = row_parallel_shard_partials(x, self.weight, c, out=symm["tensor"])
-                return symm_ordered_reduce_scatter_shards(parts, symm["handle"])
-        parts = row_parallel_shard_partials(x, self.weight, c)
+            assert (
+                buf.symm_mem_hdl is None or symm["tensor"] is not None
+            ), "TP scratch exceeds the inference context's max_tokens bound"
+            out, handle = symm["tensor"], symm["handle"]
+        if c == 1:
+            parts = _apply_linear(
+                x, self.weight, self.config, out=out[0] if out is not None else None
+            ).unsqueeze(0)
+        else:
+            parts = row_parallel_shard_partials(x, self.weight, c, out=out)
+        if handle is not None:
+            return symm_ordered_reduce_scatter_shards(parts, handle)
+        # Preserve the explicitly disabled/unavailable peer-access backend, using
+        # the same GEMM rather than a second allocation-size fallback path.
         return ordered_reduce_scatter_shards(parts, self.tp_group)
-
-    def _matmul_ordered_reduce_scatter(self, x, symm_mem_buffer):
-        """Batch-invariant mode at TP >= 3: reduce-scatter with the fixed rank-order sum.
-
-        Gives the same bits as the training forward (ops/collectives/ordered_reduce.py).
-        With a symmetric buffer, the GEMM writes into it and one kernel pulls the owned rows
-        from every peer and folds them; otherwise all-to-all + fold. Called from
-        _matmul_reduce_scatter when ``use_ordered_tp_reduce`` holds (one shard per rank).
-        """
-        if self.triton_nvls_kernels_allowed and symm_mem_buffer["handle"] is not None:
-            # The GEMM writes straight into the symmetric buffer: native kernels, and the
-            # batch-invariant aten::mm.out override, give the same bits as without out=.
-            x = _apply_linear(x, self.weight, self.config, out=symm_mem_buffer["tensor"])
-            return symm_ordered_reduce_scatter(x, symm_mem_buffer["handle"])
-        x = _apply_linear(x, self.weight, self.config)
-        return reduce_scatter_to_sequence_parallel_region(x, group=self.tp_group, ordered=True)
 
     def _set_next_layer_norm_weights(self, weights: torch.Tensor):
         """

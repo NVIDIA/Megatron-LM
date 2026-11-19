@@ -4,8 +4,7 @@
 
 Inputs are local K shards [..., K/TP]; outputs are sequence shards or replicated rows.
 The caller supplies the process group. Backward keeps ordinary TP collectives.
-Scratch is allocated on first eager use; CUDA graphs reuse it after warmup or use
-the all-to-all fallback when captured without warmup."""
+Scratch is allocated on first eager use; CUDA graphs reuse it after warmup."""
 
 import math
 from typing import Optional
@@ -147,14 +146,7 @@ class _TPShardRowLinear(torch.autograd.Function):
         shape = (num_shards, *x.shape[:-1], weight.shape[0])
         scratch = {"tensor": None, "handle": None}
         key, size_mb = _training_buffer_spec(group, math.prod(shape) * x.element_size())
-        if (
-            group.size() > 1
-            and x.shape[0] % group.size() == 0
-            and (
-                SymmetricMemoryManager.is_initialized(key)
-                or not torch.cuda.is_current_stream_capturing()
-            )
-        ):
+        if group.size() > 1 and x.shape[0] % group.size() == 0:
             scratch = SymmetricMemoryManager.get_buffer(
                 key, process_group=group, size_mb=size_mb
             ).maybe_get_tensor(shape, x.dtype)
