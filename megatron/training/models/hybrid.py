@@ -215,6 +215,14 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         Note:
             Virtual pipeline model parallelism is not supported for Hybrid models.
         """
+        if (
+            self._model_config.engram_config is not None
+            and self._model_config.transformations is not None
+        ):
+            # Not validated: this builder would compose the memory into the ModelOpt stack spec
+            # and into a distillation teacher (a second copy of the tables), and the ModelOpt
+            # hooks (state restore, QAD freeze, KD conversion) have never run with it.
+            raise ValueError("Engram does not support ModelOpt model building.")
         hybrid_stack_spec = resolve_hybrid_stack_spec(self._model_config)
 
         assert (

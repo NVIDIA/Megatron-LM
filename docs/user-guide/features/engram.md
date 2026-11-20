@@ -348,6 +348,7 @@ Rejected at startup, unless noted:
 - FP16 parameters and FP4 training (BF16 and FP32 parameters work, and FP8 or MXFP8 recipes run
   the rest of the model);
 - Megatron-FSDP and FSDP2;
+- ModelOpt model building, including distillation (rejected when the hybrid model is built);
 - whole-layer and full-iteration CUDA graphs;
 - sequence-packing schedulers (including the one `--use-varlen-dataset` selects) and dynamic
   context parallelism;

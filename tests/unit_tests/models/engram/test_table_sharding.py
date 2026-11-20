@@ -626,6 +626,22 @@ def test_builder_sets_up_the_groups_before_building_the_model(monkeypatch):
     ]
 
 
+def test_builder_rejects_modelopt_transformations():
+    """ModelOpt models go through the same builder, which would compose the memory into them."""
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from megatron.training.models import hybrid
+    from megatron.training.models.transforms import ModelTransformConfig
+
+    model_config = hybrid.HybridModelConfig(
+        transformer=TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=1),
+        vocab_size=1024,
+        engram_config=_engram_config(),
+        transformations=ModelTransformConfig(),
+    )
+    with pytest.raises(ValueError, match="Engram does not support ModelOpt"):
+        hybrid.HybridModelBuilder(model_config).build_model(ProcessGroupCollection())
+
+
 def test_legacy_hybrid_builder_rejects_table_sharding():
     from hybrid_builders import hybrid_builder
 
