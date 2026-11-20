@@ -153,6 +153,12 @@ def model_defaults(backend, fa_version):
     )
 
 
+# Batch invariance is a property of each step's numerics, which the engine's GC mode cannot
+# change. The production default (freeze_overlap) runs two full collections at every engine
+# start and stop, and these tests build two to four engines per case.
+GC_MODE = "default"
+
+
 def build_engine(case, backend, fa_version):
     """Build the same tiny, real model for every ordering of a case."""
     torch.manual_seed(321)
@@ -212,6 +218,7 @@ def build_engine(case, backend, fa_version):
         use_cuda_graphs_for_non_decode_steps=False,
         unified_memory_level=0,
         async_sched_mode=AsyncScheduleMode.LEGACY,
+        gc_mode=GC_MODE,
     )
     options.update(case.context)
     ctx = DynamicInferenceContext(cfg, InferenceConfig(**options))
