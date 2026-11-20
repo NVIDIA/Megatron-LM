@@ -51,6 +51,10 @@ spec:
     # test_gtp_muon.py/test_gtp_muon_qkv.py, and will skip here instead).
     if [[ "$BUCKET" == "tests/unit_tests/generalized_tensor_parallel/**/*.py" ]]; then
         export GPUS_PER_NODE=4
+        # One launch, not two packed four-GPU shards: these tests build multi-rank Gloo groups,
+        # and with two shards creating them on one node a rank's Gloo connect was reset by its
+        # peer in one of four measured runs, which left the shard hung.
+        export UNIT_TEST_PACK=0
     fi
 
     if [[ "$TAG" == "latest" ]]; then
