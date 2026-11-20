@@ -21,9 +21,11 @@ from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
 from megatron.core.transformer.moe.ops.paged_stash import GLOBAL_BLOCK_SIZE, GLOBAL_MAX_BLOCKS
 from megatron.core.transformer.moe.paged_stash import (
+    SCALE_INV_BLOCK_SIZE,
     PagedStashBuffer,
     PagedStashManager,
     PagedTensor,
+    _page_copy_launch,
     _stash_buffer_dtype,
     check_paged_stash_overflow,
     paged_stash_init_chunk_handler,
@@ -154,7 +156,11 @@ def test_paged_stash_copy_device_sizes(monkeypatch, capability, with_config):
     manager = SimpleNamespace(iteration=0, status="begin")
     monkeypatch.setattr(PagedStashManager, "get_instance", lambda: manager)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
-    stash_config = SimpleNamespace(moe_paged_stash_page_size=64) if with_config else None
+    stash_config = (
+        SimpleNamespace(moe_paged_stash_page_size=64, moe_paged_stash_page_copy=False)
+        if with_config
+        else None
+    )
     paged_stash_reset(config=stash_config)
     expected = (4096, 8192) if capability == (10, 7) else (1024, 2048)
     assert (manager.copy_block_size, manager.copy_max_blocks) == expected
@@ -184,8 +190,9 @@ class TestPagedTensorRoundTrip:
     @pytest.mark.parametrize("hidden_size", [64, 1000, 7168])
     # With more rows than programs, each program loops over several rows.
     @pytest.mark.parametrize("more_rows_than_programs", [False, True])
+    @pytest.mark.parametrize("page_copy", [False, True])
     def test_round_trip_is_bit_exact(
-        self, block_size, max_blocks, dtype, hidden_size, more_rows_than_programs
+        self, block_size, max_blocks, dtype, hidden_size, more_rows_than_programs, page_copy
     ):
         device = torch.device("cuda")
         page_size = 64
@@ -210,13 +217,156 @@ class TestPagedTensorRoundTrip:
             page_size=page_size,
         )
 
-        paged.offload_to_stash(stash, block_size=block_size, max_blocks=max_blocks)
+        paged.offload_to_stash(
+            stash, block_size=block_size, max_blocks=max_blocks, page_copy=page_copy
+        )
         paged._tensor = torch.zeros_like(src)
-        paged.reload_from_stash(stash, block_size=block_size, max_blocks=max_blocks)
+        paged.reload_from_stash(
+            stash, block_size=block_size, max_blocks=max_blocks, page_copy=page_copy
+        )
         torch.cuda.synchronize()
 
         assert overflow.item() == 0
         assert torch.equal(paged._tensor[:num_tokens], src[:num_tokens])
+
+
+_STASH_PAGE_SIZE = 64
+
+
+def _make_stash_buffer(dtype, hidden_size, cuda_rows, host_rows=0):
+    device = torch.device("cuda")
+    overflow = torch.zeros(1, dtype=torch.int64, device=device)
+    host_spill = torch.zeros(1, dtype=torch.int64, device=device)
+    stash = PagedStashBuffer(
+        cuda_rows,
+        hidden_size,
+        _STASH_PAGE_SIZE,
+        device,
+        overflow,
+        host_spill,
+        dtype,
+        num_tokens_host=host_rows,
+    )
+    stash.cuda_buffer.zero_()
+    if stash.host_buffer is not None:
+        stash.host_buffer.zero_()
+    # Start from a rotated free list so page ids are not the identity.
+    stash.free_list_cuda.copy_(torch.roll(stash.free_list_cuda, 3 % stash.num_cuda_pages))
+    return stash
+
+
+def _stash_and_reload(
+    page_copy, dtype, hidden_size, columnwise, num_tokens_list, cuda_rows, host_rows, seed
+):
+    """Stash a sequence of tensors, then reload them in order; return all observable state."""
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(seed)
+    max_num_tokens = 8192
+    div = SCALE_INV_BLOCK_SIZE if columnwise else 1
+    rows = max_num_tokens // div
+    stash = _make_stash_buffer(dtype, hidden_size, cuda_rows, host_rows)
+    inputs, paged = [], []
+    for num_tokens in num_tokens_list:
+        if dtype == torch.uint8:
+            src = torch.randint(
+                0, 256, (rows, hidden_size), dtype=dtype, device=device, generator=generator
+            )
+        else:
+            src = torch.randn(rows, hidden_size, device=device, generator=generator).to(dtype)
+        inputs.append(src.clone())
+        tensor = PagedTensor(
+            src.flatten(),
+            num_tokens_tensor=torch.tensor([num_tokens], dtype=torch.int64, device=device),
+            original_shape=[rows, hidden_size],
+            is_columnwise_scale_inv=columnwise,
+            max_num_tokens=max_num_tokens,
+            hidden_size=hidden_size,
+            page_size=_STASH_PAGE_SIZE,
+        )
+        tensor.offload_to_stash(stash, block_size=4096, max_blocks=8192, page_copy=page_copy)
+        paged.append(tensor)
+    torch.cuda.synchronize()
+    state = {
+        "cuda_buffer": stash.cuda_buffer.clone(),
+        "host_buffer": None if stash.host_buffer is None else stash.host_buffer.clone(),
+        "head": stash.free_list_head.clone(),
+        "overflow": stash.overflow.clone(),
+        "host_spill": stash.host_spill.clone(),
+        "spilled": [t.spilled_to_host.clone() for t in paged],
+    }
+    if stash.overflow.item() == 0:
+        # Only the slots of the stashed pages are defined.
+        state["records"] = [
+            t.page_record[: (n // div + _STASH_PAGE_SIZE - 1) // _STASH_PAGE_SIZE].clone()
+            for t, n in zip(paged, num_tokens_list)
+        ]
+    outputs = []
+    for tensor in paged:
+        tensor._tensor = torch.zeros(rows, hidden_size, dtype=dtype, device=device)
+        tensor.reload_from_stash(stash, block_size=4096, max_blocks=8192, page_copy=page_copy)
+        outputs.append(tensor._tensor)
+    torch.cuda.synchronize()
+    state.update(
+        tail=stash.free_list_tail.clone(),
+        free_cuda=stash.free_list_cuda.clone(),
+        free_host=stash.free_list_host.clone(),
+        outputs=outputs,
+    )
+    return state, inputs
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+class TestPagedStashPageCopy:
+    """The page-contiguous kernels (moe_paged_stash_page_copy) replay the row kernels bit-exactly."""
+
+    @pytest.mark.parametrize(
+        "dtype,hidden_size,columnwise",
+        [
+            (torch.uint8, 3584, False),
+            (torch.uint8, 14336, True),
+            (torch.bfloat16, 4096, False),
+            (torch.float32, 1, False),
+            (torch.uint8, 1000, False),
+            (torch.uint8, 4096, True),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "num_tokens_list", [[0, 64, 4096], [1, 63, 65, 8192], [7777, 128, 3000]]
+    )
+    # Roomy CUDA buffer; spill to host; overflow.
+    @pytest.mark.parametrize("cuda_rows,host_rows", [(40000, 0), (9000, 20000), (5000, 0)])
+    def test_matches_row_kernels(
+        self, dtype, hidden_size, columnwise, num_tokens_list, cuda_rows, host_rows
+    ):
+        div = SCALE_INV_BLOCK_SIZE if columnwise else 1
+        num_tokens_list = [n - n % div for n in num_tokens_list]
+        cuda_rows = cuda_rows // div + _STASH_PAGE_SIZE
+        host_rows = host_rows // div + (_STASH_PAGE_SIZE if host_rows else 0)
+        args = (dtype, hidden_size, columnwise, num_tokens_list, cuda_rows, host_rows, 7)
+        ref, inputs = _stash_and_reload(False, *args)
+        out, _ = _stash_and_reload(True, *args)
+        out_again, _ = _stash_and_reload(True, *args)
+
+        assert ref.keys() == out.keys()
+        for state in (out, out_again):
+            for key, value in ref.items():
+                if isinstance(value, list):
+                    assert all(torch.equal(a, b) for a, b in zip(value, state[key])), key
+                elif value is None:
+                    assert state[key] is None, key
+                else:
+                    assert torch.equal(value, state[key]), key
+        if ref["overflow"].item() == 0:
+            for src, dst, n in zip(inputs, out["outputs"], num_tokens_list):
+                assert torch.equal(dst[: n // div], src[: n // div])
+
+    def test_launch_divides_page(self):
+        for page_size, hidden_size, element_size in [(64, 7168, 1), (48, 3, 4), (64, 1, 4)]:
+            chunk, grid = _page_copy_launch(page_size, hidden_size, element_size, 10000)
+            assert chunk & (chunk - 1) == 0
+            assert (page_size * hidden_size) % chunk == 0
+            assert chunk * element_size <= 16384
+            assert grid[0] >= 1
 
 
 class MoEModelTestContainer:

@@ -71,6 +71,18 @@ The stash copy/pop kernels are memory-bound; with 1024/2048, wide activations (t
 elements per token) do not saturate DRAM bandwidth. For example, on VR200 with DeepSeek-V3
 (hidden size 7168), using 4096/8192 makes the stash kernels ~2.3x faster.
 
+```bash
+# Copy whole pages in contiguous chunks instead of row by row (bit-identical results)
+--moe-paged-stash-page-copy
+```
+
+`--moe-paged-stash-page-copy` switches the copy/pop kernels to page-contiguous kernels: a page
+holds consecutive rows in both the activation and the stash buffer, so each program copies a
+contiguous chunk of a page (16 KiB) instead of one row per inner-loop iteration. Narrow
+activations such as columnwise scales and router probabilities no longer pay a page lookup and a
+mostly masked vector load per row. The stash contents and reloaded activations are bit-identical
+to the row kernels.
+
 ## What `moe_expert_rank_capacity_factor` and `moe_paged_stash_buffer_size_factor_cuda` mean
 
 Both are **multipliers on buffer size relative to the perfectly balanced case**—the space you would need if routed tokens were evenly distributed across expert ranks. A larger factor adds headroom for real-world **skew**.
