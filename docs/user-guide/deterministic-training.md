@@ -61,6 +61,7 @@ Checked against the parsed `args` Namespace in `apply_determinism_to_args`. Inco
 | `--cross-entropy-loss-fusion` | Must be off — asserted (fused CE is non-deterministic); drop the flag yourself |
 | `--tp-comm-overlap` | Must be off — asserted (the overlap path is not bit-exact); drop the flag yourself |
 | `moe_router_aux_loss_fusion` | Supported when TE's `fused_moe_aux_loss` API accepts `deterministic`; Megatron selects its deterministic kernel. Older TE requires `--no-moe-router-aux-loss-fusion`. Follows `moe_router_fusion` when unset |
+| `gdn_kernel_backend` (Gated DeltaNet) | Must be `torch` or `transformer_engine`; `fla` is rejected. `transformer_engine` is accepted only where cuDNN serves GDN from its FROST engine: head dims 64 or 128, an SM100/103/107 device, CuTe DSL (`nvidia-cutlass-dsl`) installed. Other head dims and Hopper are rejected until NVIDIA/cudnn-frontend#1735 lands; use `torch` there. See `megatron.core.ssm.gdn_kernel_backend` |
 | `torch.use_deterministic_algorithms` | Set to `True` |
 | `torch.utils.deterministic.fill_uninitialized_memory` | Set to `False` — see below |
 
