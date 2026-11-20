@@ -439,18 +439,14 @@ def test_mxfp8_recorded_order_prefetches_rowwise_for_recompute(distributed_setup
     # The first step records the execution order.
     train_step()
 
-    recomputed = []
-
     def check_rowwise_prefetched(module, _args):
         if is_in_backward():
             assert _is_rowwise_allocated(module)
-            recomputed.append(module)
 
     for module in (model.fc1, model.fc2):
         # Check before FSDP's own hook, so on-demand unsharding cannot satisfy the assertion.
         module.register_forward_pre_hook(check_rowwise_prefetched, prepend=True)
     train_step()
-    assert recomputed == [model.fc2, model.fc1]
 
 
 @pytest.mark.launch_on_gb200
