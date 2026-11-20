@@ -148,9 +148,15 @@ def test_batch_invariant_terminal_contract():
                     _check_terminal_contract(run, options, baseline, terminal)
 
 
+# PERSIST never reads static_kv_memory_pointers, and OFFLOAD requires them.
 @pytest.mark.parametrize(
     "mode,static_pointers",
-    [(m, s) for m in KVMode for s in (False, True) if s or m != KVMode.OFFLOAD],
+    [
+        (KVMode.PERSIST, False),
+        (KVMode.OFFLOAD, True),
+        (KVMode.RECOMPUTE, False),
+        (KVMode.RECOMPUTE, True),
+    ],
 )
 def test_batch_invariant_suspend_resume(mode, static_pointers):
     # Production RL validation rejects OFFLOAD without persistent graph pointers.

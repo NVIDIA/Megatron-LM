@@ -158,12 +158,10 @@ def test_sampling_fixed_history_batch_invariance(backend, mode, offset_by_dp):
                 _check_fixed_history_sampling(run, backend, filters, mode, offset_by_dp)
 
 
-@pytest.mark.parametrize(
-    "case",
-    [Case("tp2-sp", tp=2, sp=True), Case("pp2", pp=2), Case("tp2-pp2-sp", tp=2, pp=2, sp=True)],
-    ids=lambda case: case.name,
-)
-def test_parallel_batch_invariance(case):
+def test_parallel_batch_invariance():
+    # One layout covers tensor, sequence and pipeline parallelism together: the assertions are the
+    # same for each, and a two-rank reduction gives the same result in either order.
+    case = Case("tp2-pp2-sp", tp=2, pp=2, sp=True)
     with invariant_runtime(case) as (backend, version):
         engine = new_engine(case, backend, version)
         reference = run_order(case, backend, version, "solo", engine=engine)

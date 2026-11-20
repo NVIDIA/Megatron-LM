@@ -8,7 +8,7 @@ import torch
 from transformer_engine.pytorch.module import linear as te_linear
 from transformer_engine.pytorch.tensor import QuantizedTensorStorage
 
-from megatron.core.enums import Fp4Recipe, Fp8Recipe
+from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -141,9 +141,9 @@ def test_dense_fp8_target_batch_invariance(monkeypatch, recipe):
         Utils.destroy_model_parallel()
 
 
-@pytest.mark.parametrize("recipe", ["nvfp4", Fp4Recipe.nvfp4])
-def test_dense_nvfp4_admission(recipe):
-    options = dict(fp8=None, fp4="e2m1", fp4_recipe=recipe)
+def test_dense_nvfp4_admission():
+    # Fp4Recipe is a str enum, so the string form covers Fp4Recipe.nvfp4 as well.
+    options = dict(fp8=None, fp4="e2m1", fp4_recipe="nvfp4")
     with pytest.raises(AssertionError, match="NVFP4.*tensor-global"):
         _config("delayed", **options)
     assert _config("delayed", **options, batch_invariant_mode=False).fp4 == "e2m1"
