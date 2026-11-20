@@ -21,15 +21,25 @@ from tests.unit_tests.transformer.experimental_attention_variant.dsa_native_pari
 )
 
 
-# Disabled in dev (flaky_in_dev) and LTS (flaky) CI: this real-kernel cuDNN/flash_mla
-# case fails with a CUDA error in CI (deterministic, not truly flaky). Re-enable once the
-# kernel/build root cause is resolved.
-@pytest.mark.flaky
-@pytest.mark.flaky_in_dev
-@pytest.mark.parametrize("kernel_backend", ["cudnn", "tilelang"])
 @pytest.mark.parametrize("seqlen", [1024, 2048])
 @pytest.mark.parametrize("calculate_per_token_loss", [False, True])
-@pytest.mark.parametrize("use_sparse_loss", [False, True], ids=["dense_loss", "sparse_loss"])
+@pytest.mark.parametrize(
+    "use_sparse_loss,kernel_backend",
+    [
+        pytest.param(False, "cudnn", id="dense_loss-cudnn"),
+        pytest.param(False, "tilelang", id="dense_loss-tilelang"),
+        # Disabled in dev (flaky_in_dev) and LTS (flaky) CI: on H100 the indexer.linear_wk.weight
+        # gradient misses the 0.999 cosine-similarity bar (0.998945, 0.998996 and 0.998912 with
+        # per-token loss False at seqlen 1024 and 2048 and True at 1024; True at 2048 passed).
+        pytest.param(
+            True,
+            "cudnn",
+            id="sparse_loss-cudnn",
+            marks=[pytest.mark.flaky, pytest.mark.flaky_in_dev],
+        ),
+        pytest.param(True, "tilelang", id="sparse_loss-tilelang"),
+    ],
+)
 def test_fused_absorbed_mla_dsa_matches_native(
     kernel_backend: str, seqlen: int, calculate_per_token_loss: bool, use_sparse_loss: bool
 ) -> None:
@@ -43,9 +53,10 @@ def test_fused_absorbed_mla_dsa_matches_native(
     )
 
 
-# Disabled in dev (flaky_in_dev) and LTS (flaky) CI: this real-kernel cuDNN/flash_mla
-# case fails with a CUDA error in CI (deterministic, not truly flaky). Re-enable once the
-# kernel/build root cause is resolved.
+# Disabled in dev (flaky_in_dev) and LTS (flaky) CI: runs out of memory on an 80 GB H100. All four
+# seqlen=4096 cases fail (the first tries to allocate 8 GiB with 63.6 GiB already allocated by
+# PyTorch), and dense_loss-True-2048, sparse_loss-False-1024 and sparse_loss-True-1024 also fail
+# when they run after a 4096 case in the same process (77-78 GiB allocated).
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 @pytest.mark.parametrize("seqlen", [1024, 2048, 4096])
@@ -2082,11 +2093,6 @@ def test_cudnn_sparse_attention_declines_unsupported_flashmla_value_dim(monkeypa
     assert output is None
 
 
-# Disabled in dev (flaky_in_dev) and LTS (flaky) CI: this real-kernel cuDNN/flash_mla
-# case fails with a CUDA error in CI (deterministic, not truly flaky). Re-enable once the
-# kernel/build root cause is resolved.
-@pytest.mark.flaky
-@pytest.mark.flaky_in_dev
 def test_cudnn_attention_backward_supports_small_local_head_count():
     _skip_if_fused_dsa_unavailable()
     torch.manual_seed(1234)
@@ -2147,11 +2153,6 @@ def test_cudnn_attention_backward_supports_small_local_head_count():
     assert weights.grad is None
 
 
-# Disabled in dev (flaky_in_dev) and LTS (flaky) CI: this real-kernel cuDNN/flash_mla
-# case fails with a CUDA error in CI (deterministic, not truly flaky). Re-enable once the
-# kernel/build root cause is resolved.
-@pytest.mark.flaky
-@pytest.mark.flaky_in_dev
 def test_cudnn_attention_backward_pads_small_local_head_count(monkeypatch):
     seen = {}
 
@@ -2991,9 +2992,10 @@ def test_cudnn_full_fusion_strips_flagged_plain_causal_varlen(monkeypatch):
     assert "called" not in seen
 
 
-# Disabled in dev (flaky_in_dev) and LTS (flaky) CI: this real-kernel cuDNN/flash_mla
-# case fails with a CUDA error in CI (deterministic, not truly flaky). Re-enable once the
-# kernel/build root cause is resolved.
+# Disabled in dev (flaky_in_dev) and LTS (flaky) CI: on H100, cuDNN Frontend's SM90 sparse
+# score-recompute kernel (sparse indexer loss target) fails to compile for this case: CuTe DSL
+# raises "ValueError: Expected size in shape to be strictly positive, but got 0" in
+# softmax_l1norm_parallel (sparse_score_recompute_sm90.py).
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 def test_cudnn_full_fusion_real_kernel_packed_cp_varlen_matches_reference():
@@ -3049,9 +3051,10 @@ def test_cudnn_full_fusion_real_kernel_packed_cp_varlen_matches_reference():
     torch.testing.assert_close(fused_loss, ref_loss, rtol=5e-2, atol=5e-3)
 
 
-# Disabled in dev (flaky_in_dev) and LTS (flaky) CI: this real-kernel cuDNN/flash_mla
-# case fails with a CUDA error in CI (deterministic, not truly flaky). Re-enable once the
-# kernel/build root cause is resolved.
+# Disabled in dev (flaky_in_dev) and LTS (flaky) CI: on H100, cuDNN Frontend's SM90 sparse
+# score-recompute kernel (sparse indexer loss target) fails to compile for this case: CuTe DSL
+# raises "ValueError: Expected size in shape to be strictly positive, but got 0" in
+# softmax_l1norm_parallel (sparse_score_recompute_sm90.py).
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 def test_cudnn_split_real_kernel_packed_cp_varlen_matches_reference():

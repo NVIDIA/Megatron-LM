@@ -424,9 +424,11 @@ def _record_backend_calls(backend: str, monkeypatch: pytest.MonkeyPatch):
     yield called
 
 
-# Disabled in dev (flaky_in_dev) and LTS (flaky) CI: this real-kernel cuDNN/flash_mla
-# case fails with a CUDA error in CI (deterministic, not truly flaky). Re-enable once the
-# kernel/build root cause is resolved.
+# Disabled in dev (flaky_in_dev) and LTS (flaky) CI. On 4 H100s, the cudnn case's output differs
+# from the unfused reference on ranks 1, 2 and 3 (cosine similarity 0.37, 0.87 and 0.52; above
+# 0.995 required). Those ranks then time out after 600 s in destroy_model_parallel's barrier, which
+# aborts the NCCL communicator, so the tilelang case fails at its start with
+# "torch.distributed.DistBackendError: NCCL communicator was aborted on rank 1" and has not run.
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 @pytest.mark.parametrize("backend", ["cudnn", "tilelang"])
@@ -481,9 +483,10 @@ def test_packed_cp_tp2_sequence_local_query_backend_matches_unfused_attention(
         Utils.destroy_model_parallel()
 
 
-# Disabled in dev (flaky_in_dev) and LTS (flaky) CI: this real-kernel cuDNN/flash_mla
-# case fails with a CUDA error in CI (deterministic, not truly flaky). Re-enable once the
-# kernel/build root cause is resolved.
+# Disabled in dev (flaky_in_dev) and LTS (flaky) CI: not yet run on H100 with FlashMLA's SM90
+# kernels. In the only such run, every case failed at its start with "torch.distributed.
+# DistBackendError: NCCL communicator was aborted on rank 1", left by the NCCL timeout in the
+# sequence-local query test above.
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 @pytest.mark.parametrize("backend", ["cudnn", "tilelang"])
@@ -549,9 +552,10 @@ def test_packed_cp_tp2_sequence_parallel_backend_matches_unfused_reference(
         Utils.destroy_model_parallel()
 
 
-# Disabled in dev (flaky_in_dev) and LTS (flaky) CI: this real-kernel cuDNN/flash_mla
-# case fails with a CUDA error in CI (deterministic, not truly flaky). Re-enable once the
-# kernel/build root cause is resolved.
+# Disabled in dev (flaky_in_dev) and LTS (flaky) CI: not yet run on H100 with FlashMLA's SM90
+# kernels. In the only such run, every case failed at its start with "torch.distributed.
+# DistBackendError: NCCL communicator was aborted on rank 1", left by the NCCL timeout in the
+# sequence-local query test above.
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 @pytest.mark.parametrize("backend", ["cudnn", "tilelang"])
@@ -614,9 +618,10 @@ def test_packed_cp_tp2_sequence_parallel_shared_indexer_backend_matches_unfused_
         Utils.destroy_model_parallel()
 
 
-# Disabled in dev (flaky_in_dev) and LTS (flaky) CI: this real-kernel cuDNN/flash_mla
-# case fails with a CUDA error in CI (deterministic, not truly flaky). Re-enable once the
-# kernel/build root cause is resolved.
+# Disabled in dev (flaky_in_dev) and LTS (flaky) CI: not yet run on H100 with FlashMLA's SM90
+# kernels. In the only such run, every case failed at its start with "torch.distributed.
+# DistBackendError: NCCL communicator was aborted on rank 1", left by the NCCL timeout in the
+# sequence-local query test above.
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 @pytest.mark.parametrize("backend", ["cudnn", "tilelang"])
