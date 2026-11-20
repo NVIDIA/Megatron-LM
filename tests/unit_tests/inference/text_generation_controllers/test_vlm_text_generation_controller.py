@@ -25,12 +25,14 @@ from megatron.core.inference.model_inference_wrappers.multimodal.utils import (
 )
 from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
     VLMInferenceWrapper,
+    _reduce_scatter_embeddings,
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.vlm_text_generation_controller import (
     VLMTextGenerationController,
 )
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -104,6 +106,102 @@ def test_vlm_dynamic_forward_sanitizes_preexpanded_media_sentinel():
         )
 
     assert torch.equal(embedding.call_args.kwargs["input_ids"], torch.tensor([[10, 0, 0]]))
+
+
+@pytest.mark.internal
+def test_vlm_dynamic_forward_reduce_scatters_sequence_parallel_embeddings():
+    """Under sequence parallelism, the embedding is reduce-scattered into this rank's shard,
+    media embeddings are merged into the shard, and the shard is passed through unchanged."""
+    shard = torch.zeros(2, 1, 4)  # [seq_len / tp, b, h] for 4 tokens over TP 2, rank 1
+
+    class Embedding:
+        tp_group = mock.Mock(size=mock.Mock(return_value=2), rank=mock.Mock(return_value=1))
+        add_position_embedding = False
+        num_tokentypes = 0
+        reduce_scatter_embeddings = False
+        word_embeddings = SimpleNamespace(reduce_scatter_embeddings=False)
+
+        def __call__(self, input_ids, position_ids):
+            assert self.reduce_scatter_embeddings and self.word_embeddings.reduce_scatter_embeddings
+            return shard
+
+    embedding = Embedding()
+    model = SimpleNamespace(
+        image_token_index=-200,
+        sequence_parallel_lm=True,
+        context_parallel_lm=1,
+        language_model=SimpleNamespace(embedding=embedding),
+        forward_lm_only=mock.Mock(return_value=torch.zeros(1, 4, 8)),
+    )
+    wrapper = object.__new__(VLMInferenceWrapper)
+    wrapper.model = model
+    wrapper.pp_group = mock.Mock()
+    wrapper._recv_only_vision_embeds = False
+    wrapper.inference_context = None
+    image_embeddings = torch.arange(12, dtype=torch.float).reshape(3, 1, 4)
+
+    with mock.patch(
+        "megatron.core.inference.model_inference_wrappers.multimodal."
+        "vlm_inference_wrapper.is_pipeline_first_stage",
+        return_value=True,
+    ):
+        wrapper._forward_dynamic(
+            {
+                "tokens": torch.tensor([[10, -200, 11, -200]]),
+                "position_ids": torch.tensor([[0, 1, 2, 3]]),
+                "image_token_mask": torch.tensor([[-1, 0, -1, 2]]),
+                "image_embeddings": image_embeddings,
+                "attention_mask": None,
+            }
+        )
+
+    kwargs = model.forward_lm_only.call_args.kwargs
+    assert kwargs["combined_embeddings"] is shard
+    assert kwargs["sequence_parallel_sharded"]
+    # Rank 1 holds tokens 2 and 3: text token 11, then media embedding 2.
+    assert torch.equal(shard[0, 0], torch.zeros(4))
+    assert torch.equal(shard[1, 0], image_embeddings[2, 0])
+    assert not embedding.reduce_scatter_embeddings
+    assert not embedding.word_embeddings.reduce_scatter_embeddings
+
+
+@pytest.mark.internal
+def test_reduce_scatter_embeddings_matches_all_reduce_then_split():
+    """Reduce-scattering the vocab-parallel embedding gives this rank exactly the shard that
+    all-reducing it and splitting the sequence would."""
+    Utils.initialize_model_parallel(2, 1)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            tensor_model_parallel_size=2,
+            sequence_parallel=True,
+            use_cpu_initialization=True,
+            params_dtype=torch.bfloat16,
+            bf16=True,
+            hidden_dropout=0.0,
+        )
+        embedding = LanguageModelEmbedding(
+            config,
+            vocab_size=256,
+            max_sequence_length=64,
+            position_embedding_type="none",
+            scatter_to_sequence_parallel=False,
+        ).cuda().eval()
+        input_ids = torch.randint(0, 256, (1, 16), device="cuda")
+        position_ids = torch.arange(16, device="cuda").unsqueeze(0)
+
+        full = embedding(input_ids=input_ids, position_ids=position_ids)  # [s, b, h]
+        with _reduce_scatter_embeddings(embedding):
+            sharded = embedding(input_ids=input_ids, position_ids=position_ids)
+
+        rank = embedding.tp_group.rank()
+        assert torch.equal(sharded, full[8 * rank : 8 * (rank + 1)])
+        assert not embedding.reduce_scatter_embeddings
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.internal
