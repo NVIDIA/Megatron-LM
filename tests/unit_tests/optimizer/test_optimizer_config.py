@@ -175,6 +175,34 @@ def test_gate_follows_fp8_param_gather_resolution(fp8_recipe):
     assert bf16_params.fp8_param_gather is False
 
 
+def test_fp4_param_gather_is_not_user_settable():
+    """Whether the params are FP4 is a property of the model, taken from its DDP config."""
+    with pytest.raises(TypeError):
+        OptimizerConfig(fp4_param_gather=True)
+    with pytest.raises(TypeError):
+        OptimizerConfig(_fp4_param_gather=True)
+    config = OptimizerConfig()
+    with pytest.raises(AttributeError):
+        config.fp4_param_gather = True
+    assert config.fp4_param_gather is None
+
+
+@pytest.mark.parametrize("fp8_recipe", [None, "delayed", *_NON_DELAYED_FP8_RECIPES])
+def test_fp4_params_keep_mcore_main_params(fp8_recipe):
+    """TE FusedAdam cannot update FP4 params, so FP4 params never get TE-owned main weights,
+    whatever the FP8 recipe, while unresolved and BF16 configs keep the FP8-based gate."""
+    config = OptimizerConfig(fp8_recipe=fp8_recipe, **_PAO).resolve_fp8_param_gather(False)
+    assert config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+
+    fp4_params = config.resolve_fp4_param_gather(True)
+    assert fp4_params.fp4_param_gather is True
+    assert not fp4_params.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+
+    bf16_params = config.resolve_fp4_param_gather(False)
+    assert bf16_params.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+    assert config.fp4_param_gather is None
+
+
 @pytest.mark.parametrize("fp8_recipe", [None, "delayed", "tensorwise"])
 @pytest.mark.parametrize("store_param_remainders", [True, False])
 def test_store_param_remainders_explicit_value_wins(fp8_recipe, store_param_remainders):

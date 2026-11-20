@@ -833,6 +833,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             f"OptimizerConfig resolved with fp8_param_gather={config.fp8_param_gather} for a "
             f"model whose ddp_config.fp8_param_gather is {self.ddp_config.fp8_param_gather}"
         )
+        assert config.fp4_param_gather in (None, self.ddp_config.fp4_param_gather), (
+            f"OptimizerConfig resolved with fp4_param_gather={config.fp4_param_gather} for a "
+            f"model whose ddp_config.fp4_param_gather is {self.ddp_config.fp4_param_gather}"
+        )
 
         self._cudagraphed_grad_copy = None
         if (

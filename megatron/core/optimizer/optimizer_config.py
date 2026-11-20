@@ -186,6 +186,12 @@ class OptimizerConfig:
        get_megatron_optimizer takes it from ddp_config.fp8_param_gather (resolve_fp8_param_gather).
     """
 
+    _fp4_param_gather: Optional[bool] = field(default=None, init=False)
+    """Whether model parameters are stored (and all-gathered) as FP4 tensors, read through the
+       fp4_param_gather property. Not user settable: it is a property of the model, so
+       get_megatron_optimizer takes it from ddp_config.fp4_param_gather (resolve_fp4_param_gather).
+    """
+
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
     """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
        set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True."""
@@ -448,20 +454,27 @@ class OptimizerConfig:
         """fp8_param_gather of the model's DDP config, or None if not resolved for a model."""
         return self._fp8_param_gather
 
+    @property
+    def fp4_param_gather(self) -> Optional[bool]:
+        """fp4_param_gather of the model's DDP config, or None if not resolved for a model."""
+        return self._fp4_param_gather
+
     def _te_fused_adam_main_weight_and_decoupled_grad(
-        self, fp8_param_gather: Optional[bool]
+        self, fp8_param_gather: Optional[bool], fp4_param_gather: Optional[bool] = None
     ) -> bool:
         """Whether TE FusedAdam (the precision-aware optimizer) owns the main weights and consumes
         decoupled grads (param.decoupled_grad), for FP8 params (fp8_param_gather True, or None:
-        unresolved) or BF16 params (False)."""
+        unresolved), FP4 params (fp4_param_gather True) or BF16 params (both False)."""
         return self.use_precision_aware_optimizer and (
             # Non-FP32 main params are always owned by TE.
             self.main_params_dtype != torch.float32
             # Any compute recipe works with BF16 model weights, and the Adam kernel handles FP8
             # delayed-scaling weights. Other quantized weights (e.g. MXFP8, NVFP4) need
             # MCore-managed main params.
-            or self.fp8_recipe in (None, "delayed")
-            or fp8_param_gather is False
+            or (
+                fp4_param_gather is not True
+                and (self.fp8_recipe in (None, "delayed") or fp8_param_gather is False)
+            )
             # The hybrid-device optimizer has its own decoupled-grad support.
             or self.optimizer_cpu_offload
         )
@@ -470,7 +483,9 @@ class OptimizerConfig:
     def use_precision_aware_optimizer_no_fp8_or_ds_fp8(self) -> bool:
         """See _te_fused_adam_main_weight_and_decoupled_grad. Also selects param.grad vs
         param.decoupled_grad."""
-        return self._te_fused_adam_main_weight_and_decoupled_grad(self.fp8_param_gather)
+        return self._te_fused_adam_main_weight_and_decoupled_grad(
+            self.fp8_param_gather, self.fp4_param_gather
+        )
 
     def _use_te_precision_aware_optimizer_legacy(self) -> bool:
         """The precision-aware optimizer gate before BF16 model weights could use it.
@@ -511,6 +526,12 @@ class OptimizerConfig:
         """Return a copy of this config with fp8_param_gather taken from the model's DDP config."""
         resolved = copy.copy(self)
         resolved._fp8_param_gather = ddp_fp8_param_gather
+        return resolved
+
+    def resolve_fp4_param_gather(self, ddp_fp4_param_gather: bool) -> "OptimizerConfig":
+        """Return a copy of this config with fp4_param_gather taken from the model's DDP config."""
+        resolved = copy.copy(self)
+        resolved._fp4_param_gather = ddp_fp4_param_gather
         return resolved
 
     def __post_init__(self):
