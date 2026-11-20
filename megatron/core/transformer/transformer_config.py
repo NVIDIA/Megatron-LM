@@ -950,7 +950,9 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_megakernel_backend: Optional[str] = None
     """Optional backend that replaces MoE dispatch, expert computation, and combine.
-    Supported values: None and "mok". When set, the megakernel owns dispatch/combine;
+    Supported values: None, "mok", and "te". The "te" backend composes NCCL EP dispatch,
+    grouped MLP, and combine in one Transformer Engine Sequential. When set, the backend owns
+    dispatch/combine;
     moe_token_dispatcher_type and moe_flex_dispatcher_backend do not select its transport.
     """
 
@@ -958,6 +960,7 @@ class TransformerConfig(ModelParallelConfig):
     """Backend options for moe_megakernel_backend.
 
     For example, ``fwd_num_comm_sms`` is a valid MOK backend option.
+    The TE backend accepts ``max_tokens_per_rank`` to bound inputs before its first forward.
     """
 
     moe_layer_freq: Union[int, List[int]] = 1
@@ -1759,7 +1762,7 @@ class TransformerConfig(ModelParallelConfig):
     offload_modules: Optional[list[str]] = field(default_factory=list)
     """The submodules to offload its input.
     choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj",
-             "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp", "gdp_qkv",
+             "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp", "fused_moe_op", "gdp_qkv",
              "shortcut_post_norm".
     "attn_norm": offload the input of the normalization in the attention part.
     "qkv_linear": offload the input of the qkv linear part.
@@ -1775,6 +1778,9 @@ class TransformerConfig(ModelParallelConfig):
         path: a fused instance offloads the block input, an unfused instance offloads the fc1
         and activation inputs. So either spelling covers a model that mixes fused (quantized)
         and unfused (e.g. bf16 MTP) experts.
+    "fused_moe_op": offload eligible saved activations of the complete TE MoE operation,
+        including dispatch, expert computation, and combine, independently of TE fusion choices.
+        Requires moe_megakernel_backend="te"; excludes routing and shared experts.
     "gdp_qkv": offload the input of the causal conv and QKV preparation in the
                GatedDeltaProduct mixer.
     "shortcut_post_norm": offload the input of the shortcut output normalization.
@@ -1900,6 +1906,76 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor-parallel size, got {self.tensor_model_parallel_size}."
             )
 
+    def _validate_te_fused_moe_op(self) -> None:
+        """Validate the NCCL EP plus TE grouped-MLP execution contract."""
+        if not self.num_moe_experts or not self.moe_grouped_gemm:
+            raise ValueError("The TE MoE backend requires grouped MoE experts")
+        if self.tensor_model_parallel_size != 1 or self.expert_tensor_parallel_size != 1:
+            raise ValueError("The TE MoE backend requires TP=1 and expert TP=1")
+        if self.expert_model_parallel_size < 2:
+            raise ValueError("The TE MoE backend requires EP>=2")
+        if not self.bf16 or self.fp16 or self.fp4 or self.fp4_param:
+            raise ValueError("The TE MoE backend supports BF16 and MXFP8 only")
+        if self.fp8 and self.fp8_recipe != Fp8Recipe.mxfp8:
+            raise ValueError("The TE MoE backend supports only the MXFP8 recipe")
+        if self.fp8_param and not self.fp8:
+            raise ValueError("The TE MoE backend requires MXFP8 compute with FP8 parameters")
+        if self.params_dtype != torch.bfloat16:
+            raise ValueError("The TE MoE backend requires params_dtype=torch.bfloat16")
+        if not self.gated_linear_unit or self.activation_func != F.silu:
+            raise ValueError("The TE MoE backend currently requires SwiGLU")
+        if self.glu_linear_offset != 0 or self.activation_func_tanh_clamp_scale is not None:
+            raise ValueError("The TE MoE backend does not support modified SwiGLU")
+        unsupported = (
+            "add_bias_linear",
+            "moe_apply_probs_on_input",
+            "delay_wgrad_compute",
+            "overlap_dispatch_backward_with_experts_wgrad",
+            "overlap_moe_expert_parallel_comm",
+            "moe_shared_expert_overlap",
+            "moe_ncclep_zero_copy",
+            "moe_pad_expert_input_to_capacity",
+            "moe_router_padding_for_quantization",
+            "moe_virtual_expert_load_balance",
+            "moe_shortcut_connection",
+            "cpu_offloading",
+        )
+        for name in unsupported:
+            if getattr(self, name):
+                raise ValueError(f"The TE MoE backend does not support {name}")
+        if self.moe_latent_size is not None:
+            raise ValueError("The TE MoE backend does not support latent MoE")
+        if self.gtp_weight_remat_size != 1 or self.expert_gtp_weight_remat_size != 1:
+            raise ValueError("The TE MoE backend does not support GTP weight rematerialization")
+        if self.transformer_impl != "transformer_engine":
+            raise ValueError("The TE MoE backend requires transformer_impl='transformer_engine'")
+        if self.moe_router_dtype == "fp64":
+            raise ValueError("The TE MoE backend requires FP32 router probabilities")
+        if self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph:
+            if self.moe_expert_rank_capacity_factor is None:
+                raise ValueError(
+                    "The TE MoE backend requires fixed receive capacity for CUDA graphs; "
+                    "set moe_expert_rank_capacity_factor"
+                )
+        if self.moe_expert_rank_capacity_factor is not None and (
+            not math.isfinite(self.moe_expert_rank_capacity_factor)
+            or self.moe_expert_rank_capacity_factor <= 0
+        ):
+            raise ValueError("The TE MoE backend requires a positive finite rank capacity factor")
+        if self.moe_dispatch_fwd_dtype == "mxfp8" or self.moe_combine_bwd_dtype == "mxfp8":
+            if not self.fp8 or self.hidden_size % 512:
+                raise ValueError(
+                    "TE MXFP8 communication requires MXFP8 compute and hidden_size%512=0"
+                )
+        options = self.moe_megakernel_backend_config
+        if options is not None:
+            if not isinstance(options, dict) or options.keys() - {"max_tokens_per_rank"}:
+                raise ValueError("TE backend options support only max_tokens_per_rank")
+            if "max_tokens_per_rank" in options:
+                bound = options["max_tokens_per_rank"]
+                if not isinstance(bound, int) or isinstance(bound, bool) or bound <= 0:
+                    raise ValueError("TE max_tokens_per_rank must be a positive integer")
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -1995,7 +2071,9 @@ class TransformerConfig(ModelParallelConfig):
                 "cudnn" if self.experimental_attention_variant == "dsv4_hybrid" else "none"
             )
 
-        if self.use_transformer_engine_op_fuser and self.moe_grouped_gemm:
+        if (
+            self.use_transformer_engine_op_fuser or self.moe_megakernel_backend == "te"
+        ) and self.moe_grouped_gemm:
             self.moe_use_grouped_tensor = True
 
         if self.moe_use_grouped_tensor and not self.moe_grouped_gemm:
@@ -2712,7 +2790,7 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.moe_dispatch_fwd_dtype != 'bf16' or self.moe_combine_bwd_dtype != 'bf16':
-            if (
+            if self.moe_megakernel_backend != "te" and (
                 self.moe_token_dispatcher_type != "flex"
                 or self.moe_flex_dispatcher_backend != "ncclep"
             ):
@@ -2720,7 +2798,10 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_dispatch_fwd_dtype / moe_combine_bwd_dtype require the 'ncclep' flex "
                     "dispatcher backend."
                 )
-            if not (self.use_transformer_engine_op_fuser and self.moe_grouped_gemm):
+            if not (
+                (self.use_transformer_engine_op_fuser or self.moe_megakernel_backend == "te")
+                and self.moe_grouped_gemm
+            ):
                 raise ValueError(
                     "moe_dispatch_fwd_dtype / moe_combine_bwd_dtype = 'mxfp8' or 'nvfp4' require "
                     "BOTH use_transformer_engine_op_fuser and moe_grouped_gemm: only the fused "
@@ -2910,15 +2991,18 @@ class TransformerConfig(ModelParallelConfig):
                     f"moe_shared_expert_overlap only works with alltoall or flex token dispatcher."
                 )
 
-        if self.moe_megakernel_backend not in (None, "mok"):
+        if self.moe_megakernel_backend not in (None, "mok", "te"):
             raise ValueError(
-                "moe_megakernel_backend must be None or 'mok', got "
+                "moe_megakernel_backend must be None, 'mok', or 'te', got "
                 f"{self.moe_megakernel_backend!r}"
             )
         if self.moe_megakernel_backend is None and self.moe_megakernel_backend_config:
             raise ValueError(
                 "moe_megakernel_backend_config requires moe_megakernel_backend to be set"
             )
+
+        if self.moe_megakernel_backend == "te":
+            self._validate_te_fused_moe_op()
 
         if self.moe_megakernel_backend == "mok":
             if self.moe_router_dtype == "fp64":
@@ -3119,13 +3203,17 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.moe_expert_rank_capacity_factor is not None:
-            if self.moe_flex_dispatcher_backend not in ("hybridep", "ncclep"):
+            if self.moe_megakernel_backend != "te" and self.moe_flex_dispatcher_backend not in (
+                "hybridep",
+                "ncclep",
+            ):
                 raise ValueError(
                     "moe_expert_rank_capacity_factor requires moe_flex_dispatcher_backend to be "
                     "'hybridep' or 'ncclep'."
                 )
             if (
-                self.moe_flex_dispatcher_backend == "hybridep"
+                self.moe_megakernel_backend != "te"
+                and self.moe_flex_dispatcher_backend == "hybridep"
                 and not self.use_transformer_engine_op_fuser
                 and not self.moe_use_grouped_tensor
             ):
@@ -3479,6 +3567,7 @@ class TransformerConfig(ModelParallelConfig):
                 "attn_proj",
                 "expert_fc1",
                 "fused_group_mlp",
+                "fused_moe_op",
                 "moe_act",
                 "attn_norm",
                 "mlp_norm",
@@ -3491,6 +3580,17 @@ class TransformerConfig(ModelParallelConfig):
                 f'Invalid choices for offload_modules: {invalid_modules}. '
                 f'Allowed modules are: {allowed_modules}'
             )
+            if "fused_moe_op" in self.offload_modules and self.moe_megakernel_backend != "te":
+                raise ValueError("fused_moe_op offloading requires moe_megakernel_backend='te'.")
+            if self.moe_megakernel_backend == "te":
+                expert_offload_modules = {"expert_fc1", "moe_act", "fused_group_mlp"} & set(
+                    self.offload_modules
+                )
+                if expert_offload_modules:
+                    raise ValueError(
+                        "The TE MoE backend requires offload_modules=['fused_moe_op'] "
+                        f"for expert activations instead of {sorted(expert_offload_modules)}."
+                    )
             if "attn_proj" in self.offload_modules and "core_attn" not in self.offload_modules:
                 raise ValueError(
                     "attn_proj cannot be set to offload_modules alone without core_attn "
@@ -3509,9 +3609,12 @@ class TransformerConfig(ModelParallelConfig):
                     "nothing for the gdp_qkv offload group to keep on the host."
                 )
             if self.recompute_granularity == "selective" and "moe" in self.recompute_modules:
-                offload_inside_moe = {"moe_act", "expert_fc1", "fused_group_mlp"} & set(
-                    self.offload_modules
-                )
+                offload_inside_moe = {
+                    "moe_act",
+                    "expert_fc1",
+                    "fused_group_mlp",
+                    "fused_moe_op",
+                } & set(self.offload_modules)
                 assert not offload_inside_moe, (
                     f"Cannot offload {offload_inside_moe} while recomputing the entire MoE layer. "
                     f"'moe' in recompute_modules wraps the full MoE forward in a checkpoint, "
@@ -3564,17 +3667,20 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_paged_stash requires moe_expert_rank_capacity_factor to be set; "
                     "there is no need to use paged stashing without it."
                 )
-            moe_offload_conflict = {"expert_fc1", "moe_act", "fused_group_mlp"} & set(
-                self.offload_modules
-            )
+            moe_offload_conflict = {
+                "expert_fc1",
+                "moe_act",
+                "fused_group_mlp",
+                "fused_moe_op",
+            } & set(self.offload_modules)
             if moe_offload_conflict:
                 raise ValueError(
                     "When moe_paged_stash is enabled, offload_modules must not include "
-                    f"expert_fc1, moe_act, or fused_group_mlp "
+                    f"expert_fc1, moe_act, fused_group_mlp, or fused_moe_op "
                     f"(paged stash covers those activations). "
                     f"Remove: {moe_offload_conflict}"
                 )
-            if not self.use_transformer_engine_op_fuser:
+            if not self.use_transformer_engine_op_fuser and self.moe_megakernel_backend != "te":
                 if not self.moe_use_grouped_tensor:
                     raise ValueError(
                         "moe_paged_stash without use_transformer_engine_op_fuser requires "
@@ -4300,6 +4406,15 @@ class TransformerConfig(ModelParallelConfig):
             self.cuda_graph_impl == "full_iteration" and self.cuda_graph_modules
         ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
 
+        if self.moe_megakernel_backend == "te" and self.cuda_graph_impl != "none":
+            if {CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess} & set(
+                self.cuda_graph_modules
+            ):
+                raise ValueError(
+                    "The TE MoE backend requires whole-MoE CUDA graph capture; "
+                    "moe_router/moe_preprocess scopes are not supported"
+                )
+
         if self.moe_megakernel_backend == "mok":
             if self.cuda_graph_impl in ("local", "transformer_engine"):
                 if CudaGraphModule.moe_preprocess in self.cuda_graph_modules:
@@ -4418,7 +4533,7 @@ class TransformerConfig(ModelParallelConfig):
                             'virtual-expert load balancing supports the moe CUDA graph scope only; '
                             'moe_router and moe_preprocess are not supported.'
                         )
-                    elif (
+                    elif self.moe_megakernel_backend != "te" and (
                         self.moe_expert_capacity_factor is None
                         or not self.moe_pad_expert_input_to_capacity
                     ):
@@ -4514,12 +4629,17 @@ class TransformerConfig(ModelParallelConfig):
             if self.fine_grained_activation_offloading:
                 offload_modules = set(self.offload_modules or [])
                 if self.cuda_graph_impl == "local":
-                    local_supported_offload_modules = {"expert_fc1", "moe_act", "fused_group_mlp"}
+                    local_supported_offload_modules = {
+                        "expert_fc1",
+                        "moe_act",
+                        "fused_group_mlp",
+                        "fused_moe_op",
+                    }
                     unsupported_offload_modules = offload_modules - local_supported_offload_modules
                     assert not unsupported_offload_modules, (
                         "fine-grained activation offloading with cuda_graph_impl='local' "
-                        "only supports offload_modules 'expert_fc1', 'moe_act', and "
-                        "'fused_group_mlp'. "
+                        "only supports offload_modules 'expert_fc1', 'moe_act', "
+                        "'fused_group_mlp', and 'fused_moe_op'. "
                         f"Unsupported offload_modules: {sorted(unsupported_offload_modules)}."
                     )
                     assert self.cuda_graph_modules, (
@@ -4529,7 +4649,8 @@ class TransformerConfig(ModelParallelConfig):
                 local_partial_moe_offload = (
                     self.cuda_graph_impl == "local"
                     and bool(offload_modules)
-                    and offload_modules <= {"expert_fc1", "moe_act", "fused_group_mlp"}
+                    and offload_modules
+                    <= {"expert_fc1", "moe_act", "fused_group_mlp", "fused_moe_op"}
                     and CudaGraphModule.moe not in self.cuda_graph_modules
                 )
                 assert (
@@ -4539,7 +4660,7 @@ class TransformerConfig(ModelParallelConfig):
                     "fine-grained activation offloading is only supported with "
                     "transformer_engine CUDA graph implementation or local CUDA graph "
                     "implementation with partial MoE offload. Local partial CUDA graphs "
-                    "are supported only for expert_fc1, moe_act, or fused_group_mlp "
+                    "are supported only for expert_fc1, moe_act, fused_group_mlp, or fused_moe_op "
                     "offload when the full MoE module is not captured."
                 )
                 assert (

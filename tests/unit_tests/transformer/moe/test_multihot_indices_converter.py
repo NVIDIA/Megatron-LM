@@ -8,7 +8,7 @@ import torch
 
 from megatron.core import config
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
-from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
+from megatron.core.transformer.moe.megakernel.route_adapter import routing_map_to_indices
 from tests.unit_tests.transformer.moe.megakernel_test_utils import drop_padding_routes
 
 
@@ -113,7 +113,7 @@ class TestRoutingMapToIndices:
         )
         probs_reference = probs.detach().clone().requires_grad_(True)
 
-        weights, indices = routing_map_to_mok_inputs(probs, routing_map, topk)
+        weights, indices = routing_map_to_indices(probs, routing_map, topk)
 
         gather_indices = expected_indices.clamp_min(0).to(torch.int64)
         expected_weights = torch.gather(probs_reference, dim=1, index=gather_indices)
@@ -159,8 +159,8 @@ class TestRoutingMapToIndices:
             "strided": padding_mask.t().contiguous().t(),
         }[mask_layout]
 
-        weights, indices = routing_map_to_mok_inputs(probs, routing_map, topk, mask_argument)
-        expected_weights, expected_indices = routing_map_to_mok_inputs(
+        weights, indices = routing_map_to_indices(probs, routing_map, topk, mask_argument)
+        expected_weights, expected_indices = routing_map_to_indices(
             *drop_padding_routes(probs_reference, routing_map, padding_mask), topk
         )
 
@@ -180,7 +180,7 @@ class TestRoutingMapToIndices:
         probs = torch.rand((12, 8), device="cuda")
         routing_map = probs > 0.5
         with pytest.raises(ValueError, match="one entry per token"):
-            routing_map_to_mok_inputs(probs, routing_map, 2, torch.zeros((2, 5), dtype=torch.bool))
+            routing_map_to_indices(probs, routing_map, 2, torch.zeros((2, 5), dtype=torch.bool))
 
     @pytest.mark.experimental
     def test_backward_does_not_materialize_the_indices_gradient(self):
@@ -188,7 +188,7 @@ class TestRoutingMapToIndices:
         probs = torch.rand((num_tokens, num_experts), device="cuda", requires_grad=True)
         routing_map = torch.zeros((num_tokens, num_experts), dtype=torch.bool, device="cuda")
         routing_map[:, :topk] = True
-        weights, _ = routing_map_to_mok_inputs(probs, routing_map, topk)
+        weights, _ = routing_map_to_indices(probs, routing_map, topk)
         grad = torch.randn_like(weights)
 
         with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profiler:

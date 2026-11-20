@@ -829,7 +829,7 @@ def test_output_gate_autograd_preserves_native_main_grad(monkeypatch, gated, mai
     x = torch.zeros((4, 8), dtype=torch.bfloat16, requires_grad=True)
     probs = torch.zeros((4, 2), requires_grad=True)
     experts = torch.zeros((4, 2), dtype=torch.int32)
-    monkeypatch.setattr(mok_backend, "routing_map_to_mok_inputs", lambda *_: (probs, experts))
+    monkeypatch.setattr(mok_backend, "routing_map_to_indices", lambda *_: (probs, experts))
     # MCore DDP consumes the hook-only sentinel and clears .grad; numerical
     # gradients must remain in the original main_grad buffer across microbatches.
     handles = [
@@ -1346,7 +1346,7 @@ def test_gate_autograd_accumulation_and_ddp_hooks(
     x = torch.zeros((2, 2, 8), dtype=torch.bfloat16, requires_grad=True)
     probs = torch.zeros((4, 2), dtype=torch.float32, requires_grad=True)
     experts = torch.zeros((4, 2), dtype=torch.int32)
-    monkeypatch.setattr(mok_backend, "routing_map_to_mok_inputs", lambda *_: (probs, experts))
+    monkeypatch.setattr(mok_backend, "routing_map_to_indices", lambda *_: (probs, experts))
     monkeypatch.setattr(ddp_module, "is_graph_capturing", lambda: False)
     waited, ready = [], []
     bucket = SimpleNamespace(register_grad_ready=lambda param, force: ready.append((param, force)))
@@ -1423,7 +1423,7 @@ def test_runtime_passes_supported_backward_options(monkeypatch):
     x = torch.zeros((4, 8), dtype=torch.bfloat16, requires_grad=True)
     probs = torch.zeros((4, 2), dtype=torch.float32, requires_grad=True)
     experts = torch.zeros((4, 2), dtype=torch.int32)
-    monkeypatch.setattr(mok_backend, "routing_map_to_mok_inputs", lambda *_: (probs, experts))
+    monkeypatch.setattr(mok_backend, "routing_map_to_indices", lambda *_: (probs, experts))
 
     module(x, probs, experts).sum().backward()
 

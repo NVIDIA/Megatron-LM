@@ -43,7 +43,7 @@ from megatron.core.transformer.moe.experts import (
     TEGroupedMLP,
     _te_supports_scaled_tanh_srelu,
 )
-from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
+from megatron.core.transformer.moe.megakernel.route_adapter import routing_map_to_indices
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.ops.virtual_expert_triton import VirtualExpertPlannerWorkspace
 from megatron.core.transformer.moe.router import InferenceTopKRouter, TopKRouter
@@ -970,7 +970,7 @@ def _padding_mask(pattern, batch_size, seq_length):
 class _CompactingMegakernel(torch.nn.Module):
     """Megakernel backend stand-in that runs MOK's route compaction without MOK or Blackwell.
 
-    It compacts the routes it receives with ``routing_map_to_mok_inputs``, whose Triton kernel
+    It compacts the routes it receives with ``routing_map_to_indices``, whose Triton kernel
     drops the routes of the padding tokens, and scales each token by its routed probabilities,
     weighted by ``e + 1`` for expert ``e``. With ``reference`` set, it drops the padding routes
     with the reference semantics (``drop_padding_routes``) and compacts without a mask instead.
@@ -986,7 +986,7 @@ class _CompactingMegakernel(torch.nn.Module):
         if self.reference:
             probs, routing_map = drop_padding_routes(probs, routing_map, padding_mask)
             padding_mask = None
-        weights, indices = routing_map_to_mok_inputs(probs, routing_map, self.topk, padding_mask)
+        weights, indices = routing_map_to_indices(probs, routing_map, self.topk, padding_mask)
         self.routes = (weights.detach(), indices)
         # Unused route slots hold index -1 and weight 0, so they add nothing.
         token_scale = (weights * (indices + 1)).sum(dim=-1)

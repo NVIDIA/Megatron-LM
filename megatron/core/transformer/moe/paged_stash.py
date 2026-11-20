@@ -919,17 +919,25 @@ def paged_stash_group_start(tensor):
 
 
 def get_paged_stash_context(
-    name=None, max_num_tokens=None, num_tokens_tensor=None, avg_num_tokens=None
+    name=None,
+    max_num_tokens=None,
+    num_tokens_tensor=None,
+    avg_num_tokens=None,
+    clone_num_tokens=True,
 ):
-    """Get the paged stash context"""
+    """Get the paged stash context, snapshotting token counts by default.
+    We would want to not clone num_tokens_tensor for megamoe backend which
+    creates the context before dispatch populates the num_tokens_tensor
+    """
     stash_manager = PagedStashManager.get_instance()
     if not stash_manager.enabled:
         return nullcontext()
     stash_manager.max_num_tokens = max_num_tokens
     stash_manager.avg_num_tokens = avg_num_tokens
     assert num_tokens_tensor is not None and isinstance(num_tokens_tensor, torch.Tensor)
-    # One clone per context; PagedTensor reuses this tensor (no per-instance clone).
-    stash_manager.num_tokens_tensor = num_tokens_tensor.clone()
+    stash_manager.num_tokens_tensor = (
+        num_tokens_tensor.clone() if clone_num_tokens else num_tokens_tensor
+    )
     stash_manager.set_current_layer_name(name) if name is not None else None
     pack_unpack_context = PagedStashContext(stash_manager)
     return pack_unpack_context
@@ -1054,6 +1062,7 @@ class PagedStashRunner:
         self.optimizer = optimizer
         self.forward_backward_func = forward_backward_func
         self.moe_layers = []
+        self.megakernel_moe_layers = []
         # Peak per-rank receive capacity the last over-budget step needed, and the
         # moe_expert_rank_capacity_factor that would have covered it, if the backend reports
         # them (NCCL EP only). Both set by check_moe_overflow.
@@ -1090,6 +1099,11 @@ class PagedStashRunner:
             # This keeps overflow and retry behavior unchanged for models whose modules share
             # the root config while allowing distinct module configs to stay synchronized.
             for module in model_with_decoder.modules():
+                megakernel = getattr(module, 'megakernel_experts', None)
+                if callable(getattr(megakernel, 'invalidate_ep_bootstrap', None)):
+                    if module not in self.megakernel_moe_layers:
+                        self.megakernel_moe_layers.append(module)
+                    _track_cfg(getattr(module, 'config', None))
                 token_dispatcher = getattr(module, 'token_dispatcher', None)
                 if token_dispatcher is None or not hasattr(token_dispatcher, 'check_over_budget'):
                     continue
@@ -1128,7 +1142,7 @@ class PagedStashRunner:
 
     def _reset_qb_histograms(self) -> None:
         """Discard histogram observations from a failed full-iteration attempt."""
-        for mlp in self.moe_layers:
+        for mlp in self.moe_layers + self.megakernel_moe_layers:
             router = getattr(mlp, 'router', None)
             qb_histogram = getattr(router, 'qb_histogram', None)
             if qb_histogram is not None:
@@ -1288,6 +1302,8 @@ class PagedStashRunner:
                 stage='training' if is_training else 'validation'
             )
 
+        for mlp in self.megakernel_moe_layers:
+            mlp.megakernel_experts.invalidate_ep_bootstrap()
         nccl_ep_release_context()
 
         # Only drop page buffers on training fallback. Validation uses forward_only=True, so
@@ -1371,6 +1387,8 @@ class PagedStashRunner:
                 if num_tries > 1:
                     for mlp in self.moe_layers:
                         mlp.token_dispatcher.invalidate_ep_bootstrap()
+                    for mlp in self.megakernel_moe_layers:
+                        mlp.megakernel_experts.invalidate_ep_bootstrap()
                     nccl_ep_release_context()
                 for config, value in saved_moe_paged_stash_values:
                     config.moe_paged_stash = value

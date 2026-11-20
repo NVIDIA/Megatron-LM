@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
+from megatron.core.transformer.moe.megakernel.route_adapter import routing_map_to_indices
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -36,12 +36,12 @@ def test_routing_map_forward_and_backward_replay(dtype, num_experts, topk, padde
         valid_routes = valid_routes & (tokens % 5 != 0)[:, None]
 
     outputs, gradients = assert_replays_bit_exact(
-        routing_map_to_mok_inputs,
+        routing_map_to_indices,
         inputs,
         grad_outputs={"out[0]": upstream},
         replays=3,
         contention=True,
-        what=f"MOK routing map[{dtype}, experts={num_experts}, topk={topk}, padded={padded}]",
+        what=f"Megakernel routing map[{dtype}, experts={num_experts}, topk={topk}, padded={padded}]",
     )
 
     expected_indices = expert_indices.masked_fill(~valid_routes, num_experts).sort(dim=1).values

@@ -395,8 +395,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "the default atomic branch is a negative control.",
     ),
     KernelEntry(
-        name="mok_route_adapter",
-        sources=("megatron/core/transformer/moe/megakernel/mok/route_adapter.py",),
+        name="megakernel_route_adapter",
+        sources=("megatron/core/transformer/moe/megakernel/route_adapter.py",),
         tests=(K + "test_mok_kernels.py",),
         kind="triton",
         notes="Dense routing-map compaction and router-gradient scatter use one CTA per token "
@@ -415,6 +415,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         exempt_reason="MOK forward/backward, schedule, and weight-descriptor kernels require "
         "Blackwell GPUs and the optional qizhang/mcore-integration MOK build, which are not "
         "available in the H100 determinism bucket. Routing conversion is replayed separately.",
+    ),
+    KernelEntry(
+        name="te_fused_moe_op",
+        sources=("megatron/core/transformer/moe/megakernel/te_fused_moe_op/backend.py",),
+        tests=(K + "test_te_fused_moe_op.py",),
+        kind="dispatch",
+        notes="Authoritative route conversion and probability-gradient replay. Distributed "
+        "NCCL EP plus grouped-MLP numerical coverage is in transformer/moe/test_te_fused_moe_op.py.",
     ),
     KernelEntry(
         name="moe_router",
