@@ -10,9 +10,9 @@
 `flash-linear-attention <https://github.com/fla-org/flash-linear-attention>`_
 (v0.5.1).
 
-Training and the static-batching inference path call the pip
-`flash-linear-attention` kernels, which own the backward pass. Only the
-dynamic-batching decode and prefill steps route here:
+Training uses the configured GDP backend. Static-batching prefill calls the pip
+`flash-linear-attention` kernels. Both static- and dynamic-batching decode, and
+dynamic-batching prefill, route here independently of the training backend:
 
 * `fused_recurrent_gated_delta_rule_update` -- decode (shared with GDN, whose
   gate and beta sigmoid it can apply in-kernel).

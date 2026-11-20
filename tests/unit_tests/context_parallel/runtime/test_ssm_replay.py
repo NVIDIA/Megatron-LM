@@ -137,7 +137,7 @@ def test_gdp_chunkwise_runtime_cp_full_head_gating_replays():
     mixer.config = SimpleNamespace(
         linear_cp_mode="chunkwise",
         linear_cp_layout="contiguous",
-        gdp_cutedsl_kernel=False,
+        gdp_backend="fla",
         gdp_g_clamp_value=None,
     )
     mixer.pg_collection = SimpleNamespace(cp=SimpleNamespace(size=lambda: 4, rank=lambda: 0))

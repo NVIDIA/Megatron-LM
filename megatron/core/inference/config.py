@@ -933,10 +933,9 @@ class InferenceConfig:
                 "inference_shortcut_moe_overlap requires "
                 "fine_grained_activation_offloading=False"
             )
-        if model_config.batch_invariant_mode or model_config.gdp_cutedsl_kernel:
+        if model_config.batch_invariant_mode:
             raise ValueError(
-                "inference_shortcut_moe_overlap requires further testing with batch-invariant mode "
-                "or CuTeDSL GDP kernels"
+                "inference_shortcut_moe_overlap requires further testing with batch-invariant mode"
             )
 
     def resolve_pg_collection(self) -> ProcessGroupCollection:

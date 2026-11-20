@@ -170,6 +170,7 @@ def _make_config(tp: int = 1) -> TransformerConfig:
         mamba_num_groups=4,
         mamba_state_dim=16,
         gdp_num_householder=2,
+        gdp_backend="fla",  # Full-forward references use small heads and also run on H100.
         is_hybrid_model=True,  # needed for correct out_proj init
         tensor_model_parallel_size=tp,
         sequence_parallel=False,

@@ -54,6 +54,7 @@ def test_runtime_cp_full_mixer_matches_static_cp(variant):
             mamba_num_groups=2,
             mamba_state_dim=128 if variant == "mamba" else 32,
             gdp_num_householder=1,
+            gdp_backend="fla",  # GDP parity cases use 32-wide heads and require FLA above.
             params_dtype=torch.bfloat16,
             bf16=True,
             use_mamba_mem_eff_path=True,

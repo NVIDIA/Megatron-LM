@@ -9,13 +9,13 @@ import torch
 from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer, _GDPRuntimeCP
 
 
-@pytest.mark.parametrize("cutedsl", [False, True])
-def test_beta_sigmoid_forward_and_backward(cutedsl: bool) -> None:
+@pytest.mark.parametrize("backend", ["fla", "cudnn"])
+def test_beta_sigmoid_forward_and_backward(backend: str) -> None:
     """Preserve BF16 beta values without losing the sigmoid gradient at saturation."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logits = torch.tensor(
         [-8, -6, -1, 0, 1, 5, 6, 6.25, 7, 8, 8.5, 9], device=device, dtype=torch.bfloat16
-    ).reshape(2, 1, 6)
+    ).reshape(1, 2, 6)
     ba = torch.cat((logits, torch.zeros_like(logits[..., :2])), dim=-1).requires_grad_()
     mixer = SimpleNamespace(
         nheads_local_cp=2,
@@ -24,7 +24,8 @@ def test_beta_sigmoid_forward_and_backward(cutedsl: bool) -> None:
         A_log=torch.zeros(2, device=device),
         dt_bias=torch.zeros(2, device=device),
         training=False,
-        config=SimpleNamespace(gdp_cutedsl_kernel=cutedsl, gdp_g_clamp_value=None),
+        config=SimpleNamespace(gdp_g_clamp_value=None),
+        gdp_backend=backend,
     )
     mixer._clamp_g = GatedDeltaProductMixer._clamp_g.__get__(mixer)
     runtime_cp = _GDPRuntimeCP(
@@ -38,7 +39,7 @@ def test_beta_sigmoid_forward_and_backward(cutedsl: bool) -> None:
     beta, _ = GatedDeltaProductMixer._compute_gating(
         cast(GatedDeltaProductMixer, mixer), ba, runtime_cp=runtime_cp
     )
-    expected_shape = (2, 6) if cutedsl else (2, 3, 2)
+    expected_shape = (2, 3, 2) if backend == "cudnn" else (1, 6, 2)
     torch.testing.assert_close(beta, logits.sigmoid().reshape(expected_shape), rtol=0, atol=0)
     assert beta.dtype == torch.bfloat16
     assert beta.is_contiguous()
