@@ -5914,6 +5914,13 @@ class TransformerConfig(ModelParallelConfig):
                     "2 cuda_graph_warmup_steps to record the pipeline schedule before capture."
                 )
 
+            if self.cuda_graph_impl == "full_iteration" and self.moe_paged_stash:
+                assert self.cuda_graph_warmup_steps >= 2, (
+                    "Full-iteration CUDA graphs with paged stash require at least two eager "
+                    "warmup steps to discover the stash schedule and allocate its buffers "
+                    "before capture."
+                )
+
             if self.recompute_granularity:
                 if self.recompute_granularity != "selective":
                     assert (
@@ -6706,16 +6713,25 @@ class TransformerConfig(ModelParallelConfig):
                     "('alltoall', 'flex'), "
                     f"got '{self.moe_token_dispatcher_type}'"
                 )
+                # pad_packed_seq_alignment='max', or an integer alignment equal to
+                # max_seqlen_per_dp_cp_rank, pads every pack to max_seqlen_per_dp_cp_rank tokens
+                # per CP rank before the CP slice (pad_packed_batch_before_cp_slice), so every
+                # dispatcher rank holds the same token count, the upstream padding the field's
+                # contract asks for; the per-layer all-reduce of the group maximum (a host
+                # synchronization) is then not needed.
                 if (
                     self.moe_megakernel_backend is None
                     and self.moe_token_dispatcher_type == "flex"
                     and self.moe_flex_dispatcher_backend == "hybridep"
                     and not self.moe_hybridep_pad_variable_tokens
+                    and self.pad_packed_seq_alignment not in ("max", self.max_seqlen_per_dp_cp_rank)
                 ):
                     raise ValueError(
                         "sequence_packing with HybridEP requires "
                         "moe_hybridep_pad_variable_tokens=True because packed token "
-                        "counts can differ across dispatcher ranks"
+                        "counts can differ across dispatcher ranks, unless "
+                        "pad_packed_seq_alignment ('max' or max_seqlen_per_dp_cp_rank) pads "
+                        "every pack to max_seqlen_per_dp_cp_rank"
                     )
 
         if self.cuda_graph_impl != "none" and (

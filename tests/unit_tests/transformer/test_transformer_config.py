@@ -837,12 +837,16 @@ def test_sequence_packing_moe_alltoall_dispatcher_passes():
 
 
 @requires_te_2_9
-def test_sequence_packing_moe_hybridep_requires_uneven_input_padding():
+@pytest.mark.parametrize("alignment", [None, 128])
+def test_sequence_packing_moe_hybridep_requires_uneven_input_padding(alignment):
+    # Without padding to max_seqlen_per_dp_cp_rank (no alignment, or a smaller one), the
+    # dispatcher ranks can hold different token counts.
     with pytest.raises(ValueError, match="HybridEP requires"):
         _make_packing_config(
             num_moe_experts=2,
             moe_token_dispatcher_type="flex",
             moe_flex_dispatcher_backend="hybridep",
+            pad_packed_seq_alignment=alignment,
         )
 
 
@@ -858,6 +862,23 @@ def test_sequence_packing_moe_hybridep_with_uneven_input_padding_passes():
     assert config.variable_seq_lengths is True
     assert config.moe_hybridep_pad_variable_tokens is True
     assert config.moe_hybridep_pad_uneven_dispatch_inputs is True
+
+
+@requires_te_2_9
+@pytest.mark.parametrize("alignment", ["max", 4096])
+def test_sequence_packing_moe_hybridep_with_max_padded_packs_needs_no_dispatch_padding(alignment):
+    # pad_packed_seq_alignment='max', or an integer equal to max_seqlen_per_dp_cp_rank, pads
+    # every pack to max_seqlen_per_dp_cp_rank tokens per CP rank, so every dispatcher rank
+    # holds the same token count.
+    config = _make_packing_config(
+        num_moe_experts=2,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        pad_packed_seq_alignment=alignment,
+        max_seqlen_per_dp_cp_rank=4096,
+    )
+
+    assert config.moe_hybridep_pad_variable_tokens is False
 
 
 @pytest.mark.parametrize(
