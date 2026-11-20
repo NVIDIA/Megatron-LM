@@ -91,3 +91,58 @@ def drop_transfer_prefix_blocks(
 
     trimmed_src_blocks = list(src_block_ids[prefix_count:])
     return trim_metadata(peer_meta), trimmed_src_blocks
+
+
+# Geometry fields two DSA index-key caches must share to exchange whole blocks.
+_DSA_INDEX_KEY_FIELDS = ("index_key_dtype", "head_dim", "tokens_per_block", "element_size")
+
+
+def dsa_index_key_transfer_view(dsa_memory_buffer: Any) -> Any:
+    """View a paged DSA index-key cache in the [planes, L, B, T, H, d] KV transfer layout.
+
+    The ``[L, B, T, Di]`` cache becomes one plane of one head.
+    """
+    if dsa_memory_buffer.dim() != 4:
+        raise ValueError(
+            f"DSA index-key cache must be 4-D [L, B, T, d], got {list(dsa_memory_buffer.shape)}"
+        )
+    return dsa_memory_buffer.unsqueeze(0).unsqueeze(4)
+
+
+def dsa_transfer_meta(peer_meta: Any, local_meta: dict) -> Any:
+    """Replace every rank descriptor in KV transfer metadata with its DSA index-key descriptor.
+
+    Keeps the flat/TP/PP nesting and per-rank or per-stage ``block_ids``, so the result can be
+    passed to the same transfer call as the KV metadata. Every peer descriptor must match this
+    rank's DSA descriptor ``local_meta``.
+    """
+
+    def convert(value: Any) -> Any:
+        if isinstance(value, list):
+            return [convert(entry) for entry in value]
+        if not isinstance(value, dict):
+            return value
+        if "pp_metas" in value or "tp_metas" in value:
+            converted = dict(value)
+            for key in ("pp_metas", "tp_metas"):
+                if key in converted:
+                    converted[key] = convert(converted[key])
+            return converted
+        peer_dsa = value.get("dsa")
+        if not isinstance(peer_dsa, dict):
+            raise ValueError(
+                "peer does not export DSA index keys; both engines must run the same DSA model"
+            )
+        mismatches = [
+            f"{field}: peer={peer_dsa.get(field)} local={local_meta.get(field)}"
+            for field in _DSA_INDEX_KEY_FIELDS
+            if peer_dsa.get(field) != local_meta.get(field)
+        ]
+        if mismatches:
+            raise ValueError(f"DSA index-key cache mismatch: {', '.join(mismatches)}")
+        converted = dict(peer_dsa)
+        if "block_ids" in value:
+            converted["block_ids"] = value["block_ids"]
+        return converted
+
+    return convert(peer_meta)
