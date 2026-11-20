@@ -46,6 +46,55 @@ See ModelOpt's example (https://github.com/NVIDIA/Model-Optimizer/tree/main/spec
 for more details. The final output is stored as `jsonlines` in an OpenAI chat completion format.
 
 
+### Stream teacher features to EAGLE3 (experimental)
+
+Use a [ModelOpt vLLM teacher server](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/speculative_decoding#megatron-eagle3-teacher-features)
+and an offline EAGLE3 GPTModel checkpoint prepared with
+`convert_speculative.py --algorithm eagle3 --export-offline-model`. The checkpoint and server
+must use the same teacher weights and tokenizer. Install a ModelOpt build with
+`MegatronEagleVllmStreamingDataset` and NIXL in the trainer environment.
+
+The following one-step Qwen3-0.6B smoke test assumes the server is already running on a separate
+GPU at port 18876 under the name `qwen3-teacher`. Set `TEACHER_MODEL` to the local teacher
+tokenizer directory and `OFFLINE_EAGLE_CKPT` to the converted checkpoint directory.
+
+```sh
+cat > train.jsonl <<'JSONL'
+{"conversation_id":"smoke","messages":[{"role":"user","content":"What is speculative decoding?"},{"role":"assistant","content":"A drafter proposes tokens and a teacher verifies them."}],"chat_template_kwargs":{"enable_thinking":false}}
+JSONL
+
+torchrun --standalone --nproc-per-node=1 examples/post_training/modelopt/finetune.py \
+    --num-layers 28 --hidden-size 1024 --ffn-hidden-size 3072 \
+    --num-attention-heads 16 --group-query-attention --num-query-groups 8 --kv-channels 128 \
+    --normalization RMSNorm --norm-epsilon 1e-6 --position-embedding-type rope \
+    --rotary-base 1000000 --swiglu --disable-bias-linear --make-vocab-size-divisible-by 1187 \
+    --seq-length 256 --max-position-embeddings 1024 --bf16 \
+    --tokenizer-type HuggingFaceTokenizer --tokenizer-model "$TEACHER_MODEL" \
+    --export-offline-model --export-model-type GPTModel --ckpt-format torch_dist \
+    --load "$OFFLINE_EAGLE_CKPT" --finetune --no-load-optim --no-load-rng \
+    --save eagle-smoke --save-interval 1 --no-save-optim --no-save-rng \
+    --micro-batch-size 1 --global-batch-size 1 --train-iters 1 --lr 1e-4 --lr-decay-style constant \
+    --no-gradient-accumulation-fusion --no-masked-softmax-fusion --no-bias-swiglu-fusion \
+    --mock-data --dataloader-type single --num-workers 0 --eval-iters 0 --log-interval 1 \
+    --eagle-streaming-server-urls http://127.0.0.1:18876 \
+    --eagle-streaming-model qwen3-teacher --eagle-streaming-train-data train.jsonl
+```
+
+For a checkpoint with zero-based auxiliary layer IDs `[1, 13, 24]`, configure captures
+`[2, 14, 25, 28]`. The server counts completed layers. Keep auxiliary captures in checkpoint
+order and append the final layer as a distinct pre-norm capture. The adapter emits `S+1` token IDs
+and an unshifted loss mask, plus `S` BF16 rows for each feature tensor. Megatron shifts the IDs
+and mask once to build next-token training batches and passes the final residual to ModelOpt with
+`base_hidden_prenorm=True` so ModelOpt applies the saved teacher final norm before the LM head.
+
+Use BF16, micro-batch size 1, CP=PP=1, and one conversation per sample. The trainer reads the
+JSONL through the streaming flags. Here `--mock-data` satisfies Megatron's generic data-source
+validation. The capture slot must hold the full prompt and the server must allow one extra
+generation token. For same-host UCX, set `NIXL_BACKENDS=UCX` and `UCX_TLS=tcp,sm,self,cuda_copy`
+on both processes. Supply `--eagle-streaming-valid-data` when using nonzero `--eval-iters`.
+Optional test data uses `--eagle-streaming-test-data`. To supervise only assistant tokens, use
+`--eagle-streaming-answer-only-loss` with a compatible chat template.
+
 ### Quantization-Aware Training (QAT)
 
 For quantize-aware training (QAT), the process is `bf16 training`, `fake quantization`, `qat`.

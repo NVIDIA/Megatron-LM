@@ -12,21 +12,21 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 import datasets
 import torch
 import transformers
+from utils import build_lm_batch, get_eos_token_id, get_hf_tokenizer
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
+from megatron.core.parallel_state import get_context_parallel_group
+from megatron.core.utils import get_attr_wrapped_model
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.loss_func import loss_func
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.non_loss_data_func import report_draft_acceptance_length
 from megatron.training import get_args, get_timers, pretrain
-from megatron.training.utils import print_rank_0
 from megatron.training.global_vars import set_run_config
-from utils import build_lm_batch, get_eos_token_id, get_hf_tokenizer
+from megatron.training.utils import print_rank_0
 from model_provider import model_provider
-from megatron.core.parallel_state import get_context_parallel_group
-
 
 REMOVE_THINK_CHAT_TEMPLATE = (
     "{% if '</think>' in content %}{% set content = content.split('</think>')[-1] %}{% endif %}"
@@ -37,7 +37,12 @@ def add_finetune_args(parser):
     """Add additional arguments for finetune."""
     group = parser.add_argument_group(title='Finetune')
     group.add_argument("--offline-distillation-data", type=str, help="Path to the offline dataset directory with base model features.")
-
+    group.add_argument("--eagle-streaming-server-urls", help="Comma-separated vLLM endpoints.")
+    group.add_argument("--eagle-streaming-model", help="Model ID served by those endpoints.")
+    group.add_argument("--eagle-streaming-train-data", help="Local JSONL conversation corpus.")
+    group.add_argument("--eagle-streaming-valid-data", help="Optional validation JSONL corpus.")
+    group.add_argument("--eagle-streaming-test-data", help="Optional test JSONL corpus.")
+    group.add_argument("--eagle-streaming-answer-only-loss", action="store_true")
 
     add_modelopt_args(parser)
     return parser
@@ -446,7 +451,32 @@ def train_valid_test_sft_datasets_provider(train_val_test_num_samples):
     if args.micro_batch_size > 1:
         raise ValueError("SFTDataloader only supports micro_batch_size=1.")
 
-    if args.export_offline_model:
+    if args.eagle_streaming_server_urls is not None:
+        # Only streaming needs the ModelOpt vLLM reader.
+        from modelopt.torch.speculative.plugins.hf_streaming_dataset import (
+            EagleVllmStreamingConfig,
+            MegatronEagleVllmStreamingDataset,
+        )
+
+        config = EagleVllmStreamingConfig(
+            server_urls=args.eagle_streaming_server_urls,
+            model=args.eagle_streaming_model,
+            max_seq_len=args.seq_length,
+            answer_only_loss=args.eagle_streaming_answer_only_loss,
+        )
+        train_ds, valid_ds, test_ds = (
+            MegatronEagleVllmStreamingDataset(
+                datasets.load_dataset("json", data_files=path, split="train"),
+                hf_tokenizer,
+                config,
+            ) if path is not None else None
+            for path in (
+                args.eagle_streaming_train_data,
+                args.eagle_streaming_valid_data,
+                args.eagle_streaming_test_data,
+            )
+        )
+    elif args.export_offline_model:
         train_ds = OfflineDataset(os.path.join(args.offline_distillation_data, "train"), train_val_test_num_samples[0])
         valid_ds = OfflineDataset(os.path.join(args.offline_distillation_data, "valid"), train_val_test_num_samples[1])
         test_ds = OfflineDataset(os.path.join(args.offline_distillation_data, "test"), train_val_test_num_samples[2])
@@ -489,7 +519,8 @@ def get_batch(data_iterator):
         data = next(data_iterator)
     else:
         data = None
-    if not args.export_offline_model:
+    streaming = args.eagle_streaming_server_urls is not None
+    if streaming or not args.export_offline_model:
         keys = ["input_ids", "loss_mask"]
         datatype = torch.int64
         data_b = tensor_parallel.broadcast_data(keys, data, datatype)
@@ -500,11 +531,6 @@ def get_batch(data_iterator):
         data_b["loss_mask"] = torch.ones_like(data_b["input_ids"])
         data_b["loss_mask"][data_b["loss_mask"] == get_eos_token_id()] = 0
         data_b["loss_mask"] = torch.cat([data_b["loss_mask"], torch.zeros(1,1).to(torch.cuda.current_device())], dim=-1)
-
-        keys = ["aux_hidden_states", "hidden_states"]
-        datatype = torch.bfloat16
-        feature_b = tensor_parallel.broadcast_data(keys, data, datatype)
-
 
     sample_loss_mask = data_b.get("loss_mask")
     batch = build_lm_batch(
@@ -519,6 +545,9 @@ def get_batch(data_iterator):
     )
 
     if args.export_offline_model:
+        feature_b = tensor_parallel.broadcast_data(
+            ["aux_hidden_states", "hidden_states"], data, torch.bfloat16
+        )
         batch["aux_hidden_states"] = feature_b["aux_hidden_states"].transpose(0, 1)[: args.seq_length]
         batch["hidden_states"] = feature_b["hidden_states"].transpose(0, 1)[: args.seq_length]
 
@@ -546,6 +575,9 @@ def forward_step(data_iterator, model: GPTModel):
     timers = get_timers()
 
     args = get_args()
+    streaming = args.eagle_streaming_server_urls is not None
+    if streaming and not get_attr_wrapped_model(model, "eagle_offline"):
+        raise ValueError("Streaming requires a checkpoint converted for offline EAGLE.")
 
     # Get the batch.
     timers("batch-generator", log_level=2).start()
@@ -555,17 +587,51 @@ def forward_step(data_iterator, model: GPTModel):
     loss_mask = batch["loss_mask"]
     attention_mask = batch["attention_mask"]
     position_ids = batch["position_ids"]
-    if args.export_offline_model:
-        aux_hidden_states = batch["aux_hidden_states"]
-        hidden_states = batch["hidden_states"]
     timers("batch-generator").stop()
 
+    model_kwargs = {}
     if args.export_offline_model:
-        output_tensor = model(tokens, position_ids, attention_mask, labels=labels, aux_hidden_states=aux_hidden_states, hidden_states=hidden_states,)
-    else:
-        output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
+        model_kwargs.update(
+            aux_hidden_states=batch["aux_hidden_states"], hidden_states=batch["hidden_states"]
+        )
+    if streaming:
+        model_kwargs["base_hidden_prenorm"] = True
+    output_tensor = model(tokens, position_ids, attention_mask, labels=labels, **model_kwargs)
 
     return output_tensor, partial(loss_func, loss_mask, model=model)
+
+
+def validate_eagle_streaming_args(args):
+    """Require an offline EAGLE checkpoint and the supported trainer layout for streaming."""
+    if args.eagle_streaming_server_urls is None:
+        if (
+            args.eagle_streaming_model is not None
+            or args.eagle_streaming_train_data is not None
+            or args.eagle_streaming_valid_data is not None
+            or args.eagle_streaming_test_data is not None
+            or args.eagle_streaming_answer_only_loss
+        ):
+            raise ValueError("EAGLE streaming options require --eagle-streaming-server-urls.")
+        return
+    if not args.eagle_streaming_model or not args.eagle_streaming_train_data:
+        raise ValueError("Streaming requires --eagle-streaming-model and --eagle-streaming-train-data.")
+    if not args.export_offline_model or not args.load or args.export_model_type != "GPTModel":
+        raise ValueError("Streaming requires loading an offline EAGLE GPTModel checkpoint.")
+    if args.offline_distillation_data is not None:
+        raise ValueError("Choose one of streaming and --offline-distillation-data.")
+    if args.micro_batch_size != 1:
+        raise ValueError("EAGLE streaming requires --micro-batch-size 1.")
+    if (
+        not args.bf16
+        or args.context_parallel_size != 1
+        or args.pipeline_model_parallel_size != 1
+        or args.dynamic_context_parallel
+    ):
+        raise ValueError("EAGLE streaming requires BF16 and CP=PP=1.")
+    if args.dataloader_type == "external" or args.full_validation:
+        raise ValueError("EAGLE streaming requires a built-in sampler without full validation.")
+    if args.eval_iters and not args.eagle_streaming_valid_data:
+        raise ValueError("Specify --eagle-streaming-valid-data or set --eval-iters 0.")
 
 
 if __name__ == "__main__":
@@ -576,6 +642,7 @@ if __name__ == "__main__":
         extra_args_provider=add_finetune_args,
         args_defaults={"tokenizer_type": "HuggingFaceTokenizer"},
     )
+    validate_eagle_streaming_args(args)
     full_config = pretrain_cfg_container_from_args(args)
     set_run_config(full_config)
     pretrain(
