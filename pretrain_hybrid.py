@@ -60,13 +60,15 @@ from megatron.training.datasets.providers import build_gpt_datasets, is_dataset_
 from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import is_first_or_last_pipeline_stage
-from model_provider import model_provider
 
 try:
     from megatron.post_training.arguments import add_modelopt_args
     from megatron.post_training.loss_func import loss_func as loss_func_modelopt
-    from megatron.post_training.model_builder import ModelOptHybridModelConfig
-    from megatron.post_training.utils import maybe_enable_modelopt
+    from megatron.post_training.model_config import (
+        apply_modelopt_model_config,
+        distillation_config_from_args,
+    )
+    from megatron.post_training.utils import is_distillation_model, should_use_modelopt_config
 
     has_nvidia_modelopt = True
 except ImportError:
@@ -125,11 +127,17 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
     is_sft = args.sft
     has_cu_seqlens = is_sft or args.dataloader_inter_document_masking
     create_attention_mask_in_dataloader = args.create_attention_mask_in_dataloader
+    # Use the caller's pipeline group when it is given, so a model on its own grid places MTP by
+    # the same group the model uses (GPTModel/HybridModel read pg_collection.pp).
+    pp_group = pg_collection.pp if pg_collection is not None else None
+    if pp_group is None:
+        pp_group = mpu.get_pipeline_model_parallel_group()
     mtp_on_this_rank = mtp_on_this_rank_func(
         layout=cfg.model.transformer.pipeline_model_parallel_layout,
         mtp_num_layers=cfg.model.transformer.mtp_num_layers,
         ignore_virtual=False,
         vp_stage=vp_stage,
+        pp_group=pp_group,
     )
     # Dynamic CP always uses the sequence-packing path above.
     assert not cfg.model.transformer.dynamic_context_parallel
@@ -267,7 +275,7 @@ def loss_func(
             ignore_hash=args.logits_load_ignore_hash,
         )
         loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
-    elif has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
+    elif has_nvidia_modelopt and is_distillation_model(model):  # [ModelOpt]
         loss, num_tokens, report = loss_func_modelopt(loss_mask, output_tensor, model=model)
     else:
         losses = output_tensor.view(-1).float()
@@ -478,17 +486,13 @@ if __name__ == "__main__":
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
-    if has_nvidia_modelopt:
-        maybe_enable_modelopt(args)
-    if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
-        model_cfg = hybrid_config_from_args(
-            args, model_config_cls=ModelOptHybridModelConfig, vocab_size_from_tokenizer=True
-        )
-    else:
-        model_cfg = hybrid_config_from_args(args, vocab_size_from_tokenizer=True)
+    model_cfg = hybrid_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(
         args, model_cfg, data_cfg=gpt_data_config_from_args(args)
     )
+    if has_nvidia_modelopt and should_use_modelopt_config(args):
+        apply_modelopt_model_config(full_config.model, args)
+        full_config.distillation = distillation_config_from_args(args, full_config.model)
     set_run_config(full_config)
     pretrain(
         full_config,

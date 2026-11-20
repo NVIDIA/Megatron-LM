@@ -25,6 +25,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
 from megatron.training.models.dist_utils import unimodal_build_distributed_models
+from megatron.training.models.transforms import ModelTransformConfig
 from megatron.training.vocab_utils import calculate_padded_vocab_size
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,12 @@ class HybridModelConfig(ModelConfig):
     tp_comm_overlap_cfg: str | dict[str, Any] | None = None
     """User-buffer settings, or their YAML path, when TP communication overlap is enabled."""
 
+    ### ModelOpt ###
+    transformations: ModelTransformConfig | None = None
+    """Declarative ModelOpt options. The builder selects the ModelOpt layer spec from it; the
+    training and inference entry points install the matching pre-wrap hooks
+    (``megatron.post_training.model_hooks.modelopt_setup_hooks``)."""
+
     @property
     def mamba_stack_spec(self):
         """Deprecated alias for hybrid_stack_spec."""
@@ -115,6 +122,11 @@ class HybridModelConfig(ModelConfig):
         else:
             super().__setattr__(name, value)
 
+    def validate(self) -> None:
+        """Check the ModelOpt transformations against the transformer implementation."""
+        if self.transformations is not None:
+            self.transformations.validate(self.transformer.transformer_impl)
+
     def finalize(self) -> None:
         """Finalize nested model settings before the run derives optimizer precision."""
 
@@ -122,11 +134,27 @@ class HybridModelConfig(ModelConfig):
             self.transformer.finalize()
 
 
+def _check_modelopt_spec_supported(use_wide_residual: bool) -> None:
+    if use_wide_residual:
+        raise NotImplementedError(
+            "wide_residual does not support ModelOpt HybridStack specs because they "
+            "do not statically construct wide-residual layer classes."
+        )
+
+
 def resolve_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:
     """Return the configured stack spec, or the default one for the transformer config."""
     if model_config.hybrid_stack_spec is not None:
         return model_config.hybrid_stack_spec
     use_wide_residual = model_config.transformer.wide_residual is not None
+    if model_config.transformations is not None:
+        _check_modelopt_spec_supported(use_wide_residual)
+        options = model_config.transformations
+        return get_hybrid_stack_modelopt_spec(
+            remap_te_layernorm=not options.default_te_spec,
+            use_default_te_spec=options.default_te_spec,
+            moe_grouped_gemm=options.moe_grouped_gemm,
+        )
     if model_config.transformer.transformer_impl == "inference_optimized":
         return (
             wide_residual_hybrid_inference_stack_spec
@@ -134,11 +162,9 @@ def resolve_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:
             else hybrid_inference_stack_spec
         )
     if model_config.restore_modelopt_state:
-        if use_wide_residual:
-            raise NotImplementedError(
-                "wide_residual does not support ModelOpt HybridStack specs because they "
-                "do not statically construct wide-residual layer classes."
-            )
+        # Megatron-Bridge compatibility only; Megatron-LM uses model_config.transformations above.
+        # Keeps the unfused norm keys: Bridge loads without Megatron-LM's checkpoint key aliases.
+        _check_modelopt_spec_supported(use_wide_residual)
         return get_hybrid_stack_modelopt_spec(local_core_attention=False, remap_te_layernorm=False)
     return wide_residual_hybrid_stack_spec if use_wide_residual else default_hybrid_stack_spec
 
@@ -236,6 +262,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
         use_layer_wise_param_layout: bool = True,
+        device: torch.device | str | None = None,
     ) -> list[HybridModel]:
         """Build model stages and wrap for distributed training.
 
@@ -248,6 +275,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             use_torch_fsdp2: Whether to use Torch FSDP 2.0
             wrap_with_ddp: Set to False to skip the DDP/FSDP wrapper.
             data_parallel_random_init: Whether to use data parallel random initialization
+            device: Explicit final device, including for meta materialization; None keeps the default.
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
             model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
@@ -274,6 +302,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             model_type,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
             use_layer_wise_param_layout=use_layer_wise_param_layout,
+            device=device,
         )
 
         composed_post_wrap_hook = compose_hooks(self._model_config.post_wrap_hooks)
