@@ -251,15 +251,15 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
     strategies such as All-to-All and All-Gather.
     """
 
-    @classmethod
     def estimate_flops(
-        cls,
-        config: TransformerConfig,
+        self,
         *,
         total_real_tokens_in_batch: float,
         seqlen_squared_sum_in_batch: float,
+        include_backward: bool = False,
     ) -> float:
-        """Estimate forward FLOPs for routed/shared experts and latent projections."""
+        """Estimate FLOPs for routed/shared experts and latent projections."""
+        config = self.config
         tokens = total_real_tokens_in_batch
         projections = 3 if config.gated_linear_unit else 2
         expert_width = config.moe_ffn_hidden_size or config.ffn_hidden_size
@@ -276,7 +276,8 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
             * config.hidden_size
             * (config.moe_shared_expert_intermediate_size or 0)
         )
-        return routed + shared
+        forward = routed + shared
+        return (3 if include_backward else 1) * forward
 
     def __init__(
         self,

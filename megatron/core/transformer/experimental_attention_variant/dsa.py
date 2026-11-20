@@ -35,7 +35,7 @@ from megatron.core.transformer.experimental_attention_variant import (
 )
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import ensure_params_ready, get_pg_size
 
 logger = logging.getLogger(__name__)
@@ -2206,10 +2206,8 @@ class DSAIndexer(MegatronModule):
         https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py#L431-L480
     """
 
-    @classmethod
     def estimate_flops(
-        cls,
-        config: TransformerConfig,
+        self,
         *,
         total_real_tokens_in_batch: float,
         seqlen_squared_sum_in_batch: float,
@@ -2221,6 +2219,7 @@ class DSAIndexer(MegatronModule):
         cost fwd + wgrad and scoring costs dense fwd plus dense or sparse dq/dk.
         Do not apply the ordinary x3 multiplier when include_backward is true.
         """
+        config = self.config
         total_tokens = total_real_tokens_in_batch
         seqlen_squared_sum = seqlen_squared_sum_in_batch
         dsa_indexer_loss_enabled = (config.dsa_indexer_loss_coeff or 0) > 0
@@ -2872,6 +2871,55 @@ def unfused_dsa_fn(
     return output
 
 
+def dsa_attention_flops(
+    config: MLATransformerConfig,
+    *,
+    total_real_tokens_in_batch: float,
+    seqlen_squared_sum_in_batch: float,
+    absorbed_mla: bool = True,
+) -> float:
+    """Count the DSA projection and sparse attention work for one forward pass."""
+    from megatron.core.transformer.multi_latent_attention import mla_projection_flops_per_token
+
+    total_tokens = total_real_tokens_in_batch
+    seqlen_squared_sum = seqlen_squared_sum_in_batch
+    num_attention_heads = config.num_attention_heads
+    kv_lora_rank = config.kv_lora_rank
+    qk_head_dim = config.qk_head_dim
+    qk_pos_emb_head_dim = config.qk_pos_emb_head_dim
+    v_head_dim = config.v_head_dim
+    dsa_indexer_topk = config.dsa_indexer_topk
+    dsa_indexer_kpool = config.dsa_indexer_kpool
+    dsa_indexer_kpool_always_select_tail = config.dsa_indexer_kpool_always_select_tail
+    if dsa_indexer_kpool > 1:
+        sparse_core_scale = _dsa_kpool_attention_scale(
+            total_tokens,
+            seqlen_squared_sum,
+            dsa_indexer_topk,
+            dsa_indexer_kpool,
+            dsa_indexer_kpool_always_select_tail,
+        )
+    else:
+        sparse_core_scale = _dsa_sparse_core_scale(
+            total_tokens, seqlen_squared_sum, dsa_indexer_topk
+        )
+    core = (
+        2
+        * (
+            num_attention_heads * (kv_lora_rank + qk_pos_emb_head_dim) / 2
+            + num_attention_heads * kv_lora_rank / 2
+        )
+        * sparse_core_scale
+    )
+    if not absorbed_mla:
+        core = (
+            num_attention_heads
+            * (qk_head_dim + qk_pos_emb_head_dim + v_head_dim)
+            * sparse_core_scale
+        )
+    return total_tokens * mla_projection_flops_per_token(config) + seqlen_squared_sum * core
+
+
 class DSAttention(MegatronModule):
     """
     This module implements sparse attention mechanism using an DSA Indexer to compute top-k
@@ -2881,75 +2929,16 @@ class DSAttention(MegatronModule):
         https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py#L491-L597
     """
 
-    @classmethod
     def estimate_flops(
-        cls,
-        config: TransformerConfig,
-        *,
-        total_real_tokens_in_batch: float,
-        seqlen_squared_sum_in_batch: float,
-        absorbed_mla: bool = True,
+        self, *, include_backward: bool = False, absorbed_mla: bool = True, **batch_stats: float
     ) -> float:
-        """Estimate forward DSA projections and attention, excluding indexer FLOPs.
-
-        The estimator includes FMA x2. The indexer has separate execution counts and
-        loss-dependent backward work; account for it with DSAIndexer.estimate_flops.
-        """
-        total_tokens = total_real_tokens_in_batch
-        seqlen_squared_sum = seqlen_squared_sum_in_batch
-        hidden_size = config.hidden_size
-        num_attention_heads = config.num_attention_heads
-        q_lora_rank = config.q_lora_rank
-        kv_lora_rank = config.kv_lora_rank
-        qk_head_dim = config.qk_head_dim
-        qk_pos_emb_head_dim = config.qk_pos_emb_head_dim
-        v_head_dim = config.v_head_dim
-        dsa_indexer_topk = config.dsa_indexer_topk
-        dsa_indexer_kpool = config.dsa_indexer_kpool
-        dsa_indexer_kpool_always_select_tail = config.dsa_indexer_kpool_always_select_tail
-        if q_lora_rank is None:
-            q_term = hidden_size * num_attention_heads * (qk_head_dim + qk_pos_emb_head_dim)
-        else:
-            q_term = q_lora_rank * (
-                hidden_size + num_attention_heads * (qk_head_dim + qk_pos_emb_head_dim) + 1
-            )
-        fma_expansion_factor = 2
-        token_linear = fma_expansion_factor * (
-            ## q lora + rope + q norm
-            q_term
-            ## kv lora + rope + kv norm
-            + kv_lora_rank * (hidden_size + num_attention_heads * (qk_head_dim + v_head_dim) + 1)
-            + hidden_size * qk_pos_emb_head_dim
-            ## o proj
-            + (num_attention_heads * v_head_dim) * hidden_size
+        """Compose attention and the indexer actually executed by this layer."""
+        flops = (3 if include_backward else 1) * dsa_attention_flops(
+            self.config, absorbed_mla=absorbed_mla, **batch_stats
         )
-        if dsa_indexer_kpool > 1:
-            sparse_core_scale = _dsa_kpool_attention_scale(
-                total_tokens,
-                seqlen_squared_sum,
-                dsa_indexer_topk,
-                dsa_indexer_kpool,
-                dsa_indexer_kpool_always_select_tail,
-            )
-        else:
-            sparse_core_scale = _dsa_sparse_core_scale(
-                total_tokens, seqlen_squared_sum, dsa_indexer_topk
-            )
-        core = (
-            fma_expansion_factor
-            * (
-                num_attention_heads * (kv_lora_rank + qk_pos_emb_head_dim) / 2
-                + num_attention_heads * kv_lora_rank / 2
-            )
-            * sparse_core_scale
-        )
-        if not absorbed_mla:
-            core = (
-                num_attention_heads
-                * (qk_head_dim + qk_pos_emb_head_dim + v_head_dim)
-                * sparse_core_scale
-            )
-        return total_tokens * token_linear + seqlen_squared_sum * core
+        if self.indexer is not None:
+            flops += self.indexer.estimate_flops(include_backward=include_backward, **batch_stats)
+        return flops
 
     consumes_absorbed_v_up_projection = True
     requires_dsa_inputs = True

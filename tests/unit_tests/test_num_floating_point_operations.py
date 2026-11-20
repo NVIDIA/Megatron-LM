@@ -29,6 +29,7 @@ from megatron.training.training import (
     num_floating_point_operations,
     update_seqlen_stats_from_cu_seqlens,
 )
+from tests.unit_tests.test_utilities import make_flops_test_layer
 
 
 def _reset_seqlen_accumulator():
@@ -1091,9 +1092,9 @@ class TestDSAHelperEdgeCases:
         """
         args, _ = _make_dsa_args(loss_coeff, sparse_loss)
         args.dsa_indexer_topk = topk
+        indexer = make_flops_test_layer(DSAIndexer, args.transformer)
         assert (
-            DSAIndexer.estimate_flops(
-                args.transformer,
+            indexer.estimate_flops(
                 total_real_tokens_in_batch=256,
                 seqlen_squared_sum_in_batch=32768,
                 include_backward=True,
@@ -1164,10 +1165,9 @@ class TestDSAFlopsHelpers:
             args, total_tokens, sum_sq, num_dsa_layers=1, num_indexer_layers=0
         )
         expected = (total_tokens * token_term + sum_sq * core_term) / 3
-        assert DSAttention.estimate_flops(
-            args.transformer,
-            total_real_tokens_in_batch=total_tokens,
-            seqlen_squared_sum_in_batch=sum_sq,
+        attention = make_flops_test_layer(DSAttention, args.transformer, indexer=None)
+        assert attention.estimate_flops(
+            total_real_tokens_in_batch=total_tokens, seqlen_squared_sum_in_batch=sum_sq
         ) == pytest.approx(expected, rel=1e-15)
 
     @pytest.mark.parametrize("pattern, num_indexer_layers", [(None, 2), ("D-D-|D-D-/D-/D-", 4)])
@@ -1380,10 +1380,9 @@ class TestDSAKPool:
         expected = 2 * length * (projections + 2 * 32 * compression) + 2 * length**2 * (
             4 * 32 * scoring
         )
-        flops = DSAIndexer.estimate_flops(
-            args.transformer,
-            total_real_tokens_in_batch=2 * length,
-            seqlen_squared_sum_in_batch=2 * length**2,
+        indexer = make_flops_test_layer(DSAIndexer, args.transformer)
+        flops = indexer.estimate_flops(
+            total_real_tokens_in_batch=2 * length, seqlen_squared_sum_in_batch=2 * length**2
         )
         assert actual == pytest.approx(attention)
         assert flops == pytest.approx(expected)
@@ -1414,8 +1413,9 @@ class TestDSAKPool:
         )
         compression = 2 * tokens * compression_scale * args.dsa_indexer_head_dim
         scoring = sum_sq * index_dim * scoring_scale
-        assert DSAIndexer.estimate_flops(
-            args.transformer, total_real_tokens_in_batch=tokens, seqlen_squared_sum_in_batch=sum_sq
+        indexer = make_flops_test_layer(DSAIndexer, args.transformer)
+        assert indexer.estimate_flops(
+            total_real_tokens_in_batch=tokens, seqlen_squared_sum_in_batch=sum_sq
         ) == pytest.approx(projections + compression + scoring)
 
     @pytest.mark.parametrize("pool_size", [2, 4, 8])
@@ -1485,9 +1485,9 @@ class TestDSAKPool:
     def test_invalid_indexer_loss(self):
         args, _ = _make_dsa_args()
         args.dsa_indexer_kpool = 4
+        indexer = make_flops_test_layer(DSAIndexer, args.transformer)
         with pytest.raises(ValueError, match="indexer loss to be disabled"):
-            DSAIndexer.estimate_flops(
-                args.transformer,
+            indexer.estimate_flops(
                 total_real_tokens_in_batch=512,
                 seqlen_squared_sum_in_batch=131072,
                 include_backward=True,
@@ -1510,9 +1510,7 @@ class TestDSAKPool:
         assert _dsa_kpool_attention_scale(0, 0, 16, 4, True) == 0
         args, _ = _make_dsa_args(dsa_indexer_loss_coeff=0)
         args.dsa_indexer_kpool = 4
+        indexer = make_flops_test_layer(DSAIndexer, args.transformer)
         assert (
-            DSAIndexer.estimate_flops(
-                args.transformer, total_real_tokens_in_batch=0, seqlen_squared_sum_in_batch=0
-            )
-            == 0
+            indexer.estimate_flops(total_real_tokens_in_batch=0, seqlen_squared_sum_in_batch=0) == 0
         )

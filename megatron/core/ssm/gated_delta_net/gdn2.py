@@ -23,7 +23,6 @@ from megatron.core.ssm.gated_delta_net.common import (
     get_parameter_local_cp,
     l2norm,
 )
-from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     deprecate_inference_params,
     get_pg_size,
@@ -63,16 +62,16 @@ class GatedDeltaNet2(_GDNBase):
     The layer takes input with size [s, b, h] and returns output of the same size.
     """
 
-    @classmethod
     def estimate_flops(
-        cls,
-        config: TransformerConfig,
+        self,
         *,
         total_real_tokens_in_batch: float,
         seqlen_squared_sum_in_batch: float,
+        include_backward: bool = False,
     ) -> float:
-        """Estimate forward FLOPs including GDN2's channel-wise gate projections."""
-        return cls._estimate_flops(config, total_real_tokens_in_batch, use_gdn2=True)
+        """Estimate FLOPs including GDN2's channel-wise gate projections."""
+        forward = _GDNBase._estimate_flops(self.config, total_real_tokens_in_batch, use_gdn2=True)
+        return (3 if include_backward else 1) * forward
 
     def _setup_variant_attrs(self):
         """Set the GDN2 in_proj sizing, split tables, gate parameter dims, and kernel."""

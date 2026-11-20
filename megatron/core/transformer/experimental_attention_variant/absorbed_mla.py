@@ -144,31 +144,16 @@ class AbsorbedMLASelfAttention(Attention):
     computation which can be more efficient for certain attention variants.
     """
 
-    @classmethod
-    def estimate_flops(
-        cls,
-        config: MLATransformerConfig,
-        *,
-        total_real_tokens_in_batch: float,
-        seqlen_squared_sum_in_batch: float,
-    ) -> float:
-        """Estimate forward absorbed DSA attention, excluding its separately counted indexer."""
-        from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
-        from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import (
-            DSALayerConfig,
-        )
-        from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+    def estimate_flops(self, *, include_backward: bool = False, **batch_stats: float) -> float:
+        """Include the constructed sparse core's indexer and optional backward work."""
+        if getattr(self.core_attention, "requires_dsa_inputs", False):
+            return getattr(self.core_attention, "estimate_flops")(
+                absorbed_mla=True, include_backward=include_backward, **batch_stats
+            )
+        from megatron.core.transformer.multi_latent_attention import mla_attention_flops
 
-        estimator = (
-            DSAttention
-            if isinstance(config, DSALayerConfig) or config.experimental_attention_variant == "dsa"
-            else MLASelfAttention
-        )
-        return estimator.estimate_flops(
-            config,
-            total_real_tokens_in_batch=total_real_tokens_in_batch,
-            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
-        )
+        forward = mla_attention_flops(self.config, absorbed_mla=True, **batch_stats)
+        return (3 if include_backward else 1) * forward
 
     def _mla_projection_context(self, *, is_init: bool = False):
         """Use high precision for MLA projections only when explicitly requested."""

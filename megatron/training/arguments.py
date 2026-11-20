@@ -40,6 +40,7 @@ from megatron.training.argument_utils import (  # noqa: F401 # pylint: disable=u
 )
 from megatron.training.utils import (
     get_device_arch_version,
+    is_hybrid_model,
     print_rank_0,
     setup_multi_storage_client,
     update_use_dist_ckpt,
@@ -851,14 +852,13 @@ def validate_args(args, defaults={}):
         if args.virtual_pipeline_model_parallel_size == 1:
             args.virtual_pipeline_model_parallel_size = None
     else:
-        # Only set VPP to None if it wasn't already derived from --hybrid-layer-pattern
-        if args.hybrid_layer_pattern is None:
+        # CLI patterns and Python configs may already provide the VPP topology.
+        if not hasattr(args, 'virtual_pipeline_model_parallel_size'):
             args.virtual_pipeline_model_parallel_size = None
 
         if args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None:
-            # Divisibility check not applicable for T5 models which specify encoder_num_layers
-            # and decoder_num_layers, or for hybrid models using --hybrid-layer-pattern.
-            if args.num_layers is not None and args.hybrid_layer_pattern is None:
+            # HybridModel validates its pipeline splits when it builds the architecture.
+            if args.num_layers is not None and not is_hybrid_model(args):
                 num_layers = args.num_layers
 
                 if args.account_for_embedding_in_pipeline_split:

@@ -77,25 +77,24 @@ class MegatronModule(torch.nn.Module):
         super().__init__()
         self.config = config
 
-    @classmethod
     def estimate_flops(
-        cls,
-        config: TransformerConfig,
+        self,
         *,
         total_real_tokens_in_batch: float,
         seqlen_squared_sum_in_batch: float,
+        include_backward: bool = False,
     ) -> float:
-        """Estimate this module's forward FLOPs for one global batch from its config.
+        """Estimate this module's work for one global batch.
 
-        Built-in and custom layers share this optional hook. It must be pure:
-        do not mutate the config, construct modules, or run collectives.
-        Return a finite nonnegative real number. Training accounts for repeated
-        layer executions and applies the forward/backward multiplier separately.
+        Return forward FLOPs by default, or forward plus backward when requested.
+        Each concrete layer implements its own estimate; composites sum their children.
+        Custom layers implement this method directly; no registration is required.
 
-        Include multiply/add operations, but exclude model-level work such as logits.
+        Estimates must be pure, finite, nonnegative real numbers. Do not construct
+        modules, mutate state, or run collectives. Count each child execution once.
         """
         raise NotImplementedError(
-            f"{cls.__name__} must implement estimate_flops for layer FLOP accounting."
+            f"{type(self).__name__} must implement estimate_flops for layer FLOP accounting."
         )
 
     def refresh_cache(self) -> None:

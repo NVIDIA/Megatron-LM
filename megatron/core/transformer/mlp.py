@@ -171,23 +171,24 @@ class MLP(MegatronModule):
      s: sequence length
     """
 
-    @classmethod
     def estimate_flops(
-        cls,
-        config: TransformerConfig,
+        self,
         *,
         total_real_tokens_in_batch: float,
         seqlen_squared_sum_in_batch: float,
+        include_backward: bool = False,
     ) -> float:
-        """Estimate forward projection FLOPs for a dense MLP."""
+        """Estimate projection FLOPs for a dense MLP."""
+        config = self.config
         projections = 3 if config.gated_linear_unit else 2
-        return (
+        forward = (
             2
             * projections
             * total_real_tokens_in_batch
             * config.hidden_size
             * config.ffn_hidden_size
         )
+        return (3 if include_backward else 1) * forward
 
     def __init__(
         self,
