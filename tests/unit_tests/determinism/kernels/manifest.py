@@ -239,6 +239,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="triton",
     ),
     KernelEntry(
+        name="fused_tokens_per_expert",
+        sources=("megatron/core/fusions/fused_tokens_per_expert.py",),
+        tests=(K + "test_fused_triton_kernels.py",),
+        kind="triton",
+        notes="Integer atomics only; exact and order independent, equal to routing_map.sum(0).",
+    ),
+    KernelEntry(
         name="fused_row_copy",
         sources=("megatron/core/fusions/fused_row_copy.py",),
         tests=(K + "test_fused_triton_kernels.py",),
