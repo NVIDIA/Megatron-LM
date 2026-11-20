@@ -416,6 +416,15 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
         return grad, None, None, None, None, None, None, None, None, None, None, None
 
 
+class _FusedMLARoPEOutOfPlace(_FusedMLARoPEInplace):
+    """Use the same rotation kernels with private forward and backward storage."""
+
+    @staticmethod
+    def backward(ctx, grad):
+        # The caller can reuse this cotangent on another autograd edge.
+        return _FusedMLARoPEInplace.backward(ctx, grad.clone(memory_format=torch.contiguous_format))
+
+
 def fused_mla_rope_inplace(
     t: torch.Tensor,
     cos: torch.Tensor,
@@ -486,25 +495,25 @@ def fused_mla_rope_out_of_place(
     remove_interleaving: bool = False,
     position_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Apply the fused RoPE kernel without modifying the input tensor.
+    """Apply fused RoPE without modifying the input or the incoming gradient.
 
     Use this wrapper when an upstream autograd function may have retained its
     output for backward. The underlying kernel remains in-place, so a private
     copy is required to keep the retained tensor unchanged.
     """
-    return fused_mla_rope_inplace(
-        t.clone(),
+    return _FusedMLARoPEOutOfPlace.apply(
+        t.clone(memory_format=torch.contiguous_format),
         cos,
         sin,
         nope_dim,
         emb_dim,
-        cu_seqlens_q=cu_seqlens_q,
-        cp_rank=cp_rank,
-        cp_size=cp_size,
-        rotary_interleaved=rotary_interleaved,
-        inverse=inverse,
-        remove_interleaving=remove_interleaving,
-        position_ids=position_ids,
+        cu_seqlens_q,
+        cp_rank,
+        cp_size,
+        rotary_interleaved,
+        inverse,
+        remove_interleaving,
+        position_ids,
     )
 
 

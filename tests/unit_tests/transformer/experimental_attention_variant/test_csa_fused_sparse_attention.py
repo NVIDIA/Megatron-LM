@@ -17,6 +17,43 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.csa_teac
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_shared_rotary_input_preserves_storage_and_fp32_angles():
+    from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_out_of_place
+    from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+    from megatron.core.transformer.experimental_attention_variant.csa import _apply_rope
+
+    cp = MagicMock()
+    cp.rank.return_value, cp.size.return_value = 0, 1
+    rotary = RotaryEmbedding(64, 1.0, cp_group=cp)
+    x = torch.randn(8, 1, 2, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    original = x.detach().clone()
+    cos, sin = rotary.get_cached_cos_sin(8, dtype=torch.float32, packed_seq=False, mscale=1.0)
+    reference = fused_mla_rope_out_of_place(
+        x, cos, sin, 64, 64, None, 0, 1, remove_interleaving=True
+    )
+    result = _apply_rope(
+        x,
+        64,
+        64,
+        rotary,
+        SimpleNamespace(apply_rope_fusion=True),
+        8,
+        cp_group=cp,
+        inplace=False,
+        rotary_dtype=torch.float32,
+    )
+    upstream = torch.randn_like(result)
+    torch.testing.assert_close(x, original, atol=0, rtol=0)
+    torch.testing.assert_close(result, reference, atol=0, rtol=0)
+    torch.testing.assert_close(
+        torch.autograd.grad(result, x, upstream)[0],
+        torch.autograd.grad(reference, x, upstream)[0],
+        atol=0,
+        rtol=0,
+    )
+
+
 def test_local_to_global_flat_preserves_sbhd_row_order_and_invalid_entries():
     local = torch.tensor([[[0, -1], [2, 3], [4, -1]], [[1, 2], [0, -1], [3, 4]]], dtype=torch.int64)
 

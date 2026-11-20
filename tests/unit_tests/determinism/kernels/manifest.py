@@ -217,6 +217,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/experimental_attention_variant/deepseek_v4_hybrid_attention.py",
         ),
         tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa2.py",
             K + "test_fused_activations.py",
             "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_attention.py",
         ),
@@ -1076,6 +1077,49 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
     KernelEntry(
+        name="csa2_cp_projection_compaction",
+        sources=("megatron/core/ops/attention/csa/compressor_projection.py",),
+        tests=(
+            K + "test_csa_packed_kernels.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa2.py",
+        ),
+        kind="triton",
+        notes="Compiled narrow CP projection gather and unique-source inverse gather. "
+        "Bit-exact forward/backward replay and live-map graph replay cover r1/r2; CPU "
+        "compressor tests check hidden-storage ownership, NaN padding and wgrad accumulation.",
+    ),
+    KernelEntry(
+        name="csa2_cudnn_r2_pool",
+        sources=("megatron/core/ops/attention/csa/cudnn_pooling.py",),
+        tests=(
+            K + "test_fused_triton_kernels.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa2.py",
+        ),
+        kind="dispatch",
+        notes="cuDNN ratio-2 forward/dKV/dGate replay with unused dAPE; native fallback under "
+        "strict determinism. BF16 padding and warmed CUDA Graph gradients are checked separately.",
+    ),
+    KernelEntry(
+        name="csa2_shared_attention",
+        sources=(
+            "megatron/core/ops/attention/csa/indexer_quantization.py",
+            "megatron/core/transformer/experimental_attention_variant/csa2.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/csa2_candidates.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/csa2_indexer.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/csa2_teacher_lse.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/csa2_context_parallel.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/thd_utils.py",
+        ),
+        tests=(
+            K + "test_csa_packed_kernels.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa2.py",
+        ),
+        kind="triton",
+        notes="CPU owner-gradient and packed-capacity contracts, plus window/sink teacher GPU parity "
+        "and KL forward replay. Shared-K backward has an atomic-add negative control. Full FlashMLA attention and shared-K atomic gradients remain "
+        "unqualified for deterministic mode; this draft rejects that mode.",
+    ),
+    KernelEntry(
         name="csa_teacher_lse",
         sources=(
             "megatron/core/transformer/experimental_attention_variant/csa_utils/csa_teacher_lse.py",
@@ -1093,6 +1137,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/experimental_attention_variant/csa_utils/packed_layout.py",
         ),
         tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa2.py",
             K + "test_csa_packed_kernels.py",
             "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_packed_cp.py",
         ),

@@ -9,7 +9,10 @@ import torch
 import torch.nn as nn
 
 from megatron.core.fp8_utils import get_fp8_disabled_context
-from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
+from megatron.core.fusions.fused_mla_yarn_rope_apply import (
+    fused_mla_rope_inplace,
+    fused_mla_rope_out_of_place,
+)
 from megatron.core.models.common.embeddings import RotaryEmbedding, apply_rotary_pos_emb
 from megatron.core.ops.attention.csa.output_rope import OutputRopeParams
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -137,6 +140,9 @@ def _apply_rope(
     rotary_seq_len: int,
     ratio: int = 1,
     cp_group: torch.distributed.ProcessGroup = None,
+    *,
+    inplace: bool = True,
+    rotary_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Apply RoPE to the last ``qk_pos_emb_head_dim`` dims, leaving the rest unchanged.
 
@@ -161,7 +167,7 @@ def _apply_rope(
         # rotation as the unfused split-rotate path (DSv4 "pure
         # rotation" contract).
         rotary_pos_cos, rotary_pos_sin = rotary_pos_emb_module.get_cached_cos_sin(
-            total_seq_len, dtype=x.dtype, packed_seq=False, mscale=mscale
+            total_seq_len, dtype=rotary_dtype or x.dtype, packed_seq=False, mscale=mscale
         )
         rotary_pos_emb = None
         assert (
@@ -190,7 +196,8 @@ def _apply_rope(
     if squeeze_head:
         x = x.unsqueeze(-2)
     if config.apply_rope_fusion:
-        out = fused_mla_rope_inplace(
+        rotate = fused_mla_rope_inplace if inplace else fused_mla_rope_out_of_place
+        out = rotate(
             x,
             rotary_pos_cos,
             rotary_pos_sin,

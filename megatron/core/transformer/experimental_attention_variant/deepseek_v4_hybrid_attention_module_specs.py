@@ -37,6 +37,11 @@ def get_dsv4_hybrid_module_spec_for_backend(
     config: TransformerConfig, backend: BackendSpecProvider
 ) -> ModuleSpec:
     """Build the native SBHD DSv4 HybridModel attention spec."""
+    if config.dsv4_version == "v4.1":
+        raise ValueError(
+            "CSA2 requires a state-aware stack that passes one CSA2State to its attention "
+            "layers per forward. Use get_csa2_module_spec_for_backend in that stack."
+        )
     assert config.multi_latent_attention, "Currently only MLA supports sparse attention."
     assert config.qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
 
