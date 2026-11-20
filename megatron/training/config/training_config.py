@@ -798,6 +798,14 @@ class CheckpointConfig:
     `_extra_state` are persisted, preserving the previous behavior. Older checkpoints load
     unchanged either way."""
 
+    custom_manager_class: str | None = None
+    """Fully qualified class name for a custom CheckpointManager implementation.
+    When set, checkpoint operations will instantiate and delegate to this class instead of the default
+    checkpoint manager. The custom class must implement the `CheckpointManager` protocol
+    defined in `megatron.bridge.training.checkpointing`.
+    Example: ``'mypackage.checkpoint.MyCheckpointManager'``
+    """
+
     @property
     def use_dist_ckpt(self) -> bool:
         """Whether ``ckpt_format`` names a distributed checkpoint (everything but ``torch``).
@@ -819,6 +827,12 @@ class CheckpointConfig:
 
         assert self.async_strategy in ["nvrx"], \
             f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx."
+
+        if self.custom_manager_class is not None:
+            assert "." in self.custom_manager_class, (
+                f"--custom-manager-class {self.custom_manager_class!r} must be a fully qualified "
+                "class name like 'mypackage.module.ClassName'."
+            )
 
         # An asynchronous distributed save needs the persistent checkpoint worker (a legacy torch
         # save cannot be asynchronous at all: save_checkpoint rejects it). Megatron-Bridge makes
