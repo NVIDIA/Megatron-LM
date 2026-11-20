@@ -72,6 +72,7 @@ DENSE_CASES = [
 ]
 
 
+@pytest.mark.single_rank
 @pytest.mark.parametrize("case", DENSE_CASES, ids=lambda case: case.name)
 def test_dense_dynamic_feature_batch_invariance(case):
     with invariant_runtime(case) as (backend, version):

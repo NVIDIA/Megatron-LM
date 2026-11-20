@@ -25,6 +25,8 @@ from tests.unit_tests.inference.text_generation_controllers.test_text_generation
     _make_async_sched_controller,
 )
 
+pytestmark = pytest.mark.single_rank
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["legacy", "no_overlap", "overlap"])

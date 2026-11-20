@@ -17,6 +17,8 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.inference.engines import batch_invariant_test_utils as bi
 
+pytestmark = pytest.mark.single_rank
+
 MEDIA_TOKEN = 126
 CACHE_REQUEST = 102
 

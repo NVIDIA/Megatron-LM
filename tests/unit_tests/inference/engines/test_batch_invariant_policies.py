@@ -7,6 +7,8 @@ import torch
 from megatron.core.inference.config import CudaGraphSizingDistribution, PrefixCachingEvictionPolicy
 from tests.unit_tests.inference.engines import batch_invariant_test_utils as f
 
+pytestmark = pytest.mark.single_rank
+
 REF_ZERO = PrefixCachingEvictionPolicy.REF_ZERO
 
 
