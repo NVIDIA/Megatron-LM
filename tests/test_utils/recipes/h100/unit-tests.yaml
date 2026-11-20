@@ -101,8 +101,10 @@ products:
         gpus: [2]
         n_repeat: [1]
         time_limit: [1800]
-  # This file runs in isolated one-rank processes; other buckets exclude it.
-  - test_case: [tests/unit_tests/inference/test_batch_invariant_fp8.py]
+  # Inference tests that need their own launches (run_ci_test.sh profiles): a fresh one-rank
+  # process per FP8 recipe, six ranks for the KV transfer pairs and four for the
+  # disaggregation coordinator. Other buckets exclude this directory.
+  - test_case: [tests/unit_tests/inference/isolated/**/*.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
@@ -223,20 +225,6 @@ products:
         n_repeat: [1]
         time_limit: [1800]
   - test_case: [tests/unit_tests/inference/test_hybrid_moe.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/inference/test_disagg_transfer_pairwise.py]
     products:
       - environment: [lts, dev]
         tag: [latest]

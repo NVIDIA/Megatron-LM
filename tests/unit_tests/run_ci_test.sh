@@ -114,38 +114,78 @@ fi
 
 cd $TEST_PATH
 
-# These buckets need fixed world sizes and isolated precision processes, but
-# share the same Testmon baseline/selection lifecycle as every other bucket.
+# Profiles are launches a bucket needs apart from one launch at GPUS_PER_NODE ranks: a fresh
+# process per FP8 recipe, or a fixed world size per file. They share the same Testmon
+# baseline/selection lifecycle as every other bucket.
 UNIT_PROFILES=()
-UNIT_PYTEST_ARGS=()
 UNIT_RESULTS_DIR=
-case "$BUCKET" in
-tests/unit_tests/inference/test_batch_invariant_fp8.py)
-    GPUS_PER_NODE=1
-    export CUBLASLT_WORKSPACE_SIZE=0
-    case "$PLATFORM" in
-        h100) UNIT_PROFILES=(delayed blockwise) ;;
-        gb200) UNIT_PROFILES=(mxfp8) ;;
-        *) echo "Unsupported FP8 platform: $PLATFORM" >&2; exit 1 ;;
+UNIT_TARGETS=()
+ISOLATED_DIR=tests/unit_tests/inference/isolated
+
+# profile_spec PROFILE: set PROFILE_WORLD, PROFILE_FILE, PROFILE_SELECT (-k), PROFILE_ARGS and
+# PROFILE_ENV for one profile of the isolated inference bucket.
+profile_spec() {
+    PROFILE_SELECT=
+    PROFILE_ARGS=()
+    PROFILE_ENV=()
+    case "$1" in
+    delayed | blockwise | mxfp8)
+        PROFILE_WORLD=1
+        PROFILE_FILE=$ISOLATED_DIR/test_batch_invariant_fp8.py
+        PROFILE_SELECT=$1
+        [[ "$1" != delayed ]] || PROFILE_SELECT='not mxfp8 and not blockwise'
+        PROFILE_ENV=(CUBLASLT_WORKSPACE_SIZE=0)
+        ;;
+    transfer)
+        PROFILE_WORLD=6
+        PROFILE_FILE=$ISOLATED_DIR/test_disagg_transfer_pairwise.py
+        PROFILE_ARGS=(--experimental)
+        ;;
+    coordinator)
+        PROFILE_WORLD=4
+        PROFILE_FILE=$ISOLATED_DIR/test_disagg_coordinator_pairwise.py
+        PROFILE_ARGS=(--experimental)
+        ;;
+    *)
+        echo "Unknown unit-test profile: $1" >&2
+        return 1
+        ;;
     esac
-    ;;
-tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py)
-    GPUS_PER_NODE=4
-    UNIT_PROFILES=(default)
-    UNIT_PYTEST_ARGS=(--experimental)
-    if ! uv run --no-sync python -c 'from nixl import _api'; then
-        if [[ "$UNIT_TESTMON_MODE" == full ]]; then
-            echo "NIXL is unavailable; skipping $BUCKET"
-            exit 0
-        fi
-        echo "NIXL must be importable to record or select this Testmon bucket." >&2
-        exit 1
+}
+
+case "$BUCKET" in
+"$ISOLATED_DIR/**/*.py")
+    # One job for the inference tests that need their own launches: a fresh one-rank process
+    # per FP8 recipe, six ranks for the KV transfer pairs and four for the disaggregation
+    # coordinator. UNIT_TEST_PROFILES runs a subset (e.g. "delayed blockwise").
+    case "$PLATFORM" in
+        h100) UNIT_PROFILES=(delayed blockwise transfer coordinator) ;;
+        gb200) UNIT_PROFILES=(mxfp8) ;;
+        *) echo "Unsupported platform for $BUCKET: $PLATFORM" >&2; exit 1 ;;
+    esac
+    if [[ -n "${UNIT_TEST_PROFILES:-}" ]]; then
+        read -r -a UNIT_PROFILES <<< "$UNIT_TEST_PROFILES"
     fi
-    ;;
-tests/unit_tests/inference/test_disagg_transfer_pairwise.py)
-    GPUS_PER_NODE=6
-    UNIT_PROFILES=(default)
-    UNIT_PYTEST_ARGS=(--experimental)
+    if [[ " ${UNIT_PROFILES[*]} " == *" coordinator "* ]] \
+        && ! uv run --no-sync python -c 'from nixl import _api'; then
+        # The coordinator tests need NIXL; without it, run the other profiles.
+        echo "NIXL is unavailable; skipping the coordinator profile."
+        profiles=()
+        for profile in "${UNIT_PROFILES[@]}"; do
+            [[ "$profile" == coordinator ]] || profiles+=("$profile")
+        done
+        UNIT_PROFILES=("${profiles[@]}")
+    fi
+    if (( ${#UNIT_PROFILES[@]} == 0 )); then
+        echo "No profile of $BUCKET can run here."
+        exit 0
+    fi
+    # Testmon merges one selection per rank of the widest profile.
+    GPUS_PER_NODE=1
+    for profile in "${UNIT_PROFILES[@]}"; do
+        profile_spec "$profile"
+        (( PROFILE_WORLD <= GPUS_PER_NODE )) || GPUS_PER_NODE=$PROFILE_WORLD
+    done
     ;;
 esac
 if (( ${#UNIT_PROFILES[@]} )); then
@@ -276,48 +316,94 @@ bucket_uses_mark() {
     return 1
 }
 
-# Keep profile data in Testmon's native environments within each phase database.
-# Appending the second profile preserves the first; CPU selection already reads
-# all environments. Each torchrun still gets a fresh interpreter and rank logs.
+# launch_profile PHASE MODE PROFILE DEVICES APPEND LAUNCH LAUNCH_ARGS...: one profile's launch.
+# LAUNCH_ARGS is what follows the torchrun arguments (a module or script and its options),
+# without test targets. The targets are the profile's file, or the node ids of UNIT_TARGETS in
+# it. DEVICES, when set, confines a concurrent launch to those GPUs.
+launch_profile() {
+    local phase="$1" mode="$2" profile="$3" devices="$4" append="$5" launch="$6"
+    shift 6
+    local -a targets=() args=() dist=() wrapper=() env_args=()
+    local target output junit rc=0
+    profile_spec "$profile"
+    if [[ "$mode" == selected ]]; then
+        for target in "${UNIT_TARGETS[@]}"; do
+            if [[ "$target" == "$PROFILE_FILE" || "$target" == "$PROFILE_FILE::"* ]]; then
+                targets+=("$target")
+            fi
+        done
+        (( ${#targets[@]} )) || return 0
+    else
+        targets=("$PROFILE_FILE")
+    fi
+    args=("${PROFILE_ARGS[@]}")
+    [[ -z "$PROFILE_SELECT" ]] || args+=(-k "$PROFILE_SELECT")
+    if [[ "$mode" == baseline || "$mode" == select ]]; then
+        args+=("--testmon-env=$profile")
+    fi
+    [[ "$append" != true ]] || wrapper=(--append)
+    if [[ -n "$devices" ]]; then
+        env_args=(CUDA_VISIBLE_DEVICES="$devices")
+        dist=(--standalone --nproc_per_node "$PROFILE_WORLD")
+    else
+        dist=(--nproc_per_node "$PROFILE_WORLD" --nnodes 1 --master_addr "$MASTER_ADDR"
+            --master_port "$MASTER_PORT" --node_rank 0)
+    fi
+    dist+=(--log-dir "$LOG_DIR/profile-$profile-$launch" --tee "0:3" --redirects "3")
+    env_args+=("${PROFILE_ENV[@]}")
+    if [[ "$mode" == select ]]; then
+        env "${env_args[@]}" uv run --no-sync python -m torch.distributed.run "${dist[@]}" \
+            "$1" "${wrapper[@]}" "${@:2}" "${args[@]}" "${targets[@]}" || return
+        for output in "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$phase"/rank-*/selected-tests; do
+            mv -- "$output" "$output.$profile" || return
+        done
+        return 0
+    fi
+    junit="$UNIT_RESULTS_DIR/$profile/$phase-$launch"
+    mkdir -p "$junit"
+    # Expand RANK inside the worker, including when it runs the Testmon wrapper.
+    env "${env_args[@]}" UNIT_TEST_JUNIT_DIR="$junit" \
+        uv run --no-sync python -m torch.distributed.run "${dist[@]}" --no-python bash -c \
+        'exec uv run --no-sync python "$@" --junitxml="$UNIT_TEST_JUNIT_DIR/rank-$RANK.xml"' bash \
+        "$1" "${wrapper[@]}" "${@:2}" "${args[@]}" "${targets[@]}" || rc=$?
+    [[ "$rc" -eq 0 || "$rc" -eq 5 ]] || return "$rc"
+}
+
+# run_profiled_command PHASE MODE LAUNCH_ARGS...: run every profile (see launch_profile).
+# Profile data stays in Testmon's native environments within each phase database: the Testmon
+# modes run the profiles one at a time, appending each to the phase database after the first,
+# and CPU selection already reads all environments. A full run starts the profiles that fit on
+# the runner together; each torchrun still gets a fresh interpreter and its own rank logs.
 run_profiled_command() {
     local phase="$1" mode="$2"
     shift 2
-    local -a command=("$@") profile_args wrapper_args
-    local profile selection output rank_dir rc first=true
-    local launcher_length=$((6 + ${#DISTRIBUTED_ARGS[@]}))
+    local profile rank_dir pid devices used=0 rc=0 append=false
+    local -a pids=()
     for profile in "${UNIT_PROFILES[@]}"; do
-        profile_args=("${UNIT_PYTEST_ARGS[@]}")
-        wrapper_args=()
-        if [[ "$profile" != default ]]; then
-            selection="$profile"
-            [[ "$profile" != delayed ]] || selection='not mxfp8 and not blockwise'
-            profile_args+=(-k "$selection")
-            if [[ "$mode" == baseline || "$mode" == select ]]; then
-                profile_args+=("--testmon-env=$profile")
+        profile_spec "$profile"
+        UNIT_LAUNCH=$((UNIT_LAUNCH + 1))
+        if [[ "$mode" == full ]] && (( PROFILE_WORLD <= NODE_GPUS )); then
+            if (( used + PROFILE_WORLD > NODE_GPUS )); then
+                for pid in "${pids[@]}"; do
+                    wait "$pid" || rc=$?
+                done
+                [[ "$rc" -eq 0 ]] || return "$rc"
+                pids=()
+                used=0
             fi
-        fi
-        if [[ "$mode" == baseline && "$first" == false ]]; then
-            wrapper_args=(--append)
-        fi
-        first=false
-        if [[ "$mode" == select ]]; then
-            "${command[@]}" "${profile_args[@]}" || return $?
-            for output in "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$phase"/rank-*/selected-tests; do
-                mv -- "$output" "$output.$profile" || return
-            done
+            devices=$(IFS=,; echo "${NODE_DEVICES[*]:used:PROFILE_WORLD}")
+            used=$((used + PROFILE_WORLD))
+            launch_profile "$phase" "$mode" "$profile" "$devices" false "$UNIT_LAUNCH" "$@" &
+            pids+=("$!")
         else
-            UNIT_LAUNCH=$((UNIT_LAUNCH + 1))
-            export UNIT_TEST_JUNIT_DIR="$UNIT_RESULTS_DIR/$profile/$phase-$UNIT_LAUNCH"
-            mkdir -p "$UNIT_TEST_JUNIT_DIR"
-            # Expand RANK inside the worker, including when it runs the Testmon wrapper.
-            rc=0
-            "${command[@]:0:launcher_length}" --no-python bash -c \
-                'exec uv run --no-sync python "$@" --junitxml="$UNIT_TEST_JUNIT_DIR/rank-$RANK.xml"' bash \
-                "${command[@]:launcher_length:1}" "${wrapper_args[@]}" \
-                "${command[@]:launcher_length+1}" "${profile_args[@]}" || rc=$?
-            [[ "$rc" -eq 0 || "$rc" -eq 5 ]] || return "$rc"
+            launch_profile "$phase" "$mode" "$profile" "" "$append" "$UNIT_LAUNCH" "$@" || return
+            [[ "$mode" != baseline ]] || append=true
         fi
     done
+    for pid in "${pids[@]}"; do
+        wait "$pid" || rc=$?
+    done
+    [[ "$rc" -eq 0 ]] || return "$rc"
     if [[ "$mode" == select ]]; then
         for rank_dir in "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$phase"/rank-*; do
             cat "$rank_dir"/selected-tests.* | LC_ALL=C sort -u > "$rank_dir/selected-tests" || return
@@ -326,13 +412,19 @@ run_profiled_command() {
 }
 
 validate_profile_results() {
-    uv run --no-sync python - "$UNIT_RESULTS_DIR" "$GPUS_PER_NODE" "$UNIT_RESULTS_MODE" "${UNIT_PROFILES[@]}" <<'PY'
+    local profile
+    local -a worlds=()
+    for profile in "${UNIT_PROFILES[@]}"; do
+        profile_spec "$profile"
+        worlds+=("$profile:$PROFILE_WORLD")
+    done
+    uv run --no-sync python - "$UNIT_RESULTS_DIR" "$UNIT_RESULTS_MODE" "${worlds[@]}" <<'PY'
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-root, ranks, mode, *profiles = sys.argv[1:]
-for profile in profiles:
+root, mode, *worlds = sys.argv[1:]
+for profile, ranks in (item.rsplit(":", 1) for item in worlds):
     launches = list((Path(root) / profile).iterdir()) if (Path(root) / profile).exists() else []
     if mode in ("full", "baseline"):
         assert launches, f"{profile}: executed no tests"
@@ -354,7 +446,7 @@ PY
 run_full_tests() {
     UNIT_RESULTS_MODE=full
     local phase target pack_shards=1 single_rank=false
-    local -a command
+    local -a command launch
     target=$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')
     if [[ "$UNIT_TEST_PACK" == 1 && ${#UNIT_PROFILES[@]} -eq 0 && "$NUM_NODES" -eq 1 ]]; then
         if (( GPUS_PER_NODE < NODE_GPUS && NODE_GPUS % GPUS_PER_NODE == 0 )); then
@@ -393,18 +485,19 @@ run_full_tests() {
                 [[ "$rc" -eq 0 || "$rc" -eq 5 ]] || return "$rc"
                 continue
             fi
-            command=(uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}")
             if [[ "$phase" == prod ]]; then
-                command+=(-m coverage run --data-file=.coverage.unit_tests --source=megatron/core
-                    -m pytest -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target")
+                launch=(-m coverage run --data-file=.coverage.unit_tests --source=megatron/core
+                    -m pytest -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}")
             else
-                command+=(-m pytest -vs --experimental "${IGNORE_ARGS[@]}"
-                    -m "experimental and ${MARKER_ARG}" "$target")
+                launch=(-m pytest -vs --experimental "${IGNORE_ARGS[@]}"
+                    -m "experimental and ${MARKER_ARG}")
             fi
             if (( ${#UNIT_PROFILES[@]} )); then
-                run_profiled_command "$phase" full "${command[@]}"
+                UNIT_TARGETS=("$target")
+                run_profiled_command "$phase" full "${launch[@]}"
             else
-                run_test_cmd "${command[@]}"
+                run_test_cmd uv run --no-sync python -m torch.distributed.run \
+                    "${DISTRIBUTED_ARGS[@]}" "${launch[@]}" "$target"
             fi
         done
     done
@@ -440,18 +533,19 @@ run_testmon_phase() {
         uv pip install --python /opt/venv/bin/python --no-deps "pytest-testmon==2.2.0" || return
         UNIT_TESTMON_INSTALLED=true
     fi
-    local -a command=(uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}")
-    command+=(
+    local -a launch=(
         tests/unit_tests/testmon_selector.py
         --mode "$mode"
         --cache-dir "$UNIT_TESTMON_CACHE_DIR"
         --phase "$phase"
-        -- "$@"
+        --
     )
     if [[ -n "${UNIT_RESULTS_DIR:-}" ]]; then
-        run_profiled_command "$phase" "$mode" "${command[@]}"
+        # The last pytest argument is the bucket; each profile runs its own file instead.
+        UNIT_TARGETS=("${@: -1}")
+        run_profiled_command "$phase" "$mode" "${launch[@]}" "${@:1:$#-1}"
     else
-        "${command[@]}"
+        uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}" "${launch[@]}" "$@"
     fi
 }
 
@@ -502,8 +596,7 @@ apply_mandatory_tests() {
 run_selected_phase() {
     local phase="$1"
     local selection_file="$UNIT_TESTMON_CACHE_DIR/.testmon-work/$phase/selected-tests"
-    local -a selected_tests=()
-    local -a command=(uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}")
+    local -a selected_tests=() launch
 
     while IFS= read -r nodeid; do
         [[ -n "$nodeid" ]] && selected_tests+=("$nodeid")
@@ -514,7 +607,7 @@ run_selected_phase() {
     fi
 
     if [[ "$phase" == "prod" ]]; then
-        command+=(
+        launch=(
             -m coverage run
             --data-file=.coverage.unit_tests
             --source=megatron/core
@@ -522,25 +615,25 @@ run_selected_phase() {
             -vs
             "${IGNORE_ARGS[@]}"
             -m "not experimental and ${MARKER_ARG}"
-            "${selected_tests[@]}"
         )
     else
-        command+=(
+        launch=(
             -m pytest
             -vs
             --experimental
             "${IGNORE_ARGS[@]}"
             -m "experimental and ${MARKER_ARG}"
-            "${selected_tests[@]}"
         )
     fi
     # Mandatory files are passed whole, so a phase's marker filter can
     # legitimately deselect everything in them (pytest exit 5).
     local rc=0
     if [[ -n "${UNIT_RESULTS_DIR:-}" ]]; then
-        run_profiled_command "$phase" selected "${command[@]}" || rc=$?
+        UNIT_TARGETS=("${selected_tests[@]}")
+        run_profiled_command "$phase" selected "${launch[@]}" || rc=$?
     else
-        "${command[@]}" || rc=$?
+        uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}" \
+            "${launch[@]}" "${selected_tests[@]}" || rc=$?
     fi
     if [[ "$rc" -eq 5 ]]; then
         echo "No $phase tests collected from the selection (pytest exit 5) — treating as pass."

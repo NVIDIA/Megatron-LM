@@ -87,8 +87,9 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  # This file runs in isolated one-rank processes; other buckets exclude it.
-  - test_case: [tests/unit_tests/inference/test_batch_invariant_fp8.py]
+  # Inference tests that need their own launches (run_ci_test.sh profiles); on GB200, the
+  # MXFP8 recipe in a fresh one-rank process. Other buckets exclude this directory.
+  - test_case: [tests/unit_tests/inference/isolated/**/*.py]
     products:
       - environment: [dev]
         tag: [latest]

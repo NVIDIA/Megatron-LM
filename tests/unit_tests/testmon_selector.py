@@ -48,6 +48,19 @@ def _copy_database(cache_dir: Path, phase: str, rank: int) -> Path:
     return destination
 
 
+def _without_testmon_options(pytest_args: list[str]) -> list[str]:
+    """Drop --testmon-env (a profile's Testmon environment) for a rank that runs without it."""
+    kept, skip = [], False
+    for arg in pytest_args:
+        if skip:
+            skip = False
+        elif arg == "--testmon-env":
+            skip = True
+        elif not arg.startswith("--testmon-env="):
+            kept.append(arg)
+    return kept
+
+
 def _testmon_dependency_override() -> str:
     from testmon_cache import is_tracked_package
 
@@ -91,6 +104,8 @@ def _run(args: argparse.Namespace) -> int:
             )
         else:
             os.environ.pop("TESTMON_DATAFILE", None)
+            # Other ranks run without Testmon, so they must not receive its options.
+            pytest_args = _without_testmon_options(pytest_args)
             pytest_args.extend(("-p", "no:testmon", "-p", "no:pytest-testmon"))
     else:
         validate_phase(args.cache_dir, args.phase)
