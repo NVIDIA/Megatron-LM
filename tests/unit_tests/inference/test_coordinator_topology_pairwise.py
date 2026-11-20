@@ -2,7 +2,7 @@
 
 """Real coordinator routing over TP, PP and TP2xPP2xDP2 layouts, which need eight ranks.
 
-The other routed-feature tests run at two ranks (tests/unit_tests/inference/two_rank/).
+The other routed-feature tests run at two ranks (tests/unit_tests/inference/isolated/two_rank/).
 """
 
 from collections import Counter
@@ -13,7 +13,7 @@ from tests.unit_tests.inference.coordinator_pairwise_utils import greedy_params,
 from tests.unit_tests.inference.engines.test_dynamic_engine_async_sched import (
     _instrument_parallel_runtime,
 )
-from tests.unit_tests.inference.two_rank.test_coordinator_features_pairwise import (
+from tests.unit_tests.inference.isolated.two_rank.test_coordinator_features_pairwise import (
     _exercise_all_owners,
 )
 

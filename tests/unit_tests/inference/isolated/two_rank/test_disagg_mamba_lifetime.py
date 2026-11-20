@@ -17,7 +17,9 @@ from tests.unit_tests.inference.engines.disagg_test_utils import (
     run_to_completion,
     sampling,
 )
-from tests.unit_tests.inference.two_rank.test_disagg_pairwise import transport_world  # noqa: F401
+from tests.unit_tests.inference.isolated.two_rank.test_disagg_pairwise import (  # noqa: F401
+    transport_world,
+)
 
 
 @pytest.mark.parametrize("mode", [AsyncScheduleMode.LEGACY, AsyncScheduleMode.ASYNC])

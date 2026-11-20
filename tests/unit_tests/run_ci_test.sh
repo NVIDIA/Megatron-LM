@@ -122,12 +122,16 @@ UNIT_RESULTS_DIR=
 UNIT_TARGETS=()
 ISOLATED_DIR=tests/unit_tests/inference/isolated
 
-# profile_spec PROFILE: set PROFILE_WORLD, PROFILE_FILE, PROFILE_SELECT (-k), PROFILE_ARGS and
-# PROFILE_ENV for one profile of the isolated inference bucket.
+# profile_spec PROFILE: set PROFILE_WORLD, PROFILE_FILE (a file or directory), PROFILE_SELECT
+# (-k), PROFILE_ARGS and PROFILE_ENV for one profile of the isolated inference bucket.
+# PROFILE_PACKED profiles fill the runner with concurrent shards in a full run; PROFILE_SKIPS_OK
+# profiles may report skipped tests.
 profile_spec() {
     PROFILE_SELECT=
     PROFILE_ARGS=()
     PROFILE_ENV=()
+    PROFILE_PACKED=false
+    PROFILE_SKIPS_OK=false
     case "$1" in
     delayed | blockwise | mxfp8)
         PROFILE_WORLD=1
@@ -135,6 +139,14 @@ profile_spec() {
         PROFILE_SELECT=$1
         [[ "$1" != delayed ]] || PROFILE_SELECT='not mxfp8 and not blockwise'
         PROFILE_ENV=(CUBLASLT_WORKSPACE_SIZE=0)
+        ;;
+    pairs)
+        # Two-DP-replica coordinator routing, one-prefill/one-decode disaggregation pairs and
+        # the two-worker NIXL handoff, which skips without NIXL.
+        PROFILE_WORLD=2
+        PROFILE_FILE=$ISOLATED_DIR/two_rank
+        PROFILE_PACKED=true
+        PROFILE_SKIPS_OK=true
         ;;
     transfer)
         PROFILE_WORLD=6
@@ -156,10 +168,11 @@ profile_spec() {
 case "$BUCKET" in
 "$ISOLATED_DIR/**/*.py")
     # One job for the inference tests that need their own launches: a fresh one-rank process
-    # per FP8 recipe, six ranks for the KV transfer pairs and four for the disaggregation
-    # coordinator. UNIT_TEST_PROFILES runs a subset (e.g. "delayed blockwise").
+    # per FP8 recipe, six ranks for the KV transfer pairs, two for the routed-coordinator and
+    # disaggregation pairs, and four for the disaggregation coordinator. UNIT_TEST_PROFILES
+    # runs a subset (e.g. "delayed blockwise").
     case "$PLATFORM" in
-        h100) UNIT_PROFILES=(delayed blockwise transfer coordinator) ;;
+        h100) UNIT_PROFILES=(delayed blockwise transfer pairs coordinator) ;;
         gb200) UNIT_PROFILES=(mxfp8) ;;
         *) echo "Unsupported platform for $BUCKET: $PLATFORM" >&2; exit 1 ;;
     esac
@@ -316,19 +329,21 @@ bucket_uses_mark() {
     return 1
 }
 
-# launch_profile PHASE MODE PROFILE DEVICES APPEND LAUNCH LAUNCH_ARGS...: one profile's launch.
-# LAUNCH_ARGS is what follows the torchrun arguments (a module or script and its options),
-# without test targets. The targets are the profile's file, or the node ids of UNIT_TARGETS in
-# it. DEVICES, when set, confines a concurrent launch to those GPUs.
+# launch_profile PHASE MODE PROFILE DEVICES APPEND LAUNCH SHARD LAUNCH_ARGS...: one profile's
+# launch. LAUNCH_ARGS is what follows the torchrun arguments (a module or script and its options),
+# without test targets. The targets are the profile's file or directory, or the node ids of
+# UNIT_TARGETS in it. DEVICES, when set, confines a concurrent launch to those GPUs; SHARD
+# ("<index>/<count>"), when set, runs that share of the profile's tests.
 launch_profile() {
-    local phase="$1" mode="$2" profile="$3" devices="$4" append="$5" launch="$6"
-    shift 6
+    local phase="$1" mode="$2" profile="$3" devices="$4" append="$5" launch="$6" shard="$7"
+    shift 7
     local -a targets=() args=() dist=() wrapper=() env_args=()
     local target output junit rc=0
     profile_spec "$profile"
     if [[ "$mode" == selected ]]; then
         for target in "${UNIT_TARGETS[@]}"; do
-            if [[ "$target" == "$PROFILE_FILE" || "$target" == "$PROFILE_FILE::"* ]]; then
+            if [[ "$target" == "$PROFILE_FILE" || "$target" == "$PROFILE_FILE"/* \
+                || "$target" == "$PROFILE_FILE::"* ]]; then
                 targets+=("$target")
             fi
         done
@@ -349,8 +364,10 @@ launch_profile() {
         dist=(--nproc_per_node "$PROFILE_WORLD" --nnodes 1 --master_addr "$MASTER_ADDR"
             --master_port "$MASTER_PORT" --node_rank 0)
     fi
-    dist+=(--log-dir "$LOG_DIR/profile-$profile-$launch" --tee "0:3" --redirects "3")
+    dist+=(--log-dir "$LOG_DIR/profile-$profile-$launch${shard:+-${shard%/*}}" --tee "0:3"
+        --redirects "3")
     env_args+=("${PROFILE_ENV[@]}")
+    [[ -z "$shard" ]] || env_args+=(UNIT_TEST_SHARD="$shard")
     if [[ "$mode" == select ]]; then
         env "${env_args[@]}" uv run --no-sync python -m torch.distributed.run "${dist[@]}" \
             "$1" "${wrapper[@]}" "${@:2}" "${args[@]}" "${targets[@]}" || return
@@ -359,7 +376,7 @@ launch_profile() {
         done
         return 0
     fi
-    junit="$UNIT_RESULTS_DIR/$profile/$phase-$launch"
+    junit="$UNIT_RESULTS_DIR/$profile/$phase-$launch${shard:+-${shard%/*}}"
     mkdir -p "$junit"
     # Expand RANK inside the worker, including when it runs the Testmon wrapper.
     env "${env_args[@]}" UNIT_TEST_JUNIT_DIR="$junit" \
@@ -382,7 +399,29 @@ run_profiled_command() {
     for profile in "${UNIT_PROFILES[@]}"; do
         profile_spec "$profile"
         UNIT_LAUNCH=$((UNIT_LAUNCH + 1))
-        if [[ "$mode" == full ]] && (( PROFILE_WORLD <= NODE_GPUS )); then
+        if [[ "$mode" == full && "$PROFILE_PACKED" == true ]] \
+            && (( NODE_GPUS > PROFILE_WORLD && NODE_GPUS % PROFILE_WORLD == 0 )); then
+            # A packed profile takes the whole runner: finish the wave in flight, then start
+            # one shard per PROFILE_WORLD GPUs.
+            for pid in "${pids[@]}"; do
+                wait "$pid" || rc=$?
+            done
+            [[ "$rc" -eq 0 ]] || return "$rc"
+            pids=()
+            used=0
+            local shards=$((NODE_GPUS / PROFILE_WORLD)) shard
+            for ((shard = 0; shard < shards; shard++)); do
+                devices=$(IFS=,; echo "${NODE_DEVICES[*]:shard*PROFILE_WORLD:PROFILE_WORLD}")
+                launch_profile "$phase" "$mode" "$profile" "$devices" false "$UNIT_LAUNCH" \
+                    "$shard/$shards" "$@" &
+                pids+=("$!")
+            done
+            for pid in "${pids[@]}"; do
+                wait "$pid" || rc=$?
+            done
+            [[ "$rc" -eq 0 ]] || return "$rc"
+            pids=()
+        elif [[ "$mode" == full ]] && (( PROFILE_WORLD <= NODE_GPUS )); then
             if (( used + PROFILE_WORLD > NODE_GPUS )); then
                 for pid in "${pids[@]}"; do
                     wait "$pid" || rc=$?
@@ -393,10 +432,10 @@ run_profiled_command() {
             fi
             devices=$(IFS=,; echo "${NODE_DEVICES[*]:used:PROFILE_WORLD}")
             used=$((used + PROFILE_WORLD))
-            launch_profile "$phase" "$mode" "$profile" "$devices" false "$UNIT_LAUNCH" "$@" &
+            launch_profile "$phase" "$mode" "$profile" "$devices" false "$UNIT_LAUNCH" "" "$@" &
             pids+=("$!")
         else
-            launch_profile "$phase" "$mode" "$profile" "" "$append" "$UNIT_LAUNCH" "$@" || return
+            launch_profile "$phase" "$mode" "$profile" "" "$append" "$UNIT_LAUNCH" "" "$@" || return
             [[ "$mode" != baseline ]] || append=true
         fi
     done
@@ -416,7 +455,7 @@ validate_profile_results() {
     local -a worlds=()
     for profile in "${UNIT_PROFILES[@]}"; do
         profile_spec "$profile"
-        worlds+=("$profile:$PROFILE_WORLD")
+        worlds+=("$profile:$PROFILE_WORLD:$PROFILE_SKIPS_OK")
     done
     uv run --no-sync python - "$UNIT_RESULTS_DIR" "$UNIT_RESULTS_MODE" "${worlds[@]}" <<'PY'
 import sys
@@ -424,10 +463,11 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 root, mode, *worlds = sys.argv[1:]
-for profile, ranks in (item.rsplit(":", 1) for item in worlds):
+for profile, ranks, skips_ok in (item.split(":") for item in worlds):
     launches = list((Path(root) / profile).iterdir()) if (Path(root) / profile).exists() else []
     if mode in ("full", "baseline"):
         assert launches, f"{profile}: executed no tests"
+    banned = ("failure", "error") if skips_ok == "true" else ("skipped", "failure", "error")
     for launch in launches:
         for rank in range(int(ranks)):
             report = launch / f"rank-{rank}.xml"
@@ -435,8 +475,8 @@ for profile, ranks in (item.rsplit(":", 1) for item in worlds):
             cases = ET.parse(report).findall(".//testcase")
             if mode in ("full", "baseline") and launch.name.startswith("prod-"):
                 assert cases, f"{profile}: rank {rank} executed no tests in {launch.name}"
-            assert all(case.find(tag) is None for case in cases for tag in ("skipped", "failure", "error")), (
-                f"{profile}: rank {rank} has skipped or failed tests in {launch.name}"
+            assert all(case.find(tag) is None for case in cases for tag in banned), (
+                f"{profile}: rank {rank} has {' or '.join(banned)} tests in {launch.name}"
             )
 PY
 }

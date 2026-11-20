@@ -51,10 +51,6 @@ spec:
     # test_gtp_muon.py/test_gtp_muon_qkv.py, and will skip here instead).
     if [[ "$BUCKET" == "tests/unit_tests/generalized_tensor_parallel/**/*.py" ]]; then
         export GPUS_PER_NODE=4
-    elif [[ "$BUCKET" == "tests/unit_tests/inference/two_rank/**/*.py" ]]; then
-        # Inference tests that run at two ranks (see the product entry below). A full run
-        # packs four two-GPU shards onto the runner (run_ci_test.sh).
-        export GPUS_PER_NODE=2
     fi
 
     if [[ "$TAG" == "latest" ]]; then
@@ -90,20 +86,10 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  # Inference tests that run at two ranks: real coordinator routing over two DP replicas,
-  # one-prefill/one-decode disaggregation pairs and the two-worker NIXL handoff. The broad
-  # inference buckets exclude this directory.
-  - test_case: [tests/unit_tests/inference/two_rank/**/*.py]
-    products:
-      - environment: [lts, dev]
-        tag: [latest]
-        scope: [unit-tests]
-        gpus: [2]
-        n_repeat: [1]
-        time_limit: [1800]
   # Inference tests that need their own launches (run_ci_test.sh profiles): a fresh one-rank
-  # process per FP8 recipe, six ranks for the KV transfer pairs and four for the
-  # disaggregation coordinator. Other buckets exclude this directory.
+  # process per FP8 recipe, six ranks for the KV transfer pairs, two for the routed-coordinator
+  # and disaggregation pairs in two_rank/ (packed four to a runner in full runs), and four for
+  # the disaggregation coordinator. Other buckets exclude this directory.
   - test_case: [tests/unit_tests/inference/isolated/**/*.py]
     products:
       - environment: [lts, dev]
