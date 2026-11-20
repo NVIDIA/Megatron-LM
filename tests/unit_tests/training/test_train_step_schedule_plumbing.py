@@ -252,14 +252,10 @@ def test_train_step_invokes_tensor_metric_observer_before_optimizer(
         mock.patch.object(training_mod, "is_pp_last_stage", return_value=False),
         mock.patch.object(training_mod, "_get_samples_seen_in_iteration", return_value=1),
         mock.patch.object(
-            training_mod,
-            "logical_and_across_model_parallel_group",
-            side_effect=success_reduction,
+            training_mod, "logical_and_across_model_parallel_group", side_effect=success_reduction
         ),
         mock.patch.object(
-            training_mod,
-            "reduce_max_stat_across_model_parallel_group",
-            side_effect=stat_reduction,
+            training_mod, "reduce_max_stat_across_model_parallel_group", side_effect=stat_reduction
         ),
     ):
         result = training_mod.train_step(

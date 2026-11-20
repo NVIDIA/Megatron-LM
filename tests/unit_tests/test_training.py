@@ -140,7 +140,9 @@ def test_entrypoint_loss_checks_read_rerun_config(
         assert call.kwargs["tolerance"] == 0
         assert call.kwargs["fatal"] == (call.kwargs["message"] != "Spiky loss")
         if call.kwargs["message"] == "Spiky loss":
-            threshold = 0.2 if module_name == "train_rl" else (10.0 if loss_factor is None else loss_factor)
+            threshold = (
+                0.2 if module_name == "train_rl" else (10.0 if loss_factor is None else loss_factor)
+            )
             assert call.kwargs["rejection_func"].keywords["threshold"] == threshold
 
 
