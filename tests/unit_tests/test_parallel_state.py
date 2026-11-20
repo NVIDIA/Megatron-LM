@@ -14,6 +14,46 @@ world_size = Utils.world_size
 test_parallel_order = ['tp-cp-ep-dp-pp', 'tp-cp-pp-ep-dp']
 
 
+@pytest.mark.parametrize(
+    "accessor, kwargs, group_name",
+    [
+        (ps.get_data_parallel_group_gloo, {}, '_DATA_PARALLEL_GROUP_GLOO'),
+        (
+            ps.get_data_parallel_group_gloo,
+            {'with_context_parallel': True},
+            '_DATA_PARALLEL_GROUP_WITH_CP_GLOO',
+        ),
+        (
+            ps.get_data_parallel_group_gloo,
+            {'with_context_parallel': True, 'partial_data_parallel': True},
+            '_INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO',
+        ),
+        (ps.get_expert_data_parallel_group_gloo, {}, '_EXPERT_DATA_PARALLEL_GROUP_GLOO'),
+        (
+            ps.get_expert_data_parallel_group_gloo,
+            {'partial_expert_data_parallel': True},
+            '_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO',
+        ),
+    ],
+)
+def test_optional_gloo_group_accessors(monkeypatch, accessor, kwargs, group_name):
+    """Absent Gloo groups are optional only when initialization checks are disabled."""
+    monkeypatch.setattr(ps, group_name, None)
+    with pytest.raises(AssertionError, match='not initialized'):
+        accessor(**kwargs)
+    assert accessor(**kwargs, check_initialized=False) is None
+
+    group = object()
+    monkeypatch.setattr(ps, group_name, group)
+    assert accessor(**kwargs) is group
+    assert accessor(**kwargs, check_initialized=False) is group
+
+
+def test_optional_gloo_group_still_requires_cp_for_partial_dp():
+    with pytest.raises(AssertionError, match='needs to include CP'):
+        ps.get_data_parallel_group_gloo(partial_data_parallel=True, check_initialized=False)
+
+
 def test_inject_gtp_remat_axis():
     # Decoder/dense axis: GTP_remat is injected after 'cp', so CP keeps the more-local
     # (smaller-stride) placement and GTP_remat sits one step further out.

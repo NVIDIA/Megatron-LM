@@ -97,6 +97,13 @@ def mock_pipeline(monkeypatch):
     monkeypatch.setattr(factory_module, "DisaggDynamicInferenceEngine", _DisaggEngine)
     configure = MagicMock()
     monkeypatch.setattr(factory_module, "configure_prebuilt_disagg_engine", configure)
+    monkeypatch.setattr(
+        factory_module,
+        "dist",
+        SimpleNamespace(
+            get_world_size=MagicMock(return_value=2), get_rank=MagicMock(return_value=0)
+        ),
+    )
     return context, wrapper_cls, controller, configure
 
 
@@ -125,6 +132,35 @@ def test_builds_and_configures_engine(mock_pipeline, disaggregated):
         configure.assert_called_once_with(engine)
     else:
         configure.assert_not_called()
+    assert config.disaggregation_role == ("prefill" if disaggregated else None)
+
+
+@pytest.mark.parametrize("rank, role", [(0, "prefill"), (1, "decode")])
+def test_disaggregation_role_is_set_before_the_context_is_built(
+    mock_pipeline, monkeypatch, rank, role
+):
+    """The context sizes role-specific buffers (the Mamba prefix cache) from the role."""
+    monkeypatch.setattr(factory_module.dist, "get_rank", MagicMock(return_value=rank))
+    roles_at_build = []
+    monkeypatch.setattr(
+        factory_module,
+        "DynamicInferenceContext",
+        lambda _model_config, inference_config: roles_at_build.append(
+            inference_config.disaggregation_role
+        ),
+    )
+    config = InferenceConfig(
+        disaggregation_shards="tp=1,role=prefill+tp=1,role=decode", enable_prefix_caching=True
+    )
+
+    factory_module.build_dynamic_inference_engine(
+        model=SimpleNamespace(config=MagicMock()),
+        tokenizer="tokenizer",
+        inference_config=config,
+        inference_wrapper_cls=MagicMock(),
+    )
+
+    assert roles_at_build == [role]
 
 
 def test_disaggregation_rejects_incompatible_engine_override(mock_pipeline):
