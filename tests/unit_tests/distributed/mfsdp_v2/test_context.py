@@ -118,12 +118,29 @@ def test_recorded_execution_order(distributed_setup):
         fully_shard(model, mesh, _default_placements())
 
     inputs = torch.ones(2, 4, device=device)
+
+    def evaluate_without_consuming_order():
+        expected_order = tuple(context.execution_order)
+        expected_position = context.execution_order.position
+        was_recording = context.is_recording_execution_order
+        model.eval()
+        with torch.no_grad():
+            first = model(inputs)
+            second = model(inputs)
+        torch.testing.assert_close(first, second, rtol=0, atol=0)
+        assert tuple(context.execution_order) == expected_order
+        assert context.execution_order.position == expected_position
+        assert context.is_recording_execution_order == was_recording
+        model.train()
+
     assert context.is_recording_execution_order
+    evaluate_without_consuming_order()
     model(inputs).sum().backward()
     assert not context.is_recording_execution_order
     assert list(context.execution_order) == [
         ExecutionEvent(module, Phase.FORWARD) for module in [model, model.first, model.second]
     ] + [ExecutionEvent(module, Phase.BACKWARD) for module in [model, model.second, model.first]]
+    evaluate_without_consuming_order()
 
     def check_prefetched(layer, _args):
         storage_bytes = unsharded_weights[layer].untyped_storage().nbytes()

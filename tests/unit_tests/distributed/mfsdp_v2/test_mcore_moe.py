@@ -8,6 +8,7 @@ from dataclasses import replace
 
 import pytest
 import torch
+from torch.distributed.tensor import DTensor
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
@@ -69,8 +70,9 @@ def process_group_collections(distributed_setup):
 
 
 @pytest.mark.parametrize("grouped_gemm", [True, False], ids=["grouped", "sequential"])
+@pytest.mark.parametrize("evaluate", [False, True], ids=["train", "train-eval"])
 def test_standard_moe_training_and_clipping(
-    process_group_collections, distributed_setup, grouped_gemm
+    process_group_collections, distributed_setup, grouped_gemm, evaluate
 ):
     """Compare ordinary MoE training and clipping against an EP=1 reference."""
     process_group_collection, reference_process_group_collection = process_group_collections
@@ -158,10 +160,15 @@ def test_standard_moe_training_and_clipping(
     )
 
     reference_losses = _train(
-        reference_model, reference_optimizer, input_ids, position_ids, targets
+        reference_model, reference_optimizer, input_ids, position_ids, targets, evaluate=evaluate
     )
     losses = _train(
-        model, optimizer, input_ids[input_slice], position_ids[input_slice], targets[input_slice]
+        model,
+        optimizer,
+        input_ids[input_slice],
+        position_ids[input_slice],
+        targets[input_slice],
+        evaluate=evaluate,
     )
     torch.distributed.all_reduce(losses, op=torch.distributed.ReduceOp.AVG)
     if torch.distributed.get_rank() == 0:
@@ -305,12 +312,31 @@ def _sync_model_parameters(reference_model, model):
                         model_parameter.data.copy_(reference_parameter.data)
 
 
-def _train(model, optimizer, input_ids, position_ids, targets):
+def _train(model, optimizer, input_ids, position_ids, targets, *, evaluate=False):
     """Train one model for five steps and return its stacked losses."""
 
     def forward():
         output = model(input_ids=input_ids, position_ids=position_ids, attention_mask=None)
         return torch.nn.functional.mse_loss(output, targets)
+
+    def clone(value):
+        if isinstance(value, DTensor):
+            value = value.to_local()
+        return value.detach().clone() if isinstance(value, torch.Tensor) else value
+
+    def training_state():
+        return (
+            [clone(parameter) for parameter in model.parameters()],
+            [
+                {
+                    key: clone(value)
+                    for key, value in optimizer.optimizer.state.get(parameter, {}).items()
+                }
+                for group in optimizer.optimizer.param_groups
+                for parameter in group["params"]
+            ],
+            [clone(group.get("step", 0)) for group in optimizer.optimizer.param_groups],
+        )
 
     losses = []
     for _ in range(5):
@@ -322,4 +348,24 @@ def _train(model, optimizer, input_ids, position_ids, targets):
             pre_clip_norm > optimizer.config.clip_grad
         ), "Gradients must exceed the clipping threshold to exercise clipping."
         losses.append(loss)
+        if evaluate:
+            expected_state = training_state()
+            context = (
+                model.module.context
+                if isinstance(getattr(model, "module", None), FsdpModule)
+                else None
+            )
+            if context is not None:
+                expected_order = tuple(context.execution_order)
+                expected_position = context.execution_order.position
+            model.eval()
+            with torch.no_grad():
+                first = model(input_ids=input_ids, position_ids=position_ids, attention_mask=None)
+                second = model(input_ids=input_ids, position_ids=position_ids, attention_mask=None)
+            torch.testing.assert_close(first, second)
+            torch.testing.assert_close(training_state(), expected_state, rtol=0, atol=0)
+            if context is not None:
+                assert tuple(context.execution_order) == expected_order
+                assert context.execution_order.position == expected_position
+            model.train()
     return torch.stack(losses)
