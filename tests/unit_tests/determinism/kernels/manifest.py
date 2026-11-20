@@ -348,6 +348,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_mla_device_placement.py",
             K + "test_te_wrappers.py",
+            K + "test_gdn_chunkwise.py",
             C + "test_fp8_determinism.py",
             K + "test_runtime_cp_attention.py",
             R + 'test_te_replay.py',
@@ -628,6 +629,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_ssm_kernels.py",
             K + "test_gated_norm.py",
+            K + "test_gdn_chunkwise.py",
             C + "test_hybrid_model.py",
             R + 'test_ssm_replay.py',
         ),
@@ -637,6 +639,20 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "fused_recurrent_gated_delta_rule_update (in-kernel gate), both replayed in "
         "test_ssm_kernels.py. Dynamic-inference prefill runs the GDP chunk scan with a single "
         "Householder update, replayed with M=1 by test_chunk_gated_delta_product_varlen_replays.",
+    ),
+    KernelEntry(
+        name="gdn_chunkwise_state_dispatch",
+        sources=(
+            "megatron/core/ssm/context_parallel/gdn_layout.py",
+            "megatron/core/ssm/context_parallel/gdn_graph_layout.py",
+            "megatron/core/ssm/gated_delta_net/chunkwise_core.py",
+            "megatron/core/ssm/gated_delta_net/chunkwise.py",
+        ),
+        tests=(K + "test_gdn_chunkwise.py",),
+        kind="dispatch",
+        notes="Replays TE/cuDNN forward and backward summaries, state composition, output "
+        "and all recurrence input gradients. Fused preparation retains its existing "
+        "non-deterministic-mode guard and separate registered coverage.",
     ),
     KernelEntry(
         name="gdn_pre_gated_delta_rule_fusion",
