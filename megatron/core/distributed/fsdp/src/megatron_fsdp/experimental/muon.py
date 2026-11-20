@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Shard
 
 try:
     import emerging_optimizers  # pylint: disable=unused-import
@@ -61,13 +61,14 @@ class FsdpMuon(Muon):
     fixed set of buffers and are computed during initialization. Each step
     gathers, orthogonalizes, scatters, and applies one buffer's updates at a time on
     the caller's CUDA stream. Full matrices exist only on their assigned owners.
-    The mesh is inferred from the FSDP groups, which must all share the same mesh.
+    The FSDP groups may use different meshes; owners are planned separately for each mesh.
     Parameters and optimizer groups must have the same order on every DP rank, and
     ranks must agree on which parameters have gradients. Parameter membership and
     optimizer-group order must remain fixed after construction.
 
-    This optimizer refreshes its FSDP model weights itself, so it does not need
-    ``fully_shard_optimizer``.
+    This optimizer updates only the main weights. Wrap it with ``fully_shard_optimizer``, using
+    ``precision_aware=True`` because it casts gradients itself, or with an MCore
+    ``FullyShardedOptimizer`` to refresh the FSDP model weights after each step.
     Momentum is initialized lazily as DTensors in the standard optimizer state.
 
     Limitations:
@@ -121,13 +122,15 @@ class FsdpMuon(Muon):
             fsdp_group: FsdpParameterGroup = assignment.fsdp_group
             if fsdp_group.mesh.ndim != 1:
                 raise NotImplementedError("FsdpMuon requires a one-dimensional DP mesh.")
+            if not isinstance(fsdp_group.main_weight.placements[0], Shard):
+                raise NotImplementedError("FsdpMuon requires sharded main weights, not no_shard.")
             for buffer in (fsdp_group.main_weight, fsdp_group.main_grad):
                 if not isinstance(buffer, DBuffer):
                     raise ValueError("FsdpMuon requires non-quantized main weights and gradients.")
 
     @torch.no_grad()
     def step(self, closure: Callable[[], float] | None = None) -> None:
-        """Update sharded parameters and refresh their model weights."""
+        """Update the sharded main weights."""
         if closure is not None:
             raise ValueError("closure is not supported")
 
@@ -143,7 +146,6 @@ class FsdpMuon(Muon):
             self._step_group(
                 fsdp_group, active, {i: assignment.tensor_to_owner_rank[i] for i in active}
             )
-            fsdp_group.sync_model_weight_from_main_weight()
 
     def _step_group(
         self,
