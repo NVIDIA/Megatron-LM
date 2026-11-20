@@ -784,6 +784,12 @@ from one flush into the next, so prefetch never restarts cold. Only world rank 0
 the replay listing when the student reaches the known frontier. Corpus discovery
 happens once during planning.
 
+A background thread collates the next microbatch, and with CP = 1 pins it, while the
+current one trains. Without batch-size ramp-up this includes the next iteration's first
+microbatch, as long as it lies within the samples all ranks have agreed are available.
+Target indices stay int32 on the host and across the TP broadcast, and are widened to
+int64 on the GPU for the loss.
+
 ## Student corpus manifest
 
 The manifest ("plan") is the student's materialized consumption schedule. World rank 0

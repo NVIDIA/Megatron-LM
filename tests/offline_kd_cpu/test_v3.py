@@ -885,6 +885,34 @@ def test_shuffle_is_deterministic_and_group_granular(tmp_path):
     second.close()
 
 
+def test_fixed_microbatches_prefetch_the_next_iteration_within_the_cache(tmp_path):
+    storage, metadata = write_cache(tmp_path, iterations=2)  # 16 samples
+    source = reader(storage, metadata)
+    iterator = replay.ReplayIterator(
+        source,
+        consumed=0,
+        dp_rank=0,
+        dp_size=1,
+        micro_batch_size=4,
+        seq_length=8,
+        num_microbatches=lambda: 2,
+        prefetch=True,
+        fixed_microbatches=True,
+    )
+    try:
+        seen = []
+        # After the first iteration, the next one's first microbatch is prepared; after
+        # the second, it would lie past the cache's agreed end, so it is not.
+        for expected in ((8, 16), None):
+            first = next(iterator)
+            assert first["_kd_indices"][0].dtype == torch.int32
+            seen += first["_kd_sample_ids"] + next(iterator)["_kd_sample_ids"]
+            assert (iterator._prefetched and iterator._prefetched[0]) == expected
+        assert sorted(seen) == list(range(16))
+    finally:
+        iterator.close()
+
+
 def test_prefetch_stays_within_iteration_and_preserves_rampup(tmp_path):
     storage, metadata = write_cache(tmp_path)
     count = [2]

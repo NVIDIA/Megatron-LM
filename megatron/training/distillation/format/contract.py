@@ -194,12 +194,16 @@ def split_indices(
 
 
 def join_indices(low: np.ndarray, high: np.ndarray | None) -> np.ndarray:
-    """Invert :func:`split_indices` (sentinel entries come back as arbitrary indices)."""
-    indices = low.astype(np.int64)
+    """Invert :func:`split_indices` (sentinel entries come back as arbitrary indices).
+
+    Indices are int32, which holds every index below ``2**24``; readers keep them in
+    int32 on the host and widen them on the GPU where ``torch.gather`` needs int64.
+    """
+    indices = low.astype(np.int32)
     if high is not None:
         if high.shape != low.shape:
             raise ValueError("Malformed offline KD target indices")
-        indices |= high.astype(np.int64) << 16
+        indices |= high.astype(np.int32) << 16
     return indices
 
 

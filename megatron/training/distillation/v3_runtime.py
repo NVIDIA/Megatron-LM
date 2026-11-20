@@ -747,6 +747,7 @@ def build_replay_loader(args: Any, consumed: int) -> torch.utils.data.DataLoader
             seq_length=args.seq_length,
             num_microbatches=get_num_microbatches,
             prefetch=True,
+            fixed_microbatches=getattr(args, "rampup_batch_size", None) is None,
             cp_size=cp_size,
             layout=layout_options(args, hybrid=_HYBRID_LAYOUT),
             divisor=student_padding_divisor(args),
@@ -869,36 +870,43 @@ def broadcast_targets(sidecar: dict | None, *, vp_stage: int | None = None) -> d
         return None
     source = mpu.get_tensor_model_parallel_src_rank()
     group = mpu.get_tensor_model_parallel_group()
+    fields = ("values", "indices", "tail")
     header = [
         (
             None
             if sidecar is None
-            else (tuple(sidecar["values"].shape), sidecar["values"].dtype, sidecar["sample_ids"])
+            else (
+                tuple(sidecar["values"].shape),
+                [sidecar[field].dtype for field in fields],
+                sidecar["sample_ids"],
+            )
         )
     ]
     if dist.is_initialized():
         dist.broadcast_object_list(header, src=source, group=group)
     if header[0] is None:
         return None  # Ordinary validation data does not carry cached targets.
-    shape, dtype, ids = header[0]
+    shape, dtypes, ids = header[0]
     device = torch.cuda.current_device()
     if sidecar is None:
+        shapes = (shape, shape, shape[:-1])
         sidecar = {
-            "values": torch.empty(shape, dtype=dtype, device=device),
-            "indices": torch.empty(shape, dtype=torch.int64, device=device),
-            "tail": torch.empty(shape[:-1], dtype=torch.float32, device=device),
-            "sample_ids": ids,
+            field: torch.empty(size, dtype=dtype, device=device)
+            for field, size, dtype in zip(fields, shapes, dtypes)
         }
+        sidecar["sample_ids"] = ids
     else:
         sidecar = dict(sidecar)
-        for field in ("values", "indices", "tail"):
+        for field in fields:
             tensor = sidecar[field]
             if torch.cuda.is_available() and tensor.device.type == "cpu" and not tensor.is_pinned():
                 tensor = tensor.pin_memory()
             sidecar[field] = tensor.to(device, non_blocking=True)
     if dist.is_initialized():
-        for field in ("values", "indices", "tail"):
+        for field in fields:
             dist.broadcast(sidecar[field], src=source, group=group)
+    # Decoded indices travel as int32; torch.gather in the loss needs int64.
+    sidecar["indices"] = sidecar["indices"].long()
     return sidecar
 
 

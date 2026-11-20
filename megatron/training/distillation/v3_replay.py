@@ -727,8 +727,8 @@ def collate_samples(
             row_values = torch.full(
                 (seq_length, k), LOGPROB_SENTINEL, dtype=sample["teacher_values"].dtype
             )
-            row_indices = torch.zeros((seq_length, k), dtype=torch.int64)
-            row_tail = torch.zeros(seq_length, dtype=torch.float32)
+            row_indices = torch.zeros((seq_length, k), dtype=sample["teacher_indices"].dtype)
+            row_tail = torch.zeros(seq_length, dtype=sample["teacher_tail"].dtype)
             row_values[has_row, :sample_k] = sample["teacher_values"][rows]
             row_indices[has_row, :sample_k] = sample["teacher_indices"][rows]
             row_tail[has_row] = sample["teacher_tail"][rows]
@@ -781,6 +781,7 @@ class ReplayIterator:
         seq_length: int,
         num_microbatches: Callable[[], int],
         prefetch: bool = False,
+        fixed_microbatches: bool = False,
         cp_size: int = 1,
         layout: dict[str, Any] | None = None,
         divisor: int = 1,
@@ -798,8 +799,13 @@ class ReplayIterator:
         self._microbatch = 0
         self._count = 0
         self.unsupervised_samples = 0
+        # Without batch-size ramp-up every iteration has the same microbatch count, so
+        # the next iteration's first microbatch can be prepared ahead too.
+        self.fixed_microbatches = fixed_microbatches
+        # CP > 1 serializes batches for the CP scatter, so pinning there would be wasted.
+        self.pin = cp_size == 1 and torch.cuda.is_available()
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1) if prefetch else None
-        self._prefetched = None
+        self._prefetched = None  # ((start, end), future)
 
     def __iter__(self) -> "ReplayIterator":
         return self
@@ -807,7 +813,7 @@ class ReplayIterator:
     def _load(self, start: int, end: int) -> dict[str, Any]:
         samples = self.reader.samples(list(range(start, start + self.mbs)), end)
         self._note_shortening(samples)
-        return collate_samples(
+        batch = collate_samples(
             samples,
             self.seq_length,
             packed=self.reader.isolated,
@@ -816,6 +822,36 @@ class ReplayIterator:
             layout=self.layout,
             prefix_stable=self.reader.prefix_stable,
         )
+        if self.pin:
+            # Pin here, off the training thread; the DataLoader's own pinning of an
+            # already pinned tensor is then a no-op.
+            batch = {
+                key: (
+                    value.pin_memory()
+                    if isinstance(value, torch.Tensor)
+                    else (
+                        [shard.pin_memory() for shard in value]
+                        if key in ("_kd_values", "_kd_indices", "_kd_tail")
+                        else value
+                    )
+                )
+                for key, value in batch.items()
+            }
+        return batch
+
+    def _prefetch(self, start: int, end: int) -> None:
+        self._prefetched = ((start, end), self._executor.submit(self._load, start, end))
+
+    def _take(self, start: int, end: int) -> dict[str, Any]:
+        """Return the prefetched batch for ``(start, end)``, or load it now."""
+        prefetched, self._prefetched = self._prefetched, None
+        if prefetched is not None:
+            key, future = prefetched
+            if key == (start, end):
+                return future.result()
+            if not future.cancel():
+                future.exception()  # Let it finish: the reader serves one caller at a time.
+        return self._load(start, end)
 
     def _note_shortening(self, samples: list[dict]) -> None:
         """Report samples whose supervised tokens all lie beyond the student length."""
@@ -847,21 +883,23 @@ class ReplayIterator:
         if self._microbatch == 0:
             self._count = self.num_microbatches()
         end = self.consumed + self._count * self.mbs * self.dp_size
-        start = self._start(self._microbatch)
-        if self._prefetched is None:
-            batch = self._load(start, end)
-        else:
-            batch = self._prefetched.result()
-            self._prefetched = None
+        batch = self._take(self._start(self._microbatch), end)
         self._microbatch += 1
         if self._microbatch == self._count:
             self.consumed = end
             self._microbatch = 0
+            following = end + self._count * self.mbs * self.dp_size
+            # With ramp-up, the next count is known only once Megatron updates its batch
+            # calculator. Never prefetch past the collectively agreed end of a growing
+            # cache: that would fail before the next frontier check could extend it.
+            if (
+                self._executor is not None
+                and self.fixed_microbatches
+                and following <= self.reader.total_samples
+            ):
+                self._prefetch(self._start(0), following)
         elif self._executor is not None:
-            # Stay within this iteration: the next iteration's ramp-up count is
-            # determined only when Megatron updates its batch calculator. The
-            # per-rank streams already decode ahead across iterations.
-            self._prefetched = self._executor.submit(self._load, self._start(self._microbatch), end)
+            self._prefetch(self._start(self._microbatch), end)
         return batch
 
     def close(self) -> None:
