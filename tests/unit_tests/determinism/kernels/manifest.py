@@ -239,6 +239,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="triton",
     ),
     KernelEntry(
+        name="fused_mtp_acceptance_counts",
+        sources=("megatron/core/fusions/fused_mtp_acceptance_counts.py",),
+        tests=(K + "test_fused_triton_kernels.py",),
+        kind="triton",
+        notes="Single program, integer counts; bit-identical to the PyTorch reference.",
+    ),
+    KernelEntry(
         name="fused_row_copy",
         sources=("megatron/core/fusions/fused_row_copy.py",),
         tests=(K + "test_fused_triton_kernels.py",),
