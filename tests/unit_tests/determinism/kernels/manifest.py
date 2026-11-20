@@ -162,7 +162,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_dev_sync_kernels.py",),
         kind="torch-op",
         notes="The detected bincount is CPU integer shard metadata inside ntp_map; replay it "
-        "directly. This does not qualify NTP distributed resharding collectives.",
+        "with the side-gradient and bucket ranges for replicated and sharded buffers.",
     ),
     KernelEntry(
         name="fused_linear_cross_entropy",
