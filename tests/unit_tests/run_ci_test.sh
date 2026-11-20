@@ -269,17 +269,17 @@ run_test_cmd() {
     return "$rc"
 }
 
-# Packed shards (full runs only). The runner has NODE_GPUS GPUs, and every rank runs every
-# selected test. A bucket that needs fewer ranks than the runner has leaves the other GPUs
-# idle, and a test that needs one rank repeats the same work on every rank. A full run
-# therefore packs independent shards onto the runner instead:
+# Packed shards. The runner has NODE_GPUS GPUs, and every rank runs every selected test. A
+# bucket that needs fewer ranks than the runner has leaves the other GPUs idle, and a test that
+# needs one rank repeats the same work on every rank. A full run, and the run of the tests
+# Testmon selected, therefore pack independent shards onto the runner instead:
 #   - a bucket whose GPUS_PER_NODE divides NODE_GPUS runs NODE_GPUS / GPUS_PER_NODE
 #     concurrent shards, each with its own GPUS_PER_NODE GPUs and torchrun;
 #   - in a bucket that uses every GPU, tests marked `single_rank` first run as NODE_GPUS
 #     concurrent one-GPU shards, and the full-width launch that follows excludes them.
 # Each shard runs every UNIT_TEST_SHARD-th selected test (tests/unit_tests/conftest.py), so
-# the shards together run each test once, at the world size it needs. Testmon modes keep
-# one launch at GPUS_PER_NODE ranks. UNIT_TEST_PACK=0 turns packing off.
+# the shards together run each test once, at the world size it needs. Testmon's baseline and
+# selection keep one launch at GPUS_PER_NODE ranks. UNIT_TEST_PACK=0 turns packing off.
 UNIT_TEST_PACK=${UNIT_TEST_PACK:-1}
 if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
     IFS=, read -r -a NODE_DEVICES <<< "$CUDA_VISIBLE_DEVICES"
@@ -387,10 +387,11 @@ launch_profile() {
 }
 
 # run_profiled_command PHASE MODE LAUNCH_ARGS...: run every profile (see launch_profile).
-# Profile data stays in Testmon's native environments within each phase database: the Testmon
-# modes run the profiles one at a time, appending each to the phase database after the first,
-# and CPU selection already reads all environments. A full run starts the profiles that fit on
-# the runner together; each torchrun still gets a fresh interpreter and its own rank logs.
+# Profile data stays in Testmon's native environments within each phase database: Testmon's
+# baseline and selection run the profiles one at a time, appending each to the phase database
+# after the first, and CPU selection already reads all environments. A full run, and the run of
+# the selected tests, start the profiles that fit on the runner together; each torchrun still
+# gets a fresh interpreter and its own rank logs.
 run_profiled_command() {
     local phase="$1" mode="$2"
     shift 2
@@ -399,7 +400,7 @@ run_profiled_command() {
     for profile in "${UNIT_PROFILES[@]}"; do
         profile_spec "$profile"
         UNIT_LAUNCH=$((UNIT_LAUNCH + 1))
-        if [[ "$mode" == full && "$PROFILE_PACKED" == true ]] \
+        if [[ "$mode" == full || "$mode" == selected ]] && [[ "$PROFILE_PACKED" == true ]] \
             && (( NODE_GPUS > PROFILE_WORLD && NODE_GPUS % PROFILE_WORLD == 0 )); then
             # A packed profile takes the whole runner: finish the wave in flight, then start
             # one shard per PROFILE_WORLD GPUs.
@@ -421,7 +422,7 @@ run_profiled_command() {
             done
             [[ "$rc" -eq 0 ]] || return "$rc"
             pids=()
-        elif [[ "$mode" == full ]] && (( PROFILE_WORLD <= NODE_GPUS )); then
+        elif [[ "$mode" == full || "$mode" == selected ]] && (( PROFILE_WORLD <= NODE_GPUS )); then
             if (( used + PROFILE_WORLD > NODE_GPUS )); then
                 for pid in "${pids[@]}"; do
                     wait "$pid" || rc=$?
@@ -483,19 +484,51 @@ PY
 
 # Keep this path identical to exhaustive CI. The installed Testmon plugin is
 # inactive unless one of the selective paths below passes --testmon.
+# pack_plan TARGET: set PACK_SHARDS (concurrent shards of GPUS_PER_NODE GPUs) and
+# PACK_SINGLE_RANK (whether TARGET's single_rank tests run first as one-GPU shards).
+pack_plan() {
+    PACK_SHARDS=1
+    PACK_SINGLE_RANK=false
+    [[ "$UNIT_TEST_PACK" == 1 && ${#UNIT_PROFILES[@]} -eq 0 && "$NUM_NODES" -eq 1 ]] || return 0
+    if (( GPUS_PER_NODE < NODE_GPUS && NODE_GPUS % GPUS_PER_NODE == 0 )); then
+        PACK_SHARDS=$((NODE_GPUS / GPUS_PER_NODE))
+    elif (( GPUS_PER_NODE > 1 && GPUS_PER_NODE == NODE_GPUS )) \
+        && bucket_uses_mark single_rank "$1"; then
+        PACK_SINGLE_RANK=true
+    fi
+}
+
+# run_prod_tests TARGETS...: the prod phase over TARGETS (the bucket directory, or the node ids
+# Testmon selected), packed as pack_plan decided.
+run_prod_tests() {
+    local -a args=(-vs "${IGNORE_ARGS[@]}")
+    local rc=0
+    if (( PACK_SHARDS > 1 )); then
+        echo "Running prod tests as $PACK_SHARDS packed shards of $GPUS_PER_NODE GPUs."
+        run_sharded "$GPUS_PER_NODE" "$PACK_SHARDS" "${args[@]}" \
+            -m "not experimental and ${MARKER_ARG}" "$@"
+        return
+    fi
+    if [[ "$PACK_SINGLE_RANK" == true ]]; then
+        echo "Running single_rank prod tests as $NODE_GPUS one-GPU shards."
+        run_sharded 1 "$NODE_GPUS" "${args[@]}" \
+            -m "not experimental and single_rank and ${MARKER_ARG}" "$@" || return
+        args+=(-m "not experimental and not single_rank and ${MARKER_ARG}")
+    else
+        args+=(-m "not experimental and ${MARKER_ARG}")
+    fi
+    run_test_cmd uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}" \
+        -m coverage run --data-file=.coverage.unit_tests --source=megatron/core \
+        -m pytest "${args[@]}" "$@" || rc=$?
+    # The single_rank lane can take every test, which leaves the full-width launch nothing.
+    [[ "$rc" -eq 0 || ( "$rc" -eq 5 && "$PACK_SINGLE_RANK" == true ) ]] || return "$rc"
+}
+
 run_full_tests() {
     UNIT_RESULTS_MODE=full
-    local phase target pack_shards=1 single_rank=false
-    local -a command launch
+    local phase target
+    local -a launch
     target=$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')
-    if [[ "$UNIT_TEST_PACK" == 1 && ${#UNIT_PROFILES[@]} -eq 0 && "$NUM_NODES" -eq 1 ]]; then
-        if (( GPUS_PER_NODE < NODE_GPUS && NODE_GPUS % GPUS_PER_NODE == 0 )); then
-            pack_shards=$((NODE_GPUS / GPUS_PER_NODE))
-        elif (( GPUS_PER_NODE > 1 && GPUS_PER_NODE == NODE_GPUS )) \
-            && bucket_uses_mark single_rank "$target"; then
-            single_rank=true
-        fi
-    fi
     for i in $(seq $UNIT_TEST_REPEAT); do
         for phase in prod experimental; do
             [[ "$phase" != experimental || "$TAG" == latest ]] || continue
@@ -503,26 +536,6 @@ run_full_tests() {
             # the launch, which otherwise starts every rank only to deselect every test.
             if [[ "$phase" == experimental ]] && ! bucket_uses_mark experimental "$target"; then
                 echo "No experimental tests in $target; skipping the experimental launch."
-                continue
-            fi
-            if [[ "$phase" == prod ]] && (( pack_shards > 1 )); then
-                echo "Running prod tests as $pack_shards packed shards of $GPUS_PER_NODE GPUs."
-                run_sharded "$GPUS_PER_NODE" "$pack_shards" -vs "${IGNORE_ARGS[@]}" \
-                    -m "not experimental and ${MARKER_ARG}" "$target"
-                continue
-            fi
-            if [[ "$phase" == prod && "$single_rank" == true ]]; then
-                echo "Running single_rank prod tests as $NODE_GPUS one-GPU shards."
-                run_sharded 1 "$NODE_GPUS" -vs "${IGNORE_ARGS[@]}" \
-                    -m "not experimental and single_rank and ${MARKER_ARG}" "$target"
-                command=(uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}"
-                    -m coverage run --data-file=.coverage.unit_tests --source=megatron/core
-                    -m pytest -vs "${IGNORE_ARGS[@]}"
-                    -m "not experimental and not single_rank and ${MARKER_ARG}" "$target")
-                # Every selected test can be single_rank, which leaves this launch nothing.
-                local rc=0
-                "${command[@]}" || rc=$?
-                [[ "$rc" -eq 0 || "$rc" -eq 5 ]] || return "$rc"
                 continue
             fi
             if [[ "$phase" == prod ]]; then
@@ -535,6 +548,8 @@ run_full_tests() {
             if (( ${#UNIT_PROFILES[@]} )); then
                 UNIT_TARGETS=("$target")
                 run_profiled_command "$phase" full "${launch[@]}"
+            elif [[ "$phase" == prod ]]; then
+                run_prod_tests "$target"
             else
                 run_test_cmd uv run --no-sync python -m torch.distributed.run \
                     "${DISTRIBUTED_ARGS[@]}" "${launch[@]}" "$target"
@@ -671,6 +686,8 @@ run_selected_phase() {
     if [[ -n "${UNIT_RESULTS_DIR:-}" ]]; then
         UNIT_TARGETS=("${selected_tests[@]}")
         run_profiled_command "$phase" selected "${launch[@]}" || rc=$?
+    elif [[ "$phase" == prod ]]; then
+        run_prod_tests "${selected_tests[@]}" || rc=$?
     else
         uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}" \
             "${launch[@]}" "${selected_tests[@]}" || rc=$?
@@ -732,6 +749,8 @@ data.write()
     coverage combine -q
     write_testmon_summary "selective tests passed" "$((prod_count + experimental_count))" "$mandatory_count"
 }
+
+pack_plan "$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')"
 
 case "$UNIT_TESTMON_MODE" in
 full)
