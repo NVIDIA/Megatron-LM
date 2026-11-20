@@ -7,7 +7,7 @@ from megatron.core.inference.config import AsyncScheduleMode
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
 from tests.unit_tests.inference import coordinator_pairwise_utils as pairwise
-from tests.unit_tests.inference import test_coordinator_features_pairwise as features
+from tests.unit_tests.inference.two_rank import test_coordinator_features_pairwise as features
 
 
 @pytest.mark.internal

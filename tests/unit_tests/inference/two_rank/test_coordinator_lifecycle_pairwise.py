@@ -14,7 +14,9 @@ from megatron.core.inference.headers import Headers
 from megatron.core.transformer.cuda_graphs import _CudaGraphRunner
 from tests.unit_tests.inference.coordinator_pairwise_utils import greedy_params, routed_model, until
 from tests.unit_tests.inference.engines import test_dynamic_engine as engine_tests
-from tests.unit_tests.inference.test_coordinator_features_pairwise import _exercise_all_owners
+from tests.unit_tests.inference.two_rank.test_coordinator_features_pairwise import (
+    _exercise_all_owners,
+)
 
 pytestmark = [pytest.mark.internal, pytest.mark.asyncio]
 

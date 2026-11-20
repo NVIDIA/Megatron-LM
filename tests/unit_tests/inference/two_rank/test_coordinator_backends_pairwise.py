@@ -9,8 +9,8 @@ from transformer_engine.pytorch.fp8 import check_mxfp8_support, check_nvfp4_supp
 from megatron.core.transformer import attention
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.inference import coordinator_pairwise_utils as utils
-from tests.unit_tests.inference import test_coordinator_features_pairwise as features
 from tests.unit_tests.inference.engines import test_dynamic_engine as engines
+from tests.unit_tests.inference.two_rank import test_coordinator_features_pairwise as features
 
 # Decide hardware support at collection so every rank skips the same rows.
 MXFP8, NVFP4 = check_mxfp8_support(), check_nvfp4_support()

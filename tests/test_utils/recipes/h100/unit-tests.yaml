@@ -52,7 +52,7 @@ spec:
     if [[ "$BUCKET" == "tests/unit_tests/generalized_tensor_parallel/**/*.py" ]]; then
         export GPUS_PER_NODE=4
     elif [[ "$BUCKET" == "tests/unit_tests/inference/two_rank/**/*.py" ]]; then
-        # Two-DP-replica coordinator schedules and the two-worker NIXL handoff. A full run
+        # Inference tests that run at two ranks (see the product entry below). A full run
         # packs four two-GPU shards onto the runner (run_ci_test.sh).
         export GPUS_PER_NODE=2
     fi
@@ -90,8 +90,8 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  # Tests written for exactly two ranks: two-DP-replica coordinator schedules and the
-  # two-worker NIXL handoff. The broad inference buckets exclude this directory.
+  # Inference tests that run at two ranks: real coordinator routing over two DP replicas
+  # and the two-worker NIXL handoff. The broad inference buckets exclude this directory.
   - test_case: [tests/unit_tests/inference/two_rank/**/*.py]
     products:
       - environment: [lts, dev]
