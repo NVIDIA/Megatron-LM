@@ -8,10 +8,18 @@ from dataclasses import replace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    GradientFinalizationMode,
+    fully_shard_optimizer,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec,
@@ -20,12 +28,14 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
+from megatron.core.pipeline_parallel.schedules import forward_backward_no_pipelining
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.moe.experts import SequentialMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig, WideResidualConfig
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
     run_forward_backward_on_microbatches,
 )
@@ -277,6 +287,122 @@ def test_shortcut_moe_training_and_clipping(process_group_collections, distribut
     assert torch.isfinite(reference_losses).all()
     assert losses[-1] < losses[0]
     torch.testing.assert_close(losses, reference_losses)
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] < 10
+    or not is_te_min_version("2.14.0"),
+    reason="Fused MXFP8 experts require Blackwell and Transformer Engine >= 2.14.",
+)
+@pytest.mark.parametrize("delay_wgrad", [False, True])
+def test_fused_expert_ep_overlap_training(process_group_collections, delay_wgrad):
+    """Match ordinary training after releasing expert weights between forward and backward."""
+    pg_collection, _ = process_group_collections
+    torch.manual_seed(4321 + torch.distributed.get_rank())
+    batches = [
+        [
+            {
+                "input_ids": torch.randint(0, 128, (1, 32), device="cuda"),
+                "labels": torch.randint(0, 128, (1, 32), device="cuda"),
+                "position_ids": torch.arange(32, device="cuda").unsqueeze(0),
+                "attention_mask": None,
+            }
+            for _ in range(2)
+        ]
+        for _ in range(3)
+    ]
+
+    def train(overlap):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=256,
+            num_attention_heads=4,
+            attention_backend=AttnBackend.unfused,
+            num_moe_experts=4,
+            expert_model_parallel_size=2,
+            moe_router_topk=2,
+            moe_ffn_hidden_size=256,
+            moe_grouped_gemm=True,
+            moe_token_dispatcher_type="alltoall",
+            use_transformer_engine_op_fuser=True,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+            add_bias_linear=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            fp8="e4m3",
+            fp8_recipe="mxfp8",
+            fp8_param=True,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            gradient_accumulation_fusion=False,
+            overlap_moe_expert_parallel_comm=overlap,
+            delay_wgrad_compute=overlap and delay_wgrad,
+        )
+        torch.manual_seed(123)
+        model_parallel_cuda_manual_seed(123)
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=get_gpt_decoder_block_spec(config, use_transformer_engine=True),
+            vocab_size=128,
+            max_sequence_length=32,
+            pg_collection=pg_collection,
+        ).cuda()
+        wrapped = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                data_parallel_sharding_strategy="optim_grads_params",
+                fp8_param_gather=True,
+            ),
+            module=model,
+            pg_collection=pg_collection,
+        )
+        optimizer = torch.optim.SGD(wrapped.parameters(), lr=0.01)
+        fully_shard_optimizer(optimizer)
+        config.no_sync_func = wrapped.no_sync
+        config.finalize_model_grads_func = finalize_model_grads
+
+        def loss_func(output):
+            loss = output.float().sum()
+            return loss, {"loss": loss.detach().clone()}
+
+        def forward_step(iterator, inner_model, return_schedule_plan=False):
+            batch = next(iterator)
+            if return_schedule_plan:
+                return inner_model.build_schedule_plan(**batch), loss_func
+            return inner_model(**batch), loss_func
+
+        losses = []
+        for microbatches in batches:
+            optimizer.zero_grad()
+            with wrapped.module.context.finalize_gradients(
+                mode=GradientFinalizationMode.REDUCE_OUTER
+            ):
+                data = forward_backward_no_pipelining(
+                    forward_step_func=forward_step,
+                    data_iterator=iter(microbatches),
+                    model=wrapped,
+                    num_microbatches=len(microbatches),
+                    seq_length=32,
+                    micro_batch_size=1,
+                    pg_collection=pg_collection,
+                )
+            optimizer.step()
+            losses.extend(item["loss"] for item in data)
+        return dict(wrapped.named_parameters()), torch.stack(losses)
+
+    reference, reference_losses = train(False)
+    actual, actual_losses = train(True)
+    torch.testing.assert_close(actual_losses, reference_losses)
+    assert actual.keys() == reference.keys()
+    for name, parameter in actual.items():
+        torch.testing.assert_close(
+            parameter.to_local(), reference[name].to_local(), msg=lambda error: f"{name}: {error}"
+        )
 
 
 def _sync_model_parameters(reference_model, model):

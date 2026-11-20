@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.transformer.moe.experts import TEGroupedMLP
 
 
 def _make_unshard_forward_hook(owner: FsdpModule):
@@ -45,11 +46,22 @@ def register_combined_1f1b_hooks(module: FsdpModule) -> None:
     def register_hooks(submodule, owner):
         if isinstance(submodule, FsdpModule):
             owner = submodule  # BEFORE registering: an FSDP unit owns itself
-        if len(list(submodule.parameters(recurse=False))) > 0:
+        is_expert_unit = isinstance(submodule, TEGroupedMLP) and isinstance(submodule, FsdpModule)
+        has_nested_fsdp_unit = False
+        if is_expert_unit:
+            for descendant in submodule.modules():
+                if descendant is not submodule and isinstance(descendant, FsdpModule):
+                    has_nested_fsdp_unit = True
+                    break
+        intact_expert = is_expert_unit and not has_nested_fsdp_unit
+        if intact_expert or len(list(submodule.parameters(recurse=False))) > 0:
             submodule.register_forward_pre_hook(
                 _make_unshard_forward_hook(owner), prepend=True, with_kwargs=True
             )
             submodule.register_full_backward_pre_hook(_make_unshard_backward_hook(owner))
+        # The schedule calls this expert intact; its fused FC1/FC2 bypass child hooks.
+        if intact_expert:
+            return
         for child in submodule.children():
             register_hooks(child, owner)
 
