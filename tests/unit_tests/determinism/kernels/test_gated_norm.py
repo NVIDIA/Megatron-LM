@@ -18,7 +18,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is u
 @pytest.mark.parametrize("zero_centered", [False, True])
 @pytest.mark.parametrize("strided_gate", [False, True])
 @pytest.mark.parametrize(
-    "batch,length,heads,dim,cp", [(1, 1027, 16, 128, 1), (2, 37, 8, 64, 2), (3, 13, 4, 256, 4)]
+    "batch,length,heads,dim,cp",
+    [(1, 1027, 16, 128, 1), (1, 65, 3, 32, 4), (2, 37, 8, 64, 2), (3, 13, 4, 256, 4)],
 )
 def test_output_norm_replays(zero_centered, strided_gate, batch, length, heads, dim, cp):
     te = pytest.importorskip("transformer_engine.pytorch")
