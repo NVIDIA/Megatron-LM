@@ -45,6 +45,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import HAVE_EMERGING_OPTIMIZERS, ChainedOptimizer
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer, get_legacy_grad_dtypes
+from megatron.core.optimizer.grad_scaler import DynamicGradScaler
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
@@ -59,7 +60,10 @@ from tests.unit_tests.dist_checkpointing import (
     setup_model_and_optimizer,
     setup_moe_model_and_optimizer,
 )
-from tests.unit_tests.dist_checkpointing.utils import initialize_quantized_gpt_model
+from tests.unit_tests.dist_checkpointing.utils import (
+    initialize_moe_model,
+    initialize_quantized_gpt_model,
+)
 from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 
@@ -1012,6 +1016,133 @@ class TestDistributedOptimizer:
                 # Test both param state dicts are equal
                 diffs = diff(optim_param_state_A, optim_param_state_B)
                 assert not any(map(bool, diffs)), (rank, diffs)
+
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("ckpt_format", ["torch_dist", "torch"])
+    @pytest.mark.parametrize("fp16", [False, True])
+    def test_stub_dense_optimizer_checkpoint_round_trip(
+        self, tmp_path_dist_ckpt, ckpt_format, fp16
+    ):
+        """Restore expert tensors and loss scalers when the dense optimizer is a stub."""
+        ep = 2
+
+        def initialize_experts_only_model(*args, **kwargs):
+            model = initialize_moe_model(*args, **kwargs)
+            for name, param in model.named_parameters():
+                param.requires_grad_(".experts." in name)
+            return model
+
+        def expert_optimizer(optimizer):
+            return next(
+                child for child in optimizer.chained_optimizers if not child.is_stub_optimizer
+            )
+
+        def snapshot_expert(optimizer):
+            expert = expert_optimizer(optimizer)
+            return {
+                "state": deepcopy(expert.optimizer.state_dict()["state"]),
+                "params": [
+                    param.detach().clone()
+                    for group in expert.param_groups
+                    for param in group["params"]
+                ],
+            }
+
+        def initialize_scalers(optimizer):
+            if fp16:
+                for child in optimizer.chained_optimizers:
+                    child.grad_scaler = DynamicGradScaler(
+                        initial_scale=8,
+                        min_scale=1,
+                        growth_factor=2,
+                        backoff_factor=0.5,
+                        growth_interval=2,
+                        hysteresis=2,
+                    )
+
+        def unscaled_expert_grads(optimizer):
+            expert = expert_optimizer(optimizer)
+            params = [param for group in expert.param_groups for param in group["params"]]
+            for param in params:
+                param.grad = torch.full_like(param, 3.0) * optimizer.get_loss_scale()
+            assert not expert._unscale_main_grads_and_check_for_nan()
+            return [param.grad.detach().clone() for param in params]
+
+        Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=ep)
+
+        with TempNamedDir(tmp_path_dist_ckpt / "test_stub_dense_optimizer", sync=True) as ckpt_dir:
+            mock_args = parse_args(ignore_unknown_args=True)
+            mock_args.fp16 = fp16
+            mock_args.bf16 = not fp16
+            mock_args.use_distributed_optimizer = True
+            mock_args.save_tokenizer_assets = False
+            with mock.patch("megatron.training.checkpointing.get_args", new=lambda: mock_args):
+                model, optimizer_A = setup_moe_model_and_optimizer(
+                    seed=2,
+                    tp=1,
+                    pp=1,
+                    ep=ep,
+                    initialize_fn=initialize_experts_only_model,
+                    bf16=not fp16,
+                    fp16=fp16,
+                )
+                stubs = [
+                    opt
+                    for opt in optimizer_A.chained_optimizers
+                    if isinstance(opt, DistributedOptimizer) and opt.is_stub_optimizer
+                ]
+                assert len(stubs) == 1, "expected exactly one stub (dense) DistributedOptimizer"
+                assert optimizer_A.chained_optimizers[0] is stubs[0]
+                assert len(optimizer_A.chained_optimizers) == 2
+                initialize_scalers(optimizer_A)
+                if fp16:
+                    for child in optimizer_A.chained_optimizers:
+                        for found_inf in (False, False, True, False):
+                            child.grad_scaler.update(found_inf)
+                    assert optimizer_A.get_loss_scale().item() == 16
+                else:
+                    assert stubs[0].state_dict() == {}
+
+                init_checkpointing_mock_args(mock_args, ckpt_dir)
+                mock_args.ckpt_format = ckpt_format
+                mock_args.use_dist_ckpt = ckpt_format != "torch"
+                sync_checkpoint_config(mock_args)
+                expert_state_A = snapshot_expert(optimizer_A)
+                save_checkpoint(10, model, optimizer_A, None, 0)
+                optim_state_A = deepcopy(optimizer_A.state_dict())
+                if ckpt_format == "torch":
+                    legacy_paths = list(ckpt_dir.rglob("distrib_optim.pt"))
+                    assert legacy_paths
+                    legacy_states = torch.load(legacy_paths[0], weights_only=False)
+                    assert len(legacy_states) == 2
+                    assert legacy_states[0] is None
+                    assert legacy_states[1] is not None
+
+                model, optimizer_B = setup_moe_model_and_optimizer(
+                    seed=3,
+                    tp=1,
+                    pp=1,
+                    ep=ep,
+                    initialize_fn=initialize_experts_only_model,
+                    bf16=not fp16,
+                    fp16=fp16,
+                )
+                initialize_scalers(optimizer_B)
+                assert any(map(bool, diff(expert_state_A, snapshot_expert(optimizer_B))))
+                sync_checkpoint_config(mock_args)
+                load_checkpoint_no_arg_checks(model, optimizer_B, None)
+                diffs = diff(optim_state_A, optimizer_B.state_dict())
+                assert not any(map(bool, diffs)), diffs
+                diffs = diff(expert_state_A, snapshot_expert(optimizer_B))
+                assert not any(map(bool, diffs)), diffs
+                if fp16:
+                    assert optimizer_B.get_loss_scale().item() == 16
+                    grads_A = unscaled_expert_grads(optimizer_A)
+                    grads_B = unscaled_expert_grads(optimizer_B)
+                    for grad_A, grad_B in zip(grads_A, grads_B):
+                        torch.testing.assert_close(grad_A, torch.full_like(grad_A, 3.0))
+                        torch.testing.assert_close(grad_B, grad_A)
 
         Utils.destroy_model_parallel()
 

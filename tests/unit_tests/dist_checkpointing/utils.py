@@ -179,17 +179,20 @@ def initialize_moe_model(
         post_process=post_process,
     )
 
-    model.bfloat16()
+    if transformer_config.fp16:
+        model.half()
+    else:
+        model.bfloat16()
     with torch.no_grad():
         for p in model.parameters():
             p.random_()
     return model
 
 
-def init_basic_mock_args(args, tp, pp, bf16=True):
+def init_basic_mock_args(args, tp, pp, bf16=True, fp16=False):
     args.data_parallel_random_init = False
     args.virtual_pipeline_model_parallel_size = None
-    args.fp16 = False
+    args.fp16 = fp16
     args.bf16 = bf16
     args.accumulate_allreduce_grads_in_fp32 = False
     args.overlap_grad_reduce = False
@@ -473,7 +476,10 @@ def setup_moe_model_and_optimizer(
     use_glu=False,
     optimizer='adam',
     use_param_layout=False,
+    fp16=False,
 ):
+    assert not (bf16 and fp16)
+    pipeline_dtype = torch.float16 if fp16 else torch.bfloat16
     optimizer_type = optimizer
     use_layer_wise = False
     if optimizer_type == 'dist_muon':
@@ -488,7 +494,7 @@ def setup_moe_model_and_optimizer(
 
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
-        init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
+        init_basic_mock_args(mock_args, tp, pp, bf16=bf16, fp16=fp16)
         mock_args.use_distributed_optimizer = ddp_use_dist_opt
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
         if ddp_use_layer_wise:
@@ -502,13 +508,14 @@ def setup_moe_model_and_optimizer(
                 seed=seed,
                 tensor_model_parallel_size=tp,
                 pipeline_model_parallel_size=pp,
-                pipeline_dtype=torch.bfloat16,
+                pipeline_dtype=pipeline_dtype,
                 expert_model_parallel_size=ep,
                 use_sp=(tp > 1 and ep > 1),
                 use_te=use_te,
                 use_grouped_mlp=use_grouped_mlp,
                 use_glu=use_glu,
                 bf16=bf16,
+                fp16=fp16,
             ),
             config=TransformerConfig(
                 num_layers=NUM_LAYERS,
@@ -516,12 +523,13 @@ def setup_moe_model_and_optimizer(
                 num_attention_heads=NUM_ATTENTION_HEADS,
                 tensor_model_parallel_size=tp,
                 pipeline_model_parallel_size=pp,
-                pipeline_dtype=torch.bfloat16,
+                pipeline_dtype=pipeline_dtype,
                 expert_model_parallel_size=ep,
                 num_moe_experts=8,
                 add_bias_linear=False,
                 sequence_parallel=tp > 1 and ep > 1,
                 bf16=bf16,
+                fp16=fp16,
             ),
             ddp_config=get_megatron_ddp_config(
                 mock_args, use_torch_fsdp2=mock_args.use_torch_fsdp2
@@ -531,7 +539,8 @@ def setup_moe_model_and_optimizer(
     get_run_config().model.transformer = unwrap_model(model)[0].config
     config = OptimizerConfig(
         bf16=bf16,
-        params_dtype=torch.bfloat16 if bf16 else torch.float,
+        fp16=fp16,
+        params_dtype=torch.float16 if fp16 else (torch.bfloat16 if bf16 else torch.float),
         use_distributed_optimizer=ddp_use_dist_opt,
         use_layer_wise_distributed_optimizer=use_layer_wise,
         optimizer=optimizer,
