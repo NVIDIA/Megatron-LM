@@ -69,7 +69,7 @@ def _reference(query, key, indices, scale):
 
 @pytest.mark.parametrize("dim", [512, 576])
 @pytest.mark.parametrize("topk", [64, 65, 127])
-@pytest.mark.parametrize("heads", [8, 16, 32])
+@pytest.mark.parametrize("heads", [8, 16, 32, 48, 96])
 def test_absorbed_shapes_match_reference_on_cuda(dim, topk, heads):
     """Compare real TileLang output and both input gradients to unpadded sparse attention."""
     if not torch.cuda.is_available():
