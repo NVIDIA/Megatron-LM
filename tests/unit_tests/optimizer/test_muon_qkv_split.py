@@ -7,7 +7,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.optimizer import OptimizerConfig, emerging_optimizers
+from megatron.core.optimizer import OptimizerConfig, emerging_optimizers, get_megatron_optimizer
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.qkv_layout import QKVLayout
 
 pytestmark = pytest.mark.skipif(
@@ -32,6 +33,45 @@ def test_qkv_layouts():
     assert mla.projection_split_shapes == mla.per_head_split_shapes == (24, 8)
     with pytest.raises(ValueError, match="same rows"):
         QKVLayout(num_groups=1, projection_split_shapes=(4, 4), per_head_split_shapes=(4,))
+
+
+@pytest.mark.parametrize("per_head", [False, True])
+def test_scalar_head_gate_keeps_the_whole_muon_matrix(per_head):
+    """A divisible total row count does not make appended scalar gates part of a QKV group."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    chunks = []
+    # 96 QKV rows, plus either 24 scalar gates (one per head) or 48 elementwise gates.
+    for rows, scalar_gate, output_gate in [
+        (120, True, False),
+        (96, False, False),
+        (144, False, True),
+    ]:
+        chunk = torch.nn.Module()
+        chunk.config = SimpleNamespace(
+            num_attention_heads=24,
+            num_query_groups=12,
+            kv_channels=2,
+            head_wise_attn_gate=scalar_gate,
+            attention_output_gate=output_gate,
+        )
+        chunk.linear_qkv = torch.nn.Linear(48, rows, bias=False, device=device)
+        chunks.append(chunk)
+    chain = get_megatron_optimizer(
+        OptimizerConfig(
+            optimizer="muon", lr=0.01, muon_split_qkv_per_head=per_head, muon_tp_mode="duplicated"
+        ),
+        chunks,
+        pg_collection=ProcessGroupCollection(),
+        use_gloo_process_groups=False,
+    )
+    weight, ordinary, output_gated = (chunk.linear_qkv.weight for chunk in chunks)
+    assert ordinary.qkv_split_shapes == ([2, 2, 2, 2] if per_head else [4, 2, 2])
+    assert output_gated.qkv_split_shapes == ([2] * 6 if per_head else [4, 4, 2, 2])
+    assert not getattr(weight, "is_qkv", False)
+    muon = chain.chained_optimizers[0].optimizer
+    grad = torch.randn_like(weight)
+    expected = muon.orthogonalize(torch.nn.Parameter(weight.detach().clone()), grad.clone())
+    torch.testing.assert_close(muon.orthogonalize(weight, grad), expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(

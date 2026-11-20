@@ -882,6 +882,9 @@ def _get_megatron_emerging_optimizer(
                 continue
             qkv_layout = getattr(param, 'qkv_layout', None)
             if qkv_layout is None and 'linear_qkv.weight' in name:
+                # Scalar head gates append rows outside the interleaved QKV groups.
+                if getattr(model_chunk.config, 'head_wise_attn_gate', False):
+                    continue
                 if config_qkv_layout is None:
                     config_qkv_layout = QKVLayout.from_transformer_config(model_chunk.config)
                 qkv_layout = config_qkv_layout
