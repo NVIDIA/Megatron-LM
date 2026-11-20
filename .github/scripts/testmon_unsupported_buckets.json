@@ -1,0 +1,10 @@
+{
+  "dgx_h100": [
+    "tests/unit_tests/inference/test_batch_invariant_fp8.py",
+    "tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py",
+    "tests/unit_tests/inference/test_disagg_transfer_pairwise.py"
+  ],
+  "dgx_gb200": [
+    "tests/unit_tests/inference/test_batch_invariant_fp8.py"
+  ]
+}

@@ -14,6 +14,9 @@ import pytest
 import yaml
 
 ROOT = Path(__file__).parents[2]
+UNSUPPORTED_BUCKETS_FILE = Path(".github/scripts/testmon_unsupported_buckets.json")
+STANDALONE_BUCKETS = json.loads((ROOT / UNSUPPORTED_BUCKETS_FILE).read_text())
+FP8_BUCKET = "tests/unit_tests/inference/test_batch_invariant_fp8.py"
 
 
 def _step(workflow: str, job: str, step_id: str) -> dict:
@@ -71,6 +74,9 @@ def shell_environment(tmp_path: Path) -> dict[str, str]:
         "print(json.dumps(cases if len(sys.argv) == 5 else [{'bucket': case} for case in cases]))\n"
     )
     yq.chmod(0o755)
+    policy = tmp_path / UNSUPPORTED_BUCKETS_FILE
+    policy.parent.mkdir(parents=True)
+    policy.symlink_to(ROOT / UNSUPPORTED_BUCKETS_FILE)
     for platform in ("h100", "gb200"):
         relative = Path("tests/test_utils/recipes") / platform / "unit-tests.yaml"
         destination = tmp_path / relative
@@ -139,7 +145,9 @@ def test_producer_consumes_the_actual_build_matrix(
             ).read_text()
         )
         buckets = [case for product in recipe["products"] for case in product["test_case"]]
-        assert [entry["bucket"] for entry in entries] == buckets
+        assert [entry["bucket"] for entry in entries] == [
+            bucket for bucket in buckets if bucket not in STANDALONE_BUCKETS[platform]
+        ]
         assert all(
             entry["runner"] == runner and entry["image"] == f"{registry}/megatron-lm:{sha}-{cloud}"
             for entry in entries
@@ -207,7 +215,9 @@ def test_producer_publishes_one_h100_testmon_baseline_for_aws_and_gcp_builds(
         )
         expected_buckets = [case for product in recipe["products"] for case in product["test_case"]]
         entries = [entry for entry in matrix if entry["platform"] == platform]
-        assert [entry["bucket"] for entry in entries] == expected_buckets
+        assert [entry["bucket"] for entry in entries] == [
+            bucket for bucket in expected_buckets if bucket not in STANDALONE_BUCKETS[platform]
+        ]
         assert all(
             entry["runner"] == runner
             and entry["image"] == f"{registry}/megatron-lm:{source_sha}-{cloud}"
@@ -1001,10 +1011,6 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
     assert workflow["jobs"]["run"]["strategy"]["matrix"]["include"] == (
         "${{ fromJSON(needs.select.outputs.matrix || inputs.buckets) }}"
     )
-    assert workflow["jobs"]["run"]["steps"][-1]["with"]["unit_testmon_mode"] == (
-        "${{ inputs.unit_testmon_mode == 'enforce' && "
-        "inputs.unit_testmon_target_branch == 'main' && 'enforce' || 'full' }}"
-    )
     assert "unit_testmon_plan_artifact" not in workflow["jobs"]["run"]["steps"][-1]["with"]
 
     # CPU failures stop GPU scheduling; full-suite requests bypass selection.
@@ -1069,6 +1075,7 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
     [
         pytest.param("enforce", "main", "preselected", "enforce", id="cpu-selected"),
         pytest.param("enforce", "main", "full", "enforce", id="cpu-fallback"),
+        pytest.param("enforce", "main", "standalone", "full", id="standalone-launcher"),
         pytest.param("full", "main", "", "full", id="explicit-full"),
         pytest.param("full", "", "", "full", id="merge-group-full"),
         pytest.param("enforce", "dev", "preselected", "full", id="unsupported-target"),
@@ -1188,6 +1195,9 @@ for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
         capture_output=True,
         text=True,
     )
+    standalone = {"bucket": FP8_BUCKET, "timeout": 20}
+    if scenario == "mixed":
+        environment["BUCKETS"] = json.dumps([*buckets, standalone])
     spec = importlib.util.spec_from_file_location(
         "select_unit_tests", ROOT / ".github/scripts/select_unit_tests.py"
     )
@@ -1265,6 +1275,9 @@ for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
     assert restores == len(buckets)
     outputs = dict(line.split("=", 1) for line in (tmp_path / "outputs").read_text().splitlines())
     matrix = json.loads(outputs["matrix"])
+    if scenario == "mixed":
+        assert matrix.pop() == {**standalone, "mode": "standalone"}
+        assert all(upload["plan"]["bucket"] != FP8_BUCKET for upload in uploads)
     assert outputs["has_tests"] == str(scenario != "empty").lower()
     assert [entry["bucket"] for entry in matrix] == [
         entry["bucket"] for entry in buckets if entry["bucket"] != "tests/unit_tests/empty/**/*.py"
