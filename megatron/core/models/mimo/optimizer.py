@@ -292,11 +292,22 @@ def _extract_grad_scaler(sub_sd, module_name, suffix, replica_id):
 
 
 def _extract_param_state_sharding_type(sub_sd, module_name, suffix, replica_id):
-    """Save: extract param_state_sharding_type into a ShardedObject."""
+    """Save: extract param_state_sharding_type into a ShardedObject.
+
+    The param remainders flag (param_state_param_remainders) travels in the same object, as a
+    dict payload: plain values reach only rank 0's common state, and a separate object would be
+    missing from checkpoints saved before the flag existed.
+    """
     if 'param_state_sharding_type' in sub_sd:
+        payload = sub_sd.pop('param_state_sharding_type')
+        if 'param_state_param_remainders' in sub_sd:
+            payload = {
+                'param_state_sharding_type': payload,
+                'param_state_param_remainders': sub_sd.pop('param_state_param_remainders'),
+            }
         sub_sd[f'_mimo_param_state_sharding_type{suffix}'] = ShardedObject(
             f'optimizer.mimo.{module_name}{suffix}.param_state_sharding_type',
-            sub_sd.pop('param_state_sharding_type'),
+            payload,
             (1,),
             (0,),
             replica_id=replica_id,
@@ -334,10 +345,16 @@ def _restore_param_groups(sub_sd, inner_optimizer, module_name):
 
 
 def _restore_param_state_sharding_type(sub_sd):
-    """Load: restore param_state_sharding_type from ShardedObject key."""
+    """Load: restore param_state_sharding_type (and the param remainders flag, when the
+    checkpoint records it) from ShardedObject key."""
     for k in list(sub_sd.keys()):
         if isinstance(k, str) and k.startswith('_mimo_param_state_sharding_type'):
-            sub_sd['param_state_sharding_type'] = sub_sd.pop(k)
+            payload = sub_sd.pop(k)
+            if isinstance(payload, dict):
+                sub_sd.update(payload)
+            else:
+                # Checkpoints saved before the param remainders flag store the sharding type only.
+                sub_sd['param_state_sharding_type'] = payload
             break
 
 
