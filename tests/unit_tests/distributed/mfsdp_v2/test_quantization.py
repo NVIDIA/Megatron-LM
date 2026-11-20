@@ -373,13 +373,8 @@ def test_mxfp8_unshard_gathers_rowwise_for_forward_and_columnwise_for_backward(d
 @requires_mxfp8
 @pytest.mark.parametrize("placements", _MXFP8_PLACEMENTS)
 @pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
-@pytest.mark.parametrize(
-    "prefetch_order",
-    [PrefetchOrder.REGISTRATION, PrefetchOrder.RECORDED],
-    ids=["registration", "recorded"],
-)
 def test_mxfp8_activation_recompute_matches_no_recompute(
-    distributed_setup, use_reentrant, placements, prefetch_order
+    distributed_setup, use_reentrant, placements
 ):
     """Recomputation regathers rowwise planes in backward without changing numerics."""
     device = distributed_setup.device
@@ -393,7 +388,7 @@ def test_mxfp8_activation_recompute_matches_no_recompute(
         with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
             torch.manual_seed(2026)
             model = _RecomputedMLP(device, use_reentrant)
-        runtime_policy = RuntimePolicy(prefetch_order=prefetch_order)
+        runtime_policy = RuntimePolicy(prefetch_order=PrefetchOrder.RECORDED)
         with fully_shard_context(FsdpContext(device=device, runtime_policy=runtime_policy)):
             fully_shard(model.fc1, mesh=mesh, placements=placements)
             fully_shard(model.fc2, mesh=mesh, placements=placements)

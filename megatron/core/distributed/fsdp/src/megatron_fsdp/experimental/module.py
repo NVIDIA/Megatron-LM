@@ -319,31 +319,26 @@ class FsdpModule:
 
             if not prefetch:
                 return
-            context = self.context
             match phase:
                 case Phase.FORWARD:
-                    self._prefetch_parameter_groups(
-                        phase, context.execution_order, self._schedule_policy.forward_prefetch_size
-                    )
+                    prefetch_size = self._schedule_policy.forward_prefetch_size
                 case Phase.BACKWARD:
-                    self._prefetch_parameter_groups(
-                        phase, context.execution_order, self._schedule_policy.backward_prefetch_size
-                    )
+                    prefetch_size = self._schedule_policy.backward_prefetch_size
                 case _:
                     raise ValueError(
                         f"Prefetching requires a FORWARD or BACKWARD phase, got {phase!r}."
                     )
+            order = self.context.execution_order
+            event = ExecutionEvent(cast(nn.Module, self), phase)
+            if order.peek() != event:
+                raise RuntimeError(
+                    "FSDP module calls diverged from the expected execution order "
+                    f"at position {order.position}: expected {order.peek()}, got {event}."
+                )
+            self._prefetch_parameter_groups(order, prefetch_size)
 
-    def _prefetch_parameter_groups(
-        self, phase: Phase, order: ExecutionOrder, prefetch_size: int | None
-    ) -> None:
-        """Validate the current event, prefetch successors, and advance once."""
-        event = ExecutionEvent(cast(nn.Module, self), phase)
-        if order.peek() != event:
-            raise RuntimeError(
-                "FSDP module calls diverged from the expected execution order "
-                f"at position {order.position}: expected {order.peek()}, got {event}."
-            )
+    def _prefetch_parameter_groups(self, order: ExecutionOrder, prefetch_size: int | None) -> None:
+        """Prefetch successors of the current event and advance once."""
         prefetched_size = 0
         for next_event in order.successors():
             if prefetch_size is not None and prefetched_size >= prefetch_size:
