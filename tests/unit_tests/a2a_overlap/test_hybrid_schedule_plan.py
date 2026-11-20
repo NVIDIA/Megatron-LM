@@ -27,54 +27,89 @@ from tests.unit_tests.models.hybrid.external_layer import ExternalGainConfig
 from tests.unit_tests.test_utilities import Utils
 
 
-def _overlap_model_stub(**config_overrides):
+def _overlap_model_stub(
+    *, static_cp_size=1, layer_cp_layouts=("contiguous", "contiguous"), **config_overrides
+):
     config = dict(
         cuda_graph_impl="none",
         enable_mhc_connections=False,
         moe_shortcut_connection=False,
         wide_residual=None,
         recompute_granularity=None,
+        dynamic_context_parallel=False,
+        sequence_parallel=False,
     )
     config.update(config_overrides)
-    return SimpleNamespace(
-        config=SimpleNamespace(**config),
-        _has_custom_layers=False,
-        decoder=SimpleNamespace(
-            layer_config_list=[],
-            _cp_layout_manager=None,
-            _has_linear_layer_with_chunkwise_cp=False,
-            cp_group=SimpleNamespace(size=lambda: 1),
-        ),
-    )
-
-
-@pytest.mark.parametrize("needs_conversion", [True, False])
-def test_hybrid_ep_overlap_checks_physical_layer_cp_layouts(needs_conversion):
-    """A group may contain physical layers with different CP layouts."""
-    model = _overlap_model_stub()
-    model.decoder._cp_layout_manager = ContextParallelLayoutManager(
-        layer_layouts=("contiguous", "zigzag" if needs_conversion else "contiguous"),
+    config = SimpleNamespace(**config)
+    decoder = SimpleNamespace(
+        config=config,
+        layer_config_list=[],
         boundary_layout="contiguous",
-        sequence_parallel=False,
-        cp_group=SimpleNamespace(size=lambda: 2),
+        layer_cp_layouts=layer_cp_layouts,
+        _cp_layout_manager=None,
+        _has_linear_layer_with_chunkwise_cp=False,
+        cp_group=SimpleNamespace(size=lambda: static_cp_size),
         tp_group=None,
         tp_cp_group=None,
     )
-    if needs_conversion:
-        with pytest.raises(ValueError, match="mixed context-parallel layouts"):
-            validate_overlap_schedule(model)
-    else:
+    if static_cp_size > 1:
+        decoder._cp_layout_manager = ContextParallelLayoutManager(
+            layer_layouts=decoder.layer_cp_layouts,
+            boundary_layout=decoder.boundary_layout,
+            sequence_parallel=config.sequence_parallel,
+            cp_group=decoder.cp_group,
+            tp_group=decoder.tp_group,
+            tp_cp_group=decoder.tp_cp_group,
+        )
+    return SimpleNamespace(config=config, _has_custom_layers=False, decoder=decoder)
+
+
+@pytest.mark.parametrize(
+    "static_cp_size, dynamic_cp, reject",
+    [(1, False, False), (2, False, True), (1, True, True)],
+    ids=["static_cp1", "static_cp2", "dynamic_from_cp1"],
+)
+@pytest.mark.parametrize(
+    "layer_cp_layouts, chunkwise, message",
+    [
+        (("zigzag", "contiguous"), False, "mixed context-parallel layouts"),
+        (("contiguous", "contiguous"), True, "linear_cp_mode='chunkwise'"),
+    ],
+    ids=["mixed_layout", "chunkwise"],
+)
+def test_hybrid_ep_overlap_cp_compatibility(
+    static_cp_size, dynamic_cp, reject, layer_cp_layouts, chunkwise, message
+):
+    """Physical layout conversion and chunkwise metadata are needed only when CP may be active."""
+    model = _overlap_model_stub(
+        static_cp_size=static_cp_size,
+        layer_cp_layouts=layer_cp_layouts,
+        dynamic_context_parallel=dynamic_cp,
+    )
+    model.decoder._has_linear_layer_with_chunkwise_cp = chunkwise
+    with pytest.raises(ValueError, match=message) if reject else nullcontext():
         validate_overlap_schedule(model)
 
 
-def test_hybrid_ep_overlap_rejects_chunkwise_linear_cp():
-    """Chunkwise linear CP needs packed-sequence metadata that only HybridStack.forward builds."""
-    model = _overlap_model_stub()
-    model.decoder._has_linear_layer_with_chunkwise_cp = True
+@pytest.mark.parametrize(
+    "static_cp_size, runtime_cp_size",
+    [(2, None), (1, 1), (1, 2)],
+    ids=["static_cp2", "dynamic_runtime_cp1", "dynamic_runtime_cp2"],
+)
+def test_hybrid_ep_overlap_accepts_uniform_headwise_cp(static_cp_size, runtime_cp_size):
+    model = _overlap_model_stub(
+        static_cp_size=static_cp_size, dynamic_context_parallel=runtime_cp_size is not None
+    )
     validate_overlap_schedule(model)
-    model.decoder.cp_group = SimpleNamespace(size=lambda: 2)
-    with pytest.raises(ValueError, match="linear_cp_mode='chunkwise'"):
-        validate_overlap_schedule(model)
+
+    packed = None
+    if runtime_cp_size is not None:
+        packed = PackedSeqParams(
+            local_cp_size=runtime_cp_size, cp_group=SimpleNamespace(size=lambda: runtime_cp_size)
+        )
+    group, manager = HybridStack._resolve_runtime_cp_layout(model.decoder, packed)
+    assert group.size() == (runtime_cp_size or static_cp_size)
+    assert manager is None or not manager.requires_conversion
 
 
 @pytest.mark.parametrize(

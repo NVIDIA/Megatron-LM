@@ -131,13 +131,17 @@ def validate_overlap_schedule(model):
     # The schedule calls physical layers directly. HybridStack.forward owns CP
     # layout conversions and the packed metadata for chunkwise linear layers.
     decoder = model.decoder
-    if decoder._cp_layout_manager is not None and decoder._cp_layout_manager.requires_conversion:
+    # A dynamic microbatch can use multiple CP ranks even when the static group has size 1.
+    may_use_multi_rank_cp = config.dynamic_context_parallel or decoder.cp_group.size() > 1
+    if may_use_multi_rank_cp and any(
+        layout != decoder.boundary_layout for layout in decoder.layer_cp_layouts
+    ):
         raise ValueError(
             "overlap_moe_expert_parallel_comm with HybridModel does not support mixed "
             "context-parallel layouts (linear_cp_layout != attention_cp_layout with "
             "context_parallel_size > 1)."
         )
-    if decoder._has_linear_layer_with_chunkwise_cp and decoder.cp_group.size() > 1:
+    if may_use_multi_rank_cp and decoder._has_linear_layer_with_chunkwise_cp:
         raise ValueError(
             "overlap_moe_expert_parallel_comm with HybridModel does not support "
             "linear_cp_mode='chunkwise' with context_parallel_size > 1."
