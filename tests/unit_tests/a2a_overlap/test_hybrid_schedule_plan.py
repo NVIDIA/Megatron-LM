@@ -13,21 +13,16 @@ from megatron.core.models.common.model_chunk_schedule_plan import (
     TransformerLayerSchedulePlan,
     TransformerModelChunkSchedulePlan,
 )
-from megatron.core.models.hybrid.fine_grained_callables import (
-    hybrid_layer_schedule_groups,
-    validate_overlap_schedule,
-)
+from megatron.core.models.hybrid.fine_grained_callables import validate_overlap_schedule
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.pipeline_parallel.utils import get_comm_stream, get_comp_stream, set_streams
+from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe.moe_utils import MoEAuxLossAutoScaler
 from megatron.core.transformer.transformer_config import MLATransformerConfig
-from tests.unit_tests.a2a_overlap.utils import DummyState
 from tests.unit_tests.models.hybrid.external_layer import ExternalGainConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -318,13 +313,25 @@ def test_packed_moe_overlap_routes_per_sample_like_eager(monkeypatch):
             moe_token_dispatcher_type="alltoall",
             overlap_moe_expert_parallel_comm=True,
         )
-        block = HybridStack(
-            config,
-            hybrid_stack_spec.submodules,
-            layer_config_list=validate_segment_layers("E", config),
+        model = HybridModel(
+            config=config,
+            hybrid_layer_pattern="E",
+            vocab_size=128,
+            max_sequence_length=seq_length,
             pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
-        packed_seq_params = PackedSeqParams(tokens_per_sample=seq_length)
+
+        def decoder_output(*, hidden_states, **kwargs):
+            # Compare the normalized packed activations on both model paths.
+            return hidden_states.float()
+
+        kwargs = dict(
+            input_ids=None,
+            position_ids=None,
+            attention_mask=None,
+            packed_seq_params=PackedSeqParams(tokens_per_sample=seq_length),
+            output_processor=decoder_output,
+        )
         inputs = [
             torch.randn(
                 micro_batch_size * seq_length, 1, hidden_size, device="cuda", dtype=torch.bfloat16
@@ -333,58 +340,37 @@ def test_packed_moe_overlap_routes_per_sample_like_eager(monkeypatch):
         ]
         references = []
         for hidden_states in inputs:
-            output = block(
-                hidden_states.clone().requires_grad_(),
-                attention_mask=None,
-                packed_seq_params=packed_seq_params,
-            )
+            output = model(decoder_input=hidden_states.clone().requires_grad_(), **kwargs)
             references.append(output.detach().clone())
             output.backward(torch.ones_like(output))
         reference_grads = {
             name: param.grad.detach().clone()
-            for name, param in block.named_parameters()
+            for name, param in model.decoder.named_parameters()
             if param.grad is not None
         }
-        block.zero_grad(set_to_none=True)
+        model.zero_grad(set_to_none=True)
 
         set_streams()
-        plans = []
-        for _ in inputs:
-            state = DummyState()
-            state.model = SimpleNamespace(decoder=block)
-            state.packed_seq_params = packed_seq_params
-            plans.append(
-                TransformerLayerSchedulePlan(
-                    hybrid_layer_schedule_groups(block)[0],
-                    torch.cuda.Event(),
-                    state,
-                    get_comp_stream,
-                    get_comm_stream,
-                    extra_args={"is_last_layer": True},
-                )
-            )
-
         outputs = []
         previous = None
-        for index, plan in enumerate(plans):
-            output, _ = TransformerLayerSchedulePlan.run(
-                plan,
-                previous,
-                f_input=inputs[index].clone().requires_grad_(),
-                b_grad=None if previous is None else torch.ones_like(outputs[-1]),
+        for hidden_states in inputs:
+            plan = model.build_schedule_plan(
+                decoder_input=hidden_states.clone().requires_grad_(), **kwargs
             )
-            torch.cuda.synchronize()
+            output = TransformerModelChunkSchedulePlan.run(
+                plan, previous, b_grad=None if previous is None else torch.ones_like(outputs[-1])
+            )
             outputs.append(output.detach().clone())
             previous = plan
-        TransformerLayerSchedulePlan.run(None, previous, b_grad=torch.ones_like(outputs[-1]))
-        torch.cuda.synchronize()
+        TransformerModelChunkSchedulePlan.run(None, previous, b_grad=torch.ones_like(outputs[-1]))
 
         for output, reference in zip(outputs, references):
             assert output.shape == reference.shape
             torch.testing.assert_close(output, reference, rtol=1e-2, atol=1e-2)
         router_grads = [name for name in reference_grads if name.endswith("router.weight")]
         assert router_grads
-        for name, param in block.named_parameters():
+        assert "final_norm.weight" in reference_grads
+        for name, param in model.decoder.named_parameters():
             if name in reference_grads:
                 assert param.grad is not None, name
                 torch.testing.assert_close(param.grad, reference_grads[name], rtol=2e-2, atol=2e-2)

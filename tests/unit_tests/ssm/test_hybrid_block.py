@@ -30,6 +30,7 @@ from megatron.core.ssm.gated_delta_product import HAVE_FLA as HAVE_GDP
 from megatron.core.ssm.gated_delta_product import HAVE_MAMBA_SSM as HAVE_GDP_MAMBA
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
+from megatron.core.ssm.mlp_layer import MLPLayer
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -1567,7 +1568,7 @@ class TestHybridBlock:
             MambaLayer,
             MambaLayer,
             TransformerLayer,
-            TransformerLayer,
+            MLPLayer,
         ]
         assert [layer.layer_number for layer in block.layers] == [1, 2, 3, 4]
         assert block.layers[1].config is layer_config_list[1][0]
