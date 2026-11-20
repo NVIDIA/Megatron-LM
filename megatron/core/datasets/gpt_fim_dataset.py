@@ -9,6 +9,7 @@ import numpy as np
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.utils import Split
+from megatron.core.safe_globals import safe_numpy_load
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,17 @@ class GPTFIMDataset(GPTDataset):
             Tuple[np.ndarray, np.ndarray, list]: The text ids, document ids,
                 and per-document token counts.
         """
+        if self.shuffle_index is None:
+            self.shuffle_index = safe_numpy_load(
+                self.path_to_shuffle_index, allow_pickle=True, mmap_mode="r"
+            )
+            self.sample_index = safe_numpy_load(
+                self.path_to_sample_index, allow_pickle=True, mmap_mode="r"
+            )
+            self.document_index = safe_numpy_load(
+                self.path_to_document_index, allow_pickle=True, mmap_mode="r"
+            )
+
         # Do the shuffle mapping
         idx = self.shuffle_index[idx]
 
