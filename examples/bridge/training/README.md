@@ -13,6 +13,39 @@ and datasets can continue to use the lower-level training entrypoint.
 
 ## Llama 3 example
 
+Use the generic recipe runner from the repository root:
+
+```bash
+CUDA_DEVICE_MAX_CONNECTIONS=1 uv run python -m torch.distributed.run \
+    --nproc-per-node=2 scripts/run_recipe.py \
+    --recipe examples.bridge.training.llama3_pretrain:llama3_pretrain_config \
+    model.transformer.context_parallel_size=1 \
+    model.transformer.tensor_model_parallel_size=2 \
+    model.transformer.max_seq_length_per_sample=512 \
+    data.dataset.sequence_length=512 \
+    train.global_batch_size=4 train.train_iters=20 \
+    scheduler.lr_warmup_iters=1 scheduler.lr_decay_iters=20 \
+    validation.eval_iters=1 validation.eval_interval=5 \
+    data.dataloader.num_workers=0 logger.log_interval=1
+```
+
+The recipe is a trusted, importable zero-argument Python factory returning an
+MLM `PretrainConfigContainer`. Trailing `KEY=VALUE` overrides edit existing
+public dataclass fields (numbers, booleans, `null`, lists, or strings); repeated
+keys use the last value. Unknown fields are rejected. Define optional config
+sections, dataset classes, and Python callables in the recipe itself.
+
+The runner selects the standard GPT/Hybrid forward step from the model config.
+Use `--forward-step module:function` for an explicit MLM-compatible step.
+`--dry-run` validates and displays the unfinalized config without setting global
+config, initializing distributed services, building datasets, or training.
+It is not a substitute for runtime validation against the actual GPU topology.
+
+Dataset selection stays in `cfg.data`. The runner neither synchronizes sequence
+lengths nor finalizes the config: both remain under the existing framework
+ownership rules. It calls the current `megatron.training.api.pretrain` wrapper;
+neither that wrapper nor the underlying training API is changed by the runner.
+
 The independently expressed settings follow the
 [Bridge Llama 3 8B BF16 recipe](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/eea53e431a8b0b4e9c4f47a76784c6f3200c9a1f/src/megatron/bridge/recipes/llama/h100/llama3.py).
 Like that scratch-training recipe, this uses mock data and a 32K NullTokenizer,
