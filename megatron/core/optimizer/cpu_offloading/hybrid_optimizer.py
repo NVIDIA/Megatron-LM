@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION and Alibaba PAI. All rights reserved.
 from collections import defaultdict
 from typing import Dict
+from weakref import ref
 
 import torch
 
@@ -117,28 +118,37 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             self._cpu_optimizer_map_data_event[optimizer] = self._d2h_stream.record_event()
 
     def _register_param_copy_back_gpu_hook(self):
+        # Sub-optimizers must not keep their owner (and its CPU copies) alive.
+        owner_ref = ref(self)
+
         def param_copy_back_gpu_hook_closure():
             def param_copy_back_gpu_hook(optimizer, args, kwargs):
-                self._h2d_stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(self._h2d_stream):
+                owner = owner_ref()
+                if owner is None:
+                    return
+                owner._h2d_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(owner._h2d_stream):
                     for param in _param_generator(optimizer):
-                        gpu_param = self.cpu_copys_map_gpu_param[param]
+                        gpu_param = owner.cpu_copys_map_gpu_param[param]
                         gpu_param.data.copy_(param.data, non_blocking=True)
-                self._h2d_stream.record_event().wait(torch.cuda.current_stream())
+                owner._h2d_stream.record_event().wait(torch.cuda.current_stream())
 
             return param_copy_back_gpu_hook
 
         def fp32_param_copy_back_gpu_hook_closure():
             def fp32_param_copy_back_gpu_hook(optimizer, args, kwargs):
-                for group in self.param_groups:
+                owner = owner_ref()
+                if owner is None:
+                    return
+                for group in owner.param_groups:
                     for param in group["params"]:
-                        if param in self.gpu_params_map_cpu_copy:
+                        if param in owner.gpu_params_map_cpu_copy:
                             # Skip if the param is offloaded to GPU, it has been
                             # copied back in the previous hook.
                             continue
 
-                        if param in self.param_to_fp32_param:
-                            fp32_param = self.param_to_fp32_param[param]
+                        if param in owner.param_to_fp32_param:
+                            fp32_param = owner.param_to_fp32_param[param]
                             param.data.copy_(fp32_param.data)
 
             return fp32_param_copy_back_gpu_hook
