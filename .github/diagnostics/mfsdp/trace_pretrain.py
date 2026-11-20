@@ -14,7 +14,9 @@
 
 """Diagnostic collective fingerprints for the first real training step."""
 
+import ctypes
 import functools
+import hashlib
 import importlib
 import inspect
 import json
@@ -36,6 +38,58 @@ gemm_counts = Counter()
 active = False
 compute_active = False
 steps = 0
+
+
+def dump_gemm(values, outputs, directory):
+    """Save exact operands once, deduplicating repeated gated-MLP inputs."""
+    directory.mkdir(parents=True, exist_ok=True)
+    saved = {}
+
+    def dump(tensor):
+        raw = tensor.detach().contiguous().cpu().view(torch.uint8).numpy().tobytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        filename = f"{digest}.bin"
+        if digest not in saved:
+            (directory / filename).write_bytes(raw)
+            saved[digest] = True
+        return {
+            "file": filename,
+            "sha256": digest,
+            "shape": list(tensor.shape),
+            "stride": list(tensor.stride()),
+            "dtype": str(tensor.dtype),
+        }
+
+    manifest = {
+        "A": [dump(tensor) for tensor in values["A"]],
+        "B": [dump(tensor) for tensor in values["B"]],
+        "outputs": [dump(tensor) for tensor in outputs],
+        "metadata": {
+            key: values[key]
+            for key in [
+                "layout",
+                "grad",
+                "accumulate",
+                "m_splits",
+                "use_bias",
+                "use_split_accumulator",
+                "single_output",
+            ]
+        },
+        "out_dtype": str(values["out_dtype"]),
+        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+        "allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+        "environment": {
+            key: os.environ.get(key)
+            for key in [
+                "CUBLAS_WORKSPACE_CONFIG",
+                "NVTE_ALLOW_NONDETERMINISTIC_ALGO",
+                "NVTE_EXT_MARGIN_SM",
+                "CUDA_DEVICE_MAX_CONNECTIONS",
+            ]
+        },
+    }
+    (directory / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
 
 def signature(tensor):
@@ -105,7 +159,28 @@ for gemm_name in ("general_gemm", "general_grouped_gemm"):
             }
             if values.get("accumulate"):
                 entry["inputs"]["prior_output"] = tensor_signatures(values.get("out"))
+            capture = (
+                os.environ.get("MFSDP_CAPTURE_GEMM") == entry["id"]
+                and name == "general_grouped_gemm"
+            )
+            if capture:
+                directory = Path(os.environ["COLLECTIVE_TRACE_DIR"])
+                directory.mkdir(parents=True, exist_ok=True)
+                rank = torch.distributed.get_rank()
+                logger = ctypes.CDLL("libcublasLt.so.13")
+                assert (
+                    logger.cublasLtLoggerOpenFile(
+                        str(directory / f"cublaslt-rank{rank}.log").encode()
+                    )
+                    == 0
+                )
+                assert logger.cublasLtLoggerSetLevel(5) == 0
             result = original(*args, **kwargs)
+            if capture:
+                torch.cuda.synchronize()
+                assert logger.cublasLtLoggerSetLevel(0) == 0
+                if rank == 0:
+                    dump_gemm(values, result[0], directory / "gemm-snapshot-rank0")
             entry["outputs"] = tensor_signatures(result[0])
             gemm_records.append(entry)
             return result

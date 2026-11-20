@@ -27,9 +27,12 @@ result = Path('/workspace/results') / label
 result.mkdir(parents=True, exist_ok=False)
 (result / 'request.json').write_text(json.dumps({
     'label': label, 'steps': 4, 'trace': '-traced-' in label,
+    'env': {'MFSDP_CAPTURE_GEMM': 'general_grouped_gemm:14'} if '-traced-' in label else {},
 }))
 PYCODE
   uv run --no-sync python /workspace/payload.py \
     "/workspace/results/$label/request.json" > "/workspace/results/$label/payload.log" 2>&1
   cat "/workspace/results/$label/result.json"
 done
+CUDA_VISIBLE_DEVICES=0 uv run --no-sync python /workspace/replay_gemm.py \
+  "/workspace/results/$prefix-traced-4/collectives/gemm-snapshot-rank0"
