@@ -149,6 +149,14 @@ def _assert_projected(reference, actual):
     assert torch.equal(reference, actual), "projected media embeddings changed"
 
 
+def _take_media_evidence(engine):
+    """Return what the finished run recorded and empty the record for the next run."""
+    taken = list(engine._bi_media_evidence), list(engine._bi_decoder_inputs)
+    engine._bi_media_evidence.clear()
+    engine._bi_decoder_inputs.clear()
+    return taken
+
+
 def _drain(engine):
     for _ in range(32):
         if not engine.has_unfinished_requests():
@@ -160,28 +168,28 @@ def _drain(engine):
 @pytest.mark.parametrize("modality", ["image", "video"])
 def test_vlm_dynamic_batch_invariance(modality):
     case = bi.Case(f"vlm-{modality}")
-    engines = []
     with bi.invariant_runtime(case) as (backend, version), pytest.MonkeyPatch.context() as patch:
-        patch.setattr(
-            bi, "build_engine", partial(_build_engine, modality=modality, engines=engines)
-        )
-        reference = bi.run_order(case, backend, version, "solo")
-        actual = bi.run_order(case, backend, version, "back")
+        patch.setattr(bi, "build_engine", partial(_build_engine, modality=modality, engines=[]))
+        # The orders differ only in their requests, so both run on one engine. Its reset
+        # clears the vision cache, so each run encodes the target's media itself.
+        engine = bi.new_engine(case, backend, version)
+        reference = bi.run_order(case, backend, version, "solo", engine=engine)
+        expected, reference_inputs = _take_media_evidence(engine)
+        actual = bi.run_order(case, backend, version, "back", engine=engine)
         bi.assert_same_target(reference, actual)
-        expected, observed = (engine._bi_media_evidence for engine in engines)
+        observed = engine._bi_media_evidence
         assert len(expected) == len(observed) == 1
         _assert_projected(expected[0]["projected"], observed[0]["projected"])
         frames = 2 if modality == "video" else 1
         assert observed[0]["projected"].shape == (12 * frames, 1, 128)
         assert ("num_frames" in observed[0]["kwargs"]) == (modality == "video")
-        for engine in engines:
-            assert len(engine._bi_decoder_inputs) == 1, "target media never reached decoder"
-            decoder_input, mask = engine._bi_decoder_inputs[0]
+        for decoder_inputs in (reference_inputs, engine._bi_decoder_inputs):
+            assert len(decoder_inputs) == 1, "target media never reached decoder"
+            decoder_input, mask = decoder_inputs[0]
             _assert_projected(expected[0]["projected"].squeeze(1), decoder_input[mask >= 0])
         assert {s["physical"] for s in reference[1].steps if s["decode"]} == {64}
         assert any(s["physical"] == 128 and s["target_row"] > 0 for s in actual[1].steps)
 
-        engine = engines[1]
         engine.add_request(
             CACHE_REQUEST,
             bi.target_prompt(case.prompt_length),

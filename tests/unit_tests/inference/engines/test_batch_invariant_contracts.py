@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Output, terminal, residency, and explicit unsupported BI contracts."""
 
-from dataclasses import replace
+from functools import partial
 
 import pytest
 import torch
@@ -48,8 +48,7 @@ def test_batch_invariant_rejects_flashinfer_rope():
             fixture.build_engine(case, backend, version)
 
 
-@pytest.mark.parametrize("output", ["top-n", "skip-prompt", "total-length", "bos"])
-def test_batch_invariant_output_contract(output):
+def _check_output_contract(run, output):
     options = dict(top_n_logprobs=3)
     if output == "skip-prompt":
         options["skip_prompt_log_probs"] = True
@@ -57,18 +56,14 @@ def test_batch_invariant_output_contract(output):
         options.update(num_tokens_to_generate=None, num_tokens_total=23)
     if output == "bos":
         options["add_BOS"] = True
-    case = fixture.Case("output", sampling=options)
-    with (
-        fixture.invariant_runtime(case) as (backend, version),
-        pytest.MonkeyPatch.context() as patch,
-    ):
+    with pytest.MonkeyPatch.context() as patch:
         if output == "bos":
             original_prompt = fixture.target_prompt
             patch.setattr(
                 fixture, "target_prompt", lambda n: " ".join(map(str, original_prompt(n)))
             )
-        reference = fixture.run_order(case, backend, version, "solo")
-        actual = fixture.run_order(case, backend, version, "back")
+        reference = run("solo", sampling=options)
+        actual = run("back", sampling=options)
         fixture.assert_same_target(reference, actual)
         request = actual[0]
         assert request.succeeded() and request.generated_length == 6
@@ -92,48 +87,65 @@ def test_batch_invariant_output_contract(output):
         assert actual[1].sample_steps[0]["requests"] == 65
 
 
-@pytest.mark.parametrize("terminal", ["eos", "stop-kept", "stop-trimmed", "stop-prefix"])
-@pytest.mark.parametrize("skip_prompt", [False, True])
-def test_batch_invariant_terminal_contract(terminal, skip_prompt):
-    case = fixture.Case(
-        "terminal", sampling=dict(top_n_logprobs=3, skip_prompt_log_probs=skip_prompt)
-    )
+def test_batch_invariant_output_contract():
+    # Output forms are request options, so every form runs on one engine.
+    case = fixture.Case("output")
     with fixture.invariant_runtime(case) as (backend, version):
-        baseline = fixture.run_order(case, backend, version, "solo")
-        tokens = baseline[0].generated_tokens
-        assert len(tokens) == 6
-        prefix = next((i for i in range(1, len(tokens)) if tokens[i] not in tokens[:i]), None)
-        if terminal == "stop-prefix":
-            assert prefix is not None, "need a real later token with no earlier stop match"
-        if terminal == "eos":
-            params = dict(termination_id=tokens[0])
-        else:
-            # A stop is derived from an unmodified real greedy forward, never by
-            # replacing model logits or forcing the sampler's returned token.
-            stop = tokens[prefix : prefix + 1] if terminal == "stop-prefix" else tokens[:2]
-            params = dict(
-                stop_words=[" ".join(map(str, stop))],
-                detokenize_stop_sequence=terminal == "stop-kept",
-            )
-        limited = replace(case, sampling={**case.sampling, **params})
-        reference = fixture.run_order(limited, backend, version, "solo")
-        actual = fixture.run_order(limited, backend, version, "back")
-        fixture.assert_same_target(reference, actual)
-        fixture.assert_same_target(baseline, actual, require_trajectory=False)
-        expected_count = {"eos": 1, "stop-kept": 2, "stop-trimmed": 0, "stop-prefix": prefix}[
-            terminal
-        ]
-        assert actual[0].succeeded() and len(actual[0].generated_tokens) == expected_count
-        assert len(actual[0].generated_log_probs or []) == expected_count
-        for field in ("generated_tokens", "generated_log_probs", "generated_top_n_logprobs"):
-            assert getattr(actual[0], field) == getattr(baseline[0], field)[:expected_count]
-        for field in ("prompt_log_probs", "prompt_top_n_logprobs"):
-            assert getattr(actual[0], field) == getattr(baseline[0], field)
-            assert len(getattr(actual[0], field) or []) == (0 if skip_prompt else 16)
-        terminal_length = 1 if terminal == "eos" else prefix + 1 if terminal == "stop-prefix" else 2
-        sampled = [step["token"] for step in actual[1].sample_steps]
-        assert sampled[:terminal_length] == tokens[:terminal_length]
-        assert actual[1].sample_steps[0]["requests"] == 65
+        engine = fixture.new_engine(case, backend, version)
+        run = partial(fixture.run_order, case, backend, version, engine=engine)
+        for output in ("top-n", "skip-prompt", "total-length", "bos"):
+            with fixture.labeled(output):
+                _check_output_contract(run, output)
+
+
+def _check_terminal_contract(run, options, baseline, terminal):
+    skip_prompt = options["skip_prompt_log_probs"]
+    tokens = baseline[0].generated_tokens
+    prefix = next((i for i in range(1, len(tokens)) if tokens[i] not in tokens[:i]), None)
+    if terminal == "stop-prefix":
+        assert prefix is not None, "need a real later token with no earlier stop match"
+    if terminal == "eos":
+        params = dict(termination_id=tokens[0])
+    else:
+        # A stop is derived from an unmodified real greedy forward, never by
+        # replacing model logits or forcing the sampler's returned token.
+        stop = tokens[prefix : prefix + 1] if terminal == "stop-prefix" else tokens[:2]
+        params = dict(
+            stop_words=[" ".join(map(str, stop))], detokenize_stop_sequence=terminal == "stop-kept"
+        )
+    reference = run("solo", sampling={**options, **params})
+    actual = run("back", sampling={**options, **params})
+    fixture.assert_same_target(reference, actual)
+    fixture.assert_same_target(baseline, actual, require_trajectory=False)
+    expected_count = {"eos": 1, "stop-kept": 2, "stop-trimmed": 0, "stop-prefix": prefix}[terminal]
+    assert actual[0].succeeded() and len(actual[0].generated_tokens) == expected_count
+    assert len(actual[0].generated_log_probs or []) == expected_count
+    for field in ("generated_tokens", "generated_log_probs", "generated_top_n_logprobs"):
+        assert getattr(actual[0], field) == getattr(baseline[0], field)[:expected_count]
+    for field in ("prompt_log_probs", "prompt_top_n_logprobs"):
+        assert getattr(actual[0], field) == getattr(baseline[0], field)
+        assert len(getattr(actual[0], field) or []) == (0 if skip_prompt else 16)
+    terminal_length = 1 if terminal == "eos" else prefix + 1 if terminal == "stop-prefix" else 2
+    sampled = [step["token"] for step in actual[1].sample_steps]
+    assert sampled[:terminal_length] == tokens[:terminal_length]
+    assert actual[1].sample_steps[0]["requests"] == 65
+
+
+def test_batch_invariant_terminal_contract():
+    # Terminal conditions are request options, so every case runs on one engine, and the
+    # cases of one skip-prompt setting share its unterminated baseline.
+    case = fixture.Case("terminal")
+    with fixture.invariant_runtime(case) as (backend, version):
+        engine = fixture.new_engine(case, backend, version)
+        run = partial(fixture.run_order, case, backend, version, engine=engine)
+        for skip_prompt in (False, True):
+            options = dict(top_n_logprobs=3, skip_prompt_log_probs=skip_prompt)
+            with fixture.labeled(f"baseline, skip_prompt={skip_prompt}"):
+                baseline = run("solo", sampling=options)
+                assert len(baseline[0].generated_tokens) == 6
+            for terminal in ("eos", "stop-kept", "stop-trimmed", "stop-prefix"):
+                with fixture.labeled(f"{terminal}, skip_prompt={skip_prompt}"):
+                    _check_terminal_contract(run, options, baseline, terminal)
 
 
 @pytest.mark.parametrize(
@@ -158,79 +170,71 @@ def test_batch_invariant_suspend_resume(mode, static_pointers):
         fixture.invariant_runtime(case) as (backend, version),
         pytest.MonkeyPatch.context() as patch,
     ):
-        reference = fixture.run_order(case, backend, version, "solo")
-        build = fixture.build_engine
+        # The resumed run differs from the reference only in its requests and the suspension
+        # its step wrapper adds, so both run on one engine.
+        engine = fixture.new_engine(case, backend, version)
+        reference = fixture.run_order(case, backend, version, "solo", engine=engine)
+        original = engine.step_modern
+        context = engine.context
+        suspended = False
+        resumed = False
 
-        def resumed_engine(*args, **kwargs):
-            engine = build(*args, **kwargs)
-            original = engine.step_modern
-            context = engine.context
-            suspended = False
-            resumed = False
+        def active_ids():
+            active = context.request_ids[context.paused_request_count : context.total_request_count]
+            return tuple(map(int, active.tolist()))
 
-            def active_ids():
-                active = context.request_ids[
-                    context.paused_request_count : context.total_request_count
-                ]
-                return tuple(map(int, active.tolist()))
+        def observe_forward():
+            ids = active_ids()
+            if fixture.TARGET in ids and context.is_decode_only():
+                forwards.append((resumed, ids))
 
-            def observe_forward():
-                ids = active_ids()
-                if fixture.TARGET in ids and context.is_decode_only():
-                    forwards.append((resumed, ids))
+        engine._bi_after_forward = observe_forward
 
-            engine._bi_after_forward = observe_forward
+        def step(*args, **kwargs):
+            nonlocal resumed, suspended
+            result = original(*args, **kwargs)
+            if not suspended and forwards and fixture.TARGET in engine.requests:
+                request = engine.get_request(fixture.TARGET)
+                if len(request.generated_tokens or []) >= 2:
+                    before = tuple(request.generated_tokens)
+                    live = forwards[-1][1]
+                    assert fixture.TARGET in live and set(live) - {fixture.TARGET}
+                    assert set(active_ids()) - {fixture.TARGET}
+                    pointer = context.memory_buffer.data_ptr()
+                    record = engine.requests[fixture.TARGET].record
+                    segments = len(record.requests)
+                    target_idx = int((context.request_ids == fixture.TARGET).nonzero()[0])
+                    block = int(context.request_to_kv_block_ids[target_idx, 0])
+                    stored = len(request.prompt_tokens) + len(before) - 1
+                    kv = context.memory_buffer[:, :, block, :stored].cpu().clone()
+                    physical = torch.cuda.mem_get_info()[0]
+                    engine.suspend()
+                    torch.cuda.synchronize()
+                    suspended_free = torch.cuda.mem_get_info()[0]
+                    assert not context.is_tensor_state_allocated
+                    if mode == KVMode.OFFLOAD:
+                        assert context._uses_torch_memory_saver
+                        assert suspended_free > physical
+                        print("BI_OFFLOAD_WITNESS", block, stored, suspended_free)
+                    if mode == KVMode.RECOMPUTE:
+                        assert len(record.requests) == segments + 1
+                    engine.resume()
+                    resumed = True
+                    merged = record.merge()
+                    assert tuple(merged.generated_tokens or []) == before
+                    if mode == KVMode.RECOMPUTE:
+                        assert fixture.TARGET in engine.waiting_request_ids
+                        assert not engine.get_request(fixture.TARGET).generated_tokens
+                    else:
+                        assert torch.equal(context.memory_buffer[:, :, block, :stored].cpu(), kv)
+                    if static_pointers or mode == KVMode.PERSIST:
+                        assert context.memory_buffer.data_ptr() == pointer
+                    print("BI_RESIDENCY_WITNESS", mode.value, live, len(before))
+                    suspended = True
+            return result
 
-            def step(*args, **kwargs):
-                nonlocal resumed, suspended
-                result = original(*args, **kwargs)
-                if not suspended and forwards and fixture.TARGET in engine.requests:
-                    request = engine.get_request(fixture.TARGET)
-                    if len(request.generated_tokens or []) >= 2:
-                        before = tuple(request.generated_tokens)
-                        live = forwards[-1][1]
-                        assert fixture.TARGET in live and set(live) - {fixture.TARGET}
-                        assert set(active_ids()) - {fixture.TARGET}
-                        pointer = context.memory_buffer.data_ptr()
-                        record = engine.requests[fixture.TARGET].record
-                        segments = len(record.requests)
-                        target_idx = int((context.request_ids == fixture.TARGET).nonzero()[0])
-                        block = int(context.request_to_kv_block_ids[target_idx, 0])
-                        stored = len(request.prompt_tokens) + len(before) - 1
-                        kv = context.memory_buffer[:, :, block, :stored].cpu().clone()
-                        physical = torch.cuda.mem_get_info()[0]
-                        engine.suspend()
-                        torch.cuda.synchronize()
-                        suspended_free = torch.cuda.mem_get_info()[0]
-                        assert not context.is_tensor_state_allocated
-                        if mode == KVMode.OFFLOAD:
-                            assert context._uses_torch_memory_saver
-                            assert suspended_free > physical
-                            print("BI_OFFLOAD_WITNESS", block, stored, suspended_free)
-                        if mode == KVMode.RECOMPUTE:
-                            assert len(record.requests) == segments + 1
-                        engine.resume()
-                        resumed = True
-                        merged = record.merge()
-                        assert tuple(merged.generated_tokens or []) == before
-                        if mode == KVMode.RECOMPUTE:
-                            assert fixture.TARGET in engine.waiting_request_ids
-                            assert not engine.get_request(fixture.TARGET).generated_tokens
-                        else:
-                            assert torch.equal(
-                                context.memory_buffer[:, :, block, :stored].cpu(), kv
-                            )
-                        if static_pointers or mode == KVMode.PERSIST:
-                            assert context.memory_buffer.data_ptr() == pointer
-                        print("BI_RESIDENCY_WITNESS", mode.value, live, len(before))
-                        suspended = True
-                return result
-
-            patch.setattr(engine, "step_modern", step)
-            return engine
-
-        patch.setattr(fixture, "build_engine", resumed_engine)
-        actual = fixture.run_order(case, backend, version, "back")
+        patch.setattr(engine, "step_modern", step)
+        actual = fixture.run_order(case, backend, version, "back", engine=engine)
         fixture.assert_same_target(reference, actual)
         decode_steps = [step for step in actual[1].steps if step["decode"]]
         assert len(forwards) == len(decode_steps), "missing target residency forward observation"
