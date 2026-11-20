@@ -35,9 +35,14 @@ on:
   schedule:
     - cron: "17 */6 * * *"
   workflow_dispatch:
+    inputs:
+      mfsdp_isolation:
+        description: Trace the fixed MFSDP loss reproduction instead of populating caches
+        type: boolean
+        default: false
 
 concurrency:
-  group: populate-ci-caches-main
+  group: populate-ci-caches-${{ inputs.mfsdp_isolation && github.ref || 'main' }}
   cancel-in-progress: false
 
 permissions:
@@ -47,7 +52,7 @@ permissions:
 jobs:
   validate-source:
     name: Validate cache source
-    if: github.repository == 'NVIDIA/Megatron-LM'
+    if: github.repository == 'NVIDIA/Megatron-LM' && !inputs.mfsdp_isolation
     runs-on: ubuntu-latest
     steps:
       - name: Require main
@@ -63,7 +68,7 @@ jobs:
   populate-build-cache:
     name: Populate build caches
     needs: validate-source
-    if: github.repository == 'NVIDIA/Megatron-LM'
+    if: github.repository == 'NVIDIA/Megatron-LM' && !inputs.mfsdp_isolation
     permissions:
       contents: read
       id-token: write
@@ -138,3 +143,48 @@ jobs:
           is_unit_test: "true"
           unit_testmon_mode: baseline
           unit_testmon_target_branch: main
+
+  mfsdp-isolation:
+    name: Trace MFSDP gradient reductions
+    if: github.repository == 'NVIDIA/Megatron-LM' && github.event_name == 'workflow_dispatch' && inputs.mfsdp_isolation
+    runs-on: nvidia-ci-aws-use2-gpu-x4
+    timeout-minutes: 20
+    env:
+      AWS_REGION: us-east-2
+      IMAGE: 766267172432.dkr.ecr.us-east-2.amazonaws.com/megatron-lm@sha256:b5a0587987dbbb500943cbdd2090707ef16912c3c3476d25b72d860d6858e1c2
+    steps:
+      - name: Checkout diagnostic scripts
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Checkout unchanged training source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: 68f829281ffec0a158f2c875b0f3273a035292b4
+          path: mfsdp-source
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+      - name: Trace the exact passing image
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/mfsdp-isolation-$GITHUB_RUN_ID"
+          mkdir -p "$stage"
+          cp .github/diagnostics/mfsdp/* "$stage/"
+          case_dir=mfsdp-source/tests/functional_tests/test_cases/moe/deepseek_proxy_mfsdp_v2_ep2_mb4_per_token_loss_1node
+          cp "$case_dir/model_config.yaml" "$stage/model_config.yaml"
+          cp "$case_dir/golden_values_dev_dgx_gb200.json" "$stage/reference-github.json"
+          git -C mfsdp-source rev-parse HEAD > "$stage/source-commit.txt"
+          docker pull "$IMAGE"
+          docker image inspect --format '{{json .RepoDigests}}' "$IMAGE" > "$stage/image-digests.json"
+          docker run --rm --gpus all --runtime nvidia --ipc host --shm-size 30g \
+            -v "$PWD/mfsdp-source:/opt/megatron-lm" \
+            -v "$stage:/workspace" \
+            -v /mnt/datadrive/TestData/megatron-lm/artifacts:/mnt/artifacts:ro \
+            -v /mnt/datadrive/TestData/nemo-fw/TestData/HF_HOME:/workspace/cache/hf:ro \
+            -w /opt/megatron-lm "$IMAGE" bash /workspace/run.sh
+      - name: Upload reduction hashes and logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mfsdp-collective-isolation-${{ github.run_id }}
+          path: ${{ runner.temp }}/mfsdp-isolation-${{ github.run_id }}
+          retention-days: 3
