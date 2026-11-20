@@ -44,6 +44,7 @@ from megatron.core.utils import (
     get_torch_version,
 )
 from megatron.training import (
+    get_args,
     get_timers,
     inprocess_restart,
     pretrain,
@@ -58,7 +59,7 @@ from megatron.training.argument_utils import (
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.datasets.providers import build_gpt_datasets, is_dataset_built_on_rank
 from megatron.training.datasets.utils import get_dataset_input_length
-from megatron.training.global_vars import get_run_config, set_run_config
+from megatron.training.global_vars import get_run_config, is_args_initialized, set_run_config
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import is_first_or_last_pipeline_stage
 
@@ -263,17 +264,18 @@ def loss_func(
         a dict containing reporting metrics on the loss and number of tokens across
             the data parallel ranks
     """
-    cfg = get_run_config()
+    # Optional CLI boundary until offline KD is config-owned by #9635.
+    args = get_args() if is_args_initialized() else None
 
-    if cfg.cached_logits.logits_load_dir is not None:
+    if getattr(args, "logits_load_dir", None) is not None:
         # Offline knowledge distillation loss using cached teacher log-probabilities.
         loss_func_cached_logits = _build_cached_logits_loss_func(
-            logprobs_dir=cfg.cached_logits.logits_load_dir,
-            decode_threads=cfg.cached_logits.logits_load_decode_threads,
-            msc_prefetch_depth=cfg.cached_logits.logits_load_msc_prefetch_depth,
-            kd_loss_alpha=cfg.cached_logits.logits_load_kd_loss_alpha,
-            ignore_errors=cfg.cached_logits.logits_load_ignore_errors,
-            ignore_hash=cfg.cached_logits.logits_load_ignore_hash,
+            logprobs_dir=args.logits_load_dir,
+            decode_threads=args.logits_load_decode_threads,
+            msc_prefetch_depth=args.logits_load_msc_prefetch_depth,
+            kd_loss_alpha=args.logits_load_kd_loss_alpha,
+            ignore_errors=args.logits_load_ignore_errors,
+            ignore_hash=args.logits_load_ignore_hash,
         )
         loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
     elif has_nvidia_modelopt and is_distillation_model(model):  # [ModelOpt]

@@ -63,7 +63,6 @@ from megatron.training.models import (
     ModelConfig,
     T5ModelConfig,
 )
-from megatron.training.models.distillation import CachedLogitsConfig
 from megatron.training.utils import warn_rank_0
 
 # TODO: support arg renames
@@ -1251,7 +1250,6 @@ def pretrain_cfg_container_from_args(
         training.vision_pretraining_type = None
 
     cfg = PretrainConfigContainer(
-        cached_logits=_default_config_from_args(CachedLogitsConfig, args),
         triton_autotune=_triton_autotune_config_from_args(args),
         train=training,
         validation=_default_config_from_args(ValidationConfig, args),

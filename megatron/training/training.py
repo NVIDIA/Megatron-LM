@@ -2613,19 +2613,21 @@ def setup_model_and_optimizer(
             cuda_graph_impl=cfg.model.transformer.cuda_graph_impl,
         )
 
-    if cfg.cached_logits.logits_save_dir is not None and mpu.is_pipeline_last_stage():
+    # Optional CLI boundary until offline KD is config-owned by #9635.
+    args = get_args() if is_args_initialized() else None
+    if getattr(args, "logits_save_dir", None) is not None and mpu.is_pipeline_last_stage():
         from megatron.training.distillation import LogitsSaverHooks
 
         logits_saver = LogitsSaverHooks(
-            save_dir=cfg.cached_logits.logits_save_dir,
-            k=cfg.cached_logits.logits_save_top_k,
-            p=cfg.cached_logits.logits_save_top_p,
-            min_k=cfg.cached_logits.logits_save_top_p_min_k,
-            save_dtype=cfg.cached_logits.logits_save_dtype,
+            save_dir=args.logits_save_dir,
+            k=args.logits_save_top_k,
+            p=args.logits_save_top_p,
+            min_k=args.logits_save_top_p_min_k,
+            save_dtype=args.logits_save_dtype,
         )
         logits_saver.attach_hooks(unwrapped_model[-1])
 
-    if cfg.cached_logits.logits_load_dir is not None and mpu.is_pipeline_last_stage():
+    if getattr(args, "logits_load_dir", None) is not None and mpu.is_pipeline_last_stage():
         from megatron.training.distillation import StudentLogitsCapture
 
         student_logits_capture = StudentLogitsCapture()
@@ -4520,6 +4522,9 @@ def train(
     timers = get_timers()
     train_state = get_train_state()
 
+    # Optional CLI boundary until offline KD is config-owned by #9635.
+    args = get_args() if is_args_initialized() else None
+
     fault_injector_config = cfg.fault_tolerance.fault_injector
 
     _maybe_raise_workload_exception = None
@@ -5301,7 +5306,7 @@ def train(
         # uncaught exception there would otherwise stall silently (both future
         # logits and regular checkpoint saves for that rank) rather than
         # surfacing until a much later blocking checkpoint finalize hangs.
-        if cfg.cached_logits.logits_save_dir is not None:
+        if getattr(args, "logits_save_dir", None) is not None:
             from megatron.training.distillation import check_logits_saver_failure
 
             check_logits_saver_failure()

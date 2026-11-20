@@ -18,11 +18,11 @@ class TrainingConfig:
     phase_transition_iterations: list[int] | None = None
     """Iterations where dataset phases change; global batch size stays fixed across phases."""
 
-    freeze_all_layers: bool = False
-    """Freeze every model parameter, for example when recording teacher logits."""
-
     vision_pretraining_type: Literal["classify", "inpaint", "dino"] | None = None
     """Vision pretraining objective, or None when vision pretraining is disabled."""
+
+    freeze_all_layers: bool = False
+    """Freeze model parameters and run forward-only, for example when saving teacher logits."""
 
     micro_batch_size: int | None = None
     """Batch size per model instance (local batch size). Global batch size is local batch size times

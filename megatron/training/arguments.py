@@ -2729,7 +2729,7 @@ def _add_training_args(parser):
     # Keep the legacy vision CLI master switch/defaults at their existing boundary.
     train_factory = ArgumentGroupFactory(
         TrainingConfig,
-        exclude=["vision_pretraining_type", "phase_transition_iterations", "freeze_all_layers",
+        exclude=["vision_pretraining_type", "phase_transition_iterations",
                  "deduplicate_dataloader_across_context_parallel"],
     )
     group = train_factory.build_group(parser, "training")
@@ -2862,8 +2862,6 @@ def _add_learning_rate_args(parser):
     group.add_argument('--decoupled-min-lr', type=float, default=None,
                        help='Minimum value for learning rate for the input and output layer. The scheduler'
                        'clip values below this threshold')
-    group.add_argument('--freeze-all-layers', action='store_true',
-                       help='Freeze all layers of the model.')
 
     return parser
 
