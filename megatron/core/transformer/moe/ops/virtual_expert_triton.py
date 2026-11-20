@@ -471,7 +471,10 @@ class VirtualExpertPlannerWorkspace:
     from its own, so planning needs no collective. ``scratch`` is the int32 field arena of
     :func:`_scratch_layout`; :meth:`field` views one field for inspection."""
 
-    def __init__(self, *, num_experts: int, device: torch.device, group: dist.ProcessGroup) -> None:
+    def __init__(
+        self, *, num_experts: int, device: torch.device, group: dist.ProcessGroup,
+        symm_backend: str = "NCCL",
+    ) -> None:
         _check_triton_version()
         import torch.distributed._symmetric_memory as symm_mem
 
@@ -484,8 +487,8 @@ class VirtualExpertPlannerWorkspace:
         self.rank = dist.get_rank(group=group)
         # The window needs the group's communicator (created by a first collective).
         dist.all_reduce(torch.zeros(1, device=device), group=group)
-        if symm_mem.get_backend(device) != "NCCL":
-            symm_mem.set_backend("NCCL")
+        if symm_mem.get_backend(device) != symm_backend:
+            symm_mem.set_backend(symm_backend)
         window = symm_mem.empty(ep_size * num_experts, dtype=torch.int32, device=device)
         self.histogram_handle = symm_mem.rendezvous(window, group)
         if self.histogram_handle.signal_pad_size < ep_size * 4:
@@ -822,6 +825,7 @@ def _virtual_expert_grad_reduce_kernel(
     NUM_LOCAL_EXPERTS: tl.constexpr,
     WORLD: tl.constexpr,
     NUM_SMS: tl.constexpr,
+    UNIFORM_PEER_STRIDE: tl.constexpr,
 ):
     """Reduce every peer's virtual-expert gradients into native wgrad staging.
 
@@ -869,16 +873,16 @@ def _virtual_expert_grad_reduce_kernel(
 
     # One descriptor whose outermost index selects the peer: the source loop sits inside the
     # pipelined tile loop, where Triton cannot build a descriptor, so one has to reach every peer.
-    # The symmetric allocator maps each rank's arena at a fixed virtual stride; the host workspace
-    # verifies that once.
+    # The host checks whether the allocator mapped peers at a fixed positive stride.
     bases = peer_bases.to(tl.pointer_type(tl.int64))
-    base = tl.load(bases)
-    window = tl.make_tensor_descriptor(
-        base.to(tl.pointer_type(arena.dtype.element_ty)),
-        [WORLD, ARENA_ROWS, _ROW],
-        [(tl.load(bases + 1) - base) // ELEMENT_BYTES, _ROW, 1],
-        [1, TILE_ROWS, _ROW],
-    )
+    if UNIFORM_PEER_STRIDE:
+        base = tl.load(bases)
+        window = tl.make_tensor_descriptor(
+            base.to(tl.pointer_type(arena.dtype.element_ty)),
+            [WORLD, ARENA_ROWS, _ROW],
+            [(tl.load(bases + 1) - base) // ELEMENT_BYTES, _ROW, 1],
+            [1, TILE_ROWS, _ROW],
+        )
     _cross_rank_barrier(signal_bases, grid_barrier, dummy_signal, rank, WORLD, NUM_SMS)
     materialized = tl.load(virtual_experts + NUM_LOCAL_EXPERTS)
 
@@ -911,9 +915,14 @@ def _virtual_expert_grad_reduce_kernel(
             # summation order ``native + s0 + s1 + ...``.
             offset = tl.arange(0, TILE_ROWS)[None, :, None].to(tl.int64) * _ROW + tl.arange(0, _ROW)
             staged = tl.load(native + offset).to(tl.float32)
-            partial = tl.where(index == 0, staged, partial) + window.load([peer, row, 0]).to(
-                tl.float32
-            )
+            if UNIFORM_PEER_STRIDE:
+                contribution = window.load([peer, row, 0])
+            else:
+                # CUDA/VMM may map the peer windows in any order. Index the actual
+                # peer address and issue coalesced loads over the same transport tile.
+                peer_base = tl.load(bases + peer).to(tl.pointer_type(arena.dtype.element_ty))
+                contribution = tl.load(peer_base + row.to(tl.int64) * _ROW + offset)
+            partial = tl.where(index == 0, staged, partial) + contribution.to(tl.float32)
             tl.store(native + offset, partial.to(arena.dtype.element_ty), mask=index == count - 1)
     _cross_rank_barrier(signal_bases, grid_barrier, dummy_signal, rank, WORLD, NUM_SMS)
 
@@ -1072,6 +1081,7 @@ def launch_virtual_expert_grad_reduce(
         NUM_LOCAL_EXPERTS=num_local_experts,
         WORLD=world_size,
         NUM_SMS=num_sms,
+        UNIFORM_PEER_STRIDE=getattr(workspace, "uniform_grad_stride", True),
         num_warps=_GRAD_NUM_WARPS,
         launch_cooperative_grid=True,
     )

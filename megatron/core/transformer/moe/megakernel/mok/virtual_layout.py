@@ -86,6 +86,7 @@ class MoKVirtualLayout:
         self.clear()
 
     def clear(self):
+        self.transport.clear()
         self.native_views = None
         self.owner_members = None
         self.weight_descriptors = None

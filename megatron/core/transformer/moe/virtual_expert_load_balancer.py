@@ -121,6 +121,7 @@ class _VirtualExpertConfig:
     grad_dtype: torch.dtype
     num_sms: int
     gtp: tuple[bool, ...] = (False, False)
+    symm_backend: str = "NCCL"
 
 
 class _VirtualExpertStorage:
@@ -158,8 +159,8 @@ class _VirtualExpertStorage:
         ]
         self._grad_sections = [count * numel for numel in self.member_numels]
         try:
-            if symm_mem.get_backend(device) != "NCCL":
-                symm_mem.set_backend("NCCL")
+            if symm_mem.get_backend(device) != config.symm_backend:
+                symm_mem.set_backend(config.symm_backend)
             self.weight_arena = symm_mem.empty(
                 sum(self._weight_sections),
                 dtype=torch.uint8 if mxfp8 else torch.bfloat16,
@@ -172,19 +173,26 @@ class _VirtualExpertStorage:
             self.grad_handle = symm_mem.rendezvous(self.grad_arena, group)
         except RuntimeError as exc:
             raise RuntimeError(
-                "Virtual-expert weights could not allocate NCCL symmetric memory for the EP group; "
+                f"Virtual-expert weights could not allocate {config.symm_backend} symmetric memory for the EP group; "
                 "the EP group must lie within one NVLink domain."
             ) from exc
-        # The reduction reaches every peer's gradient slots through one TMA descriptor whose
-        # outermost stride is the distance between consecutive peers' windows, so the allocator's
-        # uniform mapping is a hard requirement: verify it once, here.
+        # The fast TMA reduction uses a descriptor with a constant positive peer stride.
+        # CUDA VMM can return irregular addresses; the MoK integration also supports
+        # direct peer reads through the window pointer table.
         bases = self.grad_handle.buffer_ptrs
         stride = bases[1] - bases[0] if len(bases) > 1 else 0
-        if any(base != bases[0] + peer * stride for peer, base in enumerate(bases)):
+        self.uniform_grad_stride = (
+            0 < stride < 2**40
+            and all(base == bases[0] + peer * stride for peer, base in enumerate(bases))
+        )
+        if config.symm_backend == "NCCL" and not self.uniform_grad_stride:
             raise RuntimeError(
                 "NCCL symmetric memory did not map the peers' gradient windows at a uniform "
                 f"stride: {bases}."
             )
+        for handle in (self.weight_handle, self.grad_handle):
+            if handle.signal_pad_size < 4 * self.world_size:
+                raise RuntimeError("Virtual-expert transport needs one signal word per EP rank.")
         self.weight_arena.zero_()
         self.grad_arena.zero_()
         self.weight_grid_barrier = torch.zeros(1, dtype=torch.int32, device=device)

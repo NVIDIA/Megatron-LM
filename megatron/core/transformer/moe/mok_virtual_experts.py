@@ -51,6 +51,8 @@ class _MoKReplicaPool(_VirtualExpertStorage):
                     num_local_experts=self.num_local_experts,
                     num_sms=self.num_sms,
                 )
+                if self.column.weight_handle.signal_pad_size < 4 * self.world_size:
+                    raise RuntimeError("MoK virtual experts need one signal word per EP rank.")
                 arena.zero_()
             self.slot_views = self._weight_views()
             self.slot_grads = tuple(
@@ -102,6 +104,10 @@ class MoKVirtualExperts:
         self.config = config
         self.group = ep_group
         self.num_local_experts = num_local_experts
+        self.clear()
+
+    def clear(self):
+        """Drop per-module state when owner storage moves, retaining the shared arenas."""
         self.pool = None
         self._tables = {}
 
@@ -111,13 +117,16 @@ class MoKVirtualExperts:
         """Keep logical route order, including the MoK -1 empty-route sentinel."""
         if VirtualExpertPlannerWorkspace is None:
             raise RuntimeError(
-                "MoK virtual experts require Triton >= 3.5 and NCCL symmetric memory."
+                "MoK virtual experts require Triton >= 3.5 and CUDA symmetric memory."
             )
         key = (self.group, top_experts.device, self.config.num_moe_experts)
         workspace = self._planners.get(key)
         if workspace is None:
             workspace = VirtualExpertPlannerWorkspace(
-                num_experts=self.config.num_moe_experts, device=top_experts.device, group=self.group
+                num_experts=self.config.num_moe_experts,
+                device=top_experts.device,
+                group=self.group,
+                symm_backend="CUDA",
             )
             self._planners[key] = workspace
         return VirtualExpertPlan(
@@ -145,6 +154,7 @@ class MoKVirtualExperts:
             mxfp8,
             torch.float32,
             min(sms, MAX_VIRTUAL_EXPERT_WEIGHT_SMS),
+            symm_backend="CUDA",
         )
         if layout not in self._pools:
             self._pools[layout] = _MoKReplicaPool(self.group, layout)
@@ -212,7 +222,7 @@ class MoKVirtualExperts:
 
     @classmethod
     def finalize(cls):
-        """Release shared NCCL windows while their owning EP process group is alive."""
+        """Release shared windows while their owning EP process group is alive."""
         for pool in cls._pools.values():
             pool.destroy()
         for workspace in cls._planners.values():
