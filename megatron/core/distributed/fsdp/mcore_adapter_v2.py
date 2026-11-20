@@ -303,8 +303,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 and active_context.prefetch_order is not PrefetchOrder.RECORDED
             ):
                 raise ValueError(
-                    "Ordinary PP/VPP MFSDP v2 schedules require "
-                    "RuntimePolicy(prefetch_order=PrefetchOrder.RECORDED)."
+                    "The active FSDP context supplied by the caller uses prefetch order "
+                    f"{active_context.prefetch_order}, but the model configuration requires "
+                    f"{prefetch_order}."
                 )
             if active_context.autograd_completes_execution:
                 raise ValueError(
@@ -334,10 +335,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
     @staticmethod
     def prefetch_order_for(config: TransformerConfig) -> "PrefetchOrder":
-        """Record ordinary pipeline schedules; combined 1F1B gathers only on demand."""
+        """Record ordinary pipeline schedules and repeated shared-MTP execution."""
         if not config.overlap_moe_expert_parallel_comm and (
             config.pipeline_model_parallel_size > 1
             or config.virtual_pipeline_model_parallel_size is not None
+            or config.mtp_use_repeated_layer
         ):
             return PrefetchOrder.RECORDED
         return PrefetchOrder.REGISTRATION
