@@ -94,6 +94,8 @@ def test_shortcut_uses_moe_layout_mask_for_routed_and_shared_paths(with_layout):
         ),
         attn_local_idx=4,
         moe_local_idx=5,
+        fuses_residual_seams=False,
+        fused_shortcut_read=False,
         attn_layer_idx=8,
         moe_layer_idx=9,
         overlap_mode=False,

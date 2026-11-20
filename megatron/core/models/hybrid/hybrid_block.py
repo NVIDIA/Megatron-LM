@@ -62,6 +62,7 @@ from megatron.core.transformer.utils import (
 from megatron.core.transformer.wide_residual import (
     build_wide_residual_readout,
     expand_wide_residual_stream,
+    link_residual_seams,
     wide_residual_recompute_enabled,
 )
 from megatron.core.typed_torch import apply_module
@@ -88,6 +89,10 @@ class HybridStackSubmodules:
     moe_layer: ModuleSpec | type | None = None
     mtp_block_spec: ModuleSpec | None = None
     mtp_stack_submodules: "HybridStackSubmodules | None" = None
+    # Submodules for the stack's first and last layers, if they differ (e.g. fused residual seams:
+    # the first layer has no predecessor write to apply, the last no successor read to defer to).
+    first_layer_submodules: "HybridStackSubmodules | None" = None
+    last_layer_submodules: "HybridStackSubmodules | None" = None
 
 
 class HybridStack(MegatronModule):
@@ -228,7 +233,13 @@ class HybridStack(MegatronModule):
             )
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
+        stack_submodules = submodules
         for i, layer_config in enumerate(self.layer_config_list):
+            submodules = (
+                (i == 0 and stack_submodules.first_layer_submodules)
+                or (i == len(self.layer_config_list) - 1 and stack_submodules.last_layer_submodules)
+                or stack_submodules
+            )
             layer_number = i + 1 + pp_layer_offset
             if layer_config.fp8:
                 quant_init_context = get_fp8_context(
@@ -449,6 +460,23 @@ class HybridStack(MegatronModule):
                 )
                 for layer in self.layers
             ]
+        self._fused_reads = ()
+        if self.config.moe_shortcut_wide_residual_norm_fusion and self.uses_wide_residual_stream:
+            # Fused residual seams, after grouping (whose blocks link their own MoE and shortcut
+            # reads): link each deferred write to the next physical layer's fused read and each
+            # remaining read to its consumer, in the formats this stack's forward runs them in.
+            self._fused_reads = link_residual_seams(
+                [
+                    sublayer
+                    for layer in self.layers
+                    for sublayer in (
+                        (layer.compute_layer, layer.moe_layer)
+                        if isinstance(layer, ShortcutMoEBlock)
+                        else (layer,)
+                    )
+                ],
+                self.config,
+            )
         self._residual_stream_atomic_layer_pairs = self._shortcut_layer_pairs()
         self._execution_layer_config_list = [
             self.layer_config_list[layer_index] for layer_index in self._execution_layer_indices
@@ -638,6 +666,10 @@ class HybridStack(MegatronModule):
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        for read in self._fused_reads:
+            # A forward that raised between a deferred write's hand-off and this read's take
+            # left the write behind; the next forward starts without it.
+            read.pending = None
         if self._has_custom_layers and (inference_context is not None or InferenceMode.is_active()):
             raise ValueError("Custom hybrid layers do not support inference contexts yet.")
 

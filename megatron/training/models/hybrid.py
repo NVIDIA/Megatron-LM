@@ -13,6 +13,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec as default_hybrid_stack_spec,
 )
 from megatron.core.models.hybrid.hybrid_layer_specs import (
+    shortcut_fusion_stack_spec,
     wide_residual_hybrid_inference_stack_spec,
     wide_residual_hybrid_stack_spec,
 )
@@ -144,6 +145,14 @@ def _check_modelopt_spec_supported(use_wide_residual: bool) -> None:
 
 def resolve_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:
     """Return the configured stack spec, or the default one for the transformer config."""
+    spec = _configured_hybrid_stack_spec(model_config)
+    if model_config.transformer.moe_shortcut_wide_residual_norm_fusion:
+        spec = shortcut_fusion_stack_spec(spec)
+    return spec
+
+
+def _configured_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:
+    """The explicit stack spec, else the built-in default for the transformer config."""
     if model_config.hybrid_stack_spec is not None:
         return model_config.hybrid_stack_spec
     use_wide_residual = model_config.transformer.wide_residual is not None
