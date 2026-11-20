@@ -363,6 +363,51 @@ class DynamoHelper:
                 logging.exception("KV-event listener failed while handling %r", kind)
 
 
+def compute_buffer_sizing(
+    *,
+    buffer_size_bytes: int,
+    paused_buffer_size_bytes: int,
+    block_size_bytes: int,
+    mamba_states_memory_per_request: int,
+    mamba_memory_ratio: Optional[float] = None,
+    max_requests: Optional[int] = None,
+    reserved_mamba_slots: int = 0,
+) -> Tuple[int, int, Optional[int]]:
+    """Split the memory buffer between KV blocks and recurrent states."""
+    kv_bytes = buffer_size_bytes
+    bytes_per_block = block_size_bytes
+    mamba_max_requests = None
+    has_recurrent_states = mamba_states_memory_per_request > 0
+    if mamba_memory_ratio is not None:
+        # The ratio is a share of the buffer, which contains the paused buffer.
+        if has_recurrent_states:
+            mamba_max_requests = (
+                int(buffer_size_bytes * mamba_memory_ratio // mamba_states_memory_per_request)
+                - reserved_mamba_slots
+            )
+
+        # Reduce buffer sizes for KV cache
+        kv_bytes = int(buffer_size_bytes * (1.0 - mamba_memory_ratio))
+    elif has_recurrent_states and max_requests is not None:
+        # Auto-derive mamba/KV split from max_requests. Allocate exactly enough
+        # mamba memory for max_requests, and give the rest to KV cache blocks.
+        mamba_max_requests = (
+            buffer_size_bytes - 1
+        ) // mamba_states_memory_per_request - reserved_mamba_slots
+
+        # The KV cache gets the bytes of the buffer that the recurrent states leave;
+        # the paused buffer keeps its fraction of them.
+        kv_bytes = buffer_size_bytes - (
+            (max_requests + reserved_mamba_slots) * mamba_states_memory_per_request
+        )
+    else:
+        bytes_per_block = block_size_bytes + mamba_states_memory_per_request
+
+    block_count = max(2, kv_bytes // bytes_per_block)  # need >= 1 usable block + 1 dummy block
+    paused_kv_bytes = paused_buffer_size_bytes * kv_bytes // max(buffer_size_bytes, 1)
+    return block_count, paused_kv_bytes // bytes_per_block, mamba_max_requests
+
+
 @internal_api
 # pylint: disable=line-too-long
 class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
@@ -374,9 +419,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
     arbitrary sequence length may be added, paused, or removed from the context
     at any step. The only constraint is the maximum number of requests or tokens
     that the context is defined to support. For the block-level KV cache, a memory
-    buffer is allocated up front (size `buffer_size_gb` if `unified_memory_level`
-    == 0, or `buffer_size_gb + paused_buffer_size_gb` if `unified_memory_level` ==
-    1), that is divided into blocks and dynamically assigned to requests. At any
+    buffer is allocated up front (within `buffer_size_gb` at every
+    `unified_memory_level`; `paused_buffer_size_gb` is a part of it and never adds
+    memory), that is divided into blocks and dynamically assigned to requests. At any
     given step, any unassigned blocks equate to unused space.
 
     Args:
@@ -749,7 +794,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             else int(inference_config.paused_buffer_size_gb * 1024**3)
         )
 
-        mamba_max_requests = float('inf')
         # Handoff may retain every request-owned recurrent-state slot after the requests leave
         # the batch. An idle rank must still run a dummy forward to join its tp_ep peers'
         # collectives, so disaggregated callers can reserve one slot outside request capacity.
@@ -765,63 +809,25 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # Set by setup_kv_transfer. Disaggregated handoffs can hold recurrent-state
         # slots outside request rows, so admission must not assume one slot per row.
         self.kv_transfer_enabled = False
-        reserved_mamba_bytes = reserved_mamba_slots * mamba_states_memory_per_request
 
-        if (mamba_memory_ratio := inference_config.mamba_memory_ratio) is not None:
-            assert self.is_hybrid_model
+        mamba_memory_ratio = inference_config.mamba_memory_ratio
+        if mamba_memory_ratio is not None:
             assert mamba_memory_ratio > 0 and mamba_memory_ratio < 1
-
-            # Calculate total memory before partition
-            total_memory = buffer_size_bytes + paused_buffer_size_bytes
-            mamba_memory_bytes = total_memory * mamba_memory_ratio
-            mamba_max_requests = (
-                int(mamba_memory_bytes // mamba_states_memory_per_request) - reserved_mamba_slots
-            )
-            if mamba_max_requests < 1:
-                raise ValueError(
-                    f"mamba_memory_ratio {mamba_memory_ratio} leaves no request capacity after "
-                    f"reserving {reserved_mamba_slots} recurrent-state dummy slot(s)"
-                )
-
-            # Reduce buffer sizes for KV cache
-            buffer_size_bytes = int(buffer_size_bytes * (1.0 - mamba_memory_ratio))
-            paused_buffer_size_bytes = int(paused_buffer_size_bytes * (1.0 - mamba_memory_ratio))
-
-            block_count = buffer_size_bytes // self.block_size_bytes
-            block_count = max(2, block_count)  # need >= 1 usable block + 1 dummy block
-            paused_block_count = paused_buffer_size_bytes // self.block_size_bytes
-        elif self.is_hybrid_model and inference_config.max_requests is not None:
-            # Auto-derive mamba/KV split from max_requests. Allocate exactly enough
-            # mamba memory for max_requests, and give the rest to KV cache blocks.
-            total_memory = buffer_size_bytes + paused_buffer_size_bytes
-            mamba_memory_needed = (
-                inference_config.max_requests * mamba_states_memory_per_request
-                + reserved_mamba_bytes
-            )
-            assert mamba_memory_needed < total_memory, (
-                f"Not enough memory for {inference_config.max_requests} mamba requests "
-                f"plus {reserved_mamba_slots} reserved tp_ep dummy slot(s). "
-                f"Need {mamba_memory_needed / 1024**3:.2f} GB for recurrent states, "
-                f"but total buffer is {total_memory / 1024**3:.2f} GB."
-            )
-            mamba_max_requests = inference_config.max_requests
-
-            # Subtract Mamba memory proportionally from both configured buffer inputs.
-            mamba_memory_ratio = mamba_memory_needed / total_memory
-            buffer_size_bytes = int(buffer_size_bytes * (1.0 - mamba_memory_ratio))
-            paused_buffer_size_bytes = int(paused_buffer_size_bytes * (1.0 - mamba_memory_ratio))
-
-            block_count = buffer_size_bytes // self.block_size_bytes
-            block_count = max(2, block_count)  # need >= 1 usable block + 1 dummy block
-            paused_block_count = paused_buffer_size_bytes // self.block_size_bytes
-        else:
-            block_count = buffer_size_bytes // (
-                self.block_size_bytes + mamba_states_memory_per_request
-            )
-            block_count = max(2, block_count)  # need >= 1 usable block + 1 dummy block
-            paused_block_count = paused_buffer_size_bytes // (
-                self.block_size_bytes + mamba_states_memory_per_request
-            )
+        block_count, paused_block_count, mamba_max_requests = compute_buffer_sizing(
+            buffer_size_bytes=buffer_size_bytes,
+            paused_buffer_size_bytes=paused_buffer_size_bytes,
+            block_size_bytes=self.block_size_bytes,
+            mamba_states_memory_per_request=mamba_states_memory_per_request,
+            mamba_memory_ratio=mamba_memory_ratio,
+            max_requests=inference_config.max_requests,
+            reserved_mamba_slots=reserved_mamba_slots,
+        )
+        pipeline_mamba_cache_slot_bytes = self.mamba_cache_slot_bytes
+        mamba_prefix_cache_requested = (
+            self.enable_prefix_caching
+            and inference_config.prefix_caching_mamba_gb is not None
+            and inference_config.prefix_caching_mamba_gb > 0
+        )
 
         # If using pipeline parallelism synchronize the total block count in case the
         # pipeline stages have different layer allocations. Non-uniform block counts
@@ -831,34 +837,43 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # negated flag is the negated MAX.
         self.pipeline_has_recurrent_layers = self.is_hybrid_model
         if pp_size > 1:
+            no_request_limit = torch.iinfo(torch.int64).max
             has_recurrent_layers = int(self.is_hybrid_model)
-            block_count_tensor = torch.tensor(
-                (block_count, paused_block_count, has_recurrent_layers, -has_recurrent_layers),
-                dtype=torch.int32,
+            capacities = torch.tensor(
+                (
+                    block_count,
+                    paused_block_count,
+                    no_request_limit if mamba_max_requests is None else mamba_max_requests,
+                    has_recurrent_layers,
+                    -has_recurrent_layers,
+                    -pipeline_mamba_cache_slot_bytes,
+                ),
+                dtype=torch.int64,
                 device=torch.cuda.current_device(),
             )
             torch.distributed.all_reduce(
-                block_count_tensor,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.pipeline_parallel_group,
+                capacities, op=torch.distributed.ReduceOp.MIN, group=self.pipeline_parallel_group
             )
-            block_count = block_count_tensor[0].item()
-            paused_block_count = block_count_tensor[1].item()
-            all_stages_recurrent = block_count_tensor[2].item() == 1
-            self.pipeline_has_recurrent_layers = block_count_tensor[3].item() == -1
+            (
+                block_count,
+                paused_block_count,
+                mamba_max_requests,
+                min_has_recurrent_layers,
+                min_negated_has_recurrent_layers,
+                min_negated_mamba_cache_slot_bytes,
+            ) = capacities.tolist()
+            if mamba_max_requests == no_request_limit:
+                mamba_max_requests = None
+            all_stages_recurrent = min_has_recurrent_layers == 1
+            self.pipeline_has_recurrent_layers = min_negated_has_recurrent_layers == -1
+            pipeline_mamba_cache_slot_bytes = -min_negated_mamba_cache_slot_bytes
 
             # Every stage must skip the same prompt tokens on a prefix-cache hit. With a
             # Mamba cache budget, a recurrent stage skips only the blocks whose Mamba
-            # state it can restore, which a stage without recurrent layers cannot track;
-            # the recurrent stages would also wait alone in the cache-capacity
-            # negotiation. Every stage sees the same reduced flags, so all of them raise
+            # state it can restore, which a stage without recurrent layers cannot track.
+            # Every stage sees the same reduced flags, so all of them raise
             # here together. Memory-only prefix caching skips no prompt tokens on any
             # stage (see `_compute_prefix_match`), so it stays available.
-            mamba_prefix_cache_requested = (
-                self.enable_prefix_caching
-                and inference_config.prefix_caching_mamba_gb is not None
-                and inference_config.prefix_caching_mamba_gb > 0
-            )
             if (
                 mamba_prefix_cache_requested
                 and self.pipeline_has_recurrent_layers
@@ -873,12 +888,55 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     "prefix_caching_mamba_gb unset for memory-only prefix caching."
                 )
 
+        if mamba_memory_ratio is not None:
+            assert self.pipeline_has_recurrent_layers, "mamba_memory_ratio needs a hybrid model"
+            if mamba_max_requests is not None and mamba_max_requests < 1:
+                raise ValueError(
+                    f"mamba_memory_ratio {mamba_memory_ratio} leaves no request capacity after "
+                    f"reserving {reserved_mamba_slots} recurrent-state dummy slot(s)"
+                )
+            # An explicit max_requests is used verbatim to size the recurrent-state tensors,
+            # so a request count beyond this capacity would allocate more than the ratio's share.
+            if (
+                inference_config.max_requests is not None
+                and mamba_max_requests is not None
+                and inference_config.max_requests > mamba_max_requests
+            ):
+                reserved_slot_note = (
+                    f" after reserving {reserved_mamba_slots} recurrent-state dummy slot(s)"
+                    if reserved_mamba_slots
+                    else ""
+                )
+                raise ValueError(
+                    f"max_requests {inference_config.max_requests} does not fit in "
+                    f"mamba_memory_ratio {mamba_memory_ratio}: that share of the memory buffer "
+                    f"holds the recurrent states of {mamba_max_requests} request(s)"
+                    f"{reserved_slot_note}. "
+                    "Raise mamba_memory_ratio or buffer_size_gb, lower max_requests, or leave "
+                    "mamba_memory_ratio unset to size the recurrent states from max_requests."
+                )
+        elif inference_config.max_requests is not None and mamba_max_requests is not None:
+            assert inference_config.max_requests <= mamba_max_requests, (
+                f"Not enough memory for {inference_config.max_requests} mamba requests "
+                f"plus {reserved_mamba_slots} reserved tp_ep dummy slot(s). "
+                f"The buffer ({buffer_size_bytes / 1024**3:.2f} GB) holds the recurrent states "
+                f"of at most {mamba_max_requests} request(s)."
+            )
+
+        # The paused buffer is a part of the buffer at every unified memory level:
+        # its KV share is the block retention limit of paused requests and adds no block.
+        kv_pool_size = block_count
+        if paused_block_count > kv_pool_size - 2:
+            raise ValueError(
+                f"paused_buffer_size_gb ({inference_config.paused_buffer_size_gb}) lets paused "
+                f"requests retain {paused_block_count} KV blocks, but must leave at least two of "
+                f"the {kv_pool_size} blocks of buffer_size_gb ({inference_config.buffer_size_gb}) "
+                "outside that limit: one usable block and the dummy block."
+            )
+
         # Prefix-cache state lives beside the allocator:
         # the host hash registry is shared with the Mamba cache,
         # and the per-block shadow state exists only when prefix caching is on.
-        kv_pool_size = (
-            block_count if self.unified_memory_level == 0 else block_count + paused_block_count
-        )
         self.prefix_cache_registry = PrefixCacheRegistry()
         pc_state: Optional[PrefixCacheBlockState] = None
         if self.enable_prefix_caching:
@@ -923,8 +981,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.max_requests = self.kv_block_allocator.pool_size - 1  # -1 for dummy block
 
             # Adjust max_requests for Mamba memory constraints if necessary
-            if self.is_hybrid_model and mamba_max_requests < self.max_requests:
-                self.max_requests = int(mamba_max_requests)
+            if mamba_max_requests is not None and mamba_max_requests < self.max_requests:
+                self.max_requests = mamba_max_requests
 
             self.max_requests = self.max_requests // tp_size * tp_size
             self.max_requests = self.max_requests // self.REQUEST_ROUNDER * self.REQUEST_ROUNDER
@@ -944,6 +1002,48 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         token_based_count = math.ceil(self.max_tokens / self.block_size_tokens)
         request_based_count = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * self.max_requests
         self.max_mamba_intermediate_states_per_step = min(token_based_count, request_based_count)
+
+        self.mamba_cache_max_slots: Optional[int] = None
+        if mamba_prefix_cache_requested and self.is_hybrid_model:
+            mamba_gb = inference_config.prefix_caching_mamba_gb
+            total_bytes = int(mamba_gb * 1024**3)
+
+            # Prefix-cache state is replicated across pipeline stages. Use the
+            # smallest stage-local capacity so identical cache operations produce
+            # identical block-to-slot mappings on every stage. A recurrent prefix
+            # is executable only when all stages retain its state, so additional
+            # slots on an individual stage would not increase usable cache capacity.
+            per_slot_bytes = pipeline_mamba_cache_slot_bytes
+
+            # Two GPU buffer families with the same per-slot footprint are charged to
+            # this budget, and both are allocated below only once the checks pass:
+            #   - "durable" cache:  MambaSlotAllocator.ssm_states / conv_states, sized
+            #                       to `max_slots` slots (computed below).
+            #   - "scratch" buffers: PrefixCachedMambaMetadata.intermediate_ssm_out /
+            #                       intermediate_conv_out,
+            #                       fixed CUDA-graph-safe staging for intermediate-state
+            #                       extraction, sized to the per-step token-budget cap
+            #                       `scratch_slots` = max_mamba_intermediate_states_per_step.
+            # The scratch is not part of the durable cache but consumes the same
+            # per-slot bytes, so reserve it from the budget up front before sizing the
+            # durable cache; otherwise total usage silently exceeds mamba_gb (and can
+            # OOM) when scratch_slots > max_slots.
+            scratch_slots = self.max_mamba_intermediate_states_per_step
+            scratch_bytes = scratch_slots * per_slot_bytes
+            max_slots = (total_bytes - scratch_bytes) // per_slot_bytes  # durable slots
+
+            if max_slots < 1:
+                raise ValueError(
+                    f"Mamba prefix cache budget (prefix_caching_mamba_gb={mamba_gb:.4g} GB) "
+                    f"is too small. The CUDA-graph extraction scratch reserves "
+                    f"{scratch_bytes / 1024**3:.4g} GB ({scratch_slots} slots x "
+                    f"{per_slot_bytes / 1024:.1f} KB/slot on the pipeline stage with the "
+                    f"largest slots), leaving room for "
+                    f"fewer than one durable cache slot. Increase prefix_caching_mamba_gb "
+                    f"to at least {(scratch_bytes + per_slot_bytes) / 1024**3:.4g} GB, or "
+                    f"reduce max_tokens."
+                )
+            self.mamba_cache_max_slots = max_slots
 
         assert self.max_tokens >= self.max_requests, (
             f"max_tokens ({self.max_tokens}) must be >= "
@@ -2329,71 +2429,25 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
     # Mamba prefix cache infrastructure
     # =========================================================================
 
+    @property
+    def mamba_cache_slot_bytes(self) -> int:
+        """Bytes of one Mamba prefix-cache slot on this pipeline stage; 0 without recurrent layers."""
+        if not self.num_mamba_layers:
+            return 0
+        conv_size = math.prod(self.mamba_conv_states_shape) * self.mamba_conv_states_dtype.itemsize
+        ssm_size = math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
+        return self.num_mamba_layers * (conv_size + ssm_size)
+
     def _allocate_mamba_cache(self, mamba_gb: float) -> None:
         """Allocate the Mamba state cache for prefix caching.
 
         Args:
             mamba_gb: GPU memory budget in GB for the cache.
         """
-        import math as _math
-
-        conv_size = _math.prod(self.mamba_conv_states_shape) * self.mamba_conv_states_dtype.itemsize
-        ssm_size = _math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
-        per_slot_bytes = self.num_mamba_layers * (conv_size + ssm_size)
-        total_bytes = int(mamba_gb * 1024**3)
-
-        # Two GPU buffer families with the same per-slot footprint are charged to
-        # this budget, and both are allocated below only once the checks pass:
-        #   - "durable" cache:  MambaSlotAllocator.ssm_states / conv_states, sized
-        #                       to `max_slots` slots (computed below).
-        #   - "scratch" buffers: PrefixCachedMambaMetadata.intermediate_ssm_out /
-        #                       intermediate_conv_out,
-        #                       fixed CUDA-graph-safe staging for intermediate-state
-        #                       extraction, sized to the per-step token-budget cap
-        #                       `scratch_slots` = max_mamba_intermediate_states_per_step.
-        # The scratch is not part of the durable cache but consumes the same
-        # per-slot bytes, so reserve it from the budget up front before sizing the
-        # durable cache; otherwise total usage silently exceeds mamba_gb (and can
-        # OOM) when scratch_slots > max_slots.
+        per_slot_bytes = self.mamba_cache_slot_bytes
         scratch_slots = self.max_mamba_intermediate_states_per_step
         scratch_bytes = scratch_slots * per_slot_bytes
-        max_slots = (total_bytes - scratch_bytes) // per_slot_bytes  # durable slots
-        local_max_slots = max_slots
-
-        # Prefix-cache state is replicated across pipeline stages. Use the
-        # smallest stage-local capacity so identical cache operations produce
-        # identical block-to-slot mappings on every stage. A recurrent prefix
-        # is executable only when all stages retain its state, so additional
-        # slots on an individual stage would not increase usable cache capacity.
-        if get_pg_size(self.pipeline_parallel_group) > 1:
-            max_slots_tensor = torch.tensor(
-                max_slots, dtype=torch.int64, device=torch.cuda.current_device()
-            )
-            torch.distributed.all_reduce(
-                max_slots_tensor,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.pipeline_parallel_group,
-            )
-            max_slots = int(max_slots_tensor.item())
-
-        if max_slots < 1:
-            if local_max_slots >= 1:
-                raise ValueError(
-                    f"Mamba prefix cache budget (prefix_caching_mamba_gb={mamba_gb:.4g} GB) "
-                    f"has room for {local_max_slots} durable slots on this pipeline stage, but "
-                    f"another stage has room for fewer than one. Cache capacity is mirrored to "
-                    f"the minimum across stages; increase prefix_caching_mamba_gb, reduce "
-                    f"max_tokens, or rebalance the Mamba layers."
-                )
-            raise ValueError(
-                f"Mamba prefix cache budget (prefix_caching_mamba_gb={mamba_gb:.4g} GB) "
-                f"is too small. The CUDA-graph extraction scratch reserves "
-                f"{scratch_bytes / 1024**3:.4g} GB ({scratch_slots} slots x "
-                f"{per_slot_bytes / 1024:.1f} KB/slot), leaving room for "
-                f"fewer than one durable cache slot. Increase prefix_caching_mamba_gb "
-                f"to at least {(scratch_bytes + per_slot_bytes) / 1024**3:.4g} GB, or "
-                f"reduce max_tokens."
-            )
+        max_slots = self.mamba_cache_max_slots
 
         self.mamba_metadata.allocate_scratch_buffers(
             num_mamba_layers=self.num_mamba_layers,

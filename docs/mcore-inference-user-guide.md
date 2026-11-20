@@ -484,8 +484,8 @@ used fields:
 | Field | Purpose |
 |---|---|
 | `max_sequence_length` | Max prompt and output length you expect |
-| `buffer_size_gb` | On-GPU portion of the shared KV-cache block pool |
-| `paused_buffer_size_gb` | Block-retention budget for paused requests |
+| `buffer_size_gb` | Memory of the shared KV-cache block pool and, for hybrid models, of the recurrent states. With unified memory it may exceed device memory |
+| `paused_buffer_size_gb` | The part of `buffer_size_gb` that paused requests may retain under allocation pressure. |
 | `block_size_tokens` | KV-cache block (page) size. MLA requires exactly `64` |
 | `max_requests` / `max_tokens` | Caps on concurrent requests or tokens per forward pass |
 | `enable_chunked_prefill` | Chunked prefill (piggybacking) |

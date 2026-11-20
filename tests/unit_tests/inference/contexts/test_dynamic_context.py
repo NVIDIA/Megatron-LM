@@ -22,6 +22,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     RequestOverflowError,
     TokenOverflowError,
+    compute_buffer_sizing,
 )
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling.flashinfer_sampling import FlashInferSampling
@@ -233,6 +234,29 @@ def test_zero_padding_tokens_reads_real_token_count_at_cuda_graph_replay(
         graph.replay()
         assert torch.equal(activations[:real_token_count], original[:real_token_count])
         assert torch.all(activations[real_token_count:] == 0)
+
+
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [
+        ({}, (6, 1, None)),
+        ({"mamba_memory_ratio": 0.25}, (7, 1, 4)),
+        ({"mamba_memory_ratio": 0.25, "mamba_states_memory_per_request": 0}, (7, 1, None)),
+        ({"max_requests": 10}, (4, 0, 18)),
+    ],
+)
+def test_compute_buffer_sizing(kwargs, expected):
+    """Every sizing mode splits the buffer into KV bytes of which the paused buffer keeps its
+    fraction (a fifth here), and reports how many requests the recurrent states can hold."""
+    sizing_inputs = {
+        "buffer_size_bytes": 1000,
+        "paused_buffer_size_bytes": 200,
+        "block_size_bytes": 100,
+        "mamba_states_memory_per_request": 50,
+        "reserved_mamba_slots": 1,
+        **kwargs,
+    }
+    assert compute_buffer_sizing(**sizing_inputs) == expected
 
 
 class TestDynamicContext:
@@ -2490,46 +2514,20 @@ class TestDynamicContext:
 
                 current_global_token_offset += expected_len
 
-    @pytest.mark.internal
-    @rounder_override(64)
-    def test_pipeline_parallel_uneven_layers(self):
-        """
-        Test that DynamicInferenceContext synchronizes cache capacities across
-        pipeline stages when they have unequal layer counts.
-        """
-        pp_size = 2
-        self._setup_model_parallel_group(tensor_parallel_size=1, pipeline_parallel_size=pp_size)
-
-        rank = parallel_state.get_pipeline_model_parallel_rank()
-
-        mamba_conv_states_shape = (544, 4)
-        mamba_ssm_states_shape = (8, 64, 16)
+    def _get_context_with_uneven_recurrent_stages(self, **inference_config_kwargs):
+        """Build a PP=2 context whose stages hold one and four Mamba layers."""
         params_dtype = torch.float32
-
-        if rank == 0:
-            mamba_inference_state_config = MambaInferenceStateConfig(
-                [Symbols.MAMBA] + [Symbols.ATTENTION] * 4,
-                mamba_conv_states_shape,
-                mamba_ssm_states_shape,
-                params_dtype,
-                params_dtype,
-            )
+        if parallel_state.get_pipeline_model_parallel_rank() == 0:
+            layer_type_list = [Symbols.MAMBA] + [Symbols.ATTENTION] * 4
         else:
-            mamba_inference_state_config = MambaInferenceStateConfig(
-                [Symbols.MAMBA] * 4 + [Symbols.ATTENTION],
-                mamba_conv_states_shape,
-                mamba_ssm_states_shape,
-                params_dtype,
-                params_dtype,
-            )
-
-        context = DynamicInferenceContext(
+            layer_type_list = [Symbols.MAMBA] * 4 + [Symbols.ATTENTION]
+        return DynamicInferenceContext(
             model_config=TransformerConfig(
                 params_dtype=params_dtype,
                 num_layers=10,
                 kv_channels=64,
                 num_attention_heads=8,
-                pipeline_model_parallel_size=pp_size,
+                pipeline_model_parallel_size=2,
                 tensor_model_parallel_size=1,
                 pipeline_dtype=params_dtype,
             ),
@@ -2539,15 +2537,37 @@ class TestDynamicContext:
                 block_size_tokens=16,
                 max_tokens=1024,
                 unified_memory_level=0,
-                enable_prefix_caching=True,
-                prefix_caching_mamba_gb=0.05,
-                mamba_inference_state_config=mamba_inference_state_config,
+                mamba_inference_state_config=MambaInferenceStateConfig(
+                    layer_type_list, (544, 4), (8, 64, 16), params_dtype, params_dtype
+                ),
+                **inference_config_kwargs,
             ),
+        )
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    @pytest.mark.parametrize("mamba_memory_ratio", [None, 0.2])
+    def test_pipeline_parallel_uneven_layers(self, mamba_memory_ratio):
+        """
+        Test that DynamicInferenceContext synchronizes cache capacities across
+        pipeline stages when they have unequal layer counts.
+        """
+        pp_size = 2
+        self._setup_model_parallel_group(tensor_parallel_size=1, pipeline_parallel_size=pp_size)
+
+        context = self._get_context_with_uneven_recurrent_stages(
+            enable_prefix_caching=True,
+            prefix_caching_mamba_gb=0.05,
+            mamba_memory_ratio=mamba_memory_ratio,
         )
 
         # Collect cache capacities on each rank (CUDA needed for NCCL all_gather).
         local_capacities = torch.tensor(
-            [context.kv_block_allocator.pool_size, context.mamba_slot_allocator.max_slots],
+            [
+                context.kv_block_allocator.pool_size,
+                context.mamba_slot_allocator.max_slots,
+                context.max_requests,
+            ],
             device='cuda',
             dtype=torch.long,
         )
@@ -2568,30 +2588,33 @@ class TestDynamicContext:
         self._restore_model_parallel()
 
     @pytest.mark.internal
-    def test_mamba_cache_error_identifies_limiting_pipeline_stage(self):
-        context = object.__new__(DynamicInferenceContext)
-        context.mamba_conv_states_shape = (1,)
-        context.mamba_ssm_states_shape = (1,)
-        context.mamba_conv_states_dtype = torch.float32
-        context.mamba_ssm_states_dtype = torch.float32
-        context.num_mamba_layers = 1
-        context.max_mamba_intermediate_states_per_step = 1
-        context.pipeline_parallel_group = object()
+    @rounder_override(64)
+    def test_max_requests_beyond_recurrent_capacity_raises_on_every_pipeline_stage(self):
+        """A request count that the recurrent states of one stage can hold and those of another
+        cannot is rejected on every stage: a stage that raised alone would leave the others
+        waiting in the capacity collective."""
+        self._setup_model_parallel_group(tensor_parallel_size=1, pipeline_parallel_size=2)
+        try:
+            with pytest.raises(ValueError, match="does not fit in mamba_memory_ratio"):
+                self._get_context_with_uneven_recurrent_stages(
+                    mamba_memory_ratio=0.2, max_requests=256
+                )
+        finally:
+            self._restore_model_parallel()
 
-        def reduce_to_remote_capacity(tensor, **_kwargs):
-            tensor.fill_(0)
-
-        get_pg_size = "megatron.core.inference.contexts.dynamic_context.get_pg_size"
-        with (
-            mock.patch(get_pg_size, return_value=2),
-            mock.patch.object(
-                torch.distributed, "all_reduce", side_effect=reduce_to_remote_capacity
-            ),
-            pytest.raises(ValueError, match="another stage has room for fewer than one") as error,
-        ):
-            context._allocate_mamba_cache(32 / 1024**3)
-
-        assert "room for 3 durable slots on this pipeline stage" in str(error.value)
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_mamba_cache_budget_is_sized_for_the_largest_pipeline_stage(self):
+        """A budget that holds durable slots on the one-Mamba-layer stage and none on the
+        four-layer stage, whose slots are four times larger, is rejected on every stage."""
+        self._setup_model_parallel_group(tensor_parallel_size=1, pipeline_parallel_size=2)
+        try:
+            with pytest.raises(ValueError, match="fewer than one durable cache slot"):
+                self._get_context_with_uneven_recurrent_stages(
+                    enable_prefix_caching=True, prefix_caching_mamba_gb=5_000_000 / 1024**3
+                )
+        finally:
+            self._restore_model_parallel()
 
     def _get_context_with_attention_only_stage(self, **inference_config_kwargs):
         """Build a PP=2 context for layout ``M*|**``; stage 1 holds no recurrent layer."""
@@ -2782,8 +2805,8 @@ class TestDynamicContext:
 
         kv_buffer_bytes = int(buffer_gb * 1024**3)
         kv_paused_bytes = int(paused_gb * 1024**3)
-        total_mem_bytes = kv_buffer_bytes + kv_paused_bytes
-        expected_mamba_mem = total_mem_bytes * ratio
+        # The ratio is a share of the buffer, which contains the paused buffer.
+        expected_mamba_mem = kv_buffer_bytes * ratio
         expected_mamba_max_reqs = int(expected_mamba_mem // mamba_mem_per_req)
 
         # KV block calculation with buffer size reduced by Mamba memory ratio
@@ -2794,7 +2817,6 @@ class TestDynamicContext:
 
         expected_active_blocks = kv_buffer_bytes // kv_block_size_bytes
         expected_paused_blocks = kv_paused_bytes // kv_block_size_bytes
-        expected_total_blocks = expected_active_blocks + expected_paused_blocks
 
         # Check that block allocator received the reduced block counts
         assert context.kv_block_allocator.pool_size == expected_active_blocks
@@ -2802,7 +2824,7 @@ class TestDynamicContext:
 
         # max_requests should be limited by the Mamba calculation if mamba_max_requests is smaller
         # or the block count - 1 if that is smaller
-        expected_limit = min(expected_total_blocks - 1, expected_mamba_max_reqs)
+        expected_limit = min(expected_active_blocks - 1, expected_mamba_max_reqs)
 
         # Apply rounding (REQUEST_ROUNDER = 64 in this test)
         expected_max_requests = (expected_limit // 64) * 64
@@ -2862,21 +2884,21 @@ class TestDynamicContext:
         mamba_mem_per_req = math.prod(mamba_conv_states_shape) + math.prod(mamba_ssm_states_shape)
         mamba_mem_per_req *= dtype_size
 
-        kv_buffer_bytes = int(buffer_gb * 1024**3)
-        kv_paused_bytes = int(paused_gb * 1024**3)
-        total_mem_bytes = kv_buffer_bytes + kv_paused_bytes
+        buffer_bytes = int(buffer_gb * 1024**3)
+        paused_bytes = int(paused_gb * 1024**3)
 
-        # Auto-derived ratio from max_requests.
+        # The recurrent states of max_requests come out of the buffer. The KV cache gets the
+        # rest, and the paused buffer keeps its fraction of it.
         mamba_memory_needed = max_requests * mamba_mem_per_req
-        ratio = mamba_memory_needed / total_mem_bytes
-
-        kv_buffer_bytes = int(kv_buffer_bytes * (1.0 - ratio))
-        kv_paused_bytes = int(kv_paused_bytes * (1.0 - ratio))
+        kv_buffer_bytes = buffer_bytes - mamba_memory_needed
+        kv_paused_bytes = paused_bytes * kv_buffer_bytes // buffer_bytes
 
         kv_block_size_bytes = dtype_size * 2 * 1 * block_size * num_attention_heads * kv_channels
         expected_active_blocks = kv_buffer_bytes // kv_block_size_bytes
+        expected_paused_blocks = kv_paused_bytes // kv_block_size_bytes
 
         assert context.kv_block_allocator.pool_size == expected_active_blocks
+        assert context.kv_block_allocator.paused_limit == expected_paused_blocks
         assert context.max_requests == max_requests
 
         # With max_requests=1, more memory goes to KV blocks than with max_requests=64.

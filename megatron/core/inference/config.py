@@ -504,20 +504,17 @@ class InferenceConfig:
 
     buffer_size_gb: int = 20
     """
-    On-GPU portion of the shared KV cache block pool.
-    If `unified_memory_level` >= 1, then CPU memory is additionally utilized, resulting in a total
-    buffer size of `buffer_size_gb + paused_buffer_size_gb`.
+    Memory of the shared KV cache block pool and, for hybrid models, of the recurrent states.
+    If `unified_memory_level` >= 1, this is unified memory and may exceed device memory.
     """
 
     paused_buffer_size_gb: Optional[int] = None
     """
-    Memory used to derive the paused-request block retention budget. This does not reserve blocks
-    from active requests: active requests may use the entire shared pool of usable KV cache blocks.
+    The part of `buffer_size_gb` that paused requests may retain under allocation pressure;
+    its KV share is the paused-request block retention limit. This does not reserve blocks from
+    active requests: active requests may use the entire shared pool of usable KV cache blocks.
     When the pool cannot satisfy new allocations, paused requests retain blocks only within this
-    budget and excess paused requests may be evicted. The total buffer size depends on
-    `unified_memory_level` (uvm):
-        - uvm 0: buffer_size_gb (paused buffer is inclusive)
-        - uvm 1: buffer_size_gb + paused_buffer_size_gb
+    limit and excess paused requests may be evicted.
     """
 
     mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None
