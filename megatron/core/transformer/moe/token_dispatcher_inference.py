@@ -490,7 +490,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         cls = NVLSAllGatherVDispatcher
         if self.config.inference_grouped_gemm_backend in (
             InferenceGroupedGemmBackend.FLASHINFER,
-            InferenceGroupedGemmBackend.FLASHINFER_CUTEDSL,
+            InferenceGroupedGemmBackend.FLASHINFER_FUSED_FINALIZE,
         ):
             cls._symm_agv_routing["tensor"].fill_(-1)
         fused_metadata_update(

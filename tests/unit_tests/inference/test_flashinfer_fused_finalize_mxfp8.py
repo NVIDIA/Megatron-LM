@@ -5,11 +5,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.inference.moe import flashinfer_cutedsl_mxfp8
+from megatron.core.inference.moe import flashinfer_fused_finalize_mxfp8
 
 
 def _run_with_fake_kernels(monkeypatch, out, num_tokens=3, hidden=64):
-    """Call flashinfer_cutedsl_mxfp8_moe on CPU with the FlashInfer kernels replaced."""
+    """Call flashinfer_fused_finalize_mxfp8_moe on CPU with the FlashInfer kernels replaced."""
 
     def fake_quantize(x, is_sf_swizzled_layout, alignment):
         return torch.zeros_like(x, dtype=torch.uint8), torch.zeros(
@@ -19,18 +19,22 @@ def _run_with_fake_kernels(monkeypatch, out, num_tokens=3, hidden=64):
     def fake_moe(**kwargs):
         return torch.full((num_tokens, hidden), 7, dtype=torch.bfloat16)
 
-    monkeypatch.setattr(flashinfer_cutedsl_mxfp8, "mxfp8_quantize", fake_quantize, raising=False)
-    monkeypatch.setattr(flashinfer_cutedsl_mxfp8, "cute_dsl_fused_moe", fake_moe, raising=False)
+    monkeypatch.setattr(
+        flashinfer_fused_finalize_mxfp8, "mxfp8_quantize", fake_quantize, raising=False
+    )
+    monkeypatch.setattr(
+        flashinfer_fused_finalize_mxfp8, "cute_dsl_fused_moe", fake_moe, raising=False
+    )
     weights = SimpleNamespace(
         hidden_size=hidden,
-        localized_shards=None,
+        locality_domain_weights=None,
         fc1_data=torch.zeros(2, 1),
         fc1_scale=None,
         fc2_data=None,
         fc2_scale=None,
-        alpha=None,
+        global_scale=None,
     )
-    return flashinfer_cutedsl_mxfp8.flashinfer_cutedsl_mxfp8_moe(
+    return flashinfer_fused_finalize_mxfp8.flashinfer_fused_finalize_mxfp8_moe(
         torch.zeros(num_tokens, hidden, dtype=torch.bfloat16),
         torch.zeros(num_tokens, 2, dtype=torch.int64),
         torch.zeros(num_tokens, 2, dtype=torch.float32),

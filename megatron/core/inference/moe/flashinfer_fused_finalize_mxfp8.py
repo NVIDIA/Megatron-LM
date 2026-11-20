@@ -1,8 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""FlashInfer CuTe-DSL fused MXFP8 MoE for MCore MXFP8 expert weights.
+"""FlashInfer fused-finalize MXFP8 MoE for MCore MXFP8 expert weights.
 
-Runs MXFP8 non-gated squared-ReLU experts as two fused grouped GEMMs: FC1 with squared-ReLU
-and MXFP8 requantization, FC2 with routing-weight scaling and token scatter. With
+Runs MXFP8 non-gated squared-ReLU experts as two fused grouped GEMMs through FlashInfer's
+cute_dsl_fused_moe: FC1 fused with squared-ReLU and MXFP8 requantization, and FC2 fused with
+the MoE finalize (scaling each expert output by its routing weight and scatter-adding it into
+its token's output row), so no separate unpermute/reduce kernel runs. With
 inference_moe_locality_domains (Rubin), every expert's intermediate dimension is split across
 the two CUDA locality domains: each domain runs FC1 and FC2 over its half on its own
 green-context stream and adds its partial sum into the output.
@@ -22,21 +24,21 @@ import torch
 from megatron.core.inference.moe.flashinfer_mxfp8 import _unshuffle_cublas_scale
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
-_BLOCK = 32  # MXFP8 scale block (elements per E8M0 scale)
-_ROW_TILE = 128  # scale-layout row atom
-_COL_ATOM = 4  # scale columns per atom
+_MXFP8_BLOCK_SIZE = 32  # MXFP8 scale block (elements per E8M0 scale)
+_SCALE_TILE_ROWS = 128  # scale-layout row atom
+_SCALE_TILE_COLS = 4  # scale columns per atom
 
 # FlashInfer's default MXFP8 MoE tactic: tile size 128, FC1 and FC2 with a 128x128 MMA tile
 # on a 1x1 cluster, rastered along N.
 DEFAULT_TACTIC = (128, ((128, 128), (1, 1), False), ((128, 128), (1, 1), False))
 # Locality domains: intermediate split + add, both domains adding BF16 partial sums into the
 # output (FlashInfer's default output_memset, "overlap_fc1").
-LOCALIZED_OPTIONS = {"fc2_split": "k", "fc2_accumulator": "output"}
+LOCALITY_DOMAIN_KERNEL_OPTIONS = {"fc2_split": "k", "fc2_accumulator": "output"}
 # Green-context SM split: "backfill" uses every SM, borrowing remainder SMs across domains.
 LOCALITY_DOMAIN_SM_SPLIT = "backfill"
 # Each locality domain's FC1 output is preallocated in its own memory for calls of up to this
 # many tokens; larger calls let FlashInfer allocate it.
-PRIVATE_INTERMEDIATE_MAX_TOKENS = 4096
+FC1_OUTPUT_BUFFER_MAX_TOKENS = 4096
 
 _REQUIRED_CUTE_DSL_FUSED_MOE_ARGS = (
     "quant_mode",
@@ -49,23 +51,23 @@ try:
     from flashinfer import cute_dsl_fused_moe
     from flashinfer.fp8_quantization import mxfp8_quantize
 
-    HAVE_FLASHINFER_CUTEDSL_MXFP8 = set(_REQUIRED_CUTE_DSL_FUSED_MOE_ARGS) <= set(
+    HAVE_FLASHINFER_FUSED_FINALIZE_MXFP8 = set(_REQUIRED_CUTE_DSL_FUSED_MOE_ARGS) <= set(
         inspect.signature(cute_dsl_fused_moe).parameters
     )
-    _FLASHINFER_CUTEDSL_MXFP8_IMPORT_ERROR: Optional[ImportError] = None
+    _FLASHINFER_FUSED_FINALIZE_MXFP8_IMPORT_ERROR: Optional[ImportError] = None
 except ImportError as exc:
-    HAVE_FLASHINFER_CUTEDSL_MXFP8 = False
-    _FLASHINFER_CUTEDSL_MXFP8_IMPORT_ERROR = exc
+    HAVE_FLASHINFER_FUSED_FINALIZE_MXFP8 = False
+    _FLASHINFER_FUSED_FINALIZE_MXFP8_IMPORT_ERROR = exc
 
 
-def require_flashinfer_cutedsl_mxfp8() -> None:
-    """Raise an error when the FlashInfer CuTe-DSL MXFP8 MoE API is unavailable."""
-    if not HAVE_FLASHINFER_CUTEDSL_MXFP8:
+def require_flashinfer_fused_finalize_mxfp8() -> None:
+    """Raise an error when FlashInfer's fused-finalize MXFP8 MoE API is unavailable."""
+    if not HAVE_FLASHINFER_FUSED_FINALIZE_MXFP8:
         raise RuntimeError(
-            "inference_grouped_gemm_backend='flashinfer_cutedsl' requires a FlashInfer build "
-            "providing cute_dsl_fused_moe(quant_mode='mxfp8') with "
+            "inference_grouped_gemm_backend='flashinfer_fused_finalize' requires a FlashInfer "
+            "build providing cute_dsl_fused_moe(quant_mode='mxfp8') with "
             f"{', '.join(_REQUIRED_CUTE_DSL_FUSED_MOE_ARGS[1:])} and nvidia-cutlass-dsl."
-        ) from _FLASHINFER_CUTEDSL_MXFP8_IMPORT_ERROR
+        ) from _FLASHINFER_FUSED_FINALIZE_MXFP8_IMPORT_ERROR
 
 
 def _round_up(value: int, multiple: int) -> int:
@@ -73,21 +75,21 @@ def _round_up(value: int, multiple: int) -> int:
 
 
 @dataclass
-class FlashInferCuteDslMXFP8Weights:
-    """FC1/FC2 expert stacks in the CuTe-DSL MXFP8 layout, optionally split across
+class FlashInferFusedFinalizeMXFP8Weights:
+    """FC1/FC2 expert stacks in the cute_dsl_fused_moe MXFP8 layout, optionally split across
     locality domains."""
 
     fc1_data: torch.Tensor  # [E, I_pad, H] float8_e4m3fn
     fc1_scale: torch.Tensor  # 6-D MMA-layout E8M0 bytes (32, 4, I_pad/128, 4, ceil(H/128), E)
     fc2_data: torch.Tensor  # [E, H, I_pad] float8_e4m3fn
     fc2_scale: torch.Tensor  # (32, 4, ceil(H/128), 4, I_pad/128, E)
-    alpha: torch.Tensor  # [E] float32 ones (per-expert global scale)
+    global_scale: torch.Tensor  # [E] float32 ones (per-expert global scale)
     hidden_size: int
-    localized_shards: Optional[list] = None
-    localized_streams: Optional[list] = None
-    localized_sm_count: Optional[int] = None
-    # Per-locality-domain FC1 outputs for calls of <= PRIVATE_INTERMEDIATE_MAX_TOKENS tokens.
-    private_intermediates: Optional[dict] = None
+    locality_domain_weights: Optional[list] = None
+    locality_domain_streams: Optional[list] = None
+    sms_per_locality_domain: Optional[int] = None
+    # Per-locality-domain FC1 outputs for calls of <= FC1_OUTPUT_BUFFER_MAX_TOKENS tokens.
+    fc1_output_buffers: Optional[dict] = None
 
 
 def _swizzle_to_mma(logical: torch.Tensor) -> torch.Tensor:
@@ -100,14 +102,16 @@ def _swizzle_to_mma(logical: torch.Tensor) -> torch.Tensor:
     """
     experts, rows, cols = logical.shape
     physical = (
-        logical.reshape(experts, rows // _ROW_TILE, 4, 32, cols // _COL_ATOM, _COL_ATOM)
+        logical.reshape(
+            experts, rows // _SCALE_TILE_ROWS, 4, 32, cols // _SCALE_TILE_COLS, _SCALE_TILE_COLS
+        )
         .permute(0, 1, 4, 3, 2, 5)
         .contiguous()
     )
     return physical.permute(3, 4, 1, 5, 2, 0)
 
 
-def _padded_logical_scales(
+def _unswizzle_and_pad_scales(
     weight: MXFP8Tensor, rows: int, cols: int, padded_rows: int, padded_cols: int
 ) -> torch.Tensor:
     """Unswizzle every expert's scales into a zero-padded [E, padded_rows, padded_cols/32].
@@ -115,16 +119,20 @@ def _padded_logical_scales(
     padded_rows must be a multiple of 128 and padded_cols of 128 (whole scale atoms)."""
     experts = weight.data.shape[0]
     out = torch.zeros(
-        experts, padded_rows, padded_cols // _BLOCK, dtype=torch.uint8, device=weight.data.device
+        experts,
+        padded_rows,
+        padded_cols // _MXFP8_BLOCK_SIZE,
+        dtype=torch.uint8,
+        device=weight.data.device,
     )
     for expert in range(experts):
-        out[expert, :rows, : cols // _BLOCK].copy_(
+        out[expert, :rows, : cols // _MXFP8_BLOCK_SIZE].copy_(
             _unshuffle_cublas_scale(weight.scale[expert], rows, cols)
         )
     return out
 
 
-def _place(domains, domain: int, tensor: torch.Tensor) -> torch.Tensor:
+def _copy_to_locality_domain(domains, domain: int, tensor: torch.Tensor) -> torch.Tensor:
     """Copy a tensor (contiguous, same shape) into one locality domain's memory."""
     placed = domains.empty(domain, tuple(tensor.shape), tensor.dtype)
     placed.copy_(tensor)
@@ -134,45 +142,47 @@ def _place(domains, domain: int, tensor: torch.Tensor) -> torch.Tensor:
 # Shared by all MoE layers of the process: this relies on each layer's FC1 and FC2 running in
 # order on the locality domain's stream, so one layer's FC2 has read the buffer before the
 # next layer's FC1 overwrites it.
-_PRIVATE_INTERMEDIATE_CACHE: dict = {}
+_FC1_OUTPUT_BUFFER_CACHE: dict = {}
 
 
-def _private_intermediates(domains, shards, max_tokens, *, top_k):
+def _allocate_fc1_output_buffers(domains, domain_weights, max_tokens, *, top_k):
     """FC1 output buffers (FP8 data + MMA-layout scales) in each locality domain's memory,
     sized for max_tokens tokens at any routing tile size."""
     from flashinfer.fused_moe.cute_dsl.moe_utils import get_max_num_permuted_tokens
     from flashinfer.fused_moe.cute_dsl.tuner import VALID_TILE_SIZES
 
-    layout = []
-    for shard in shards:
-        domain_experts, width = shard["w1_weight"].shape[0], shard["w1_weight"].shape[1]
+    buffer_shapes = []
+    for domain_weight in domain_weights:
+        domain_experts, width = domain_weight["w1_weight"].shape[:2]
         rows = max(
             get_max_num_permuted_tokens(max_tokens, top_k, domain_experts, tile)
             for tile in VALID_TILE_SIZES
         )
-        layout.append((_round_up(rows, _ROW_TILE), width))
-    key = (domains.device, tuple(layout))
-    if key not in _PRIVATE_INTERMEDIATE_CACHE:
+        buffer_shapes.append((_round_up(rows, _SCALE_TILE_ROWS), width))
+    key = (domains.device, tuple(buffer_shapes))
+    if key not in _FC1_OUTPUT_BUFFER_CACHE:
         outs, scales = [], []
-        for domain, (rows, width) in enumerate(layout):
+        for domain, (rows, width) in enumerate(buffer_shapes):
             outs.append(domains.empty(domain, (rows, width), torch.float8_e4m3fn))
             scale = domains.empty(
-                domain, (32, 4, rows // _ROW_TILE, 4, -(-width // _ROW_TILE), 1), torch.uint8
+                domain,
+                (32, 4, rows // _SCALE_TILE_ROWS, 4, -(-width // _SCALE_TILE_ROWS), 1),
+                torch.uint8,
             )
             scale.zero_()
             scales.append(scale)
-        _PRIVATE_INTERMEDIATE_CACHE[key] = {"gemm1_out": outs, "gemm1_out_scale": scales}
-    return _PRIVATE_INTERMEDIATE_CACHE[key]
+        _FC1_OUTPUT_BUFFER_CACHE[key] = {"gemm1_out": outs, "gemm1_out_scale": scales}
+    return _FC1_OUTPUT_BUFFER_CACHE[key]
 
 
 @torch.no_grad()
-def prepare_cutedsl_mxfp8_weights(
+def prepare_flashinfer_fused_finalize_mxfp8_weights(
     fc1: MXFP8Tensor,
     fc2: MXFP8Tensor,
     *,
     locality_domains: bool = False,
     top_k: Optional[int] = None,
-) -> FlashInferCuteDslMXFP8Weights:
+) -> FlashInferFusedFinalizeMXFP8Weights:
     """Repack stacked canonical MXFP8 expert weights for cute_dsl_fused_moe.
 
     Args:
@@ -180,41 +190,49 @@ def prepare_cutedsl_mxfp8_weights(
         fc2: [E, H, I] stacked MCore MXFP8 FC2 weights.
         locality_domains: split every local expert's intermediate dimension across the
             device's two CUDA locality domains (domain d holds FC1 rows and FC2 columns
-            [d*I/2, (d+1)*I/2) of every expert), placing every shard in its domain's memory.
-        top_k: router top-k, used to size the per-domain private FC1 outputs.
+            [d*I/2, (d+1)*I/2) of every expert), placing each half in its domain's memory.
+        top_k: router top-k, used to size each locality domain's FC1 output buffers.
     """
-    require_flashinfer_cutedsl_mxfp8()
+    require_flashinfer_fused_finalize_mxfp8()
     for name, weight in (("fc1", fc1), ("fc2", fc2)):
         if weight.backend != "triton" or weight.data.ndim != 3:
             raise ValueError(
                 f"{name} must be a stacked [E, M, K] MXFP8Tensor in the Triton/cuBLAS layout; "
                 f"got backend={weight.backend!r}, shape={tuple(weight.data.shape)}"
             )
-    experts, inter, hidden = fc1.data.shape
-    if tuple(fc2.data.shape) != (experts, hidden, inter):
+    experts, intermediate_size, hidden = fc1.data.shape
+    if tuple(fc2.data.shape) != (experts, hidden, intermediate_size):
         raise ValueError(
             f"FC2 shape {tuple(fc2.data.shape)} does not match FC1 {tuple(fc1.data.shape)}"
         )
     if hidden % 16:
-        raise ValueError(f"CuTe-DSL MXFP8 MoE requires hidden % 16 == 0; got {hidden}")
-    inter_pad = _round_up(inter, _ROW_TILE)
+        raise ValueError(f"The fused-finalize MXFP8 MoE requires hidden % 16 == 0; got {hidden}")
+    padded_intermediate_size = _round_up(intermediate_size, _SCALE_TILE_ROWS)
     device = fc1.data.device
 
     # Zero rows of FC1 give zero (ReLU^2) activations; the matching FC2 columns are zero too.
-    fc1_data = torch.zeros(experts, inter_pad, hidden, dtype=fc1.data.dtype, device=device)
-    fc1_data[:, :inter].copy_(fc1.data)
-    fc2_data = torch.zeros(experts, hidden, inter_pad, dtype=fc2.data.dtype, device=device)
-    fc2_data[:, :, :inter].copy_(fc2.data)
-    hidden_pad = _round_up(hidden, _ROW_TILE)
-    fc1_scale = _padded_logical_scales(fc1, inter, hidden, inter_pad, hidden_pad)
-    fc2_scale = _padded_logical_scales(fc2, hidden, inter, hidden_pad, inter_pad)
+    fc1_data = torch.zeros(
+        experts, padded_intermediate_size, hidden, dtype=fc1.data.dtype, device=device
+    )
+    fc1_data[:, :intermediate_size].copy_(fc1.data)
+    fc2_data = torch.zeros(
+        experts, hidden, padded_intermediate_size, dtype=fc2.data.dtype, device=device
+    )
+    fc2_data[:, :, :intermediate_size].copy_(fc2.data)
+    padded_hidden_size = _round_up(hidden, _SCALE_TILE_ROWS)
+    fc1_scale = _unswizzle_and_pad_scales(
+        fc1, intermediate_size, hidden, padded_intermediate_size, padded_hidden_size
+    )
+    fc2_scale = _unswizzle_and_pad_scales(
+        fc2, hidden, intermediate_size, padded_hidden_size, padded_intermediate_size
+    )
 
-    weights = FlashInferCuteDslMXFP8Weights(
+    weights = FlashInferFusedFinalizeMXFP8Weights(
         fc1_data=fc1_data,
         fc1_scale=_swizzle_to_mma(fc1_scale),
         fc2_data=fc2_data,
         fc2_scale=_swizzle_to_mma(fc2_scale),
-        alpha=torch.ones(experts, dtype=torch.float32, device=device),
+        global_scale=torch.ones(experts, dtype=torch.float32, device=device),
         hidden_size=hidden,
     )
     if not locality_domains:
@@ -223,54 +241,62 @@ def prepare_cutedsl_mxfp8_weights(
     from flashinfer.locality_domain import get_localized_domains
 
     domains = get_localized_domains(device, sm_split=LOCALITY_DOMAIN_SM_SPLIT)
-    return _intermediate_split(weights, domains, fc1_data, fc2_data, inter_pad, top_k=top_k)
+    return _split_intermediate_across_locality_domains(
+        weights, domains, fc1_data, fc2_data, padded_intermediate_size, top_k=top_k
+    )
 
 
-def _intermediate_split(weights, domains, fc1_data, fc2_data, inter_pad, *, top_k):
-    """Intermediate split + add (fc2_split="k"): locality domain d holds rows inter_rows[d] of
-    every local expert's FC1 and the same columns (K) of its FC2, data and scales sliced
-    bit-exactly at a 128-row scale-tile boundary and placed in its own memory."""
-    tiles = inter_pad // _ROW_TILE
+def _split_intermediate_across_locality_domains(
+    weights, domains, fc1_data, fc2_data, padded_intermediate_size, *, top_k
+):
+    """Intermediate split + add (fc2_split="k"): locality domain d holds rows
+    domain_row_ranges[d] of every local expert's FC1 and the same columns (K) of its FC2, data
+    and scales sliced bit-exactly at a 128-row scale-tile boundary and placed in its own memory."""
+    tiles = padded_intermediate_size // _SCALE_TILE_ROWS
     if tiles % 2:
         raise ValueError(
             f"the intermediate split needs an even number of 128-row FC1 tiles; got {tiles} "
-            f"(padded intermediate size {inter_pad})"
+            f"(padded intermediate size {padded_intermediate_size})"
         )
-    half = inter_pad // 2
-    inter_rows = [(0, half), (half, inter_pad)]
-    fc1_scale_phys = weights.fc1_scale.permute(5, 2, 4, 0, 1, 3)  # (E, mt, kt, 32, 4, 4)
-    fc2_scale_phys = weights.fc2_scale.permute(5, 2, 4, 0, 1, 3)  # (E, H tiles, I tiles, ...)
-    shards = []
-    for domain, (lo, hi) in enumerate(inter_rows):
-        tiles = slice(lo // _ROW_TILE, hi // _ROW_TILE)
-        shards.append(
+    half_size = padded_intermediate_size // 2
+    domain_row_ranges = [(0, half_size), (half_size, padded_intermediate_size)]
+    fc1_scale_tiles = weights.fc1_scale.permute(5, 2, 4, 0, 1, 3)  # (E, mt, kt, 32, 4, 4)
+    fc2_scale_tiles = weights.fc2_scale.permute(5, 2, 4, 0, 1, 3)  # (E, H tiles, I tiles, ...)
+    domain_weights = []
+    for domain, (start, end) in enumerate(domain_row_ranges):
+        tiles = slice(start // _SCALE_TILE_ROWS, end // _SCALE_TILE_ROWS)
+        domain_weights.append(
             {
-                "w1_weight": _place(domains, domain, fc1_data[:, lo:hi].contiguous()),
-                "w1_weight_sf": _place(
-                    domains, domain, fc1_scale_phys[:, tiles].contiguous()
+                "w1_weight": _copy_to_locality_domain(
+                    domains, domain, fc1_data[:, start:end].contiguous()
+                ),
+                "w1_weight_sf": _copy_to_locality_domain(
+                    domains, domain, fc1_scale_tiles[:, tiles].contiguous()
                 ).permute(3, 4, 1, 5, 2, 0),
-                "w2_weight": _place(domains, domain, fc2_data[:, :, lo:hi].contiguous()),
-                "w2_weight_sf": _place(
-                    domains, domain, fc2_scale_phys[:, :, tiles].contiguous()
+                "w2_weight": _copy_to_locality_domain(
+                    domains, domain, fc2_data[:, :, start:end].contiguous()
+                ),
+                "w2_weight_sf": _copy_to_locality_domain(
+                    domains, domain, fc2_scale_tiles[:, :, tiles].contiguous()
                 ).permute(3, 4, 1, 5, 2, 0),
             }
         )
     if top_k is not None:
         # Every locality domain sees every routed row; its FC1 output is its intermediate half.
-        weights.private_intermediates = _private_intermediates(
-            domains, shards, PRIVATE_INTERMEDIATE_MAX_TOKENS, top_k=top_k
+        weights.fc1_output_buffers = _allocate_fc1_output_buffers(
+            domains, domain_weights, FC1_OUTPUT_BUFFER_MAX_TOKENS, top_k=top_k
         )
-    weights.localized_shards = shards
-    weights.localized_streams = list(domains.streams)
-    weights.localized_sm_count = int(domains.sm_counts[0])  # SMs per locality domain
+    weights.locality_domain_weights = domain_weights
+    weights.locality_domain_streams = list(domains.streams)
+    weights.sms_per_locality_domain = int(domains.sm_counts[0])  # SMs per locality domain
     return weights
 
 
-def flashinfer_cutedsl_mxfp8_moe(
+def flashinfer_fused_finalize_mxfp8_moe(
     hidden_states: torch.Tensor,
     routing_map: torch.Tensor,
     probabilities: torch.Tensor,
-    weights: FlashInferCuteDslMXFP8Weights,
+    weights: FlashInferFusedFinalizeMXFP8Weights,
     *,
     num_experts: int,
     local_expert_offset: int,
@@ -278,7 +304,7 @@ def flashinfer_cutedsl_mxfp8_moe(
     clamped_relu2_limit: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Run MXFP8 MoE through FlashInfer's CuTe-DSL fused kernels.
+    """Run MXFP8 MoE through FlashInfer's fused-finalize kernels (cute_dsl_fused_moe).
 
     ``clamped_relu2_limit`` is the (1,) FP32 limit L of ActivationType.ClampedRelu2
     (relu(L * tanh(x / L)) ** 2), required with that activation and None otherwise.
@@ -298,7 +324,8 @@ def flashinfer_cutedsl_mxfp8_moe(
         )
     if probabilities.dtype != torch.float32:
         raise TypeError(
-            f"FlashInfer CuTe-DSL MoE requires FP32 probabilities; got {probabilities.dtype}"
+            "The FlashInfer fused-finalize MoE requires FP32 probabilities; "
+            f"got {probabilities.dtype}"
         )
     num_tokens = hidden_states.shape[0]
     if out is not None and (out.shape[0] < num_tokens or out.shape[1:] != hidden_states.shape[1:]):
@@ -311,19 +338,16 @@ def flashinfer_cutedsl_mxfp8_moe(
     quantized, scale = mxfp8_quantize(
         hidden_states.contiguous(), is_sf_swizzled_layout=False, alignment=128
     )
-    scale = scale.view(torch.uint8).reshape(num_tokens, quantized.shape[1] // _BLOCK)
+    scale = scale.view(torch.uint8).reshape(num_tokens, quantized.shape[1] // _MXFP8_BLOCK_SIZE)
     localized = {}
-    if weights.localized_shards is not None:
-        localized_options = LOCALIZED_OPTIONS
-        if (
-            weights.private_intermediates is not None
-            and num_tokens <= PRIVATE_INTERMEDIATE_MAX_TOKENS
-        ):
-            localized_options = {**localized_options, **weights.private_intermediates}
+    if weights.locality_domain_weights is not None:
+        localized_options = LOCALITY_DOMAIN_KERNEL_OPTIONS
+        if weights.fc1_output_buffers is not None and num_tokens <= FC1_OUTPUT_BUFFER_MAX_TOKENS:
+            localized_options = {**localized_options, **weights.fc1_output_buffers}
         localized = dict(
-            localized_weights=weights.localized_shards,
-            localized_streams=weights.localized_streams,
-            localized_sm_count=weights.localized_sm_count,
+            localized_weights=weights.locality_domain_weights,
+            localized_streams=weights.locality_domain_streams,
+            localized_sm_count=weights.sms_per_locality_domain,
             localized_options=localized_options,
         )
     output = cute_dsl_fused_moe(
@@ -333,11 +357,11 @@ def flashinfer_cutedsl_mxfp8_moe(
         token_final_scales=probabilities.contiguous(),
         w1_weight=weights.fc1_data,
         w1_weight_sf=weights.fc1_scale,
-        w1_alpha=weights.alpha,
+        w1_alpha=weights.global_scale,
         fc2_input_scale=None,
         w2_weight=weights.fc2_data,
         w2_weight_sf=weights.fc2_scale,
-        w2_alpha=weights.alpha,
+        w2_alpha=weights.global_scale,
         num_experts=num_experts,
         top_k=routing_map.shape[1],
         num_local_experts=weights.fc1_data.shape[0],

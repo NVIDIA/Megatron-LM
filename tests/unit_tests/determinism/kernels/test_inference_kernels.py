@@ -825,26 +825,26 @@ def test_inference_default_unpermute_is_the_racy_path():
 
 @pytest.mark.skipif(
     not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,
-    reason="the FlashInfer CuTe-DSL MXFP8 MoE needs Blackwell or newer",
+    reason="the FlashInfer fused-finalize MXFP8 MoE needs Blackwell or newer",
 )
 @pytest.mark.xfail(
     strict=False,
     raises=AssertionError,
-    reason="Negative control: the CuTe-DSL fused MoE (inference_grouped_gemm_backend="
-    "'flashinfer_cutedsl') scatters every (token, expert) row into the token's output row with "
-    "atomic adds in its FC2 epilogue, so the summation order of the top-k experts varies; "
+    reason="Negative control: the FlashInfer fused-finalize MoE (inference_grouped_gemm_backend="
+    "'flashinfer_fused_finalize') scatters every (token, expert) row into the token's output "
+    "row with atomic adds in its FC2 epilogue, so the summation order of the top-k experts varies; "
     "recorded, not gated.",
 )
-def test_flashinfer_cutedsl_moe_is_the_racy_path():
-    from megatron.core.inference.moe.flashinfer_cutedsl_mxfp8 import (
-        HAVE_FLASHINFER_CUTEDSL_MXFP8,
-        flashinfer_cutedsl_mxfp8_moe,
-        prepare_cutedsl_mxfp8_weights,
+def test_flashinfer_fused_finalize_moe_is_the_racy_path():
+    from megatron.core.inference.moe.flashinfer_fused_finalize_mxfp8 import (
+        HAVE_FLASHINFER_FUSED_FINALIZE_MXFP8,
+        flashinfer_fused_finalize_mxfp8_moe,
+        prepare_flashinfer_fused_finalize_mxfp8_weights,
     )
     from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
-    if not HAVE_FLASHINFER_CUTEDSL_MXFP8:
-        pytest.skip("requires the FlashInfer CuTe-DSL MXFP8 MoE")
+    if not HAVE_FLASHINFER_FUSED_FINALIZE_MXFP8:
+        pytest.skip("requires the FlashInfer fused-finalize MXFP8 MoE")
     from flashinfer import ActivationType
 
     seeded()
@@ -865,13 +865,13 @@ def test_flashinfer_cutedsl_moe_is_the_racy_path():
     fc2 = stack(
         torch.randn(experts, hidden, intermediate, device="cuda", dtype=torch.bfloat16) * 0.05
     )
-    weights = prepare_cutedsl_mxfp8_weights(fc1, fc2, top_k=topk)
+    weights = prepare_flashinfer_fused_finalize_mxfp8_weights(fc1, fc2, top_k=topk)
     hidden_states = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
     routing = torch.rand(tokens, experts, device="cuda").topk(topk, dim=-1).indices
     probabilities = torch.rand(tokens, topk, device="cuda")
 
-    def fused(hidden_states):
-        return flashinfer_cutedsl_mxfp8_moe(
+    def run_moe(hidden_states):
+        return flashinfer_fused_finalize_mxfp8_moe(
             hidden_states,
             routing,
             probabilities,
@@ -881,9 +881,9 @@ def test_flashinfer_cutedsl_moe_is_the_racy_path():
             activation_type=ActivationType.Relu2.value,
         )
 
-    differing = count_differing_replays(fused, (hidden_states,), replays=8, backward=False)
+    differing = count_differing_replays(run_moe, (hidden_states,), replays=8, backward=False)
     assert differing > 0, (
-        "the CuTe-DSL fused MoE replayed bit-exactly 7 times; if its finalize scatter became "
+        "the fused-finalize MoE replayed bit-exactly 7 times; if its finalize scatter became "
         "deterministic, drop this control and register the backend as tested"
     )
 

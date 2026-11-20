@@ -1588,9 +1588,9 @@ class TransformerConfig(ModelParallelConfig):
     inference_disable_triton_nvls_kernels: bool = False
     """ If true, disables the use of Triton NVLS kernels during inference. """
 
-    inference_grouped_gemm_backend: Literal['flashinfer', 'flashinfer_cutedsl', 'torch', 'vllm'] = (
-        "vllm"
-    )
+    inference_grouped_gemm_backend: Literal[
+        'flashinfer', 'flashinfer_fused_finalize', 'torch', 'vllm'
+    ] = "vllm"
     """Specifies the backend to use for grouped GEMM operations during inference.
     Options:
     - 'flashinfer': Uses FlashInfer cutlass_fused_moe for BF16 and tanh-clamped
@@ -1598,7 +1598,8 @@ class TransformerConfig(ModelParallelConfig):
       The MXFP8 paths retain canonical expert weights
       for refit and also store a derived execution copy, increasing
       expert-weight memory relative to the torch backend.
-    - 'flashinfer_cutedsl': FlashInfer CuTe-DSL fused MXFP8 MoE for non-gated squared-ReLU
+    - 'flashinfer_fused_finalize': FlashInfer MXFP8 MoE with the MoE finalize (routing-weight
+      scaling and scatter back to token order) fused into FC2, for non-gated squared-ReLU
       experts (tanh-clamped via ClampedRelu2). Stores a derived execution copy of the expert
       weights in addition to the canonical MXFP8 weights.
     - 'torch': Uses torch.nn.functional.grouped_mm (mcore_fused_moe with Triton kernels).
@@ -1640,8 +1641,8 @@ class TransformerConfig(ModelParallelConfig):
     routing with an expert bias in both training and inference."""
 
     inference_flashinfer_mxfp8_token_capacity: int | None = None
-    """Optional fixed token-row capacity for FlashInfer routed MXFP8, FlashInfer CuTe-DSL
-    MXFP8 (inference_grouped_gemm_backend='flashinfer_cutedsl') and per-token NVFP4 MoE
+    """Optional fixed token-row capacity for FlashInfer routed MXFP8, FlashInfer fused-finalize
+    MXFP8 (inference_grouped_gemm_backend='flashinfer_fused_finalize') and per-token NVFP4 MoE
     (inference_moe_nvfp4_recipe).
 
     Decode-only dynamic-inference graphs use this fixed prefix when their
@@ -1671,7 +1672,7 @@ class TransformerConfig(ModelParallelConfig):
     inference_moe_locality_domains: bool = False
     """Split every routed expert's intermediate dimension across the GPU's two CUDA locality
     domains (Rubin), each running its half on its own green context and adding its partial sum
-    into the MoE output. Requires inference_grouped_gemm_backend='flashinfer_cutedsl' and
+    into the MoE output. Requires inference_grouped_gemm_backend='flashinfer_fused_finalize' and
     CUDA 13.4."""
 
     inference_moe_token_dispatcher_type: Literal['nccl', 'nvls'] = 'nvls'
@@ -2429,7 +2430,7 @@ class TransformerConfig(ModelParallelConfig):
 
             if (
                 self.inference_grouped_gemm_backend
-                == InferenceGroupedGemmBackend.FLASHINFER_CUTEDSL
+                == InferenceGroupedGemmBackend.FLASHINFER_FUSED_FINALIZE
             ):
                 if (
                     not mxfp8_enabled
@@ -2439,18 +2440,18 @@ class TransformerConfig(ModelParallelConfig):
                     or self.add_bias_linear
                 ):
                     raise ValueError(
-                        "inference_grouped_gemm_backend='flashinfer_cutedsl' supports only MXFP8 "
-                        "(fp8_recipe='mxfp8') non-gated squared-ReLU experts (optionally "
-                        "tanh-clamped) without bias or inference_moe_nvfp4_recipe."
+                        "inference_grouped_gemm_backend='flashinfer_fused_finalize' supports "
+                        "only MXFP8 (fp8_recipe='mxfp8') non-gated squared-ReLU experts "
+                        "(optionally tanh-clamped) without bias or inference_moe_nvfp4_recipe."
                     )
             if (
                 self.inference_moe_locality_domains
                 and self.inference_grouped_gemm_backend
-                != InferenceGroupedGemmBackend.FLASHINFER_CUTEDSL
+                != InferenceGroupedGemmBackend.FLASHINFER_FUSED_FINALIZE
             ):
                 raise ValueError(
                     "inference_moe_locality_domains requires "
-                    "inference_grouped_gemm_backend='flashinfer_cutedsl'."
+                    "inference_grouped_gemm_backend='flashinfer_fused_finalize'."
                 )
 
             if (
@@ -2517,7 +2518,7 @@ class TransformerConfig(ModelParallelConfig):
                     self.inference_grouped_gemm_backend
                     not in (
                         InferenceGroupedGemmBackend.FLASHINFER,
-                        InferenceGroupedGemmBackend.FLASHINFER_CUTEDSL,
+                        InferenceGroupedGemmBackend.FLASHINFER_FUSED_FINALIZE,
                     )
                     or not (mxfp8_enabled or self.inference_moe_nvfp4_recipe is not None)
                     or self.inference_moe_token_dispatcher_type != "nvls"
@@ -2525,8 +2526,8 @@ class TransformerConfig(ModelParallelConfig):
                 ):
                     raise ValueError(
                         "inference_flashinfer_mxfp8_token_capacity requires "
-                        "inference_grouped_gemm_backend='flashinfer' or 'flashinfer_cutedsl', "
-                        "FP8 enabled with "
+                        "inference_grouped_gemm_backend='flashinfer' or "
+                        "'flashinfer_fused_finalize', FP8 enabled with "
                         "fp8_recipe='mxfp8' or inference_moe_nvfp4_recipe, "
                         "inference_moe_token_dispatcher_type='nvls' and "
                         "expert_model_parallel_size > 1"
