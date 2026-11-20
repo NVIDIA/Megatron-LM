@@ -46,8 +46,8 @@ the first `-` or `E`. Source GPT layer 1 maps to the next pair, and so on.
 The pattern can also describe execution layout. A `|` marks a pipeline segment
 boundary, and `/` introduces a repeated Multi-Token Prediction (MTP) pattern.
 For example, `*-*-|*-*-` places four GPT-equivalent blocks across two pipeline
-segments. Separators do not count as layers. Square brackets group layers into
-one logical layer, as described in [Bracketed layer groups](#bracketed-layer-groups).
+segments. Separators do not count as layers. Square brackets mark which layers
+the EP-overlap scheduler runs together. See [Bracketed layer groups](#bracketed-layer-groups).
 
 HybridModel provides the following benefits:
 
@@ -71,32 +71,24 @@ treated as a new architecture and benchmarked independently.
 
 ### Bracketed layer groups
 
-Square brackets group consecutive layers into one logical layer, for example
-`[*E][*E]` or `M[M*E]`. HybridModel builds each group as one nested
-`HybridStack`. Groups change how layers execute, not what is stored: every layer
-keeps the layer number and distributed-checkpoint key it has in the pattern
-without brackets, so a `torch_dist` checkpoint saved with `[*E][*E]` loads into
-a model built with `*E*E`, and the reverse. Live weight refit also matches
-parameters and persistent buffers by physical layer number, so the trainer and
-receiver can use different groupings and pipeline partitions. Layer-indexed
-settings such as FP8 layer ranges and hash-routed MoE thresholds are also
-unchanged.
+With `--overlap-moe-expert-parallel-comm`, square brackets mark consecutive
+layers that share one 1F1B schedule entry. For example, `[M*E]` groups Mamba,
+attention and MoE so the scheduler can overlap one microbatch's MoE all-to-all
+with another microbatch's compute. An unbracketed layer gets its own entry.
 
-Use groups with MoE expert-parallel communication overlap
-(`--overlap-moe-expert-parallel-comm`). The overlap schedule interleaves one
-microbatch's MoE all-to-all with another microbatch's compute one logical layer
-at a time, so group each MoE layer with the layers that run before it, as in
-`[M*E]`. A flat config list schedules each supported built-in layer separately.
-Custom layers cannot use EP overlap because their forward and weight-gradient
-operations have no defined slots in the schedule.
+`[*E][*E]` and `*E*E` both register four physical layers under `decoder.layers`.
+They have the same eager forward path, module names and layer numbers. You can
+load a checkpoint saved with either pattern into the other and use different
+groupings on the trainer and receiver during live weight refit. FP8 layer ranges
+and hash-routed MoE thresholds refer to the physical layer numbers.
 
 Groups have the following constraints:
 
 - A group cannot be empty or nested, cannot span a `|` pipeline boundary, and
   cannot appear in an MTP pattern.
 - An MoE layer must be the last layer of its group.
-- Groups cannot be combined with mHC connections, wide residual streams, or MoE
-  shortcut connections.
+- EP overlap requires built-in layers. It does not support MTP, mHC connections,
+  wide residual streams or MoE shortcut connections.
 
 ## 2. How to Convert a Checkpoint
 

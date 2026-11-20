@@ -283,7 +283,7 @@ def test_swap_grouped_hybrid_pipeline(src_pattern, dst_pattern):
             models.append(_build_hybrid(config, 64, 8, pg, pattern).cuda())
 
         def layer_tensors(model):
-            for layer in model.decoder.physical_layers():
+            for layer in model.decoder.layers:
                 for index, (name, tensor) in enumerate(named_refit_tensors(layer)):
                     yield name, tensor, 100 * layer.layer_number + index
 

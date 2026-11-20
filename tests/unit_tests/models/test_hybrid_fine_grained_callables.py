@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -11,6 +11,7 @@ import torch
 import megatron.core.models.common.utils as node_utils
 import megatron.core.models.hybrid.fine_grained_callables as hybrid_callables
 import megatron.core.pipeline_parallel.utils as schedule_utils
+from megatron.core.enums import Fp8Recipe
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.mamba_mixer import MambaMixer
@@ -79,10 +80,7 @@ def _chunk_state():
         padding_mask=None,
         attention_mask=None,
         rotary_pos_emb=None,
-        rotary_pos_cos=None,
-        rotary_pos_sin=None,
         packed_seq_params=None,
-        sequence_len_offset=None,
     )
 
 
@@ -117,7 +115,9 @@ def test_delayed_wgrad_hooks_belong_to_the_slot_that_computes_them(cpu_streams, 
         def backward_dw(self):
             events.append(f"{self.name}:wgrad")
 
-    layer = _moe_layer(_config(moe_latent_size=2 if latent else None), shared=shared)
+    layer = _moe_layer(
+        _config(delay_wgrad_compute=True, moe_latent_size=2 if latent else None), shared=shared
+    )
     mlp = layer.mlp
     mlp.experts = Expert("routed")
     mlp.shared_experts = Expert("shared") if shared else None
@@ -125,7 +125,7 @@ def test_delayed_wgrad_hooks_belong_to_the_slot_that_computes_them(cpu_streams, 
         mlp.fc1_latent_proj = Expert("down")
         mlp.fc2_latent_proj = Expert("up")
     mlp.backward_dw = partial(MoELayer.backward_dw, mlp)
-    _, backward_dw, _, _ = hybrid_callables.build_hybrid_stack_callables(layer)
+    _, backward_dw, _, _ = hybrid_callables.build_hybrid_stack_callables((layer,), (layer.config,))
 
     def run_wgrad(modules):
         node = SimpleNamespace(
@@ -169,14 +169,16 @@ def test_attention_half_layer_forward_and_wgrad_are_scheduled(symbol):
     """All attention symbols, including MLA '+', preserve their forward and backward work."""
     backward_dw_wrapper = Mock()
     layer = SimpleNamespace(
-        config=_config(symbol),
+        config=_config(symbol, delay_wgrad_compute=True),
         _forward_attention=Mock(
             side_effect=lambda hidden_states, **kwargs: (hidden_states.sin(), None)
         ),
         backward_dw_wrapper=backward_dw_wrapper,
         init_backward_dw_wrapper=Mock(),
     )
-    forward, backward_dw, is_moe, _ = hybrid_callables.build_hybrid_stack_callables(layer)
+    forward, backward_dw, is_moe, _ = hybrid_callables.build_hybrid_stack_callables(
+        (layer,), (layer.config,)
+    )
     node = SimpleNamespace(chunk_state=_chunk_state(), is_mtp=False, is_last_layer=False)
     hidden_states = torch.tensor([0.2, 0.4], requires_grad=True)
     output = forward[0](node, hidden_states)
@@ -189,6 +191,45 @@ def test_attention_half_layer_forward_and_wgrad_are_scheduled(symbol):
     assert not is_moe
 
 
+def test_group_uses_physical_quantization_and_delayed_wgrad_configs(monkeypatch):
+    """Mixed per-layer settings still apply when both modules share a schedule group."""
+    visits = []
+
+    @contextmanager
+    def record_context(config, layer_index):
+        visits.append((config, layer_index))
+        yield
+
+    monkeypatch.setattr(hybrid_callables, "get_fp8_context", record_context)
+    monkeypatch.setattr(hybrid_callables, "get_fp4_context", record_context)
+    attention = SimpleNamespace(
+        config=_config(
+            Symbols.ATTENTION, fp8="e4m3", fp8_recipe=Fp8Recipe.tensorwise, delay_wgrad_compute=True
+        ),
+        layer_number=4,
+        init_backward_dw_wrapper=Mock(),
+        backward_dw_wrapper=Mock(),
+        _forward_attention=lambda x, **kwargs: (x + 1, None),
+    )
+    mlp = SimpleNamespace(
+        config=_config(Symbols.MLP, fp4="e2m1", delay_wgrad_compute=False),
+        layer_number=5,
+        _forward_mlp=lambda x, **kwargs: x * 3,
+    )
+    decoder = SimpleNamespace(
+        layers=[attention, mlp],
+        layer_config_list=[attention.config, mlp.config],
+        schedule_group_sizes=(2,),
+    )
+    (group,) = hybrid_callables.hybrid_layer_schedule_groups(decoder)
+    node = SimpleNamespace(chunk_state=_chunk_state(), is_mtp=False, is_last_layer=False)
+    x = torch.tensor([1.0])
+    hidden = group.forward[0](node, x)
+    torch.testing.assert_close(group.forward[2](node, hidden), (x + 1) * 3)
+    assert visits == [(attention.config, 3), (mlp.config, 4)]
+    assert group.backward_dw == {"pre_dispatch_computation": [attention.backward_dw_wrapper]}
+
+
 @pytest.mark.parametrize("delay_wgrad_compute", [False, True])
 @pytest.mark.parametrize("mamba_mixer", [False, True])
 def test_mamba_pre_layer_wgrad_requires_a_mixer_that_defers_it(delay_wgrad_compute, mamba_mixer):
@@ -199,10 +240,14 @@ def test_mamba_pre_layer_wgrad_requires_a_mixer_that_defers_it(delay_wgrad_compu
     )
     if delay_wgrad_compute and not mamba_mixer:
         with pytest.raises(ValueError, match="SimpleNamespace mixer"):
-            hybrid_callables.build_hybrid_stack_callables(layer)
+            hybrid_callables.build_hybrid_stack_callables((layer,), (layer.config,))
     else:
-        _, backward_dw, is_moe, _ = hybrid_callables.build_hybrid_stack_callables(layer)
-        assert backward_dw["pre_dispatch_computation"] == [layer]
+        _, backward_dw, is_moe, _ = hybrid_callables.build_hybrid_stack_callables(
+            (layer,), (layer.config,)
+        )
+        assert backward_dw.get("pre_dispatch_computation", []) == (
+            [layer] if delay_wgrad_compute else []
+        )
         assert not is_moe
 
 
@@ -239,7 +284,7 @@ def test_ncclep_probabilities_do_not_reconnect_schedule_graphs(cpu_streams, zero
         tokens * manager.dispatched_probs,
         None,
     )
-    forward, _, _, _ = hybrid_callables.build_hybrid_stack_callables(layer)
+    forward, _, _, _ = hybrid_callables.build_hybrid_stack_callables((layer,), (layer.config,))
 
     def preprocess(node, hidden_states):
         manager.token_probs = hidden_states.square()

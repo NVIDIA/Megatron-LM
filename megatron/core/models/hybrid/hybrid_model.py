@@ -2,7 +2,7 @@
 
 import logging
 from contextlib import nullcontext
-from typing import Any, Callable, Dict, Literal, Optional, Sequence
+from typing import Any, Callable, Literal, Optional, Sequence
 
 import torch
 from torch import Tensor
@@ -10,7 +10,6 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.context_parallel import ContextParallelBatch
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
@@ -18,7 +17,6 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEm
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.hybrid import HybridLayerEntry
-from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -140,13 +138,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             pipeline stage boundaries.
             Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
             The main pattern may contain "|" to define pipeline stage boundaries and
-            "[...]" to group layers into one logical layer (see "Bracketed layer groups"
+            "[...]" to group layers for the EP-overlap scheduler (see "Bracketed layer groups"
             in docs/user-guide/hybrid-model-migration.md).
             Examples:
                 - "M*M*" -> main decoder only, no MTP
                 - "M*M*/MM/MM" -> main="M*M*", mtp="MM", 2 depths
                 - "M-M-|M-M*-|M-M-|M-M*-" -> 4 pipeline segments
-                - "[M*E][M*E]" -> 2 logical layers, each grouping Mamba, attention and MoE
+                - "[M*E][M*E]" -> 6 physical layers in 2 EP-overlap schedule entries
         hybrid_attention_ratio (float, optional): Deprecated. Use hybrid_layer_pattern instead.
             If set to a value > 0.0 and hybrid_layer_pattern is None, a pattern will be
             generated from the ratio with a deprecation warning.
@@ -445,7 +443,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         ):
             raise ValueError(
                 "Hybrid MTP does not support overlap_moe_expert_parallel_comm because the "
-                "overlap scheduler does not expand the nested HybridStack."
+                "overlap schedule supports decoder layers only."
             )
         if self.config.freeze_base_model_for_mtp and self.mtp_num_depths < 1:
             raise ValueError(
@@ -625,64 +623,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             self.setup_embeddings_and_output_layer()
 
         if self.config.overlap_moe_expert_parallel_comm:
-            self._validate_ep_overlap_support()
+            from .fine_grained_callables import validate_overlap_schedule
+
+            validate_overlap_schedule(self)
 
         for name, module in self.named_modules():
             if hasattr(module, 'finish_init'):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
-
-    def _validate_ep_overlap_support(self) -> None:
-        """Reject features that the EP-overlap schedule plan cannot run.
-
-        Hash-routed MoE layers and wide residuals are rejected by TransformerConfig.
-        """
-        if self._has_custom_layers:
-            # Custom layers define their own forward and have no schedule-slot or wgrad contract.
-            raise ValueError(
-                "Custom hybrid layers do not support overlap_moe_expert_parallel_comm."
-            )
-        if self.config.cuda_graph_impl != "none":
-            raise ValueError(
-                "overlap_moe_expert_parallel_comm with HybridModel does not support CUDA graphs "
-                "yet. Set cuda_graph_impl='none'."
-            )
-        if self.config.enable_mhc_connections or self.config.moe_shortcut_connection:
-            raise ValueError(
-                "overlap_moe_expert_parallel_comm with HybridModel does not support "
-                "enable_mhc_connections or moe_shortcut_connection."
-            )
-        # Segment replay still needs validation for Mamba and grouped layers.
-        if self.config.recompute_granularity == "full":
-            raise ValueError(
-                "overlap_moe_expert_parallel_comm with HybridModel does not support "
-                "recompute_granularity='full' yet."
-            )
-        # The schedule plan calls the layer callables directly and bypasses
-        # ``HybridStack.forward``, which is where per-layer context-parallel layout
-        # conversion happens and where chunkwise linear CP gets its packed-sequence
-        # metadata. A bracketed group presents the boundary layout to its enclosing
-        # stack even when its own layers need conversion, so check every stack,
-        # including the nested ones.
-        for module in self.modules():
-            if not isinstance(module, HybridStack):
-                continue
-            if (
-                module._cp_layout_manager is not None
-                and module._cp_layout_manager.requires_conversion
-            ):
-                raise ValueError(
-                    "overlap_moe_expert_parallel_comm with HybridModel does not support mixed "
-                    "context-parallel layouts (linear_cp_layout != attention_cp_layout with "
-                    "context_parallel_size > 1)."
-                )
-            # The stack records chunkwise layers for any CP size, because it resolves the
-            # CP group per microbatch; they only need the metadata when CP is active.
-            if module._has_linear_layer_with_chunkwise_cp and module.cp_group.size() > 1:
-                raise ValueError(
-                    "overlap_moe_expert_parallel_comm with HybridModel does not support "
-                    "linear_cp_mode='chunkwise' with context_parallel_size > 1."
-                )
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
@@ -765,385 +713,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
             self.cudagraph_manager = CudaGraphManager(config)
 
-    def _preprocess(
-        self,
-        input_ids: Tensor,
-        position_ids: Tensor,
-        decoder_input: Tensor = None,
-        inference_context: BaseInferenceContext = None,
-        packed_seq_params: PackedSeqParams = None,
-        padding_mask: Optional[Tensor] = None,
-    ):
-        """Preprocess inputs for HybridStack or combined-1F1B scheduling.
-
-        Return the fields consumed by eager forward and the shared schedule's
-        ``PreProcessNode``: decoder input, rotary embeddings, rotary cosine and
-        sine, sequence length offset, and padding mask.
-        """
-        in_inference_mode = InferenceMode.is_active()
-
-        # If decoder_input is provided, input_ids and position_ids are ignored;
-        # otherwise apply the embedding layer to get decoder_input.
-        if decoder_input is not None:
-            pass
-        elif self.pre_process:
-            # Decoder embedding.
-            decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
-
-            if self.config.sequence_parallel and not self.embedding.scatter_to_sequence_parallel:
-                # The embedding skips SP scatter for models whose outer wrapper scatters instead
-                # (e.g. VLM LMs); scatter here so a standalone LM forward isn't double-gathered.
-                decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(
-                    decoder_input, group=self.pg_collection.tp
-                )
-
-            # Clear the outputs for padding tokens when using dynamic batching with
-            # quantization scales to avoid corrupting amax calculations. Under sequence
-            # parallelism, decoder_input holds this rank's shard of the tokens.
-            if (
-                in_inference_mode
-                and inference_context is not None
-                and inference_context.is_dynamic_batching()
-                and is_using_quantization_scales(self.config)
-            ):
-                inference_context.zero_padding_tokens(
-                    decoder_input,
-                    sequence_parallel_rank=(
-                        get_pg_rank(self.pg_collection.tp) if self.config.sequence_parallel else 0
-                    ),
-                )
-        else:
-            # Intermediate stage of pipeline parallelism -- the decoder will get
-            # hidden_states from encoder.input_tensor.
-            decoder_input = None
-
-        # TODO: Apply the same later-stage SP mask alignment in GPTModel.
-        # Later pipeline stages receive activations through set_input_tensor.
-        decoder_reference = decoder_input
-        if padding_mask is not None and self.config.sequence_parallel and decoder_reference is None:
-            decoder_reference = self.decoder.input_tensor
-        if (
-            padding_mask is not None
-            and self.config.sequence_parallel
-            and decoder_reference is not None
-            and padding_mask.shape[1] != decoder_reference.shape[0]
-        ):
-            padding_mask = (
-                tensor_parallel.scatter_to_sequence_parallel_region(
-                    padding_mask.transpose(0, 1).contiguous(), group=self.pg_collection.tp
-                )
-                .transpose(0, 1)
-                .contiguous()
-            )
-
-        rotary_pos_emb = None
-        if self.position_embedding_type == 'rope' and hasattr(self, 'rotary_pos_emb'):
-            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
-            )
-            rotary_pos_emb = self.rotary_pos_emb(
-                rotary_seq_len,
-                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
-                cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
-            )
-        elif self.position_embedding_type == 'yarn' and hasattr(self, 'rotary_pos_emb'):
-            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
-            )
-            # YarnRotaryEmbedding.forward returns (emb, mscale); discard mscale here.
-            rotary_pos_emb, _ = self.rotary_pos_emb(
-                rotary_seq_len,
-                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
-                cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
-            )
-
-        # ``sequence_len_offset`` is only needed for flash-decode / local-cudagraph
-        # static-batching inference; otherwise leave it as ``None``.
-        if (
-            in_inference_mode
-            and inference_context is not None
-            and (self.config.cuda_graph_impl == "local" or self.config.flash_decode)
-            and inference_context.is_static_batching()
-        ):
-            # Caller-supplied embeddings and later PP stages may omit token IDs.
-            hidden_states = (
-                decoder_input if decoder_input is not None else self.decoder.input_tensor
-            )
-            sequence_len_offset = torch.full(
-                (hidden_states.shape[1],),
-                inference_context.sequence_len_offset,
-                dtype=torch.int32,
-                device=hidden_states.device,
-            )
-        else:
-            sequence_len_offset = None
-
-        return decoder_input, rotary_pos_emb, None, None, sequence_len_offset, padding_mask
-
-    def _postprocess(
-        self,
-        hidden_states,
-        input_ids,
-        position_ids,
-        labels,
-        rotary_pos_emb,
-        rotary_pos_cos=None,
-        rotary_pos_sin=None,
-        mtp_in_postprocess=None,
-        loss_mask=None,
-        mtp_input_mask=None,
-        decoder_input=None,
-        attention_mask=None,
-        padding_mask=None,
-        packed_seq_params=None,
-        sequence_len_offset=None,
-        runtime_gather_output=None,
-        extra_block_kwargs=None,
-        inference_context=None,
-        output_processor=None,
-        output_processor_context=None,
-        compute_mtp_loss=True,
-        cp_batch=None,
-        mhc_multistream=None,
-        mtp_decoder_input=None,
-    ):
-        """Postprocess HybridStack hidden states into logits or language-model loss.
-
-        Eager forward runs MTP here when ``mtp_in_postprocess`` is enabled.
-        ``compute_mtp_loss`` controls the MTP auxiliary objective. The MTP block
-        uses ``cp_batch`` and ``mhc_multistream`` to prepare its inputs.
-        Eager forward and the schedule's ``PostProcessNode`` can supply an
-        ``output_processor`` to override the default logits or loss computation.
-        """
-        in_inference_mode = InferenceMode.is_active()
-        if in_inference_mode:
-            assert runtime_gather_output, "Inference must always gather TP logits"
-
-        output_weight = None
-        if self.share_embeddings_and_output_weights:
-            output_weight = self.shared_embedding_or_output_weight()
-
-        # Speculative decoding: when active, MTP must run *after* verification so
-        # it conditions on verified tokens rather than stale speculative ones.
-        is_spec_decode = (
-            in_inference_mode
-            and inference_context is not None
-            and inference_context.is_dynamic_batching()
-            and inference_context.num_speculative_tokens > 0
-        )
-
-        # Whether the MTP auxiliary objective is computed in this call.
-        # ``self.mtp_process`` guards against models built without an MTP block.
-        mtp_loss_active = (
-            self.mtp_process and not (in_inference_mode or is_spec_decode) and compute_mtp_loss
-        )
-        # MTP forward inline (skipped when the EP-overlap plan schedules MTP separately).
-        mtp_forward_ran = bool(mtp_in_postprocess) and mtp_loss_active
-        mtp_hidden_states = hidden_states
-        mtp_inputs = None
-        if mtp_forward_ran:
-            packed_seq_params_by_layout = (
-                cp_batch.packed_seq_params_by_layout if cp_batch is not None else None
-            )
-            cp_layout_plan = cp_batch.thd_plan if cp_batch is not None else None
-            mtp_inputs = self.mtp.prepare_cp_layout(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                decoder_input=mtp_decoder_input,
-                mhc_multistream=mhc_multistream,
-                labels=labels,
-                loss_mask=loss_mask,
-                padding_mask=padding_mask,
-                mtp_input_mask=mtp_input_mask,
-                packed_seq_params=packed_seq_params,
-                cp_batch=cp_batch,
-            )
-            if mtp_inputs.decoder_input is None:
-                assert mtp_inputs.input_ids is not None and mtp_inputs.position_ids is not None, (
-                    "MTP requires both input_ids and position_ids when precomputed "
-                    "decoder_input embeddings are not provided."
-                )
-            mtp_hidden_states = self.mtp(
-                input_ids=mtp_inputs.input_ids,
-                position_ids=mtp_inputs.position_ids,
-                hidden_states=mtp_inputs.hidden_states,
-                mhc_multistream=mtp_inputs.mhc_multistream,
-                attention_mask=attention_mask,
-                inference_params=inference_context,
-                rotary_pos_emb=(
-                    None
-                    if self.hybrid_layer_config_list is not None and self._mtp_uses_mla
-                    else rotary_pos_emb
-                ),
-                packed_seq_params=mtp_inputs.packed_seq_params,
-                embedding=self.embedding,
-                decoder_input=mtp_inputs.decoder_input,
-                padding_mask=mtp_inputs.padding_mask,
-                mtp_input_mask=mtp_inputs.mtp_input_mask,
-                packed_seq_params_by_layout=packed_seq_params_by_layout,
-                cp_layout_plan=cp_layout_plan,
-            )
-
-        if not self.post_process:
-            return mtp_hidden_states if mtp_forward_ran else hidden_states
-
-        if self.config.mtp_num_layers is not None and self.mtp_process:
-            assert self.config.mtp_num_layers > 0
-            if is_spec_decode:
-                # Cache decoder hidden states for serial MTP computation after
-                # speculative token verification.
-                assert inference_context is not None
-                if self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
-                    # Block-scope CUDA graph mode: copy_() into the pre-allocated buffer so
-                    # every graph replay writes to the same fixed GPU address regardless of
-                    # batch size.
-                    assert inference_context.mtp_decoder_hidden_states is not None
-                    inference_context.mtp_decoder_hidden_states[: hidden_states.shape[0]].copy_(
-                        hidden_states
-                    )
-                else:
-                    # Non-block scope: direct assignment; the controller will set
-                    # this back to None after reading to allow GC.
-                    inference_context.mtp_decoder_hidden_states = hidden_states
-            elif mtp_loss_active:
-                # In training/eval, fold the MTP loss into hidden_states. When the MTP block
-                # ran inline above, use its CP-layout-prepared inputs; on the EP-overlap path
-                # the MTP layer nodes already produced the concatenated hidden states and the
-                # raw inputs apply.
-                # For RL (labels is None), process_mtp_loss derives labels from
-                # input_ids to match the SFT label format.
-                if mtp_inputs is not None:
-                    mtp_loss_inputs = dict(
-                        hidden_states=mtp_hidden_states,
-                        labels=mtp_inputs.labels,
-                        loss_mask=mtp_inputs.loss_mask,
-                        packed_seq_params=mtp_inputs.packed_seq_params,
-                        input_ids=mtp_inputs.input_ids,
-                        mtp_input_mask=mtp_inputs.mtp_input_mask,
-                        main_hidden_states=hidden_states,
-                    )
-                else:
-                    mtp_loss_inputs = dict(
-                        hidden_states=hidden_states,
-                        labels=labels,
-                        loss_mask=loss_mask,
-                        packed_seq_params=packed_seq_params,
-                        input_ids=input_ids,
-                        mtp_input_mask=mtp_input_mask,
-                    )
-                hidden_states = process_mtp_loss(
-                    output_layer=self.output_layer,
-                    output_weight=output_weight,
-                    is_training=self.training,
-                    compute_language_model_loss=self.compute_language_model_loss,
-                    config=self.config,
-                    cp_group=self.pg_collection.cp,
-                    tp_group=self.tp_group,
-                    scale_logits_fn=self._scale_logits if self.config.use_mup else None,
-                    metric_avg_group=(
-                        getattr(self.pg_collection, 'dp_cp_gtp_remat', None)
-                        or self.pg_collection.dp_cp
-                    ),
-                    **mtp_loss_inputs,
-                )
-
-        sequence_parallel_override = False
-
-        if output_processor is not None:
-            return output_processor(
-                hidden_states=hidden_states,
-                output_layer=self.output_layer,
-                output_weight=output_weight,
-                labels=labels,
-                loss_mask=loss_mask,
-                input_ids=input_ids,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                decoder_input=decoder_input,
-                inference_context=inference_context,
-                packed_seq_params=packed_seq_params,
-                runtime_gather_output=runtime_gather_output,
-                context=output_processor_context,
-                compute_language_model_loss=self.compute_language_model_loss,
-                scale_logits=self._scale_logits,
-                config=self.config,
-            )
-
-        if (
-            in_inference_mode
-            and inference_context is not None
-            and inference_context.config.materialize_only_last_token_logits
-        ):
-            if inference_context.is_static_batching():
-                hidden_states = hidden_states[-1:, :, :]
-            else:
-                if self.output_layer.sequence_parallel:
-                    # Perform the sequence-parallel gather here instead of after
-                    # the output layer so we can slice the last-token logits from
-                    # the full view of the packed logits across all requests.
-                    hidden_states = gather_from_sequence_parallel_region(
-                        hidden_states, group=self.pg_collection.tp
-                    )
-                    self.output_layer.sequence_parallel = False
-                    sequence_parallel_override = True
-
-                # Reshape [S, B, H] (with B=1) to [1, S, H] for logit extraction,
-                # then back to [S', B, H] for the output layer.
-                reshaped = hidden_states.squeeze(1).unsqueeze(0)
-                hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
-
-        # Inference consumes logits in fp32: emit them so when the head can, upcast otherwise.
-        emit_fp32 = in_inference_mode and self.lm_head_can_emit_fp32
-        logits, _ = self.output_layer(
-            hidden_states,
-            weight=output_weight,
-            runtime_gather_output=runtime_gather_output,
-            output_dtype=torch.float32 if emit_fp32 else None,
-        )
-        # Apply MuP output scaling to logits
-        logits = self._scale_logits(logits)
-        if in_inference_mode:
-            logits = logits.float()
-        # Dynamic inference under CUDA graphs: write the logits into the controller's
-        # persistent buffer and return a view of it, so no graph pins its own copy.
-        logits_buffer = getattr(inference_context, "logits_output_buffer", None)
-        if logits_buffer is not None:
-            buffer_rows = logits_buffer[0, : logits.shape[0]]
-            buffer_rows.copy_(logits.squeeze(1))
-            logits = buffer_rows.unsqueeze(1)
-        gather_output = (
-            self.output_layer.gather_output
-            if runtime_gather_output is None
-            else runtime_gather_output
-        )
-        observe_tensor(
-            self.output_layer,
-            "output_logits",
-            "output_logits",
-            logits,
-            tp_shard_dim=None if gather_output else -1,
-            sequence_dim=0,
-            batch_dim=1,
-        )
-
-        # Restore sequence parallel execution to the output layer if necessary.
-        if sequence_parallel_override:
-            assert (
-                in_inference_mode
-                and inference_context.is_dynamic_batching()
-                and inference_context.config.materialize_only_last_token_logits
-            )
-            self.output_layer.sequence_parallel = True
-
-        if labels is None:
-            # [s b h] => [b s h]
-            return logits.transpose(0, 1).contiguous()
-
-        loss = self.compute_language_model_loss(labels, logits)
-
-        return loss
-
     def build_schedule_plan(
         self,
         input_ids: Tensor,
@@ -1162,16 +731,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         output_processor_context: Optional[Any] = None,
     ):
         """Build a combined-1F1B training plan with one entry per logical decoder layer."""
-        if self.config.fine_grained_activation_offloading:
-            self.preprocess_for_fine_grained_offloading()
-        if self.config.moe_paged_stash:
-            self.preprocess_for_paged_stash()
+        from .fine_grained_callables import build_hybrid_schedule_plan
 
-        from megatron.core.models.common.model_chunk_schedule_plan import (
-            TransformerModelChunkSchedulePlan,
-        )
-
-        return TransformerModelChunkSchedulePlan(
+        return build_hybrid_schedule_plan(
             self,
             input_ids,
             position_ids,
@@ -1187,21 +749,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             output_processor=output_processor,
             output_processor_context=output_processor_context,
         )
-
-    def sharded_state_dict(
-        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[Dict] = None
-    ) -> ShardedStateDict:
-        """Return a Transformer-compatible sharded state dict for HybridModel."""
-        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
-        output_layer_extra_state_key = f'{prefix}output_layer._extra_state'
-
-        # Only the output layer weight is checkpointed. Its TE extra state must be empty.
-        output_extra_state = sharded_state_dict.pop(output_layer_extra_state_key, None)
-        assert not (
-            output_extra_state and output_extra_state.data
-        ), f'Expected output layer extra state to be empty, got: {output_extra_state}'
-
-        return sharded_state_dict
 
     def forward(
         self,
@@ -1243,6 +790,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             output_processor_context (Any, optional): Opaque caller-owned context passed to
                 ``output_processor`` as ``context``.
         """
+        # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
+        # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
+
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
 
@@ -1260,21 +810,25 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         mtp_decoder_input = decoder_input
 
-        (
-            decoder_input,
-            rotary_pos_emb,
-            rotary_pos_cos,
-            rotary_pos_sin,
-            sequence_len_offset,
-            padding_mask,
-        ) = self._preprocess(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            decoder_input=decoder_input,
-            inference_context=inference_context,
-            packed_seq_params=packed_seq_params,
-            padding_mask=padding_mask,
-        )
+        if decoder_input is None and self.pre_process:
+            decoder_input = _embed_tokens(self, input_ids, position_ids)
+
+            # Clear the outputs for padding tokens when using dynamic batching with
+            # quantization scales to avoid corrupting amax calculations. Under sequence
+            # parallelism, decoder_input holds this rank's shard of the tokens.
+            if (
+                in_inference_mode
+                and inference_context is not None
+                and inference_context.is_dynamic_batching()
+                and is_using_quantization_scales(self.config)
+            ):
+                inference_context.zero_padding_tokens(
+                    decoder_input,
+                    sequence_parallel_rank=(
+                        get_pg_rank(self.pg_collection.tp) if self.config.sequence_parallel else 0
+                    ),
+                )
+
         # Hash routing consumes batch-major token IDs. Under sequence parallelism,
         # shard them with decoder activations so each TP rank hashes its local tokens.
         hash_input_ids = None
@@ -1294,8 +848,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 .contiguous()
             )
 
-        # Wrap decoder_input so the decoder (HybridStack) can drop its caller's
-        # reference for early garbage collection during inference.
+        padding_mask = _align_padding_mask(self, decoder_input, padding_mask)
+        rotary_pos_emb = _rotary_embedding(
+            self, decoder_input, packed_seq_params, inference_context
+        )
+
+        # Wrap decoder_input to allow the decoder (HybridStack) to delete the
+        # reference held by this caller function, enabling early garbage collection
+        # for inference.
         if in_inference_mode:
             decoder_input = WrappedTensor(decoder_input)
 
@@ -1362,28 +922,263 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             hidden_states = decoder_output
             mhc_multistream = None
 
-        return self._postprocess(
-            hidden_states=hidden_states,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            labels=labels,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            mtp_in_postprocess=True,
-            loss_mask=loss_mask,
-            mtp_input_mask=mtp_input_mask,
-            decoder_input=decoder_input,
-            attention_mask=attention_mask,
-            padding_mask=padding_mask,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-            runtime_gather_output=runtime_gather_output,
-            inference_context=inference_context,
-            compute_mtp_loss=compute_mtp_loss,
-            cp_batch=cp_batch,
-            mhc_multistream=mhc_multistream,
-            mtp_decoder_input=mtp_decoder_input,
-            output_processor=output_processor,
-            output_processor_context=output_processor_context,
+        output_weight = None
+        if self.share_embeddings_and_output_weights:
+            output_weight = self.shared_embedding_or_output_weight()
+
+        # Check if speculative decoding is active. When it is, MTP must be
+        # computed *after* verification so that it is conditioned on verified
+        # tokens rather than stale speculative tokens from the previous step.
+        is_spec_decode = (
+            in_inference_mode
+            and inference_context is not None
+            and inference_context.is_dynamic_batching()
+            and inference_context.num_speculative_tokens > 0
         )
+
+        mtp_forward_ran = (
+            self.mtp_process and not (in_inference_mode or is_spec_decode) and compute_mtp_loss
+        )
+        mtp_hidden_states = hidden_states
+        mtp_inputs = None
+        if mtp_forward_ran:
+            mtp_inputs = self.mtp.prepare_cp_layout(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                decoder_input=mtp_decoder_input,
+                mhc_multistream=mhc_multistream,
+                labels=labels,
+                loss_mask=loss_mask,
+                padding_mask=padding_mask,
+                mtp_input_mask=mtp_input_mask,
+                packed_seq_params=packed_seq_params,
+                cp_batch=cp_batch,
+            )
+            if mtp_inputs.decoder_input is None:
+                assert mtp_inputs.input_ids is not None and mtp_inputs.position_ids is not None, (
+                    "MTP requires both input_ids and position_ids when precomputed "
+                    "decoder_input embeddings are not provided."
+                )
+            mtp_hidden_states = self.mtp(
+                input_ids=mtp_inputs.input_ids,
+                position_ids=mtp_inputs.position_ids,
+                hidden_states=mtp_inputs.hidden_states,
+                mhc_multistream=mtp_inputs.mhc_multistream,
+                attention_mask=attention_mask,
+                inference_params=inference_context,
+                rotary_pos_emb=(
+                    None
+                    if self.hybrid_layer_config_list is not None and self._mtp_uses_mla
+                    else rotary_pos_emb
+                ),
+                packed_seq_params=mtp_inputs.packed_seq_params,
+                embedding=self.embedding,
+                decoder_input=mtp_inputs.decoder_input,
+                padding_mask=mtp_inputs.padding_mask,
+                mtp_input_mask=mtp_inputs.mtp_input_mask,
+                packed_seq_params_by_layout=packed_seq_params_by_layout,
+                cp_layout_plan=cp_layout_plan,
+            )
+
+        if not self.post_process:
+            return mtp_hidden_states if mtp_forward_ran else hidden_states
+
+        if self.config.mtp_num_layers is not None and self.mtp_process:
+            assert self.config.mtp_num_layers > 0
+            if is_spec_decode:
+                assert inference_context is not None
+                if self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
+                    # Block-scope CUDA graph mode: copy_() into the
+                    # pre-allocated buffer so every graph replay writes to
+                    # the same fixed GPU address regardless of batch size.
+                    assert inference_context.mtp_decoder_hidden_states is not None
+                    inference_context.mtp_decoder_hidden_states[: hidden_states.shape[0]].copy_(
+                        hidden_states
+                    )
+                else:
+                    # Non-block scope: direct assignment; the controller will set
+                    # this back to None after reading to allow GC.
+                    inference_context.mtp_decoder_hidden_states = hidden_states
+            elif mtp_forward_ran:
+                assert mtp_inputs is not None
+                # For RL (labels is None), process_mtp_loss derives labels from
+                # input_ids to match the SFT label format.
+                hidden_states = process_mtp_loss(
+                    hidden_states=mtp_hidden_states,
+                    labels=mtp_inputs.labels,
+                    loss_mask=mtp_inputs.loss_mask,
+                    output_layer=self.output_layer,
+                    output_weight=output_weight,
+                    is_training=self.training,
+                    compute_language_model_loss=self.compute_language_model_loss,
+                    config=self.config,
+                    cp_group=self.pg_collection.cp,
+                    tp_group=self.tp_group,
+                    packed_seq_params=mtp_inputs.packed_seq_params,
+                    scale_logits_fn=self._scale_logits if self.config.use_mup else None,
+                    input_ids=mtp_inputs.input_ids,
+                    mtp_input_mask=mtp_inputs.mtp_input_mask,
+                    metric_avg_group=(
+                        getattr(self.pg_collection, 'dp_cp_gtp_remat', None)
+                        or self.pg_collection.dp_cp
+                    ),
+                    main_hidden_states=hidden_states,
+                )
+
+        # Give callers a post-decoder hook before the default output projection and loss path.
+        if output_processor is not None:
+            return _run_output_processor(
+                self,
+                output_processor,
+                hidden_states=hidden_states,
+                output_weight=output_weight,
+                labels=labels,
+                loss_mask=loss_mask,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                decoder_input=decoder_input,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+                runtime_gather_output=runtime_gather_output,
+                context=output_processor_context,
+            )
+        sequence_parallel_override = False
+        if (
+            in_inference_mode
+            and inference_context is not None
+            and inference_context.config.materialize_only_last_token_logits
+        ):
+            if inference_context.is_static_batching():
+                hidden_states = hidden_states[-1:, :, :]
+            else:
+                if self.output_layer.sequence_parallel:
+                    # Perform the sequence parallel gather here instead of after the output layer
+                    # because we need to slice the last token logits from the full view of the
+                    # packed logits across all requests.
+                    hidden_states = gather_from_sequence_parallel_region(
+                        hidden_states, group=self.pg_collection.tp
+                    )
+                    self.output_layer.sequence_parallel = False
+                    sequence_parallel_override = True
+
+                # Reshape [S, B, H] (with B=1) to [1, S, H] for logit extraction,
+                # then back to [S', B, H] for the output layer.
+                reshaped = hidden_states.squeeze(1).unsqueeze(0)
+                hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
+
+        logits = _project_logits(
+            self, hidden_states, output_weight, runtime_gather_output, inference_context
+        )
+
+        # Restore sequence parallel execution to the output layer if necessary.
+        if sequence_parallel_override:
+            assert (
+                in_inference_mode
+                and inference_context.is_dynamic_batching()
+                and inference_context.config.materialize_only_last_token_logits
+            )
+            self.output_layer.sequence_parallel = True
+
+        if labels is None:
+            # [s b h] => [b s h]
+            return logits.transpose(0, 1).contiguous()
+
+        loss = self.compute_language_model_loss(labels, logits)
+
+        return loss
+
+
+def _embed_tokens(model, input_ids, position_ids):
+    """Embed tokens in the sequence layout consumed by the decoder."""
+    embeddings = model.embedding(input_ids=input_ids, position_ids=position_ids)
+    if model.config.sequence_parallel and not model.embedding.scatter_to_sequence_parallel:
+        embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
+            embeddings, group=model.pg_collection.tp
+        )
+    return embeddings
+
+
+def _align_padding_mask(model, decoder_input, padding_mask):
+    """Shard the batch-major mask to match embeddings or incoming pipeline activations."""
+    if padding_mask is None or not model.config.sequence_parallel:
+        return padding_mask
+    reference = decoder_input if decoder_input is not None else model.decoder.input_tensor
+    if reference is None or padding_mask.shape[1] == reference.shape[0]:
+        return padding_mask
+    return (
+        tensor_parallel.scatter_to_sequence_parallel_region(
+            padding_mask.transpose(0, 1).contiguous(), group=model.pg_collection.tp
+        )
+        .transpose(0, 1)
+        .contiguous()
+    )
+
+
+def _rotary_embedding(model, decoder_input, packed_seq_params, inference_context=None):
+    """Build the shared rotary embedding when this model owns one."""
+    if model.position_embedding_type not in ("rope", "yarn") or not hasattr(
+        model, "rotary_pos_emb"
+    ):
+        return None
+    seq_len = model.rotary_pos_emb.get_rotary_seq_len(
+        inference_context, model.decoder, decoder_input, model.config, packed_seq_params
+    )
+    embedding = model.rotary_pos_emb(
+        seq_len,
+        packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == "thd",
+        cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
+    )
+    return embedding[0] if model.position_embedding_type == "yarn" else embedding
+
+
+def _run_output_processor(model, output_processor, **inputs):
+    """Bind the model's output layer and loss functions to the caller's hook."""
+    return output_processor(
+        output_layer=model.output_layer,
+        compute_language_model_loss=model.compute_language_model_loss,
+        scale_logits=model._scale_logits,
+        config=model.config,
+        **inputs,
+    )
+
+
+def _project_logits(
+    model, hidden_states, output_weight, runtime_gather_output, inference_context=None
+):
+    """Project decoder outputs, apply MuP scaling and publish the logits observation."""
+    in_inference_mode = InferenceMode.is_active()
+    # Inference consumes logits in fp32: emit them so when the head can, upcast otherwise.
+    emit_fp32 = in_inference_mode and model.lm_head_can_emit_fp32
+    logits, _ = model.output_layer(
+        hidden_states,
+        weight=output_weight,
+        runtime_gather_output=runtime_gather_output,
+        output_dtype=torch.float32 if emit_fp32 else None,
+    )
+    # Apply MuP output scaling to logits
+    logits = model._scale_logits(logits)
+    if in_inference_mode:
+        logits = logits.float()
+    # Dynamic inference under CUDA graphs: write the logits into the controller's
+    # persistent buffer and return a view of it, so no graph pins its own copy.
+    logits_buffer = getattr(inference_context, "logits_output_buffer", None)
+    if logits_buffer is not None:
+        buffer_rows = logits_buffer[0, : logits.shape[0]]
+        buffer_rows.copy_(logits.squeeze(1))
+        logits = buffer_rows.unsqueeze(1)
+    gather_output = (
+        model.output_layer.gather_output if runtime_gather_output is None else runtime_gather_output
+    )
+    observe_tensor(
+        model.output_layer,
+        "output_logits",
+        "output_logits",
+        logits,
+        tp_shard_dim=None if gather_output else -1,
+        sequence_dim=0,
+        batch_dim=1,
+    )
+
+    return logits

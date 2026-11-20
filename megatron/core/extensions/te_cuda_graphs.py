@@ -10,7 +10,7 @@ from weakref import WeakKeyDictionary, proxy
 import torch
 
 from megatron.core.transformer.enums import CudaGraphModule
-from megatron.core.utils import expand_hybrid_layer_groups, get_attr_wrapped_model
+from megatron.core.utils import get_attr_wrapped_model
 
 
 class _TECudaGraphBackwardDWWrapperMixin:
@@ -448,7 +448,7 @@ def set_te_cuda_graph_current_microbatch(model, microbatch_id):
     except RuntimeError:
         decoder_exists = False
     if decoder_exists and model_with_decoder is not None:
-        for layer in expand_hybrid_layer_groups(model_with_decoder.decoder.layers):
+        for layer in model_with_decoder.decoder.layers:
             if layer.config.cuda_graph_impl == "transformer_engine":
                 layer.te_cuda_graph_current_microbatch = microbatch_id
         if hasattr(model_with_decoder, 'mtp'):

@@ -99,7 +99,7 @@ class ParameterMetadata:
     #   layer 16). For reshard/refit across different PP partitionings (e.g., PP2 ↔ PP1),
     #   `resolved_name` may be further canonicalized to global layer indices.
     #
-    # Bracketed hybrid groups also resolve to the same physical layer names as flat stacks.
+    # For non-EP and non-PP cases, resolved_name == name.
     resolved_name: Optional[str] = None
     # The global expert index this parameter belongs to (e.g., 4 for global expert 4).
     # Computed alongside resolved_name; None for non-EP or fused expert tensors.
@@ -350,24 +350,19 @@ def _build_layer_module_prefix_map(module: torch.nn.Module) -> dict[str, str]:
     convention used in parameter names and build a map such as:
 
     - "decoder.layers.0" → "decoder.layers.16"  (if layer_number == 17)
-    - "decoder.layers.0.layers.1" → "decoder.layers.17"  (inside a bracketed hybrid group)
     """
     prefix_map: dict[str, str] = {}
-    group_layer_lists: dict[str, str] = {}
     for module_name, submodule in module.named_modules():
-        parent, _, index = module_name.rpartition('.')
-        if not index.isdigit():
-            continue
-        if getattr(submodule, 'is_layer_group_stack', False):
-            # Children of a bracketed HybridStack belong to the outer physical layer list.
-            group_layer_lists[f'{module_name}.layers'] = parent
+        if not module_name:
             continue
         layer_number = getattr(submodule, 'layer_number', None)
         if not isinstance(layer_number, int):
             continue
-        parent = group_layer_lists.get(parent, parent)
-        global_index = str(layer_number - 1)
-        prefix_map[module_name] = f'{parent}.{global_index}' if parent else global_index
+        parts = module_name.split('.')
+        if not parts[-1].isdigit():
+            continue
+        parts[-1] = str(layer_number - 1)  # convert 1-indexed to 0-indexed
+        prefix_map[module_name] = '.'.join(parts)
     return prefix_map
 
 

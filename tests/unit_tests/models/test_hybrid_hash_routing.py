@@ -130,7 +130,9 @@ class RecordingDecoder:
     def __call__(self, **kwargs):
         self.kwargs = kwargs
         hidden_states = kwargs['hidden_states']
-        return hidden_states.unwrap() if isinstance(hidden_states, WrappedTensor) else hidden_states
+        if isinstance(hidden_states, WrappedTensor):
+            hidden_states = hidden_states.unwrap()
+        return self.input_tensor if hidden_states is None else hidden_states
 
 
 class RecordingMoE(torch.nn.Module):
@@ -326,8 +328,6 @@ def test_hybrid_model_passes_ids_to_decoder_only_for_hash_routing(
         mtp_process=False,
         vocab_size=128,
     )
-    model._preprocess = HybridModel._preprocess.__get__(model)
-    model._postprocess = HybridModel._postprocess.__get__(model)
     input_ids = torch.arange(8).reshape(2, 4)
     hidden_states = torch.randn(4, 2, 8)
 
@@ -384,8 +384,6 @@ def test_hybrid_model_sequence_shards_hash_ids_with_decoder_input(
         vocab_size=128,
         pg_collection=SimpleNamespace(tp=tp_group),
     )
-    model._preprocess = HybridModel._preprocess.__get__(model)
-    model._postprocess = HybridModel._postprocess.__get__(model)
     monkeypatch.setattr(InferenceMode, 'is_active', lambda: inference)
     input_ids = torch.arange(8).reshape(2, 4)
     padding_mask = torch.tensor([[False, True, False, True], [True, False, True, False]])
@@ -466,8 +464,6 @@ def test_hybrid_model_scatters_embedding_for_sequence_parallel(monkeypatch):
         vocab_size=128,
         pg_collection=SimpleNamespace(tp=tp_group),
     )
-    model._preprocess = HybridModel._preprocess.__get__(model)
-    model._postprocess = HybridModel._postprocess.__get__(model)
     input_ids = torch.arange(8).reshape(2, 4)
     position_ids = torch.arange(4).repeat(2, 1)
 
@@ -536,8 +532,6 @@ def test_hybrid_model_shards_each_layout_padding_mask(
         mtp_process=False,
         pg_collection=SimpleNamespace(tp=tp_group),
     )
-    model._preprocess = HybridModel._preprocess.__get__(model)
-    model._postprocess = HybridModel._postprocess.__get__(model)
     hidden_states = torch.randn(4 if sequence_parallel else 8, 1, 8)
     decoder.input_tensor = hidden_states
     HybridModel.forward(
@@ -558,30 +552,46 @@ def test_hybrid_model_shards_each_layout_padding_mask(
 
 @pytest.mark.parametrize("pre_process", [True, False])
 @pytest.mark.parametrize("cuda_graph_impl,flash_decode", [("local", False), ("none", True)])
-def test_hybrid_preprocess_static_inference_without_token_ids(
-    pre_process, cuda_graph_impl, flash_decode
-):
+def test_hybrid_static_inference_without_token_ids(pre_process, cuda_graph_impl, flash_decode):
     hidden_states = torch.randn(4, 2, 8)
+    decoder = RecordingDecoder()
+    decoder.input_tensor = None if pre_process else hidden_states
     model = SimpleNamespace(
         config=SimpleNamespace(
-            sequence_parallel=False, cuda_graph_impl=cuda_graph_impl, flash_decode=flash_decode
+            fine_grained_activation_offloading=False,
+            moe_paged_stash=False,
+            moe_num_hash_layers=0,
+            sequence_parallel=False,
+            freeze_base_model_for_mtp=False,
+            cuda_graph_impl=cuda_graph_impl,
+            flash_decode=flash_decode,
         ),
-        pre_process=pre_process,
+        decoder=decoder,
+        hybrid_layer_config_list=None,
+        _has_custom_layers=False,
         position_embedding_type="none",
-        decoder=SimpleNamespace(input_tensor=hidden_states),
+        pre_process=pre_process,
+        post_process=False,
+        share_embeddings_and_output_weights=False,
+        mtp_process=False,
     )
-    inference_context = SimpleNamespace(is_static_batching=lambda: True, sequence_len_offset=7)
-
+    inference_context = SimpleNamespace(
+        is_static_batching=lambda: True, is_dynamic_batching=lambda: False, sequence_len_offset=7
+    )
     with InferenceMode.active():
-        *_, sequence_len_offset, _ = HybridModel._preprocess(
+        output = HybridModel.forward(
             model,
             input_ids=None,
             position_ids=None,
+            attention_mask=None,
             decoder_input=hidden_states if pre_process else None,
             inference_context=inference_context,
+            runtime_gather_output=True,
         )
 
-    torch.testing.assert_close(sequence_len_offset, torch.tensor([7, 7], dtype=torch.int32))
+    assert isinstance(decoder.kwargs['hidden_states'], WrappedTensor)
+    assert decoder.kwargs['inference_context'] is inference_context
+    assert output is hidden_states
 
 
 def test_chunked_hash_moe_keeps_ids_and_padding_aligned():

@@ -8,15 +8,17 @@ import pytest
 import torch
 
 from megatron.core.enums import Fp8Recipe
-from megatron.core.models.common.model_chunk_schedule_plan import TransformerLayerSchedulePlan
+from megatron.core.models.common.model_chunk_schedule_plan import (
+    LayerScheduleGroup,
+    TransformerLayerSchedulePlan,
+)
 from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
-def _schedule_plan(layer, *, hybrid_layer_config=None):
+def _schedule_plan(layer):
     plan = TransformerLayerSchedulePlan.__new__(TransformerLayerSchedulePlan)
     plan.layer = layer
-    plan._hybrid_layer_config = hybrid_layer_config
     return plan
 
 
@@ -34,7 +36,7 @@ def test_schedule_uses_layer_quantization_context(layer_cls):
 
 def test_hybrid_schedule_runs_without_a_transformer_context_hook():
     """Hybrid callables manage quantization within each schedule slot."""
-    plan = _schedule_plan(SimpleNamespace(), hybrid_layer_config=object())
+    plan = _schedule_plan(LayerScheduleGroup((SimpleNamespace(),), [], {}, False, None))
     plan.recompute_segment = None
     visited = []
     for name in (

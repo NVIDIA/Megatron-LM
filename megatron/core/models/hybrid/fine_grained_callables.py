@@ -2,15 +2,15 @@
 
 """Layer callables for HybridModel's EP-overlap (combined 1F1B) schedule plan.
 
-``build_hybrid_stack_callables`` splits one logical HybridStack layer, either a bracketed
-group such as ``[M*E]`` or a single layer symbol, into the schedule plan's slots:
+``build_hybrid_stack_callables`` splits a group of physical decoder layers, such as
+``[M*E]`` or a single unbracketed layer, into the schedule plan's slots:
 
 * pre-dispatch compute: the Mamba, attention, MLA or GDN layers that precede the
   terminal MLP/MoE layer, then the MoE layer's pre-MLP norm, shared experts, router
   and dispatch preprocessing;
 * token dispatch;
 * the dense MLP or the routed experts;
-* token combine and the MoE residual add, plus the final norm on the last layer.
+* token combine and the MoE residual add.
 
 ``_MoEBackwardDWWrapper`` gives each slot the delayed MoE weight-gradient work it
 owns.
@@ -18,7 +18,6 @@ owns.
 
 from contextlib import nullcontext
 from functools import partial
-from typing import Optional
 
 import torch
 from torch import Tensor
@@ -26,8 +25,11 @@ from torch import Tensor
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.models.hybrid.hybrid_block import HybridStack
-from megatron.core.models.hybrid.hybrid_layer_allocation import LayerConfigItem, is_layer_group
+from megatron.core.models.common.model_chunk_schedule_plan import (
+    LayerScheduleGroup,
+    TransformerModelChunkSchedulePlan,
+)
+from megatron.core.models.common.utils import PostProcessNode, PreProcessNode
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.pipeline_parallel.utils import (
     ScheduleNode,
@@ -35,6 +37,7 @@ from megatron.core.pipeline_parallel.utils import (
     get_comm_stream,
 )
 from megatron.core.ssm.mamba_mixer import MambaMixer
+from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.transformer.transformer_layer import make_viewless_tensor
 
 _ATTENTION_CONFIG_TYPES = (
@@ -97,18 +100,67 @@ def _get_inner_quant_context(layer):
     return nullcontext()
 
 
-def _split_hybrid_layers_for_overlap(layer, layer_config: Optional[LayerConfigItem]):
-    if isinstance(layer, HybridStack):
-        configs = layer.layer_config_list if layer_config is None else layer_config
-        layers = layer.layers
-    else:
-        configs = (layer.config if layer_config is None else layer_config,)
-        layers = (layer,)
+def validate_overlap_schedule(model):
+    """Reject configurations whose eager behavior the schedule cannot reproduce."""
+    config = model.config
+    if model._has_custom_layers:
+        raise ValueError("Custom hybrid layers do not support overlap_moe_expert_parallel_comm.")
+    if config.cuda_graph_impl != "none":
+        raise ValueError(
+            "overlap_moe_expert_parallel_comm with HybridModel does not support CUDA graphs "
+            "yet. Set cuda_graph_impl='none'."
+        )
+    if config.enable_mhc_connections or config.moe_shortcut_connection:
+        raise ValueError(
+            "overlap_moe_expert_parallel_comm with HybridModel does not support "
+            "enable_mhc_connections or moe_shortcut_connection."
+        )
+    # A first-class layer config can enable wide residuals independently of the root.
+    # These callables bypass the stack's residual expansion/readout and the MoE residual write.
+    if config.wide_residual is not None or any(
+        layer_config.wide_residual is not None for layer_config in model.decoder.layer_config_list
+    ):
+        raise ValueError(
+            "overlap_moe_expert_parallel_comm with HybridModel does not support wide_residual."
+        )
+    if config.recompute_granularity == "full":
+        raise ValueError(
+            "overlap_moe_expert_parallel_comm with HybridModel does not support "
+            "recompute_granularity='full' yet."
+        )
+    # The schedule calls physical layers directly. HybridStack.forward owns CP
+    # layout conversions and the packed metadata for chunkwise linear layers.
+    decoder = model.decoder
+    if decoder._cp_layout_manager is not None and decoder._cp_layout_manager.requires_conversion:
+        raise ValueError(
+            "overlap_moe_expert_parallel_comm with HybridModel does not support mixed "
+            "context-parallel layouts (linear_cp_layout != attention_cp_layout with "
+            "context_parallel_size > 1)."
+        )
+    if decoder._has_linear_layer_with_chunkwise_cp and decoder.cp_group.size() > 1:
+        raise ValueError(
+            "overlap_moe_expert_parallel_comm with HybridModel does not support "
+            "linear_cp_mode='chunkwise' with context_parallel_size > 1."
+        )
 
+
+def hybrid_layer_schedule_groups(decoder):
+    """Build schedule slots over the flat, stage-local decoder layers."""
+    groups = []
+    start = 0
+    sizes = decoder.schedule_group_sizes or (1,) * len(decoder.layers)
+    for size in sizes:
+        end = start + size
+        layers = tuple(decoder.layers[i] for i in range(start, end))
+        callables = build_hybrid_stack_callables(layers, decoder.layer_config_list[start:end])
+        groups.append(LayerScheduleGroup(layers, *callables))
+        start = end
+    return groups
+
+
+def _split_hybrid_layers_for_overlap(layers, configs):
     layer_items = []
     for config, item_layer in zip(configs, layers, strict=True):
-        if is_layer_group(config):
-            raise ValueError("Nested HybridStack groups are not supported in overlap scheduling.")
         if layer_utils.get_custom_layer_type(config) is not None:
             raise ValueError(
                 "Custom hybrid layers do not support overlap_moe_expert_parallel_comm."
@@ -134,20 +186,6 @@ def _split_hybrid_layers_for_overlap(layer, layer_config: Optional[LayerConfigIt
     is_moe = terminal_type is layer_utils.MoELayerConfig
     num_local_experts = terminal_layer.mlp.num_local_experts if is_moe else None
     return pre_layers, terminal_type, terminal_layer, is_moe, num_local_experts
-
-
-def get_hybrid_stack_moe_metadata(layer, layer_config: Optional[LayerConfigItem] = None):
-    """Return ``(is_moe, num_local_experts)`` for one HybridStack schedule layer."""
-    _, _, _, is_moe, num_local_experts = _split_hybrid_layers_for_overlap(layer, layer_config)
-    return is_moe, num_local_experts
-
-
-def _maybe_apply_final_norm(node: ScheduleNode, hidden_states: Tensor):
-    final_norm = node.chunk_state.model.decoder.final_norm
-    if not node.is_mtp and final_norm is not None and node.is_last_layer:
-        hidden_states = final_norm(hidden_states)
-        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
-    return hidden_states
 
 
 def _run_moe_preprocess(layer, node: ScheduleNode, hidden_states: Tensor):
@@ -262,25 +300,22 @@ def _run_moe_combine(layer, node: ScheduleNode, output: Tensor):
     node.layer_state.residual = None
     node.layer_state.shared_expert_output = None
 
-    return _maybe_apply_final_norm(node, output)
+    return output
 
 
-def build_hybrid_stack_callables(layer, layer_config: Optional[LayerConfigItem] = None):
-    """Create fine-grained callables for one logical HybridStack layer.
-
-    A logical layer may be a bracketed nested ``HybridStack`` (for example ``[M*E]``)
-    or a single ungrouped hybrid layer symbol. The split is:
-    pre-dispatch compute -> dispatch -> MLP/experts -> combine.
-    """
+def build_hybrid_stack_callables(layers, configs):
+    """Split a contiguous group of physical layers into compute and communication slots."""
     pre_layers, terminal_type, terminal_layer, is_moe, num_local_experts = (
-        _split_hybrid_layers_for_overlap(layer, layer_config)
+        _split_hybrid_layers_for_overlap(layers, configs)
     )
 
     def pre_dispatch_computation(node: ScheduleNode, hidden_states: Tensor):
         for item_type, item_layer in pre_layers:
             with _get_inner_quant_context(item_layer):
                 if item_type is layer_utils.MambaLayerConfig:
-                    hidden_states = item_layer(
+                    # The schedule releases each physical FSDP unit explicitly. Calling
+                    # forward directly leaves the unit hooks to the schedule, as for attention.
+                    hidden_states = item_layer.forward(
                         hidden_states,
                         attention_mask=node.chunk_state.attention_mask,
                         packed_seq_params=node.chunk_state.packed_seq_params,
@@ -294,10 +329,7 @@ def build_hybrid_stack_callables(layer, layer_config: Optional[LayerConfigItem] 
                         hidden_states,
                         attention_mask=node.chunk_state.attention_mask,
                         rotary_pos_emb=node.chunk_state.rotary_pos_emb,
-                        rotary_pos_cos=node.chunk_state.rotary_pos_cos,
-                        rotary_pos_sin=node.chunk_state.rotary_pos_sin,
                         packed_seq_params=node.chunk_state.packed_seq_params,
-                        sequence_len_offset=node.chunk_state.sequence_len_offset,
                     )
                     # _forward_attention returns the bias_dropout_add output which can be a
                     # view tensor (the mlp_bda's add into the post-attention residual produces
@@ -307,8 +339,7 @@ def build_hybrid_stack_callables(layer, layer_config: Optional[LayerConfigItem] 
                     # strides, so a view can make the forward output differ slightly between
                     # processes. TransformerLayer makes its MLP output viewless for the same
                     # reason (``TransformerLayer._apply_mlp_bda_step``); the _forward_attention
-                    # shortcut here does not, so do it explicitly. Same idea as the
-                    # make_viewless_tensor in _maybe_apply_final_norm.
+                    # shortcut here does not, so do it explicitly.
                     hidden_states = make_viewless_tensor(
                         inp=hidden_states,
                         requires_grad=hidden_states.requires_grad,
@@ -326,9 +357,6 @@ def build_hybrid_stack_callables(layer, layer_config: Optional[LayerConfigItem] 
         if terminal_type is layer_utils.MoELayerConfig:
             with _get_inner_quant_context(terminal_layer):
                 return _run_moe_preprocess(terminal_layer, node, hidden_states)
-
-        if terminal_type is None:
-            return _maybe_apply_final_norm(node, hidden_states)
 
         return hidden_states
 
@@ -358,10 +386,9 @@ def build_hybrid_stack_callables(layer, layer_config: Optional[LayerConfigItem] 
     def mlp(node: ScheduleNode, hidden_states: Tensor):
         if terminal_type is layer_utils.MLPLayerConfig:
             with _get_inner_quant_context(terminal_layer):
-                hidden_states = terminal_layer._forward_mlp(
+                return terminal_layer._forward_mlp(
                     hidden_states, padding_mask=node.chunk_state.padding_mask
                 )
-            return _maybe_apply_final_norm(node, hidden_states)
         if terminal_type is layer_utils.MoELayerConfig:
             with _get_inner_quant_context(terminal_layer):
                 return _run_moe_experts(terminal_layer, node, hidden_states)
@@ -377,6 +404,8 @@ def build_hybrid_stack_callables(layer, layer_config: Optional[LayerConfigItem] 
     backward_dw = {}
     pre_bwd_dw = []
     for item_type, item_layer in pre_layers:
+        if not item_layer.config.delay_wgrad_compute:
+            continue
         if item_type in _ATTENTION_CONFIG_TYPES:
             # TransformerLayer-backed pre-layers go through the standard
             # _BackwardDWWrapper which coordinates attn / shared-expert wgrad
@@ -389,22 +418,20 @@ def build_hybrid_stack_callables(layer, layer_config: Optional[LayerConfigItem] 
             # in turn calls backward_dw on the in_proj / out_proj linears. The
             # schedule node iterates this list and calls .backward_dw() on each;
             # registering the layer directly is sufficient.
-            if item_layer.config.delay_wgrad_compute and not isinstance(
-                item_layer.mixer, MambaMixer
-            ):
+            if not isinstance(item_layer.mixer, MambaMixer):
                 raise ValueError(
                     "delay_wgrad_compute with overlap_moe_expert_parallel_comm does not support "
                     f"Mamba layers with a {type(item_layer.mixer).__name__} mixer."
                 )
             pre_bwd_dw.append(item_layer)
-    if is_moe:
+    if is_moe and terminal_layer.config.delay_wgrad_compute:
         # Each slot owns the hooks for exactly the parameters whose delayed wgrad
         # it computes. Shared-expert dgrad has not run yet in the routed MLP slot.
         pre_dispatch_dw = _MoEBackwardDWWrapper(terminal_layer.mlp, routed_experts=False)
         if pre_dispatch_dw.submodules:
             pre_bwd_dw.append(pre_dispatch_dw)
         backward_dw["mlp"] = _MoEBackwardDWWrapper(terminal_layer.mlp, routed_experts=True)
-    elif terminal_type is layer_utils.MLPLayerConfig:
+    elif terminal_type is layer_utils.MLPLayerConfig and terminal_layer.config.delay_wgrad_compute:
         backward_dw["mlp"] = terminal_layer.mlp
 
     if pre_bwd_dw:
@@ -418,3 +445,87 @@ def build_hybrid_stack_callables(layer, layer_config: Optional[LayerConfigItem] 
         None,
     ]
     return forward_funcs, backward_dw, is_moe, num_local_experts
+
+
+class HybridEmbeddingNode(PreProcessNode):
+    """Prepare a training microbatch or receive the previous pipeline stage's activations."""
+
+    def forward_impl(self):
+        """Store the inputs used by the physical layer callables."""
+        from .hybrid_model import _align_padding_mask, _embed_tokens, _rotary_embedding
+
+        model, state = self.model, self.chunk_state
+        if not model.pre_process:
+            state.decoder_input = model.decoder.input_tensor
+        elif state.decoder_input is None:
+            state.decoder_input = _embed_tokens(model, state.input_ids, state.position_ids)
+        state.padding_mask = _align_padding_mask(model, state.decoder_input, state.padding_mask)
+        state.rotary_pos_emb = (
+            None
+            if model.hybrid_layer_config_list is not None and model._decoder_uses_mla
+            else _rotary_embedding(model, state.decoder_input, state.packed_seq_params)
+        )
+        return state.decoder_input
+
+
+class HybridOutputNode(PostProcessNode):
+    """Produce the training output after the last logical layer of the chunk."""
+
+    def forward_impl(self, hidden_states):
+        """Apply the decoder's final norm and the same output head used by eager training."""
+        from .hybrid_model import _project_logits, _run_output_processor
+
+        model, state = self.model, self.chunk_state
+        final_norm = getattr(model.decoder, "final_norm", None)
+        if final_norm is not None:
+            hidden_states = final_norm(hidden_states)
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=True, keep_graph=True
+            )
+        weight = (
+            model.shared_embedding_or_output_weight()
+            if model.share_embeddings_and_output_weights
+            else None
+        )
+        if state.output_processor is not None:
+            output = _run_output_processor(
+                model,
+                state.output_processor,
+                hidden_states=hidden_states,
+                output_weight=weight,
+                labels=state.labels,
+                loss_mask=state.loss_mask,
+                input_ids=state.input_ids,
+                position_ids=state.position_ids,
+                attention_mask=state.attention_mask,
+                decoder_input=state.decoder_input,
+                inference_context=None,
+                packed_seq_params=state.packed_seq_params,
+                runtime_gather_output=state.runtime_gather_output,
+                context=state.output_processor_context,
+            )
+        else:
+            logits = _project_logits(model, hidden_states, weight, state.runtime_gather_output)
+            if state.labels is None:
+                output = logits.transpose(0, 1).contiguous()
+            else:
+                output = model.compute_language_model_loss(state.labels, logits)
+        return float16_to_fp32(output)
+
+
+class HybridSchedulePlan(TransformerModelChunkSchedulePlan):
+    """Use the Hybrid embedding and output head around the shared 1F1B executor."""
+
+    PRE_PROCESS_NODE_CLASS = HybridEmbeddingNode
+    POST_PROCESS_NODE_CLASS = HybridOutputNode
+
+
+def build_hybrid_schedule_plan(model, *args, **kwargs):
+    """Attach the stage's groups of physical decoder layers to the overlap schedule."""
+    if model.config.fine_grained_activation_offloading:
+        model.preprocess_for_fine_grained_offloading()
+    if model.config.moe_paged_stash:
+        model.preprocess_for_paged_stash()
+    return HybridSchedulePlan(
+        model, *args, decoder_layer_groups=hybrid_layer_schedule_groups(model.decoder), **kwargs
+    )

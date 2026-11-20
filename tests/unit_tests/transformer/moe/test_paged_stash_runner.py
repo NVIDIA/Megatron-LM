@@ -3,11 +3,14 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-import pytest
 import torch
 
-from megatron.core.models.hybrid.hybrid_block import HybridStack
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe.paged_stash import PagedStashManager, PagedStashRunner
+from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.test_utilities import Utils
 
 
 def _config(moe_paged_stash):
@@ -80,50 +83,9 @@ class _FakeModelChunk(torch.nn.Module):
         self.zero_grad_count += 1
 
 
-@pytest.mark.parametrize("grouped_decoder", [False, True])
-@pytest.mark.parametrize("grouped_mtp", [False, True])
-def test_discovers_moe_layers_in_hybrid_groups(monkeypatch, grouped_decoder, grouped_mtp):
-    """Paged-stash overflow handling must include MoE leaves inside decoder and MTP groups."""
-    config = _config(True)
-    decoder_moe = _FakeMoELayer(config)
-    mtp_moe = _FakeMoELayer(config)
-    model = _FakeModelChunk(config, decoder_moe, mtp_moe, nested_mtp=False)
-
-    def group(layer):
-        stack = HybridStack.__new__(HybridStack)
-        torch.nn.Module.__init__(stack)
-        stack.layers = torch.nn.ModuleList([layer])
-        stack.mlp = None
-        return stack
-
-    if grouped_decoder:
-        model.decoder.layers[0] = group(model.decoder.layers[0])
-    if grouped_mtp:
-        model.mtp.layers[0].mtp_model_layer = group(model.mtp.layers[0].mtp_model_layer)
-
-    monkeypatch.setattr(
-        "megatron.core.transformer.multi_token_prediction.MultiTokenPredictionLayer",
-        _FakeMTPPredictionLayer,
-    )
-    monkeypatch.setattr(PagedStashManager, "STASH_MGR", SimpleNamespace())
-    runner = PagedStashRunner(
-        config=config,
-        copy_main_params=False,
-        model=[model],
-        optimizer=None,
-        forward_backward_func=None,
-    )
-
-    assert runner.moe_layers == [decoder_moe, mtp_moe]
-
-
 def _run_retry(
     monkeypatch, training_config, model_config, decoder_config, mtp_config, nested_mtp=False
 ):
-    monkeypatch.setattr(
-        "megatron.core.transformer.multi_token_prediction.MultiTokenPredictionLayer",
-        _FakeMTPPredictionLayer,
-    )
     decoder_moe = _FakeMoELayer(decoder_config)
     mtp_moe = _FakeMoELayer(mtp_config)
     model = _FakeModelChunk(model_config, decoder_moe, mtp_moe, nested_mtp=nested_mtp)
@@ -221,7 +183,7 @@ def test_retry_disables_and_restores_per_module_configs(monkeypatch):
         nested_mtp=True,
     )
 
-    assert run.runner.moe_layers == [run.decoder_moe]
+    assert run.runner.moe_layers == [run.decoder_moe, run.mtp_moe]
     assert [id(config) for config in run.runner._configs_to_sync_moe_paged_stash] == [
         id(training_config),
         id(model_config),
@@ -233,9 +195,9 @@ def test_retry_disables_and_restores_per_module_configs(monkeypatch):
     assert run.model.zero_grad_count == 1
     assert len(run.release_stash_buffer_calls) == 1
     assert run.decoder_moe.token_dispatcher.reset_count == 1
-    assert run.mtp_moe.token_dispatcher.reset_count == 0
+    assert run.mtp_moe.token_dispatcher.reset_count == 1
     assert run.decoder_moe.token_dispatcher.invalidate_count == 2
-    assert run.mtp_moe.token_dispatcher.invalidate_count == 0
+    assert run.mtp_moe.token_dispatcher.invalidate_count == 2
     assert run.decoder_moe.token_dispatcher._comm_manager.moe_expert_rank_capacity_factor == 1.5
     assert run.mtp_moe.token_dispatcher._comm_manager.moe_expert_rank_capacity_factor == 1.5
     assert (
@@ -244,6 +206,41 @@ def test_retry_disables_and_restores_per_module_configs(monkeypatch):
         decoder_moe_config.moe_paged_stash,
         mtp_moe_config.moe_paged_stash,
     ) == (True, True, True, False)
+
+
+def test_hybrid_mtp_dispatcher_signals_over_budget(monkeypatch):
+    # No dispatch kernels run. Exercise real decoder/MTP module and dispatcher construction
+    # even in environments without the optional HybridEP kernel.
+    monkeypatch.setattr("megatron.core.transformer.moe.token_dispatcher.hybrid_ep_dispatch", Mock())
+    monkeypatch.setattr(PagedStashManager, "STASH_MGR", None)
+    Utils.initialize_model_parallel()
+    try:
+        model_parallel_cuda_manual_seed(42)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            moe_grouped_gemm=True,
+            moe_router_topk=2,
+            add_bias_linear=False,
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="hybridep",
+        )
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=32,
+            max_sequence_length=16,
+            hybrid_layer_pattern="E/*E",
+        )
+        runner = PagedStashRunner(config, False, [model], None, None)
+        mtp_moe = model.mtp.layers[0].mtp_model_layer.layers[1].mlp
+        assert runner.moe_layers == [model.decoder.layers[0].mlp, mtp_moe]
+        mtp_moe.token_dispatcher.check_over_budget().fill_(torch.distributed.get_rank() == 0)
+        assert runner.check_moe_overflow() == (0, 1, 0)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_retry_stages_only_overlapped_reused_mxfp8_buffers(monkeypatch):

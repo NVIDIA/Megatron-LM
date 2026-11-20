@@ -42,7 +42,7 @@ class MTPSplit:
 HybridLayerEntry: TypeAlias = TransformerConfig | type[PipelineSplit] | type[MTPSplit]
 
 # A parsed layer item is either a single layer symbol (e.g. ``'M'``) or a bracketed group of
-# symbols (e.g. ``('M', '*')`` for ``[M*]``) that HybridStack builds as one nested logical layer.
+# symbols (e.g. ``('M', '*')`` for ``[M*]``) that share one EP-overlap schedule entry.
 LayerPatternItem = Union[str, Tuple[str, ...]]
 # The per-layer config projection of ``LayerPatternItem``: one independent config per physical
 # layer, with bracketed groups kept together as a tuple of configs.
@@ -597,8 +597,7 @@ def validate_segment_layers(segment: str, config: TransformerConfig) -> List[Lay
     grouped with brackets (e.g. ``M[M*]-``).
 
     Each layer config is copied from the source config without running ``__post_init__``
-    a second time. Bracketed groups are returned as a tuple of per-layer configs so that
-    ``HybridStack`` can build them as one nested logical layer.
+    a second time. Tuples retain bracket boundaries for the EP-overlap scheduler.
 
     Args:
         segment: A single pipeline segment pattern string (e.g., "M-M*-" or "M[M*]-")

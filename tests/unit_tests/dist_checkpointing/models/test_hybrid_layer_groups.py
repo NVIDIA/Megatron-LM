@@ -7,7 +7,6 @@ import torch
 
 from megatron.core import parallel_state as ps
 from megatron.core.dist_checkpointing import load, save
-from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -28,8 +27,15 @@ def _hybrid_model(seed, pattern, pp, moe):
         pipeline_model_parallel_size=pp,
     )
     if moe:
+        ep = ps.get_expert_model_parallel_world_size()
         config_kwargs.update(
-            num_moe_experts=8, moe_grouped_gemm=True, add_bias_linear=False, moe_router_topk=2
+            num_moe_experts=8,
+            moe_grouped_gemm=True,
+            add_bias_linear=False,
+            moe_router_topk=2,
+            bf16=True,
+            expert_model_parallel_size=ep,
+            overlap_moe_expert_parallel_comm=ep > 1 and '[' in pattern,
         )
     return HybridModel(
         config=TransformerConfig(**config_kwargs),
@@ -40,22 +46,6 @@ def _hybrid_model(seed, pattern, pp, moe):
         pre_process=ps.is_pipeline_first_stage(),
         post_process=ps.is_pipeline_last_stage(),
     )
-
-
-def _physical_layers(model):
-    """Return the decoder's layers in pattern order, looking inside bracketed groups."""
-    layers = []
-    for layer in model.decoder.layers:
-        layers.extend(layer.layers if isinstance(layer, HybridStack) else [layer])
-    return layers
-
-
-def _tensors(module):
-    return {
-        name: tensor
-        for name, tensor in module.state_dict().items()
-        if isinstance(tensor, torch.Tensor) and not name.endswith('_extra_state')
-    }
 
 
 class TestGroupedHybridCheckpoints:
@@ -75,7 +65,9 @@ class TestGroupedHybridCheckpoints:
     def test_grouped_and_ungrouped_checkpoints_load_into_each_other(
         self, tmp_path_dist_ckpt, saved_pattern, loaded_pattern, moe, pp
     ):
-        Utils.initialize_model_parallel(1, pp)
+        # At PP=1, load between the grouped EP-overlap model and its eager flat counterpart.
+        ep = 2 if moe and pp == 1 and Utils.world_size % 2 == 0 else 1
+        Utils.initialize_model_parallel(1, pp, expert_model_parallel_size=ep)
         with TempNamedDir(tmp_path_dist_ckpt / 'hybrid_layer_groups') as ckpt_dir:
             saved_model = _hybrid_model(1, saved_pattern, pp, moe)
             with torch.no_grad():
@@ -86,19 +78,12 @@ class TestGroupedHybridCheckpoints:
             loaded_model = _hybrid_model(2, loaded_pattern, pp, moe)
             loaded_model.load_state_dict(load(loaded_model.sharded_state_dict(), ckpt_dir))
 
-        saved_layers = _physical_layers(saved_model)
-        loaded_layers = _physical_layers(loaded_model)
-        assert [layer.layer_number for layer in loaded_layers] == [
-            layer.layer_number for layer in saved_layers
+        saved_state = saved_model.state_dict()
+        loaded_state = loaded_model.state_dict()
+        assert loaded_state.keys() == saved_state.keys()
+        assert [(type(layer), layer.layer_number) for layer in loaded_model.decoder.layers] == [
+            (type(layer), layer.layer_number) for layer in saved_model.decoder.layers
         ]
-        for saved_layer, loaded_layer in zip(saved_layers, loaded_layers, strict=True):
-            saved_tensors = _tensors(saved_layer)
-            loaded_tensors = _tensors(loaded_layer)
-            assert loaded_tensors.keys() == saved_tensors.keys()
-            for name, tensor in saved_tensors.items():
-                assert torch.equal(
-                    loaded_tensors[name], tensor
-                ), f'layer {saved_layer.layer_number} {name}'
-        if loaded_model.post_process:
-            for name, tensor in _tensors(saved_model.decoder.final_norm).items():
-                assert torch.equal(_tensors(loaded_model.decoder.final_norm)[name], tensor)
+        for name, tensor in saved_state.items():
+            if isinstance(tensor, torch.Tensor) and not name.endswith('_extra_state'):
+                assert torch.equal(loaded_state[name], tensor), name

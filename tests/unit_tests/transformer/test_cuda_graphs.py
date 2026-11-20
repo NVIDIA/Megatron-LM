@@ -1361,7 +1361,7 @@ class TestGroupedHybridStackCudagraphs:
     def test_first_last_marks_ignore_groups(self, layer_pattern):
         """Only the stack's first and last physical layers are marked, grouped or not."""
         block = self.get_hybrid_block(layer_pattern, cuda_graph_impl="local")
-        layers = block.physical_layers()
+        layers = block.layers
 
         assert [layer.layer_number for layer in layers] == [1, 2, 3, 4, 5]
         assert [layer.is_first_layer for layer in layers] == [True, False, False, False, False]
@@ -1376,7 +1376,7 @@ class TestGroupedHybridStackCudagraphs:
         block = self.get_hybrid_block(layer_pattern, cuda_graph_impl="transformer_engine")
         model = torch.nn.Module()
         model.decoder = block
-        layers = block.physical_layers()
+        layers = block.layers
 
         helper = TECudaGraphHelper([model], block.config, 32, 2)
 
@@ -1434,7 +1434,7 @@ class TestGroupedHybridStackCudagraphs:
             pg_collection=pg_collection,
         )
         decoder = hybrid_model.decoder
-        layers = decoder.physical_layers()
+        layers = decoder.layers
         hidden_states = torch.randn(
             seq_length, micro_batch_size, hidden_size, dtype=torch.bfloat16, device="cuda"
         )

@@ -1197,19 +1197,13 @@ class TestHybridBlock:
             for layer, layer_config in zip(block.layers, block.layer_config_list)
         )
 
-    @pytest.mark.parametrize("pp_layer_offset", [0, 7])
-    def test_shortcut_replay_pairs_use_stage_local_indices(self, pp_layer_offset):
-        layer_pattern = (
-            Symbols.MLP
-            + Symbols.MAMBA
-            + Symbols.MOE
-            + Symbols.MLP
-            + Symbols.ATTENTION
-            + Symbols.MOE
-        )
+    @pytest.mark.parametrize(
+        ("pp_layer_offset", "layer_pattern"), [(0, "-ME-*E"), (7, "-ME-*E"), (7, "-[ME]-[*E]")]
+    )
+    def test_shortcut_replay_pairs_use_stage_local_indices(self, pp_layer_offset, layer_pattern):
         config = TransformerConfig(
             hidden_size=256,
-            num_layers=len(layer_pattern),
+            num_layers=_num_physical_layers(layer_pattern),
             num_attention_heads=4,
             use_cpu_initialization=True,
             num_moe_experts=1,
@@ -1550,8 +1544,8 @@ class TestHybridBlock:
         assert hidden_states.grad is not None
         assert torch.isfinite(hidden_states.grad).all()
 
-    def test_group_layer_type_builds_nested_hybrid_stack(self):
-        """Bracketed groups build an inner HybridStack with physical layer numbering."""
+    def test_group_layer_configs_build_flat_physical_layers(self):
+        """Bracketed groups retain stage-local scheduling boundaries and global layer numbers."""
         layer_pattern = "M[M*]-"
         transformer_config = TransformerConfig(
             hidden_size=256,
@@ -1567,22 +1561,20 @@ class TestHybridBlock:
             pp_layer_offset=0,
             pg_collection=self.get_pg_collection(),
         )
-        assert block.layer_type_list == ['M', ('M', '*'), '-']
-        assert isinstance(block.layers[0], MambaLayer)
-        assert isinstance(block.layers[1], HybridStack)
-        assert block.layers[1].is_layer_group_stack
-        assert block.layers[1].layer_type_list == ['M', '*']
-        assert isinstance(block.layers[1].layers[0], MambaLayer)
-        assert isinstance(block.layers[1].layers[1], TransformerLayer)
-        assert isinstance(block.layers[2], TransformerLayer)
-        assert [layer.layer_number for layer in block.layers[1].layers] == [2, 3]
-        assert block.layers[2].layer_number == 4
-        # Each physical layer owns the independent per-layer config it was built from.
-        assert block.layers[1].layers[0].config is layer_config_list[1][0]
-        assert block.layers[1].layers[1].config is layer_config_list[1][1]
+        assert block.schedule_group_sizes == (1, 2, 1)
+        assert block.layer_type_list == ['M', 'M', '*', '-']
+        assert [type(layer) for layer in block.layers] == [
+            MambaLayer,
+            MambaLayer,
+            TransformerLayer,
+            TransformerLayer,
+        ]
+        assert [layer.layer_number for layer in block.layers] == [1, 2, 3, 4]
+        assert block.layers[1].config is layer_config_list[1][0]
+        assert block.layers[2].config is layer_config_list[1][1]
 
-    def test_group_layer_type_list_builds_nested_hybrid_stack(self):
-        """The deprecated ``layer_type_list`` path accepts symbol tuples for groups."""
+    def test_group_layer_type_list_builds_flat_physical_layers(self):
+        """The deprecated symbol constructor preserves the same schedule boundaries."""
         transformer_config = TransformerConfig(
             hidden_size=256, num_layers=3, num_attention_heads=4, use_cpu_initialization=True
         )
@@ -1594,9 +1586,9 @@ class TestHybridBlock:
                 pp_layer_offset=0,
                 pg_collection=self.get_pg_collection(),
             )
-        assert block.layer_type_list == ['M', ('*', '-')]
-        assert isinstance(block.layers[1], HybridStack)
-        assert [layer.layer_number for layer in block.layers[1].layers] == [2, 3]
+        assert block.schedule_group_sizes == (1, 2)
+        assert block.layer_type_list == ['M', '*', '-']
+        assert [layer.layer_number for layer in block.layers] == [1, 2, 3]
 
     @pytest.mark.parametrize("stack_spec", [hybrid_stack_spec, hybrid_inference_stack_spec])
     @pytest.mark.parametrize("grouped_pattern", ["[*-]", "M[*-]", "[M*-]", "[**-]"])
@@ -1604,7 +1596,7 @@ class TestHybridBlock:
     def test_group_sharded_state_dict_keeps_ungrouped_keys(
         self, stack_spec, grouped_pattern, pp_layer_offset
     ):
-        """Brackets change execution, not checkpoint keys: grouped and ungrouped stacks match."""
+        """Bracketed and unbracketed stacks publish the same physical checkpoint keys."""
 
         def sharded_keys(layer_pattern):
             transformer_config = TransformerConfig(
@@ -1661,13 +1653,13 @@ class TestHybridBlock:
         assert f"decoder.layers.{pp_layer_offset + 1}.mlp.linear_fc1.weight" in sharded_keys
 
     def test_group_forward_matches_equivalent_flat_layers(self):
-        """A bracket group is only a scheduling/checkpoint boundary, not new math."""
+        """Brackets preserve state-dict keys and eager forward outputs."""
         flat_block = self.get_attention_mlp_block("*-")
         group_block = self.get_attention_mlp_block("[*-]")
 
-        group_block.layers[0].layers[0].load_state_dict(flat_block.layers[0].state_dict())
-        group_block.layers[0].layers[1].load_state_dict(flat_block.layers[1].state_dict())
-        group_block.final_norm.load_state_dict(flat_block.final_norm.state_dict())
+        assert flat_block.schedule_group_sizes is None
+        assert group_block.schedule_group_sizes == (2,)
+        group_block.load_state_dict(flat_block.state_dict())
 
         flat_block.cuda().eval()
         group_block.cuda().eval()
@@ -1689,9 +1681,12 @@ class TestHybridBlock:
     def test_group_overlap_callables_keep_ep_moe_split_visible(self):
         """EP-overlap scheduling still sees dispatch/experts/combine inside a group."""
         block = self.get_attention_moe_block("[*E]")
+        # This builder-only test also inspects the work assigned to delayed-wgrad slots.
+        for config in block.layer_config_list:
+            config.delay_wgrad_compute = True
 
         forward_callables, bwd_dw_callable_map, is_moe, num_local_experts = (
-            build_hybrid_stack_callables(block.layers[0])
+            build_hybrid_stack_callables(block.layers, block.layer_config_list)
         )
 
         pre_dispatch, dispatch, experts, combine, mtp_post_process = forward_callables

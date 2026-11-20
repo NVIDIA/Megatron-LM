@@ -18,7 +18,7 @@ from megatron.core.transformer.moe.ops.paged_stash import (
     paged_stash_pop_kernel,
 )
 from megatron.core.transformer.moe.token_dispatcher import nccl_ep_release_context
-from megatron.core.utils import expand_hybrid_layer_groups, get_attr_wrapped_model
+from megatron.core.utils import get_attr_wrapped_model
 
 logger = logging.getLogger(__name__)
 
@@ -1076,45 +1076,18 @@ class PagedStashRunner:
 
         _track_cfg(config)
 
-        # Local import avoids circular import: schedules -> paged_stash -> multi_token_prediction
-        # -> megatron.core (still loading).
-        from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
-
-        def _moe_mlps_in(layer):
-            # Descend into grouped HybridStack layers: for bracketed hybrid patterns,
-            # decoder.layers[] holds the group whose own .mlp is None, so the flat lookup
-            # finds zero MoE layers and the paged stash silently skips the whole model.
-            if isinstance(layer, MultiTokenPredictionLayer):
-                layer = layer.mtp_model_layer
-            for leaf in expand_hybrid_layer_groups((layer,)):
-                mlp = getattr(leaf, 'mlp', None)
-                if (
-                    mlp is not None
-                    and hasattr(mlp, 'token_dispatcher')
-                    and hasattr(mlp.token_dispatcher, 'check_over_budget')
-                ):
-                    yield mlp
-
         for model_chunk in self.model:
             model_with_decoder = get_attr_wrapped_model(
                 model_chunk, "decoder", allow_none=False, return_model_obj=True
             )
             _track_cfg(model_with_decoder.config)
 
-            # Track MoE configs independently from the existing structural discovery below.
-            # This keeps overflow and retry behavior unchanged for models whose modules share
-            # the root config while allowing distinct module configs to stay synchronized.
+            # Includes the decoder and local MTP depths, visiting each physical module once.
             for module in model_with_decoder.modules():
                 token_dispatcher = getattr(module, 'token_dispatcher', None)
-                if token_dispatcher is None or not hasattr(token_dispatcher, 'check_over_budget'):
-                    continue
-                _track_cfg(getattr(module, 'config', None))
-
-            for layer in model_with_decoder.decoder.layers:
-                self.moe_layers.extend(_moe_mlps_in(layer))
-            if model_with_decoder.mtp_process:
-                for layer in model_with_decoder.mtp.layers:
-                    self.moe_layers.extend(_moe_mlps_in(layer))
+                if hasattr(token_dispatcher, 'check_over_budget'):
+                    self.moe_layers.append(module)
+                    _track_cfg(getattr(module, 'config', None))
 
     def _set_moe_paged_stash_all(self, value: bool) -> None:
         """Set moe_paged_stash on every tracked training, model, and MoE config."""

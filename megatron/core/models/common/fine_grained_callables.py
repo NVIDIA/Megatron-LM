@@ -1,6 +1,6 @@
 # Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Build combined-1F1B callables for transformer layers, hybrid groups, and MTP depths."""
+"""Build combined-1F1B callables for transformer layers and MTP depths."""
 
 from contextlib import nullcontext
 from functools import partial
@@ -8,11 +8,6 @@ from functools import partial
 import torch
 
 from megatron.core import tensor_parallel
-from megatron.core.models.hybrid.fine_grained_callables import (
-    build_hybrid_stack_callables,
-    get_hybrid_stack_moe_metadata,
-)
-from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
@@ -37,14 +32,8 @@ def build_mtp_layer_callables(layer):
     def submodule_mtp_pre_dispatch_forward(node, hidden_states):
         # MTP Block Preprocess
         if node.is_first_layer:
-            # Apply the main decoder's final_norm if this VPP chunk owns it but
-            # holds no main HybridStack layers — without this, ``_maybe_apply_final_norm``
-            # never fires for the main path and the unnormalized hidden_states feed
-            # straight into the LM head (lm_loss explodes by ~10x; grads diverge).
-            # Restricted to HybridModel because GPT models go through a different
-            # MTP wiring path. Must run before ``torch.chunk`` so every chunk —
-            # including the main-decoder slice consumed by the LM head — sees
-            # the norm; the MTP slices then go through MTP's own ``hnorm`` as usual.
+            # On an MTP-only Hybrid stage, normalize the main hidden states before
+            # splitting off the activations for each prediction depth.
             from megatron.core.models.hybrid.hybrid_model import HybridModel
 
             model = node.chunk_state.model
@@ -159,8 +148,6 @@ def get_layer_moe_metadata(layer):
 
     if isinstance(layer, MultiTokenPredictionLayer):
         return get_layer_moe_metadata(layer.mtp_model_layer)
-    if isinstance(layer, HybridStack):
-        return get_hybrid_stack_moe_metadata(layer)
     if isinstance(layer, TransformerLayer):
         is_moe = isinstance(layer.mlp, MoELayer)
         num_local_experts = layer.mlp.num_local_experts if is_moe else None
@@ -177,9 +164,6 @@ def build_layer_callables(layer):
 
     if isinstance(layer, MultiTokenPredictionLayer):
         return build_mtp_layer_callables(layer)
-    if isinstance(layer, HybridStack):
-        forward_funcs, backward_dw, _, _ = build_hybrid_stack_callables(layer)
-        return forward_funcs, backward_dw
     if isinstance(layer, TransformerLayer):
         from megatron.core.models.gpt.fine_grained_callables import (
             build_transformer_layer_callables,

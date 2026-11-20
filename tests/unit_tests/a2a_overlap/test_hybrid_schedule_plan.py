@@ -1,14 +1,21 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 from megatron.core.context_parallel.layout import ContextParallelLayoutManager
 from megatron.core.models.common.model_chunk_schedule_plan import (
+    LayerScheduleGroup,
     TransformerLayerSchedulePlan,
     TransformerModelChunkSchedulePlan,
+)
+from megatron.core.models.hybrid.fine_grained_callables import (
+    hybrid_layer_schedule_groups,
+    validate_overlap_schedule,
 )
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
@@ -18,7 +25,6 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import get_comm_stream, get_comp_stream, set_streams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.moe.moe_utils import MoEAuxLossAutoScaler
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.a2a_overlap.utils import DummyState
@@ -26,91 +32,54 @@ from tests.unit_tests.models.hybrid.external_layer import ExternalGainConfig
 from tests.unit_tests.test_utilities import Utils
 
 
-def _hybrid_stack_stub(cp_layout_manager=None):
-    stack = HybridStack.__new__(HybridStack)
-    torch.nn.Module.__init__(stack)
-    stack._cp_layout_manager = cp_layout_manager
-    stack._has_linear_layer_with_chunkwise_cp = False
-    stack.cp_group = SimpleNamespace(size=lambda: 1)
-    return stack
-
-
 def _overlap_model_stub(**config_overrides):
     config = dict(
         cuda_graph_impl="none",
         enable_mhc_connections=False,
         moe_shortcut_connection=False,
+        wide_residual=None,
         recompute_granularity=None,
     )
     config.update(config_overrides)
-    model = torch.nn.Module()
-    model.config = SimpleNamespace(**config)
-    model._has_custom_layers = False
-    model.decoder = _hybrid_stack_stub()
-    return model
+    return SimpleNamespace(
+        config=SimpleNamespace(**config),
+        _has_custom_layers=False,
+        decoder=SimpleNamespace(
+            layer_config_list=[],
+            _cp_layout_manager=None,
+            _has_linear_layer_with_chunkwise_cp=False,
+            cp_group=SimpleNamespace(size=lambda: 1),
+        ),
+    )
 
 
-@pytest.mark.parametrize("location", ["decoder", "group", "mtp"])
 @pytest.mark.parametrize("needs_conversion", [True, False])
-def test_hybrid_ep_overlap_checks_nested_cp_layouts(location, needs_conversion):
-    """An outer group's boundary layout can hide an inner attention conversion."""
-    config = AttentionLayerConfig(num_layers=1, hidden_size=64, num_attention_heads=4)
-    config.attention_cp_layout = "zigzag" if needs_conversion else "contiguous"
-    cp_group = SimpleNamespace(size=lambda: 2)
-
-    def layout_manager(layer_configs):
-        return ContextParallelLayoutManager(
-            layer_layouts=tuple(
-                HybridStack._get_layer_cp_layout(layer_config, "contiguous")
-                for layer_config in layer_configs
-            ),
-            boundary_layout="contiguous",
-            sequence_parallel=False,
-            cp_group=cp_group,
-            tp_group=None,
-            tp_cp_group=None,
-        )
-
+def test_hybrid_ep_overlap_checks_physical_layer_cp_layouts(needs_conversion):
+    """A group may contain physical layers with different CP layouts."""
     model = _overlap_model_stub()
-    model.decoder._cp_layout_manager = layout_manager([(config,)])
-    assert not model.decoder._cp_layout_manager.requires_conversion
-    if location == "group":
-        model.decoder.group = _hybrid_stack_stub()
-        target = model.decoder.group
-    elif location == "mtp":
-        model.mtp = _hybrid_stack_stub()
-        target = model.mtp
-    else:
-        target = model.decoder
-    target._cp_layout_manager = layout_manager([config])
-
+    model.decoder._cp_layout_manager = ContextParallelLayoutManager(
+        layer_layouts=("contiguous", "zigzag" if needs_conversion else "contiguous"),
+        boundary_layout="contiguous",
+        sequence_parallel=False,
+        cp_group=SimpleNamespace(size=lambda: 2),
+        tp_group=None,
+        tp_cp_group=None,
+    )
     if needs_conversion:
         with pytest.raises(ValueError, match="mixed context-parallel layouts"):
-            HybridModel._validate_ep_overlap_support(model)
+            validate_overlap_schedule(model)
     else:
-        HybridModel._validate_ep_overlap_support(model)
+        validate_overlap_schedule(model)
 
 
-@pytest.mark.parametrize("location", ["decoder", "group", "mtp"])
-def test_hybrid_ep_overlap_rejects_chunkwise_linear_cp(location):
+def test_hybrid_ep_overlap_rejects_chunkwise_linear_cp():
     """Chunkwise linear CP needs packed-sequence metadata that only HybridStack.forward builds."""
     model = _overlap_model_stub()
-    HybridModel._validate_ep_overlap_support(model)
-    if location == "group":
-        model.decoder.group = _hybrid_stack_stub()
-        target = model.decoder.group
-    elif location == "mtp":
-        model.mtp = _hybrid_stack_stub()
-        target = model.mtp
-    else:
-        target = model.decoder
-    target._has_linear_layer_with_chunkwise_cp = True
-    # Chunkwise layers need no packed-sequence metadata without context parallelism.
-    HybridModel._validate_ep_overlap_support(model)
-    target.cp_group = SimpleNamespace(size=lambda: 2)
-
+    model.decoder._has_linear_layer_with_chunkwise_cp = True
+    validate_overlap_schedule(model)
+    model.decoder.cp_group = SimpleNamespace(size=lambda: 2)
     with pytest.raises(ValueError, match="linear_cp_mode='chunkwise'"):
-        HybridModel._validate_ep_overlap_support(model)
+        validate_overlap_schedule(model)
 
 
 @pytest.mark.parametrize(
@@ -125,7 +94,18 @@ def test_hybrid_ep_overlap_rejects_chunkwise_linear_cp(location):
 def test_hybrid_ep_overlap_rejects_unsupported_features(config_overrides, message):
     """Direct overlap callables must not bypass CUDA graphs or residual wrappers."""
     with pytest.raises(ValueError, match=message):
-        HybridModel._validate_ep_overlap_support(_overlap_model_stub(**config_overrides))
+        validate_overlap_schedule(_overlap_model_stub(**config_overrides))
+
+
+@pytest.mark.parametrize("wide_on_model", [False, True])
+def test_hybrid_ep_overlap_rejects_wide_residual(wide_on_model):
+    """First-class layer configs can be constructed separately from the model's overlap config."""
+    model = _overlap_model_stub(wide_residual=object() if wide_on_model else None)
+    model.decoder.layer_config_list = [
+        SimpleNamespace(wide_residual=None if wide_on_model else object())
+    ]
+    with pytest.raises(ValueError, match="overlap_moe_expert_parallel_comm.*wide_residual"):
+        validate_overlap_schedule(model)
 
 
 def test_hybrid_ep_overlap_rejects_custom_layers_at_construction():
@@ -213,6 +193,25 @@ def test_grouped_overlap_matches_eager_outputs_and_gradients(pattern, num_layers
             )
             for _ in range(3)
         ]
+        if pattern == "*E":
+
+            def scaled_loss(
+                *,
+                hidden_states,
+                output_layer,
+                output_weight,
+                compute_language_model_loss,
+                scale_logits,
+                labels,
+                context,
+                **kwargs,
+            ):
+                logits, _ = output_layer(hidden_states, weight=output_weight)
+                return compute_language_model_loss(labels, scale_logits(logits)) * context
+
+            for index, data in enumerate(microbatches):
+                data.update(output_processor=scaled_loss, output_processor_context=index + 2)
+
         references = []
         for data in microbatches:
             output = model(**data)
@@ -232,6 +231,11 @@ def test_grouped_overlap_matches_eager_outputs_and_gradients(pattern, num_layers
         previous = None
         for data in microbatches:
             plan = model.build_schedule_plan(**data)
+            groups = [plan.get_layer(i).layer.layers for i in range(plan.num_layers())]
+            assert [layer for group in groups for layer in group] == list(model.decoder.layers)
+            assert [len(group) for group in groups] == (
+                [2] * pattern.count("[") if "[" in pattern else [1] * num_layers
+            )
             output = TransformerModelChunkSchedulePlan.run(
                 plan, previous, b_grad=None if previous is None else torch.ones_like(outputs[-1])
             )
@@ -247,6 +251,36 @@ def test_grouped_overlap_matches_eager_outputs_and_gradients(pattern, num_layers
                 torch.testing.assert_close(param.grad, reference_grads[name], rtol=2e-2, atol=2e-2)
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("include_nested_units", [False, True])
+def test_fsdp_release_hooks_target_each_physical_layer(monkeypatch, include_nested_units):
+    """The bracket has no parameters. Release the physical units, including v2 expert units."""
+
+    class Unit(torch.nn.Module):
+        pass
+
+    monkeypatch.setattr("megatron.core.models.common.model_chunk_schedule_plan.FsdpModule", Unit)
+    layers = (Unit(), Unit())
+    layers[1].experts = Unit()
+    plan = TransformerLayerSchedulePlan.__new__(TransformerLayerSchedulePlan)
+    plan.layer = LayerScheduleGroup(layers, [], {}, True, 1)
+    plan.pre_dispatch_computation = Mock()
+    plan.moe_combine = Mock()
+    releases = []
+    plan.set_fsdp_reshard_hooks(
+        lambda layer: releases.append(("forward", layer)),
+        lambda layer: releases.append(("backward", layer)),
+        include_nested_units=include_nested_units,
+    )
+    monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
+    plan.moe_combine.set_post_forward_hook.call_args.args[0]()
+    plan.pre_dispatch_computation.set_post_backward_hook.call_args.args[0]()
+    forward_units = (*layers, layers[1].experts) if include_nested_units else layers
+    assert releases == [("forward", unit) for unit in forward_units] + [
+        ("backward", layers[1]),
+        ("backward", layers[0]),
+    ]
 
 
 def test_packed_moe_overlap_routes_per_sample_like_eager(monkeypatch):
@@ -321,15 +355,12 @@ def test_packed_moe_overlap_routes_per_sample_like_eager(monkeypatch):
             state.packed_seq_params = packed_seq_params
             plans.append(
                 TransformerLayerSchedulePlan(
-                    block.layers[0],
+                    hybrid_layer_schedule_groups(block)[0],
                     torch.cuda.Event(),
                     state,
                     get_comp_stream,
                     get_comm_stream,
-                    extra_args={
-                        "hybrid_layer_config": block.layer_config_list[0],
-                        "is_last_layer": True,
-                    },
+                    extra_args={"is_last_layer": True},
                 )
             )
 

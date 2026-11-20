@@ -705,22 +705,6 @@ def get_pg_src_rank(group=None):
     return ranks[0]
 
 
-def expand_hybrid_layer_groups(layers: Iterable[torch.nn.Module]) -> Iterable[torch.nn.Module]:
-    """Yield layers in execution order, descending into HybridStack groups."""
-    try:
-        from megatron.core.models.hybrid.hybrid_block import HybridStack
-    except ImportError:
-        # Hybrid dependencies are optional for other model types.
-        yield from layers
-        return
-
-    for layer in layers:
-        if isinstance(layer, HybridStack):
-            yield from expand_hybrid_layer_groups(layer.layers)
-        else:
-            yield layer
-
-
 def get_attr_wrapped_model(model, attr, allow_none=True, return_model_obj=False):
     """Get an attribute from a wrapped model.
     If return_model_obj is true, return the object that has the 'attr' attribute;

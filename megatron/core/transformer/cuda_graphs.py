@@ -45,7 +45,6 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     ensure_params_ready,
-    expand_hybrid_layer_groups,
     get_attr_wrapped_model,
     get_torch_version,
     is_te_min_version,
@@ -2387,17 +2386,15 @@ class TECudaGraphHelper:
                     f'No valid layer in model chunk {chunk_number}.',
                 )
             else:
-                # A bracketed HybridStack group is one entry of decoder.layers; capture the
-                # physical layers inside it, in execution order.
-                decoder_layers = list(expand_hybrid_layer_groups(chunk_with_decoder.decoder.layers))
-                num_decoder_layers = len(decoder_layers)
+                num_decoder_layers = len(chunk_with_decoder.decoder.layers)
                 if hasattr(chunk_with_decoder, 'mtp'):
                     num_mtp_layers = len(chunk_with_decoder.mtp.layers)
                 else:
                     num_mtp_layers = 0
                 num_graphable_layers = 0
                 callables, callables_is_mtp = [], []
-                for layer in decoder_layers:
+                for layer_number in range(num_decoder_layers):
+                    layer = chunk_with_decoder.decoder.layers[layer_number]
                     if _te_cuda_graph_layer_is_graphable(layer, self.config):
                         num_graphable_layers += 1
                         callables.append(layer)
@@ -2528,10 +2525,7 @@ class TECudaGraphHelper:
             """
             Get the static inputs for a layer.
             """
-            assert any(
-                layer is leaf
-                for leaf in expand_hybrid_layer_groups(chunk_of_the_layer.decoder.layers)
-            ) or any(
+            assert layer in chunk_of_the_layer.decoder.layers or any(
                 layer is mtp_layer.mtp_model_layer for mtp_layer in chunk_of_the_layer.mtp.layers
             ), "Layer is not in the chunk"
 
