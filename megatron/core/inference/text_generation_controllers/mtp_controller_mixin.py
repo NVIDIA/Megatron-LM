@@ -29,7 +29,6 @@ from megatron.core.tensor_parallel.mappings import (
     scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.enums import InferenceCudaGraphScope
-from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push, round_up_to_nearest_multiple
 
 
@@ -374,8 +373,8 @@ class MTPControllerMixin:
             request_start_positions=request_start_positions,
             total=total,
         )
-        if context._nvls_dispatcher:
-            NVLSAllGatherVDispatcher.modify_real_token_count_for_mtp(total)
+        # Padding-row zeroing and the NVLS routing mask must see this pass's real row count.
+        context.set_forward_real_token_count(total)
 
         token_ids = packed_tokens.view(1, -1).to(torch.long)
         # Positions are unused for attention (no RoPE); the write positions come from the metadata.
@@ -554,12 +553,11 @@ class MTPControllerMixin:
 
         nvtx_range_pop("mtp-spec-decoding/serial-mtp-init")
 
-        # MTP MoE forwards are request-count shaped: the routing map holds
-        # active_request_count real rows followed by padding up to padded_count.
-        # The NVLS routing mask defaults to the main step's token count, so point
-        # it at the MTP row count instead, else padding rows route to experts.
-        if context._nvls_dispatcher:
-            NVLSAllGatherVDispatcher.modify_real_token_count_for_mtp(active_request_count)
+        # MTP forwards are request-count shaped: active_request_count real rows followed by
+        # padding up to padded_count. The real token count defaults to the main step's, so
+        # point it at the MTP row count instead, else padding rows route to experts (NVLS) and,
+        # under FP8/FP4, reach the quantization scales unzeroed.
+        context.set_forward_real_token_count(active_request_count)
 
         # Give the draft attention its own KV in the shared buffer's reserved
         # slot. Each depth is a decode-style forward (one token per active request). The depth-0

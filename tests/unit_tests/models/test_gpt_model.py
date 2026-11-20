@@ -754,7 +754,7 @@ class TestGPTDynamicInferencePaddingWithCudaGraphs:
                 Attention, "flash_decode_and_prefill", flash_decode_and_prefill_with_stale_rows
             ),
             patch(
-                "megatron.core.transformer.attention.is_using_quantization_scales",
+                "megatron.core.inference.contexts.dynamic_context.is_using_quantization_scales",
                 return_value=True,
             ),
             patch(
