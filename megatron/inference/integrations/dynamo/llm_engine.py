@@ -38,6 +38,10 @@ from dynamo.common.model_fetch import fetch_model
 from dynamo.llm import KvEventPublisher, ModelInput
 from dynamo.llm.exceptions import EngineShutdown, StreamIncomplete
 
+from megatron.core.inference.data_parallel_inference_coordinator.auth import (
+    present_credentials,
+    split_authenticated_address,
+)
 from megatron.core.inference.disaggregation.handoff_ownership import HandoffClaimStatus
 from megatron.core.inference.engine_endpoint import InferenceEngineEndpoint
 from megatron.core.inference.headers import Headers
@@ -55,6 +59,25 @@ from megatron.inference.integrations.dynamo.telemetry import EngineEventReceiver
 logger = logging.getLogger(__name__)
 _HEALTH_CHECK_TIMEOUT = 5.0
 _RELEASE_TIMEOUT = 5.0
+
+
+def _write_private_file(path: Path, text: str) -> None:
+    """Atomically write ``text`` to ``path``, readable only by the current user.
+
+    The file is created with its final permissions, never briefly world-readable, because it
+    holds a credential (the authenticated coordinator address).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.unlink(missing_ok=True)  # never inherit the permissions of a stale file
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write(text)
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 class InferenceRequestRejected(InferenceRequestError, ValueError):
@@ -257,6 +280,11 @@ class MegatronLLMEngine(LLMEngine):
             temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
             temporary.write_text(json.dumps(identity, sort_keys=True) + "\n")
             os.replace(temporary, path)
+
+        if self.config.coordinator_address_file is not None:
+            _write_private_file(
+                Path(self.config.coordinator_address_file), endpoint.coordinator_address + "\n"
+            )
 
         capabilities = endpoint.capabilities
         return EngineConfig(
@@ -627,7 +655,9 @@ class MegatronLLMEngine(LLMEngine):
                 socket = self._release_context.socket(zmq.DEALER)
                 socket.setsockopt(zmq.SNDHWM, 0)
                 socket.setsockopt(zmq.RCVHWM, 0)
-                socket.connect(address)
+                endpoint, auth_token = split_authenticated_address(address)
+                present_credentials(socket, auth_token)
+                socket.connect(endpoint)
                 self._release_sockets[address] = socket
             try:
                 # ZMQ reconnects sockets across coordinator replacement, but the

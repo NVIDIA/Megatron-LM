@@ -2,6 +2,7 @@
 
 """Tests for configurable defaults on the dynamic text generation server."""
 
+import asyncio
 import os
 
 import pytest
@@ -183,6 +184,8 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
         default_top_p=0.8,
         default_top_k=5,
         eval_mode=True,
+        max_inflight_requests=7,
+        max_inflight_bytes=2**31,
     )
 
     # The port is taken from the socket; no fd is handed to the replica, which
@@ -206,10 +209,92 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
         # frontend does not hash and the coordinator keeps doing it.
         None,
         None,
+        7,
+        2**31,
     )
     assert captured["socket_closed"] is True
     assert server._SERVER_PROCESSES[0].daemon is True
     assert server._SERVER_PROCESSES[0].started is True
+
+
+def _patch_replica_launch(monkeypatch):
+    """Record the byte budget each launched replica receives, without starting processes."""
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
+        text_generation_server as server,
+    )
+
+    budgets = []
+
+    class FakeProcess:
+        pid = 1
+
+        def __init__(self, *, target, args, daemon) -> None:
+            *_, replica_budget, self._ready_conn = args
+            budgets.append(replica_budget)
+            self.sentinel = os.pipe()[0]
+
+        def start(self):
+            # Report the replica as listening so start_text_gen_server returns.
+            self._ready_conn.send(True)
+            self._ready_conn.close()
+
+    class FakeProcessContext:
+        Process = FakeProcess
+
+    monkeypatch.setattr(server, "_SERVER_PROCESSES", [])
+    monkeypatch.setattr(server, "_SERVER_PROCESS_CONTEXT", FakeProcessContext())
+    return server, budgets
+
+
+def _start(server, **kwargs):
+    return server.start_text_gen_server(
+        coordinator_addr="tcp://coord:5555",
+        tokenizer=object(),
+        rank=0,
+        server_port=5000,
+        hostname="127.0.0.1",
+        **kwargs,
+    )
+
+
+def test_inflight_byte_budget_is_split_across_replicas(monkeypatch):
+    server, budgets = _patch_replica_launch(monkeypatch)
+
+    _start(server, num_replicas=4, max_inflight_bytes=2**34)
+
+    # The budget is per rank, so the host-wide total is unchanged by replica count.
+    assert budgets == [2**32] * 4
+    assert sum(budgets) == 2**34
+
+
+@pytest.mark.parametrize("num_replicas", [1, 4, 16, 17, 32, 64])
+def test_default_budget_starts_for_every_replica_count(monkeypatch, num_replicas):
+    """The launcher picks max(DP size, 4) replicas, so no replica count may be refused."""
+    server, budgets = _patch_replica_launch(monkeypatch)
+
+    _start(server, num_replicas=num_replicas)
+
+    assert len(budgets) == num_replicas
+    # Every replica can still accept a maximum-size request ...
+    assert min(budgets) >= 2**30
+    # ... and the aggregate stays bounded: 16 GiB, or one maximum-size request per replica
+    # once there are more than 16 replicas.
+    assert sum(budgets) <= max(2**34, num_replicas * 2**30)
+    assert len(set(budgets)) == 1
+
+
+def test_inflight_byte_budget_must_fit_a_max_size_request_per_replica(monkeypatch):
+    server, budgets = _patch_replica_launch(monkeypatch)
+
+    with pytest.raises(ValueError, match="max_inflight_bytes"):
+        _start(server, num_replicas=4, max_inflight_bytes=3 * 2**30)
+    with pytest.raises(ValueError, match="num_replicas"):
+        _start(server, num_replicas=0, max_inflight_bytes=2**34)
+    assert budgets == []
+
+    # Exactly one maximum-size request per replica is allowed.
+    _start(server, num_replicas=4, max_inflight_bytes=4 * 2**30)
+    assert budgets == [2**30] * 4
 
 
 @pytest.mark.asyncio
@@ -274,6 +359,8 @@ async def test_frontend_process_exposes_sampling_config_and_stops_client(monkeyp
         default_top_p=0.8,
         default_top_k=5,
         eval_mode=True,
+        max_inflight_requests=7,
+        max_inflight_bytes=2**31,
     )
 
     app_config = captured["app"].config
@@ -291,6 +378,11 @@ async def test_frontend_process_exposes_sampling_config_and_stops_client(monkeyp
     assert app_config["default_top_p"] == 0.8
     assert app_config["default_top_k"] == 5
     assert app_config["eval_mode"] is True
+    assert isinstance(captured["app"].asgi_app, server._InflightHTTPLimit)
+    assert captured["app"].asgi_app.max_inflight_requests == 7
+    assert captured["app"].asgi_app.max_inflight_bytes == 2**31
+    assert captured["app"].asgi_app.max_request_content_size == app_config["MAX_CONTENT_LENGTH"]
+    assert captured["hypercorn_config"].h2_max_concurrent_streams == 7
     assert captured["hypercorn_config"].bind == ["fd://23"]
     assert captured["listener_closed"] is True
 
@@ -342,3 +434,73 @@ async def test_completions_request_uses_sampling_defaults_and_overrides(
     assert sampling_params.temperature == expected_temperature
     assert sampling_params.top_p == expected_top_p
     assert sampling_params.top_k == expected_top_k
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body_size", "max_request_content_size", "expected_status"),
+    [(8, 2**30, 200), (64, 2**30, 503), (24, 16, 413)],
+)
+async def test_quart_request_over_byte_limit_is_rejected(
+    body_size, max_request_content_size, expected_status
+):
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
+        text_generation_server as server,
+    )
+
+    app = Quart(__name__)
+    handled = []
+
+    @app.post("/echo")
+    async def echo():
+        handled.append(len(await quart.request.get_data()))
+        return "ok"
+
+    app.asgi_app = server._InflightHTTPLimit(
+        app.asgi_app,
+        max_inflight_requests=10,
+        max_inflight_bytes=32,
+        max_request_content_size=max_request_content_size,
+    )
+
+    chunk = body_size // 2
+    messages = [
+        {"type": "http.request", "body": b"x" * chunk, "more_body": True},
+        {"type": "http.request", "body": b"x" * chunk, "more_body": False},
+    ]
+    disconnected = asyncio.Event()
+
+    async def receive():
+        if messages:
+            return messages.pop(0)
+        await disconnected.wait()
+        return {"type": "http.disconnect"}
+
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+        if message["type"] == "http.response.body" and not message.get("more_body"):
+            disconnected.set()
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/echo",
+        "raw_path": b"/echo",
+        "root_path": "",
+        "query_string": b"",
+        "headers": [(b"host", b"localhost"), (b"content-length", str(body_size).encode())],
+        "client": ("127.0.0.1", 1),
+        "server": ("127.0.0.1", 80),
+        "extensions": {},
+    }
+    await asyncio.wait_for(app(scope, receive, send), timeout=5)
+
+    starts = [m for m in sent if m["type"] == "http.response.start"]
+    assert [m["status"] for m in starts] == [expected_status]
+    assert handled == ([body_size] if expected_status == 200 else [])
+    assert app.asgi_app.inflight_bytes == 0 and app.asgi_app.inflight == 0

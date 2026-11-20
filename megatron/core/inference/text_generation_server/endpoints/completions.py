@@ -4,6 +4,8 @@
 See https://platform.openai.com/docs/api-reference/completions/create
 """
 
+import re
+
 import numpy as np
 import torch
 
@@ -19,6 +21,17 @@ except ImportError:
 
 from megatron.core.inference.text_generation_server.endpoints.common import LOCK, send_do_generate
 from megatron.core.inference.text_generation_server.run_mcore_engine import run_mcore_engine
+
+_DEBUG_FILENAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+
+
+def _validate_debug_filename(value) -> str:
+    """Validate a debug artifact label before including it in a local filename."""
+    if not isinstance(value, str) or not _DEBUG_FILENAME_PATTERN.fullmatch(value):
+        raise ValueError(
+            "debug_fname must be 1-128 ASCII letters, digits, dots, underscores, or hyphens"
+        )
+    return value
 
 
 def detokenize(prompt, tok) -> list[str]:
@@ -55,6 +68,12 @@ class MegatronCompletions(Resource):
         assert HAVE_FLASK
 
         req = request.get_json()
+        try:
+            debug_fname = (
+                _validate_debug_filename(req["debug_fname"]) if "debug_fname" in req else None
+            )
+        except ValueError as exc:
+            return str(exc), 400
         tokenizer = self.engine.controller.tokenizer
         prompts = detokenize(req["prompt"], tokenizer)
 
@@ -139,7 +158,7 @@ class MegatronCompletions(Resource):
         if top_n_logprobs > 0:
             assert logprobs_topk is not None
 
-        if "debug_fname" in req:
+        if debug_fname is not None:
             torch.save(
                 {
                     "args": local_kwargs,
@@ -150,7 +169,7 @@ class MegatronCompletions(Resource):
                     "tokens": tokens,
                     "logprobs_topk": logprobs_topk,
                 },
-                f"completions_result_{req['debug_fname']}.pt",
+                f"completions_result_{debug_fname}.pt",
             )
 
         batch_size = len(tokens)

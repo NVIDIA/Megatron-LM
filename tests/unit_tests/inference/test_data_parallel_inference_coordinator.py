@@ -5,9 +5,12 @@ import itertools
 import logging
 import multiprocessing
 import os
+import queue
+import threading
 import time
 import unittest.mock
 from collections import deque
+from types import SimpleNamespace
 from typing import Dict, List, Optional
 
 import msgpack
@@ -19,6 +22,11 @@ from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.data_parallel_inference_coordinator import (
     CoordinatorState,
     DataParallelInferenceCoordinator,
+)
+from megatron.core.inference.data_parallel_inference_coordinator.auth import (
+    generate_auth_token,
+    present_credentials,
+    split_authenticated_address,
 )
 from megatron.core.inference.data_parallel_inference_coordinator.handlers import (
     HANDLERS,
@@ -453,6 +461,7 @@ class DummyEngine(DynamicInferenceEngine):
         total_world_size = torch.distributed.get_world_size()
         self.world_zmq_communicator = AsyncZMQCommunicator(self.zmq_context, process_group=None)
         self.use_synchronous_zmq_collectives = False
+        self.authenticate_coordinator = False
 
     async def run_engine_with_coordinator(self, *, loop=None):
         """Override to bypass @trace_async_exceptions for testability.
@@ -613,6 +622,110 @@ def test_case_communicator():
     ctx.term()
 
 
+def _connect_peer(address, *, token="launch"):
+    """A raw DEALER to the coordinator, presenting the launch secret, another one, or none."""
+    endpoint, launch_token = split_authenticated_address(address)
+    context = zmq.Context()
+    peer = context.socket(zmq.DEALER)
+    peer.setsockopt(zmq.LINGER, 0)
+    present_credentials(peer, launch_token if token == "launch" else token)
+    peer.connect(endpoint)
+    return context, peer
+
+
+def _send_if_possible(peer, frame):
+    """Send without waiting: a refused peer has no connection, so a blocking send never returns."""
+    try:
+        peer.send(frame, flags=zmq.DONTWAIT)
+    except zmq.Again:
+        pass
+
+
+@pytest.fixture
+def standalone_coordinator(request):
+    """A real coordinator with no engines, run on a thread so tests can talk to its socket.
+
+    Parametrize indirectly with True to make the coordinator authenticate its peers.
+    """
+    auth_token = generate_auth_token() if getattr(request, "param", False) else None
+    addresses = queue.Queue()
+    created = []
+
+    def run():
+        coordinator = DataParallelInferenceCoordinator(
+            pipe_connection=SimpleNamespace(send=addresses.put, close=lambda: None),
+            data_parallel_size=0,
+            tokenizer=DummyTokenizer(),
+            max_requests=16,
+            deterministic_mode=False,
+            hostname="127.0.0.1",
+            auth_token=auth_token,
+        )
+        created.append(coordinator)
+        coordinator.start()
+        coordinator.stop()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    address = addresses.get(timeout=30)
+    yield address, created, thread
+
+    if thread.is_alive():
+        context, client = _connect_peer(address)
+        client.send(msgpack.packb([Headers.CONNECT.value], use_bin_type=True))
+        if client.poll(5000):
+            client.recv()
+            client.send(msgpack.packb([Headers.SHUTDOWN.value], use_bin_type=True))
+        client.close(linger=100)
+        context.term()
+        thread.join(timeout=10)
+
+
+@pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
+@pytest.mark.parametrize("standalone_coordinator", [True], indirect=True)
+@pytest.mark.parametrize("token", [None, bytes(32)], ids=["no-credentials", "wrong-secret"])
+def test_coordinator_refuses_peers_without_the_launch_secret(standalone_coordinator, token):
+    """With authentication on, the published exploit: register as an engine, CONNECT, SHUTDOWN."""
+    address, created, thread = standalone_coordinator
+    context, attacker = _connect_peer(address, token=token)
+    try:
+        _send_if_possible(attacker, b"")  # engine registration
+        _send_if_possible(attacker, msgpack.packb([Headers.CONNECT.value], use_bin_type=True))
+        assert not attacker.poll(1500), "coordinator answered a peer without the launch secret"
+        _send_if_possible(attacker, msgpack.packb([Headers.SHUTDOWN.value], use_bin_type=True))
+    finally:
+        attacker.close(linger=0)
+        context.term()
+
+    # An authenticated client is served, so the coordinator is alive and was not shut down.
+    context, client = _connect_peer(address)
+    try:
+        client.send(msgpack.packb([Headers.CONNECT.value], use_bin_type=True))
+        assert client.poll(5000), "authenticated client was not served"
+        assert msgpack.unpackb(client.recv(), raw=False)[0] == Headers.CONNECT_ACK.value
+    finally:
+        client.close(linger=0)
+        context.term()
+    assert thread.is_alive()
+    assert not created[0].identities_of_data_parallel_ranks
+
+
+@pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
+@pytest.mark.parametrize("standalone_coordinator", [False], indirect=True)
+def test_coordinator_without_authentication_serves_any_peer(standalone_coordinator):
+    """Authentication is opt-in: by default the address is plain and peers need no secret."""
+    address, _, _ = standalone_coordinator
+    assert split_authenticated_address(address) == (address, None)
+    context, peer = _connect_peer(address)
+    try:
+        peer.send(msgpack.packb([Headers.CONNECT.value], use_bin_type=True))
+        assert peer.poll(5000), "coordinator did not serve a peer without credentials"
+        assert msgpack.unpackb(peer.recv(), raw=False)[0] == Headers.CONNECT_ACK.value
+    finally:
+        peer.close(linger=0)
+        context.term()
+
+
 @pytest.fixture(scope="class")
 def coordinator():
     """Launch a single coordinator process for the entire test class.
@@ -625,6 +738,9 @@ def coordinator():
     The coordinator is spawned with data_parallel_size=0 so it doesn't block
     waiting for engines; engines register dynamically via the empty-payload
     re-registration path.
+
+    The coordinator authenticates its peers, so the tests that connect to it also cover the
+    secret reaching every rank.
     """
     rank = int(os.environ.get("RANK", "0"))
 
@@ -642,6 +758,7 @@ def coordinator():
                 "max_requests": 16,
                 "inference_coordinator_port": DEFAULT_PORT,
                 "deterministic_mode": False,
+                "auth_token": generate_auth_token(),
             },
         )
         proc.start()
@@ -663,7 +780,9 @@ def coordinator():
     if rank == 0 and proc is not None and proc.is_alive():
         ctx = zmq.Context()
         sock = ctx.socket(zmq.DEALER)
-        sock.connect(dp_addr)
+        endpoint, auth_token = split_authenticated_address(dp_addr)
+        present_credentials(sock, auth_token)
+        sock.connect(endpoint)
         sock.send(msgpack.packb([Headers.CONNECT.value], use_bin_type=True))
         sock.recv()  # CONNECT_ACK
         sock.send(msgpack.packb([Headers.SHUTDOWN.value], use_bin_type=True))
@@ -731,13 +850,16 @@ class TestCoordinator:
     ):
         """Test coordinator with various TP, PP, and EP configurations."""
         dp_addr = coordinator
-        port = int(dp_addr.rsplit(":", 1)[-1])
+        endpoint, auth_token = split_authenticated_address(dp_addr)
+        port = int(endpoint.rsplit(":", 1)[-1])
         requests = self.build_requests()
         engine = DummyEngine()
         rank = torch.distributed.get_rank()
 
         await engine.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=port, launch_inference_coordinator=False
+            inference_coordinator_port=port,
+            launch_inference_coordinator=False,
+            coordinator_auth_token=auth_token,
         )
 
         # Ensure all engines are registered before submitting requests.
@@ -772,12 +894,15 @@ class TestCoordinator:
     ):
         """Test that the correct response type is returned based on the deserialize flag."""
         dp_addr = coordinator
-        port = int(dp_addr.rsplit(":", 1)[-1])
+        endpoint, auth_token = split_authenticated_address(dp_addr)
+        port = int(endpoint.rsplit(":", 1)[-1])
         engine = DummyEngine()
         requests = self.build_requests(num_requests=2)
 
         await engine.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=port, launch_inference_coordinator=False
+            inference_coordinator_port=port,
+            launch_inference_coordinator=False,
+            coordinator_auth_token=auth_token,
         )
 
         # Ensure all engines are registered before submitting requests.
@@ -820,7 +945,8 @@ class TestCoordinator:
     ):
         """Comprehensive lifecycle test for the engine state machine."""
         dp_addr = coordinator
-        port = int(dp_addr.rsplit(":", 1)[-1])
+        endpoint, auth_token = split_authenticated_address(dp_addr)
+        port = int(endpoint.rsplit(":", 1)[-1])
         requests = self.build_requests(num_requests=16)
         engine = DummyEngine()
         client = None
@@ -829,7 +955,9 @@ class TestCoordinator:
 
         try:
             await engine.start_listening_to_data_parallel_coordinator(
-                inference_coordinator_port=port, launch_inference_coordinator=False
+                inference_coordinator_port=port,
+                launch_inference_coordinator=False,
+                coordinator_auth_token=auth_token,
             )
 
             # Synchronize all ranks so every engine has registered.
@@ -974,15 +1102,18 @@ class TestCoordinator:
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
     @pytest.mark.parametrize("resume_first", [False, True], ids=["stop", "resume-then-stop"])
+    @pytest.mark.parametrize("authenticate", [False, True], ids=["open", "authenticated"])
     async def test_start_suspended_lifecycle(
-        self, initialize_model_parallel, test_case_communicator, resume_first
+        self, initialize_model_parallel, test_case_communicator, resume_first, authenticate
     ):
         """An engine built suspended answers pause and stop before its first resume().
 
         The engine spawns its own coordinator here, so the coordinator starts SUSPENDED too.
+        It authenticates its peers only when the engine is configured to.
         """
         requests = self.build_requests(num_requests=2)
         engine = DummyEngine()
+        engine.authenticate_coordinator = authenticate
         # Mirrors the engine's start_suspended construction.
         engine.state = EngineState.SUSPENDED
         engine._state_events[EngineState.RUNNING].clear()
@@ -996,6 +1127,7 @@ class TestCoordinator:
             dp_addr = await engine.start_listening_to_data_parallel_coordinator(
                 inference_coordinator_port=None, launch_inference_coordinator=True
             )
+            assert (split_authenticated_address(dp_addr)[1] is not None) == authenticate
             # Synchronize all ranks so every engine has registered.
             await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
 
@@ -1056,12 +1188,15 @@ class TestCoordinator:
         num_iterations = 10
 
         dp_addr = coordinator
-        port = int(dp_addr.rsplit(":", 1)[-1])
+        endpoint, auth_token = split_authenticated_address(dp_addr)
+        port = int(endpoint.rsplit(":", 1)[-1])
         engine = DummyEngine()
         requests = self.build_requests(num_requests=num_requests)
 
         await engine.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=port, launch_inference_coordinator=False
+            inference_coordinator_port=port,
+            launch_inference_coordinator=False,
+            coordinator_auth_token=auth_token,
         )
 
         # Ensure all engines are registered before submitting requests.

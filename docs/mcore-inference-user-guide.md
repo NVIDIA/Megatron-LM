@@ -504,6 +504,7 @@ used fields:
 | `image_preprocessing_config` | Image preprocessing for vision-language models |
 | `use_flashinfer_fused_rope` | Use FlashInfer's fused RoPE kernel |
 | `ep_consensus_interval`, `use_synchronous_zmq_collectives` | MoE and expert-parallel coordination tuning |
+| `authenticate_coordinator` | Off by default. When `True`, the coordinator the engine launches refuses every peer that does not present a secret generated at launch. The secret travels in the address returned by `start_listening_to_data_parallel_coordinator` (`<endpoint>#auth=<secret>`), so treat that address as a credential and do not log it. Authentication does not encrypt traffic. Leave it off only on a trusted network, because otherwise anyone who can reach the coordinator port can control the engines (CLI: `--inference-authenticate-coordinator`) |
 | `track_paused_request_events`, `track_generated_token_events`, `metrics_writer`, `logging_step_interval` | Observability |
 
 ```python
