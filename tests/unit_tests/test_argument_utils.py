@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+from megatron.core.models.engram import EngramConfig
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.transformer import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -369,6 +370,109 @@ def test_shortcut_connection_rejects_fsdp(monkeypatch, fsdp_flag):
     setattr(args, fsdp_flag, True)
 
     with pytest.raises(AssertionError, match="FSDP is not supported"):
+        validate_args(args)
+
+
+_TRAINING_ARGV = (
+    'test_argument_utils.py --num-layers 2 --hidden-size 128 --num-attention-heads 4 '
+    '--max-position-embeddings 1024 --seq-length 1024 --micro-batch-size 1 --train-iters 1 '
+    '--lr 1e-4 --tokenizer-type NullTokenizer --vocab-size 1024'
+)
+_ENGRAM_FLAGS = (
+    '--engram-vocab-sizes 1009 1009 --engram-layer-ids 2 --engram-variant qwen '
+    '--engram-eos-token-id 1 --engram-unigram-vocab-size 2048'
+)
+
+
+def _parse_training_args(monkeypatch, flags):
+    monkeypatch.setattr(sys, 'argv', f'{_TRAINING_ARGV} {flags}'.split())
+    return parse_args()
+
+
+def test_engram_cli_reaches_hybrid_model_config(monkeypatch):
+    """The flat --engram-* flags enable Engram and build HybridModelConfig.engram_config."""
+    args = _parse_training_args(
+        monkeypatch,
+        f'{_ENGRAM_FLAGS} --engram-num-hash-heads 4 --engram-memory-dim 64 '
+        '--engram-embedding-lr-multiplier 3 --engram-embedding-weight-decay 0.01 '
+        '--engram-freeze-embedding '
+        # Engram shards its tables over expert parallelism, which then needs no MoE experts.
+        '--expert-model-parallel-size 2',
+    )
+    assert args.engram_enabled
+    validate_args(args)
+    transformer_config = core_transformer_config_from_args(args)
+    assert transformer_config.engram_enabled
+
+    model_config = hybrid_config_from_args(
+        args, config=transformer_config, vocab_size_from_tokenizer=False
+    )
+
+    engram_config = model_config.engram_config
+    assert isinstance(engram_config, EngramConfig)
+    assert engram_config.global_vocab_sizes == (1009, 1009)
+    assert engram_config.layer_ids == (2,)
+    assert engram_config.variant == 'qwen'
+    assert engram_config.boundary_token_id == 1
+    assert engram_config.unigram_vocab_size == 2048
+    assert engram_config.num_hash_heads == 4
+    assert engram_config.memory_dim == 64
+    assert engram_config.embedding_lr_multiplier == 3.0
+    assert engram_config.embedding_weight_decay == 0.01
+    assert engram_config.freeze_embedding
+
+
+def test_engram_enabled_is_derived_not_a_cli_flag(monkeypatch):
+    """parse_args derives engram_enabled from --engram-vocab-sizes; it has no flag of its own."""
+    assert 'engram_enabled' in TransformerConfig.__dataclass_fields__
+    parser = add_megatron_arguments(ArgumentParser())
+    assert 'engram_enabled' not in {action.dest for action in parser._actions}
+
+    assert not _parse_training_args(monkeypatch, '').engram_enabled
+    assert _parse_training_args(monkeypatch, _ENGRAM_FLAGS).engram_enabled
+    with pytest.raises(SystemExit):
+        _parse_training_args(monkeypatch, '--engram-enabled')
+
+
+def test_engram_cli_rejects_yaml_config(monkeypatch):
+    """The experimental YAML path must not silently discard the Engram CLI flags."""
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        ['test_argument_utils.py', '--yaml-cfg', 'unused.yaml', '--engram-vocab-sizes', '1009'],
+    )
+
+    with pytest.raises(ValueError, match='Engram CLI arguments cannot be combined with --yaml-cfg'):
+        parse_args()
+
+
+@pytest.mark.parametrize('engram', [False, True])
+def test_expert_parallelism_without_experts_requires_engram(monkeypatch, engram):
+    args = _parse_training_args(
+        monkeypatch, f'{_ENGRAM_FLAGS if engram else ""} --expert-model-parallel-size 2'
+    )
+    with nullcontext() if engram else pytest.raises(AssertionError, match='unless Engram'):
+        validate_args(args)
+
+
+@pytest.mark.parametrize(
+    ('flags', 'error'),
+    [
+        ('--sequence-packing-scheduler dp_balanced --calculate-per-token-loss', 'sequence-packing'),
+        # The varlen dataset selects the dp_balanced scheduler while the arguments are validated.
+        ('--use-varlen-dataset --mock-data --calculate-per-token-loss', 'sequence-packing'),
+        ('--use-mup', '--use-mup'),
+        # Bare FSDP flags: the Engram check must fire before the generic FSDP validation, whose
+        # prerequisites (flags, CUDA_DEVICE_MAX_CONNECTIONS) would otherwise fail first.
+        ('--use-torch-fsdp2', 'Torch FSDP2'),
+        ('--use-megatron-fsdp', 'Megatron-FSDP'),
+        ('--moe-expert-rank-capacity-factor 1.5', 'moe-expert-rank-capacity-factor'),
+    ],
+    ids=['scheduler', 'varlen', 'mup', 'fsdp2', 'megatron_fsdp', 'expert_rank_capacity'],
+)
+def test_engram_rejects_unsupported_training_features(monkeypatch, flags, error):
+    args = _parse_training_args(monkeypatch, f'{_ENGRAM_FLAGS} {flags}')
+    with pytest.raises(AssertionError, match=error):
         validate_args(args)
 
 

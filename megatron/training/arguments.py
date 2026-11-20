@@ -13,6 +13,8 @@ import torch
 
 from megatron.core.config import set_experimental_flag
 from megatron.core.model_parallel_config import normalize_gtp_nccl_ub
+from megatron.core.models.engram.symmetric_lookup import expandable_segments_enabled
+from megatron.core.models.engram.variants import DEEPSEEK_VARIANT_NAME, ENGRAM_VARIANTS
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
@@ -67,6 +69,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_tokenizer_args(parser)
     parser = _add_vision_args(parser)
     parser = _add_moe_args(parser)
+    parser = _add_engram_args(parser)
     parser = _add_mla_args(parser)
     parser = _add_experimental_attention_variant_args(parser)
     parser = _add_heterogeneous_args(parser)
@@ -158,6 +161,11 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
                 'Wide-residual CLI arguments cannot be combined with --yaml-cfg because '
                 'YAML model configuration replaces argparse model arguments.'
             )
+        if args.engram_vocab_sizes is not None:
+            raise ValueError(
+                "Engram CLI arguments cannot be combined with --yaml-cfg because "
+                "YAML model configuration replaces argparse model arguments."
+            )
         from .yaml_arguments import load_yaml
 
         args = load_yaml(args.yaml_cfg)
@@ -166,6 +174,10 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     # Args from environment
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
+
+    # Engram activation is intentionally derived from table vocabulary configuration rather than
+    # a second boolean switch. TransformerConfig uses this before model construction to permit EP.
+    args.engram_enabled = getattr(args, "engram_vocab_sizes", None) is not None
 
     # Args to enable MSC (opt-in: disabled by default)
     if args.disable_msc_deprecated:
@@ -409,6 +421,167 @@ def tuple_type(x):
         return x
     assert isinstance(x, str)
     return tuple(int(i) for i in x.strip('()').split(','))
+
+
+def _validate_engram_parallel_size(args):
+    """Check the setup that --engram-parallel-size shards the Engram tables in.
+
+    The tables then form a parameter domain of their own: DDP reduces their gradients over their
+    replica group, and a DistributedOptimizer without a Gloo group shards their state (see
+    megatron/core/models/engram/table_sharding.py).
+    """
+    parallel_size = args.engram_parallel_size
+    assert getattr(
+        args, 'engram_enabled', False
+    ), '--engram-parallel-size requires Engram (--engram-vocab-sizes).'
+    assert parallel_size > 0, f'--engram-parallel-size must be positive, got {parallel_size}.'
+    sharding = {
+        'tensor_model_parallel_size': args.tensor_model_parallel_size,
+        'expert_tensor_parallel_size': getattr(args, 'expert_tensor_parallel_size', 1),
+        'gtp_weight_remat_size': getattr(args, 'gtp_weight_remat_size', 1),
+        'expert_gtp_weight_remat_size': getattr(args, 'expert_gtp_weight_remat_size', 1),
+    }
+    unsupported = [f'{name}={size}' for name, size in sharding.items() if size != 1]
+    assert not unsupported, (
+        '--engram-parallel-size shards the tables over the data- and context-parallel group, '
+        'which requires tensor and expert tensor parallel sizes of 1 and no GTP weight remat '
+        f'(--tensor-parallel-num-weight-shards); got {", ".join(unsupported)}.'
+    )
+    dp_cp_size = args.data_parallel_size * args.context_parallel_size
+    assert dp_cp_size % parallel_size == 0, (
+        f'--engram-parallel-size ({parallel_size}) must divide the data-parallel size times the '
+        f'context-parallel size ({dp_cp_size}).'
+    )
+    # The run config turns --use-distributed-optimizer into the layer-wise distributed optimizer
+    # for the emerging optimizers only later (OptimizerConfig.finalize_optimizer_config), and the
+    # deprecated dist_muon alias selects it by itself.
+    assert (
+        args.use_distributed_optimizer
+        or getattr(args, 'use_layer_wise_distributed_optimizer', False)
+        or args.optimizer == 'dist_muon'
+    ), (
+        '--engram-parallel-size requires --use-distributed-optimizer: the tables get a '
+        'DistributedOptimizer of their own.'
+    )
+    # With an emerging optimizer that DistributedOptimizer sits next to the layer-wise one, in the
+    # split that the precomputed layer-wise layout builds. The legacy single-buffer layer-wise
+    # path has no such split.
+    assert args.optimizer in ('sgd', 'adam') or getattr(
+        args, 'use_layer_wise_param_layout', True
+    ), (
+        '--engram-parallel-size with an emerging optimizer requires the precomputed layer-wise '
+        'parameter layout; remove --no-use-layer-wise-param-layout.'
+    )
+    assert args.num_distributed_optimizer_instances == 1, (
+        '--engram-parallel-size requires --num-distributed-optimizer-instances 1, got '
+        f'{args.num_distributed_optimizer_instances}.'
+    )
+    # validate_args rejects FSDP with Engram in every layout before it gets here; the table
+    # domain needs the standard DDP even without that check.
+    assert not (
+        args.use_megatron_fsdp or args.use_torch_fsdp2
+    ), '--engram-parallel-size does not support Megatron-FSDP or Torch FSDP2.'
+    assert not getattr(
+        args, 'overlap_param_gather_with_optimizer_step', False
+    ), '--engram-parallel-size does not support --overlap-param-gather-with-optimizer-step.'
+    assert not getattr(args, 'tensor_metrics', None), (
+        '--engram-parallel-size does not support --tensor-metrics: the tensor-metric observer '
+        'does not know the parameter domain of the tables.'
+    )
+    # The checkpoint modes that gather the distributed optimizer state over Gloo cannot save the
+    # tables' optimizer, which has no Gloo group. A conversion run also saves once in
+    # --ckpt-convert-format, so both formats are checked.
+    for flag, ckpt_format in (
+        ('--ckpt-format', args.ckpt_format),
+        ('--ckpt-convert-format', getattr(args, 'ckpt_convert_format', None)),
+    ):
+        assert (
+            ckpt_format != 'torch'
+        ), f'--engram-parallel-size requires a distributed checkpoint format, not {flag} torch.'
+    assert not (
+        args.dist_ckpt_optim_fully_reshardable
+        and args.distrib_optim_fully_reshardable_mem_efficient
+    ), (
+        '--engram-parallel-size does not support --distrib-optim-fully-reshardable-mem-efficient '
+        'with --dist-ckpt-optim-fully-reshardable.'
+    )
+    # A fake process group gathers every rank's own object, so the creation of the table groups
+    # sees only this rank's dp_cp group; that one spans the world only with one pipeline stage.
+    assert not (
+        getattr(args, 'fake_process_group', False) and args.pipeline_model_parallel_size > 1
+    ), (
+        '--engram-parallel-size with --fake-process-group requires '
+        '--pipeline-model-parallel-size 1: the fake group cannot exchange the dp_cp groups of '
+        'the other pipeline stages that the Engram table groups are split from.'
+    )
+
+
+def _validate_engram_communication_backend(args):
+    """Resolve --engram-communication-backend and check what the symmetric transport needs.
+
+    The sharded table layout (--engram-parallel-size above 1) defaults to the symmetric
+    transport; one rank per row group and the expert-parallel layout default to NCCL, the
+    expert-parallel layout's only backend (see megatron/core/models/engram/symmetric_lookup.py).
+    The setups the transport cannot serve are checked first, then its CUDA and allocator needs.
+    Its libraries are checked on every rank before the model is built
+    (initialize_engram_parallel_state).
+    """
+    backend = getattr(args, 'engram_communication_backend', None)
+    if not getattr(args, 'engram_enabled', False):
+        assert (
+            backend is None
+        ), '--engram-communication-backend requires Engram (--engram-vocab-sizes).'
+        return
+    workspace_mb = getattr(args, 'engram_symmetric_workspace_mb', 64)
+    assert (
+        workspace_mb > 0
+    ), f'--engram-symmetric-workspace-mb must be positive, got {workspace_mb}.'
+    parallel_size = getattr(args, 'engram_parallel_size', None)
+    if backend is None:
+        # As EngramConfig resolves it: one rank per row group looks its rows up locally.
+        backend = 'symmetric' if parallel_size is not None and parallel_size > 1 else 'nccl'
+        args.engram_communication_backend = backend
+    if backend != 'symmetric':
+        return
+    assert parallel_size is not None, (
+        '--engram-communication-backend symmetric requires --engram-parallel-size: the '
+        'expert-parallel table layout looks its rows up with NCCL all-to-alls only. '
+        '--engram-parallel-size equal to the expert-parallel size reproduces its row groups.'
+    )
+    assert not getattr(args, 'fake_process_group', False), (
+        'The Engram symmetric backend (the default with --engram-parallel-size above 1) creates '
+        'NCCL communicators of its own and cannot run on a fake process group; pass '
+        '--engram-communication-backend nccl. The memory estimate then holds what the NCCL '
+        'lookup allocates, including the dense per-table gradient of its backward, which the '
+        'symmetric backend does not allocate.'
+    )
+    assert not getattr(args, 'moe_use_upcycling', False), (
+        'The Engram symmetric backend does not support --moe-use-upcycling: its transports '
+        'serve one model per process, and upcycling builds a second, dense one.'
+    )
+    for flag in ('disable_param_buffers_cpu_backup', 'disable_grad_buffers_cpu_backup'):
+        assert not getattr(args, flag, False), (
+            f'The Engram symmetric backend does not support --{flag.replace("_", "-")}: '
+            'torch_memory_saver remaps buffer pages at the same virtual addresses, which the '
+            'registered table windows cannot detect.'
+        )
+    assert not getattr(args, 'inprocess_restart', False), (
+        'The Engram symmetric backend does not support --inprocess-restart: its device kernels '
+        'spin-wait on their peers, and no in-process abort can stop them.'
+    )
+    assert torch.cuda.is_available(), (
+        'The Engram symmetric backend (the default with --engram-parallel-size above 1) needs '
+        'CUDA; pass --engram-communication-backend nccl without it.'
+    )
+    assert expandable_segments_enabled(os.environ), (
+        'The Engram symmetric backend (the default with --engram-parallel-size above 1) '
+        "registers the tables' parameter buffers as NCCL windows, which needs expandable-segment "
+        '(CUDA VMM) allocations: set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True in the '
+        'environment of every rank (PyTorch reads the first of PYTORCH_CUDA_ALLOC_CONF, '
+        'PYTORCH_HIP_ALLOC_CONF and PYTORCH_ALLOC_CONF that is set; under pyxis/enroot, values '
+        'from the image win unless srun passes them with --container-env), or pass '
+        '--engram-communication-backend nccl.'
+    )
 
 
 def validate_args(args, defaults={}):
@@ -906,6 +1079,22 @@ def validate_args(args, defaults={}):
         "per-layer FSDP parameter all-gather hooks, leaving the paired attention and MoE layer "
         "parameters sharded. Use DDP or --use-distributed-optimizer instead."
     )
+
+    if getattr(args, "engram_enabled", False):
+        # Checked before the FSDP validation below, whose own prerequisites would otherwise
+        # fail first with an unrelated message.
+        assert not args.use_mup, (
+            "Engram does not support --use-mup: muP learning-rate overrides conflict with the "
+            "Engram embedding learning-rate override."
+        )
+        assert not (
+            args.use_megatron_fsdp or args.use_torch_fsdp2
+        ), "Engram does not support Megatron-FSDP or Torch FSDP2."
+        assert getattr(args, "moe_expert_rank_capacity_factor", None) is None, (
+            "Engram does not support --moe-expert-rank-capacity-factor: its paged-stash runner "
+            "replays the microbatches through plain iterators, which bypass the Engram token "
+            "prefetch."
+        )
 
     if args.use_torch_fsdp2:
         assert is_torch_min_version("2.4.0"), \
@@ -1471,9 +1660,12 @@ def validate_args(args, defaults={}):
 
     # Expert parallelism check
     if args.expert_model_parallel_size  > 1:
-        assert args.num_experts is not None, "num_experts must be non None to use expert model parallelism"
-        assert args.num_experts % args.expert_model_parallel_size == 0, \
-            "Number of experts should be a multiple of expert model parallel_size."
+        # Engram shards its tables over expert parallelism, so EP is useful without experts.
+        assert args.num_experts is not None or getattr(args, "engram_enabled", False), \
+            "num_experts must be non None to use expert model parallelism unless Engram is enabled"
+        if args.num_experts is not None:
+            assert args.num_experts % args.expert_model_parallel_size == 0, \
+                "Number of experts should be a multiple of expert model parallel_size."
 
     # MoE router check
     if isinstance(args.moe_router_load_balancing_type, list) and len(args.moe_router_load_balancing_type) == 1:
@@ -1557,6 +1749,16 @@ def validate_args(args, defaults={}):
                 f'must be >= single sequence max length ({args.seq_length})'
             )
 
+    if getattr(args, "engram_enabled", False):
+        # Checked once the scheduler is resolved: --use-varlen-dataset and dynamic CP select one
+        # above. Engram's token prefetch reads microbatches from the plain data iterator, which a
+        # sequence-packing scheduler replaces with its own packed iterator.
+        assert args.sequence_packing_scheduler is None, (
+            "Engram does not support sequence-packing schedulers, including the ones that "
+            "--use-varlen-dataset (without --varlen-sbhd-validation) and dynamic context "
+            "parallelism select."
+        )
+
     if args.sequence_packing_scheduler == "dp_balanced" and args.cuda_graph_impl == "transformer_engine":
         assert args.use_varlen_dataset and args.micro_batch_size == 1, (
             "Scheduler CUDA graphs require one variable-length sample per dataset item "
@@ -1615,6 +1817,10 @@ def validate_args(args, defaults={}):
                 "MFSDP v2 Muon requires --muon-no-split-qkv."
         else:
             assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
+
+    if getattr(args, "engram_parallel_size", None) is not None:
+        _validate_engram_parallel_size(args)
+    _validate_engram_communication_backend(args)
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
@@ -2334,6 +2540,8 @@ def _add_network_size_args(parser):
         "gtp_weight_remat_size",
         # internal/derived: controlled only via --expert-tensor-parallel-num-weight-shards
         "expert_gtp_weight_remat_size",
+        # internal/derived: set in parse_args from --engram-vocab-sizes
+        "engram_enabled",
         # Constructed from the dedicated flat CLI arguments below.
         "wide_residual",
         # Parsed manually as a JSON object below.
@@ -3360,6 +3568,142 @@ def _add_moe_args(parser):
                        help='This param sepecifics how many times smaller is the expert hidden size compared with the original dense FFN hidden size. '
                        'For using granular upcycling strategy, please set this param as a positive integer. If this param is set to 1, it means using the default upcycling strategy.')
     return parser
+
+
+def _add_engram_args(parser):
+    group = parser.add_argument_group(title="engram")
+    group.add_argument(
+        '--engram-vocab-sizes',
+        type=int,
+        nargs='+',
+        default=None,
+        help='Global table vocabulary budget for each Engram n-gram order; enables Engram.',
+    )
+    group.add_argument(
+        '--engram-layer-ids',
+        type=int,
+        nargs='+',
+        default=None,
+        help='Selected 1-based global transformer layer IDs.',
+    )
+    group.add_argument(
+        '--engram-max-ngram-order',
+        type=int,
+        default=3,
+        help='Largest n-gram order hashed; every order from 2 up to it gets its own tables.',
+    )
+    group.add_argument(
+        '--engram-num-hash-heads',
+        type=int,
+        default=8,
+        help='Hash heads per n-gram order, each with its own prime-sized table.',
+    )
+    group.add_argument(
+        '--engram-memory-dim',
+        type=int,
+        default=512,
+        help='Retrieved-memory width per n-gram order, split evenly over its hash heads.',
+    )
+    group.add_argument(
+        '--engram-kernel-size',
+        type=int,
+        default=4,
+        help='Kernel size of the depthwise causal short convolution, dilated by the maximum '
+        'n-gram order. Unused by the deepseek_v41 variant, which has no convolution.',
+    )
+    group.add_argument(
+        '--engram-hash-seed', type=int, default=0, help='Seed of the n-gram hash multipliers.'
+    )
+    group.add_argument(
+        '--engram-pad-token-id',
+        type=int,
+        default=None,
+        help='Token ID padded before the sequence start (deepseek and deepseek_v41 variants).',
+    )
+    group.add_argument(
+        '--engram-tokenizer-map',
+        type=str,
+        default=None,
+        help='Versioned token-ID compression and hash-constant artifact (deepseek and '
+        'deepseek_v41 variants).',
+    )
+    group.add_argument(
+        '--engram-variant',
+        type=str,
+        choices=sorted(ENGRAM_VARIANTS),
+        default=DEEPSEEK_VARIANT_NAME,
+        help='Hashing/layout variant: deepseek (offline tokenizer map + PCG64 multipliers), '
+        'deepseek_v41 (the deepseek hashing with the DeepSeek-V4.1 fusion: one bias-free '
+        'projection, FP32 gate, no short convolution) or qwen (raw token IDs, splitmix64 '
+        'multipliers, per-head nth-prime tables, EOS-reset n-gram windows, fused bias-free '
+        'projections with zero-centered group norms).',
+    )
+    group.add_argument(
+        '--engram-eos-token-id',
+        type=int,
+        default=None,
+        help='EOS token ID at which qwen-variant n-gram windows reset (document boundary).',
+    )
+    group.add_argument(
+        '--engram-unigram-vocab-size',
+        type=int,
+        default=None,
+        help='HF config.vocab_size bounding the qwen-variant hash multipliers; the padded '
+        'vocabulary must not exceed it.',
+    )
+    group.add_argument(
+        '--engram-embedding-lr-multiplier',
+        type=float,
+        default=5.0,
+        help='Multiplier on the learning rate and minimum learning rate of the Engram tables.',
+    )
+    group.add_argument(
+        '--engram-embedding-weight-decay',
+        type=float,
+        default=0.0,
+        help='Weight decay of the Engram tables.',
+    )
+    group.add_argument(
+        '--engram-freeze-embedding',
+        action='store_true',
+        help='Keep the n-gram hash-embedding tables fixed (no gradient, no optimizer state); '
+        'the dense part of the n-gram memory still trains.',
+    )
+    group.add_argument(
+        '--engram-parallel-size',
+        type=int,
+        default=None,
+        help='Shard the rows of every Engram table over this many consecutive ranks of the '
+        'data- times context-parallel group of each pipeline stage, and replicate each shard '
+        'over the others; it must divide that group size. By default the rows are sharded over '
+        'the expert-parallel group. Requires --use-distributed-optimizer (also with Muon), '
+        'tensor and expert tensor parallel sizes of 1, no GTP, one distributed optimizer '
+        'instance and a distributed checkpoint format.',
+    )
+    group.add_argument(
+        '--engram-communication-backend',
+        type=str,
+        choices=['symmetric', 'nccl'],
+        default=None,
+        help='How Engram looks table rows up across the ranks that shard them. symmetric, the '
+        'default with --engram-parallel-size above 1, reads them through the CuTe DSL / NCCL4Py '
+        'device transport (direct loads inside an NVLink domain, GIN across domains) and adds '
+        'row-sparse gradients to main_grad; it needs CUDA, Triton, nvidia-cutlass-dsl >= 4.8.1, '
+        'nccl4py >= 0.6.0 with a matching NCCL runtime and device bitcode, and '
+        'PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True, and does not run on a fake process '
+        'group. nccl runs NCCL all-to-alls; it is the default with --engram-parallel-size 1 '
+        '(rows are then looked up locally either way) and the only choice without '
+        '--engram-parallel-size.',
+    )
+    group.add_argument(
+        '--engram-symmetric-workspace-mb',
+        type=int,
+        default=64,
+        help='Size in MiB of the workspace that the Engram symmetric transport registers on '
+        'every rank: the staging and receive slots of its exchanges.',
+    )
+    return parser
+
 
 def _add_mla_args(parser):
     group = parser.add_argument_group(title="mla")

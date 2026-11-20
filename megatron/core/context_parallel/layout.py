@@ -9,7 +9,11 @@ from typing import Literal
 import torch
 
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.tensor_parallel.mappings import all_to_all
+from megatron.core.tensor_parallel.mappings import (
+    all_to_all,
+    gather_from_sequence_parallel_region,
+    scatter_to_sequence_parallel_region,
+)
 
 CPLayout = Literal["contiguous", "zigzag"]
 
@@ -760,6 +764,9 @@ class ContextParallelLayoutState:
     _input_ids_by_layout: dict[CPLayout, torch.Tensor] = field(
         default_factory=dict, init=False, repr=False
     )
+    _replicated_input_ids_by_layout: dict[CPLayout, torch.Tensor] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     def prepare_layer(
         self, layer_index: int, hidden_states: torch.Tensor
@@ -774,28 +781,41 @@ class ContextParallelLayoutState:
         return hidden_states, packed_seq_params
 
     def get_layer_input_ids(
-        self, layer_index: int, input_ids: torch.Tensor | None
+        self,
+        layer_index: int,
+        input_ids: torch.Tensor | None,
+        *,
+        sequence_parallel_local: bool = True,
     ) -> torch.Tensor | None:
         """Align batch-first boundary token IDs with a layer's activations.
 
         Unlike activations, the supplied IDs always start in the boundary layout.
         Cache converted IDs for this forward, including activation recomputation.
+
+        The IDs are taken to be in the frame of the activations, sequence-parallel shards
+        included. IDs that every tensor-parallel rank holds in full instead
+        (``sequence_parallel_local=False``) enter the shard frame for the conversion under
+        sequence parallelism and are gathered back, so the result is full on every
+        tensor-parallel rank again.
         """
         target_layout = self.manager.layer_layouts[layer_index]
         if input_ids is None or target_layout == self.manager.boundary_layout:
             return input_ids
-        if target_layout not in self._input_ids_by_layout:
-            self._input_ids_by_layout[target_layout] = (
-                self.manager._convert_cp_layout(
-                    input_ids.transpose(0, 1),
-                    self.manager.boundary_layout,
-                    target_layout,
-                    self.thd_plan,
+        reshard = self.manager.sequence_parallel and not sequence_parallel_local
+        cache = self._replicated_input_ids_by_layout if reshard else self._input_ids_by_layout
+        if target_layout not in cache:
+            value = input_ids.transpose(0, 1)
+            if reshard:
+                value = scatter_to_sequence_parallel_region(
+                    value.contiguous(), group=self.manager.tp_group
                 )
-                .transpose(0, 1)
-                .contiguous()
+            value = self.manager._convert_cp_layout(
+                value, self.manager.boundary_layout, target_layout, self.thd_plan
             )
-        return self._input_ids_by_layout[target_layout]
+            if reshard:
+                value = gather_from_sequence_parallel_region(value, group=self.manager.tp_group)
+            cache[target_layout] = value.transpose(0, 1).contiguous()
+        return cache[target_layout]
 
     def get_layer_padding_mask(
         self,

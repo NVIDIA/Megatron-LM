@@ -26,6 +26,7 @@ from megatron.core.distributed import (
     DistributedDataParallelConfig,
     TorchFullyShardedDataParallelConfig,
 )
+from megatron.core.models.engram import EngramConfig
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer import TransformerConfig, WideResidualConfig
@@ -765,6 +766,10 @@ def hybrid_config_from_args(
         if not isinstance(hybrid_stack_spec, ModuleSpec):
             raise TypeError("--spec must refer to a static ModuleSpec for HybridModel.")
         kwargs["hybrid_stack_spec"] = hybrid_stack_spec
+
+    # Built here so the CLI/YAML validation runs once; the padded vocabulary is checked later
+    # by the model builder, which is the first place that knows it.
+    kwargs["engram_config"] = EngramConfig.from_args(args, transformer_cfg)
 
     kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
     kwargs["logit_dtype"] = getattr(args, "logit_dtype", None)
