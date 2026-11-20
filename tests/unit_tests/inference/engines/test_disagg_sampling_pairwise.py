@@ -27,7 +27,6 @@ from tests.unit_tests.inference.engines.disagg_test_utils import (
     snapshot_source,
 )
 from tests.unit_tests.inference.engines.test_disagg_pairwise import transport_world  # noqa: F401
-from tests.unit_tests.test_utilities import Utils
 
 
 @contextmanager
@@ -128,32 +127,3 @@ def test_handoff_stochastic_fixed_history(transport_world, backend, filters):
                 engine._poll_pending_kv_pushes()
                 engine.release_handoff_blocks(101)
                 assert_released(engine)
-
-
-@pytest.mark.parametrize("skip_prompt", [False, True])
-@pytest.mark.parametrize("score_fields", [{"return_log_probs": True}, {"top_n_logprobs": 2}])
-@torch.inference_mode()
-def test_handoff_rejects_unsupported_or_missing_scores_before_transfer(skip_prompt, score_fields):
-    """Reject unsupported scores or a missing carried first-token score."""
-    Utils.initialize_model_parallel()
-    try:
-        with real_engine(disagg_config(), role="decode") as engine:
-            params = SamplingParams(
-                num_tokens_to_generate=2, skip_prompt_log_probs=skip_prompt, **score_fields
-            )
-            allocator = engine.context.kv_block_allocator
-            before = allocator.pool_avail
-            if score_fields.get("top_n_logprobs"):
-                error, message = NotImplementedError, "top-token log probabilities"
-            elif skip_prompt:
-                error, message = ValueError, "first-token log probability count"
-            else:
-                error, message = NotImplementedError, "prompt log probabilities"
-            with pytest.raises(error, match=message):
-                engine.add_request_with_kv_handoff(
-                    101, prompt(33), params, {"resume_tokens": [9]}, [1, 2, 3]
-                )
-            assert allocator.pool_avail == before
-            assert_released(engine)
-    finally:
-        Utils.destroy_model_parallel()

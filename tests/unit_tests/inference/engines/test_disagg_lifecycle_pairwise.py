@@ -17,6 +17,7 @@ import zmq
 from megatron.core.inference.config import KVCacheManagementMode, PrefixCachingEvictionPolicy
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.headers import Headers
+from megatron.core.inference.sampling_params import SamplingParams
 from tests.unit_tests.inference.engines.disagg_test_utils import (
     ForwardWitness,
     _enqueue_decode_handoff,
@@ -34,7 +35,10 @@ from tests.unit_tests.inference.engines.disagg_test_utils import (
     sampling,
     snapshot_source,
 )
-from tests.unit_tests.inference.engines.test_disagg_pairwise import transport_world  # noqa: F401
+from tests.unit_tests.inference.engines.test_disagg_pairwise import (  # noqa: F401
+    labeled,
+    transport_world,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -150,50 +154,79 @@ def test_real_handoff_capacity_fifo(transport_world, policy):
         assert_released(engine)
 
 
-@torch.inference_mode()
-def test_abort_capacity_queued_handoff_resolves_without_transfer():
+def check_scores_rejected_before_transfer(engine, skip_prompt, score_fields):
+    """Reject unsupported scores or a missing carried first-token score."""
+    params = SamplingParams(
+        num_tokens_to_generate=2, skip_prompt_log_probs=skip_prompt, **score_fields
+    )
+    allocator = engine.context.kv_block_allocator
+    before = allocator.pool_avail
+    if score_fields.get("top_n_logprobs"):
+        error, message = NotImplementedError, "top-token log probabilities"
+    elif skip_prompt:
+        error, message = ValueError, "first-token log probability count"
+    else:
+        error, message = NotImplementedError, "prompt log probabilities"
+    with pytest.raises(error, match=message):
+        engine.add_request_with_kv_handoff(
+            101, prompt(33), params, {"resume_tokens": [9]}, [1, 2, 3]
+        )
+    assert allocator.pool_avail == before
+    assert_released(engine)
+
+
+def check_abort_capacity_queued_handoff_resolves_without_transfer(engine):
     """A delivered ABORT must reach handoffs not yet present in engine.requests.
 
     This is a focused negative/lifecycle regression, not positive transfer credit.
     """
+    allocator = engine.context.kv_block_allocator
+    held = allocator.allocate_memory_blocks(allocator.pool_avail).clone()
+    params = sampling(detokenize_generations=False)
+    future = engine.add_request_with_kv_handoff(
+        101, prompt(33), params, {"resume_tokens": [9]}, [1, 2, 3]
+    )
+    assert not engine.requests and not engine._pending_kv_imports
+    assert [item.request_id for item in engine._deferred_kv_handoffs] == [101]
+    try:
+        assert not future.done()
+        with ForwardWitness(engine) as witness:
+            reply = deliver_abort(engine, 101)
+        # Assert while capacity is still exhausted, before teardown can
+        # cancel anything or release the independently held blocks.
+        resolved = future.cancelled()
+        retired = not engine._deferred_kv_handoffs and not engine._pending_kv_imports
+        assert not witness.steps
+        assert torch.equal(allocator.pc_state.block_ref_counts[held], torch.ones_like(held))
+        assert resolved, "Delivered ABORT left a capacity-queued handoff future unresolved"
+        assert retired, "Aborted handoff remained eligible for a later real transfer"
+        assert not (engine.requests or engine.failed_request_ids or engine.local_metadata_ledger)
+        assert reply is not None, "Delivered ABORT did not publish REQUEST_ABORTED"
+        assert len(reply) == 1
+        assert msgpack.unpackb(reply[0], raw=False) == [Headers.REQUEST_ABORTED.value, 101, True]
+        assert deliver_abort(engine, 101) is None
+    finally:
+        allocator.release_memory_blocks(held)
+        engine._reset_pending_kv_imports()
+
+
+@torch.inference_mode()
+def test_decode_handoff_rejections_then_capacity_queued_abort():
+    """Decode checks that never transfer, in turn on one real decode engine.
+
+    The score rejections are argument checks that raise before hashing, allocation, transfer
+    or any forward pass, and each asserts that it left the engine as it found it. The ABORT
+    case runs last: it exhausts the allocator and installs coordinator flags and sockets.
+    """
     Utils.initialize_model_parallel()
     try:
-        config = disagg_config()
-        with real_engine(config, role="decode") as engine:
-            allocator = engine.context.kv_block_allocator
-            held = allocator.allocate_memory_blocks(allocator.pool_avail).clone()
-            params = sampling(detokenize_generations=False)
-            future = engine.add_request_with_kv_handoff(
-                101, prompt(33), params, {"resume_tokens": [9]}, [1, 2, 3]
-            )
-            assert not engine.requests and not engine._pending_kv_imports
-            assert [item.request_id for item in engine._deferred_kv_handoffs] == [101]
-            try:
-                assert not future.done()
-                with ForwardWitness(engine) as witness:
-                    reply = deliver_abort(engine, 101)
-                # Assert while capacity is still exhausted, before teardown can
-                # cancel anything or release the independently held blocks.
-                resolved = future.cancelled()
-                retired = not engine._deferred_kv_handoffs and not engine._pending_kv_imports
-                assert not witness.steps
-                assert torch.equal(allocator.pc_state.block_ref_counts[held], torch.ones_like(held))
-                assert resolved, "Delivered ABORT left a capacity-queued handoff future unresolved"
-                assert retired, "Aborted handoff remained eligible for a later real transfer"
-                assert not (
-                    engine.requests or engine.failed_request_ids or engine.local_metadata_ledger
-                )
-                assert reply is not None, "Delivered ABORT did not publish REQUEST_ABORTED"
-                assert len(reply) == 1
-                assert msgpack.unpackb(reply[0], raw=False) == [
-                    Headers.REQUEST_ABORTED.value,
-                    101,
-                    True,
-                ]
-                assert deliver_abort(engine, 101) is None
-            finally:
-                allocator.release_memory_blocks(held)
-                engine._reset_pending_kv_imports()
+        with real_engine(disagg_config(), role="decode") as engine:
+            for score_fields in ({"return_log_probs": True}, {"top_n_logprobs": 2}):
+                for skip_prompt in (False, True):
+                    with labeled(f"{score_fields}, skip_prompt_log_probs={skip_prompt}"):
+                        check_scores_rejected_before_transfer(engine, skip_prompt, score_fields)
+            with labeled("abort-capacity-queued-handoff"):
+                check_abort_capacity_queued_handoff_resolves_without_transfer(engine)
     finally:
         Utils.destroy_model_parallel()
 
