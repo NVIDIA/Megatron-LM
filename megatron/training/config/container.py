@@ -576,8 +576,12 @@ class PretrainConfigContainer(ConfigContainerBase):
             if self.optimizer.optimizer not in ("sgd", "adam"):
                 raise ValueError("Torch FSDP2 requires the SGD or Adam optimizer.")
         if self.ddp.use_megatron_fsdp:
-            if self.optimizer.optimizer not in ("sgd", "adam"):
-                raise ValueError("Megatron FSDP requires the SGD or Adam optimizer.")
+            if self.optimizer.optimizer not in ("sgd", "adam") and not (
+                self.ddp.megatron_fsdp_version == 2 and self.optimizer.optimizer == "muon"
+            ):
+                raise ValueError(
+                    "Megatron FSDP requires the SGD or Adam optimizer, or Muon with MFSDP v2."
+                )
         if isinstance(self.ddp, TorchFullyShardedDataParallelConfig) or self.ddp.use_megatron_fsdp:
             if os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS") == "1":
                 raise ValueError("FSDP requires CUDA_DEVICE_MAX_CONNECTIONS > 1 or unset.")
