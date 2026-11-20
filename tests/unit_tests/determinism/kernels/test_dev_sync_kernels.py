@@ -527,6 +527,62 @@ def test_kda_recurrence_with_fused_gated_output_norm_replays():
     assert compared <= set(grads)
 
 
+def test_kda_cp_state_exchange_replays():
+    """Replay the two-level CP boundary-state exchange for one rank of a 64-rank group.
+
+    The all-gathers are stand-ins that return fixed peer summaries, so the replay covers the
+    block composition (batched matmuls) and FLA's merge kernel, forward and backward.
+    """
+    from megatron.core.ssm.context_parallel import state_exchange
+
+    if not state_exchange.HAVE_FLA_MERGE:
+        pytest.skip("FLA CP merge kernel is unavailable")
+    seeded()
+    ranks, size, heads, key, value = 64, 8, 4, 64, 64
+    me = 37  # block 4: needs the composed summaries of blocks 0-3 and ranks 32-36
+
+    def summaries(count):
+        delta = torch.randn(count, heads, key, value, device="cuda")
+        trans = torch.randn(count, heads, key, key, device="cuda") * (0.4 / key**0.5)
+        return torch.cat((delta, trans), dim=-1)
+
+    peers, cross_in = summaries(ranks), summaries(ranks // size)
+    chains = state_exchange.rank_chains(torch.tensor([0, ranks * 64]), ranks)
+
+    class Group:
+        def size(self):
+            return ranks
+
+        def rank(self):
+            return me
+
+    def all_gather(output, local, group):
+        if group == "block":
+            block = (me // size) * size
+            output.copy_(peers[block : block + size])
+            output[me - block].copy_(local)
+        else:
+            output.copy_(cross_in)
+
+    def run(local):
+        return tuple(
+            state_exchange.exchange_boundary_state(
+                local,
+                group=Group(),
+                chains=chains,
+                reverse=reverse,
+                size=size,
+                subgroups=lambda group, block: ("block", "cross"),
+                all_gather=all_gather,
+            )
+            for reverse in (False, True)
+        )
+
+    assert_replays_bit_exact(
+        run, (peers[me].clone(),), backward=False, contention=True, what="KDA CP state exchange"
+    )
+
+
 def test_mok_route_adapter_replays():
     """Replay the fixed-width route gather and its probability-gradient scatter."""
     from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs

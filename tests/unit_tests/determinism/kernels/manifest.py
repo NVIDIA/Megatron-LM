@@ -238,6 +238,25 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "and exercise mutation invalidation and forward routing; they do not qualify kernel numerics.",
     ),
     KernelEntry(
+        name="kda_cp_state_exchange",
+        sources=(
+            "megatron/core/ssm/context_parallel/state_exchange.py",
+            "megatron/core/ssm/gated_delta_net/kda_cp_state_exchange.py",
+        ),
+        tests=(
+            K + "test_dev_sync_kernels.py",
+            "tests/unit_tests/ssm/test_kda_cp_state_exchange.py",
+        ),
+        kind="dispatch",
+        notes="Two-level CP boundary-state exchange for KDA chunkwise CP: FLA's CP summary kernels "
+        "(the forward pre-process and backward dhu pre-process stages) and FLA's "
+        "merge_fwd_bwd_kernel, with batched matmul composition in between. The replay drives "
+        "exchange_boundary_state for one rank of a 64-rank group (blocks of 8) on CUDA FP32 "
+        "summaries, forward and backward, through the composition and the FLA merge kernel; the "
+        "NCCL exchange and chunk_kda end to end against FLA's all-gather are in "
+        "tests/unit_tests/ssm/test_kda_cp_state_exchange.py.",
+    ),
+    KernelEntry(
         name="balanced_cp_route_metadata",
         sources=(
             "megatron/core/transformer/experimental_attention_variant/cp_balanced_indexer.py",

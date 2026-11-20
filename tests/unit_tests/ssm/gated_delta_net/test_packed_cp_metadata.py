@@ -124,7 +124,9 @@ def test_metadata_cache_is_bounded():
 def test_forward_uses_microbatch_context_across_layers(monkeypatch, variant):
     group, calls = _Group(), []
     builder = _builder(calls)
-    monkeypatch.setattr(variant, 'build_cp_context', builder)
+    # KDA builds its contexts through kda_cp_state_exchange (rank-chain state exchange).
+    builder_owner = kda.kda_cp_state_exchange if variant is kda else variant
+    monkeypatch.setattr(builder_owner, 'build_cp_context', builder)
     monkeypatch.setattr(
         variant,
         'convert_module_input_tensors_cp_partition_mode',
