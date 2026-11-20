@@ -1564,10 +1564,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     # for now, we convert it to dict with index as key and convert back in load_state_dict
     def load_state_dict(self, state_dict):
         if len(self.chained_optimizers) == 1:
-            wrapped_state_dict = {1: state_dict}
+            child_states = (state_dict,)
         else:
-            wrapped_state_dict = state_dict
-        for sd in wrapped_state_dict.values():
+            child_states = state_dict.values() if isinstance(state_dict, dict) else state_dict
+        for sd in child_states:
             if 'fp32_from_fp16_params' in sd and isinstance(sd['fp32_from_fp16_params'], dict):
                 log_single_rank(
                     logger,

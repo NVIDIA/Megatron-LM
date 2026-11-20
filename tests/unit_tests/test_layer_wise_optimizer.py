@@ -2,6 +2,7 @@
 
 import os
 from contextlib import nullcontext
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -775,8 +776,14 @@ class TestLayerWiseOptimizer:
         )
         assert len(optimizer.chained_optimizers) == 2
         for param in params:
-            param.grad = torch.randn_like(param)
+            param.main_grad.fill_(0.25)
         assert optimizer.step()[0]
+        saved = deepcopy(optimizer.state_dict())
+        for param in params:
+            param.main_grad.fill_(-0.5)
+        assert optimizer.step()[0]
+        optimizer.load_state_dict(saved)
+        torch.testing.assert_close(optimizer.state_dict(), saved, rtol=0, atol=0)
 
     @pytest.mark.parametrize('with_pg_collection', [True, False])
     def test_direct_construction_pg_collection(self, with_pg_collection):
