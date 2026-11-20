@@ -118,6 +118,9 @@ navigation:
       - page: "Fused Gradient Descent and Weight Decay"
         path: ./developer/gdn_ew_fusion.md
         slug: gdn-ew-fusion
+      - page: "Shared-Prefix Execution for Hybrid Models"
+        path: ./developer/shared_prefix.md
+        slug: shared-prefix
 
   - section: "Inference"
     skip-slug: true

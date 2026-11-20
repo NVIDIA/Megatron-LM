@@ -1195,6 +1195,7 @@ def process_mtp_loss(
     mtp_input_mask: Optional[Tensor] = None,
     metric_avg_group: Optional[torch.distributed.ProcessGroup] = None,
     main_hidden_states: Optional[Tensor] = None,
+    loss_group_lengths: Optional[tuple[int, ...]] = None,
 ) -> Tensor:
     """Process Multi-Token Prediction (MTP) loss computation.
 
@@ -1225,6 +1226,13 @@ def process_mtp_loss(
         metric_avg_group (Optional[ProcessGroup]): Group used to average MTP logging metrics.
         main_hidden_states (Optional[Tensor]): Hidden states returned to the main model.
             Defaults to the first chunk of ``hidden_states``.
+        loss_group_lengths (Optional[tuple[int, ...]]): CP-local lengths of independently
+            normalized packed groups. Each group keeps the original/rolled token-count
+            correction it would have in its own call, so combining forwards does not change
+            its MTP gradient. Requires per-token loss, ``packed_seq_params`` and the zigzag
+            CP layout (or CP=1). Each group must consist of whole packed sequences: its
+            CP-local boundaries must be physical sequence boundaries (``cu_seqlens_q_padded``,
+            or ``cu_seqlens_q`` when unpadded) divided by the CP size.
 
     Returns:
         Tensor: Main-model hidden states with the MTP loss attached.
@@ -1309,6 +1317,50 @@ def process_mtp_loss(
             teacher_normalizer = vocab_parallel_log_normalizer(
                 teacher_logits, config.mtp_kd_logit_temperature, tp_group
             )
+
+    original_group_counts = None
+    if loss_group_lengths is not None:
+        if (
+            not loss_group_lengths
+            or any(length < 1 for length in loss_group_lengths)
+            or sum(loss_group_lengths) != loss_mask.shape[-1]
+        ):
+            raise ValueError("MTP loss groups must partition the CP-local packed sequence")
+        if not config.calculate_per_token_loss:
+            raise NotImplementedError(
+                "grouped MTP normalization requires calculate_per_token_loss=True"
+            )
+        # With a contiguous CP layout a rank's share of a group depends on what else is
+        # packed, so the per-rank token counts would differ from a separate call.
+        if (
+            getattr(config, "attention_cp_layout", "zigzag") == "contiguous"
+            and cp_group is not None
+            and cp_group.size() > 1
+        ):
+            raise NotImplementedError(
+                "grouped MTP normalization requires the zigzag CP layout at CP>1"
+            )
+        # Rolls stop at packed-sequence ends; a group boundary inside a sequence (or a
+        # single unpacked sequence) would let labels roll across groups.
+        if packed_seq_params is None:
+            raise ValueError("grouped MTP normalization requires packed_seq_params")
+        cu_seqlens = (
+            packed_seq_params.cu_seqlens_q_padded
+            if packed_seq_params.cu_seqlens_q_padded is not None
+            else packed_seq_params.cu_seqlens_q
+        )
+        sequence_ends = {end // cp_size for end in cu_seqlens.tolist() if end % cp_size == 0}
+        group_end = 0
+        for length in loss_group_lengths[:-1]:
+            group_end += length
+            if group_end not in sequence_ends:
+                raise ValueError(
+                    "MTP loss groups must consist of whole packed sequences: CP-local group "
+                    f"boundary {group_end} is not a sequence boundary"
+                )
+        original_group_counts = tuple(
+            part.sum() for part in loss_mask.split(loss_group_lengths, dim=-1)
+        )
 
     cumulative_mtp_input_mask = None
     rolled_num_tokens = original_num_tokens
@@ -1524,7 +1576,8 @@ def process_mtp_loss(
         ):
             # Preserve the loss as a sum. Gradient finalization divides the accumulated main
             # and MTP gradients once by the global main-loss token count, making the result
-            # invariant to rank and microbatch partitioning.
+            # invariant to rank and microbatch partitioning. Loss groups need no correction
+            # of their own here.
             mtp_loss_normalized = mtp_loss_scale * mtp_loss
         elif config.calculate_per_token_loss:
             # finalize_model_grads divides by the global main-loss token count.
@@ -1532,11 +1585,48 @@ def process_mtp_loss(
             # local counts unchanged for logging, which sums them over DP+CP.
             # This preserves CP partition invariance, not a global MTP-token mean
             # across different DP microbatches with different main/MTP ratios.
-            mtp_loss_normalized = (
-                mtp_loss_scale
-                * mtp_loss
-                * (normalization_original_tokens / safe_normalization_tokens)
-            )
+            if loss_group_lengths is None:
+                mtp_loss_normalized = (
+                    mtp_loss_scale
+                    * mtp_loss
+                    * (normalization_original_tokens / safe_normalization_tokens)
+                )
+            else:
+                assert original_group_counts is not None
+                # Combining forwards must not change each group's main/MTP token ratio,
+                # especially when a loss mask starts at a packed-sequence boundary: use one
+                # ratio per group. Each group's MTP count is num_tokens restricted to that
+                # group, so it includes the cumulative mtp_input_mask when one is given.
+                group_token_counts = torch.stack(
+                    (
+                        torch.stack(original_group_counts),
+                        torch.stack(
+                            [
+                                mask.sum()
+                                for mask in layer_loss_mask.split(loss_group_lengths, dim=-1)
+                            ]
+                        ),
+                    )
+                )
+                if cp_size > 1:
+                    # As for the ungrouped counts above: CP ranks own disjoint parts of the
+                    # same groups, and empty ranks must take part in the collective.
+                    torch.distributed.all_reduce(
+                        group_token_counts, op=torch.distributed.ReduceOp.SUM, group=cp_group
+                    )
+                main_group_tokens, mtp_group_tokens = group_token_counts.unbind()
+                group_token_ratios = main_group_tokens / mtp_group_tokens.clamp(min=1)
+                mtp_loss_normalized = torch.cat(
+                    [
+                        mtp_loss_scale * part * ratio
+                        for part, ratio in zip(
+                            mtp_loss.split(loss_group_lengths, dim=-1),
+                            group_token_ratios,
+                            strict=True,
+                        )
+                    ],
+                    dim=-1,
+                )
         else:
             # The legacy path averages parameter gradients over DP and CP.
             # Compensate the CP average when using a CP-wide denominator.

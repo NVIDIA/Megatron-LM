@@ -9,6 +9,7 @@ import enum
 import logging
 import weakref
 from collections.abc import Callable
+from contextvars import copy_context
 from typing import Any, Optional, TypeVar, Union
 
 import torch
@@ -133,6 +134,28 @@ _DATA_PARALLEL_RNG_TRACKER_NAME = 'data-parallel-rng'
 # registered only when the axis is active (see model_parallel_cuda_manual_seed).
 _GTP_REMAT_RNG_TRACKER_NAME = 'gtp-remat-rng'
 _EXPERT_GTP_REMAT_RNG_TRACKER_NAME = 'egtp-remat-rng'
+
+
+def _capture_forward_context():
+    """Copy the caller's context for recomputation, without the tensor observer.
+
+    Recomputation suspends observations, so the observer is never called there. Keeping it would
+    let an observer that retains graph tensors close a reference cycle through autograd nodes,
+    which the garbage collector cannot break.
+    """
+    from megatron.core.tensor_observation import _ACTIVE_OBSERVER
+
+    context = copy_context()
+    context.run(_ACTIVE_OBSERVER.set, None)
+    return context
+
+
+def _run_recompute_with_observation_suspended(function, *args):
+    """Suppress observations inside the restored forward context, not outside it."""
+    # Tensor-observation suspension is itself a ContextVar. Entering the copied
+    # forward context after suspending would restore its old unsuspended value.
+    with suspend_tensor_observations():
+        return function(*args)
 
 
 def _get_cuda_rng_state(
@@ -718,6 +741,10 @@ class CheckpointFunction(torch.autograd.Function):
         _set_checkpointing()
 
         ctx.run_function = run_function
+        # CUDA autograd can recompute on an engine thread whose Python context
+        # differs from the caller. Preserve forward execution scopes (including
+        # router GEMM row blocks) instead of inheriting that thread's defaults.
+        ctx.forward_context = _capture_forward_context()
         ctx.distribute_saved_activations = distribute_saved_activations
         # Activation recomputation must use the same autocast policy as the original forward.
         # Otherwise it replays under the ambient autocast state.
@@ -776,8 +803,10 @@ class CheckpointFunction(torch.autograd.Function):
                 enabled=ctx.autocast_enabled,
                 cache_enabled=ctx.autocast_cache_enabled,
             )
-            with torch.enable_grad(), autocast_context, suspend_tensor_observations():
-                outputs = ctx.run_function(*detached_inputs)
+            with torch.enable_grad(), autocast_context:
+                outputs = ctx.forward_context.copy().run(
+                    _run_recompute_with_observation_suspended, ctx.run_function, *detached_inputs
+                )
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
@@ -937,6 +966,10 @@ class _RecomputeRegion:
         self._layout = _ArgLayout(args)
         # Taken before the function draws any random number.
         self._rng_states = _get_all_rng_states()
+        # CUDA autograd can rebuild on an engine thread whose Python context differs from the
+        # caller. Preserve forward execution scopes (including router GEMM row blocks) instead of
+        # inheriting that thread's defaults.
+        self._forward_context = _capture_forward_context()
         self._te_context = _TERecomputeContext(use_te_context)
         self._retained_storage_ptrs = (
             frozenset(t.untyped_storage().data_ptr() for t in self._layout.tensors_of(args))
@@ -993,12 +1026,19 @@ class _RecomputeRegion:
         leaves = self._unstash_inputs()
         with _fork_rng():
             _set_all_rng_states(*self._rng_states)
-            with torch.enable_grad(), self._te_context.second_pass(), suspend_tensor_observations():
-                outputs = _as_tuple(self._function(*self._layout.rebuild(leaves)))
+            with torch.enable_grad(), self._te_context.second_pass():
+                outputs = _as_tuple(
+                    self._forward_context.copy().run(
+                        _run_recompute_with_observation_suspended,
+                        self._function,
+                        *self._layout.rebuild(leaves),
+                    )
+                )
 
         self._share_rebuilt_storages(outputs)
         self._rebuilt = (outputs, leaves)
         self._function = self._layout = self._rng_states = self._te_context = None
+        self._forward_context = None
         self._output_aliases = ()
         self.state = _RegionState.REBUILT
 
