@@ -167,6 +167,7 @@ MODEL_ARGS:
 
 # iteration-time is deliberately not compared: it varies ~4% run-to-run against
 # a 5% tolerance, and this is a correctness test, not a perf test.
+  --disable-deterministic-mode: true
 METRICS:
   - lm loss
   - mtp_1 loss

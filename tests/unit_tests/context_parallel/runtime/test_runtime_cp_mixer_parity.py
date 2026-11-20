@@ -60,6 +60,7 @@ def test_runtime_cp_full_mixer_matches_static_cp(variant):
             linear_cp_mode="chunkwise" if chunkwise else "headwise",
             linear_cp_layout="contiguous" if chunkwise else "zigzag",
             dynamic_context_parallel=True,
+            deterministic_mode=False,  # dynamic CP does not support deterministic_mode
             calculate_per_token_loss=True,
             max_seqlen_per_dp_cp_rank=128,
             hidden_dropout=0.0,

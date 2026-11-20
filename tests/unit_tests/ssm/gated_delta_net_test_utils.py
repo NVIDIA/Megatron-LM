@@ -78,6 +78,7 @@ class GatedDeltaNetTestBase:
             sequence_parallel=sp,
             context_parallel_size=cp_size,
             experimental_attention_variant="gdn2" if use_gdn2 else "gated_delta_net",
+            deterministic_mode=False,
             linear_attention_freq=[1],
             transformer_impl="transformer_engine",
         )

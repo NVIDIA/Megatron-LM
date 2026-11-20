@@ -62,6 +62,7 @@ MODEL_ARGS:
   --wandb-entity: adlr
   --wandb-exp-name: ${WANDB_EXPERIMENT}
   --wandb-save-dir: ${WANDB_SAVE_PATH}
+  --disable-deterministic-mode: true
 METRICS:
   - "iteration-time"
   - "lm loss"

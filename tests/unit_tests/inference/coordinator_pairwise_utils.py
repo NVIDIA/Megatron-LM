@@ -301,6 +301,8 @@ async def routed_model(monkeypatch, *, coordinator_options=None, engine_factory=
         transformer_impl="transformer_engine",
         flash_attention_version=FLASH_ATTENTION_VERSION,
         hidden_size=64,
+        # These routed rows do not exercise deterministic mode (on by default in TransformerConfig).
+        deterministic_mode=False,
     )
     settings.update(overrides)
     config = engine_tests.DynamicEngineTestConfig(**settings)

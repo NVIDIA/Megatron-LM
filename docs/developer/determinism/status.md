@@ -9,7 +9,7 @@ orphan: true
 
 ## Deterministic Mode
 
-`--deterministic-mode` (refer to `megatron/training/determinism.py`) does the
+Deterministic mode (refer to `megatron/training/determinism.py`) does the
 following:
 
 - Validates the determinism environment variables and fills canonical defaults

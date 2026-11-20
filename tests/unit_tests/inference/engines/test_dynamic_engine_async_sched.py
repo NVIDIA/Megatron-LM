@@ -805,6 +805,9 @@ _ASYNC_PARALLEL_SCENARIOS = (
             "tensor_model_parallel_size": 2,
             "pipeline_model_parallel_size": 2,
             "sequence_parallel": True,
+            # Deterministic mode (on by default) disables the DP-rank sampling-seed offset
+            # that this scenario exercises.
+            "deterministic_mode": False,
         },
         sampling=({"temperature": 0.8, "top_k": 8},),
         signals=("dp-offset", "parallel", "sampled", "temperature-filter", "top-k-filter"),

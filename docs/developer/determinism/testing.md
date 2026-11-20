@@ -43,7 +43,7 @@ covered by the replay tests of the kernels they call, named in the entry's
 | --- | --- | --- |
 | Kernel | `tests/unit_tests/determinism/kernels/test_*.py` | One kernel family per file. Each kernel is run several times on identical inputs and every output tensor and gradient must be byte-identical (`harness.assert_replays_bit_exact`, `assert_module_replays_bit_exact`; `harness.bytes_equal` compares bit patterns, so signed zeros and NaN payloads must match too). |
 | Module / model | `tests/unit_tests/determinism/correctness/` | GPT, TransformerBlock, HybridModel and FP8/FP4 recipes across parallelism cells (`BitExactRunner`). |
-| End to end | functional tests with `--deterministic-mode` | Loss and `num-zeros` compared against golden values at their recorded precision; legacy goldens use five decimals. |
+| End to end | functional tests with deterministic mode | Loss and `num-zeros` compared against golden values at their recorded precision; legacy goldens use five decimals. |
 
 The manifest (`tests/unit_tests/determinism/kernels/manifest.py`) is the
 registry that ties kernel source files to the tests that cover them. Each

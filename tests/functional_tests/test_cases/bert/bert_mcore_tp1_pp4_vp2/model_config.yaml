@@ -36,7 +36,6 @@ MODEL_ARGS:
   --tensor-model-parallel-size: 1
   --pipeline-model-parallel-size: 4
   --num-layers-per-virtual-pipeline-stage: 2
-  --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true

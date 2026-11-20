@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Bit-exact correctness tests for ``--deterministic-mode``.
+"""Bit-exact correctness tests for deterministic mode.
 
 Two-run comparison + parametrize over preset × parallelism. The package
 import sets the determinism env vars eagerly so cuBLAS / TE / NCCL capture
