@@ -43,12 +43,14 @@ class TestMFSDPv2EPOverlapCudaGraph:
         # Free this test's models now rather than during a later test's memory accounting.
         gc.collect()
 
-    def test_ep_overlap_full_iteration_cuda_graph_matches_default_schedule(self):
+    @pytest.mark.parametrize("retain", [False, True], ids=["baseline", "weight-retention"])
+    def test_ep_overlap_full_iteration_cuda_graph_matches_reference(self, retain):
         """Capture a full iteration driven by the EP-overlap 1F1B schedule.
 
         The overlap schedule bypasses FsdpModule's pre-backward hook, which otherwise joins the
         gradient-reduction stream to the capture before the first reduction allocates on it.
-        Compare against the captured default schedule, which must train identically.
+        Compare the overlap schedule against the default schedule, or retention against
+        the same overlap schedule with retention disabled.
         """
         process_group_collection = self.process_group_collection
         config = TransformerConfig(
@@ -74,7 +76,7 @@ class TestMFSDPv2EPOverlapCudaGraph:
             cuda_graph_impl="full_iteration",
         )
 
-        def build_model_and_optimizer(config: TransformerConfig):
+        def build_model_and_optimizer(config: TransformerConfig, retain: bool):
             # Seed identically so both models start from the same weights.
             torch.manual_seed(123)
             model_parallel_cuda_manual_seed(123, te_rng_tracker=True, force_reset_rng=True)
@@ -95,6 +97,7 @@ class TestMFSDPv2EPOverlapCudaGraph:
                     use_distributed_optimizer=False,
                     data_parallel_sharding_strategy="optim_grads_params",
                     megatron_fsdp_cuda_graph_mode=True,
+                    megatron_fsdp_weight_retention=retain,
                 ),
                 module=model,
                 pg_collection=process_group_collection,
@@ -130,16 +133,19 @@ class TestMFSDPv2EPOverlapCudaGraph:
             for _ in range(4)
         ]
 
-        def train(overlap: bool):
+        def train(overlap: bool, retain_weights: bool = False):
             _reset_full_cuda_graph_state()
             model, optimizer = build_model_and_optimizer(
-                replace(config, overlap_moe_expert_parallel_comm=overlap)
+                replace(config, overlap_moe_expert_parallel_comm=overlap), retain_weights
             )
+            context = model.module.context
+            initial_mask = context.retain_mask
+            compiled_mask = None
             forward_backward_func = FullCudaGraphWrapper(
-                get_forward_backward_func(), cuda_graph_warmup_steps=1
+                get_forward_backward_func(), cuda_graph_warmup_steps=2 if retain else 1
             )
             losses = []
-            for microbatches in steps:
+            for step, microbatches in enumerate(steps):
                 optimizer.zero_grad(set_to_none=False)
                 microbatch_losses = forward_backward_func(
                     forward_step_func=forward_step,
@@ -152,11 +158,19 @@ class TestMFSDPv2EPOverlapCudaGraph:
                 )
                 optimizer.step()
                 losses.append(torch.stack([entry["loss"] for entry in microbatch_losses]))
+                if retain_weights:
+                    if step == 0:
+                        compiled_mask = context.retain_mask
+                        assert compiled_mask is not initial_mask
+                    assert context.retain_mask is compiled_mask
+                    order = context.execution_order_view
+                    assert order is not None and len(order) > 0
+                    assert order.position == 0
             assert FullCudaGraphWrapper.cuda_graph["training"] is not None
             return model, torch.stack(losses)
 
-        reference_model, reference_losses = train(overlap=False)
-        model, losses = train(overlap=True)
+        reference_model, reference_losses = train(overlap=retain)
+        model, losses = train(overlap=True, retain_weights=retain)
 
         torch.testing.assert_close(losses, reference_losses, rtol=0, atol=0)
         for (name, parameter), (_, reference_parameter) in zip(

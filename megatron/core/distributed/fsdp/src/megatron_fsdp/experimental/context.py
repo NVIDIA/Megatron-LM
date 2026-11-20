@@ -15,7 +15,7 @@
 """Shared runtime state for Megatron-FSDP modules."""
 
 import enum
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from weakref import WeakKeyDictionary
 
@@ -109,6 +109,8 @@ class FsdpContext:
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
         self.prefetch_order = runtime_policy.prefetch_order
         self.execution_order = ExecutionOrder()
+        self.retain_mask: Mapping[int, bool] = {}
+        self.prefetch_at: Mapping[int, int] | None = None
         self._execution_order_view: ExecutionOrderView | None = None
         self._prefetch_order_view: ExecutionOrderView | None = None
         self._recording_execution_order = runtime_policy.prefetch_order is PrefetchOrder.RECORDED
@@ -214,10 +216,12 @@ class FsdpContext:
             for root in reversed(list(self._roots)):
                 _collect_backward_order(root, registered_modules, self.execution_order)
 
-        if self.prefetch_order is PrefetchOrder.RECORDED and any(
-            not module._schedule_policy.register_hooks for module in self._module_names
+        if (
+            self.prefetch_order is PrefetchOrder.RECORDED
+            and self.autograd_completes_execution
+            and any(not module._schedule_policy.register_hooks for module in self._module_names)
         ):
-            raise ValueError("Recorded FSDP execution requires ordinary module hooks.")
+            raise ValueError("Recorded execution with custom hooks requires explicit completion.")
 
         self._registered_modules.clear()
         self.parameter_to_owner = None

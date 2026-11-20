@@ -380,9 +380,12 @@ def _ddp_wrap(
             fully_shard_context(
                 FsdpContext(
                     runtime_policy=RuntimePolicy(
-                        prefetch_order=FullyShardedDataParallelV2.prefetch_order_for(config),
+                        prefetch_order=FullyShardedDataParallelV2.prefetch_order_for(
+                            config, ddp_config
+                        ),
                         autograd_completes_execution=not (
-                            config.pipeline_model_parallel_size > 1
+                            ddp_config.megatron_fsdp_weight_retention
+                            or config.pipeline_model_parallel_size > 1
                             or config.virtual_pipeline_model_parallel_size is not None
                         ),
                         use_symmetric_memory=ddp_config.nccl_ub,

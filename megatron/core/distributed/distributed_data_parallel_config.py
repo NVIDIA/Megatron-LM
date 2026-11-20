@@ -113,6 +113,9 @@ class DistributedDataParallelConfig:
     megatron_fsdp_version: int = 1
     """Megatron-FSDP implementation version. Valid values are 1 and 2."""
 
+    megatron_fsdp_weight_retention: bool = False
+    """Reuse MFSDP v2 gathered weights within its standard double-buffer window."""
+
     overlap_outer_communication: bool = False
     """Overlap MFSDP v2's last-microbatch outer-DP gradient reduction with inner-DP
     reductions on a separate CUDA stream."""
@@ -401,6 +404,9 @@ class DistributedDataParallelConfig:
                 )
         if self.megatron_fsdp_version not in (1, 2):
             raise ValueError("megatron_fsdp_version must be either 1 or 2")
+        if self.megatron_fsdp_weight_retention:
+            if not self.use_megatron_fsdp or self.megatron_fsdp_version != 2:
+                raise ValueError("Weight retention requires Megatron-FSDP v2.")
         if self.overlap_outer_communication:
             if not self.use_megatron_fsdp:
                 raise ValueError("overlap_outer_communication requires Megatron-FSDP.")
