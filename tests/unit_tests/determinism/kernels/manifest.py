@@ -667,17 +667,20 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/optimizer/clip_grads.py",
             "megatron/core/optimizer/__init__.py",
             "megatron/core/optimizer/optimizer.py",
+            "megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py",
             "megatron/training/utils/common_utils.py",
         ),
         tests=(
             K + "test_optimizer_kernels.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
             "tests/unit_tests/distributed/test_parameter_domains.py",
+            "tests/unit_tests/distributed/mfsdp_v2/test_mcore_muon.py",
         ),
         kind="external-lib",
         notes="multi_tensor l2norm / scale (TE, apex or local fallback) and fused Adam; "
         "optimizer.py (gradient unscaling) and training/utils/common_utils.py (param / grad norm "
         "logging) launch the same multi_tensor kernels through multi_tensor_applier. "
+        "Hybrid CPU/GPU Adam replay also covers overlapped parameter and gradient copies. "
         "test_parameter_domains trains a table of an extra parameter domain through its own "
         "distributed optimizer bit for bit against the same table held as a dense parameter, and "
         "checks the params norm over domains against the dense reference.",
