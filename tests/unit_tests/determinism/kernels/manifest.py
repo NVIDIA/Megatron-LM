@@ -514,6 +514,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="triton_autotune_policy",
         sources=(
+            "megatron/core/tuning/cutile.py",
             "megatron/core/tuning/interception.py",
             "megatron/core/tuning/policy.py",
             "megatron/core/tuning/selection.py",
@@ -524,7 +525,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Bit-exact reduction replay through the Autotuner adapter using min-cost and "
         "JSON-table choices; every candidate of each config-invariant kernel must give "
         "bit-identical outputs; SSM replay runs the real SSM autotuners through runtime "
-        "pinning, with autotune caching on and off.",
+        "pinning, with autotune caching on and off; the cuDNN frontend's cuTile GDN engine "
+        "replays from cold launch caches with its timed picks recorded, merged and pinned.",
     ),
     KernelEntry(
         name="triton_block_pointer_compat",

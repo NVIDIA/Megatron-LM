@@ -199,3 +199,109 @@ def test_config_invariant_kernels_are_invariant(monkeypatch):
     assert not varying, "config-invariant kernels whose output depends on the config:\n" + (
         "\n".join(f"  {name}: {detail}" for name, detail in sorted(varying.items()))
     )
+
+
+def test_cutile_gdn_pinned_pick_replays(isolated_policy, monkeypatch, tmp_path):
+    """cudnn-frontend's cuTile GDN engine under the policy: a record run captures the timed
+    launch picks, the merged table pins them, and the pinned op replays bit-exactly from cold
+    launch caches. The cuTile plan is forced through ``plan_name``; on SM100 the default
+    engine is FROST, which has no launch autotune."""
+    la_ops = pytest.importorskip("cudnn.linear_attention.ops")
+    common = pytest.importorskip("cudnn.linear_attention.cutile.kernels.common")
+    if not all(hasattr(common, name) for name in ("select_hints", "record_hint")):
+        pytest.skip("cudnn-frontend without the cuTile autotune hooks (NVIDIA/cudnn-frontend#1735)")
+    for name in ("select_hints", "record_hint"):
+        monkeypatch.setattr(common, name, None)
+    from megatron.core.tuning import table
+
+    seeded()
+    T, H, K, V = 2048, 16, 128, 128
+    q, k, v = (
+        torch.randn(T, H, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        for d in (K, K, V)
+    )
+    g = (-torch.nn.functional.softplus(torch.randn(T, H, device="cuda"))).requires_grad_(True)
+    beta = torch.rand(T, H, device="cuda").requires_grad_(True)
+    cu_seqlens = torch.tensor([0, T], device="cuda", dtype=torch.int32)
+
+    def gdn(q, k, v, g, beta):
+        common.launch_hint_cache.clear()  # every call tunes, or is handed the pinned pick
+        return la_ops.gated_delta_net(
+            q, k, v, g, beta, cu_seqlens, output_final_state=True, plan_name="gdn_cutile"
+        )
+
+    interception.install(AutotunePolicy(mode="record", record_path=str(tmp_path / "rec")))
+    o, state = gdn(q, k, v, g, beta)
+    (o.float().sum() + state.float().sum()).backward()
+    torch.cuda.synchronize()
+    recorded = {
+        kernel
+        for kernels in interception._tune_records.values()
+        for kernel in kernels
+        if kernel.startswith("cudnn.linear_attention.cutile.")
+    }
+    assert recorded, "the record run captured no cuTile launch pick"
+    interception._dump_records()
+    merged = table.merge_records([tmp_path / "rec.rank0.json"])
+    (arch,) = merged
+    table.write(arch, merged[arch], tmp_path / "tables" / f"{arch}.json")
+
+    interception.install(
+        AutotunePolicy(mode="pinned", table_path=(str(tmp_path / "tables"),), on_miss="error")
+    )
+    assert_replays_bit_exact(
+        gdn, (q, k, v, g, beta), replays=3, what="cuTile GDN pinned from table"
+    )
+    pinned = {
+        entry
+        for entry, value in interception.choice_log().items()
+        if "cudnn.linear_attention.cutile." in entry and value.endswith(";pinned")
+    }
+    assert {entry.split("|")[1] for entry in pinned} == recorded
+
+
+def test_cutile_packaged_table_pins_gdn_and_kda(isolated_policy, monkeypatch):
+    """The packaged table pins every cuTile GDN and KDA launch on this architecture with no user table:
+    ``on_miss="error"`` would raise on the first miss."""
+    la_ops = pytest.importorskip("cudnn.linear_attention.ops")
+    common = pytest.importorskip("cudnn.linear_attention.cutile.kernels.common")
+    if not all(hasattr(common, name) for name in ("select_hints", "record_hint")):
+        pytest.skip("cudnn-frontend without the cuTile autotune hooks (NVIDIA/cudnn-frontend#1735)")
+    from megatron.core.tuning import selection
+
+    if selection.arch_tag() != "sm103":
+        pytest.skip("packaged cuTile entries exist for sm103 only")
+    for name in ("select_hints", "record_hint"):
+        monkeypatch.setattr(common, name, None)
+    interception.install(AutotunePolicy(mode="pinned", on_miss="error"))
+    seeded()
+    T, H, K, V = 2048, 16, 128, 128
+    cu_seqlens = torch.tensor([0, T], device="cuda", dtype=torch.int32)
+
+    def leaves(gate_shape, beta_shape):
+        q, k, v = (
+            torch.randn(T, H, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            for d in (K, K, V)
+        )
+        g = (-torch.nn.functional.softplus(torch.randn(*gate_shape, device="cuda"))).requires_grad_(
+            True
+        )
+        beta = torch.rand(*beta_shape, device="cuda").requires_grad_(True)
+        return q, k, v, g, beta
+
+    for name, op, shapes in (
+        ("gdn_cutile", la_ops.gated_delta_net, ((T, H), (T, H))),
+        ("kda_cutile", la_ops.kimi_delta_attention, ((T, H, K), (T, H))),
+    ):
+        common.launch_hint_cache.clear()
+        q, k, v, g, beta = leaves(*shapes)
+        o, state = op(q, k, v, g, beta, cu_seqlens, output_final_state=True, plan_name=name)
+        (o.float().sum() + state.float().sum()).backward()
+        torch.cuda.synchronize()
+    pinned = {
+        entry.split("|")[1]
+        for entry, value in interception.choice_log().items()
+        if "cudnn.linear_attention.cutile." in entry and value.endswith(";pinned")
+    }
+    assert pinned, "no cuTile launch was pinned from the packaged table"
+    assert all(".kernels.gdn." in k or ".kernels.kda." in k for k in pinned), pinned

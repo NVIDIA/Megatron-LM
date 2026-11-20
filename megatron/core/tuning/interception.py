@@ -19,7 +19,7 @@ from functools import wraps
 from weakref import WeakKeyDictionary, WeakSet
 
 from megatron.core._rank_utils import log_single_rank, safe_get_rank
-from megatron.core.tuning import selection
+from megatron.core.tuning import cutile, selection
 from megatron.core.tuning import table as table_mod
 from megatron.core.tuning.policy import AutotunePolicy, coerce_policy
 
@@ -73,25 +73,31 @@ def _enumerate(qualified: str, count: int, state: str) -> None:
     logger.warning("[autotune] %-8s %s (%d configs)", state, qualified, count)
 
 
-def _record_choice(arch: str, qualified: str, key: str, config, pinned: bool) -> None:
+def _log_choice(arch: str, qualified: str, key: str, signature: str, pinned: bool) -> None:
     entry = f"{arch}|{qualified}|{key}"
-    value = f"{selection.config_signature(config)};{'pinned' if pinned else 'timed'}"
+    value = f"{signature};{'pinned' if pinned else 'timed'}"
     if _choice_log.get(entry) != value:
         _choice_log[entry] = value
         _unverified[entry] = value
 
 
-def _record_winner(arch: str, qualified: str, key: str, config) -> None:
+def _record_choice(arch: str, qualified: str, key: str, config, pinned: bool) -> None:
+    _log_choice(arch, qualified, key, selection.config_signature(config), pinned)
+
+
+def _note_winner(arch: str, qualified: str, key: str, data: dict) -> None:
     global _record_rank
-    if config is None:
-        return
     if _record_rank is None:
         # Resolve the rank while the process group is alive; the capture is written
         # at exit, possibly after the group has been destroyed.
         _record_rank = safe_get_rank()
-    _tune_records.setdefault(arch, {}).setdefault(qualified, {})[key] = selection.config_data(
-        config
-    )
+    _tune_records.setdefault(arch, {}).setdefault(qualified, {})[key] = data
+
+
+def _record_winner(arch: str, qualified: str, key: str, config) -> None:
+    if config is None:
+        return
+    _note_winner(arch, qualified, key, selection.config_data(config))
 
 
 def _record_file(record_path: str, rank: int) -> str:
@@ -276,6 +282,9 @@ def _install(policy: AutotunePolicy) -> None:
         _policy = policy
         _reset_runtime_state()
         selection.warn_if_mamba_env_ignored(policy)
+    # cudnn-frontend's cuTile launches have hooks rather than a class to patch, so they
+    # follow every (re)installation, with or without Triton.
+    cutile.apply(policy)
 
     if autotuner_class is None:
         return

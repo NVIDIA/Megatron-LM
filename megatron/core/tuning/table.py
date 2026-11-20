@@ -51,7 +51,7 @@ def _package_versions() -> dict:
     from importlib import metadata
 
     out = {}
-    for name in ("mamba-ssm", "transformer-engine", "triton"):
+    for name in ("mamba-ssm", "transformer-engine", "triton", "nvidia-cudnn-frontend"):
         try:
             out[name] = metadata.version(name)
         except metadata.PackageNotFoundError:

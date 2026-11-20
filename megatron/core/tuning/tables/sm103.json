@@ -159,6 +159,78 @@
     "num_warps": 4
    }
   },
+  "cudnn.linear_attention.cutile.kernels.gdn.chunk_bwd_kernel_dqkwg": {
+   "*": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   }
+  },
+  "cudnn.linear_attention.cutile.kernels.gdn.chunk_bwd_kernel_dv_local": {
+   "*": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   }
+  },
+  "cudnn.linear_attention.cutile.kernels.gdn.chunk_fwd_kernel_o": {
+   "*": {
+    "num_worker_warps": 8,
+    "occupancy": 4
+   }
+  },
+  "cudnn.linear_attention.cutile.kernels.gdn.chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64": {
+   "*": {
+    "num_worker_warps": 8,
+    "occupancy": 1
+   }
+  },
+  "cudnn.linear_attention.cutile.kernels.gdn.chunk_gated_delta_rule_fwd_kernel_h_blockdim64": {
+   "*": {
+    "num_worker_warps": 8,
+    "occupancy": 1
+   }
+  },
+  "cudnn.linear_attention.cutile.kernels.gdn.chunk_gated_delta_rule_fwd_kkt_solve_kernel": {
+   "*": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   }
+  },
+  "cudnn.linear_attention.cutile.kernels.gdn.prepare_wy_repr_bwd_kernel": {
+   "*": {
+    "num_worker_warps": 8,
+    "occupancy": 4
+   }
+  },
+  "cudnn.linear_attention.cutile.kernels.gdn.recompute_w_u_fwd_kernel": {
+   "*": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   }
+  },
+  "cudnn.linear_attention.cutile.kernels.kda.chunk_gla_fwd_kernel_o": {
+   "*": {
+    "num_worker_warps": 4,
+    "occupancy": 2
+   }
+  },
+  "cudnn.linear_attention.cutile.kernels.kda.chunk_kda_fwd_kernel_inter_diag_compute_solve": {
+   "*": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   }
+  },
+  "cudnn.linear_attention.cutile.kernels.kda.chunk_kda_fwd_kernel_inter_solve_fused": {
+   "*": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   }
+  },
+  "cudnn.linear_attention.cutile.kernels.kda.recompute_w_u_fwd_kda_kernel": {
+   "*": {
+    "num_worker_warps": 4,
+    "occupancy": 8
+   }
+  },
   "megatron.core.fusions.fused_mhc_kernels._triton_h_agg_fwd_kernel": {
    "*": {
     "kwargs": {
@@ -532,6 +604,6 @@
   }
  },
  "packages": {},
- "source": "mamba_ssm kernels: nemotron_3_ultra 96-GPU recording, majority vote over ranks; megatron.core MLA RoPE and mHC kernels: two sweeps timing every candidate at 2k, 8k and 32k tokens, smallest worst-case slowdown",
+ "source": "mamba_ssm kernels: nemotron_3_ultra 96-GPU recording, majority vote over ranks; megatron.core MLA RoPE and mHC kernels: two sweeps timing every candidate at 2k, 8k and 32k tokens, smallest worst-case slowdown; cudnn-frontend cuTile GDN/KDA launch hints: GB300 record sweep (cudnn-frontend#1735 hooks) over 8 shapes (T 512..8192, B 1..4, H 16/32, ragged, head dim 64/128) x bf16/fp16 x 3 repeats, per-kernel majority vote written as a wildcard entry",
  "triton": ""
 }

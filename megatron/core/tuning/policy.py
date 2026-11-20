@@ -24,7 +24,7 @@ import torch
 
 _deterministic_override = None
 
-DEFAULT_MODULES = ("mamba_ssm", "transformer_engine", "megatron.core")
+DEFAULT_MODULES = ("mamba_ssm", "transformer_engine", "megatron.core", "cudnn")
 
 # Kernels whose outputs do not depend on the launch configuration, so a timed choice
 # cannot change results and pinning would only cost throughput. Only pure data movement
