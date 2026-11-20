@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Recurrent-state and real-inner-MTP complements to the dense BI campaign."""
 
+from copy import copy
 from functools import partial
 
 import pytest
@@ -189,6 +190,15 @@ def _build_model_engine(case, backend, version, *, mamba, engines, patch):
     return engine
 
 
+def _take_evidence(engine):
+    """Return what the finished run recorded and empty the record for the next run."""
+    evidence = engine._bi_model_evidence
+    taken = {key: copy(value) for key, value in evidence.items()}
+    for value in evidence.values():
+        value.clear()
+    return taken
+
+
 def _assert_same_mtp(reference, actual, depth):
     expected = {key: logits for key, _, _, logits in reference["mtp"]}
     compared = {d: 0 for d in range(depth)}
@@ -265,18 +275,18 @@ def test_mtp_dynamic_batch_invariance(depth, graph_mode):
         sampling={"num_tokens_to_generate": 10},
         prompt_length=401 if graph_mode == "mixed" else 17,
     )
-    engines = []
     with bi.invariant_runtime(case) as (backend, version), pytest.MonkeyPatch.context() as patch:
         patch.setattr(
-            bi,
-            "build_engine",
-            partial(_build_model_engine, mamba=False, engines=engines, patch=patch),
+            bi, "build_engine", partial(_build_model_engine, mamba=False, engines=[], patch=patch)
         )
-        reference = bi.run_order(case, backend, version, "solo")
-        actual = bi.run_order(case, backend, version, "staggered")
+        # The orders differ only in their requests, so both run on one engine.
+        engine = bi.new_engine(case, backend, version)
+        reference = bi.run_order(case, backend, version, "solo", engine=engine)
+        expected = _take_evidence(engine)
+        actual = bi.run_order(case, backend, version, "staggered", engine=engine)
         bi.assert_same_target(reference, actual)
-        evidence = engines[1]._bi_model_evidence
-        compared, mtp_shapes = _assert_same_mtp(engines[0]._bi_model_evidence, evidence, depth)
+        evidence = engine._bi_model_evidence
+        compared, mtp_shapes = _assert_same_mtp(expected, evidence, depth)
         print("BI_MTP_LOGIT_WITNESS", depth, graph_mode, compared, mtp_shapes)
         if graph_mode == "eager":
             assert evidence["inner_calls"] == set(range(depth)), "missing actual target MTP depth"
