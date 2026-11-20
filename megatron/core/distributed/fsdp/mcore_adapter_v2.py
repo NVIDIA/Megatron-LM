@@ -284,11 +284,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # Execution also ends at that boundary, even for a single pipeline stage.
         active_context = current_fully_shard_context()
         prefetch_order = self.prefetch_order_for(config)
-        if config.mtp_use_repeated_layer and config.overlap_moe_expert_parallel_comm:
-            raise ValueError(
-                "Shared MTP requires recorded FSDP execution order and ordinary module hooks "
-                "rather than combined 1F1B."
-            )
         if active_context is None:
             construction_context = fully_shard_context(
                 FsdpContext(
