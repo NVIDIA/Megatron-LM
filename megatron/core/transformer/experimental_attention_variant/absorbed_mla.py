@@ -1332,13 +1332,21 @@ class AbsorbedMLASelfAttention(Attention):
             self.qkv_up_checkpoint = None
 
         # Convert the attention output back to the caller's CP layout (the inverse of the
-        # latent conversion in get_query_key_value_tensors). Doing it here -- before the output
-        # gate and linear_proj -- keeps the gate (which reads the caller-layout hidden_states)
-        # and the residual add in the caller's native layout without a second hidden-width
-        # conversion. core_attn_out is TP-gathered (full over the TP sequence dim) at this
-        # point, so it rides the CP-only route. Placed after the up-proj recompute registration
-        # so the recomputed (zigzag) core_attn_out matches the registered trigger.
-        if source_cp_partition_mode is not None and source_cp_partition_mode != "zigzag":
+        # latent conversion in get_query_key_value_tensors).
+        # - With an output gate, convert here -- before the gate and linear_proj -- so the gate
+        #   (which reads the caller-layout hidden_states) and the residual add stay in the
+        #   caller's layout without a second hidden-width conversion. core_attn_out is
+        #   TP-gathered (full over the TP sequence dim) at this point, so it rides the CP-only
+        #   route. Placed after the up-proj recompute registration so the recomputed (zigzag)
+        #   core_attn_out matches the registered trigger.
+        # - Without one, convert linear_proj's output instead. linear_proj acts row by row, so it
+        #   commutes with the row permutation, and its output is hidden-width rather than
+        #   heads * v_head_dim wide: GLM-5.3-Flash moves a quarter of the bytes.
+        convert_back = (
+            source_cp_partition_mode is not None and source_cp_partition_mode != "zigzag"
+        )
+        convert_after_proj = convert_back and self.linear_gate is None
+        if convert_back and not convert_after_proj:
             core_attn_out = CpPartitionModeConverter(
                 cp_group=self.pg_collection.cp,
                 packed_seq_params=packed_seq_params,
@@ -1362,6 +1370,24 @@ class AbsorbedMLASelfAttention(Attention):
         # =================
         with self._mla_projection_context():
             output, bias = self.linear_proj(core_attn_out)
+
+        if convert_after_proj:
+            # linear_proj's output has hidden_states' distribution (sequence-parallel scattered
+            # when SP is on), so it takes the same route as the hidden-state conversion above.
+            output = CpPartitionModeConverter(
+                cp_group=self.pg_collection.cp,
+                packed_seq_params=packed_seq_params,
+                source_partition_mode="zigzag",
+                target_partition_mode=source_cp_partition_mode,
+                config=self.config,
+                tp_group=self.pg_collection.tp,
+                tp_cp_group=resolve_tp_cp_group(
+                    getattr(self.pg_collection, "tp_cp", None),
+                    packed_seq_params,
+                    sequence_parallel=self.config.sequence_parallel,
+                    tp_group=self.pg_collection.tp,
+                ),
+            ).convert(output, seq_dim=0, sequence_parallel=self.config.sequence_parallel)
 
         self.pg_collection.cp = _orig_cp_group
         return output, bias
