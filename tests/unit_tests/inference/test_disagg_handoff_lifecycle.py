@@ -2142,13 +2142,17 @@ def test_idle_prefill_without_expert_parallelism_skips_dummy_forward(handoff_loo
 def test_idle_expert_parallel_rank_keeps_amortized_consensus_dummy_forward(handoff_loop):
     """EP>1 ranks still reuse consensus within the interval and join busy peers."""
     dummy_forward = mock.Mock()
+    # The busy peer runs the model; this rank only attempts to admit its waiting prompt.
     engine = _CoordinatorLoopPrefillEngine(
-        ep_world_size=2, peer_work=1, iterations=4, dummy_forward=dummy_forward
+        ep_world_size=2,
+        peer_work=DynamicInferenceEngine._EP_MODEL_WORK,
+        iterations=4,
+        dummy_forward=dummy_forward,
     )
 
     _run_coordinator_loop(engine, handoff_loop)
 
-    assert engine.all_reduce_inputs == [1]
+    assert engine.all_reduce_inputs == [DynamicInferenceEngine._EP_ADMISSION_ATTEMPT]
     assert engine.step_calls == 1
     assert dummy_forward.call_count == 3
     assert engine.context.step_count == 3

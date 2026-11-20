@@ -125,6 +125,41 @@ class EngineLoopMixin:
         EngineState.STOPPED,
     )
 
+    # Work levels a rank reports to EP consensus, which takes their maximum.
+    _EP_NO_WORK = 0
+    # Only an attempt to admit waiting requests, which may admit nothing.
+    _EP_ADMISSION_ATTEMPT = 1
+    # Work that runs the model.
+    _EP_MODEL_WORK = 2
+
+    # Whether the last step ran the model; a step that admits nothing does not.
+    _last_step_ran_model = True
+    # Whether a step admitted no waiting request since the loop last idled.
+    _waiting_queue_stalled = False
+
+    def _should_attempt_admission(self) -> bool:
+        """Return whether the run loops should step to admit waiting requests.
+
+        Waiting requests can be blocked while nothing runs, for example on a
+        recurrent-state slot that a pending KV handoff holds. A step then admits
+        nothing and returns without awaiting, so stepping again at once would spin
+        and starve the event loop. After such a step the queue is stalled: it does
+        not count as work until the loop next idles, after which the scheduler,
+        which alone decides admission, tries again.
+        """
+        return bool(self.waiting_request_ids) and not self._waiting_queue_stalled
+
+    def _note_admission_outcome(self) -> None:
+        """Mark the waiting queue stalled if a step ran no model yet left requests waiting.
+
+        A step that runs no model for another reason, such as releasing a failed KV
+        import, leaves an empty queue unstalled, so a request that arrives next is
+        tried at once.
+        """
+        self._waiting_queue_stalled = not self._last_step_ran_model and bool(
+            self.waiting_request_ids
+        )
+
     async def wait_until(self, state: EngineState):
         """Wait until the engine reaches the given state.
 
@@ -227,6 +262,9 @@ class EngineLoopMixin:
             await self.controller.async_generate_output_tokens_dynamic_batch(**controller_kwargs)
         )
         self.decode_only = controller_result.decode_only
+        self._last_step_ran_model = (
+            controller_result.output is not None or controller_result.primer_only
+        )
         pre_step_context_state["decode_only"] = self.decode_only
         result = controller_result.output
         if result is not None:
@@ -696,18 +734,41 @@ class EngineLoopMixin:
                 self._poll_pending_kv_pushes()
                 if (
                     self.context.get_active_request_count() > 0
-                    or self.waiting_request_ids
+                    or self._should_attempt_admission()
                     or self.has_admittable_kv_import
                 ):
                     await self.async_step()
+                    self._note_admission_outcome()
                 else:
                     # Reached when there is no model work to step but a handoff transfer is
-                    # still pending. Handles expose polling rather than an async completion
-                    # callback, so yield briefly to avoid busy-spinning while keeping decode
-                    # admission responsive when the transfer completes.
+                    # still pending, or the last step admitted no waiting request. Handles
+                    # expose polling rather than an async completion callback, so yield
+                    # briefly to avoid busy-spinning while keeping admission responsive
+                    # when the transfer completes or blocked capacity is released.
                     await asyncio.sleep(0.001)
+                    self._waiting_queue_stalled = False
         except asyncio.CancelledError:
             pass
+
+    async def _ep_dummy_forward(self, *, advance_clocks: bool = True) -> None:
+        """Run a dummy forward to participate in the EP collective, then yield.
+
+        Args:
+            advance_clocks: Whether this forward is the pass's step. False when a
+                step that ran no model already advanced the step and LRU clocks.
+        """
+        self.step_start_event.record()
+        nvtx_range_push("EP-dummy-forward")
+        self.controller.dummy_forward()
+        self.step_end_event.record()
+        self.step_end_event.synchronize()
+        nvtx_range_pop("EP-dummy-forward")
+        if advance_clocks:
+            self.context.step_count += 1
+            self.context.prefix_cache_lru_clock += 1
+        # The dummy forward awaits nothing, and while peers have work the loop
+        # reaches no other await between consensus refreshes: let other tasks run.
+        await asyncio.sleep(0)
 
     @trace_async_exceptions
     async def run_engine_with_coordinator(
@@ -730,18 +791,22 @@ class EngineLoopMixin:
                 self.schedule_requests()
 
                 if self.state in (EngineState.RUNNING, EngineState.PAUSING):
-                    local_schedulable = (
-                        self.context.get_active_request_count()
-                        + len(self.waiting_request_ids)
-                        + int(self.has_admittable_kv_import)
+                    has_model_work = (
+                        self.context.get_active_request_count() > 0 or self.has_admittable_kv_import
                     )
+                    if has_model_work:
+                        local_work = self._EP_MODEL_WORK
+                    elif self._should_attempt_admission():
+                        local_work = self._EP_ADMISSION_ATTEMPT
+                    else:
+                        local_work = self._EP_NO_WORK
                     local_pending_transfers = (
                         self.pending_kv_import_count + self.pending_kv_push_count
                     )
                     global_work_from_last_consensus, _ = self._last_ep_consensus
                     if (
                         self.tp_ep_world_size == 1
-                        or global_work_from_last_consensus == 0
+                        or global_work_from_last_consensus < self._EP_MODEL_WORK
                         or self._ep_consensus_loop_counter % self.ep_consensus_interval == 0
                     ):
                         # selectively enter ep_establish_consensus if
@@ -750,14 +815,16 @@ class EngineLoopMixin:
                         #    with no collective to join. Such a dummy forward would also need a
                         #    request-owned recurrent-state slot (the dedicated dummy slot is only
                         #    reserved when tp_ep > 1), which pending handoffs may all be holding.
-                        # 1. there is no global work -> engine is idle. At any step in the future
-                        #    one of the ranks can receive work. So we should be eagerly checking for that
+                        # 1. there is no global model work -> engine is idle, or ranks only
+                        #    attempt admission, which may admit nothing anywhere. At any step in
+                        #    the future one of the ranks can receive work, or every attempt may
+                        #    stall. So we should be eagerly checking for that
                         # 2. it has been 20 steps since we last established consensus, and that consensus
-                        #    had some work.
+                        #    had some model work.
                         # In the worst case, this delays pausing by 20 steps which is around
                         # 200-400 milliseconds.
                         self._last_ep_consensus = await self._ep_establish_consensus(
-                            local_schedulable, signal_consensus=(self.state == EngineState.PAUSING)
+                            local_work, signal_consensus=(self.state == EngineState.PAUSING)
                         )
                     global_work, all_pausing = self._last_ep_consensus
                     self._ep_consensus_loop_counter += 1
@@ -767,24 +834,41 @@ class EngineLoopMixin:
                         await self._world_barrier()
                         self.state = EngineState.PAUSED
                         self._state_events[EngineState.PAUSED].set()
-                    elif global_work > 0:
-                        # At least one EP peer has work: all must participate.
-                        if local_schedulable > 0:
+                    elif global_work > self._EP_NO_WORK:
+                        # At least one EP peer has work: all must participate. A stalled
+                        # queue retries while peers run the model, since this rank joins
+                        # their collective either way.
+                        if has_model_work or (
+                            self.waiting_request_ids
+                            and (
+                                not self._waiting_queue_stalled
+                                or global_work == self._EP_MODEL_WORK
+                            )
+                        ):
                             await self.async_step()
+                            self._note_admission_outcome()
+                            if not self._last_step_ran_model and self.tp_ep_world_size > 1:
+                                # The step ran no model and joined no EP collective,
+                                # but a peer with work may be in one now: join it before
+                                # the next pass, which may block in the consensus all-reduce.
+                                # The step already advanced this pass's clocks.
+                                await self._ep_dummy_forward(advance_clocks=False)
                         else:
-                            # Dummy forward to participate in the EP collective.
-                            self.step_start_event.record()
-                            nvtx_range_push("EP-dummy-forward")
-                            self.controller.dummy_forward()
-                            self.step_end_event.record()
-                            self.step_end_event.synchronize()
-                            nvtx_range_pop("EP-dummy-forward")
-                            self.context.step_count += 1
-                            self.context.prefix_cache_lru_clock += 1
+                            await self._ep_dummy_forward()
                     else:
-                        # No work, but not all pausing means the engine has drained.
-                        self._collect_gc_while_idle(drained=True)
-                        await asyncio.sleep(0.001 if local_pending_transfers > 0 else 0.02)
+                        # No work, but not all pausing. The engine has drained unless a step
+                        # admitted no waiting request; the next pass then retries admission.
+                        # Without EP peers a retry only runs the scheduler, so poll as often
+                        # as for a pending transfer, since a release may free capacity any
+                        # time. With peers each retry runs a dummy forward on every rank.
+                        self._collect_gc_while_idle(drained=not self.waiting_request_ids)
+                        await asyncio.sleep(
+                            0.001
+                            if local_pending_transfers > 0
+                            or (self.waiting_request_ids and self.tp_ep_world_size == 1)
+                            else 0.02
+                        )
+                        self._waiting_queue_stalled = False
 
                 elif self.state == EngineState.PAUSED:
                     # Paused requests still hold state, so this should not count as the first drain.
@@ -800,6 +884,9 @@ class EngineLoopMixin:
                     # without this reset the next RUNNING iteration would skip
                     # consensus, read the stale flag, and immediately re-pause.
                     self._last_ep_consensus = (0, False)
+                    # A pause or suspend may have released what blocked the waiting
+                    # queue, so the first RUNNING pass tries admission again.
+                    self._waiting_queue_stalled = False
 
                 elif self.state == EngineState.SUSPENDING:
                     await self._world_barrier()
