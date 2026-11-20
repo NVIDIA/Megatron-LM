@@ -2,12 +2,13 @@
 
 """Strategies using PyTorch distributed.checkpoint as an underlying format."""
 
+import dataclasses
 import inspect
 import io
 import os
 import pickle
 import warnings
-from collections import defaultdict
+from collections import ChainMap, defaultdict
 from contextlib import contextmanager
 from itertools import product
 from logging import getLogger
@@ -37,6 +38,7 @@ from torch.distributed.checkpoint import (
 )
 from torch.distributed.checkpoint._nested_dict import FLATTEN_MAPPING, unflatten_state_dict
 from torch.distributed.checkpoint._traverse import OBJ_PATH, traverse_state_dict
+from torch.distributed.checkpoint.default_planner import create_default_global_save_plan
 from torch.distributed.checkpoint.metadata import Metadata
 from torch.distributed.checkpoint.planner import WriteItemType
 from torch.distributed.checkpoint.planner_helpers import _create_write_items
@@ -52,6 +54,7 @@ from ..mapping import (
     is_main_replica,
 )
 from .checkpointable import CheckpointableShardedTensor, LocalShardsContainer
+from .global_plan_validation import validate_global_plan
 from .nvrx import has_nvrx_async_support, make_nvrx_async_request
 
 if TYPE_CHECKING:
@@ -496,6 +499,48 @@ class MCoreSavePlanner(DefaultSavePlanner):
         ):
             object = object.dequantize()
         return object
+
+    def _create_global_plan(self, all_plans: List[SavePlan]) -> Tuple[List[SavePlan], Metadata]:
+        """Merge the gathered local plans into the global plan and metadata.
+
+        Same steps as ``DefaultSavePlanner._create_global_plan`` (deduplicate, build the global
+        plan and metadata, validate), with torch's ``_validate_global_plan`` replaced by
+        :func:`validate_global_plan`. torch validates chunk overlap with a sweep along the
+        largest tensor dimension, which for Megatron's expert-axis-sharded MoE weights keeps
+        thousands of chunks active and degenerates to O(n^2) per key. The replacement
+        derives the algorithm from the chunk layout and is linear for Megatron's grids while
+        giving the same verdict; see ``global_plan_validation.py``.
+
+        Args:
+            all_plans: local plans of every rank in the planning group.
+
+        Returns:
+            The global plan and the checkpoint metadata, as the base planner does.
+        """
+        # TorchDistSaveShardedStrategy already dedups plans, so dedup here is a NOP.
+        deduped_plans = all_plans
+        global_plan, metadata = create_default_global_save_plan(deduped_plans)
+        if self.flatten_state_dict:
+            planner_data_dict = [p.planner_data for p in global_plan]
+            merged_mappings = dict(ChainMap(*planner_data_dict))
+            metadata = dataclasses.replace(metadata, planner_data=merged_mappings)
+        validation_errors = validate_global_plan(global_plan, metadata)
+        if validation_errors:
+            error_summary = "; ".join(validation_errors)
+            if len(error_summary) > 500:
+                error_summary = error_summary[:500] + "... (truncated)"
+            raise ValueError(f"Failed to validate global plan: {error_summary}")
+        return global_plan, metadata
+
+    if not hasattr(DefaultSavePlanner, '_create_global_plan'):
+        # torch < 2.7 builds the global plan inside create_global_plan itself; route it through
+        # the override above so the layout-aware validation applies there too.
+        def create_global_plan(self, all_plans: List[SavePlan]) -> Tuple[List[SavePlan], Metadata]:
+            """Create the global plan (torch < 2.7 entry point)."""
+            global_plan, metadata = self._create_global_plan(all_plans)
+            self.global_plan = global_plan
+            self.metadata = metadata
+            return global_plan, metadata
 
 
 class MCoreLoadPlanner(DefaultLoadPlanner):

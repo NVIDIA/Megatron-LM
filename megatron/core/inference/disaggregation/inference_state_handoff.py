@@ -298,8 +298,9 @@ class InferenceStateHandoffMixin:
         if self.context.is_hybrid_model:
             if role == "decode" and self.context.mamba_slot_allocator is not None:
                 raise RuntimeError(
-                    "A hybrid decode handoff writes directly into live SSM state; "
-                    "do not configure prefix_caching_mamba_gb on the decode engine"
+                    "A hybrid decode handoff writes directly into live SSM state, but "
+                    "this context allocated a Mamba prefix cache; build it with "
+                    "InferenceConfig.disaggregation_role='decode'"
                 )
         if self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST:
             raise ValueError(

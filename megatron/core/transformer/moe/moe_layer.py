@@ -19,19 +19,18 @@ from megatron.core.inference.moe.flashinfer_nvfp4 import require_flashinfer_rout
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
-from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.megakernel import (
     build_megakernel_backend,
     megakernel_shared_expert_init_context,
     prepare_megakernel_shared_expert_config,
 )
-from megatron.core.transformer.moe.moe_utils import (
-    MoECudaGraphPartialCaptureSignal,
-    MoECudaGraphTensorStore,
-    get_default_pg_collection,
-    maybe_skip_or_early_return_by_cudagraph,
+from megatron.core.transformer.moe.moe_layer_mixins import (
+    TEMoECudaGraphPartialCaptureSignal,
+    TEPartialCaptureMoEMixin,
+    maybe_skip_or_early_return_by_te_cuda_graph,
 )
+from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
@@ -226,13 +225,7 @@ class BaseMoELayer(MegatronModule, ABC):
         self.use_shared_expert = self.config.moe_shared_expert_intermediate_size is not None
         self.shared_expert_overlap = self.config.moe_shared_expert_overlap
         # MoonEP starts its planner in preprocess, then overlaps it with shared-expert compute.
-        self.run_shared_experts_after_router = self.config.moe_virtual_expert_load_balance and not (
-            self.config.cuda_graph_impl == "transformer_engine"
-            and bool(
-                {CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess}
-                & set(self.config.cuda_graph_modules)
-            )
-        )
+        self.run_shared_experts_after_router = self.config.moe_virtual_expert_load_balance
 
         self.local_expert_indices = [
             local_expert_indices_offset + i for i in range(self.num_local_experts)
@@ -255,13 +248,40 @@ class BaseMoELayer(MegatronModule, ABC):
         self.router.set_layer_number(layer_number)
 
 
-class MoELayer(BaseMoELayer):
+class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
     """Mixture of Experts layer.
 
     This layer implements a Mixture of Experts model, where each token is routed to a
     subset of experts. This implementation supports different token dispatching
     strategies such as All-to-All and All-Gather.
     """
+
+    @classmethod
+    def estimate_flops(
+        cls,
+        config: TransformerConfig,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+    ) -> float:
+        """Estimate forward FLOPs for routed/shared experts and latent projections."""
+        tokens = total_real_tokens_in_batch
+        projections = 3 if config.gated_linear_unit else 2
+        expert_width = config.moe_ffn_hidden_size or config.ffn_hidden_size
+        routed_hidden = (
+            config.hidden_size if config.moe_latent_size is None else config.moe_latent_size
+        )
+        routed = 2 * projections * tokens * routed_hidden * expert_width * config.moe_router_topk
+        if config.moe_latent_size is not None:
+            routed += 4 * tokens * config.hidden_size * config.moe_latent_size
+        shared = (
+            2
+            * projections
+            * tokens
+            * config.hidden_size
+            * (config.moe_shared_expert_intermediate_size or 0)
+        )
+        return routed + shared
 
     def __init__(
         self,
@@ -488,8 +508,6 @@ class MoELayer(BaseMoELayer):
                 )
             self._setup_inference_mode(pg_collection)
 
-        # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
-        self.cudagraph_tensor_store = MoECudaGraphTensorStore()
         self.fwd_execution_map = ["route", "expert_compute", "postprocess"]
 
         # Setup events and streams for delayed wgrad computation.
@@ -558,7 +576,7 @@ class MoELayer(BaseMoELayer):
             self._delayed_wgrad_event = torch.cuda.Event()
             self._delayed_wgrad_stream = torch.cuda.Stream(device="cuda")
 
-    @maybe_skip_or_early_return_by_cudagraph("route")
+    @maybe_skip_or_early_return_by_te_cuda_graph("route")
     def route(
         self,
         hidden_states: torch.Tensor,
@@ -592,7 +610,7 @@ class MoELayer(BaseMoELayer):
             )
         return probs, routing_map
 
-    @maybe_skip_or_early_return_by_cudagraph("preprocess")
+    @maybe_skip_or_early_return_by_te_cuda_graph("preprocess")
     def preprocess(
         self,
         hidden_states: torch.Tensor,
@@ -663,7 +681,7 @@ class MoELayer(BaseMoELayer):
             hidden_states = _RegisterDelayedWgradForExperts.apply(self, hidden_states)
         return self.token_dispatcher.token_dispatch(hidden_states, probs)
 
-    @maybe_skip_or_early_return_by_cudagraph("shared_experts_compute")
+    @maybe_skip_or_early_return_by_te_cuda_graph("shared_experts_compute")
     def shared_experts_compute(self, hidden_states: torch.Tensor):
         """Computes the output of the shared experts.
 
@@ -871,8 +889,9 @@ class MoELayer(BaseMoELayer):
                     if intermediate_tensors is not None:
                         return hidden_states, probs, shared_expert_output
 
-            except MoECudaGraphPartialCaptureSignal as e:
-                # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
+            except TEMoECudaGraphPartialCaptureSignal as e:
+                # This signal is raised from the
+                # maybe_skip_or_early_return_by_te_cuda_graph decorator.
                 # It means we should early-return from the MoE layer forward pass.
                 # This happens when we are partially capturing the CUDA graph of the MoE layer,
                 # like cuda_graph_modules=["moe_router", "moe_preprocess"].
