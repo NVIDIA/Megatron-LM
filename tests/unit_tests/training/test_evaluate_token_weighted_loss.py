@@ -82,6 +82,7 @@ def test_evaluate_weights_valid_tokens_across_batches_ranks_and_iterations(
         mock.patch.object(training_mod, "get_attr_wrapped_model", return_value=groups),
         mock.patch.object(training_mod, "is_pp_last_stage", return_value=True),
         mock.patch.object(training_mod, "has_nvidia_modelopt", True),
+        mock.patch.object(training_mod, "is_distillation_model", return_value=True, create=True),
         mock.patch.object(
             training_mod, "get_tensor_shapes_adjust_fn_for_distillation", distillation, create=True
         ),

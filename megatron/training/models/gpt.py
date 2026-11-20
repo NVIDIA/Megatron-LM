@@ -21,7 +21,11 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_first_stage,
     is_vp_last_stage,
 )
-from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
+from megatron.core.post_training.modelopt.gpt.model_specs import (
+    get_gpt_modelopt_layer_spec,
+    get_gpt_modelopt_mtp_layer_spec,
+    get_gpt_modelopt_spec,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.dot_product_attention import (
     DotProductAttention as MCoreDotProductAttention,
@@ -36,6 +40,7 @@ from megatron.core.transformer.transformer_block import TransformerBlockSubmodul
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
 from megatron.training.models.dist_utils import unimodal_build_distributed_models
+from megatron.training.models.transforms import ModelTransformConfig
 from megatron.training.vocab_utils import calculate_padded_vocab_size
 
 logger = logging.getLogger(__name__)
@@ -55,7 +60,17 @@ def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
     """Determine the most appropriate layer specification based on availability."""
     transformer_cfg = config.transformer
     use_te = transformer_cfg.transformer_impl == "transformer_engine"
-    if (
+    if config.transformations is not None:
+        options = config.transformations
+        return get_gpt_modelopt_layer_spec(
+            config=transformer_cfg,
+            local_core_attention=options.force_local_attention,
+            remap_te_layernorm=True,
+            real_quant_cfg=options.real_quant_cfg,
+            use_default_te_spec=options.default_te_spec,
+            moe_grouped_gemm=options.moe_grouped_gemm,
+        )
+    elif (
         transformer_cfg.transformer_impl == "inference_optimized"
         and transformer_cfg.num_moe_experts is None
     ):
@@ -68,6 +83,7 @@ def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
         )
     elif config.restore_modelopt_state:
         ## Layer specification for quantization with ModelOpt. ##
+        # Megatron-Bridge compatibility only; Megatron-LM uses config.transformations above.
 
         # arbitrary attention mask is used for speculative decoding training
         # When context parallel > 1, only causal mask type is supported
@@ -159,6 +175,9 @@ class GPTModelConfig(ModelConfig):
     transformer: TransformerConfig
     transformer_layer_spec: ModuleSpec | Callable[["GPTModelConfig"], ModuleSpec] | None = None
 
+    mtp_layer_spec: ModuleSpec | Callable[["GPTModelConfig"], ModuleSpec] | None = None
+    """Optional independent transformer layer spec for MTP. Defaults to the decoder spec."""
+
     ### vocab padding related ###
     vocab_size: int | None = None
     """This represents the unpadded vocab size. The padded vocab size is
@@ -193,6 +212,13 @@ class GPTModelConfig(ModelConfig):
 
     ### settings for default layer spec options ###
     use_arbitrary_attention_mask: bool | None = None
+    """Megatron-Bridge compatibility only: read by the ``restore_modelopt_state`` layer spec."""
+
+    ### ModelOpt ###
+    transformations: ModelTransformConfig | None = None
+    """Declarative ModelOpt options. The builder selects the ModelOpt layer spec from it; the
+    training and inference entry points install the matching pre-wrap hooks
+    (``megatron.post_training.model_hooks.modelopt_setup_hooks``)."""
 
     @override
     def __getattr__(self, name: str, /) -> Any:
@@ -223,6 +249,8 @@ class GPTModelConfig(ModelConfig):
 
     def validate(self) -> None:
         """Check model layout without mutation or runtime-derived RNG settings."""
+        if self.transformations is not None:
+            self.transformations.validate(self.transformer.transformer_impl)
         vp_size = self.transformer.virtual_pipeline_model_parallel_size
         is_pipeline_asymmetric = (
             self.transformer.account_for_embedding_in_pipeline_split
@@ -242,6 +270,13 @@ class GPTModelConfig(ModelConfig):
         """Finalize nested model settings after the run has propagated its RNG policy."""
         if hasattr(self.transformer, "finalize") and callable(self.transformer.finalize):
             self.transformer.finalize()
+
+        # Offline speculative decoding builds the base model with num_layers=0; ModelOpt reads
+        # the original layer count from the TransformerConfig. It is not a TransformerConfig
+        # field, so it is serialized in ``transformations`` and restored here.
+        options = self.transformations
+        if options is not None and options.original_num_layers is not None:
+            self.transformer.original_num_layers = options.original_num_layers
 
         # Standalone model finalization retains the same layout checks as container startup.
         self.validate()
@@ -355,10 +390,13 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
         use_torch_fsdp2: bool = False,
         wrap_with_ddp: bool = True,
         data_parallel_random_init: bool = True,
-        mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
+        mixed_precision_wrapper: (
+            Callable[[Any, MegatronModule], MegatronModule] | None
+        ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
         use_layer_wise_param_layout: bool = True,
+        device: torch.device | str | None = None,
     ) -> list[GPTModel]:
         """Build model stages and wrap for distributed training.
 
@@ -371,6 +409,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             use_torch_fsdp2: Whether to use Torch FSDP 2.0
             wrap_with_ddp: Set to False to skip the DDP/FSDP wrapper.
             data_parallel_random_init: Whether to use data parallel random initialization
+            device: Explicit final device, including for meta materialization; None keeps the default.
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
             model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
@@ -397,6 +436,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             model_type,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
             use_layer_wise_param_layout=use_layer_wise_param_layout,
+            device=device,
         )
 
         composed_post_wrap_hook = compose_hooks(self._model_config.post_wrap_hooks)
@@ -432,7 +472,13 @@ def mtp_block_spec(
     if config.transformer.mtp_num_layers is not None:
         from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
 
-        if isinstance(transformer_layer_spec, TransformerBlockSubmodules):
+        if config.mtp_layer_spec is not None:
+            spec = config.mtp_layer_spec
+            if not isinstance(spec, ModuleSpec) and callable(spec):
+                spec = spec(config)
+        elif config.transformations is not None:
+            spec = get_gpt_modelopt_mtp_layer_spec(config.transformer)
+        elif isinstance(transformer_layer_spec, TransformerBlockSubmodules):
             if transformer_layer_spec.layer_specs:
                 # Reuse the resolved spec: the generic decoder builder rejects experimental attention.
                 spec = transformer_layer_spec.layer_specs[-1]

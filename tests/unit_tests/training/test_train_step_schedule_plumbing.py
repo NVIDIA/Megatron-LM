@@ -65,6 +65,12 @@ def _run(
         mock.patch.object(training_mod, "get_num_microbatches", return_value=1),
         mock.patch.object(training_mod, "has_nvidia_modelopt", distillation is not None),
         mock.patch.object(
+            training_mod,
+            "is_distillation_model",
+            return_value=distillation is not None,
+            create=True,
+        ),
+        mock.patch.object(
             training_mod, "get_tensor_shapes_adjust_fn_for_distillation", distillation, create=True
         ),
     ):
