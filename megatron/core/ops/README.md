@@ -43,7 +43,9 @@ megatron/core/ops/
 │   ├── csa/               modules.py
 │   ├── mla.py             absorbed MLA
 │   └── dsv4.py            DeepSeek-v4 hybrid attention
-├── loss/                  vocab-parallel cross entropy and select_cross_entropy()
+├── collectives/           ordered rank/shard folds and symmetric-memory pulls
+├── linear/                ordered row-parallel GEMMs, scratch ownership, and autograd
+├── loss/                  vocab-parallel cross entropy, fixed-order sums, and selectors
 └── norm/                  norm builder protocols, Torch and Apex norm modules
 ```
 

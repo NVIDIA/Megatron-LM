@@ -63,6 +63,7 @@ class SymmetricMemoryBuffer:
     """
 
     def __init__(self, size_in_mb, process_group):
+        self.size_mb = size_in_mb
         self.init_failure_reason: Optional[str] = None
         if not HAVE_TORCH_SYMM_MEM:
             self.init_failure_reason = "torch.distributed._symmetric_memory not importable"
@@ -165,6 +166,7 @@ class SymmetricMemoryManager:
     """
 
     _buffers: dict[str, SymmetricMemoryBuffer] = {}
+    _retired_buffers: dict[str, list[SymmetricMemoryBuffer]] = {}
     _default_size_mb: int = 512
 
     @classmethod
@@ -178,17 +180,23 @@ class SymmetricMemoryManager:
 
         Args:
             key: Unique identifier (e.g. "tp", "ep").
-            process_group: Required on the first call for a given key.
+            process_group: Required when creating or growing a buffer.
                 Subsequent calls may omit it.
-            size_mb: Buffer size in MiB (default 256).
+            size_mb: Minimum buffer capacity in MiB (default 512 on first access).
+                Growing retains earlier allocations for already captured CUDA graphs.
         """
-        if key not in cls._buffers:
+        buffer = cls._buffers.get(key)
+        if buffer is None or (size_mb is not None and size_mb > buffer.size_mb):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("Reserve symmetric buffers before CUDA graph capture")
             assert (
                 process_group is not None
-            ), f"SymmetricMemoryManager: process_group is required on first access for key='{key}'"
+            ), f"SymmetricMemoryManager: process_group is required to allocate key='{key}'"
             cls._buffers[key] = SymmetricMemoryBuffer(
                 size_in_mb=size_mb or cls._default_size_mb, process_group=process_group
             )
+            if buffer is not None:
+                cls._retired_buffers.setdefault(key, []).append(buffer)
         return cls._buffers[key]
 
     @classmethod
@@ -200,8 +208,10 @@ class SymmetricMemoryManager:
         """
         if key is not None:
             cls._buffers.pop(key, None)
+            cls._retired_buffers.pop(key, None)
         else:
             cls._buffers.clear()
+            cls._retired_buffers.clear()
 
     @classmethod
     def is_initialized(cls, key: str) -> bool:

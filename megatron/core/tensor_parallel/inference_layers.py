@@ -20,6 +20,13 @@ from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.inference.quantization.utils import mm_mxfp8
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.ops.collectives.ordered_reduce import (
+    ordered_reduce_scatter_shards,
+    symm_ordered_reduce_scatter,
+    symm_ordered_reduce_scatter_shards,
+    use_ordered_tp_reduce,
+)
+from megatron.core.ops.linear.ordered import row_parallel_shard_partials
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.tensor_parallel.mappings import (
     gather_from_tensor_model_parallel_region,
@@ -466,6 +473,8 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         it will revert to torch.dist (NCCL) reduce-scatter.
         """
         use_mxfp8 = isinstance(self.weight, MXFP8Tensor)
+        if self._bi_tp_local_shards > 1 or use_ordered_tp_reduce(self.tp_group, x.dtype):
+            return self._matmul_shards_reduce(x, use_mxfp8)
         symm_mem_buffer_dims = list(x.size())
         if use_mxfp8:
             # Remove seq_len dimension for MXFP8 (mm_mxfp8 squeezes internally)
@@ -478,7 +487,8 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         # Check the matmul output shape: if it is NVLS-eligible, the RS output
         # (world_size times smaller on dim 0) is too.
         # TP sequence-parallel RS: use NCCL in batch-invariant mode to match
-        # the training reduction path. This does not affect MoE EP NVLS.
+        # the training reduction path (TP <= 2 here; TP >= 3 returned above).
+        # This does not affect MoE EP NVLS.
         can_use_nvls = (
             self.triton_nvls_kernels_allowed
             and x.dtype == torch.bfloat16
@@ -525,6 +535,37 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             x, _ = reduce_scatter_along_first_dim(x, tp_group=self.tp_group)
         return x
 
+    def _matmul_shards_reduce(self, x, use_mxfp8):
+        """Compute canonical shard partials once and reduce them in global order.
+
+        One local partial keeps the native/quantized GEMM; several use a strided
+        batched GEMM. TP1 only folds its local partials.
+        """
+        c = self._bi_tp_local_shards
+        assert c == 1 or not use_mxfp8, "MXFP8 with multiple local TP shards is not supported"
+        out, handle = None, None
+        if self.tp_size > 1 and self.triton_nvls_kernels_allowed:
+            buf = SymmetricMemoryManager.get_buffer("tp", process_group=self.tp_group)
+            dims = [c, *x.shape[:-1], self.weight.size(0)]
+            if use_mxfp8:
+                del dims[2]  # mm_mxfp8 returns [tokens, hidden], without the batch axis.
+            symm = buf.maybe_get_tensor(dims, dtype=x.dtype)
+            assert (
+                buf.symm_mem_hdl is None or symm["tensor"] is not None
+            ), "TP scratch exceeds the inference context's max_tokens bound"
+            out, handle = symm["tensor"], symm["handle"]
+        if c == 1:
+            parts = _apply_linear(
+                x, self.weight, self.config, out=out[0] if out is not None else None
+            ).unsqueeze(0)
+        else:
+            parts = row_parallel_shard_partials(x, self.weight, c, out=out)
+        if handle is not None:
+            return symm_ordered_reduce_scatter_shards(parts, handle)
+        # Preserve the explicitly disabled/unavailable peer-access backend, using
+        # the same GEMM rather than a second allocation-size fallback path.
+        return ordered_reduce_scatter_shards(parts, self.tp_group)
+
     def _set_next_layer_norm_weights(self, weights: torch.Tensor):
         """
         Set next layer norm weights for fused reduce-scatter + add + rms-norm + all-gather.
@@ -547,6 +588,8 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             return super().forward(x)
 
         if self.tp_size == 1:
+            if self._bi_tp_local_shards > 1:
+                return self._matmul_shards_reduce(x, isinstance(self.weight, MXFP8Tensor)), None
             x = _apply_linear(x, self.weight, self.config)
             return x, None
         else:
@@ -620,6 +663,10 @@ def inference_reduce_scatter_to_sequence_parallel_region(
 
     Replaces `reduce_scatter_to_sequence_parallel_region` in inference paths
     where autograd is not needed and NVLS symmetric-memory is available.
+
+    ``x`` may be a non-contiguous view (e.g. the embedding's [b, s, h] -> [s, b, h]
+    transpose): the symmetric-memory paths copy it into the buffer in the target layout,
+    so the caller needs no separate ``.contiguous()`` copy.
     """
     # TODO(ksanthanam): Refactor InferenceRowParallelLinear._matmul_reduce_scatter
     # to use this function for its non-fused NVLS reduce-scatter path.
@@ -631,8 +678,22 @@ def inference_reduce_scatter_to_sequence_parallel_region(
         config, 'inference_disable_triton_nvls_kernels', False
     )
 
+    if use_ordered_tp_reduce(tp_group, x.dtype):
+        # Batch-invariant mode at TP >= 3: fixed rank-order sum, same bits as training.
+        if triton_nvls_kernels_allowed and SymmetricMemoryManager.is_initialized("tp"):
+            buf = SymmetricMemoryManager.get_buffer("tp", process_group=tp_group)
+            symm_mem_buffer = buf.maybe_get_tensor(list(x.size()), dtype=x.dtype)
+            if symm_mem_buffer["handle"] is not None:
+                symm_mem_buffer["tensor"].copy_(x)
+                return symm_ordered_reduce_scatter(
+                    symm_mem_buffer["tensor"], symm_mem_buffer["handle"]
+                )
+        return reduce_scatter_to_sequence_parallel_region(
+            x.contiguous(), group=tp_group, ordered=True
+        )
+
     # TP sequence-parallel RS: use NCCL in batch-invariant mode to match
-    # training. This does not affect MoE EP NVLS.
+    # training (TP <= 2 here). This does not affect MoE EP NVLS.
     if (
         triton_nvls_kernels_allowed
         and SymmetricMemoryManager.is_initialized("tp")
@@ -653,4 +714,4 @@ def inference_reduce_scatter_to_sequence_parallel_region(
             multimem_reduce_scatter(output, symm_mem_buffer["tensor"], symm_mem_buffer["handle"])
             return output
 
-    return reduce_scatter_to_sequence_parallel_region(x, group=tp_group)
+    return reduce_scatter_to_sequence_parallel_region(x.contiguous(), group=tp_group)

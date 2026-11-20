@@ -331,9 +331,34 @@ KERNELS: Tuple[KernelEntry, ...] = (
             C + "test_transformer_layer.py",
             C + "test_gpt_model.py",
             K + "test_csa_packed_kernels.py",
+            K + "test_ordered_reduce_kernels.py",
         ),
         kind="external-lib",
-        notes="NCCL floating-point reductions pinned by NCCL_ALGO=Ring; covered by the TP/EP/FSDP cells of the model-level suite.",
+        notes="NCCL floating-point reductions pinned by NCCL_ALGO=Ring; covered by the TP/EP/FSDP cells of the model-level suite. "
+        "Under batch-invariant mode at TP >= 3 explicitly opted-in TP forward reductions use ordered_reduce (replayed in test_ordered_reduce_kernels.py).",
+    ),
+    KernelEntry(
+        name="tensor_parallel_ordered_reduce",
+        sources=("megatron/core/ops/collectives/ordered_reduce.py",),
+        tests=(K + "test_ordered_reduce_kernels.py",),
+        kind="triton",
+        notes="Fixed-order rank/shard folds, direct-buffer symmetric-memory pulls, and NCCL "
+        "all-to-all fallbacks. Replay coverage includes one and several partials per rank.",
+    ),
+    KernelEntry(
+        name="ordered_row_linear",
+        sources=("megatron/core/ops/linear/ordered.py",),
+        tests=(K + "test_ordered_reduce_kernels.py", K + "test_te_wrappers.py"),
+        kind="external-lib",
+        notes="Torch and TE row-parallel GEMMs with operation-owned symmetric scratch and "
+        "ordinary TP backward; replayed through shard and TE module paths.",
+    ),
+    KernelEntry(
+        name="batch_invariant_vocab_sum",
+        sources=("megatron/core/ops/loss/vocab_sum.py",),
+        tests=(K + "test_ordered_reduce_kernels.py",),
+        kind="triton",
+        notes="Fixed-order vocabulary-shard row sums followed by ordered collective folding.",
     ),
     KernelEntry(
         name="tensor_parallel_random_share_storage",
@@ -354,7 +379,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         kind="te-wrapper",
         notes="TE Linear / LayerNormLinear / Norm / GroupedLinear / DotProductAttention / fused RoPE replayed standalone; "
-        "FP8/FP4 recipes in the model-level suite. Runtime CP binding and restoration are "
+        "MXFP8 ordered row reductions with BF16 master weights replay through TE autograd; "
+        "other FP8/FP4 recipes are in the model-level suite. Runtime CP binding and restoration are "
         "replayed through packed SelfAttention in test_runtime_cp_attention.py. "
         "QB-capable TE routing replays probabilities, gradients, and atomic histograms.",
     ),
@@ -930,12 +956,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/fp4_utils.py",
             "megatron/core/distributed/fsdp/src/megatron_fsdp/mixed_precision.py",
         ),
-        tests=(C + "test_fp8_determinism.py", K + "test_optimizer_kernels.py"),
+        tests=(
+            C + "test_fp8_determinism.py",
+            K + "test_optimizer_kernels.py",
+            K + "test_ordered_reduce_kernels.py",
+            K + "test_te_wrappers.py",
+        ),
         kind="dispatch",
         notes="TE cast_master_weights_to_fp8 / cast_to_fp8 (covered at model level by "
         "test_fp8_determinism.py), NVFP4 quantize_master_weights (needs TE>=2.7 + Blackwell, "
         "uncovered) and the apex multi_tensor_scale used by Megatron-FSDP mixed precision "
-        "(kernel replayed in test_optimizer_kernels.py).",
+        "(kernel replayed in test_optimizer_kernels.py). TP forward ordered-reduction dispatch "
+        "is replayed by test_ordered_reduce_kernels.py and the quantized TE row-linear tests.",
     ),
     KernelEntry(
         name="inference_mxfp8_quantization",

@@ -505,21 +505,25 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         if self.reduce_scatter_embeddings:
             # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
-            output_parallel = output_parallel.transpose(0, 1).contiguous()
+            output_parallel = output_parallel.transpose(0, 1)
             if self.use_inference_optimized_reduce_scatter and InferenceMode.is_active():
                 # Deferred to avoid circular import: inference_layers → TE → layers.
                 from .inference_layers import inference_reduce_scatter_to_sequence_parallel_region
 
+                # Passes the transposed view: the symmetric-memory paths copy it into their
+                # buffer in [s b h] layout directly, without a separate contiguous copy.
                 output = inference_reduce_scatter_to_sequence_parallel_region(
                     output_parallel, self.tp_group, self.config
                 )
             else:
                 output = reduce_scatter_to_sequence_parallel_region(
-                    output_parallel, group=self.tp_group
+                    output_parallel.contiguous(), group=self.tp_group, ordered=True
                 )
         elif self.tp_group.size() > 1:
             # Reduce across all the model parallel GPUs.
-            output = reduce_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)
+            output = reduce_from_tensor_model_parallel_region(
+                output_parallel, group=self.tp_group, ordered=True
+            )
         else:
             output = output_parallel
         return output
@@ -1765,10 +1769,12 @@ class RowParallelLinear(torch.nn.Module):
             output_ = output_parallel
         elif self.sequence_parallel:
             output_ = reduce_scatter_to_sequence_parallel_region(
-                output_parallel, group=self.tp_group
+                output_parallel, group=self.tp_group, ordered=True
             )
         else:
-            output_ = reduce_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)
+            output_ = reduce_from_tensor_model_parallel_region(
+                output_parallel, group=self.tp_group, ordered=True
+            )
         if not self.skip_bias_add:
             output = (output_ + self.bias) if self.bias is not None else output_
             output_bias = None

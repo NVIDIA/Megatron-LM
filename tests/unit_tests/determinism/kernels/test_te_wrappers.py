@@ -25,7 +25,7 @@ import megatron.core.extensions.transformer_engine as te_ext
 from megatron.core import parallel_state
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE, TEFusedMLP, mark_grouped_tensor
-from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
+from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor, prepare_model_for_fp8_inference
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
@@ -34,7 +34,7 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     set_batch_invariant_mode,
     te_supports_batch_invariant_grouped_gemm,
 )
-from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     _compute_index_scores,
     _dsa_index_share_carrier_scope,
@@ -1206,3 +1206,81 @@ def test_te_fused_topk_dense_indices_replays(indices_dtype):
     assert_replays_bit_exact(
         fn, (logits,), replays=3, what=f"TE fused topk dense indices[{indices_dtype}]"
     )
+
+
+@pytest.mark.parametrize(
+    "tp,shards,sequence_parallel,mxfp8",
+    [
+        (2, 4, True, False),
+        (4, None, False, False),
+        (4, None, True, False),
+        pytest.param(4, None, False, True, marks=pytest.mark.launch_on_gb200),
+        pytest.param(4, None, True, True, marks=pytest.mark.launch_on_gb200),
+    ],
+    ids=["tp2-4shards-sp", "tp4-ordered", "tp4-ordered-sp", "tp4-mxfp8", "tp4-mxfp8-sp"],
+)
+def test_te_row_parallel_linear_batch_invariant_replays(tp, shards, sequence_parallel, mxfp8):
+    """Batch-invariant row-parallel forward: ordered TP reduction (TP >= 3) and fixed shards.
+
+    With several shards per rank the forward computes the shard partials itself and the
+    backward is the stock row-parallel one; both must replay bit-exactly. MXFP8 with one
+    partial per rank keeps TE quantization and autograd before the ordered reduction.
+    """
+    if Utils.world_size < tp or Utils.world_size % tp != 0:
+        pytest.skip(f"needs a multiple of {tp} GPUs")
+    if mxfp8:
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+        available, reason = FP8GlobalStateManager.is_mxfp8_available()
+        if not available:
+            pytest.skip(reason)
+    Utils.initialize_model_parallel(tp, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        seeded()
+        config = _config(
+            fp8="e4m3" if mxfp8 else None,
+            fp8_recipe=Fp8Recipe.mxfp8,
+            tensor_model_parallel_size=tp,
+            sequence_parallel=sequence_parallel,
+            batch_invariant_mode=True,
+            batch_invariant_backend="te_native",
+            batch_invariant_peer_tp_size=shards,
+            add_bias_linear=False,
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4 if _IS_BLACKWELL else 3,
+        )
+        module = TERowParallelLinear(
+            FFN,
+            HIDDEN,
+            config=config,
+            init_method=init_method_normal(0.02),
+            bias=False,
+            input_is_parallel=True,
+            skip_bias_add=False,
+            is_expert=False,
+        ).cuda()
+        x = torch.randn(
+            TOKENS // 2, 2, FFN // tp, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        with set_batch_invariant_mode(True, backend="te_native"), get_fp8_context(config):
+            assert_module_replays_bit_exact(
+                module,
+                (x,),
+                replays=3,
+                contention=True,
+                what=f"TERowParallelLinear batch-invariant tp={tp} shards={shards} mxfp8={mxfp8}",
+            )
+            if mxfp8:
+                module.eval()
+                prepare_model_for_fp8_inference(module)
+                with torch.no_grad():
+                    assert_replays_bit_exact(
+                        lambda inputs: module(inputs)[0],
+                        (x[:12].detach().contiguous(),),
+                        replays=3,
+                        contention=True,
+                        what="MXFP8 padded inference before ordered TP reduction",
+                    )
+    finally:
+        Utils.destroy_model_parallel()

@@ -29,6 +29,7 @@ from megatron.core.inference.sampling_params import (
     is_no_op_top_k,
     is_no_op_top_p,
 )
+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
     create_unified_mempool,
@@ -652,6 +653,25 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 f"max_tokens ({self.max_tokens}) must respect token rounding "
                 f"({self.TOKEN_ROUNDER}) and tensor parallel size ({tp_size}) "
                 "in batch-invariant mode."
+            )
+
+        if (
+            model_config.transformer_impl == "inference_optimized"
+            and tp_size > 1
+            and not model_config.inference_disable_triton_nvls_kernels
+        ):
+            # Eager prefill can exceed the graph budget. Reserve every local shard's
+            # full output before KV-cache sizing and graph capture.
+            local_shards = (model_config.batch_invariant_tp_shards or tp_size) // tp_size
+            # MTP's embedding/hidden projection also gathers twice the hidden width.
+            buffer_width = model_config.hidden_size * max(
+                local_shards, 2 if model_config.mtp_num_layers else 1
+            )
+            nbytes = self.max_tokens * buffer_width * model_config.params_dtype.itemsize
+            SymmetricMemoryManager.get_buffer(
+                "tp",
+                process_group=inference_config.resolve_pg_collection().tp,
+                size_mb=math.ceil(nbytes / (1 << 20)),
             )
 
         self._mtp_initialize_kv_cache(model_config, inference_config.mtp_layer_type_list)

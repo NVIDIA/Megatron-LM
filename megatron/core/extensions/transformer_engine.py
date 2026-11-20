@@ -26,6 +26,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedState
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.ops.linear.ordered import tp_shard_row_linear
 from megatron.core.ops.norm.torch_norm import LayerNormInterface
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
@@ -48,13 +49,18 @@ from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     set_tensor_model_parallel_attributes,
 )
-from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_tensor_model_parallel_region,
+    reduce_from_tensor_model_parallel_region,
+    reduce_scatter_to_sequence_parallel_region,
+)
 from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     get_data_parallel_rng_tracker_name,
     get_expert_parallel_rng_tracker_name,
 )
 from megatron.core.tensor_parallel.utils import divide
+from megatron.core.transformer.custom_layers import batch_invariant_kernels as bi_kernels
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.module import is_first_microbatch_tracked
@@ -1298,6 +1304,14 @@ class TENorm:
         return cast(LayerNormInterface, instance)
 
 
+class _BITPForward(enum.Enum):
+    """How a row-parallel TELinear does its forward TP reduction (see TELinear.__init__)."""
+
+    TE = enum.auto()  # TE's linear and reduction (stock; also batch-invariant at TP <= 2)
+    ORDERED_REDUCE = enum.auto()  # TE's local GEMM, then Megatron's ordered reduction
+    SHARD_GEMMS = enum.auto()  # Megatron's shard GEMMs and shard-order reduction
+
+
 class TELinear(te.pytorch.Linear):
     """Wrapper for the Transformer-Engine's `Linear` layer.
 
@@ -1462,6 +1476,38 @@ class TELinear(te.pytorch.Linear):
                 tp_size = 1
                 tp_group_for_te = None
 
+        # Batch-invariant row-parallel forward (ops/linear/ordered.py):
+        # - SHARD_GEMMS (batch_invariant_tp_shards > TP): the K dim is cut into fixed shards and
+        #   forward() computes this rank's shard GEMMs and folds all shards in order, so the bits
+        #   do not depend on the TP size (the backward stays the stock row-parallel one).
+        # - ORDERED_REDUCE (TP >= 3): NCCL's summation order for an element depends on where it
+        #   sits in the message, so TE runs the local GEMM only and Megatron reduces with the
+        #   fixed rank-order sum. TP = 2 is a single commutative addition and stays in TE.
+        tp_shards = self.config.batch_invariant_tp_shards
+        bi_row = parallel_mode == "row" and not is_expert and self.config.batch_invariant_mode
+        self._bi_tp_local_shards = divide(tp_shards, tp_size) if bi_row and tp_shards else 1
+        if self._bi_tp_local_shards > 1:
+            self._bi_tp_forward = _BITPForward.SHARD_GEMMS
+        elif bi_row and tp_size >= 3:
+            self._bi_tp_forward = _BITPForward.ORDERED_REDUCE
+        else:
+            self._bi_tp_forward = _BITPForward.TE
+        # Set by a caller that runs the TP communication itself (shared-expert overlap): the
+        # forward then returns this rank's partial and the caller reduces it.
+        self.bi_tp_reduce_by_caller = False
+        if self._bi_tp_forward is not _BITPForward.TE:
+            input_size = divide(input_size, tp_size)
+            te_parallel_mode = None
+            tp_size = 1
+            tp_group_for_te = None
+            # TE runs the local GEMM only (or nothing, with shard GEMMs): it must not reduce
+            # (userbuffers / symmetric all-reduce) nor add the bias before the reduction; the
+            # bias is added after it in forward().
+            extra_kwargs.pop("symmetric_ar_type", None)
+            for key in ("ub_overlap_rs", "ub_overlap_ag", "ub_split_rs", "ub_atomic_gemm_rs"):
+                if key in extra_kwargs:
+                    extra_kwargs[key] = False
+
         self.te_quant_params: Optional[TEQuantizationParams] = None
         quant_config = get_quant_config_or_none(name, config.quant_recipe)
         self.finish_init(quant_config)
@@ -1492,7 +1538,8 @@ class TELinear(te.pytorch.Linear):
                 ),
                 init_method=condition_init_method(config, init_method),
                 bias=bias,
-                return_bias=self.te_return_bias,
+                return_bias=self.te_return_bias
+                or (self._bi_tp_forward is _BITPForward.ORDERED_REDUCE and bias),
                 parallel_mode=te_parallel_mode,
                 **extra_kwargs,
             )
@@ -1513,6 +1560,93 @@ class TELinear(te.pytorch.Linear):
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
 
+    def _set_bi_row_parallel_attributes(self):
+        """Restore row-parallel parameter metadata on a layer built with TE parallel_mode=None.
+
+        TE marks a parallel_mode=None weight as split along dim 0; the weight is the dim-1
+        shard of a row-parallel layer. The bias is replicated, and under sequence
+        parallelism its gradient is reduced over TP like the one TE's row mode marks.
+        """
+        self.weight.tensor_model_parallel = True
+        self.weight.partition_dim = 1
+        self.weight.partition_stride = 1
+        if self.use_bias:
+            self.bias.tensor_model_parallel = False
+            self.bias.sequence_parallel = self.config.sequence_parallel
+
+    def reset_parameters(self, defer_init=False):
+        """Reset parameters (keeping the row-parallel metadata, see above)."""
+        super().reset_parameters(defer_init=defer_init)
+        if self._bi_tp_forward is not _BITPForward.TE and not defer_init:
+            self._set_bi_row_parallel_attributes()
+
+    def _bi_tp_can_direct(self) -> bool:
+        """Whether this execution mode can use direct-output TE GEMMs and stock TP backward.
+
+        MXFP8 compute keeps TE's quantizers and autograd, then reduces its BF16 partials
+        through the ordered collective fallback. The direct path accepts unquantized GEMMs.
+        """
+        return (
+            self._bi_tp_forward is _BITPForward.ORDERED_REDUCE
+            and not self.config.cpu_offloading
+            and not self.config.delay_wgrad_compute
+            and (
+                not bi_kernels.is_batch_invariant_mode_enabled()
+                or bi_kernels.get_batch_invariant_backend() == "te_native"
+            )
+            and not self.bi_tp_reduce_by_caller
+            and _resolve_is_first_microbatch(self) is None
+            and not getattr(self.weight, "overwrite_main_grad", False)
+            and not getattr(self, "is_fsdp2", False)
+            and self.te_quant_params is None
+            and not self.config.fp8_param
+            and not self.config.fp4_param
+            and not FP8GlobalStateManager.is_fp8_enabled()
+        )
+
+    def _bi_tp_reduce(self, out):
+        """Batch-invariant forward TP reduction of the local GEMM output (see __init__).
+
+        Called from forward() in ORDERED_REDUCE mode (TP >= 3): the ordered
+        reduce-scatter (SP) or all-reduce of ``mappings.py``, then the bias.
+        """
+        bias = None
+        if self.use_bias:
+            out, bias = out
+        if self.config.sequence_parallel:
+            out = reduce_scatter_to_sequence_parallel_region(
+                out, group=self._tp_group, ordered=True
+            )
+        else:
+            out = reduce_from_tensor_model_parallel_region(out, group=self._tp_group, ordered=True)
+        return self._bi_finish_bias(out, bias)
+
+    def _bi_finish_bias(self, out, bias):
+        """Return the bias (te_return_bias) or add it once, after the TP reduction.
+
+        As stock row-parallel TE does; shared by _bi_tp_reduce and _bi_tp_row_forward.
+        """
+        if self.te_return_bias or bias is None:
+            return out, bias
+        return out + bias, None
+
+    def _bi_tp_row_forward(self, x):
+        """Local or fixed-shard GEMMs into symmetric scratch, followed by ordered pull.
+
+        The one-partial path uses TE GEMMs for forward and backward; fixed shards keep
+        their existing batched GEMM definition. Unavailable scratch falls back to all-to-all.
+        """
+        out = tp_shard_row_linear(
+            x,
+            self.weight,
+            self._tp_group,
+            self._bi_tp_local_shards,
+            self.config.sequence_parallel,
+            wgrad_into_main_grad=self.config.gradient_accumulation_fusion,
+            use_te_gemm=self._bi_tp_forward is _BITPForward.ORDERED_REDUCE,
+        )
+        return self._bi_finish_bias(out, self.bias if self.use_bias else None)
+
     def finish_init(self, quantization_config: QuantizationConfig):
         """Post-init of quantization override"""
         if quantization_config is None:
@@ -1528,14 +1662,34 @@ class TELinear(te.pytorch.Linear):
             self.te_quant_params, self.training, is_context_quantized
         )
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Forward."""
+    def _te_forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Run TE's linear; inference padding wraps this before any caller-side TP reduction."""
         _is_first_microbatch = _resolve_is_first_microbatch(self)
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
         with quant_context:
             out = super().forward(x, is_first_microbatch=_is_first_microbatch)
         self.is_first_microbatch = False
+        return out
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Forward."""
+        if self._bi_tp_forward is _BITPForward.SHARD_GEMMS:
+            return self._bi_tp_row_forward(x)
+        if (
+            self._bi_tp_can_direct()
+            and x.dtype in (torch.bfloat16, torch.float32)
+            and self.weight.dtype == x.dtype
+            and not torch.is_autocast_enabled()
+        ):
+            return self._bi_tp_row_forward(x)
+        out = self._te_forward(x)
+
+        if self._bi_tp_forward is _BITPForward.ORDERED_REDUCE:
+            if self.bi_tp_reduce_by_caller:
+                assert not self.use_bias, "the caller-side TP reduction does not add the bias"
+                return out, None
+            return self._bi_tp_reduce(out)
 
         # TE only returns a tuple when return_bias is True, otherwise
         # it returns a single Tensor, we always want to return two

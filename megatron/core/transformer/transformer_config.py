@@ -1540,14 +1540,22 @@ class TransformerConfig(ModelParallelConfig):
     as "te_native"."""
 
     batch_invariant_collective: Literal["ordered", "multimem"] = "ordered"
-    """Cross-rank EP combine collective under batch_invariant_mode. "ordered"
-    (default) reduces with an explicit fixed rank-order fp32 Triton kernel —
-    deterministic by construction on any hardware. "multimem" keeps the native
+    """Cross-rank EP combine collective under batch_invariant_mode (TP reductions always use
+    the fp32 rank-order fold of ops/collectives/ordered_reduce.py). "ordered" (default)
+    reduces with an explicit fixed rank-order fp32 Triton kernel — deterministic by
+    construction on any hardware. "multimem" keeps the native
     NVLS in-switch reduce-scatter: measured to return the correctly-rounded
     exact fp32 sum (bitwise-equal to an fp64 reference over 16.7M adversarial
     channels on B200), deterministic and batch-invariant, with better scaling
     at large NVLink domains; software paths that must match it bitwise should
     accumulate in fp64."""
+
+    batch_invariant_peer_tp_size: Optional[int] = None
+    """The other model's tensor-parallel size when matching training and inference forward
+    bits under batch_invariant_mode. Set this to inference TP on the trainer and training
+    TP on inference. Row-parallel linears and native vocab-parallel cross entropy use a
+    common reduction partition derived from both TP sizes. Both models must use the same
+    padded vocabulary. None keeps reductions tied to this model's TP size."""
 
     moe_ep_invariant_combine: bool = False
     """Under batch_invariant_mode, combine each token's expert outputs over one fixed fp32
@@ -1899,6 +1907,13 @@ class TransformerConfig(ModelParallelConfig):
                 "Sequence-parallel CP layout conversion requires an even "
                 f"tensor-parallel size, got {self.tensor_model_parallel_size}."
             )
+
+    @property
+    def batch_invariant_tp_shards(self) -> Optional[int]:
+        """Common reduction partition for this model and its batch-invariant peer."""
+        if self.batch_invariant_peer_tp_size is None:
+            return None
+        return math.lcm(self.tensor_model_parallel_size, self.batch_invariant_peer_tp_size)
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
@@ -4985,6 +5000,12 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.num_moe_experts is None
             ), "--inference-fuse-tp-communication is not supported for MoE models."
+            # The fused reduce-scatter + add + norm + all-gather is an NVLS multimem kernel;
+            # batch-invariant mode reduces with the ordered sum instead, and the next layer
+            # would read a symmetric buffer that the fused kernel never wrote.
+            assert (
+                not self.batch_invariant_mode
+            ), "inference_fuse_tp_communication with batch_invariant_mode is not built yet."
 
         if self.inference_disable_triton_nvls_kernels:
             assert self.transformer_impl == "inference_optimized", (
@@ -4997,6 +5018,43 @@ class TransformerConfig(ModelParallelConfig):
                 "flash_attention_version must be one of 2, 3, or 4, got "
                 f"{self.flash_attention_version}"
             )
+
+        if self.batch_invariant_peer_tp_size is not None:
+            assert (
+                self.batch_invariant_mode
+            ), "batch_invariant_peer_tp_size requires batch_invariant_mode"
+            assert (
+                isinstance(self.batch_invariant_peer_tp_size, int)
+                and not isinstance(self.batch_invariant_peer_tp_size, bool)
+                and self.batch_invariant_peer_tp_size > 0
+            ), "batch_invariant_peer_tp_size must be a positive integer"
+            if self.cross_entropy_loss_fusion and self.cross_entropy_fusion_impl == "te":
+                raise ValueError(
+                    "batch_invariant_peer_tp_size needs the native cross entropy: TE's fused "
+                    "cross entropy sums each rank's vocab slice, which depends on the TP size."
+                )
+            if self.batch_invariant_tp_shards > self.tensor_model_parallel_size:
+                # Several shards per rank: the row-parallel forward is one batched cuBLAS GEMM
+                # over the rank's shards plus the ordered reduction, outside TE's linear.
+                unsupported = {
+                    # An MXFP8 GEMM per K-shard is not built yet; per-tensor-scaled FP8/FP4
+                    # would also need one scale per shard to match a rank holding one shard.
+                    "fp8": self.fp8 is not None,
+                    "fp4": self.fp4 is not None,
+                    "quant_recipe": self.quant_recipe is not None,
+                    # The weight gradient is computed in the backward, not deferred to TE.
+                    "delay_wgrad_compute": self.delay_wgrad_compute,
+                    "tp_comm_overlap": self.tp_comm_overlap,
+                    # The caller would reduce one partial per rank, not one per shard.
+                    "moe_shared_expert_overlap": self.moe_shared_expert_overlap,
+                }
+                names = sorted(name for name, enabled in unsupported.items() if enabled)
+                if names:
+                    raise ValueError(
+                        f"Matching peer TP {self.batch_invariant_peer_tp_size} from "
+                        f"tensor_model_parallel_size ({self.tensor_model_parallel_size}) is not "
+                        f"supported with {', '.join(names)} yet."
+                    )
 
         if self.moe_ep_invariant_combine:
             if not self.batch_invariant_mode:
