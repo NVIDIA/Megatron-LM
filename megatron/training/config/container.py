@@ -49,7 +49,7 @@ from megatron.training.config.utils import (
     serialize_value,
 )
 from megatron.training.config.yaml_utils import safe_yaml_representers
-from megatron.training.global_vars import get_args, is_args_initialized
+from megatron.training.global_vars import get_args
 from megatron.training.models import (
     BertModelConfig,
     LLaVAModelConfig,
@@ -851,13 +851,6 @@ class PretrainConfigContainer(ConfigContainerBase):
         self.ddp.finalize()
 
 
-def _step_schedule_seq_length() -> int | None:
-    """args.seq_length once set_args() has run; otherwise thresholds stay in samples."""
-    if not is_args_initialized():
-        return None
-    return getattr(get_args(), "seq_length", None)
-
-
 def update_train_iters(train: TrainingConfig) -> None:
     """Resolve the sample-based training horizon on the supplied training config."""
     # Imported lazily: megatron.training.utils imports megatron.training.config.
@@ -876,7 +869,7 @@ def update_train_iters(train: TrainingConfig) -> None:
             data_parallel_size=1,
             decrease_batch_size_if_needed=train.decrease_batch_size_if_needed,
             schedule=train.step_batch_size_schedule,
-            seq_length=_step_schedule_seq_length(),
+            seq_length=get_args().seq_length,
         )
         iterations = 0
         consumed_samples = 0
