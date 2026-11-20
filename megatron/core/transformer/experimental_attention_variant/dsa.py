@@ -1,4 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# CLI changes adapted from https://github.com/021ai/ZJ-Megatron-LM at
+# a06c53757f6bc636db3a88f5dfca99f5b3ee6030 (BSD-3-Clause, repository LICENSE).
 
 import copy
 import functools
@@ -19,6 +21,11 @@ from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
     apply_rotary_pos_emb,
+)
+from megatron.core.ops.attention.dsa.cli_state import (
+    DSACrossLayerIndexerState,
+    cli_group_size,
+    get_dsa_cross_layer_state_holder,
 )
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import (
@@ -53,7 +60,7 @@ except ImportError:
 
 
 class _DSAIndexShareCarrier:
-    """Per-forward DSA index-share carrier for non-packed activation recompute."""
+    """Per-forward DSA index-share carrier for activation recompute."""
 
 
 _CURRENT_DSA_INDEX_SHARE_CARRIER: ContextVar[Optional[object]] = ContextVar(
@@ -63,7 +70,7 @@ _CURRENT_DSA_INDEX_SHARE_CARRIER: ContextVar[Optional[object]] = ContextVar(
 
 @contextmanager
 def _dsa_index_share_carrier_scope(carrier: object) -> Iterator[None]:
-    """Expose one non-packed forward's index-share carrier to its checkpoint closures."""
+    """Expose one forward's index-share carrier to its checkpoint closures."""
     token = _CURRENT_DSA_INDEX_SHARE_CARRIER.set(carrier)
     try:
         yield
@@ -246,6 +253,7 @@ def _run_sparse_attention(
     varlen_ends: Optional[torch.Tensor],
     key_positions: Optional[torch.Tensor],
     topk_length: Optional[torch.Tensor] = None,
+    cli_backward_callback=None,
 ) -> torch.Tensor:
     """Run sparse attention for absorbed and non-absorbed MLA paths."""
     if absorbed_mla:
@@ -273,10 +281,15 @@ def _run_sparse_attention(
                 softmax_scale,
                 latent_v_channels,
                 topk_length=topk_length,
+                cli_backward_callback=cli_backward_callback,
             )
         # Fused backends may decline unsupported shapes or layouts by returning
         # None, so keep the absorbed PyTorch path as the authoritative fallback.
         if output is None:
+            if cli_backward_callback is not None:
+                raise RuntimeError(
+                    "The cuDNN sparse-attention path declined a required CLI backward target."
+                )
             output = _unfused_absorbed_dsa_fn(
                 query,
                 key,
@@ -2977,6 +2990,17 @@ class DSAttention(MegatronModule):
         self.index_topk_freq = self.config.dsa_indexer_topk_freq or 1
         self.index_skip_topk_offset = self.config.dsa_indexer_skip_topk_offset or 0
         self.index_share = self.index_topk_freq > 1
+        self.cross_layer_distillation = (
+            self.index_share
+            and getattr(self.config, "dsa_indexer_cross_layer_distillation", False)
+            and cli_group_size(
+                layer_number,
+                self.config.num_layers,
+                self.index_skip_topk_offset,
+                self.index_topk_freq,
+            )
+            > 1
+        )
         self.skip_topk = self.index_share and is_dsa_skip_topk_layer(
             layer_number, self.index_skip_topk_offset, self.index_topk_freq
         )
@@ -2987,6 +3011,14 @@ class DSAttention(MegatronModule):
             if self.index_share
             else layer_number
         )
+
+        self._accumulate_cli_target = None
+        if self.cross_layer_distillation:
+            from megatron.core.ops.attention.dsa.cli_target import accumulate_cli_attention_target
+
+            if not dsa_kernels.supports_fused_cli_target_in_attention_backward(self.config):
+                raise RuntimeError("Sparse DSA CLI requires SM90 and cuDNN teacher-target output")
+            self._accumulate_cli_target = accumulate_cli_attention_target
 
         if pg_collection is None:
             warn_global_process_group_fallback(type(self).__name__)
@@ -3010,11 +3042,14 @@ class DSAttention(MegatronModule):
         self, packed_seq_params: Optional[PackedSeqParams], attention_mask: Optional[torch.Tensor]
     ) -> object:
         """Return the object that carries DSA top-k sharing state for this forward."""
+        carrier = _CURRENT_DSA_INDEX_SHARE_CARRIER.get()
+        if carrier is not None and (
+            packed_seq_params is None
+            or getattr(self.config, "dsa_indexer_cross_layer_distillation", False)
+        ):
+            return carrier
         if packed_seq_params is not None:
             return packed_seq_params
-        carrier = _CURRENT_DSA_INDEX_SHARE_CARRIER.get()
-        if carrier is not None:
-            return carrier
         return attention_mask if attention_mask is not None else self.config
 
     def _get_index_share_topk_holder(
@@ -3326,6 +3361,15 @@ class DSAttention(MegatronModule):
 
         indexer_loss_coeff = self.config.dsa_indexer_loss_coeff or 0.0
         computes_topk = not self.skip_topk
+        defer_cross_layer_gradients = (
+            self.training and indexer_loss_coeff > 0 and self.cross_layer_distillation
+        )
+        collect_deferred_cross_layer_grads = (
+            defer_cross_layer_gradients and torch.is_grad_enabled() and self.skip_topk
+        )
+        inject_deferred_cross_layer_grads = (
+            defer_cross_layer_gradients and torch.is_grad_enabled() and computes_topk
+        )
         use_indexer_loss = (
             self.training and torch.is_grad_enabled() and indexer_loss_coeff > 0 and computes_topk
         )
@@ -3335,7 +3379,9 @@ class DSAttention(MegatronModule):
                 "DSA indexer loss is not supported with kpool selection; set "
                 "dsa_indexer_loss_coeff=0 or use dsa_indexer_kpool=1."
             )
-        if use_indexer_loss and sequence_parallel_query_is_local:
+        if (
+            use_indexer_loss or collect_deferred_cross_layer_grads
+        ) and sequence_parallel_query_is_local:
             raise RuntimeError(
                 "DSA indexer loss requires TP ranks to own the same query rows; "
                 "sequence-local TP query shards cannot form a global-head target."
@@ -3367,6 +3413,21 @@ class DSAttention(MegatronModule):
         )
         use_fused_kernels = dsa_kernels.use_fused_dsa_kernels(self.config)
         sparse_indexer_loss = self.config.dsa_indexer_use_sparse_loss
+        cli_chunk_rows = getattr(
+            self.config, "dsa_indexer_cross_layer_distillation_chunk_size", 512
+        )
+        if defer_cross_layer_gradients and (
+            not sparse_indexer_loss
+            or b != 1
+            or tp_size != 1
+            or getattr(self.config, "dsa_kernel_backend", "none") != "cudnn"
+            or getattr(self.config, "dsa_indexer_search_strategy", "flat") != "flat"
+        ):
+            raise RuntimeError(
+                "Full-recompute CLI requires sparse indexer loss, batch size 1, TP size 1, "
+                "flat search, and the cuDNN backend so reuse targets can merge into the "
+                "owner backward."
+            )
         use_local_indexer_varlen = (
             packed_thd
             and cp_size > 1
@@ -3382,6 +3443,13 @@ class DSAttention(MegatronModule):
             cp_group if cp_size > 1 and not self.config.calculate_per_token_loss else None
         )
 
+        cross_layer_state_holder = None
+        if defer_cross_layer_gradients:
+            carrier = _CURRENT_DSA_INDEX_SHARE_CARRIER.get()
+            if carrier is None:
+                raise RuntimeError("DSA CLI training requires a per-forward checkpoint carrier.")
+            cross_layer_state_holder = get_dsa_cross_layer_state_holder(carrier)
+
         topk_holder = (
             self._get_index_share_topk_holder(packed_seq_params, attention_mask)
             if self.index_share
@@ -3395,6 +3463,7 @@ class DSAttention(MegatronModule):
         topk_indices = None
         topk_length = None
         q = k = weights = None
+        deferred_owner_state = None
         local_packed_cp_query_start = 0
         local_packed_cp_query_len = sq
         if sequence_parallel_query_is_local:
@@ -3403,7 +3472,22 @@ class DSAttention(MegatronModule):
 
         if self.skip_topk:
             assert topk_holder is not None
-            if self.source_layer not in topk_holder:
+            if defer_cross_layer_gradients and torch.is_grad_enabled():
+                assert cross_layer_state_holder is not None
+                deferred_owner_state = cross_layer_state_holder.get(self.source_layer)
+                if deferred_owner_state is None:
+                    raise RuntimeError(
+                        "Deferred DSA CLI requires checkpointed owner state from layer "
+                        f"{self.source_layer} while recomputing layer {self.layer_number}."
+                    )
+                topk_indices = deferred_owner_state.topk_indices
+                topk_length = deferred_owner_state.topk_length
+                if topk_indices is None:
+                    raise RuntimeError(
+                        "Deferred DSA CLI owner state is missing the original forward Top-K for "
+                        f"layer {self.source_layer}."
+                    )
+            elif self.source_layer not in topk_holder:
                 raise RuntimeError(
                     "DSA index-share skip layer "
                     f"(layer_number={self.layer_number}) needs top-k indices from source "
@@ -3414,9 +3498,10 @@ class DSAttention(MegatronModule):
                     f"dsa_indexer_skip_topk_offset={self.index_skip_topk_offset}). "
                     f"Holder has layers {sorted(topk_holder)}."
                 )
-            topk_indices = topk_holder[self.source_layer]
-            if topk_length_holder is not None:
-                topk_length = topk_length_holder.get(self.source_layer)
+            else:
+                topk_indices = topk_holder[self.source_layer]
+                if topk_length_holder is not None:
+                    topk_length = topk_length_holder.get(self.source_layer)
         else:
             assert self.indexer is not None
             with torch.enable_grad() if use_indexer_loss else torch.no_grad():
@@ -3459,6 +3544,29 @@ class DSAttention(MegatronModule):
                     row_end = row_start + sq
                     q = q[row_start:row_end].contiguous()
                     weights = weights[row_start:row_end].contiguous()
+            if defer_cross_layer_gradients and not torch.is_grad_enabled():
+                assert cross_layer_state_holder is not None
+                if self.layer_number in cross_layer_state_holder:
+                    raise RuntimeError(
+                        f"DSA CLI owner layer {self.layer_number} ran twice in one forward."
+                    )
+                deferred_owner_state = DSACrossLayerIndexerState()
+                cross_layer_state_holder[self.layer_number] = deferred_owner_state
+
+        def finalize_deferred_cross_layer_state(output: torch.Tensor) -> torch.Tensor:
+            if not inject_deferred_cross_layer_grads:
+                return output
+            assert cross_layer_state_holder is not None
+            owner_state = cross_layer_state_holder.pop(self.layer_number)
+            if owner_state.deferred_cli_target is not None:
+                raise RuntimeError(
+                    "Deferred DSA CLI owner target accumulator was not consumed by the "
+                    "owner indexer backward."
+                )
+            owner_state.release_forward_values()
+            topk_holder.pop(self.layer_number, None)
+            topk_length_holder.pop(self.layer_number, None)
+            return output
 
         def compute_indexer_loss_with_reference_path():
             key_for_loss = key.detach()
@@ -3572,6 +3680,37 @@ class DSAttention(MegatronModule):
             if topk_length is not None:
                 topk_length = topk_length[:, row_start:row_end].contiguous()
 
+        cli_owner_state = None
+        cli_owner_accumulator = None
+        if inject_deferred_cross_layer_grads:
+            assert cross_layer_state_holder is not None
+            cli_owner_state = cross_layer_state_holder.get(self.layer_number)
+            if cli_owner_state is None:
+                raise RuntimeError(
+                    "DSA CLI owner-backward fusion could not find the checkpointed state for "
+                    f"layer {self.layer_number}."
+                )
+            cli_owner_accumulator = cli_owner_state.deferred_cli_target
+            if cli_owner_accumulator is None:
+                raise RuntimeError(
+                    "DSA CLI owner-backward fusion did not receive accumulated reuse targets"
+                )
+            expected_reuse = (
+                cli_group_size(
+                    self.layer_number,
+                    self.config.num_layers,
+                    self.index_skip_topk_offset,
+                    self.index_topk_freq,
+                )
+                - 1
+            )
+            if cli_owner_accumulator.reuse_count != expected_reuse:
+                raise RuntimeError("DSA CLI did not receive exactly one target per reuse layer")
+            if fused_bounds is None:
+                raise RuntimeError(
+                    "DSA CLI owner-backward fusion requires fused causal indexer bounds"
+                )
+
         if use_indexer_loss:
             assert q is not None and k is not None and weights is not None
             # ===================================
@@ -3604,9 +3743,14 @@ class DSAttention(MegatronModule):
                     local_packed_cp_query_len=local_packed_cp_query_len,
                     packed_seq_params=packed_seq_params,
                     cp_size=cp_size,
+                    cli_target_accumulator=cli_owner_accumulator,
                 )
                 if fused_topk_with_loss is not None:
                     topk_indices, topk_length, indexer_loss = fused_topk_with_loss
+                    if cli_owner_state is not None:
+                        cli_owner_state.deferred_cli_target = None
+                elif cli_owner_accumulator is not None:
+                    raise RuntimeError("cuDNN declined the required DSA CLI owner-backward fusion")
 
             if topk_indices is None or indexer_loss is None:
                 topk_indices, indexer_loss = compute_indexer_loss_with_reference_path()
@@ -3697,10 +3841,44 @@ class DSAttention(MegatronModule):
             topk_holder[self.layer_number] = topk_indices
             if topk_length_holder is not None and topk_length is not None:
                 topk_length_holder[self.layer_number] = topk_length
+            if deferred_owner_state is not None:
+                deferred_owner_state.topk_indices = topk_indices.detach()
+                deferred_owner_state.topk_length = (
+                    topk_length.detach() if topk_length is not None else None
+                )
 
         # ===================================
         # Run sparse attention kernel
         # ===================================
+        use_backward_cli_target = (
+            collect_deferred_cross_layer_grads
+            and absorbed_mla
+            and dsa_kernels.supports_fused_cli_target_in_attention_backward(self.config)
+        )
+        if collect_deferred_cross_layer_grads and not use_backward_cli_target:
+            raise RuntimeError(
+                "Full-recompute CLI requires the cuDNN sparse-attention backward wrapper "
+                "to return the selected teacher target."
+            )
+
+        def consume_deferred_cli_target(attention_target: torch.Tensor) -> None:
+            assert cross_layer_state_holder is not None
+            if deferred_owner_state is None:
+                raise RuntimeError(
+                    "Deferred DSA CLI did not select an owner state while recomputing layer "
+                    f"{self.layer_number}."
+                )
+            if attention_target is None:
+                raise RuntimeError("Sparse-attention backward did not return a CLI target.")
+            deferred_owner_state.deferred_cli_target = self._accumulate_cli_target(
+                attention_target.detach(),
+                topk_indices,
+                topk_length,
+                query_valid_rows,
+                cli_chunk_rows,
+                accumulator=deferred_owner_state.deferred_cli_target,
+            ).detach()
+
         output = _run_sparse_attention(
             absorbed_mla=absorbed_mla,
             query=query,
@@ -3715,11 +3893,15 @@ class DSAttention(MegatronModule):
             varlen_starts=varlen_starts,
             varlen_ends=varlen_ends,
             key_positions=key_positions,
+            cli_backward_callback=(
+                consume_deferred_cli_target if use_backward_cli_target else None
+            ),
         )
 
         if use_indexer_loss:
             if indexer_loss is None:
                 raise RuntimeError("Indexer loss path did not produce a valid loss tensor.")
             output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
+        output = finalize_deferred_cross_layer_state(output)
 
         return _normalize_dsattention_output_rank(output, x.ndim)

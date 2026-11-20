@@ -1,4 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# CLI changes adapted from https://github.com/021ai/ZJ-Megatron-LM at
+# a06c53757f6bc636db3a88f5dfca99f5b3ee6030 (BSD-3-Clause, repository LICENSE).
 
 """Backend-neutral hooks for optional fused DeepSeek sparse attention kernels."""
 
@@ -174,6 +176,7 @@ def run_fused_qk_topk_with_loss(
     local_packed_cp_query_len: Optional[int] = None,
     packed_seq_params: Optional[PackedSeqParams] = None,
     cp_size: int = 1,
+    cli_target_accumulator=None,
 ) -> Optional[Tuple[Tensor, Optional[Tensor], Tensor]]:
     """Optional fused indexer+loss hook for backend-specific implementations."""
     fn = _resolve_fused_hook(config, "run_fused_qk_topk_with_loss")
@@ -203,6 +206,7 @@ def run_fused_qk_topk_with_loss(
         local_packed_cp_query_len=local_packed_cp_query_len,
         packed_seq_params=packed_seq_params,
         cp_size=cp_size,
+        cli_target_accumulator=cli_target_accumulator,
     )
     if result is None:
         _log_declined_hook(config, "run_fused_qk_topk_with_loss", "backend returned None")
@@ -217,15 +221,33 @@ def run_fused_absorbed_sparse_attention(
     softmax_scale: float,
     v_channels: int,
     topk_length: Optional[Tensor] = None,
+    cli_backward_callback=None,
 ) -> Optional[Tensor]:
     """Optional fused sparse-attention hook for backend-specific implementations."""
     fn = _resolve_fused_hook(config, "run_fused_absorbed_sparse_attention")
     if fn is None:
         return None
-    result = fn(query, key, topk_indices, softmax_scale, v_channels, topk_length)
+    if cli_backward_callback is not None:
+        result = fn(
+            query,
+            key,
+            topk_indices,
+            softmax_scale,
+            v_channels,
+            topk_length,
+            cli_backward_callback=cli_backward_callback,
+        )
+    else:
+        result = fn(query, key, topk_indices, softmax_scale, v_channels, topk_length)
     if result is None:
         _log_declined_hook(config, "run_fused_absorbed_sparse_attention", "backend returned None")
     return result
+
+
+def supports_fused_cli_target_in_attention_backward(config: TransformerConfig) -> bool:
+    """Return whether the selected backend can emit the CLI target during attention backward."""
+    fn = _resolve_fused_hook(config, "supports_fused_cli_target_in_attention_backward")
+    return bool(fn is not None and fn())
 
 
 def run_fused_dsa_attention(
@@ -305,5 +327,6 @@ __all__ = [
     "run_fused_dsa_attention",
     "run_fused_qk_topk",
     "run_fused_qk_topk_with_loss",
+    "supports_fused_cli_target_in_attention_backward",
     "use_fused_dsa_kernels",
 ]
