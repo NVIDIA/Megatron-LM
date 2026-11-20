@@ -5,13 +5,15 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from megatron.core.activation_policy.recompute.residual_recompute import (
+    ResidualStreamRecomputeContext,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
     CheckpointWithoutOutputManager,
     initialize_rng_tracker,
 )
-from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock, TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig

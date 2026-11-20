@@ -7,6 +7,9 @@ import pytest
 import torch
 import transformer_engine as te
 
+from megatron.core.activation_policy.recompute.residual_recompute import (
+    build_residual_stream_recompute_plan,
+)
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.models.hybrid.shortcut_block import (
@@ -14,7 +17,6 @@ from megatron.core.models.hybrid.shortcut_block import (
     group_layers_into_shortcut_blocks,
 )
 from megatron.core.transformer.module import TwoStageAttentionLayer
-from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualConnection

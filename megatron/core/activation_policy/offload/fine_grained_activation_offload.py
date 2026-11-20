@@ -20,7 +20,7 @@ try:
 except ImportError:
     from megatron.core.telemetry.fallbacks import trace_fn as _otel_trace_fn
 
-from megatron.core.pipeline_parallel.pinned_activation_buffer import PinnedActivationBuffer
+from megatron.core.activation_policy.offload.pinned_activation_buffer import PinnedActivationBuffer
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 

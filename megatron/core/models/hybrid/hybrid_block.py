@@ -13,6 +13,13 @@ from typing import List, Optional, Sequence, Tuple, Union
 import torch
 from torch import Tensor, nn
 
+from megatron.core.activation_policy.recompute.recompute import checkpointed_forward
+from megatron.core.activation_policy.recompute.residual_recompute import (
+    build_recompute_block_end_plan,
+    build_recompute_layer_managers,
+    build_residual_stream_recompute_plan,
+    finalize_recompute_block,
+)
 from megatron.core.context_parallel import ContextParallelLayoutManager, CPLayout, THDCPLayoutPlan
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
@@ -34,7 +41,6 @@ from megatron.core.models.hybrid.shortcut_block import (
 )
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.recompute import checkpointed_forward
 from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_observation import observe_layer_residuals
@@ -46,12 +52,6 @@ from megatron.core.transformer.hyper_connection import (
     learned_output_contract,
 )
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
-from megatron.core.transformer.residual_recompute import (
-    build_recompute_block_end_plan,
-    build_recompute_layer_managers,
-    build_residual_stream_recompute_plan,
-    finalize_recompute_block,
-)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import (

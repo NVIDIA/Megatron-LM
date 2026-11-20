@@ -9,11 +9,13 @@ import torch
 from torch import nn
 
 from megatron.core import parallel_state
+from megatron.core.activation_policy.recompute.residual_recompute import (
+    build_residual_stream_recompute_plan,
+)
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import (
     _allreduce_non_tensor_model_parallel_grads,
 )
-from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualConnection
 from megatron.core.transformer.wide_residual_config import WideResidualConfig

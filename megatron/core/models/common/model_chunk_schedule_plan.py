@@ -680,7 +680,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
     def _build_recompute_segments(self, config):
         """Split this chunk's layers into full-recompute segments.
 
-        Decoder segmentation mirrors megatron.core.recompute.checkpointed_forward, so
+        Decoder segmentation mirrors
+        megatron.core.activation_policy.recompute.recompute.checkpointed_forward, so
         recompute_method / recompute_num_layers mean the same thing with and without
         --overlap-moe-expert-parallel-comm: 'uniform' groups every decoder layer by
         recompute_num_layers, 'block' recomputes the first recompute_num_layers decoder

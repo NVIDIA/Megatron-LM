@@ -8,16 +8,16 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from megatron.core.activation_policy.recompute import residual_recompute
+from megatron.core.activation_policy.recompute.residual_recompute import (
+    ResidualStreamRecomputeContext,
+    build_residual_stream_recompute_plan,
+)
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
-from megatron.core.transformer import residual_recompute
 from megatron.core.transformer.hyper_connection import (
     build_mhc_recompute_layer_plan,
     finalize_mhc_recompute_layer,
-)
-from megatron.core.transformer.residual_recompute import (
-    ResidualStreamRecomputeContext,
-    build_residual_stream_recompute_plan,
 )
 
 

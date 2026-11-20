@@ -25,11 +25,12 @@ first = {
     "connection-first": ("residual_connection", "residual_recompute"),
     "recompute-first": ("residual_recompute", "residual_connection"),
 }[sys.argv[1]]
+modules = {"residual_recompute": "megatron.core.activation_policy.recompute.residual_recompute"}
 for name in first:
-    importlib.import_module(prefix + name)
+    importlib.import_module(modules.get(name, prefix + name))
 
 connection = importlib.import_module(prefix + "residual_connection")
-recompute = importlib.import_module(prefix + "residual_recompute")
+recompute = importlib.import_module(modules["residual_recompute"])
 for method in (
     connection.ResidualConnection._checkpoint_read,
     connection.ResidualConnection._checkpoint_write,

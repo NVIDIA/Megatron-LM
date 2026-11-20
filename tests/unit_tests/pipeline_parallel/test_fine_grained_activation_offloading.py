@@ -12,17 +12,19 @@ import pytest
 import torch
 
 from megatron.core._rank_utils import safe_get_rank
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import ChunkOffloadHandler
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
+    ChunkOffloadHandler,
+)
+from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
     OffloadTensorGroup,
     OffloadTensorPool,
     PipelineOffloadManager,
 )
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
     model_parallel_cuda_manual_seed,
@@ -330,7 +332,9 @@ def reset_hybrid_ep():
 
 
 def test_offload_summary_uses_explicit_process_group(monkeypatch):
-    from megatron.core.pipeline_parallel import fine_grained_activation_offload as off_module
+    from megatron.core.activation_policy.offload import (
+        fine_grained_activation_offload as off_module,
+    )
 
     process_group = object()
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
@@ -575,7 +579,9 @@ def _run_post_warmup_callback(chunk: ChunkOffloadHandler) -> None:
     Utils.world_size < 2, reason="Rank-0 duplicate aggregation requires at least two ranks."
 )
 def test_post_warmup_callback_warns_on_duplicated_storage_offload(caplog, monkeypatch):
-    from megatron.core.pipeline_parallel import fine_grained_activation_offload as off_module
+    from megatron.core.activation_policy.offload import (
+        fine_grained_activation_offload as off_module,
+    )
 
     # post_warmup_callback gathers the per-rank duplicate summaries, so this test needs a
     # live process group. The skipif above reads the launcher's world size rather than
@@ -695,7 +701,9 @@ def test_bulk_offload_group_counts_full_storage_and_logical_view_duplicates(full
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
 def test_bulk_offload_group_does_not_flag_views_copying_their_own_bytes(caplog, monkeypatch):
-    from megatron.core.pipeline_parallel import fine_grained_activation_offload as off_module
+    from megatron.core.activation_policy.offload import (
+        fine_grained_activation_offload as off_module,
+    )
 
     base = torch.randn(1024, 512, device="cuda")
     storage_bytes = base.numel() * base.element_size()
@@ -1101,7 +1109,7 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
         seq_length=seq_length, micro_batch_size=micro_batch_size, device=device
     )
 
-    from megatron.core.pipeline_parallel import fine_grained_activation_offload as off
+    from megatron.core.activation_policy.offload import fine_grained_activation_offload as off
 
     off_interface.reset_instance()
 
@@ -1174,7 +1182,7 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
         # Reset once more to trigger post_warmup_callback and apply steady-state offload decisions.
         off_interface.reset()
 
-        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
             PipelineOffloadManager,
         )
 
@@ -1304,7 +1312,7 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
     micro_batch_size = 2
     device = torch.device("cuda")
 
-    from megatron.core.pipeline_parallel import fine_grained_activation_offload as off
+    from megatron.core.activation_policy.offload import fine_grained_activation_offload as off
 
     def _make_schedule_inputs() -> Dict[str, torch.Tensor]:
         data = list(range(seq_length))
@@ -1457,7 +1465,7 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
             off_interface.reset()
             _run_schedule_1f1b_two_microbatches(off_model, enable_offload_reset=False)
             off_interface.reset()
-            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
                 PipelineOffloadManager,
             )
 
