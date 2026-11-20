@@ -23,6 +23,7 @@ dist_optimizer
 checkpoint-merge
 optimizer_cpu_offload
 paged_stash
+post_training_quantization
 tokenizers
 megatron_energon
 megatron_rl
