@@ -64,6 +64,20 @@ def _te_do_not_offload(tensor):
     )
 
 
+def _allocator_tracks_storage(tensor: torch.Tensor) -> bool:
+    """Return whether ``record_stream`` protects the memory behind ``tensor``.
+
+    The CUDA caching allocator only tracks stream uses of memory it allocated; it silently
+    ignores ``record_stream`` for any other storage, such as the ``from_blob`` views that
+    Transformer Engine's ``bulk_allocate`` carves out of one buffer (grouped GEMM split offsets,
+    grouped MXFP8 data). Such storages are not resizable, while allocator-owned ones are.
+    """
+    try:
+        return tensor.untyped_storage().resizable()
+    except (RuntimeError, NotImplementedError):
+        return False
+
+
 def _covers_whole_storage(tensor: torch.Tensor) -> bool:
     """Return whether a contiguous tensor spans every byte of its underlying storage."""
     return (
@@ -496,6 +510,9 @@ class OffloadTensorGroup:
         # Warmup-only bookkeeping for redundant copies within this group.
         self.duplicate_storage_tensor_count = 0
         self.duplicate_storage_bytes = 0
+        # Offloaded sources whose memory record_stream cannot protect, kept alive until their
+        # D2H copies have finished (see ChunkOffloadHandler.bulk_offload_group).
+        self._unrecorded_sources = []
         # Using memory pool is for the compatibility with cuda graph.
         # Variable MoE shapes bypass the shape/dtype cache. ChunkOffloadHandler
         # overrides this when the pool has fixed byte storage for cross-shape reuse.
@@ -519,6 +536,27 @@ class OffloadTensorGroup:
     def wait_offload_event(self, stream):
         """Wait for the offload event."""
         stream.wait_event(self._offload_event)
+
+    def hold_offload_source(self, tensor):
+        """Keep the source of a pending D2H copy alive until release_offload_sources."""
+        self._unrecorded_sources.append(tensor)
+
+    def release_offload_sources(self, wait_stream=None, force=False):
+        """Drop the held offload sources once their D2H copies can no longer be overtaken.
+
+        With ``wait_stream``, that stream first waits for the offload event, so memory the
+        allocator returns to it is only reused after the copies. With ``force``, the caller
+        guarantees the ordering. Otherwise the sources are dropped only if the offload event
+        has completed. Returns whether no source is held anymore.
+        """
+        if not self._unrecorded_sources:
+            return True
+        if wait_stream is not None:
+            wait_stream.wait_event(self._offload_event)
+        elif not force and not self._offload_event.query():
+            return False
+        self._unrecorded_sources.clear()
+        return True
 
     def record_reload_event(self, stream):
         """Record the reload event."""
@@ -1264,6 +1302,10 @@ class ChunkOffloadHandler:
                     # record_stream on the view marks the shared storage
                     # allocation, so this also covers base-storage offloads.
                     tensor_on_device.record_stream(self.d2h_stream)
+                    if not _allocator_tracks_storage(tensor_on_device):
+                        # record_stream was a no-op: once the last reference is dropped, the
+                        # producer's stream may reuse the memory before this copy reads it.
+                        group_to_offload.hold_offload_source(tensor_on_device)
                     group_to_offload.push_tensor(tensor_tag, state)
             group_to_offload.record_offload_event(self.d2h_stream)
         nvtx_range_pop(nvtx_msg)
@@ -1374,6 +1416,13 @@ class ChunkOffloadHandler:
                 debug_rank(f"----recovered_tensor {recovered_tensor.shape}")
                 group_to_reload.push_tensor(tensor_tag, recovered_tensor)
             group_to_reload.record_reload_event(self.h2d_stream)
+        # The copies are complete before the consumer can see the reloaded tensors. Outside
+        # capture, the consumer stream waits for them before the held sources are dropped;
+        # under capture the reload is ordered behind the forward's copies, as for the H2D wait.
+        if is_graph_capturing():
+            group_to_reload.release_offload_sources(force=True)
+        else:
+            group_to_reload.release_offload_sources(wait_stream=consumer_stream)
         group_to_reload._reload_graph_task_id = _capturing_graph_task_id()
         self._groups_to_reload.pop()
         # Add the group to the reloading group to wait for the reload event.
@@ -1467,9 +1516,18 @@ class ChunkOffloadHandler:
         if not self.do_offload:
             return
         debug_rank(f"--on_group_commit_forward {name}")
+        self._release_copied_offload_sources()
         # Wait for compute to finish before starting offload
         self.d2h_stream.wait_stream(torch.cuda.current_stream())
         self.bulk_offload(name, forced_released_tensors)
+
+    def _release_copied_offload_sources(self):
+        """Drop the held offload sources of groups whose D2H copies have finished."""
+        if is_graph_capturing() or torch.cuda.is_current_stream_capturing():
+            # Events cannot be queried during capture; the group's reload releases them.
+            return
+        for group in self.offload_groups:
+            group.release_offload_sources()
 
     def bulk_reload(self):
         """Reload the next group of tensors from CPU to GPU."""
