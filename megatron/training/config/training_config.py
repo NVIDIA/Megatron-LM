@@ -9,8 +9,20 @@ from typing import List, Literal, Optional
 class TrainingConfig:
     """Configuration settings related to the training loop."""
 
+    train_full_dataset: bool = False
+    """Train for one complete pass over an externally provided dataset."""
+
+    deduplicate_dataloader_across_context_parallel: bool = False
+    """Count context-parallel loader replicas once for full-dataset training."""
+
+    phase_transition_iterations: list[int] | None = None
+    """Iterations where dataset phases change; global batch size stays fixed across phases."""
+
     vision_pretraining_type: Literal["classify", "inpaint", "dino"] | None = None
     """Vision pretraining objective, or None when vision pretraining is disabled."""
+
+    freeze_all_layers: bool = False
+    """Freeze model parameters and run forward-only, for example when saving teacher logits."""
 
     micro_batch_size: int | None = None
     """Batch size per model instance (local batch size). Global batch size is local batch size times
@@ -316,6 +328,12 @@ class SchedulerConfig:
 @dataclass(kw_only=True)
 class LoggerConfig:
     """Configuration settings for logging, including TensorBoard and WandB."""
+
+    dump_param_to_param_group_map: str | None = None
+    """Optional output path for the optimizer's parameter-to-group mapping."""
+
+    log_packed_sequence_stats: bool = False
+    """Log the existing packed-sequence token and padding statistics."""
 
     log_interval: int = 100
     """Report loss and timing interval."""

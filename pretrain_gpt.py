@@ -30,9 +30,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.transformer.multi_token_prediction import (
-    get_mtp_ranks,
-)
+from megatron.core.transformer.multi_token_prediction import get_mtp_ranks
 from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank as mtp_on_this_rank_func,
 )
@@ -53,15 +51,15 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.argument_utils import (  # noqa: F401  (core_gpt_dataset_config_from_args: legacy shape, importable from here)
-    core_gpt_dataset_config_from_args,
+from megatron.training.argument_utils import (
     gpt_config_from_args,
     gpt_data_config_from_args,
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.datasets.providers import build_gpt_datasets, is_dataset_built_on_rank
-from megatron.training.global_vars import get_run_config, set_run_config
+from megatron.training.datasets.utils import get_dataset_input_length
+from megatron.training.global_vars import get_run_config, is_args_initialized, set_run_config
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import is_first_or_last_pipeline_stage
 
@@ -103,7 +101,6 @@ def get_batch(
 ):
     """Generate a batch."""
 
-    args = get_args()
     cfg = get_run_config()
 
     if cfg.model.transformer.sequence_packing_scheduler is not None:
@@ -129,11 +126,11 @@ def get_batch(
             config=cfg.model.transformer,
         )
 
+    # The data section's predicates and the dataset's fields; the packing path above needs
+    # neither them nor the length.
     cp_size = cfg.model.transformer.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
-    is_sft = args.sft
-    has_cu_seqlens = is_sft or args.dataloader_inter_document_masking
-    create_attention_mask_in_dataloader = args.create_attention_mask_in_dataloader
+    has_cu_seqlens = cfg.data.has_cu_seqlens()
     # Use the caller's pipeline group when it is given, so a model on its own grid places MTP by
     # the same group the model uses (GPTModel/HybridModel read pg_collection.pp).
     pp_group = pg_collection.pp if pg_collection is not None else None
@@ -156,6 +153,8 @@ def get_batch(
     ):
         return [None for _ in BATCH_KEYS]
 
+    # The dataset's row width (the derived pack width for SFT).
+    seq_length = get_dataset_input_length(cfg.data.dataset)
     batch = {}
     if tp_rank == 0:
         batch = next(data_iterator)
@@ -166,6 +165,9 @@ def get_batch(
                 else None
             )
 
+    # Read after the early return above: an intermediate stage without cu_seqlens never looks at
+    # the dataset (a loader-only section has none).
+    create_attention_mask_in_dataloader = cfg.data.creates_attention_mask()
     batch = get_batch_on_this_tp_rank(
         batch,
         broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
@@ -175,8 +177,8 @@ def get_batch(
         create_attention_mask_in_dataloader=create_attention_mask_in_dataloader,
         cp_size=cp_size,
         tp_rank=tp_rank,
-        micro_batch_size=args.micro_batch_size,
-        seq_length=args.seq_length,
+        micro_batch_size=cfg.train.micro_batch_size,
+        seq_length=seq_length,
         mtp_on_this_rank=mtp_on_this_rank,
         pipeline_model_parallel_size=cfg.model.transformer.pipeline_model_parallel_size,
         is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
@@ -204,7 +206,7 @@ def get_batch(
         batch,
         dynamic_cp=False,
         cp_group=get_context_parallel_group(),
-        use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
+        use_per_sequence_balancing=cfg.data.use_per_sequence_balancing(),
     )
 
     # Return values in BATCH_KEYS order so callers can unpack into the fixed
@@ -262,9 +264,10 @@ def loss_func(
         a dict containing reporting metrics on the loss and number of tokens across
             the data parallel ranks
     """
-    args = get_args()
+    # Optional CLI boundary until offline KD is config-owned by #9635.
+    args = get_args() if is_args_initialized() else None
 
-    if args.logits_load_dir is not None:
+    if getattr(args, "logits_load_dir", None) is not None:
         # Offline knowledge distillation loss using cached teacher log-probabilities.
         loss_func_cached_logits = _build_cached_logits_loss_func(
             logprobs_dir=args.logits_load_dir,
@@ -328,7 +331,6 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         model (GPTModel): The GPT Model
         return_schedule_plan (bool): Whether to return the schedule plan instead of the output tensor
     """
-    args = get_args()
     cfg = get_run_config()
     timers = get_timers()
 
@@ -396,7 +398,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                     max_seqlen_kv=int(max_seqlen.item()),
                     local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
                     cp_group=dynamic_cp_group,
-                    tokens_per_sample=args.seq_length,
+                    tokens_per_sample=get_dataset_input_length(cfg.data.dataset),
                 )
 
         # Offline logits KD: record this microbatch's global (un-CP-sharded)

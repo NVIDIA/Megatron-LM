@@ -63,11 +63,7 @@ from megatron.core.utils import (
     resolve_gtp_pad_for_alignment,
     unwrap_model,
 )
-from megatron.training.argument_utils import (
-    _default_config_from_args,
-    checkpoint_config_from_args,
-    project_checkpoint_policy,
-)
+from megatron.training.argument_utils import checkpoint_config_from_args, project_checkpoint_policy
 from megatron.training.config import CheckpointConfig, PretrainConfigContainer, TokenizerConfig
 from megatron.training.global_vars import get_run_config, get_tokenizer, get_train_state
 from megatron.training.utils.checkpoint_utils import (
@@ -85,7 +81,7 @@ from .ckpt.glu_checkpointing import (
     validate_glu_checkpoint_backend,
     validate_glu_optimizer_layout,
 )
-from .global_vars import get_args
+from .global_vars import get_args, is_args_initialized
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
 from .utils import append_to_progress_log, is_last_rank, print_rank_0, print_rank_last, warn_rank_0
 
@@ -311,7 +307,6 @@ def check_checkpoint_args(
     ``ckpt_format`` is the format of this load (default: the run's checkpoint section's).
     """
     cfg = get_run_config()
-    args = get_args()
     use_dist_ckpt = (cfg.checkpoint.ckpt_format if ckpt_format is None else ckpt_format) != 'torch'
     skip_args = skip_args or set()
 
@@ -326,7 +321,7 @@ def check_checkpoint_args(
         else:
             ckpt_arg_name = arg_name
         config_name = config_name or arg_name
-        current_config = args
+        current_config = cfg if config_section is not None else get_args()
         saved_config = checkpoint_config or {}
         if config_section is not None:
             current_config = cfg
@@ -355,7 +350,11 @@ def check_checkpoint_args(
     _compare('gdp_num_householder', default=3, config_section='model.transformer')
     # Preserve the existing load policy: changing RoPE to YaRN is supported.
     # Exact position_embedding_type equality would introduce a new restriction.
-    _compare('add_position_embedding', default=True)
+    # This deprecated CLI boolean is not equivalent to position_embedding_type:
+    # --no-position-embedding is accepted with RoPE and does not turn RoPE off.
+    # Preserve the old CLI-to-CLI comparison, without inventing it for native configs.
+    if is_args_initialized() and checkpoint_args is not None:
+        _compare('add_position_embedding', default=True)
     if cfg.model.transformer.wide_residual is not None or hasattr(
         checkpoint_args, 'wide_residual_num_streams'
     ):
@@ -375,14 +374,21 @@ def check_checkpoint_args(
                 f'the input argument value ({args_value}).'
             )
     if cfg.tokenizer.vocab_file:
-        _compare('max_position_embeddings', config_section='model', config_name='seq_length')
+        # This is a parameter-shape constraint for learned position tables, not
+        # a context-length restriction on RoPE/YaRN checkpoint reuse.
+        if getattr(cfg.model, 'position_embedding_type', 'learned_absolute') == 'learned_absolute':
+            _compare('max_position_embeddings', config_section='model', config_name='seq_length')
         _compare('make_vocab_size_divisible_by', config_section='model')
         if not use_dist_ckpt:
             _compare('padded_vocab_size', config_section='tokenizer')
         _compare('tokenizer_type', config_section='tokenizer')
     if cfg.rng.data_parallel_random_init:
         _compare('data_parallel_random_init', config_section='rng')
-    if check_training_state and args.phase_transition_iterations:
+    if (
+        check_training_state
+        and isinstance(cfg, PretrainConfigContainer)
+        and cfg.train.phase_transition_iterations
+    ):
         _compare('global_batch_size', config_section='train')
     if get_checkpoint_version() < 3.0:
         _compare('tensor_model_parallel_size', old_arg_name='model_parallel_size', config_section='model.transformer')
@@ -834,7 +840,7 @@ def save_checkpoint(
             follows the section, which is not written.
     """
     start_ckpt = time()
-    args = get_args()
+    args = get_args() if is_args_initialized() else None
     cfg = get_run_config()
     checkpoint = cfg.checkpoint
     # The values of this save; ``ckpt_format`` below is the format actually written. The run
@@ -862,7 +868,7 @@ def save_checkpoint(
 
     # --freeze-all-layers: weights are frozen, so skip the weight write and its finalizers; dump
     # progress is recorded separately via the post-logits finalize (see the async block below).
-    skip_weight_ckpt = getattr(args, 'freeze_all_layers', False)
+    skip_weight_ckpt = isinstance(cfg, PretrainConfigContainer) and cfg.train.freeze_all_layers
 
     # Handle non_persistent_ckpt flag. Besides overwriting the save directory and the checkpoint
     # type, non-persistent global ckpt requires no additional logic
@@ -1024,8 +1030,9 @@ def save_checkpoint(
                 verify_integrity=verify_integrity,
             )
 
-        validate_glu_checkpoint_backend(args, ckpt_format=ckpt_format)
-        state_dict = prepare_glu_checkpoint_for_save(state_dict, args)
+        model_config = cfg.model.transformer if cfg.model is not None else args
+        validate_glu_checkpoint_backend(model_config, ckpt_format=ckpt_format)
+        state_dict = prepare_glu_checkpoint_for_save(state_dict, model_config)
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
         if ckpt_type == CheckpointType.GLOBAL and ckpt_format == 'torch_dist':
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
@@ -1350,8 +1357,7 @@ def save_checkpoint(
                     and save_format == 'torch_dist'
                     and iteration > 0
                 ):
-                    config = _default_config_from_args(TokenizerConfig, args)
-                    save_tokenizer_assets(get_tokenizer(), config, checkpoint_name)
+                    save_tokenizer_assets(get_tokenizer(), cfg.tokenizer, checkpoint_name)
                 if cfg.logger.log_progress and checkpoint.async_save:
                     append_to_progress_log(
                         save_root, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
@@ -1851,15 +1857,28 @@ def generate_state_dict(
     # Bridge) stay right when the live namespace and the run config disagree. The live namespace
     # is not written.
     state_dict = {}
-    state_dict['args'] = project_checkpoint_policy(
-        args, checkpoint, **{name: value for name, value in saved_policy.items() if value is not None}
-    )
-    # Preserve the resolved vocabulary for checkpoint-args readers without updating runtime args
-    # (#8401); the projection above is already a copy of the namespace.
-    padded_vocab_size = get_run_config().tokenizer.padded_vocab_size
-    if getattr(args, 'padded_vocab_size', None) != padded_vocab_size:
-        state_dict['args'].padded_vocab_size = padded_vocab_size
+    if args is not None:
+        state_dict['args'] = project_checkpoint_policy(
+            args, checkpoint,
+            **{name: value for name, value in saved_policy.items() if value is not None},
+        )
+        # CLI compatibility metadata is optional. Native runs save run_config instead.
+        state_dict['args'].padded_vocab_size = get_run_config().tokenizer.padded_vocab_size
     state_dict['checkpoint_version'] = 3.1
+    if ckpt_format == 'torch_dist':
+        cfg = get_run_config()
+        # Launch topology is runtime metadata, not user configuration. RNG/rerun
+        # restoration needs it even when the checkpoint has no CLI namespace.
+        # Other formats do not consume this metadata; adding it to their strict
+        # load templates would reject existing checkpoints that lack these keys.
+        state_dict['parallel_state'] = {
+            'world_size': safe_get_world_size(),
+            'data_parallel_size': (
+                cfg.get_data_parallel_size()
+                if isinstance(cfg, PretrainConfigContainer)
+                else mpu.get_data_parallel_world_size()
+            ),
+        }
     if iteration is not None:
         state_dict['iteration'] = iteration
 
@@ -2243,7 +2262,7 @@ def _load_global_dist_base_checkpoint(
     if rank0:
         checkpoint_name = find_checkpoint_rank_0(load_dir, iteration, release)
         state_dict = dist_checkpointing.load_common_state_dict(
-            checkpoint_name, cache_metadata=args.ckpt_assume_constant_structure
+            checkpoint_name, cache_metadata=checkpoint.ckpt_assume_constant_structure
         )
         return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
 
@@ -2363,7 +2382,7 @@ def _load_base_checkpoint(
     ``finetune`` whether this load is weights-only (default: the section's).
     ``args`` is still read for the settings other sections own.
     """
-    if args is None:
+    if args is None and is_args_initialized():
         args = get_args()
     checkpoint = get_run_config().checkpoint if checkpoint is None else checkpoint
     if finetune is None:
@@ -2923,7 +2942,7 @@ def load_checkpoint(
         must not inherit the student's selected iteration, fallback or nonpersistent source).
     """
     cfg = get_run_config()
-    args = get_args()
+    args = get_args() if is_args_initialized() else None
     checkpoint = cfg.checkpoint
     selector_overrides = {
         key: value
@@ -2957,7 +2976,11 @@ def load_checkpoint(
     # progress from --save (this job's output) rather than --load lets --load stay pinned to a
     # fixed checkpoint across resubmits. An explicit --override-ckpt-iteration wins. (The main use
     # today is offline-KD teacher-logit dumps.)
-    if restore_training_state and getattr(args, 'freeze_all_layers', False):
+    if (
+        restore_training_state
+        and isinstance(cfg, PretrainConfigContainer)
+        and cfg.train.freeze_all_layers
+    ):
         # Weights only: don't adopt the loaded checkpoint's optimizer / LR-scheduler / rng, or run
         # check_checkpoint_args against a checkpoint from a different run (finetune gates all of
         # those; --freeze-all-layers alone would still load the scheduler and assert on arg drift).
@@ -3090,8 +3113,10 @@ def load_checkpoint(
     gpt_compat_load_optim = gpt_compat_load_optim and not release and restore_training_state
 
     def validate_glu_layout(checkpoint_state, is_release):
+        model_config = cfg.model.transformer if cfg.model is not None else args
         validate_glu_checkpoint_backend(
-            args, ckpt_format=ckpt_format, skip_load_to_model_and_opt=skip_load_to_model_and_opt
+            model_config, ckpt_format=ckpt_format,
+            skip_load_to_model_and_opt=skip_load_to_model_and_opt
         )
         # Whether the checkpoint holds optimizer state follows its saved checkpoint section (the
         # saved arguments only without one), as the optimizer load template below does.
@@ -3107,7 +3132,10 @@ def load_checkpoint(
             and load_optim
             and holds_optimizer
         )
-        validate_glu_optimizer_layout(checkpoint_state, args, loading_optimizer=loading_optimizer)
+        validate_glu_optimizer_layout(
+            checkpoint_state, model_config, loading_optimizer=loading_optimizer,
+            checkpoint_config=checkpoint_config,
+        )
 
     if state_dict is not None:
         # Check common metadata before DCP can write into model/optimizer storage.
@@ -3131,9 +3159,14 @@ def load_checkpoint(
             cfg.model.transformer.pipeline_model_parallel_size,
         )
 
-        ckpt_world_size = getattr(ckpt_args, 'world_size', 0)
+        saved_parallel_state = state_dict.get('parallel_state') or {}
+        ckpt_world_size = saved_parallel_state.get(
+            'world_size', getattr(ckpt_args, 'world_size', 0)
+        )
         run_world_size = safe_get_world_size()
-        ckpt_dp = getattr(ckpt_args, 'data_parallel_size', 0)
+        ckpt_dp = saved_parallel_state.get(
+            'data_parallel_size', getattr(ckpt_args, 'data_parallel_size', 0)
+        )
         run_dp = (
             cfg.get_data_parallel_size()
             if isinstance(cfg, PretrainConfigContainer) else args.data_parallel_size
@@ -3482,7 +3515,9 @@ def load_checkpoint(
     if not checkpoint_config_read:
         checkpoint_config = _read_checkpoint_run_config(state_dict, checkpoint_name, ckpt_type)
     validate_glu_layout(state_dict, release)
-    state_dict = prepare_glu_checkpoint_for_load(state_dict, args)
+    state_dict = prepare_glu_checkpoint_for_load(
+        state_dict, cfg.model.transformer if cfg.model is not None else args
+    )
 
     # Set checkpoint version.
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))
@@ -3533,8 +3568,8 @@ def load_checkpoint(
         num_floating_point_operations_so_far = state_dict.get('num_floating_point_operations_so_far', 0)
 
     # Check arguments.
-    if 'args' in state_dict and not finetune:
-        checkpoint_args = state_dict['args']
+    if ('args' in state_dict or checkpoint_config) and not finetune:
+        checkpoint_args = state_dict.get('args')
         # A GPT block is split into separate attention and MLP positions in
         # HybridModel, so num_layers intentionally differs even for an
         # architecture-preserving load. Keep every other resume-time argument

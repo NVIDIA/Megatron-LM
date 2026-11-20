@@ -161,6 +161,7 @@ from megatron.training.checkpointing import (
 from megatron.training.config import TrainingConfig, ValidationConfig
 from megatron.training.config.container import PretrainConfigContainer
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
+from megatron.training.datasets.utils import get_training_data_sequence_length
 from megatron.training.initialize import (
     initialize_megatron,
     set_jit_fusion_options,
@@ -173,7 +174,7 @@ from megatron.training.logging.packed_sequence_stats import (
     consume_packed_sequence_stats_in_iteration,
     update_packed_sequence_stats,
 )
-from megatron.training.models import ModelConfig
+from megatron.training.models import ModelConfig, T5ModelConfig
 from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
 
 # Local.
@@ -200,6 +201,7 @@ from .global_vars import (
     get_timers,
     get_train_state,
     get_wandb_writer,
+    is_args_initialized,
 )
 from .theoretical_memory_usage import report_theoretical_memory
 from .utils import (
@@ -855,7 +857,8 @@ def num_floating_point_operations(
 
     Args:
         model_config: Model configuration containing the resolved TransformerConfig.
-        sequence_length: Actual data/decoder length, distinct from position capacity.
+        sequence_length: Actual input length, distinct from position capacity. T5 uses its
+            configured decoder length when present, preserving the existing FLOPs estimate.
         batch_size: Global batch size (samples per iteration). Only used to
             compute the default token counts for the BSHD path -- with THD
             both ``total_real_tokens_in_batch`` and ``seqlen_squared_sum_in_batch``
@@ -884,6 +887,9 @@ def num_floating_point_operations(
 
     transformer_cfg = model_config.transformer
     llm_seq_length = sequence_length
+    if isinstance(model_config, T5ModelConfig) and model_config.decoder_seq_length is not None:
+        # Preserve T5's decoder-based estimate without exposing it to pipeline sizing.
+        llm_seq_length = model_config.decoder_seq_length
     group_query_attention = transformer_cfg.num_query_groups != transformer_cfg.num_attention_heads
     swiglu = (
         transformer_cfg.gated_linear_unit
@@ -1242,12 +1248,13 @@ def preprocess_common_state_dict(common_state_dict):
 
     # Convert args key of type namespace to dictionary
     preprocessed_common_state_dict = copy.deepcopy(common_state_dict)
-    preprocessed_common_state_dict['args'] = vars(preprocessed_common_state_dict['args'])
-    # Remove rank and local rank from state dict if it exists, since they are expected to be different
-    preprocessed_common_state_dict['args'].pop('local_rank', None)
-    preprocessed_common_state_dict['args'].pop('rank', None)
+    if 'args' in preprocessed_common_state_dict:
+        preprocessed_common_state_dict['args'] = vars(preprocessed_common_state_dict['args'])
+        # CLI launch metadata differs by rank and is absent in config-only runs.
+        preprocessed_common_state_dict['args'].pop('local_rank', None)
+        preprocessed_common_state_dict['args'].pop('rank', None)
     if (
-        preprocessed_common_state_dict['args']['use_distributed_optimizer']
+        get_run_config().optimizer.use_distributed_optimizer
         and "optimizer" in preprocessed_common_state_dict
     ):
         def reorder_inner_param_groups(optimizer_state_dict):
@@ -1288,7 +1295,7 @@ def preprocess_common_state_dict(common_state_dict):
     return preprocessed_common_state_dict
 
 
-def _get_train_full_dataset_sample_count(args, dataset_provider):
+def _get_train_full_dataset_sample_count(dataset_provider):
     """Measure the training horizon without restoring a temporary dataloader.
 
     Opt-in providers must accept ``restore_dataloader_state=False`` and expose
@@ -1315,9 +1322,7 @@ def _get_train_full_dataset_sample_count(args, dataset_provider):
     total_num_samples = reduce_max_stat_across_model_parallel_group(
         _reduce_sum_across_data_parallel_group(
             local_num_samples,
-            with_context_parallel=getattr(
-                args, 'deduplicate_dataloader_across_context_parallel', False
-            ),
+            with_context_parallel=cfg.train.deduplicate_dataloader_across_context_parallel,
         )
     )
     if total_num_samples is None:
@@ -1458,9 +1463,6 @@ def pretrain(
 
     timestamp_after_initialize_megatron = time.time()
 
-    # Temporary args/config duplication during the training-loop refactor:
-    # migrated settings use cfg_container; remaining settings still use legacy args.
-    args = get_args()
     train_state = get_train_state()
     timers = get_timers()
 
@@ -1482,9 +1484,10 @@ def pretrain(
     if cfg_container.logger.log_progress:
         append_to_progress_log(cfg_container.checkpoint.save, "Starting job")
 
+    sequence_length = cfg_container.model.transformer.max_seq_length_per_sample
     set_jit_fusion_options(
         cfg_container.model.transformer,
-        sequence_length=args.seq_length,
+        sequence_length=sequence_length,
         micro_batch_size=cfg_container.train.micro_batch_size,
         tp_size=cfg_container.model.transformer.tensor_model_parallel_size,
     )
@@ -1507,7 +1510,7 @@ def pretrain(
     warmup_training_kernels(
         cfg_container.model,
         warmup_tp_group,
-        seq_length=args.seq_length,
+        seq_length=sequence_length,
         micro_batch_size=cfg_container.train.micro_batch_size,
     )
     print_rank_0("Finished training-kernel warmup.")
@@ -1719,10 +1722,10 @@ def pretrain(
     callback_manager.callback_context.checkpointing_context = checkpointing_context
     callback_manager.trigger("on_setup_start")
 
-    if args.train_full_dataset:
+    if cfg_container.train.train_full_dataset:
         # The scheduler must know the training horizon before model and optimizer setup.
         cfg_container.train.train_samples = _get_train_full_dataset_sample_count(
-            args, train_valid_test_dataset_provider
+            train_valid_test_dataset_provider
         )
 
     # Model, optimizer, and learning rate.
@@ -1838,7 +1841,7 @@ def pretrain(
         train_state.do_train,
         train_state.do_valid,
         train_state.do_test,
-        args.dataloader_type,
+        cfg_container.data.dataloader.dataloader_type or 'single',
     )
 
     # Print setup timing.
@@ -1871,7 +1874,6 @@ def pretrain(
             print_rank_0('training ...')
 
         iteration = 0
-        args.curr_iteration = iteration
         # Mirrors train()'s own loop-entry condition, so the "misaligned save_interval"
         # fallback below can skip when there was nothing left to train this invocation
         # (e.g. resubmitting an already-finished job) instead of redoing a redundant save.
@@ -2213,7 +2215,7 @@ def _add_model_freeze_pre_wrap_hook(model_config, *, freeze_all_layers, freeze_b
         model_config.pre_wrap_hooks.append(freeze_hook)
 
 
-def _forward_backward_grad_context(args):
+def _forward_backward_grad_context(config):
     """Grad context for a train step's forward/backward pass.
 
     Returns a tuple of (grad_context, forward_only).
@@ -2222,8 +2224,8 @@ def _forward_backward_grad_context(args):
     autograd graph. Otherwise returns a no-op context.
     forward_only is True when all layers are frozen, False otherwise.
     """
-    grad_context = torch.no_grad() if getattr(args, "freeze_all_layers", False) else nullcontext()
-    forward_only = getattr(args, "freeze_all_layers", False)
+    forward_only = config.freeze_all_layers
+    grad_context = torch.no_grad() if forward_only else nullcontext()
     return grad_context, forward_only
 
 
@@ -2232,10 +2234,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     cfg = get_run_config()
     if ddp_config is None and isinstance(cfg, PretrainConfigContainer):
         ddp_config = cfg.ddp
-    args = get_args()
     if config is None:
         config = cfg.model.transformer
-    args.model_type = model_type
+    if is_args_initialized():
+        get_args().model_type = model_type
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
@@ -2301,7 +2303,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         model = [model]
 
     # For rare operations like post-training logits saving
-    if args.freeze_all_layers:
+    if isinstance(cfg, PretrainConfigContainer) and cfg.train.freeze_all_layers:
         _freeze_all_model_chunks(model)
     elif config.freeze_base_model_for_mtp:
         _freeze_base_model_for_mtp(model)
@@ -2436,7 +2438,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 def get_optimizer_param_scheduler(optimizer):
     """Build the learning rate scheduler."""
     cfg = get_run_config()
-    args = get_args()
 
     if cfg.train.train_iters is None and cfg.train.train_samples is None:
         raise Exception('either train-iters or train-samples should be provided.')
@@ -2488,10 +2489,7 @@ def setup_model_and_optimizer(
     run_train_loop_without_updates: bool = False,
 ):
     """Setup model and optimizer."""
-    # Temporary args/config duplication during the training-loop refactor:
-    # migrated settings use cfg_container; remaining settings still use legacy args.
     cfg = cfg_container if cfg_container is not None else get_run_config()
-    args = get_args()
     train_state = get_train_state()
     timers = get_timers()
     one_logger = get_one_logger()
@@ -2519,7 +2517,7 @@ def setup_model_and_optimizer(
             # gradient storage for parameters that remain trainable (matching get_model behavior).
             _add_model_freeze_pre_wrap_hook(
                 model_config,
-                freeze_all_layers=args.freeze_all_layers,
+                freeze_all_layers=cfg.train.freeze_all_layers,
                 freeze_base_model_for_mtp=cfg.model.transformer.freeze_base_model_for_mtp,
             )
 
@@ -2615,7 +2613,9 @@ def setup_model_and_optimizer(
             cuda_graph_impl=cfg.model.transformer.cuda_graph_impl,
         )
 
-    if args.logits_save_dir is not None and mpu.is_pipeline_last_stage():
+    # Optional CLI boundary until offline KD is config-owned by #9635.
+    args = get_args() if is_args_initialized() else None
+    if getattr(args, "logits_save_dir", None) is not None and mpu.is_pipeline_last_stage():
         from megatron.training.distillation import LogitsSaverHooks
 
         logits_saver = LogitsSaverHooks(
@@ -2627,7 +2627,7 @@ def setup_model_and_optimizer(
         )
         logits_saver.attach_hooks(unwrapped_model[-1])
 
-    if args.logits_load_dir is not None and mpu.is_pipeline_last_stage():
+    if getattr(args, "logits_load_dir", None) is not None and mpu.is_pipeline_last_stage():
         from megatron.training.distillation import StudentLogitsCapture
 
         student_logits_capture = StudentLogitsCapture()
@@ -2658,7 +2658,7 @@ def setup_model_and_optimizer(
             model,
             config_overrides=optim_cfg_overrides,
             use_gloo_process_groups=cfg.dist.use_gloo_process_groups,
-            dump_param_to_param_group_map=args.dump_param_to_param_group_map,
+            dump_param_to_param_group_map=cfg.logger.dump_param_to_param_group_map,
         )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
@@ -2669,7 +2669,12 @@ def setup_model_and_optimizer(
     setup_dp_group = _get_memory_report_dp_group(_get_model_pg_collection(model[0]))
     report_memory("(after model and optimizer build)", process_group=setup_dp_group)
 
-    if args.moe_use_upcycling:
+    if getattr(cfg.model, 'moe_use_upcycling', False):
+        # Upcycling's temporary model mutation is a separate migration. Native
+        # training must not fabricate arguments for this legacy-only operation.
+        if not is_args_initialized():
+            raise NotImplementedError("Config-only MoE upcycling is not supported yet")
+        args = get_args()
         torch.distributed.barrier()
         assert not checkpoint_exists(cfg.checkpoint.save), (
             "The upcycling destination directory already exists. "
@@ -2739,7 +2744,7 @@ def setup_model_and_optimizer(
 
     if (
         cfg.checkpoint.load is not None or cfg.checkpoint.pretrained_checkpoint is not None
-    ) and not args.moe_use_upcycling:
+    ) and not getattr(cfg.model, 'moe_use_upcycling', False):
         one_logger and one_logger.log_metrics(
             {'load_checkpoint_start_time': one_logger_utils.get_timestamp_in_ms()}
         )
@@ -2873,9 +2878,12 @@ def setup_model_and_optimizer(
 def dummy_train_step(data_iterator):
     """Single dummy training step."""
     cfg = get_run_config()
-    args = get_args()
+    sequence_length = cfg.model.transformer.max_seq_length_per_sample
     tp_rank = mpu.get_tensor_model_parallel_rank()
-    has_cu_seqlens = getattr(args, 'sft', False) or getattr(args, 'dataloader_inter_document_masking', False)
+    # Data predicates and model parallelism describe the batch transfer.
+    has_cu_seqlens = cfg.data.has_cu_seqlens()
+    dataset = cfg.data.dataset
+    create_attention_mask = cfg.data.creates_attention_mask() if dataset is not None else None
     dynamic_cp = cfg.model.transformer.dynamic_context_parallel
 
     BATCH_KEYS = [
@@ -2894,17 +2902,32 @@ def dummy_train_step(data_iterator):
                 batch = next(data_iterator)
                 for key in BATCH_KEYS:
                     batch[key] = batch[key].cuda(non_blocking=True) if key in batch and batch[key] is not None else None
+            if dataset is None:
+                # Callback datasets have no mask config. Agree on the source batch's
+                # mask presence before entering optional TP collectives. This metadata
+                # exchange is only needed on the skipped-iteration path.
+                mask_present = torch.tensor(
+                    batch.get("attention_mask") is not None,
+                    dtype=torch.bool,
+                    device=torch.cuda.current_device(),
+                )
+                torch.distributed.broadcast(
+                    mask_present,
+                    src=mpu.get_tensor_model_parallel_src_rank(),
+                    group=mpu.get_tensor_model_parallel_group(),
+                )
+                create_attention_mask = mask_present.item()
             batch = get_batch_on_this_tp_rank(
                 batch,
                 broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
                 broadcast_group=mpu.get_tensor_model_parallel_group(),
                 has_cu_seqlens=has_cu_seqlens,
                 dynamic_cp=dynamic_cp,
-                create_attention_mask_in_dataloader=args.create_attention_mask_in_dataloader,
+                create_attention_mask_in_dataloader=create_attention_mask,
                 cp_size=cfg.model.transformer.context_parallel_size,
                 tp_rank=tp_rank,
                 micro_batch_size=cfg.train.micro_batch_size,
-                seq_length=args.seq_length,
+                seq_length=sequence_length,
                 mtp_on_this_rank=False,
                 pipeline_model_parallel_size=cfg.model.transformer.pipeline_model_parallel_size,
                 is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
@@ -2934,7 +2957,7 @@ def _pop_samples_seen(losses_reduced):
     return total
 
 
-def _get_samples_seen_in_iteration(losses_reduced, args, pg_collection):
+def _get_samples_seen_in_iteration(losses_reduced, pg_collection):
     """Return the global sample count and synchronize it across pipeline stages."""
     cfg = get_run_config()
     local_samples_seen = _pop_samples_seen(losses_reduced)
@@ -2963,7 +2986,7 @@ def _get_samples_seen_in_iteration(losses_reduced, args, pg_collection):
     return get_num_microbatches() * cfg.train.micro_batch_size * cfg.get_batch_parallel_size()
 
 
-def _get_optimizer_param_scheduler_increment(args, samples_seen_in_iteration):
+def _get_optimizer_param_scheduler_increment(samples_seen_in_iteration):
     """Return the scheduler increment for the configured training horizon."""
     cfg = get_run_config()
     if cfg.train.train_iters and cfg.train.train_samples is None:
@@ -3006,6 +3029,66 @@ def _get_model_pg_collection(
     return pg_collection
 
 
+def _reduce_microbatch_losses(losses_reduced, *, is_sft, sft_loss_log_mode, group):
+    """Average the per-microbatch losses of a step for reporting.
+
+    ``is_sft`` is the data section's SFT family (``cfg.data.is_sft()``). For the
+    two-element (numerator, token count) values: SFT runs average over the trainable tokens of
+    the global batch (or, with ``--sft-loss-log-mode microbatch``, over the valid per-microbatch
+    means), the others take the ratio of the global sums; one-element values keep the legacy
+    per-microbatch mean. Reporting only; gradient normalization is elsewhere.
+    """
+    loss_reduced = {}
+    for key in losses_reduced[0].keys():
+        val = [x[key].view(-1) for x in losses_reduced]
+        if val[0].numel() == 2:
+            if is_sft and sft_loss_log_mode == 'microbatch':
+                # Some CP shards can legitimately contain no trainable tokens.
+                # Average only the valid per-microbatch losses.
+                val = torch.vstack(val)
+                numerators = val[:, 0]
+                denominators = val[:, 1]
+                valid = denominators > 0
+                if valid.any():
+                    local_sum = (numerators[valid] / denominators[valid]).sum()
+                    local_count = torch.tensor(
+                        float(valid.sum().item()),
+                        dtype=local_sum.dtype,
+                        device=local_sum.device,
+                    )
+                else:
+                    local_sum = torch.zeros_like(numerators[0])
+                    local_count = torch.zeros_like(denominators[0])
+
+                torch.distributed.all_reduce(local_sum, group=group)
+                torch.distributed.all_reduce(local_count, group=group)
+                loss_reduced[key] = torch.where(
+                    local_count > 0,
+                    local_sum / local_count.clamp(min=1),
+                    torch.zeros_like(local_sum),
+                )
+            elif is_sft:
+                # Average over the total number of tokens across the global batch.
+                val = torch.vstack(val).sum(dim=0)
+                torch.distributed.all_reduce(val, group=group)
+                loss_reduced[key] = torch.where(
+                    val[1] > 0,
+                    val[0] / val[1].clamp(min=1),
+                    torch.zeros_like(val[0]),
+                )
+            else:
+                val = torch.vstack(val).sum(dim=0)
+                torch.distributed.all_reduce(val, group=group)
+                loss_reduced[key] = val[0] / val[1]
+        elif val[0].numel() == 1:
+            # legacy behavior, we average over the number of microbatches
+            val = torch.cat(val).mean()
+            loss_reduced[key] = val
+        else:
+            raise ValueError(f"Invalid value shape: {val[0].shape} for key {key}")
+    return loss_reduced
+
+
 def train_step(
     forward_step_func,
     data_iterator,
@@ -3032,8 +3115,8 @@ def train_step(
         Observers exposing `observe_forward_backward` also receive a context around the
         forward-backward execution for short-lived tensors.
     """
-    args = get_args()
     cfg = get_run_config()
+    sequence_length = cfg.model.transformer.max_seq_length_per_sample
     timers = get_timers()
 
     # OTel: set up per-step sub-span support.
@@ -3071,9 +3154,9 @@ def train_step(
             # Pipeline-parallel distillation stacks student and teacher tensors.
             adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
                 model,
-                seq_length=args.seq_length,
+                seq_length=sequence_length,
                 micro_batch_size=cfg.train.micro_batch_size,
-                decoder_seq_length=args.decoder_seq_length,
+                decoder_seq_length=None,
             )
         else:
             adjust_tensor_shapes_fn = None
@@ -3144,7 +3227,7 @@ def train_step(
             enable_tokens_per_expert_logging(model, checkpoint.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, checkpoint.save)
-        grad_context, forward_only = _forward_backward_grad_context(args)
+        grad_context, forward_only = _forward_backward_grad_context(cfg.train)
         _fb_cm = (
             span_cm("megatron.train.iteration.forward_backward", tracer=_otel_step_tracer, num_microbatches=scheduled_num_microbatches)
             if _otel_sg_enabled('forward_backward') and _otel_step_tracer is not None else nullcontext()
@@ -3173,9 +3256,8 @@ def train_step(
                 data_iterator=forward_backward_data_iterator,
                 model=model,
                 num_microbatches=scheduled_num_microbatches,
-                seq_length=args.seq_length,
+                seq_length=sequence_length,
                 micro_batch_size=cfg.train.micro_batch_size,
-                decoder_seq_length=args.decoder_seq_length,
                 forward_only=forward_only,
                 adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
                 force_all_reduce=save_wgrads_in_this_iteration,
@@ -3236,7 +3318,7 @@ def train_step(
     if model_pg_collection is None:
         model_pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     samples_seen_in_iteration = _get_samples_seen_in_iteration(
-        losses_reduced, args, model_pg_collection
+        losses_reduced, model_pg_collection
     )
 
     if tensor_metric_observer is not None:
@@ -3304,7 +3386,7 @@ def train_step(
     # Update learning rate.
     if update_successful:
         increment = _get_optimizer_param_scheduler_increment(
-            args, samples_seen_in_iteration
+            samples_seen_in_iteration
         )
         opt_param_scheduler.step(increment=increment)
         skipped_iter = 0
@@ -3318,54 +3400,13 @@ def train_step(
     if is_last_stage and losses_reduced:
         # Average loss across microbatches.
         # Last stage may have no loss (e.g. MIMO encoder-grid ranks).
-        loss_reduced = {}
-        for key in losses_reduced[0].keys():
-            val = [x[key].view(-1) for x in losses_reduced]
-            if val[0].numel() == 2:
-                if args.sft and args.sft_loss_log_mode == 'microbatch':
-                    # Some CP shards can legitimately contain no trainable tokens.
-                    # Average only the valid per-microbatch losses.
-                    val = torch.vstack(val)
-                    numerators = val[:, 0]
-                    denominators = val[:, 1]
-                    valid = denominators > 0
-                    if valid.any():
-                        local_sum = (numerators[valid] / denominators[valid]).sum()
-                        local_count = torch.tensor(
-                            float(valid.sum().item()),
-                            dtype=local_sum.dtype,
-                            device=local_sum.device,
-                        )
-                    else:
-                        local_sum = torch.zeros_like(numerators[0])
-                        local_count = torch.zeros_like(denominators[0])
-
-                    torch.distributed.all_reduce(local_sum, group=dp_cp_group)
-                    torch.distributed.all_reduce(local_count, group=dp_cp_group)
-                    loss_reduced[key] = torch.where(
-                        local_count > 0,
-                        local_sum / local_count.clamp(min=1),
-                        torch.zeros_like(local_sum),
-                    )
-                elif args.sft:
-                    # Average over the total number of tokens across the global batch.
-                    val = torch.vstack(val).sum(dim=0)
-                    torch.distributed.all_reduce(val, group=dp_cp_group)
-                    loss_reduced[key] = torch.where(
-                        val[1] > 0,
-                        val[0] / val[1].clamp(min=1),
-                        torch.zeros_like(val[0]),
-                    )
-                else:
-                    val = torch.vstack(val).sum(dim=0)
-                    torch.distributed.all_reduce(val, group=dp_cp_group)
-                    loss_reduced[key] = val[0] / val[1]
-            elif val[0].numel() == 1:
-                # legacy behavior, we average over the number of microbatches
-                val = torch.cat(val).mean()
-                loss_reduced[key] = val
-            else:
-                raise ValueError(f"Invalid value shape: {val[0].shape} for key {key}")
+        loss_reduced = _reduce_microbatch_losses(
+            losses_reduced,
+            is_sft=cfg.data.is_sft(),
+            # Plain/legacy GPT dataset configs have no SFT reporting override.
+            sft_loss_log_mode=getattr(cfg.data.dataset, "sft_loss_log_mode", "token-weighted"),
+            group=dp_cp_group,
+        )
         return (
             loss_reduced,
             skipped_iter,
@@ -3442,11 +3483,9 @@ def training_log(
 ):
     """Log training information such as losses, timing, ...."""
     callback_manager = normalize_callbacks(callback_manager)
-    args = get_args()
     train_state = get_train_state()
-    # Temporary args/config duplication during the training-loop refactor:
-    # migrated settings use config; remaining settings still use legacy args.
     cfg = get_run_config()
+    sequence_length = cfg.model.transformer.max_seq_length_per_sample
     timers = get_timers()
     writer = get_tensorboard_writer()
     wandb_writer = get_wandb_writer()
@@ -3527,7 +3566,7 @@ def training_log(
     )
 
     # Track app tag & app tag ID
-    one_logger_utils.track_app_tag(batch_size, safe_get_world_size(), args.seq_length)
+    one_logger_utils.track_app_tag(batch_size, safe_get_world_size(), sequence_length)
 
     total_iterations = total_loss_dict[advanced_iters_key] + total_loss_dict[skipped_iters_key]
     if packed_sequence_stats and wandb_writer:
@@ -3538,7 +3577,7 @@ def training_log(
     learning_rate: float | None = reduce_max_stat_across_model_parallel_group(
         learning_rate, group=_lr_mp_group
     )
-    if learning_rate is None and args.freeze_all_layers:
+    if learning_rate is None and cfg.train.freeze_all_layers:
         learning_rate = 0.0
     # Tensorboard values.
     if writer and (iteration % cfg.logger.tensorboard_log_interval == 0):
@@ -3734,7 +3773,7 @@ def training_log(
         throughput = num_floating_point_operations(
             cfg.model,
             batch_size,
-            sequence_length=args.decoder_seq_length if args.decoder_seq_length is not None else args.seq_length,
+            sequence_length=sequence_length,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
         ) / (elapsed_time_per_iteration * 10**12 * llm_world_size)
@@ -3864,7 +3903,7 @@ def training_log(
             from megatron.core.telemetry.training_metrics import record_training_metrics
             _avg_loss = _otel_loss_snapshot
             _tokens_per_sec = (
-                batch_size * args.seq_length / elapsed_time_per_iteration
+                batch_size * get_training_data_sequence_length(cfg) / elapsed_time_per_iteration
                 if elapsed_time_per_iteration > 0 else None
             )
             _mem_gb = torch.cuda.max_memory_allocated() / (1024 ** 3) if torch.cuda.is_available() else None
@@ -3886,7 +3925,7 @@ def training_log(
             if torch.distributed.get_rank() == 0:
                 num_microbatches = get_num_microbatches()
                 report_theoretical_memory(
-                    cfg, sequence_length=args.seq_length, micro_batch_size=cfg.train.micro_batch_size,
+                    cfg, sequence_length=sequence_length, micro_batch_size=cfg.train.micro_batch_size,
                     data_parallel_size=cfg.get_data_parallel_size(), world_size=safe_get_world_size(),
                     num_microbatches=num_microbatches, verbose=True,
                 )
@@ -3915,7 +3954,7 @@ def training_log(
     return report_memory_flag
 
 
-def _should_compute_params_norm(args, iteration, is_first_iteration):
+def _should_compute_params_norm(iteration, is_first_iteration):
     """Whether this iteration can emit the parameter norm."""
     cfg = get_run_config()
     return cfg.logger.log_params_norm and (
@@ -3960,8 +3999,8 @@ def _consume_embedding_min_norm_metrics(optimizer) -> Dict[str, float]:
 
 
 def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point_operations_so_far):
-    args = get_args()
     cfg = get_run_config()
+    sequence_length = get_training_data_sequence_length(cfg)
     checkpoint = cfg.checkpoint
     train_state = get_train_state()
     if checkpoint.save is None:
@@ -3985,7 +4024,7 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
         num_floating_point_operations_so_far - start_num_floating_point_operations
     ) / (elapsed_time * 10**12 * llm_world_size)
 
-    tokens_so_far = train_state.consumed_train_samples * args.seq_length
+    tokens_so_far = train_state.consumed_train_samples * sequence_length
     saved_ckpt_prefix = 'Saving async checkpoint' if checkpoint.async_save else 'Saved checkpoint'
     append_to_progress_log(
         checkpoint.save,
@@ -4058,7 +4097,6 @@ def save_checkpoint_and_time(
 ):
     callback_manager = normalize_callbacks(callback_manager)
     cfg = get_run_config()
-    args = get_args()
     timers = get_timers()
     energy_monitor = get_energy_monitor()
 
@@ -4085,7 +4123,7 @@ def save_checkpoint_and_time(
     try:
 
         # Synchronize forward pre-hook state before checkpoint save to avoid race conditions
-        if should_disable_forward_pre_hook(args, optimizer):
+        if should_disable_forward_pre_hook(optimizer):
             force_param_sync(model, optimizer=optimizer)
 
         # Stop timer to get accurate train interval time and exclude checkpointing duration
@@ -4226,9 +4264,6 @@ def post_training_step_callbacks(
     nsys_nvtx_context = None,
 ):
     """Run all post-training-step functions (e.g., FT heartbeats, GC)."""
-    args = get_args()
-    # Temporary args/config duplication during the training-loop refactor:
-    # migrated settings use config; remaining settings still use legacy args.
     cfg = get_run_config()
 
     # Bring CPU and GPU back in sync if on right iteration.
@@ -4250,14 +4285,14 @@ def post_training_step_callbacks(
         cfg.train.check_weight_hash_across_dp_replicas_interval is not None
         and iteration % cfg.train.check_weight_hash_across_dp_replicas_interval == 0
     ):
-        if should_disable_forward_pre_hook(args, optimizer):
+        if should_disable_forward_pre_hook(optimizer):
             disable_forward_pre_hook(model, optimizer=optimizer)
         assert check_param_hashes_across_dp_replicas(
             model, cross_check=True
         ), "Parameter hashes not matching across DP replicas"
         torch.distributed.barrier()
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
-        if should_disable_forward_pre_hook(args, optimizer):
+        if should_disable_forward_pre_hook(optimizer):
             enable_forward_pre_hook(model)
 
     # Autoresume.
@@ -4319,7 +4354,6 @@ def checkpoint_and_decide_exit(
     --exit-duration-in-mins is set). Actual exit happens in main training loop
     based on the return value of this function."""
     cfg = get_run_config()
-    args = get_args()
     timers = get_timers()
 
     # Exit based on signal handler.
@@ -4411,8 +4445,8 @@ def checkpoint_and_decide_exit(
         cfg.train.exit_interval
         and iteration % cfg.train.exit_interval == 0
     ) or (
-        args.phase_transition_iterations
-        and iteration in args.phase_transition_iterations
+        cfg.train.phase_transition_iterations
+        and iteration in cfg.train.phase_transition_iterations
     ):
         if cfg.checkpoint.save and not saved_checkpoint:
             save_checkpoint_and_time(
@@ -4483,12 +4517,13 @@ def train(
         changes (for data sources that reconfigure microbatches every iteration).
     """
     callback_manager = normalize_callbacks(callback_manager)
-    args = get_args()
-    # Temporary args/config duplication during the training-loop refactor:
-    # migrated settings use config; remaining settings still use legacy args.
     cfg = get_run_config()
+    sequence_length = cfg.model.transformer.max_seq_length_per_sample
     timers = get_timers()
     train_state = get_train_state()
+
+    # Optional CLI boundary until offline KD is config-owned by #9635.
+    args = get_args() if is_args_initialized() else None
 
     fault_injector_config = cfg.fault_tolerance.fault_injector
 
@@ -4571,7 +4606,7 @@ def train(
         iteration=iteration,
         consumed_train_samples=train_state.consumed_train_samples,
         train_samples=cfg.train.train_samples,
-        seq_length=args.seq_length,
+        seq_length=get_training_data_sequence_length(cfg),
         train_iters=cfg.train.train_iters,
         save=cfg.checkpoint.save,
         async_save=cfg.checkpoint.async_save,
@@ -4714,7 +4749,7 @@ def train(
             'num_floating_point_operations_so_far': train_state.num_floating_point_operations_so_far,
             'consumed_train_samples': train_state.consumed_train_samples,
             'world_size': cfg.get_model_world_size(),
-            'seq_length': args.seq_length,
+            'seq_length': get_training_data_sequence_length(cfg),
         }
 
     # Cache into one-logger for callback.
@@ -4757,7 +4792,7 @@ def train(
     # Disable forward pre-hook to start training to ensure that errors in checkpoint loading
     # or random initialization don't propagate to all ranks in first all-gather (which is a
     # no-op if things work correctly).
-    if should_disable_forward_pre_hook(args, optimizer):
+    if should_disable_forward_pre_hook(optimizer):
         disable_forward_pre_hook(model, param_sync=False)
         # Also remove param_sync_func temporarily so that sync calls made in
         # `forward_backward_func` are no-ops.
@@ -4781,7 +4816,7 @@ def train(
         cuda_graph_helper = TECudaGraphHelper(
             model=model,
             config=config,
-            seq_length=args.seq_length,
+            seq_length=sequence_length,
             micro_batch_size=cfg.train.micro_batch_size,
             optimizers=[optimizer],
         )
@@ -4911,12 +4946,12 @@ def train(
                 'job', 'megatron.train.cuda_graph_capture', is_goodput_span=True, **{'megatron.iteration': iteration}
             ):
                 if cfg.model.transformer.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(
-                    args, optimizer
+                    optimizer
                 ):
                     disable_forward_pre_hook(model, param_sync=False)
                 cuda_graph_helper.create_cudagraphs()
                 if cfg.model.transformer.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(
-                    args, optimizer
+                    optimizer
                 ):
                     enable_forward_pre_hook(model)
                     cuda_graph_helper.cuda_graph_set_manual_hooks()
@@ -5051,7 +5086,7 @@ def train(
                 # param-gather pre-hook re-enable -- runs between the train_step
                 # and train_log spans on the first iteration only, which is
                 # exactly the ~1.8s post-first-iteration gap.
-                if should_disable_forward_pre_hook(args, optimizer):
+                if should_disable_forward_pre_hook(optimizer):
                     with _otel_managed_span('first_iteration', 'megatron.train.forward_pre_hook', is_goodput_span=True):
                         enable_forward_pre_hook(model)
                     config.param_sync_func = param_sync_func
@@ -5122,12 +5157,12 @@ def train(
             consume_seqlen_stats_in_iteration()
         )
         packed_sequence_stats = None
-        if getattr(args, 'log_packed_sequence_stats', False):
+        if cfg.logger.log_packed_sequence_stats:
             packed_sequence_stats = consume_packed_sequence_stats_in_iteration()
         num_floating_point_operations_in_batch = num_floating_point_operations(
             cfg.model,
             batch_size,
-            sequence_length=args.decoder_seq_length if args.decoder_seq_length is not None else args.seq_length,
+            sequence_length=sequence_length,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
         )
@@ -5163,7 +5198,7 @@ def train(
             embedding_min_norm_metrics = None
 
             if (
-                getattr(args, "embedding_min_norm", None) is not None
+                cfg.optimizer.embedding_min_norm is not None
                 and iteration % cfg.logger.log_interval == 0
             ):
                 embedding_min_norm_metrics = _consume_embedding_min_norm_metrics(optimizer)
@@ -5175,7 +5210,7 @@ def train(
                 if wandb_writer:
                     wandb_writer.log(embedding_min_norm_metrics, iteration)
 
-            if _should_compute_params_norm(args, iteration, is_first_iteration):
+            if _should_compute_params_norm(iteration, is_first_iteration):
                 # Cross-rank param L2 norm (--log-params-norm): a full-model reduction
                 # + all-reduce that BLOCKS the training loop -- exposed goodput cost
                 # (~1.5s cold on the first iteration, ~10ms steady). Kept as a real
@@ -5226,7 +5261,7 @@ def train(
             if cfg.logger.log_energy:
                 energy_monitor.pause()
             timers('interval-time').stop()
-            if should_disable_forward_pre_hook(args, optimizer):
+            if should_disable_forward_pre_hook(optimizer):
                 disable_forward_pre_hook(model, optimizer=optimizer)
                 pre_hook_enabled = False
             if cfg.train.manual_gc and cfg.train.manual_gc_eval:
@@ -5244,7 +5279,7 @@ def train(
             if cfg.train.manual_gc and cfg.train.manual_gc_eval:
                 # Collect only the objects created and used in evaluation.
                 gc.collect(generation=0)
-            if should_disable_forward_pre_hook(args, optimizer):
+            if should_disable_forward_pre_hook(optimizer):
                 enable_forward_pre_hook(model)
                 pre_hook_enabled = True
             timers('interval-time', log_level=0).start(barrier=True)
@@ -5271,7 +5306,7 @@ def train(
         # uncaught exception there would otherwise stall silently (both future
         # logits and regular checkpoint saves for that rank) rather than
         # surfacing until a much later blocking checkpoint finalize hangs.
-        if args.logits_save_dir is not None:
+        if getattr(args, "logits_save_dir", None) is not None:
             from megatron.training.distillation import check_logits_saver_failure
 
             check_logits_saver_failure()
@@ -5394,8 +5429,8 @@ def evaluate(
 ):
     """Evaluation."""
     callback_manager = normalize_callbacks(callback_manager)
-    args = get_args()
     cfg = get_run_config()
+    sequence_length = cfg.model.transformer.max_seq_length_per_sample
     timers = get_timers()
     train_state = get_train_state()
 
@@ -5459,9 +5494,9 @@ def evaluate(
         # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
         adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
             model,
-            seq_length=args.seq_length,
+            seq_length=sequence_length,
             micro_batch_size=eval_micro_batch_size,
-            decoder_seq_length=args.decoder_seq_length,
+            decoder_seq_length=None,
         )
     else:
         adjust_tensor_shapes_fn = None
@@ -5511,9 +5546,8 @@ def evaluate(
                     data_iterator=packed_data_iterator,
                     model=model,
                     num_microbatches=scheduled_eval_num_microbatches,
-                    seq_length=args.seq_length,
+                    seq_length=sequence_length,
                     micro_batch_size=eval_micro_batch_size,
-                    decoder_seq_length=args.decoder_seq_length,
                     forward_only=True,
                     adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
                     pg_collection=pg_collection,
@@ -5572,9 +5606,8 @@ def evaluate(
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=eval_num_microbatches,
-                seq_length=args.seq_length,
+                seq_length=sequence_length,
                 micro_batch_size=eval_micro_batch_size,
-                decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
                 collect_non_loss_data=True,
                 pg_collection=pg_collection,
@@ -5634,7 +5667,6 @@ def evaluate_and_print_results(
     """Helper function to evaluate and dump results on screen."""
     cfg = get_run_config()
     callback_manager = normalize_callbacks(callback_manager)
-    args = get_args()
     train_state = get_train_state()
     if write_to_tensorboard:
         writer = get_tensorboard_writer()
@@ -5757,13 +5789,12 @@ def get_train_valid_test_num_samples():
     """Train/valid/test num samples."""
 
     cfg = get_run_config()
-    args = get_args()
     train_state = get_train_state()
 
     return calculate_train_valid_test_num_samples(
         cfg.train,
         cfg.validation,
-        phase_transition_iterations=args.phase_transition_iterations,
+        phase_transition_iterations=cfg.train.phase_transition_iterations,
         iteration=train_state.iteration if train_state is not None else 0,
     )
 
@@ -5832,10 +5863,7 @@ def build_train_valid_test_data_loaders(
 ):
     """Build pretraining data loaders."""
 
-    args = get_args()
     train_state = get_train_state()
-    # Temporary args/config duplication during the training-loop refactor:
-    # migrated settings use config; remaining settings still use legacy args.
     cfg = get_run_config()
 
     (train_dataloader, valid_dataloaders, test_dataloader) = (None, None, None)
@@ -5845,8 +5873,11 @@ def build_train_valid_test_data_loaders(
     backfill_consumed_samples_from_iteration()
 
     # Get consumed train samples in this phase.
-    if args.phase_transition_iterations:
-        last_transition = max(iteration for iteration in (0, *args.phase_transition_iterations) if iteration <= train_state.iteration)
+    if cfg.train.phase_transition_iterations:
+        last_transition = max(
+            iteration for iteration in (0, *cfg.train.phase_transition_iterations)
+            if iteration <= train_state.iteration
+        )
         consumed_train_samples_in_current_phase = (train_state.iteration - last_transition) * cfg.train.global_batch_size
     else:
         consumed_train_samples_in_current_phase = train_state.consumed_train_samples
@@ -5933,7 +5964,6 @@ def build_train_valid_test_data_iterators(
     """Build pretraining data iterators."""
 
     cfg = get_run_config()
-    args = get_args()
 
     # Build loaders.
     train_dataloader, valid_dataloaders, test_dataloader = build_train_valid_test_data_loaders(
@@ -5941,7 +5971,7 @@ def build_train_valid_test_data_iterators(
     )
 
     # Build iterators.
-    dl_type = args.dataloader_type
+    dl_type = cfg.data.dataloader.dataloader_type or 'single'  # unset selects single
     assert dl_type in ['single', 'cyclic', 'external']
 
     def _get_iterator(dataloader_type, dataloader):
@@ -6014,7 +6044,7 @@ def build_train_valid_test_data_iterators(
     return train_data_iterator, valid_data_iterators, test_data_iterator
 
 
-def should_disable_forward_pre_hook(args, optimizer):
+def should_disable_forward_pre_hook(optimizer):
     """Block forward pre-hook for certain configurations."""
     # The forward pre-hooks are part of the distributed optimizer's overlapped param-gather;
     # so in order to disable them, we must check that the optimizer actually exists.

@@ -506,7 +506,7 @@ def test_autoresume_saves_only_when_the_section_has_a_save_directory(
     run_config.checkpoint.save = "/section/save" if section_saves else None
     args = _validated()
     args.save = None if section_saves else "/namespace/save"
-    monkeypatch.setattr(common_utils, "get_args", lambda: args)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
     autoresume = SimpleNamespace(termination_requested=lambda: True, request_resume=Mock())
     monkeypatch.setattr(common_utils, "get_adlr_autoresume", lambda: autoresume)
     monkeypatch.setattr(

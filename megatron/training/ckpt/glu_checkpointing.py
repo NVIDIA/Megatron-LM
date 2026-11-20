@@ -67,7 +67,9 @@ def _parallel_sizes(config):
     return {'routed': etp, 'shared': tp}
 
 
-def validate_glu_optimizer_layout(state_dict, args, *, loading_optimizer):
+def validate_glu_optimizer_layout(
+    state_dict, args, *, loading_optimizer, checkpoint_config=None
+):
     """Reject incompatible runtime optimizer rows before loading any tensor storage.
 
     Saved configuration describes the optimizer's runtime layout. Model weights
@@ -76,7 +78,9 @@ def validate_glu_optimizer_layout(state_dict, args, *, loading_optimizer):
     """
     if not loading_optimizer:
         return
-    source_config = _checkpoint_config(state_dict)
+    source_config = _config_value(_config_value(checkpoint_config, 'model'), 'transformer')
+    if source_config is None:
+        source_config = _checkpoint_config(state_dict)
     source_optimizer = _interleave_sizes(source_config)
     target = _interleave_sizes(args)
     source_parallel = _parallel_sizes(source_config)

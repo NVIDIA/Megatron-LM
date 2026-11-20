@@ -219,6 +219,7 @@ def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_conf
     original_args = vars(args).copy()
     # Keep the legacy defaults different so an accidental args read is detected.
     monkeypatch.setenv("WORLD_SIZE", "4")
+    monkeypatch.setenv("RANK", "0")
     run_config.dist = DistributedInitConfig(
         distributed_backend="gloo",
         distributed_timeout_minutes=37,
@@ -453,11 +454,13 @@ def test_vocabulary_resolves_after_config_construction(
 
 
 @pytest.mark.parametrize("use_bootstrap", [False, True])
+@pytest.mark.parametrize("dataset_length", [None, 16])
 def test_runtime_service_order_and_microbatch_inputs(
-    monkeypatch, isolated_globals, use_bootstrap, run_config
+    monkeypatch, isolated_globals, use_bootstrap, dataset_length, run_config
 ):
     args = _runtime_args()
     cfg = run_config
+    monkeypatch.setattr(global_vars, "safe_get_rank", lambda: 0)
     monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 2)
     cfg.train.global_batch_size = 8
     cfg.train.micro_batch_size = 2
@@ -466,10 +469,25 @@ def test_runtime_service_order_and_microbatch_inputs(
     args.micro_batch_size = 99
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
     cfg.model = GPTModelConfig(
-        transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+        transformer=TransformerConfig(
+            num_layers=2,
+            hidden_size=32,
+            num_attention_heads=4,
+            max_seq_length_per_sample=dataset_length or 32,
+        ),
         seq_length=32,
         vocab_size=128,
     )
+    if dataset_length is not None:
+        from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
+
+        cfg.data.dataset = GPTDatasetConfig(
+            random_seed=1234,
+            sequence_length=dataset_length,
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
+        )
     if not use_bootstrap:
         global_vars.set_args(args)
         global_vars.set_run_config(cfg)
@@ -542,8 +560,31 @@ def test_runtime_service_order_and_microbatch_inputs(
         data_parallel_size=2,
         decrease_batch_size_if_needed=False,
         step_batch_size_schedule=None,
-        seq_length=32,
+        seq_length=dataset_length or 32,
     )
+
+
+def test_vlm_length_resolution_includes_images_and_parallel_padding():
+    from pretrain_vlm import resolve_vlm_sequence_lengths
+
+    args = SimpleNamespace(
+        dataloader_seq_length=24,
+        seq_length=32,
+        img_h=28,
+        img_w=28,
+        patch_dim=14,
+        disable_vision_class_token=False,
+        context_parallel_size=2,
+        tensor_model_parallel_size=1,
+        sequence_parallel=False,
+        decoder_seq_length=None,
+        max_seq_length_per_sample=None,
+        max_position_embeddings=24,
+        position_embedding_type="rope",
+    )
+    # 24 text + 4 patches + one class token, padded to a multiple of 2 * CP.
+    assert resolve_vlm_sequence_lengths(args) == (24, 3)
+    assert args.max_seq_length_per_sample == args.max_position_embeddings == 32
 
 
 def test_custom_model_config_does_not_receive_vocabulary(monkeypatch, isolated_globals):
@@ -856,6 +897,8 @@ def test_callback_upcycling_uses_temporary_dense_config(monkeypatch, run_config)
     args.expert_model_parallel_size = 1
     args.ffn_hidden_size = 64
     run_config.model = GPTModelConfig(
+        moe_use_upcycling=True,
+        moe_upcycling_granularity=2,
         transformer=TransformerConfig(
             num_layers=2,
             hidden_size=32,
@@ -866,7 +909,7 @@ def test_callback_upcycling_uses_temporary_dense_config(monkeypatch, run_config)
         seq_length=16,
         vocab_size=128,
     )
-    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
     monkeypatch.setattr(training, "get_timers", Mock())
     monkeypatch.setattr(training, "get_one_logger", lambda: None)
     monkeypatch.setattr(training, "has_nvidia_modelopt", False)
@@ -979,7 +1022,7 @@ def test_callbacks_construct_from_registered_model_config(
         dataset_builder = Mock()
         dataset_builder.return_value.build.return_value = (None, None, None)
         monkeypatch.setattr(provider, "BlendedMegatronDatasetBuilder", dataset_builder)
-        provider.train_valid_test_datasets_provider([1, 1, 1])
+        provider.train_valid_test_datasets_provider([1, 1, 1], sequence_length=64)
         assert dataset_config.call_args.kwargs["classification_head"] is binary_head
     else:
         assert build.call_args.kwargs["encoder_config"].num_layers == 2
@@ -1020,9 +1063,7 @@ def test_model_precision_is_derived_centrally(monkeypatch, run_config, fp8_recip
 
 
 @pytest.mark.parametrize("missing_model", [False, True])
-@pytest.mark.parametrize(
-    "consumer", ["model", "dataset", "batch", "data_inputs", "mimo_data", "radio"]
-)
+@pytest.mark.parametrize("consumer", ["model", "dataset", "batch", "mimo_data", "radio"])
 def test_vlm_consumers_reject_incompatible_model_config(
     monkeypatch, run_config, consumer, missing_model
 ):
@@ -1036,10 +1077,9 @@ def test_vlm_consumers_reject_incompatible_model_config(
     args = Namespace()
     monkeypatch.setattr(pretrain_vlm, "get_args", lambda: args)
     calls = {
-        "model": lambda: pretrain_vlm.model_provider(),
-        "dataset": lambda: pretrain_vlm.train_valid_test_datasets_provider([]),
+        "model": lambda: pretrain_vlm.model_provider(mp_padding_needed=0),
+        "dataset": lambda: pretrain_vlm.train_valid_test_datasets_provider([], sequence_length=16),
         "batch": lambda: pretrain_vlm.get_batch(None),
-        "data_inputs": lambda: pretrain_vlm.set_vlm_sequence_lengths(args, run_config.model),
         "mimo_data": lambda: build_train_valid_test_data_loaders(args, None),
         "radio": lambda: radio_vision_encoder_spec(args, None, None),
     }
@@ -1059,6 +1099,7 @@ def test_vlm_consumers_reject_incompatible_model_config(
         (1, "sbhd", 32, 32, "local"),
     ],
 )
+@pytest.mark.parametrize("inference", [False, True])
 def test_llava_callback_consumes_its_model_config(
     monkeypatch,
     isolated_globals,
@@ -1068,6 +1109,7 @@ def test_llava_callback_consumes_its_model_config(
     decoder_length,
     expected_model_length,
     transformer_impl,
+    inference,
 ):
     import pretrain_vlm
     from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
@@ -1086,6 +1128,8 @@ def test_llava_callback_consumes_its_model_config(
     args.params_dtype = torch.float32
     args.ckpt_format = "torch"
     args.transformer_impl = transformer_impl
+    monkeypatch.setattr(pretrain_vlm, "get_num_image_embeddings", lambda *a, **kw: 4)
+    _, padding_needed = pretrain_vlm.resolve_vlm_sequence_lengths(args)
     cfg = run_config
     cfg.checkpoint.ckpt_format = "torch"
     cfg.model = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
@@ -1095,6 +1139,14 @@ def test_llava_callback_consumes_its_model_config(
     cfg.model.drop_vision_class_token = True
     cfg.model.freeze_language_model = True
     cfg.model.freeze_vision_model = True
+    if inference:
+        cfg = inference_cfg_container_from_args(args, cfg.model)
+        monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+    else:
+        cfg.train.micro_batch_size = 2
+        args.micro_batch_size = (
+            999  # Training must use the config; inference keeps its CLI adapter.
+        )
     monkeypatch.setattr(pretrain_vlm, "get_args", lambda: args)
     monkeypatch.setattr(pretrain_vlm, "get_num_image_embeddings", lambda *a, **kw: 4)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
@@ -1114,7 +1166,6 @@ def test_llava_callback_consumes_its_model_config(
     args.use_rope_scaling = False
     args.padded_vocab_size = 999
 
-    pretrain_vlm.set_vlm_sequence_lengths(args, cfg.model)
     args.use_packed_sequence = qkv_format == "thd"
     for name in (
         "img_h",
@@ -1125,7 +1176,7 @@ def test_llava_callback_consumes_its_model_config(
         "freeze_ViT",
     ):
         delattr(args, name)
-    pretrain_vlm.model_provider()
+    pretrain_vlm.model_provider(mp_padding_needed=padding_needed)
 
     assert build.call_args.kwargs["language_vocab_size"] == 128
     assert build.call_args.kwargs["language_rotary_base"] == 12345
@@ -1231,15 +1282,15 @@ def test_mock_vlm_resolves_padding_before_startup(
         # The inference caller does not register the mock-training data-length flag.
         del args.dataloader_seq_length
         args.seq_length = 1792
-    model = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
     if isinstance(expected, str):
         with pytest.raises(ValueError, match=expected):
-            pretrain_vlm.set_vlm_sequence_lengths(args, model)
+            pretrain_vlm.resolve_vlm_sequence_lengths(args)
         return
-    pretrain_vlm.set_vlm_sequence_lengths(args, model)
+    text_length, _ = pretrain_vlm.resolve_vlm_sequence_lengths(args)
+    model = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
     assert model.transformer.tp_comm_overlap == overlap
-    assert args.dataloader_seq_length == 1792
-    assert args.decoder_seq_length == expected
+    assert text_length == 1792
+    assert model.transformer.max_seq_length_per_sample == expected
 
 
 @pytest.mark.parametrize("eval_batch_sizes", [None, (16, 4)])
@@ -1518,6 +1569,7 @@ def test_dataset_helpers_use_registered_model(
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
     args.seq_length = 32
+    args.sft = True
     args.data_parallel_size = 999
     args.sequence_packing_scheduler = None if sequence_packing_scheduler else "dp_balanced"
     transformer = TransformerConfig(
