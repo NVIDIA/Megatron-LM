@@ -900,6 +900,27 @@ def test_callback_upcycling_uses_temporary_dense_config(monkeypatch, run_config)
     assert run_config.model.transformer.ffn_hidden_size == 64
 
 
+def test_sample_generator_provider_forwards_get_model_inputs(monkeypatch, run_config):
+    from examples.academic_paper_scripts.detxoify_lm import generate_samples_gpt as provider
+
+    args = Mock(transformer_impl="local")
+    args.spec = None
+    monkeypatch.setattr(provider, "get_args", lambda: args)
+    monkeypatch.setattr(provider, "get_gpt_layer_local_spec", Mock())
+    build = Mock()
+    monkeypatch.setattr(provider, "GPTModel", build)
+
+    config = run_config.model.transformer
+    groups = Mock()
+    provider.model_provider(
+        pre_process=False, post_process=True, config=config, pg_collection=groups, vp_stage=1
+    )
+
+    assert build.call_args.kwargs["config"] is config
+    assert build.call_args.kwargs["pg_collection"] is groups
+    assert build.call_args.kwargs["vp_stage"] == 1
+
+
 @pytest.mark.parametrize("family", ["bert", "t5"])
 @pytest.mark.parametrize("inference", [False, True])
 @pytest.mark.parametrize("binary_head", [False, True])
@@ -933,14 +954,11 @@ def test_callbacks_construct_from_registered_model_config(
     monkeypatch.setattr(provider, "get_args", lambda: args)
     build = Mock()
     monkeypatch.setattr(provider, "BertModel" if family == "bert" else "T5Model", build)
-    if family == "t5":
-        # The T5 callback resolves the global process groups itself and passes them on.
-        global_groups = Mock()
-        monkeypatch.setattr(
-            provider.ProcessGroupCollection,
-            "use_mpu_process_groups",
-            Mock(return_value=global_groups),
-        )
+    # Both callbacks resolve the global process groups themselves and pass them on.
+    global_groups = Mock()
+    monkeypatch.setattr(
+        provider.ProcessGroupCollection, "use_mpu_process_groups", Mock(return_value=global_groups)
+    )
     for name in (
         "hidden_size",
         "num_layers",
@@ -963,6 +981,7 @@ def test_callbacks_construct_from_registered_model_config(
     assert build.call_args.kwargs["vocab_size"] == 128
     assert build.call_args.kwargs["max_sequence_length"] == 64
     assert build.call_args.kwargs["share_embeddings_and_output_weights"] is True
+    assert build.call_args.kwargs["pg_collection"] is global_groups
     if family == "bert":
         assert build.call_args.kwargs["add_binary_head"] is binary_head
         assert build.call_args.kwargs["num_tokentypes"] == (2 if binary_head else 0)

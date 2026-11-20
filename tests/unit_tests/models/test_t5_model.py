@@ -129,10 +129,19 @@ class TestT5Model:
         pass
 
 
-@pytest.mark.parametrize("explicit_pg_collection", [False, True])
-def test_constructor_process_groups(mocker, explicit_pg_collection):
-    """T5 and LanguageModule must agree on the caller's process-group collection."""
+@pytest.fixture
+def clean_nvte_env():
+    """Clear the NVTE attention variables that LanguageModule sets, before and after a test."""
     clear_nvte_env_vars()
+    yield
+    clear_nvte_env_vars()
+
+
+@pytest.mark.usefixtures("clean_nvte_env")
+@pytest.mark.parametrize("position_embedding_type", ["learned_absolute", "rope"])
+@pytest.mark.parametrize("explicit_pg_collection", [False, True])
+def test_constructor_process_groups(mocker, explicit_pg_collection, position_embedding_type):
+    """T5 and LanguageModule must agree on the caller's process-group collection."""
     mocker.patch.object(process_groups_config, "_warned_global_process_group_fallbacks", set())
     mocker.patch("torch.distributed.is_initialized", return_value=True)
     pg_collection = ProcessGroupCollection(
@@ -147,7 +156,9 @@ def test_constructor_process_groups(mocker, explicit_pg_collection):
     if explicit_pg_collection:
         global_groups.side_effect = AssertionError("Explicit groups must not read the global grid")
 
-    config = TransformerConfig(num_layers=2, hidden_size=16, num_attention_heads=4)
+    config = TransformerConfig(
+        num_layers=2, hidden_size=16, num_attention_heads=4, use_cpu_initialization=True
+    )
     # An empty pipeline stage exercises both constructors without constructing GPU layers.
     t5_kwargs = dict(
         config=config,
@@ -160,6 +171,7 @@ def test_constructor_process_groups(mocker, explicit_pg_collection):
         post_process=False,
         add_encoder=False,
         add_decoder=False,
+        position_embedding_type=position_embedding_type,
         pg_collection=pg_collection if explicit_pg_collection else None,
     )
     if explicit_pg_collection:
@@ -173,12 +185,18 @@ def test_constructor_process_groups(mocker, explicit_pg_collection):
     assert model.cp_group is pg_collection.cp
     assert model.pp_group is pg_collection.pp
     assert model.embd_group is pg_collection.embd
+    if position_embedding_type == "rope":
+        # The rotary embedding is built on the collection LanguageModule resolved, not on the
+        # omitted argument.
+        assert model.rotary_pos_emb.cp_group is pg_collection.cp
     if explicit_pg_collection:
         global_groups.assert_not_called()
     else:
-        global_groups.assert_called()
+        # LanguageModule resolves the global grid once, and T5 builds on that same collection.
+        global_groups.assert_called_once_with()
 
 
+@pytest.mark.usefixtures("clean_nvte_env")
 @pytest.mark.parametrize(
     'pp_size, pre_process, post_process, tied, embedding_state, valid',
     [
@@ -191,31 +209,29 @@ def test_constructor_process_groups(mocker, explicit_pg_collection):
         (2, True, False, True, 'none', False),
         (2, True, True, True, 'none', False),
         (2, False, True, True, 'none', False),
+        (2, False, True, True, 'global_none', False),
         (2, True, False, True, 'nonmember', False),
-        (2, False, False, True, 'nonmember', True),
+        (2, False, False, True, 'nonmember', False),
     ],
 )
 def test_constructor_embedding_group_contract(
     mocker, pp_size, pre_process, post_process, tied, embedding_state, valid
 ):
-    """An explicit collection cannot silently disable tied pipeline embedding synchronization."""
-    clear_nvte_env_vars()
+    """The resolved collection must support tied pipeline embedding synchronization."""
     mocker.patch('torch.distributed.is_initialized', return_value=True)
     mocker.patch('megatron.core.models.T5.t5_model.LanguageModelEmbedding')
     mocker.patch('megatron.core.models.T5.t5_model.T5LMHead')
     mocker.patch.object(T5Model, 'setup_embeddings_and_output_layer')
-    global_groups = mocker.patch.object(
-        ProcessGroupCollection,
-        'use_mpu_process_groups',
-        side_effect=AssertionError('explicit collection must not resolve global groups'),
-    )
     pg_collection = ProcessGroupCollection(
         tp=mocker.sentinel.tp, cp=mocker.sentinel.cp, pp=mocker.sentinel.pp
     )
-    if embedding_state != 'omitted':
-        pg_collection.embd = (
-            None if embedding_state == 'none' else torch.distributed.GroupMember.NON_GROUP_MEMBER
-        )
+    if embedding_state == 'nonmember':
+        pg_collection.embd = torch.distributed.GroupMember.NON_GROUP_MEMBER
+    elif embedding_state != 'omitted':
+        pg_collection.embd = None
+    global_groups = mocker.patch.object(
+        ProcessGroupCollection, 'use_mpu_process_groups', return_value=pg_collection
+    )
     config = TransformerConfig(
         num_layers=2,
         hidden_size=16,
@@ -235,8 +251,9 @@ def test_constructor_embedding_group_contract(
         add_encoder=False,
         add_decoder=False,
         share_embeddings_and_output_weights=tied,
-        pg_collection=pg_collection,
     )
+    if embedding_state != 'global_none':
+        kwargs['pg_collection'] = pg_collection
     # A collection without an embd field is treated as embd=None, with a deprecation warning.
     missing_embd = (
         pytest.warns(FutureWarning, match='without an embd field')
@@ -250,12 +267,18 @@ def test_constructor_embedding_group_contract(
     else:
         with pytest.raises(ValueError, match='embd'), missing_embd:
             T5Model(**kwargs)
-    global_groups.assert_not_called()
+        # Reject the groups before configuring the process-wide attention backend.
+        for name in ('NVTE_FLASH_ATTN', 'NVTE_FUSED_ATTN', 'NVTE_UNFUSED_ATTN'):
+            assert name not in os.environ
+    if embedding_state == 'global_none':
+        global_groups.assert_called_once_with()
+    else:
+        global_groups.assert_not_called()
 
 
+@pytest.mark.usefixtures("clean_nvte_env")
 def test_pipeline_tied_embeddings_use_supplied_group(mocker):
     """Real PP endpoints synchronize nonzero embedding weights through the supplied group."""
-    clear_nvte_env_vars()
     if Utils.world_size < 2 or Utils.world_size % 2:
         pytest.skip('requires a world size divisible by two')
     Utils.initialize_model_parallel(pipeline_model_parallel_size=2)

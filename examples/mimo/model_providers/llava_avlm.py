@@ -22,9 +22,10 @@ from examples.mimo.utils.logging import print_mimo_structure
 from examples.mimo.utils.model_helpers import load_submodule_ckpt
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mimo import MimoModel, MimoModelConfig
-from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.models.mimo.submodules.audio import AudioModalitySubmodules
+from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.spec_utils import ModuleSpec
 
 
@@ -45,6 +46,9 @@ def model_provider_llava_avlm(
     • 2-layer MLP vision→language projector.
     • 2-layer MLP audio→language projector.
     """
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
     # NOTE: Pipeline parallelism for the encoder/decoder is not yet supported in this
     # MIMO path, therefore *add_encoder* and *add_decoder* are currently ignored.
 
@@ -100,6 +104,7 @@ def model_provider_llava_avlm(
             "submodules": get_llava_projection_layer_spec().submodules,
             "projector_type": "mlp",
             "input_size": 1024,
+            "pg_collection": pg_collection,
         },
     )
     audio_projection = ModuleSpec(
@@ -109,6 +114,7 @@ def model_provider_llava_avlm(
             "submodules": get_llava_projection_layer_spec().submodules,
             "projector_type": "mlp",
             "input_size": 512,
+            "pg_collection": pg_collection,
         },
     )
 
@@ -142,6 +148,7 @@ def model_provider_llava_avlm(
             "max_sequence_length": 4096,
             "pre_process": pre_process,
             "post_process": post_process,
+            "pg_collection": pg_collection,
             "position_embedding_type": "rope",
         },
     )

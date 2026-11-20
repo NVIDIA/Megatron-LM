@@ -15,11 +15,7 @@ from megatron.core.models.common.embeddings.relative_pos_embedding import Relati
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import (
-    ProcessGroupCollection,
-    warn_global_process_group_fallback,
-    warn_process_group_deprecation,
-)
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import scatter_to_tensor_model_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -138,6 +134,11 @@ class T5Model(LanguageModule):
         add_decoder (bool): Include an output layer (used with pipeline parallelism).
             As with `add_encoder`, when using this model and pipelining,
             the decoder will only be created on a subset of the pipeline ranks.
+
+        pg_collection (ProcessGroupCollection, optional): Process groups for the model and
+            its submodules. Omitting it emits a FutureWarning and uses the global parallel_state
+            groups. When embeddings are tied across pipeline stages, the embedding and output
+            stages must participate in the resolved `embd` group.
     """
 
     def __init__(
@@ -165,30 +166,17 @@ class T5Model(LanguageModule):
         pg_collection: ProcessGroupCollection = None,
     ):
 
-        if pg_collection is None:
-            warn_global_process_group_fallback(type(self).__name__)
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        else:
-            for _pg in ('tp', 'cp', 'pp'):
-                # A group that is present but None is as unusable as a missing one.
-                if vars(pg_collection).get(_pg) is None:
-                    raise ValueError(f"T5Model pg_collection must have {_pg}")
-        if 'embd' not in vars(pg_collection):
-            warn_process_group_deprecation(
-                "T5Model was given a pg_collection without an embd field and treats it as "
-                "embd=None. Set embd explicitly, to None when it is unused; a missing embd "
-                "becomes an error in Megatron Core 0.23."
-            )
-        if (
-            share_embeddings_and_output_weights
-            and config.pipeline_model_parallel_size > 1
-            and (pre_process or post_process)
-            and pg_collection.embd in (None, torch.distributed.GroupMember.NON_GROUP_MEMBER)
-        ):
-            raise ValueError(
-                "T5Model tied pipeline embedding/output stages require a usable embd group"
-            )
-        super(T5Model, self).__init__(config=config, pg_collection=pg_collection)
+        super().__init__(
+            config=config,
+            pg_collection=pg_collection,
+            require_embedding_group=(
+                share_embeddings_and_output_weights
+                and config.pipeline_model_parallel_size > 1
+                and (pre_process or post_process)
+            ),
+        )
+        # LanguageModule resolves an omitted collection; build the submodules on the same groups.
+        pg_collection = self.pg_collection
 
         self.config: TransformerConfig = config
         self.encoder_config: TransformerConfig = encoder_config
@@ -205,7 +193,6 @@ class T5Model(LanguageModule):
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
         self.encoder_hidden_state = None
-        self.tp_group = pg_collection.tp
 
         self.model_type = ModelType.encoder_or_decoder
 
