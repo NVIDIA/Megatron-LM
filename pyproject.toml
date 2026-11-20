@@ -192,14 +192,7 @@ test = [
 # GitHub CI installs Testmon at runtime for baseline and selective test modes.
 # Testmon remains inactive unless pytest receives a --testmon option.
 testmon = ["pytest-testmon==2.2.0"]
-docs = [
-    "sphinx",
-    "sphinx-autobuild",    # For live doc serving while editing docs
-    "sphinx-autodoc2",     # For documenting Python API
-    "sphinx-copybutton",   # Adds a copy button for code blocks
-    "myst_parser",         # For our markdown docs
-    "nvidia-sphinx-theme", # Our NVIDIA theme
-]
+
 build = [
     "setuptools>=80",
     "packaging>=24.2",
