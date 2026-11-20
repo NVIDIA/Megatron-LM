@@ -76,7 +76,7 @@ def stochastic_round_to_bf16_(dst: torch.Tensor, src: torch.Tensor, offset: int,
     dst.copy_(src)
 
 
-def copy_with_rounding_(
+def round(
     dst: torch.Tensor, src: torch.Tensor, rounding: RoundingMode = "nearest", seed: int = 0
 ) -> None:
     """Copy ``src`` into ``dst`` with the given rounding mode.

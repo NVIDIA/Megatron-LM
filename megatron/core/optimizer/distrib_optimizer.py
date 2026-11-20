@@ -65,6 +65,7 @@ from ..fp8_utils import (
 from ..full_cuda_graph import FullIterationGradCopy
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
+from . import rounding
 from .grad_scaler import MegatronGradScaler
 from .optimizer import (
     MixedPrecisionOptimizer,
@@ -76,7 +77,6 @@ from .optimizer import (
 )
 from .optimizer_config import OptimizerConfig
 from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
-from .stochastic_rounding import copy_with_rounding_
 
 logger = getLogger(__name__)
 
@@ -3297,7 +3297,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # function.
                         continue
                     else:
-                        copy_with_rounding_(
+                        rounding.round(
                             shard_model_param.data,
                             shard_main_param,
                             self.config.main_params_rounding,
