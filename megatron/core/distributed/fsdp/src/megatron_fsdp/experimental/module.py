@@ -29,9 +29,9 @@ from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .context import FsdpContext, GradientFinalizationMode
+from .context import FsdpContext, GradientFinalizationMode, _RsInput
 from .countdown import Countdown
-from .execution_order import ExecutionEvent, ExecutionOrder
+from .execution_order import ExecutionAction, ExecutionEvent, ExecutionOrderView
 from .module_utils import get_parameter_owner, is_in_backward
 from .parameter_group import (
     FsdpParameter,
@@ -41,6 +41,7 @@ from .parameter_group import (
 )
 from .phase import Phase
 from .placement import BlockAtomic, RowAtomic, ShardLayout
+from .runtime_policy import PrefetchOrder
 from .schedule_policy import SchedulePolicy
 
 
@@ -174,7 +175,8 @@ class FsdpModule:
 
         Without input gradients, PyTorch's module hook fires before internal
         backward. Defer that case to autograd completion instead.
-        Custom schedulers must call context.post_backward() after each microbatch's backward.
+        Custom schedulers call context.post_microbatch() after each microbatch's backward
+        and context.post_backward() once after the complete schedule, including delayed wgrad.
         """
 
         def grad_checking_post_backward_hook(module, grad_input, _grad_output):
@@ -282,8 +284,6 @@ class FsdpModule:
 
         # TODO: Recomputation gathers MXFP8 rowwise planes on demand, because backward
         # prefetch gathers only columnwise planes. Thw two planes can be prefetched at once.
-        if context.is_recording_execution_order and not is_recomputing:
-            context.execution_order.append(ExecutionEvent(cast(nn.Module, self), Phase.FORWARD))
         self.unshard(
             Phase.FORWARD, prefetch=not is_recomputing and not context.is_recording_execution_order
         )
@@ -303,6 +303,24 @@ class FsdpModule:
         before this when ``self.is_root()``; the automatic forward path
         performs that root sync in ``pre_forward()`` immediately before this.
         """
+        context = self.context
+        prefetch = prefetch and context.training and not context.is_recording_execution_order
+        if prefetch and phase not in (Phase.FORWARD, Phase.BACKWARD):
+            raise ValueError(f"Prefetching requires a FORWARD or BACKWARD phase, got {phase!r}.")
+        self._execution_event(ExecutionAction.UNSHARD, phase=phase)
+        order = None
+        if (
+            context.training
+            and not context.is_recording_execution_order
+            and (prefetch or context.prefetch_order is PrefetchOrder.RECORDED)
+        ):
+            order = context.prefetch_order_view
+            event = ExecutionEvent(cast(nn.Module, self), phase)
+            if order.peek() != event:
+                raise RuntimeError(
+                    "FSDP module calls diverged from the expected prefetch order "
+                    f"at position {order.position}: expected {order.peek()}, got {event}."
+                )
         with self._nvtx_range("unshard"):
             compute_stream = self.context.current_stream()
             self._unshard_parameter_groups(phase)
@@ -312,31 +330,21 @@ class FsdpModule:
                 for group in self._parameter_groups:
                     group.wait_for_unshard(phase)
 
-            if not prefetch:
+            if order is None:
                 return
-            context = self.context
-            match phase:
-                case Phase.FORWARD:
-                    self._prefetch_parameter_groups(
-                        context.execution_order, self._schedule_policy.forward_prefetch_size
-                    )
-                case Phase.BACKWARD:
-                    self._prefetch_parameter_groups(
-                        context.execution_order, self._schedule_policy.backward_prefetch_size
-                    )
-                case _:
-                    raise ValueError(
-                        f"Prefetching requires a FORWARD or BACKWARD phase, got {phase!r}."
-                    )
+            if prefetch:
+                size = (
+                    self._schedule_policy.forward_prefetch_size
+                    if phase is Phase.FORWARD
+                    else self._schedule_policy.backward_prefetch_size
+                )
+                self._prefetch_parameter_groups(order, size)
+            order.advance()
 
-    def _prefetch_parameter_groups(self, order: ExecutionOrder, prefetch_size: int | None) -> None:
-        """Validate the current event, prefetch successors, and advance once."""
-        event = ExecutionEvent(cast(nn.Module, self), self.phase)
-        if order.peek() != event:
-            raise RuntimeError(
-                "FSDP module calls diverged from the expected execution order "
-                f"at position {order.position}: expected {order.peek()}, got {event}."
-            )
+    def _prefetch_parameter_groups(
+        self, order: ExecutionOrderView, prefetch_size: int | None
+    ) -> None:
+        """Gather speculative successors without consuming logical execution events."""
         prefetched_size = 0
         for next_event in order.successors():
             if prefetch_size is not None and prefetched_size >= prefetch_size:
@@ -346,7 +354,6 @@ class FsdpModule:
             if prefetch_size is None:
                 break
             prefetched_size += fsdp_module.num_parameter_elements
-        order.advance()
 
     def _unshard_parameter_groups(self, phase: Phase | None) -> None:
         """Ask each group to gather missing weights on the all-gather stream."""
@@ -374,39 +381,44 @@ class FsdpModule:
             self.phase = Phase.RESTING
         torch.cuda.nvtx.range_pop()
 
-    def reshard(self) -> None:
+    def reshard(self, *, force: bool = False) -> None:
         """Bind sharded parameters and release full parameter storage."""
         with self._nvtx_range("reshard"):
             self.bind_sharded_parameters()
-            self.release_unsharded_storage()
+            self.release_unsharded_storage(force=force)
 
     def bind_sharded_parameters(self) -> None:
         """Install sharded parameter references without changing storage."""
         for group in self._parameter_groups:
             group.bind_sharded_parameters()
 
-    def release_unsharded_storage(self) -> None:
+    def release_unsharded_storage(self, *, force: bool = False) -> None:
         """Free full parameter storage after compute without changing bindings."""
         with self._nvtx_range("release_unsharded_storage"):
-            self._release_unsharded_storage()
+            self._release_unsharded_storage(force=force)
 
-    def _release_unsharded_storage(self, *, rowwise_only: bool = False) -> None:
+    def _release_unsharded_storage(
+        self, *, rowwise_only: bool = False, force: bool = False
+    ) -> None:
         """Select and release gathered storage after the current compute finishes."""
+        if not force:
+            event = self._execution_event(ExecutionAction.RESHARD, rowwise_only=rowwise_only)
+            if event is not None and self.context.retain_mask.get(event.event_id, False):
+                return
         if rowwise_only:
             groups_to_release = tuple(
                 group for group in self._parameter_groups if group.is_rowwise_unsharded
             )
         else:
             groups_to_release = self._parameter_groups
-        if not groups_to_release:
-            return
-        allgather_stream = self.context.allgather_stream
-        allgather_stream.wait_stream(self.context.current_stream())
-        # Release on the all-gather stream where unsharded storage was allocated,
-        # so no record_stream() call is required for the storage.
-        with torch.cuda.stream(allgather_stream):
-            for group in groups_to_release:
-                group.release_unsharded_storage(rowwise_only=rowwise_only)
+        if groups_to_release:
+            allgather_stream = self.context.allgather_stream
+            allgather_stream.wait_stream(self.context.current_stream())
+            # Release on the all-gather stream where unsharded storage was allocated,
+            # so no record_stream() call is required for the storage.
+            with torch.cuda.stream(allgather_stream):
+                for group in groups_to_release:
+                    group.release_unsharded_storage(rowwise_only=rowwise_only)
 
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
@@ -427,8 +439,6 @@ class FsdpModule:
         self.phase = Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
-        if context.is_recording_execution_order:
-            context.execution_order.append(ExecutionEvent(cast(nn.Module, self), Phase.BACKWARD))
         if self.is_root():
             context.register_post_backward_hook()
             context.pre_backward()
@@ -444,7 +454,7 @@ class FsdpModule:
         torch.cuda.nvtx.range_pop()
 
     def post_accumulate_grad(self) -> None:
-        """Pack completed gradients and immediately launch their reductions."""
+        """Pack completed gradients and submit reductions at the planned boundary."""
         self.context.validate_grad_sync()
         self._reduce_gradient_groups()
 
@@ -458,17 +468,32 @@ class FsdpModule:
         with self._nvtx_range("reduce_gradients"):
             context = self.context
             inner_reduction_stream = context.inner_reduction_stream
+            finalizes_outer = (
+                context.gradient_finalization_mode is not GradientFinalizationMode.SKIP_OUTER
+            )
+            event = (
+                self._execution_event(ExecutionAction.GRAD_READY, finalizes_outer=finalizes_outer)
+                if context.rs_window_budget_bytes
+                else None
+            )
+            if event is not None and context.rs_plan is None:
+                raise RuntimeError("An FSDP replay started before the RS window was compiled.")
 
-            for group in self._parameter_groups:
+            for index, group in enumerate(self._parameter_groups):
                 if not group.requires_grad:
                     continue
 
-                if group.requires_inner_reduction:
+                end = context.rs_plan.get((event.event_id, index)) if event is not None else None
+                if end is not None:
+                    self._accumulate_rs_window(group, flush=end == event.event_id)
+                    if end != event.event_id:
+                        continue
+                elif group.requires_inner_reduction:
                     self._reduce_inner_gradients(group)
                 else:
                     self._accumulate_local_gradients(group)
 
-                if context.gradient_finalization_mode is GradientFinalizationMode.SKIP_OUTER:
+                if not finalizes_outer:
                     continue
                 # Finalize the DP-outer reduction. When overlap is enabled its stream is
                 # distinct, so it overlaps the following group's DP-inner reduce; the
@@ -479,6 +504,39 @@ class FsdpModule:
                     context.outer_reduction_stream.wait_stream(inner_reduction_stream)
                 with torch.cuda.stream(context.outer_reduction_stream):
                     group.reduce_outer_gradients()
+
+    def _accumulate_rs_window(self, group: FsdpParameterGroup, *, flush: bool) -> None:
+        context = self.context
+        current_stream = context.current_stream()
+        inner_stream = context.inner_reduction_stream
+        saved = context.rs_inputs.get(group)
+        if saved is None:
+            if flush:
+                raise RuntimeError("An RS window reached its flush without a pending input.")
+            with torch.cuda.stream(inner_stream):
+                partial_grad = group.allocate_partial_grad_buffer(dtype=group.main_grad.dtype)
+            current_stream.wait_stream(inner_stream)
+        else:
+            partial_grad = saved.buffer
+            if saved.bound_grad_dtypes:
+                if current_stream != saved.write_stream:
+                    current_stream.wait_stream(saved.write_stream)
+            else:
+                current_stream.wait_event(saved.ready)
+        group.copy_gradients_to_partial_buffer(
+            partial_grad,
+            accumulate=saved is not None,
+            bound_grad_dtypes=None if saved is None else saved.bound_grad_dtypes,
+        )
+        if flush:
+            inner_stream.wait_stream(current_stream)
+            with torch.cuda.stream(inner_stream):
+                group.reduce_inner_gradients(partial_grad.cast(group.grad_comm_dtype))
+            del context.rs_inputs[group]
+        else:
+            context.rs_inputs[group] = _RsInput(
+                partial_grad, current_stream.record_event(), current_stream
+            )
 
     def _accumulate_local_gradients(self, group: FsdpParameterGroup) -> None:
         """Accumulate on compute without waiting for other groups' inner reductions."""
@@ -506,6 +564,44 @@ class FsdpModule:
         inner_reduction_stream.wait_stream(current_stream)
         with torch.cuda.stream(inner_reduction_stream):
             group.reduce_inner_gradients(partial_grad)
+
+    def _execution_event(
+        self,
+        action: ExecutionAction,
+        *,
+        phase: Phase | None = None,
+        rowwise_only: bool = False,
+        finalizes_outer: bool = False,
+    ) -> ExecutionEvent | None:
+        """Record a request or validate replay before its physical storage operation."""
+        context = self.context
+        if not context.training or context.prefetch_order is not PrefetchOrder.RECORDED:
+            return None
+        recording = context.is_recording_execution_order
+        event = ExecutionEvent(
+            cast(nn.Module, self),
+            phase if action is ExecutionAction.UNSHARD else self.phase,
+            action,
+            rowwise_only=rowwise_only,
+            finalizes_outer=finalizes_outer,
+            unsharded_bytes=(
+                sum(group.unsharded_storage_bytes for group in self.parameter_groups)
+                if recording and action is not ExecutionAction.GRAD_READY
+                else None
+            ),
+        )
+        if recording:
+            context.execution_order.record_event(event, device=context.allgather_stream.device)
+            return None
+        order = context.execution_order_view
+        expected = None if order is None else order.peek()
+        if expected != event:
+            raise RuntimeError(
+                "FSDP module calls diverged from the recorded execution order: "
+                f"expected {expected}, got {event}."
+            )
+        order.advance()
+        return expected
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:

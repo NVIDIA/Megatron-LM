@@ -27,6 +27,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
+    ExecutionAction,
     ExecutionEvent,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
@@ -119,9 +120,11 @@ def test_recorded_execution_order(distributed_setup):
 
     inputs = torch.ones(2, 4, device=device)
     assert context.is_recording_execution_order
-    model(inputs).sum().backward()
+    # Recording ends after this microbatch even while outer reduction is skipped.
+    with context.finalize_gradients(mode=GradientFinalizationMode.SKIP_OUTER):
+        model(inputs).sum().backward()
     assert not context.is_recording_execution_order
-    assert list(context.execution_order) == [
+    assert list(context.execution_order.view(action=ExecutionAction.UNSHARD)) == [
         ExecutionEvent(module, Phase.FORWARD) for module in [model, model.first, model.second]
     ] + [ExecutionEvent(module, Phase.BACKWARD) for module in [model, model.second, model.first]]
 
@@ -135,6 +138,40 @@ def test_recorded_execution_order(distributed_setup):
         layer.register_full_backward_pre_hook(check_prefetched, prepend=True)
     model.zero_grad(set_to_none=True)
     model(inputs).sum().backward()
+
+
+def test_recorded_evaluation_order(distributed_setup):
+    """Evaluation preserves pending recording and the completed training trace."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = (
+        nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)).to(device).eval()
+    )
+    with fully_shard_context(
+        FsdpContext(
+            device=device, runtime_policy=RuntimePolicy(prefetch_order=PrefetchOrder.RECORDED)
+        )
+    ) as context:
+        for layer in model.children():
+            fully_shard(layer, mesh, _default_placements())
+        fully_shard(model, mesh, _default_placements())
+
+    inputs = torch.ones(2, 4, device=device)
+    with torch.no_grad():
+        expected = model(inputs)
+        assert list(context.execution_order) == []
+        context.post_backward()
+        assert context._recording_execution_order
+    model.train()
+    model(inputs).sum().backward()
+    recorded = tuple(context.execution_order)
+    view = context.execution_order_view
+    model.eval()
+    with torch.no_grad():
+        for _ in range(2):
+            torch.testing.assert_close(model(inputs), expected)
+            assert context.execution_order_view is view and view.position == 0
+            assert tuple(context.execution_order) == recorded
 
 
 def test_registration_order_rejects_reordered_execution(distributed_setup):

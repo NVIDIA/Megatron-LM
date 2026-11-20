@@ -15,6 +15,7 @@
 """Transformer Engine MXFP8 distributed buffers composed from physical planes."""
 
 import functools
+import math
 from collections.abc import Iterable
 
 import torch
@@ -165,6 +166,19 @@ class QuantizedDBuffer:
     columnwise_data: DBuffer
     rowwise_scale: DBuffer
     columnwise_scale: DBuffer
+
+    @property
+    def gathered_storage_bytes(self) -> int:
+        """Conservative four-plane capacity, including TE's padded-scale upper bound."""
+        size = sum(
+            buffer.local_buffer.numel() * buffer.local_buffer.element_size()
+            for buffer in self.planes_for(rowwise=True, columnwise=True)
+        )
+        quantizer = _get_quantizer(rowwise=True, columnwise=True)
+        for shape in self.rowwise_data.layout.tensor_shapes:
+            for columnwise in (False, True):
+                size += math.prod(quantizer.get_scale_shape(shape, columnwise=columnwise))
+        return size
 
     def __init__(
         self,

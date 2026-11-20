@@ -225,6 +225,40 @@ def load_model_and_optimizer_state_dict(state_dict):
     optimizer.load_state_dict(state_dict["optimizer"])
 ```
 
+### Weight retention in MFSDP v2
+
+With `--use-megatron-fsdp --megatron-fsdp-version 2`, enable
+`--megatron-fsdp-weight-retention` to reuse gathered weights between module calls.
+The first eager iteration records the complete schedule. Before the next iteration
+or CUDA graph capture, M-LM builds a release mask from that trace.
+
+Compute, single-successor prefetch and retained weights share the standard
+window of two gathered FSDP owners. The planner keeps prefetch enabled and retains
+an owner only when its complete release-to-next-use interval fits that window.
+For nested root/layer/expert execution, it preserves the normal prefetch schedule's
+larger owner-slot envelope instead of adding retention buffers. Replicated weights
+that alias persistent storage use no gathered-buffer slot.
+
+All recorded FSDP modules can participate; no layer-type registry or byte budget
+is needed. This is a module-slot policy, not a bound on allocated bytes when owners
+have different sizes. Every iteration releases gathered weights before optimizer
+updates. Recording and planning happen once, before CUDA graph capture.
+
+Retention defaults to off and requires a fixed module/microbatch schedule with
+ordinary hooks. Enabled M-LM wrappers use single-successor prefetch; standalone
+callers must use prefetch sizes of `None` (one successor) or `0` (disabled).
+MoE EP overlap and NCCL user buffers are currently unsupported. Gradient
+accumulation and reduction modes are unchanged.
+
+### Reduce-scatter windows in MFSDP v2
+
+Set `--megatron-fsdp-rs-window-budget-mib` to a positive budget to accumulate full
+gradients between inner reduce-scatters. The default, `0`, disables windows.
+One eager iteration records the schedule before planning or CUDA graph capture;
+full-iteration graphs require at least one warmup iteration. This option is
+independent of weight retention and requires a fixed schedule with ordinary
+module hooks. MoE EP overlap and NCCL user buffers are unsupported.
+
 ### 🔁 Checkpoint Conversion
 
 Megatron-FSDP checkpointing supports [PyTorch Distributed Checkpoint (DCP)](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html). In Megatron-LM, this is the `--ckpt-format fsdp_dtensor` checkpointing format.
@@ -625,3 +659,29 @@ NCCL (`v2.27+`) supports symmetric allocation or registration for communicators 
 - **High-Precision Reduction**: When training large models, high-precision gradient reduction and accumulation is desired for accuracy and convergence, but communicating FP32 gradients is expensive. With symmetric registration, FP32 accumulators enable gradients to be reduced in FP32 but communicated in BF16, which decreases gradient RS communication latency while maintaining high accuracy during training. Megatron-FSDP supports FP32 main gradient accumulation but BF16 gradient communication, customizable through `megatron_fsdp.MixedPrecisionPolicy`.
 
 These optimizations significantly reduce SM resource contention for overlapped compute and communication kernels in FSDP. Symmetric registration, allocation, and pooling is also supported in PyTorch: [`torch.distributed._symmetric_memory`](https://docs.pytorch.org/docs/stable/symmetric_memory.html).
+
+### Recorded execution (v2)
+
+`RuntimePolicy(prefetch_order=PrefetchOrder.RECORDED)` records every module's
+weight request (`UNSHARD`) and release (`RESHARD`) in one weak `execution_order`
+source. Events keep stable IDs, phase, release kind, rank-local allocated bytes
+and the module's conservative full gathered-weight capacity. A request includes
+reuse of already gathered weights. Allocated bytes are sampled before the
+requested storage operation; they measure allocator state, not CUDA completion
+or an allocation delta. Recording and replay use the same pre-action event point.
+
+The first complete eager schedule ends at `context.post_backward()`. Ordinary
+single-backward training calls this automatically. PP/VPP schedulers use
+`autograd_completes_execution=False`, complete deferred module callbacks with
+`post_microbatch()`, and call `post_backward()` once after all microbatches and
+delayed weight gradients. `finish_grad_sync()` only orders gradient waits.
+Completion force-releases any remaining gathered weights before optimizer updates.
+
+Replay validates the complete U/R sequence before each operation and rejects
+missing, extra or reordered calls. The full cursor does not wrap until successful
+`post_backward()` completion. Prefetch uses an independent filtered `UNSHARD`
+view; speculative gathers do not consume logical events. Evaluation preserves
+recording state and training cursors. Changing the schedule requires a new
+context. Recorded execution requires ordinary hooks; combined EP-overlap
+scheduling is unsupported. Recording and byte sampling must finish before
+CUDA Graph capture; capture executes the replay operations.

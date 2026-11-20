@@ -45,6 +45,7 @@ try:
         FsdpContext,
         GradientFinalizationMode,
         Placements,
+        PrefetchOrder,
         RuntimePolicy,
         SchedulePolicy,
         ShardLayout,
@@ -59,6 +60,9 @@ try:
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
         sync_model_weights_from_main_weights,
+    )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.weight_retention import (
+        build_retain_mask,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import get_sharding_strategy
 
@@ -264,9 +268,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
         # ncclCommWindowRegister:
         # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#window-registration
+        prefetch_size = (
+            None
+            if ddp_config.megatron_fsdp_weight_retention
+            else ddp_config.suggested_communication_unit_size
+        )
         schedule_policy = SchedulePolicy(
-            forward_prefetch_size=ddp_config.suggested_communication_unit_size,
-            backward_prefetch_size=ddp_config.suggested_communication_unit_size,
+            forward_prefetch_size=prefetch_size,
+            backward_prefetch_size=prefetch_size,
             register_hooks=not config.overlap_moe_expert_parallel_comm,
         )
         common_fully_shard_kwargs = dict(
@@ -281,18 +290,47 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # open and finalize our own. MCore's finalize_model_grads() owns the wait
         # after the schedule completes, including delayed wgrad and custom 1F1B work.
         active_context = current_fully_shard_context()
+        prefetch_order = self.prefetch_order_for(config, ddp_config)
+        rs_window_budget_bytes = ddp_config.megatron_fsdp_rs_window_budget_mib * 1024**2
         if active_context is None:
             construction_context = fully_shard_context(
                 FsdpContext(
                     device=device,
                     gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER,
+                    rs_window_budget_bytes=rs_window_budget_bytes,
                     runtime_policy=RuntimePolicy(
+                        prefetch_order=prefetch_order,
+                        autograd_completes_execution=not (
+                            ddp_config.megatron_fsdp_weight_retention
+                            or ddp_config.megatron_fsdp_rs_window_budget_mib > 0
+                            or config.pipeline_model_parallel_size > 1
+                            or config.virtual_pipeline_model_parallel_size is not None
+                        ),
                         use_symmetric_memory=ddp_config.nccl_ub,
                         overlap_outer_communication=ddp_config.overlap_outer_communication,
                     ),
                 )
             )
         else:
+            if active_context.rs_window_budget_bytes != rs_window_budget_bytes:
+                raise ValueError("MFSDP v2 RS window budget differs from the active context.")
+            if rs_window_budget_bytes and active_context.use_symmetric_memory:
+                raise ValueError("MFSDP v2 RS windows do not support NCCL user buffers.")
+            if ddp_config.megatron_fsdp_weight_retention and active_context.use_symmetric_memory:
+                raise ValueError("MFSDP v2 weight retention does not support NCCL user buffers.")
+            if (
+                prefetch_order is PrefetchOrder.RECORDED
+                and active_context.prefetch_order is not PrefetchOrder.RECORDED
+            ):
+                raise ValueError(
+                    "Recorded MFSDP v2 schedules require "
+                    "RuntimePolicy(prefetch_order=PrefetchOrder.RECORDED)."
+                )
+            if (
+                prefetch_order is PrefetchOrder.RECORDED
+                and active_context.autograd_completes_execution
+            ):
+                raise ValueError("Recorded schedules require autograd_completes_execution=False.")
             construction_context = nullcontext(active_context)
         with construction_context:
             collector = FsdpUnitCollector(fsdp_unit_modules)
@@ -316,6 +354,28 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         if config.overlap_moe_expert_parallel_comm:
             register_combined_1f1b_hooks(self.module)
+
+    @staticmethod
+    def prefetch_order_for(
+        config: TransformerConfig, ddp_config: DistributedDataParallelConfig
+    ) -> "PrefetchOrder":
+        """Record pipeline schedules and iterations using weight retention or RS windows."""
+        if not config.overlap_moe_expert_parallel_comm and (
+            ddp_config.megatron_fsdp_weight_retention
+            or ddp_config.megatron_fsdp_rs_window_budget_mib > 0
+            or config.pipeline_model_parallel_size > 1
+            or config.virtual_pipeline_model_parallel_size is not None
+        ):
+            return PrefetchOrder.RECORDED
+        return PrefetchOrder.REGISTRATION
+
+    @staticmethod
+    def compile_weight_retention(model, agreement_group) -> None:
+        """Plan once from the complete eager trace, before any CUDA graph capture."""
+        context = model[0].module.context
+        context.retain_mask = build_retain_mask(
+            context.execution_order, agreement_group, device=context.allgather_stream.device
+        )
 
     def load_state_dict(self, state_dict, strict=True):
         """Load main weights and refresh the buffers used for forward compute."""
@@ -347,6 +407,18 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             ValueError: If a required process group is missing or the model,
                 topology, or data-parallel configuration uses an unsupported feature.
         """
+        if ddp_config.megatron_fsdp_weight_retention:
+            if config.overlap_moe_expert_parallel_comm:
+                raise ValueError("MFSDP v2 weight retention requires ordinary module hooks.")
+            if ddp_config.nccl_ub:
+                raise ValueError("MFSDP v2 weight retention does not support nccl_ub.")
+        if ddp_config.megatron_fsdp_rs_window_budget_mib > 0:
+            if config.overlap_moe_expert_parallel_comm:
+                raise ValueError("MFSDP v2 RS windows require ordinary module hooks.")
+            if ddp_config.nccl_ub:
+                raise ValueError("MFSDP v2 RS windows do not support nccl_ub.")
+            if config.cuda_graph_impl == "full_iteration" and config.cuda_graph_warmup_steps < 1:
+                raise ValueError("MFSDP v2 RS windows require an eager iteration before capture.")
         if config.moe_virtual_expert_load_balance:
             raise ValueError(
                 "MoonEP is not yet integrated with Megatron-FSDP v2. Supporting it requires "
