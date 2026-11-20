@@ -114,16 +114,18 @@ fi
 
 cd $TEST_PATH
 
-# Profiles are launches a bucket needs apart from one launch at GPUS_PER_NODE ranks: a fresh
-# process per FP8 recipe, or a fixed world size per file. They share the same Testmon
-# baseline/selection lifecycle as every other bucket.
+# Profiles are launches a bucket needs apart from its main launch at GPUS_PER_NODE ranks: a
+# fresh process per FP8 recipe, or a fixed world size per file. They run the tests in
+# ISOLATED_DIR, which the main launch leaves out, in the same job and the same Testmon
+# baseline/selection lifecycle.
 UNIT_PROFILES=()
 UNIT_RESULTS_DIR=
 UNIT_TARGETS=()
+MAIN_ARGS=()
 ISOLATED_DIR=tests/unit_tests/inference/isolated
 
 # profile_spec PROFILE: set PROFILE_WORLD, PROFILE_FILE (a file or directory), PROFILE_SELECT
-# (-k), PROFILE_ARGS and PROFILE_ENV for one profile of the isolated inference bucket.
+# (-k), PROFILE_ARGS and PROFILE_ENV for one profile of the isolated inference tests.
 # PROFILE_PACKED profiles fill the runner with concurrent shards in a full run; PROFILE_SKIPS_OK
 # profiles may report skipped tests.
 profile_spec() {
@@ -166,11 +168,12 @@ profile_spec() {
 }
 
 case "$BUCKET" in
-"$ISOLATED_DIR/**/*.py")
-    # One job for the inference tests that need their own launches: a fresh one-rank process
-    # per FP8 recipe, six ranks for the KV transfer pairs, two for the routed-coordinator and
-    # disaggregation pairs, and four for the disaggregation coordinator. UNIT_TEST_PROFILES
-    # runs a subset (e.g. "delayed blockwise").
+"tests/unit_tests/inference/**/*.py" | "$ISOLATED_DIR/**/*.py")
+    # The inference job also runs the inference tests that need their own launches: a fresh
+    # one-rank process per FP8 recipe, six ranks for the KV transfer pairs, two for the
+    # routed-coordinator and disaggregation pairs, and four for the disaggregation coordinator.
+    # The isolated bucket runs only these. UNIT_TEST_PROFILES runs a subset (e.g. "delayed
+    # blockwise").
     case "$PLATFORM" in
         h100) UNIT_PROFILES=(delayed blockwise transfer pairs coordinator) ;;
         gb200) UNIT_PROFILES=(mxfp8) ;;
@@ -189,16 +192,25 @@ case "$BUCKET" in
         done
         UNIT_PROFILES=("${profiles[@]}")
     fi
-    if (( ${#UNIT_PROFILES[@]} == 0 )); then
-        echo "No profile of $BUCKET can run here."
-        exit 0
-    fi
-    # Testmon merges one selection per rank of the widest profile.
-    GPUS_PER_NODE=1
+    # Testmon merges one selection per rank of the widest launch.
+    widest=1
     for profile in "${UNIT_PROFILES[@]}"; do
         profile_spec "$profile"
-        (( PROFILE_WORLD <= GPUS_PER_NODE )) || GPUS_PER_NODE=$PROFILE_WORLD
+        (( PROFILE_WORLD <= widest )) || widest=$PROFILE_WORLD
     done
+    if [[ "$BUCKET" == "$ISOLATED_DIR/**/*.py" ]]; then
+        if (( ${#UNIT_PROFILES[@]} == 0 )); then
+            echo "No profile of $BUCKET can run here."
+            exit 0
+        fi
+        GPUS_PER_NODE=$widest
+    else
+        MAIN_ARGS=(--ignore="$ISOLATED_DIR")
+        if (( widest > ${GPUS_PER_NODE:-8} )); then
+            echo "A profile of $BUCKET needs $widest ranks, more than its main launch." >&2
+            exit 1
+        fi
+    fi
     ;;
 esac
 if (( ${#UNIT_PROFILES[@]} )); then
@@ -315,18 +327,24 @@ run_sharded() {
     return "$rc"
 }
 
-# bucket_uses_mark MARK TARGET: a file this bucket collects, one under TARGET that no child
-# bucket's --ignore removes, applies pytest.mark.MARK.
-bucket_uses_mark() {
-    local mark="$1" target="$2" file
-    local -A ignored=()
-    for file in "${IGNORE_ARGS[@]}"; do
-        ignored["${file#--ignore=}"]=1
-    done
+# uses_mark MARK TARGET IGNORE_ARGS...: a file under TARGET that none of IGNORE_ARGS (--ignore
+# of a file or directory) removes applies pytest.mark.MARK.
+uses_mark() {
+    local mark="$1" target="$2" file ignore
+    shift 2
     while IFS= read -r file; do
-        [[ -n "${ignored[$file]:-}" ]] || return 0
+        for ignore; do
+            ignore="${ignore#--ignore=}"
+            [[ "$file" != "$ignore" && "$file" != "$ignore"/* ]] || continue 2
+        done
+        return 0
     done < <(grep -rlsFw --include='*.py' "pytest.mark.$mark" "$target")
     return 1
+}
+
+# main_uses_mark MARK TARGET: a file the main launch collects under TARGET applies the mark.
+main_uses_mark() {
+    uses_mark "$1" "$2" "${IGNORE_ARGS[@]}" "${MAIN_ARGS[@]}"
 }
 
 # launch_profile PHASE MODE PROFILE DEVICES APPEND LAUNCH SHARD LAUNCH_ARGS...: one profile's
@@ -386,16 +404,17 @@ launch_profile() {
     [[ "$rc" -eq 0 || "$rc" -eq 5 ]] || return "$rc"
 }
 
-# run_profiled_command PHASE MODE LAUNCH_ARGS...: run every profile (see launch_profile).
+# run_profiled_command PHASE MODE APPEND LAUNCH_ARGS...: run every profile (see launch_profile).
 # Profile data stays in Testmon's native environments within each phase database: Testmon's
-# baseline and selection run the profiles one at a time, appending each to the phase database
-# after the first, and CPU selection already reads all environments. A full run, and the run of
-# the selected tests, start the profiles that fit on the runner together; each torchrun still
-# gets a fresh interpreter and its own rank logs.
+# baseline and selection run the profiles one at a time, each baseline appending to the phase
+# database once it holds one (APPEND=true when the main launch recorded it), and CPU selection
+# already reads all environments. A full run, and the run of the selected tests, start the
+# profiles that fit on the runner together; each torchrun still gets a fresh interpreter and its
+# own rank logs.
 run_profiled_command() {
-    local phase="$1" mode="$2"
-    shift 2
-    local profile rank_dir pid devices used=0 rc=0 append=false
+    local phase="$1" mode="$2" append="$3"
+    shift 3
+    local profile rank_dir pid devices used=0 rc=0
     local -a pids=()
     for profile in "${UNIT_PROFILES[@]}"; do
         profile_spec "$profile"
@@ -485,21 +504,22 @@ PY
 # Keep this path identical to exhaustive CI. The installed Testmon plugin is
 # inactive unless one of the selective paths below passes --testmon.
 # pack_plan TARGET: set PACK_SHARDS (concurrent shards of GPUS_PER_NODE GPUs) and
-# PACK_SINGLE_RANK (whether TARGET's single_rank tests run first as one-GPU shards).
+# PACK_SINGLE_RANK (whether the main launch's single_rank tests under TARGET run first as
+# one-GPU shards).
 pack_plan() {
     PACK_SHARDS=1
     PACK_SINGLE_RANK=false
-    [[ "$UNIT_TEST_PACK" == 1 && ${#UNIT_PROFILES[@]} -eq 0 && "$NUM_NODES" -eq 1 ]] || return 0
+    [[ "$UNIT_TEST_PACK" == 1 && "$NUM_NODES" -eq 1 ]] || return 0
     if (( GPUS_PER_NODE < NODE_GPUS && NODE_GPUS % GPUS_PER_NODE == 0 )); then
         PACK_SHARDS=$((NODE_GPUS / GPUS_PER_NODE))
     elif (( GPUS_PER_NODE > 1 && GPUS_PER_NODE == NODE_GPUS )) \
-        && bucket_uses_mark single_rank "$1"; then
+        && main_uses_mark single_rank "$1"; then
         PACK_SINGLE_RANK=true
     fi
 }
 
-# run_prod_tests TARGETS...: the prod phase over TARGETS (the bucket directory, or the node ids
-# Testmon selected), packed as pack_plan decided.
+# run_prod_tests ARGS...: the main launch's prod phase over ARGS (the bucket directory, or the
+# node ids Testmon selected, and MAIN_ARGS), packed as pack_plan decided.
 run_prod_tests() {
     local -a args=(-vs "${IGNORE_ARGS[@]}")
     local rc=0
@@ -524,20 +544,61 @@ run_prod_tests() {
     [[ "$rc" -eq 0 || ( "$rc" -eq 5 && "$PACK_SINGLE_RANK" == true ) ]] || return "$rc"
 }
 
+# run_bucket PHASE MODE LAUNCH_ARGS...: one phase of the bucket over UNIT_TARGETS (the bucket
+# directory, or the node ids Testmon selected). MODE is full, baseline, select or selected, and
+# LAUNCH_ARGS is what follows the torchrun arguments, without test targets. The main launch
+# takes the targets outside ISOLATED_DIR at GPUS_PER_NODE ranks (a prod phase of a full or
+# selected run packed as pack_plan decided); then each profile takes its own.
+run_bucket() {
+    local phase="$1" mode="$2" target output rc=0 append=false profiles=true
+    shift 2
+    local -a main=()
+    for target in "${UNIT_TARGETS[@]}"; do
+        [[ "$target" == "$ISOLATED_DIR" || "$target" == "$ISOLATED_DIR"/* ]] || main+=("$target")
+    done
+    (( ${#UNIT_PROFILES[@]} )) || profiles=false
+    if [[ "$mode" == full && "$phase" == experimental ]]; then
+        # Without pytest.mark.experimental a launch selects nothing in this phase; skip it,
+        # which otherwise starts every rank only to deselect every test.
+        if (( ${#main[@]} )) && ! main_uses_mark experimental "${main[0]}"; then
+            echo "No experimental tests in ${main[0]}; skipping the experimental launch."
+            main=()
+        fi
+        if [[ "$profiles" == true ]] \
+            && ! uses_mark experimental "$ISOLATED_DIR" "${IGNORE_ARGS[@]}"; then
+            echo "No experimental tests in $ISOLATED_DIR; skipping the experimental profiles."
+            profiles=false
+        fi
+    fi
+    if (( ${#main[@]} )); then
+        if [[ "$phase" == prod && ( "$mode" == full || "$mode" == selected ) ]]; then
+            run_prod_tests "${MAIN_ARGS[@]}" "${main[@]}" || rc=$?
+        else
+            run_test_cmd uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}" \
+                "$@" "${MAIN_ARGS[@]}" "${main[@]}" || rc=$?
+        fi
+        # The phase's markers can deselect every selected test (pytest exit 5).
+        [[ "$rc" -eq 0 || ( "$rc" -eq 5 && "$mode" == selected ) ]] || return "$rc"
+        if [[ "$profiles" == true && "$mode" == select ]]; then
+            # Keep the main launch's selections apart; run_profiled_command merges them all.
+            for output in "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$phase"/rank-*/selected-tests; do
+                mv -- "$output" "$output.main" || return
+            done
+        fi
+        [[ "$mode" != baseline ]] || append=true
+    fi
+    [[ "$profiles" == true ]] || return "$rc"
+    run_profiled_command "$phase" "$mode" "$append" "$@"
+}
+
 run_full_tests() {
     UNIT_RESULTS_MODE=full
-    local phase target
+    local phase
     local -a launch
-    target=$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')
+    UNIT_TARGETS=("$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')")
     for i in $(seq $UNIT_TEST_REPEAT); do
         for phase in prod experimental; do
             [[ "$phase" != experimental || "$TAG" == latest ]] || continue
-            # A bucket without pytest.mark.experimental selects nothing in that phase; skip
-            # the launch, which otherwise starts every rank only to deselect every test.
-            if [[ "$phase" == experimental ]] && ! bucket_uses_mark experimental "$target"; then
-                echo "No experimental tests in $target; skipping the experimental launch."
-                continue
-            fi
             if [[ "$phase" == prod ]]; then
                 launch=(-m coverage run --data-file=.coverage.unit_tests --source=megatron/core
                     -m pytest -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}")
@@ -545,15 +606,7 @@ run_full_tests() {
                 launch=(-m pytest -vs --experimental "${IGNORE_ARGS[@]}"
                     -m "experimental and ${MARKER_ARG}")
             fi
-            if (( ${#UNIT_PROFILES[@]} )); then
-                UNIT_TARGETS=("$target")
-                run_profiled_command "$phase" full "${launch[@]}"
-            elif [[ "$phase" == prod ]]; then
-                run_prod_tests "$target"
-            else
-                run_test_cmd uv run --no-sync python -m torch.distributed.run \
-                    "${DISTRIBUTED_ARGS[@]}" "${launch[@]}" "$target"
-            fi
+            run_bucket "$phase" full "${launch[@]}"
         done
     done
 
@@ -595,13 +648,9 @@ run_testmon_phase() {
         --phase "$phase"
         --
     )
-    if [[ -n "${UNIT_RESULTS_DIR:-}" ]]; then
-        # The last pytest argument is the bucket; each profile runs its own file instead.
-        UNIT_TARGETS=("${@: -1}")
-        run_profiled_command "$phase" "$mode" "${launch[@]}" "${@:1:$#-1}"
-    else
-        uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}" "${launch[@]}" "$@"
-    fi
+    # The last pytest argument is the bucket directory.
+    UNIT_TARGETS=("${@: -1}")
+    run_bucket "$phase" "$mode" "${launch[@]}" "${@:1:$#-1}"
 }
 
 run_baseline_tests() {
@@ -683,15 +732,8 @@ run_selected_phase() {
     # Mandatory files are passed whole, so a phase's marker filter can
     # legitimately deselect everything in them (pytest exit 5).
     local rc=0
-    if [[ -n "${UNIT_RESULTS_DIR:-}" ]]; then
-        UNIT_TARGETS=("${selected_tests[@]}")
-        run_profiled_command "$phase" selected "${launch[@]}" || rc=$?
-    elif [[ "$phase" == prod ]]; then
-        run_prod_tests "${selected_tests[@]}" || rc=$?
-    else
-        uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}" \
-            "${launch[@]}" "${selected_tests[@]}" || rc=$?
-    fi
+    UNIT_TARGETS=("${selected_tests[@]}")
+    run_bucket "$phase" selected "${launch[@]}" || rc=$?
     if [[ "$rc" -eq 5 ]]; then
         echo "No $phase tests collected from the selection (pytest exit 5) — treating as pass."
         return 0

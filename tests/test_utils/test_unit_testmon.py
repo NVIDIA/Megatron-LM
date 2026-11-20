@@ -36,6 +36,25 @@ def _function(source: str, name: str) -> str:
     return source.split(f"{name}() {{", 1)[1].split("\n}\n", 1)[0]
 
 
+# The runner functions that launch the tests Testmon selected, and the state the runner sets
+# up for them in a bucket without profiles or packing.
+SELECTED_RUN_FUNCTIONS = (
+    "uses_mark",
+    "main_uses_mark",
+    "run_test_cmd",
+    "run_prod_tests",
+    "run_bucket",
+)
+SELECTED_RUN_STATE = (
+    "UNIT_PROFILES=() MAIN_ARGS=() ISOLATED_DIR=tests/unit_tests/inference/isolated "
+    "PACK_SHARDS=1 PACK_SINGLE_RANK=false"
+)
+
+
+def _functions(source: str, *names: str) -> str:
+    return "\n".join(name + "() {" + _function(source, name) + "\n}" for name in names)
+
+
 def _invoke(project, cache, mode, phase="prod", rank=0, pytest_args=()):
     return subprocess.run(
         [
@@ -260,17 +279,19 @@ def test_changed_function_selects_and_runs_only_affected_cases_in_same_file(proj
             (
                 "NUM_NODES=1",
                 "GPUS_PER_NODE=2",
+                "PLATFORM=h100",
                 "DISTRIBUTED_ARGS=()",
                 "IGNORE_ARGS=()",
                 "MARKER_ARG='not flaky'",
+                SELECTED_RUN_STATE,
                 # Replace only uv/torchrun; run the actual coverage/pytest command locally.
                 "uv() {",
                 '    [[ "$1 $2 $3 $4 $5" == "run --no-sync python -m torch.distributed.run" ]]',
                 "    shift 5",
                 '    "$TEST_PYTHON" "$@"',
                 "}",
-                "merge_rank_selections() {" + _function(runner, "merge_rank_selections") + "\n}",
-                "run_selected_phase() {" + _function(runner, "run_selected_phase") + "\n}",
+                _functions(runner, "merge_rank_selections", "run_selected_phase"),
+                _functions(runner, *SELECTED_RUN_FUNCTIONS),
                 "merge_rank_selections prod",
                 "run_selected_phase prod",
             )
@@ -637,14 +658,18 @@ def test_cpu_plan_execution(tmp_path, validation_status, selected_runs):
         (directory / "mandatory-tests").write_text("")
     (tmp_path / ".coverage.unit_tests").touch()
     runner = _source("tests/unit_tests/run_ci_test.sh")
-    functions = "\n".join(
-        name + "() {" + _function(runner, name) + "\n}"
-        for name in ("run_selected_phase", "write_testmon_summary", "run_enforced_tests")
+    functions = _functions(
+        runner,
+        "run_selected_phase",
+        "write_testmon_summary",
+        "run_enforced_tests",
+        *SELECTED_RUN_FUNCTIONS,
     )
     script = "\n".join(
         (
             "set -euo pipefail",
             "DISTRIBUTED_ARGS=() IGNORE_ARGS=()",
+            SELECTED_RUN_STATE,
             "MARKER_ARG='not flaky_in_dev'",
             "UNIT_TEST_REPEAT=2 NUM_NODES=1 GPUS_PER_NODE=8 PLATFORM=h100",
             "BUCKET=tests/unit_tests/test_example.py",

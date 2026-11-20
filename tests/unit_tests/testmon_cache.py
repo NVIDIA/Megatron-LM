@@ -121,7 +121,7 @@ def cache_identity(
     if not bucket.startswith("tests/unit_tests/") or "\n" in bucket:
         raise ValueError("invalid unit-test bucket")
     paths = {root / path for path in COMPATIBILITY_FILES}
-    if bucket == "tests/unit_tests/inference/isolated/**/*.py":
+    if bucket == "tests/unit_tests/inference/**/*.py":
         # This bucket depends on the runner's profiles and the selector's
         # accumulation of those profiles into a complete baseline.
         paths.update(
