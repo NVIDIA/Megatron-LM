@@ -643,6 +643,7 @@ class EngineLoopMixin:
         # Send staged replies still in flight before the socket closes. NeMo RL never calls
         # this (it kills the worker instead), so the unbounded wait only affects a clean shutdown.
         await self._drain_staging_tasks()
+        self.controller.release_device_waiter()
         self.state = EngineState.STOPPED
         self._exit_custom_gc_mode()
 
@@ -773,12 +774,10 @@ class EngineLoopMixin:
                             await self.async_step()
                         else:
                             # Dummy forward to participate in the EP collective.
-                            self.step_start_event.record()
                             nvtx_range_push("EP-dummy-forward")
                             self.controller.dummy_forward()
-                            self.step_end_event.record()
-                            self.step_end_event.synchronize()
                             nvtx_range_pop("EP-dummy-forward")
+                            await self.controller.submit_device_wait()
                             self.context.step_count += 1
                             self.context.prefix_cache_lru_clock += 1
                     else:

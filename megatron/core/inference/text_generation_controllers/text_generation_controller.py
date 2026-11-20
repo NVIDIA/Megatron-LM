@@ -34,6 +34,7 @@ from megatron.core.inference.text_generation_controllers.mtp_controller_mixin im
     MTPControllerMixin,
 )
 from megatron.core.inference.utils import (
+    DeviceWaiter,
     InferenceMode,
     detokenize_tokens,
     get_attention_mask,
@@ -436,6 +437,7 @@ class TextGenerationController(MTPControllerMixin):
         self._async_sched_log_probs_gpu_ready_event = torch.cuda.Event()
         self._async_sched_log_probs_cpu_ready_event = torch.cuda.Event()
         self._async_sched_copy_stream = torch.cuda.Stream(device=device)
+        self._device_waiter: Optional[DeviceWaiter] = None
         self._async_sched_routing_copy_stream = None
         self._async_sched_routing_buffer_slots = []
         self._async_sched_routing_buffer_index = -1
@@ -2072,16 +2074,15 @@ class TextGenerationController(MTPControllerMixin):
         if run_async_overlap and context.paused_request_count != 0:
             raise RuntimeError("Async scheduling overlap does not support paused requests.")
 
-    @staticmethod
-    def _synchronize_async_sched_event(event: Optional[torch.cuda.Event]) -> None:
-        """Block the host until an async-scheduling CUDA event completes.
+    async def _await_async_sched_event(self, event: Optional[torch.cuda.Event]) -> None:
+        """Await an async-scheduling CUDA event through the device waiter; the loop stays free.
 
         Args:
-            event (Optional[torch.cuda.Event]): CUDA event to synchronize, or
-                `None` when no CUDA work was recorded.
+            event (Optional[torch.cuda.Event]): CUDA event to await, or `None` when no CUDA work
+                was recorded.
         """
         if event is not None:
-            event.synchronize()
+            await self.submit_device_wait(event)
 
     def _acquire_async_sched_routing_buffer_slot(
         self, shape: torch.Size
@@ -2148,7 +2149,7 @@ class TextGenerationController(MTPControllerMixin):
             gpu_source=stacked_routing,
         )
 
-    def _publish_async_sched_routing(
+    async def _publish_async_sched_routing(
         self, routing_record: Optional[_AsyncScheduleRoutingRecord]
     ) -> None:
         """Publish one consumed async forward's routing output.
@@ -2161,7 +2162,7 @@ class TextGenerationController(MTPControllerMixin):
             return
 
         try:
-            self._synchronize_async_sched_event(routing_record.cpu_ready_event)
+            await self._await_async_sched_event(routing_record.cpu_ready_event)
             row_indices = routing_record.row_indices
             routing_cpu = routing_record.cpu_view
             block_ids = routing_record.block_ids
@@ -2523,7 +2524,7 @@ class TextGenerationController(MTPControllerMixin):
         assert row_offset == current_row_count
         routing_record.select_rows(torch.tensor(selected_rows, dtype=torch.int64))
 
-    def _run_async_sched_mtp_rewind(self, sample_result: _AsyncScheduleSampleResult) -> None:
+    async def _run_async_sched_mtp_rewind(self, sample_result: _AsyncScheduleSampleResult) -> None:
         """Rewind rejected MTP KV state before preparing the successor.
 
         Args:
@@ -2533,7 +2534,7 @@ class TextGenerationController(MTPControllerMixin):
         if accepted_counts_cpu is None:
             raise RuntimeError("Async MTP sampling did not produce accepted-token counts.")
 
-        self._synchronize_async_sched_event(sample_result.accepted_counts_cpu_ready_event)
+        await self._await_async_sched_event(sample_result.accepted_counts_cpu_ready_event)
         self._select_async_sched_accepted_routing_rows(sample_result)
 
         blocks_to_release, remove_mask = self._rewind_kv_cache(accepted_counts_cpu)
@@ -2897,7 +2898,7 @@ class TextGenerationController(MTPControllerMixin):
 
         return True, bookkeeping_done_event
 
-    def _finalize_async_sched_log_probs(
+    async def _finalize_async_sched_log_probs(
         self, request_result, sample_result, log_probs_transfer
     ) -> None:
         """Materialize scores once, either for early completion or normal step output.
@@ -2909,13 +2910,13 @@ class TextGenerationController(MTPControllerMixin):
         """
         if request_result.log_probs_result is None:
             if log_probs_transfer is not None:
-                self._synchronize_async_sched_event(log_probs_transfer.cpu_ready_event)
+                await self._await_async_sched_event(log_probs_transfer.cpu_ready_event)
             request_result.log_probs_result = self._materialize_async_sched_log_probs(
                 log_probs_transfer,
                 sample_result.accepted_counts_cpu_view if self.num_speculative_tokens > 0 else None,
             )
 
-    def _finalize_async_sched_requests(
+    async def _finalize_async_sched_requests(
         self, request_result, sample_result, log_probs_transfer, finalize_requests
     ) -> None:
         """Assemble completed requests before lifecycle cleanup can reuse their storage.
@@ -2928,7 +2929,9 @@ class TextGenerationController(MTPControllerMixin):
         """
         if finalize_requests is None or not request_result.finished_request_ids.numel():
             return
-        self._finalize_async_sched_log_probs(request_result, sample_result, log_probs_transfer)
+        await self._finalize_async_sched_log_probs(
+            request_result, sample_result, log_probs_transfer
+        )
         log_probs, top_n_logprobs = request_result.log_probs_result
         finalize_requests(
             request_ids=request_result.active_request_ids,
@@ -2943,7 +2946,7 @@ class TextGenerationController(MTPControllerMixin):
             finished_handoff_decode_tokens=request_result.finished_handoff_decode_tokens,
         )
 
-    def _run_async_sched_resolve(
+    async def _run_async_sched_resolve(
         self,
         sample_result: _AsyncScheduleSampleResult,
         resolved_sequence_lengths: Tensor,
@@ -2980,7 +2983,7 @@ class TextGenerationController(MTPControllerMixin):
         range_pop()
 
         # Publish consumed routing while the successor forward remains in flight.
-        self._publish_async_sched_routing(sample_result.routing_record)
+        await self._publish_async_sched_routing(sample_result.routing_record)
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
         )
@@ -3001,7 +3004,7 @@ class TextGenerationController(MTPControllerMixin):
             finished_handoff_decode_tokens=finished_handoff_decode_tokens,
             finished_routing_block_ids=finished_routing_block_ids,
         )
-        self._finalize_async_sched_requests(
+        await self._finalize_async_sched_requests(
             result, sample_result, log_probs_transfer, finalize_requests
         )
 
@@ -3019,7 +3022,7 @@ class TextGenerationController(MTPControllerMixin):
         result.survivor_idxs = survivor_idxs
         return result
 
-    def _run_async_sched_update_requests(
+    async def _run_async_sched_update_requests(
         self,
         sample_result: _AsyncScheduleSampleResult,
         resolved_sequence_lengths: Tensor,
@@ -3050,7 +3053,7 @@ class TextGenerationController(MTPControllerMixin):
         active_request_ids, finished_request_ids, active_request_mask = (
             self._build_async_sched_request_state(sampled_tokens_cpu, resolved_sequence_lengths)
         )
-        self._publish_async_sched_routing(sample_result.routing_record)
+        await self._publish_async_sched_routing(sample_result.routing_record)
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
         )
@@ -3075,7 +3078,7 @@ class TextGenerationController(MTPControllerMixin):
             finished_handoff_decode_tokens=finished_handoff_decode_tokens,
             finished_routing_block_ids=finished_routing_block_ids,
         )
-        self._finalize_async_sched_requests(
+        await self._finalize_async_sched_requests(
             result, sample_result, log_probs_transfer, finalize_requests
         )
 
@@ -3182,7 +3185,7 @@ class TextGenerationController(MTPControllerMixin):
                 # -------------------------------------------------------------------------
                 if self.num_speculative_tokens > 0:
                     sample_result = self._run_async_sched_sample_mtp()
-                    self._run_async_sched_mtp_rewind(sample_result)
+                    await self._run_async_sched_mtp_rewind(sample_result)
                 else:
                     sample_result = self._run_async_sched_sample()
 
@@ -3192,7 +3195,7 @@ class TextGenerationController(MTPControllerMixin):
                 # blocks now and pin them until the rows are stored.
                 prompt_logprob_writes = context.capture_prompt_logprob_writes()
 
-                self._synchronize_async_sched_event(sample_result.sample_cpu_ready_event)
+                await self._await_async_sched_event(sample_result.sample_cpu_ready_event)
 
                 # -------------------------------------------------------------------------
                 # Update
@@ -3200,7 +3203,7 @@ class TextGenerationController(MTPControllerMixin):
                 resolved_sequence_lengths = context.get_active_sequence_lengths() + 1
 
                 self._async_sched_forward.clear()
-                request_result = self._run_async_sched_update_requests(
+                request_result = await self._run_async_sched_update_requests(
                     sample_result,
                     resolved_sequence_lengths,
                     finalize_requests=finalize_requests,
@@ -3227,7 +3230,7 @@ class TextGenerationController(MTPControllerMixin):
                     primer_launched, bookkeeping_done_event = self._run_async_sched_forward_primer()
                     assert primer_launched, "Initial no-overlap step must launch a forward primer."
                     launched_decode_only = context.is_decode_only()
-                    self._synchronize_async_sched_event(bookkeeping_done_event)
+                    await self._await_async_sched_event(bookkeeping_done_event)
             elif had_pending_forward and self.model_config.expert_model_parallel_size > 1:
                 self._run_dummy_async_sched_base_step()
 
@@ -3239,7 +3242,9 @@ class TextGenerationController(MTPControllerMixin):
                 return DynamicBatchControllerStepResult(decode_only=decode_only)
             return DynamicBatchControllerStepResult(decode_only=decode_only, primer_only=True)
 
-        self._finalize_async_sched_log_probs(request_result, sample_result, log_probs_transfer)
+        await self._finalize_async_sched_log_probs(
+            request_result, sample_result, log_probs_transfer
+        )
         log_probs, top_n_logprobs = request_result.log_probs_result
         context.commit_prompt_logprob_writes(prompt_logprob_writes, log_probs, top_n_logprobs)
         result = self._build_async_sched_step_result(
@@ -3317,11 +3322,11 @@ class TextGenerationController(MTPControllerMixin):
             # Resolve
             # -------------------------------------------------------------------------
             # Wait for the CPU sample and the published bookkeeping snapshot.
-            self._synchronize_async_sched_event(sample_result.sample_cpu_ready_event)
-            self._synchronize_async_sched_event(bookkeeping_done_event)
+            await self._await_async_sched_event(sample_result.sample_cpu_ready_event)
+            await self._await_async_sched_event(bookkeeping_done_event)
 
             # Resolve N while forward N+1 continues.
-            resolve_result = self._run_async_sched_resolve(
+            resolve_result = await self._run_async_sched_resolve(
                 sample_result,
                 resolved_sequence_lengths,
                 finalize_requests=finalize_requests,
@@ -3333,7 +3338,9 @@ class TextGenerationController(MTPControllerMixin):
                 resolve_result.sampled_tokens_cpu[resolve_result.survivor_idxs]
             )
 
-        self._finalize_async_sched_log_probs(resolve_result, sample_result, log_probs_transfer)
+        await self._finalize_async_sched_log_probs(
+            resolve_result, sample_result, log_probs_transfer
+        )
         log_probs, top_n_logprobs = resolve_result.log_probs_result
         result = self._build_async_sched_step_result(
             resolve_result,
@@ -3371,7 +3378,7 @@ class TextGenerationController(MTPControllerMixin):
             # -------------------------------------------------------------------------
             # Verify pending drafts, sample replacements, and rewind rejected KV state.
             sample_result = self._run_async_sched_sample_mtp()
-            self._run_async_sched_mtp_rewind(sample_result)
+            await self._run_async_sched_mtp_rewind(sample_result)
             resolved_sequence_lengths = context.get_active_sequence_lengths() + 1
             log_probs_gpu_result = self._run_async_sched_log_probs(sample_result)
             log_probs_transfer = self._copy_async_sched_log_probs_to_cpu(log_probs_gpu_result)
@@ -3410,10 +3417,10 @@ class TextGenerationController(MTPControllerMixin):
             # Resolve
             # -------------------------------------------------------------------------
             # Wait for the CPU samples and the published bookkeeping snapshot.
-            self._synchronize_async_sched_event(sample_result.sample_cpu_ready_event)
-            self._synchronize_async_sched_event(bookkeeping_done_event)
+            await self._await_async_sched_event(sample_result.sample_cpu_ready_event)
+            await self._await_async_sched_event(bookkeeping_done_event)
 
-            resolve_result = self._run_async_sched_resolve(
+            resolve_result = await self._run_async_sched_resolve(
                 sample_result,
                 resolved_sequence_lengths,
                 finalize_requests=finalize_requests,
@@ -3431,7 +3438,9 @@ class TextGenerationController(MTPControllerMixin):
                 resolve_result.sampled_tokens_cpu[survivor_idxs], sampled_mtp_tokens_cpu
             )
 
-        self._finalize_async_sched_log_probs(resolve_result, sample_result, log_probs_transfer)
+        await self._finalize_async_sched_log_probs(
+            resolve_result, sample_result, log_probs_transfer
+        )
         log_probs, top_n_logprobs = resolve_result.log_probs_result
         result = self._build_async_sched_step_result(
             resolve_result,
@@ -3447,6 +3456,18 @@ class TextGenerationController(MTPControllerMixin):
     # -------------------------------------------------------------------------
     # End async scheduling methods
     # -------------------------------------------------------------------------
+
+    def submit_device_wait(self, event: Optional[torch.cuda.Event] = None) -> asyncio.Future:
+        """A future resolved once `event` completes or once the work queued so far is complete."""
+        if self._device_waiter is None:
+            self._device_waiter = DeviceWaiter(get_asyncio_loop())
+        return self._device_waiter.submit(event)
+
+    def release_device_waiter(self) -> None:
+        """Close the device waiter."""
+        if self._device_waiter is not None:
+            self._device_waiter.close()
+            self._device_waiter = None
 
     async def _run_legacy_step(
         self, skip_bookkeeping: Optional[bool] = False, *, finalize_requests=None
@@ -3508,14 +3529,8 @@ class TextGenerationController(MTPControllerMixin):
                 self._publish_router_recording(routing_indices, block_ids, positions)
             range_pop()
 
-        # This is the best place to yield control back to event loop.
-        # At this point we have enqueued FW pass GPU kernels asynchronously.
-        # While they are running, we can do other useful CPU work.
-        # Note: This can be moved further ahead if sampling can be made
-        # asynchronous.
-        # Todo [Siddharth]: Can we condition the sleep on a cuda event?
-        # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
-        await asyncio.sleep(0)
+        # Mark the forward's completion so that it can be awaited later.
+        gpu_done = self.submit_device_wait()
 
         with torch.inference_mode():
             range_push("sampling")
@@ -3549,7 +3564,12 @@ class TextGenerationController(MTPControllerMixin):
                 context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
             else:
                 self._dynamic_step_sample_logits()
+            range_pop()
 
+        await gpu_done
+
+        with torch.inference_mode():
+            range_push("log_probs")
             self._replace_partial_prefill_sample_with_prompt_token()
 
             log_probs = None
