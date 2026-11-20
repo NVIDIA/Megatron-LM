@@ -1113,12 +1113,12 @@ def is_gtp_param(param) -> bool:
 
 
 def dequantize_gtp_native_fp8(param):
-    """Dequantize a native-FP8 GTP param to a plain BF16 tensor (used at the checkpoint boundary).
-
-    TE's ``tex.dequantize`` dispatches on the *exact* FP8 class and rejects our dynamic
-    ``GTP_<Fp8TensorClass>`` subclass, so restore the base FP8 class for the call and reclass after.
-    """
+    """Dequantize a native-FP8 GTP shard, retaining compatibility with older TE dispatch."""
     from megatron.core.fp8_utils import dequantize_fp8_tensor
+
+    # TE #3393 enables subclass dispatch in 2.20; prerelease builds may lack the fix.
+    if _te_version >= Version("2.20"):
+        return dequantize_fp8_tensor(param)
 
     sub_cls = type(param)
     base_cls = sub_cls.__mro__[1]  # _gtp_native_fp8_subclass builds type("GTP_X", (base_cls,), ...)
@@ -1131,13 +1131,15 @@ def dequantize_gtp_native_fp8(param):
 
 @contextmanager
 def gtp_native_fp8_load_context(module):
-    """Restore the base FP8 class on native-FP8 GTP params under ``module`` for a load copy.
+    """Allow checkpoint copies into native-FP8 GTP shards on older TE.
 
-    ``load_state_dict`` does ``param.copy_(bf16)`` -> TE ``convert_and_update_tensor``, whose
-    ``IsMXFP8Tensor`` C++ check rejects our dynamic subclass (the load-side twin of
-    :func:`dequantize_gtp_native_fp8`). Presenting the base class lets TE re-quantize into the FP8
-    storage; instance attrs live in ``__dict__`` and survive the swap, so the GTP surface persists.
+    TE >= 2.20 accepts GTP subclasses directly. Earlier versions temporarily need
+    the base FP8 class, as in :func:`dequantize_gtp_native_fp8`.
     """
+    if _te_version >= Version("2.20"):
+        yield
+        return
+
     from megatron.core.fp8_utils import is_float8tensor
 
     swapped = []
