@@ -19,9 +19,6 @@ import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
 from megatron.core._rank_utils import warn_single_rank
-from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
-    FineGrainedActivationOffloadingInterface as off_interface,
-)
 from megatron.core.activations import situ_glu, squared_relu, tanh_soft_clamp
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
@@ -42,6 +39,9 @@ from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_r
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor, validate_mxfp8_tensor
 from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.transformer.mlp import (
     MLP,
     MLPSubmodules,

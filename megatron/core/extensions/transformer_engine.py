@@ -3943,6 +3943,12 @@ try:
 except ImportError:
     SplitAlongDim = None
 
+# Transformer Engine CPU offloading moved to te_cpu_offload.
+from megatron.core.extensions.te_cpu_offload import (  # pylint: disable=unused-import
+    cpu_offload,
+    get_cpu_offload_context,
+)
+
 try:
     if HAVE_TE and is_te_min_version("2.3.0"):
         from transformer_engine.pytorch.attention.rope import apply_rotary_pos_emb

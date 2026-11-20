@@ -5,12 +5,10 @@ import gc
 import pytest
 import torch
 
-from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
-    PipelineOffloadManager,
-)
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import fully_shard_optimizer
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import PipelineOffloadManager
 from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.transformer import TransformerLayer
 from megatron.core.utils import is_te_min_version

@@ -22,9 +22,6 @@ except ImportError:
     from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
 
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.activation_policy.recompute.residual_recompute import (
-    ResidualStreamRecomputeContext,
-)
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.enums import Fp8Recipe
@@ -43,6 +40,7 @@ from megatron.core.transformer.residual_connection import (
     ResidualConnectionOperation,
     ResidualConnectionState,
 )
+from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer_mixins import TECudaGraphTransformerLayerMixin
@@ -66,7 +64,7 @@ logger = logging.getLogger(__name__)
 def _get_offloading_interface():
     """Get the offloading interface for fine-grained activation offloading."""
     # Keep this import lazy to avoid a transformer/pipeline circular import.
-    from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
         FineGrainedActivationOffloadingInterface,
     )
 

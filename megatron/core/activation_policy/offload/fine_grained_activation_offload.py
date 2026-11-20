@@ -20,7 +20,7 @@ try:
 except ImportError:
     from megatron.core.telemetry.fallbacks import trace_fn as _otel_trace_fn
 
-from megatron.core.activation_policy.offload.pinned_activation_buffer import PinnedActivationBuffer
+from megatron.core.pipeline_parallel.pinned_activation_buffer import PinnedActivationBuffer
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
@@ -912,7 +912,7 @@ class PipelineOffloadManager:
         debug_rank("----__enter__")
         if self._cur_forward_chunk is None or not self.cur_forward_chunk().do_offload:
             return
-        from megatron.core.extensions.te_cpu_offload import cpu_offload
+        from megatron.core.extensions.transformer_engine import cpu_offload
 
         if cpu_offload is not None:
             cpu_offload.CPUOffloadEnabled = True
@@ -926,7 +926,7 @@ class PipelineOffloadManager:
         debug_rank("----__exit__")
         if self._cur_forward_chunk is None or not self.cur_forward_chunk().do_offload:
             return
-        from megatron.core.extensions.te_cpu_offload import cpu_offload
+        from megatron.core.extensions.transformer_engine import cpu_offload
 
         if cpu_offload is not None:
             cpu_offload.CPUOffloadEnabled = False

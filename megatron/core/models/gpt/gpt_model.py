@@ -9,9 +9,6 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
-from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
-    FineGrainedActivationOffloadingInterface as off_interface,
-)
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import TELMHeadColumnParallelLinear
@@ -26,6 +23,9 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import (
 )
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_observation import observe_tensor

@@ -7,9 +7,6 @@ from typing import NoReturn, Optional, Union
 import torch
 
 from megatron.core import tensor_parallel
-from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
-    FineGrainedActivationOffloadingInterface as off_interface,
-)
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
@@ -18,6 +15,9 @@ from megatron.core.models.common.embeddings import (
 )
 from megatron.core.ops.attention.csa.output_rope import OutputRopeParams
 from megatron.core.ops.norm.torch_norm import LayerNormBuilder
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType

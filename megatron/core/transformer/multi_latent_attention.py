@@ -17,9 +17,6 @@ except ImportError:
     HAVE_EINOPS = False
 
 from megatron.core import tensor_parallel
-from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
-    FineGrainedActivationOffloadingInterface as off_interface,
-)
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_row_copy import contiguous_rows
@@ -31,6 +28,9 @@ from megatron.core.models.common.embeddings import (
 )
 from megatron.core.ops.norm.torch_norm import LayerNormBuilder
 from megatron.core.packed_seq_params import resolve_cp_group
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
     warn_global_process_group_fallback,

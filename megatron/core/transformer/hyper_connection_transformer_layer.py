@@ -8,9 +8,6 @@ from typing import Optional
 
 from torch import Tensor
 
-from megatron.core.activation_policy.recompute.residual_recompute import (
-    ResidualStreamRecomputeContext,
-)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.hyper_connection import (
@@ -23,6 +20,7 @@ from megatron.core.transformer.residual_connection import (
     ResidualConnection,
     ResidualConnectionState,
 )
+from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules

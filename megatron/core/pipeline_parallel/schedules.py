@@ -9,10 +9,10 @@ import torch
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
-from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
+from megatron.core.extensions.te_cuda_graphs import set_te_cuda_graph_current_microbatch
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
-from megatron.core.extensions.te_cuda_graphs import set_te_cuda_graph_current_microbatch
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import (

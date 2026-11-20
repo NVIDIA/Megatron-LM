@@ -6,12 +6,12 @@ import os
 import pytest
 import torch
 
-from megatron.core.activation_policy.offload import pinned_activation_buffer
-from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
+from megatron.core.pipeline_parallel import pinned_activation_buffer
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     ChunkOffloadHandler,
     OffloadTensorPool,
 )
-from megatron.core.activation_policy.offload.pinned_activation_buffer import PinnedActivationBuffer
+from megatron.core.pipeline_parallel.pinned_activation_buffer import PinnedActivationBuffer
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA pinned copies required")
 MIB = 2**20

@@ -8,10 +8,6 @@ import pytest
 import torch
 from torch import nn
 
-from megatron.core.activation_policy.recompute.residual_recompute import (
-    ResidualStreamRecomputeContext,
-    build_residual_stream_recompute_plan,
-)
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
@@ -25,6 +21,10 @@ from megatron.core.transformer.hyper_connection_transformer_layer import (
 )
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.module import TwoStageAttentionLayer
+from megatron.core.transformer.residual_recompute import (
+    ResidualStreamRecomputeContext,
+    build_residual_stream_recompute_plan,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.wide_residual_config import WideResidualConfig

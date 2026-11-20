@@ -55,7 +55,7 @@ class TECudaGraphOffloadingInterface:
     @classmethod
     def get_instance(cls):
         """Share graph resources across layers for the lifetime of the offload manager."""
-        from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
             PipelineOffloadManager,
         )
 
@@ -115,9 +115,7 @@ class TECudaGraphBackwardReloadSyncFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, tensor) -> torch.Tensor:
         """Forward pass for cuda graph capture."""
-        from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
-            debug_rank,
-        )
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import debug_rank
 
         debug_rank("TECudaGraphBackwardReloadSyncFunction forward")
         return tensor
@@ -125,9 +123,7 @@ class TECudaGraphBackwardReloadSyncFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         """Record the backward event and wait for the h2d stream on cuda graph stream."""
-        from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
-            debug_rank,
-        )
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import debug_rank
 
         debug_rank("TECudaGraphBackwardReloadSyncFunction backward")
         off_interface = TECudaGraphOffloadingInterface.get_instance()

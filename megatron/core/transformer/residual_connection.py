@@ -9,9 +9,7 @@ from typing import Generic, Literal, NamedTuple, Optional, TypeAlias, TypeVar, o
 import torch
 from torch import Tensor, nn
 
-from megatron.core.activation_policy.recompute.residual_recompute import (
-    ResidualStreamRecomputeContext,
-)
+from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 
 ResidualBranchOutput: TypeAlias = Tensor | tuple[Tensor, Optional[Tensor]]
 ResidualConnectionState: TypeAlias = tuple[Tensor, ...]

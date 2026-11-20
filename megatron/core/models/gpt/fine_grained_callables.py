@@ -6,9 +6,6 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
-from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
-    FineGrainedActivationOffloadingInterface as off_interface,
-)
 from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.fusions.fused_moe_residual_add import (
@@ -16,6 +13,9 @@ from megatron.core.fusions.fused_moe_residual_add import (
     fused_moe_residual_add,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.pipeline_parallel.utils import ScheduleNode, StageDispatchBwdGrad
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor

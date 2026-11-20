@@ -8,9 +8,6 @@ import pytest
 import torch
 from torch import nn
 
-from megatron.core.activation_policy.recompute.residual_recompute import (
-    ResidualStreamRecomputeContext,
-)
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutputManager,
     model_parallel_cuda_manual_seed,
@@ -20,6 +17,7 @@ from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
     HyperConnectionResidualConnection,
 )
+from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 

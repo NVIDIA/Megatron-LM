@@ -11,9 +11,6 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from megatron.core.activation_policy.recompute.residual_recompute import (
-    ResidualStreamRecomputeContext,
-)
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -23,6 +20,7 @@ from megatron.core.transformer.residual_connection import (
     ResidualConnectionOperation,
     ResidualConnectionState,
 )
+from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.streamwise_residual_ops import (
     streamwise_sigmoid_read,
     streamwise_sigmoid_writeback,

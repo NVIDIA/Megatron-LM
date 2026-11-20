@@ -13,12 +13,6 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 
-from megatron.core.activation_policy.recompute.residual_recompute import (
-    ResidualStreamRecomputeContext,
-    build_recompute_block_end_plan,
-    build_recompute_layer_managers,
-    finalize_recompute_block,
-)
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.residual_connection import (
@@ -26,6 +20,12 @@ from megatron.core.transformer.residual_connection import (
     ResidualConnection,
     ResidualConnectionOperation,
     ResidualConnectionState,
+)
+from megatron.core.transformer.residual_recompute import (
+    ResidualStreamRecomputeContext,
+    build_recompute_block_end_plan,
+    build_recompute_layer_managers,
+    finalize_recompute_block,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module

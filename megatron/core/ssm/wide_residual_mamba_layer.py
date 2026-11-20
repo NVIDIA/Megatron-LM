@@ -5,9 +5,6 @@ from contextlib import nullcontext
 
 from torch import Tensor
 
-from megatron.core.activation_policy.recompute.residual_recompute import (
-    ResidualStreamRecomputeContext,
-)
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
@@ -16,6 +13,7 @@ from megatron.core.transformer.residual_connection import (
     ResidualBranchInput,
     ResidualConnectionState,
 )
+from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,

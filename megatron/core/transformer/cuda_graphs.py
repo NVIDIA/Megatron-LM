@@ -2882,7 +2882,7 @@ class TECudaGraphHelper:
             else:
                 kwargs['fp8_enabled'] = False
 
-            from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
                 FineGrainedActivationOffloadingInterface as off_interface,
             )
 
@@ -2939,7 +2939,7 @@ class TECudaGraphHelper:
         )
         _set_capture_end()
 
-        from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
             FineGrainedActivationOffloadingInterface as off_interface,
         )
 

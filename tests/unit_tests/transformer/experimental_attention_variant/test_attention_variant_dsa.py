@@ -9,7 +9,6 @@ import pytest
 import torch
 
 import megatron.core.parallel_state as parallel_state
-from megatron.core.activation_policy.recompute.recompute import checkpointed_forward
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     _validate_dsa_index_share_pipeline_split,
     get_dsa_module_spec_for_backend,
@@ -17,6 +16,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.recompute import checkpointed_forward
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import dsa_indexer_loss, dsa_kernels

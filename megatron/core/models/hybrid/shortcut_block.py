@@ -21,9 +21,6 @@ from typing import Sequence
 
 import torch
 
-from megatron.core.activation_policy.recompute.residual_recompute import (
-    ResidualStreamRecomputeContext,
-)
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
@@ -38,6 +35,7 @@ from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.moe.router import InferenceTopKRouter
 from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequence_sr
 from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
+from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -53,7 +51,7 @@ SUPPORTED_SHORTCUT_PREDECESSOR_CONFIGS = frozenset(
 
 def _get_offloading_interface():
     """Get the fine-grained activation offloading interface lazily."""
-    from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
         FineGrainedActivationOffloadingInterface,
     )
 

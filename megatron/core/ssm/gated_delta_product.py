@@ -16,9 +16,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
-from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
-    FineGrainedActivationOffloadingInterface as off_interface,
-)
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
     LocalNonpersistentObject,
@@ -30,6 +27,9 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_masked_update,
 )
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic, causal_conv1d_cp
 from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata

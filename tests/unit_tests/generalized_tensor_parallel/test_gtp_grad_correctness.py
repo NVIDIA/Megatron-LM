@@ -207,7 +207,7 @@ def _run_wide_backward(
     )
     layers = list(ddp_model.module.children())
     if residual_stream_recompute:
-        from megatron.core.activation_policy.recompute.residual_recompute import (
+        from megatron.core.transformer.residual_recompute import (
             build_residual_stream_recompute_plan,
         )
 

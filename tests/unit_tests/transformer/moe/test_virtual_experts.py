@@ -33,12 +33,6 @@ from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 from triton.runtime import _allocation
 
 from megatron.core import parallel_state as ps
-from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
-    FineGrainedActivationOffloadingInterface as offload,
-)
-from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
-    PipelineOffloadManager,
-)
 from megatron.core.activations import squared_relu
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -46,6 +40,10 @@ from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as offload,
+)
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import PipelineOffloadManager
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.tensor_parallel import generalized_tensor_parallelism as gtp
