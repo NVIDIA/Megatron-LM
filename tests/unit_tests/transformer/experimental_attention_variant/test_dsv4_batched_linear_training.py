@@ -3,6 +3,7 @@
 """Optimizer and gradient-buffer contracts for DSv4's grouped projection."""
 
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -28,6 +29,58 @@ def _initialize(weight):
         weight.copy_(
             torch.linspace(-0.27, 0.23, weight.numel(), device=weight.device).view_as(weight)
         )
+
+
+@pytest.mark.parametrize(
+    "mfsdp,mxfp8,missing_plane,requires_grad,rejected",
+    [
+        (True, True, "data", True, True),
+        (True, True, "scale", True, True),
+        (True, True, None, True, False),  # Replicated compute weights keep both planes.
+        (False, True, None, True, False),  # Ordinary DDP.
+        (True, False, None, True, False),  # BF16 primary weights.
+        (True, True, "data", False, False),  # No backward needs columnwise weights.
+    ],
+)
+def test_native_projection_phase_sharded_mxfp8_boundary(
+    monkeypatch, mfsdp, mxfp8, missing_plane, requires_grad, rejected
+):
+    """Reject the unsupported storage phase before making a view or entering TE."""
+    if TEBatchedLinear is None:
+        pytest.skip("Transformer Engine BatchedLinear is unavailable")
+    from megatron.core.extensions import te_batched_linear as adapter
+
+    class QuantizedWeight:
+        _columnwise_data = None if missing_plane == "data" else object()
+        _columnwise_scale_inv = None if missing_plane == "scale" else object()
+
+    monkeypatch.setattr(adapter, "MXFP8TensorStorage", QuantizedWeight)
+    weight = QuantizedWeight() if mxfp8 else SimpleNamespace()
+    if mfsdp:
+        weight._mfsdp_parameter_group = object()
+    calls = []
+    operation = object()
+
+    def grouped_operation():
+        calls.append("view")
+        return operation
+
+    def te_forward(actual_operation, ctx, input_):
+        assert actual_operation is operation
+        calls.append("TE")
+        return input_
+
+    monkeypatch.setattr(adapter.BatchedLinear, "op_forward", te_forward)
+    projection = SimpleNamespace(weight=weight, _grouped_operation=grouped_operation)
+    ctx = SimpleNamespace(requires_grad=requires_grad)
+    input_ = object()
+    if rejected:
+        with pytest.raises(NotImplementedError, match="MFSDPv2 phase-sharded MXFP8"):
+            TEBatchedLinear.op_forward(projection, ctx, input_)
+        assert not calls
+    else:
+        assert TEBatchedLinear.op_forward(projection, ctx, input_) is input_
+        assert calls == ["view", "TE"]
 
 
 class _Projection(MegatronModule):

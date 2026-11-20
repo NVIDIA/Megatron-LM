@@ -11,6 +11,7 @@ import torch
 try:
     from transformer_engine.pytorch.ops import BatchedLinear
     from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+    from transformer_engine.pytorch.tensor.storage.mxfp8_tensor_storage import MXFP8TensorStorage
 except ImportError:
     BatchedLinear = None
 
@@ -36,6 +37,10 @@ if BatchedLinear is not None:
         matrix with Muon. A 3D parameter instead selects the scalar optimizer.
         The operation view shares storage, but never replaces the registered
         parameter during forward/backward or changes its shape in place.
+
+        Training with MFSDPv2 phase-sharded MXFP8 primary weights is unsupported:
+        TE saves a weight view that needs both orientations available in forward.
+        BF16 primary weights and replicated MXFP8 compute weights are unaffected.
         """
 
         weight: torch.nn.Parameter
@@ -128,6 +133,21 @@ if BatchedLinear is not None:
 
         def op_forward(self, ctx, input_, **kwargs):
             """Delegate arithmetic and quantization to TE using the grouped view."""
+            if (
+                ctx.requires_grad
+                and getattr(self.weight, "_mfsdp_parameter_group", None) is not None
+                and isinstance(self.weight, MXFP8TensorStorage)
+                and (
+                    self.weight._columnwise_data is None
+                    or self.weight._columnwise_scale_inv is None
+                )
+            ):
+                raise NotImplementedError(
+                    "DSv4's native batched projection does not support MFSDPv2 "
+                    "phase-sharded MXFP8 primary weights. Use BF16 primary weights "
+                    "(disable fp8_param) or replicated compute weights. Both MXFP8 "
+                    "orientations must be available before the training forward."
+                )
             return BatchedLinear.op_forward(self._grouped_operation(), ctx, input_, **kwargs)
 
         def op_backward(self, ctx, grad_output):
