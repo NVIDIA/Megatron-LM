@@ -1345,7 +1345,7 @@ class TransformerConfig(ModelParallelConfig):
     TransformerEngine's transformer_engine.pytorch.ep API."""
 
     moe_virtual_expert_load_balance: bool = False
-    """Balance MoE routes by materializing virtual experts over HybridEP."""
+    """Balance physical expert placement using HybridEP or the MoK megakernel."""
 
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
@@ -3886,8 +3886,7 @@ class TransformerConfig(ModelParallelConfig):
             ), "moe_shortcut_parallel requires MoE to be enabled (num_moe_experts > 0)"
 
         if self.moe_virtual_expert_load_balance:
-            if self.moe_megakernel_backend == "mok":
-                raise ValueError("MOK does not support MoonEP (moe_virtual_expert_load_balance)")
+            mok = self.moe_megakernel_backend == "mok"
             MAX_VIRTUAL_EXPERT_EP_SIZE = 64
 
             def require(condition: bool, message: str) -> None:
@@ -3895,21 +3894,15 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError(f"Virtual-expert load balancing requires {message}.")
 
             required_values = {
-                "moe_token_dispatcher_type": "flex",
-                "moe_flex_dispatcher_backend": "hybridep",
-                "moe_hybridep_routing_map_mode": "indices",
                 "bf16": True,
                 "params_dtype": torch.bfloat16,
                 "fp4": None,
                 "add_bias_linear": False,
                 "moe_grouped_gemm": True,
-                "moe_single_grouped_weight": False,
                 "moe_expert_rank_capacity_factor": None,
                 "moe_paged_stash": False,
-                "moe_use_grouped_tensor": True,
                 "gradient_accumulation_fusion": True,
                 "moe_router_dtype": "fp32",
-                "moe_router_enable_expert_bias": False,
                 "expert_tensor_parallel_size": 1,
                 "delay_wgrad_compute": False,
                 "overlap_dispatch_backward_with_experts_wgrad": False,
@@ -3920,6 +3913,21 @@ class TransformerConfig(ModelParallelConfig):
                 "moe_token_dropping": False,
                 "moe_apply_probs_on_input": False,
             }
+            if mok:
+                # The planner runs after the logical router. MoK owns dispatch,
+                # materializes no TE expert slots, and consumes logical router bias normally.
+                required_values["cuda_graph_impl"] = "none"
+            else:
+                required_values.update(
+                    {
+                        "moe_token_dispatcher_type": "flex",
+                        "moe_flex_dispatcher_backend": "hybridep",
+                        "moe_hybridep_routing_map_mode": "indices",
+                        "moe_single_grouped_weight": False,
+                        "moe_use_grouped_tensor": True,
+                        "moe_router_enable_expert_bias": False,
+                    }
+                )
             for name, value in required_values.items():
                 require(getattr(self, name) == value, f"{name}={value!r}")
             require(

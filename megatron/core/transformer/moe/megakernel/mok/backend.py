@@ -20,6 +20,7 @@ from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
 from megatron.core.transformer.moe.megakernel.factory import split_megakernel_backend_config
 from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
 from megatron.core.transformer.moe.megakernel.mok.runtime import _MoKAutograd
+from megatron.core.transformer.moe.megakernel.mok.virtual_layout import MoKVirtualLayout
 from megatron.core.transformer.moe.megakernel.mok.weights import (
     _native_single_grouped_weight_view,
     _native_split_weight_view,
@@ -37,6 +38,8 @@ if TYPE_CHECKING:
 
 class MoKMegakernel(MegakernelBackend):
     """Execute MOK using trainable parameters owned by native MCore modules."""
+
+    virtual_layout: MoKVirtualLayout | None = None
 
     def __init__(
         self,
@@ -162,6 +165,11 @@ class MoKMegakernel(MegakernelBackend):
         # once per optimizer iteration while retaining graph-captured addresses.
         self._routed_weight_view_cache = None
         self._split_main_grad_descriptor_cache = None
+        self.virtual_layout = (
+            MoKVirtualLayout(config, ep_group, num_local_experts)
+            if getattr(config, "moe_virtual_expert_load_balance", False)
+            else None
+        )
 
     @property
     def routed_fc1_parameters(self) -> tuple[nn.Parameter, ...]:
@@ -345,6 +353,8 @@ class MoKMegakernel(MegakernelBackend):
         del missing_keys, unexpected_keys, error_msgs
         self._routed_weight_view_cache = None
         self._split_main_grad_descriptor_cache = None
+        if self.virtual_layout is not None:
+            self.virtual_layout.clear()
         self.is_first_microbatch = True
 
     def _apply(self, *args, **kwargs):
@@ -381,6 +391,8 @@ class MoKMegakernel(MegakernelBackend):
         # Device/dtype conversion invalidates cached storage views and descriptors.
         self._routed_weight_view_cache = None
         self._split_main_grad_descriptor_cache = None
+        if self.virtual_layout is not None:
+            self.virtual_layout.clear()
         self.is_first_microbatch = True
         return out
 

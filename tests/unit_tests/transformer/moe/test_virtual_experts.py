@@ -1129,6 +1129,34 @@ def test_virtual_expert_recompute_offload_scopes(
         Utils.destroy_model_parallel()
 
 
+@requires_cuda
+def test_mok_virtual_expert_plan_preserves_masked_routes():
+    """MoK's sparse tails retain their -1 ID and do not count toward placement."""
+    Utils.initialize_model_parallel(expert_model_parallel_size=4)
+    workspace = None
+    try:
+        group = ps.get_expert_model_parallel_group()
+        device = torch.device("cuda", torch.cuda.current_device())
+        workspace = vt.VirtualExpertPlannerWorkspace(num_experts=8, device=device, group=group)
+        # An incomplete final planner tile and an empty row cover both kinds of padding.
+        ids = torch.zeros((1025, 2), dtype=torch.int32, device=device)
+        ids[:, 1] = -1
+        ids[-1, 0] = -1
+        physical, copy_table = vt.launch_virtual_expert_planner(
+            ids, workspace, alignment=256, masked_routes=True
+        )
+        assert torch.equal(physical < 0, ids < 0)
+        active = physical[physical >= 0].long()
+        rank, slot = active // 4, active % 4
+        owner = torch.where(slot < 2, rank * 2 + slot, copy_table[rank, (slot - 2).clamp_min(0)])
+        assert (owner == 0).all()
+        assert (copy_table == 0).any()
+    finally:
+        if workspace is not None:
+            workspace.destroy()
+        Utils.destroy_model_parallel()
+
+
 @requires_hybridep
 def test_virtual_expert_manager_rejects_mismatched_topk():
     """A supplied transport top-k must satisfy the planner's fixed-layout contract."""

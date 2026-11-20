@@ -598,6 +598,9 @@ class TopKRouter(Router):
         )
         backend = config.moe_flex_dispatcher_backend
 
+        if config.moe_virtual_expert_load_balance and config.moe_megakernel_backend == "mok":
+            # MoK compacts its logical routing map in its autograd route adapter.
+            return None
         if config.moe_virtual_expert_load_balance:
             # The MoonEP planner consumes int64 IDs for every routing mode.
             return torch.int64
@@ -1217,7 +1220,11 @@ class TopKRouter(Router):
                 # identical across activation-checkpoint recompute, evaluation and inference.
                 allow_batch_invariant_sigmoid_topk=not self.use_quantile_balancing,
             )
-            if self.config.moe_virtual_expert_load_balance and fused:
+            if (
+                self.config.moe_virtual_expert_load_balance
+                and self.config.moe_megakernel_backend is None
+                and fused
+            ):
                 # TE returns compact IDs but full-width probabilities; normalize the pair.
                 probs = probs.gather(1, routing_map)
 

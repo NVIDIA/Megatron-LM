@@ -100,6 +100,17 @@ class _MoKAutograd(torch.autograd.Function):
             )
         routed_parameters = parameters[:num_routed_parameters]
         shared_fc1, shared_fc2 = parameters[num_routed_parameters:]
+        layout = module.virtual_layout
+        ctx.replica_plan = None
+        physical_experts = top_experts
+        num_local_experts = module.num_local_experts
+        if layout is not None:
+            # Each autograd context keeps its own route plan across GA, recompute and tied MTP.
+            # The rank/slot IDs only affect execution. Router probabilities and their original
+            # logical top-k positions are unchanged.
+            ctx.replica_plan = layout.transport.plan(top_experts)
+            physical_experts = ctx.replica_plan.virtual_experts.to(torch.int32)
+            num_local_experts *= 2
         workspace = functional.get_workspace(
             module.mok_config,
             module.ep_group,
@@ -109,10 +120,15 @@ class _MoKAutograd(torch.autograd.Function):
             topk=top_experts.shape[1],
         )
         schedule = functional.build_schedule(
-            workspace, module.mok_config, top_experts, num_local_experts=module.num_local_experts
+            workspace, module.mok_config, physical_experts, num_local_experts=num_local_experts
         )
-        fc1_weight_view, fc2_weight_view = module.quantized_routed_weights()
-        if module.use_mxfp8_weights and module.native_single_grouped_weights:
+        native_views = module.quantized_routed_weights()
+        fc1_weight_view, fc2_weight_view = native_views
+        if layout is not None:
+            fc1_forward, fc2_forward = layout.prepare_weights(
+                module, ctx.replica_plan, native_views, backward=False
+            )
+        elif module.use_mxfp8_weights and module.native_single_grouped_weights:
             # Single-weight MXFP8 forward consumes only rowwise data and scale.
             fc1_forward = fc1_weight_view[:2]
             fc2_forward = fc2_weight_view[:2]
@@ -144,7 +160,7 @@ class _MoKAutograd(torch.autograd.Function):
         ctx.workspace = workspace
         ctx.schedule = schedule
         ctx.forward_context = forward_context
-        ctx.routed_weight_views = (fc1_weight_view, fc2_weight_view)
+        ctx.routed_weight_views = native_views
         ctx.save_for_backward(
             x, router_weights, shared_output_gate_weight, *routed_parameters, shared_fc1, shared_fc2
         )
@@ -159,7 +175,15 @@ class _MoKAutograd(torch.autograd.Function):
         num_routed_parameters = len(ctx.module.autograd_routed_parameters)
         shared_fc1, shared_fc2 = parameters[num_routed_parameters:]
         fc1_weight_view, fc2_weight_view = ctx.routed_weight_views
-        if ctx.module.use_mxfp8_weights and ctx.module.native_single_grouped_weights:
+        layout = ctx.module.virtual_layout
+        owner_grads = None
+        if layout is not None:
+            # Other layers may already have overwritten the shared slots; re-push from the
+            # owners of this forward's logical experts, with both FC1 orientations available.
+            backward_fc1, backward_fc2 = layout.prepare_weights(
+                ctx.module, ctx.replica_plan, ctx.routed_weight_views, backward=True
+            )
+        elif ctx.module.use_mxfp8_weights and ctx.module.native_single_grouped_weights:
             # FC1 backward may need rowwise weights for recompute and columnwise weights for
             # dgrad, while FC2 only needs columnwise weights for dgrad.
             backward_fc1 = fc1_weight_view
@@ -170,7 +194,12 @@ class _MoKAutograd(torch.autograd.Function):
         weight_args = _MoKWeightArguments.from_combined(
             shared_fc1, shared_fc2, backward_fc1, backward_fc2, ctx.module.intermediate_size
         )
-        main_grads, main_grad_storage_tables = ctx.module.main_grad_arguments()
+        if layout is None:
+            main_grads, main_grad_storage_tables = ctx.module.main_grad_arguments()
+        else:
+            main_grads, main_grad_storage_tables, owner_grads = layout.main_grad_arguments(
+                ctx.module
+            )
         main_grads, main_grad_storage_tables = _gate_up_main_grad_arguments(
             main_grads, main_grad_storage_tables, ctx.module.intermediate_size
         )
@@ -197,6 +226,9 @@ class _MoKAutograd(torch.autograd.Function):
             **gate_kwargs,
         )
 
+        if layout is not None:
+            # Complete the replica sum before returning dummy owner gradients to DDP.
+            layout.transport.reduce_gradients(ctx.replica_plan, owner_grads)
         routed_parameter_grads = ctx.module.finish_routed_weight_gradients()
         d_shared_fc1 = (
             _finish_weight_gradient(ctx.module.shared_fc1_weight)
@@ -219,6 +251,7 @@ class _MoKAutograd(torch.autograd.Function):
         ctx.schedule = None
         ctx.forward_context = None
         ctx.routed_weight_views = None
+        ctx.replica_plan = None
         return (
             None,
             d_x,

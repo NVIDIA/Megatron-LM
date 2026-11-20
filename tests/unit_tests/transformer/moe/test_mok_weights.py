@@ -164,6 +164,22 @@ def test_shared_execution_is_independent_of_activation_and_preserves_native_prec
         _mok_transformer_config(expert_tensor_parallel_size=2)
 
 
+def test_mok_virtual_expert_config_supports_eager_native_routing():
+    """The MoK integration owns the slots and requires no HybridEP dispatcher."""
+    kwargs = dict(
+        moe_virtual_expert_load_balance=True,
+        moe_router_dtype="fp32",
+        params_dtype=torch.bfloat16,
+        moe_token_dispatcher_type="alltoall",
+        moe_use_grouped_tensor=False,
+    )
+    assert _mok_transformer_config(**kwargs).moe_virtual_expert_load_balance
+    with pytest.raises(ValueError, match="2<=expert_model_parallel_size<=64"):
+        _mok_transformer_config(**kwargs, expert_model_parallel_size=1)
+    with pytest.raises(ValueError, match="cuda_graph_impl='none'"):
+        _mok_transformer_config(**kwargs, cuda_graph_impl="local")
+
+
 @pytest.mark.parametrize(
     ("overrides", "error"),
     [
@@ -175,7 +191,6 @@ def test_shared_execution_is_independent_of_activation_and_preserves_native_prec
         ({"fp4": "e2m1"}, "FP32, FP16, and FP4 are not supported"),
         ({"moe_grouped_gemm": False}, "moe_grouped_gemm=True"),
         ({"moe_router_dtype": "fp64"}, "MOK does not support moe_router_dtype='fp64'"),
-        ({"moe_virtual_expert_load_balance": True}, "MOK does not support MoonEP"),
         ({"use_transformer_engine_op_fuser": True}, "use_transformer_engine_op_fuser=False"),
         (
             {"overlap_moe_expert_parallel_comm": True},

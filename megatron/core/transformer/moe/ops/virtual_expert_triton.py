@@ -147,6 +147,7 @@ def _plan_virtual_expert_routes_kernel(
     EP_SIZE: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
     ALIGNMENT: tl.constexpr = 1,
+    MASKED_ROUTES: tl.constexpr = False,
 ):
     """Plan histogram, placement, and stable route remapping in one 32-block launch.
 
@@ -196,6 +197,9 @@ def _plan_virtual_expert_routes_kernel(
         offsets = route_start + flat
         valid = offsets < program_end
         ids = tl.load(top_indices + offsets, mask=valid, other=0)
+        if MASKED_ROUTES:
+            tl.device_assert((~valid) | ((ids >= -1) & (ids < NUM_EXPERTS)), "invalid router ID")
+            valid = valid & (ids >= 0) & (ids < NUM_EXPERTS)
         row += tl.histogram(ids.to(tl.int32), BLOCK_NUM_EXPERTS, mask=valid)
     tl.store(histogram_rows + program * NUM_EXPERTS + experts, row, mask=valid_experts)
     tl.atomic_add(totals + experts, row, mask=valid_experts)
@@ -264,7 +268,8 @@ def _plan_virtual_expert_routes_kernel(
             axis=1,
         )
         tl.device_assert(
-            (source_total == NUM_ROUTES) | ~valid_owned_ranks,
+            (source_total <= NUM_ROUTES if MASKED_ROUTES else source_total == NUM_ROUTES)
+            | ~valid_owned_ranks,
             "virtual-expert planner: a rank's route count differs from tokens * topk",
         )
         tl.store(
@@ -390,6 +395,8 @@ def _plan_virtual_expert_routes_kernel(
         route_offsets = route_start + flat
         valid = route_offsets < program_end
         ids = tl.load(top_indices + route_offsets, mask=valid, other=0).to(tl.int32)
+        if MASKED_ROUTES:
+            valid = valid & (ids >= 0) & (ids < NUM_EXPERTS)
         packed = tl.sort(tl.where(valid, ids, NUM_EXPERTS) * ROUTE_TILE + flat, descending=False)
         sorted_ids = packed // ROUTE_TILE
         previous_ids = tl.gather(sorted_ids, tl.maximum(flat - 1, 0), axis=0)
@@ -421,7 +428,14 @@ def _plan_virtual_expert_routes_kernel(
         runtime = destination * (2 * NUM_EXPERTS_PER_GPU) + tl.where(
             remote, NUM_EXPERTS_PER_GPU + slot, ids % NUM_EXPERTS_PER_GPU
         )
-        tl.store(virtual_experts + route_offsets, runtime.to(tl.int16), mask=valid)
+        if MASKED_ROUTES:
+            tl.store(
+                virtual_experts + route_offsets,
+                tl.where(valid, runtime, -1).to(tl.int16),
+                mask=route_offsets < program_end,
+            )
+        else:
+            tl.store(virtual_experts + route_offsets, runtime.to(tl.int16), mask=valid)
         running += tl.histogram(ids, BLOCK_NUM_EXPERTS, mask=valid)
 
 
@@ -499,7 +513,7 @@ class VirtualExpertPlannerWorkspace:
 
 
 def launch_virtual_expert_planner(
-    top_indices: torch.Tensor, workspace, alignment: int = 1
+    top_indices: torch.Tensor, workspace, alignment: int = 1, *, masked_routes: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Plan one layer's routes in a fused 32-block cooperative launch.
 
@@ -521,6 +535,7 @@ def launch_virtual_expert_planner(
         router_topk,
         alignment,
         top_indices.dtype,
+        masked_routes,
         top_indices.data_ptr() % 16,
     )
     arguments = (
@@ -544,6 +559,7 @@ def launch_virtual_expert_planner(
         EP_SIZE=ep_size,
         NUM_EXPERTS=num_experts,
         ALIGNMENT=alignment,
+        MASKED_ROUTES=masked_routes,
         launch_cooperative_grid=True,
         num_warps=4,
     )
@@ -726,6 +742,7 @@ def _virtual_expert_weight_push_kernel(
     NUM_LOCAL_EXPERTS: tl.constexpr,
     WORLD: tl.constexpr,
     NUM_SMS: tl.constexpr,
+    WAIT_FOR_CONSUMERS: tl.constexpr,
 ):
     """Push every owner-local expert into its virtual-expert slots and rendezvous.
 
@@ -737,6 +754,8 @@ def _virtual_expert_weight_push_kernel(
     each section ``NUM_LOCAL_EXPERTS`` members long; the two scale sections are empty for BF16
     weights.
     """
+    if WAIT_FOR_CONSUMERS:
+        _cross_rank_barrier(signal_bases, grid_barrier, dummy_signal, rank, WORLD, NUM_SMS)
     FC1_SCALE_ARENA: tl.constexpr = NUM_LOCAL_EXPERTS * FC1_BYTES
     FC2_ARENA: tl.constexpr = FC1_SCALE_ARENA + NUM_LOCAL_EXPERTS * FC1_SCALE_BYTES
     FC2_SCALE_ARENA: tl.constexpr = FC2_ARENA + NUM_LOCAL_EXPERTS * FC2_BYTES
@@ -953,6 +972,7 @@ def launch_virtual_expert_weight_prefetch(
     sources: tuple[torch.Tensor, torch.Tensor],
     experts_to_copy: torch.Tensor,
     scale_sources: tuple[torch.Tensor, torch.Tensor] | None = None,
+    wait_for_consumers: bool = False,
 ) -> None:
     """Push BF16 or native MXFP8 owner weights into destination virtual slots.
 
@@ -997,6 +1017,7 @@ def launch_virtual_expert_weight_prefetch(
         NUM_LOCAL_EXPERTS=num_local_experts,
         WORLD=world_size,
         NUM_SMS=num_sms,
+        WAIT_FOR_CONSUMERS=wait_for_consumers,
         num_warps=_PUSH_NUM_WARPS,
         launch_cooperative_grid=True,
     )
