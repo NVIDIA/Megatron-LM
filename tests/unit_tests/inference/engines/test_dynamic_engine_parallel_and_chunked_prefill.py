@@ -668,8 +668,8 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
     # Coverage is observed in the KV memory itself: the MTP plane's keys are poisoned with a
     # sentinel before any request runs, and a committed position is covered iff its key is no
     # longer the sentinel. That holds whichever code path did the write -- the eager varlen
-    # commit pass or the Triton draft-step metadata -- and covers graph replays, which no
-    # Python hook can observe.
+    # commit pass, the Triton draft-step metadata, or the CUDA-graphed commit pass -- and
+    # covers graph replays, which no Python hook can observe.
     #
     # Write DESTINATIONS (needed for the shared-block and unallocated-column guards) are
     # recorded by wrapping every MTPMetadata method that builds MTP token write maps. A
@@ -691,7 +691,8 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             `overlap_start_token` span; this is the guard on that redirect.
 
         Every MTPMetadata method that builds MTP token write maps is wrapped: the eager
-        `write_token_maps` and the Triton `write_draft_step_metadata` (each draft depth). Each fills
+        `write_token_maps`, and the Triton `write_draft_step_metadata` (each draft depth) and
+        `write_commit_step_metadata` (the CUDA-graphed commit pass). Each fills
         `gpu_view.token_to_block_idx` / `token_to_local_position_within_kv_block` with the
         forward's write destinations before the (possibly graphed) forward consumes them, so
         reading them right after the builder returns sees exactly what the forward writes.
@@ -725,7 +726,11 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
         # still catches any write path the recorder misses.
         originals = {
             name: getattr(meta, name)
-            for name in ("write_token_maps", "write_draft_step_metadata")
+            for name in (
+                "write_token_maps",
+                "write_draft_step_metadata",
+                "write_commit_step_metadata",
+            )
             if hasattr(meta, name)
         }
 
@@ -748,9 +753,17 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             record(gpu_view, meta.padded_count)
             return result
 
+        def write_commit_step_metadata(gpu_view, *args, **kw):
+            # `num_slots` rows per request slot; unused and padding rows go to the dummy block.
+            result = originals["write_commit_step_metadata"](gpu_view, *args, **kw)
+            num_slots = kw["num_slots"] if "num_slots" in kw else args[2]
+            record(gpu_view, meta.padded_count * num_slots)
+            return result
+
         wrappers = {
             "write_token_maps": write_token_maps,
             "write_draft_step_metadata": write_draft_step_metadata,
+            "write_commit_step_metadata": write_commit_step_metadata,
         }
         wrappers = {name: wrapper for name, wrapper in wrappers.items() if name in originals}
         for name, wrapper in wrappers.items():

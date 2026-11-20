@@ -27,6 +27,7 @@ from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch impor
 )
 from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
     mamba_state_selective_copy,
+    mtp_commit_step_metadata,
     mtp_draft_step_metadata,
     prepare_next_forward_pass,
     rewind_kv_cache,
@@ -864,6 +865,144 @@ class TestMtpDraftStepMetadata:
         self._kernel_step(tri_meta, tri_view)
         for name, ref in before.items():
             assert torch.equal(getattr(tri_view, name), ref), name
+
+
+class TestMtpCommitStepMetadata:
+    """Tests for the CUDA-graphed commit-pass metadata Triton kernel.
+
+    The reference spells out the fixed-slot layout directly: request r owns rows
+    r*S .. r*S+S-1, slot j writes position base_r - 1 - a_r + j when j < a_r (else the dummy
+    block), and each real request attends with S query rows over start_r + S keys.
+    """
+
+    MAX_REQUESTS = 64
+    DUMMY_BLOCK = 999
+    SENTINEL = -7
+
+    def _make_gpu_view(self, num_tokens, num_cols):
+        r, s = self.MAX_REQUESTS, self.SENTINEL
+
+        def full(n, dtype):
+            return torch.full((n,), s, dtype=dtype, device=DEVICE)
+
+        return SimpleNamespace(
+            token_to_block_idx=full(num_tokens, torch.int64),
+            token_to_local_position_within_kv_block=full(num_tokens, torch.int32),
+            token_to_request_idx=full(num_tokens, torch.int32),
+            token_to_position_in_request=full(num_tokens, torch.int32),
+            token_to_pos_ids=full(num_tokens, torch.int64),
+            mha_query_lengths=full(r, torch.int32),
+            mha_cu_query_seq_lengths=full(r + 1, torch.int32),
+            mha_kv_seq_lengths=full(r, torch.int32),
+            mha_cu_kv_seq_lengths=full(r + 1, torch.int32),
+            mha_block_table=torch.full((r, num_cols), s, dtype=torch.int32, device=DEVICE),
+        )
+
+    def _reference(self, view, accepted, base, block_table, n, padded, slots, block_size):
+        dummy = self.DUMMY_BLOCK
+        accepted = accepted.long().cpu()
+        base = base.long().cpu()
+        bt = block_table.long().cpu()
+        cu_q = cu_kv = 0
+        view.mha_cu_query_seq_lengths[0] = 0
+        view.mha_cu_kv_seq_lengths[0] = 0
+        for r in range(padded):
+            real = r < n
+            start = int(base[r] - 1 - accepted[r]) if real else 0
+            for j in range(slots):
+                t = r * slots + j
+                pos = start + j
+                writes = real and j < int(accepted[r])
+                view.token_to_block_idx[t] = int(bt[r, pos // block_size]) if writes else dummy
+                view.token_to_local_position_within_kv_block[t] = pos % block_size if writes else 0
+                view.token_to_request_idx[t] = r
+                view.token_to_position_in_request[t] = pos if real else 0
+                view.token_to_pos_ids[t] = pos if real else 0
+            q_len = slots if real else 0
+            kv_len = start + slots if real else 0
+            cu_q += q_len
+            cu_kv += kv_len
+            view.mha_query_lengths[r] = q_len
+            view.mha_kv_seq_lengths[r] = kv_len
+            view.mha_cu_query_seq_lengths[r + 1] = cu_q
+            view.mha_cu_kv_seq_lengths[r + 1] = cu_kv
+            view.mha_block_table[r] = block_table[r].to(torch.int32) if real else -1
+
+    def _check(self, n, padded, slots, block_size, num_cols, accepted, base, seed=0):
+        torch.manual_seed(seed)
+        block_table = torch.randint(
+            0, 500, (self.MAX_REQUESTS, num_cols), dtype=torch.int32, device=DEVICE
+        )
+        num_tokens = self.MAX_REQUESTS * slots
+        ref_view = self._make_gpu_view(num_tokens, num_cols)
+        tri_view = self._make_gpu_view(num_tokens, num_cols)
+        self._reference(ref_view, accepted, base, block_table, n, padded, slots, block_size)
+        mtp_commit_step_metadata(
+            gpu_view=tri_view,
+            accepted_counts=accepted,
+            base_positions=base,
+            block_table=block_table,
+            active_request_count=n,
+            padded_count=padded,
+            num_slots=slots,
+            block_size_tokens=block_size,
+            dummy_block_idx=self.DUMMY_BLOCK,
+        )
+        for name, ref in vars(ref_view).items():
+            assert torch.equal(getattr(tri_view, name), ref), name
+
+    @pytest.mark.parametrize(
+        "active_request_count, padded_count", [(1, 1), (5, 8), (8, 8), (13, 16), (64, 64)]
+    )
+    @pytest.mark.parametrize("num_slots", [1, 2, 3, 12])
+    @pytest.mark.parametrize("block_size_tokens", [16, 64])
+    def test_matches_reference(
+        self, active_request_count, padded_count, num_slots, block_size_tokens
+    ):
+        num_cols = 33
+        torch.manual_seed(active_request_count * 100 + num_slots)
+        accepted = torch.randint(
+            0, num_slots + 1, (self.MAX_REQUESTS,), dtype=torch.int64, device=DEVICE
+        )
+        # base - 1 - accepted >= 0, and base + num_slots stays inside the block table.
+        base = torch.randint(
+            num_slots + 1,
+            block_size_tokens * num_cols - num_slots,
+            (self.MAX_REQUESTS,),
+            dtype=torch.int64,
+            device=DEVICE,
+        )
+        self._check(
+            active_request_count,
+            padded_count,
+            num_slots,
+            block_size_tokens,
+            num_cols,
+            accepted,
+            base,
+        )
+
+    def test_block_boundary_crossing(self):
+        # Refreshed runs that straddle a block boundary at every offset.
+        slots, block_size = 12, 16
+        accepted = torch.full((self.MAX_REQUESTS,), slots, dtype=torch.int64, device=DEVICE)
+        base = torch.arange(20, 20 + self.MAX_REQUESTS, dtype=torch.int64, device=DEVICE)
+        self._check(16, 16, slots, block_size, 8, accepted, base)
+
+    def test_capture_inputs(self):
+        # Capture / EP-dummy staging: nothing accepted, base position 1, all rows active.
+        accepted = torch.zeros(self.MAX_REQUESTS, dtype=torch.int64, device=DEVICE)
+        base = torch.ones(self.MAX_REQUESTS, dtype=torch.int64, device=DEVICE)
+        self._check(16, 16, 12, 16, 8, accepted, base)
+
+    def test_padding_count_zero_is_noop(self):
+        view = self._make_gpu_view(self.MAX_REQUESTS, 8)
+        before = {k: v.clone() for k, v in vars(view).items()}
+        zeros = torch.zeros(self.MAX_REQUESTS, dtype=torch.int64, device=DEVICE)
+        block_table = torch.zeros((self.MAX_REQUESTS, 8), dtype=torch.int32, device=DEVICE)
+        mtp_commit_step_metadata(view, zeros, zeros + 1, block_table, 0, 0, 12, 16, 0)
+        for name, ref in before.items():
+            assert torch.equal(getattr(view, name), ref), name
 
 
 class TestStressRandom:
