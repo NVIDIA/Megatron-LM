@@ -1596,16 +1596,28 @@ def test_tp2_cp2_reuses_canonical_cp_global_latent_kv(monkeypatch):
 
         monkeypatch.setattr(dsa_module, "_run_sparse_attention", observed_sparse_attention)
         original_gather = dsa_module.gather_from_sequence_parallel_region
+        original_async_gather = dsa_module.async_gather_from_sequence_parallel_region
 
-        def observed_gather(tensor, group=None, **kwargs):
+        def count_latent_gather(tensor, group):
             if tensor.size(-1) == config.kv_lora_rank + config.qk_pos_emb_head_dim:
                 if group is parallel_state.get_tensor_model_parallel_group():
                     gather_counts["tp"] += 1
                 elif group is parallel_state.get_context_parallel_group():
                     gather_counts["cp"] += 1
+
+        def observed_gather(tensor, group=None, **kwargs):
+            count_latent_gather(tensor, group)
             return original_gather(tensor, group=group, **kwargs)
 
+        def observed_async_gather(tensor, group=None, **kwargs):
+            # The latent K/V CP gather is launched asynchronously.
+            count_latent_gather(tensor, group)
+            return original_async_gather(tensor, group=group, **kwargs)
+
         monkeypatch.setattr(dsa_module, "gather_from_sequence_parallel_region", observed_gather)
+        monkeypatch.setattr(
+            dsa_module, "async_gather_from_sequence_parallel_region", observed_async_gather
+        )
 
         local_tokens = 8
         cp_local_tokens = local_tokens * config.tensor_model_parallel_size

@@ -332,9 +332,9 @@ class _KeyPartials:
         self.eager = []
         self.captured = None
         real = dsa.gather_from_sequence_parallel_region
+        real_async = dsa.async_gather_from_sequence_parallel_region
 
-        def gather(input_, *args, **kwargs):
-            output = real(input_, *args, **kwargs)
+        def hook_key(output):
             if (
                 output.requires_grad
                 and output.size(0) == _GRAPH_GLOBAL_ROWS
@@ -343,7 +343,18 @@ class _KeyPartials:
                 output.register_hook(self._record)
             return output
 
+        def gather(input_, *args, **kwargs):
+            return hook_key(real(input_, *args, **kwargs))
+
+        def gather_async(input_, *args, **kwargs):
+            # DSAttention launches the latent key gather asynchronously; its handle's tensor
+            # is the gathered key, whose gradient the hook records.
+            handle = real_async(input_, *args, **kwargs)
+            hook_key(handle.tensor)
+            return handle
+
         monkeypatch.setattr(dsa, "gather_from_sequence_parallel_region", gather)
+        monkeypatch.setattr(dsa, "async_gather_from_sequence_parallel_region", gather_async)
 
     def _record(self, grad) -> None:
         partial = grad.detach().clone()

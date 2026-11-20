@@ -27,7 +27,10 @@ from megatron.core.process_groups_config import (
     ProcessGroupCollection,
     warn_global_process_group_fallback,
 )
-from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+from megatron.core.tensor_parallel.mappings import (
+    async_gather_from_sequence_parallel_region,
+    gather_from_sequence_parallel_region,
+)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import (
     dsa_indexer_loss,
@@ -457,6 +460,79 @@ def _permute_rows(
     if inv_perm is None or not (torch.is_grad_enabled() and x.requires_grad):
         return x.index_select(0, perm)
     return _PermuteRows.apply(x, perm, inv_perm)
+
+
+class _DeferredCpKvGather:
+    """DSA's CP all-gather and reorder of the latent K/V, launched late and finished at first use.
+
+    Neither the indexer nor the top-k selection reads the gathered K/V. Launching their
+    all-gathers after the indexer's own CP collectives, and waiting only where the gathered
+    K/V is first read, lets NCCL move them while the selection runs. Every CP rank launches
+    in the same program order, so the collective order across the group is unchanged, and the
+    gathers and their reduce-scatter backward are the same collectives as the synchronous
+    ``gather_from_sequence_parallel_region``. Under CUDA graph capture (full-iteration graphs)
+    the launch and the wait are captured as a fork to NCCL's stream and a join back, so a
+    replay overlaps them the same way.
+    """
+
+    def __init__(
+        self,
+        key: Optional[torch.Tensor],
+        value: Optional[torch.Tensor],
+        *,
+        cp_group: torch.distributed.ProcessGroup,
+        reorder_idx: Optional[torch.Tensor],
+        reorder_inv_idx: Optional[torch.Tensor],
+    ) -> None:
+        """Hold the rank-local ``key``/``value`` to gather; ``None`` for one not gathered."""
+        self._inputs = (key, value)
+        self._cp_group = cp_group
+        self._reorder_idx = reorder_idx
+        self._reorder_inv_idx = reorder_inv_idx
+        self._handles = None
+
+    def launch(self) -> None:
+        """Queue the all-gathers on NCCL; a no-op once launched."""
+        if self._handles is None:
+            self._handles = tuple(
+                None
+                if local is None
+                else async_gather_from_sequence_parallel_region(local, group=self._cp_group)
+                for local in self._inputs
+            )
+
+    def key_shape_twin(self, key: torch.Tensor) -> torch.Tensor:
+        """A tensor with the finished key's shape, dtype and device, for host-side checks.
+
+        Its data may still be in flight: callers read only its metadata.
+        """
+        assert self._handles is not None, "launch() the deferred CP gather first"
+        handle = self._handles[0]
+        return key if handle is None else handle.tensor
+
+    def finish(
+        self, key: torch.Tensor, value: Optional[torch.Tensor]
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Wait for the gathers and reorder them; returns the gathered ``key`` and ``value``."""
+        self.launch()
+        finished = []
+        for name, local, handle in zip(("key", "value"), (key, value), self._handles):
+            if handle is None:
+                finished.append(local)
+                continue
+            gathered = handle.wait()
+            if self._reorder_idx is not None:
+                if gathered.size(0) != self._reorder_idx.numel():
+                    raise RuntimeError(
+                        f"DSA gathered {name} length mismatch: "
+                        f"{name}_seqlen={gathered.size(0)}, "
+                        f"expected={self._reorder_idx.numel()}"
+                    )
+                gathered = _permute_rows(gathered, self._reorder_idx, self._reorder_inv_idx)
+            finished.append(gathered)
+        self._handles = None
+        self._inputs = (None, None)
+        return finished[0], finished[1]
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
@@ -5244,6 +5320,10 @@ class DSAttention(MegatronModule):
 
         local_cp_kv_lens = {cp_local_sequence_rows}
         local_cp_kv_len = None
+        # The deferred CP K/V gather (_DeferredCpKvGather) while it is in flight, else None;
+        # skv is the key length after it.
+        cp_kv_gather = None
+        skv = key.size(0)
         if cp_size > 1:
             assert (
                 self.cp_comm_type == "allgather"
@@ -5311,50 +5391,53 @@ class DSAttention(MegatronModule):
                     return_inverse_key_reorder=True,
                 )
 
-            gathered_cp_key = False
-            gathered_cp_value = False
-            if key.size(0) in local_cp_kv_lens:
+            gather_cp_key = key.size(0) in local_cp_kv_lens
+            gather_cp_value = value is not None and value.size(0) in local_cp_kv_lens
+            if gather_cp_key:
                 local_cp_kv_len = key.size(0)
-                if kv_reorder_idx is None:
-                    kv_reorder_idx, kv_reorder_inv_idx = _build_kv_reorder_idx(local_cp_kv_len)
-                key = gather_from_sequence_parallel_region(key, group=cp_group)
-                gathered_cp_key = True
-            if value is not None and value.size(0) in local_cp_kv_lens:
+            if gather_cp_value:
                 if local_cp_kv_len is None:
                     local_cp_kv_len = value.size(0)
-                    if kv_reorder_idx is None:
-                        kv_reorder_idx, kv_reorder_inv_idx = _build_kv_reorder_idx(local_cp_kv_len)
                 elif value.size(0) != local_cp_kv_len:
                     raise RuntimeError(
                         "DSA local key/value sequence length mismatch before CP gather: "
                         f"key_len={local_cp_kv_len}, value_len={value.size(0)}"
                     )
-                value = gather_from_sequence_parallel_region(value, group=cp_group)
-                gathered_cp_value = True
-            if kv_reorder_idx is not None:
-                if gathered_cp_key:
-                    if key.size(0) != kv_reorder_idx.numel():
-                        raise RuntimeError(
-                            "DSA gathered key length mismatch: "
-                            f"key_seqlen={key.size(0)}, expected={kv_reorder_idx.numel()}"
-                        )
-                    key = _permute_rows(key, kv_reorder_idx, kv_reorder_inv_idx)
-                if gathered_cp_value:
-                    if value.size(0) != kv_reorder_idx.numel():
-                        raise RuntimeError(
-                            "DSA gathered value length mismatch: "
-                            f"value_seqlen={value.size(0)}, expected={kv_reorder_idx.numel()}"
-                        )
-                    value = _permute_rows(value, kv_reorder_idx, kv_reorder_inv_idx)
+            if local_cp_kv_len is not None:
+                if kv_reorder_idx is None:
+                    kv_reorder_idx, kv_reorder_inv_idx = _build_kv_reorder_idx(local_cp_kv_len)
+                # Launched after the indexer and finished where the gathered K/V is first read
+                # (finish_cp_kv_gather), so NCCL moves it under the top-k selection.
+                cp_kv_gather = _DeferredCpKvGather(
+                    key if gather_cp_key else None,
+                    value if gather_cp_value else None,
+                    cp_group=cp_group,
+                    reorder_idx=kv_reorder_idx,
+                    reorder_inv_idx=kv_reorder_inv_idx,
+                )
+                if gather_cp_key:
+                    skv = key.size(0) * cp_size
 
-        skv = key.size(0)
+        def capture_mtp_latent_kv():
+            if self.mtp_latent_kv_share and mtp_payload is not None and is_mtp_source:
+                # Capture the exact canonical tensor consumed by sparse attention: TP/SP and
+                # CP gathers plus CP reorder have already run. This must precede the combined
+                # fused DSA early return, which remains eligible for latent-KV-only sharing.
+                assert mtp_payload is not None
+                mtp_payload.latent_kv_by_layer[self.layer_number] = key
 
-        if self.mtp_latent_kv_share and mtp_payload is not None and is_mtp_source:
-            # Capture the exact canonical tensor consumed by sparse attention: TP/SP and
-            # CP gathers plus CP reorder have already run. This must precede the combined
-            # fused DSA early return, which remains eligible for latent-KV-only sharing.
-            assert mtp_payload is not None
-            mtp_payload.latent_kv_by_layer[self.layer_number] = key
+        def finish_cp_kv_gather():
+            # Idempotent: waits for the deferred CP K/V gather once, then publishes the
+            # finished key to the MTP payload.
+            nonlocal key, value, cp_kv_gather
+            if cp_kv_gather is None:
+                return
+            key, value = cp_kv_gather.finish(key, value)
+            cp_kv_gather = None
+            capture_mtp_latent_kv()
+
+        if cp_kv_gather is None:
+            capture_mtp_latent_kv()
 
         if not packed_thd and sequence_parallel_query_is_local:
             nonpacked_query_positions = dsa_layout.extract_query_positions_from_position_ids(
@@ -5660,6 +5743,11 @@ class DSAttention(MegatronModule):
                     q = q[row_start:row_end].contiguous()
                     weights = weights[row_start:row_end].contiguous()
 
+        # The indexer's own CP collectives (its pooled-key or key gathers) are queued by now,
+        # so the latent K/V gathers move under the top-k selection below.
+        if cp_kv_gather is not None:
+            cp_kv_gather.launch()
+
         def compute_indexer_loss_with_reference_path():
             # The token-level loss selects tokens, not pools; KPool layers take the
             # KPoolSparseIndexerLoss branch below and must never reach this one.
@@ -5699,6 +5787,7 @@ class DSAttention(MegatronModule):
             and not _is_kpool
         ):
             assert q is not None and k is not None and weights is not None
+            finish_cp_kv_gather()
             fused_output = dsa_kernels.run_fused_dsa_attention(
                 config=self.config,
                 query=query,
@@ -5843,8 +5932,12 @@ class DSAttention(MegatronModule):
             kpool_pytorch_loss_reason = None
             kpool_pool_scores_out = None
             if use_indexer_loss:
+                # Host facts only: the key's shape stands in while its gather is in flight.
                 kpool_pytorch_loss_reason = self._kpool_cudnn_loss_decline_reason(
-                    tp_size=tp_size, absorbed_mla=absorbed_mla, query=query, key=key
+                    tp_size=tp_size,
+                    absorbed_mla=absorbed_mla,
+                    query=query,
+                    key=key if cp_kv_gather is None else cp_kv_gather.key_shape_twin(key),
                 )
                 if kpool_pytorch_loss_reason is None:
                     kpool_pool_scores_out = {}
@@ -5900,6 +5993,7 @@ class DSAttention(MegatronModule):
                 kpool_cudnn_loss = kpool_pytorch_loss_reason is None
                 _log_kpool_loss_path_once(self.config, kpool_pytorch_loss_reason)
             if use_indexer_loss and not kpool_cudnn_loss:
+                finish_cp_kv_gather()
                 # Also records the layer's tail mass p_E, in its own tracker slots.
                 indexer_loss = self._kpool_sparse_indexer_loss(
                     q=q,
@@ -5926,6 +6020,7 @@ class DSAttention(MegatronModule):
                 )
         elif use_indexer_loss:
             assert q is not None and k is not None and weights is not None
+            finish_cp_kv_gather()
             # ===================================
             # Attach indexer topk and loss
             # ===================================
@@ -6085,6 +6180,7 @@ class DSAttention(MegatronModule):
                     varlen_is_plain_causal=varlen_is_plain_causal,
                 )
                 if stash_checkpoint_topk_scores:
+                    finish_cp_kv_gather()
                     fused_topk_with_scores = dsa_kernels.run_fused_qk_topk_with_scores(
                         *fused_topk_args, query=query, key=key, **fused_topk_kwargs
                     )
@@ -6175,6 +6271,7 @@ class DSAttention(MegatronModule):
         # ===================================
         # Run sparse attention kernel
         # ===================================
+        finish_cp_kv_gather()
         output = _run_sparse_attention(
             absorbed_mla=absorbed_mla,
             query=query,

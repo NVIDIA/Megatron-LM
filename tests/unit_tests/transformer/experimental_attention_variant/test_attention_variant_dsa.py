@@ -76,6 +76,9 @@ from megatron.core.transformer.experimental_attention_variant.dsa_masking import
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.experimental_attention_variant.dsa_cp_gather_fakes import (
+    patch_dsa_cp_gather,
+)
 
 try:
     from fast_hadamard_transform import hadamard_transform
@@ -3475,7 +3478,7 @@ def _run_cp_reorder_forward(
         return output + mixed, indexer_loss
 
     monkeypatch.setattr(attention.indexer, "forward_before_topk", _fake_forward_before_topk)
-    monkeypatch.setattr(f"{_DSA_MODULE}.gather_from_sequence_parallel_region", _recording_gather)
+    patch_dsa_cp_gather(monkeypatch, _recording_gather)
     monkeypatch.setattr(
         f"{_DSA_MODULE}.dsa_kernels.run_fused_dsa_attention", _fake_run_fused_attention
     )
@@ -3494,6 +3497,11 @@ def _run_cp_reorder_forward(
         )
     finally:
         attention.train(was_training)
+    # DSAttention gathers the indexer key (3-D here) inside its indexer and launches the latent
+    # key and value gathers (4-D, in that order) after it; list them as (key, value, k_indexer).
+    gathered_cp = [g for g in gathered_cp if g.dim() == 4] + [
+        g for g in gathered_cp if g.dim() != 4
+    ]
     return output, _randn(*output.shape), leaves, gathered_cp, consumed
 
 
@@ -3903,11 +3911,7 @@ class TestDSAttention:
             "dsa_kernels.run_fused_dsa_attention",
             _fake_run_fused_attention,
         )
-        monkeypatch.setattr(
-            "megatron.core.transformer.experimental_attention_variant.dsa."
-            "gather_from_sequence_parallel_region",
-            _fake_gather_from_sequence_parallel_region,
-        )
+        patch_dsa_cp_gather(monkeypatch, _fake_gather_from_sequence_parallel_region)
 
         was_training = self.sparse_attention.training
         self.sparse_attention.train()
@@ -4018,11 +4022,7 @@ class TestDSAttention:
             "megatron.core.transformer.experimental_attention_variant.dsa." "_cp_reorder_from_host",
             _counted_host_reorder,
         )
-        monkeypatch.setattr(
-            "megatron.core.transformer.experimental_attention_variant.dsa."
-            "gather_from_sequence_parallel_region",
-            _fake_gather_from_sequence_parallel_region,
-        )
+        patch_dsa_cp_gather(monkeypatch, _fake_gather_from_sequence_parallel_region)
         monkeypatch.setattr(
             "megatron.core.transformer.experimental_attention_variant.dsa."
             "dsa_kernels.run_fused_dsa_attention",
@@ -4110,11 +4110,7 @@ class TestDSAttention:
             "dsa_kernels.run_fused_dsa_attention",
             _fake_run_fused_attention,
         )
-        monkeypatch.setattr(
-            "megatron.core.transformer.experimental_attention_variant.dsa."
-            "gather_from_sequence_parallel_region",
-            _fake_gather_from_sequence_parallel_region,
-        )
+        patch_dsa_cp_gather(monkeypatch, _fake_gather_from_sequence_parallel_region)
 
         cu_seqlens = torch.tensor([0, global_seq_len], dtype=torch.int32)
         packed_seq_params = PackedSeqParams(
@@ -4384,11 +4380,7 @@ class TestDSAttention:
             "dsa_kernels.run_fused_dsa_attention",
             _fake_run_fused_attention,
         )
-        monkeypatch.setattr(
-            "megatron.core.transformer.experimental_attention_variant.dsa."
-            "gather_from_sequence_parallel_region",
-            _fake_gather_from_sequence_parallel_region,
-        )
+        patch_dsa_cp_gather(monkeypatch, _fake_gather_from_sequence_parallel_region)
 
         was_training = self.sparse_attention.training
         self.sparse_attention.train()

@@ -36,6 +36,9 @@ from megatron.core.transformer.experimental_attention_variant import (
 )
 from tests.unit_tests.transformer.experimental_attention_variant import dsa_cudnn_fe_fakes as fakes
 from tests.unit_tests.transformer.experimental_attention_variant import kpool_selection_utils as ks
+from tests.unit_tests.transformer.experimental_attention_variant.dsa_cp_gather_fakes import (
+    patch_dsa_cp_gather,
+)
 from tests.unit_tests.transformer.experimental_attention_variant.test_mtp_dsa_cross_depth_sharing import (
     _make_config as make_small_dsa_config,
 )
@@ -142,7 +145,7 @@ def _run_dsattention(monkeypatch, config, cp_size, cp_rank, training, fake_kpool
                 pieces.append(piece)
         return torch.cat(pieces, dim=0)
 
-    monkeypatch.setattr(dsa_module, "gather_from_sequence_parallel_region", fake_gather)
+    patch_dsa_cp_gather(monkeypatch, fake_gather)
     monkeypatch.setattr(dsa_module, "fused_qk_topk_kpool", fake_kpool)
 
     attention = dsa_module.DSAttention(
@@ -348,7 +351,7 @@ def _real_kpool_layers(monkeypatch, cp_size, cp_rank, tp_group=None):
         return torch.cat(pieces, dim=0)
 
     monkeypatch.setattr(dsa_module, "build_module", build)
-    monkeypatch.setattr(dsa_module, "gather_from_sequence_parallel_region", gather)
+    patch_dsa_cp_gather(monkeypatch, gather)
     monkeypatch.setattr(
         rotary_pos_embedding, "get_pos_emb_on_this_cp_rank", _host_pos_emb_on_this_cp_rank
     )

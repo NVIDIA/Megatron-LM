@@ -39,6 +39,9 @@ from megatron.core.transformer.experimental_attention_variant.dsa_layout import 
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.training.utils import packed_seq_utils
+from tests.unit_tests.transformer.experimental_attention_variant.dsa_cp_gather_fakes import (
+    patch_dsa_cp_gather,
+)
 
 _CPU = torch.device("cpu")
 _HIDDEN = 64
@@ -256,7 +259,7 @@ class _ForwardHarness:
             self.seen["packed_query_positions"] = kwargs["packed_query_positions"]
             return real_mask(**kwargs)
 
-        monkeypatch.setattr(dsa_module, "gather_from_sequence_parallel_region", fake_gather)
+        patch_dsa_cp_gather(monkeypatch, fake_gather)
         monkeypatch.setattr(dsa_module.dsa_kernels, "run_fused_dsa_attention", fake_attention)
         monkeypatch.setattr(dsa_masking, "build_dsattention_forward_mask", recording_mask)
         for name in ("_cp_reorder_from_host", "_build_cp_positions_from_host"):
