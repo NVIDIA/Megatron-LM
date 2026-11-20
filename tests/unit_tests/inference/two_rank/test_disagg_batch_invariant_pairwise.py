@@ -8,7 +8,7 @@ from megatron.core.transformer import attention
 from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
 from tests.unit_tests.inference.engines import disagg_test_utils as du
 from tests.unit_tests.inference.engines import test_dynamic_engine as dynamic_tests
-from tests.unit_tests.inference.engines.test_disagg_pairwise import transport_world  # noqa: F401
+from tests.unit_tests.inference.two_rank.test_disagg_pairwise import transport_world  # noqa: F401
 
 
 def _observe(engine, active):

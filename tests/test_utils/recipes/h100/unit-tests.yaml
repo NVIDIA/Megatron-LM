@@ -90,8 +90,9 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  # Inference tests that run at two ranks: real coordinator routing over two DP replicas
-  # and the two-worker NIXL handoff. The broad inference buckets exclude this directory.
+  # Inference tests that run at two ranks: real coordinator routing over two DP replicas,
+  # one-prefill/one-decode disaggregation pairs and the two-worker NIXL handoff. The broad
+  # inference buckets exclude this directory.
   - test_case: [tests/unit_tests/inference/two_rank/**/*.py]
     products:
       - environment: [lts, dev]

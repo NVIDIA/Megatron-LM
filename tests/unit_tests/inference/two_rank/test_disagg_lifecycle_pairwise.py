@@ -34,7 +34,7 @@ from tests.unit_tests.inference.engines.disagg_test_utils import (
     sampling,
     snapshot_source,
 )
-from tests.unit_tests.inference.engines.test_disagg_pairwise import transport_world  # noqa: F401
+from tests.unit_tests.inference.two_rank.test_disagg_pairwise import transport_world  # noqa: F401
 from tests.unit_tests.test_utilities import Utils
 
 
