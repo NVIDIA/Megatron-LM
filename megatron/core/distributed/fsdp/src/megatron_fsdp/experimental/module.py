@@ -482,7 +482,7 @@ class FsdpModule:
 
     def _accumulate_local_gradients(self, group: FsdpParameterGroup) -> None:
         """Accumulate on compute without waiting for other groups' inner reductions."""
-        group.accumulate_local_gradients()
+        group.accumulate_gradients()
         # The source gradients are read on compute, where they were allocated,
         # so their storage can be released without joining the reduction stream.
         for fsdp_parameter in group.fsdp_parameters:
@@ -505,7 +505,7 @@ class FsdpModule:
         group.copy_gradients_to_partial_buffer(partial_grad)
         inner_reduction_stream.wait_stream(current_stream)
         with torch.cuda.stream(inner_reduction_stream):
-            group.reduce_inner_gradients(partial_grad)
+            group.accumulate_gradients(partial_grad)
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
