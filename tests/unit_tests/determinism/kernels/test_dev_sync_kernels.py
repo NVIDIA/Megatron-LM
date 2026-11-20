@@ -583,6 +583,43 @@ def test_kda_cp_state_exchange_replays():
     )
 
 
+def test_kda_short_conv_replays():
+    """Replay KDA's row-walking short-convolution kernels, forward and backward.
+
+    Packed sequences with a SiLU, a bias and per-sequence initial states, as FLA's CP conv
+    passes them; the backward returns dx, the summed weight and bias gradients and dh0.
+    """
+    from megatron.core.ssm.gated_delta_net import kda_conv
+
+    if not kda_conv.HAVE_FLA_CONV:
+        pytest.skip("FLA conv ops are unavailable")
+    seeded()
+    total, channels = 512, 1024
+    cu_seqlens = torch.tensor([0, 100, 300, total], dtype=torch.int64, device="cuda")
+    x = torch.randn(1, total, channels, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(channels, 4, dtype=torch.bfloat16, device="cuda") * 0.5
+    bias = torch.randn(channels, dtype=torch.bfloat16, device="cuda")
+    h0 = torch.randn(3, channels, 4, dtype=torch.bfloat16, device="cuda")
+    dy = torch.randn_like(x)
+    # The Megatron kernels, not FLA's fallback, take these inputs.
+    assert kda_conv._supported(x, dy, None, weight, None, "silu", cu_seqlens)
+
+    def run(x, weight, bias, h0, dy):
+        kwargs = dict(
+            initial_state=h0,
+            activation="silu",
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens.cpu(),
+        )
+        y, _ = kda_conv.causal_conv1d_fwd(x, weight, bias, None, **kwargs)
+        dx, dw, db, _, dh0 = kda_conv.causal_conv1d_bwd(x, dy, None, weight, bias, None, **kwargs)
+        return y, dx, dw, db, dh0
+
+    assert_replays_bit_exact(
+        run, (x, weight, bias, h0, dy), backward=False, contention=True, what="KDA short conv"
+    )
+
+
 def test_mok_route_adapter_replays():
     """Replay the fixed-width route gather and its probability-gradient scatter."""
     from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs

@@ -18,7 +18,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_net import kda_cp_state_exchange
+from megatron.core.ssm.gated_delta_net import kda_conv, kda_cp_state_exchange
 from megatron.core.ssm.gated_delta_net.common import (
     HAVE_FLA,
     GatedDeltaNetSubmodules,
@@ -155,6 +155,8 @@ class KimiDeltaAttention(_GDNBase):
         # Chunkwise CP passes the boundary states with two all-gathers inside and across rank
         # blocks instead of FLA's one over every rank (contexts built by kda_cp_state_exchange).
         kda_cp_state_exchange.install()
+        # The short convolution runs on row-walking kernels instead of FLA's tiled ones.
+        kda_conv.install()
         if config.gdn_pre_gated_delta_rule_fusion and fused_streamed_pre_kda is None:
             raise ImportError(
                 "gdn_pre_gated_delta_rule_fusion for KDA requires the streamed "

@@ -257,6 +257,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "tests/unit_tests/ssm/test_kda_cp_state_exchange.py.",
     ),
     KernelEntry(
+        name="kda_short_conv",
+        sources=("megatron/core/ssm/gated_delta_net/kda_conv.py",),
+        tests=(K + "test_dev_sync_kernels.py", "tests/unit_tests/ssm/test_kda_conv.py"),
+        kind="triton",
+        notes="Row-walking width-4 causal convolution forward and backward that replace FLA's "
+        "Triton conv ops for KDA (SiLU, bias, packed sequences, CP initial state); the per-chunk "
+        "weight and bias gradients are summed with torch. The replay covers forward and backward "
+        "with all of them; tests/unit_tests/ssm/test_kda_conv.py compares them with FLA's kernels.",
+    ),
+    KernelEntry(
         name="balanced_cp_route_metadata",
         sources=(
             "megatron/core/transformer/experimental_attention_variant/cp_balanced_indexer.py",
