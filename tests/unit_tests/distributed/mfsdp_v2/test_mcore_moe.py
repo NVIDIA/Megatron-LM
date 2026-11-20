@@ -68,9 +68,10 @@ def process_group_collections(distributed_setup):
     destroy_model_parallel()
 
 
+@pytest.mark.parametrize("gradient_accumulation_fusion", [False, True], ids=["unfused", "fused"])
 @pytest.mark.parametrize("grouped_gemm", [True, False], ids=["grouped", "sequential"])
 def test_standard_moe_training_and_clipping(
-    process_group_collections, distributed_setup, grouped_gemm
+    process_group_collections, distributed_setup, grouped_gemm, gradient_accumulation_fusion
 ):
     """Compare ordinary MoE training and clipping against an EP=1 reference."""
     process_group_collection, reference_process_group_collection = process_group_collections
@@ -91,7 +92,7 @@ def test_standard_moe_training_and_clipping(
         params_dtype=torch.float32,
         attention_dropout=0.0,
         hidden_dropout=0.0,
-        gradient_accumulation_fusion=False,
+        gradient_accumulation_fusion=gradient_accumulation_fusion,
         attention_backend=AttnBackend.unfused,
     )
     stack_spec = deepcopy(hybrid_stack_spec)
@@ -100,7 +101,7 @@ def test_standard_moe_training_and_clipping(
     )
     torch.manual_seed(123)
     reference_model = HybridModel(
-        config=replace(config, expert_model_parallel_size=1),
+        config=replace(config, expert_model_parallel_size=1, gradient_accumulation_fusion=False),
         hybrid_stack_spec=stack_spec,
         vocab_size=128,
         max_sequence_length=8,
