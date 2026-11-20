@@ -21,6 +21,11 @@ def _step(workflow: str, job: str, step_id: str) -> dict:
     return next(step for step in document["jobs"][job]["steps"] if step.get("id") == step_id)
 
 
+def _pr_files_step(step_id: str) -> dict:
+    action = yaml.safe_load((ROOT / ".github/actions/pr-changed-files/action.yml").read_text())
+    return next(step for step in action["runs"]["steps"] if step.get("id") == step_id)
+
+
 def _run(
     script: str, directory: Path, environment: dict[str, str]
 ) -> tuple[subprocess.CompletedProcess, dict]:
@@ -230,6 +235,12 @@ def pr_files_environment(tmp_path: Path, shell_environment: dict[str, str]) -> d
     gh = tmp_path / "bin/gh"
     gh.write_text(
         '#!/bin/sh\n[ "$1" = "api" ] || exit 2\n'
+        'if [ "$2" = "-H" ]; then\n'
+        '  [ "$3" = "Accept: application/vnd.github.raw+json" ] && '
+        '[ "$4" = "repos/$GITHUB_REPOSITORY/contents/.github/workflows/config/'
+        'pr-ci-skip-paths.txt?ref=$TARGET_SHA" ] || exit 2\n'
+        '  exec cat "$TEST_PR_SKIP_CONFIG"\n'
+        'fi\n'
         'if [ "$2" = "--paginate" ]; then\n'
         '  [ "$#" -eq 3 ] && '
         '[ "$3" = "repos/NVIDIA/Megatron-LM/pulls/7824/files?per_page=100" ] || exit 2\n'
@@ -338,7 +349,7 @@ def test_pr_files_producer_requires_complete_data_for_the_tested_commit(
         }[scenario]
         response.write_text(json.dumps([record]))
         environment["PR_CHANGED_FILES"] = "1"
-    step = _step("cicd-main.yml", "configure", "unit-test-pr-files")
+    step = _pr_files_step("files")
     result, outputs = _run(step["run"], tmp_path, environment)
     assert result.returncode == 0, result.stderr
     if scenario in {"multi-page", "empty"}:
@@ -381,7 +392,7 @@ def test_pr_rename_endpoints_trigger_mandatory_selection(
         )
     Path(pr_files_environment["TEST_PR_RESPONSE"]).write_text(json.dumps(records))
     pr_files_environment["PR_CHANGED_FILES"] = str(len(records))
-    step = _step("cicd-main.yml", "configure", "unit-test-pr-files")
+    step = _pr_files_step("files")
     result, outputs = _run(step["run"], tmp_path, pr_files_environment)
     assert result.returncode == 0, result.stderr
     paths = [
@@ -425,6 +436,39 @@ def test_pr_rename_endpoints_trigger_mandatory_selection(
     assert (tmp_path / "mandatory-tests").read_text().splitlines() == [test_file]
 
 
+@pytest.mark.parametrize(
+    ("previous_name", "expected"),
+    [("examples/bridge/nested/old.py", "true"), ("examples/bridge_tools/old.py", "false")],
+)
+def test_pr_ci_skip_paths_include_both_rename_endpoints(
+    tmp_path: Path, pr_files_environment: dict[str, str], previous_name: str, expected: str
+) -> None:
+    records = [
+        {"status": "removed", "filename": "examples/bridge/removed.py"},
+        {
+            "status": "renamed",
+            "previous_filename": previous_name,
+            "filename": "megatron/bridge/model.py",
+        },
+    ]
+    config = tmp_path / "target-skip-paths"
+    config.write_text("examples/bridge/**\nmegatron/bridge/**\n")
+    Path(pr_files_environment["TEST_PR_RESPONSE"]).write_text(json.dumps(records))
+    environment = {
+        **pr_files_environment,
+        "PR_CHANGED_FILES": str(len(records)),
+        "TARGET_SHA": "b" * 40,
+        "TEST_PR_SKIP_CONFIG": str(config),
+    }
+
+    producer, outputs = _run(_pr_files_step("files")["run"], tmp_path, environment)
+    assert producer.returncode == 0, producer.stderr
+    assert outputs["ready"] == "true"
+    scope, outputs = _run(_pr_files_step("scope")["run"], tmp_path, environment)
+    assert scope.returncode == 0, scope.stderr
+    assert outputs.get("skip_builds_and_tests", "false") == expected
+
+
 def test_pr_files_producer_accepts_3000_renames_with_6000_paths(
     tmp_path: Path, pr_files_environment: dict[str, str]
 ) -> None:
@@ -436,7 +480,7 @@ def test_pr_files_producer_accepts_3000_renames_with_6000_paths(
         "\n".join(json.dumps(records[start : start + 100]) for start in range(0, 3000, 100))
     )
     pr_files_environment["PR_CHANGED_FILES"] = "3000"
-    step = _step("cicd-main.yml", "configure", "unit-test-pr-files")
+    step = _pr_files_step("files")
     result, outputs = _run(step["run"], tmp_path, pr_files_environment)
     assert result.returncode == 0, result.stderr
     paths = [
@@ -800,6 +844,7 @@ def test_nemo_cicd_validator_checks_h100_functional_result(
             "GH_TOKEN": "test-token",
             "GITHUB_RUN_ID": "1",
             "DOCS_ONLY": "false",
+            "SKIP_BUILDS_AND_TESTS": "false",
             "IS_DEPLOYMENT": "false",
             "IS_MAINTAINER": "true",
             "IS_CI_WORKLOAD": "false",

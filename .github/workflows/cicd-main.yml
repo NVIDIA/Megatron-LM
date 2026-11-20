@@ -199,6 +199,7 @@ jobs:
     needs: [pre-flight, is-not-external-contributor, ephemeral-runner-routing]
     if: github.repository == 'NVIDIA/Megatron-LM'
     outputs:
+      skip_builds_and_tests: ${{ steps.unit-test-pr-files.outputs.skip_builds_and_tests || 'false' }}
       merge_queue_jobs: ${{ steps.configure.outputs.merge_queue_jobs }}
       scope:          ${{ steps.configure.outputs.scope }}
       n_repeat:       ${{ steps.configure.outputs.n_repeat }}
@@ -583,58 +584,35 @@ jobs:
           - **\`run_nemo_rl\`**: whether to trigger the NeMo RL downstream CI. Off for merge queue validation; PR authors can opt in by adding the _Run NeMoRL tests_ label.
           SUMMARY
 
-      - name: Get changed files for mandatory unit tests
-        id: unit-test-pr-files
-        if: steps.configure.outputs.unit_testmon_eligible == 'true'
-        shell: bash -e -u -o pipefail {0}
+      - name: Checkout PR file collector
+        id: checkout-pr-files
+        if: steps.get-pr-info.outcome == 'success'
         continue-on-error: true
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          PR_NUMBER: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-          PR_CHANGED_FILES: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').changed_files }}
-          PR_MERGE_SHA: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}
-          TESTED_SHA: ${{ steps.resolve-sha.outputs.sha }}
-        run: |
-          PR_FILES_DIR="$RUNNER_TEMP/unit-test-pr-files"
-          PR_FILES_RESPONSE="$RUNNER_TEMP/unit-test-pr-files-response.json"
-          # Fetch once for all buckets. Missing or stale PR data leaves no
-          # artifact ID, so consumers fall back to the full unit-test bucket.
-          if mkdir -p "$PR_FILES_DIR" \
-            && [[ "$TESTED_SHA" =~ ^[0-9a-f]{40}$ \
-                  && "$PR_MERGE_SHA" == "$TESTED_SHA" \
-                  && "$PR_NUMBER" =~ ^[1-9][0-9]*$ \
-                  && "$PR_CHANGED_FILES" =~ ^[0-9]+$ \
-                  && "$PR_CHANGED_FILES" -le 3000 ]] \
-            && gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
-              > "$PR_FILES_RESPONSE" \
-            && CHANGED_FILES=$(jq -se '
-              def valid_path: type == "string" and length > 0 and (test("[\r\n]") | not);
-              if length > 0 and all(.[]; type == "array") then add
-              else error("Expected PR file pages") end
-              | if all(.[]; (.filename | valid_path)
-                  and (if .status == "renamed" or has("previous_filename")
-                       then (.previous_filename | valid_path) else true end))
-                then length else error("Invalid PR file record") end
-              ' "$PR_FILES_RESPONSE") \
-            && [[ "$CHANGED_FILES" == "$PR_CHANGED_FILES" ]] \
-            && jq -sr '[.[][] | .filename, (.previous_filename // empty)] | unique[]' \
-              "$PR_FILES_RESPONSE" > "$PR_FILES_DIR/changed-files" \
-            && CHANGED_PATHS=$(wc -l < "$PR_FILES_DIR/changed-files" | tr -d ' ') \
-            && CURRENT_PR_SHA=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.merge_commit_sha') \
-            && [[ "$CURRENT_PR_SHA" == "$TESTED_SHA" ]] \
-            && jq -n --arg tested_sha "$TESTED_SHA" --argjson changed_files "$CHANGED_FILES" \
-              --argjson changed_paths "$CHANGED_PATHS" \
-              '{tested_sha: $tested_sha, changed_files: $changed_files, changed_paths: $changed_paths}' \
-              > "$PR_FILES_DIR/metadata.json"; then
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::PR changed-file list unavailable or incomplete for the tested commit; unit-test buckets will run in full."
-          fi
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          sparse-checkout: .github/actions/pr-changed-files
+          persist-credentials: false
+
+      - name: Get changed files for CI scope and mandatory unit tests
+        id: unit-test-pr-files
+        if: steps.checkout-pr-files.outcome == 'success'
+        continue-on-error: true
+        uses: ./.github/actions/pr-changed-files
+        with:
+          pr-info: ${{ steps.get-pr-info.outputs.pr-info }}
+          tested-sha: ${{ steps.resolve-sha.outputs.sha }}
+          pr-token: ${{ steps.app-token.outputs.token }}
 
       # Set UNIT_TESTMON_USE_CACHE_BASE=false to keep testing the normal PR merge.
       # Eligibility excludes merge groups, full-suite requests, and LTS runs.
       - name: Checkout PR for Testmon baseline preparation
-        if: steps.unit-test-pr-files.outputs.ready == 'true' && fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref == 'main' && vars.UNIT_TESTMON_USE_CACHE_BASE != 'false'
+        id: checkout-testmon-baseline
+        if: >-
+          steps.configure.outputs.unit_testmon_eligible == 'true'
+          && steps.unit-test-pr-files.outputs.ready == 'true'
+          && steps.unit-test-pr-files.outputs.skip_builds_and_tests != 'true'
+          && fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref == 'main'
+          && vars.UNIT_TESTMON_USE_CACHE_BASE != 'false'
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ steps.resolve-sha.outputs.sha }}
@@ -642,7 +620,7 @@ jobs:
 
       - name: Prepare PR on the Testmon baseline
         id: prepare-testmon-checkout
-        if: steps.unit-test-pr-files.outputs.ready == 'true' && fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref == 'main' && vars.UNIT_TESTMON_USE_CACHE_BASE != 'false'
+        if: steps.checkout-testmon-baseline.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_HEAD: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').head.sha }}
@@ -656,7 +634,10 @@ jobs:
 
       - name: Upload changed files for mandatory unit tests
         id: upload-unit-test-pr-files
-        if: steps.unit-test-pr-files.outputs.ready == 'true'
+        if: >-
+          steps.configure.outputs.unit_testmon_eligible == 'true'
+          && steps.unit-test-pr-files.outputs.ready == 'true'
+          && steps.unit-test-pr-files.outputs.skip_builds_and_tests != 'true'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         # Once prepared, every consumer must receive the same checkout and metadata.
         continue-on-error: ${{ steps.prepare-testmon-checkout.outputs.sha == '' }}
@@ -667,15 +648,14 @@ jobs:
 
   linting:
     runs-on: ubuntu-latest
-    needs: [pre-flight]
+    needs: [pre-flight, configure]
     if: |
-      (
-        needs.pre-flight.outputs.is_deployment_workflow == 'false'
-          && needs.pre-flight.outputs.is_ci_workload == 'true'
-      ) || (
-        needs.pre-flight.outputs.is_deployment_workflow == 'false'
-          && needs.pre-flight.outputs.is_ci_workload == 'false'
-          && needs.pre-flight.outputs.docs_only == 'false'
+      !cancelled() && needs.pre-flight.result == 'success'
+      && needs.configure.outputs.skip_builds_and_tests != 'true'
+      && needs.pre-flight.outputs.is_deployment_workflow == 'false'
+      && (
+        needs.pre-flight.outputs.is_ci_workload == 'true'
+        || (needs.pre-flight.outputs.is_ci_workload == 'false' && needs.pre-flight.outputs.docs_only == 'false')
       )
     steps:
       - name: Checkout
@@ -794,7 +774,8 @@ jobs:
       - configure
       - cicd-wait-in-queue
     if: |
-      needs.pre-flight.result != 'cancelled'
+      needs.configure.outputs.skip_builds_and_tests != 'true'
+      && needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && (
@@ -826,7 +807,8 @@ jobs:
     # "Run MBridge tests" label — all three cases set
     # configure.outputs.run_mbridge == 'true'.
     if: |
-      needs.pre-flight.result != 'cancelled'
+      needs.configure.outputs.skip_builds_and_tests != 'true'
+      && needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-parse-downstream-testing.result != 'cancelled'
@@ -885,7 +867,8 @@ jobs:
     # Skip downstream NeMo RL testing for docs-only and merge queue changes.
     # PR authors opt in with the "Run NeMoRL tests" label.
     if: |
-      needs.pre-flight.result != 'cancelled'
+      needs.configure.outputs.skip_builds_and_tests != 'true'
+      && needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-parse-downstream-testing.result != 'cancelled'
@@ -975,7 +958,8 @@ jobs:
       id-token: write
       pull-requests: read
     if: |
-      needs.is-not-external-contributor.result != 'cancelled'
+      needs.configure.outputs.skip_builds_and_tests != 'true'
+      && needs.is-not-external-contributor.result != 'cancelled'
       && needs.pre-flight.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && (
@@ -1005,7 +989,8 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
     if: |
-      needs.pre-flight.result != 'cancelled'
+      needs.configure.outputs.skip_builds_and_tests != 'true'
+      && needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
@@ -1043,7 +1028,8 @@ jobs:
       - cicd-parse-unit-tests
     name: Unit tests (H100)
     if: |
-      needs.is-not-external-contributor.result != 'cancelled'
+      needs.configure.outputs.skip_builds_and_tests != 'true'
+      && needs.is-not-external-contributor.result != 'cancelled'
       && needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
@@ -1079,7 +1065,8 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
     if: |
-      needs.pre-flight.result != 'cancelled'
+      needs.configure.outputs.skip_builds_and_tests != 'true'
+      && needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
@@ -1166,7 +1153,8 @@ jobs:
       - cicd-container-build
       - cicd-unit-tests-latest
     if: |
-      needs.pre-flight.result != 'cancelled'
+      needs.configure.outputs.skip_builds_and_tests != 'true'
+      && needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
@@ -1418,6 +1406,8 @@ jobs:
           sha: ${{ needs.configure.outputs.sha }}
 
   Nemo_CICD_Test:
+    outputs:
+      skip_builds_and_tests: ${{ steps.result.outputs.skip_builds_and_tests }}
     needs:
       - pre-flight
       - configure
@@ -1449,6 +1439,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_RUN_ID: ${{ github.run_id }}
+          SKIP_BUILDS_AND_TESTS: ${{ needs.configure.outputs.skip_builds_and_tests == 'true' && needs.configure.result == 'success' }}
           DOCS_ONLY: ${{ needs.pre-flight.outputs.docs_only }}
           IS_DEPLOYMENT: ${{ needs.pre-flight.outputs.is_deployment_workflow }}
           IS_MAINTAINER: ${{ needs.is-not-external-contributor.outputs.is_maintainer }}
@@ -1462,6 +1453,12 @@ jobs:
           H100_RESULT: ${{ needs.cicd-integration-tests-latest-h100.result }}
           GB200_RESULT: ${{ needs.cicd-integration-tests-latest-gb200.result }}
         run: |
+          if [ "$SKIP_BUILDS_AND_TESTS" == "true" ]; then
+            echo "skip_builds_and_tests=true" >> "$GITHUB_OUTPUT"
+            echo "All changed paths match the PR CI skip list. Build and test jobs skipped."
+            exit 0
+          fi
+
           # Docs-only and deployment workflows intentionally skip all tests
           if [ "$DOCS_ONLY" == "true" ] || [ "$IS_DEPLOYMENT" == "true" ]; then
             echo "✅ Docs-only or deployment workflow — test checks skipped"
@@ -1550,10 +1547,10 @@ jobs:
     needs: [Nemo_CICD_Test, pre-flight]
     if: |
       (
-        needs.pre-flight.outputs.docs_only == 'true'
-        || needs.pre-flight.outputs.is_deployment_workflow == 'true'
+        (needs.Nemo_CICD_Test.outputs.skip_builds_and_tests == 'true' && needs.Nemo_CICD_Test.result == 'success')
+        || ((needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true')
+            && needs.pre-flight.outputs.is_ci_workload == 'false')
       )
-      && needs.pre-flight.outputs.is_ci_workload == 'false'
       && !cancelled()
       && github.repository == 'NVIDIA/Megatron-LM'
     steps:
@@ -1575,7 +1572,7 @@ jobs:
               repo: context.repo.repo,
               sha: context.sha,
               state: 'success',
-              description: 'No code changes - coverage check skipped',
+              description: 'Build and test jobs skipped for this change',
               context: 'codecov/patch'
             });
 
@@ -1585,6 +1582,7 @@ jobs:
     if: |
       !cancelled()
       && needs.Nemo_CICD_Test.result == 'success'
+      && needs.Nemo_CICD_Test.outputs.skip_builds_and_tests != 'true'
       && needs.pre-flight.outputs.docs_only != 'true'
       && needs.pre-flight.outputs.is_deployment_workflow != 'true'
       && github.repository == 'NVIDIA/Megatron-LM'
