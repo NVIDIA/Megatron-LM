@@ -2058,6 +2058,17 @@ def wrap_model_chunks_with_ddp(
     if disable_bucketing_per_chunk is None:
         disable_bucketing_per_chunk = [False] * n
 
+    # Never a silent fallback: the element-granular layout exists only in the LayerWise layout
+    # computed below.
+    if getattr(ddp_config, "layerwise_element_granular_dense", False) and not (
+        DP is DDP and use_layer_wise_distributed_optimizer and use_layer_wise_param_layout
+    ):
+        raise ValueError(
+            "layerwise_element_granular_dense needs the LayerWise distributed optimizer with "
+            "its precomputed param layout on DistributedDataParallel "
+            "(no --no-use-layer-wise-param-layout, no FSDP); otherwise no layout would honor it."
+        )
+
     # Compute per-chunk layouts (DDP only).
     per_chunk_layouts = [None] * n
     if DP is DDP:

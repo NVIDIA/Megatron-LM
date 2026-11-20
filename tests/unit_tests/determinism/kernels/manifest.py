@@ -702,6 +702,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             C + "test_gpt_model.py",
             "tests/unit_tests/distributed/test_param_storage_copyback.py",
             "tests/unit_tests/distributed/test_gradient_scaling.py",
+            "tests/unit_tests/distributed/test_layerwise_element_granular.py",
             "tests/unit_tests/rl/test_rl_utils.py",
         ),
         kind="external-lib",
@@ -709,7 +710,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "Relocated parameter storage is checked exactly after all-gather and CUDA graph replay; "
         "the RL test checks exact classic-DDP reduce-scatter after gradient-buffer restoration. "
         "Token scaling is compared exactly with FP32 multiplication in eager and CUDA graph "
-        "replay, including changing factors and low-precision gradient buffers.",
+        "replay, including changing factors and low-precision gradient buffers. "
+        "The element-granular LayerWise dense layout (owner exchange over point-to-point or "
+        "all-to-all, then reduce-scatter) is trained next to the shard-aligned layout and "
+        "parameters, FP32 main params and grad norms are compared exactly.",
     ),
     KernelEntry(
         name="nccl_allocator",
