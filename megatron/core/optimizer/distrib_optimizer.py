@@ -577,6 +577,26 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             model_param, param_range.start, param_range.end
                         )
 
+                    if (
+                        shard_model_param is None
+                        and config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+                    ):
+                        # TE FusedAdam would own this param's master weight, but this quantized
+                        # param cannot be sliced into a shard for it: only an MCore-managed main
+                        # param can update it. Typically the DDP config says the params are not
+                        # quantized while the model holds them quantized.
+                        raise ValueError(
+                            "The precision-aware optimizer would own the master weight of a "
+                            f"quantized {type(model_param).__name__} model param, which needs an "
+                            "MCore-managed FP32 main param instead (OptimizerConfig fp8_recipe="
+                            f"{config.fp8_recipe!r}, main_params_dtype={config.main_params_dtype}, "
+                            f"optimizer_cpu_offload={config.optimizer_cpu_offload}, "
+                            f"resolved_fp8_param_gather={config.resolved_fp8_param_gather}, "
+                            f"resolved_fp4_param_gather={config.resolved_fp4_param_gather}). Set "
+                            "ddp_config.fp8_param_gather / fp4_param_gather to match "
+                            "TransformerConfig.fp8_param / fp4_param, with FP32 main params."
+                        )
+
                     # Generate main param.
                     if not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                         # If we use FP8 params to initialize FP32 main params (compared to using the

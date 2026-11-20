@@ -344,6 +344,30 @@ def _load_parameter_state(optimizer, model, sharding_type, ckpt_dir):
     optimizer.load_state_dict(load({"optimizer": sharded_state_dict}, ckpt_dir)["optimizer"])
 
 
+def test_quantized_params_with_bf16_ddp_flags_raise_a_clear_error(model_parallel):
+    """Whether TE FusedAdam owns the master weights follows ddp_config.fp8_param_gather. If the
+    model holds quantized params while that flag says otherwise, building the optimizer must
+    fail clearly instead of giving TE FusedAdam a missing (None) shard that crashes training."""
+    import transformer_engine.pytorch as te
+    from transformer_engine.common.recipe import Float8CurrentScaling
+    from transformer_engine.pytorch import fp8 as te_fp8
+
+    available, reason = te_fp8.check_fp8_support()
+    if not available:
+        pytest.skip(reason)
+    model_init = getattr(te, "quantized_model_init", None) or te.fp8_model_init
+    with model_init(enabled=True, recipe=Float8CurrentScaling()):
+        linear = te.Linear(128, 128, bias=False, params_dtype=torch.bfloat16, device="cuda")
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1),
+        DistributedDataParallelConfig(use_distributed_optimizer=True, grad_reduce_in_fp32=True),
+        linear,
+    )
+    assert not model.ddp_config.fp8_param_gather
+    with pytest.raises(ValueError, match="needs an MCore-managed FP32 main param"):
+        _get_optimizer(model, "tensorwise")
+
+
 @pytest.mark.parametrize("sharding_type", ["torch", "dp_zero_gather_scatter", "fully_reshardable"])
 @pytest.mark.parametrize(
     ("fp8_recipe", "store_param_remainders"), [(None, None), ("tensorwise", True)]
