@@ -62,16 +62,33 @@ def test_initial_stash_releases_eager_cache_without_changing_live_tensors(monkey
     torch.cuda.empty_cache()
     canary = torch.arange(1024, device="cuda", dtype=torch.float32)
     stash = []
-    manager = _manager(lambda: stash.append(torch.empty(2**21, device="cuda", dtype=torch.uint8)))
+    reserved_at_allocation = []
+
+    def allocate():
+        reserved_at_allocation.append(torch.cuda.memory_reserved())
+        stash.append(torch.empty(2**21, device="cuda", dtype=torch.uint8))
+
+    manager = _manager(allocate)
     monkeypatch.setattr(PagedStashManager, "get_instance", lambda: manager)
     paged_stash_reset()
-    eager = torch.empty(2**26, device="cuda", dtype=torch.uint8)
+
+    # Earlier tests may leave a live tensor in a cached segment with a large free remainder.
+    # The allocator would carve the eager tensor out of that remainder, and empty_cache() never
+    # returns a segment that still holds a live block. Requesting more than all cached free
+    # memory forces the eager tensor into a segment of its own, which empty_cache() can return.
+    cached_free = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    eager_bytes = max(2**26, (cached_free // 2**21 + 1) * 2**21)
+    reserved_without_eager = torch.cuda.memory_reserved()
+    eager = torch.empty(eager_bytes, device="cuda", dtype=torch.uint8)
+    assert (
+        torch.cuda.memory_reserved() - reserved_without_eager >= eager_bytes
+    ), "eager tensor must occupy its own segment"
     del eager
     torch.cuda.synchronize()
-    before = torch.cuda.memory_reserved()
 
     paged_stash_reset()
 
-    assert before - torch.cuda.memory_reserved() >= 2**25
     assert len(stash) == 1
+    # The eager footprint is back with the driver before the persistent stash is allocated.
+    assert reserved_at_allocation[0] <= reserved_without_eager
     assert torch.equal(canary.cpu(), torch.arange(1024, dtype=torch.float32))
