@@ -71,6 +71,7 @@ from megatron.training.global_vars import (
     set_args,
     set_global_variables,
 )
+from megatron.training.models.dist_utils import _ddp_wrap
 from megatron.training.training import setup_model_and_optimizer
 from tests.unit_tests.test_utilities import (
     Utils,
@@ -1426,11 +1427,12 @@ class TestGroupedHybridStackCudagraphs:
             hybrid_layer_pattern=layer_pattern,
             pg_collection=pg_collection,
         ).cuda()
-        model = DistributedDataParallel(
-            config,
-            DistributedDataParallelConfig(),
-            hybrid_model,
-            disable_bucketing=True,
+        # Use training's DDP initialization stream for the retained AccumulateGrad nodes.
+        (model,) = _ddp_wrap(
+            [hybrid_model],
+            data_parallel_random_init=False,
+            ddp_config=DistributedDataParallelConfig(),
+            overlap_param_gather_with_optimizer_step=False,
             pg_collection=pg_collection,
         )
         decoder = hybrid_model.decoder
