@@ -218,6 +218,7 @@ class _StubEngine(DynamicInferenceEngine):
 
 class TestPrefixCachingCore(PrefixCachingTestBase):
 
+    @pytest.mark.single_rank
     @pytest.mark.internal
     def test_hash_computation(self):
         # determinism and range
@@ -3183,6 +3184,7 @@ class TestPrefixCachePolicyStressMatrix(PrefixCachingTestBase):
         self._run_feature_probe(feature, policy)
 
 
+# The TP=PP=EP=1 rows build one full model and need no other rank.
 PREFIX_CACHE_ENGINE_CASES = [
     pytest.param(
         dict(name="tp4-ref-zero", feature="tp", tp=4, policy=PrefixCachingEvictionPolicy.REF_ZERO),
@@ -3199,6 +3201,7 @@ PREFIX_CACHE_ENGINE_CASES = [
     pytest.param(
         dict(name="gpt-chunked-lru", feature="chunked", policy=PrefixCachingEvictionPolicy.LRU),
         id="gpt-chunked-lru",
+        marks=pytest.mark.single_rank,
     ),
     pytest.param(
         dict(
@@ -3207,10 +3210,12 @@ PREFIX_CACHE_ENGINE_CASES = [
             policy=PrefixCachingEvictionPolicy.REF_ZERO,
         ),
         id="gpt-fused-rope-ref-zero",
+        marks=pytest.mark.single_rank,
     ),
     pytest.param(
         dict(name="mtp2-ref-zero", feature="mtp", policy=PrefixCachingEvictionPolicy.REF_ZERO),
         id="mtp2-ref-zero",
+        marks=pytest.mark.single_rank,
     ),
     pytest.param(
         dict(
@@ -3220,6 +3225,7 @@ PREFIX_CACHE_ENGINE_CASES = [
             policy=PrefixCachingEvictionPolicy.REF_ZERO,
         ),
         id="hybrid-mamba-ref-zero",
+        marks=pytest.mark.single_rank,
     ),
     pytest.param(
         dict(
@@ -3230,6 +3236,7 @@ PREFIX_CACHE_ENGINE_CASES = [
             policy=PrefixCachingEvictionPolicy.LRU,
         ),
         id="hybrid-gdp-lru",
+        marks=pytest.mark.single_rank,
     ),
 ]
 
@@ -3832,6 +3839,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         for actual_row, expected_row in zip(actual_rows, expected_rows):
             cls._assert_top_n_logprobs_close(actual_row, expected_row)
 
+    @pytest.mark.single_rank
     @pytest.mark.internal
     @pytest.mark.parametrize(
         ("model_provider", "chunked_donor"),
@@ -3975,6 +3983,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             Utils.destroy_model_parallel()
             self._clear_engine_runtime()
 
+    @pytest.mark.single_rank
     @pytest.mark.internal
     @torch.inference_mode()
     def test_uncacheable_prompt_top_n_recomputes(self):

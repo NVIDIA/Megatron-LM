@@ -1391,6 +1391,7 @@ def test_engine_reply_defaults_to_detokenizing():
     assert metadata[1] == [[3, True]]
 
 
+@pytest.mark.single_rank
 def test_engine_reply_honours_an_opt_out():
     """A client that detokenizes for itself lets the coordinator skip the body."""
     from megatron.core.inference.sampling_params import SamplingParams
