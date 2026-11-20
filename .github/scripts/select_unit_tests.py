@@ -11,6 +11,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from unit_test_launchers import launcher_for, supports_testmon
+
 logger = logging.getLogger(__name__)
 
 
@@ -35,8 +37,6 @@ def main() -> None:
     if os.environ["TARGET_BRANCH"] != "main":
         raise ValueError("Testmon selection requires main")
     platform = os.environ["RECIPE_PLATFORM"]
-    policy = Path(__file__).with_name("testmon_unsupported_buckets.json")
-    unsupported = json.loads(policy.read_text()).get(platform, [])
     generation = f"{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
     baseline_generation = os.environ.get("TESTMON_GENERATION", "")
     temporary = Path(os.environ["RUNNER_TEMP"])
@@ -53,7 +53,7 @@ def main() -> None:
     # Restore sequentially: the path is part of the existing cache version.
     for entry in json.loads(os.environ["BUCKETS"]):
         bucket = entry["bucket"]
-        if bucket in unsupported:
+        if not supports_testmon(launcher_for(platform, bucket)):
             # Standalone launchers run their own pytest commands without Testmon.
             matrix.append({**entry, "mode": "standalone"})
             summary.append(f"| `{bucket}` | full (standalone launcher) | true |")

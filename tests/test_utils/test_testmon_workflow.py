@@ -14,9 +14,15 @@ import pytest
 import yaml
 
 ROOT = Path(__file__).parents[2]
-UNSUPPORTED_BUCKETS_FILE = Path(".github/scripts/testmon_unsupported_buckets.json")
-STANDALONE_BUCKETS = json.loads((ROOT / UNSUPPORTED_BUCKETS_FILE).read_text())
 FP8_BUCKET = "tests/unit_tests/inference/test_batch_invariant_fp8.py"
+STANDALONE_BUCKETS = {
+    "dgx_h100": {
+        FP8_BUCKET,
+        "tests/unit_tests/inference/test_disagg_transfer_pairwise.py",
+        "tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py",
+    },
+    "dgx_gb200": {FP8_BUCKET},
+}
 
 
 def _step(workflow: str, job: str, step_id: str) -> dict:
@@ -74,9 +80,9 @@ def shell_environment(tmp_path: Path) -> dict[str, str]:
         "print(json.dumps(cases if len(sys.argv) == 5 else [{'bucket': case} for case in cases]))\n"
     )
     yq.chmod(0o755)
-    policy = tmp_path / UNSUPPORTED_BUCKETS_FILE
-    policy.parent.mkdir(parents=True)
-    policy.symlink_to(ROOT / UNSUPPORTED_BUCKETS_FILE)
+    launchers = Path("tests/test_utils/unit_test_launchers.py")
+    (tmp_path / launchers).parent.mkdir(parents=True)
+    (tmp_path / launchers).symlink_to(ROOT / launchers)
     for platform in ("h100", "gb200"):
         relative = Path("tests/test_utils/recipes") / platform / "unit-tests.yaml"
         destination = tmp_path / relative
@@ -1198,8 +1204,14 @@ for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
     standalone = {"bucket": FP8_BUCKET, "timeout": 20}
     if scenario == "mixed":
         environment["BUCKETS"] = json.dumps([*buckets, standalone])
+    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
+    stage = next(
+        step for step in workflow["jobs"]["select"]["steps"] if step["name"] == "Save CPU planner"
+    )
+    subprocess.run(["bash", "-eu", "-c", stage["run"]], cwd=ROOT, env=environment, check=True)
+    monkeypatch.syspath_prepend(str(tmp_path))
     spec = importlib.util.spec_from_file_location(
-        "select_unit_tests", ROOT / ".github/scripts/select_unit_tests.py"
+        "select_unit_tests", tmp_path / "select_unit_tests.py"
     )
     assert spec is not None and spec.loader is not None
     selector = importlib.util.module_from_spec(spec)

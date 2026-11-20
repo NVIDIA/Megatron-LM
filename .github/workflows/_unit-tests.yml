@@ -61,7 +61,7 @@ jobs:
 
       # Keep cache transport from this workflow even if the baseline predates it.
       - name: Save CPU planner
-        run: cp .github/scripts/{select_unit_tests.py,testmon_unsupported_buckets.json} "$RUNNER_TEMP/"
+        run: cp .github/scripts/select_unit_tests.py tests/test_utils/unit_test_launchers.py "$RUNNER_TEMP/"
 
       - name: Restore prepared unit-test checkout
         id: testmon-checkout
@@ -117,6 +117,8 @@ jobs:
         id: plan
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
+          # Use the tested checkout's launcher routing when it exists. Older baselines use the staged copy.
+          PYTHONPATH: tests/test_utils:${{ runner.temp }}
           BUCKETS: ${{ inputs.buckets }}
           RECIPE_PLATFORM: ${{ inputs.platform }}
           SOURCE_SHA: ${{ steps.testmon-checkout.outputs.sha || inputs.sha }}
@@ -142,7 +144,7 @@ jobs:
                 }
               })().catch(error => { console.error(error); process.exitCode = 1; });
             `;
-            await exec.exec('python', [process.env.RUNNER_TEMP + '/select_unit_tests.py'], {
+            await exec.exec('python', ['-P', process.env.RUNNER_TEMP + '/select_unit_tests.py'], {
               env: {...process.env, TESTMON_NODE: process.execPath, TESTMON_ACTIONS: client},
             });
 

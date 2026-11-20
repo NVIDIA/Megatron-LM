@@ -65,17 +65,18 @@ spec:
         TEST_PATH="/opt/megatron-lm-legacy/"
     fi
 
-    case "$BUCKET" in
-      tests/unit_tests/inference/test_batch_invariant_fp8.py)
-        bash "$TEST_PATH/tests/test_utils/run_batch_invariant_fp8.sh" \
+    LAUNCHER=$(python3 /opt/megatron-lm/tests/test_utils/unit_test_launchers.py {platforms} "$BUCKET")
+    case "$LAUNCHER" in
+      tests/test_utils/run_batch_invariant_fp8.sh)
+        bash "$TEST_PATH/$LAUNCHER" \
           h100 "$ENVIRONMENT" "$UNIT_TEST_REPEAT" "{assets_dir}/logs/1/"
         ;;
-      tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py|tests/unit_tests/inference/test_disagg_transfer_pairwise.py)
-        bash "$TEST_PATH/tests/test_utils/run_disagg_pairwise.sh" \
+      tests/test_utils/run_disagg_pairwise.sh)
+        bash "$TEST_PATH/$LAUNCHER" \
           "$ENVIRONMENT" "$UNIT_TEST_REPEAT" "$BUCKET" "{assets_dir}/logs/1/"
         ;;
       *)
-        bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
+        bash "$TEST_PATH/$LAUNCHER" \
           --tag $TAG \
           --environment $ENVIRONMENT \
           --bucket $BUCKET \

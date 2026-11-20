@@ -53,12 +53,12 @@ spec:
         TEST_PATH="/opt/megatron-lm-legacy/"
     fi
 
-
-    if [[ "$BUCKET" == "tests/unit_tests/inference/test_batch_invariant_fp8.py" ]]; then
-        bash "$TEST_PATH/tests/test_utils/run_batch_invariant_fp8.sh" \
+    LAUNCHER=$(python3 /opt/megatron-lm/tests/test_utils/unit_test_launchers.py {platforms} "$BUCKET")
+    if [[ "$LAUNCHER" == "tests/test_utils/run_batch_invariant_fp8.sh" ]]; then
+        bash "$TEST_PATH/$LAUNCHER" \
           gb200 "$ENVIRONMENT" "$UNIT_TEST_REPEAT" "{assets_dir}/logs/1/"
     else
-        bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
+        bash "$TEST_PATH/$LAUNCHER" \
           --tag $TAG \
           --environment $ENVIRONMENT \
           --bucket $BUCKET \
