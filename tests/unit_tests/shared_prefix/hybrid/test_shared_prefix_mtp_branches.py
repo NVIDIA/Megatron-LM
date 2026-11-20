@@ -12,7 +12,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from megatron.core.models.hybrid.hybrid_model import (
+from megatron.core.models.hybrid.shared_prefix import (
     _fixed_order_copy_contributors,
     _gather_shared_prefix_mtp_rows,
     _shared_prefix_mtp_branch_indices,

@@ -178,7 +178,7 @@ def _mtp_scale():
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
 def test_mtp_branch_packing_reassembles_dense_branches(cp_size):
     """Every CP rank packs its zigzag share of each dense branch ``[prompt, completion_g]``."""
-    from megatron.core.models.hybrid.hybrid_model import _pack_shared_prefix_mtp_branches
+    from megatron.core.models.hybrid.shared_prefix import _pack_shared_prefix_mtp_branches
 
     problem = SharedPrefixProblem(((5, (3, 6)), (7, (1, 9, 4))), padding_multiple=8)
     layout = problem.layout(forest=True)
@@ -460,7 +460,7 @@ class TestSharedPrefixMTPParity:
     @pytest.mark.usefixtures("_mtp_scale")
     @pytest.mark.parametrize("root_counts", [(), (2, 1)], ids=["per-root", "explicit-2-1"])
     def test_grouped_mtp_normalization_follows_layout(self, root_counts, monkeypatch):
-        """``_forward_shared_prefix_mtp`` normalizes each layout loss group on its own."""
+        """``forward_hybrid_mtp_shared_prefix`` normalizes each layout loss group on its own."""
         _check_grouped_mtp_normalization(monkeypatch, root_counts)
 
 
