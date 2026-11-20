@@ -32,7 +32,6 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.moe.experts import InferenceGroupedMLP
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
-from megatron.core.transformer.moe.router import InferenceTopKRouter
 from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequence_sr
 from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
@@ -243,21 +242,20 @@ class ShortcutMoEBlock(MegatronModule):
     def setup_inference_overlap(self) -> None:
         """Create synchronization state and check stream ownership before graph capture.
 
-        At TP>1 the shortcut stream must not issue any TP-group collective (see
-        `_forward_inference_overlap`). The inference router and grouped experts communicate
-        only through the NVLS dispatcher, so require them rather than trusting a custom spec.
+        The shortcut stream must not issue any collective (see `_forward_inference_overlap`).
+        It runs only the routed experts. At TP>1 require the inference grouped experts, which
+        communicate only through the NVLS dispatcher on the main stream, rather than trusting
+        a custom spec.
         """
         if self.route_ready_event is None:
             self.route_ready_event = torch.cuda.Event()
-        if get_pg_size(self.tp_group) > 1:
-            mlp = self.moe_layer.mlp
-            if not isinstance(getattr(mlp, "router", None), InferenceTopKRouter) or not (
-                isinstance(getattr(mlp, "experts", None), InferenceGroupedMLP)
-            ):
-                raise RuntimeError(
-                    "Shortcut MoE inference overlap at TP>1 requires InferenceTopKRouter and "
-                    "InferenceGroupedMLP, which issue no TP-group collectives"
-                )
+        if get_pg_size(self.tp_group) > 1 and not isinstance(
+            getattr(self.moe_layer.mlp, "experts", None), InferenceGroupedMLP
+        ):
+            raise RuntimeError(
+                "Shortcut MoE inference overlap at TP>1 requires InferenceGroupedMLP experts, "
+                "which issue no TP-group collectives"
+            )
 
     def _read_shortcut_hidden(
         self,
@@ -485,32 +483,20 @@ class ShortcutMoEBlock(MegatronModule):
         attn_recompute_context,
         moe_recompute_context,
     ):
-        """Run independent mixer and routed-expert branches until their outputs join.
+        """Run the routed experts on a side stream while the mixer runs on the main stream.
 
-        Every phase uses the predecessor's ordinary cache-aware forward on the
-        main stream. Routing, dispatch, experts and combine run on the MoE
-        stream. CUDA graphs capture the input-ready fork and the join before
-        the residual write.
+        Every collective stays on the main stream, in the same program order on every rank:
+        the predecessor's and the shared expert's TP / sequence-parallel collectives, and the
+        NVLS dispatcher's metadata exchange, AllGather-V and ReduceScatter-V. These kernels
+        spin-wait on their peers, so if two streams could each have one in flight, two GPUs
+        that schedule them in different orders would wait on each other forever. Only local
+        compute forks to the shortcut stream: the routed experts' grouped GEMMs.
 
-        Collective ownership, which makes TP>1 safe without ordering the two streams:
-
-        - Main stream: every TP-group collective. That is the predecessor's and the shared
-          expert's sequence-parallel all-gathers and reduce-scatters, on the "tp" symmetric
-          buffer or, when a tensor does not fit it, on the NCCL TP communicator.
-        - Shortcut stream: only the NVLS dispatcher's metadata exchange, AllGather-V and
-          ReduceScatter-V over the tp_ep group, on its own "ep_*" symmetric buffers. Each
-          buffer has its own signal pad, so the two streams share no buffer, barrier slot
-          or communicator. The shortcut norm, inference router, latent projections
-          ("duplicated") and grouped experts are local. With sequence parallelism each rank
-          routes its own token shard, and the experts receive tokens only through the
-          AllGather-V, so no TP gather is needed first. Expert-TP partial sums are added by
-          the ReduceScatter-V.
-
-        Each stream therefore issues its collectives in program order, which is the same on
-        every rank, and nothing on the main stream waits on the shortcut stream before the
-        join. Configurations that would break this (shared-expert overlap, fused TP
-        communication, batch-invariant collectives, non-NVLS dispatch) are rejected by
-        `InferenceConfig.validate_shortcut_moe_model` and `setup_inference_overlap`.
+        Main stream: shortcut read, norm, router and latent projection, then dispatch. Fork the
+        experts, then run the mixer and the shared expert. Join, combine, residual write.
+        The experts read the AllGather-V buffers and may write the ReduceScatter-V buffer; no
+        main-stream work between fork and join touches either, and the next dispatch or
+        combine on them runs after the join.
         """
         if attn_recompute_context is not None or moe_recompute_context is not None:
             raise RuntimeError("Shortcut MoE inference cannot use residual-stream recomputation")
@@ -530,32 +516,28 @@ class ShortcutMoEBlock(MegatronModule):
 
         main_stream = torch.cuda.current_stream()
         shortcut_stream = self._get_moe_overlap_stream()
-        # Fork before the shortcut read/router. Protect the original pair input
-        # and padding mask until side-stream routing has consumed them.
+        with quant_context_factory(self.moe_layer.config, self.moe_layer_idx):
+            shortcut_hidden = self._read_shortcut_hidden(shortcut_hidden, recompute_context=None)
+            route_input, route_probs = self._moe_router_preprocess(
+                shortcut_hidden=shortcut_hidden,
+                padding_mask=padding_mask,
+                packed_seq_params=packed_seq_params,
+                recompute_context=None,
+            )
+            dispatched_input, dispatched_probs = self._launch_dispatch(
+                route_input, route_probs, async_op=False
+            )
+
+        # Fork after the dispatch: only the experts' local compute runs on the shortcut stream.
         self.route_ready_event.record(main_stream)
         shortcut_stream.wait_event(self.route_ready_event)
-        shortcut_hidden.record_stream(shortcut_stream)
-        if isinstance(padding_mask, torch.Tensor) and padding_mask.is_cuda:
-            padding_mask.record_stream(shortcut_stream)
+        dispatched_input.record_stream(shortcut_stream)
+        dispatched_probs.record_stream(shortcut_stream)
         with torch.cuda.stream(shortcut_stream):
             with quant_context_factory(self.moe_layer.config, self.moe_layer_idx):
-                shortcut_hidden = self._read_shortcut_hidden(
-                    shortcut_hidden, recompute_context=None
-                )
-                route_input, route_probs = self._moe_router_preprocess(
-                    shortcut_hidden=shortcut_hidden,
-                    padding_mask=padding_mask,
-                    packed_seq_params=packed_seq_params,
-                    recompute_context=None,
-                )
-                dispatched_input, dispatched_probs = self._launch_dispatch(
-                    route_input, route_probs, async_op=False
-                )
-
                 routed_output, _ = self.moe_layer.mlp.routed_experts_compute(
                     dispatched_input, dispatched_probs
                 )
-                combined_output = self._launch_combine(routed_output, async_op=False)
 
         with quant_context_factory(self.compute_layer.config, self.attn_layer_idx):
             compute_output = self._forward_compute_atomic(
@@ -575,7 +557,8 @@ class ShortcutMoEBlock(MegatronModule):
                 packed_seq_params=packed_seq_params,
                 recompute_context=None,
             )
-            combined_output = self._wait_combine(combined_output)
+            routed_output = self._wait_combine(routed_output)
+            combined_output = self._launch_combine(routed_output, async_op=False)
             return self._postprocess(
                 residual=residual,
                 combined_output=combined_output,
