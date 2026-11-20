@@ -306,19 +306,6 @@ class FsdpContext:
         if self.outer_reduction_stream is not self.inner_reduction_stream:
             self.current_stream().wait_stream(self.outer_reduction_stream)
 
-    def prefetch_next(self) -> None:
-        """Start the next recorded unshard before a pipeline receive."""
-        view = self.execution_order_view
-        if view is None or not self.training:
-            return
-        event = view.peek()
-        if event is None or event.action is not ExecutionAction.UNSHARD:
-            return
-
-        self.allgather_stream.wait_stream(self.current_stream())
-        with event.module._nvtx_range("prefetch before PP recv"):
-            event.module._unshard_parameter_groups(event.phase)
-
     def pre_backward(self) -> None:
         """Fork the reduce-scatter stream into any active CUDA-graph capture.
 

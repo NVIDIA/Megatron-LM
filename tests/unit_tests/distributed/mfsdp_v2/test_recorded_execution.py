@@ -111,7 +111,6 @@ def test_complete_recorded_execution_and_invalid_schedules():
         assert context._recording_execution_order and len(context.execution_order) == 0
         gather = owners[0]._parameter_groups[0].unshard_parameters
         gather.reset_mock()
-        context.prefetch_next()
         with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
             with pytest.raises(RuntimeError, match="before CUDA graph capture"):
                 owners[0].unshard(Phase.FORWARD)
@@ -134,9 +133,6 @@ def test_complete_recorded_execution_and_invalid_schedules():
         sample.reset_mock()
         for owner in owners:
             owner.eval()
-        gather.reset_mock()
-        context.prefetch_next()
-        gather.assert_not_called()
         for owner in owners:
             FsdpModule.pre_forward(owner)
             FsdpModule.post_forward(owner)
@@ -147,7 +143,6 @@ def test_complete_recorded_execution_and_invalid_schedules():
         assert context.execution_order_view is view and view.position == len(view)
         gather = owners[0]._parameter_groups[0].unshard_parameters
         gather.reset_mock()
-        context.prefetch_next()  # Do not wrap to the first event of the next iteration.
         with pytest.raises(RuntimeError, match="diverged"):
             owners[0].unshard(Phase.FORWARD)
         gather.assert_not_called()
@@ -155,13 +150,7 @@ def test_complete_recorded_execution_and_invalid_schedules():
         assert view.position == 0
         owner = owners[0]
         owner.phase = Phase.FORWARD
-        context.prefetch_next()
-        gather.assert_called_once_with(Phase.FORWARD)
-        assert view.position == context.prefetch_order_view.position == 0
         owner.unshard(Phase.FORWARD)
-        gather.reset_mock()
-        context.prefetch_next()  # Do not look past the next reshard.
-        gather.assert_not_called()
         # Both filtered orders could accept this, but the recorded interleaving cannot.
         other = owners[1]
         other.phase = Phase.FORWARD
