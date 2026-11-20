@@ -9,6 +9,34 @@ if TYPE_CHECKING:
     from megatron.training.models.base import ModelConfig
 
 
+@dataclass(kw_only=True)
+class CachedLogitsConfig:
+    """Existing offline teacher-logit recording and student-logit loss options."""
+
+    logits_save_dir: str | None = None
+    """Directory in which to record teacher logits; None disables recording."""
+    logits_save_top_k: int = 128
+    """Maximum number of teacher logits saved per token."""
+    logits_save_top_p: float | None = None
+    """Optional cumulative probability threshold for saved teacher logits."""
+    logits_save_top_p_min_k: int = 1
+    """Minimum number of logits retained with top-p recording."""
+    logits_save_dtype: str = "fp16"
+    """Storage dtype for recorded logits."""
+    logits_load_dir: str | None = None
+    """Directory containing cached teacher logits; None uses the ordinary LM loss."""
+    logits_load_decode_threads: int = 4
+    """Number of threads decoding cached logits."""
+    logits_load_msc_prefetch_depth: int = 2
+    """Number of cached-logit files prefetched through MSC."""
+    logits_load_kd_loss_alpha: float = 1.0
+    """Weight of the cached-logit distillation loss."""
+    logits_load_ignore_errors: bool = False
+    """Skip cached-logit read errors, following the existing CLI policy."""
+    logits_load_ignore_hash: bool = False
+    """Skip cached-logit token-hash verification."""
+
+
 def load_distillation_loss_yaml(path: str) -> dict[str, Any]:
     """Read a ModelOpt distillation-config YAML (``--export-kd-cfg``) into a dict."""
     import yaml

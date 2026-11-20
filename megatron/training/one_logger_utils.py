@@ -5,7 +5,7 @@ import time
 from megatron.core._rank_utils import safe_get_world_size
 from megatron.training.global_vars import get_run_config
 
-from .global_vars import get_args, get_one_logger
+from .global_vars import get_one_logger
 
 _one_logger_utils_version = "1.2.0-mlm"
 
@@ -36,7 +36,6 @@ def on_train_start(iteration, consumed_train_samples, train_samples, seq_length,
         num_floating_point_operations_so_far (int): flops so far
     """
     cfg = get_run_config()
-    args = get_args()
     one_logger = get_one_logger()
 
     if one_logger:

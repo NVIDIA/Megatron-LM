@@ -63,6 +63,7 @@ from megatron.training.models import (
     ModelConfig,
     T5ModelConfig,
 )
+from megatron.training.models.distillation import CachedLogitsConfig
 from megatron.training.utils import warn_rank_0
 
 # TODO: support arg renames
@@ -375,7 +376,7 @@ def _triton_autotune_config_from_args(args: Namespace) -> AutotunePolicy:
     A ``--yaml-cfg`` configuration replaces those arguments and sets the same fields in
     an optional top-level ``triton_autotune`` section.
     """
-    if args.yaml_cfg is None:
+    if getattr(args, 'yaml_cfg', None) is None:
         return _default_config_from_args(AutotunePolicy, args, prefix='triton_autotune')
     # A YAML namespace only has the sections that the file sets.
     section = getattr(args, 'triton_autotune', None)
@@ -648,6 +649,8 @@ def gpt_config_from_args(
         transformer_cfg = config
     kwargs["transformer"] = transformer_cfg
 
+    kwargs["moe_use_upcycling"] = getattr(args, "moe_use_upcycling", False)
+    kwargs["moe_upcycling_granularity"] = getattr(args, "moe_upcycling_granularity", 1)
     kwargs["tp_comm_overlap_cfg"] = getattr(args, "tp_comm_overlap_cfg", None)
     if args.spec is not None:
         kwargs["transformer_layer_spec"] = import_module(args.spec)
@@ -738,7 +741,10 @@ def hybrid_config_from_args(
     """
     assert issubclass(model_config_cls, HybridModelConfig)
 
-    kwargs = {}
+    kwargs = {
+        "moe_use_upcycling": getattr(args, "moe_use_upcycling", False),
+        "moe_upcycling_granularity": getattr(args, "moe_upcycling_granularity", 1),
+    }
     if config is None:
         transformer_cfg = core_transformer_config_from_args(args)
     else:
@@ -1245,6 +1251,8 @@ def pretrain_cfg_container_from_args(
         training.vision_pretraining_type = None
 
     cfg = PretrainConfigContainer(
+        cached_logits=_default_config_from_args(CachedLogitsConfig, args),
+        triton_autotune=_triton_autotune_config_from_args(args),
         train=training,
         validation=_default_config_from_args(ValidationConfig, args),
         model=model_cfg,
@@ -1302,6 +1310,7 @@ def inference_cfg_container_from_args(
         model_cfg = model_config_from_args(args)
 
     cfg = InferenceConfigContainer(
+        triton_autotune=_triton_autotune_config_from_args(args),
         model=model_cfg,
         checkpoint=checkpoint_config_from_args(args),
         inference=inference_cfg_from_args(args),

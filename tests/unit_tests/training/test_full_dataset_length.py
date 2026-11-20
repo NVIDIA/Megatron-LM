@@ -43,6 +43,7 @@ def test_length_probe_preserves_iteration_and_skips_restore(
     if iteration is not None:
         args.iteration = iteration
     before = vars(args).copy()
+    run_config.train.deduplicate_dataloader_across_context_parallel = True
     iterator = SimpleNamespace(_dataloader=range(42)) if owns_data else None
     provider = Mock(return_value=(iterator, None, None), supports_train_full_dataset=True)
     reduce_sum = Mock(return_value=84 if owns_data else None)
@@ -50,7 +51,7 @@ def test_length_probe_preserves_iteration_and_skips_restore(
     monkeypatch.setattr(training, "_reduce_sum_across_data_parallel_group", reduce_sum)
     monkeypatch.setattr(training, "reduce_max_stat_across_model_parallel_group", reduce_max)
 
-    assert training._get_train_full_dataset_sample_count(args, provider) == 84
+    assert training._get_train_full_dataset_sample_count(provider) == 84
     assert vars(args) == before
     provider.assert_called_once_with(None, restore_dataloader_state=False)
     reduce_sum.assert_called_once_with(42 if owns_data else None, with_context_parallel=True)
@@ -63,12 +64,12 @@ def test_length_probe_rejects_explicit_horizon(field, run_config):
     setattr(run_config.train, field, 10)
     provider = Mock(supports_train_full_dataset=True)
     with pytest.raises(ValueError, match="cannot be combined"):
-        training._get_train_full_dataset_sample_count(args, provider)
+        training._get_train_full_dataset_sample_count(provider)
     provider.assert_not_called()
 
 
 def test_length_probe_rejects_provider_without_opt_in(run_config):
     provider = Mock(supports_train_full_dataset=False)
     with pytest.raises(ValueError, match="supports_train_full_dataset"):
-        training._get_train_full_dataset_sample_count(SimpleNamespace(), provider)
+        training._get_train_full_dataset_sample_count(provider)
     provider.assert_not_called()

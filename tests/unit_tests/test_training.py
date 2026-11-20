@@ -117,7 +117,10 @@ def test_entrypoint_loss_checks_read_rerun_config(
         entrypoint = importlib.import_module(module_name)
     # Unmigrated application inputs only; there are no rerun fields in args.
     monkeypatch.setattr(
-        entrypoint, "get_args", lambda: SimpleNamespace(logits_load_dir=None, loss_alpha=1)
+        entrypoint,
+        "get_args",
+        lambda: SimpleNamespace(logits_load_dir=None, loss_alpha=1),
+        raising=False,
     )
     if hasattr(entrypoint, "has_nvidia_modelopt"):
         monkeypatch.setattr(entrypoint, "has_nvidia_modelopt", False)
@@ -204,7 +207,7 @@ def test_indexer_logging_counts_only_active_legacy_ratios():
 
 def test_no_optimizer_does_not_require_training_wrapper_config(monkeypatch):
     monkeypatch.setattr(training, "get_run_config", lambda: SimpleNamespace())
-    assert not training.should_disable_forward_pre_hook(SimpleNamespace(), None)
+    assert not training.should_disable_forward_pre_hook(None)
 
 
 @pytest.mark.parametrize("fsdp2", [False, True])
@@ -262,13 +265,13 @@ def test_should_disable_forward_pre_hook_needs_a_live_optimizer(optimizer, layer
     run_config.optimizer.use_distributed_optimizer = not layer_wise
     run_config.optimizer.use_layer_wise_distributed_optimizer = layer_wise
     run_config.optimizer.overlap_param_gather = True
-    assert training.should_disable_forward_pre_hook(args, optimizer) is (optimizer is not None)
+    assert training.should_disable_forward_pre_hook(optimizer) is (optimizer is not None)
     run_config.optimizer.overlap_param_gather = False
-    assert not training.should_disable_forward_pre_hook(args, optimizer)
+    assert not training.should_disable_forward_pre_hook(optimizer)
     run_config.optimizer.overlap_param_gather = True
     run_config.ddp.use_megatron_fsdp = True
     args.use_megatron_fsdp = False
-    assert not training.should_disable_forward_pre_hook(args, optimizer)
+    assert not training.should_disable_forward_pre_hook(optimizer)
 
 
 def test_indexer_logging_counts_hybrid_mtp_depths_and_dense_mode():
@@ -417,16 +420,16 @@ class TestTraining:
         )
         run_config.logger = args
 
-        assert _should_compute_params_norm(args, iteration=1, is_first_iteration=True)
-        assert _should_compute_params_norm(args, iteration=20, is_first_iteration=False)
-        assert not _should_compute_params_norm(args, iteration=19, is_first_iteration=False)
+        assert _should_compute_params_norm(iteration=1, is_first_iteration=True)
+        assert _should_compute_params_norm(iteration=20, is_first_iteration=False)
+        assert not _should_compute_params_norm(iteration=19, is_first_iteration=False)
 
         args.tensorboard_dir = "/tmp/tensorboard"
         args.tensorboard_log_interval = 5
-        assert _should_compute_params_norm(args, iteration=5, is_first_iteration=False)
+        assert _should_compute_params_norm(iteration=5, is_first_iteration=False)
 
         args.log_params_norm = False
-        assert not _should_compute_params_norm(args, iteration=20, is_first_iteration=False)
+        assert not _should_compute_params_norm(iteration=20, is_first_iteration=False)
 
     def test_embedding_min_norm_metrics_combine_model_shards(self, monkeypatch):
         local_stats = torch.tensor([2.0, 4.0, 0.5, 1.0], dtype=torch.float64, device='cuda')
@@ -611,10 +614,10 @@ class TestPackedSampleAccounting:
         monkeypatch.setattr(training, "is_pp_last_stage", lambda group: True)
         monkeypatch.setattr(training, "get_pg_size", lambda group: 1)
 
-        count = training._get_samples_seen_in_iteration([{}] * 3, args, SimpleNamespace(pp=None))
+        count = training._get_samples_seen_in_iteration([{}] * 3, SimpleNamespace(pp=None))
 
         assert count == 3 * 2 * samples
-        assert _get_optimizer_param_scheduler_increment(args, count) == 3 * 2 * samples
+        assert _get_optimizer_param_scheduler_increment(count) == 3 * 2 * samples
 
     def test_pop_samples_seen_sums_and_removes_metadata(self):
         losses = [
@@ -641,13 +644,13 @@ class TestPackedSampleAccounting:
             "megatron.training.training.get_current_running_global_batch_size", lambda: 256
         )
 
-        assert _get_optimizer_param_scheduler_increment(args, 3342) == 256
+        assert _get_optimizer_param_scheduler_increment(3342) == 256
 
     def test_sample_schedule_uses_samples_seen(self, run_config):
         args = SimpleNamespace(train_iters=39, train_samples=10_000)
         run_config.train = TrainingConfig(train_iters=39, train_samples=10_000)
 
-        assert _get_optimizer_param_scheduler_increment(args, 3342) == 3342
+        assert _get_optimizer_param_scheduler_increment(3342) == 3342
 
 
 class TestSaveGrads:

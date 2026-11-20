@@ -105,6 +105,7 @@ def test_native_memory_interval_validation(interval, valid, run_config):
 
 @pytest.mark.parametrize('rank,enabled', [(0, False), (1, True)])
 def test_tensorboard_uses_owned_directory_and_queue(monkeypatch, rank, enabled, run_config):
+    monkeypatch.setattr(global_vars, 'safe_get_rank', lambda: rank)
     monkeypatch.setattr(global_vars, 'safe_get_world_size', lambda: 2)
     factory = Mock()
     monkeypatch.setitem(
@@ -122,6 +123,7 @@ def test_tensorboard_uses_owned_directory_and_queue(monkeypatch, rank, enabled, 
 
 
 def test_wandb_uses_owned_settings_and_legacy_metadata(monkeypatch, tmp_path, run_config):
+    monkeypatch.setattr(global_vars, 'safe_get_rank', lambda: 0)
     monkeypatch.setattr(global_vars, 'safe_get_world_size', lambda: 1)
     wandb = SimpleNamespace(init=Mock())
     monkeypatch.setitem(sys.modules, 'wandb', wandb)
@@ -153,6 +155,7 @@ def test_wandb_uses_owned_settings_and_legacy_metadata(monkeypatch, tmp_path, ru
 
 @pytest.mark.parametrize('wandb_project,asynchronous', [(None, False), ('project', True)])
 def test_one_logger_async_policy(monkeypatch, wandb_project, asynchronous, run_config):
+    monkeypatch.setattr(global_vars, 'safe_get_rank', lambda: 0)
     monkeypatch.setattr(global_vars, 'safe_get_world_size', lambda: 1)
     factory = Mock()
     monkeypatch.setitem(sys.modules, 'one_logger', SimpleNamespace(OneLogger=factory))
@@ -216,7 +219,7 @@ def test_tensorboard_metadata_preserves_legacy_args(monkeypatch):
     args = Namespace(log_interval=99, run_workload_inspector_server=False)
     train_state = TrainState(iteration=13)
     writer = Mock()
-    monkeypatch.setattr(initialize, 'get_args', lambda: args)
+    monkeypatch.setattr(global_vars, '_GLOBAL_ARGS', args)
     monkeypatch.setattr(initialize, 'get_train_state', lambda: train_state)
     monkeypatch.setattr(initialize, 'get_tensorboard_writer', lambda: writer)
     monkeypatch.setattr(global_vars, '_GLOBAL_RUN_CONFIG', None)
@@ -257,9 +260,9 @@ def test_native_parameter_norm_cadence(run_config):
         log_params_norm=True, log_interval=20, tensorboard_dir='events', tensorboard_log_interval=5
     )
     run_config.logger = config
-    assert _should_compute_params_norm(Namespace(), 1, True)
-    assert _should_compute_params_norm(Namespace(), 5, False)
-    assert not _should_compute_params_norm(Namespace(), 6, False)
+    assert _should_compute_params_norm(1, True)
+    assert _should_compute_params_norm(5, False)
+    assert not _should_compute_params_norm(6, False)
 
 
 def test_logging_level_config_overrides_environment(monkeypatch, run_config):

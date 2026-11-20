@@ -27,6 +27,7 @@ from megatron.core.num_microbatches_calculator import (
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.tensor_parallel.gtp_parallel_layout import GTPParallelLayout
+from megatron.core.tuning import AutotunePolicy
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
 from megatron.training.config.dataset_config import (
@@ -64,7 +65,11 @@ from megatron.training.models import (
     T5ModelConfig,
 )
 from megatron.training.models.base import ModelConfig
-from megatron.training.models.distillation import DistillationConfig, validate_distillation_student
+from megatron.training.models.distillation import (
+    CachedLogitsConfig,
+    DistillationConfig,
+    validate_distillation_student,
+)
 
 T = TypeVar("T", bound="ConfigContainerBase")
 logger = logging.getLogger(__name__)
@@ -78,6 +83,9 @@ class ConfigContainerBase:
     """
 
     _finalized: bool = field(default=False, init=False, repr=False, compare=False)
+
+    triton_autotune: AutotunePolicy = field(default_factory=AutotunePolicy)
+    """Kernel tuning policy installed before any runtime warmup or model construction."""
 
     def validate(self) -> None:
         """Check sub-configs without mutation; callers may validate repeatedly."""
@@ -309,6 +317,9 @@ class PretrainConfigContainer(ConfigContainerBase):
     distillation: DistillationConfig | None = None
     """ModelOpt knowledge distillation (teacher and loss). ``None`` disables it."""
 
+    cached_logits: CachedLogitsConfig = field(default_factory=CachedLogitsConfig)
+    """Offline teacher-logit recording and student distillation loss."""
+
     def get_model_world_size(self) -> int:
         """Return ranks in the model grid, which may be a subset of the launch."""
         launch_world_size = safe_get_world_size()
@@ -363,6 +374,9 @@ class PretrainConfigContainer(ConfigContainerBase):
             name: getattr(self.model.transformer, name)
             for name in ("fp16", "bf16", "params_dtype", "fp8_recipe")
         }
+        if self.train.freeze_all_layers:
+            # Same derivation as validate_args for frozen teacher-logit dumps.
+            precision.update(use_distributed_optimizer=False, overlap_param_gather=False)
         return replace(self.optimizer, **precision)
 
     def _resolve_batch_sizes(
@@ -463,6 +477,13 @@ class PretrainConfigContainer(ConfigContainerBase):
         # Config-only topology checks also run when validating a recipe off-cluster.
         # Launch world-size checks remain in the runtime parallel-size helpers.
         transformer = self.model.transformer
+        if self.train.freeze_all_layers and transformer.freeze_base_model_for_mtp:
+            raise ValueError("freeze_base_model_for_mtp cannot be combined with freeze_all_layers")
+        if self.cached_logits.logits_save_dir is not None:
+            if not self.checkpoint.async_save:
+                raise ValueError("logits_save_dir requires async_save")
+            if self.train.rampup_batch_size is not None:
+                raise ValueError("logits_save_dir does not support rampup_batch_size")
         if (
             transformer.max_seq_length_per_sample is not None
             and transformer.max_seq_length_per_sample <= 0

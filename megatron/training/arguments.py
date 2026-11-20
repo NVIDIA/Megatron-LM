@@ -2597,7 +2597,7 @@ def _add_fault_tolerance_args(parser):
 def _add_logging_args(parser):
     from megatron.training.config import LoggerConfig
 
-    log_factory = ArgumentGroupFactory(LoggerConfig, exclude = ["log_throughput_to_tensorboard", "throughput_window_size", "memory_keys", "log_l2_norm_grad_to_tensorboard", "log_runtime_to_tensorboard", "runtime_time_unit", "filter_warnings", "modules_to_filter", "set_level_for_all_loggers", "save_config_filepath"])
+    log_factory = ArgumentGroupFactory(LoggerConfig, exclude = ["log_throughput_to_tensorboard", "throughput_window_size", "memory_keys", "log_l2_norm_grad_to_tensorboard", "log_runtime_to_tensorboard", "runtime_time_unit", "filter_warnings", "modules_to_filter", "set_level_for_all_loggers", "save_config_filepath", "log_packed_sequence_stats", "dump_param_to_param_group_map"])
     group = log_factory.build_group(parser, title="logging")
 
     return parser
@@ -2727,16 +2727,13 @@ def _add_training_args(parser):
                        'options should be specified in commandline.')
 
     # Keep the legacy vision CLI master switch/defaults at their existing boundary.
-    train_factory = ArgumentGroupFactory(TrainingConfig, exclude=["vision_pretraining_type"])
+    train_factory = ArgumentGroupFactory(
+        TrainingConfig,
+        exclude=["vision_pretraining_type", "phase_transition_iterations", "freeze_all_layers",
+                 "deduplicate_dataloader_across_context_parallel"],
+    )
     group = train_factory.build_group(parser, "training")
 
-    # Keep this CLI-only until dataset options have their own config dataclass.
-    group.add_argument(
-        "--train-full-dataset",
-        action="store_true",
-        default=False,
-        help="Train for one complete pass over an externally provided dataset.",
-    )
     group.add_argument('--batch-size', type=int, default=None,
                        help='Old batch size parameter, do not use. '
                        'Use --micro-batch-size instead')
@@ -2939,7 +2936,7 @@ def _add_mixed_precision_args(parser):
 def _add_distributed_args(parser):
     from megatron.training.config import DistributedInitConfig
 
-    dist_init_factory = ArgumentGroupFactory(DistributedInitConfig)
+    dist_init_factory = ArgumentGroupFactory(DistributedInitConfig, exclude=["enable_experimental"])
     group = dist_init_factory.build_group(parser, "distributed init")
 
     group.add_argument('--use-torch-fsdp2', action='store_true', default=False,

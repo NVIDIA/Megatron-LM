@@ -10,9 +10,8 @@ import time
 from abc import ABC
 from typing import TYPE_CHECKING, Any
 
-from megatron.core._rank_utils import safe_get_world_size
+from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
 from megatron.core.dist_checkpointing.strategies.nvrx import make_nvrx_async_request
-from megatron.training import get_args
 from megatron.training.global_vars import get_run_config
 from megatron.training.utils import print_rank_0
 
@@ -67,7 +66,7 @@ def _get_async_calls_queue():
     return _async_calls_queue
 
 
-def build_otel_worker_bootstrap(args):
+def build_otel_worker_bootstrap(args=None):
     """Build the plain-dict otel config + resource attributes to hand to the
     persistent checkpoint worker process.
 
@@ -127,7 +126,7 @@ def build_otel_worker_bootstrap(args):
         'service_name': service_name,
         'span_groups': worker_span_groups,
         'resolved_span_groups': resolved_span_groups,
-        'rank': args.rank,
+        'rank': safe_get_rank(),
         'world_size': safe_get_world_size(),
         # Same reasoning as _set_telemetry(): building these calls NVML
         # (_detect_gpu_identity), and the worker discards them when 'enabled' is
@@ -144,7 +143,6 @@ def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
     )
 
     global _async_calls_queue
-    args = get_args()
     checkpoint = get_run_config().checkpoint
     # Recreate the async_calls_queue for persistent worker
     # This duplicate step is for backward compatiblity
@@ -171,7 +169,7 @@ def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
     # Older nvidia-resiliency-ext installs won't have this parameter yet --
     # degrade to no worker-side telemetry rather than hard-failing checkpointing.
     if "otel_bootstrap" in inspect.signature(AsyncCallsQueue.warmup_persistent_caller).parameters:
-        warmup_kwargs["otel_bootstrap"] = build_otel_worker_bootstrap(args)
+        warmup_kwargs["otel_bootstrap"] = build_otel_worker_bootstrap()
     AsyncCallsQueue.warmup_persistent_caller(
         rank,
         cpu_priority=checkpoint.async_ckpt_cpu_priority,

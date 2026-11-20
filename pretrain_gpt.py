@@ -30,9 +30,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.transformer.multi_token_prediction import (
-    get_mtp_ranks,
-)
+from megatron.core.transformer.multi_token_prediction import get_mtp_ranks
 from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank as mtp_on_this_rank_func,
 )
@@ -46,7 +44,6 @@ from megatron.core.utils import (
     get_torch_version,
 )
 from megatron.training import (
-    get_args,
     get_timers,
     inprocess_restart,
     pretrain,
@@ -266,17 +263,17 @@ def loss_func(
         a dict containing reporting metrics on the loss and number of tokens across
             the data parallel ranks
     """
-    args = get_args()
+    cfg = get_run_config()
 
-    if args.logits_load_dir is not None:
+    if cfg.cached_logits.logits_load_dir is not None:
         # Offline knowledge distillation loss using cached teacher log-probabilities.
         loss_func_cached_logits = _build_cached_logits_loss_func(
-            logprobs_dir=args.logits_load_dir,
-            decode_threads=args.logits_load_decode_threads,
-            msc_prefetch_depth=args.logits_load_msc_prefetch_depth,
-            kd_loss_alpha=args.logits_load_kd_loss_alpha,
-            ignore_errors=args.logits_load_ignore_errors,
-            ignore_hash=args.logits_load_ignore_hash,
+            logprobs_dir=cfg.cached_logits.logits_load_dir,
+            decode_threads=cfg.cached_logits.logits_load_decode_threads,
+            msc_prefetch_depth=cfg.cached_logits.logits_load_msc_prefetch_depth,
+            kd_loss_alpha=cfg.cached_logits.logits_load_kd_loss_alpha,
+            ignore_errors=cfg.cached_logits.logits_load_ignore_errors,
+            ignore_hash=cfg.cached_logits.logits_load_ignore_hash,
         )
         loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
     elif has_nvidia_modelopt and is_distillation_model(model):  # [ModelOpt]

@@ -144,6 +144,7 @@ def test_runtime_services_initialize_training_only_when_requested(
     )
     args = Namespace(enable_experimental=enable_runtime_flags)
     run_config.dist.disable_jit_fuser = enable_runtime_flags
+    run_config.dist.enable_experimental = enable_runtime_flags
     experimental = Mock()
     jit = Mock()
     monkeypatch.setattr(global_vars, "set_experimental_flag", experimental)
@@ -242,7 +243,7 @@ def test_inference_distributed_initialization_without_training_fields(
         delattr(args, name)
     cfg = inference_cfg_container_from_args(args, build_model_config=False)
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
-    monkeypatch.setattr(initialize, "get_args", lambda: args)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
     monkeypatch.setattr(initialize, "initialize_runtime_services", Mock())
     monkeypatch.setattr(initialize, "setup_logging", Mock())
     monkeypatch.setattr(initialize, "print_rank_0", Mock())
@@ -271,7 +272,7 @@ def test_inference_rejects_training_tp_overlap_before_initialization(monkeypatch
     args = Namespace(tp_comm_overlap=True)
     cfg = inference_cfg_container_from_args(args, build_model_config=False)
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
-    monkeypatch.setattr(initialize, "get_args", lambda: args)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
     distributed = Mock()
     monkeypatch.setattr(initialize, "_initialize_distributed", distributed)
     with pytest.raises(ValueError, match="fixed training user buffers"):
@@ -321,7 +322,7 @@ def test_distributed_training_services_require_explicit_opt_in(
         from megatron.training.argument_utils import model_config_from_args
 
         run_config.model = model_config_from_args(args, model_config_cls=model_config_cls)
-    monkeypatch.setattr(initialize, "get_args", lambda: args)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
     monkeypatch.setattr(initialize, "setup_logging", Mock())
     monkeypatch.setattr(initialize, "print_rank_0", Mock())
     monkeypatch.setattr(initialize, "set_default_log_ranks", Mock())

@@ -107,6 +107,9 @@ class ProfilingConfig:
 class DistributedInitConfig:
     """Configuration settings for distributed training initialization."""
 
+    enable_experimental: bool = False
+    """Enable Megatron Core experimental features."""
+
     distributed_backend: Literal["nccl", "gloo"] = "nccl"
     """Which backend to use for distributed training."""
 

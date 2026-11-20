@@ -219,6 +219,7 @@ def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_conf
     original_args = vars(args).copy()
     # Keep the legacy defaults different so an accidental args read is detected.
     monkeypatch.setenv("WORLD_SIZE", "4")
+    monkeypatch.setenv("RANK", "0")
     run_config.dist = DistributedInitConfig(
         distributed_backend="gloo",
         distributed_timeout_minutes=37,
@@ -459,6 +460,7 @@ def test_runtime_service_order_and_microbatch_inputs(
 ):
     args = _runtime_args()
     cfg = run_config
+    monkeypatch.setattr(global_vars, "safe_get_rank", lambda: 0)
     monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 2)
     cfg.train.global_batch_size = 8
     cfg.train.micro_batch_size = 2
@@ -895,6 +897,8 @@ def test_callback_upcycling_uses_temporary_dense_config(monkeypatch, run_config)
     args.expert_model_parallel_size = 1
     args.ffn_hidden_size = 64
     run_config.model = GPTModelConfig(
+        moe_use_upcycling=True,
+        moe_upcycling_granularity=2,
         transformer=TransformerConfig(
             num_layers=2,
             hidden_size=32,
@@ -905,7 +909,7 @@ def test_callback_upcycling_uses_temporary_dense_config(monkeypatch, run_config)
         seq_length=16,
         vocab_size=128,
     )
-    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
     monkeypatch.setattr(training, "get_timers", Mock())
     monkeypatch.setattr(training, "get_one_logger", lambda: None)
     monkeypatch.setattr(training, "has_nvidia_modelopt", False)

@@ -12,7 +12,7 @@ from datetime import timedelta
 import torch
 
 from megatron.core import Timers
-from megatron.core._rank_utils import safe_get_world_size
+from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
 from megatron.core.config import set_experimental_flag
 from megatron.core.energy_monitor import EnergyMonitor
 from megatron.core.jit import disable_jit_fuser
@@ -38,9 +38,14 @@ _GLOBAL_SIGNAL_HANDLER = None
 _GLOBAL_TELEMETRY_HANDLE = None
 
 def get_args():
-    """Return arguments."""
+    """Return CLI arguments."""
     _ensure_var_is_initialized(_GLOBAL_ARGS, 'args')
     return _GLOBAL_ARGS
+
+
+def is_args_initialized() -> bool:
+    """Whether CLI metadata is available; config-only runs do not register args."""
+    return _GLOBAL_ARGS is not None
 
 
 def get_run_config():
@@ -193,7 +198,7 @@ def set_global_variables(args, cfg_container, build_tokenizer=True):
 
 
 def initialize_runtime_services(
-    args: Namespace, *, build_tokenizer: bool = True, training: bool = False
+    args: Namespace | None = None, *, build_tokenizer: bool = True, training: bool = False
 ) -> None:
     """Build services from finalized config; normally called by initialize_megatron."""
     from megatron.training.argument_utils import resolve_tokenizer_vocab_size
@@ -209,7 +214,7 @@ def initialize_runtime_services(
     _set_wandb_writer(args)
     _set_telemetry(args, include_training=training)
 
-    if args.enable_experimental:
+    if cfg.dist.enable_experimental:
         set_experimental_flag(True)
 
     if cfg.dist.disable_jit_fuser:
@@ -219,7 +224,7 @@ def initialize_runtime_services(
         initialize_training_runtime_services(args)
 
 
-def initialize_training_runtime_services(args: Namespace) -> None:
+def initialize_training_runtime_services(args: Namespace | None = None) -> None:
     """Initialize training-only services after the shared runtime services."""
     cfg = get_run_config()
     if cfg.train.step_batch_size_schedule is not None:
@@ -229,7 +234,7 @@ def initialize_training_runtime_services(args: Namespace) -> None:
         print_rank_0(f'> using step batch size schedule: {cfg.train.step_batch_size_schedule}')
 
     init_num_microbatches_calculator(
-        rank=args.rank,
+        rank=safe_get_rank(),
         global_batch_size=cfg.train.global_batch_size,
         micro_batch_size=cfg.train.micro_batch_size,
         # Independent sequences, including when CP and weight sharding share ranks.
@@ -369,7 +374,7 @@ def _set_tensorboard_writer(args):
     _ensure_var_is_not_initialized(_GLOBAL_TENSORBOARD_WRITER,
                                    'tensorboard writer')
 
-    if cfg.logger.tensorboard_dir and args.rank == (safe_get_world_size() - 1):
+    if cfg.logger.tensorboard_dir and safe_get_rank() == (safe_get_world_size() - 1):
         try:
             from torch.utils.tensorboard import SummaryWriter
             print('> setting tensorboard ...')
@@ -397,7 +402,7 @@ def _set_wandb_writer(args):
     global _GLOBAL_WANDB_WRITER
     _ensure_var_is_not_initialized(_GLOBAL_WANDB_WRITER,
                                    'wandb writer')
-    if cfg.logger.wandb_project and args.rank == (safe_get_world_size() - 1):
+    if cfg.logger.wandb_project and safe_get_rank() == (safe_get_world_size() - 1):
         if cfg.logger.wandb_exp_name == '':
             raise ValueError("Please specify the wandb experiment name!")
 
@@ -409,7 +414,10 @@ def _set_wandb_writer(args):
             save_dir = os.path.join(cfg.checkpoint.save, 'wandb')
         # Private attributes are runtime state rather than configuration and can be large; keep
         # them out of the wandb config. Copy so the kitchen contents added below stay off args.
-        wandb_config = {k: v for k, v in vars(args).items() if not k.startswith('_')}
+        wandb_config = (
+            {k: v for k, v in vars(args).items() if not k.startswith('_')}
+            if args is not None else cfg.to_dict()
+        )
         if 'kitchen_config_file' in wandb_config and wandb_config['kitchen_config_file'] is not None:
             # Log the contents of the config for discovery of what the quantization
             # settings were.
@@ -444,7 +452,7 @@ def _set_one_logger(args):
     global _GLOBAL_ONE_LOGGER
     _ensure_var_is_not_initialized(_GLOBAL_ONE_LOGGER, 'one logger')
 
-    if cfg.logger.enable_one_logger and args.rank == (safe_get_world_size() - 1):
+    if cfg.logger.enable_one_logger and safe_get_rank() == (safe_get_world_size() - 1):
         if cfg.logger.one_logger_async or cfg.logger.wandb_project:
             one_logger_async = True
         else:
@@ -571,9 +579,8 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
     # Process tags in Jaeger, making it easy to identify and compare runs.
     cfg = get_run_config()
     resource_attrs = {'dl.local_rank': cfg.dist.local_rank}
-    fields = [
-        ('megatron.ckpt_format', 'ckpt_format'),
-    ]
+    resource_attrs['megatron.ckpt_format'] = cfg.checkpoint.ckpt_format
+    fields = []
     if include_training:
         resource_attrs['dl.data_parallel.size'] = cfg.get_data_parallel_size()
         for attr, name in (
@@ -710,7 +717,7 @@ def _set_telemetry(args, *, include_training: bool = True):
     )
 
     _GLOBAL_TELEMETRY_HANDLE = setup_telemetry(
-        config, rank=args.rank, world_size=safe_get_world_size(),
+        config, rank=safe_get_rank(), world_size=safe_get_world_size(),
         resource_attributes=resource_attrs,
     )
 

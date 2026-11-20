@@ -701,8 +701,13 @@ def test_checkpoint_position_capacity(run_config, saved_config, position_embeddi
             )
         else:
             check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
+        run_config.model.seq_length = checkpoint_args.max_position_embeddings
         checkpoint_args.add_position_embedding = False
-        with pytest.raises(AssertionError, match="add_position_embedding"):
+        with mock.patch('megatron.training.checkpointing.is_args_initialized', return_value=True):
+            with pytest.raises(AssertionError, match="add_position_embedding"):
+                check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
+            # The deprecated False spelling remains valid for an identical CLI run.
+            args.add_position_embedding = False
             check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
 
 
@@ -831,6 +836,7 @@ def test_check_checkpoint_args_uses_config_owner(
         **{name: other},
     )
     owner = getattr(run_config, section)
+    run_config.train.phase_transition_iterations = args.phase_transition_iterations
     if section == "tokenizer":
         run_config.tokenizer.vocab_file = "vocab.json"
         args.max_position_embeddings = run_config.model.seq_length
@@ -916,6 +922,7 @@ def create_args(run_config):
         position_embedding_type='rope',
     )
 
+    set_args(args)
     yield args
 
 
@@ -1352,8 +1359,14 @@ def test_load_checkpoint_override_opt_param_scheduler(
 
 
 @pytest.mark.parametrize("load_rerun_mode", [RerunMode.DISABLED, RerunMode.VALIDATE_RESULTS])
+@pytest.mark.parametrize("native_config", [False, True])
 def test_strict_load_idle_rerun_checkpoint(
-    init_model_parallel, tmp_path_dist_ckpt, create_ckpt_load_args, load_rerun_mode
+    init_model_parallel,
+    tmp_path_dist_ckpt,
+    create_ckpt_load_args,
+    load_rerun_mode,
+    native_config,
+    monkeypatch,
 ):
     """Load an idle rerun shard without treating it as a pending rerun."""
     args = create_ckpt_load_args
@@ -1364,8 +1377,8 @@ def test_strict_load_idle_rerun_checkpoint(
     args.use_dist_ckpt = True
     args.use_distributed_optimizer = False
     args.dist_ckpt_strictness = "raise_all"
-    args.no_save_rng = True
-    args.no_load_rng = True
+    args.no_save_rng = False
+    args.no_load_rng = False
     args.no_save_optim = True
     args.no_load_optim = True
     args.fp16 = False
@@ -1380,6 +1393,15 @@ def test_strict_load_idle_rerun_checkpoint(
         args.save = ckpt_dir
         args.load = ckpt_dir
         set_args(args)
+        sync_checkpoint_config(args)
+        if native_config:
+            monkeypatch.setattr('megatron.training.global_vars._GLOBAL_ARGS', None)
+            monkeypatch.setattr(
+                'megatron.training.checkpointing.get_args',
+                mock.Mock(side_effect=AssertionError('native checkpoint accessed CLI args')),
+            )
+        expected_cpu_rng = torch.get_rng_state().clone()
+        expected_cuda_rng = torch.cuda.get_rng_state().clone()
         with mock.patch(
             "megatron.training.checkpointing.get_rerun_state_machine", return_value=saved_machine
         ):
@@ -1387,6 +1409,8 @@ def test_strict_load_idle_rerun_checkpoint(
             save_checkpoint(123, [model], None, None, 456)
 
         loaded_model = MockModel(config)
+        torch.rand(17)
+        torch.rand(17, device='cuda')
         with torch.no_grad():
             loaded_model.l.weight.zero_()
         loaded_machine = RerunStateMachine(mode=load_rerun_mode)
@@ -1400,6 +1424,8 @@ def test_strict_load_idle_rerun_checkpoint(
 
         assert iteration == 123
         assert flops == 456
+        torch.testing.assert_close(torch.get_rng_state(), expected_cpu_rng, rtol=0, atol=0)
+        torch.testing.assert_close(torch.cuda.get_rng_state(), expected_cuda_rng, rtol=0, atol=0)
         torch.testing.assert_close(loaded_model.l.weight, model.l.weight, rtol=0, atol=0)
         assert loaded_machine.state == RerunState.NOT_RUNNING_YET
         assert loaded_machine.mode == load_rerun_mode
@@ -1879,7 +1905,7 @@ def test_the_glu_optimizer_guard_follows_the_saved_checkpoint_section(
     class StopAtTheGuard(Exception):
         pass
 
-    def guard(state_dict, run_args, *, loading_optimizer):
+    def guard(state_dict, run_args, *, loading_optimizer, checkpoint_config=None):
         decisions.append(loading_optimizer)
         raise StopAtTheGuard  # Before any tensor storage is read.
 
@@ -2151,6 +2177,7 @@ def test_the_frozen_layer_load_is_weights_only_at_any_data_position(
     run's own progress tracker: the classification is recorded on the train state, the position
     stays the load's own business, and the namespace receives neither."""
     args = _loader_args(freeze_all_layers=True)
+    run_config.train.freeze_all_layers = True
     train_state = TrainState()
     monkeypatch.setattr(checkpointing, "get_train_state", lambda: train_state)
     run_config.checkpoint.load = "/frozen"

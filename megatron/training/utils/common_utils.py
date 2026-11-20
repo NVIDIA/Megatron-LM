@@ -50,7 +50,7 @@ from megatron.core.utils import (
     to_local_if_dtensor,
     unwrap_model,
 )
-from megatron.training import get_adlr_autoresume, get_args, get_timers, get_train_state
+from megatron.training import get_adlr_autoresume, get_timers, get_train_state
 from megatron.training.global_vars import get_run_config
 
 
@@ -101,7 +101,6 @@ def calc_params_l2_norm(
             return_squared_tensor=return_squared_tensor,
         )
 
-    args = get_args()
     cfg = get_run_config()
 
     if cfg.ddp.use_megatron_fsdp:
@@ -455,7 +454,6 @@ def check_adlr_autoresume_termination(iteration, model, optimizer, opt_param_sch
     """Check for autoresume signal and exit if it is received."""
     from megatron.training.checkpointing import save_checkpoint
 
-    args = get_args()
     autoresume = get_adlr_autoresume()
     # Add barrier to ensure consistnecy.
     torch.distributed.barrier()
