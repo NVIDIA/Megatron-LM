@@ -76,6 +76,7 @@ _FROZEN_OPTIMIZER_FLAGS = (
     "overlap_param_gather_with_optimizer_step",
 )
 
+
 @dataclass(kw_only=True)
 class ConfigContainerBase:
     """

@@ -61,3 +61,9 @@ across launches. Config-only save/resume currently supports `torch_dist`. Saved
 configuration and runtime topology replace optional CLI metadata; checkpoints
 from native runs do not contain fabricated `args`. Older tools that require
 checkpoint `args` are not yet supported. Config-only MoE upcycling is also deferred.
+
+Offline cached-logit distillation remains on its CLI path until
+[#9635](https://github.com/NVIDIA/Megatron-LM/pull/9635) supplies
+`cfg.offline_distillation`. This entrypoint does not add a competing cached-logit
+config or fabricate args to enable that feature. Ordinary pretraining needs no
+legacy argument namespace.

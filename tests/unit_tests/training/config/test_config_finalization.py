@@ -30,6 +30,42 @@ from megatron.training.models import (
 from megatron.training.models.base import ModelConfig
 
 
+@pytest.mark.parametrize("overlap_grad_reduce", [False, True])
+@pytest.mark.parametrize("overlap_optimizer_step", [False, True])
+def test_frozen_training_config_disables_optimizer_gather_without_cli_args(
+    monkeypatch, run_config, caplog, overlap_grad_reduce, overlap_optimizer_step
+):
+    run_config.train.micro_batch_size = 1
+    run_config.train.global_batch_size = 8
+    run_config.train.freeze_all_layers = True
+    run_config.optimizer.use_distributed_optimizer = True
+    run_config.optimizer.overlap_param_gather = True
+    run_config.optimizer.overlap_param_gather_with_optimizer_step = overlap_optimizer_step
+    run_config.ddp.use_distributed_optimizer = True
+    run_config.ddp.overlap_param_gather = True
+    run_config.ddp.overlap_grad_reduce = overlap_grad_reduce
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
+
+    before = copy.deepcopy(run_config.to_dict())
+    for _ in range(2):
+        run_config.validate()
+        assert run_config.to_dict() == before
+        assert not run_config._finalized
+
+    with caplog.at_level("WARNING", logger="megatron.training.config.container"):
+        run_config.finalize()
+
+    assert "freeze_all_layers" in caplog.text
+    assert "use_distributed_optimizer" in caplog.text and "overlap_param_gather" in caplog.text
+    assert not run_config.optimizer.use_distributed_optimizer
+    assert not run_config.optimizer.overlap_param_gather
+    assert not run_config.optimizer.overlap_param_gather_with_optimizer_step
+    assert not run_config.ddp.use_distributed_optimizer
+    assert not run_config.ddp.overlap_param_gather
+    if overlap_optimizer_step:
+        assert "overlap_param_gather_with_optimizer_step" in caplog.text
+
+
 @pytest.mark.parametrize("packed", [False, True])
 def test_dataset_content_limit_and_execution_bound_are_distinct(run_config, packed):
     cfg = run_config
