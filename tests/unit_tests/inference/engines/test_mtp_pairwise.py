@@ -1351,7 +1351,7 @@ class TestMTPPairwiseParallel(_DynamicEngineTestBase):
                 assert parallel_state.get_data_parallel_world_size() == 2
                 outputs = [request.generated_tokens for request in treatment.requests]
                 acceptance = dict(treatment.witness.accepted_by_request)
-                dp_group = parallel_state.get_data_parallel_group_gloo()
+                dp_group = parallel_state.get_data_parallel_group()
                 gathered = [None] * torch.distributed.get_world_size(group=dp_group)
                 torch.distributed.all_gather_object(gathered, (outputs, acceptance), group=dp_group)
                 assert all(rank_result == (outputs, acceptance) for rank_result in gathered)
