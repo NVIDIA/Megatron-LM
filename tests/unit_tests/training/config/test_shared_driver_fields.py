@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 """Shared configuration ownership, native flags, and saved driver settings."""
 
 from argparse import ArgumentParser
