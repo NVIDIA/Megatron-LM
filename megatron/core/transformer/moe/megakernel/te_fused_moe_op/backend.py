@@ -154,7 +154,11 @@ class TEFusedMoEOp(MegakernelBackend):
         return mega_op
 
     def forward(
-        self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        probs: torch.Tensor,
+        routing_map: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run NCCL EP and grouped MLP, retaining per-forward routing state for backward."""
         from transformer_engine.pytorch import ep
@@ -188,6 +192,7 @@ class TEFusedMoEOp(MegakernelBackend):
             probs.reshape(-1, self.config.num_moe_experts).contiguous(),
             routing_map.reshape(-1, self.config.num_moe_experts).contiguous(),
             config.top_k,
+            padding_mask,
         )
         experts, shared_experts = self._native_experts
         fc1_recipe = _get_fp8_autocast_recipe_for_quant_params(
