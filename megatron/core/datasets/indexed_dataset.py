@@ -5,6 +5,7 @@
 
 # Essentially re-written in entirety
 
+import errno
 import gc
 import logging
 import os
@@ -428,20 +429,99 @@ class _MMapBinReader(_BinReader):
 
 
 class _FileBinReader(_BinReader):
-    """A _BinReader that reads from the data (.bin) file using a file pointer
+    """A _BinReader that reads from the data (.bin) file with positional reads
+
+    Holds one lazily opened descriptor per reader instead of reopening the file for every
+    document. os.preadv takes the offset as an argument, so a persistent descriptor has no shared
+    cursor for forked DataLoader workers to race on. Reads are safe across forked processes, but
+    concurrent reads through the same reader from multiple threads are unsupported: lazy opening
+    can leak descriptors, and retries can close a descriptor used by another thread.
 
     Args:
         bin_path (str): The path to the data (.bin) file.
+
+        num_max_retries (int): Maximum retries after read failures; truncation and
+            out-of-descriptor errors raise immediately. Defaults to 3.
+
+        sleep_duration_start (int): Seconds to sleep before the first retry, doubled each
+            attempt. Defaults to 10.
     """
 
     def __init__(
         self, bin_path: str, num_max_retries: int = 3, sleep_duration_start: int = 10
     ) -> None:
         self._bin_path = bin_path
-        # Retry-specific parameters. With default arguments, sleep for 10, 20, 40 seconds
-        # between retries.
+        self._fd: Optional[int] = None
         self.num_max_retries = num_max_retries
         self.sleep_duration_start = sleep_duration_start
+
+    def __getstate__(self) -> dict:
+        """Get the state during pickling and copying, without the descriptor
+
+        A copy holding the original's descriptor number could close it out from under the
+        original; the copy reopens lazily.
+        """
+        state = self.__dict__.copy()
+        state["_fd"] = None
+        return state
+
+    def _open_fd(self) -> int:
+        """Return the descriptor, opening it on first use."""
+        if self._fd is None:
+            try:
+                self._fd = os.open(self._bin_path, os.O_RDONLY)
+            except OSError as e:
+                if e.errno in (errno.EMFILE, errno.ENFILE):
+                    logger.error(
+                        "Out of file descriptors opening %s; this reader holds one per dataset. "
+                        "%s",
+                        self._bin_path,
+                        (
+                            "Raise the process limit (RLIMIT_NOFILE)."
+                            if e.errno == errno.EMFILE
+                            else "Check the system-wide open-file limit."
+                        ),
+                    )
+                raise
+        return self._fd
+
+    def _close_fd(self) -> None:
+        """Close the descriptor if one is open."""
+        # Clear first so the descriptor is closed at most once, even if close raises.
+        fd, self._fd = self._fd, None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _read_preadv(self, dtype: Type[numpy.number], count: int, offset: int) -> numpy.ndarray:
+        """Read `count` items from the held descriptor at `offset`."""
+        sequence = numpy.empty(count, dtype=dtype)
+        buffer = memoryview(sequence).cast("B")
+        fd = self._open_fd()
+        # preadv may return fewer bytes than requested, including when Linux's per-call
+        # transfer limit is reached. Loop until the buffer is full.
+        nread = 0
+        while nread < len(buffer):
+            n = os.preadv(fd, [buffer[nread:]], int(offset) + nread)
+            if n == 0:
+                # The tail is uninitialized heap; returning it would be silent corruption.
+                raise EOFError(
+                    f"Read {nread} of {len(buffer)} bytes from {self._bin_path} at offset "
+                    f"{offset}; the .bin file is shorter than the .idx file claims"
+                )
+            nread += n
+        return sequence
+
+    def _read_msc(self, dtype: Type[numpy.number], count: int, offset: int) -> numpy.ndarray:
+        """Read through the multi-storage client's file interface, retaining open/seek/read."""
+        sequence = numpy.empty(count, dtype=dtype)
+        msc = MultiStorageClientFeature.import_package()
+        with msc.open(self._bin_path, mode="rb", buffering=0) as bin_buffer_file:
+            bin_buffer_file.seek(offset)
+            bin_buffer_file.readinto(sequence)
+        return sequence
 
     def read(self, dtype: Type[numpy.number], count: int, offset: int) -> numpy.ndarray:
         """Read bytes into a numpy array.
@@ -457,20 +537,19 @@ class _FileBinReader(_BinReader):
             numpy.ndarray: An array with `count` items and data-type `dtype` constructed from
                 reading bytes from the data file starting at `offset`.
         """
-
-        def _read():
-            """Helper method to read `count` bytes from self._bin_path at provided offset."""
-            sequence = numpy.empty(count, dtype=dtype)
-            with maybe_msc.open(self._bin_path, mode="rb", buffering=0) as bin_buffer_file:
-                bin_buffer_file.seek(offset)
-                bin_buffer_file.readinto(sequence)
-            return sequence
+        _read = self._read_msc if MultiStorageClientFeature.is_enabled() else self._read_preadv
 
         sleep_duration = self.sleep_duration_start
         for i in range(self.num_max_retries + 1):
             try:
-                return _read()
+                return _read(dtype, count, offset)
             except Exception as e:
+                # A stale descriptor may be the cause, so drop it and reopen on the next attempt.
+                self._close_fd()
+                if isinstance(e, EOFError):
+                    raise  # a truncated file stays truncated
+                if isinstance(e, OSError) and e.errno in (errno.EMFILE, errno.ENFILE):
+                    raise  # fail fast on descriptor exhaustion rather than retrying
                 time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
                 if i == self.num_max_retries:
                     logger.warning(
@@ -488,6 +567,13 @@ class _FileBinReader(_BinReader):
                 sleep_duration = sleep_duration * 2
 
         raise RuntimeError("Should not reach here!")
+
+    def __del__(self) -> None:
+        """Clean up the object."""
+        try:
+            self._close_fd()
+        except Exception:
+            pass
 
 
 class _S3BinReader(_BinReader):
