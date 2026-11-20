@@ -753,13 +753,8 @@ def test_evict_lru_preserves_invariant_under_random_chains():
         _assert_prefix_invariant(a)
 
 
-@pytest.mark.parametrize(
-    "order",
-    [np.arange(8), np.array([0, 4, 1, 5, 2, 6, 3, 7])],
-    ids=["block-contiguous", "interleaved"],
-)
-def test_store_prompt_logprobs_preserves_rows(order):
-    """Store each row in its block and slot regardless of input grouping."""
+def test_store_prompt_logprobs_preserves_rows():
+    """Store grouped rows in their blocks even when block IDs are out of order."""
     allocator = _pc_allocator(_make_context(), POOL_SIZE, PAUSED_LIMIT)
     block_ids = np.repeat([4, 2], BLOCK_SIZE_TOKENS)
     slots = np.tile(np.arange(BLOCK_SIZE_TOKENS), 2)
@@ -769,12 +764,7 @@ def test_store_prompt_logprobs_preserves_rows(order):
     next_token_ids = np.arange(300, 308)
 
     allocator.store_prompt_logprobs(
-        block_ids[order],
-        slots[order],
-        log_probs[order],
-        top_n_log_probs[order],
-        top_n_token_ids[order],
-        next_token_ids[order],
+        block_ids, slots, log_probs, top_n_log_probs, top_n_token_ids, next_token_ids
     )
 
     for block_id, start in ((4, 0), (2, BLOCK_SIZE_TOKENS)):
@@ -785,3 +775,18 @@ def test_store_prompt_logprobs_preserves_rows(order):
         np.testing.assert_array_equal(entry.top_n_token_ids, top_n_token_ids[rows])
         assert entry.valid.all()
         assert entry.next_token_id == next_token_ids[start + BLOCK_SIZE_TOKENS - 1]
+
+
+def test_store_prompt_logprobs_rejects_interleaved_blocks():
+    """Reject a repeated block run before writing any cache entries."""
+    allocator = _pc_allocator(_make_context(), POOL_SIZE, PAUSED_LIMIT)
+    with pytest.raises(AssertionError, match="grouped by block"):
+        allocator.store_prompt_logprobs(
+            block_ids=np.array([4, 2, 4]),
+            slots=np.array([0, 0, 1]),
+            log_probs=np.zeros(3, dtype=np.float32),
+            top_n_log_probs=np.empty((3, 0), dtype=np.float32),
+            top_n_token_ids=np.empty((3, 0), dtype=np.int64),
+            next_token_ids=np.arange(3),
+        )
+    assert not allocator.pc_state.block_prompt_logprobs

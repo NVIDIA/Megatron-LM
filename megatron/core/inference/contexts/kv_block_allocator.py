@@ -412,7 +412,7 @@ class KVBlockAllocator:
         earlier writer requested.
 
         Args:
-            block_ids: Block ID of each row, shape `[R]`.
+            block_ids: Block ID of each row, shape `[R]`. Rows must be grouped by block.
             slots: Source position of each row within its block, shape `[R]`.
             log_probs: Selected-token log-prob of each row, shape `[R]`.
             top_n_log_probs: Top-N log-probs of each row, shape `[R, top_n]`.
@@ -425,7 +425,7 @@ class KVBlockAllocator:
             block_ids, return_index=True, return_counts=True
         )
         num_runs = int(block_ids.size > 0) + np.count_nonzero(block_ids[1:] != block_ids[:-1])
-        blocks_are_contiguous = len(unique_blocks) == num_runs
+        assert len(unique_blocks) == num_runs, "Prompt log-prob rows must be grouped by block"
         for block_id, first_row, row_count in zip(
             unique_blocks.tolist(), first_rows.tolist(), row_counts.tolist()
         ):
@@ -435,12 +435,7 @@ class KVBlockAllocator:
                 self.pc_state.block_prompt_logprobs[block_id] = entry
             elif entry.top_n > top_n:
                 continue
-            # Captured prompt rows are block-contiguous; retain generic caller behavior.
-            rows = (
-                slice(first_row, first_row + row_count)
-                if blocks_are_contiguous
-                else block_ids == block_id
-            )
+            rows = slice(first_row, first_row + row_count)
             block_slots = slots[rows]
             entry.log_probs[block_slots] = log_probs[rows]
             entry.top_n_log_probs[block_slots] = top_n_log_probs[rows]
