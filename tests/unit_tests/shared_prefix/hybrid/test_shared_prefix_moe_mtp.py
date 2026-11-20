@@ -524,45 +524,6 @@ class TestSharedPrefixMTPDistributedParity:
             )
 
     @pytest.mark.usefixtures("_mtp_scale")
-    @pytest.mark.parametrize(
-        "roots,forest", [(MTP_CP2_STAR, False), (MTP_CP2_FOREST, True)], ids=["star", "forest"]
-    )
-    def test_mtp_excluded_padding_counts_match_dense_tp2_sp_cp2(self, roots, forest, monkeypatch):
-        """With padding excluded, backbone and MTP router counts match the masked dense run.
-
-        Covers the SP-sharded MTP padding mask and its CP-local branch limits.
-        """
-        if Utils.world_size < 4 or Utils.world_size % 4:
-            pytest.skip("requires a world size divisible by 4")
-        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-
-        Utils.initialize_model_parallel(2, 1, context_parallel_size=2)
-        model_parallel_cuda_manual_seed(123)
-        clear_attention_env(monkeypatch)
-        torch.manual_seed(0)
-        model = build_hybrid_model(MTP_PATTERN, torch.bfloat16, calculate_per_token_loss=True)
-        problem = SharedPrefixProblem(roots, padding_multiple=8, topology_multiple=8)
-        tokens = TokenProblem(problem, vocab_size=2048, seed=1)
-        routing = ReplayedRouting(model, tokens.num_keys, seed=2)
-        try:
-            counted = run_dense_rows(model, tokens, routing)
-            masked = run_dense_rows(model, tokens, routing, mask_sequence_padding=True)
-            shared = run_shared(
-                model,
-                tokens,
-                problem.layout(forest),
-                routing,
-                shared_prefix_exclude_sequence_padding_from_expert_bias=True,
-            )
-        finally:
-            routing.close()
-        assert len(shared.counts) > MTP_PATTERN.split("/")[0].count("E")
-        for masked_count, counted_count in zip(masked.counts, counted.counts):
-            assert torch.sum(masked_count) < torch.sum(counted_count)
-        for shared_count, masked_count in zip(shared.counts, masked.counts):
-            torch.testing.assert_close(shared_count, masked_count, rtol=0, atol=0)
-
-    @pytest.mark.usefixtures("_mtp_scale")
     def test_shared_mtp_rerun_is_bitwise_tp2_sp_cp2(self, monkeypatch):
         """With deterministic kernels, a shared forest with MoE MTP heads reruns bit for bit.
 

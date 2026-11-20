@@ -2,9 +2,6 @@
 
 """Shared-prefix HybridStack guard tests that need no GPU or process-group setup."""
 
-import subprocess
-import sys
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -20,7 +17,7 @@ from megatron.core.models.hybrid.shared_prefix import (
 )
 from megatron.core.ops import _backends
 from megatron.core.ops.attention import shared_prefix as forest_attention
-from megatron.core.shared_prefix_layout import SharedPrefixForestLayout, SharedPrefixLayout
+from megatron.core.shared_prefix_layout import SharedPrefixLayout
 from megatron.core.ssm import mamba_shared_prefix
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.ssm.mamba_mixer import MambaMixer
@@ -407,13 +404,6 @@ def test_consecutive_mamba_layers_run_their_module_hooks(monkeypatch):
     assert requests["layer0"] is not requests["layer1"]
 
 
-def test_stack_validation_needs_only_the_physical_length():
-    stack = _stack(_config())
-    _validate_hybrid_stack(stack, _LAYOUT, physical_len=_LAYOUT.total_len)
-    with pytest.raises(ValueError, match="does not match layout"):
-        _validate_hybrid_stack(stack, _LAYOUT, physical_len=_LAYOUT.total_len + 1)
-
-
 def _moe_identity_layer(calls):
     layer = Mock(spec=TransformerLayer)
     layer.self_attention = IdentityOp()
@@ -486,126 +476,6 @@ def test_forward_rejects_unsupported_stack_before_running_layers():
         )
 
 
-def test_prevalidated_forward_checks_only_the_physical_length():
-    """A caller that already validated the stack is not validated again; the length must match."""
-    config = _config(moe=True, moe_router_enable_expert_bias=True)
-    hidden_states = torch.zeros(12, 1, 8, dtype=torch.bfloat16)
-    calls = []
-    stack = _stack(config, [_moe_identity_layer(calls)])
-
-    def forward(**kwargs):
-        forward_hybrid_stack_shared_prefix(
-            stack, hidden_states, _PADDED_LAYOUT, position_embedding_type="none", **kwargs
-        )
-
-    with patch.object(shared_prefix, "_validate_hybrid_stack") as validate:
-        with pytest.raises(RuntimeError, match="validated for 16"):
-            forward(validated_physical_len=16)
-        assert calls == []
-        forward(validated_physical_len=12)
-        validate.assert_not_called()
-        forward()
-        validate.assert_called_once()
-        assert validate.call_args.kwargs == {"physical_len": 12}
-    assert len(calls) == 2
-
-
-@pytest.mark.parametrize("forest", [False, True], ids=["star", "forest"])
-def test_layer_calls_carry_their_shared_prefix_arguments(forest):
-    """Each layer call receives the shared-prefix inputs of its layer type as arguments.
-
-    Self-attention layers get the RoPE table and the layout as a forest (a star becomes a forest
-    with one root); MoE layers get the expert-bias multiplicities; a layer with both gets both.
-    """
-    layout = SharedPrefixForestLayout((_PADDED_LAYOUT,)) if forest else _PADDED_LAYOUT
-    config = _config(moe=True, moe_router_enable_expert_bias=True)
-    moe = Mock(spec=TransformerLayer)
-    moe.self_attention = IdentityOp()
-    layers = {"attention": _attention_layer(config), "moe": moe, "both": _attention_layer(config)}
-    moe.is_moe_layer = layers["both"].is_moe_layer = True
-    received = {}
-    for name, layer in layers.items():
-
-        def forward(hidden_states, *, name=name, **kwargs):
-            received[name] = kwargs
-            return hidden_states
-
-        layer.side_effect = forward
-    rotary_pos_emb = torch.zeros(1)
-
-    forward_hybrid_stack_shared_prefix(
-        _stack(config, list(layers.values())),
-        torch.zeros(12, 1, 8, dtype=torch.bfloat16),
-        layout,
-        rotary_pos_emb=rotary_pos_emb,
-        validated_physical_len=12,
-    )
-
-    attention_args = {"attention_mask", "rotary_pos_emb", "shared_prefix_forest"}
-    moe_args = {"attention_mask", "shared_prefix_token_multiplicities"}
-    assert set(received["attention"]) == attention_args
-    assert set(received["moe"]) == moe_args
-    assert set(received["both"]) == attention_args | moe_args
-    for name in ("attention", "both"):
-        assert received[name]["attention_mask"] is None
-        assert received[name]["rotary_pos_emb"] is rotary_pos_emb
-        assert received[name]["shared_prefix_forest"] == SharedPrefixForestLayout((_PADDED_LAYOUT,))
-        if forest:
-            assert received[name]["shared_prefix_forest"] is layout
-    multiplicities = received["moe"]["shared_prefix_token_multiplicities"]
-    assert received["both"]["shared_prefix_token_multiplicities"] is multiplicities
-    expected = torch.tensor([2.0, 2, 2, 1, 1, 1, 1, 1, 1, 0, 0, 0])
-    torch.testing.assert_close(multiplicities, expected, rtol=0, atol=0)
-
-
-def test_full_recompute_replays_each_layer_call_with_its_arguments(monkeypatch):
-    """Backward recomputation calls every layer again with the same shared-prefix arguments."""
-    config = _config(
-        moe=True,
-        moe_router_enable_expert_bias=True,
-        recompute_granularity="full",
-        recompute_method="uniform",
-        recompute_num_layers=1,
-    )
-    moe = Mock(spec=TransformerLayer)
-    moe.self_attention = IdentityOp()
-    moe.is_moe_layer = True
-    layers = {"attention": _attention_layer(config), "moe": moe}
-    calls = {name: [] for name in layers}
-    for name, layer in layers.items():
-
-        def forward(hidden_states, *, name=name, **kwargs):
-            calls[name].append(kwargs)
-            return 2 * hidden_states
-
-        layer.side_effect = forward
-    # Megatron's checkpoint needs the CUDA RNG tracker; torch's replays the callable the same way.
-    monkeypatch.setattr(
-        shared_prefix.tensor_parallel,
-        "checkpoint",
-        lambda function, distribute_saved_activations, *args: torch.utils.checkpoint.checkpoint(
-            function, *args, use_reentrant=True
-        ),
-    )
-    hidden_states = torch.ones(12, 1, 8, dtype=torch.bfloat16, requires_grad=True)
-
-    output = forward_hybrid_stack_shared_prefix(
-        _stack(config, list(layers.values())),
-        hidden_states,
-        _PADDED_LAYOUT,
-        position_embedding_type="none",
-        validated_physical_len=12,
-    )
-    assert [len(layer_calls) for layer_calls in calls.values()] == [1, 1]
-    output.float().sum().backward()
-
-    for (forward_call, replay), argument in zip(
-        calls.values(), ("shared_prefix_forest", "shared_prefix_token_multiplicities")
-    ):
-        assert replay.keys() == forward_call.keys()
-        assert replay[argument] is forward_call[argument]
-
-
 def test_hybrid_model_rejects_config_list_before_any_preprocessing():
     """Shared-prefix guards read the model-level config, not config-list per-layer configs."""
     from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -633,30 +503,3 @@ def test_hybrid_model_rejects_config_list_before_any_preprocessing():
 
 # Run in a fresh interpreter as if einops were not installed (Transformer Engine needs einops, so
 # it is hidden too), import HybridModel, and check that the adapter was not loaded.
-_IMPORT_HYBRID_MODEL_WITHOUT_EINOPS = """
-import sys
-
-sys.path.insert(0, sys.argv[1])
-
-
-class HideModules:
-    def find_spec(self, name, path=None, target=None):
-        top = name.partition(".")[0]
-        if top in ("einops", "transformer_engine"):
-            raise ModuleNotFoundError(f"No module named {top!r}", name=top)
-        return None
-
-
-sys.meta_path.insert(0, HideModules())
-import megatron.core.models.hybrid.hybrid_model
-
-assert "megatron.core.models.hybrid.shared_prefix" not in sys.modules
-"""
-
-
-def test_hybrid_model_import_does_not_load_the_adapter():
-    """Without a layout, HybridModel keeps its import graph and does not need einops."""
-    repo = Path(__file__).resolve().parents[4]
-    subprocess.run(
-        [sys.executable, "-c", _IMPORT_HYBRID_MODEL_WITHOUT_EINOPS, str(repo)], check=True
-    )

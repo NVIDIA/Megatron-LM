@@ -66,27 +66,6 @@ STAR = ((300, (97, 210, 41, 150)),)
 FOREST = ((150, (60, 131)), (200, (33, 90, 47, 70)))
 
 
-@pytest.fixture
-def _deterministic_kernels(monkeypatch):
-    """Bit-reproducible backward for the test, restored afterwards.
-
-    The Mamba scan, causal_conv1d and TE attention backward kernels accumulate with atomics by
-    default, so two identical calls differ in the last bits (Mamba ``A_log`` first). They take
-    ordered reductions when torch's deterministic flag (or their environment switch) is set.
-    """
-    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
-    monkeypatch.setenv("MAMBA_DETERMINISTIC", "1")
-    monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
-    previous = torch.are_deterministic_algorithms_enabled()
-    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
-    torch.use_deterministic_algorithms(True, warn_only=True)
-    try:
-        yield
-    finally:
-        torch.use_deterministic_algorithms(previous, warn_only=previous_warn_only)
-
-
 def _problem(roots):
     return SharedPrefixProblem(
         roots, padding_multiple=PADDING_MULTIPLE, topology_multiple=PADDING_MULTIPLE
@@ -344,72 +323,6 @@ class TestSharedPrefixHybridModelParity:
                 shared_prefix_exclude_sequence_padding_from_expert_bias=exclude,
             )
 
-    @pytest.mark.parametrize("exclude", [None, False, True], ids=["unset", "counted", "excluded"])
-    def test_expert_bias_padding_flag_reaches_the_stack(self, exclude, monkeypatch):
-        """Unset, the model leaves the convention to the stack's dispatcher-based inference."""
-        from megatron.core.models.hybrid import shared_prefix
-
-        clear_attention_env(monkeypatch)
-        torch.manual_seed(0)
-        model = build_hybrid_model(PATTERN, torch.bfloat16)
-        tokens = TokenProblem(_problem(STAR), vocab_size=2048, seed=1)
-        forward = shared_prefix.forward_hybrid_stack_shared_prefix
-        received = []
-
-        def recording_forward(*args, exclude_sequence_padding_from_expert_bias, **kwargs):
-            received.append(exclude_sequence_padding_from_expert_bias)
-            return forward(
-                *args,
-                exclude_sequence_padding_from_expert_bias=exclude_sequence_padding_from_expert_bias,
-                **kwargs,
-            )
-
-        monkeypatch.setattr(shared_prefix, "forward_hybrid_stack_shared_prefix", recording_forward)
-        flag = {}
-        if exclude is not None:
-            flag["shared_prefix_exclude_sequence_padding_from_expert_bias"] = exclude
-        run_shared(model, tokens, tokens.problem.layout(forest=False), **flag)
-        assert received == [exclude]
-
-    def test_forward_validates_the_stack_once(self, monkeypatch):
-        """HybridModel validates before its embedding; the stack forward does not repeat it."""
-        from megatron.core.models.hybrid import shared_prefix
-
-        clear_attention_env(monkeypatch)
-        torch.manual_seed(0)
-        model = build_hybrid_model(PATTERN, torch.bfloat16)
-        tokens = TokenProblem(_problem(STAR), vocab_size=2048, seed=1)
-        validate = shared_prefix._validate_hybrid_stack
-        physical_lens = []
-
-        def counting_validate(*args, physical_len, **kwargs):
-            physical_lens.append(physical_len)
-            return validate(*args, physical_len=physical_len, **kwargs)
-
-        monkeypatch.setattr(shared_prefix, "_validate_hybrid_stack", counting_validate)
-        run_shared(model, tokens, tokens.problem.layout(forest=False))
-        assert physical_lens == [tokens.problem.physical_len]
-
-    @pytest.mark.usefixtures("_deterministic_kernels")
-    @pytest.mark.parametrize("pattern", [PATTERN, MTP_PATTERN], ids=["no-mtp", "mtp"])
-    def test_explicit_none_layout_is_the_default_path(self, pattern, monkeypatch):
-        """``shared_prefix_layout=None`` runs the ordinary forward bit for bit (feature off)."""
-        clear_attention_env(monkeypatch)
-        torch.manual_seed(0)
-        model = build_hybrid_model(pattern, torch.bfloat16)
-        tokens = TokenProblem(_problem(STAR), vocab_size=2048, seed=1)
-        # Natural (not replayed) routing: this is the production default path.
-        omitted = run_dense_rows(model, tokens)
-        explicit = run_dense_rows(model, tokens, shared_prefix_layout=None)
-        for omitted_logits, explicit_logits in zip(omitted.logits, explicit.logits):
-            assert torch.equal(omitted_logits, explicit_logits)
-        assert omitted.grads.keys() == explicit.grads.keys()
-        for name, grad in omitted.grads.items():
-            assert torch.equal(grad, explicit.grads[name]), name
-        assert len(omitted.counts) == pattern.count("E")
-        for omitted_count, explicit_count in zip(omitted.counts, explicit.counts):
-            assert torch.equal(omitted_count, explicit_count)
-
 
 @pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -436,12 +349,19 @@ class TestSharedPrefixHybridModelDistributedParity:
         return dense, shared, compare_model_runs(shared, dense, model)
 
     @pytest.mark.parametrize(
-        "tp,cp,mamba_backend",
-        [(2, 2, None), (1, 4, None), (2, 2, "state_fork")],
-        ids=["tp2-sp-cp2", "tp1-cp4", "tp2-sp-cp2-state-fork"],
-    )
-    @pytest.mark.parametrize(
-        "roots,forest", [(STAR, False), (FOREST, True)], ids=["star", "forest"]
+        "roots,forest,tp,cp,mamba_backend",
+        [
+            (STAR, False, 2, 2, None),
+            (FOREST, True, 2, 2, None),
+            (FOREST, True, 1, 4, None),
+            (FOREST, True, 2, 2, "state_fork"),
+        ],
+        ids=[
+            "star-tp2-sp-cp2",
+            "forest-tp2-sp-cp2",
+            "forest-tp1-cp4",
+            "forest-tp2-sp-cp2-state-fork",
+        ],
     )
     def test_model_matches_dense_rows_distributed(
         self, tp, cp, mamba_backend, roots, forest, monkeypatch

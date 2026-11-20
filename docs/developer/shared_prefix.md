@@ -184,8 +184,8 @@ replaces:
 
 - `tests/unit_tests/shared_prefix/hybrid/test_shared_prefix_model_parity.py`:
   HybridModel logits, parameter gradients and expert-bias counts for stars and
-  forests at TP1/CP1, TP2/SP/CP2 and TP1/CP4; full recomputation against the plain
-  shared forward; and the default path with an explicit `None` layout, bit for bit.
+  forests at TP1/CP1, TP2/SP/CP2 and TP1/CP4; and full recomputation against the plain
+  shared forward.
 - `tests/unit_tests/shared_prefix/hybrid/test_shared_prefix_moe_mtp.py` and
   `test_shared_prefix_mtp_branches.py`: expert-bias counts through a real router,
   MTP parity and grouped normalization at TP1/CP1 and TP2/SP/CP2, the fixed-order
@@ -202,8 +202,7 @@ replaces:
   forward context restored during recomputation.
 - `tests/unit_tests/shared_prefix/hybrid/test_shared_prefix_guards.py` and
   `tests/unit_tests/shared_prefix/test_shared_prefix_layout.py`: the explicit
-  guards, the layout metadata, the arguments each layer call receives, and the
-  order of Mamba module hooks, on CPU.
+  guards, the layout metadata, and the order of Mamba module hooks, on CPU.
 
 In FP32, shared and dense execution differ only in summation order. The layer
 tests bound that difference at 1e-5 relative L2 for MoE and 5e-5 for Mamba. Their

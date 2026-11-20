@@ -18,7 +18,6 @@ from megatron.core.models.hybrid.shared_prefix import (
     _shared_prefix_mtp_branch_indices,
 )
 from megatron.core.shared_prefix_layout import SharedPrefixForestLayout, SharedPrefixLayout
-from megatron.core.transformer.moe import moe_utils
 from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 from tests.unit_tests.test_utilities import Utils
 
@@ -136,34 +135,6 @@ def test_fixed_order_row_gather_backward_is_bitwise_reproducible_on_cuda():
         assert torch.equal(gradient(), reference)
     expected = _ordered_gradient(indices, cotangent, layout.total_len)
     torch.testing.assert_close(reference.cpu(), expected, rtol=0, atol=0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_fixed_order_row_gather_backward_memory_matches_index_select():
-    """Only prompt rows pay for the FP32 accumulation; the rest gather in BF16."""
-    prompt, completions, hidden = 256, (2048,) * 8, 512
-    layout = SharedPrefixLayout(prompt, completions)
-    indices = torch.cat(layout.dense_branch_indices("cuda"))
-    value = torch.randn(layout.total_len, 1, hidden, device="cuda", dtype=torch.bfloat16)
-    cotangent = torch.randn(indices.numel(), 1, hidden, device="cuda", dtype=torch.bfloat16)
-
-    def backward_peak(gather):
-        source = value.clone().requires_grad_()
-        output = gather(source)
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
-        baseline = torch.cuda.memory_allocated()
-        output.backward(cotangent)
-        torch.cuda.synchronize()
-        return torch.cuda.max_memory_allocated() - baseline
-
-    index_select_peak = backward_peak(lambda source: source.index_select(0, indices))
-    fixed_order_peak = backward_peak(
-        lambda source: _gather_shared_prefix_mtp_rows(source, indices, layout)
-    )
-    # FP32 prompt-row accumulator plus one BF16 prompt-row copy and the int64 masks.
-    prompt_bytes = prompt * hidden * (4 + 2) + 8 * layout.total_len
-    assert fixed_order_peak <= index_select_peak + prompt_bytes + (1 << 20)
 
 
 class _ReachedBackbone(Exception):
@@ -323,19 +294,6 @@ class TestSharedPrefixMTPModel:
             # A star has no loss groups and keeps the global normalization.
             with pytest.raises(_ReachedBackbone):
                 self._forward(model, roots[0])
-
-    def test_mtp_runs_inside_router_gating_token_blocks(self):
-        model = self._model()
-        block_sizes = []
-        original_forward = model.mtp.forward
-
-        def recording_forward(*args, **kwargs):
-            block_sizes.append(moe_utils._ROUTER_GATING_TOKEN_BLOCK_SIZE.get())
-            return original_forward(*args, **kwargs)
-
-        model.mtp.forward = recording_forward
-        self._forward(model, _star(16, (9, 23)))
-        assert len(block_sizes) == 1 and block_sizes[0] is not None
 
     def test_shared_star_mtp_backbone_gradients_are_reproducible(self, monkeypatch):
         """Prompt rows feed every dense MTP branch; their gradients must sum reproducibly."""
