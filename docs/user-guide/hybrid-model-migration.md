@@ -368,7 +368,9 @@ with additional pipe-delimited segments instead.
 
 For Python-defined architectures, `HybridModelBuilder` accepts
 `hybrid_layer_config_list` with `PipelineSplit` markers and a matching PP/VPP
-topology. Configure VPP explicitly with
+topology. If a CLI entry point supplies the layer list after argument validation,
+set `parser.set_defaults(is_hybrid_model=True)` in its extra argument provider so
+validation allows uneven pipeline splits. Configure VPP explicitly with
 `--num-virtual-stages-per-pipeline-rank`; do not infer it with
 `--num-layers-per-virtual-pipeline-stage`. Core validates the markers against
 the configured topology. GPT checkpoint translation still requires a pattern.

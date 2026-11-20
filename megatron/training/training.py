@@ -4612,12 +4612,6 @@ def train(
     moe_logging_metadata = None
     has_moe_layers = cfg.model.transformer.num_moe_experts is not None
     if hybrid_model is not None and hybrid_model.hybrid_layer_config_list is not None:
-        # Validate custom estimates before the first step through the same accounting path.
-        num_floating_point_operations(
-            cfg.model, 1, sequence_length=1,
-            total_real_tokens_in_batch=1, seqlen_squared_sum_in_batch=1,
-            hybrid_models=hybrid_models,
-        )
         moe_logging_metadata = _hybrid_config_list_moe_logging_metadata(
             hybrid_model.hybrid_layer_config_list,
             hybrid_model.config.mtp_use_repeated_layer,
