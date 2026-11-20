@@ -388,6 +388,46 @@ def test_load_from_state_dict_backwards_compatible_with_split_kv_up_projection(m
     assert f"{prefix}linear_v_up_proj._extra_state" not in captured_state_dict
 
 
+def test_softmax_scale_respects_explicit_config_override():
+    """AbsorbedMLA is documented as mathematically equivalent to standard MLA, so an
+    explicit config.softmax_scale (e.g. the one TransformerConfig derives for muP
+    training) must produce the same softmax_scale on both, not just the implicit
+    1/sqrt(q_head_dim) default."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+    model_parallel_cuda_manual_seed(123)
+
+    qk_layernorm = True
+    config = get_mock_mla_config(
+        tensor_model_parallel_size=1, context_parallel_size=1, qk_layernorm=qk_layernorm
+    )
+    config.softmax_scale = 1.0 / 128  # an arbitrary non-default override, e.g. from muP
+    absorbed_submodules = get_absorbed_mla_submodules(
+        down_proj_use_column_parallel=False, qk_layernorm=qk_layernorm, rms_norm=True
+    )
+    standard_submodules = get_mla_submodules(
+        down_proj_use_column_parallel=False, qk_layernorm=qk_layernorm, rms_norm=True
+    )
+    absorbed_mla = AbsorbedMLASelfAttention(
+        config=config,
+        submodules=absorbed_submodules,
+        layer_number=0,
+        attn_mask_type=AttnMaskType.causal,
+        cp_comm_type=None,
+        pg_collection=None,
+    )
+    standard_mla = MLASelfAttention(
+        config=config,
+        submodules=standard_submodules,
+        layer_number=0,
+        attn_mask_type=AttnMaskType.causal,
+        cp_comm_type=None,
+        pg_collection=None,
+    )
+
+    assert absorbed_mla.softmax_scale == standard_mla.softmax_scale
+    Utils.destroy_model_parallel()
+
+
 @pytest.mark.parametrize("tp_cp", [[1, 1], [2, 1], [1, 2], [2, 2]])
 @pytest.mark.parametrize("qkv_format", ['sbhd', 'thd'])
 @pytest.mark.parametrize("down_proj_use_column_parallel", [False, True])
