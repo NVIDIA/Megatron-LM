@@ -1863,6 +1863,17 @@ class ChainedOptimizer(MegatronOptimizer):
             non_indexer_params.extend(child_non_indexer_params)
         return indexer_params, non_indexer_params
 
+    def get_main_param_shard(self, model_param: torch.nn.Parameter) -> Optional[torch.Tensor]:
+        """Return the FP32 main param shard held by this rank for model_param, or None."""
+        for optimizer in self.chained_optimizers:
+            get_main_param_shard = getattr(optimizer, 'get_main_param_shard', None)
+            if get_main_param_shard is None:
+                continue
+            shard = get_main_param_shard(model_param)
+            if shard is not None:
+                return shard
+        return None
+
     @property
     def state(self) -> ProxyDict:
         """

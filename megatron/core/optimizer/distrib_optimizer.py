@@ -1431,6 +1431,35 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     tensors[k] = v
         return tensors
 
+    def get_main_param_shard(self, model_param: torch.nn.Parameter) -> Optional[torch.Tensor]:
+        """FP32 main param shard this rank holds for model_param, or None if it holds none."""
+
+        if self.is_stub_optimizer or self.ddp_config.use_megatron_fsdp:
+            return None
+        if model_param not in self.model_param_group_index_map:
+            return None
+        group_index, group_order = self.model_param_group_index_map[model_param]
+        inner_param = self.optimizer.param_groups[group_index]["params"][group_order]
+        if not self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            # The inner optimizer's params are the FP32 main param shards.
+            return inner_param
+
+        # inner_param is the local 16-bit model param shard; TE owns the masters.
+        state = self.optimizer.state.get(inner_param, {})
+        master = state.get("master_param")
+        if master is None:
+            # TE creates the masters from the model params on the first step.
+            return inner_param.float()
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            # CPU-offloaded masters live on the host.
+            return master.to(device=inner_param.device, dtype=torch.float32)
+        if master.dtype == torch.int16:
+            # Int16 param remainders: reassemble the FP32 master as the TE Adam kernel does.
+            high_bits = inner_param.view(torch.int16) - (master < 0).to(torch.int16)
+            fp32_bits = (high_bits.to(torch.int32) << 16) | (master.to(torch.int32) & 0xFFFF)
+            return fp32_bits.view(torch.float32)
+        return self.optimizer.get_unscaled_state(inner_param, "master_param")
+
     @staticmethod
     def _is_grouped_quantized_tensor(tensor: torch.Tensor) -> bool:
         """Check if tensor is a TE GroupedTensor using quantized storage."""

@@ -65,15 +65,19 @@ def _compute_norm_2(params_list):
     return torch.zeros((1,), dtype=torch.float32, device='cuda')
 
 
-def _get_param_data(param, force_create_fp32_copy, bf16):
+def _get_param_data(param, force_create_fp32_copy, bf16, main_param_getter=None):
     """Extract the appropriate data tensor from a param for norm computation.
 
     Returns (data_tensor, is_sharded) where is_sharded indicates the param has
     a DP-sharded optimizer main_param. Non-owners may have no main_param attribute.
+    data_tensor is None if this rank holds no shard of the param. main_param_getter returns
+    the main param shard this rank holds, or None.
     """
     if bf16:
         if not force_create_fp32_copy:
             if getattr(param, 'main_param_sharded', False):
+                if main_param_getter is not None:
+                    return main_param_getter(param), True
                 return getattr(param, 'main_param', None), True
             if hasattr(param, 'main_param'):
                 return param.main_param, False
@@ -88,8 +92,14 @@ def calc_params_l2_norm(
     pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None = None,
     return_squared_tensor=False,
     trainable_only=False,
+    main_param_getter=None,
 ):
-    """Calculate the parameter L2 norm using global, single-model, or multi-module groups."""
+    """Calculate the parameter L2 norm using global, single-model, or multi-module groups.
+
+    main_param_getter: optional callable mapping a model param to the FP32 main param shard this
+    rank holds, or None, e.g. the optimizer's get_main_param_shard. Needed with the
+    precision-aware optimizer, which leaves param.main_param as None.
+    """
     if not isinstance(model, list):
         model = [model]
 
@@ -99,6 +109,7 @@ def calc_params_l2_norm(
             pg_collection,
             force_create_fp32_copy=force_create_fp32_copy,
             return_squared_tensor=return_squared_tensor,
+            main_param_getter=main_param_getter,
         )
 
     args = get_args()
@@ -186,7 +197,7 @@ def calc_params_l2_norm(
                 assert param_is_not_shared(param)
                 param = to_local_if_dtensor(param)
                 data, is_sharded = _get_param_data(
-                    param, force_create_fp32_copy, cfg.model.transformer.bf16
+                    param, force_create_fp32_copy, cfg.model.transformer.bf16, main_param_getter
                 )
                 if data is None:
                     continue
@@ -198,7 +209,7 @@ def calc_params_l2_norm(
                 if param_is_not_shared(param):
                     param = to_local_if_dtensor(param)
                     data, is_sharded = _get_param_data(
-                        param, force_create_fp32_copy, cfg.model.transformer.bf16
+                        param, force_create_fp32_copy, cfg.model.transformer.bf16, main_param_getter
                     )
                     if data is None:
                         continue
@@ -277,6 +288,7 @@ def _calc_mimo_params_l2_norm(
     *,
     force_create_fp32_copy=False,
     return_squared_tensor=False,
+    main_param_getter=None,
 ):
     """Calculate a combined parameter L2 norm across MIMO model grids."""
     model_chunks = [unwrap_model(model_chunk) for model_chunk in model]
@@ -301,6 +313,7 @@ def _calc_mimo_params_l2_norm(
             pg_collection=pg_collection[name],
             return_squared_tensor=True,
             trainable_only=True,
+            main_param_getter=main_param_getter,
         )
         norm_sq[index].copy_(module_norm_sq.reshape(()))
 
