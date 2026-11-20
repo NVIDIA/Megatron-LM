@@ -25,7 +25,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_ord
     ExecutionAction,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.weight_retention import (
-    build_retain_mask,
+    build_weight_plan,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     uneven_dtensor_to_full_tensor,
@@ -325,7 +325,7 @@ def test_weight_retention_eager_and_capture_match_baseline(distributed_setup):
         was_recording = context.is_recording_execution_order
         context.post_backward()
         if was_recording:
-            context.retain_mask = build_retain_mask(
+            context.retain_mask, context.prefetch_at = build_weight_plan(
                 context.execution_order, dist.group.WORLD, device=device
             )
         context.finish_grad_sync()

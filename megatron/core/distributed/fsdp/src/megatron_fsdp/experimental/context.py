@@ -110,6 +110,7 @@ class FsdpContext:
         self.prefetch_order = runtime_policy.prefetch_order
         self.execution_order = ExecutionOrder()
         self.retain_mask: Mapping[int, bool] = {}
+        self.prefetch_at: Mapping[int, int] | None = None
         self._execution_order_view: ExecutionOrderView | None = None
         self._prefetch_order_view: ExecutionOrderView | None = None
         self._recording_execution_order = runtime_policy.prefetch_order is PrefetchOrder.RECORDED

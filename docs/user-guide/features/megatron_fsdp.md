@@ -229,15 +229,15 @@ def load_model_and_optimizer_state_dict(state_dict):
 
 With `--use-megatron-fsdp --megatron-fsdp-version 2`, enable
 `--megatron-fsdp-weight-retention` to reuse gathered weights between module calls.
-The first eager iteration records the complete schedule. Before the next iteration
-or CUDA graph capture, M-LM builds a release mask from that trace.
+The first eager iteration records the complete schedule. M-LM uses that trace to
+plan retained releases and prefetches before the next iteration or CUDA graph capture.
 
-Compute, single-successor prefetch and retained weights share the standard
-window of two gathered FSDP owners. The planner preserves configured prefetch and retains
-an owner only when its complete release-to-next-use interval fits that window.
-For nested root/layer/expert execution, it preserves the normal prefetch schedule's
-larger owner-slot envelope instead of adding retention buffers. Replicated weights
-that alias persistent storage use no gathered-buffer slot.
+Compute, prefetched weights, and retained weights share a window of two gathered
+FSDP owners. The planner first admits release-to-next-use intervals that fit and
+then uses the remaining slots to prefetch upcoming misses. A prefetch starts at an
+existing unshard and can target a later microbatch. Nested root/layer/expert execution
+can use as many slots as its demand schedule requires. Replicated weights that alias
+persistent storage use no gathered-buffer slot.
 
 All recorded FSDP modules can participate; no layer-type registry or byte budget
 is needed. This is a module-slot policy, not a bound on allocated bytes when owners
@@ -245,9 +245,8 @@ have different sizes. Every iteration releases gathered weights before optimizer
 updates. Recording and planning happen once, before CUDA graph capture.
 
 Retention defaults to off and requires a fixed module/microbatch schedule.
-M-LM uses single-successor prefetch with ordinary hooks and demand gathers with
-MoE EP overlap. Standalone callers must use prefetch sizes of `None` (one
-successor) or `0` (disabled). NCCL user buffers are unsupported.
+When enabled, the joint plan controls prefetch for ordinary hooks and Combined 1F1B.
+NCCL user buffers are unsupported.
 
 ### 🔁 Checkpoint Conversion
 
@@ -669,8 +668,9 @@ Completion force-releases any remaining gathered weights before optimizer update
 
 Replay validates the complete U/R sequence before each operation and rejects
 missing, extra or reordered calls. The full cursor does not wrap until successful
-`post_backward()` completion. Prefetch uses an independent filtered `UNSHARD`
-view; speculative gathers do not consume logical events. Evaluation preserves
+`post_backward()` completion. Ordinary prefetch uses an independent filtered
+`UNSHARD` view, and the weight-retention plan indexes the full trace. Speculative
+gathers do not consume logical events. Evaluation preserves
 recording state and training cursors. Changing the schedule requires a new
 context. The combined EP-overlap schedule uses explicit completion and records its
 demand gathers and layer releases. Recording and byte sampling must finish before

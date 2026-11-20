@@ -307,7 +307,7 @@ class FsdpModule:
         prefetch = prefetch and context.training and not context.is_recording_execution_order
         if prefetch and phase not in (Phase.FORWARD, Phase.BACKWARD):
             raise ValueError(f"Prefetching requires a FORWARD or BACKWARD phase, got {phase!r}.")
-        self._execution_event(ExecutionAction.UNSHARD, phase=phase)
+        request = self._execution_event(ExecutionAction.UNSHARD, phase=phase)
         order = None
         if (
             context.training
@@ -332,7 +332,15 @@ class FsdpModule:
 
             if order is None:
                 return
-            if prefetch:
+            if request is not None and context.prefetch_at is not None:
+                target_id = context.prefetch_at.get(request.event_id)
+                if target_id is not None:
+                    target = context.execution_order.seek(target_id)
+                    assert target is not None, "A planned FSDP prefetch owner expired."
+                    owner = cast(FsdpModule, target.module)
+                    with owner._nvtx_range("planned prefetch"):
+                        owner._unshard_parameter_groups(target.phase)
+            elif prefetch:
                 size = (
                     self._schedule_policy.forward_prefetch_size
                     if phase is Phase.FORWARD
@@ -411,14 +419,15 @@ class FsdpModule:
             )
         else:
             groups_to_release = self._parameter_groups
-        if groups_to_release:
-            allgather_stream = self.context.allgather_stream
-            allgather_stream.wait_stream(self.context.current_stream())
-            # Release on the all-gather stream where unsharded storage was allocated,
-            # so no record_stream() call is required for the storage.
-            with torch.cuda.stream(allgather_stream):
-                for group in groups_to_release:
-                    group.release_unsharded_storage(rowwise_only=rowwise_only)
+        if not groups_to_release:
+            return
+        allgather_stream = self.context.allgather_stream
+        allgather_stream.wait_stream(self.context.current_stream())
+        # Release on the all-gather stream where unsharded storage was allocated,
+        # so no record_stream() call is required for the storage.
+        with torch.cuda.stream(allgather_stream):
+            for group in groups_to_release:
+                group.release_unsharded_storage(rowwise_only=rowwise_only)
 
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""

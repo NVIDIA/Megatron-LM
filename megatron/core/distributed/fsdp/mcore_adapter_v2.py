@@ -61,7 +61,7 @@ try:
         sync_model_weights_from_main_weights,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.weight_retention import (
-        build_retain_mask,
+        build_weight_plan,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import get_sharding_strategy
 
@@ -267,12 +267,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
         # ncclCommWindowRegister:
         # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#window-registration
-        prefetch_size = ddp_config.suggested_communication_unit_size
-        if ddp_config.megatron_fsdp_weight_retention:
-            prefetch_size = 0 if config.overlap_moe_expert_parallel_comm else None
         schedule_policy = SchedulePolicy(
-            forward_prefetch_size=prefetch_size,
-            backward_prefetch_size=prefetch_size,
+            forward_prefetch_size=ddp_config.suggested_communication_unit_size,
+            backward_prefetch_size=ddp_config.suggested_communication_unit_size,
             register_hooks=not config.overlap_moe_expert_parallel_comm,
         )
         common_fully_shard_kwargs = dict(
@@ -340,17 +337,18 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         super().__init__(config=config, module=module)
 
         if config.overlap_moe_expert_parallel_comm:
-            register_combined_1f1b_hooks(self.module)
+            register_combined_1f1b_hooks(
+                self.module, recompute=config.recompute_granularity is not None
+            )
 
     @staticmethod
     def prefetch_order_for(
         config: TransformerConfig, ddp_config: DistributedDataParallelConfig
     ) -> "PrefetchOrder":
-        """Record ordinary pipeline schedules and weight-retention iterations."""
-        if ddp_config.megatron_fsdp_weight_retention:
-            return PrefetchOrder.RECORDED
-        if not config.overlap_moe_expert_parallel_comm and (
-            config.pipeline_model_parallel_size > 1
+        """Record FSDP weight requests for pipeline schedules and weight planning."""
+        if (
+            ddp_config.megatron_fsdp_weight_retention
+            or config.pipeline_model_parallel_size > 1
             or config.virtual_pipeline_model_parallel_size is not None
         ):
             return PrefetchOrder.RECORDED
@@ -360,7 +358,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
     def compile_weight_retention(model, agreement_group) -> None:
         """Plan once from the complete eager trace, before any CUDA graph capture."""
         context = model[0].module.context
-        context.retain_mask = build_retain_mask(
+        context.retain_mask, context.prefetch_at = build_weight_plan(
             context.execution_order, agreement_group, device=context.allgather_stream.device
         )
 

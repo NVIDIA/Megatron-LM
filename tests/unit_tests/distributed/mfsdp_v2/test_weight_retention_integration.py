@@ -121,8 +121,8 @@ def test_record_compile_replay_and_iteration_cleanup(mode):
         replacements["get_model_config"] = lambda _: config
         stack.enter_context(patch.dict(finalize_model_grads.__globals__, replacements))
         compiler_globals = FullyShardedDataParallelV2.compile_weight_retention.__globals__
-        planner = Mock(wraps=compiler_globals["build_retain_mask"])
-        stack.enter_context(patch.dict(compiler_globals, build_retain_mask=planner))
+        planner = Mock(wraps=compiler_globals["build_weight_plan"])
+        stack.enter_context(patch.dict(compiler_globals, build_weight_plan=planner))
         group = object()
         groups = SimpleNamespace(tp=None, pp=None, embd=None, pos_embd=None, dp_cp=group)
         allocations = []
