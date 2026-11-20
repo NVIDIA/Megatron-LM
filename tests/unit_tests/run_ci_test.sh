@@ -113,7 +113,7 @@ cd $TEST_PATH
 
 MARKER=()
 if [[ "$PLATFORM" == "gb200" ]]; then
-    MARKER+=("launch_on_gb200" "not flaky_on_gb200")
+    MARKER+=("launch_on_gb200")
 fi
 
 if [[ "$TAG" == "legacy" ]]; then
