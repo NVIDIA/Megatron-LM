@@ -1041,6 +1041,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "NCCL_ALGO=Ring under --deterministic-mode, not exercised by the determinism model tests.",
     ),
     KernelEntry(
+        name="gtp_fp8_checkpoint_casts",
+        sources=("megatron/core/tensor_parallel/generalized_tensor_parallelism.py",),
+        tests=("tests/unit_tests/generalized_tensor_parallel/test_gtp_dcp.py",),
+        kind="dispatch",
+        notes="Native-FP8 checkpoint copy/dequantization, with legacy TE class compatibility.",
+    ),
+    KernelEntry(
         name="te_thd_partitioned_indices",
         sources=(
             "megatron/core/datasets/data_schedule.py",

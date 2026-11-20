@@ -15,7 +15,9 @@ from unittest import mock
 import pytest
 import torch
 import torch.distributed as dist
+from packaging.version import Version
 
+import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp
 from megatron.core import parallel_state as ps
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
@@ -87,6 +89,82 @@ def _require_world_size(n):
         pytest.skip(
             f"Requires world_size={n}, got {dist.get_world_size()} "
             f"(launch with torchrun --nproc-per-node={n})"
+        )
+
+
+@pytest.mark.parametrize(
+    "te_version,native", [("2.19.0", False), ("2.20.0.dev0+abcdef", False), ("2.20.0", True)]
+)
+def test_native_fp8_compatibility_preserves_class(monkeypatch, te_version, native):
+    """Modern TE sees the GTP class; legacy operations restore it even on failure."""
+
+    class FP8Weight:
+        def dequantize(self):
+            assert type(self) is (GTPWeight if native else FP8Weight)
+            if self.fail:
+                raise ValueError("dequantization failed")
+            return payload
+
+    class GTPWeight(FP8Weight):
+        is_gtp_weight_remat = True
+
+    payload = torch.tensor([1.0, 2.0])
+    weight = GTPWeight()
+    weight.fail = False
+    module = SimpleNamespace(parameters=lambda **kwargs: [weight])
+    monkeypatch.setattr(gtp, "_te_version", Version(te_version))
+    monkeypatch.setattr("megatron.core.fp8_utils.is_float8tensor", lambda p: p is weight)
+
+    assert torch.equal(dequantize_gtp_native_fp8(weight), payload)
+    assert type(weight) is GTPWeight
+    weight.fail = True
+    with pytest.raises(ValueError, match="dequantization failed"):
+        dequantize_gtp_native_fp8(weight)
+    assert type(weight) is GTPWeight
+
+    with pytest.raises(ValueError, match="load failed"):
+        with gtp_native_fp8_load_context(module):
+            assert type(weight) is (GTPWeight if native else FP8Weight)
+            raise ValueError("load failed")
+    assert type(weight) is GTPWeight
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["native", "legacy"])
+def test_gtp_fp8_checkpoint_casts_replay(monkeypatch, legacy):
+    """Replay checkpoint casts bit-exactly while preserving GTP identity and storage."""
+    _requires_mxfp8()
+    if not legacy and gtp._te_version < Version("2.20"):
+        pytest.skip("native subclass dispatch requires TE >= 2.20")
+
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
+    generator = torch.Generator(device="cuda").manual_seed(1234)
+    source, target = torch.randn(
+        2, 128, 128, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
+    expected = quantizer(target).dequantize()
+    weight = gtp._gtp_reclass_native_fp8_shard(quantizer(source))
+    original_type = type(weight)
+    original_quantizer = weight._quantizer
+    storage_ptr = weight._rowwise_data.data_ptr()
+    module = SimpleNamespace(parameters=lambda **kwargs: [weight])
+    monkeypatch.setattr(gtp, "_te_version", Version("2.19" if legacy else "2.20"))
+
+    for _ in range(3):
+        with torch.no_grad(), gtp_native_fp8_load_context(module):
+            if not legacy:
+                assert type(weight) is original_type
+            weight.copy_(target)
+        result = dequantize_gtp_native_fp8(weight)
+        assert type(weight) is original_type
+        assert weight.is_gtp_weight_remat
+        assert weight._quantizer is original_quantizer
+        assert weight._rowwise_data.data_ptr() == storage_ptr
+        # Compare bytes against plain TE on every replay, including signed zeros.
+        torch.testing.assert_close(
+            result.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
         )
 
 
@@ -210,9 +288,7 @@ def _worker_native_fp8_dcp_load_copy(rank, world_size, port):
     through ``gtp_native_fp8_load_context``, keep the GTP subclass, and leave the weight holding
     the loaded values.
 
-    The context exists because TE's ``IsMXFP8Tensor`` compared the *exact* class and so rejected
-    GTP's dynamic ``GTP_<Fp8Tensor>`` subclass. TE #3393 made that check subclass-tolerant, so on
-    newer TE a bare copy succeeds as well — hence step (1) probes rather than requires a raise.
+    Modern TE accepts GTP subclasses directly; older TE needs the compatibility context.
     """
     _requires_mxfp8()
 
@@ -247,11 +323,14 @@ def _worker_native_fp8_dcp_load_copy(rank, world_size, port):
         with torch.no_grad():
             lin.weight.copy_(probe_bf16)
     except Exception as e:  # noqa: BLE001
+        assert gtp._te_version < Version("2.20"), "released TE >= 2.20 must accept subclasses"
         assert "MXFP8" in str(e) or "IsMXFP8Tensor" in str(e), str(e)
     assert is_gtp_fp8(lin.weight), "bare copy_ must leave the GTP subclass intact"
 
     # (2) Under the context the copy always lands, on every TE version.
     with torch.no_grad(), gtp_native_fp8_load_context(lin):
+        if gtp._te_version >= Version("2.20"):
+            assert is_gtp_fp8(lin.weight), "modern TE must retain the GTP class during loading"
         lin.weight.copy_(target_bf16)
     assert is_gtp_fp8(lin.weight), "load context must reclass back to the GTP subclass"
 
