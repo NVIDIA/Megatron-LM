@@ -619,53 +619,61 @@ class MegatronLLMEngine(LLMEngine):
         self, address: str, request_id: int, instance_id: str, *, owner: str | None = None
     ) -> None:
         lock = self._release_locks.setdefault(address, asyncio.Lock())
-        async with asyncio.timeout(_RELEASE_TIMEOUT), lock:
-            socket = self._release_sockets.get(address)
-            if socket is None:
-                if self._release_context is None:
-                    self._release_context = zmq.asyncio.Context()
-                socket = self._release_context.socket(zmq.DEALER)
-                socket.setsockopt(zmq.SNDHWM, 0)
-                socket.setsockopt(zmq.RCVHWM, 0)
-                socket.connect(address)
-                self._release_sockets[address] = socket
-            try:
-                # ZMQ reconnects sockets across coordinator replacement, but the
-                # replacement's known-client set is empty. Register on every use.
-                await socket.send(msgpack.packb([Headers.CONNECT.value], use_bin_type=True))
-                reply = msgpack.unpackb(await socket.recv(), raw=False)
-                if len(reply) != 2 or reply[0] != Headers.CONNECT_ACK.value:
-                    raise RuntimeError("Handoff control requires a coordinator instance ID")
-                if reply[1] != instance_id:
+        # Commands to one source share a socket and take turns. Bound the wait for a turn,
+        # but start the acknowledgement deadline only once the turn begins: a claim the source
+        # accepts after this adapter has given up is never released while the adapter lives.
+        async with asyncio.timeout(_RELEASE_TIMEOUT):
+            await lock.acquire()
+        try:
+            async with asyncio.timeout(_RELEASE_TIMEOUT):
+                socket = self._release_sockets.get(address)
+                if socket is None:
+                    if self._release_context is None:
+                        self._release_context = zmq.asyncio.Context()
+                    socket = self._release_context.socket(zmq.DEALER)
+                    socket.setsockopt(zmq.SNDHWM, 0)
+                    socket.setsockopt(zmq.RCVHWM, 0)
+                    socket.connect(address)
+                    self._release_sockets[address] = socket
+                try:
+                    # ZMQ reconnects sockets across coordinator replacement, but the
+                    # replacement's known-client set is empty. Register on every use.
+                    await socket.send(msgpack.packb([Headers.CONNECT.value], use_bin_type=True))
+                    reply = msgpack.unpackb(await socket.recv(), raw=False)
+                    if len(reply) != 2 or reply[0] != Headers.CONNECT_ACK.value:
+                        raise RuntimeError("Handoff control requires a coordinator instance ID")
+                    if reply[1] != instance_id:
+                        if owner is not None:
+                            raise RuntimeError("Cannot claim a handoff from a replaced source")
+                        # The old coordinator/engine incarnation is gone. Never
+                        # release a recycled request ID in its replacement.
+                        return
+                    command = (
+                        [Headers.CLAIM_KV.value, int(request_id), instance_id, owner]
+                        if owner is not None
+                        else [Headers.RELEASE_KV.value, int(request_id), instance_id]
+                    )
+                    await socket.send(msgpack.packb(command, use_bin_type=True))
+                    reply = msgpack.unpackb(await socket.recv(), raw=False)
+                    expected = (
+                        [Headers.CLAIM_KV_ACK.value, int(request_id), instance_id]
+                        if owner is not None
+                        else [Headers.RELEASE_KV_ACK.value, int(request_id), instance_id]
+                    )
+                    if owner is not None and reply == [*expected, HandoffClaimStatus.EXPIRED.value]:
+                        # No remote read was submitted. Let Dynamo's migration layer
+                        # replay the request through prefill to obtain a fresh offer.
+                        raise StreamIncomplete("Unclaimed Megatron prefill handoff expired")
                     if owner is not None:
-                        raise RuntimeError("Cannot claim a handoff from a replaced source")
-                    # The old coordinator/engine incarnation is gone. Never
-                    # release a recycled request ID in its replacement.
-                    return
-                command = (
-                    [Headers.CLAIM_KV.value, int(request_id), instance_id, owner]
-                    if owner is not None
-                    else [Headers.RELEASE_KV.value, int(request_id), instance_id]
-                )
-                await socket.send(msgpack.packb(command, use_bin_type=True))
-                reply = msgpack.unpackb(await socket.recv(), raw=False)
-                expected = (
-                    [Headers.CLAIM_KV_ACK.value, int(request_id), instance_id]
-                    if owner is not None
-                    else [Headers.RELEASE_KV_ACK.value, int(request_id), instance_id]
-                )
-                if owner is not None and reply == [*expected, HandoffClaimStatus.EXPIRED.value]:
-                    # No remote read was submitted. Let Dynamo's migration layer
-                    # replay the request through prefill to obtain a fresh offer.
-                    raise StreamIncomplete("Unclaimed Megatron prefill handoff expired")
-                if owner is not None:
-                    expected.append(HandoffClaimStatus.ACCEPTED.value)
-                if reply != expected:
-                    raise RuntimeError("Unexpected or rejected handoff acknowledgement")
-            except BaseException:
-                self._release_sockets.pop(address, None)
-                socket.close(linger=0)
-                raise
+                        expected.append(HandoffClaimStatus.ACCEPTED.value)
+                    if reply != expected:
+                        raise RuntimeError("Unexpected or rejected handoff acknowledgement")
+                except BaseException:
+                    self._release_sockets.pop(address, None)
+                    socket.close(linger=0)
+                    raise
+        finally:
+            lock.release()
 
     async def _release_completed_handoff(self, metadata: dict) -> None:
         release = HandoffRelease.from_metadata(metadata)
