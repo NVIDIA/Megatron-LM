@@ -1126,6 +1126,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "tests/unit_tests/transformer/experimental_attention_variant/test_dsa_gqa_inference.py, "
         "including empty/ragged requests, causal masks, and graph page-table refresh.",
     ),
+    KernelEntry(
+        name="dsa_flashinfer_plan",
+        sources=("megatron/core/inference/contexts/attention_context/dsa_flashinfer_plan.py",),
+        tests=(K + "test_dsa_flashinfer_plan.py",),
+        kind="torch-op",
+        training_path=False,
+        notes="Per-step FlashInfer DSA page-table fill (one torch.add over the block table); the "
+        "rest of the step plan is built on the host.",
+    ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(
         name="dsa_tilelang_absorbed_shape_dispatch",
