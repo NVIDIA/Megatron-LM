@@ -433,11 +433,11 @@ class TestVisionTECudaGraphHelper:
         assert helper.capture_finished()  # Capture process finished
         assert not helper.graphs_created()  # But no graphs were created
 
-    def test_delete_cudagraphs_before_create_asserts(self):
-        """delete_cuda_graphs before creation should raise AssertionError."""
+    def test_delete_cudagraphs_before_create_is_a_noop(self):
+        """delete_cuda_graphs before creation only releases capture-only state."""
         helper = self._make_helper()
-        with pytest.raises(AssertionError):
-            helper.delete_cuda_graphs()
+        helper.delete_cuda_graphs()
+        assert not helper.graphs_created()
 
 
 # ---------------------------------------------------------------------------

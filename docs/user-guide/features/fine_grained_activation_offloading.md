@@ -140,6 +140,37 @@ Fine-grained offloading is compatible with CUDA graphs. When CUDA graph is enabl
 - `cuda_graph_impl` must be `transformer_engine`.
 - Requires `torch >= 2.9.0` and `transformer_engine >= 2.14.0`.
 
+#### Dynamic-CP Slot Graphs
+
+Set `NVTE_CPU_OFFLOAD_V1=1`, as required by fine-grained offloading. The TE build
+must support slot offload and save quantized wrappers through their physical
+buffers, so CPU copies preserve FP8 data and scale metadata instead of converting
+them to the wrapper's nominal dtype.
+
+Dynamic-CP graphs use TE's slot saved-tensor hooks for offload scopes inside a graph,
+rather than nesting the ordinary offload hook inside the TE hook. Offloading requires
+partial `cuda_graph_modules` scopes (for example `attn`); whole-layer capture is
+rejected. Pinned CPU buffers follow the same union-liveness colors as the GPU saved
+arenas: mutually exclusive CP variants share the largest required host allocation.
+Forward records D2H copies; backward records H2D copies and reconstructs saved views,
+including their aliases. Offloaded saves do not also occupy GPU saved-arena storage.
+Because D2H runs on its own stream, each offloaded save is first copied on the compute
+stream so a later in-place write cannot change it; these copies stay in the graph pool
+until the end of that forward graph.
+If any saved view of a storage is retained on GPU, all saved views of that storage
+remain on GPU so mixed offload decisions cannot split their aliases.
+
+The offload policy is frozen per module scope after eager warmup. If any warmed
+instance of a scope is retained on GPU by the offload-fraction, PP-balancing or tail
+policy, slot graphs conservatively retain that scope on GPU for every invocation.
+This avoids binding a reusable physical slot to one logical microbatch's policy.
+Memory savings can therefore differ from eager offloading. Slot graphs use the
+existing D2H/H2D streams and capture their dependencies; they do not implement the
+ordinary offloader's ahead-of-use group-prefetch optimization. Offload outside the
+captured scope and non-slot graph execution keep their existing implementation.
+Graph input staging retains its existing slot lifetime; offloading does not shorten
+that staging lifetime.
+
 ```bash
 # Optional: defer D2H enqueue for offloads *outside* cuda_graph_scope (MoE experts; see below)
 --delay-offload-until-cuda-graph

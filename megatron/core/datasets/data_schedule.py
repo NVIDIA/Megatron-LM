@@ -15,6 +15,7 @@ from megatron.core.datasets.data_schedule_utils import (
     build_packed_microbatches,
     create_data_iterator,
     get_batch_and_global_seqlens,
+    get_data_parallel_gather_group,
     get_global_real_seqlen_stats,
     get_packed_sequence_alignment,
     get_packed_sequence_length,
@@ -37,6 +38,21 @@ try:
 except ImportError:
     # TE isn't installed or the torch wrapper is missing
     tex = None
+
+
+def _validate_cuda_graph_microbatch_count(config, num_microbatches: int) -> None:
+    """Require runtime packing to stay within the captured schedule proof."""
+    limit = getattr(config, "_cuda_graph_num_microbatches", None)
+    if limit is not None and not 1 <= num_microbatches <= limit:
+        raise ValueError(
+            f"{num_microbatches=} is outside the captured CUDA graph range 1..{limit}."
+        )
+    allowed = getattr(config, "_cuda_graph_allowed_microbatches", None)
+    if allowed is not None and num_microbatches not in allowed:
+        raise ValueError(
+            f"{num_microbatches=} is not covered by the CUDA graph liveness proof; "
+            f"supported counts are {sorted(allowed)}."
+        )
 
 
 def _build_thd_padding_mask(
@@ -130,6 +146,7 @@ class BasePackingScheduler:
         dp_cp_group,
         dev,
         config,
+        validate_cuda_graph_limits: bool = True,
     ):
         """
         Run the scheduler and return the new data_iterator.
@@ -242,6 +259,7 @@ class DpBalancedScheduler(BasePackingScheduler):
         dp_cp_group,
         dev: torch.device,
         config,
+        validate_cuda_graph_limits: bool = True,
     ):
         """
         Run the complete scheduling pipeline.
@@ -269,6 +287,7 @@ class DpBalancedScheduler(BasePackingScheduler):
             seqlen_squared_sum_this_global_batch: Sum of squared real seqlens for FLOPs.
         """
 
+        scheduler_dp_group = get_data_parallel_gather_group(dp_group, dp_cp_group)
         is_first_pp = pp_group.rank() == 0
         is_last_pp = pp_group.rank() == pp_group.size() - 1
         vpp_size = config.virtual_pipeline_model_parallel_size or 1
@@ -325,7 +344,7 @@ class DpBalancedScheduler(BasePackingScheduler):
 
             # Step 1: Gather global sequence lengths for the fetched batches
             batch, global_id_seqlens, global_ids_this_rank, offsets, _ = (
-                get_batch_and_global_seqlens(iter(batch_list), num_microbatches, dp_group)
+                get_batch_and_global_seqlens(iter(batch_list), num_microbatches, scheduler_dp_group)
             )
 
             # Step 2: Check required sample keys
@@ -365,7 +384,7 @@ class DpBalancedScheduler(BasePackingScheduler):
                 global_id_seqlens,
                 sample_id_groups,
                 offsets,
-                dp_group,
+                scheduler_dp_group,
                 dp_cp_group,
                 sample_keys=keys_to_keep,
             )
@@ -385,7 +404,7 @@ class DpBalancedScheduler(BasePackingScheduler):
             # Step 6: Calculate FLOPs info from real tokens. Padded lengths only size
             # the schedule and the packed buffers.
             seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch = (
-                get_global_real_seqlen_stats(batch, dp_group, dev)
+                get_global_real_seqlen_stats(batch, scheduler_dp_group, dev)
             )
         else:
             (
@@ -408,6 +427,8 @@ class DpBalancedScheduler(BasePackingScheduler):
             )
         )
         num_micro_batches = int(num_micro_batches)
+        if validate_cuda_graph_limits:
+            _validate_cuda_graph_microbatch_count(config, num_micro_batches)
 
         # Build an independent iterator for each VPP stage so rerun/rewind state
         # and per-stage field stripping cannot leak between virtual stages.
@@ -472,6 +493,7 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
                 min_cp_size=self.min_cp_size,
                 cp_group_sizes=self.cp_group_sizes,
                 pad_sequences=self.pad_sequences,
+                max_num_seqs=self.max_num_seqs,
             )
             sample_id_groups.append(sample_ids)
 
@@ -501,8 +523,8 @@ def _get_scheduler_max_real_num_seqs(config) -> Optional[int]:
     """Return the scheduler cap for real THD sequences.
 
     ``thd_max_packed_sequences`` is the final static THD capacity, including the
-    optional dummy sequence appended for a padding tail. The dp_balanced
-    scheduler only packs real sequences, so reserve one slot when dummy-tail
+    optional dummy sequence appended for a padding tail. Packing schedulers
+    only place real sequences, so reserve one slot when dummy-tail
     padding is enabled.
     """
     max_num_seqs = getattr(config, 'thd_max_packed_sequences', None)
@@ -528,7 +550,11 @@ def _get_scheduler_max_real_num_seqs(config) -> Optional[int]:
 
 
 def wrap_data_iterator(
-    data_iterator, config, num_microbatches, pg_collection: ProcessGroupCollection
+    data_iterator,
+    config,
+    num_microbatches,
+    pg_collection: ProcessGroupCollection,
+    validate_cuda_graph_limits: bool = True,
 ):
     """
     A wrapper function that wraps around an existing data_iterator
@@ -538,6 +564,8 @@ def wrap_data_iterator(
         data_iterator: The original data_iterator to wrap around
         config: The config object containing the max_seqlen_per_dp_cp_rank
         pg_collection: Caller-owned process groups; must define dp_cp, dp, tp, and pp.
+        validate_cuda_graph_limits: Check the packed microbatch count against the range the
+            captured CUDA graph schedule supports. Eager-only (evaluation) steps skip it.
     """
 
     # GTP_remat peers consume distinct samples, so packing must span them like the rest of DP.
@@ -587,16 +615,11 @@ def wrap_data_iterator(
         if capacity < alignment:
             raise ValueError(f"Packed sequence capacity must fit alignment {alignment}")
 
-    # dp_balanced packs only real sequences, so the static THD capacity has to be
-    # discounted by the dummy tail sequence; dynamic CP packs against the raw cap.
+    # Both schedulers pack real sequences, so reserve capacity for a dummy tail.
     # Keep the cap derived above from cuda_graph_thd_max_packed_sequences; the config
     # rejects combining it with thd_max_packed_sequences.
     if scheduler_kwargs.get('max_num_seqs') is None:
-        scheduler_kwargs['max_num_seqs'] = (
-            _get_scheduler_max_real_num_seqs(config)
-            if scheduler_type == PackingSchedulerEnum.DP_BALANCED
-            else getattr(config, 'thd_max_packed_sequences', None)
-        )
+        scheduler_kwargs["max_num_seqs"] = _get_scheduler_max_real_num_seqs(config)
 
     scheduler = scheduler_map[scheduler_type](
         capacity,
@@ -617,7 +640,15 @@ def wrap_data_iterator(
         seqlen_sum_this_global_batch,
         seqlen_squared_sum_this_global_batch,
     ) = scheduler.run(
-        data_iterator, num_microbatches, dp_group, tp_group, pp_group, dp_cp_group, dev, config
+        data_iterator,
+        num_microbatches,
+        dp_group,
+        tp_group,
+        pp_group,
+        dp_cp_group,
+        dev,
+        config,
+        validate_cuda_graph_limits=validate_cuda_graph_limits,
     )
 
     return (

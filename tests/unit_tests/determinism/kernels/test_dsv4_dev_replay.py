@@ -147,9 +147,10 @@ def test_dev_aligned_hca_backward_replays(sequence_length, cp_size, reconstruct)
             hca_cp_rank=selected,
             hca_cp_size=cp_size,
         )
-        context = output.grad_fn.next_functions[0][0]
-        assert context.saved_tensors[-3] is None
-        assert context.topk_length is None
+        # Saved layout ends with (topk_idxs, out, lse, topk_length, *out_rope tensors).
+        saved = output.grad_fn.next_functions[0][0].saved_tensors
+        assert saved[-6] is None
+        assert saved[-3] is None
         return output
 
     _, grads = assert_replays_bit_exact(

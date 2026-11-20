@@ -13,8 +13,10 @@ still fill all DP ranks; their zero loss masks exclude them from the loss. A DP
 rank can contribute no samples and still receive scheduled work. A global batch
 with no sequences is rejected on all ranks.
 
-Dynamic CP does not currently support `--deterministic-mode`, CUDA graphs, or
-router z-loss. Configuration validation rejects these combinations before training.
+Dynamic CP does not currently support `--deterministic-mode` or router z-loss, and
+supports CUDA graphs only as layer-wise TE graphs (`--cuda-graph-impl transformer_engine`
+with `--cuda-graph-dynamic-microbatches`). Configuration validation rejects the other
+combinations before training.
 Static sequence packing without dynamic CP retains its existing deterministic-mode
 support. GPT and Hybrid models support dynamic CP. The batch fetch records each
 microbatch's selected CP group, size, and (under TP sequence parallelism) TP×CP

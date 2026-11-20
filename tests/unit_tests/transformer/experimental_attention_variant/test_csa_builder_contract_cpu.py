@@ -99,7 +99,9 @@ def test_wrapper_does_not_repeat_core_inverse_rope(monkeypatch, fused, packed):
         recompute_up_proj=False,
         training=True,
     )
-    monkeypatch.setattr(dsv4, "off_interface", lambda enabled, value, name: _NoOffload(value))
+    monkeypatch.setattr(
+        dsv4, "off_interface", lambda enabled, value, name, *, owner=None: _NoOffload(value)
+    )
     monkeypatch.setattr(
         dsv4, "apply_rotary_pos_emb", lambda *args, **kwargs: pytest.fail("duplicate inverse RoPE")
     )

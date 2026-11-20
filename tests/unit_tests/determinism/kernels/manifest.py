@@ -1035,7 +1035,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_te_wrappers.py", R + 'test_mla_replay.py', R + 'test_indexer_replay.py'),
         kind="dispatch",
         notes="apply_rotary_pos_emb selects TE fused RoPE (replayed in test_te_wrappers.py), "
-        "flash-attn apply_rotary_emb (not in the CI container) or the unfused torch path.",
+        "flash-attn apply_rotary_emb (not in the CI container) or the unfused torch path. A THD "
+        "frequency table shorter than max_seqlen (bounded dynamic-CP graph tables) bypasses TE; "
+        "test_te_wrappers.py replays that fallback for CP1 and both CP2 ranks.",
     ),
     KernelEntry(
         name="mla_rope_dispatch",

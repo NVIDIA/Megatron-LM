@@ -60,7 +60,9 @@ GDN2 do not support dynamic CP; DeepSeek-V4 is not supported.
 The following constraints apply:
 
 - Use per-token loss and variable-length packed training data. Dynamic CP does
-  not support deterministic mode, CUDA graphs, or router z-loss.
+  not support deterministic mode or router z-loss. CUDA graphs are supported only
+  as layer-wise TE graphs (`--cuda-graph-impl transformer_engine` with
+  `--cuda-graph-dynamic-microbatches`).
 - Headwise Mamba, GDP, and GDN require their TP-local head/group geometry
   to divide **every** CP size the scheduler can select. Construction validates
   this against the caller's DP×CP group, before a long sequence reaches forward.
@@ -105,3 +107,8 @@ Packed absorbed MLA uses the microbatch's actual CP group for RoPE indexing. Its
 frequency table must cover the full sequence even when each rank holds only a
 chunk and the configured CP size is one. QKV up-projection recomputation retains
 the forward microbatch's group after the caller restores or changes its group.
+
+With `--cuda-graph-impl transformer_engine` and pipeline parallelism, Dynamic CP graphs
+size their schedule from a bound on the sequences in one dataset item. GPT data with
+`--dataloader-inter-document-masking` has no useful bound and is rejected; SFT, varlen
+and FIM data are not affected.

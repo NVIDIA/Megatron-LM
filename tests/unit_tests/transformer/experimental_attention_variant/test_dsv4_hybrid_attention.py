@@ -715,9 +715,9 @@ def _run_cpu_post_o_group_proj_forward(monkeypatch, attention, qkv_format):
         lambda module, args: captured.update(proj_input=args[0])
     )
 
-    def recording_off_interface(offload, tensor, name):
+    def recording_off_interface(offload, tensor, name, *, owner=None):
         captured["offload_inputs"][name] = tensor
-        return FineGrainedActivationOffloadingInterface(offload, tensor, name)
+        return FineGrainedActivationOffloadingInterface(offload, tensor, name, owner=owner)
 
     monkeypatch.setattr(dsv4_attention, "off_interface", recording_off_interface)
 
