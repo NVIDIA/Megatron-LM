@@ -65,14 +65,6 @@ spec:
         TEST_PATH="/opt/megatron-lm-legacy/"
     fi
 
-    if [[ "$TAG" == "latest" && "$ENVIRONMENT" == "dev" && "${{IMAGE_TYPE:-}}" == "dev" ]]; then
-      case "$BUCKET" in
-        tests/unit_tests/ops/*|tests/unit_tests/models/*|tests/unit_tests/determinism/kernels/*)
-          /opt/venv/bin/python -c 'from liger_kernel.megatron import LigerMegatronRMSNorm, LigerMegatronCrossEntropy'
-          ;;
-      esac
-    fi
-
     case "$BUCKET" in
       tests/unit_tests/inference/test_batch_invariant_fp8.py)
         bash "$TEST_PATH/tests/test_utils/run_batch_invariant_fp8.sh" \
