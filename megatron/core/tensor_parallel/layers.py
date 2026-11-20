@@ -456,8 +456,9 @@ class VocabParallelEmbedding(torch.nn.Module):
         """Whether the backward adds the weight gradient into ``main_grad`` itself.
 
         With ``gradient_accumulation_fusion``, for a weight whose ``main_grad`` is owned by
-        Megatron's DDP (not Megatron-FSDP, GTP or ``zero_out_wgrad``, which mixes the gradients
-        of a weight shared on one stage through ``param.grad``).
+        Megatron's DDP (not Megatron-FSDP or GTP). This includes a ``zero_out_wgrad`` weight
+        shared on one stage: its DDP hook adds ``param.grad``, to which the ZeroTensor returned
+        here contributes nothing, so only the gradients of unfused uses are added there.
         """
         return (
             self.config.gradient_accumulation_fusion
@@ -466,7 +467,6 @@ class VocabParallelEmbedding(torch.nn.Module):
             and torch.is_grad_enabled()
             and hasattr(weight, "main_grad")
             and hasattr(weight, "grad_added_to_main_grad")
-            and not getattr(weight, "zero_out_wgrad", False)
             and not hasattr(weight, "__fsdp_param__")
         )
 
@@ -913,6 +913,15 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                             device=torch.cuda.current_device(),
                             requires_grad=False,
                         )
+                elif getattr(weight, "zero_tensor_dummy_wgrad", False) and not hasattr(
+                    weight, "__fsdp_param__"
+                ):
+                    # A weight used more than once in one backward pass, such as an output layer
+                    # shared by the main and MTP heads, gets a ZeroTensor: autograd sums these
+                    # without storage or a kernel, unlike dense [vocab, hidden] dummies.
+                    grad_weight = torch._efficientzerotensor(
+                        weight.shape, dtype=weight.dtype, device=weight.device
+                    )
                 else:
                     if HAVE_TE:
                         grad_weight = get_dummy_wgrad(list(weight.main_grad.shape), input.dtype)

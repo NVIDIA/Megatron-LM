@@ -635,8 +635,13 @@ class DistributedDataParallel(_BaseDataParallel):
                         assert (
                             param.grad is not None
                         ), 'param.grad being None is not safe when overlap_grad_reduce is True'
-                if param.grad is not None and (
-                    not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
+                # A ZeroTensor grad (the dummy of fused uses) has nothing to add.
+                if (
+                    param.grad is not None
+                    and not torch._is_zerotensor(param.grad)
+                    and (
+                        not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
+                    )
                 ):
                     param.main_grad.add_(param.grad.data)
                 param.grad = None

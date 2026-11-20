@@ -23,6 +23,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
     get_mlp_module_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -966,5 +967,35 @@ def test_word_embedding_marker_reaches_tied_copies_only(share_embeddings_and_out
     if parallel_state.is_pipeline_last_stage():
         marked = getattr(model.output_layer.weight, "is_word_embedding_parameter", False)
         assert marked == share_embeddings_and_output_weights
+
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("mtp_num_layers", [None, 1])
+def test_mtp_output_layer_gets_zero_tensor_dummy_wgrad(mtp_num_layers):
+    """With MTP the main and MTP heads use the output layer in one backward pass, so its weight
+    asks for ZeroTensor dummy weight gradients, whose sum is free."""
+    Utils.initialize_model_parallel()
+    model_parallel_cuda_manual_seed(123)
+    config = TransformerConfig(
+        num_layers=2, hidden_size=128, num_attention_heads=4, mtp_num_layers=mtp_num_layers
+    )
+    layer_spec = get_gpt_layer_with_transformer_engine_spec()
+    mtp_block_spec = (
+        get_gpt_mtp_block_spec(config=config, spec=layer_spec, use_transformer_engine=True)
+        if mtp_num_layers
+        else None
+    )
+    model = GPTModel(
+        config=config,
+        transformer_layer_spec=layer_spec,
+        mtp_block_spec=mtp_block_spec,
+        vocab_size=128,
+        max_sequence_length=8,
+        share_embeddings_and_output_weights=False,
+    )
+
+    marked = getattr(model.output_layer.weight, "zero_tensor_dummy_wgrad", False)
+    assert marked == bool(mtp_num_layers)
 
     Utils.destroy_model_parallel()

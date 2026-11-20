@@ -116,6 +116,36 @@ class TestTensorParallelLayers:
         )
         assert module.weight.grad_added_to_main_grad
 
+    def test_shared_embedding_wgrad_fusion_replays(self):
+        """A ``zero_out_wgrad`` weight used twice, as by the main and MTP embeddings at PP=1:
+        both uses accumulate into main_grad and autograd sums their ZeroTensors."""
+        seeded()
+        config = _config(deterministic_mode=False, gradient_accumulation_fusion=True)
+        embedding = VocabParallelEmbedding(
+            8192, 1024, init_method=init_method_normal(0.02), config=config
+        ).cuda()
+        embedding.weight.zero_out_wgrad = True
+        embedding.weight.main_grad = torch.zeros_like(embedding.weight, dtype=torch.float32)
+        embedding.weight.grad_added_to_main_grad = False
+
+        class TwoUses(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.embedding = embedding
+
+            def forward(self, ids, mtp_ids):
+                return self.embedding(ids) + self.embedding(mtp_ids)
+
+        ids, mtp_ids = (torch.randint(0, 64, (1, 4096), device="cuda") * 100 for _ in range(2))
+        assert_module_replays_bit_exact(
+            TwoUses(),
+            (ids, mtp_ids),
+            replays=4,
+            contention=True,
+            what="VocabParallelEmbedding[gradient_accumulation_fusion, shared] x2",
+        )
+        assert embedding.weight.grad._is_zerotensor()
+
     def test_accumulate_embedding_wgrad_replays(self):
         seeded()
         ids = torch.randint(0, 64, (1, 4096), device="cuda") * 100

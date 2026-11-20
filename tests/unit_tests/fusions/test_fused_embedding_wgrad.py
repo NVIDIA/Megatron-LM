@@ -238,3 +238,114 @@ class TestVocabParallelEmbeddingWgradFusion:
             model.finish_grad_sync()
         _assert_same_bits(modules[True].weight.main_grad, modules[False].weight.main_grad)
         assert modules[True].weight.grad is None
+
+    def test_shared_weight_two_uses_return_zero_tensor(self):
+        """A weight used twice on one stage, as by the main and MTP embeddings, is marked
+        ``zero_out_wgrad`` but still accumulates into main_grad; autograd sums two ZeroTensors
+        instead of two dense [vocab, hidden] gradients."""
+        Utils.initialize_model_parallel()
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=HIDDEN,
+            num_attention_heads=8,
+            params_dtype=torch.bfloat16,
+            bf16=True,
+            gradient_accumulation_fusion=True,
+        )
+        module = VocabParallelEmbedding(
+            VOCAB, HIDDEN, init_method=init_method_normal(0.02), config=config
+        )
+        weight = module.weight
+        weight.zero_out_wgrad = True
+        weight.main_grad = torch.zeros(weight.shape, dtype=torch.float32, device="cuda")
+        weight.grad_added_to_main_grad = False
+
+        torch.manual_seed(1)
+        ids = [_token_ids("zipf", 4096).view(2, 2048) for _ in range(2)]
+        grads = [torch.randn(2, 2048, HIDDEN, device="cuda", dtype=torch.bfloat16) for _ in ids]
+        torch.autograd.backward([module(i) for i in ids], grads)
+
+        assert torch._is_zerotensor(weight.grad)
+        assert weight.grad_added_to_main_grad
+        # Each use adds what PyTorch's embedding backward followed by main_grad.add_ would.
+        expected = torch.zeros_like(weight.main_grad)
+        for i, g in zip(ids, grads):
+            expected.add_(torch.ops.aten.embedding_dense_backward(g, i, VOCAB, -1, False))
+        torch.testing.assert_close(weight.main_grad, expected)
+
+    @pytest.mark.parametrize("overlap_grad_reduce", [False, True])
+    @pytest.mark.parametrize("unfused_use", [False, True])
+    def test_shared_weight_under_ddp(self, overlap_grad_reduce, unfused_use):
+        """Megatron DDP's hook on a ``zero_out_wgrad`` weight used by two fused embeddings and,
+        optionally, an unfused consumer (a tied output layer computed outside the fusion): the
+        ZeroTensors add nothing and the unfused gradient lands in main_grad exactly once.
+        Measured against an fp64 oracle, with the dense (unfused) path as the error baseline."""
+        Utils.initialize_model_parallel()
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=HIDDEN,
+            num_attention_heads=8,
+            params_dtype=torch.bfloat16,
+            bf16=True,
+        )
+        ddp_config = DistributedDataParallelConfig(
+            grad_reduce_in_fp32=True, overlap_grad_reduce=overlap_grad_reduce, bucket_size=None
+        )
+        modules = {
+            fused: VocabParallelEmbedding(
+                VOCAB,
+                HIDDEN,
+                init_method=init_method_normal(0.02),
+                config=dataclasses.replace(config, gradient_accumulation_fusion=fused),
+            )
+            for fused in (False, True)
+        }
+        with torch.no_grad():
+            modules[True].weight.copy_(modules[False].weight)
+        for m in modules.values():
+            m.weight.zero_out_wgrad = True
+        models = {
+            fused: DistributedDataParallel(config, ddp_config=ddp_config, module=m)
+            for fused, m in modules.items()
+        }
+
+        torch.manual_seed(1)
+        batches = []
+        for num_tokens in (4096, 2048):  # inside and below the fused token window
+            uses = [_token_ids("zipf", num_tokens).view(2, num_tokens // 2) for _ in range(2)]
+            grads = [
+                torch.randn(2, num_tokens // 2, HIDDEN, device="cuda", dtype=torch.bfloat16)
+                for _ in uses
+            ]
+            hidden = torch.randn(128, HIDDEN, device="cuda", dtype=torch.bfloat16)
+            logits_grad = torch.randn(128, VOCAB, device="cuda", dtype=torch.bfloat16)
+            batches.append((uses, grads, hidden, logits_grad))
+
+        expected = torch.zeros(VOCAB, HIDDEN, dtype=torch.float64, device="cuda")
+        for uses, grads, hidden, logits_grad in batches:
+            for ids, grad in zip(uses, grads):
+                expected += torch.ops.aten.embedding_dense_backward(
+                    grad.double(), ids, VOCAB, -1, False
+                )
+            if unfused_use:
+                expected += logits_grad.double().t() @ hidden.double()
+
+        errors = {}
+        for fused, model in models.items():
+            weight = modules[fused].weight
+            model.zero_grad_buffer()
+            # no_sync: no data-parallel reduction, so main_grad holds exactly this rank's sum.
+            with model.no_sync():
+                for uses, grads, hidden, logits_grad in batches:
+                    outputs = [model(ids) for ids in uses]
+                    if unfused_use:
+                        outputs.append(torch.nn.functional.linear(hidden, weight))
+                        grads = grads + [logits_grad]
+                    torch.autograd.backward(outputs, grads)
+            assert weight.grad is None
+            errors[fused] = (weight.main_grad.double() - expected).abs().max().item()
+
+        # Dropping or double-counting any use would leave an error the size of that use.
+        assert errors[True] <= 1.5 * errors[False] + 1e-6 * expected.abs().max().item(), errors
