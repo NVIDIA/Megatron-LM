@@ -478,8 +478,7 @@ class OptimizerConfig:
     optimizer_cuda_graph: bool = False
     """If true, enables CUDA graph for optimizer step."""
 
-    # The resolved_* names must not match a DDP or mixed-precision config field: Megatron-Bridge
-    # copies those fields by name onto this config, which a read-only property would reject.
+    # Megatron-Bridge sets attributes named fp8_param_gather / fp4_param_gather on this config.
     @property
     def resolved_fp8_param_gather(self) -> Optional[bool]:
         """fp8_param_gather of the model's DDP config, or None if not resolved for a model."""
@@ -499,8 +498,7 @@ class OptimizerConfig:
         return bool(
             self.use_precision_aware_optimizer
             and (
-                # Non-FP32 main params are always owned by TE. Dtypes may still be CLI strings
-                # before finalize_optimizer_config.
+                # Non-FP32 main params are always owned by TE. Dtypes may still be strings.
                 self.main_params_dtype not in (torch.float32, 'fp32')
                 # Any compute recipe works with BF16 model weights, and the Adam kernel handles
                 # FP8 delayed-scaling weights. Other quantized weights (e.g. MXFP8, NVFP4) need
@@ -517,8 +515,7 @@ class OptimizerConfig:
     @property
     def use_precision_aware_optimizer_no_fp8_or_ds_fp8(self) -> bool:
         """See _te_fused_adam_main_weight_and_decoupled_grad. Also selects param.grad vs
-        param.decoupled_grad. Derived on access so configs built directly (without
-        finalize_optimizer_config) work."""
+        param.decoupled_grad."""
         return self._te_fused_adam_main_weight_and_decoupled_grad(
             self.resolved_fp8_param_gather, self.resolved_fp4_param_gather
         )
@@ -559,15 +556,13 @@ class OptimizerConfig:
         return requested and self._param_remainders_supported() and not self.optimizer_cuda_graph
 
     def resolve_fp8_param_gather(self, ddp_fp8_param_gather: bool) -> "OptimizerConfig":
-        """Return a copy of this config with resolved_fp8_param_gather taken from the model's DDP
-        config."""
+        """Return a copy of this config with fp8_param_gather from the model's DDP config."""
         resolved = copy.copy(self)
         resolved._fp8_param_gather = ddp_fp8_param_gather
         return resolved
 
     def resolve_fp4_param_gather(self, ddp_fp4_param_gather: bool) -> "OptimizerConfig":
-        """Return a copy of this config with resolved_fp4_param_gather taken from the model's DDP
-        config."""
+        """Return a copy of this config with fp4_param_gather from the model's DDP config."""
         resolved = copy.copy(self)
         resolved._fp4_param_gather = ddp_fp4_param_gather
         return resolved

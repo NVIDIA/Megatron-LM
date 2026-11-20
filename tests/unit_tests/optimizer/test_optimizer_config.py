@@ -92,7 +92,7 @@ def test_optimizer_cuda_graph_disables_store_param_remainders():
         assert not OptimizerConfig(
             optimizer_cuda_graph=True, **_PAO
         ).resolved_store_param_remainders
-    # An explicit request is overridden too, with a warning when the config is validated.
+    # An explicit request is overridden too, with a warning from validate().
     config = OptimizerConfig(optimizer_cuda_graph=True, store_param_remainders=True, **_PAO)
     with pytest.warns(UserWarning, match="optimizer-cuda-graph"):
         config.validate()
@@ -203,9 +203,7 @@ def test_gate_follows_fp8_param_gather_resolution(fp8_recipe):
 
 
 def test_ddp_and_model_field_names_stay_settable():
-    """Megatron-Bridge copies its mixed-precision fields (fp8_param_gather, fp4_param_gather, ...)
-    by name onto every config that has an attribute of that name, so a read-only OptimizerConfig
-    property named like a DDP or model config field would break its config setup."""
+    """Megatron-Bridge sets DDP and model config fields by name on OptimizerConfig."""
     from dataclasses import fields
 
     from megatron.core.distributed import DistributedDataParallelConfig
@@ -220,7 +218,7 @@ def test_ddp_and_model_field_names_stay_settable():
             )
     config = OptimizerConfig()
     for name in ("fp8_param_gather", "fp4_param_gather"):
-        setattr(config, name, True)  # What Megatron-Bridge does; must not change the gate.
+        setattr(config, name, True)
     assert config.resolved_fp8_param_gather is None
     assert config.resolved_fp4_param_gather is None
 
@@ -272,11 +270,8 @@ def test_gate_without_precision_aware_optimizer():
 
 @pytest.mark.parametrize(("main_params_dtype", "te_owned"), [("fp32", False), ("fp16", True)])
 def test_gate_accepts_unfinalized_dtype_strings(main_params_dtype, te_owned):
-    """Before finalize_optimizer_config, dtypes may still be CLI strings: 'fp32' main params must
-    not be mistaken for non-FP32 ones, which TE always owns."""
-    config = _config(
-        True, fp8_recipe="mxfp8", main_params_dtype=main_params_dtype, **_PAO
-    )
+    """Dtypes may still be strings before finalize_optimizer_config."""
+    config = _config(True, fp8_recipe="mxfp8", main_params_dtype=main_params_dtype, **_PAO)
     assert config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 is te_owned
     assert config._param_remainders_supported() is (
         main_params_dtype == "fp32" and _te_supports_param_remainders()

@@ -514,8 +514,7 @@ class TestOptimizerCheckpointHelpers:
 
     @pytest.mark.parametrize('param_remainders', [False, True])
     def test_param_remainders_flag_round_trips_with_sharding_type(self, param_remainders):
-        """Plain values reach only rank 0's common state, so modules without rank 0 would lose
-        the param remainders flag and fall back to guessing it from their configuration."""
+        """Plain values reach only rank 0's common state, so the flag must be sharded."""
         sub_sd = {
             'param_state_sharding_type': 'dp_reshardable',
             'param_state_param_remainders': param_remainders,
@@ -524,7 +523,7 @@ class TestOptimizerCheckpointHelpers:
         self._extract_param_state_sharding_type(sub_sd, 'language', '', replica_id=(0, 0, 0))
 
         assert set(sub_sd) == {'_mimo_param_state_sharding_type'}
-        # The flag shares the existing object: a new key would be missing from old checkpoints.
+        # Same key as the sharding type alone, so existing checkpoints still load.
         assert (
             sub_sd['_mimo_param_state_sharding_type'].key
             == 'optimizer.mimo.language.param_state_sharding_type'

@@ -119,14 +119,10 @@ def _train_step(model, optimizer):
 
 
 def _master_state(distrib_optimizer, model_param):
-    """The master weight state distrib_optimizer holds for model_param, or None if this rank
-    holds no shard of it. Exact, for comparing master weights across checkpoint round trips:
+    """The master weight state for model_param, or None if this rank holds no shard of it.
 
-    - MCore-managed: the FP32 main param shard.
-    - TE-owned FP32 masters: TE's master_param itself (so tests can modify it in place).
-    - TE-owned int16 param remainders: the BF16 param shard bits stacked with the remainders,
-      which together make up the FP32 master.
-    - TE-owned FP16 masters: the unscaled FP32 values.
+    Int16 param remainders come stacked with the BF16 param bits they complete. FP32 masters
+    are returned in place, so tests can modify them.
     """
     if model_param not in distrib_optimizer.model_param_group_index_map:
         return None
@@ -184,7 +180,6 @@ def test_bf16_params_master_param_format(model_parallel, store_param_remainders)
     expected_dtype = torch.int16 if store_param_remainders else torch.float32
     masters = _master_params(optimizer)
     assert masters and all(master.dtype == expected_dtype for master in masters)
-
 
 
 @pytest.mark.parametrize("store_param_remainders", [None, True])
@@ -346,8 +341,7 @@ def _load_parameter_state(optimizer, model, sharding_type, ckpt_dir):
 
 
 def _save_legacy_parameter_state(optimizer, model, sharding_type, ckpt_dir):
-    """Like _save_parameter_state, but without the param remainders flag, as checkpoints saved
-    before it existed."""
+    """Like _save_parameter_state, but without the param remainders flag."""
     if sharding_type == "torch":
         state_dict = optimizer.get_parameter_state_dp_zero()
         if state_dict is not None:
@@ -361,7 +355,7 @@ def _save_legacy_parameter_state(optimizer, model, sharding_type, ckpt_dir):
         _model_sharded_state_dict(model), metadata=metadata
     )
     del sharded_state_dict["param_state_param_remainders"]
-    # dp_zero_gather_scatter wraps the DP-rank-0 gathered state, which records the flag too.
+    # dp_zero_gather_scatter also records the flag in the gathered state.
     gathered_state = getattr(sharded_state_dict["param_state"], "data", None)
     if isinstance(gathered_state, dict):
         del gathered_state["param_state_param_remainders"]
@@ -375,15 +369,13 @@ def _save_legacy_parameter_state(optimizer, model, sharding_type, ckpt_dir):
 def test_resume_mcore_managed_checkpoint_with_te_owned_master_weights(
     model_parallel, tmp_path_dist_ckpt, monkeypatch, sharding_type, fp8_recipe
 ):
-    """The upgrade path: before BF16 params could use TE-owned master weights, the
-    precision-aware optimizer kept MCore-managed FP32 main params with any non-delayed FP8
-    recipe, and its checkpoints have no param remainders flag. Resuming one with BF16 params must
-    load the same FP32 master weights and Adam moments into TE FusedAdam, then keep training."""
+    """A checkpoint of MCore-managed FP32 main params without the param remainders flag loads
+    the same master weights and Adam moments into TE-owned master weights."""
     name = f"mcore_managed_to_te_owned_{sharding_type}_{fp8_recipe}"
     with TempNamedDir(tmp_path_dist_ckpt / name, sync=True) as ckpt_dir:
         model = _ddp_model()
         with monkeypatch.context() as patch:
-            # Left unresolved, the config gates TE ownership as earlier versions did.
+            # Unresolved, a non-delayed FP8 recipe gives MCore-managed main params.
             patch.setattr(OptimizerConfig, "resolve_fp8_param_gather", lambda self, _: self)
             _, optimizer = _get_optimizer(model, fp8_recipe)
         (saving,) = optimizer.chained_optimizers
@@ -403,7 +395,6 @@ def test_resume_mcore_managed_checkpoint_with_te_owned_master_weights(
         _, optimizer = _get_optimizer(model, fp8_recipe)
         (loading,) = optimizer.chained_optimizers
         assert loading.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
-        # The default keeps full FP32 master weights, so the legacy checkpoint loads as is.
         assert not loading._stores_param_remainders()
         _load_parameter_state(loading, model, sharding_type, ckpt_dir)
         for param_name, param in model.module.named_parameters():
@@ -418,9 +409,8 @@ def test_resume_mcore_managed_checkpoint_with_te_owned_master_weights(
 
 
 def test_quantized_params_with_bf16_ddp_flags_raise_a_clear_error(model_parallel):
-    """Whether TE FusedAdam owns the master weights follows ddp_config.fp8_param_gather. If the
-    model holds quantized params while that flag says otherwise, building the optimizer must
-    fail clearly instead of giving TE FusedAdam a missing (None) shard that crashes training."""
+    """Quantized params with ddp_config.fp8_param_gather=False raise when building the
+    optimizer."""
     import transformer_engine.pytorch as te
     from transformer_engine.common.recipe import Float8CurrentScaling
     from transformer_engine.pytorch import fp8 as te_fp8
@@ -437,7 +427,7 @@ def test_quantized_params_with_bf16_ddp_flags_raise_a_clear_error(model_parallel
         linear,
     )
     assert not model.ddp_config.fp8_param_gather
-    with pytest.raises(ValueError, match="needs an MCore-managed FP32 main param"):
+    with pytest.raises(ValueError, match="need MCore-managed FP32 main params"):
         _get_optimizer(model, "tensorwise")
 
 
