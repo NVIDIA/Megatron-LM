@@ -32,7 +32,6 @@ from .copy_services.nixl_copy_service import NixlCopyService
 from .copy_services.nvshmem_copy_service import NVSHMEMCopyService
 from .planner import _extract_module_metadata
 from .transforms import MXFP8ReshardTransform, ReshardTransform
-from .utils import invalidate_refit_tensor_cache, named_persistent_buffers
 
 # Supported refit backend names
 RefitBackendName = Literal["nccl", "nccl_m2n", "gloo", "nvshmem", "nixl"]
@@ -527,87 +526,6 @@ def swap_model_weights(
         )
 
 
-def _harmonize_buffer_dtypes(plan, src_core, tgt_core, group=None):
-    """Bring destination persistent-buffer dtypes into agreement with source.
-
-    Some buffers (notably the MoE router ``expert_bias``) are upcast to fp32
-    inside the trainer on first forward by ``_maintain_float32_expert_bias``,
-    while the freshly-built inference model still holds them in bf16 from the
-    ``Float16Module`` wrap.  The reshard send/recv path is dtype-strict —
-    sending fp32 bytes into a bf16 receive buffer corrupts the data — so dst's
-    buffer must match src's dtype before the transfer.
-
-    Source dtypes are collected once via ``all_gather_object``, matched by
-    transfer ID, and cached under local destination buffer names on the plan.
-    Subsequent refits reuse the cached map and only do the per-buffer dtype
-    check / replacement (no collective).
-    """
-    if plan.buffer_dtypes is None:
-        source_buffers = {}
-        if src_core is not None:
-            source_buffers = {
-                name: buf.dtype for name, _, _, buf in named_persistent_buffers(src_core)
-            }
-        # Transfer IDs already pair source and destination tensors, even when
-        # their storage names or local pipeline indices differ.
-        local_src_dtypes = {
-            op.task_id: source_buffers[op.param_name]
-            for op in plan.send_ops
-            if op.param_name in source_buffers
-        }
-        destination_buffers = (
-            {name for name, _, _, _ in named_persistent_buffers(tgt_core)}
-            if tgt_core is not None
-            else set()
-        )
-        local_dst_names = {
-            op.task_id: op.param_name
-            for op in plan.recv_ops
-            if op.param_name in destination_buffers
-        }
-        world_size = group.size() if group is not None else torch.distributed.get_world_size()
-        gathered: list = [None] * world_size
-        torch.distributed.all_gather_object(
-            gathered, (local_src_dtypes, local_dst_names), group=group
-        )
-        transfer_dtypes = {
-            task_id: dtype for src_dtypes, _ in gathered for task_id, dtype in src_dtypes.items()
-        }
-        # Every rank validates every destination before any rank enters transfers.
-        # Different task IDs may contribute shards to the same destination buffer.
-        destination_dtypes = []
-        for rank, (_, dst_names) in enumerate(gathered):
-            dtypes = {}
-            for task_id, name in dst_names.items():
-                if task_id not in transfer_dtypes:
-                    continue
-                dtype = transfer_dtypes[task_id]
-                previous = dtypes.setdefault(name, dtype)
-                if previous != dtype:
-                    raise ValueError(
-                        f"Source shards disagree on buffer dtype for {name} on rank {rank}"
-                    )
-            destination_dtypes.append(dtypes)
-        rank = group.rank() if group is not None else torch.distributed.get_rank()
-        plan.buffer_dtypes = destination_dtypes[rank]
-
-    if tgt_core is None:
-        return
-
-    canonical = plan.buffer_dtypes
-    invalidated = False
-    for full_name, sub, buf_name, dst_buf in named_persistent_buffers(tgt_core):
-        expected = canonical.get(full_name)
-        if expected is not None and dst_buf.dtype != expected:
-            # Replace the tensor in-place on the parent module so subsequent
-            # recvs write the right number of bytes and the in-model lookup
-            # (``self.expert_bias``) sees the new storage.
-            sub._buffers[buf_name] = dst_buf.to(expected)
-            invalidated = True
-    if invalidated:
-        invalidate_refit_tensor_cache(tgt_core)
-
-
 def reshard_model_weights(
     src_model: LanguageModule | None,
     target_model: LanguageModule | None,
@@ -647,7 +565,6 @@ def reshard_model_weights(
         pool_index=pool_index,
         execution_batch_bytes=execution_batch_bytes,
     )
-    _harmonize_buffer_dtypes(plan, src_core, tgt_core, group=group)
     service.set_model_roles(is_source=src_core is not None, is_destination=tgt_core is not None)
     execute_reshard_plan(
         plan, src_core, tgt_core, service=service, group=group, transform=transform

@@ -1873,8 +1873,8 @@ class TestMegatronFsdpOverlapSchedule:
         """Run one step through the no-pipelining schedule, as the training loop does.
 
         The schedule runs the 1F1B overlap schedule when overlap_moe_expert_parallel_comm is
-        set, runs every microbatch but the last under no_sync(), and finalizes the gradients
-        with finalize_model_grads().
+        set, runs every microbatch but the last under no_sync(), so the last one reduces over
+        DP-Outer, and finalizes the gradients with finalize_model_grads().
         """
         from megatron.core.pipeline_parallel.schedules import forward_backward_no_pipelining
 
@@ -1892,7 +1892,9 @@ class TestMegatronFsdpOverlapSchedule:
         optimizer.step()
         return torch.stack([output["lm loss"] for output in forward_data_store])
 
-    def _check_matches_standard_schedule(self):
+    def _check_matches_standard_schedule(
+        self, num_optimizer_instances=1, outer_dp_sharding_strategy="no_shard"
+    ):
         """Train with both schedules from identical weights and compare the losses."""
         from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
             fully_shard_optimizer,
@@ -1900,10 +1902,14 @@ class TestMegatronFsdpOverlapSchedule:
         from megatron.core.pipeline_parallel.utils import set_streams
         from tests.unit_tests.a2a_overlap.utils import deterministic_mode
 
-        if Utils.world_size % self.EXPERT_MODEL_PARALLEL_SIZE != 0:
-            pytest.skip(f"Requires a world size divisible by {self.EXPERT_MODEL_PARALLEL_SIZE}.")
+        group_size = self.EXPERT_MODEL_PARALLEL_SIZE * num_optimizer_instances
+        if Utils.world_size % group_size != 0:
+            pytest.skip(f"Requires a world size divisible by {group_size}.")
 
-        Utils.initialize_model_parallel(expert_model_parallel_size=self.EXPERT_MODEL_PARALLEL_SIZE)
+        Utils.initialize_model_parallel(
+            expert_model_parallel_size=self.EXPERT_MODEL_PARALLEL_SIZE,
+            num_distributed_optimizer_instances=num_optimizer_instances,
+        )
         try:
             with deterministic_mode():
                 # Create the 1F1B communication stream up front, as the a2a_overlap tests do.
@@ -1922,6 +1928,8 @@ class TestMegatronFsdpOverlapSchedule:
                             overlap_grad_reduce=True,
                             overlap_param_gather=True,
                             use_megatron_fsdp=True,
+                            num_distributed_optimizer_instances=num_optimizer_instances,
+                            outer_dp_sharding_strategy=outer_dp_sharding_strategy,
                             # Give the word embedding a bucket of its own.
                             bucket_size=model.embedding.word_embeddings.weight.numel(),
                         ),
@@ -1962,6 +1970,23 @@ class TestMegatronFsdpOverlapSchedule:
             Utils.destroy_model_parallel()
             gc.collect()
             torch.cuda.empty_cache()
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.4.0"), reason="Megatron-FSDP requires torch >= 2.4.0"
+    )
+    @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
+    @pytest.mark.parametrize("outer_dp_sharding_strategy", ["no_shard", "optim"])
+    def test_dp_outer_reduces_once_per_step(self, outer_dp_sharding_strategy):
+        """
+        HSDP reduces each bucket over DP-Outer once per optimization step.
+
+        The 1F1B overlap schedule runs the model and the MTP layer in separate backward
+        passes, so it reduces the embedding bucket twice in the last microbatch. The in-place
+        DP-Outer reduction must still run only once.
+        """
+        self._check_matches_standard_schedule(
+            num_optimizer_instances=2, outer_dp_sharding_strategy=outer_dp_sharding_strategy
+        )
 
     @pytest.mark.skipif(
         not is_torch_min_version("2.4.0"), reason="Megatron-FSDP requires torch >= 2.4.0"
