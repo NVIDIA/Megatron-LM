@@ -273,6 +273,10 @@ class Utils:
     local_rank = int(os.environ.get('LOCAL_RANK', '0'))
     inited = False
     store = None
+    # Default for initialize_model_parallel's create_gloo_process_groups. A package whose
+    # tests never use Gloo groups can turn it off in its conftest.py: each group costs a
+    # TCP rendezvous to create and a blocking teardown to destroy.
+    create_gloo_process_groups = True
 
     @staticmethod
     def initialize_distributed():
@@ -362,6 +366,7 @@ class Utils:
             torch.distributed.barrier()
         ps.destroy_model_parallel()
         Utils.initialize_distributed()
+        kwargs.setdefault("create_gloo_process_groups", Utils.create_gloo_process_groups)
         ps.initialize_model_parallel(
             tensor_model_parallel_size,
             pipeline_model_parallel_size,
