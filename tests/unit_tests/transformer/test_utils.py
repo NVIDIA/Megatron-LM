@@ -2,19 +2,22 @@
 
 import inspect
 import os
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
+from packaging.version import Version
 
 import megatron.core.transformer.utils as transformer_utils
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
+    check_te_flash_attention_4_window,
     is_layer_window_attention,
     set_attention_backend,
     set_model_config_attribute,
@@ -70,6 +73,124 @@ def test_set_attention_backend_rejects_process_wide_conflicts(isolated_nvte_atte
     for config in conflicts:
         with pytest.raises(AssertionError, match="process-wide"):
             set_attention_backend(config)
+
+
+@contextmanager
+def _te_flash_attention_4_pairing(te_version="2.20.2+44f31bbe", fa4_version="4.0.0b37"):
+    """An SM100 GPU with the given Transformer Engine and imported flash-attn-4 versions."""
+    import megatron.core.transformer.attention as attention_module
+
+    with (
+        patch("torch.cuda.is_available", return_value=True),
+        patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        patch.object(transformer_utils, "get_te_version", return_value=Version(te_version)),
+        patch.object(attention_module, "_FA4_VERSION", fa4_version),
+    ):
+        yield
+
+
+@pytest.mark.parametrize(
+    "te_version, fa4_version, attention_backend, flash_attention_version, rejected",
+    [
+        # TE before 2.21 with FA4 4.0.0b30 or later, where TE can pick FA4.
+        ("2.20.2+44f31bbe", "4.0.0b37", AttnBackend.flash, None, True),
+        ("2.20.2+44f31bbe", "4.0.0b30", AttnBackend.auto, None, True),
+        ("2.20.2+44f31bbe", "4.0.0b37", AttnBackend.flash, 4, True),
+        # The FA4 releases the lock allows, a fixed TE, and backends that keep TE off FA4.
+        ("2.20.2+44f31bbe", "4.0.0b29", AttnBackend.flash, 4, False),
+        ("2.21.0", "4.0.0b37", AttnBackend.flash, 4, False),
+        ("2.20.2+44f31bbe", "4.0.0b37", AttnBackend.fused, None, False),
+        ("2.20.2+44f31bbe", "4.0.0b37", AttnBackend.unfused, None, False),
+        ("2.20.2+44f31bbe", "4.0.0b37", AttnBackend.flash, 2, False),
+        ("2.20.2+44f31bbe", "4.0.0b37", AttnBackend.flash, 3, False),
+        ("2.20.2+44f31bbe", None, AttnBackend.flash, None, False),
+    ],
+)
+def test_te_flash_attention_4_window_pairing_is_refused(
+    isolated_nvte_attention_env,
+    te_version,
+    fa4_version,
+    attention_backend,
+    flash_attention_version,
+    rejected,
+):
+    """A causal TE attention layer is refused when TE would run it on an FA4 that reads its
+    unbounded-window value as an empty window. set_attention_backend, which models call before
+    their layer spec is built, accepts every pairing, so a model whose spec builds no TE attention
+    (such as get_gpt_layer_local_spec with the default transformer_impl) is not refused."""
+    config = _attention_config(
+        attention_backend=attention_backend, flash_attention_version=flash_attention_version
+    )
+    with _te_flash_attention_4_pairing(te_version, fa4_version):
+        set_attention_backend(config)
+        if rejected:
+            with pytest.raises(RuntimeError, match="would return zeros"):
+                check_te_flash_attention_4_window(config, AttnMaskType.causal, layer_number=1)
+        else:
+            check_te_flash_attention_4_window(config, AttnMaskType.causal, layer_number=1)
+
+
+@pytest.mark.parametrize(
+    "attn_mask_type, window_size, window_attn_skip_freq, layer_number, rejected",
+    [
+        # Causal masks get TE's unbounded left bound.
+        (AttnMaskType.causal, None, None, 1, True),
+        (AttnMaskType.padding_causal, None, None, 1, True),
+        (AttnMaskType.causal_bottom_right, None, None, 1, True),
+        # A sliding window with a bounded left edge reaches FA4 as its own bounds...
+        (AttnMaskType.causal, (8, 0), None, 1, False),
+        # ...except on the layers window_attn_skip_freq leaves unwindowed.
+        (AttnMaskType.causal, (8, 0), 2, 2, True),
+        # Noncausal masks, such as BERT's padding mask, get (-1, -1): no window for FA4.
+        (AttnMaskType.padding, None, None, 1, False),
+        (AttnMaskType.no_mask, None, None, 1, False),
+        # With config.window_size set, single-token decode runs no_mask as causal_bottom_right.
+        (AttnMaskType.no_mask, (8, 0), 2, 2, True),
+        (AttnMaskType.no_mask, (8, 0), 2, 1, False),
+    ],
+)
+def test_te_flash_attention_4_window_check_follows_the_effective_mask(
+    isolated_nvte_attention_env,
+    attn_mask_type,
+    window_size,
+    window_attn_skip_freq,
+    layer_number,
+    rejected,
+):
+    """Only a layer that TE would run as causal with an unbounded left edge is refused."""
+    config = _attention_config(
+        attention_backend=AttnBackend.flash,
+        window_size=window_size,
+        window_attn_skip_freq=window_attn_skip_freq,
+    )
+    with _te_flash_attention_4_pairing():
+        set_attention_backend(config)
+        if rejected:
+            with pytest.raises(RuntimeError, match="would return zeros"):
+                check_te_flash_attention_4_window(config, attn_mask_type, layer_number)
+        else:
+            check_te_flash_attention_4_window(config, attn_mask_type, layer_number)
+
+
+def test_te_dot_product_attention_refuses_te_flash_attention_4_window_pairing(
+    isolated_nvte_attention_env,
+):
+    """The check runs where TE attention is built, so a TE layer spec is checked even when
+    config.transformer_impl is 'local', and the refusal comes before TE builds anything."""
+    from megatron.core.extensions.transformer_engine import TEDotProductAttention
+
+    config = _attention_config(
+        transformer_impl="local", attention_backend=AttnBackend.flash, flash_attention_version=4
+    )
+    with _te_flash_attention_4_pairing():
+        set_attention_backend(config)
+        with pytest.raises(RuntimeError, match="would return zeros"):
+            TEDotProductAttention(
+                config=config,
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+                attention_type="self",
+            )
 
 
 class _TrackingConfig:

@@ -60,6 +60,7 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.module import is_first_microbatch_tracked
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
+    check_te_flash_attention_4_window,
     ensure_metadata_has_dp_cp_group,
     is_layer_window_attention,
     make_sharded_tensors_for_checkpoint,
@@ -2379,6 +2380,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 "Transformer Engine is not installed. "
                 "Please install it with `pip install transformer-engine`."
             )
+        # Refuse, before building anything, a TE/FlashAttention-4 pairing that would zero this
+        # layer's causal attention. Checked here, where TE attention is built, and not from the
+        # config: the layer spec, not config.transformer_impl, decides whether TE attention runs.
+        check_te_flash_attention_4_window(config, attn_mask_type, layer_number)
 
         self.config = config
         self.te_forward_mask_type = False
