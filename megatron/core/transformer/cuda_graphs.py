@@ -905,8 +905,10 @@ def delete_cuda_graphs():
     _CudagraphGlobalRecord.captured_runners.clear()
     _GTP_RUNNER_STREAMS.clear()
 
-    # TODO: Optional?: Force garbage collection to clean up memory
-    gc.collect()
+    if runners:
+        # Free the memory the reset graphs and their capture inputs held. With no graphs
+        # there is nothing to free, and a full collection costs ~0.4 s on a large heap.
+        gc.collect()
     torch.cuda.empty_cache()
 
     CudaGraphManager.global_mempool = None
