@@ -698,6 +698,8 @@ def _end_otel_job_spans():
 
 
 def destroy_global_state():
+    if "megatron.training.distillation.v3_runtime" in sys.modules:
+        sys.modules["megatron.training.distillation.v3_runtime"].reset_runtime()
     destroy_global_vars()
     destroy_num_microbatches_calculator()
     destroy_global_memory_buffer()
@@ -2618,7 +2620,12 @@ def setup_model_and_optimizer(
     if args.logits_save_dir is not None and mpu.is_pipeline_last_stage():
         from megatron.training.distillation import LogitsSaverHooks
 
-        logits_saver = LogitsSaverHooks(
+        saver_class = LogitsSaverHooks
+        if getattr(args, "logits_save_inputs", False):
+            from megatron.training.distillation.v3_runtime import v3_saver_class
+
+            saver_class = v3_saver_class(args)
+        logits_saver = saver_class(
             save_dir=args.logits_save_dir,
             k=args.logits_save_top_k,
             p=args.logits_save_top_p,
@@ -3060,6 +3067,10 @@ def train_step(
     save_dgrads_in_this_iteration = (checkpoint.save_dgrads_interval is not None and
                                      (iteration + 1) % checkpoint.save_dgrads_interval == 0)
     while rerun_state_machine.should_run_forward_backward(rerun_data_iterator):
+        if getattr(args, "logits_save_inputs", False):
+            from megatron.training.distillation.v3_runtime import begin_attempt
+
+            begin_attempt()
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -3222,6 +3233,11 @@ def train_step(
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
         return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0, None, scheduled_num_microbatches
+
+    if getattr(args, "logits_save_inputs", False):
+        from megatron.training.distillation.v3_runtime import commit_attempt
+
+        commit_attempt()
 
     # Empty unused memory.
     if cfg.train.empty_unused_memory_level >= 1:
@@ -4899,6 +4915,12 @@ def train(
         global_batch_size = get_current_global_batch_size()
         update_num_microbatches(train_state.consumed_train_samples, consistency_check=True, verbose=True)
 
+        # Offline KD v3: agree on the replay frontier before each step.
+        if getattr(args, "logits_load_inputs", False):
+            from megatron.training.distillation.v3_runtime import before_train_step
+
+            before_train_step(args)
+
         # Capture CUDA Graphs. One-off, at the warmup-step boundary -- the actual
         # graph capture (create_cudagraphs) is a notable one-time cost worth its
         # own span, distinct from the megatron.train.iteration spans around it.
@@ -5322,6 +5344,10 @@ def train(
     # function.
     with _otel_managed_span('checkpoint', 'megatron.checkpoint.exit_finalize', is_goodput_span=True):
         maybe_finalize_async_save(blocking=True, terminate=should_exit)
+    if getattr(args, "logits_save_inputs", False):
+        from megatron.training.distillation.v3_runtime import finish_dump
+
+        finish_dump()
     ft_integration.on_checkpointing_end(is_async_finalization=True)
 
     if cfg.logger.log_energy:
@@ -5858,12 +5884,26 @@ def build_train_valid_test_data_loaders(
     if is_distributed or mpu.get_tensor_model_parallel_rank() == 0:
 
         # Build datasets.
-        train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
+        if getattr(args, "logits_save_corpus_source", None):
+            from megatron.training.distillation.corpus_runtime import build_corpus_dump_datasets
+
+            train_ds, valid_ds, test_ds = build_corpus_dump_datasets(
+                args, build_train_valid_test_datasets_provider
+            )
+        else:
+            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
+                build_train_valid_test_datasets_provider
+            )
         valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
         if cfg.validation.skip_train or not build_train_dataloader:
             train_dataloader = None
         else:
-            train_dataloader = build_pretraining_data_loader(train_ds, consumed_train_samples_in_current_phase)
+            if getattr(args, "logits_load_inputs", False):
+                from megatron.training.distillation.v3_runtime import build_replay_loader
+
+                train_dataloader = build_replay_loader(args, consumed_train_samples_in_current_phase)
+            else:
+                train_dataloader = build_pretraining_data_loader(train_ds, consumed_train_samples_in_current_phase)
         valid_dataloaders = []
         for valid_d in valid_ds:
             if cfg.validation.skip_train or cfg.validation.full_validation:
@@ -5887,6 +5927,11 @@ def build_train_valid_test_data_loaders(
         do_test = test_dataloader is not None and (cfg.validation.full_validation or cfg.validation.eval_iters > 0)
     else:
         do_train, do_valid, do_test = False, False, False
+
+    if getattr(args, "logits_save_corpus_source", None):
+        from megatron.training.distillation.corpus_runtime import agree_corpus_epoch
+
+        agree_corpus_epoch(args)  # Every rank sizes the run to the source's epoch.
 
     broadcast_data_flags(do_train=do_train, do_valid=do_valid, do_test=do_test)
     return train_dataloader, valid_dataloaders, test_dataloader

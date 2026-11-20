@@ -9,6 +9,10 @@
 
 # Offline Logits Knowledge Distillation
 
+For caches that include training inputs and replace the student training dataloader,
+see [Offline KD V3: Paired Inputs and Targets](offline_logits_distillation_v3.md).
+This page describes the existing V1/V2 paths.
+
 Offline logits knowledge distillation (KD) trains a student model against a teacher's
 cached top-K token log-probabilities instead of running the teacher live. A separate
 teacher run saves top-K log-probs to disk once; any number of later student runs stream
@@ -102,7 +106,7 @@ load-side microbatch, which saved DP-rank shard(s) and row ranges to read.
 | `--logits-save-top-k` | Number of top log-probs to save per token. Default: `128`. |
 | `--logits-save-top-p` | Optional top-P (nucleus) threshold applied after top-K selection — keeps only the smallest prefix of entries whose cumulative probability mass reaches this value. Must be in `(0, 1]`. Default: `None` (disabled). |
 | `--logits-save-top-p-min-k` | Minimum entries kept per token when top-P masking is active, regardless of cumulative mass. Default: `1`. |
-| `--logits-save-dtype` | On-disk dtype for saved log-probabilities: `fp16`, `bf16`, or `fp32`. Default: `fp16`. |
+| `--logits-save-dtype` | On-disk dtype for saved log-probabilities: `fp16` or `fp32`. Default: `fp16`. |
 | `--freeze-all-layers` | Freezes all model parameters. Not required by `--logits-save-dir`, but recommended for a dedicated teacher-dump run: without it, the LM loss is still computed and gradients still update the model while logits are being saved. |
 
 **Student loading:**

@@ -108,8 +108,6 @@ def check_logits_saver_failure() -> None:
         )
 
 
-_MAX_VOCAB_SIZE = 2 ** 17  # 131072 - maximum supported vocab size
-
 class LogitsSaverHooks:
     """
     Hook-based utility to save top-K log-probabilities during training with minimal overhead.
@@ -180,12 +178,16 @@ class LogitsSaverHooks:
         min_k: Minimum number of entries kept per token when top-P masking
             is active, regardless of cumulative mass.  Defaults to 1.
         save_dtype: String name of the dtype for top-K log-probabilities on
-            disk.  One of ``'fp16'``, ``'bf16'``, or ``'fp32'``.
+            disk.  Either ``'fp16'`` or ``'fp32'``.
     """
+
+    _max_vocab_size = 2 ** 17  # V1/V2 use 17-bit vocabulary indices.
+    # When set, IDs at or above it (vocabulary padding) are excluded from the softmax
+    # and the top-K selection, so targets are a distribution over real tokens only.
+    _real_vocab_size: Optional[int] = None
 
     _DTYPE_MAP = {
         'fp16': torch.float16,
-        'bf16': torch.bfloat16,
         'fp32': torch.float32,
     }
 
@@ -483,7 +485,17 @@ class LogitsSaverHooks:
     def _process_single_microbatch(
         self, logits: torch.Tensor
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Process a single logits tensor and return top-K log-probability data.
+        """Return top-K log-probabilities cast to ``save_dtype`` (see :meth:`_topk_logprobs`)."""
+        result = self._topk_logprobs(logits)
+        if result is None:
+            return None
+        values, indices = result
+        return values.to(self._save_dtype), indices
+
+    def _topk_logprobs(
+        self, logits: torch.Tensor
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Process a single logits tensor and return fp32 top-K log-probability data.
 
         Selects local top-K positions on raw logits first, then computes
         the global log-sum-exp denominator using ``torch.logsumexp`` for
@@ -500,23 +512,37 @@ class LogitsSaverHooks:
             logits: Tensor of shape (seq_len, batch, local_vocab_size)
 
         Returns:
-            Tuple of (log_prob_values, global_indices) on TP rank 0,
+            Tuple of (fp32 log_prob_values, global_indices) on TP rank 0,
             ``None`` on other TP ranks.
         """
         local_vocab_size = logits.shape[-1]
         global_vocab_size = local_vocab_size * self.tp_size
 
-        assert global_vocab_size <= _MAX_VOCAB_SIZE, (
-            f"Global vocab size {global_vocab_size} exceeds maximum supported {_MAX_VOCAB_SIZE} (17 bits)"
+        max_vocab_size = self._max_vocab_size
+        assert global_vocab_size <= max_vocab_size, (
+            f"Global vocab size {global_vocab_size} exceeds maximum supported {max_vocab_size}"
         )
 
-        effective_k = min(self.k, global_vocab_size)
+        real_vocab_size = self._real_vocab_size or global_vocab_size
+        effective_k = min(self.k, real_vocab_size)
         local_k = min(effective_k, local_vocab_size)
 
-        # Convert to fp32 to lessen precision issues
-        logits = logits.float()
+        # Padding sits at the end of the vocabulary, so excluding it is a view of this
+        # shard's real entries (possibly none), not a copy. Convert to fp32 to lessen
+        # precision issues.
+        real = min(local_vocab_size, max(0, real_vocab_size - self.tp_rank * local_vocab_size))
+        logits = logits[..., :real].float()
 
-        local_logit_vals, local_indices = torch.topk(logits, local_k, dim=-1)
+        local_logit_vals, local_indices = torch.topk(logits, min(local_k, real), dim=-1)
+        if real < local_k:
+            # Keep every rank's candidate count equal for the gather; -inf is never chosen
+            # because effective_k does not exceed the number of real entries.
+            missing = local_k - real
+            padding = local_logit_vals.new_full((*logits.shape[:-1], missing), -torch.inf)
+            local_logit_vals = torch.cat((local_logit_vals, padding), dim=-1)
+            local_indices = torch.cat(
+                (local_indices, local_indices.new_zeros((*logits.shape[:-1], missing))), dim=-1
+            )
 
         # Local log-sum-exp via PyTorch's fused CUDA kernel
         local_lse = torch.logsumexp(logits, dim=-1, keepdim=True)
@@ -549,8 +575,6 @@ class LogitsSaverHooks:
             global_values, global_indices = self._apply_topp_truncation(
                 global_values, global_indices,
             )
-
-        global_values = global_values.to(self._save_dtype)
 
         return global_values, global_indices
 
