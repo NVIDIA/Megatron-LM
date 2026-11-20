@@ -9,8 +9,8 @@ import torch
 from megatron.core.inference.config import CudaGraphSizingDistribution
 from megatron.core.transformer.cuda_graphs import _CudagraphReplayNode
 from tests.unit_tests.inference import test_coordinator_features_pairwise as features
-from tests.unit_tests.inference import test_coordinator_schedule_pairwise as schedule
 from tests.unit_tests.inference.coordinator_pairwise_utils import greedy_params, routed_model
+from tests.unit_tests.inference.two_rank import test_coordinator_schedule_pairwise as schedule
 
 pytestmark = [pytest.mark.internal, pytest.mark.asyncio]
 
