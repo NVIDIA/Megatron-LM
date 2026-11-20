@@ -34,7 +34,6 @@ def hybrid_models():
             normalization="RMSNorm",
             rmsnorm_impl=impl,
             num_moe_experts=2,
-            moe_router_topk=1,
             hidden_dropout=0.0,
             attention_dropout=0.0,
             use_cpu_initialization=True,
