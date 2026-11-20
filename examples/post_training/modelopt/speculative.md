@@ -15,7 +15,7 @@ can however signal whether the training is converged).
 ## Training and Export Workflow
 
 In practice, speculative decoding should be combined with quantization (weights and kv-cache)
-to achieve the the highest tokens-per-second-per-user (or TPS) without changing the quality of
+to achieve the highest tokens-per-second-per-user (or TPS) without changing the quality of
 the model. We provide quantization-aware training (QAT) receipt with self-distillation in the following.
 
 
@@ -27,7 +27,7 @@ For EAGLE, set `--export-algorithm eagle` and provide `--export-eagle-algorithm`
 the resulting model stored in `${MLM_MODEL_SAVE}` will have randomly initialized draft model weights.
 
 ```
-python examples/post_training/modelopt/convert_model.py \
+python examples/post_training/modelopt/convert_speculative.py \
     --export-algorithm eagle \
     --export-eagle-algorithm eagle3 \
     --load ${MLM_MODEL_CKPT} --save ${MLM_MODEL_SAVE} ${MLM_EXTRA_ARGS}

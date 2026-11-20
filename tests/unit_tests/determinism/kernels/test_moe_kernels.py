@@ -455,6 +455,8 @@ def test_virtual_expert_planner_graph_replay(virtual_expert_planner_group, ep_si
                             f"graph {num_tokens=} {topk=} {alignment=} {skew=} {replay=} {label}",
                             errors,
                         )
+                    # Finish reading before peers overwrite the shared histogram on replay.
+                    dist.barrier(group=group)
         _report(errors, dist.group.WORLD)
     finally:
         workspace.destroy()
@@ -1348,6 +1350,49 @@ class TestMoEModules:
             )
         assert layer.experts._nvfp4_weights is not None
 
+    def test_inference_vllm_moe_layer_replays(self):
+        """Inference MoELayer through the vLLM BF16 experts (parallel alignment and tiled
+        top-k sum included)."""
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
+
+        self._init(ep=1)
+        seeded()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=1024,
+            num_attention_heads=8,
+            num_moe_experts=8,
+            moe_ffn_hidden_size=1024,
+            moe_router_topk=2,
+            moe_router_score_function="sigmoid",
+            moe_router_enable_expert_bias=True,
+            moe_router_dtype="fp32",
+            moe_grouped_gemm=True,
+            activation_func=squared_relu,
+            add_bias_linear=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_cpu_initialization=True,
+            normalization="RMSNorm",
+            transformer_impl="inference_optimized",
+            inference_grouped_gemm_backend="vllm",
+            inference_moe_token_dispatcher_type="nccl",
+        )
+        NCCLAllGatherDispatcher.allocate_buffers()
+        layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        # 64 tokens: 32-row tiles, which the parallel alignment covers.
+        hidden = torch.randn(64, 1, 1024, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad(), deterministic_algorithms(True), InferenceMode.active():
+            assert_module_replays_bit_exact(
+                layer,
+                (hidden,),
+                replays=3,
+                backward=False,
+                contention=True,
+                what="MoELayer[inference, vllm]",
+            )
+
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
     @pytest.mark.parametrize(
         "offload_modules,offloaded_group,op_fuser",
@@ -2046,4 +2091,28 @@ def test_batch_invariant_unpermute_replays(monkeypatch, collective, dtype):
         contention=True,
         grad_outputs={"out": grad},
         what=f"batch-invariant unpermute[{collective=}, {dtype=}]",
+    )
+
+
+@pytest.mark.parametrize("weighted", [False, True], ids=["unweighted", "weighted"])
+def test_ep_invariant_tree_replays(weighted):
+    """moe_ep_invariant_combine's training tree (forward, row and probability gradients)
+    replays bit-exactly, with missing routes and three-expert leaves (96 experts)."""
+    from megatron.core.transformer.moe import ep_invariant_combine as eic
+
+    seeded()
+    tokens, experts, topk, hidden = 4096, 96, 6, 256
+    cols = torch.rand(tokens, experts, device="cuda").topk(topk, 1).indices
+    slot_rows = torch.arange(tokens * topk, device="cuda").view(tokens, topk)
+    slot_rows[::5, 0] = -1
+    rows = torch.randn(
+        tokens * topk, hidden, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    if weighted:
+        probs = torch.rand(tokens, experts, device="cuda", requires_grad=True)
+        fn, inputs = (lambda r, p: eic.tree_combine(r, slot_rows, cols, experts, p)), (rows, probs)
+    else:
+        fn, inputs = (lambda r: eic.tree_combine(r, slot_rows, cols, experts)), (rows,)
+    assert_replays_bit_exact(
+        fn, inputs, replays=3, contention=True, what=f"EP-invariant tree, weighted={weighted}"
     )

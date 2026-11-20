@@ -76,6 +76,11 @@ rm -f "$RESULTS_JSON"
 
 # ── Read model_config.yaml ────────────────────────────────────────────────────
 
+# Opt in only for configs using trusted legacy CI checkpoints.
+if [[ "$("$YQ" '.ENV_VARS.NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE // 0' "$CONFIG_PATH")" == 1 ]]; then
+    export NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE=1
+fi
+
 MODEL=$("$YQ" '.MODEL' "$CONFIG_PATH")
 TP=$("$YQ" '.TP // 1' "$CONFIG_PATH")
 PP=$("$YQ" '.PP // 1' "$CONFIG_PATH")
