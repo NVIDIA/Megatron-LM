@@ -151,10 +151,17 @@ def test_gtp_hsdp_remains_unsupported(enabled, cp):
     Utils.destroy_model_parallel()
 
 
-@pytest.mark.parametrize("enabled", [False, True], ids=["ag-off", "ag-on"])
+@pytest.mark.parametrize(
+    "instances,outer_strategy,enabled",
+    [
+        pytest.param(1, "no_shard", False, id="fsdp-ag-off"),
+        pytest.param(1, "no_shard", True, id="fsdp-ag-on"),
+        pytest.param(2, "no_shard", False, id="hsdp-ag-off"),
+        pytest.param(2, "optim", False, id="hfsdp-ag-off"),
+    ],
+)
 @pytest.mark.parametrize("expert", [False, True], ids=["dense", "expert"])
-@pytest.mark.parametrize("instances", [1, 2, 4])
-def test_training_matches_reference(enabled, expert, instances):
+def test_training_matches_reference(enabled, expert, instances, outer_strategy):
     Utils.initialize_distributed()
     if dist.get_world_size() // (2 if expert else 1) % instances:
         pytest.skip("Optimizer instances must divide expert DP size.")
@@ -166,49 +173,33 @@ def test_training_matches_reference(enabled, expert, instances):
         assert (pg.dp_cp_ag is not None) == enabled
         assert (pg.expt_dp_ag is not None) == (enabled and expert)
         assert_training_matches_reference(
-            pg, expert, enabled, instances, "optim_grads_params", "no_shard", False
+            pg, expert, enabled, instances, "optim_grads_params", outer_strategy, False
         )
 
 
-@pytest.mark.parametrize("expert", [False, True], ids=["dense", "expert"])
-@pytest.mark.parametrize("layout", ["replica", "wrong-members"])
-def test_basic_hsdp_rejects_mismatched_custom_ag(expert, layout):
+@pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"], ids=["hsdp", "hfsdp"])
+@pytest.mark.parametrize("ag_source", ["core", "dense-only", "expert-only", "unused-expert"])
+def test_hybrid_rejects_separate_ag(outer_strategy, ag_source):
     with initialized_groups(
-        create_all_gather_group=True,
+        create_all_gather_group=ag_source == "core",
         expert_model_parallel_size=2,
         num_distributed_optimizer_instances=2,
     ) as pg:
-        if expert:
-            pg.expt_dp_ag = pg.expt_dp if layout == "replica" else pg.ep
-        else:
-            pg.dp_cp_ag = pg.dp_cp if layout == "replica" else pg.expt_dp
-        with pytest.raises(ValueError, match="match the inner shard group's ordered ranks"):
+        # Even matching caller-supplied handles are unsupported for hybrid modes.
+        if ag_source == "dense-only":
+            pg.dp_cp_ag = pg.intra_dp_cp
+        elif ag_source in ("expert-only", "unused-expert"):
+            pg.expt_dp_ag = pg.intra_expt_dp
+        with pytest.raises(ValueError, match="not supported with HSDP or HFSDP"):
             assert_training_matches_reference(
-                pg, True, True, 2, "optim_grads_params", "no_shard", False
+                pg,
+                ag_source != "unused-expert",
+                True,
+                2,
+                "optim_grads_params",
+                outer_strategy,
+                False,
             )
-
-
-def test_outer_sharding_ignores_unused_custom_ag():
-    with initialized_groups(
-        create_all_gather_group=True,
-        expert_model_parallel_size=2,
-        num_distributed_optimizer_instances=2,
-    ) as pg:
-        pg.dp_cp_ag, pg.expt_dp_ag = pg.dp_cp, pg.expt_dp
-        assert_training_matches_reference(pg, True, True, 2, "optim_grads_params", "optim", False)
-
-
-def test_basic_hsdp_ignores_unused_expert_ag():
-    with initialized_groups(
-        create_all_gather_group=True,
-        expert_model_parallel_size=2,
-        num_distributed_optimizer_instances=2,
-    ) as pg:
-        # A collection may include expert handles while this model is dense-only.
-        pg.expt_dp_ag = pg.ep
-        assert_training_matches_reference(
-            pg, False, True, 2, "optim_grads_params", "no_shard", False
-        )
 
 
 def assert_training_matches_reference(

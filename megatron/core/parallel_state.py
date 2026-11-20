@@ -1822,7 +1822,8 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
     Creates separate communicators with the same ordered ranks as the inner data
     parallel shard groups, including CP for dense parameters. With one optimizer
     instance these are the full data parallel groups. This enables overlapping
-    all-gather operations with reduce-scatter operations, including basic HSDP.
+    all-gather operations with reduce-scatter operations. Megatron-FSDP v1 rejects
+    separate AG groups with HSDP and HFSDP.
     Prefer initialize_model_parallel(create_all_gather_group=True) for standard bootstrap
     and retain its returned collection. This helper always creates new, caller-owned groups;
     do not call it again to retrieve groups already created by the initializer.
