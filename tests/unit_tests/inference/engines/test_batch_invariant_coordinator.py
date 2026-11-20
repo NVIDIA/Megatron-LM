@@ -91,15 +91,17 @@ async def _shutdown(engine, client, address, comm, context, rank):
 @pytest.mark.internal
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "policy,progress",
+    "progress",
     [
-        pytest.param(Policy.LONGEST_PREFIX, None, id="longest-prefix"),
-        pytest.param(Policy.FIRST_PREFIX_BLOCK, None, id="first-block"),
-        pytest.param(Policy.LONGEST_PREFIX, (False, 1), id="ep-async"),
-        pytest.param(Policy.LONGEST_PREFIX, (True, 3), id="ep-sync"),
+        pytest.param(None, id="longest-prefix"),
+        pytest.param((False, 1), id="ep-async"),
+        pytest.param((True, 3), id="ep-sync"),
     ],
 )
-async def test_live_coordinator_batch_invariance_and_output_contracts(policy, progress):
+async def test_live_coordinator_batch_invariance_and_output_contracts(progress):
+    # The prompt is one 256-token block, where first-prefix-block routing equals longest-prefix
+    # routing; test_routed_prefix_reuse_executes_on_warm_owner covers the first-block truncation.
+    policy = Policy.LONGEST_PREFIX
     synchronous, interval = progress or (False, 1)
     model = {}
     if progress is not None:
