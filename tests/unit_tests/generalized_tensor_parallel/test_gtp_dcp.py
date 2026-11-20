@@ -17,8 +17,9 @@ import torch
 import torch.distributed as dist
 
 from megatron.core import parallel_state as ps
-from megatron.core.dist_checkpointing import ShardedTensor
+from megatron.core.dist_checkpointing import ShardedTensor, load, load_plain_tensors, save
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+from megatron.core.tensor_parallel.gtp_ckpt_util import GTPCheckpointFactory, physical_gtp_shard
 
 if not HAVE_GTP:
     pytest.skip("GTP requires TE with hook registry", allow_module_level=True)
@@ -28,10 +29,16 @@ from transformer_engine.common.recipe import MXFP8BlockScaling  # noqa: E402
 from transformer_engine.pytorch import fp8_autocast, fp8_model_init  # noqa: E402
 
 from megatron.core.dist_checkpointing.mapping import (  # noqa: E402
+    LocalNonpersistentObject,
     ShardedObject,
     ShardedTensorFactory,
     is_main_replica,
 )
+from megatron.core.dist_checkpointing.optimizer import (  # noqa: E402
+    get_param_id_to_sharded_param_map,
+    make_sharded_optimizer_tensor,
+)
+from megatron.core.dist_checkpointing.serialization import load_tensors_metadata  # noqa: E402
 from megatron.core.extensions.transformer_engine import (  # noqa: E402
     TELayerNormColumnParallelLinear,
     TERowParallelLinear,
@@ -55,19 +62,23 @@ from megatron.core.tensor_parallel.gtp_api import (  # noqa: E402
     gtp_remat_shard_dim0,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed  # noqa: E402
+from megatron.core.transformer.mlp import apply_swiglu_sharded_factory  # noqa: E402
 from megatron.core.transformer.spec_utils import ModuleSpec  # noqa: E402
 from megatron.core.transformer.transformer_config import TransformerConfig  # noqa: E402
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint  # noqa: E402
 from megatron.core.utils import (  # noqa: E402
     get_pg_rank,
     get_pg_size,
+    grant_shape_mismatch_for_gtp_padding,
     make_tp_sharded_tensor_for_checkpoint,
 )
+from tests.unit_tests.dist_checkpointing import TempNamedDir  # noqa: E402
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: E402,F401
     _requires_mxfp8,
     _torchrun_dist_init,
     reset_gtp_globals,
 )
+from tests.unit_tests.test_utilities import Utils  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -422,7 +433,7 @@ def _worker_helper_padded_inproj_no_pad_case(rank, world_size, port):
 def _worker_helper_padded_inproj_pad_case(rank, world_size, port):
     """in_proj with a dim-0 size needing GTP_remat padding (dim0=1160, gtp_remat_size=4,
     pad_for_alignment=16 -> 56 pad rows -> padded 1216, per-rank shard 304). Pins that the
-    padded global shape round-trips when save_gtp_remat_size == load_gtp_remat_size.
+    checkpoint omits padding while retaining physical row offsets.
     """
     update_gtp_config(pad_for_alignment=16)
     dim0_unpadded = 1160  # z(512) + x(512) + B(64) + C(64) + dt(8)
@@ -454,23 +465,17 @@ def _worker_helper_padded_inproj_pad_case(rank, world_size, port):
         tp_group=_cached_new_group([rank]),
         dp_cp_group=_cached_new_group(list(range(world_size))),
     )
-    st = sharded["weight"]
-    # Helper saves the padded global. Cross-topology portability (allow_shape_mismatch) is
-    # decided later, at load time, by grant_shape_mismatch_for_gtp_padding -- it's a save-time
-    # no-op regardless, so it's not baked in here.
-    assert (
-        st.global_shape[0] == dim0_padded
-    ), f"rank={rank} pad case: global_shape[0] {st.global_shape[0]} != {dim0_padded}"
+    st = sharded["weight"].build()['0']
+    assert st.global_shape[0] == dim0_unpadded
     assert st.global_offset[0] == rank * per_shard
+    assert st.local_shape[0] == min(per_shard, dim0_unpadded - rank * per_shard)
 
 
 def _worker_helper_cross_topology_reshard_metadata(rank, world_size, port):
     """Pin the cross-topology reshard contract via ShardedTensor metadata.
 
-    Can't run a real DCP save/load against itself in one torchrun (needs separate worlds), but we
-    can verify the saved global_shape covers any compatible load-side topology (>= unpadded
-    original). allow_shape_mismatch, the other half of the contract, is decided later at load
-    time by grant_shape_mismatch_for_gtp_padding, not baked in here.
+    Saved global_shape is the unpadded original shape, independent of the runtime
+    GTP degree and alignment. Local shards retain their physical row offsets.
     """
     update_gtp_config(pad_for_alignment=16)
     dim0_unpadded = 1160
@@ -493,16 +498,9 @@ def _worker_helper_cross_topology_reshard_metadata(rank, world_size, port):
         tp_group=_cached_new_group([rank]),
         dp_cp_group=_cached_new_group(list(range(world_size))),
     )
-    st = sharded["weight"]
-    # 1. The saved global covers >= unpadded original size.
-    assert st.global_shape[0] >= dim0_unpadded, (
-        f"rank={rank} saved global_shape ({st.global_shape[0]}) < unpadded ({dim0_unpadded}); "
-        f"would lose valid data on cross-topology reshard."
-    )
-    # 2. Each rank's offset+local_shape covers a contiguous slice of the
-    #    padded global; together the ranks cover [0, padded_global).
-    assert st.global_offset[0] + st.local_shape[0] <= st.global_shape[0]
-    assert st.global_offset[0] + st.local_shape[0] == (rank + 1) * per_shard
+    st = sharded["weight"].build()['0']
+    assert st.global_shape[0] == dim0_unpadded
+    assert st.global_offset[0] + st.local_shape[0] == min((rank + 1) * per_shard, dim0_unpadded)
 
 
 def _worker_save_then_load_offsets_symmetric(rank, world_size, port):
@@ -1780,6 +1778,7 @@ def _worker_cross_gtp_degree_save_load_roundtrip(rank, world_size, ckpt_base):
         )  # save_gtp_group covers the whole world -- no replication, trivial replica group
         assert getattr(weight_save, "pad_length", 0) == 64, weight_save.pad_length
         sharded_save = _wrap(weight_save, "weight")
+        sharded_save["weight"] = physical_gtp_shard(sharded_save["weight"])
         assert sharded_save["weight"].global_shape[0] == 256, sharded_save["weight"].global_shape
 
         weight_load = _make_gtp_shard(
@@ -1829,14 +1828,16 @@ def _worker_restrict_shape_mismatch_to_explainable_padding(rank, world_size, ckp
 
     def _wrap(tensor, key, prepend_offsets=(), **extra):
         return {
-            key: make_tp_sharded_tensor_for_checkpoint(
-                tensor=tensor,
-                key=key,
-                tp_axis=0,
-                prepend_offsets=prepend_offsets,
-                tp_group=trivial_replica_group,
-                dp_cp_group=world_group,
-                **extra,
+            key: physical_gtp_shard(
+                make_tp_sharded_tensor_for_checkpoint(
+                    tensor=tensor,
+                    key=key,
+                    tp_axis=0,
+                    prepend_offsets=prepend_offsets,
+                    tp_group=trivial_replica_group,
+                    dp_cp_group=world_group,
+                    **extra,
+                )
             )
         }
 
@@ -2021,7 +2022,8 @@ def _sharded_weight(weight, rank, world_group, *, gtp, expect_global_shape):
         dp_cp_group=world_group,
     )
     entry = sharded[_PREFIX + "weight"]
-    assert entry.global_shape == expect_global_shape, entry.global_shape
+    shape = entry.logical_shape if isinstance(entry, GTPCheckpointFactory) else entry.global_shape
+    assert shape == expect_global_shape, shape
     return sharded
 
 
@@ -2135,14 +2137,7 @@ def _worker_save_with_gtp_load_without_gtp_aligned(rank, world_size, ckpt_base):
 
 
 def _worker_save_with_gtp_padded_load_without_gtp_shape_mismatch(rank, world_size, ckpt_base):
-    """Same reverse direction, but out_features needs alignment padding at save time
-    (pad_length > 0). The checkpoint then declares the PADDED global_shape; a load with GTP
-    disabled has no signal that padding is involved, so it requests the true (unpadded)
-    global_shape and must hard-fail with a global-shape-mismatch CheckpointingException rather
-    than silently truncating or corrupting data.
-    """
-    import traceback
-
+    """Padded GTP saves logical rows, so a plain load needs no shape relaxation."""
     from megatron.core.dist_checkpointing import load, save
     from tests.unit_tests.dist_checkpointing import TempNamedDir
 
@@ -2158,13 +2153,9 @@ def _worker_save_with_gtp_padded_load_without_gtp_shape_mismatch(rank, world_siz
         )
         assert gtp_weight.pad_length == 4, gtp_weight.pad_length  # (8 - 20%8) % 8
 
-        # Checkpoint declares the padded shape (24, 8), not the true (20, 8).
+        # Checkpoint declares the logical shape (20, 8), omitting the four pad rows.
         gtp_sharded = _sharded_weight(
-            gtp_weight,
-            rank,
-            world_group,
-            gtp=True,
-            expect_global_shape=(out_features + 4, in_features),
+            gtp_weight, rank, world_group, gtp=True, expect_global_shape=(out_features, in_features)
         )
 
         with TempNamedDir(ckpt_base / 'gtp_padded_save', sync=True) as ckpt_dir:
@@ -2182,20 +2173,11 @@ def _worker_save_with_gtp_padded_load_without_gtp_shape_mismatch(rank, world_siz
                 expect_global_shape=(out_features, in_features),
             )
 
-            # load()'s real failure surfaces as torch's own collective-wrapping
-            # CheckpointException, which subclasses BaseException directly (not Exception!), so
-            # match on the underlying message rather than the wrapper type -- and run this
-            # identically (no rank-asymmetric branching) on every rank to avoid desyncing NCCL.
-            raised = False
-            try:
-                load(no_gtp_sharded, ckpt_dir)
-            except BaseException as e:  # noqa: BLE001
-                raised = True
-                full_msg = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-                assert "Global shape mismatch" in full_msg, full_msg
-            assert (
-                raised
-            ), "load() unexpectedly succeeded despite the padded/unpadded global_shape mismatch"
+            loaded = load(no_gtp_sharded, ckpt_dir)
+            golden = torch.arange(
+                out_features * in_features, dtype=torch.bfloat16, device='cuda'
+            ).reshape(out_features, in_features)
+            assert torch.equal(loaded[_PREFIX + 'weight'], golden)
     finally:
         update_gtp_config(pad_for_alignment=orig_pad)
         ps.initialize_model_parallel()
@@ -2320,8 +2302,289 @@ class TestGtpDcpHelper:
         _require_world_size(4)
         _worker_save_with_gtp_load_without_gtp_aligned(dist.get_rank(), 4, tmp_path_dist_ckpt)
 
-    def test_save_with_gtp_padded_load_without_gtp_shape_mismatch(self, tmp_path_dist_ckpt):
+    def test_save_with_gtp_padded_load_without_gtp_logical_shape(self, tmp_path_dist_ckpt):
         _require_world_size(4)
         _worker_save_with_gtp_padded_load_without_gtp_shape_mismatch(
             dist.get_rank(), 4, tmp_path_dist_ckpt
         )
+
+
+def _logical_group(rank, size):
+    return SimpleNamespace(rank=lambda: rank, size=lambda: size)
+
+
+def _logical_entry(full, tp_rank, tp_size, gtp_rank, gtp_size, alignment, axis, offsets=()):
+    part = full.chunk(tp_size, dim=axis)[tp_rank]
+    block = alignment * gtp_size
+    padding = (-part.shape[0]) % block
+    padded = torch.cat([part, part.new_full((padding, *part.shape[1:]), float('nan'))])
+    param = torch.nn.Parameter(padded.chunk(gtp_size)[gtp_rank].clone())
+    param.is_gtp_weight_remat = True
+    param.gtp_remat_size = gtp_size
+    param.group = _logical_group(gtp_rank, gtp_size)
+    param.gtp_replica_group = _logical_group(0, 1)
+    param.pad_length = padding
+    entry = make_tp_sharded_tensor_for_checkpoint(
+        param,
+        'weight',
+        tp_axis=axis,
+        prepend_offsets=offsets,
+        tp_group=_logical_group(tp_rank, tp_size),
+        dp_cp_group=_logical_group(0, 1),
+    )
+    return param, entry
+
+
+@pytest.mark.launch_on_gb200
+class TestGTPLogicalPadding:
+    @pytest.fixture(autouse=True)
+    def model_parallel(self):
+        Utils.initialize_model_parallel(1, 1)
+        yield
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        'axis,tp_size,gtp_size,rows,prepend',
+        [(0, 2, 2, 20, True), (1, 2, 2, 20, False), (0, 1, 4, 6, False), (1, 2, 3, 28, True)],
+    )
+    def test_gtp_checkpoint_contains_only_logical_rows(
+        self, axis, tp_size, gtp_size, rows, prepend
+    ):
+        full = torch.arange(rows * 8, dtype=torch.float32).reshape(rows, 8)
+        offsets = ((0, 1, 2),) if prepend else ()
+        coverage = torch.zeros_like(full, dtype=torch.bool)
+        restored = torch.empty_like(full)
+        for tp_rank in range(tp_size):
+            for gtp_rank in range(gtp_size):
+                param, entry = _logical_entry(
+                    full, tp_rank, tp_size, gtp_rank, gtp_size, 4, axis, offsets
+                )
+                assert isinstance(entry, GTPCheckpointFactory)
+                assert physical_gtp_shard(entry).data is param
+                assert entry.without_data().physical_shard.data is None
+                assert get_param_id_to_sharded_param_map({'w': entry}, [param]) == {0: entry}
+                loaded = {}
+                for name, piece in entry.build().items():
+                    if isinstance(piece, LocalNonpersistentObject):
+                        loaded[name] = piece.unwrap()
+                        continue
+                    assert piece.global_shape == tuple(x[2] for x in offsets) + tuple(full.shape)
+                    assert piece.global_offset[: len(offsets)] == tuple(x[1] for x in offsets)
+                    a, b = piece.global_offset[len(offsets) :]
+                    h, w = piece.local_shape
+                    assert (
+                        piece.data.untyped_storage().data_ptr()
+                        == param.untyped_storage().data_ptr()
+                    )
+                    assert torch.isfinite(piece.data).all()
+                    assert not coverage[a : a + h, b : b + w].any()
+                    coverage[a : a + h, b : b + w] = True
+                    restored[a : a + h, b : b + w] = piece.data
+                    loaded[name] = full[a : a + h, b : b + w]
+                expected = torch.nan_to_num(param.detach().clone())
+                with torch.no_grad():
+                    param.fill_(-999)
+                assert torch.equal(entry.merge_fn(loaded), expected)
+        assert coverage.all()
+        assert torch.equal(restored, full)
+
+    @pytest.mark.parametrize('axis', [0, 1])
+    def test_gtp_logical_disk_resharding(self, tmp_path_dist_ckpt, axis):
+        if torch.distributed.get_world_size() != 4:
+            pytest.skip('Requires four ranks.')
+        rank = torch.distributed.get_rank()
+        full = torch.arange(20 * 8, dtype=torch.float32).reshape(20, 8)
+        offsets = ((0, 0, 1),)
+        _, target = _logical_entry(full, 0, 1, rank, 4, 8, axis, offsets)
+        expected = torch.nan_to_num(target.data.detach().clone())
+        # A non-GTP source catches a self-consistently wrong padded save/load mapping.
+        plain = ShardedTensor.from_rank_offsets(
+            'weight', full, *offsets, replica_id=rank, prepend_axis_num=1
+        )
+        with TempNamedDir(tmp_path_dist_ckpt / 'gtp_unpadded_source', sync=True) as ckpt_dir:
+            save({'w': plain}, ckpt_dir)
+            with torch.no_grad():
+                target.data.fill_(-999)
+            loaded = load({'w': target}, ckpt_dir)
+        assert torch.equal(loaded['w'], expected)
+        _, source = _logical_entry(full, rank // 2, 2, rank % 2, 2, 4, axis, offsets)
+        source_moment = make_sharded_optimizer_tensor(source, source.data.detach() + 1000, 'moment')
+        with TempNamedDir(tmp_path_dist_ckpt / 'gtp_logical_source', sync=True) as ckpt_dir:
+            save({'w': source, 'm': source_moment}, ckpt_dir)
+            for metadata in load_tensors_metadata(ckpt_dir).values():
+                assert metadata.global_shape == (1, 20, 8)
+            _, target = _logical_entry(full, 0, 1, rank, 4, 8, axis, offsets)
+            expected = torch.nan_to_num(target.data.detach().clone())
+            expected_moment = torch.nan_to_num(target.data.detach() + 1000)
+            moment = make_sharded_optimizer_tensor(target, target.data.detach().clone(), 'moment')
+            with torch.no_grad():
+                target.data.fill_(-999)
+                moment.data.fill_(-888)
+            loaded = load({'w': target, 'm': moment}, ckpt_dir)
+        assert torch.equal(loaded['w'], expected)
+        assert torch.equal(loaded['m'], expected_moment)
+        target.data = loaded['w']
+        moment.data = loaded['m']
+        with TempNamedDir(tmp_path_dist_ckpt / 'gtp_logical_resaved', sync=True) as ckpt_dir:
+            save({'w': target, 'm': moment}, ckpt_dir)
+            plain = ShardedTensor.from_rank_offsets(
+                'weight', torch.empty_like(full), *offsets, replica_id=rank, prepend_axis_num=1
+            )
+            plain_moment = make_sharded_optimizer_tensor(plain, torch.empty_like(full), 'moment')
+            restored = load({'w': plain, 'm': plain_moment}, ckpt_dir)
+        assert torch.equal(restored['w'], full)
+        assert torch.equal(restored['m'], full + 1000)
+
+    def test_legacy_padded_gtp_checkpoint_load(self, tmp_path_dist_ckpt):
+        rank, size = torch.distributed.get_rank(), torch.distributed.get_world_size()
+        full = torch.arange(20 * 8, dtype=torch.float32).reshape(20, 8)
+        _, target = _logical_entry(full, 0, 1, rank, size, 8, 0)
+        old_entry = physical_gtp_shard(target)
+        with TempNamedDir(tmp_path_dist_ckpt / 'legacy_gtp_padding', sync=True) as ckpt_dir:
+            save({'w': old_entry, 'args': {'tensor_model_parallel_size': 1}}, ckpt_dir)
+            grant_shape_mismatch_for_gtp_padding({'w': target}, ckpt_dir, 8)
+            restored = load({'w': target}, ckpt_dir)
+        assert torch.equal(restored['w'], torch.nan_to_num(target.data))
+
+    @pytest.mark.parametrize('source_tp,allow_mismatch', [(None, False), (2, True)])
+    def test_legacy_row_tp_padding_requires_source_layout(
+        self, tmp_path_dist_ckpt, source_tp, allow_mismatch
+    ):
+        """A TP1 destination cannot identify padding gaps in an older TP2 checkpoint."""
+        if torch.distributed.get_world_size() != 4:
+            pytest.skip('Requires four ranks.')
+        rank = torch.distributed.get_rank()
+        full = torch.arange(20 * 8, dtype=torch.float32).reshape(20, 8)
+        _, old = _logical_entry(full, rank // 2, 2, rank % 2, 2, 4, 0)
+        _, target = _logical_entry(full, 0, 1, rank, 4, 8, 0)
+        target.physical_shard.allow_shape_mismatch = allow_mismatch
+        with torch.no_grad():
+            target.data.fill_(-999)
+        snapshot = target.data.detach().clone()
+        source = {'w': physical_gtp_shard(old)}
+        if source_tp is not None:
+            source['args'] = {'tensor_model_parallel_size': source_tp}
+        with TempNamedDir(tmp_path_dist_ckpt / 'legacy_row_tp_padding', sync=True) as ckpt_dir:
+            save(source, ckpt_dir)
+            with pytest.raises(ValueError, match='known source TP1'):
+                grant_shape_mismatch_for_gtp_padding({'w': target}, ckpt_dir, 8)
+        assert torch.equal(target.data, snapshot)
+
+    @pytest.mark.parametrize('singleton', [False, True])
+    @pytest.mark.parametrize('tp_size,gtp_size', [(1, 2), (2, 4)])
+    def test_padded_swiglu_uses_logical_checkpoint_rows(self, singleton, tp_size, gtp_size):
+        half_rows = 6 * tp_size
+        full = torch.arange(2 * half_rows * 4, dtype=torch.float32).reshape(-1, 4)
+        physical = torch.cat(
+            [
+                torch.cat(
+                    [full[t * 6 : (t + 1) * 6], full[half_rows + t * 6 : half_rows + (t + 1) * 6]]
+                )
+                for t in range(tp_size)
+            ]
+        )
+        targets = (
+            {'weight_w': full[:half_rows], 'weight_v': full[half_rows:]}
+            if singleton
+            else {'weight': full}
+        )
+        restored = {key: torch.empty_like(value) for key, value in targets.items()}
+        offsets = ((0, 0, 1),)
+        for tp_rank in range(tp_size):
+            for gtp_rank in range(gtp_size):
+                _, entry = _logical_entry(
+                    physical, tp_rank, tp_size, gtp_rank, gtp_size, 4, 0, offsets
+                )
+                factory = apply_swiglu_sharded_factory(entry, offsets, singleton)
+                loaded = {}
+                for name, piece in factory.build().items():
+                    if isinstance(piece, LocalNonpersistentObject):
+                        loaded[name] = piece.unwrap()
+                        continue
+                    assert piece.global_shape == (1, *targets[piece.key].shape)
+                    start = piece.global_offset[1]
+                    stop = start + piece.local_shape[0]
+                    restored[piece.key][start:stop] = piece.data
+                    loaded[name] = targets[piece.key][start:stop]
+                assert torch.equal(factory.merge_fn(loaded), torch.nan_to_num(entry.data))
+        assert all(torch.equal(restored[key], value) for key, value in targets.items())
+
+    def test_padded_expert_checkpoint(self, tmp_path_dist_ckpt):
+        """EP2 x EGTP2 keeps expert coordinates while dropping each expert's padding."""
+        _require_world_size(4)
+        rank = dist.get_rank()
+        ep_rank, egtp_rank = divmod(rank, 2)
+        group = _cached_new_group([0, 1] if ep_rank == 0 else [2, 3])
+        replica = _cached_new_group([rank])
+        previous_alignment = GTP_CONFIG.pad_for_alignment
+        update_gtp_config(pad_for_alignment=8)
+        try:
+            param = _make_gtp_shard(10, 8, group, replica_group=replica)
+            param.allreduce = False
+            full = torch.arange(160, dtype=torch.bfloat16, device='cuda').reshape(2, 10, 8)
+            physical = torch.nn.functional.pad(full[ep_rank], (0, 0, 0, 6))
+            with torch.no_grad():
+                param.copy_(physical[egtp_rank * 8 : (egtp_rank + 1) * 8])
+            entry = make_tp_sharded_tensor_for_checkpoint(
+                param,
+                'weight',
+                prepend_offsets=((0, ep_rank, 2),),
+                tp_group=replica,
+                dp_cp_group=dist.group.WORLD,
+            )
+            assert entry.is_expert and entry.replica_id[2] == 0
+            with TempNamedDir(tmp_path_dist_ckpt / 'padded_experts', sync=True) as path:
+                save({'w': entry}, path)
+                loaded = load_plain_tensors(path)
+            assert torch.equal(loaded['weight'], full.cpu())
+        finally:
+            update_gtp_config(pad_for_alignment=previous_alignment)
+
+    def test_native_mxfp8_padding_disk_roundtrip(self, tmp_path_dist_ckpt):
+        """Dequantized payloads retain optimizer identity and omit native-FP8 pad rows."""
+        from transformer_engine.common.recipe import MXFP8BlockScaling
+
+        from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+            GTP_CONFIG,
+            update_gtp_config,
+        )
+        from megatron.core.tensor_parallel.gtp_api import dequantize_gtp_native_fp8
+        from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import _requires_mxfp8
+
+        _requires_mxfp8()
+        previous_alignment = GTP_CONFIG.pad_for_alignment
+        try:
+            rank, size = torch.distributed.get_rank(), torch.distributed.get_world_size()
+            if size != 4:
+                pytest.skip('Requires four ranks.')
+            update_gtp_config(pad_for_alignment=32)
+            param = _make_native_fp8_gtp_shard(
+                160, 128, torch.distributed.group.WORLD, MXFP8BlockScaling()
+            )
+            param.gtp_replica_group = _logical_group(0, 1)
+            entry = make_tp_sharded_tensor_for_checkpoint(
+                param, 'weight', tp_group=_logical_group(0, 1), dp_cp_group=_logical_group(0, 1)
+            )
+            assert isinstance(entry, GTPCheckpointFactory)
+            assert entry.data is not param
+            assert get_param_id_to_sharded_param_map({'w': entry}, [param]) == {0: entry}
+            assert entry.without_data().physical_shard.data is None
+            expected = dequantize_gtp_native_fp8(param).clone()
+            valid_rows = max(0, min(expected.shape[0], 160 - rank * expected.shape[0]))
+            expected[valid_rows:].zero_()
+            moment = make_sharded_optimizer_tensor(entry, entry.data.float() + 1000, 'moment')
+            with TempNamedDir(tmp_path_dist_ckpt / 'native_gtp_padding', sync=True) as ckpt_dir:
+                save({'w': entry, 'm': moment}, ckpt_dir)
+                metadata = load_tensors_metadata(ckpt_dir)
+                assert metadata['weight'].global_shape == (160, 128)
+                assert metadata['moment.weight'].dtype == torch.float32
+                with torch.no_grad():
+                    entry.data.fill_(-999)
+                    moment.data.fill_(-888)
+                loaded = load({'w': entry, 'm': moment}, ckpt_dir)
+            assert torch.equal(loaded['w'], expected)
+            expected_moment = expected.float() + 1000
+            expected_moment[valid_rows:].zero_()
+            assert torch.equal(loaded['m'], expected_moment)
+        finally:
+            update_gtp_config(pad_for_alignment=previous_alignment)

@@ -1117,6 +1117,7 @@ def make_tp_sharded_tensor_for_checkpoint(
             new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
     gtp_pad_length = 0  # overwritten below for GTP params
+    gtp_source_param = None
 
     # GTP: a GTP param additionally shards out_features (axis 0) by 1/gtp_remat. Layer that
     # split onto TP offset — mirrors make_sharded_tensors_for_checkpoint_with_gtp_remat so direct
@@ -1133,6 +1134,7 @@ def make_tp_sharded_tensor_for_checkpoint(
         )
 
         if is_gtp_param(tensor):
+            gtp_source_param = tensor
             gtp_rank = get_pg_rank(tensor.group)
             gtp_remat_size = get_pg_size(tensor.group)
             if tp_axis == 0:
@@ -1181,6 +1183,12 @@ def make_tp_sharded_tensor_for_checkpoint(
     # Plain attribute (not a ShardedTensor field, so DCP never serializes it): global_shape minus
     # this gives the true unpadded dim0. Read later by grant_shape_mismatch_for_gtp_padding.
     sharded_tensor.gtp_pad_length = gtp_pad_length
+    if gtp_pad_length:
+        from megatron.core.tensor_parallel.gtp_ckpt_util import make_gtp_checkpoint_factory
+
+        return make_gtp_checkpoint_factory(
+            sharded_tensor, gtp_source_param, tp_axis, tp_rank, tp_size, gtp_rank, gtp_remat_size
+        )
     return sharded_tensor
 
 
@@ -1203,7 +1211,12 @@ def resolve_gtp_pad_for_alignment(*, fp4=False, fp8_recipe=None, fp8=False):
 
 
 def grant_shape_mismatch_for_gtp_padding(
-    sharded_state_dict, checkpoint_dir, pad_for_alignment, sharded_strategy=None
+    sharded_state_dict,
+    checkpoint_dir,
+    pad_for_alignment,
+    sharded_strategy=None,
+    *,
+    legacy_tp_size=None,
 ):
     """Decide, per tensor, whether a checkpoint-vs-expected shape mismatch is GTP padding.
 
@@ -1226,9 +1239,18 @@ def grant_shape_mismatch_for_gtp_padding(
     so that both share its metadata cache. Defaults to the default load strategy.
     """
     from megatron.core.dist_checkpointing.dict_utils import nested_values
+    from megatron.core.tensor_parallel.gtp_ckpt_util import (
+        GTPCheckpointFactory,
+        allow_legacy_gtp_padding,
+    )
 
     sharded_tensors = [v for v in nested_values(sharded_state_dict) if isinstance(v, ShardedTensor)]
-    if not sharded_tensors:
+    gtp_factories = [
+        v
+        for v in nested_values(sharded_state_dict)
+        if isinstance(v, GTPCheckpointFactory) and v.logical_shape
+    ]
+    if not sharded_tensors and not gtp_factories:
         return
 
     try:
@@ -1241,6 +1263,10 @@ def grant_shape_mismatch_for_gtp_padding(
             f"skipping GTP padding check: {e}"
         )
         return
+
+    allow_legacy_gtp_padding(
+        gtp_factories, checkpoint_metadata, checkpoint_dir, pad_for_alignment, legacy_tp_size
+    )
 
     for sh_ten in sharded_tensors:
         if sh_ten.allow_shape_mismatch:
