@@ -1062,7 +1062,7 @@ class TestMegatronFSDPE2E:
         def check_optimizer(optim, model_chunks):
             # The combination under test: TE owns the master weights of BF16 params (for the
             # distributed optimizer).
-            assert optim.config.fp8_param_gather is False
+            assert optim.config.resolved_fp8_param_gather is False
             assert optim.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
 
             fused_adam = optim.optimizer

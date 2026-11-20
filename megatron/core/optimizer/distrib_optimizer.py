@@ -877,17 +877,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # Megatron-FSDP will manage optimizer weights and gradients.
             return
 
-        # Whether TE FusedAdam or MCore owns the master weights depends on fp8_param_gather, so the
-        # config must either be resolved for this model's DDP config, or unresolved (None), in which
-        # case the params are assumed to be quantized (the stricter condition for TE ownership).
-        assert config.fp8_param_gather in (None, self.ddp_config.fp8_param_gather), (
-            f"OptimizerConfig resolved with fp8_param_gather={config.fp8_param_gather} for a "
-            f"model whose ddp_config.fp8_param_gather is {self.ddp_config.fp8_param_gather}"
-        )
-        assert config.fp4_param_gather in (None, self.ddp_config.fp4_param_gather), (
-            f"OptimizerConfig resolved with fp4_param_gather={config.fp4_param_gather} for a "
-            f"model whose ddp_config.fp4_param_gather is {self.ddp_config.fp4_param_gather}"
-        )
+        # Whether TE FusedAdam or MCore owns the master weights depends on fp8_param_gather and
+        # fp4_param_gather, so the config must either be resolved for this model's DDP config, or
+        # unresolved (None), in which case FP8 params are assumed (the stricter condition for TE
+        # ownership with a non-delayed FP8 recipe).
+        for name in ("fp8_param_gather", "fp4_param_gather"):
+            resolved = getattr(config, f"resolved_{name}")
+            ddp_value = getattr(self.ddp_config, name)
+            assert resolved in (None, ddp_value), (
+                f"OptimizerConfig resolved with {name}={resolved} for a model whose "
+                f"ddp_config.{name} is {ddp_value}"
+            )
 
         self._cudagraphed_grad_copy = None
         if (

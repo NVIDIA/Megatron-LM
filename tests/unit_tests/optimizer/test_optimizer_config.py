@@ -78,8 +78,8 @@ def test_fp8_param_gather_is_not_user_settable():
         OptimizerConfig(_fp8_param_gather=False)
     config = OptimizerConfig()
     with pytest.raises(AttributeError):
-        config.fp8_param_gather = False
-    assert config.fp8_param_gather is None
+        config.resolved_fp8_param_gather = False
+    assert config.resolved_fp8_param_gather is None
 
 
 def test_optimizer_cuda_graph_disables_store_param_remainders():
@@ -189,7 +189,7 @@ def test_gate_follows_fp8_param_gather_resolution(fp8_recipe):
     """The gate is derived on access, so it follows fp8_param_gather when the config is resolved
     after construction, and resolution does not modify the config it is called on."""
     config = OptimizerConfig(fp8_recipe=fp8_recipe, **_PAO)
-    assert config.fp8_param_gather is None
+    assert config.resolved_fp8_param_gather is None
     assert not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8  # Possibly quantized.
 
     bf16_params = config.resolve_fp8_param_gather(False)
@@ -198,8 +198,31 @@ def test_gate_follows_fp8_param_gather_resolution(fp8_recipe):
         True
     ).use_precision_aware_optimizer_no_fp8_or_ds_fp8
 
-    assert config.fp8_param_gather is None
-    assert bf16_params.fp8_param_gather is False
+    assert config.resolved_fp8_param_gather is None
+    assert bf16_params.resolved_fp8_param_gather is False
+
+
+def test_ddp_and_model_field_names_stay_settable():
+    """Megatron-Bridge copies its mixed-precision fields (fp8_param_gather, fp4_param_gather, ...)
+    by name onto every config that has an attribute of that name, so a read-only OptimizerConfig
+    property named like a DDP or model config field would break its config setup."""
+    from dataclasses import fields
+
+    from megatron.core.distributed import DistributedDataParallelConfig
+    from megatron.core.transformer import TransformerConfig
+
+    for config_class in (DistributedDataParallelConfig, TransformerConfig):
+        for config_field in fields(config_class):
+            attribute = getattr(OptimizerConfig, config_field.name, None)
+            assert not (isinstance(attribute, property) and attribute.fset is None), (
+                f"OptimizerConfig.{config_field.name} is a read-only property named like "
+                f"{config_class.__name__}.{config_field.name}"
+            )
+    config = OptimizerConfig()
+    for name in ("fp8_param_gather", "fp4_param_gather"):
+        setattr(config, name, True)  # What Megatron-Bridge does; must not change the gate.
+    assert config.resolved_fp8_param_gather is None
+    assert config.resolved_fp4_param_gather is None
 
 
 def test_fp4_param_gather_is_not_user_settable():
@@ -210,8 +233,8 @@ def test_fp4_param_gather_is_not_user_settable():
         OptimizerConfig(_fp4_param_gather=True)
     config = OptimizerConfig()
     with pytest.raises(AttributeError):
-        config.fp4_param_gather = True
-    assert config.fp4_param_gather is None
+        config.resolved_fp4_param_gather = True
+    assert config.resolved_fp4_param_gather is None
 
 
 @pytest.mark.parametrize("fp8_recipe", [None, "delayed", *_NON_DELAYED_FP8_RECIPES])
@@ -222,12 +245,12 @@ def test_fp4_params_keep_mcore_main_params(fp8_recipe):
     assert config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
 
     fp4_params = config.resolve_fp4_param_gather(True)
-    assert fp4_params.fp4_param_gather is True
+    assert fp4_params.resolved_fp4_param_gather is True
     assert not fp4_params.use_precision_aware_optimizer_no_fp8_or_ds_fp8
 
     bf16_params = config.resolve_fp4_param_gather(False)
     assert bf16_params.use_precision_aware_optimizer_no_fp8_or_ds_fp8
-    assert config.fp4_param_gather is None
+    assert config.resolved_fp4_param_gather is None
 
 
 @pytest.mark.parametrize("fp8_recipe", [None, "delayed", "tensorwise"])

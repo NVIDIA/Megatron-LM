@@ -202,13 +202,13 @@ class OptimizerConfig:
 
     _fp8_param_gather: Optional[bool] = field(default=None, init=False)
     """Whether model parameters are stored (and all-gathered) as FP8 tensors, read through the
-       fp8_param_gather property. Not user settable: it is a property of the model, so
+       resolved_fp8_param_gather property. Not user settable: it is a property of the model, so
        get_megatron_optimizer takes it from ddp_config.fp8_param_gather (resolve_fp8_param_gather).
     """
 
     _fp4_param_gather: Optional[bool] = field(default=None, init=False)
     """Whether model parameters are stored (and all-gathered) as FP4 tensors, read through the
-       fp4_param_gather property. Not user settable: it is a property of the model, so
+       resolved_fp4_param_gather property. Not user settable: it is a property of the model, so
        get_megatron_optimizer takes it from ddp_config.fp4_param_gather (resolve_fp4_param_gather).
     """
 
@@ -478,13 +478,15 @@ class OptimizerConfig:
     optimizer_cuda_graph: bool = False
     """If true, enables CUDA graph for optimizer step."""
 
+    # The resolved_* names must not match a DDP or mixed-precision config field: Megatron-Bridge
+    # copies those fields by name onto this config, which a read-only property would reject.
     @property
-    def fp8_param_gather(self) -> Optional[bool]:
+    def resolved_fp8_param_gather(self) -> Optional[bool]:
         """fp8_param_gather of the model's DDP config, or None if not resolved for a model."""
         return self._fp8_param_gather
 
     @property
-    def fp4_param_gather(self) -> Optional[bool]:
+    def resolved_fp4_param_gather(self) -> Optional[bool]:
         """fp4_param_gather of the model's DDP config, or None if not resolved for a model."""
         return self._fp4_param_gather
 
@@ -518,7 +520,7 @@ class OptimizerConfig:
         param.decoupled_grad. Derived on access so configs built directly (without
         finalize_optimizer_config) work."""
         return self._te_fused_adam_main_weight_and_decoupled_grad(
-            self.fp8_param_gather, self.fp4_param_gather
+            self.resolved_fp8_param_gather, self.resolved_fp4_param_gather
         )
 
     def _use_te_precision_aware_optimizer_legacy(self) -> bool:
@@ -557,13 +559,15 @@ class OptimizerConfig:
         return requested and self._param_remainders_supported() and not self.optimizer_cuda_graph
 
     def resolve_fp8_param_gather(self, ddp_fp8_param_gather: bool) -> "OptimizerConfig":
-        """Return a copy of this config with fp8_param_gather taken from the model's DDP config."""
+        """Return a copy of this config with resolved_fp8_param_gather taken from the model's DDP
+        config."""
         resolved = copy.copy(self)
         resolved._fp8_param_gather = ddp_fp8_param_gather
         return resolved
 
     def resolve_fp4_param_gather(self, ddp_fp4_param_gather: bool) -> "OptimizerConfig":
-        """Return a copy of this config with fp4_param_gather taken from the model's DDP config."""
+        """Return a copy of this config with resolved_fp4_param_gather taken from the model's DDP
+        config."""
         resolved = copy.copy(self)
         resolved._fp4_param_gather = ddp_fp4_param_gather
         return resolved

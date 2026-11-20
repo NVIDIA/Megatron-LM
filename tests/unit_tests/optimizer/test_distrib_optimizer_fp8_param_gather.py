@@ -35,11 +35,11 @@ def test_resolve_inherits_from_ddp_config(fp8_recipe):
     config = _optimizer_config(fp8_recipe)
     # BF16 params with FP8 compute: TE owns the masters.
     resolved = config.resolve_fp8_param_gather(False)
-    assert resolved.fp8_param_gather is False
+    assert resolved.resolved_fp8_param_gather is False
     assert resolved.use_precision_aware_optimizer_no_fp8_or_ds_fp8
     # FP8 params: MCore-managed masters, precision-aware path is off.
     resolved = config.resolve_fp8_param_gather(True)
-    assert resolved.fp8_param_gather is True
+    assert resolved.resolved_fp8_param_gather is True
     assert not resolved.use_precision_aware_optimizer_no_fp8_or_ds_fp8
 
 
@@ -47,7 +47,7 @@ def test_resolve_does_not_mutate_caller_config():
     config = _optimizer_config("mxfp8")
     resolved = config.resolve_fp8_param_gather(False)
     assert resolved is not config
-    assert config.fp8_param_gather is None
+    assert config.resolved_fp8_param_gather is None
     assert not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
 
 
@@ -55,8 +55,8 @@ def test_resolving_again_takes_the_new_ddp_value():
     """The DDP config is the source of truth, so a config already resolved for one model follows
     the DDP config of the next model it is resolved for."""
     config = _optimizer_config("mxfp8").resolve_fp8_param_gather(False)
-    assert config.resolve_fp8_param_gather(True).fp8_param_gather is True
-    assert config.fp8_param_gather is False
+    assert config.resolve_fp8_param_gather(True).resolved_fp8_param_gather is True
+    assert config.resolved_fp8_param_gather is False
 
 
 # The tests below build the optimizer with get_megatron_optimizer, which resolves fp8_param_gather
@@ -155,11 +155,11 @@ def test_get_megatron_optimizer_resolves_fp8_param_gather(
     model = _ddp_model(ddp_fp8_param_gather)
     config, optimizer = _get_optimizer(model, fp8_recipe)
 
-    assert optimizer.config.fp8_param_gather is ddp_fp8_param_gather
+    assert optimizer.config.resolved_fp8_param_gather is ddp_fp8_param_gather
     bf16_params = not ddp_fp8_param_gather
     assert optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 == bf16_params
     # The caller's config is not modified.
-    assert config.fp8_param_gather is None
+    assert config.resolved_fp8_param_gather is None
 
     fused_adam = optimizer.optimizer
     assert bool(fused_adam.master_weights) == bf16_params
