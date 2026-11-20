@@ -22,6 +22,7 @@ from .mapping import (
     ShardedTensor,
     ShardedTensorFactory,
     StateDict,
+    get_checkpoint_parameter_id,
 )
 from .utils import extract_sharded_tensors_and_factories
 
@@ -64,8 +65,9 @@ def get_param_id_to_sharded_param_map(
     # have been converted to local tensors during initialization.
     # See the make_(tp)_sharded_tensor_for_checkpoint functions.
     for ten in nested_values(model_sharded_state_dict):
-        if id(ten.data) in param_to_id_map:
-            id_to_sharded_param_map[param_to_id_map[id(ten.data)]] = ten
+        param_id = get_checkpoint_parameter_id(ten.data)
+        if param_id in param_to_id_map:
+            id_to_sharded_param_map[param_to_id_map[param_id]] = ten
         else:
             logger.debug('%s is not tracked by the optimizer', ten)
 

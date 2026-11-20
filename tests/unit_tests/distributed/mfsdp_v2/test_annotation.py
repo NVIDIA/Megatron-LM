@@ -15,6 +15,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
     PrefetchOrder,
+    RuntimePolicy,
     fully_shard,
     fully_shard_context,
 )
@@ -218,7 +219,10 @@ def test_frozen_child_without_grad_inputs_skips_backward_range(distributed_setup
         parameter.requires_grad_(False)
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     with fully_shard_context(
-        FsdpContext(device=distributed_setup.device, prefetch_order=PrefetchOrder.RECORDED)
+        FsdpContext(
+            device=distributed_setup.device,
+            runtime_policy=RuntimePolicy(prefetch_order=PrefetchOrder.RECORDED),
+        )
     ):
         fully_shard(model.layers[0], mesh=mesh, placements=_default_placements())
         fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
