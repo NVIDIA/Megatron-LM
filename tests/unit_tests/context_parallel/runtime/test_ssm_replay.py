@@ -180,12 +180,14 @@ def test_gdp_chunkwise_runtime_cp_full_head_gating_replays():
             assert all(bytes_equal(expected[name], actual[name]) for name in expected)
 
 
-@pytest.mark.parametrize("kind", ["mamba", "gdp"])
+@pytest.mark.parametrize("kind", ["mamba", "mamba_local_gate", "gdp"])
 def test_runtime_cp_ssm_conv_and_collectives_replay(kind):
     """Replay the runtime views consumed by Mamba/GDP: collectives and sliced conv grads.
 
     This targets the CP wrapper rather than the unchanged external recurrence kernel.
     Every CP size uses real groups, packed boundaries, convolution and backward.
+    ``mamba_local_gate`` leaves the gate out of the exchange (``include_gate=False``), as the
+    shared-prefix Mamba path does.
     """
     from megatron.core import parallel_state
     from megatron.core.packed_seq_params import PackedSeqParams
@@ -198,12 +200,13 @@ def test_runtime_cp_ssm_conv_and_collectives_replay(kind):
     try:
         seeded()
         inner, heads, groups, state, householder = 64, 4, 4, 8, 2
+        mamba = kind != "gdp"
         conv_channels = (
             inner + 2 * groups * state
-            if kind == "mamba"
+            if mamba
             else inner * householder + groups * state * (householder + 1)
         )
-        width = inner + conv_channels + heads * (1 if kind == "mamba" else householder + 1)
+        width = inner + conv_channels + heads * (1 if mamba else householder + 1)
 
         class ConvPath(torch.nn.Module):
             def __init__(self):
@@ -223,7 +226,7 @@ def test_runtime_cp_ssm_conv_and_collectives_replay(kind):
                     D_cp1=None,
                     D_has_hdim=False,
                 )
-                if kind == "mamba":
+                if mamba:
                     self.helper = MambaContextParallel(
                         **common,
                         conv1d_weight_cp1=self.conv.weight,
@@ -240,15 +243,21 @@ def test_runtime_cp_ssm_conv_and_collectives_replay(kind):
 
             def forward(self, hidden, packed):
                 runtime = self.helper.for_context_parallel_group(packed.cp_group)
-                projected = runtime.pre_conv_ssm(hidden, packed)
-                begin = runtime.d_inner_local_tpcp
+                d_inner = runtime.d_inner_local_tpcp
+                if kind == "mamba_local_gate":
+                    # Without the gate, the projection starts at the convolution fields.
+                    projected = runtime.pre_conv_ssm(hidden, packed, include_gate=False)
+                    begin = 0
+                else:
+                    projected = runtime.pre_conv_ssm(hidden, packed)
+                    begin = d_inner
                 conv_input = (
                     projected[..., begin : begin + runtime.conv1d_channels()]
                     .permute(1, 2, 0)
                     .contiguous()
                 )
                 conv_output = runtime.conv1d(conv_input)[..., : projected.shape[0]]
-                output = conv_output[:, :begin].permute(2, 0, 1).contiguous()
+                output = conv_output[:, :d_inner].permute(2, 0, 1).contiguous()
                 return runtime.post_conv_ssm(output, packed)
 
         module = ConvPath()
