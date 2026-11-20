@@ -305,14 +305,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 and active_context.prefetch_order is not PrefetchOrder.RECORDED
             ):
                 raise ValueError(
-                    "Ordinary PP/VPP MFSDP v2 schedules require "
+                    "Recorded PP/VPP MFSDP v2 schedules require "
                     "RuntimePolicy(prefetch_order=PrefetchOrder.RECORDED)."
                 )
             if (
                 prefetch_order is PrefetchOrder.RECORDED
                 and active_context.autograd_completes_execution
             ):
-                raise ValueError("Ordinary PP/VPP requires autograd_completes_execution=False.")
+                raise ValueError("Recorded PP/VPP requires autograd_completes_execution=False.")
             construction_context = nullcontext(active_context)
         with construction_context:
             collector = FsdpUnitCollector(fsdp_unit_modules)
@@ -331,12 +331,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         super().__init__(config=config, module=module)
 
         if config.overlap_moe_expert_parallel_comm:
-            register_combined_1f1b_hooks(self.module)
+            register_combined_1f1b_hooks(
+                self.module, recompute=config.recompute_granularity is not None
+            )
 
     @staticmethod
     def prefetch_order_for(config: TransformerConfig) -> "PrefetchOrder":
-        """Record ordinary pipeline schedules; combined 1F1B gathers only on demand."""
-        if not config.overlap_moe_expert_parallel_comm and (
+        """Record FSDP weight requests for pipeline schedules."""
+        if (
             config.pipeline_model_parallel_size > 1
             or config.virtual_pipeline_model_parallel_size is not None
         ):

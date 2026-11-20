@@ -214,10 +214,12 @@ class FsdpContext:
             for root in reversed(list(self._roots)):
                 _collect_backward_order(root, registered_modules, self.execution_order)
 
-        if self.prefetch_order is PrefetchOrder.RECORDED and any(
-            not module._schedule_policy.register_hooks for module in self._module_names
+        if (
+            self.prefetch_order is PrefetchOrder.RECORDED
+            and self.autograd_completes_execution
+            and any(not module._schedule_policy.register_hooks for module in self._module_names)
         ):
-            raise ValueError("Recorded FSDP execution requires ordinary module hooks.")
+            raise ValueError("Recorded execution with custom hooks requires explicit completion.")
 
         self._registered_modules.clear()
         self.parameter_to_owner = None
@@ -303,6 +305,19 @@ class FsdpContext:
         self.current_stream().wait_stream(self.inner_reduction_stream)
         if self.outer_reduction_stream is not self.inner_reduction_stream:
             self.current_stream().wait_stream(self.outer_reduction_stream)
+
+    def prefetch_next(self) -> None:
+        """Start the next recorded unshard before a pipeline receive."""
+        view = self.execution_order_view
+        if view is None or not self.training:
+            return
+        event = view.peek()
+        if event is None or event.action is not ExecutionAction.UNSHARD:
+            return
+
+        self.allgather_stream.wait_stream(self.current_stream())
+        with event.module._nvtx_range("prefetch before PP recv"):
+            event.module._unshard_parameter_groups(event.phase)
 
     def pre_backward(self) -> None:
         """Fork the reduce-scatter stream into any active CUDA-graph capture.
