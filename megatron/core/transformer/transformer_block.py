@@ -57,7 +57,8 @@ get_cpu_offload_context = None
 te_checkpoint = None
 
 if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import TENorm, get_cpu_offload_context
+    from megatron.core.extensions.te_cpu_offload import get_cpu_offload_context
+    from megatron.core.extensions.transformer_engine import TENorm
 
     LayerNormImpl = TENorm
 

@@ -912,7 +912,7 @@ class PipelineOffloadManager:
         debug_rank("----__enter__")
         if self._cur_forward_chunk is None or not self.cur_forward_chunk().do_offload:
             return
-        from megatron.core.extensions.transformer_engine import cpu_offload
+        from megatron.core.extensions.te_cpu_offload import cpu_offload
 
         if cpu_offload is not None:
             cpu_offload.CPUOffloadEnabled = True
@@ -926,7 +926,7 @@ class PipelineOffloadManager:
         debug_rank("----__exit__")
         if self._cur_forward_chunk is None or not self.cur_forward_chunk().do_offload:
             return
-        from megatron.core.extensions.transformer_engine import cpu_offload
+        from megatron.core.extensions.te_cpu_offload import cpu_offload
 
         if cpu_offload is not None:
             cpu_offload.CPUOffloadEnabled = False
