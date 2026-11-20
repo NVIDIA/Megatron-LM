@@ -34,11 +34,8 @@ def _parameter_gradients(module):
     return gradients
 
 
-def _assert_parameter_gradients(module, expected, *, atol=1e-5):
-    actual = _parameter_gradients(module)
-    assert actual.keys() == expected.keys()
-    for name in expected:
-        torch.testing.assert_close(actual[name], expected[name], atol=atol, rtol=1e-5, msg=name)
+def _assert_parameter_gradients_close(module, expected, **kwargs):
+    torch.testing.assert_close(_parameter_gradients(module), expected, **kwargs)
 
 
 def _weighted_loss(outputs, weights):
@@ -201,7 +198,7 @@ class TestHyperConnectionModuleCheckpoint:
             f"Checkpoint: {grad_residual_ckpt}\n"
             f"Reference: {grad_residual_ref}"
         )
-        _assert_parameter_gradients(module, parameter_grads_ref)
+        _assert_parameter_gradients_close(module, parameter_grads_ref, atol=1e-5, rtol=1e-5)
 
     def test_apply_h_post_with_checkpoint(self):
         """
@@ -299,7 +296,7 @@ class TestHyperConnectionModuleCheckpoint:
 
         # Verify gradients match
         assert torch.allclose(grad_hidden_ckpt, grad_hidden_ref, atol=1e-5)
-        _assert_parameter_gradients(module, parameter_grads_ref)
+        _assert_parameter_gradients_close(module, parameter_grads_ref, atol=1e-5, rtol=1e-5)
 
 
 class TestMHCBlockRecomputeIntegration:
@@ -405,7 +402,7 @@ class TestMHCBlockRecomputeIntegration:
         assert torch.allclose(
             grad_residual_ckpt, grad_residual_ref, atol=1e-4
         ), f"Chained HyperConnection residual gradients mismatch"
-        _assert_parameter_gradients(modules, parameter_grads_ref, atol=1e-4)
+        _assert_parameter_gradients_close(modules, parameter_grads_ref, atol=1e-4, rtol=1e-5)
 
     def test_partial_checkpoint_last_layer_not_checkpointed(self):
         """The real terminal BDA stays live while its aggregate input is replayed."""
@@ -490,7 +487,7 @@ class TestMHCBlockRecomputeIntegration:
         # Verify gradients match
         assert torch.allclose(grad_hidden_ckpt, grad_hidden_ref, atol=1e-5)
         torch.testing.assert_close(residual_ckpt.grad, grad_residual_ref, atol=1e-5, rtol=1e-5)
-        _assert_parameter_gradients(module, parameter_grads_ref)
+        _assert_parameter_gradients_close(module, parameter_grads_ref, atol=1e-5, rtol=1e-5)
 
 
 class TestTransformerConfigRecomputeMhc:
