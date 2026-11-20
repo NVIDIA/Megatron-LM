@@ -184,5 +184,8 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: mfsdp-collective-isolation-${{ github.run_id }}
-          path: ${{ runner.temp }}/mfsdp-isolation-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/mfsdp-isolation-${{ github.run_id }}/results
+            ${{ runner.temp }}/mfsdp-isolation-${{ github.run_id }}/image-digests.json
+            ${{ runner.temp }}/mfsdp-isolation-${{ github.run_id }}/source-commit.txt
           retention-days: 3

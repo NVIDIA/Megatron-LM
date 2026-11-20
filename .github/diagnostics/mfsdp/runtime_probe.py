@@ -42,6 +42,7 @@ result = {
         {
             'name': torch.cuda.get_device_name(index),
             'sm_count': torch.cuda.get_device_properties(index).multi_processor_count,
+            'capability': list(torch.cuda.get_device_capability(index)),
         }
         for index in range(torch.cuda.device_count())
     ],

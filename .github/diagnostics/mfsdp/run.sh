@@ -16,7 +16,8 @@
 set -euo pipefail
 cd /opt/megatron-lm
 export UV_PROJECT_ENVIRONMENT=/opt/venv
-for label in github-baseline-4 github-traced-4; do
+prefix=${MFS_DP_TRACE_PREFIX:-github}
+for label in "$prefix-baseline-4" "$prefix-traced-4"; do
   uv run --no-sync python - "$label" <<'PYCODE'
 import json
 import sys
@@ -25,7 +26,7 @@ label = sys.argv[1]
 result = Path('/workspace/results') / label
 result.mkdir(parents=True, exist_ok=False)
 (result / 'request.json').write_text(json.dumps({
-    'label': label, 'steps': 4, 'trace': label == 'github-traced-4',
+    'label': label, 'steps': 4, 'trace': '-traced-' in label,
 }))
 PYCODE
   uv run --no-sync python /workspace/payload.py \
