@@ -41,6 +41,11 @@ class TransferOp:
     # transient receive buffers are released.
     batch_id: int = 0
 
+    # Actual dtype of the matching receive buffer. This can differ from the
+    # destination tensor's logical dtype when the receiver stages quantized
+    # tensors in BF16.
+    wire_dtype: torch.dtype | None = None
+
 
 @dataclass
 class ParameterMetadata:
@@ -154,10 +159,6 @@ class ReshardPlan:
     send_ops: list[TransferOp]
     recv_ops: list[TransferOp]
     transform: Optional["ReshardTransform"] = None
-    # Cache of persistent-buffer dtypes keyed by local destination module path.
-    # Populated by _harmonize_buffer_dtypes on first call; reused thereafter to
-    # skip the all_gather_object + named_modules() walks on the hot path.
-    buffer_dtypes: Optional[dict[str, torch.dtype]] = None
     # Whole-tensor descriptions for transports with a native mesh-reshard
     # primitive. None means this plan cannot be represented by that path; the
     # accompanying error explains why.
@@ -325,8 +326,8 @@ def get_refit_tensor_dict(module: torch.nn.Module) -> dict[str, torch.Tensor]:
     Walking ``named_modules()`` is hundreds of ms for multi-B-parameter models,
     and the parameter/persistent-buffer set is stable across refits — so we
     cache the dict on the module itself.  ``invalidate_refit_tensor_cache``
-    must be called whenever a persistent buffer is replaced (e.g. by
-    ``_harmonize_buffer_dtypes``) so the cache picks up the new tensor.
+    must be called whenever dtype preparation replaces a persistent buffer so
+    the cache picks up the new tensor.
     """
     cached = getattr(module, _REFIT_TENSOR_CACHE_ATTR, None)
     if cached is None:
