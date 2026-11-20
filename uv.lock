@@ -2888,7 +2888,7 @@ requires-dist = [
     { name = "nemo-lens", extras = ["sdk"], marker = "extra == 'otel'", git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=b85578fc2b736a1804705e537001b5f45e9c715d" },
     { name = "numpy" },
     { name = "nvidia-cudnn-frontend", extras = ["cutedsl"], marker = "extra == 'dev'", specifier = "==1.32.0" },
-    { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'", specifier = ">=0.47" },
+    { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'", specifier = ">=0.49.0rc0" },
     { name = "nvidia-resiliency-ext", marker = "extra == 'dev'", specifier = "==0.7.0" },
     { name = "omegaconf", marker = "extra == 'bridge'", specifier = ">=2.3.0" },
     { name = "omegaconf", marker = "extra == 'mlm'" },
@@ -3735,7 +3735,7 @@ wheels = [
 
 [[package]]
 name = "nvidia-modelopt"
-version = "0.47.0"
+version = "0.49.0rc0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ninja" },
@@ -3755,7 +3755,7 @@ dependencies = [
     { name = "tqdm" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/6d/46/f32f6183f6a26db8c6bf5c70f89f68ae2cc55c3fbb981016a772c93c4fc2/nvidia_modelopt-0.47.0-py3-none-any.whl", hash = "sha256:db13e62d7efe4a1512e8b8c3f479e28d64022306f94a194f13234e7dca1d3120", size = 2186201, upload-time = "2026-09-23T19:06:44.103Z" },
+    { url = "https://files.pythonhosted.org/packages/69/90/37c335a01cca81c8772b9908c541435f4b4bcbf128376d22702dce7920d8/nvidia_modelopt-0.49.0rc0-py3-none-any.whl", hash = "sha256:f9f55094551c812102516089069acae3f19e09f0fcd9c739261de33ab057af4c", size = 3047916, upload-time = "2026-11-16T17:54:54.727107Z" },
 ]
 
 [[package]]
