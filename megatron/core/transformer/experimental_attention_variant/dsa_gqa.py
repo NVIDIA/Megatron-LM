@@ -760,8 +760,14 @@ class DSGQACoreAttention(MegatronModule):
         index_q, current_index_key = self.indexer.forward_qk_dynamic(
             indexer_hidden_states, use_rope=use_indexer_rope, inference_context=inference_context
         )
-        inference_context.append_dsa_key_cache(provider_layer_number, current_index_key)
+        # With NVFP4 index keys, the write also quantizes the step's indexer queries.
+        nvfp4_query = inference_context.append_dsa_key_cache(
+            provider_layer_number, current_index_key, index_q
+        )
         index_key_cache, _ = inference_context.dsa_key_cache(provider_layer_number)
+        extra = {}
+        if nvfp4_query is not None:
+            index_q, extra["index_query_scales"] = nvfp4_query
 
         backend = inference_context.dsa_backend
         if backend == "triton":
@@ -779,6 +785,7 @@ class DSGQACoreAttention(MegatronModule):
             inference_context=inference_context,
             index_topk=self.indexer.index_topk,
             softmax_scale=self.softmax_scale,
+            **extra,
         )
 
     def _forward_min_memory(

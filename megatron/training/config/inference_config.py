@@ -148,6 +148,11 @@ class InferenceSetupConfig:
     (CUDA-graph safe): "triton" (Megatron's Triton/Gluon kernels; KV blocks a multiple of 128
     tokens) or "flashinfer" (FlashInfer's DSA kernels and FA4)."""
 
+    inference_dynamic_batching_dsa_indexer_key_dtype: Literal["bf16", "nvfp4"] = "bf16"
+    """Format of the DSA-over-GQA index-key cache in dynamic batching: "bf16", or "nvfp4" (keys
+    and queries quantized to NVFP4 at cache-write time and scored in NVFP4; needs the
+    "flashinfer" DSA backend)."""
+
     inference_dynamic_batching_sampling_backend: Literal["torch", "flashinfer"] = "flashinfer"
     """Which sampling kernels to use during inference. Defaults to "flashinfer" and falls back to
     "torch" with a warning if the flashinfer package is not installed."""
@@ -500,6 +505,7 @@ class InferenceSetupConfig:
             mamba_replay_buffer_len=self.mamba_replay_buffer_len,
             use_synchronous_zmq_collectives=self.inference_use_synchronous_zmq_collectives,
             dsa_backend=self.inference_dynamic_batching_dsa_backend,
+            dsa_indexer_key_dtype=self.inference_dynamic_batching_dsa_indexer_key_dtype,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,
             offset_sampling_seed_by_dp_rank=self.offset_sampling_seed_by_dp_rank,
             async_sched_mode=AsyncScheduleMode(self.inference_dynamic_batching_async_sched_mode),

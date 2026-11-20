@@ -469,6 +469,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             getattr(model_config, "dsa_indexer_head_dim", 0) if self.cache_dsa_indexer_keys else 0
         )
         self.dsa_metadata: Optional[Union[DSAMetadata, FlashInferDSAMetadata]] = None
+        self.dsa_indexer_key_dtype = "bf16"
         if self.cache_dsa_indexer_keys:
             self.dsa_backend = inference_config.dsa_backend
             if self.dsa_backend not in ("triton", "flashinfer"):
@@ -477,6 +478,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 raise NotImplementedError(
                     "Speculative decoding with DSA sparse attention needs "
                     "dsa_backend='flashinfer'; the triton backend decodes one token per request."
+                )
+            # NVFP4 index keys are quantized at cache-write time; only FlashInfer scores them.
+            self.dsa_indexer_key_dtype = inference_config.dsa_indexer_key_dtype
+            if self.dsa_indexer_key_dtype == "nvfp4" and (
+                self.dsa_backend != "flashinfer" or self.dsa_indexer_head_dim != 128
+            ):
+                raise ValueError(
+                    "NVFP4 DSA index keys need dsa_backend='flashinfer' and an indexer head dim "
+                    "of 128."
                 )
         if self.cache_mla_latent:
             assert (
@@ -504,6 +514,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.dsa_index_topk = model_config.dsa_indexer_topk
 
         self.batch_invariant_mode = model_config.batch_invariant_mode
+        if self.dsa_indexer_key_dtype == "nvfp4" and self.batch_invariant_mode:
+            from megatron.core.transformer.experimental_attention_variant import dsa_gqa_flashinfer
+
+            raise ValueError(dsa_gqa_flashinfer.NVFP4_BATCH_INVARIANT_ERROR)
         self.num_speculative_tokens = inference_config.num_speculative_tokens
         assert self.num_speculative_tokens < inference_config.block_size_tokens, (
             f"num_speculative_tokens ({self.num_speculative_tokens}) must be < "
@@ -698,10 +712,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             )
         if self.cache_dsa_indexer_keys:
             self.block_size_bytes += (
-                kv_dtype_size_bytes
-                * self.num_attention_layers
+                self.num_attention_layers
                 * self.block_size_tokens
-                * self.dsa_indexer_head_dim
+                * self._dsa_index_key_bytes(kv_dtype_size_bytes)
             )
         assert self.block_size_bytes > 0
 
@@ -1294,7 +1307,22 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 dtype=self.params_dtype,
                 device=torch.cuda.current_device(),
             )
-        if self.cache_dsa_indexer_keys:
+        if self.cache_dsa_indexer_keys and self.dsa_indexer_key_dtype == "nvfp4":
+            from megatron.core.transformer.experimental_attention_variant import dsa_gqa_flashinfer
+
+            dsa_gqa_flashinfer.require_flashinfer_dsa("nvfp4")
+            # Per layer and block: its 64-key pages of packed NVFP4 keys, then their scales.
+            self.dsa_memory_buffer = torch.empty(
+                (
+                    self.num_attention_layers,
+                    *dsa_gqa_flashinfer.nvfp4_index_cache_shape(
+                        self.kv_block_allocator.pool_size, self.block_size_tokens
+                    ),
+                ),
+                dtype=torch.uint8,
+                device=torch.cuda.current_device(),
+            )
+        elif self.cache_dsa_indexer_keys:
             self.dsa_memory_buffer = torch.empty(
                 (
                     self.num_attention_layers,
@@ -2338,8 +2366,26 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             return self.mtp_kv_layer_slot
         return self.layer_map[layer_number - 1]
 
-    def append_dsa_key_cache(self, layer_number: int, key: Tensor) -> None:
-        """Append learned simplified-indexer keys to their paged cache."""
+    def _dsa_index_key_bytes(self, kv_dtype_size_bytes: int) -> int:
+        """Bytes of one cached DSA index key (with its scales, for NVFP4)."""
+        if self.dsa_indexer_key_dtype == "nvfp4":
+            from megatron.core.transformer.experimental_attention_variant import dsa_gqa_flashinfer
+
+            return dsa_gqa_flashinfer.NVFP4_KEY_BYTES + dsa_gqa_flashinfer.NVFP4_SCALES
+        return kv_dtype_size_bytes * self.dsa_indexer_head_dim
+
+    def append_dsa_key_cache(
+        self, layer_number: int, key: Tensor, query: Optional[Tensor] = None
+    ) -> Optional[Tuple[Tensor, Tensor]]:
+        """Append learned simplified-indexer keys to their paged cache.
+
+        With NVFP4 index keys, the keys are quantized as they are written, and the step's indexer
+        queries ``query`` are quantized to NVFP4 in the same launch.
+
+        Returns:
+            With NVFP4 keys, the packed NVFP4 queries ``[T, Di/2]`` and their E4M3 scale bytes
+            ``[T, Di/16]``; otherwise None.
+        """
         assert self.cache_dsa_indexer_keys, "DSA indexer key cache is not enabled."
         attention_layer_number = self._dsa_layer_slot(layer_number)
         block_idx = self.gpu_view.token_to_block_idx[: self.padded_active_token_count]
@@ -2354,12 +2400,25 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             assert key.size(1) == 1
             key = key.squeeze(1)
 
+        if self.dsa_indexer_key_dtype == "nvfp4":
+            from megatron.core.transformer.experimental_attention_variant import dsa_gqa_flashinfer
+
+            assert query is not None, "NVFP4 DSA index keys quantize the indexer queries too."
+            return dsa_gqa_flashinfer.write_nvfp4_index_keys(
+                key[: self.padded_active_token_count],
+                query.reshape(query.size(0), self.dsa_indexer_head_dim),
+                self.dsa_memory_buffer[attention_layer_number],
+                block_idx,
+                local_kv_seq_idx,
+            )
         self.dsa_memory_buffer[attention_layer_number, block_idx, local_kv_seq_idx] = key[
             : self.padded_active_token_count
         ]
+        return None
 
     def dsa_key_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
-        """Return a layer's learned indexer-key cache and active block table."""
+        """Return a layer's learned indexer-key cache (with NVFP4 index keys, the layer's uint8
+        NVFP4 cache) and active block table."""
         assert self.cache_dsa_indexer_keys, "DSA indexer key cache is not enabled."
         attention_layer_number = self._dsa_layer_slot(layer_number)
         assert self.active_attn_metadata is not None

@@ -1143,8 +1143,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         training_path=False,
         notes="FlashInfer DSA indexer scoring, selection and top-k, trtllm-gen token-sparse "
         "decode, and FA4 union-core prefill of a mixed decode + prefill step "
-        "(dsa_backend='flashinfer'). Decode is bit-exact only in batch-invariant mode, which "
-        "sorts each row's selected keys.",
+        "(dsa_backend='flashinfer'), and the NVFP4 index-key and query quantize-and-write. "
+        "Decode is bit-exact only in batch-invariant mode, which sorts each row's selected "
+        "keys. NVFP4 index keys are rejected in batch-invariant mode: their scores often tie at "
+        "the top-k boundary, and which tied key is selected can vary between runs.",
     ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(

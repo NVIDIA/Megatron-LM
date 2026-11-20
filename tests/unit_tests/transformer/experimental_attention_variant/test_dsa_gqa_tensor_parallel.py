@@ -109,7 +109,7 @@ def _model(config: TransformerConfig) -> HybridModel:
 
 
 @torch.inference_mode()
-def _serve(model, config, prompts, dsa_backend, cuda_graphs):
+def _serve(model, config, prompts, dsa_backend, index_key_dtype, cuda_graphs):
     """Serve the prompts greedily; returns {request_id: request}."""
     context = DynamicInferenceContext(
         model_config=config,
@@ -125,6 +125,7 @@ def _serve(model, config, prompts, dsa_backend, cuda_graphs):
             materialize_only_last_token_logits=False,
             use_flashinfer_fused_rope=False,
             dsa_backend=dsa_backend,
+            dsa_indexer_key_dtype=index_key_dtype,
         ),
     )
     controller = TextGenerationController(
@@ -179,7 +180,7 @@ def _serve(model, config, prompts, dsa_backend, cuda_graphs):
             pytest.param(
                 backend, graphs, True, id=f"{backend}-{'cuda_graphs' if graphs else 'eager'}"
             )
-            for backend in ("triton", "flashinfer")
+            for backend in ("triton", "flashinfer", "flashinfer-nvfp4")
             for graphs in (False, True)
         ),
         # Without sequence parallelism every rank already holds all of the step's tokens.
@@ -191,8 +192,12 @@ def test_tensor_parallel_matches_one_rank(
 ):
     """TP2 (with or without sequence parallelism) reproduces TP1 tokens and log-probs."""
     pytest.importorskip("cutlass.cute")
+    dsa_backend, _, index_key_dtype = dsa_backend.partition("-")
+    index_key_dtype = index_key_dtype or "bf16"
     if dsa_backend == "flashinfer" and not dsa_gqa_flashinfer.HAVE_FLASHINFER_DSA:
         pytest.skip("FlashInfer's DSA kernels are not installed")
+    if index_key_dtype == "nvfp4" and not dsa_gqa_flashinfer.HAVE_FLASHINFER_DSA_NVFP4:
+        pytest.skip("FlashInfer's NVFP4 indexer kernels are not installed")
 
     generator = torch.Generator().manual_seed(7)
     prompts = [
@@ -201,7 +206,7 @@ def test_tensor_parallel_matches_one_rank(
     ]
     served = {}
     Utils.initialize_model_parallel(1, 1)  # The checkpoint directory syncs ranks.
-    name = f"dsa_gqa_tp_{dsa_backend}_{cuda_graphs}_{sequence_parallel}"
+    name = f"dsa_gqa_tp_{dsa_backend}_{index_key_dtype}_{cuda_graphs}_{sequence_parallel}"
     with TempNamedDir(tmp_path_dist_ckpt / name) as checkpoint:
         for tp in (1, 2):
             Utils.initialize_model_parallel(tp, 1)
@@ -220,11 +225,12 @@ def test_tensor_parallel_matches_one_rank(
                 model.load_state_dict(
                     dist_checkpointing.load(model.sharded_state_dict(), checkpoint)
                 )
-            served[tp] = _serve(model, config, prompts, dsa_backend, cuda_graphs)
+            served[tp] = _serve(model, config, prompts, dsa_backend, index_key_dtype, cuda_graphs)
             del model
     Utils.destroy_model_parallel()
 
-    mean_budget, max_budget = 1e-2, 0.1
+    # NVFP4 index keys tie at the top-k boundary more often, so a few selections can differ.
+    mean_budget, max_budget = (2e-2, 0.25) if index_key_dtype == "nvfp4" else (1e-2, 0.1)
     prompt_deltas, generated_deltas = [], []
     for request_id, reference in served[1].items():
         actual = served[2][request_id]
@@ -250,7 +256,7 @@ def test_tensor_parallel_matches_one_rank(
     prompt_deltas = torch.cat(prompt_deltas)
     generated_deltas = torch.tensor(generated_deltas)
     print(
-        f"TP2 vs TP1 ({dsa_backend}, graphs={cuda_graphs}, "
+        f"TP2 vs TP1 ({dsa_backend}, {index_key_dtype}, graphs={cuda_graphs}, "
         f"sp={sequence_parallel}): prompt "
         f"mean {prompt_deltas.mean():.2e} max {prompt_deltas.max():.2e}; generated "
         f"{generated_deltas.numel()} tokens, max {generated_deltas.max():.2e}"
