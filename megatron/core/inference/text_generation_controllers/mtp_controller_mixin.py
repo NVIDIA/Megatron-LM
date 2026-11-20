@@ -144,9 +144,9 @@ class MTPControllerMixin:
         self._async_sched_accepted_counts_cpu_ready_event = torch.cuda.Event()
 
     def _mtp_commit_graph_supported(self) -> bool:
-        """Whether the fixed-shape commit pass applies to this model.
+        """Whether the commit pass can be CUDA-graphed at all for this model.
 
-        The fixed-shape layout gives every request `num_speculative_tokens` rows and attends over
+        The graphed layout gives every request `num_speculative_tokens` rows and attends over
         `start + num_speculative_tokens` keys, which stays inside the positions the draft loop
         itself writes only when the draft loop runs a depth per speculative token.
         """
@@ -157,7 +157,7 @@ class MTPControllerMixin:
         )
 
     def _mtp_commit_graphed_this_step(self, context) -> bool:
-        """Whether this step's commit pass takes the fixed-shape (uniform) layout.
+        """Whether this step's commit pass replays the fixed-shape CUDA graph.
 
         Requires a graphed, decode-only main step. Under the NVLS dispatcher each rank decides
         locally (its all-gather-v / reduce-scatter-v accept per-rank token counts); under the NCCL
@@ -193,14 +193,14 @@ class MTPControllerMixin:
         padded_count: int,
         base_position,
     ) -> None:
-        """Fixed-shape commit pass for a graphed decode-only step.
+        """Commit pass for a graphed decode-only step, replayed from a CUDA graph.
 
         Same KV writes as `_mtp_commit_pass` on a decode-only step: request r's accepted drafts
         are refreshed from the main hiddens at positions `base_r - 1 - a_r ..`. Instead of
         packing the variable number of refreshed rows, every request gets
         `num_speculative_tokens` rows whose unused tail writes the dummy block, so the forward's
-        shape depends only on `padded_count` and its metadata is staged on the GPU from the
-        accepted counts, with no host sync. The forward itself still runs eagerly here.
+        shape depends only on `padded_count`, needs no host sync, and replays the
+        ("mtp_commit", padded_count) graph.
         """
         num_slots = self.num_speculative_tokens
         real_rows = active_request_count * num_slots
@@ -236,6 +236,8 @@ class MTPControllerMixin:
             # Positions are unused for attention (no RoPE); the write positions come from the
             # metadata.
             position_ids=torch.zeros_like(token_ids),
+            eager=False,
+            cache_key=("mtp_commit", padded_count),
             mtp_inference_context=context,
         )
         context.mtp_metadata.end_forward()
@@ -544,6 +546,36 @@ class MTPControllerMixin:
             position_ids=dummy_positions,
             embedding=unwrapped_model.embedding,
             inference_context=context,
+        )
+        context.mtp_metadata.end_forward()
+
+    def _mtp_dummy_commit_graphed_forward(
+        self, context, unwrapped_model, padded_count: int
+    ) -> None:
+        """Replay the ("mtp_commit", padded_count) graph with every row on the dummy block.
+
+        The EP-dummy counterpart of `_mtp_commit_pass_graphed`, issuing the same MoE collectives
+        with the same token count. Its KV writes and reads touch only the dummy block.
+        """
+        num_rows = padded_count * self.num_speculative_tokens
+        dummy_hidden = torch.zeros(
+            (num_rows, 1, self.model_config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=self.model_config.params_dtype,
+        )
+        if self._sp_enabled:
+            dummy_hidden = scatter_to_sequence_parallel_region(
+                dummy_hidden, group=self.inference_wrapped_model.tp_group
+            )
+        dummy_tokens = torch.zeros((1, num_rows), device=dummy_hidden.device, dtype=torch.long)
+        context._mtp_setup_commit_graphed(padded_count, padded_count)
+        unwrapped_model.compute_mtp_kv_write(
+            hidden_states=dummy_hidden,
+            next_token_ids=dummy_tokens,
+            position_ids=torch.zeros_like(dummy_tokens),
+            eager=False,
+            cache_key=("mtp_commit", padded_count),
+            mtp_inference_context=context,
         )
         context.mtp_metadata.end_forward()
 
@@ -875,7 +907,10 @@ class MTPControllerMixin:
         mtp_context_kwarg = {"mtp_inference_context": context} if mtp_cache_active else {}
         with context._mtp_forward_phase(preserve_step_bookkeeping=mtp_cache_active):
             if mtp_cache_active:
-                self._mtp_dummy_prefill_forward(context, unwrapped_model)
+                if self._mtp_commit_graphed_this_step(context):
+                    self._mtp_dummy_commit_graphed_forward(context, unwrapped_model, padded_count)
+                else:
+                    self._mtp_dummy_prefill_forward(context, unwrapped_model)
                 context.mtp_metadata.begin_decode_for_capture(padded_count, graphed=main_graphed)
             for depth in range(self.num_mtp_depths):
                 nvtx_range_push(f"mtp-spec-decoding/dummy-depth-{depth}")

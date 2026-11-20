@@ -71,7 +71,7 @@ class LanguageModule(MegatronModule):
         )
 
     def _setup_mtp_cuda_graphs(self):
-        """Wrap `compute_mtp_single_step` with a CudaGraphManager.
+        """Wrap `compute_mtp_single_step` and `compute_mtp_kv_write` with CudaGraphManagers.
 
         Must be called by subclasses after `self.mtp` is created.
         """
@@ -80,6 +80,13 @@ class LanguageModule(MegatronModule):
                 self.config,
                 base_module=self,
                 function_name="compute_mtp_single_step",
+                need_backward=False,
+                inline_capture=True,
+            )
+            self._mtp_kv_write_cudagraph_manager = CudaGraphManager(
+                self.config,
+                base_module=self,
+                function_name="compute_mtp_kv_write",
                 need_backward=False,
                 inline_capture=True,
             )

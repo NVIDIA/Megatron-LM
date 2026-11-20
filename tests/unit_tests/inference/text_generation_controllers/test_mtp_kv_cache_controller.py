@@ -833,7 +833,7 @@ class TestGraphedCommitPass:
         controller._compute_serial_mtp_and_sample(base_position=base_position)
         return base_position
 
-    def test_decode_only_graphed_step_takes_fixed_shape_commit(self):
+    def test_decode_only_graphed_step_replays_commit_graph(self):
         controller, model, context = self._setup()
         base_position = self._run(controller)
 
@@ -841,6 +841,8 @@ class TestGraphedCommitPass:
         controller._mtp_dummy_prefill_forward.assert_not_called()
         assert len(model.kv_write_calls) == 1
         call = model.kv_write_calls[0]
+        assert call["cache_key"] == ("mtp_commit", self.PADDED)
+        assert call["eager"] is False
         assert call["mtp_inference_context"] is context
 
         # Request r's slot j reads main row r*(S+1)+j and the input token one row later;
