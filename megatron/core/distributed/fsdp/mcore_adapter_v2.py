@@ -303,8 +303,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 and active_context.prefetch_order is not PrefetchOrder.RECORDED
             ):
                 raise ValueError(
-                    "Ordinary PP/VPP and shared MTP MFSDP v2 schedules require "
-                    "RuntimePolicy(prefetch_order=PrefetchOrder.RECORDED)."
+                    "The active FSDP context supplied by the caller uses prefetch order "
+                    f"{active_context.prefetch_order}, but the model configuration requires "
+                    f"{prefetch_order}."
                 )
             if active_context.autograd_completes_execution:
                 raise ValueError(
