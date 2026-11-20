@@ -550,6 +550,16 @@ class PretrainConfigContainer(ConfigContainerBase):
                 )
             assert self.ddp.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
         transformer = getattr(self.model, "transformer", None)
+        mok_fsdp_eager = (
+            transformer is not None
+            and (transformer.moe_megakernel_backend_config or {}).get("mfsdp_v2_eager") is True
+        )
+        if mok_fsdp_eager and not (
+            self.ddp.use_megatron_fsdp
+            and self.ddp.megatron_fsdp_version == 2
+            and not isinstance(self.ddp, TorchFullyShardedDataParallelConfig)
+        ):
+            raise ValueError("MoK mfsdp_v2_eager requires Megatron-FSDP v2")
         if isinstance(self.ddp, TorchFullyShardedDataParallelConfig):
             if self.ddp.use_megatron_fsdp:
                 raise ValueError("Torch FSDP2 and Megatron FSDP cannot be used together.")
@@ -567,7 +577,11 @@ class PretrainConfigContainer(ConfigContainerBase):
                 raise ValueError("FSDP requires CUDA_DEVICE_MAX_CONNECTIONS > 1 or unset.")
             if transformer is not None and transformer.moe_shortcut_connection:
                 raise ValueError("FSDP does not support MoE shortcut connections.")
-            if transformer is not None and transformer.moe_megakernel_backend == "mok":
+            if (
+                transformer is not None
+                and transformer.moe_megakernel_backend == "mok"
+                and not mok_fsdp_eager
+            ):
                 raise ValueError("MOK has not been validated with FSDP.")
         if transformer is not None:
             if self.ddp.fp8_param_gather and not transformer.fp8:

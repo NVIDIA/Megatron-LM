@@ -826,7 +826,13 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
                     packed_seq_params=packed_seq_params,
                     replay_topk_idx=replay_topk_idx,
                 )
-                return apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
+                megakernel = apply_module(self.megakernel_experts)
+                if getattr(self.megakernel_experts, "mfsdp_v2_eager", False):
+                    output, _ = self.experts(
+                        hidden_states, probs, routing_map, megakernel=megakernel
+                    )
+                    return output
+                return megakernel(hidden_states, probs, routing_map)
 
             if self.moe_layer_recompute and self.training:
                 output = precision_aware_checkpoint(

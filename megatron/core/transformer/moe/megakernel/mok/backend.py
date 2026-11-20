@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from types import MethodType
 from typing import TYPE_CHECKING
+from weakref import ref
 
 import torch
 from torch import nn
@@ -22,6 +23,7 @@ from megatron.core.transformer.moe.megakernel.mok.weights import (
     _native_single_grouped_weight_view,
     _native_split_weight_view,
 )
+from megatron.core.transformer.moe.megakernel.parameter_bridge import dummy_weight_gradient
 from megatron.core.transformer.moe.megakernel.parameter_bridge import (
     finish_weight_gradient as _finish_weight_gradient,
 )
@@ -35,6 +37,8 @@ if TYPE_CHECKING:
 
 class MoKMegakernel(MegakernelBackend):
     """Execute MOK using trainable parameters owned by native MCore modules."""
+
+    mfsdp_v2_eager = False
 
     def __init__(
         self,
@@ -57,8 +61,12 @@ class MoKMegakernel(MegakernelBackend):
                 "megatron/core/transformer/moe/README.md"
             ) from exc
 
-        if not config.gradient_accumulation_fusion:
+        mok_options = dict(config.moe_megakernel_backend_config or {})
+        self.mfsdp_v2_eager = mok_options.pop("mfsdp_v2_eager", False) is True
+        if not config.gradient_accumulation_fusion and not self.mfsdp_v2_eager:
             raise ValueError("MOK currently requires gradient_accumulation_fusion=True")
+        if self.mfsdp_v2_eager and config.gradient_accumulation_fusion:
+            raise ValueError("MoK mfsdp_v2_eager does not use fused TE wgrad accumulation")
         if config.moe_mlp_glu_interleave_size is not None:
             raise ValueError("MOK requires non-interleaved native MCore routed FC1 weights")
         if config.moe_shared_expert_glu_interleave_size is not None:
@@ -86,7 +94,7 @@ class MoKMegakernel(MegakernelBackend):
         )
         self.native_single_grouped_weights = bool(config.moe_single_grouped_weight)
         try:
-            self.mok_config = MoKConfig(**(config.moe_megakernel_backend_config or {}))
+            self.mok_config = MoKConfig(**mok_options)
         except TypeError as exc:
             raise ValueError(f"Invalid MOK option in moe_megakernel_backend_config: {exc}") from exc
 
@@ -105,7 +113,13 @@ class MoKMegakernel(MegakernelBackend):
                 "MOK routed weight layout does not match config.moe_single_grouped_weight"
             )
 
-        if self.native_single_grouped_weights:
+        if self.mfsdp_v2_eager:
+            if self.native_single_grouped_weights:
+                raise ValueError("MoK mfsdp_v2_eager requires split routed weights")
+            # The routed FSDP unit owns these parameters and binds their compute
+            # representations before calling this backend.
+            self._routed_experts_ref = ref(routed_experts)
+        elif self.native_single_grouped_weights:
             # Register aliases of the same Parameter objects so DDP's MOK forward
             # pre-hook waits for their overlap-param-gather buckets. named_parameters
             # deduplicates them; no additional payload storage is allocated.
@@ -145,6 +159,8 @@ class MoKMegakernel(MegakernelBackend):
     @property
     def routed_fc1_parameters(self) -> tuple[nn.Parameter, ...]:
         """Return the MCore-owned routed FC1 parameters."""
+        if self.mfsdp_v2_eager:
+            return self._fsdp_routed_parameters("linear_fc1")
         if self.native_single_grouped_weights:
             return (self.routed_fc1_weight,)
         return tuple(getattr(self, name) for name in self._routed_fc1_parameter_names)
@@ -152,6 +168,8 @@ class MoKMegakernel(MegakernelBackend):
     @property
     def routed_fc2_parameters(self) -> tuple[nn.Parameter, ...]:
         """Return the MCore-owned routed FC2 parameters."""
+        if self.mfsdp_v2_eager:
+            return self._fsdp_routed_parameters("linear_fc2")
         if self.native_single_grouped_weights:
             return (self.routed_fc2_weight,)
         return tuple(getattr(self, name) for name in self._routed_fc2_parameter_names)
@@ -161,17 +179,50 @@ class MoKMegakernel(MegakernelBackend):
         """Return routed parameters tracked by the MOK autograd bridge."""
         return self.routed_fc1_parameters + self.routed_fc2_parameters
 
+    def _fsdp_routed_parameters(self, projection: str) -> tuple[nn.Parameter, ...]:
+        routed_experts = self._routed_experts_ref()
+        if routed_experts is None:
+            raise RuntimeError("MoK's routed expert module has been released")
+        linear = getattr(routed_experts, projection)
+        return tuple(
+            linear.get_parameter(f"weight{index}") for index in range(self.num_local_experts)
+        )
+
+    def weight_grad_buffer(self, parameter: nn.Parameter) -> torch.Tensor:
+        """Return the accumulation destination for the active backend."""
+        if not self.mfsdp_v2_eager:
+            return _main_grad_buffer(parameter)
+
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+            get_containing_parameter_group,
+        )
+
+        group = get_containing_parameter_group(parameter)
+        if group is None:
+            raise RuntimeError("MoK mfsdp_v2_eager expected an FSDP-owned parameter")
+        return group.allocate_external_wgrad(parameter)
+
     def main_grad_arguments(self):
         """Return MOK logical main grads and optional per-expert descriptors."""
-        shared_fc1_grad = _main_grad_buffer(self.shared_fc1_weight)
-        shared_fc2_grad = _main_grad_buffer(self.shared_fc2_weight)
-        fc1_main_grads = tuple(_main_grad_buffer(param) for param in self.routed_fc1_parameters)
-        fc2_main_grads = tuple(_main_grad_buffer(param) for param in self.routed_fc2_parameters)
+        shared_fc1_grad = self.weight_grad_buffer(self.shared_fc1_weight)
+        shared_fc2_grad = self.weight_grad_buffer(self.shared_fc2_weight)
+        fc1_main_grads = tuple(
+            self.weight_grad_buffer(param) for param in self.routed_fc1_parameters
+        )
+        fc2_main_grads = tuple(
+            self.weight_grad_buffer(param) for param in self.routed_fc2_parameters
+        )
         main_grads = (shared_fc1_grad, fc1_main_grads[0], shared_fc2_grad, fc2_main_grads[0])
         if self.native_single_grouped_weights:
             return main_grads, None
 
         from mok import ops
+
+        if self.mfsdp_v2_eager:
+            return main_grads, tuple(
+                ops.make_routed_d_weight_storage_table(list(grads))
+                for grads in (fc1_main_grads, fc2_main_grads)
+            )
 
         fingerprint = tuple(
             (grad.data_ptr(), grad.dtype, tuple(grad.shape))
@@ -188,7 +239,15 @@ class MoKMegakernel(MegakernelBackend):
 
     def finish_routed_weight_gradients(self) -> tuple[torch.Tensor, ...]:
         """Finalize and return routed weight gradients."""
-        return tuple(_finish_weight_gradient(param) for param in self.autograd_routed_parameters)
+        return tuple(
+            self.finish_weight_gradient(param) for param in self.autograd_routed_parameters
+        )
+
+    def finish_weight_gradient(self, parameter: nn.Parameter) -> torch.Tensor:
+        """Signal autograd completion after MoK has written the numerical gradient."""
+        if self.mfsdp_v2_eager:
+            return dummy_weight_gradient(parameter)
+        return _finish_weight_gradient(parameter)
 
     @torch.no_grad()
     def _register_shared_weights(self, shared: nn.Module, *, use_output_gate: bool = False) -> None:
