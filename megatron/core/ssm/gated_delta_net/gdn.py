@@ -38,7 +38,6 @@ from megatron.core.ssm.ops.gdp import (
     fused_recurrent_gated_delta_rule_update,
 )
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
-from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     deprecate_inference_params,
     get_pg_size,
@@ -78,21 +77,16 @@ def get_parameter_local_cp_headwise(
 
 class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
     # pylint: disable=missing-class-docstring
-    def estimate_flops(self, *, include_backward: bool = False, **batch_stats: float) -> float:
-        """Estimate this layer's forward work, optionally including backward."""
-        forward = self._estimate_flops_from_config(self.config, **batch_stats)
-        return (3 if include_backward else 1) * forward
-
-    @classmethod
-    def _estimate_flops_from_config(
-        cls,
-        config: TransformerConfig,
+    def estimate_flops(
+        self,
         *,
         total_real_tokens_in_batch: float,
         seqlen_squared_sum_in_batch: float,
+        include_backward: bool = False,
     ) -> float:
-        """Estimate forward projection, convolution, and gated-delta-rule FLOPs."""
-        return cls._estimate_flops(config, total_real_tokens_in_batch, use_gdn2=False)
+        """Estimate projection, convolution, and gated-delta-rule FLOPs."""
+        forward = _GDNBase._estimate_flops(self.config, total_real_tokens_in_batch, use_gdn2=False)
+        return (3 if include_backward else 1) * forward
 
     def _setup_variant_attrs(self):
         """Set the GDN in_proj sizing, split tables, gate parameter dims, and kernel."""

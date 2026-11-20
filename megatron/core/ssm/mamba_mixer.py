@@ -195,25 +195,20 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             parallel.
     """
 
-    def estimate_flops(self, *, include_backward: bool = False, **batch_stats: float) -> float:
-        """Estimate this layer's forward work, optionally including backward."""
-        forward = self._estimate_flops_from_config(self.config, **batch_stats)
-        return (3 if include_backward else 1) * forward
-
-    @classmethod
-    def _estimate_flops_from_config(
-        cls,
-        config: TransformerConfig,
+    def estimate_flops(
+        self,
         *,
         total_real_tokens_in_batch: float,
         seqlen_squared_sum_in_batch: float,
+        include_backward: bool = False,
     ) -> float:
-        """Estimate forward projection and scan FLOPs using the existing SSD approximation."""
+        """Estimate projection and scan FLOPs using the existing SSD approximation."""
+        config = self.config
         tokens = total_real_tokens_in_batch
         hidden = config.hidden_size
         inner = 2 * hidden
         heads = config.mamba_num_heads or inner // config.mamba_head_dim
-        return (
+        forward = (
             2
             * tokens
             * hidden
@@ -221,6 +216,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             + 7 * tokens * inner * config.mamba_state_dim  # Approximate scan cost.
             + 2 * tokens * inner * hidden
         )
+        return (3 if include_backward else 1) * forward
 
     def __init__(
         self,

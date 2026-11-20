@@ -23,6 +23,7 @@ from collections.abc import Callable
 from contextlib import nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple
 
 # Third-party.
@@ -822,6 +823,15 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
     return total_real_tokens / dedup, seqlen_squared_sum / dedup
 
 
+def _config_only_leaf_flops(layer_type, config, **batch_stats):
+    """Reuse a built-in leaf's arithmetic for reports that only have a config.
+
+    These leaf estimators read only their config and batch statistics. Composites
+    that inspect child modules must be estimated from a constructed model.
+    """
+    return layer_type.estimate_flops(SimpleNamespace(config=config), **batch_stats)
+
+
 def _dsv4_attention_flops(transformer_cfg, layer_counts, total_tokens, seqlen_squared_sum):
     """Aggregate the layer-owned DSv4 estimates with the training multiplier."""
     from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
@@ -834,7 +844,8 @@ def _dsv4_attention_flops(transformer_cfg, layer_counts, total_tokens, seqlen_sq
         if layer_counts[symbol]:
             config = copy.copy(transformer_cfg)
             config.compress_ratio = ratio
-            forward += layer_counts[symbol] * DSv4HybridSelfAttention._estimate_flops_from_config(
+            forward += layer_counts[symbol] * _config_only_leaf_flops(
+                DSv4HybridSelfAttention,
                 config,
                 total_real_tokens_in_batch=total_tokens,
                 seqlen_squared_sum_in_batch=seqlen_squared_sum,
@@ -925,9 +936,10 @@ def num_floating_point_operations(
         )
 
     from megatron.core.transformer.attention import SelfAttention
+    from megatron.core.transformer.experimental_attention_variant.dsa import dsa_attention_flops
     from megatron.core.transformer.mlp import MLP
     from megatron.core.transformer.moe.moe_layer import MoELayer
-    from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+    from megatron.core.transformer.multi_latent_attention import mla_attention_flops
     from megatron.training.vocab_utils import model_vocab_size
 
     transformer_cfg = model_config.transformer
@@ -944,11 +956,14 @@ def num_floating_point_operations(
         tensor_model_parallel_size=transformer_cfg.tensor_model_parallel_size,
     )
 
+    batch_stats = dict(
+        total_real_tokens_in_batch=total_real_tokens_in_batch,
+        seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+    )
+
     def estimate(layer_type, config=None):
-        return layer_type._estimate_flops_from_config(
-            legacy_config if config is None else config,
-            total_real_tokens_in_batch=total_real_tokens_in_batch,
-            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+        return _config_only_leaf_flops(
+            layer_type, legacy_config if config is None else config, **batch_stats
         )
 
     def indexer_flops(
@@ -1003,11 +1018,8 @@ def num_floating_point_operations(
                 num_indexers += parsed.mtp_num_depths * count_pattern(parsed.mtp_pattern)
 
         # The detached indexer has loss-dependent backward costs, unlike the layer's x3.
-        return num_indexers * DSAIndexer._estimate_flops_from_config(
-            transformer_cfg,
-            total_real_tokens_in_batch=total_real_tokens_in_batch,
-            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
-            include_backward=True,
+        return num_indexers * _config_only_leaf_flops(
+            DSAIndexer, transformer_cfg, include_backward=True, **batch_stats
         )
 
     def hybrid_flops():
@@ -1052,9 +1064,7 @@ def num_floating_point_operations(
             forward += counts[Symbols.GDN] * estimate(gdn_type)
         expanded = 0
         if counts[Symbols.DS_ATTENTION]:
-            from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
-
-            forward += counts[Symbols.DS_ATTENTION] * estimate(DSAttention)
+            forward += counts[Symbols.DS_ATTENTION] * dsa_attention_flops(legacy_config, **batch_stats)
             expanded += indexer_flops(
                 counts[Symbols.DS_ATTENTION], hybrid_layer_pattern=model_config.hybrid_layer_pattern
             )
@@ -1170,17 +1180,10 @@ def num_floating_point_operations(
             assert not group_query_attention
         expanded = 0
         if transformer_cfg.experimental_attention_variant == "dsa":
-            from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
-
-            attention_type = DSAttention
             expanded = indexer_flops(
                 num_layers,
                 mtp_num_layers=mtp_num_layers,
                 mtp_use_repeated_layer=transformer_cfg.mtp_use_repeated_layer,
-            )
-        else:
-            attention_type = (
-                MLASelfAttention if transformer_cfg.multi_latent_attention else SelfAttention
             )
         forward = linear_flops
         if num_dense_layers:
@@ -1188,7 +1191,13 @@ def num_floating_point_operations(
         if num_moe_layers:
             forward += num_moe_layers * estimate(MoELayer)
         if num_standard_attention_layers:
-            forward += num_standard_attention_layers * estimate(attention_type)
+            if transformer_cfg.experimental_attention_variant == "dsa":
+                attention_flops = dsa_attention_flops(legacy_config, **batch_stats)
+            elif transformer_cfg.multi_latent_attention:
+                attention_flops = mla_attention_flops(legacy_config, **batch_stats)
+            else:
+                attention_flops = estimate(SelfAttention)
+            forward += num_standard_attention_layers * attention_flops
         # MTP norms/projections and output heads belong to the model, not individual layers.
         hidden_size = transformer_cfg.hidden_size
         forward += (

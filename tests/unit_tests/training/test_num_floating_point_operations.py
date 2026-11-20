@@ -12,6 +12,7 @@ from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.training.models import GPTModelConfig, HybridModelConfig
 from megatron.training.training import num_floating_point_operations
+from tests.unit_tests.test_utilities import make_flops_test_layer
 
 
 def _make_config(transformer_cls=TransformerConfig, **overrides):
@@ -195,10 +196,9 @@ def test_mla_forward_flops_with_optional_query_projection(q_lora_rank, expected)
 
     # Projection MACs per token are 204 without Q LoRA, or 191 with it.
     # Causal attention contributes 14 FLOPs per squared sequence length.
+    attention = make_flops_test_layer(MLASelfAttention, config, core_attention=None)
     assert (
-        MLASelfAttention._estimate_flops_from_config(
-            config, total_real_tokens_in_batch=5, seqlen_squared_sum_in_batch=13
-        )
+        attention.estimate_flops(total_real_tokens_in_batch=5, seqlen_squared_sum_in_batch=13)
         == expected
     )
 
@@ -214,10 +214,9 @@ def test_mla_forward_flops_with_optional_query_projection(q_lora_rank, expected)
 )
 def test_layer_forward_flops_include_variant_projections(layer_type, overrides, expected):
     config = _make_config(**overrides).transformer
+    layer = make_flops_test_layer(layer_type, config)
     assert (
-        layer_type._estimate_flops_from_config(
-            config, total_real_tokens_in_batch=5, seqlen_squared_sum_in_batch=13
-        )
+        layer.estimate_flops(total_real_tokens_in_batch=5, seqlen_squared_sum_in_batch=13)
         == expected
     )
 

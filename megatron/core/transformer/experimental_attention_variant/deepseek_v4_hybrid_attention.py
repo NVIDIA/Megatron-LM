@@ -549,24 +549,19 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
     and returns output of the same size.
     """
 
-    def estimate_flops(self, *, include_backward: bool = False, **batch_stats: float) -> float:
-        """Estimate this layer's forward work, optionally including backward."""
-        forward = self._estimate_flops_from_config(self.config, **batch_stats)
-        return (3 if include_backward else 1) * forward
-
-    @classmethod
-    def _estimate_flops_from_config(
-        cls,
-        config: MLATransformerConfig,
+    def estimate_flops(
+        self,
         *,
         total_real_tokens_in_batch: float,
         seqlen_squared_sum_in_batch: float,
+        include_backward: bool = False,
     ) -> float:
-        """Estimate forward W/C/H attention, including projections, compression and indexing.
+        """Estimate W/C/H attention, including projections, compression and indexing.
 
         Packed top-k saturation uses the token-weighted mean sequence length, as the
         batch aggregates do not retain individual document lengths. Includes FMA x2.
         """
+        config = self.config
         if config.compress_ratio not in (0, 4, 128):
             raise ValueError(f"Unsupported CSA compression ratio: {config.compress_ratio}")
         if total_real_tokens_in_batch == 0:
@@ -608,9 +603,10 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     + hidden * indexer_heads
                 )
                 core_term += indexer_heads * indexer_dim / 4
-        return 2 * (
+        forward = 2 * (
             token_term * total_real_tokens_in_batch + core_term * seqlen_squared_sum_in_batch
         )
+        return (3 if include_backward else 1) * forward
 
     def __init__(
         self,
