@@ -23,6 +23,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Unchanged event-loop turns RolloutPipeline._drain() allows while a group is being
+# assembled, before it concludes that the pipeline has stalled.
+_ASSEMBLY_STABLE_TURNS = 8
+
 
 class _GranularityConfig(NamedTuple):
     submission: SubmissionGranularity
@@ -253,6 +257,8 @@ class RolloutPipeline:
         self._prepare_done = False
         self._groups_in_flight = 0
         self._regen_tasks: set[asyncio.Task] = set()
+        # Groups whose rollouts stage_assemble is building; see _drain().
+        self._assembling = 0
 
         # Buffers of partial results.
         self._assemble_pending: dict[int, list[_InferredItem]] = {}
@@ -474,9 +480,13 @@ class RolloutPipeline:
                     continue
                 completed = pending.pop(inferred.item.group_id)
                 completed.sort(key=lambda item: item.item.rollout_idx)
-                rollouts = await asyncio.gather(
-                    *[item.item.params.build_rollout(item.episode) for item in completed]
-                )
+                self._assembling += 1
+                try:
+                    rollouts = await asyncio.gather(
+                        *[item.item.params.build_rollout(item.episode) for item in completed]
+                    )
+                finally:
+                    self._assembling -= 1
                 first = completed[0]
                 self.assembled_count += 1
                 self.assembled_groups_per_env[first.item.env_index] += 1
@@ -599,8 +609,13 @@ class RolloutPipeline:
         previous = None
         stable = 0
         # There will be at least one turn that does not change the metrics:
-        # `stage_assemble` advances a group without updating any counters.
-        while self.ready_batches < 1 and stable < 2:
+        # `stage_assemble` advances a group without updating any counters. Building
+        # a group's rollouts needs no inference but takes more such turns (the
+        # gather's tasks, then its callback), so allow more of them while one is in
+        # flight. The bound keeps the drain finite if a build waits on the engine.
+        while self.ready_batches < 1 and stable < (
+            _ASSEMBLY_STABLE_TURNS if self._assembling else 2
+        ):
             await asyncio.sleep(0)
             progress = (
                 self.prepared_count,
