@@ -1004,6 +1004,26 @@ def test_bulk_offload_group_keeps_untracked_sources_until_copied():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+def test_held_offload_sources_are_released_from_any_chunk():
+    """A chunk's last held source is freed by the next offload hook of any chunk.
+
+    Its own chunk may commit no further group before backward reloads it, so polling only the
+    chunk's own groups would keep the source on the GPU through the whole forward-backward gap.
+    """
+    source = torch.from_dlpack(torch.arange(1 << 14, device="cuda").clone())
+    held = OffloadTensorGroup("fused_group_mlp")
+    held.push_tensor((1, 0), source)
+    chunk_a = _make_warmup_chunk([held])
+    chunk_b = _make_warmup_chunk([OffloadTensorGroup("fused_group_mlp")])
+
+    chunk_a.bulk_offload_group(held)
+    torch.cuda.synchronize()
+    assert len(held._unrecorded_sources) == 1
+    chunk_b._release_copied_offload_sources()
+    assert held._unrecorded_sources == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
 def test_bulk_offload_group_relies_on_record_stream_for_allocator_storage():
     """Allocator-owned sources stay protected by record_stream and are not held."""
     source = torch.arange(1 << 14, dtype=torch.int64, device="cuda")
