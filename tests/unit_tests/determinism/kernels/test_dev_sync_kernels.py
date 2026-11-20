@@ -403,6 +403,9 @@ def test_kda_low_rank_projection_replays():
         # The streamed pre-GDR fusion (gdn_pre_gated_delta_rule_fusion) is opt-in and rejected
         # under deterministic_mode; the deterministic replay stays on pre_gated_delta_rule.
         assert not module.gdn_pre_gated_delta_rule_fusion
+        # So is kda_kernel_backend='cudnn' (test_ssm_kernels.py): this replay covers the FLA
+        # backend, the only one deterministic_mode accepts.
+        assert config.kda_kernel_backend == "fla"
 
         hidden_states = torch.randn(
             128, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
