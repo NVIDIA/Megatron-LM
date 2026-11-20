@@ -367,6 +367,12 @@ run_full_tests() {
     for i in $(seq $UNIT_TEST_REPEAT); do
         for phase in prod experimental; do
             [[ "$phase" != experimental || "$TAG" == latest ]] || continue
+            # A bucket without pytest.mark.experimental selects nothing in that phase; skip
+            # the launch, which otherwise starts every rank only to deselect every test.
+            if [[ "$phase" == experimental ]] && ! bucket_uses_mark experimental "$target"; then
+                echo "No experimental tests in $target; skipping the experimental launch."
+                continue
+            fi
             if [[ "$phase" == prod ]] && (( pack_shards > 1 )); then
                 echo "Running prod tests as $pack_shards packed shards of $GPUS_PER_NODE GPUs."
                 run_sharded "$GPUS_PER_NODE" "$pack_shards" -vs "${IGNORE_ARGS[@]}" \
