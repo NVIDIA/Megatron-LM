@@ -375,6 +375,10 @@ for i in $(seq 1 $N_REPEAT); do
     # would false-positive-fail the goldens check and block the
     # orchestration's resumable retrigger.
     if [[ "$TEST_TYPE" == "release" ]]; then
+        if [[ "$TRAINING_EXIT_CODE" -ne 0 ]]; then
+            echo "Release training failed with exit code $TRAINING_EXIT_CODE."
+            exit "$TRAINING_EXIT_CODE"
+        fi
         TRACKER_FILE="$CHECKPOINT_SAVE_PATH/latest_checkpointed_iteration.txt"
         LATEST_ITER=0
         if [[ -f "$TRACKER_FILE" ]]; then
