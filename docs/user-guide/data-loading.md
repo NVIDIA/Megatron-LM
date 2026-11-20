@@ -107,7 +107,7 @@ torchrun --nproc_per_node=8 --nnodes=512 ... pretrain_gpt.py \
 | `--per-dataset-sequences-path` | None | **Set when blending many datasets** | Points to a JSON file mapping each dataset path to its `(sequence_count, document_count)`. Replaces per-file metadata reads with a single JSON lookup. Generate with `tools/build_sequences_per_dataset.py`. |
 | `--data-cache-path` | None | **Set** | Directory where index `.npy` files are cached. Must be on shared storage for multi-node jobs so all ranks can read it. |
 | `--num-workers` | 2 | **Keep as small as necessary** | Number of DataLoader worker processes. The goal is to satisfy: *time to process a batch > time to prepare a batch*. This hides dataloader work behind the training step. Increasing beyond what's needed wastes CPU and memory. |
-| `--no-mmap-bin-files` | mmap on | **Test both** | Memory-mapping `.bin` files leverages the OS page cache, but the optimal setting is filesystem-dependent. Some large-scale production configurations disable mmap. Test with and without to determine what works best for your storage. |
+| `--no-mmap-bin-files` | mmap on | **Test both** | Memory-mapping `.bin` files leverages the OS page cache, but the optimal setting is filesystem-dependent. For large blends that fail with mmap-related `PermissionError: [Errno 1] Operation not permitted` (EPERM), try this flag: it removes the `.bin` mapping per dataset while `.idx` remains mapped. See the [reported WekaFS case](https://github.com/NVIDIA-NeMo/Megatron-Bridge/issues/3968). Test with and without to determine what works best for your storage. |
 
 ### Object storage (S3 / Multi-Storage Client)
 
