@@ -1196,9 +1196,11 @@ class MegatronFSDP(torch.nn.Module):
                 # Only register grad acc hook for parameters that require gradients.
                 if not param.requires_grad:
                     continue
-                # Tensor post-accumulate hooks are skipped when fused wgrad returns None.
-                # AccumulateGrad node post hooks run even for an undefined gradient on
-                # PyTorch 2.6+, on the parameter's device worker thread.
+
+                # Megatron FSDP v1 registers a post hook on the parameter's AccumulateGrad node
+                # instead of a tensor post-accumulate hook: the tensor hook is skipped when fused wgrad
+                # returns None, while the node hook still runs and lets FSDP process the gradient already
+                # in main_grad. The delayed-wgrad callback remains on its existing path.
                 grad_acc = torch.autograd.graph.get_gradient_edge(param).node
                 self.grad_acc_nodes.append(grad_acc)
                 self.grad_acc_hooks[f"grad_acc and reduce for {self.param_to_name[param]}"] = (
