@@ -928,11 +928,6 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             b_schedule_plan.wait_current_stream()
             for unit in b_schedule_plan._fsdp_remaining_modules:
                 post_fsdp_backward(unit)
-            model = b_schedule_plan._model_chunk_state.model
-            if isinstance(model, FsdpModule):
-                # This schedule bypasses the root's autograd completion callback.
-                # Finish this microbatch's weight cleanup; gradient sync stays caller-managed.
-                model.context.post_microbatch()
             # Release reference as early as possible, this helps avoid memory leak.
             b_schedule_plan.release_state()
 
