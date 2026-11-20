@@ -75,7 +75,7 @@ def test_evaluate_weights_valid_tokens_across_batches_ranks_and_iterations(
         mock.patch.object(training_mod, "is_pp_last_stage", return_value=True),
         mock.patch.object(training_mod, "has_nvidia_modelopt", False),
         mock.patch.object(training_mod, "ft_integration"),
-        mock.patch.object(training_mod, "_otel_managed_span", return_value=mock.MagicMock()),
+        mock.patch.object(training_mod._otel, "managed_span", return_value=mock.MagicMock()),
         mock.patch.object(
             training_mod,
             "wrap_data_iterator",

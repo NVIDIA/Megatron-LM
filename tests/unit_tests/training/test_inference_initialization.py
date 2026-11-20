@@ -195,13 +195,13 @@ def test_inference_telemetry_does_not_read_training_fields(monkeypatch, run_conf
                 raise AssertionError(f"Inference read training field {name}")
             return super().__getattribute__(name)
 
-    monkeypatch.setattr(global_vars, "_detect_gpu_identity", Mock(return_value={}))
-    attrs = global_vars.build_telemetry_resource_attrs(
+    pytest.importorskip("nemo.lens")
+    from megatron.core.telemetry import resource_attrs
+
+    attrs = resource_attrs.build_telemetry_resource_attrs(
         InferenceArgs(local_rank=0), include_training=False
     )
-    assert "dl.batch_size" not in attrs
-    assert "megatron.micro_batch_size" not in attrs
-    assert "megatron.train_iters" not in attrs
+    assert not [key for key in attrs if key.startswith("nv.dl.training.")]
 
 
 @pytest.mark.parametrize("training_kwargs", [{}, {"training": False}])
