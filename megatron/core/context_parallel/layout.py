@@ -757,6 +757,9 @@ class ContextParallelLayoutState:
     thd_plan: THDCPLayoutPlan | None
     contiguous_packed_seq_params: PackedSeqParams | None
     zigzag_packed_seq_params: PackedSeqParams | None
+    _input_ids_by_layout: dict[CPLayout, torch.Tensor] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     def prepare_layer(
         self, layer_index: int, hidden_states: torch.Tensor
@@ -769,6 +772,47 @@ class ContextParallelLayoutState:
             else self.contiguous_packed_seq_params
         )
         return hidden_states, packed_seq_params
+
+    def get_layer_input_ids(
+        self, layer_index: int, input_ids: torch.Tensor | None
+    ) -> torch.Tensor | None:
+        """Align batch-first boundary token IDs with a layer's activations.
+
+        Unlike activations, the supplied IDs always start in the boundary layout.
+        Cache converted IDs for this forward, including activation recomputation.
+        """
+        target_layout = self.manager.layer_layouts[layer_index]
+        if input_ids is None or target_layout == self.manager.boundary_layout:
+            return input_ids
+        if target_layout not in self._input_ids_by_layout:
+            self._input_ids_by_layout[target_layout] = (
+                self.manager._convert_cp_layout(
+                    input_ids.transpose(0, 1),
+                    self.manager.boundary_layout,
+                    target_layout,
+                    self.thd_plan,
+                )
+                .transpose(0, 1)
+                .contiguous()
+            )
+        return self._input_ids_by_layout[target_layout]
+
+    def get_layer_padding_mask(
+        self,
+        layer_index: int,
+        default: torch.Tensor | None,
+        padding_masks_by_layout: dict[CPLayout, torch.Tensor | None] | None,
+    ) -> torch.Tensor | None:
+        """Return the token mask whose ordering matches this layer's input.
+
+        Pipeline stages that carry no padding mask may build a batch for the boundary layout
+        only; the boundary ``default`` applies to every layer in that case.
+        """
+        if padding_masks_by_layout is None or all(
+            mask is None for mask in padding_masks_by_layout.values()
+        ):
+            return default
+        return padding_masks_by_layout[self.manager.layer_layouts[layer_index]]
 
     def finalize_layer(self, layer_index: int, hidden_states: torch.Tensor) -> torch.Tensor:
         """Finalize a layer's output layout."""

@@ -136,7 +136,7 @@ def test_engine_service_initializes_config_before_megatron(monkeypatch):
     monkeypatch.setattr(engine_service, "initialize_runtime_services", runtime_services)
 
     def initialize():
-        build_config.assert_called_once_with(args, build_model_config=False)
+        build_config.assert_called_once_with(args)
         set_config.assert_called_once_with(config)
         runtime_services.assert_called_once_with(args)
         raise RuntimeError("initialization reached")
@@ -160,8 +160,10 @@ def test_engine_service_initializes_config_before_megatron(monkeypatch):
 async def test_engine_service_validates_handoff_before_construction(monkeypatch, role, backend):
     args = SimpleNamespace(role=role, disagg_kv_transport_backend=backend)
 
-    def build_engine(*, engine_class):
+    def build_engine(*, engine_class, disaggregation_role):
         assert engine_class is not None
+        # The role reaches the config before the context sizes role-specific buffers.
+        assert disaggregation_role == (None if role == "aggregated" else role)
         raise RuntimeError("configuration observed")
 
     monkeypatch.setattr(engine_service, "get_args", lambda: args)

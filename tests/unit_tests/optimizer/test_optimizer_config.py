@@ -4,30 +4,56 @@ import warnings
 import pytest
 import torch
 
+from megatron.core.optimizer import get_megatron_optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig, ParamKey, ParamPredicate
 
 
 def test_layer_sharded_muon_tp_mode_requirements():
     """muon_tp_mode='layer_sharded' needs muon, the layer-wise path and no split-QKV."""
     ok = dict(optimizer='muon', use_layer_wise_distributed_optimizer=True, muon_split_qkv=False)
-    OptimizerConfig(muon_tp_mode='layer_sharded', **ok)
+    OptimizerConfig(muon_tp_mode='layer_sharded', **ok).validate()
     # dist_muon is the deprecated alias for muon + the layer-wise path.
-    OptimizerConfig(muon_tp_mode='layer_sharded', optimizer='dist_muon', muon_split_qkv=False)
+    OptimizerConfig(
+        muon_tp_mode='layer_sharded', optimizer='dist_muon', muon_split_qkv=False
+    ).validate()
+    OptimizerConfig(
+        muon_tp_mode='layer_sharded',
+        optimizer='muon',
+        use_distributed_optimizer=True,
+        muon_split_qkv=False,
+    ).validate()
     with pytest.raises(ValueError, match="requires optimizer='muon'"):
-        OptimizerConfig(muon_tp_mode='layer_sharded', **{**ok, 'optimizer': 'adaptive_muon'})
+        OptimizerConfig(
+            muon_tp_mode='layer_sharded', **{**ok, 'optimizer': 'adaptive_muon'}
+        ).validate()
     with pytest.raises(ValueError, match="layer-wise"):
         OptimizerConfig(
             muon_tp_mode='layer_sharded', **{**ok, 'use_layer_wise_distributed_optimizer': False}
-        )
+        ).validate()
     with pytest.raises(ValueError, match="split-QKV"):
-        OptimizerConfig(muon_tp_mode='layer_sharded', **{**ok, 'muon_split_qkv': True})
+        OptimizerConfig(muon_tp_mode='layer_sharded', **{**ok, 'muon_split_qkv': True}).validate()
+
+
+@pytest.mark.parametrize("optimizer", ["adam", "adaptive_muon"])
+def test_factory_rejects_invalid_optimizer_config(optimizer):
+    """Standalone Core callers get validation without a training container."""
+    config = OptimizerConfig(optimizer=optimizer, lr=1e-3, muon_tp_mode="layer_sharded")
+    with pytest.raises(ValueError, match="requires optimizer='muon'"):
+        get_megatron_optimizer(config, [])
+
+
+def _te_supports_param_remainders() -> bool:
+    from megatron.core.utils import is_te_min_version
+
+    try:
+        return is_te_min_version("2.1.0")
+    except Exception:  # TransformerEngine not installed.
+        return False
 
 
 def _skip_without_param_remainders_support():
     pytest.importorskip("transformer_engine")
-    from megatron.core.utils import is_te_min_version
-
-    if not is_te_min_version("2.1.0"):
+    if not _te_supports_param_remainders():
         pytest.skip("store_param_remainders needs TE >= 2.1.0")
 
 
@@ -66,9 +92,10 @@ def test_optimizer_cuda_graph_disables_store_param_remainders():
         assert not OptimizerConfig(
             optimizer_cuda_graph=True, **_PAO
         ).resolved_store_param_remainders
-    # An explicit request is overridden too, with a warning.
+    # An explicit request is overridden too, with a warning when the config is validated.
+    config = OptimizerConfig(optimizer_cuda_graph=True, store_param_remainders=True, **_PAO)
     with pytest.warns(UserWarning, match="optimizer-cuda-graph"):
-        config = OptimizerConfig(optimizer_cuda_graph=True, store_param_remainders=True, **_PAO)
+        config.validate()
     assert not config.resolved_store_param_remainders
 
 
@@ -218,6 +245,19 @@ def test_store_param_remainders_explicit_value_wins(fp8_recipe, store_param_rema
 def test_gate_without_precision_aware_optimizer():
     config = _config(False, fp8_recipe="tensorwise")
     assert not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+
+
+@pytest.mark.parametrize(("main_params_dtype", "te_owned"), [("fp32", False), ("fp16", True)])
+def test_gate_accepts_unfinalized_dtype_strings(main_params_dtype, te_owned):
+    """Before finalize_optimizer_config, dtypes may still be CLI strings: 'fp32' main params must
+    not be mistaken for non-FP32 ones, which TE always owns."""
+    config = _config(
+        True, fp8_recipe="mxfp8", main_params_dtype=main_params_dtype, **_PAO
+    )
+    assert config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 is te_owned
+    assert config._param_remainders_supported() is (
+        main_params_dtype == "fp32" and _te_supports_param_remainders()
+    )
 
 
 def test_paramkey_matches():

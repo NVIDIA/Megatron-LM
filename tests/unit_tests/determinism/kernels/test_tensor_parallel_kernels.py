@@ -22,10 +22,13 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import te_general_gemm
-from megatron.core.fusions import fused_layer_norm
 from megatron.core.fusions.fused_embedding_wgrad import accumulate_embedding_wgrad
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
-from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
+from megatron.core.ops.loss.cross_entropy import (
+    VocabParallelCrossEntropy,
+    vocab_parallel_cross_entropy,
+)
+from megatron.core.ops.norm import fused_layer_norm
 from megatron.core.tensor_parallel.layers import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -73,6 +76,63 @@ class TestTensorParallelLayers:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("declare_boundary", [False, True])
+    def test_gtp_dynamic_accumulation_replays(self, declare_boundary, monkeypatch):
+        """Changing accumulation windows replay both widened GEMMs and reduced grads exactly."""
+        from megatron.core.tensor_parallel import generalized_tensor_parallelism as gtp
+        from megatron.core.tensor_parallel.layers import (
+            linear_with_grad_accumulation_and_async_allreduce,
+        )
+
+        group = torch.distributed.group.WORLD
+        if not gtp.HAVE_TE or group.size() < 2:
+            pytest.skip("Requires GTP and at least two ranks")
+        seeded(1234 + group.rank())
+        monkeypatch.setattr(gtp.GTP_CONFIG, "async_reduction", False)
+        monkeypatch.setattr(gtp.GTP_CONFIG, "weight_prefetch", False)
+        model = torch.nn.Module()
+        # Keep every shard nonempty under GTP's 16-row alignment.
+        model.output_layer = torch.nn.Linear(
+            64, 16 * group.size(), bias=False, device="cuda", dtype=torch.bfloat16
+        )
+        gtp.wrap_module_params_gtp(model.output_layer, ["weight"], group)
+        gtp.classify_gtp_remat_chains(model)
+        weight = model.output_layer.weight
+        weight.main_grad = torch.zeros_like(weight, dtype=torch.float32)
+        x = torch.randn(16, 1, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+        def run_windows(inputs):
+            results = []
+            for count in (2, 4, 1):
+                weight.main_grad.zero_()
+                weight.grad = None
+                for index in range(count):
+                    output = linear_with_grad_accumulation_and_async_allreduce(
+                        inputs * (index + 1),
+                        weight,
+                        None,
+                        False,
+                        False,
+                        False,
+                        tp_group=group,
+                        gtp_remat_size=group.size(),
+                    )
+                    if declare_boundary and index == count - 1:
+                        gtp.finalize_gtp_forward_counts(model)
+                    output.sum().backward()
+                gtp.wait_for_gtp_grad_reduction_on_current_stream()
+                results.append(weight.main_grad.detach().clone())
+            return results
+
+        try:
+            outputs, _ = assert_replays_bit_exact(
+                run_windows, (x,), backward=False, replays=3, what="GTP dynamic accumulation"
+            )
+            assert all(torch.count_nonzero(value) > 0 for value in outputs.values())
+        finally:
+            gtp.reset_gtp_state()
+            gtp._GTP_PARAMS.clear()
 
     @pytest.mark.parametrize(
         "deterministic_branch", [True, False], ids=["weight_index", "F.embedding"]
@@ -144,6 +204,58 @@ class TestTensorParallelLayers:
             replays=3,
             what="vocab_parallel_cross_entropy",
         )
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+    def test_vocab_parallel_cross_entropy_staged_helpers_match_composite(self, dtype):
+        """The fused path calls the read-only gather, the in-place exp and the in-place gradient
+        scaling as separate steps (each compiled on its own); they must produce exactly the
+        bytes of the composite ``calculate_predicted_logits`` / ``calculate_gradients``."""
+        seeded()
+        vocab = 32768
+        logits = torch.randn(4096, vocab, device="cuda", dtype=dtype)
+        target = torch.randint(0, vocab, (4096,), device="cuda")
+        grad_output = torch.rand(4096, device="cuda", dtype=torch.float32)
+
+        composite, logits_max = VocabParallelCrossEntropy.calculate_logits_max(logits.clone())
+        staged, staged_max = VocabParallelCrossEntropy.calculate_logits_max(logits.clone())
+        assert torch.equal(logits_max, staged_max)
+
+        target_mask, masked_target_1d, predicted, sum_exp, exp_logits = (
+            VocabParallelCrossEntropy.calculate_predicted_logits(
+                composite, target, logits_max, 0, vocab
+            )
+        )
+        s_mask, s_masked_target_1d, s_predicted = VocabParallelCrossEntropy.gather_predicted_logits(
+            staged, target, staged_max, 0, vocab
+        )
+        assert torch.equal(staged, logits), "gather_predicted_logits must not modify logits"
+        VocabParallelCrossEntropy.exp_logits_inplace(staged, staged_max)
+        for name, a, b in (
+            ("target_mask", target_mask, s_mask),
+            ("masked_target_1d", masked_target_1d, s_masked_target_1d),
+            ("predicted_logits", predicted, s_predicted),
+            ("exp_logits", exp_logits, staged),
+            ("sum_exp_logits", sum_exp, staged.sum(dim=-1)),
+        ):
+            assert torch.equal(a, b), f"{name} differs between staged and composite forward"
+
+        softmax = exp_logits / sum_exp.unsqueeze(dim=-1)
+        grad_2d, arange_1d, softmax_update, grad_input = (
+            VocabParallelCrossEntropy.prepare_gradient_calculation_operands(
+                softmax.clone(), target_mask
+            )
+        )
+        composite_grad = VocabParallelCrossEntropy.calculate_gradients(
+            grad_2d, arange_1d, masked_target_1d, softmax_update, grad_input, grad_output
+        )
+        grad_2d, arange_1d, softmax_update, grad_input = (
+            VocabParallelCrossEntropy.prepare_gradient_calculation_operands(
+                softmax.clone(), target_mask
+            )
+        )
+        grad_2d[arange_1d, masked_target_1d] -= softmax_update
+        VocabParallelCrossEntropy.scale_gradients_inplace(grad_input, grad_output)
+        assert torch.equal(composite_grad, grad_input), "staged backward differs from composite"
 
     @pytest.mark.parametrize(
         "grad_accum_fusion",

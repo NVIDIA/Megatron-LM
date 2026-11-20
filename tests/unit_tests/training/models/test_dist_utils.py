@@ -631,11 +631,9 @@ class TestDdpWrapBucketSize:
         self.model = [_make_model_module()]
 
     def _ddp_config(self, **overrides):
-        cfg = Mock()
-        cfg.num_buckets = None
-        cfg.bucket_size = None
-        cfg.overlap_grad_reduce = True
-        cfg.use_distributed_optimizer = False
+        from megatron.core.distributed import DistributedDataParallelConfig
+
+        cfg = DistributedDataParallelConfig(overlap_grad_reduce=True)
         for k, v in overrides.items():
             setattr(cfg, k, v)
         return cfg
@@ -724,18 +722,17 @@ class TestDdpWrapFullParamLayout:
         self._opt_patcher.stop()
 
     def _ddp_config(self, **overrides):
-        cfg = Mock()
-        cfg.num_buckets = None
-        cfg.bucket_size = 8_000
-        cfg.overlap_grad_reduce = True
-        cfg.use_distributed_optimizer = True
+        from megatron.core.distributed import DistributedDataParallelConfig
+
+        cfg = DistributedDataParallelConfig(
+            bucket_size=8_000, overlap_grad_reduce=True, use_distributed_optimizer=True
+        )
         for k, v in overrides.items():
             setattr(cfg, k, v)
         return cfg
 
     def _make_chunk_with_params(self):
-        p = Mock()
-        p.requires_grad = True
+        p = torch.nn.Parameter(torch.zeros(1))
         chunk = Mock()
         chunk.parameters.return_value = [p]
         chunk.modules.return_value = []
@@ -875,10 +872,8 @@ class TestDdpWrapFullParamLayout:
     ):
         mock_ctx.return_value.__enter__ = Mock(return_value=None)
         mock_ctx.return_value.__exit__ = Mock(return_value=False)
-        p_grad = Mock()
-        p_grad.requires_grad = True
-        p_no_grad = Mock()
-        p_no_grad.requires_grad = False
+        p_grad = torch.nn.Parameter(torch.zeros(1))
+        p_no_grad = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
         chunk = Mock()
         chunk.parameters.return_value = [p_grad, p_no_grad]
         chunk.modules.return_value = []
@@ -1209,3 +1204,58 @@ class TestUnimodalBuildDistributedModels:
             assert result is ddp_result
         finally:
             self._stop_patches()
+
+
+class TestExplicitExecutionDevice:
+    @pytest.mark.parametrize("device", ["cuda", "cpu"])
+    def test_cpu_initialization_does_not_override_execution_device(self, device):
+        from megatron.training.models.dist_utils import (
+            prepare_existing_model_chunks_for_distributed_training,
+        )
+
+        model = _make_model_module()
+        config = _make_transformer_config(use_cpu_initialization=True)
+        with (
+            patch(f"{_MODULE}._print_num_params"),
+            patch(f"{_MODULE}.correct_amax_history_if_needed"),
+        ):
+            prepare_existing_model_chunks_for_distributed_training(
+                [model], config, _make_pg(), wrap_with_ddp=False, device=device
+            )
+        model.to.assert_called_once_with(torch.device(device))
+
+    def test_cpu_export_materializes_only_meta_tensors(self):
+        from megatron.training.models.dist_utils import (
+            prepare_existing_model_chunks_for_distributed_training,
+        )
+
+        model = nn.Module()
+        model.register_parameter("weight", nn.Parameter(torch.empty(4, device="meta")))
+        model.register_buffer("scale", torch.tensor([7.0]))
+        config = _make_transformer_config(init_model_with_meta_device=True)
+        with (
+            patch(f"{_MODULE}._print_num_params"),
+            patch(f"{_MODULE}.correct_amax_history_if_needed"),
+        ):
+            result = prepare_existing_model_chunks_for_distributed_training(
+                [model], config, _make_pg(), wrap_with_ddp=False, device="cpu"
+            )
+        assert result[0].weight.device.type == "cpu"
+        assert result[0].scale.item() == 7.0
+
+    @pytest.mark.parametrize("fsdp", ["use_torch_fsdp2", "use_megatron_fsdp"])
+    def test_explicit_device_rejects_fsdp_owned_placement(self, fsdp):
+        from megatron.training.models.dist_utils import (
+            prepare_existing_model_chunks_for_distributed_training,
+        )
+
+        with patch(f"{_MODULE}._print_num_params"):
+            with pytest.raises(ValueError, match="FSDP-managed"):
+                prepare_existing_model_chunks_for_distributed_training(
+                    [_make_model_module()],
+                    _make_transformer_config(),
+                    _make_pg(),
+                    wrap_with_ddp=False,
+                    device="cpu",
+                    **{fsdp: True},
+                )

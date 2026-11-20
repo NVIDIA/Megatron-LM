@@ -3,7 +3,7 @@
 # What does this PR do?
 <!-- Add a one line overview of what this PR aims to accomplish. -->
 
-:warning: For major changes (either in lines of code or in its impact), please make sure to first share a design doc with the team. If you're unsure what's the best way to do so, contact @NVIDIA/mcore-oncall.
+:warning: For major changes (either in lines of code or in its impact), please make sure to first share a design doc with the team. If you're unsure what's the best way to do so, contact `@NVIDIA/mcore-oncall`.
 
 ## Issue tracking
 
@@ -13,6 +13,18 @@ For PRs from open-source community contributors:
 - **Small updates (bug fixes, minor improvements)**: a linked issue is **recommended** and will accelerate the PR review process.
 
 Linked issue: <!-- e.g. Fixes #1234 / Related to #1234 -->
+
+## Code provenance
+
+You should always make a best effort to avoid copying code from other
+ repositories. In exceptional cases in which this is unavoidable and you copied
+ or adapted code from an external source, provide the following details and
+ copy to the file header:
+
+- Source URL, revision, and original file(s):
+- Files in this PR containing the copied or adapted code:
+- Applicable license(s):
+- Required copyright notices and attribution, and where they are retained or added:
 
 ## Contribution process
 
@@ -27,14 +39,19 @@ Linked issue: <!-- e.g. Fixes #1234 / Related to #1234 -->
 
 ### Code review
 
-Feel free to message or comment @NVIDIA/mcore-oncall to help accelerate your merge into main. The less complex your PR is, the faster it will be approved and merged!
+Feel free to message or comment `@NVIDIA/mcore-oncall` to help accelerate your merge into main. The less complex your PR is, the faster it will be approved and merged!
 
 All PRs start as **draft**. If you open a non-draft PR, it will be automatically converted to draft.
 
 #### Step 1: Mark PR as "Ready for Review"
 
-1. When your PR is ready, click **Ready for Review**.
-2. An oncall reviewer is auto-assigned and expert reviewers are notified based on your changes.
+1. If you're outside `mcore-engineers`, you're automatically exempt from Autobot approval.
+   Click **Ready for review** when you want engineering feedback.
+2. If you're a team member, request Autobot approval in draft with `/review-approve`
+   (findings-only follow-up) or `/review-approve reset=true` (full review).
+   Mark the PR ready once Autobot approves the latest commit or you have added
+   `skip-bot-approval`. Without either, automation will return your PR to draft.
+3. Review groups are requested based on your changes.
    - Some PRs may jump straight to step 2. This is determined by `.github/CODEOWNERS`.
 
 :warning: Only mark as ready once merge-conflicts are resolved and the CI is passing.
