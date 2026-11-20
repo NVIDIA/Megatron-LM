@@ -12,7 +12,7 @@ from megatron.core.inference.moe.sigmoid_topk import HAVE_TRITON as HAVE_SIGMOID
 from megatron.core.inference.moe.sigmoid_topk import is_sigmoid_topk_supported, sigmoid_topk_routing
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
@@ -436,7 +436,10 @@ class TopKRouter(Router):
         return scores, map
 
     def quantile_balancing(
-        self, logits: torch.Tensor, dense_output: bool = False
+        self,
+        logits: torch.Tensor,
+        dense_output: bool = False,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply quantile-balancing (QB) routing to the logits tensor.
 
@@ -449,6 +452,7 @@ class TopKRouter(Router):
             logits (torch.Tensor): The logits tensor, shape ``[num_tokens, num_experts]``.
             dense_output (bool): Return selected probabilities and expert IDs as
                 ``[num_tokens, topk]`` tensors.
+            packed_seq_params: Context-parallel metadata for the current pack.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Routing probabilities and either a boolean
@@ -487,6 +491,17 @@ class TopKRouter(Router):
         # The DP reduction and qb_beta update run at the global-batch boundary in
         # finalize_model_grads._update_router_qb_beta.
         gather_group = self.tp_cp_group
+        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+            # DCP can put unrelated packs inside a static TP/CP group. Gather
+            # only this pack; include TP when sequence parallelism shards its tokens.
+            gather_group = resolve_cp_group(self.cp_group, packed_seq_params)
+            if self.config.sequence_parallel and self.tp_group.size() > 1:
+                gather_group = resolve_tp_cp_group(
+                    self.tp_cp_group,
+                    packed_seq_params,
+                    sequence_parallel=True,
+                    tp_group=self.tp_group,
+                )
         gather_size = gather_group.size() if gather_group is not None else 1
 
         should_update_beta = self.training and torch.is_grad_enabled()
@@ -1154,7 +1169,9 @@ class TopKRouter(Router):
             assert (
                 padding_mask is None
             ), "Quantile balancing routing does not support padding masks yet."
-            probs, routing_map = self.quantile_balancing(logits, dense_output=dense_output)
+            probs, routing_map = self.quantile_balancing(
+                logits, dense_output=dense_output, packed_seq_params=packed_seq_params
+            )
         else:
             # TE capability controls the implementation, not the requested output format.
             fused = self.config.moe_router_fusion and (
