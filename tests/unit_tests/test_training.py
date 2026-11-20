@@ -544,14 +544,20 @@ class TestGetModelBucketSizingPgCollection:
 
 
 class TestPackedSampleAccounting:
+    @pytest.fixture
+    def sample_schedule_state(self, monkeypatch):
+        from megatron.core import num_microbatches_calculator
+        from megatron.training import global_vars
+
+        # Isolate the two globals while exercising the real calculator and args APIs.
+        monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
+        monkeypatch.setattr(num_microbatches_calculator, "_GLOBAL_NUM_MICROBATCHES_CALCULATOR", None)
+        set_args(SimpleNamespace(seq_length=1))
+
     @pytest.mark.parametrize("schedule,expected_iters", [(None, 4), ("0:8 32:16", 6)])
-    def test_sample_horizon_uses_config_and_resets_batch_schedule(
-        self, monkeypatch, schedule, expected_iters
-    ):
+    def test_sample_horizon_uses_config(self, sample_schedule_state, schedule, expected_iters):
         from megatron.core import num_microbatches_calculator as calculator
         from megatron.training.config import container
-
-        monkeypatch.setattr(calculator, "_GLOBAL_NUM_MICROBATCHES_CALCULATOR", None)
 
         train = TrainingConfig(
             micro_batch_size=2,
@@ -569,6 +575,108 @@ class TestPackedSampleAccounting:
         container.update_train_iters(train)
         assert train.train_iters == expected_iters
         assert calculator.get_current_global_batch_size() == (8 if schedule else 16)
+
+    @pytest.mark.parametrize(
+        "args,error,match",
+        [
+            (None, AssertionError, "args is not initialized"),
+            (SimpleNamespace(), AttributeError, "seq_length"),
+        ],
+    )
+    def test_sample_schedule_requires_sequence_length_args(
+        self, sample_schedule_state, args, error, match
+    ):
+        from megatron.training.config import container
+
+        set_args(args)
+        train = TrainingConfig(
+            micro_batch_size=2,
+            global_batch_size=16,
+            train_samples=32,
+            step_batch_size_schedule="0:8 32:16",
+        )
+
+        with pytest.raises(error, match=match):
+            container.update_train_iters(train)
+
+    def test_sample_schedule_counts_iterations_before_calculator_init(self, sample_schedule_state):
+        """65 samples on 0:8 32:16 is 7 iterations, and startup can still init afterwards."""
+        from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator
+        from megatron.training.config import container
+
+        train = TrainingConfig(
+            micro_batch_size=2,
+            global_batch_size=16,
+            train_samples=65,
+            step_batch_size_schedule="0:8 32:16",
+        )
+        container.update_train_iters(train)
+        # 4 * 8 + 3 * 16 = 80. The short remainder is still counted.
+        assert train.train_iters == 7
+        init_num_microbatches_calculator(
+            rank=0,
+            global_batch_size=16,
+            micro_batch_size=2,
+            data_parallel_size=1,
+        )
+
+    def test_sample_schedule_count_leaves_an_existing_calculator(self, sample_schedule_state):
+        """The iteration count follows the training schedule, not the runtime calculator."""
+        from megatron.core.num_microbatches_calculator import (
+            get_current_global_batch_size,
+            init_num_microbatches_calculator,
+            update_num_microbatches,
+        )
+        from megatron.training.config import container
+
+        init_num_microbatches_calculator(
+            rank=-1,
+            micro_batch_size=1,
+            data_parallel_size=1,
+            global_batch_size=32,
+            step_batch_size_schedule="0:8 100:32",
+        )
+        update_num_microbatches(100, consistency_check=False)
+        assert get_current_global_batch_size() == 32
+        train = TrainingConfig(
+            micro_batch_size=2,
+            global_batch_size=16,
+            train_samples=65,
+            step_batch_size_schedule="0:8 32:16",
+        )
+        container.update_train_iters(train)
+        # 4 * 8 + 3 * 16 = 80. The runtime calculator stays on its own schedule.
+        assert train.train_iters == 7
+        assert get_current_global_batch_size() == 32
+
+    def test_sample_schedule_counts_token_thresholds_from_seq_length(self, sample_schedule_state):
+        """Token thresholds use args.seq_length: 32 tokens at length 4 is 8 samples."""
+        from megatron.training.config import container
+
+        set_args(SimpleNamespace(seq_length=4))
+        train = TrainingConfig(
+            micro_batch_size=2,
+            global_batch_size=16,
+            train_samples=32,
+            step_batch_size_schedule="0:8 32:16",
+        )
+        container.update_train_iters(train)
+        # Threshold 32 tokens is 8 samples, then batches of 16: 8 + 16 + 16.
+        assert train.train_iters == 3
+
+    def test_scheduler_steps_follow_sample_schedule_before_calculator_init(
+        self, run_config, sample_schedule_state
+    ):
+        run_config.train = TrainingConfig(
+            micro_batch_size=2,
+            global_batch_size=16,
+            train_samples=65,
+            step_batch_size_schedule="0:8 32:16",
+        )
+        run_config._resolve_scheduler_step_fields()
+        assert run_config.train.train_iters == 7
+        assert run_config.scheduler.lr_decay_steps == 65
+        assert run_config.scheduler.wd_incr_steps == 65
 
     @pytest.mark.parametrize(
         "total_cp,num_sequence_shards,weight_shards,samples",
