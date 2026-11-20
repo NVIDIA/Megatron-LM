@@ -46,6 +46,9 @@ requires_mxfp8 = pytest.mark.skipif(
     "make_shapes",
     [
         pytest.param(lambda num_ranks: [(128, 128), (128, 128), (64, 64), (32, 64)], id="mixed"),
+        # Exact packing can place the second tensor at 6144, which is not a multiple
+        # of its 4096-element block. Both scale planes must still divide offsets by 32.
+        pytest.param(lambda num_ranks: [(32, 192), (32, 128)], id="relative_block_alignment"),
         # One 32-row tensor per layout chunk, so every shard ends with a 32-row tensor.
         # TE's quantize kernel writes scales for whole 64-row chunks, so compact scale
         # views would be written beyond: https://github.com/NVIDIA/TransformerEngine/issues/3689

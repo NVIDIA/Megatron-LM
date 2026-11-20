@@ -16,11 +16,11 @@
 
 import bisect
 import itertools
-import math
 from collections.abc import Iterable
 
 import torch
 
+from ._packing import pack_block_atomic
 from .layout import GlobalLayout, Shape, non_leading_numel
 from .placement import ShardLayout
 
@@ -37,134 +37,61 @@ def build_row_atomic_layout(
 
 
 def build_for_row_atomic(
-    shapes: Iterable[Shape], dp_size: int, *, block_size: int = 1
+    shapes: Iterable[Shape],
+    dp_size: int,
+    *,
+    block_size: int = 1,
+    max_states: int | None = 1 << 20,
+    max_work: int | None = 10_000_000,
 ) -> GlobalLayout:
-    """Build equal-size rank segments for RowAtomic or BlockAtomic placements.
+    """Build equal rank segments with bounded padding optimization.
 
-    This is a DBuffer-specific reimplementation of
-    ``param_and_grad_buffer.build_data_parallel_buffer_index``. It keeps only
-    the global offset construction and final padding so each rank-local shard
-    size is a multiple of ``chunk_size``; DBuffer derives rank-local slices
-    later through DTensor placements.
+    Tensor IDs and contiguity are preserved. Physical order and offsets are chosen
+    to reduce total allocation, subject to every rank boundary inside a tensor
+    falling on a whole ``block_size``-row boundary relative to that tensor's start.
+    Neither globally aligned tensor starts nor common-LCM shard sizes are required.
+    The returned offsets and shard size remain multiples of the GCD of the nonempty
+    tensors' block sizes, preserving the divide-by-32 MXFP8 scale-plane mapping.
 
-    ``chunk_size`` is the least common multiple of each tensor's row size
-    (``shape[1:].numel()``), additionally multiplied by ``block_size`` for
-    ``BlockAtomic``. For example, with shapes P0=(2, 6), P1=(4, 4),
-    P2=(4, 4), P3=(1, 2), P4=(1, 6), ``chunk_size = LCM(6, 4, 4, 2, 6) = 12``
-    and a 5-rank DP layout has equal-size rank shards:
-
-    ```
-    rank 0 [ 0, 12): | P0 row 0              | P0 row 1               |
-    rank 1 [12, 24): | P1 row 0      | P1 row 1      | P1 row 2       |
-    rank 2 [24, 36): | P1 row 3      | P3    | gap   | P2 row 0       |
-    rank 3 [36, 48): | P2 row 1      | P2 row 2      | P2 row 3       |
-    rank 4 [48, 60): | P4                    | pad                    |
-    ```
-
-    The diagram uses four character columns per element; segment widths are
-    proportional. Every chunk boundary is aligned to each tensor's row size,
-    so each DP shard owns full rows even when fragments fill regular-tensor
-    padding gaps.
+    For shapes A=(5, 4), B=(10, 6), C=(2, 8) on two ranks, B/A/C occupies
+    96 elements without padding. The cut at 48 splits B after eight whole rows.
+    The previous greedy builder allocated 144 elements for the same tensors.
 
     Args:
-        shapes: Logical tensor shapes in tensor-id order.
-        dp_size: Data-parallel shard count for this global layout.
-        block_size: Number of consecutive rows kept on one rank. Defaults to
-            one for RowAtomic; larger values build a BlockAtomic layout.
+        shapes: Logical tensor shapes in tensor-id order, including empty tensors.
+        dp_size: Positive data-parallel shard count for this global layout.
+        block_size: Number of consecutive rows kept on one rank. Defaults to one.
+        max_states: Maximum count-DP states per candidate shard size, or None to
+            remove the allocation guard. Identical packing types share a count.
+            A group may be solved without any DP.
+        max_work: Total deterministic DP work budget, or None to remove this
+            limit. Each candidate reserves P * (k + 3) units for P states and k
+            packing types, covering table initialization, scanning, and type
+            checks. This is a conservative work bound, not elapsed time.
 
     Returns:
-        Global layout with row-aligned tensor offsets and a total size padded
-        to a multiple of ``chunk_size * dp_size``, so every rank-local shard
-        length is a multiple of ``chunk_size``.
-    """
+        A valid equal-shard layout no larger than the original greedy result.
+        The size is globally minimal if search completes. If a budget would be
+        exceeded, return the best cheap layout without claiming optimality.
 
+    Raises:
+        ValueError: For invalid dimensions, sizes, or budget values.
+    """
     if dp_size <= 0:
         raise ValueError(f"DP size must be positive, got {dp_size}.")
     tensor_shapes = tuple(torch.Size(shape) for shape in shapes)
-    chunk_size = math.lcm(1, *_row_atomic_alignments(tensor_shapes, block_size))
-
-    # chunk_size is the packing granularity. Since every tensor row size divides it,
-    # DP shard boundaries that are multiples of chunk_size avoid splitting dim-0 rows.
-    UNASSIGNED_OFFSET = -1
-    tensor_to_offset: list[int] = [UNASSIGNED_OFFSET] * len(tensor_shapes)
-    fragment_items = []
-    regular_items = []
-    for tensor_id, shape in enumerate(tensor_shapes):
-        if shape.numel() < chunk_size:
-            fragment_items.append((tensor_id, shape))
-        else:
-            regular_items.append((tensor_id, shape))
-
-    # Regular tensors anchor the layout. Fragments are held back to fill padding
-    # gaps left by regular tensors whose sizes are not exact multiples of chunk_size.
-    fragment_items.sort(key=lambda id_shape: id_shape[1].numel(), reverse=True)
-
-    next_offset = 0
-    while regular_items:
-        tensor_id, shape = regular_items.pop(0)
-        tensor_numel = shape.numel()
-        tensor_to_offset[tensor_id] = next_offset
-
-        if tensor_numel % chunk_size == 0:
-            next_offset += tensor_numel
-            continue
-
-        gap_offset = next_offset + tensor_numel
-        next_offset += _pad_to_multiple(tensor_numel, chunk_size)
-        fragment_gap_end = next_offset
-        remainder = tensor_numel % chunk_size
-
-        # Try to pair this non-divisible regular tensor with a conjugate regular
-        # tensor whose remainder fits in the same chunk_size interval. The
-        # conjugate starts in the gap and then continues with full chunk_size
-        # intervals after this one.
-        conjugate_item = None
-        for candidate_item in regular_items[:]:
-            _, candidate_shape = candidate_item
-            candidate_numel = candidate_shape.numel()
-            candidate_remainder = candidate_numel % chunk_size
-            if candidate_remainder == 0:
-                continue
-            if remainder + candidate_remainder <= chunk_size:
-                conjugate_item = candidate_item
-                regular_items.remove(candidate_item)
-                break
-
-        if conjugate_item is not None:
-            conjugate_id, conjugate_shape = conjugate_item
-            conjugate_numel = conjugate_shape.numel()
-            conjugate_remainder = conjugate_numel % chunk_size
-            conjugate_offset = next_offset - conjugate_remainder
-            tensor_to_offset[conjugate_id] = conjugate_offset
-            fragment_gap_end = conjugate_offset
-            next_offset += (conjugate_numel // chunk_size) * chunk_size
-
-        # Fill any remaining gap with fragments, keeping each fragment aligned to
-        # its own row size so dim-0 rows remain contiguous within DP shards.
-        for fragment in fragment_items[:]:
-            frag_id, frag_shape = fragment
-            frag_numel = frag_shape.numel()
-            aligned_gap_offset = _pad_to_multiple(
-                gap_offset, block_size * non_leading_numel(frag_shape)
-            )
-            if aligned_gap_offset + frag_numel > fragment_gap_end:
-                continue
-            tensor_to_offset[frag_id] = aligned_gap_offset
-            gap_offset = aligned_gap_offset + frag_numel
-            fragment_items.remove(fragment)
-
-    # Fragments that did not fit into regular-tensor gaps are appended at the tail.
-    for frag_id, frag_shape in fragment_items:
-        next_offset = _pad_to_multiple(next_offset, block_size * non_leading_numel(frag_shape))
-        tensor_to_offset[frag_id] = next_offset
-        next_offset += frag_shape.numel()
-
-    size = _pad_to_multiple(next_offset, chunk_size * dp_size)
-    segment = size // dp_size
+    alignments = _row_atomic_alignments(tensor_shapes, block_size)
+    tensor_to_offset, segment = pack_block_atomic(
+        tuple(shape.numel() for shape in tensor_shapes),
+        alignments,
+        dp_size,
+        max_states=max_states,
+        max_work=max_work,
+    )
     layout = GlobalLayout(
         tensor_shapes=tensor_shapes,
         tensor_to_offset=tensor_to_offset,
-        size=size,
+        size=segment * dp_size,
         rank_to_offset=(segment * rank for rank in range(dp_size)),
     )
     layout.validate_for_row_atomic(block_size=block_size)
@@ -190,8 +117,8 @@ def build_for_row_atomic_unpadding(
     rank 1 [16, 30): | P1 row 1      | P1 row 2      | P1 row 3      | P2    |
     ```
 
-    The padded layout would instead use ``chunk_size = LCM(6, 4, 2) = 12``, pad the
-    total to a multiple of ``12 * 2``, and allocate 48 elements for 30 elements of data.
+    The equal-shard builder instead optimizes tensor order and padding while keeping
+    all rank segments the same size. This builder keeps tensor order and uses no padding.
 
     Args:
         shapes: Logical tensor shapes in tensor-id order.
@@ -333,7 +260,3 @@ def _row_atomic_alignments(
             )
         alignments.append(block_size * row_size)
     return tuple(alignments)
-
-
-def _pad_to_multiple(value: int, multiple: int) -> int:
-    return ((value + multiple - 1) // multiple) * multiple
