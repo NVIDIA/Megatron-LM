@@ -7,6 +7,7 @@ from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 
 from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.distributed.fsdp.mcore_adapter_v2 import FullyShardedDataParallelV2
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -47,8 +48,17 @@ def _ddp_config() -> DistributedDataParallelConfig:
 def test_shared_mtp_matches_unsharded_training(distributed_setup):
     """Shared MTP selects recorded execution order and matches unsharded losses."""
     device = distributed_setup.device
-    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    groups = ProcessGroupCollection(dp_cp=mesh.get_group())
+    mesh = init_device_mesh(
+        device.type, (distributed_setup.world_size, 1), mesh_dim_names=("dp", "model")
+    )
+    model_group = mesh.get_group("model")
+    groups = ProcessGroupCollection(
+        dp_cp=mesh.get_group("dp"),
+        tp=model_group,
+        pp=model_group,
+        embd=model_group,
+        pos_embd=model_group,
+    )
     torch.manual_seed(1234)
     baseline = _SharedPredictor().to(device)
     module = _SharedPredictor().to(device)
@@ -67,5 +77,6 @@ def test_shared_mtp_matches_unsharded_training(distributed_setup):
         pg_collection=groups,
     )
     actual = run_forward_backward_on_microbatches(model, lambda: model(value), num_microbatches=3)
-    model.module.context.post_backward()
+    finalize_model_grads([model], pg_collection=groups)
+    assert not model.module.context.is_recording_execution_order
     torch.testing.assert_close(actual, expected)
