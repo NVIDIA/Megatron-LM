@@ -46,12 +46,17 @@ def process_group_collection(distributed_setup, outer_dp_size):
 
 
 @pytest.mark.parametrize(
-    "outer_dp_size,inner_strategy",
-    [(1, "optim_grads_params"), (2, "optim_grads")],
-    ids=["zero3", "hybrid_zero2"],
+    "outer_dp_size,inner_strategy,outer_strategy,overlap",
+    [
+        (1, "optim_grads_params", "no_shard", False),
+        (2, "optim_grads", "optim", False),
+        (2, "optim_grads_params", "no_shard", True),
+        (2, "optim_grads_params", "optim", True),
+    ],
+    ids=["zero3", "hybrid_zero2", "hsdp_overlap", "hfsdp_overlap"],
 )
 def test_full_iteration_and_optimizer_cuda_graph_match_eager(
-    process_group_collection, outer_dp_size, inner_strategy
+    process_group_collection, outer_dp_size, inner_strategy, outer_strategy, overlap
 ):
     """Compare graph replay with an otherwise identical eager MFSDP v2 run."""
     eager_config = TransformerConfig(
@@ -79,7 +84,8 @@ def test_full_iteration_and_optimizer_cuda_graph_match_eager(
                 use_distributed_optimizer=False,
                 data_parallel_sharding_strategy=inner_strategy,
                 num_distributed_optimizer_instances=outer_dp_size,
-                outer_dp_sharding_strategy="optim" if outer_dp_size > 1 else "no_shard",
+                outer_dp_sharding_strategy=outer_strategy,
+                overlap_outer_communication=overlap,
                 # With the default None, MFSDP v2 uses BF16 main grads with FP32 main
                 # params. Capturable FusedAdam in the TE revision under test requires
                 # matching dtypes (https://github.com/NVIDIA/TransformerEngine/issues/3358).

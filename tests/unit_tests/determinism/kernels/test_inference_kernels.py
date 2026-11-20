@@ -91,6 +91,7 @@ def test_flashinfer_clamped_relu2_replays(precision, ep_rank):
     clamp_scale = 0.5
     module = SimpleNamespace(
         _uses_mxfp8_weights=precision == "mxfp8",
+        _nvfp4_weights=None,
         _fc1_weight=execution_weights[0],
         _fc2_weight=execution_weights[1],
         _flashinfer_activation_type=ActivationType.ClampedRelu2,
@@ -361,17 +362,46 @@ def test_batch_invariant_inference_activations_replay():
 
 
 @pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs torch float8 e8m0 dtype")
-def test_mxfp8_quantize_replays():
+def test_batch_invariant_squared_relu_quantize_replays():
+    """The fused BI activation + MXFP8 quantize replays and equals the two-kernel path."""
+    from megatron.core.inference.moe import batch_invariant
+    from megatron.core.inference.moe.fused_moe import _quantize_mxfp8_used_rows
+
+    seeded()
+    rows, ffn, n_used = 16384, 1856, 12000
+    perm, n_used_t = _padded_layout(rows, ffn, n_used)
+    probs = torch.rand(rows, device="cuda")
+    x = torch.randn(rows, ffn, device="cuda", dtype=torch.bfloat16) * 5
+
+    def fn(x):
+        out = batch_invariant.squared_relu_with_probs_quantize_mxfp8(x, perm, n_used_t, probs)
+        return out.data[:n_used].view(torch.uint8), out.scale.view(torch.uint8)
+
+    assert_replays_bit_exact(fn, (x,), backward=False, what="squared_relu_with_probs_quantize")
+    data, scale = fn(x)
+    ref = _quantize_mxfp8_used_rows(
+        batch_invariant.squared_relu_with_probs(x, perm, n_used_t, probs, zero_padding=True),
+        n_used_t,
+    )
+    assert torch.equal(data, ref.data[:n_used].view(torch.uint8))
+    assert torch.equal(scale, ref.scale.view(torch.uint8))
+
+
+@pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs torch float8 e8m0 dtype")
+@pytest.mark.parametrize("transpose", [False, True], ids=["contiguous", "transposed"])
+def test_mxfp8_quantize_replays(transpose):
     from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize
 
     seeded()
     x = torch.randn(16384, 8192, device="cuda", dtype=torch.bfloat16)
+    if transpose:
+        x = x.t()
 
     def fn(x):
         data, scale = mxfp8_quantize(x)
         return data.view(torch.uint8), scale.view(torch.uint8)
 
-    assert_replays_bit_exact(fn, (x,), backward=False, what="mxfp8_quantize")
+    assert_replays_bit_exact(fn, (x,), backward=False, contention=True, what="mxfp8_quantize")
 
 
 @pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs torch float8 e8m0 dtype")
@@ -435,6 +465,45 @@ def test_mixed_precision_parameter_conversion_replays():
 
     assert_replays_bit_exact(
         convert, (attention, expert), backward=False, what="selective MXFP8 parameter conversion"
+    )
+
+
+@pytest.mark.skipif(
+    not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,
+    reason="FlashInfer routed MXFP8 needs Blackwell",
+)
+def test_flashinfer_routed_mxfp8_writeback_replays():
+    """Refit writes through to FlashInfer's routed MXFP8 layout bit-exactly."""
+    from megatron.core.inference.moe.flashinfer_mxfp8 import (
+        HAVE_FLASHINFER_ROUTED_MXFP8,
+        attach_routed_mxfp8_writeback,
+        prepare_routed_mxfp8_weights,
+    )
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+    if not HAVE_FLASHINFER_ROUTED_MXFP8:
+        pytest.skip("needs FlashInfer routed MXFP8")
+    seeded()
+    initial, update = (
+        torch.randn(2, 96, 128, device="cuda", dtype=torch.bfloat16) for _ in range(2)
+    )
+
+    def refit(initial, update):
+        experts = [MXFP8Tensor.from_bf16(w, backend="triton") for w in initial]
+        routed = prepare_routed_mxfp8_weights(
+            MXFP8Tensor(
+                data=torch.stack([e.data for e in experts]),
+                scale=torch.stack([e.scale for e in experts]),
+                backend="triton",
+            )
+        )
+        for i, (expert, value) in enumerate(zip(experts, update)):
+            attach_routed_mxfp8_writeback(expert, routed, i)
+            expert.copy_(value)
+        return routed.data.view(torch.uint8), routed.scale
+
+    assert_replays_bit_exact(
+        refit, (initial, update), backward=False, contention=True, what="routed MXFP8 writeback"
     )
 
 
@@ -728,6 +797,45 @@ def test_vllm_fused_moe_and_moe_sum_replay():
         fn, (hidden_states, probs), replays=4, backward=False, what="vllm_fused_moe"
     )
 
+    # Decode-sized steps at Nemotron 3.5 Lightning expert shapes: the multi-CTA
+    # indirection-table builder with 2 (8 tokens) and 24 (128 tokens) working
+    # CTAs, an 8-token hint for 256 valid tokens and, on GB300, the measured
+    # launch configs.
+    decode_hidden, decode_ffn, decode_topk = 2688, 1856, 6
+    decode_routing = torch.rand(256, 128, device="cuda").topk(decode_topk, dim=1).indices
+    decode_hidden_states = torch.randn(256, decode_hidden, device="cuda", dtype=torch.bfloat16)
+    decode_probs = torch.rand(256, decode_topk, device="cuda")
+    decode_fc1 = torch.randn(experts, decode_ffn, decode_hidden, device="cuda").bfloat16() * 0.02
+    decode_fc2 = torch.randn(experts, decode_hidden, decode_ffn, device="cuda").bfloat16() * 0.02
+    # Overestimated prefill hints on either side of the multi-CTA builder's pair
+    # limit: both use 128-row tiles and the multi-kernel builder, with the same
+    # valid prefix and reusable buffers.
+    for decode_tokens, hint in ((8, 8), (128, 128), (256, 8), (256, 1025), (256, 2049)):
+        decode_valid = _dev_scalar(decode_tokens)
+
+        def decode_fn(h, p, decode_valid=decode_valid, decode_tokens=decode_tokens, hint=hint):
+            out = vllm_fused_moe(
+                h,
+                p,
+                decode_fc1,
+                decode_fc2,
+                ActivationType.SQUARED_RELU,
+                experts,
+                0,
+                decode_valid,
+                decode_routing,
+                num_tokens_hint=hint,
+            )
+            return out[:decode_tokens]
+
+        assert_replays_bit_exact(
+            decode_fn,
+            (decode_hidden_states, decode_probs),
+            replays=4,
+            backward=False,
+            what=f"vllm_fused_moe (decode, {decode_tokens} tokens, hint {hint})",
+        )
+
     inp = torch.randn(max_tokens * topk, 2688, device="cuda", dtype=torch.bfloat16)
 
     # The top-k sum both ways: weighted (apply_weights=True) and the unweighted sum that
@@ -782,6 +890,27 @@ def test_vllm_moe_align_block_size_replays():
         backward=False,
         contention=True,
         what="_moe_align_block_size_cuda_graphable",
+    )
+
+
+@pytest.mark.parametrize(
+    "num_experts,topk,scaling_factor",
+    [(128, 6, 2.5), (512, 6, 5.0), (512, 22, 5.0)],
+    ids=["nano", "512-experts", "super-ultra"],
+)
+@pytest.mark.parametrize("num_tokens", [2, 2048])
+def test_sigmoid_topk_routing_replay(num_experts, topk, scaling_factor, num_tokens):
+    from megatron.core.inference.moe.sigmoid_topk import sigmoid_topk_routing
+
+    seeded()
+    logits = torch.randn(num_tokens, num_experts, device="cuda")
+    expert_bias = torch.randn(num_experts, device="cuda") * 0.05
+    assert_replays_bit_exact(
+        lambda lg, b: sigmoid_topk_routing(lg, b, topk, scaling_factor),
+        (logits, expert_bias),
+        replays=4,
+        backward=False,
+        what=f"sigmoid_topk_routing[tokens={num_tokens}, experts={num_experts}, topk={topk}]",
     )
 
 
@@ -1131,4 +1260,144 @@ def test_flashinfer_nvfp4_moe_is_batch_invariant(gated):
         assert torch.equal(output_alone, output), (
             f"FlashInfer NVFP4 MoE output changed at batch {name}; max abs diff: "
             f"{(output_alone.float() - output.float()).abs().max().item()}"
+        )
+
+
+def _ep_invariant_case(num_tokens=4096, valid=3000, hidden=512, num_local=24, topk=6):
+    """Fixed routing over 24 local experts (8 leaves of 3), some slots routed elsewhere,
+    tokens past ``valid`` dead; expert-grouped rows with their inverse map."""
+    seeded()
+    start = 24
+    routing = torch.stack([torch.randperm(96, device="cuda")[:topk] for _ in range(num_tokens)]).to(
+        torch.int64
+    )
+    inverse_map = torch.full((num_tokens, num_local), -1, device="cuda", dtype=torch.int32)
+    lid = routing[:valid] - start
+    local = (lid >= 0) & (lid < num_local)
+    tok = torch.arange(valid, device="cuda")[:, None].expand_as(lid)[local]
+    n_rows = int(local.sum())
+    inverse_map[tok, lid[local]] = torch.randperm(n_rows, device="cuda").int()
+    rows = torch.randn(n_rows + 64, hidden, device="cuda", dtype=torch.bfloat16)
+    return rows, inverse_map, routing, start, num_local, _dev_scalar(valid), valid
+
+
+def test_ep_invariant_dense_map_replays():
+    """moe_ep_invariant_combine on the torch backend (dense inverse map, 8 leaves of 3
+    experts): live rows replay bit-exactly and rows past the valid prefix stay untouched."""
+    from megatron.core.inference.moe import batch_invariant
+
+    rows, inverse_map, _, _, _, valid_t, valid = _ep_invariant_case()
+
+    def fn(rows):
+        out = torch.full((inverse_map.shape[0], rows.shape[1]), 7.0, device="cuda")
+        return batch_invariant.unpermute_tokens_in_expert_order(
+            rows, inverse_map, valid_t, out, ep_invariant_leaves=8
+        )
+
+    ref, _ = assert_replays_bit_exact(
+        fn, (rows,), backward=False, contention=True, what="EP-invariant dense-map combine"
+    )
+    assert torch.all(next(iter(ref.values()))[valid:] == 7.0)
+
+
+def test_ep_invariant_topk_replays():
+    """moe_ep_invariant_combine on the top-k layout (vLLM, and mcore at expert TP > 1):
+    the slot reorder and the subtree replay bit-exactly; rows past the prefix stay untouched."""
+    from megatron.core.inference.moe.fused_moe import _rows_in_topk_order
+    from megatron.core.transformer.moe import ep_invariant_combine as eic
+
+    rows, inverse_map, routing, start, num_local, valid_t, valid = _ep_invariant_case()
+
+    def fn(rows):
+        slot_rows = _rows_in_topk_order(rows, inverse_map, routing, start, num_local)
+        out = torch.full((routing.shape[0], rows.shape[1]), 7.0, device="cuda")
+        eic.tree_combine_topk_forward(slot_rows, routing, start, num_local, 8, valid_t, out)
+        return slot_rows, out
+
+    ref, _ = assert_replays_bit_exact(
+        fn, (rows,), backward=False, contention=True, what="EP-invariant top-k combine"
+    )
+    assert torch.all(list(ref.values())[1][valid:] == 7.0)
+
+
+@pytest.mark.parametrize(
+    "topk,hidden", [(6, 2688), (22, 1024), (22, 2048), (22, 4096), (22, 8192), (3, 129)]
+)
+@pytest.mark.parametrize("apply_weights", [False, True])
+def test_vllm_tiled_sum_matches_original_bits(topk, hidden, apply_weights):
+    """Keep the original slot arithmetic across layouts, sparse routes and graph replays."""
+    from megatron.core.inference.moe.vllm_fused_moe import _get_num_sms, _moe_sum, _moe_sum_kernel
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        set_batch_invariant_mode,
+    )
+
+    seeded()
+    capacity = 33
+    inp = torch.randn(capacity * topk, hidden, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(capacity, topk, device="cuda")
+    routing = torch.randint(-1, 130, (capacity, topk), device="cuda")
+    routing[0] = -1
+    routing[1] = 64
+    inp[0::7] = float("nan")  # Includes undefined non-local slots.
+    inp[1::11] = -0.0
+    valid = _dev_scalar(capacity)
+    expected = torch.full((capacity, hidden), -123.0, device="cuda")
+    actual = torch.full_like(expected, -123.0)
+    block_k = min(1 << (hidden - 1).bit_length(), 1024)
+    sms = _get_num_sms(inp.device)
+
+    def original():
+        _moe_sum_kernel[(sms,)](
+            inp,
+            expected,
+            weights,
+            valid,
+            routing,
+            64,
+            64,
+            hidden,
+            topk=topk,
+            BLOCK_M=sms,
+            BLOCK_K=block_k,
+            NUM_K_BLOCKS=(hidden + block_k - 1) // block_k,
+            APPLY_WEIGHTS=apply_weights,
+            ACC_FP64=False,
+        )
+
+    def candidate():
+        return _moe_sum(
+            inp,
+            weights,
+            capacity,
+            topk,
+            hidden,
+            valid,
+            routing,
+            64,
+            64,
+            out=actual,
+            apply_weights=apply_weights,
+        )
+
+    with set_batch_invariant_mode(False):
+        original()
+        candidate()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            candidate()
+        for tokens in (0, 1, 7, 16, 31, capacity):
+            valid.fill_(tokens)
+            weights.neg_()
+            inp[2::13].neg_()
+            expected.fill_(-123.0)
+            actual.fill_(-123.0)
+            original()
+            graph.replay()
+            assert torch.equal(actual.view(torch.int32), expected.view(torch.int32))
+        assert_replays_bit_exact(
+            lambda x: candidate(),
+            (inp,),
+            replays=3,
+            backward=False,
+            what=f"ordinary tiled MoE sum topk={topk} hidden={hidden}",
         )

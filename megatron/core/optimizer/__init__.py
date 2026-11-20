@@ -65,6 +65,7 @@ from .emerging_optimizers import (
     _EMERGING_OPTIMIZERS,
     HAVE_EMERGING_OPTIMIZERS,
     _create_emerging_optimizer,
+    _create_fsdp_emerging_optimizer,
     _get_qkv_split_shapes,
 )
 from .fully_sharded_optimizer import FullyShardedOptimizer
@@ -100,7 +101,7 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
     Returns:
         Dict[ParamKey, ParamGroupOverride]: standard config overrides.
     """
-    config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = {}
+    config_overrides: Dict[ParamKey, ParamGroupOverride] = {}
     # Select the model-family convention for zero weight decay on vector-like parameters:
     # the classic rule skips all 1-D parameters and biases, while the Qwen3-Next rule keeps
     # weight decay on Q/K layernorm parameters. Wide-residual retention controllers intentionally
@@ -110,18 +111,33 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
             name="s1_not_qkln",
             fn=lambda param, name: (len(param.shape) == 1 or name.endswith(".bias"))
             and not ("q_layernorm." in name or "k_layernorm." in name)
-            and not getattr(param, "is_wide_residual_retention_parameter", False),
+            and not getattr(param, "is_wide_residual_retention_parameter", False)
+            and not (
+                config.rmsnorm_weight_decay_mult is not None
+                and getattr(param, "is_rmsnorm_weight", False)
+            ),
         )
         param_wd_mult_key = ParamKey(with_name_predicate=shape_1_not_qkln_param)
     else:
         param_length_1_match = ParamPredicate(
-            name="param_len_1_except_wide_residual_retention",
+            name="param_len_1_except_wide_residual_retention_and_rmsnorm_override",
             fn=lambda param: len(param.shape) == 1
-            and not getattr(param, "is_wide_residual_retention_parameter", False),
+            and not getattr(param, "is_wide_residual_retention_parameter", False)
+            and not (
+                config.rmsnorm_weight_decay_mult is not None
+                and getattr(param, "is_rmsnorm_weight", False)
+            ),
         )
         param_wd_mult_key = ParamKey(name="*.bias", predicate=param_length_1_match)
 
     config_overrides[param_wd_mult_key] = ParamGroupOverride(wd_mult=0.0)
+
+    if config.rmsnorm_weight_decay_mult is not None:
+        # Norm constructors mark gamma, including TE's fused layer_norm_weight.
+        # Exclude it from the generic skip above to avoid conflicting wd_mult overrides.
+        config_overrides[ParamKey(attr="is_rmsnorm_weight")] = ParamGroupOverride(
+            wd_mult=config.rmsnorm_weight_decay_mult
+        )
 
     if config.decoupled_lr is not None:
         decoupled_lr_config: ParamGroupOverride = {"max_lr": config.decoupled_lr}
@@ -331,8 +347,9 @@ def _get_param_groups(
         List of parameter groups.
     """
 
-    # Map (pg_overrides, is_expert_parallel) to params.
+    # Map (pg_overrides, is_expert_parallel, is_dsa_indexer) to params.
     params_map = {}
+    model_order: Dict[int, int] = {}
 
     for model_chunk in model_chunks:
         for name, param in model_chunk.named_parameters():
@@ -355,15 +372,20 @@ def _get_param_groups(
                 param_override = None
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
+            is_dsa_indexer = name.startswith("indexer.") or ".indexer." in name
 
             # Create config_tuple that is hash-able, and has a consistent ordering of the keys.
             param_override_tuple: tuple[tuple[str, Any], ...] | None = (
                 param_group_override_to_tuple(param_override)
             )
-            key = (param_override_tuple, is_expert_parallel)
+            key = (param_override_tuple, is_expert_parallel, is_dsa_indexer)
             if key not in params_map:
                 params_map[key] = []
             params_map[key].append(param)
+            # Position in the model's own parameter order, which is the order the groups
+            # that preceded the indexer split were filled in. Kept to reconstruct the
+            # numbering such a checkpoint used; see _tag_pre_split_param_index.
+            model_order[id(param)] = len(model_order)
 
     # Distributed checkpoint requires all ranks to have the same param groups,
     # so we need to align the param groups across ranks, otherwise we may have
@@ -377,9 +399,18 @@ def _get_param_groups(
                 params_key.append(key)
     # Need to pick one of the param_override_tuples to use for the param group.
     param_groups = []
+
     # Sort keys, None first.
-    for key in sorted(params_key, key=lambda x: (x[0] is not None, x[0])):
-        param_override_tuple, is_expert_parallel = key
+    # Keys gathered from other ranks or module domains may predate the is_dsa_indexer
+    # element; treat a missing element as False so ordering stays total either way.
+    def _key_order(key):
+        return (key[0] is not None, key[0], key[1], key[2] if len(key) > 2 else False)
+
+    _tag_pre_split_param_index(params_map, params_key, model_order, _key_order)
+
+    for key in sorted(params_key, key=_key_order):
+        param_override_tuple, is_expert_parallel = key[0], key[1]
+        is_dsa_indexer = key[2] if len(key) > 2 else False
         params = params_map[key] if key in params_map else []
         if param_override_tuple is None:
             param_override: ParamGroupOverride = {}
@@ -401,6 +432,7 @@ def _get_param_groups(
             'wd_mult': 1.0,
             'lr_mult': 1.0,
             'is_decoupled_lr': False,
+            'is_dsa_indexer': False,
             # The following two fields may be important to keep even when we remove the
             #   above "backwards compatible" fields.
             "max_lr": config.lr,  # user may override this in param_override
@@ -416,9 +448,49 @@ def _get_param_groups(
             **default_config,
             **param_override,  # keep **param_override last so that users can override other fields.
         }
+        param_group['is_dsa_indexer'] = is_dsa_indexer
         param_groups.append(param_group)
 
     return param_groups
+
+
+def _tag_pre_split_param_index(params_map, params_key, model_order, key_order) -> None:
+    """Tag each parameter with the index it had before the indexer got its own group.
+
+    Torch identifies a parameter in a saved state dict by its position once the groups are
+    flattened in order, so splitting a group renumbers everything after the split point and a
+    checkpoint written earlier no longer lines up. Pairing the two needs the old number, and
+    it cannot be worked out when the checkpoint is read: the optimizer holds no reference to
+    the model by then, and the saved state carries integers rather than names.
+
+    Here both halves are available. ``key_order`` is the order the groups were laid out in,
+    and ``model_order`` is the order the parameters were walked in -- which is the order a
+    single group was filled. Collapsing ``is_dsa_indexer`` out of the key merges the groups
+    that used to be one, and sorting their members by model order reproduces the interleaving
+    of indexer and backbone parameters that the old group had.
+
+    Numbered separately for expert-parallel and dense parameters, because those go to
+    different optimizers and torch numbers from zero within each.
+
+    The index is written onto the parameter rather than onto the group, so it stays out of the
+    checkpoint: it describes the model in front of us, not anything that was saved.
+    """
+    collapsed = {}
+    for key in params_key:
+        collapsed.setdefault((key[0], key[1]), []).append(key)
+
+    for is_expert_parallel in (False, True):
+        subset = [k for k in collapsed if k[1] == is_expert_parallel]
+        next_index = 0
+        # (param_override_tuple, is_expert_parallel) ordered exactly as _key_order would,
+        # with the is_dsa_indexer element absent -- which is the ordering of the groups that
+        # preceded the split.
+        for collapsed_key in sorted(subset, key=lambda k: key_order((k[0], k[1]))):
+            members = [p for key in collapsed[collapsed_key] for p in params_map.get(key, [])]
+            members.sort(key=lambda param: model_order[id(param)])
+            for param in members:
+                param.pre_split_param_index = next_index
+                next_index += 1
 
 
 def _get_param_groups_and_buffers(
@@ -457,6 +529,15 @@ def _get_param_groups_and_buffers(
             buffers[model_chunk_idx + model_chunk_offset] = getattr(model_chunk, buffer_name)
 
     return param_groups, buffers
+
+
+def _omit_empty_local_shards(param_groups: List[Dict]) -> List[Dict]:
+    """Drop empty local shards from MFSDP v2 param groups."""
+    for param_group in param_groups:
+        param_group['params'] = [
+            parameter for parameter in param_group['params'] if parameter.to_local().numel() > 0
+        ]
+    return [param_group for param_group in param_groups if param_group['params']]
 
 
 def _get_megatron_optimizer_based_on_param_groups(
@@ -506,6 +587,15 @@ def _get_megatron_optimizer_based_on_param_groups(
         )
     if skip_megatron_wrapping and config.optimizer_cpu_offload:
         raise ValueError("skip_megatron_wrapping=True is incompatible with optimizer_cpu_offload.")
+
+    has_word_embedding = any(
+        getattr(param, "is_word_embedding_parameter", False)
+        for param_group in param_groups
+        for param in param_group["params"]
+    )
+    if config.embedding_min_norm is not None and has_word_embedding:
+        if not config.use_distributed_optimizer:
+            raise ValueError("embedding_min_norm requires the distributed optimizer")
 
     # When freezing sub-models we may have no trainable parameters on a rank and
     # hence an empty param_groups. However, we still need to create an optimizer
@@ -645,6 +735,11 @@ def _get_megatron_optimizer_based_on_param_groups(
     if skip_megatron_wrapping:
         return optimizer, init_state_fn
 
+    # Only the Megatron wrapper reads the collection, so require it before building any wrapper:
+    # a DistributedOptimizer would otherwise be constructed over the model's buffers first.
+    if pg_collection is None:
+        raise ValueError("pg_collection must be resolved by get_megatron_optimizer")
+
     # Grad scaler:
     #    if loss-scale is provided, instantiate the constant scaler.
     #    if we are using fp16 and loss-scale is not present, use a
@@ -698,8 +793,6 @@ def _get_megatron_optimizer_based_on_param_groups(
         optimizer = FP32Optimizer(optimizer, config, init_state_fn)
         setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
 
-    if pg_collection is None or not hasattr(pg_collection, 'tp'):
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     tp_group = pg_collection.tp
     expert_tp_group = getattr(pg_collection, 'expt_tp', tp_group)
     # TODO(M4): plumb TP groups through optimizer constructors so these setattrs disappear.
@@ -741,12 +834,28 @@ def check_config_overrides_consistency(
     return True
 
 
+def _get_default_param_overrides(config: OptimizerConfig, eopt_name: str) -> Dict[ParamKey, Any]:
+    """Return the default param overrides of an emerging optimizer.
+
+    For Muon-family optimizers, the scalar optimizer that handles non-linear/embedding
+    params is configurable via ``config.muon_scalar_optimizer`` (e.g., 'adam' or 'lion');
+    deep-copy the registry defaults before rewriting so we never mutate shared state.
+    """
+    default_param_overrides = copy.deepcopy(_EMERGING_OPTIMIZERS[eopt_name].default_param_overrides)
+    if eopt_name in ('muon', 'adaptive_muon'):
+        for override in default_param_overrides.values():
+            if override.get('optimizer') in ('adam', 'lion'):
+                override['optimizer'] = config.muon_scalar_optimizer
+    return default_param_overrides
+
+
 def _get_megatron_emerging_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
     config_overrides: Optional[Dict[ParamKey, Any]] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
     param_group_process_group: Optional[torch.distributed.ProcessGroup] = None,
+    use_gloo_process_groups: bool = True,
 ) -> MegatronOptimizer:
     """Build an emerging optimizer (e.g. Muon) for the given model chunks.
 
@@ -773,8 +882,12 @@ def _get_megatron_emerging_optimizer(
         eopt_name = bare_name
         use_layer_wise = True
 
-    if isinstance(model_chunks[0], FullyShardedDataParallelV2):
-        raise NotImplementedError("MFSDP v2 with emerging optimizers is not currently validated.")
+    if any(isinstance(chunk, FullyShardedDataParallelV2) for chunk in model_chunks):
+        if not all(isinstance(chunk, FullyShardedDataParallelV2) for chunk in model_chunks):
+            raise ValueError("MFSDP v2 requires every model chunk to be wrapped with MFSDP v2.")
+        return _get_megatron_fsdp_emerging_optimizer(
+            config, model_chunks, config_overrides, pg_collection, param_group_process_group
+        )
 
     if not HAVE_EMERGING_OPTIMIZERS:
         raise ImportError(
@@ -793,7 +906,7 @@ def _get_megatron_emerging_optimizer(
         raise ValueError('emerging optimizer with fp16 is not supported.')
 
     if pg_collection is None:
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        raise ValueError("pg_collection must be resolved by get_megatron_optimizer")
 
     log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
 
@@ -829,15 +942,7 @@ def _get_megatron_emerging_optimizer(
                     )
 
     # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).
-    # For Muon-family optimizers, the scalar optimizer that handles non-linear/embedding
-    # params is configurable via ``config.muon_scalar_optimizer`` (e.g., 'adam' or 'lion');
-    # deep-copy the registry defaults before rewriting so we never mutate shared state.
-    default_param_overrides = copy.deepcopy(_EMERGING_OPTIMIZERS[eopt_name].default_param_overrides)
-    if eopt_name in ('muon', 'adaptive_muon'):
-        for override in default_param_overrides.values():
-            if override.get('optimizer') in ('adam', 'lion'):
-                override['optimizer'] = config.muon_scalar_optimizer
-    config_overrides.update(default_param_overrides)
+    config_overrides.update(_get_default_param_overrides(config, eopt_name))
 
     # Build param groups and bucket by (optimizer_name, is_expert_parallel).
     # Layer-wise distributed optimizer handles expert params internally so we skip that split.
@@ -879,11 +984,8 @@ def _get_megatron_emerging_optimizer(
         for (opt_name, _), groups in grouped_param_groups.items()
         if groups
     ):
-        # ``setup_process_groups_for_optimizer`` rejects Gloo groups whenever
-        # an explicit ``pg_collection`` is supplied, so the only legal value
-        # here is False.
         distopt_process_groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
-            pg_collection, model_chunks, use_gloo_process_groups=False
+            pg_collection, model_chunks, use_gloo_process_groups=use_gloo_process_groups
         )
         # DistOpt should only manage non-LayerWise buffers (those holding
         # embeddings, biases, layernorm, etc.). Filter out the LayerWise
@@ -901,6 +1003,13 @@ def _get_megatron_emerging_optimizer(
             if non_layer_wise_buffers:
                 distopt_per_model_buffers[model_chunk_idx] = non_layer_wise_buffers
 
+    # Expert parameters reduce gradient statistics over the expert analog of ``mp``: tp_ep_pp
+    # merged across EGTP_remat peers, which hold distinct shards of each expert weight.
+    # tp_ep_pp is the same group when EGTP_remat is off.
+    expert_model_parallel_group = pg_collection.tp_ep_pp_with_egtp_remat
+    if expert_model_parallel_group is None:
+        expert_model_parallel_group = pg_collection.tp_ep_pp
+
     # Build an optimizer for each (optimizer_name, is_expert) bucket and combine.
     # In layer-wise mode, emerging-optimizer (Muon) groups feed into LayerWise,
     # while non-emerging (Adam) groups are managed by a separate DistributedOptimizer
@@ -912,7 +1021,7 @@ def _get_megatron_emerging_optimizer(
         if not groups:
             continue
 
-        model_parallel_group = pg_collection.tp_ep_pp if is_expert else pg_collection.mp
+        model_parallel_group = expert_model_parallel_group if is_expert else pg_collection.mp
 
         # Only the primary emerging optimizer (stored in ``eopt_name``, e.g., Muon) is
         # constructed via ``_create_emerging_optimizer``. Scalar optimizers that also appear
@@ -1020,6 +1129,80 @@ def _get_megatron_emerging_optimizer(
     return ChainedOptimizer(results)
 
 
+def _get_megatron_fsdp_emerging_optimizer(
+    config: OptimizerConfig,
+    model_chunks: List[MegatronModule],
+    config_overrides: Dict[ParamKey, Any],
+    pg_collection: Optional[ProcessGroupCollection],
+    param_group_process_group: Optional[torch.distributed.ProcessGroup],
+) -> MegatronOptimizer:
+    """Build Muon and Adam optimizers for MFSDP v2 model chunks.
+
+    FsdpMuon updates the Muon matrices, and the standard factory path builds the optimizer for
+    the remaining parameters. Each is wrapped in a FullyShardedOptimizer, which supplies the
+    DTensor-aware gradient statistics and checkpoint interfaces, and a ChainedOptimizer combines
+    them. MFSDP v2 plans Muon's owners per mesh, so dense and expert parameters share one FsdpMuon.
+    """
+    if config.optimizer != 'muon':
+        raise NotImplementedError(
+            "MFSDP v2 currently supports only Muon among emerging optimizers."
+        )
+    if config.muon_split_qkv:
+        raise NotImplementedError("MFSDP v2 Muon requires muon_split_qkv=False.")
+    if config.muon_scalar_optimizer != 'adam':
+        raise NotImplementedError("MFSDP v2 Muon supports only Adam for non-matrix parameters.")
+    if not HAVE_EMERGING_OPTIMIZERS:
+        raise ImportError(
+            "emerging-optimizers package is required for optimizer='muon'. "
+            "Install it with: pip install emerging-optimizers"
+        )
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    # FsdpMuon would treat TP-local expert shards as whole matrices; dense TP is rejected earlier.
+    expert_tp = getattr(pg_collection, 'expt_tp', None)
+    assert expert_tp is None or expert_tp.size() == 1, "MFSDP v2 Muon: expert TP is unsupported."
+
+    log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
+    config_overrides.update(_get_default_param_overrides(config, 'muon'))
+    groups_by_optimizer = defaultdict(list)
+    for group in _get_param_groups(
+        model_chunks, config, config_overrides, param_group_process_group
+    ):
+        groups_by_optimizer[group.get('optimizer', 'muon')].append(group)
+
+    optimizers = []
+    for opt_name, groups in groups_by_optimizer.items():
+        if opt_name == 'muon':
+            optimizer = _create_fsdp_emerging_optimizer(config, groups)
+            optimizer = FullyShardedOptimizer(
+                optimizer, config, None, None, model_chunks=model_chunks
+            )
+            # WORLD is correct: get_grad_norm divides each gradient by its replication factor.
+            optimizer.grad_stats_parallel_group = torch.distributed.group.WORLD
+            tp_group = pg_collection.tp
+            optimizer.tp_group = tp_group
+            optimizer.expert_tp_group = getattr(pg_collection, 'expt_tp', tp_group)
+            optimizer.gtp_group = getattr(pg_collection, 'gtp_remat', None)
+            optimizer.expert_gtp_group = getattr(pg_collection, 'expt_gtp_remat', None)
+        else:
+            fallback_config = copy.copy(config)
+            fallback_config.optimizer = opt_name
+            adam_groups = groups
+            if not is_te_min_version("2.18.0"):
+                # Same TE < 2.18 workaround as for Adam in get_megatron_optimizer.
+                adam_groups = _omit_empty_local_shards(groups)
+            optimizer = _get_megatron_optimizer_based_on_param_groups(
+                config=fallback_config,
+                model_chunks=model_chunks,
+                param_groups=adam_groups,
+                pg_collection=pg_collection,
+            )
+            # ChainedOptimizer asserts that all sub-optimizers share the top-level config.
+            optimizer.config = config
+        optimizers.append(optimizer)
+    return ChainedOptimizer(optimizers)
+
+
 def _clear_high_precision_initializers(model_chunks: List[MegatronModule]) -> None:
     """Release saved initializers after all local optimizer master weights are constructed.
 
@@ -1067,6 +1250,8 @@ def get_megatron_optimizer(
         Instance of MegatronOptimizer.
     """
 
+    config.validate()
+
     # A MimoModel routes to the heterogeneous per-module optimizer builder.
     from megatron.core.models.mimo.model.base import MimoModel
 
@@ -1085,6 +1270,12 @@ def get_megatron_optimizer(
 
     check_config_overrides_consistency(config, config_overrides)
 
+    # Compatibility boundary. get_megatron_optimizer is the edge of megatron/core for optimizer
+    # construction, so the global-state fallback lives here and nowhere deeper: every helper below
+    # receives an explicit collection. See docs/developer/parallel-state-deprecation.md.
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
     is_mfsdp_v2 = isinstance(model_chunks[0], FullyShardedDataParallelV2)
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
@@ -1095,6 +1286,7 @@ def get_megatron_optimizer(
             config_overrides=config_overrides,
             pg_collection=pg_collection,
             param_group_process_group=param_group_process_group,
+            use_gloo_process_groups=use_gloo_process_groups,
         )
         _clear_high_precision_initializers(model_chunks)
         return optimizer
@@ -1167,15 +1359,7 @@ def get_megatron_optimizer(
                     # TE FusedAdam can skip pending updates when a group ends in an empty tensor:
                     # https://github.com/NVIDIA/TransformerEngine/issues/3207.
                     # Empty local shards have no optimizer state or data to update, so omit them.
-                    for param_group in param_groups:
-                        param_group['params'] = [
-                            parameter
-                            for parameter in param_group['params']
-                            if parameter.to_local().numel() > 0
-                        ]
-                    param_groups = [
-                        param_group for param_group in param_groups if param_group['params']
-                    ]
+                    param_groups = _omit_empty_local_shards(param_groups)
                 # MFSDP v2 owns its sharded parameter and gradient storage, so
                 # FullyShardedOptimizer does not need DDP param-and-grad buffers.
                 buffers = None
@@ -1290,10 +1474,19 @@ def get_megatron_optimizer(
         # Expert analog of dense ``model_parallel_rank``; use the EGTP_remat-merged group so each
         # EGTP_remat peer gets a distinct distopt ShardedObject key (else DCP "duplicate" error).
         expt_model_parallel_rank = get_pg_rank(expt_tp_pp_with_egtp_remat_group)
-        if use_gloo_process_groups:
-            expt_data_parallel_group_gloo = intra_expt_dp_group_gloo
-        else:
-            expt_data_parallel_group_gloo = None
+        # setup_process_groups_for_optimizer leaves a missing expert Gloo group to this point,
+        # where the model is known to have expert parameters. The param groups are aligned
+        # across ranks, so every rank takes this branch and raises together.
+        if (
+            use_gloo_process_groups
+            and intra_expt_dp_group_gloo is None
+            and not ProcessGroupCollection.is_gtp_remat_active(process_groups_dict)
+        ):
+            raise ValueError(
+                "use_gloo_process_groups=True requires pg_collection.intra_expt_dp_gloo for the "
+                "expert parameters. Build the job with Gloo process groups or pass "
+                "use_gloo_process_groups=False."
+            )
         optimizers.append(
             _get_megatron_optimizer_based_on_param_groups(
                 config=config,
@@ -1302,7 +1495,7 @@ def get_megatron_optimizer(
                 per_model_buffers=moe_buffers,
                 model_parallel_group=expt_tp_pp_with_egtp_remat_group,
                 data_parallel_group=intra_expt_dp_group,
-                data_parallel_group_gloo=expt_data_parallel_group_gloo,
+                data_parallel_group_gloo=intra_expt_dp_group_gloo,
                 data_parallel_group_idx=expt_model_parallel_rank,
                 intra_dist_opt_group=intra_dist_opt_group,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,

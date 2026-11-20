@@ -10,6 +10,7 @@ from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
     Placements,
     fully_shard,
     fully_shard_context,
@@ -92,7 +93,7 @@ def test_muon_matches_reference(
     # Match FSDP's FP32 optimizer weights; autocast handles BF16 computation.
     reference = copy.deepcopy(model).float()
     reference_params = dict(reference.named_parameters())
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(
             model,
             mesh=mesh,
@@ -114,6 +115,7 @@ def test_muon_matches_reference(
     excluded_names = ["block2.3.weight", "block2.3.bias"]
     muon_names = [name for name in params if name not in excluded_names]
     optimizer = muon.FsdpMuon([params[name] for name in muon_names], **kwargs)
+    fully_shard_optimizer(optimizer, precision_aware=True)
     reference_optimizer = Muon([reference_params[name] for name in muon_names], **kwargs)
     other_optimizer = torch.optim.SGD([params[n] for n in excluded_names], lr=0.01, foreach=False)
     fully_shard_optimizer(other_optimizer)

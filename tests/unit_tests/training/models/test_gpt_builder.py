@@ -7,7 +7,7 @@ from unittest.mock import Mock, call, patch
 import pytest
 import torch
 
-from megatron.core.transformer import ModuleSpec
+from megatron.core.transformer import MLATransformerConfig, ModuleSpec
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
@@ -22,6 +22,7 @@ from megatron.training.models.gpt import (
     default_layer_spec,
     mtp_block_spec,
 )
+from megatron.training.models.transforms import ModelTransformConfig
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -48,6 +49,7 @@ def _make_dispatch_config(**transformer_kwargs):
     """
     config = Mock()
     config.restore_modelopt_state = False
+    config.transformations = None
     config.use_transformer_engine_op_fuser = False
     config.use_arbitrary_attention_mask = None
 
@@ -65,6 +67,8 @@ def _make_dispatch_config(**transformer_kwargs):
     transformer.kitchen_attention_backend = None
     transformer.use_te_activation_func = False
     transformer.mla_down_proj_fusion = False
+    transformer.heterogeneous_block_specs = None
+    transformer.context_parallel_size = 1
     for k, v in transformer_kwargs.items():
         setattr(transformer, k, v)
     config.transformer = transformer
@@ -78,6 +82,27 @@ def _make_dispatch_config(**transformer_kwargs):
 
 class TestDefaultLayerSpecDispatch:
     """Tests for ``default_layer_spec`` — branch dispatch on config flags."""
+
+    @patch("megatron.training.models.gpt.get_gpt_modelopt_layer_spec")
+    def test_transform_config_selects_modelopt_spec(self, mock_get_spec):
+        spec = Mock(spec=ModuleSpec)
+        mock_get_spec.return_value = spec
+        config = _make_dispatch_config()
+        config.transformations = ModelTransformConfig(
+            force_local_attention=True, real_quant_cfg="fp8_real_quant", moe_grouped_gemm=False
+        )
+
+        result = default_layer_spec(config, vp_stage=None)
+
+        mock_get_spec.assert_called_once_with(
+            config=config.transformer,
+            local_core_attention=True,
+            remap_te_layernorm=True,
+            real_quant_cfg="fp8_real_quant",
+            use_default_te_spec=False,
+            moe_grouped_gemm=False,
+        )
+        assert result is spec
 
     @patch("megatron.training.models.gpt.get_gpt_modelopt_spec")
     @patch("megatron.core.parallel_state")
@@ -172,6 +197,7 @@ class TestDefaultLayerSpecDispatch:
         transformer.num_moe_experts = None
         config = Mock()
         config.restore_modelopt_state = False
+        config.transformations = None
         config.transformer = transformer
 
         result = default_layer_spec(config, vp_stage=None)
@@ -370,6 +396,24 @@ class TestGPTModelConfigSetAttr:
         self.config.hidden_size = 2048
         assert "hidden_size" not in self.config.__dict__
 
+    def test_rotary_fields_reach_an_mla_transformer_config(self):
+        """rotary_base / rotary_percent exist on both GPTModelConfig and MLATransformerConfig;
+        MLA builds its rotary embeddings from the inner config, so the proxy must forward them."""
+        mla = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+        )
+        GPTModelConfig(transformer=mla, vocab_size=32000, rotary_base=500000, rotary_percent=0.5)
+        assert mla.rotary_base == 500000
+        assert mla.rotary_percent == 0.5
+
 
 class TestGPTModelConfigFinalize:
     """Tests for GPTModelConfig.finalize() — validation logic."""
@@ -387,12 +431,13 @@ class TestGPTModelConfigFinalize:
         assert not hasattr(config.transformer, "finalize")
         config.finalize()
 
-    def test_raises_when_cudagraph_without_te_rng_tracker(self):
+    def test_model_finalization_does_not_validate_runtime_rng_policy(self):
         config = _make_gpt_config()
         config.transformer.cuda_graph_impl = "local"
         config.transformer.use_te_rng_tracker = False
-        with pytest.raises(AssertionError, match="RNG tracker"):
-            config.finalize()
+        # The run container propagates RNGConfig before finalizing the model.
+        config.finalize()
+        assert not config.transformer.use_te_rng_tracker
 
     def test_no_error_when_cudagraph_with_te_rng_tracker(self):
         config = _make_gpt_config()
@@ -755,38 +800,25 @@ class TestGPTModelBuilderBuildDistributedModels:
 
         assert result is model_list
 
-    @patch("megatron.training.models.gpt.compose_hooks")
     @patch("megatron.training.models.gpt.unimodal_build_distributed_models")
-    def test_pre_wrap_hooks_composed_and_passed(self, mock_unimodal, mock_compose):
-        mock_unimodal.return_value = [Mock()]
-        composed_pre = Mock()
-        composed_post = Mock(return_value=None)
-        mock_compose.side_effect = [composed_pre, composed_post]
-
-        hook1 = Mock()
-        self.config.pre_wrap_hooks = [hook1]
+    def test_pre_wrap_hooks_composed_and_passed(self, mock_unimodal):
+        stages = [Mock()]
+        mock_unimodal.return_value = stages
+        hook = Mock(return_value=stages)
+        self.config.pre_wrap_hooks = [hook]
         self.builder.build_distributed_models(self.pg)
+        composed = mock_unimodal.call_args.args[10]
+        assert composed(stages) is stages
+        hook.assert_called_once_with(stages)
 
-        # First compose_hooks call must be with the pre_wrap_hooks list
-        assert mock_compose.call_args_list[0] == call([hook1])
-        # The composed pre-wrap hook is the 11th positional arg (index 10)
-        unimodal_args = mock_unimodal.call_args.args
-        assert unimodal_args[10] is composed_pre
-
-    @patch("megatron.training.models.gpt.compose_hooks")
     @patch("megatron.training.models.gpt.unimodal_build_distributed_models")
-    def test_post_wrap_hook_applied_to_results(self, mock_unimodal, mock_compose):
-        model_list = [Mock()]
-        wrapped_list = [Mock(), Mock()]
-        mock_unimodal.return_value = model_list
-        composed_pre = Mock()
-        composed_post = Mock(return_value=wrapped_list)
-        mock_compose.side_effect = [composed_pre, composed_post]
-
-        result = self.builder.build_distributed_models(self.pg)
-
-        composed_post.assert_called_once_with(model_list)
-        assert result is wrapped_list
+    def test_post_wrap_hook_applied_to_results(self, mock_unimodal):
+        stages, wrapped = [Mock()], [Mock(), Mock()]
+        mock_unimodal.return_value = stages
+        hook = Mock(return_value=wrapped)
+        self.config.post_wrap_hooks = [hook]
+        assert self.builder.build_distributed_models(self.pg) is wrapped
+        hook.assert_called_once_with(stages)
 
     @patch("megatron.training.models.gpt.compose_hooks")
     @patch("megatron.training.models.gpt.unimodal_build_distributed_models")
@@ -831,6 +863,8 @@ class TestMtpBlockSpec:
 
     def _make_config(self, mtp_num_layers=None, transformer_impl="transformer_engine"):
         config = Mock()
+        config.mtp_layer_spec = None
+        config.transformations = None
         config.transformer.mtp_num_layers = mtp_num_layers
         config.transformer.transformer_impl = transformer_impl
         config.transformer.normalization = "LayerNorm"
@@ -859,6 +893,20 @@ class TestMtpBlockSpec:
         )
         assert mock_get_mtp.call_args.args[1] is layer_specs[-1]
         assert result is mock_get_mtp.return_value
+
+    @patch("megatron.training.models.gpt.get_gpt_modelopt_mtp_layer_spec")
+    @patch("megatron.core.models.gpt.gpt_layer_specs.get_gpt_mtp_block_spec")
+    def test_transform_config_selects_standard_mtp_spec(self, mock_get_mtp, mock_modelopt_mtp):
+        config = self._make_config(mtp_num_layers=1)
+        config.transformations = ModelTransformConfig(real_quant_cfg="fp8_real_quant")
+        decoder_spec = ModuleSpec(module=object)
+        standard_mtp_spec = ModuleSpec(module=object)
+        mock_modelopt_mtp.return_value = standard_mtp_spec
+
+        mtp_block_spec(config, decoder_spec)
+
+        mock_modelopt_mtp.assert_called_once_with(config.transformer)
+        assert mock_get_mtp.call_args.args[1] is standard_mtp_spec
 
     @patch("megatron.training.models.gpt._te_or_local_layer_spec")
     @patch("megatron.core.models.gpt.gpt_layer_specs.get_gpt_mtp_block_spec")
@@ -938,3 +986,14 @@ class TestGPTConfigFromArgs:
 
         assert config.rope_scaling is True
         assert config.rope_scaling_factor == 32.0
+
+    def test_seq_length_and_max_position_embeddings_land_on_different_fields(self):
+        """--seq-length is the per-sample training length that core modules (NCCL EP) size
+        buffers from; --max-position-embeddings is the position-embedding capacity on the
+        model config. They must not be conflated."""
+        args = self._make_args(seq_length=128, max_position_embeddings=131072)
+
+        config = gpt_config_from_args(args)
+
+        assert config.transformer.max_seq_length_per_sample == 128
+        assert config.seq_length == 131072

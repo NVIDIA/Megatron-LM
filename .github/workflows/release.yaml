@@ -28,7 +28,7 @@ on:
         required: true
         type: string
       dry-run:
-        description: Compute the release but do not publish wheel, GH release, or docs.
+        description: Compute the release without publishing wheels, a GitHub release, or a Sphinx archive.
         required: true
         default: true
         type: boolean
@@ -43,9 +43,9 @@ on:
         default: true
         type: boolean
       publish-docs:
-        description: Publish docs
+        description: Build the Sphinx archive for a pre-Fern release SHA and publish it outside dry runs.
         required: false
-        default: true
+        default: false
         type: boolean
       version-bump-branch:
         description: Branch for version bump
@@ -149,7 +149,7 @@ jobs:
       gh-release-tag-prefix: core_
       gh-release-use-changelog-builder: ${{ inputs.generate-changelog || false }}
       gh-release-from-tag: ${{ inputs.gh-release-from-tag || '' }}
-      publish-docs: ${{ inputs.publish-docs || true }}
+      publish-docs: ${{ github.event_name == 'workflow_dispatch' && inputs.publish-docs }}
       docs-target-path: megatron-core/developer-guide
       publish-as-latest: true
       run-on-version-tag-only: ${{ github.ref_name != 'main' }}

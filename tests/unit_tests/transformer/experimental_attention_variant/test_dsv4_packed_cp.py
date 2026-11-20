@@ -346,3 +346,49 @@ def test_packed_cp_matches_full_attention_and_gradients(
         assert not failures, "\n\n".join(failures)
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("rotate", [False, True])
+def test_packed_output_rope_backward_contract(monkeypatch, rotate):
+    """Packed autograd restores backend inputs without changing the saved output or dO."""
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+        packed_sparse_attention as packed_attention,
+    )
+
+    query = torch.randn(4, 2, 4, requires_grad=True)
+    kv = torch.randn(4, 4, requires_grad=True)
+    sink = torch.zeros(2, requires_grad=True)
+    indices = torch.zeros(4, 1, dtype=torch.int32)
+    signs = torch.tensor([1.0, 1.0, -1.0, -1.0])
+    rope = (
+        SimpleNamespace(apply_=lambda x: x.mul_(signs), undo=lambda x, out: out.copy_(x * signs))
+        if rotate
+        else None
+    )
+    monkeypatch.setattr(packed_attention, "get_flash_mla_topk_alignment", lambda: 1)
+    monkeypatch.setattr(packed_attention, "_ensure_dsa_namespace", lambda: None)
+    monkeypatch.setattr(
+        packed_attention,
+        "_csa_fwd_flash_mla",
+        lambda q, *_args, **_kwargs: (q * 2, torch.zeros(4, 2), None),
+    )
+    seen = []
+
+    def backward(q, k, out, grad, *_args, **_kwargs):
+        torch.testing.assert_close(out, q * 2)
+        seen.append(grad.clone())
+        return grad * 2, torch.zeros_like(k), torch.zeros_like(sink)
+
+    monkeypatch.setattr(packed_attention, "_csa_sparse_attention_backward", backward)
+    args = (query, kv, sink, indices, None, 1.0, 0, None, None)
+    if rotate:
+        args += (rope,)
+    output, _, _ = packed_attention.CSASparseAttnFunc.apply(*args)
+    saved = output.detach().clone()
+    upstream = torch.ones(1, 1, 4).expand_as(output)
+    output.backward(upstream)
+    expected = torch.ones_like(query) * (signs if rotate else 1)
+    torch.testing.assert_close(seen[0], expected)
+    torch.testing.assert_close(query.grad, expected * 2)
+    torch.testing.assert_close(output, saved)
+    assert torch.equal(upstream, torch.ones_like(upstream))
