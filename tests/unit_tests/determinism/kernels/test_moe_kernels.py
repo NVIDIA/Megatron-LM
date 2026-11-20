@@ -1645,15 +1645,16 @@ class TestMoEModules:
         reason="MXFP8 parameter storage needs Blackwell",
     )
     @pytest.mark.parametrize(
-        "backend", ["vllm", "flashinfer_cutlass", "flashinfer_routed", "flashinfer_cutedsl"]
+        "backend", ["vllm", "flashinfer_cutlass", "flashinfer_routed", "flashinfer_fused_finalize"]
     )
     def test_mxfp8_expert_weight_build_replays(self, backend):
-        """Canonical, CUTLASS, write-through routed and CuTe-DSL expert stacks build bit-exactly."""
+        """Canonical, CUTLASS, write-through routed and fused-finalize expert stacks build
+        bit-exactly."""
         from types import SimpleNamespace
 
         from megatron.core.inference.moe import InferenceGroupedGemmBackend
-        from megatron.core.inference.moe.flashinfer_cutedsl_mxfp8 import (
-            HAVE_FLASHINFER_CUTEDSL_MXFP8,
+        from megatron.core.inference.moe.flashinfer_fused_finalize_mxfp8 import (
+            HAVE_FLASHINFER_FUSED_FINALIZE_MXFP8,
         )
         from megatron.core.inference.moe.flashinfer_mxfp8 import (
             HAVE_FLASHINFER_CUTLASS_MXFP8,
@@ -1666,13 +1667,13 @@ class TestMoEModules:
             pytest.skip("requires FlashInfer CUTLASS MXFP8")
         if backend == "flashinfer_routed" and not HAVE_FLASHINFER_ROUTED_MXFP8:
             pytest.skip("requires FlashInfer routed MXFP8")
-        if backend == "flashinfer_cutedsl" and not HAVE_FLASHINFER_CUTEDSL_MXFP8:
-            pytest.skip("requires the FlashInfer CuTe-DSL MXFP8 MoE")
+        if backend == "flashinfer_fused_finalize" and not HAVE_FLASHINFER_FUSED_FINALIZE_MXFP8:
+            pytest.skip("requires the FlashInfer fused-finalize MXFP8 MoE")
 
         class GroupedMLPStub:
             _stack_mxfp8_linear_weight = InferenceGroupedMLP._stack_mxfp8_linear_weight
-            _build_flashinfer_cutedsl_mxfp8_weights = (
-                InferenceGroupedMLP._build_flashinfer_cutedsl_mxfp8_weights
+            _build_flashinfer_fused_finalize_mxfp8_weights = (
+                InferenceGroupedMLP._build_flashinfer_fused_finalize_mxfp8_weights
             )
 
         seeded()
@@ -1684,7 +1685,7 @@ class TestMoEModules:
             grouped = GroupedMLPStub()
             grouped.num_local_experts = 2
             grouped.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.from_config(
-                backend if backend == "flashinfer_cutedsl" else backend.split("_")[0]
+                backend if backend == "flashinfer_fused_finalize" else backend.split("_")[0]
             )
             # A clamp selects FlashInfer CUTLASS; without one FlashInfer uses the routed kernel.
             grouped._activation_clamp_scale = None if backend == "flashinfer_routed" else 16.0
@@ -1707,12 +1708,12 @@ class TestMoEModules:
                 grouped._fc2_weight.data.view(torch.uint8),
                 grouped._fc2_weight.scale.view(torch.uint8),
             )
-            if backend != "flashinfer_cutedsl":
+            if backend != "flashinfer_fused_finalize":
                 return stacks
-            # The CuTe-DSL copy is repacked from the canonical stacks without requantization.
-            cutedsl = grouped._flashinfer_cutedsl_weights
+            # The fused-finalize copy is repacked from the canonical stacks without requantization.
+            fused_finalize = grouped._flashinfer_fused_finalize_weights
             return stacks + tuple(
-                getattr(cutedsl, name).view(torch.uint8)
+                getattr(fused_finalize, name).view(torch.uint8)
                 for name in ("fc1_data", "fc1_scale", "fc2_data", "fc2_scale")
             )
 
