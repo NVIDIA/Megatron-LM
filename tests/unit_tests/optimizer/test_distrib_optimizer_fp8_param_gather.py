@@ -118,6 +118,30 @@ def _train_step(model, optimizer):
     assert torch.isfinite(torch.as_tensor(grad_norm)).all()
 
 
+def _master_state(distrib_optimizer, model_param):
+    """The master weight state distrib_optimizer holds for model_param, or None if this rank
+    holds no shard of it. Exact, for comparing master weights across checkpoint round trips:
+
+    - MCore-managed: the FP32 main param shard.
+    - TE-owned FP32 masters: TE's master_param itself (so tests can modify it in place).
+    - TE-owned int16 param remainders: the BF16 param shard bits stacked with the remainders,
+      which together make up the FP32 master.
+    - TE-owned FP16 masters: the unscaled FP32 values.
+    """
+    if model_param not in distrib_optimizer.model_param_group_index_map:
+        return None
+    group_index, group_order = distrib_optimizer.model_param_group_index_map[model_param]
+    inner_param = distrib_optimizer.optimizer.param_groups[group_index]["params"][group_order]
+    if not distrib_optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+        return inner_param.detach()
+    master = distrib_optimizer.optimizer.state[inner_param]["master_param"]
+    if master.dtype == torch.int16:
+        return torch.stack([inner_param.detach().view(torch.int16), master])
+    if master.dtype == torch.float32:
+        return master
+    return distrib_optimizer.optimizer.get_unscaled_state(inner_param, "master_param")
+
+
 def _master_params(optimizer):
     return [state["master_param"] for state in optimizer.optimizer.state.values() if state]
 
@@ -150,8 +174,7 @@ def test_get_megatron_optimizer_resolves_fp8_param_gather(
 @pytest.mark.parametrize("store_param_remainders", [None, True])
 def test_bf16_params_master_param_format(model_parallel, store_param_remainders):
     """With BF16 params and a non-delayed recipe the optimizer checkpoint's master params are
-    FP32 by default, and int16 remainders only when explicitly requested. Either way
-    get_main_param_shard is exact."""
+    FP32 by default, and int16 remainders only when explicitly requested."""
     model = _ddp_model()
     _, optimizer = _get_optimizer(model, store_param_remainders=store_param_remainders)
     assert optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
@@ -161,21 +184,6 @@ def test_bf16_params_master_param_format(model_parallel, store_param_remainders)
     expected_dtype = torch.int16 if store_param_remainders else torch.float32
     masters = _master_params(optimizer)
     assert masters and all(master.dtype == expected_dtype for master in masters)
-
-    shard = optimizer.get_main_param_shard(model.module.weight)
-    if shard is not None:  # This rank may own no part of the weight.
-        assert shard.dtype == torch.float32
-        (distrib_optimizer,) = optimizer.chained_optimizers
-        index_map = distrib_optimizer.model_param_group_index_map
-        group_index, group_order = index_map[model.module.weight]
-        bf16_shard = distrib_optimizer.optimizer.param_groups[group_index]["params"][group_order]
-        # The BF16 param is the master rounded to nearest (within half a BF16 ulp), but the
-        # master keeps more bits: the shard is not just the BF16 param upcast.
-        torch.testing.assert_close(shard, bf16_shard.float(), rtol=2**-8, atol=0)
-        assert not torch.equal(shard, bf16_shard.float())
-        if not store_param_remainders:
-            master = distrib_optimizer.optimizer.state[bf16_shard]["master_param"]
-            assert torch.equal(shard, master)
 
 
 @pytest.mark.parametrize("store_param_remainders", [None, True])
@@ -277,7 +285,9 @@ def test_param_remainders_checkpoint_compatibility(
         if not with_flag:
             del sharded_state_dict["param_state_param_remainders"]
         save({"optimizer": sharded_state_dict}, ckpt_dir)
-        saved_shard = saving.get_main_param_shard(model.module.weight)
+        saved_shard = _master_state(saving, model.module.weight)
+        if saved_shard is not None:
+            saved_shard = saved_shard.clone()
 
         _, optimizer = _get_optimizer(
             model,
@@ -295,7 +305,7 @@ def test_param_remainders_checkpoint_compatibility(
                 loading.load_state_dict(loaded["optimizer"])
             return
         loading.load_state_dict(loaded["optimizer"])
-        loaded_shard = loading.get_main_param_shard(model.module.weight)
+        loaded_shard = _master_state(loading, model.module.weight)
         if saved_shard is not None:
             if main_params_dtype == torch.float32:
                 assert torch.equal(loaded_shard, saved_shard)
@@ -353,7 +363,9 @@ def test_param_remainders_through_fp32_buffers(
         _train_step(model, optimizer)
         (saving,) = optimizer.chained_optimizers
         assert saving._stores_param_remainders()
-        saved_shard = saving.get_main_param_shard(model.module.weight)
+        saved_shard = _master_state(saving, model.module.weight)
+        if saved_shard is not None:
+            saved_shard = saved_shard.clone()
         _save_parameter_state(saving, model, sharding_type, ckpt_dir)
 
         _, optimizer = _get_optimizer(
@@ -362,7 +374,7 @@ def test_param_remainders_through_fp32_buffers(
         (loading,) = optimizer.chained_optimizers
         _load_parameter_state(loading, model, sharding_type, ckpt_dir)
         if saved_shard is not None:
-            assert torch.equal(loading.get_main_param_shard(model.module.weight), saved_shard)
+            assert torch.equal(_master_state(loading, model.module.weight), saved_shard)
 
 
 @pytest.mark.parametrize(
@@ -382,7 +394,7 @@ def test_param_remainders_with_fp32_model_params(
         assert saving._stores_param_remainders()
         saved_shards = {}
         for name, param in model.module.named_parameters():
-            shard = saving.get_main_param_shard(param)
+            shard = _master_state(saving, param)
             if shard is None:
                 continue
             if param.dtype == torch.float32:
@@ -400,7 +412,7 @@ def test_param_remainders_with_fp32_model_params(
         _load_parameter_state(loading, model, sharding_type, ckpt_dir)
         for name, param in model.module.named_parameters():
             if name in saved_shards:
-                assert torch.equal(loading.get_main_param_shard(param), saved_shards[name])
+                assert torch.equal(_master_state(loading, param), saved_shards[name])
 
 
 @pytest.mark.parametrize("save_remainders", [False, True])
@@ -411,7 +423,7 @@ def test_dp_zero_param_remainders_flag_survives_repeated_loads(model_parallel, s
     _train_step(model, optimizer)
     (saving,) = optimizer.chained_optimizers
     state_dict = saving.get_parameter_state_dp_zero()
-    saved_shard = saving.get_main_param_shard(model.module.weight)
+    saved_shard = _master_state(saving, model.module.weight)
     if saved_shard is not None:
         saved_shard = saved_shard.clone()
 
@@ -431,7 +443,7 @@ def test_dp_zero_param_remainders_flag_survives_repeated_loads(model_parallel, s
         if state_dict is not None:
             assert state_dict["param_state_param_remainders"] == save_remainders
         if saved_shard is not None:
-            assert torch.equal(loading.get_main_param_shard(model.module.weight), saved_shard)
+            assert torch.equal(_master_state(loading, model.module.weight), saved_shard)
 
 
 @pytest.mark.parametrize(("save_remainders", "load_remainders"), [(False, None), (None, False)])
