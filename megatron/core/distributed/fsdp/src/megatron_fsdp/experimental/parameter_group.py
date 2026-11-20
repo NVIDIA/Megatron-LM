@@ -654,8 +654,12 @@ class FsdpParameterGroup:
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
         """Pack full local gradients on compute into the reduce-scatter input buffer."""
+        stream = torch.cuda.current_stream(partial_grad.device)
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            partial_grad.get_tensor_view(index).copy_(fsdp_parameter.unsharded.grad)
+            grad = fsdp_parameter.unsharded.grad
+            partial_grad.get_tensor_view(index).copy_(grad)
+            # The final gradient hook may run on a different stream from this gradient's producer.
+            grad.record_stream(stream)
             fsdp_parameter.unsharded.grad = None
 
     def accumulate_local_gradients(self) -> None:
@@ -671,8 +675,10 @@ class FsdpParameterGroup:
 
         has_sharded_grads = self._has_sharded_grads()
         self._clear_stale_main_grad()
+        stream = torch.cuda.current_stream(self.main_grad.device)
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             grad = fsdp_parameter.unsharded.grad
+            grad.record_stream(stream)
             destination = self.main_grad.get_tensor_view(index)
             if has_sharded_grads:
                 # Scale and accumulate in one pass, rounding once in the accumulation dtype,
