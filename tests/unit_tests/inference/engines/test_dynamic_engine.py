@@ -1426,6 +1426,8 @@ class DynamicEngineTestConfig:
     # relevant to the test. The tests only check if the required
     # context attributes are set correctly.
     suspend_resume_interval: Optional[int] = None
+    # Build the engine SUSPENDED; _run_test resumes it before adding requests.
+    start_suspended: bool = False
     kv_cache_management_mode: str = "persist"
     static_kv_memory_pointers: bool = True
     track_generated_token_events: bool = False
@@ -1642,6 +1644,7 @@ class DynamicInferenceEngineTestBase:
                 async_sched_mode=test_config.async_sched_mode,
                 logprobs_mode=test_config.logprobs_mode,
                 gc_mode=test_config.gc_mode,
+                start_suspended=test_config.start_suspended,
             ),
         )
 
@@ -1964,6 +1967,22 @@ class DynamicInferenceEngineTestBase:
         # Test environment.
         test_config = DynamicEngineTestConfig(**test_config_kwargs)
         env = cls._build_test_env(test_config)
+        if test_config.start_suspended:
+            # Nothing weight-dependent may have run yet: the first resume() captures and enters
+            # gc_mode. The events match a pause() then suspend(), so pause/stop return before it.
+            engine = env.engine
+            assert engine.state == EngineState.SUSPENDED
+            assert engine.capture_stats is None
+            assert not engine.context.is_tensor_state_allocated
+            assert not engine._in_custom_gc_mode
+            assert not InferenceMode.is_active()
+            assert not engine._state_events[EngineState.RUNNING].is_set()
+            assert engine._state_events[EngineState.PAUSED].is_set()
+            assert engine._state_events[EngineState.SUSPENDED].is_set()
+            engine.resume()
+            assert engine.state == EngineState.RUNNING
+            assert InferenceMode.is_active()
+            assert engine._in_custom_gc_mode == (test_config.gc_mode != "default")
 
         # Add requests to engine.
         env.mem_usage["start"] = torch.cuda.memory_stats()
@@ -2416,6 +2435,78 @@ def test_resume_resalts_requests_admitted_before_the_weight_epoch_bump():
         request = engine.get_request(request_id)
         assert request.block_hash_salt is None
         assert request.precomputed_block_hashes == hashes(None)
+
+
+def test_first_resume_reencodes_media_queued_before_the_weights():
+    """Media queued on a start_suspended engine is encoded before the weights are in place.
+
+    The first resume() must re-encode it and restore the context entry the deferred capture
+    cleared, even when stale embeddings are allowed; later cycles honor that flag again.
+    """
+    stale, fresh = torch.zeros(2, 1, 4), torch.ones(2, 1, 4)
+    request = DynamicVLMInferenceRequest(
+        request_id=7,
+        prompt_tokens=torch.tensor([10, 99, 99, 20]),
+        sampling_params=SamplingParams(num_tokens_to_generate=2, termination_id=0),
+        media_cache_key="media",
+        num_img_embeddings_per_tile=2,
+        imgs=torch.ones(1, 3, 4, 4),
+        num_tiles=torch.tensor([1]),
+        decoder_seq_length=0,
+        image_embeddings=stale,
+        image_token_mask=torch.tensor([-1, 0, 1, -1]),
+    )
+    context_media = {7: stale}
+    encoder = mock.Mock(return_value=fresh)
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = types.SimpleNamespace(
+        chunked_prefill_request_id=-1,
+        kv_cache_management_mode=KVCacheManagementMode.PERSIST,
+        static_kv_memory_pointers=True,
+        deallocate_inference_state_buffers=mock.Mock(),
+        reinitialize_inference_state_buffers=mock.Mock(),
+        add_vlm_request_data=lambda request_id, image_embeddings, image_token_mask: (
+            context_media.__setitem__(request_id, image_embeddings)
+        ),
+    )
+    engine.controller = types.SimpleNamespace(
+        inference_wrapped_model=types.SimpleNamespace(_forward_vision_encoder=encoder)
+    )
+    engine.requests = {
+        7: types.SimpleNamespace(record=DynamicInferenceRequestRecord.from_request(request))
+    }
+    engine.waiting_request_ids = deque([7])
+    engine.resume_request_ids = []
+    engine.state = EngineState.SUSPENDED
+    engine._deferred_cuda_graph_capture = True
+    # Capturing resets the context, which drops its media entries.
+    engine.create_cuda_graphs = mock.Mock(side_effect=context_media.clear)
+    engine.unified_memory_level = 0
+    engine.use_coordinator = False
+    engine.allow_stale_multimodal_embeddings = True
+    engine.vision_embedding_cache_max_bytes = 1 << 20
+    engine._vision_embedding_cache = OrderedDict(media=_make_vision_cache_entry(stale))
+    engine._vision_embedding_cache_bytes = 0
+    engine._add_request = mock.Mock()
+    engine._notify_cond_for_new_request = mock.Mock(return_value=None)
+    engine._loop = types.SimpleNamespace(call_soon_threadsafe=mock.Mock())
+
+    with (
+        mock.patch.object(DynamicInferenceEngine, "suspend_resume_ctx", return_value=nullcontext()),
+        mock.patch.object(InferenceMode, "unset_active"),
+        mock.patch.object(InferenceMode, "set_active"),
+        mock.patch.object(torch.cuda, "synchronize"),
+    ):
+        engine.resume()
+        assert request.image_embeddings is fresh
+        assert context_media[7] is fresh
+        assert engine._vision_embedding_cache["media"].embedding is fresh
+
+        engine.suspend()
+        engine.resume()
+
+    encoder.assert_called_once()
+    assert request.image_embeddings is fresh
 
 
 def test_collect_gc_while_idle_freezes_only_after_a_drained_step():
@@ -4391,6 +4482,41 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     f"result ({request.generated_tokens}) != "
                     f"expected ({expected_generated_tokens})."
                 )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("kv_cache_management_mode", ["persist", "recompute"])
+    @torch.inference_mode()
+    def test_start_suspended(self, kv_cache_management_mode: str) -> None:
+        """The first resume() captures and enters gc_mode; later cycles follow the normal rule."""
+        try:
+            env = self._run_test(
+                num_tokens_to_generate=16,
+                num_cuda_graphs=1,
+                force_build_cuda_graphs=True,
+                context_max_requests=128,
+                use_cuda_graphs_for_non_decode_steps=False,
+                kv_cache_management_mode=kv_cache_management_mode,
+                static_kv_memory_pointers=(kv_cache_management_mode == "persist"),
+                start_suspended=True,
+                gc_mode="freeze",
+            )
+            first_capture = env.engine.capture_stats
+            assert first_capture is not None
+            for request in env.requests:
+                assert request.status == Status.COMPLETED
+
+            # Later cycles follow the normal rule: PERSIST keeps the graphs, RECOMPUTE recaptures.
+            env.engine.suspend()
+            assert not env.engine._in_custom_gc_mode
+            env.engine.resume()
+            assert env.engine._in_custom_gc_mode
+            kept = env.engine.capture_stats is first_capture
+            assert kept == (kv_cache_management_mode == "persist")
+        finally:
+            gc.unfreeze()
 
     @pytest.mark.internal
     @pytest.mark.skipif(
