@@ -8,7 +8,9 @@ from types import SimpleNamespace
 
 from torch.autograd import DeviceType
 
-MODULE_PATH = Path(__file__).parents[2] / "tests/unit_tests/distributed/mfsdp_v2/profiler_utils.py"
+MODULE_PATH = (
+    Path(__file__).parents[2] / "tests/unit_tests/core/distributed/mfsdp_v2/profiler_utils.py"
+)
 spec = importlib.util.spec_from_file_location("mfsdp_profiler_utils", MODULE_PATH)
 profiler_utils = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(profiler_utils)

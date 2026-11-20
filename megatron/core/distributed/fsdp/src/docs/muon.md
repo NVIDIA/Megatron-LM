@@ -36,7 +36,7 @@ the shards.
 
 Five trainable FP32 parameters owned by one module are packed as follows.
 This RowAtomic layout comes from
-[`test_compute_layout_fills_lcm_padding_gaps`](../../../../../../tests/unit_tests/distributed/mfsdp_v2/test_dbuffer.py#L60)
+[`test_compute_layout_fills_lcm_padding_gaps`](../../../../../../tests/unit_tests/core/distributed/mfsdp_v2/test_dbuffer.py#L60)
 and the illustration in
 [`build_for_row_atomic`](../megatron_fsdp/experimental/layout_builder.py#L39).
 

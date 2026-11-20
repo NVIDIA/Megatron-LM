@@ -15,7 +15,7 @@ ranks are not registered as Dynamo workers.
 megatron/inference/integrations/dynamo/             adapter and engine protocol
 megatron/core/inference/engine_endpoint.py           shared endpoint contract
 megatron/core/inference/disaggregation/            reusable KV/state handoff
-tests/unit_tests/inference/dynamo/                  adapter unit tests
+tests/unit_tests/inference/integrations/dynamo/                  adapter unit tests
 ```
 
 Logic reusable by other inference engines belongs in Dynamo's
@@ -203,9 +203,9 @@ does not establish adapter coverage. Track that CI dependency update in
 
 ```bash
 python -m torch.distributed.run --standalone --nproc-per-node=1 -m pytest -q \
-  tests/unit_tests/inference/dynamo \
-  tests/unit_tests/inference/test_engine_endpoint.py \
-  tests/unit_tests/inference/test_kv_transfer_backends.py
+  tests/unit_tests/inference/integrations/dynamo \
+  tests/unit_tests/core/inference/test_engine_endpoint.py \
+  tests/unit_tests/core/inference/test_kv_transfer_backends.py
 ```
 
 ## Runtime contract

@@ -11,13 +11,28 @@ import torch.distributed
 from megatron.core import config
 from megatron.core.utils import is_te_min_version
 from tests.test_utils.python_scripts.download_unit_tests_dataset import download_and_extract_asset
-from tests.unit_tests.dist_checkpointing import TempNamedDir
+from tests.unit_tests.core.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import (
     Utils,
     reset_transient_process_state,
     restore_process_state,
     snapshot_process_state,
 )
+
+_DIRECTORY_COLLECTORS = pytest.StashKey[dict]()
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_collect_directory(path, parent):
+    """Keep directory fixtures visible when CI targets leave and re-enter a subtree."""
+    collector = yield
+    if collector is None:
+        return None
+    # Explicit file arguments can recollect their parent directory. Pytest 9.1
+    # binds conftest fixtures to collector identity, so fresh child collectors
+    # lose those fixtures. Reuse them without changing the bucket's file order.
+    collectors = parent.config.stash.setdefault(_DIRECTORY_COLLECTORS, {})
+    return collectors.setdefault((parent, path), collector)
 
 
 def pytest_configure(config):

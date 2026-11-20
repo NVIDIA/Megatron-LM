@@ -40,8 +40,8 @@ this file → applicable style guidance → review).
     `jit_fuser`/`torch.compile` function, CUDA extension, Transformer Engine
     or external-library dispatch, or a scatter/index accumulation), check that
     a bit-exact determinism test under
-    `tests/unit_tests/determinism/kernels/` is added or updated and that the
-    kernel is registered in `tests/unit_tests/determinism/kernels/manifest.py`
+    `tests/unit_tests/core/determinism/kernels/` is added or updated and that the
+    kernel is registered in `tests/unit_tests/core/determinism/kernels/manifest.py`
     (see `docs/developer/determinism/testing.md`)
 
 ## Do NOT comment on

@@ -25,7 +25,7 @@ assert SPEC is not None and SPEC.loader is not None
 cache = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(cache)
 IMAGE_ID = "sha256:" + "a" * 64
-BUCKET = "tests/unit_tests/pipeline_parallel/**/*.py"
+BUCKET = "tests/unit_tests/core/pipeline_parallel/**/*.py"
 
 
 @pytest.fixture
@@ -90,7 +90,7 @@ def test_compatibility_inputs_preserve_lookup_prefix_but_reject_restored_generat
 
 def test_platform_and_bucket_are_isolated(source_tree):
     root_conftest = "tests/unit_tests/conftest.py"
-    nested_conftest = "tests/unit_tests/pipeline_parallel/nested/conftest.py"
+    nested_conftest = "tests/unit_tests/core/pipeline_parallel/nested/conftest.py"
     for name in (root_conftest, nested_conftest):
         path = source_tree / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -110,7 +110,7 @@ def test_platform_and_bucket_are_isolated(source_tree):
     )
     assert nested_conftest not in identities[2]["compatibility"]["inputs"]
 
-    unrelated = source_tree / "tests/unit_tests/tuning/conftest.py"
+    unrelated = source_tree / "tests/unit_tests/core/tuning/conftest.py"
     unrelated.parent.mkdir()
     unrelated.write_text("unrelated fixture")
     for identity in identities:

@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 import yaml
-from find_test_cases import expand_pattern
+from find_test_cases import BUCKET_MANIFEST, expand_pattern, resolve_bucket
 from testmon_cache import PLATFORMS
 
 DEFAULT_CONFIG = Path(__file__).resolve().with_name("testmon_mandatory_tests.yaml")
@@ -66,14 +66,30 @@ def triggered_patterns(
     return sources, patterns
 
 
-def mandatory_files(patterns: list[str], bucket: str, ignored: set[str]) -> list[str]:
+def mandatory_files(
+    patterns: list[str],
+    bucket: str,
+    ignored: set[str],
+    *,
+    platform: str | None = None,
+    root: Path = Path("."),
+    tag: str = "latest",
+) -> list[str]:
     """Expand mapped files, directories, and globs within the current bucket."""
-    bucket_files = set(expand_pattern(bucket)) - ignored
+    resolved = platform is not None and tag == "latest" and (root / BUCKET_MANIFEST).is_file()
+    if resolved:
+        root = root.resolve()
+        bucket_files = {str(root / path) for path in resolve_bucket(bucket, platform, root, tag)}
+        ignored = {str(root / path) for path in ignored}
+        patterns = [str(root / pattern) for pattern in patterns]
+    else:
+        bucket_files = set(expand_pattern(bucket))
+    bucket_files -= ignored
     patterns = [
         pattern.rstrip("/") + "/**/*.py" if Path(pattern).is_dir() else pattern
         for pattern in patterns
     ]
-    return sorted(
+    files = sorted(
         {
             test_file
             for pattern in patterns
@@ -81,6 +97,7 @@ def mandatory_files(patterns: list[str], bucket: str, ignored: set[str]) -> list
             if test_file in bucket_files and Path(test_file).name.startswith("test_")
         }
     )
+    return [str(Path(path).relative_to(root)) for path in files] if resolved else files
 
 
 def merge_selection(selection: Path, files: list[str]) -> list[str]:
@@ -110,7 +127,7 @@ def _parser() -> argparse.ArgumentParser:
 def _run(args: argparse.Namespace) -> None:
     changed_files = [line for line in args.changed_files.read_text().splitlines() if line]
     sources, patterns = triggered_patterns(load_mappings(args.config), changed_files, args.platform)
-    files = mandatory_files(patterns, args.bucket, set(args.ignore))
+    files = mandatory_files(patterns, args.bucket, set(args.ignore), platform=args.platform)
     (args.selection.parent / "mandatory-tests").write_text("".join(f"{path}\n" for path in files))
     merge_selection(args.selection, files)
     if sources:
