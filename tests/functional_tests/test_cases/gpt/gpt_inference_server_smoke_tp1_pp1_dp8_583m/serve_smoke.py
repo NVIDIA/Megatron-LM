@@ -14,6 +14,7 @@ round-trip end-to-end.
 import argparse
 import json
 import os
+import platform
 import signal
 import subprocess
 import sys
@@ -67,6 +68,8 @@ def build_server_cmd(
         "-m",
         "torch.distributed.run",
         *log_args,
+        # On Grace (aarch64), the engine checks that each rank is bound to its GPU's NUMA node.
+        *(["--numa-binding", "node"] if platform.machine() == "aarch64" else []),
         f"--nproc-per-node={num_gpus}",
         "-m",
         "examples.inference.launch_inference_server",
