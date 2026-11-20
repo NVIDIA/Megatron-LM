@@ -40,6 +40,10 @@ on:
         description: Trace the fixed MFSDP loss reproduction instead of populating caches
         type: boolean
         default: false
+      mfsdp_snapshot_run:
+        description: Optional prior diagnostic run whose captured GEMM should be replayed
+        type: string
+        default: ""
 
 concurrency:
   group: populate-ci-caches-${{ inputs.mfsdp_isolation && github.ref || 'main' }}
@@ -149,6 +153,10 @@ jobs:
     if: github.repository == 'NVIDIA/Megatron-LM' && github.event_name == 'workflow_dispatch' && inputs.mfsdp_isolation
     runs-on: nvidia-ci-aws-use2-gpu-x4
     timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
     env:
       AWS_REGION: us-east-2
       IMAGE: 766267172432.dkr.ecr.us-east-2.amazonaws.com/megatron-lm@sha256:b5a0587987dbbb500943cbdd2090707ef16912c3c3476d25b72d860d6858e1c2
@@ -160,6 +168,14 @@ jobs:
         with:
           ref: 68f829281ffec0a158f2c875b0f3273a035292b4
           path: mfsdp-source
+      - name: Reuse a prior captured GEMM
+        if: inputs.mfsdp_snapshot_run != ''
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: mfsdp-collective-isolation-${{ inputs.mfsdp_snapshot_run }}
+          run-id: ${{ inputs.mfsdp_snapshot_run }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/mfsdp-isolation-${{ github.run_id }}
       - name: Trace the exact passing image
         shell: bash
         run: |

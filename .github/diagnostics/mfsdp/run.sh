@@ -17,6 +17,11 @@ set -euo pipefail
 cd /opt/megatron-lm
 export UV_PROJECT_ENVIRONMENT=/opt/venv
 prefix=${MFS_DP_TRACE_PREFIX:-github}
+snapshot="/workspace/results/$prefix-traced-4/collectives/gemm-snapshot-rank0"
+if [ -f "$snapshot/manifest.json" ]; then
+  CUDA_VISIBLE_DEVICES=0 uv run --no-sync python /workspace/replay_gemm.py "$snapshot"
+  exit
+fi
 for label in "$prefix-baseline-4" "$prefix-traced-4"; do
   uv run --no-sync python - "$label" <<'PYCODE'
 import json

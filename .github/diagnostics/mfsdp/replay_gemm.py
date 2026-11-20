@@ -64,7 +64,7 @@ def main():
                 [operands_a[index] for index in indices],
                 [operands_b[index] for index in indices],
                 outputs,
-                None,
+                [None for _ in indices],
                 torch.bfloat16,
                 **metadata,
             )[0]
