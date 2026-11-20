@@ -401,3 +401,85 @@ def test_dynamic_server_uses_inference_checkpoint_loader(monkeypatch, run_config
     else:
         check.assert_not_called()
     model.eval.assert_called_once()
+
+
+@pytest.mark.parametrize("is_mimo", [False, True])
+def test_dynamic_server_builds_vlm_shards_with_local_parallel_sizes(
+    monkeypatch, run_config, is_mimo
+):
+    """A TP=1 inference shard of a TP=2 launch builds and loads with shard-local sizes."""
+    from examples.inference.advanced import vlm_dynamic_inference
+
+    global_config = TransformerConfig(
+        num_layers=2,
+        hidden_size=32,
+        num_attention_heads=4,
+        tensor_model_parallel_size=2,
+        expert_tensor_parallel_size=2,
+        sequence_parallel=True,
+    )
+    run_config.model.transformer = global_config
+    run_config.checkpoint.load = "checkpoint"
+    args = Namespace(inference_ckpt_non_strict=False)
+    if is_mimo:
+        args.mimo_checkpoint_prefix_map = {"language_model.": "language_model.module.module."}
+    provider_module = ModuleType("model")
+    provider_module.model_provider = Mock(return_value=Mock())
+    monkeypatch.setitem(sys.modules, "model", provider_module)
+    monkeypatch.setitem(sys.modules, "mimo_checkpoint_model", provider_module)
+    monkeypatch.setattr(vlm_dynamic_inference, "get_args", lambda: args)
+    monkeypatch.setattr(vlm_dynamic_inference, "_check_mimo_checkpoint_fully_loaded", Mock())
+    load = Mock()
+    monkeypatch.setattr(vlm_dynamic_inference, "load_checkpoint", load)
+
+    def get_model(provider, wrap_with_ddp, config=None, pg_collection=None):
+        # Like training.get_model: the provider receives the config passed here.
+        assert not wrap_with_ddp
+        return [
+            provider(
+                pre_process=True, post_process=True, config=config, pg_collection=pg_collection
+            )
+        ]
+
+    monkeypatch.setattr(vlm_dynamic_inference, "_get_model", get_model)
+    # Every group of the TP=1 shard, e.g. 'tp=1,role=prefill+tp=1,role=decode', has one rank.
+    group_names = ("tp", "pp", "cp", "ep", "expt_tp", "dp_cp", "dp", "expt_dp")
+    pg_collection = SimpleNamespace(**{name: object() for name in group_names})
+    monkeypatch.setattr(vlm_dynamic_inference, "get_pg_size", lambda group: 1)
+    checkpoint_group = object()
+
+    model = vlm_dynamic_inference.get_model(
+        is_vlm=True, pg_collection=pg_collection, checkpoint_group=checkpoint_group
+    )
+
+    kwargs = provider_module.model_provider.call_args.kwargs
+    assert kwargs["pg_collection"] is pg_collection
+    shard_config = kwargs["config"]
+    assert shard_config is not global_config
+    # The sizes the disaggregated coordinator checks against the shard's groups.
+    assert (
+        shard_config.tensor_model_parallel_size,
+        shard_config.pipeline_model_parallel_size,
+        shard_config.context_parallel_size,
+        shard_config.expert_model_parallel_size,
+        shard_config.expert_tensor_parallel_size,
+    ) == (1, 1, 1, 1, 1)
+    assert not shard_config.sequence_parallel
+    assert shard_config.hidden_size == global_config.hidden_size
+    # The launch-wide config is unchanged.
+    assert run_config.model.transformer is global_config
+    assert global_config.tensor_model_parallel_size == 2
+    assert global_config.expert_tensor_parallel_size == 2
+    assert global_config.sequence_parallel
+    load.assert_called_once_with(
+        ddp_model=[model],
+        optimizer=None,
+        opt_param_scheduler=None,
+        strict=True,
+        tp_group=pg_collection.tp,
+        pp_group=pg_collection.pp,
+        dp_cp_group=pg_collection.dp_cp,
+        dp_group=pg_collection.dp,
+        expt_dp_group=pg_collection.expt_dp,
+        checkpoint_group=checkpoint_group,
+    )

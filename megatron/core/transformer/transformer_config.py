@@ -1543,8 +1543,10 @@ class TransformerConfig(ModelParallelConfig):
     enabled: "te_native" (default: keep the native cuBLASLt kernels and obtain
     invariance via workspace starvation — lowest overhead, no extra
     dependencies, and the configuration verified bitwise-identical to the TE
-    training forward), "deepgemm" (DeepGEMM bf16 kernels), or "triton"
-    (persistent Triton matmul; any dtype)."""
+    training forward) or "triton" (persistent Triton matmul for dense GEMMs, any
+    dtype; grouped expert GEMMs stay native under the same workspace starvation).
+    "deepgemm" is deprecated: it is accepted with a DeprecationWarning and runs
+    as "te_native"."""
 
     batch_invariant_collective: Literal["ordered", "multimem"] = "ordered"
     """Cross-rank EP combine collective under batch_invariant_mode. "ordered"
@@ -4328,25 +4330,57 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.moe_megakernel_backend == "mok":
             if self.cuda_graph_impl in ("local", "transformer_engine"):
-                # Empty modules mean whole-layer capture here, not full_iteration.
-                # Per-layer replay needs per-microbatch ownership or recomputation
-                # of MOK's saved schedule/activations; this bridge has no stash integration.
-                if not self.cuda_graph_modules:
-                    raise ValueError(
-                        "MOK does not support per-layer whole-layer CUDA Graph capture"
-                    )
-                if any(
-                    scope in self.cuda_graph_modules
-                    for scope in (
-                        CudaGraphModule.moe,
-                        CudaGraphModule.moe_router,
-                        CudaGraphModule.moe_preprocess,
-                    )
-                ):
+                if CudaGraphModule.moe_preprocess in self.cuda_graph_modules:
                     raise ValueError(
                         "MOK does not support per-layer CUDA Graph scopes containing "
-                        "moe/moe_router/moe_preprocess"
+                        "moe_preprocess"
                     )
+                if CudaGraphModule.moe_router in self.cuda_graph_modules:
+                    # That graph would end between the router and the megakernel. The graph of a
+                    # MOK layer contains both or neither.
+                    raise ValueError(
+                        "MOK does not support the moe_router CUDA Graph scope; capture the MoE "
+                        "layer with the moe scope or whole-layer capture (empty "
+                        "cuda_graph_modules) and cuda_graph_impl='transformer_engine', or leave "
+                        "the MoE layer out of the CUDA Graph"
+                    )
+                # With the moe scope, or with empty modules (whole-layer capture here, not
+                # full_iteration), the graph covers the router and the megakernel, and its output
+                # is the layer output: MOK has static shapes and no host synchronization after
+                # warm-up. Only the TE implementation refreshes MOK's weight views eagerly before
+                # each replay (TECudaGraphTransformerLayerMixin._before_te_cuda_graph_replay).
+                if not self.cuda_graph_modules:
+                    graph_scope = "whole-layer CUDA Graph capture (empty cuda_graph_modules)"
+                elif CudaGraphModule.moe in self.cuda_graph_modules:
+                    graph_scope = "the moe CUDA Graph scope"
+                else:
+                    graph_scope = None
+                if graph_scope is not None:
+                    if self.cuda_graph_impl != "transformer_engine":
+                        raise ValueError(
+                            f"MOK supports {graph_scope} only with "
+                            "cuda_graph_impl='transformer_engine'"
+                        )
+                    if self.pipeline_model_parallel_size > 1:
+                        # Validated only without pipeline parallelism, where each microbatch's
+                        # backward runs before the next microbatch replays the layer's graph.
+                        # Pipeline schedules keep several microbatches in flight, and per-layer
+                        # MOK replay has not been validated there.
+                        raise ValueError(
+                            f"MOK with {graph_scope} requires pipeline_model_parallel_size=1"
+                        )
+                    if self.recompute_granularity == "selective" and "moe" in (
+                        self.recompute_modules or []
+                    ):
+                        raise ValueError(
+                            f"MOK does not support {graph_scope} with 'moe' in recompute_modules"
+                        )
+                    if not is_te_min_version("2.19.0"):
+                        # Older TE clones every returned parameter gradient on replay; MOK returns
+                        # full-size gradient sentinels for its routed weights.
+                        raise ValueError(
+                            f"MOK with {graph_scope} requires Transformer Engine >= 2.19"
+                        )
             elif self.cuda_graph_impl not in ("none", "full_iteration"):
                 raise ValueError(f"MOK does not support cuda_graph_impl={self.cuda_graph_impl!r}")
 
@@ -4416,8 +4450,10 @@ class TransformerConfig(ModelParallelConfig):
                         self.moe_expert_capacity_factor is None
                         or not self.moe_pad_expert_input_to_capacity
                     ):
+                        # A megakernel backend has static shapes without drop-and-pad.
                         assert (
                             CudaGraphModule.moe not in self.cuda_graph_modules
+                            or self.moe_megakernel_backend is not None
                         ), 'moe cuda graph is only supported with drop-padding MoE.'
                         if self.moe_token_dispatcher_type == 'alltoall' and (
                             self.moe_expert_capacity_factor is not None
@@ -5010,8 +5046,11 @@ class TransformerConfig(ModelParallelConfig):
         if self.batch_invariant_mode:
             from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
                 _BATCH_INVARIANT_BACKENDS,
+                _resolve_backend,
             )
 
+            # "deepgemm" is deprecated: warn and run as "te_native".
+            self.batch_invariant_backend = _resolve_backend(self.batch_invariant_backend)
             # argparse validates via the Literal annotation; guard here too so
             # programmatic TransformerConfig construction fails at build time
             # rather than inside enable_batch_invariant_mode() after model init.
@@ -5068,51 +5107,33 @@ class TransformerConfig(ModelParallelConfig):
                 self.attention_dropout == 0.0
             ), "Batch invariant mode does not support attention dropout"
             if (self.num_moe_experts or 0) > 0:
-                from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-                    HAVE_DEEPGEMM_BF16,
-                )
-
                 if self.transformer_impl != "inference_optimized":
                     assert self.moe_token_dispatcher_type == "alltoall", (
                         "Batch-invariant MoE training requires "
                         "moe_token_dispatcher_type='alltoall'."
                     )
-                    if self.batch_invariant_backend == "te_native":
-                        # Import lazily: the TE extension imports TransformerConfig.
-                        from megatron.core.extensions.transformer_engine import (
-                            TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
-                        )
+                    # Both backends run TE's native grouped GEMMs for the experts.
+                    # Import lazily: the TE extension imports TransformerConfig.
+                    from megatron.core.extensions.transformer_engine import (
+                        TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
+                    )
 
-                        assert (
-                            not self.use_transformer_engine_op_fuser
-                        ), "Batch-invariant training does not support TE op fuser."
-                        assert self.moe_use_grouped_tensor or not bool(
-                            int(os.getenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", "0"))
-                        ), (
-                            "Enable device-metadata GEMM with moe_use_grouped_tensor=True, "
-                            "not just NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM, so expert "
-                            "padding uses the required "
-                            f"{TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT}-row alignment."
-                        )
+                    assert (
+                        not self.use_transformer_engine_op_fuser
+                    ), "Batch-invariant training does not support TE op fuser."
+                    assert self.moe_use_grouped_tensor or not bool(
+                        int(os.getenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", "0"))
+                    ), (
+                        "Enable device-metadata GEMM with moe_use_grouped_tensor=True, "
+                        "not just NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM, so expert "
+                        "padding uses the required "
+                        f"{TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT}-row alignment."
+                    )
                 mxfp8_params_enabled = (
                     bool(self.fp8)
                     and self.fp8_recipe == Fp8Recipe.mxfp8
                     and self.fp8_param
                     and not self.fp4
-                )
-                # DeepGEMM is used by the "deepgemm"/"triton" backends, and by
-                # the torch inference path for BF16 experts. MXFP8 experts use
-                # torch scaled_grouped_mm directly and do not need DeepGEMM.
-                needs_deepgemm = self.batch_invariant_backend in ("deepgemm", "triton") or (
-                    self.transformer_impl == "inference_optimized"
-                    and self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH
-                    and not mxfp8_params_enabled
-                )
-                assert not needs_deepgemm or HAVE_DEEPGEMM_BF16, (
-                    "batch_invariant_mode=True with MoE requires DeepGEMM with bf16 "
-                    "grouped-GEMM bindings (m_grouped_bf16_gemm_nt_contiguous) for "
-                    "this backend combination. "
-                    "Install via `uv pip install -e .[batch_invariant]`."
                 )
                 squared_relu_or_swiglu = (
                     not self.gated_linear_unit and self.activation_func == squared_relu
