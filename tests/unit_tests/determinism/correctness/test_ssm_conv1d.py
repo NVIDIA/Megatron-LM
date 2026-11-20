@@ -183,14 +183,17 @@ class TestMambaMixerDeterminism:
         Utils.destroy_model_parallel()
 
     @requires_deterministic_conv1d
+    @pytest.mark.parametrize("batch_first", [True, False], ids=["batch_first", "sequence_first"])
     @pytest.mark.parametrize("packed_layout", ["none", "unpadded", "padded"])
     @pytest.mark.parametrize("delay_wgrad_compute", [False, True])
-    def test_mixer_replays_bit_exactly(self, monkeypatch, packed_layout, delay_wgrad_compute):
+    def test_mixer_replays_bit_exactly(
+        self, monkeypatch, packed_layout, batch_first, delay_wgrad_compute
+    ):
         """Two runs of one mixer agree bitwise under the deterministic conv reduction.
 
         ``MAMBA_DETERMINISTIC`` pins the SSD scan, whose nondeterminism would otherwise reach
-        the conv weight gradient. The delayed arm also covers projection gradients completed
-        through ``MambaMixer.backward_dw`` after the regular backward pass.
+        the conv weight gradient. Both training layouts are replayed with immediate and
+        deferred projection gradients. The latter are completed by ``MambaMixer.backward_dw``.
         """
         if delay_wgrad_compute and (Utils.world_size < 2 or Utils.world_size % 2):
             pytest.skip("Delayed projection wgrad config requires a world size divisible by EP=2")
@@ -199,6 +202,10 @@ class TestMambaMixerDeterminism:
         monkeypatch.setenv("MAMBA_DETERMINISTIC", "1")
         monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
         mixer = _build_mixer(delay_wgrad_compute=delay_wgrad_compute)
+        # This config passes the batch-first gate, so only sequence-first needs pinning.
+        assert mixer._use_batch_first_ssm(inference_mode=False)
+        if not batch_first:
+            monkeypatch.setattr(mixer, "_use_batch_first_ssm", lambda inference_mode: False)
         hidden_size = mixer.config.hidden_size
         micro_batch = _MICRO_BATCH if packed_layout == "none" else 1
         packed_seq_params = None

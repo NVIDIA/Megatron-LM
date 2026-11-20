@@ -400,7 +400,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_mok_kernels.py",),
         kind="triton",
         notes="Dense routing-map compaction and router-gradient scatter use one CTA per token "
-        "and unique expert indices; replayed with missing routes and side-stream contention.",
+        "and unique expert indices; replayed with missing routes, a strided padding mask and "
+        "side-stream contention. test_moe_kernels.py also replays it with MoELayer's padding mask, "
+        "through a megakernel stand-in, in eager and CUDA-graph replay.",
     ),
     KernelEntry(
         name="mok_runtime",
@@ -442,7 +444,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available; "
         "virtual-expert routing metadata and probability gradients replay under stream contention; "
         "the FlashInfer per-token NVFP4 value pass (moe_training_matches_inference) with recompute "
-        "backward, and its MXFP8 training-stack quantization.",
+        "backward, and its MXFP8 training-stack quantization. The megakernel branch passes the "
+        "padding mask to a stand-in backend that runs MOK route compaction: replayed under stream "
+        "contention against the reference semantics, and in a CUDA graph whose static mask "
+        "changes between replays.",
     ),
     KernelEntry(
         name="moe_experts",
@@ -667,16 +672,19 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/optimizer/clip_grads.py",
             "megatron/core/optimizer/__init__.py",
             "megatron/core/optimizer/optimizer.py",
+            "megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py",
             "megatron/training/utils/common_utils.py",
         ),
         tests=(
             K + "test_optimizer_kernels.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
+            "tests/unit_tests/distributed/mfsdp_v2/test_mcore_muon.py",
         ),
         kind="external-lib",
         notes="multi_tensor l2norm / scale (TE, apex or local fallback) and fused Adam; "
         "optimizer.py (gradient unscaling) and training/utils/common_utils.py (param / grad norm "
-        "logging) launch the same multi_tensor kernels through multi_tensor_applier.",
+        "logging) launch the same multi_tensor kernels through multi_tensor_applier. "
+        "Hybrid CPU/GPU Adam replay also covers overlapped parameter and gradient copies.",
     ),
     KernelEntry(
         name="tensor_metric_l2",
