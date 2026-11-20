@@ -10,7 +10,11 @@ from megatron.core.inference.config import CudaGraphSizingDistribution
 from megatron.core.transformer.cuda_graphs import _CudagraphReplayNode
 from tests.unit_tests.inference import test_coordinator_features_pairwise as features
 from tests.unit_tests.inference import test_coordinator_schedule_pairwise as schedule
-from tests.unit_tests.inference.coordinator_pairwise_utils import greedy_params, routed_model
+from tests.unit_tests.inference.coordinator_pairwise_utils import (
+    greedy_params,
+    routed_model,
+    scenario,
+)
 
 pytestmark = [pytest.mark.internal, pytest.mark.asyncio]
 
@@ -69,9 +73,12 @@ async def test_routed_prefill_graph_selection(monkeypatch, all_prefills, distrib
     await schedule.test_routed_chunk_partition_beside_decode(monkeypatch)
 
 
-@pytest.mark.parametrize("interval", [20, 3])
-@pytest.mark.parametrize("synchronous", [False, True])
-async def test_routed_idle_expert_progress(monkeypatch, interval, synchronous):
+# The engine reads the consensus interval and the synchronous flag live, so all four
+# (interval, synchronous) scenarios share one EP2 setup.
+IDLE_PROGRESS_SCENARIOS = [(20, False), (20, True), (3, False), (3, True)]
+
+
+async def test_routed_idle_expert_progress(monkeypatch):
     params = greedy_params(num_tokens_to_generate=32, return_log_probs=True)
     params.skip_prompt_log_probs = True
     async with routed_model(
@@ -81,8 +88,6 @@ async def test_routed_idle_expert_progress(monkeypatch, interval, synchronous):
         transformer_impl="inference_optimized",
         inference_moe_token_dispatcher_type="nccl",
     ) as h:
-        h.engine.ep_consensus_interval = interval
-        h.engine.use_synchronous_zmq_collectives = synchronous
         assert h.dp_size == 2 and h.engine.pg_collection.ep.size() == 2
         runtime, spans, cadence = Counter(), {False: set(), True: set()}, []
         model = h.engine.controller.inference_wrapped_model.model
@@ -105,26 +110,38 @@ async def test_routed_idle_expert_progress(monkeypatch, interval, synchronous):
 
         monkeypatch.setattr(model, "forward", observed)
         monkeypatch.setattr(h.engine, "_ep_establish_consensus", observed_consensus)
+        # The direct run steps the engine itself, without the loop's consensus.
         direct = await h.direct([4, 5, 6], params)
         await h.start()
-        await h.pause()
-        runtime.clear()
-        spans, cadence = {False: set(), True: set()}, []
-        [result], owners, local_ids = await h.run_paused_batch([(0, [4, 5, 6], params)])
-        await h.pause()
-        assert local_ids == [(0, 0)] and len(owners) == 1
-        assert result["status"] == direct["status"] == "COMPLETED"
-        assert result["generated_tokens"] == direct["generated_tokens"]
-        scores = torch.tensor([r["generated_log_probs"] for r in (direct, result)])
-        assert scores.shape == (2, 32) and torch.isfinite(scores).all()
-        records = [None] * h.dp_size
-        torch.distributed.all_gather_object(records, (spans, runtime, cadence))
-        owner = next(i for i in range(h.dp_size) if owners[0] == f"mp-coord-{i}".encode())
-        real, idle = records[owner][0][True], records[1 - owner][0]
-        assert real and idle[False] and not idle[True] and real <= idle[False]
-        for _, stats, _ in records:
-            assert stats["nccl-token-dispatches"] == stats["nccl-token-combines"] >= 1
-            assert stats["nccl-combine-before-dispatch"] == stats["nccl-dispatch-inflight"] == 0
-        calls = records[owner][2]
-        assert calls and all(c % interval == 0 for c in calls)
-        h.assert_retired()
+        for index, (interval, synchronous) in enumerate(IDLE_PROGRESS_SCENARIOS):
+            with scenario(f"interval={interval}, synchronous={synchronous}"):
+                await h.pause()
+                h.engine.ep_consensus_interval = interval
+                h.engine.use_synchronous_zmq_collectives = synchronous
+                runtime.clear()
+                spans, cadence = {False: set(), True: set()}, []
+                [result], owners, local_ids = await h.run_paused_batch([(0, [4, 5, 6], params)])
+                await h.pause()
+                # Each scenario sends one request, so client and server IDs both equal index.
+                assert local_ids == [(0, index)] and len(owners) == 1
+                assert result["status"] == direct["status"] == "COMPLETED"
+                assert result["generated_tokens"] == direct["generated_tokens"]
+                scores = torch.tensor([r["generated_log_probs"] for r in (direct, result)])
+                assert scores.shape == (2, 32) and torch.isfinite(scores).all()
+                records = [None] * h.dp_size
+                torch.distributed.all_gather_object(records, (spans, runtime, cadence))
+                owner = next(
+                    i for i in range(h.dp_size) if owners[index] == f"mp-coord-{i}".encode()
+                )
+                real, idle = records[owner][0][True], records[1 - owner][0]
+                assert real and idle[False] and not idle[True] and real <= idle[False]
+                for _, stats, _ in records:
+                    assert stats["nccl-token-dispatches"] == stats["nccl-token-combines"] >= 1
+                    assert (
+                        stats["nccl-combine-before-dispatch"]
+                        == stats["nccl-dispatch-inflight"]
+                        == 0
+                    )
+                calls = records[owner][2]
+                assert calls and all(c % interval == 0 for c in calls)
+                h.assert_retired()

@@ -6,7 +6,7 @@ import asyncio
 import copy
 import queue
 import threading
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from types import SimpleNamespace
 
 import msgpack
@@ -43,6 +43,18 @@ async def until(predicate, timeout=30):
             await asyncio.sleep(0.001)
 
     await asyncio.wait_for(poll(), timeout)
+
+
+@contextmanager
+def scenario(label):
+    """Name the scenario in any failure when one test item runs several scenarios."""
+    try:
+        yield
+    except AssertionError as error:
+        raise AssertionError(f"[{label}] {error}") from error
+    except Exception as error:
+        error.add_note(f"[{label}]")
+        raise
 
 
 class CoordinatorThread:

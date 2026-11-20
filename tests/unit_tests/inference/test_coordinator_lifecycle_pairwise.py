@@ -12,14 +12,20 @@ from megatron.core.inference.contexts import dynamic_context as dynamic_context_
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.headers import Headers
 from megatron.core.transformer.cuda_graphs import _CudaGraphRunner
-from tests.unit_tests.inference.coordinator_pairwise_utils import greedy_params, routed_model, until
+from tests.unit_tests.inference.coordinator_pairwise_utils import (
+    greedy_params,
+    routed_model,
+    scenario,
+    until,
+)
 from tests.unit_tests.inference.engines import test_dynamic_engine as engine_tests
 from tests.unit_tests.inference.test_coordinator_features_pairwise import _exercise_all_owners
 
 pytestmark = [pytest.mark.internal, pytest.mark.asyncio]
 
 
-async def _pause_active(h, monkeypatch, prompt, params):
+async def _pause_active(h, monkeypatch, prompt, params, request_id=0):
+    """Pause the engines once rank 0 has generated two tokens of server request request_id."""
     arrived, release = asyncio.Event(), asyncio.Event()
     step = h.engine.async_step
 
@@ -27,8 +33,8 @@ async def _pause_active(h, monkeypatch, prompt, params):
         if arrived.is_set():
             return None
         result = await step()
-        if h.rank == 0 and not arrived.is_set() and 0 in h.engine.requests:
-            if len(h.engine.get_request(0).generated_tokens) >= 2:
+        if h.rank == 0 and not arrived.is_set() and request_id in h.engine.requests:
+            if len(h.engine.get_request(request_id).generated_tokens) >= 2:
                 arrived.set()
                 await asyncio.wait_for(release.wait(), timeout=30)
         return result
@@ -38,14 +44,19 @@ async def _pause_active(h, monkeypatch, prompt, params):
     if h.rank == 0:
         future = h.clients[0].add_request(prompt, copy.deepcopy(params))
         await asyncio.wait_for(arrived.wait(), timeout=30)
+        events = len(h.service.events)
         h.clients[0].pause_engines()
-        await until(lambda: any(e["header"] == Headers.PAUSE for e in h.service.events))
+        await until(lambda: any(e["header"] == Headers.PAUSE for e in h.service.events[events:]))
         release.set()
     await asyncio.wait_for(h.engine.wait_until(EngineState.PAUSED), timeout=60)
     monkeypatch.setattr(h.engine, "async_step", step)
     await h.barrier()
     if h.rank == 0:
-        assert 0 < len(h.engine.get_request(0).generated_tokens) < params.num_tokens_to_generate
+        assert (
+            0
+            < len(h.engine.get_request(request_id).generated_tokens)
+            < params.num_tokens_to_generate
+        )
         assert h.witnesses and not future.done()
     return future
 
@@ -133,70 +144,89 @@ async def test_routed_suspend_resumes_active_request(monkeypatch, mode, residenc
         h.assert_retired()
 
 
-@pytest.mark.parametrize("active", [False, True], ids=["queued", "active"])
-async def test_routed_abort_retires_only_cancelled_request(monkeypatch, active):
-    prompt, params = list(range(4, 20)), greedy_params(num_tokens_to_generate=16)
-    async with routed_model(monkeypatch) as h:
-        direct = await h.direct(prompt, params)
-        await h.start()
-        if active:
-            cancelled = await _pause_active(h, monkeypatch, prompt, params)
-        else:
-            await h.pause()
-            if h.rank == 0:
-                cancelled = h.clients[0].add_request(prompt, copy.deepcopy(params))
-                await until(lambda: 0 in h.engine.requests)
-                assert not h.witnesses
+async def _check_abort(h, monkeypatch, prompt, params, direct, active, local_id):
+    """Abort client 0's request; client 1's request under the same local ID survives."""
+    first = h.service.coordinator.next_request_id if h.rank == 0 else None
+    if active:
+        cancelled = await _pause_active(h, monkeypatch, prompt, params, first)
+    else:
+        await h.pause()
         if h.rank == 0:
-            survivor_id, survivor = h.clients[1].add_request_with_id(prompt, copy.deepcopy(params))
-            assert survivor_id == 0
-            await until(lambda: len(h.service.coordinator.request_id_to_rank) == 2)
-            h.clients[0].abort_request(0)
-            assert cancelled.cancelled()
-            await until(lambda: any(e["header"] == Headers.ABORT_REQUEST for e in h.service.events))
-        await h.barrier()
-        await h.unpause()
-        if h.rank == 0:
-            final = await asyncio.wait_for(survivor, timeout=60)
-            assert final["generated_tokens"] == direct["generated_tokens"]
-            await until(lambda: not h.service.coordinator.request_id_to_rank)
-            await until(lambda: not h.clients[0].aborted_request_ids)
-        await h.barrier()
-        h.assert_retired()
+            cancelled = h.clients[0].add_request(prompt, copy.deepcopy(params))
+            await until(lambda: first in h.engine.requests)
+            assert not h.witnesses
+    if h.rank == 0:
+        events = len(h.service.events)
+        survivor_id, survivor = h.clients[1].add_request_with_id(prompt, copy.deepcopy(params))
+        assert survivor_id == local_id
+        await until(lambda: len(h.service.coordinator.request_id_to_rank) == 2)
+        h.clients[0].abort_request(local_id)
+        assert cancelled.cancelled()
+        await until(
+            lambda: any(e["header"] == Headers.ABORT_REQUEST for e in h.service.events[events:])
+        )
+    await h.barrier()
+    await h.unpause()
+    if h.rank == 0:
+        final = await asyncio.wait_for(survivor, timeout=60)
+        assert final["generated_tokens"] == direct["generated_tokens"]
+        await until(lambda: not h.service.coordinator.request_id_to_rank)
+        await until(lambda: not h.clients[0].aborted_request_ids)
+    await h.barrier()
+    h.assert_retired()
 
 
-@pytest.mark.parametrize("synchronous", [False, True])
-async def test_routed_epoch_change_reaches_all_engines(monkeypatch, synchronous):
+async def _check_epoch_change(h, monkeypatch, prompt, params, direct, synchronous):
     """A paused generation update reaches idle peers and the active request."""
-    prompt, params = list(range(4, 20)), greedy_params(num_tokens_to_generate=16)
-    async with routed_model(monkeypatch) as h:
-        direct = await h.direct(prompt, params)
-        await h.start()
-        h.engine.use_synchronous_zmq_collectives = synchronous
-        calls, operation = [], h.engine.world_zmq_communicator.all_reduce_max
+    # The generation epoch outlives requests. A reset while paused clears any epoch an
+    # earlier scenario set, so only the update below stamps this scenario's request.
+    await h.pause()
+    h.engine.reset()
+    await h.unpause()
+    h.engine.use_synchronous_zmq_collectives = synchronous
+    calls, operation = [], h.engine.world_zmq_communicator.all_reduce_max
 
-        async def observed_reduce(*args, **kwargs):
-            result = await operation(*args, **kwargs)
-            calls.append(kwargs["async_op"])
-            return result
+    async def observed_reduce(*args, **kwargs):
+        result = await operation(*args, **kwargs)
+        calls.append(kwargs["async_op"])
+        return result
 
-        monkeypatch.setattr(h.engine.world_zmq_communicator, "all_reduce_max", observed_reduce)
-        future = await _pause_active(h, monkeypatch, prompt, params)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(h.engine.world_zmq_communicator, "all_reduce_max", observed_reduce)
+        first = h.service.coordinator.next_request_id if h.rank == 0 else None
+        future = await _pause_active(h, monkeypatch, prompt, params, first)
         if h.rank == 0:
             h.clients[0].set_generation_epoch(7)
         await until(lambda: h.engine._generation_epoch == 7)
         if h.rank == 0:
-            request = h.engine.get_request(0)
+            request = h.engine.get_request(first)
             assert (request.policy_epoch, request.kv_cache_epoch) == ([(0, 7)], [(0, 7)])
         await h.barrier()
         await h.unpause()
-        assert len(calls) >= 2 and set(calls) == {not synchronous}
-        if h.rank == 0:
-            final = await asyncio.wait_for(future, timeout=60)
-            assert final["generated_tokens"] == direct["generated_tokens"]
-            assert (final["policy_epoch"], final["kv_cache_epoch"]) == ([[0, 7]], [[0, 7]])
-        await h.barrier()
-        h.assert_retired()
+    assert len(calls) >= 2 and set(calls) == {not synchronous}
+    if h.rank == 0:
+        final = await asyncio.wait_for(future, timeout=60)
+        assert final["generated_tokens"] == direct["generated_tokens"]
+        assert (final["policy_epoch"], final["kv_cache_epoch"]) == ([[0, 7]], [[0, 7]])
+    await h.barrier()
+    h.assert_retired()
+
+
+async def test_routed_abort_and_epoch_change(monkeypatch):
+    """Aborts and epoch updates act per request and per signal, so they share one setup."""
+    prompt, params = list(range(4, 20)), greedy_params(num_tokens_to_generate=16)
+    async with routed_model(monkeypatch) as h:
+        direct = await h.direct(prompt, params)
+        await h.start()
+        # Each abort scenario sends one request from each client, both with local ID index.
+        for index, active in enumerate([False, True]):
+            with scenario("abort-active" if active else "abort-queued"):
+                h.witnesses.clear()
+                await _check_abort(h, monkeypatch, prompt, params, direct, active, index)
+        for synchronous in [False, True]:
+            with scenario(f"epoch-synchronous={synchronous}"):
+                h.witnesses.clear()
+                await _check_epoch_change(h, monkeypatch, prompt, params, direct, synchronous)
 
 
 async def test_routed_allocator_pressure_preserves_victim_identity(monkeypatch):
