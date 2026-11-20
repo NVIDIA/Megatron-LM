@@ -96,7 +96,7 @@ def test_forward_backward_parity(dtype, zero_centered, hidden_size):
     x.requires_grad_(True)
     original = x.detach().clone()
     ref_x = x.detach().clone().requires_grad_(True)
-    ref_weight = norm.weight.detach().clone().requires_grad_(True)
+    ref_weight = norm.weight.detach().clone()
     # Liger's "llama" casting: rstd in FP32, round to the input dtype, then scale in FP32.
     rstd = torch.rsqrt(ref_x.float().square().mean(-1, keepdim=True) + 1e-6)
     normalized = (ref_x.float() * rstd).to(dtype)
@@ -105,14 +105,17 @@ def test_forward_backward_parity(dtype, zero_centered, hidden_size):
     grad = torch.randn_like(actual)
     actual.backward(grad)
     expected.backward(grad)
+    # Its weight gradient rounds each dY * x_hat product to the input dtype, then sums in FP32.
+    expected_dw = (grad * normalized.detach()).float().sum(dim=(0, 1)).to(dtype)
     if dtype == torch.float32:
         torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
         grad_tolerance = dict(atol=2e-5, rtol=2e-5)
     else:
         torch.testing.assert_close(actual, expected)  # BF16 defaults: one rounding step
-        grad_tolerance = dict(atol=1e-2, rtol=1.6e-2)
+        # A different rstd summation order can move x_hat by one BF16 step in a few elements.
+        grad_tolerance = dict(atol=2e-2, rtol=1.6e-2)
     torch.testing.assert_close(x.grad, ref_x.grad, **grad_tolerance)
-    torch.testing.assert_close(norm.weight.grad, ref_weight.grad, **grad_tolerance)
+    torch.testing.assert_close(norm.weight.grad, expected_dw, **grad_tolerance)
     torch.testing.assert_close(x, original, atol=0, rtol=0)
 
 
