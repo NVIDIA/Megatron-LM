@@ -1,0 +1,49 @@
+# A dense GELU HybridModel; only PP/VPP and the resulting DP sharding change.
+MODEL_ARGS:
+  --hidden-size: 128
+  --ffn-hidden-size: 256
+  --num-attention-heads: 4
+  --seq-length: 32
+  --max-position-embeddings: 32
+  --spec: [megatron.core.models.hybrid.hybrid_layer_specs, hybrid_stack_spec]
+  --position-embedding-type: rope
+  --normalization: RMSNorm
+  --disable-bias-linear: true
+  --untie-embeddings-and-output-weights: true
+  --transformer-impl: transformer_engine
+  --attention-backend: unfused
+  --bf16: true
+  --tensor-model-parallel-size: 1
+  --context-parallel-size: 1
+  --use-megatron-fsdp: true
+  --megatron-fsdp-version: 2
+  --megatron-fsdp-main-params-dtype: fp32
+  --megatron-fsdp-main-grads-dtype: fp32
+  --data-parallel-sharding-strategy: optim_grads_params
+  --overlap-grad-reduce: true
+  --overlap-param-gather: true
+  --no-gradient-accumulation-fusion: true
+  --ckpt-format: fsdp_dtensor
+  # RNG layouts change with PP/DP; dropout is disabled for the continuation check.
+  --no-save-rng: true
+  --no-load-rng: true
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+  --micro-batch-size: 1
+  --global-batch-size: 16
+  --train-iters: 4
+  --save-interval: 2
+  --lr: 0.0001
+  --lr-decay-iters: 4
+  --lr-decay-style: constant
+  --weight-decay: 0.01
+  --clip-grad: 1.0
+  --seed: 1234
+  --mock-data: true
+  --tokenizer-type: NullTokenizer
+  --vocab-size: 256
+  --make-vocab-size-divisible-by: 64
+  --eval-iters: 0
+  --log-interval: 1
+  --tensorboard-log-interval: 1
+  --no-one-logger: true
