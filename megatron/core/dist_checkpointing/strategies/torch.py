@@ -3,7 +3,6 @@
 """Strategies using PyTorch distributed.checkpoint as an underlying format."""
 
 import dataclasses
-import inspect
 import io
 import os
 import pickle
@@ -860,24 +859,16 @@ class TorchDistSaveShardedStrategy:
 
             if self._metadata_cache is None:
                 self._metadata_cache = CheckpointMetadataCache()
-                if self.cached_global_metadata is not None and hasattr(
-                    self._metadata_cache, "set_cached_global_metadata"
-                ):
+                if self.cached_global_metadata is not None:
                     self._metadata_cache.set_cached_global_metadata(self.cached_global_metadata)
+                    # The cache keeps its own compact copy of the loaded metadata. Drop this
+                    # reference so that the loaded metadata can be freed instead of being
+                    # traversed by every garbage collection for the rest of training.
+                    self.cached_global_metadata = None
             # Define additional arguments
             async_writer_kwargs["use_cached_data_structure"] = self.use_cached_ckpt_structure
             if self.cpu_shm_mode:
-                if (
-                    "use_cpu_shm_for_gpu_tensors"
-                    in inspect.signature(FileSystemWriterAsync.__init__).parameters
-                ):
-                    async_writer_kwargs["use_cpu_shm_for_gpu_tensors"] = True
-                else:
-                    raise AssertionError(
-                        "Installed nvidia-resiliency-ext does not support "
-                        "use_cpu_shm_for_gpu_tensors. Update nvidia-resiliency-ext "
-                        "to enable cpu_shm_mode."
-                    )
+                async_writer_kwargs["use_cpu_shm_for_gpu_tensors"] = True
             state_dict_saver_kwargs["enable_cache"] = self.use_cached_ckpt_structure
             state_dict_saver_kwargs["metadata_cache"] = self._metadata_cache
 
@@ -892,7 +883,7 @@ class TorchDistSaveShardedStrategy:
 
             # This should be set differently if we run in a smaller process group than the default
             coordinator = 0
-            save_state_dict_ret = save_state_dict_async_plan(
+            pending_save = save_state_dict_async_plan(
                 pyt_state_dict,
                 writer,
                 None,
@@ -912,9 +903,9 @@ class TorchDistSaveShardedStrategy:
                 "Please install it to use the async save strategy."
             )
 
-        return self._get_save_and_finalize_callbacks(writer, save_state_dict_ret)
+        return self._get_save_and_finalize_callbacks(writer, pending_save)
 
-    def _get_save_and_finalize_callbacks(self, writer, save_state_dict_ret) -> AsyncRequest:
+    def _get_save_and_finalize_callbacks(self, writer, pending_save) -> AsyncRequest:
         from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest
         from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
             save_state_dict_async_finalize,
@@ -924,7 +915,7 @@ class TorchDistSaveShardedStrategy:
         save_fn, preload_fn, save_args = save_fn_args
 
         def finalize_fn():
-            save_state_dict_async_finalize(*save_state_dict_ret)
+            save_state_dict_async_finalize(pending_save)
 
         return make_nvrx_async_request(
             AsyncRequest, save_fn, save_args, [finalize_fn], preload_fn=preload_fn

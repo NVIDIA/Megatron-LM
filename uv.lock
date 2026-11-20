@@ -2877,7 +2877,7 @@ requires-dist = [
     { name = "numpy" },
     { name = "nvidia-cudnn-frontend", extras = ["cutedsl"], marker = "extra == 'dev'", specifier = "==1.32.0" },
     { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'", specifier = ">=0.49.0rc0" },
-    { name = "nvidia-resiliency-ext", marker = "extra == 'dev'", specifier = "==0.7.0" },
+    { name = "nvidia-resiliency-ext", marker = "extra == 'dev'", git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git?tag=v0.7.1-rc4" },
     { name = "omegaconf", marker = "extra == 'mlm'" },
     { name = "omegaconf", marker = "extra == 'training'" },
     { name = "onnxscript", marker = "extra == 'dev'" },
@@ -3737,13 +3737,13 @@ dependencies = [
     { name = "tqdm" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/69/90/37c335a01cca81c8772b9908c541435f4b4bcbf128376d22702dce7920d8/nvidia_modelopt-0.49.0rc0-py3-none-any.whl", hash = "sha256:f9f55094551c812102516089069acae3f19e09f0fcd9c739261de33ab057af4c", size = 3047916, upload-time = "2026-11-16T17:54:54.727107Z" },
+    { url = "https://files.pythonhosted.org/packages/69/90/37c335a01cca81c8772b9908c541435f4b4bcbf128376d22702dce7920d8/nvidia_modelopt-0.49.0rc0-py3-none-any.whl", hash = "sha256:f9f55094551c812102516089069acae3f19e09f0fcd9c739261de33ab057af4c", size = 3047916, upload-time = "2026-11-16T17:54:54.727Z" },
 ]
 
 [[package]]
 name = "nvidia-resiliency-ext"
-version = "0.7.0"
-source = { registry = "https://pypi.org/simple" }
+version = "0.7.1rc4"
+source = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git?tag=v0.7.1-rc4#d7b9394eacb77366e9b44a94cf71c607e9d38768" }
 dependencies = [
     { name = "defusedxml" },
     { name = "fastapi" },
@@ -3757,16 +3757,11 @@ dependencies = [
     { name = "psutil" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
-    { name = "pyyaml" },
+    { name = "slack-sdk" },
     { name = "slowapi" },
     { name = "torch", marker = "sys_platform == 'never'" },
+    { name = "typing-extensions" },
     { name = "uvicorn", extra = ["standard"] },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/39/75/39f7695a7a384b3879296d8b21ae691fa83c87f1cb30b0381517de14842d/nvidia_resiliency_ext-0.7.0-cp312-cp312-manylinux_2_39_aarch64.whl", hash = "sha256:8cbce0ddb2742484fcc68c1959e69b137cab95a64592b04cf3fca64e2d8f9c21", size = 999871, upload-time = "2026-09-16T06:41:18.163Z" },
-    { url = "https://files.pythonhosted.org/packages/04/a8/bca04e8e193e801e357202d012c08e9f39448ff4bc635f7373ea86ece579/nvidia_resiliency_ext-0.7.0-cp312-cp312-manylinux_2_39_x86_64.whl", hash = "sha256:e0c646ccae211de81a4c2b5bb5cff96a5e12af1373fb0eb818a40716eef685ad", size = 1003318, upload-time = "2026-09-16T06:41:40.233Z" },
-    { url = "https://files.pythonhosted.org/packages/b3/e0/f4e03a406a0af9d78d5cd284873d26a5c9a2dd3576a3a5014466292ee517/nvidia_resiliency_ext-0.7.0-cp314-cp314-manylinux_2_39_aarch64.whl", hash = "sha256:be32379f4647ab3e28382d99386249049fed5b1ce9166d82bb9cfc6233ccb635", size = 1001175, upload-time = "2026-09-16T06:42:00.179Z" },
-    { url = "https://files.pythonhosted.org/packages/b9/7a/b8c547dffac3b484e0d432df86f6be463ee0e843cef88807bdb4dc40e7f5/nvidia_resiliency_ext-0.7.0-cp314-cp314-manylinux_2_39_x86_64.whl", hash = "sha256:4d5d8cd8f20bb25440eef150aedfbb227cba15aa8bf7950c9f0424e079c8b78f", size = 1003705, upload-time = "2026-09-16T06:42:21.939Z" },
 ]
 
 [[package]]
@@ -6198,15 +6193,14 @@ name = "torch"
 version = "2.14.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cuda-bindings", marker = "python_full_version < '3.15' and sys_platform == 'linux'" },
-    { name = "filelock", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "fsspec", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "jinja2", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "networkx", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "setuptools", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "sympy", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "filelock", marker = "sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'" },
+    { name = "fsspec", marker = "sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'" },
+    { name = "jinja2", marker = "sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'" },
+    { name = "networkx", marker = "sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'" },
+    { name = "setuptools", marker = "sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'" },
+    { name = "sympy", marker = "sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'" },
     { name = "triton", marker = "sys_platform == 'never'" },
-    { name = "typing-extensions", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "typing-extensions", marker = "sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'" },
 ]
 
 [[package]]
