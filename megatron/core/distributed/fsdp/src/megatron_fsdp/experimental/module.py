@@ -108,9 +108,7 @@ class FsdpModule:
             )
         self._parameter_groups = tuple(parameter_groups)
         self._trainable_parameter_countdown = Countdown(
-            schedule_policy.grad_accumulation_count
-            if schedule_policy.grad_accumulation_count is not None
-            else sum(1 for _ in self._trainable_fsdp_parameters())
+            sum(1 for _ in self._trainable_fsdp_parameters())
         )
         # The state-dict safety hook is registered unconditionally. It is still
         # required to keep loading a state dict safe when ``schedule_policy.register_hooks`` is
@@ -174,7 +172,10 @@ class FsdpModule:
 
         Without input gradients, PyTorch's module hook fires before internal
         backward. Defer that case to autograd completion instead.
-        Custom schedulers must call context.post_backward() after each microbatch's backward.
+        Custom schedulers using this hook must call context.post_microbatch()
+        after each microbatch's backward to drain deferred callbacks. Call
+        context.post_backward() after all backward work in the schedule to
+        complete execution-order tracking.
         """
 
         def grad_checking_post_backward_hook(module, grad_input, _grad_output):
