@@ -41,6 +41,7 @@ from .parameter_group import (
 )
 from .phase import Phase
 from .placement import BlockAtomic, RowAtomic, ShardLayout
+from .runtime_policy import PrefetchOrder
 from .schedule_policy import SchedulePolicy
 
 
@@ -280,19 +281,16 @@ class FsdpModule:
         if self.is_root():
             context.allgather_stream.wait_stream(context.current_stream())
 
-        order = context.execution_order
-        event = ExecutionEvent(cast(nn.Module, self), Phase.FORWARD)
         if context.is_recording_execution_order:
             # Recomputation is recorded as a forward event too, so later passes prefetch
             # the planes it needs.
-            order.append(event)
+            context.execution_order.append(ExecutionEvent(cast(nn.Module, self), Phase.FORWARD))
             prefetch = False
-        elif is_recomputing:
-            # Only RECORDED orders contain recomputation events. A REGISTRATION order expects
-            # a backward event here.
-            prefetch = order.peek() == event
-        else:
+        elif context.prefetch_order is PrefetchOrder.RECORDED:
             prefetch = True
+        else:
+            # A REGISTRATION order has no recomputation events.
+            prefetch = not is_recomputing
         self.unshard(Phase.FORWARD, prefetch=prefetch)
 
     def unshard(self, phase: Phase | None = None, prefetch: bool = False) -> None:
