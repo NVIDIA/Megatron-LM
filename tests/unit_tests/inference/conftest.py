@@ -8,12 +8,13 @@ from tests.unit_tests.test_utilities import Utils
 
 
 @pytest.fixture(scope="package", autouse=True)
-def no_gloo_process_groups():
-    """Inference tests never use Gloo groups, so their model-parallel setup skips them."""
-    default = Utils.create_gloo_process_groups
-    Utils.create_gloo_process_groups = False
+def lean_process_groups():
+    """Inference tests never use Gloo groups, so their model-parallel setup skips them, and each
+    test's NCCL groups are destroyed when its model parallelism is torn down."""
+    defaults = Utils.create_gloo_process_groups, Utils.destroy_nccl_process_groups
+    Utils.create_gloo_process_groups, Utils.destroy_nccl_process_groups = False, True
     yield
-    Utils.create_gloo_process_groups = default
+    Utils.create_gloo_process_groups, Utils.destroy_nccl_process_groups = defaults
 
 
 @pytest.fixture(scope="package", autouse=True)
