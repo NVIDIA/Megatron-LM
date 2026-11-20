@@ -70,17 +70,18 @@ class _BackwardConfig(NamedTuple):
     MAXNREG: int
 
 
-def get_backward_knobs(m, h, streams, readers=1, *, grid="auto", bf16=False, second=False):
+def get_backward_knobs(m, h, streams, readers=1, *, grid="auto", bf16=False, second=False, ring=0):
     """Select the launch knobs for one shape; an explicit grid overrides the auto grid.
 
     Each CTA stages one row tile in shared memory (the predecessor streams, the update and,
     below six streams, every reader gradient), and the grid keeps as many CTAs per SM as that
     allows, at most four. Four leave 128 registers each, enough only for one reader or one
     stream; three take 168 and fewer take them all. From an 8K-row sweep of widths 2048-10240,
-    1-6 streams, both residual dtypes and all reader variants.
+    1-6 streams, both residual dtypes and all reader variants. ``ring`` adds per-CTA shared
+    bytes (the two-reader store ring or one reader's paired controller shares).
     """
     staged = 2 * (readers + second) if streams < 6 else 0
-    shared = 4096 * ((2 if bf16 else 4) * streams + staged + 2) + 3000
+    shared = 4096 * ((2 if bf16 else 4) * streams + staged + 2) + 3000 + ring
     per_sm = min(_SM_SHARED_BYTES // shared, 4 if readers == 1 or streams == 1 else 3)
     if grid == "auto":
         participants = triton.cdiv(h, 256)
@@ -160,9 +161,17 @@ def backward(
     if on_columns_ready is not None:
         on_columns_ready(columns)
     bf16 = previous.dtype == torch.bfloat16
-    grid, maxnreg = get_backward_knobs(
-        m, h, streams, n, grid=config, bf16=bf16, second=seconds[-1] is not None
+    knobs = lambda ring=0: get_backward_knobs(
+        m, h, streams, n, grid=config, bf16=bf16, second=seconds[-1] is not None, ring=ring
     )
+    grid, maxnreg = knobs()
+    planes = (1 + n + saved.has_retention) * streams
+    # BF16 residuals whose extra shared bytes keep residency: two readers send dR and du through
+    # a ring and TMA bulk stores (whole 256-column tiles); one reader pairs a tile's column
+    # halves, half zero leaving its controller shares for half one (FP32 measured ~1% slower).
+    ring = 8192 if n == 2 else triton.next_power_of_2(planes + n) * 512
+    resident = bf16 and knobs(ring) == (grid, maxnreg)
+    tma_store, paired = resident and n == 2 and h % 256 == 0, resident and n == 1
     # Outputs and scratch belong to this invocation; a shortcut add's updates share one gradient.
     empty = saved.coefficients.new_empty
     du = empty((m, h), dtype=torch.bfloat16)
@@ -172,9 +181,9 @@ def backward(
         *(empty((size,)) if size else None for size in saved.controller_sizes),
         *(empty((h,)) for _ in range(n)),
     )
-    p = triton.cdiv(m, 16) * triton.cdiv(h, 128) * 8
+    # Eight partials per controller plane and (row tile, column tile or half).
+    p = triton.cdiv(m, 16) * triton.cdiv(h, 256 if paired else 128) * 8
     gp = tuple(empty((triton.cdiv(m, 16), h)) for _ in range(n))
-    planes = (1 + n + saved.has_retention) * streams
     controllers = empty((planes + n, p))
     chunks = empty((planes + n, triton.cdiv(p, 1024)))
 
@@ -195,6 +204,7 @@ def backward(
         inputs=_BackwardInputs(saved.coefficients, saved.rstd, saved.gammas, carry, dys, seconds),
         GEOMETRY=_Geometry(m, h, streams, saved.has_retention),
         GRID=grid,
+        PAIRED=paired,
         outputs=_BackwardOutputs(grads[0], grads[1], controllers, pp, gp, epochs),
         CARRY_DESC=_descriptor(carry, _SLICE),
         R_DESC=_descriptor(previous, _SLICE),
@@ -203,6 +213,8 @@ def backward(
         # The last reader's second consumer gradient, staged with the others.
         DY2_DESC=_descriptor(seconds[-1] if staged else None, _SLICE),
         U_DESC=_descriptor(saved.update, _SLICE),
+        DR_DESC=_descriptor(grads[0] if tma_store else None, _SLICE),
+        DU_DESC=_descriptor(du if tma_store else None, _SLICE),
         maxnreg=maxnreg,
         num_warps=4,
         enable_fp_fusion=True,
@@ -356,34 +368,6 @@ def _verify_word(word, pointer, tag):
 
 
 @g.jit
-def _bulk_prefetch_l2(pointer, valid, BYTES: gl.constexpr, THREADS: gl.constexpr):
-    """Warm BYTES at pointer in L2 from each valid thread below THREADS (a hint only).
-
-    Inline PTX: Gluon has no bulk L2 prefetch (``cp.async.bulk.prefetch.L2``). Warming the next
-    claimed tile measured 4-13% of the backward (e.g. hidden 10240: 512 -> 580 us without it).
-    """
-    return gl.inline_asm_elementwise(
-        """
-        {
-            .reg .pred p,owner;
-            .reg .u32 tid;
-            mov.u32 tid,%tid.x;
-            setp.lt.u32 owner,tid,$4;
-            setp.ne.u32 p,$2,0;
-            and.pred p,p,owner;
-            @p cp.async.bulk.prefetch.L2.global [$1],$3;
-            mov.u32 $0,0;
-        }
-        """,
-        "=r,l,r,n,n",
-        [pointer, valid, BYTES, THREADS],
-        dtype=gl.int32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@g.jit
 def _load_dy(inputs, ds, ds2, reader: gl.constexpr, part: gl.constexpr, offset, mask):
     """A reader's FP32 dy slice from global memory or staged BF16, plus a second consumer's
     gradient when the reader has one (staged after the readers' slices)."""
@@ -401,7 +385,7 @@ def _load_dy(inputs, ds, ds2, reader: gl.constexpr, part: gl.constexpr, offset, 
 
 @g.jit
 def _thread_pairs(value):
-    """Eight per-thread (128, 2) column pairs of a 16x128 slice, in _store_controller order."""
+    """Eight per-thread (128, 2) column pairs of a 16x128 slice, in _controller_partial order."""
     owned = gl.permute(gl.reshape(value, (4, 4, 4, 8, 4)), (2, 1, 3, 0, 4))
     # Per-thread index a*4 + e = (a_hi, a_lo, e_hi, e_lo); e_lo pairs adjacent columns. Peel
     # e_hi, a_lo, then a_hi off the last axis.
@@ -415,16 +399,53 @@ def _thread_pairs(value):
 
 
 @g.jit
-def _store_controller(destination, a, b, valid):
-    """Reduce each 16x128 slice of a * b into eight fixed lane-group controller partials, each
-    thread's products accumulated as one packed FMA chain."""
+def _controller_partial(a, b):
+    """This thread's share of sum(a * b) over a 16x128 slice: its products accumulated as one
+    packed FMA chain, then its pair summed; _store_partial reduces the shares into eight fixed
+    lane-group controller partials (stores are deferred to the end of each stream)."""
     pa = _thread_pairs(a)
     pb = _thread_pairs(b)
     acc = _mul2(pa[0], pb[0])
     for k in gl.static_range(1, 8):
         acc = _fma2(pa[k], pb[k], acc)
-    total = gl.sum(gl.reshape(gl.sum(acc, 1), (8, 16)), 1)
+    return gl.sum(acc, 1)
+
+
+@g.jit
+def _store_partial(destination, partial, valid):
+    """Reduce _controller_partial shares into eight lane-group partials and store them."""
+    total = gl.sum(gl.reshape(partial, (8, 16)), 1)
     gl.store(destination + gl.arange(0, 8, layout=total.type.layout), total, valid)
+
+
+@g.jit
+def _defer(queued, a, b, PLANE: gl.constexpr, at, PART: gl.constexpr):
+    """Queue this thread's share of sum(a * b) for controller plane PLANE, stored at
+    ``row + PLANE * stride`` for ``at = (row, stride, valid[, shares])``. With ``shares``,
+    paired halves leave half zero's share in slot PLANE and queue the pair's sum from half one
+    (``valid`` zeroes a half past H)."""
+    share = _controller_partial(a, b)
+    destination = at[0] + PLANE * at[1]
+    if len(at) == 3:
+        queued += ((destination, share),)
+    else:
+        share = gl.where(at[2], share, 0)
+        slot = at[3].slice(PLANE * 128, 128)
+        if PART == 0:
+            slot.store(share)
+        else:
+            queued += ((destination, slot.load(share.type.layout) + share),)
+    return queued
+
+
+@g.jit
+def _pick(cs, scalars, INDEX: gl.constexpr):
+    """Coefficient INDEX: a uniform scalar when loaded once (one reader), else the shared table."""
+    if len(scalars):
+        value = scalars[INDEX]
+    else:
+        value = _coefficient(cs, INDEX)
+    return value
 
 
 @g.jit
@@ -434,22 +455,55 @@ def _partial_offset(reader, rr, cc, NT: gl.constexpr):
 
 
 @g.jit
+def _prefetch_warp_rows(base, rows, ROW: gl.constexpr, STRIDE: gl.constexpr, BYTES: gl.constexpr):
+    """Warm BYTES in L2 at ``base + (warp * 4 + ROW) * STRIDE`` from lane 0 of each of the four
+    warps when that tile row is below ``rows`` (a hint). The address is uniform within a warp,
+    so the bulk prefetch stays one instruction (per-thread addresses make the compiler loop).
+
+    Inline PTX: Gluon has no bulk L2 prefetch (``cp.async.bulk.prefetch.L2``). Warming the next
+    claimed tile measured 4-13% of the backward (e.g. hidden 10240: 512 -> 580 us without it).
+    """
+    return gl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred p, q;
+            .reg .u32 tid, lane, row;
+            .reg .u64 offset, address;
+            mov.u32 tid,%tid.x;
+            and.b32 lane,tid,31;
+            shr.u32 row,tid,5;
+            mad.lo.u32 row,row,4,$3;
+            setp.lt.u32 q,row,$2;
+            setp.eq.and.u32 p,lane,0,q;
+            mul.wide.u32 offset,row,$4;
+            add.s64 address,$1,offset;
+            @p cp.async.bulk.prefetch.L2.global [address],$5;
+            mov.u32 $0,0;
+        }
+        """,
+        "=r,l,r,n,n,n",
+        [base, rows, ROW, STRIDE, BYTES],
+        dtype=gl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@g.jit
 def _prefetch(P, rp, cp, GEOMETRY: gl.constexpr):
-    """Warm this tile's carry rows (every stream's 256 columns) in L2."""
+    """Warm this tile's carry rows (every stream's 256 columns) in L2: each warp four rows (a
+    width's partial last column tile gets no hint)."""
     h: gl.constexpr = GEOMETRY.H
     streams: gl.constexpr = GEOMETRY.STREAMS
     ELEMENT: gl.constexpr = P.dtype.element_ty.primitive_bitwidth // 8
-    rr = rp * 16 + gl.arange(0, 16, layout=gl.constexpr(BlockedLayout([1], [32], [4], [0])))
     cc = cp * 256
+    rows = gl.minimum(GEOMETRY.M - rp * 16, 16)
+    if h % 256:
+        rows = gl.where(cc + 256 <= h, rows, 0)
     for stream in gl.static_range(streams):
-        row = P + rr * (streams * h) + stream * h + cc
-        valid = rr < GEOMETRY.M
-        if h % 256:
-            # A short final tile keeps a single 128-column hint inside the stream.
-            tail = valid & (cc + 128 <= h) & (cc + 256 > h)
-            _bulk_prefetch_l2(row, tail.to(gl.int32), 128 * ELEMENT, 16)
-            valid &= cc + 256 <= h
-        _bulk_prefetch_l2(row, valid.to(gl.int32), 256 * ELEMENT, 16)
+        base = P + rp * 16 * (streams * h) + stream * h + cc
+        for r in gl.static_range(4):
+            _prefetch_warp_rows(base, rows, r, streams * h * ELEMENT, 256 * ELEMENT)
 
 
 @g.jit
@@ -468,6 +522,18 @@ def _load_carry_zero(carry, rows, cols, GEOMETRY: gl.constexpr, MASKED: gl.const
     if MASKED:
         return _widen_bf16(gl.load(pointer, _in_range(rows, cols, GEOMETRY), 0))
     return _widen_bf16(gl.load(pointer))
+
+
+@g.jit
+def _tma_store(DESC, slot, value, row, column):
+    """Store one 16x128 slice through a ring slot and a TMA bulk store (rows past M clip)."""
+    slot.store(value)
+    fence_async_shared()
+    # The issuer's earlier bulk stores have read their slots (the other ring slot, written
+    # next, among them) before the barrier releases any thread to write it.
+    tma.store_wait(0)
+    gl.barrier()
+    tma.async_copy_shared_to_global(DESC, [row, column], slot)
 
 
 @g.jit
@@ -512,12 +578,15 @@ def _backward_body(
     outputs,
     GEOMETRY: gl.constexpr,
     GRID: gl.constexpr,
+    PAIRED: gl.constexpr,
     CARRY_DESC,
     R_DESC,
     DY0_DESC,
     DY1_DESC,
     DY2_DESC,
     U_DESC,
+    DR_DESC,
+    DU_DESC,
 ):
     """Persistent 16-row tiles in width-spanning CTA groups; ticket admission (each group
     reserves its first tile) keeps partial groups from starving. Prefetches refill consumed
@@ -543,6 +612,11 @@ def _backward_body(
     if SECOND:
         ds2 = gl.allocate_shared_memory(DY2_DESC.dtype, [32, 128], DY2_DESC.layout)
     update_shared = gl.allocate_shared_memory(U_DESC.dtype, [32, 128], U_DESC.layout)
+    # Two readers' dR and du leave through a two-slot ring (every tile issues an even count).
+    TMA_STORE: gl.constexpr = DR_DESC is not None
+    out_shared = None
+    if TMA_STORE:
+        out_shared = gl.allocate_shared_memory(DR_DESC.dtype, [32, 128], DR_DESC.layout)
 
     # One column half of a tile's TMA copies: every predecessor stream, the staged BF16 dys, U.
     BITS: gl.constexpr = R_DESC.dtype.primitive_bitwidth * streams + U_DESC.dtype.primitive_bitwidth
@@ -588,15 +662,36 @@ def _backward_body(
         if SECOND:
             reader_copies += ((DY2_DESC, ds2, column_tile * 256),)
     reader_copies += ((U_DESC, update_shared, column_tile * 256),)
-    COEFFICIENTS: gl.constexpr = triton.next_power_of_2(4 * streams)
-    cs = gl.allocate_shared_memory(gl.float32, [COEFFICIENTS], LINEAR_SHARED)
-    ci = gl.arange(0, COEFFICIENTS, layout=gl.constexpr(BlockedLayout([1], [32], [4], [0])))
+    # One reader with a BF16 residual lands carries s > 0 in the dy and U slices, free once a
+    # column half's gradient phase holds dy and U, so they are requested a whole half early.
+    EARLY_CARRY: gl.constexpr = not TWO and R_DESC.dtype.primitive_bitwidth == 16 and streams <= 3
+    if EARLY_CARRY:
+        landed = ()
+        for c in gl.static_range(streams - 1):
+            landed += ((CARRY_DESC, reader_copies[c][1], carry_copies[c][2]),)
+        carry_copies = landed
     gs = gl.allocate_shared_memory(gl.float32, [NREADERS * 256], LINEAR_SHARED)
+    # Half zero's controller shares, one word per thread and plane (write, retention and read
+    # per stream, then raw b); only the owning thread touches a word.
+    PLANES: gl.constexpr = triton.next_power_of_2((2 + retention) * streams + 1)
+    shares = (
+        gl.allocate_shared_memory(gl.float32, [PLANES * 128], LINEAR_SHARED) if PAIRED else None
+    )
     gamma_cc = column_tile * 256 + gl.arange(0, 256, layout=_COLUMNS)
     for reader in gl.static_range(NREADERS):
         saved_gamma = gl.load(inputs.gammas[reader] + gamma_cc, gamma_cc < h, 0)
         gs.slice(reader * 256, 256).store(saved_gamma.to(gl.float32))
-    cs.store(gl.load(inputs.coefficients + ci, ci < 4 * streams, 0))
+    # One reader keeps the launch's coefficients as uniform scalars, loaded once (identical
+    # FP32 values); two readers have no registers to spare and read a shared table.
+    coefficient, cs = (), None
+    if TWO:
+        COEFFICIENTS: gl.constexpr = triton.next_power_of_2(4 * streams)
+        cs = gl.allocate_shared_memory(gl.float32, [COEFFICIENTS], LINEAR_SHARED)
+        ci = gl.arange(0, COEFFICIENTS, layout=gl.constexpr(BlockedLayout([1], [32], [4], [0])))
+        cs.store(gl.load(inputs.coefficients + ci, ci < 4 * streams, 0))
+    else:
+        for i in gl.static_range(4 * streams):
+            coefficient += (gl.load(inputs.coefficients + i),)
     row_tile = group
     iteration = 0
 
@@ -623,7 +718,7 @@ def _backward_body(
             claimed = GROUPS + gl.atomic_add(row_tile_counter, 1, sem="relaxed")
             _publish_word(next_tile_word, claimed, tag, 127)
             block = outputs.projection + claimed * BLOCK
-            _bulk_prefetch_l2(block, (claimed < total_tiles).to(gl.int32), BLOCK * 8, 1)
+            _prefetch_warp_rows(block, (claimed < total_tiles).to(gl.int32), 0, 0, BLOCK * 8)
 
         # Wait for column half zero only; half one is awaited inside the reader phase.
         mbarrier.wait(copy_barrier, iteration & 1, deps=copy_deps)
@@ -635,11 +730,11 @@ def _backward_body(
             rs += (gl.load(inputs.rstd[reader] + rr, rr < m, 0),)
         alphas, mixes = ((),) * NREADERS, (0.0,) * NREADERS
         for s in gl.static_range(streams):
-            retain = _coefficient(cs, streams + s) if retention else 1.0
-            write = _coefficient(cs, s)
+            retain = _pick(cs, coefficient, streams + s) if retention else 1.0
+            write = _pick(cs, coefficient, s)
             new_alphas, new_mixes = (), ()
             for reader in gl.static_range(NREADERS):
-                beta = _coefficient(cs, (2 + reader) * streams + s)
+                beta = _pick(cs, coefficient, (2 + reader) * streams + s)
                 new_alphas += (alphas[reader] + (beta * retain,),)
                 new_mixes += (gl.fma(beta, write, mixes[reader]),)
             alphas, mixes = new_alphas, new_mixes
@@ -659,10 +754,10 @@ def _backward_body(
                 xs = new_xs
             new_projections = ()
             for reader in gl.static_range(NREADERS):
-                z = _fma2(mixes[reader], u, xs[reader]) * rs[reader][:, None]
+                z = _mul2(_fma2(mixes[reader], u, xs[reader]), rs[reader][:, None])
                 dy = _load_dy(inputs, ds, ds2, reader, part, rr[:, None] * h + cols, mask)
                 gamma = gs.slice(reader * 256 + part * 128, 128).load(_COLUMNS)
-                new_projections += (projections[reader] + (dy * gamma[None, :]) * z,)
+                new_projections += (_fma2(_mul2(dy, gamma[None, :]), z, projections[reader]),)
                 # Gamma partials: sum over this tile's 16 rows of dy * z.
                 gamma_partials = outputs.gamma_partials[reader] + row_tile * h + cc + part * 128
                 gl.store(
@@ -720,27 +815,34 @@ def _backward_body(
         # Two readers skip the carry mask when every scheduled element is in range.
         MASKED: gl.constexpr = not TWO or h % 256 != 0
         prefetch_active = next_rp < total_tiles
-        stride = gl.cdiv(m, 16) * gl.cdiv(h, 128) * 8  # between controller partial planes
+        COLUMN_SLOTS: gl.constexpr = gl.cdiv(h, 256) if PAIRED else gl.cdiv(h, 128)
+        stride = gl.cdiv(m, 16) * COLUMN_SLOTS * 8  # between controller partial planes
+        # Planes: write and retention per stream, each reader's read per stream, then raw b.
+        READ_PLANE: gl.constexpr = (1 + retention) * streams
+        U_PLANE: gl.constexpr = (1 + retention + NREADERS) * streams
         for part in gl.static_range(2):
             cols = (cc + part * 128)[None, :]
             rows = rr[:, None]
             mask = _in_range(rows, cols, GEOMETRY)
             offset = rows * h + cols
+            column_slot = column_tile if PAIRED else column_tile * 2 + part
             controller_row = (
-                outputs.controller_partials
-                + (row_tile * gl.cdiv(h, 128) + column_tile * 2 + part) * 8
+                outputs.controller_partials + (row_tile * COLUMN_SLOTS + column_slot) * 8
             )
-            u_rows = controller_row + (1 + retention + NREADERS) * streams * stride
             valid = (row_tile * 16 < m) & (column_tile * 2 + part < gl.cdiv(h, 128))
+            # Half one's paired store also covers a half zero whose half one lies past H.
+            store_valid = (row_tile * 16 < m) if PAIRED else valid
+            at = (controller_row, stride, valid if h % 256 else True)
+            at += (shares,) if PAIRED else ()
             refill = (carry_copies, residual_copies, barriers, copy_barriers[part], row_tile)
-            if TWO:
-                # One dR row pointer per slice; stream offsets become store immediates.
-                residual_grad_rows = outputs.residual_grad + (rows * (streams * h) + cols)
+            # One dR row pointer per slice; stream offsets become store immediates.
+            residual_grad_rows = outputs.residual_grad + (rows * (streams * h) + cols)
 
             joint_coefficients = ()
             for i in gl.static_range(4 * streams):
-                joint_coefficients += (_coefficient(cs, i),)
+                joint_coefficients += (_pick(cs, coefficient, i),)
 
+            queued = ()
             u = _widen_bf16(update_shared.slice(part * 16, 16).load(L))
             incoming_zero = _load_carry_zero(inputs.carry, rows, cols, GEOMETRY, MASKED)
             dxs = ()
@@ -764,9 +866,14 @@ def _backward_body(
                 dxs += (_mul2(_fma2(_mul2(x, -r), p, dz), r),)
                 update_mixes += (update_mix,)
 
+            if EARLY_CARRY and streams > 1:
+                _sync()
+                for c in gl.static_range(streams - 1):
+                    mbarrier.expect(barriers[c], 16 * 128 * 2)
+                    _copy_tiles((carry_copies[c],), row_tile, barriers[c], part)
             if not TWO:
                 for reader in gl.static_range(NREADERS):
-                    _store_controller(u_rows + reader * stride, u, dxs[reader], valid)
+                    queued = _defer(queued, u, dxs[reader], U_PLANE + reader, at, part)
             du = gl.full((16, 128), 0, gl.float32, L)
 
             if TWO:
@@ -794,19 +901,29 @@ def _backward_body(
                     _refill_slice(s, refill, next_rp, part)
                 w = joint_coefficients[s]
                 t = joint_coefficients[streams + s] if retention else 1.0
-                controller = controller_row + s * stride
                 if TWO and s == 0:
                     for reader in gl.static_range(NREADERS):
-                        _store_controller(u_rows + reader * stride, u, dxs[reader], valid)
+                        queued = _defer(queued, u, dxs[reader], U_PLANE + reader, at, part)
                 # Raw a[r, s] = sum(Rprev_s * dx_r); the final reduction forms t * a + w * b.
                 for reader in gl.static_range(NREADERS):
-                    reads = controller + (1 + retention + reader) * streams * stride
-                    _store_controller(reads, R_prev_s, dxs[reader], valid)
-                if not TWO and (s + 1 < streams or prefetch_active):
+                    queued = _defer(
+                        queued, R_prev_s, dxs[reader], READ_PLANE + reader * streams + s, at, part
+                    )
+                if EARLY_CARRY and prefetch_active:
+                    # Slice s goes straight to the next tile; so does the dy/U slice whose
+                    # carry the previous stream consumed.
+                    _sync()
+                    _copy_tiles((residual_copies[s],), next_rp, copy_barriers[part], part)
+                    if s > 1:
+                        _copy_tiles((reader_copies[s - 2],), next_rp, copy_barriers[part], part)
+                if not TWO and not EARLY_CARRY and (s + 1 < streams or prefetch_active):
                     _sync()
                     _refill_slice(s, refill, next_rp, part)
+                    if s > 0 and prefetch_active:
+                        # The previous stream's consumed carry slice (or dy/U) for the next tile.
+                        deferred = reader_copies if s == 1 else (residual_copies[s - 2],)
+                        _copy_tiles(deferred, next_rp, copy_barriers[part], part)
 
-                wide = rows * (streams * h) + s * h + cols
                 if s == 0:
                     incoming_dR_s = incoming_zero
                 else:
@@ -818,7 +935,7 @@ def _backward_body(
                     _sync()
                     _copy_tiles((residual_copies[s - 1],), next_rp, copy_barriers[part], part)
                 if retention:
-                    _store_controller(controller + streams * stride, incoming_dR_s, R_prev_s, valid)
+                    queued = _defer(queued, incoming_dR_s, R_prev_s, streams + s, at, part)
                 if h % 256:
                     incoming_dR_s = gl.where(cols < h, incoming_dR_s, 0)
                 # Differentiate the rounded folded coefficients alpha = FP32(beta * t).
@@ -827,30 +944,47 @@ def _backward_body(
                     alpha = joint_coefficients[(2 + reader) * streams + s] * t
                     d_previous = _fma2(alpha, dxs[reader], d_previous)
 
-                if not TWO:
+                if not TWO and not EARLY_CARRY and s + 1 == streams and prefetch_active:
                     _sync()
-                    # Start the next tile into the consumed column half.
-                    if prefetch_active:
-                        pending = reader_copies if s == 0 else (residual_copies[s - 1],)
-                        _copy_tiles(pending, next_rp, copy_barriers[part], part)
+                    # Start the next tile into the consumed column half (the last stream's slice;
+                    # earlier ones went out at the following stream's release barrier).
+                    pending = reader_copies if s == 0 else (residual_copies[s - 1],)
+                    _copy_tiles(pending, next_rp, copy_barriers[part], part)
 
-                if TWO:
-                    dR_pointer = residual_grad_rows + s * h
-                else:
-                    dR_pointer = outputs.residual_grad + wide
                 d_previous = d_previous.to(outputs.residual_grad.dtype.element_ty)  # RN for BF16
-                gl.store(dR_pointer, d_previous, mask, cache_modifier=OUTPUT_CACHE)
+                if TMA_STORE:
+                    store_column = s * h + column_tile * 256 + part * 128
+                    slot = out_shared.slice((part * (streams + 1) + s) % 2 * 16, 16)
+                    _tma_store(DR_DESC, slot, d_previous, row_tile * 16, store_column)
+                else:
+                    pointer = residual_grad_rows + s * h
+                    gl.store(pointer, d_previous, mask, cache_modifier=OUTPUT_CACHE)
                 # du accumulates the carry here and the readers' q * dx after the streams.
                 du = _fma2(w, incoming_dR_s, du)
-                _store_controller(controller, incoming_dR_s, u, valid)
+                queued = _defer(queued, incoming_dR_s, u, s, at, part)
+                for k in gl.static_range(len(queued)):
+                    _store_partial(queued[k][0], queued[k][1], store_valid)
+                queued = ()
 
+            if EARLY_CARRY and prefetch_active:
+                # The reader slices not yet handed back: the last carry's and every unused one.
+                _sync()
+                for c in gl.static_range(max(0, streams - 2), len(reader_copies)):
+                    _copy_tiles((reader_copies[c],), next_rp, copy_barriers[part], part)
             for reader in gl.static_range(NREADERS):
                 du = _fma2(update_mixes[reader], dxs[reader], du)
 
-            gl.store(outputs.update_grad + offset, du, mask, cache_modifier=OUTPUT_CACHE)
+            if TMA_STORE:
+                store_column = column_tile * 256 + part * 128
+                slot = out_shared.slice((part * (streams + 1) + streams) % 2 * 16, 16)
+                _tma_store(DU_DESC, slot, du.to(gl.bfloat16), row_tile * 16, store_column)
+            else:
+                gl.store(outputs.update_grad + offset, du, mask, cache_modifier=OUTPUT_CACHE)
 
         row_tile = next_rp
         iteration += 1
+    if TMA_STORE:
+        tma.store_wait(0)
 
 
 # One kernel body; its profiler name gives the variant (reader count).

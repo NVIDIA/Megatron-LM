@@ -1391,27 +1391,30 @@ def test_reads_feed_every_declared_linear_from_one_column_take(monkeypatch, form
 
 
 @REQUIRES_FUSED_BACKWARD
+@pytest.mark.parametrize("readers", [1, 2])
 @pytest.mark.parametrize("dtype", [F32, BF16])
-def test_two_consumers_gradients_reach_the_kernel_separately(monkeypatch, dtype):
+def test_two_consumers_gradients_reach_the_kernel_separately(monkeypatch, dtype, readers):
     """A reader with two BF16 consumers returns two outputs sharing its storage; their gradients
     reach the backward kernel as a pair (no add before it), and the seam's gradients match one
     pre-summed gradient up to that sum's BF16 rounding."""
-    raw = inputs(3, 2, 2048, 2048, residual_dtype=dtype, logit_dtype=dtype, pad=0)
+    raw = inputs(3, readers, 2048, 2048, residual_dtype=dtype, logit_dtype=dtype, pad=0)
     seen = []
     spy(monkeypatch, backward_kernel, "backward", lambda s, p, dys, *a, **k: seen.append(dys))
-    out = run(raw, 3, outputs=("bf16", ("bf16", "bf16")))
-    first, second = out[2]
+    out = run(raw, 3, outputs=("bf16",) * (readers - 1) + (("bf16", "bf16"),))
+    first, second = out[readers]
     assert first.data_ptr() == second.data_ptr() and first is not second
     g0, g1 = torch.randn_like(first), torch.randn_like(first)
-    torch.autograd.backward((out[1], first, second), (torch.zeros_like(out[1]), g0, g1))
+    zeros = tuple(map(torch.zeros_like, out[1:readers]))
+    torch.autograd.backward((*out[1:readers], first, second), (*zeros, g0, g1))
     (dys,) = seen
-    assert isinstance(dys[1], tuple) and torch.equal(dys[1][0], g0) and torch.equal(dys[1][1], g1)
+    assert isinstance(dys[-1], tuple) and torch.equal(dys[-1][0], g0)
+    assert torch.equal(dys[-1][1], g1)
     paired = [t.grad.clone() for t in (raw[0], *raw[1])]
 
     clone = lambda t: t.detach().clone().requires_grad_()
     raw_ref = (clone(raw[0]), *(tuple(map(clone, group)) for group in raw[1:]))
     ref = run(raw_ref, 3)
-    torch.autograd.backward((ref[1], ref[2]), (torch.zeros_like(ref[1]), g0 + g1))
+    torch.autograd.backward(ref[1 : readers + 1], (*zeros, g0 + g1))
     for actual, expected in zip(paired, (raw_ref[0].grad, *(u.grad for u in raw_ref[1]))):
         torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
 
