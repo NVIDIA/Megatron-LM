@@ -75,6 +75,7 @@ def _build_engine(case, backend, fa_version, *, modality, engines, wire=False):
         max_tokens=256,
         materialize_only_last_token_logits=False,
         vision_embedding_cache_max_bytes=1 << 20,
+        gc_mode=bi.GC_MODE,
     )
     options.update(case.context)
     context = bi.DynamicInferenceContext(language, bi.InferenceConfig(**options))

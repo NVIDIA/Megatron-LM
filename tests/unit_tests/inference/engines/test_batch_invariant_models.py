@@ -88,6 +88,7 @@ def _build_model_engine(case, backend, version, *, mamba, engines, patch):
         materialize_only_last_token_logits=False,
         use_cuda_graphs_for_non_decode_steps=False,
         async_sched_mode="legacy",
+        gc_mode=bi.GC_MODE,
     )
     context_options.update(case.context)
     ctx = DynamicInferenceContext(cfg, InferenceConfig(**context_options))
