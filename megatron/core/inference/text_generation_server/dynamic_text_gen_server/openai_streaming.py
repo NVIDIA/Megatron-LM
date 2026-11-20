@@ -176,7 +176,8 @@ class StreamingChatParser:
         if reasoning.startswith(self._reasoning_sent):
             reasoning_delta = reasoning[len(self._reasoning_sent) :]
             if reasoning_delta:
-                deltas.append({"reasoning_content": reasoning_delta})
+                # `reasoning` is vLLM's field; `reasoning_content` is its older name.
+                deltas.append({"reasoning": reasoning_delta, "reasoning_content": reasoning_delta})
                 self._reasoning_sent = reasoning
 
         # Buffer partial control-marker prefixes so parser syntax is not emitted as content.

@@ -5,6 +5,10 @@ from typing import Any
 class BaseParser:
     """Base class for text parsers."""
 
+    # Tool parsers set this to strip a non-streamed turn's content when it carries tool calls
+    # (and drop it when only whitespace remains), as vLLM's tool parsers do.
+    strip_content_with_tool_calls: bool = False
+
     @staticmethod
     def parse(text: str, **kwargs) -> tuple[str, dict[str, Any]]:
         """
