@@ -31,7 +31,7 @@ from megatron.core.fusions import fused_mhc_kernels
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_moe_residual_add import fused_moe_residual_add
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
-from megatron.core.fusions.fused_row_copy import contiguous_rows
+from megatron.core.fusions.fused_row_copy import cat_last_dim, contiguous_rows
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa_teacher_lse import (
     fused_csa_teacher_lse,
 )
@@ -318,6 +318,29 @@ def test_contiguous_rows_replays_and_matches_torch(width, start, stop, dtype):
     )
     assert outputs["out"].is_contiguous()
     assert bytes_equal(outputs["out"], view.detach().contiguous())
+
+
+@pytest.mark.parametrize("widths", [(7168, 7168), (300, 77)])
+def test_cat_last_dim_replays_and_matches_torch(widths):
+    """cat_last_dim (torch.cat forward, contiguous_rows backward) replays and agrees bit for bit
+    with torch.cat, forward and backward."""
+    seeded()
+    a = torch.randn(4096, 1, widths[0], device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    b = torch.randn(4096, 1, widths[1], device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    grad = torch.randn(4096, 1, sum(widths), device="cuda", dtype=torch.bfloat16)
+    outputs, grads = assert_replays_bit_exact(
+        cat_last_dim,
+        (a, b),
+        replays=3,
+        grad_outputs={"out": grad},
+        contention=True,
+        what="cat_last_dim",
+    )
+    assert bytes_equal(outputs["out"], torch.cat((a, b), -1).detach())
+    ref_grads = [grad[..., : widths[0]].contiguous(), grad[..., widths[0] :].contiguous()]
+    assert len(grads) == 2
+    for got, want in zip(grads.values(), ref_grads):
+        assert bytes_equal(got, want)
 
 
 # --- MoE output residual add ---------------------------------------------------------------
