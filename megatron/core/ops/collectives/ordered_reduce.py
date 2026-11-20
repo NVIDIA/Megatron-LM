@@ -11,8 +11,8 @@ in an fp32 accumulator (fp64 for fp64 inputs) with one final rounding, so the bi
 only on the partials. Training and inference run these same kernels, so they agree bitwise.
 
 Paths (all bitwise identical):
-  * pull (training and inference): the GEMM writes into a symmetric buffer; one kernel reads the owned
-    rows from every peer and folds them in rank order.
+  * pull (training and inference): the GEMM writes into a symmetric buffer. One kernel reads
+    the owned rows from every peer and folds them in rank order.
   * all-to-all + fold: NCCL fallback for groups without symmetric memory.
 
 The all-reduce is reduce-scatter + all-gather. Only forward reductions use these paths.

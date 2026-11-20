@@ -1541,8 +1541,9 @@ class TransformerConfig(ModelParallelConfig):
 
     batch_invariant_collective: Literal["ordered", "multimem"] = "ordered"
     """Cross-rank EP combine collective under batch_invariant_mode (TP reductions always use
-    the fp32 rank-order fold of ops/collectives/ordered_reduce.py). "ordered" (default) reduces with an explicit fixed rank-order fp32 Triton kernel —
-    deterministic by construction on any hardware. "multimem" keeps the native
+    the fp32 rank-order fold of ops/collectives/ordered_reduce.py). "ordered" (default)
+    reduces with an explicit fixed rank-order fp32 Triton kernel — deterministic by
+    construction on any hardware. "multimem" keeps the native
     NVLS in-switch reduce-scatter: measured to return the correctly-rounded
     exact fp32 sum (bitwise-equal to an fp64 reference over 16.7M adversarial
     channels on B200), deterministic and batch-invariant, with better scaling
