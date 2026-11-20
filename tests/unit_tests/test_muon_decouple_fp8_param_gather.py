@@ -97,12 +97,12 @@ def _snapshot_params(model, include_quantized=False):
 
 
 def _snapshot_layerwise_grad_data(ddp):
-    # grad_data of the non-DistOpt LayerWise buffers (reused as the fp8 all-gather's bf16
-    # receive buffer, which the param-sync finalize must re-zero).
+    # In this compact layout only the LayerWise buffers are unsharded. Their grad_data
+    # receives the BF16 all-gather and must be zeroed again when parameter sync finishes.
     return [
         buf.grad_data.detach().clone()
         for buf in (ddp.buffers + ddp.expert_parallel_buffers)
-        if not buf.ddp_config.use_distributed_optimizer
+        if buf.num_optimizer_shards is None
     ]
 
 
