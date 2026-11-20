@@ -1331,6 +1331,12 @@ class TransformerConfig(ModelParallelConfig):
     attention_cp_layout: CPLayout = "zigzag"
     """CP layout for softmax-attention layers."""
 
+    cp_partition_mode: Literal["zigzag", "contiguous", "auto"] | None = None
+    """Residual-stream layout policy. Concrete modes convert only the attention/mixer branch;
+    auto coalesces equal-layout layers. None retains the existing main policy and defaults.
+    Consumer layouts linear_cp_layout and attention_cp_layout remain kernel requirements.
+    """
+
     ##################
     # Cuda Graphs
     ##################
@@ -1878,6 +1884,23 @@ class TransformerConfig(ModelParallelConfig):
 
     def _validate_cp_layouts(self) -> None:
         """Validate context-parallel layout settings."""
+        if self.cp_partition_mode not in (None, "auto", "zigzag", "contiguous"):
+            raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode!r}")
+        boundary = (
+            self.linear_cp_layout
+            if self.cp_partition_mode in (None, "auto")
+            else self.cp_partition_mode
+        )
+        converts = any(x != boundary for x in (self.linear_cp_layout, self.attention_cp_layout))
+        if self.cp_partition_mode is not None and self.context_parallel_size > 1 and converts:
+            if self.enable_mhc_connections or self.wide_residual is not None:
+                raise ValueError(
+                    "Explicit CP layout conversion with cross-layer residual state is not "
+                    "supported; leave cp_partition_mode unset to retain the existing main path"
+                )
+            if self.sequence_parallel and self.tensor_model_parallel_size % 2:
+                if self.tensor_model_parallel_size > 1:
+                    raise ValueError("Sequence-parallel CP conversion requires even TP size")
         if self.linear_cp_mode == "chunkwise" and self.linear_cp_layout != "contiguous":
             raise ValueError("linear_cp_mode='chunkwise' requires linear_cp_layout='contiguous'.")
         if (
@@ -2137,7 +2160,9 @@ class TransformerConfig(ModelParallelConfig):
             )
 
             # Check tensor parallelism compatibility
-            tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
+            tp_cp_size = self.tensor_model_parallel_size * (
+                self.context_parallel_size if self.linear_cp_mode == "headwise" else 1
+            )
             assert self.linear_num_key_heads % tp_cp_size == 0, (
                 f"{self.linear_num_key_heads=} must be a multiple of "
                 f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."

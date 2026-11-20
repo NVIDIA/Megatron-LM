@@ -2537,6 +2537,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.kept_packed_seq_params.discard("seq_idx")
         self.kept_packed_seq_params.discard("tokens_per_sample")
         self.kept_packed_seq_params.discard("cp_scatter_cache")
+        self.kept_packed_seq_params.discard("cp_partition_mode")
+        self.kept_packed_seq_params.discard("cp_layout_views")
         # Runtime groups belong to MCore layout conversion and CP binding, not TE's forward API.
         self.kept_packed_seq_params.difference_update({"cp_group", "local_cp_size", "tp_cp_group"})
 

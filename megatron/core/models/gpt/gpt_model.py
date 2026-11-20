@@ -135,6 +135,15 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 "Hash-routed MoE is supported only by HybridModel because GPTModel does not "
                 "forward token IDs to transformer layers."
             )
+        if (
+            config.mtp_num_layers
+            and config.cp_partition_mode in ("zigzag", "contiguous")
+            and config.cp_partition_mode != config.attention_cp_layout
+        ):
+            raise ValueError(
+                "GPTModel MTP requires its residual layout to match attention_cp_layout; "
+                "use HybridModel for MTP across different CP layouts"
+            )
         super().__init__(config=config, pg_collection=pg_collection)
         # MTP depth is model-wide; non-MTP pipeline stages still freeze their backbone.
         if self.config.mtp_kl_loss_weight > 0 and (

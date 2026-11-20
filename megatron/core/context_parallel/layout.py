@@ -12,6 +12,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.mappings import all_to_all
 
 CPLayout = Literal["contiguous", "zigzag"]
+CpPartitionMode = CPLayout
 
 
 @dataclass(frozen=True)
@@ -356,6 +357,8 @@ def _build_thd_zigzag_metadata(
     cu_seqlens: torch.Tensor, cu_seqlens_padded: torch.Tensor | None, cp_size: int, tp_size: int
 ) -> _THDZigzagMetadata:
     """Build padded dual-chunk metadata without Transformer Engine helpers."""
+    if cp_size < 1 or tp_size < 1:
+        raise ValueError("CP and TP sizes must be positive")
     if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
         raise ValueError("cu_seqlens must be one-dimensional with at least two entries")
     if cu_seqlens.dtype != torch.int32:
@@ -392,12 +395,25 @@ def _build_thd_zigzag_metadata(
 
     # These values must be host-known by the route allocator and PackedSeqParams. Read them back
     # together so target-layout metadata does not add another device synchronization.
-    target_token_count, pad_between_seqs = torch.stack(
+    logical_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    valid_boundaries = (
+        (cu_seqlens[0] == 0)
+        & (source_cu_seqlens[0] == 0)
+        & torch.all(logical_lengths >= 0)
+        & torch.all(source_lengths >= logical_lengths)
+    )
+    target_token_count, pad_between_seqs, valid_boundaries = torch.stack(
         (
             target_cu_seqlens[-1].to(torch.int64),
             torch.any(cu_seqlens != target_cu_seqlens).to(torch.int64),
+            valid_boundaries.to(torch.int64),
         )
     ).tolist()
+    if not valid_boundaries:
+        raise ValueError(
+            "Packed boundaries must start at zero, be nondecreasing, and provide at least "
+            "the logical length of each sequence in physical storage"
+        )
 
     target_positions = torch.arange(target_token_count, dtype=torch.int64, device=cu_seqlens.device)
     sequence_ids = torch.searchsorted(target_cu_seqlens[1:], target_positions, right=True)
@@ -653,6 +669,45 @@ def convert_cp_layout(
     raise ValueError(f"Unsupported CP layout conversion: {source_layout} to {target_layout}")
 
 
+def convert_cp_partition_mode(
+    x: torch.Tensor,
+    *,
+    source_partition_mode: CPLayout,
+    target_partition_mode: CPLayout,
+    seq_dim: int = 0,
+    sequence_parallel: bool = False,
+    cp_group: torch.distributed.ProcessGroup | None = None,
+    tp_group: torch.distributed.ProcessGroup | None = None,
+    tp_cp_group: torch.distributed.ProcessGroup | None = None,
+    thd_plan: THDCPLayoutPlan | None = None,
+) -> torch.Tensor:
+    """Convert a tensor using the canonical CP or TP x CP redistribution plan.
+
+    This partition-mode spelling shares the implementation of ``convert_cp_layout``.
+    For THD, pass the plan produced by ``get_batches_on_this_cp_rank`` and use that
+    batch's target-layout metadata. Changing a layout name on the source metadata is
+    insufficient: padding can change the physical sequence lengths during conversion.
+    Route construction belongs to batch preparation, never to this conversion edge.
+    """
+    for mode in (source_partition_mode, target_partition_mode):
+        if mode not in ("contiguous", "zigzag"):
+            raise ValueError(f"Expected a concrete CP partition mode, got {mode!r}")
+    if cp_group is None or cp_group.size() == 1 or source_partition_mode == target_partition_mode:
+        return x
+    moved = x.movedim(seq_dim, 0) if seq_dim != 0 else x
+    converted = convert_cp_layout(
+        moved,
+        source_partition_mode,
+        target_partition_mode,
+        cp_group,
+        sequence_parallel,
+        tp_group,
+        tp_cp_group,
+        thd_plan,
+    )
+    return converted.movedim(0, seq_dim).contiguous() if seq_dim != 0 else converted
+
+
 @dataclass(eq=False)
 class ContextParallelLayoutManager:
     """Manage CP layout transitions across a sequence of layers."""
@@ -663,10 +718,17 @@ class ContextParallelLayoutManager:
     cp_group: torch.distributed.ProcessGroup
     tp_group: torch.distributed.ProcessGroup | None
     tp_cp_group: torch.distributed.ProcessGroup | None
+    boundary_mode: Literal["auto", "fixed"] = "auto"
+    cuda_graph_impl: str = "none"
     requires_conversion: bool = field(init=False)
 
     def __post_init__(self) -> None:
         """Determine whether the layer sequence needs layout conversion."""
+        if self.boundary_mode not in ("auto", "fixed"):
+            raise ValueError(f"Unsupported CP boundary mode: {self.boundary_mode}")
+        for layout in (self.boundary_layout, *self.layer_layouts):
+            if layout not in ("contiguous", "zigzag"):
+                raise ValueError(f"Expected a concrete CP layout, got {layout!r}")
         self.requires_conversion = self.cp_group.size() > 1 and any(
             layout != self.boundary_layout for layout in self.layer_layouts
         )
@@ -680,15 +742,15 @@ class ContextParallelLayoutManager:
     ) -> torch.Tensor:
         if not self.requires_conversion:
             return hidden_states
-        return convert_cp_layout(
+        return convert_cp_partition_mode(
             hidden_states,
-            source_layout,
-            target_layout,
-            self.cp_group,
-            self.sequence_parallel,
-            self.tp_group,
-            self.tp_cp_group,
-            thd_plan,
+            source_partition_mode=source_layout,
+            target_partition_mode=target_layout,
+            cp_group=self.cp_group,
+            sequence_parallel=self.sequence_parallel,
+            tp_group=self.tp_group,
+            tp_cp_group=self.tp_cp_group,
+            thd_plan=thd_plan,
         )
 
     def prepare_layer_input(
@@ -696,7 +758,9 @@ class ContextParallelLayoutManager:
     ) -> torch.Tensor:
         """Convert when a layer requires a different layout than its predecessor."""
         source_layout = (
-            self.boundary_layout if layer_index == 0 else self.layer_layouts[layer_index - 1]
+            self.boundary_layout
+            if layer_index == 0 or self.boundary_mode == "fixed"
+            else self.layer_layouts[layer_index - 1]
         )
         return self._convert_cp_layout(
             hidden_states, source_layout, self.layer_layouts[layer_index], thd_plan
@@ -705,8 +769,8 @@ class ContextParallelLayoutManager:
     def finalize_layer_output(
         self, layer_index: int, hidden_states: torch.Tensor, thd_plan: THDCPLayoutPlan | None = None
     ) -> torch.Tensor:
-        """Restore the boundary layout after the final layer."""
-        if layer_index != len(self.layer_layouts) - 1:
+        """Restore the boundary after every fixed-layout layer, or after an auto run."""
+        if self.boundary_mode == "auto" and layer_index != len(self.layer_layouts) - 1:
             return hidden_states
         return self._convert_cp_layout(
             hidden_states, self.layer_layouts[layer_index], self.boundary_layout, thd_plan
@@ -727,6 +791,11 @@ class ContextParallelLayoutManager:
         """
         if not self.requires_conversion:
             return None
+
+        if thd_plan is not None and self.cuda_graph_impl == "full_iteration":
+            raise ValueError(
+                "Full-iteration CUDA graphs cannot replay variable THD CP route splits"
+            )
 
         if thd_plan is not None and packed_seq_params_by_layout is not None:
             return ContextParallelLayoutState(

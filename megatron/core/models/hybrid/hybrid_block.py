@@ -14,6 +14,7 @@ import torch
 from torch import Tensor, nn
 
 from megatron.core.context_parallel import ContextParallelLayoutManager, CPLayout, THDCPLayoutPlan
+from megatron.core.context_parallel.module import get_cp_boundary_layout, uses_fixed_cp_layout
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
@@ -180,7 +181,7 @@ class HybridStack(MegatronModule):
         # Its auxiliary stack therefore remains ordinary width when the decoder is wide.
         self.uses_wide_residual_stream = self.config.wide_residual is not None and not is_mtp_layer
         boundary_layout = (
-            self.config.linear_cp_layout if boundary_layout is None else boundary_layout
+            get_cp_boundary_layout(self.config) if boundary_layout is None else boundary_layout
         )
         self.mtp_layer_number = mtp_layer_number
         self.boundary_layout = boundary_layout
@@ -216,6 +217,26 @@ class HybridStack(MegatronModule):
             )
             for layer_config in self.layer_config_list
         )
+        module_input_layouts = self.layer_cp_layouts
+        module_compute_layouts = list(self.layer_cp_layouts)
+        if uses_fixed_cp_layout(self.config):
+            if (
+                any(layout != self.boundary_layout for layout in self.layer_cp_layouts)
+                and (self.cp_group.size() > 1 or self.config.dynamic_context_parallel)
+                and (self.config.enable_mhc_connections or self.config.wide_residual is not None)
+            ):
+                raise ValueError(
+                    "Fixed CP conversion with cross-layer residual state is unsupported"
+                )
+            for layer_config, consumer_layout in zip(self.layer_config_list, self.layer_cp_layouts):
+                if (
+                    layer_utils.get_custom_layer_type(layer_config) is not None
+                    and consumer_layout != self.boundary_layout
+                    and (self.cp_group.size() > 1 or self.config.dynamic_context_parallel)
+                ):
+                    raise ValueError("Custom layers need an explicit module CP boundary adapter")
+            module_input_layouts = (self.boundary_layout,) * len(self.layer_cp_layouts)
+            self.layer_cp_layouts = module_input_layouts
         self._cp_layout_manager = None
         if self.cp_group.size() > 1:
             self._cp_layout_manager = ContextParallelLayoutManager(
@@ -225,6 +246,7 @@ class HybridStack(MegatronModule):
                 cp_group=self.cp_group,
                 tp_group=self.tp_group,
                 tp_cp_group=self.tp_cp_group,
+                cuda_graph_impl=self.config.cuda_graph_impl,
             )
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
@@ -399,9 +421,30 @@ class HybridStack(MegatronModule):
                     "wide-residual layer classes; "
                     f"layer {layer_number} constructed {type(layer).__name__}."
                 )
+            module_compute_layouts[i] = getattr(
+                getattr(layer, "self_attention", None), "cp_input_layout", module_compute_layouts[i]
+            )
+            layer._cp_input_partition_mode = (
+                module_input_layouts[i]
+                if uses_fixed_cp_layout(self.config)
+                else module_compute_layouts[i]
+            )
+            layer._cp_compute_partition_mode = module_compute_layouts[i]
+            layer._cp_layout_conversion_enabled = uses_fixed_cp_layout(self.config)
             if self.config.enable_mhc_connections:
                 layer = HyperConnectionHybridLayer(config=layer_config, layer=layer)
             self.layers.append(layer)
+
+        # Auto and fixed policies must agree on the actual kernel consumer contract.
+        self.required_cp_layouts = frozenset((self.boundary_layout, *module_compute_layouts))
+        if (
+            not uses_fixed_cp_layout(self.config)
+            and tuple(module_compute_layouts) != self.layer_cp_layouts
+        ):
+            self.layer_cp_layouts = tuple(module_compute_layouts)
+            if self._cp_layout_manager is not None:
+                self._cp_layout_manager.layer_layouts = self.layer_cp_layouts
+                self._cp_layout_manager.__post_init__()
 
         if self.config.cuda_graph_impl == "local":
             annotate_first_last_layer(self.layers)
@@ -533,6 +576,7 @@ class HybridStack(MegatronModule):
             cp_group=runtime_cp_group,
             tp_group=self.tp_group,
             tp_cp_group=runtime_tp_cp_group,
+            cuda_graph_impl=self.config.cuda_graph_impl,
         )
 
     def set_input_tensor(self, input_tensor: Tensor):
@@ -657,10 +701,16 @@ class HybridStack(MegatronModule):
             and runtime_cp_group.size() > 1
             and packed_seq_params is not None
         ):
-            if packed_seq_params.seq_idx is None:
+            linear_params = packed_seq_params
+            if packed_seq_params_by_layout is not None:
+                linear_params = packed_seq_params_by_layout["contiguous"]
+            elif packed_seq_params.cp_layout_views is not None:
+                # Metadata-only callers still provide the consumer's physical view.
+                linear_params = packed_seq_params.cp_layout_views.contiguous
+            if linear_params.seq_idx is None:
                 raise ValueError("Packed chunkwise CP requires packed_seq_params.seq_idx")
             packed_sequence_cp_metadata = build_packed_sequence_cp_metadata(
-                packed_seq_params.seq_idx,
+                linear_params.seq_idx,
                 cp_rank=runtime_cp_group.rank(),
                 cp_size=runtime_cp_group.size(),
             )

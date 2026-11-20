@@ -2835,6 +2835,7 @@ def get_batch_on_this_cp_rank(
     dynamic_cp_group_func: Optional[Callable[[int], torch.distributed.ProcessGroup]] = None,
     use_per_sequence_balancing: bool = False,
     use_contiguous_cp: bool = False,
+    cp_partition_mode: Optional[str] = None,
 ):
     """Dispatch batch partitioning across context-parallel ranks.
 
@@ -2864,11 +2865,20 @@ def get_batch_on_this_cp_rank(
             masking where document lengths are not divisible by
             ``2 * cp_size``).
         use_contiguous_cp (bool): Use contiguous sequence shards for the linear CP layout.
+        cp_partition_mode (Optional[str]): Concrete layout spelling for adapters. When given,
+            selects the same sharder as use_contiguous_cp; conflicting arguments are rejected.
 
     Returns:
         Dict[str, Any]: The batch with sequence-dimension tensors partitioned
         to this CP rank.
     """
+
+    if cp_partition_mode is not None:
+        if cp_partition_mode not in ("zigzag", "contiguous"):
+            raise ValueError(f"Expected a concrete CP partition mode, got {cp_partition_mode!r}")
+        if use_contiguous_cp and cp_partition_mode != "contiguous":
+            raise ValueError("use_contiguous_cp=True conflicts with cp_partition_mode='zigzag'")
+        use_contiguous_cp = cp_partition_mode == "contiguous"
 
     if dynamic_cp:
         cp_group = _resolve_dynamic_cp_group_for_batch(batch, dynamic_cp_group_func)
