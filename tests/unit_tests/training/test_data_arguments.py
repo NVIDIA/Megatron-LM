@@ -170,3 +170,67 @@ def test_data_section_accepts_everything_validate_args_accepts(warnings_log, ext
     assert data.dataset.create_attention_mask == args.create_attention_mask_in_dataloader
     assert data.dataloader.dataloader_type == args.dataloader_type
     assert data.dataset_type is not None
+
+
+@pytest.mark.parametrize("packed_flag", ["--dataloader-inter-document-masking", "--sft"])
+def test_padded_static_cp_enables_pipeline_shape_exchange(monkeypatch, packed_flag):
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    args = _validated(
+        [packed_flag, "--context-parallel-size", "2", "--pipeline-model-parallel-size", "2"]
+    )
+
+    assert args.sequence_packing_scheduler is None
+    assert args.variable_seq_lengths is True
+
+
+def test_dense_static_cp_keeps_fixed_pipeline_shapes(monkeypatch):
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    args = _validated(["--context-parallel-size", "2", "--pipeline-model-parallel-size", "2"])
+
+    assert args.variable_seq_lengths is False
+
+
+@pytest.mark.parametrize(
+    "moe_args",
+    [
+        ["--moe-token-dispatcher-type", "allgather"],
+        ["--moe-router-load-balancing-type", "quantile_balancing", "--moe-aux-loss-coeff", "0"],
+    ],
+    ids=["allgather", "quantile-balancing"],
+)
+def test_aligned_sft_cp_without_pipeline_accepts_moe(monkeypatch, moe_args):
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    args = _validated(["--sft", "--context-parallel-size", "2", "--num-experts", "4", *moe_args])
+
+    # Construct the core config too: allgather rejects variable_seq_lengths there.
+    config = argument_utils.core_transformer_config_from_args(args)
+
+    assert config.variable_seq_lengths is False
+    assert config.num_moe_experts == 4
+
+
+@pytest.mark.parametrize(
+    "moe_args, message",
+    [
+        (["--moe-token-dispatcher-type", "allgather"], "different token counts"),
+        (
+            ["--moe-router-load-balancing-type", "quantile_balancing", "--moe-aux-loss-coeff", "0"],
+            "padding masks required",
+        ),
+    ],
+    ids=["allgather", "quantile-balancing"],
+)
+def test_inter_document_cp_rejects_unsupported_moe(monkeypatch, moe_args, message):
+    monkeypatch.setenv("WORLD_SIZE", "2")
+
+    with pytest.raises(ValueError, match=message):
+        _validated(
+            [
+                "--dataloader-inter-document-masking",
+                "--context-parallel-size",
+                "2",
+                "--num-experts",
+                "4",
+                *moe_args,
+            ]
+        )

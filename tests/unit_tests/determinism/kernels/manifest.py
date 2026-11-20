@@ -421,9 +421,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_moe_kernels.py",
             "tests/unit_tests/transformer/moe/test_virtual_experts.py",
             "tests/unit_tests/transformer/moe/test_aux_loss.py",
+            "tests/unit_tests/transformer/moe/test_packed_samples.py",
         ),
         kind="torch.compile",
         notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing. "
+        "Packed per-sample loss and gradients match the "
+        "rectangular reference across TP/CP without router padding. "
         "Fused aux_loss, seq_aux_loss and global_aux_loss replay their logged scalar, "
         "input and router-weight gradients with fused TopK routing, and compare to the unfused reference.",
     ),

@@ -1281,13 +1281,18 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
 
         Returns:
             (hidden_states, padding_mask, input_ids, mbs) where mbs is None if no
-            un-flattening was applied.
+            un-flattening was applied. Packed inputs with explicit sample lengths
+            remain flat; their router computes per-sample statistics directly.
         """
         if (
             not self.is_moe_layer
             or packed_seq_params is None
             or getattr(packed_seq_params, 'tokens_per_sample', None) is None
         ):
+            return hidden_states, padding_mask, input_ids, None
+
+        if packed_seq_params.moe_sample_lengths is not None:
+            # The router computes per-sample statistics directly from the flat input.
             return hidden_states, padding_mask, input_ids, None
 
         tokens_per_sample = packed_seq_params.tokens_per_sample
@@ -1299,7 +1304,11 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
         # from sample 1, etc. A plain reshape would keep that ordering, but we
         # need dim 0 to be the token position and dim 1 to be the sample index,
         # so view + transpose is required.
-        hidden_states = hidden_states.view(mbs, tokens_per_sample, -1).transpose(0, 1).contiguous()
+        hidden_states = (
+            hidden_states.view(mbs, tokens_per_sample, hidden_states.size(-1))
+            .transpose(0, 1)
+            .contiguous()
+        )
         if padding_mask is not None:
             padding_mask = padding_mask.view(mbs, tokens_per_sample)
         if input_ids is not None:
