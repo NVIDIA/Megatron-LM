@@ -1329,10 +1329,8 @@ class _HybridEPManager(_DispatchManager):
         self._original_num_tokens = None
         self._padded_num_tokens = None
         if self.config.cuda_graph_impl == "none":
-            # Each autograd invocation retains its own backward handle. Keeping
-            # these forward references on the manager also retains the last
-            # router outputs and their graph after backward, until the next
-            # dispatch replaces them. Release them after their last eager use.
+            # Drop these references so the manager does not retain the router graph.
+            # Autograd keeps the state needed for backward.
             self.token_probs = None
             self.routing_map = None
             self.topk_idx = None
