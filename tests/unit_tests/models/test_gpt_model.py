@@ -188,6 +188,46 @@ class TestGPTModel:
         assert logits.shape[1] == sequence_length
         assert logits.shape[2] == self.gpt_model.vocab_size
 
+    @pytest.mark.parametrize("mode", ["train", "eval", "inference"])
+    @pytest.mark.parametrize("sequence_length,micro_batch_size", [(4, 2), (4, 1), (1, 2)])
+    def test_postprocess_logits_view(self, mode, sequence_length, micro_batch_size):
+        model = self.gpt_model.cuda()
+        model.train(mode != "eval")
+        hidden_states = torch.randn(
+            sequence_length, micro_batch_size, model.config.hidden_size, device="cuda"
+        )
+        hidden_states.requires_grad_()
+        projected_logits = []
+
+        def capture_projection(module, args, output):
+            projected_logits.append(output[0])
+
+        with model.output_layer.register_forward_hook(capture_projection):
+            with InferenceMode.active() if mode == "inference" else nullcontext():
+                actual = model._postprocess(
+                    hidden_states=hidden_states,
+                    input_ids=None,
+                    position_ids=None,
+                    labels=None,
+                    rotary_pos_emb=None,
+                    rotary_pos_cos=None,
+                    rotary_pos_sin=None,
+                    runtime_gather_output=True,
+                )
+
+        expected = projected_logits[0].transpose(0, 1).contiguous()
+        assert torch.equal(actual, expected)
+        assert actual.is_contiguous() == (micro_batch_size == 1 or sequence_length == 1)
+        assert actual.data_ptr() == projected_logits[0].data_ptr()
+
+        inputs = (hidden_states, model.output_layer.weight)
+        actual_grads = torch.autograd.grad(
+            F.log_softmax(actual, dim=-1).square().sum(), inputs, retain_graph=True
+        )
+        expected_grads = torch.autograd.grad(F.log_softmax(expected, dim=-1).square().sum(), inputs)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+            assert torch.equal(actual_grad, expected_grad)
+
     @pytest.mark.internal
     def test_output_processor_forward(self):
         config: TransformerConfig = self.gpt_model.config

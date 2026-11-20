@@ -932,8 +932,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             log_config_to_disk(self.config, payload, prefix='input_and_logits')
 
         if labels is None:
-            # [s b h] => [b s h]
-            return logits.transpose(0, 1).contiguous()
+            # [s b h] => [b s h]. Let consumers materialize contiguous storage if needed.
+            return logits.transpose(0, 1)
 
         loss = self.compute_language_model_loss(labels, logits)
 

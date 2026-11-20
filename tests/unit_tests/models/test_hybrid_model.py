@@ -1,6 +1,7 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
 import os
+from contextlib import nullcontext
 from datetime import timedelta
 from itertools import accumulate
 from types import SimpleNamespace
@@ -43,7 +44,7 @@ from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config 
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
+from megatron.core.utils import WrappedTensor, divide, is_fa_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
 
 try:
@@ -336,6 +337,41 @@ class TestHybridModel:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("mode", ["train", "eval", "inference"])
+    def test_logits_view(self, monkeypatch, mode):
+        model = self.model.cuda().train(mode == "train")
+        hidden_states = torch.randn(4, 2, model.config.hidden_size, device="cuda")
+        hidden_states.requires_grad_()
+        projected_logits = []
+
+        def decoder_forward(**kwargs):
+            hidden = kwargs["hidden_states"]
+            return hidden.unwrap() if isinstance(hidden, WrappedTensor) else hidden
+
+        def capture_projection(module, args, output):
+            projected_logits.append(output[0])
+
+        monkeypatch.setattr(model.decoder, "forward", decoder_forward)
+        with model.output_layer.register_forward_hook(capture_projection):
+            with InferenceMode.active() if mode == "inference" else nullcontext():
+                actual = model(
+                    input_ids=None,
+                    position_ids=None,
+                    attention_mask=None,
+                    decoder_input=hidden_states,
+                    runtime_gather_output=True,
+                )
+
+        expected = projected_logits[0].transpose(0, 1).contiguous()
+        assert not actual.is_contiguous()
+        assert actual.data_ptr() == projected_logits[0].data_ptr()
+        assert torch.equal(actual, expected)
+        inputs = (hidden_states, model.output_layer.weight)
+        actual_grads = torch.autograd.grad(actual.square().sum(), inputs, retain_graph=True)
+        expected_grads = torch.autograd.grad(expected.square().sum(), inputs)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+            torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
 
     def test_constructor(self):
         assert isinstance(self.model, HybridModel)

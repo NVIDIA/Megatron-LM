@@ -1106,8 +1106,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             self.output_layer.sequence_parallel = True
 
         if labels is None:
-            # [s b h] => [b s h]
-            return logits.transpose(0, 1).contiguous()
+            # [s b h] => [b s h]. Let consumers materialize contiguous storage if needed.
+            return logits.transpose(0, 1)
 
         loss = self.compute_language_model_loss(labels, logits)
 

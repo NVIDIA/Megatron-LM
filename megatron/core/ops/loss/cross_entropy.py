@@ -21,7 +21,10 @@ class VocabParallelCrossEntropy:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Calculates logits_max."""
 
-        vocab_parallel_logits = vocab_parallel_logits.float()
+        # Cast directly into contiguous storage; same-dtype .to() may preserve strides.
+        vocab_parallel_logits = vocab_parallel_logits.to(
+            dtype=torch.float32, memory_format=torch.contiguous_format
+        ).contiguous()
         # Maximum value along vocab dimension across all GPUs.
         logits_max = torch.max(vocab_parallel_logits, dim=-1)[0]
 
