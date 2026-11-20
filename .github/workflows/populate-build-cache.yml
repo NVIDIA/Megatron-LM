@@ -160,8 +160,6 @@ jobs:
         with:
           ref: 68f829281ffec0a158f2c875b0f3273a035292b4
           path: mfsdp-source
-      - name: Login to ECR
-        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
       - name: Trace the exact passing image
         shell: bash
         run: |
