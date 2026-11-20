@@ -186,6 +186,7 @@ def test_bf16_params_master_param_format(model_parallel, store_param_remainders)
     assert masters and all(master.dtype == expected_dtype for master in masters)
 
 
+
 @pytest.mark.parametrize("store_param_remainders", [None, True])
 @pytest.mark.parametrize("fp8_recipe", ["tensorwise", "mxfp8", "blockwise"])
 def test_optimizer_cuda_graph_with_bf16_params(model_parallel, fp8_recipe, store_param_remainders):
@@ -342,6 +343,78 @@ def _load_parameter_state(optimizer, model, sharding_type, ckpt_dir):
         _model_sharded_state_dict(model), metadata=metadata, is_loading=True
     )
     optimizer.load_state_dict(load({"optimizer": sharded_state_dict}, ckpt_dir)["optimizer"])
+
+
+def _save_legacy_parameter_state(optimizer, model, sharding_type, ckpt_dir):
+    """Like _save_parameter_state, but without the param remainders flag, as checkpoints saved
+    before it existed."""
+    if sharding_type == "torch":
+        state_dict = optimizer.get_parameter_state_dp_zero()
+        if state_dict is not None:
+            del state_dict["param_state_param_remainders"]
+        if optimizer.data_parallel_group.rank() == 0:
+            torch.save(state_dict, str(ckpt_dir / "param_state.pt"))
+        torch.distributed.barrier()
+        return
+    metadata = {"distrib_optim_sharding_type": sharding_type, "checkpoint_version": 3.1}
+    sharded_state_dict = optimizer.sharded_state_dict(
+        _model_sharded_state_dict(model), metadata=metadata
+    )
+    del sharded_state_dict["param_state_param_remainders"]
+    # dp_zero_gather_scatter wraps the DP-rank-0 gathered state, which records the flag too.
+    gathered_state = getattr(sharded_state_dict["param_state"], "data", None)
+    if isinstance(gathered_state, dict):
+        del gathered_state["param_state_param_remainders"]
+    save({"optimizer": sharded_state_dict}, ckpt_dir)
+
+
+@pytest.mark.parametrize(
+    "sharding_type", ["torch", "dp_zero_gather_scatter", "fully_reshardable", "dp_reshardable"]
+)
+@pytest.mark.parametrize("fp8_recipe", ["tensorwise", "mxfp8"])
+def test_resume_mcore_managed_checkpoint_with_te_owned_master_weights(
+    model_parallel, tmp_path_dist_ckpt, monkeypatch, sharding_type, fp8_recipe
+):
+    """The upgrade path: before BF16 params could use TE-owned master weights, the
+    precision-aware optimizer kept MCore-managed FP32 main params with any non-delayed FP8
+    recipe, and its checkpoints have no param remainders flag. Resuming one with BF16 params must
+    load the same FP32 master weights and Adam moments into TE FusedAdam, then keep training."""
+    name = f"mcore_managed_to_te_owned_{sharding_type}_{fp8_recipe}"
+    with TempNamedDir(tmp_path_dist_ckpt / name, sync=True) as ckpt_dir:
+        model = _ddp_model()
+        with monkeypatch.context() as patch:
+            # Left unresolved, the config gates TE ownership as earlier versions did.
+            patch.setattr(OptimizerConfig, "resolve_fp8_param_gather", lambda self, _: self)
+            _, optimizer = _get_optimizer(model, fp8_recipe)
+        (saving,) = optimizer.chained_optimizers
+        assert not saving.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+        _train_step(model, optimizer)
+        _train_step(model, optimizer)
+        saved_states = {
+            param_name: {
+                key: value.detach().clone()
+                for key, value in saving._get_main_param_and_optimizer_states(param).items()
+            }
+            for param_name, param in model.module.named_parameters()
+            if param in saving.model_param_group_index_map
+        }
+        _save_legacy_parameter_state(saving, model, sharding_type, ckpt_dir)
+
+        _, optimizer = _get_optimizer(model, fp8_recipe)
+        (loading,) = optimizer.chained_optimizers
+        assert loading.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+        # The default keeps full FP32 master weights, so the legacy checkpoint loads as is.
+        assert not loading._stores_param_remainders()
+        _load_parameter_state(loading, model, sharding_type, ckpt_dir)
+        for param_name, param in model.module.named_parameters():
+            if param_name not in saved_states:
+                continue
+            loaded_state = loading._get_main_param_and_optimizer_states(param)
+            assert set(loaded_state) == set(saved_states[param_name])
+            for key, saved_value in saved_states[param_name].items():
+                assert loaded_state[key].dtype == saved_value.dtype, key
+                assert torch.equal(loaded_state[key], saved_value), key
+        _train_step(model, optimizer)
 
 
 def test_quantized_params_with_bf16_ddp_flags_raise_a_clear_error(model_parallel):
