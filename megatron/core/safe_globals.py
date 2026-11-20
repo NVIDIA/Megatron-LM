@@ -151,6 +151,12 @@ class SafeDCPUnpickler(SafeUnpickler):
             ("torch.distributed.checkpoint.metadata", "ChunkStorageMetadata"),
             ("torch.distributed.checkpoint.metadata", "BytesStorageMetadata"),
             ("torch.distributed.checkpoint.metadata", "_MEM_FORMAT_ENCODING"),
+            # Recent torch versions embed the save plan (and its write items) in the
+            # metadata (e.g. under ``planner_data``); these are plain dataclasses/enums.
+            ("torch.distributed.checkpoint.planner", "SavePlan"),
+            ("torch.distributed.checkpoint.planner", "WriteItem"),
+            ("torch.distributed.checkpoint.planner", "WriteItemType"),
+            ("torch.distributed.checkpoint.planner", "TensorWriteData"),
         }
     )
 
