@@ -8,6 +8,9 @@ drives them. `mamba_ssm` holds the decode-step kernels and
 `batch_invariant_decode` the buffered-replay variant used when
 `batch_invariant_mode` is on.
 
+`cudnn_ssd` is the exception: it wraps the cuDNN frontend's CuTe DSL training
+kernels, selected with `mamba_kernel_backend='cudnn'`.
+
 Kernels that are not specific to this recurrence (the causal convolution, state
 gather/scatter, autotune determinism) live in `ops.common`.
 """
