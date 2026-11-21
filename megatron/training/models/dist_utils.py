@@ -352,8 +352,8 @@ def _ddp_wrap(
 
     cuda_graph_impl = get_model_config(model[0]).cuda_graph_impl
     current_stream = torch.cuda.current_stream()
-    if cuda_graph_impl == "full_iteration":
-        # DDP initialization must use the full-iteration capture stream so its retained
+    if cuda_graph_impl in ("full_iteration", "local"):
+        # DDP initialization must use the CUDA graph capture stream so its retained
         # AccumulateGrad nodes do not reference a different, non-capturing stream.
         ddp_stream = get_shared_capture_stream()
     elif cuda_graph_impl == "none":
