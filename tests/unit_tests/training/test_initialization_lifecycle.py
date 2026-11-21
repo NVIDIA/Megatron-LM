@@ -897,8 +897,6 @@ def test_callback_upcycling_uses_temporary_dense_config(monkeypatch, run_config)
     args.expert_model_parallel_size = 1
     args.ffn_hidden_size = 64
     run_config.model = GPTModelConfig(
-        moe_use_upcycling=True,
-        moe_upcycling_granularity=2,
         transformer=TransformerConfig(
             num_layers=2,
             hidden_size=32,

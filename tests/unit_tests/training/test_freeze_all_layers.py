@@ -14,7 +14,6 @@ from types import SimpleNamespace
 
 import torch
 
-from megatron.training.config import TrainingConfig
 from megatron.training.training import _forward_backward_grad_context, _freeze_all_model_chunks
 
 
@@ -154,9 +153,9 @@ def test_unfrozen_returns_nullcontext_and_not_forward_only():
     assert forward_only is False
 
 
-def test_default_config_is_not_frozen():
-    """The native training config keeps autograd enabled by default."""
-    grad_context, forward_only = _forward_backward_grad_context(TrainingConfig())
+def test_missing_flag_defaults_to_not_frozen():
+    """A minimal args mock (no freeze_all_layers attr) is treated as unfrozen."""
+    grad_context, forward_only = _forward_backward_grad_context(SimpleNamespace())
 
     assert isinstance(grad_context, nullcontext)
     assert forward_only is False

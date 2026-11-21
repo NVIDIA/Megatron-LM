@@ -307,6 +307,7 @@ def check_checkpoint_args(
     ``ckpt_format`` is the format of this load (default: the run's checkpoint section's).
     """
     cfg = get_run_config()
+    args = get_args() if is_args_initialized() else None
     use_dist_ckpt = (cfg.checkpoint.ckpt_format if ckpt_format is None else ckpt_format) != 'torch'
     skip_args = skip_args or set()
 
@@ -321,7 +322,7 @@ def check_checkpoint_args(
         else:
             ckpt_arg_name = arg_name
         config_name = config_name or arg_name
-        current_config = cfg if config_section is not None else get_args()
+        current_config = args
         saved_config = checkpoint_config or {}
         if config_section is not None:
             current_config = cfg
@@ -353,7 +354,7 @@ def check_checkpoint_args(
     # This deprecated CLI boolean is not equivalent to position_embedding_type:
     # --no-position-embedding is accepted with RoPE and does not turn RoPE off.
     # Preserve the old CLI-to-CLI comparison, without inventing it for native configs.
-    if is_args_initialized() and checkpoint_args is not None:
+    if args is not None and checkpoint_args is not None:
         _compare('add_position_embedding', default=True)
     if cfg.model.transformer.wide_residual is not None or hasattr(
         checkpoint_args, 'wide_residual_num_streams'
@@ -384,11 +385,7 @@ def check_checkpoint_args(
         _compare('tokenizer_type', config_section='tokenizer')
     if cfg.rng.data_parallel_random_init:
         _compare('data_parallel_random_init', config_section='rng')
-    if (
-        check_training_state
-        and isinstance(cfg, PretrainConfigContainer)
-        and cfg.train.phase_transition_iterations
-    ):
+    if check_training_state and getattr(args, 'phase_transition_iterations', None):
         _compare('global_batch_size', config_section='train')
     if get_checkpoint_version() < 3.0:
         _compare('tensor_model_parallel_size', old_arg_name='model_parallel_size', config_section='model.transformer')
@@ -868,7 +865,7 @@ def save_checkpoint(
 
     # --freeze-all-layers: weights are frozen, so skip the weight write and its finalizers; dump
     # progress is recorded separately via the post-logits finalize (see the async block below).
-    skip_weight_ckpt = isinstance(cfg, PretrainConfigContainer) and cfg.train.freeze_all_layers
+    skip_weight_ckpt = getattr(args, 'freeze_all_layers', False)
 
     # Handle non_persistent_ckpt flag. Besides overwriting the save directory and the checkpoint
     # type, non-persistent global ckpt requires no additional logic
@@ -1047,17 +1044,18 @@ def save_checkpoint(
                 save_strategy = TorchDistSaveShardedStrategy(
                     cpu_shm_mode=checkpoint.async_ckpt_use_cpu_shm
                 )
+                # Writers per rank. Independent of ckpt_assume_constant_structure.
+                if checkpoint.async_save:
+                    save_strategy.thread_count = checkpoint.dist_ckpt_workers
+                elif checkpoint.dist_ckpt_workers != 1:
+                    # We don't allow per-rank parallel save for sync save
+                    logger.warning(
+                        'Per-rank parallel save is not supported for sync save. '
+                        'Setting checkpoint.dist_ckpt_workers to 1'
+                    )
+                    save_strategy.thread_count = 1
                 if checkpoint.ckpt_assume_constant_structure and save_format == 'torch_dist':
                     save_strategy.use_cached_ckpt_structure = checkpoint.ckpt_assume_constant_structure
-                    if checkpoint.async_save:
-                        save_strategy.thread_count = checkpoint.dist_ckpt_workers
-                    else:
-                        # We don't allow per-rank parallel save for sync save
-                        logger.warning(
-                            'Per-rank parallel save is not supported for sync save. '
-                            'Setting checkpoint.dist_ckpt_workers to 1'
-                        )
-                        save_strategy.thread_count = 1
                     if (
                         checkpointing_context is not None
                         and 'load_strategy' in checkpointing_context
@@ -2976,11 +2974,7 @@ def load_checkpoint(
     # progress from --save (this job's output) rather than --load lets --load stay pinned to a
     # fixed checkpoint across resubmits. An explicit --override-ckpt-iteration wins. (The main use
     # today is offline-KD teacher-logit dumps.)
-    if (
-        restore_training_state
-        and isinstance(cfg, PretrainConfigContainer)
-        and cfg.train.freeze_all_layers
-    ):
+    if restore_training_state and getattr(args, 'freeze_all_layers', False):
         # Weights only: don't adopt the loaded checkpoint's optimizer / LR-scheduler / rng, or run
         # check_checkpoint_args against a checkpoint from a different run (finetune gates all of
         # those; --freeze-all-layers alone would still load the scheduler and assert on arg drift).

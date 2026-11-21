@@ -9,20 +9,8 @@ from typing import List, Literal, Optional
 class TrainingConfig:
     """Configuration settings related to the training loop."""
 
-    train_full_dataset: bool = False
-    """Train for one complete pass over an externally provided dataset."""
-
-    deduplicate_dataloader_across_context_parallel: bool = False
-    """Count context-parallel loader replicas once for full-dataset training."""
-
-    phase_transition_iterations: list[int] | None = None
-    """Iterations where dataset phases change; global batch size stays fixed across phases."""
-
     vision_pretraining_type: Literal["classify", "inpaint", "dino"] | None = None
     """Vision pretraining objective, or None when vision pretraining is disabled."""
-
-    freeze_all_layers: bool = False
-    """Freeze model parameters and run forward-only, for example when saving teacher logits."""
 
     micro_batch_size: int | None = None
     """Batch size per model instance (local batch size). Global batch size is local batch size times
@@ -328,12 +316,6 @@ class SchedulerConfig:
 @dataclass(kw_only=True)
 class LoggerConfig:
     """Configuration settings for logging, including TensorBoard and WandB."""
-
-    dump_param_to_param_group_map: str | None = None
-    """Optional output path for the optimizer's parameter-to-group mapping."""
-
-    log_packed_sequence_stats: bool = False
-    """Log the existing packed-sequence token and padding statistics."""
 
     log_interval: int = 100
     """Report loss and timing interval."""
@@ -664,6 +646,10 @@ class CheckpointConfig:
     thread/process that outlives each save. Required when ``async_save`` is set (an asynchronous
     distributed save is rejected without it)."""
 
+    async_write_results_mp_mode: Literal["fork", "spawn", "forkserver"] = "fork"
+    """Multiprocessing start method of the async checkpoint write-results queue. Only applies
+    when using the persistent ckpt worker (``use_persistent_ckpt_worker``)."""
+
     async_ckpt_cpu_priority: int = 10
     """CPU nice value target (0-19, higher = lower priority) for the async checkpoint writer process.
     If it exceeds 19, it will be set to 19. If the current nice value is greater than the target, it will be left unchanged.
@@ -800,8 +786,10 @@ class CheckpointConfig:
     exchange algorithm. Pass it explicitly on the inference command line."""
 
     dist_ckpt_workers: int = 1
-    """Number of workers for distributed checkpointing. Only used for async save.
-    If set to 1, the checkpointing is performed in a single process."""
+    """Number of workers for distributed checkpointing. Only used for async save; a synchronous
+    torch_dist save always uses 1. If set to 1, the checkpointing is performed in a single
+    process. For torch_dist the number of checkpoint files is
+    ``saving ranks * dist_ckpt_workers``."""
 
     override_ckpt_iteration: int | None = None
     """Override the iteration stored in the loaded checkpoint. Also resets
@@ -837,6 +825,11 @@ class CheckpointConfig:
 
         assert self.async_strategy in ["nvrx"], \
             f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx."
+
+        assert self.async_write_results_mp_mode in ["fork", "spawn", "forkserver"], (
+            f"async_write_results_mp_mode {self.async_write_results_mp_mode!r} is not supported. "
+            "Available modes: fork, spawn, forkserver."
+        )
 
         # An asynchronous distributed save needs the persistent checkpoint worker (a legacy torch
         # save cannot be asynchronous at all: save_checkpoint rejects it). Megatron-Bridge makes

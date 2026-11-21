@@ -260,9 +260,9 @@ def test_native_parameter_norm_cadence(run_config):
         log_params_norm=True, log_interval=20, tensorboard_dir='events', tensorboard_log_interval=5
     )
     run_config.logger = config
-    assert _should_compute_params_norm(1, True)
-    assert _should_compute_params_norm(5, False)
-    assert not _should_compute_params_norm(6, False)
+    assert _should_compute_params_norm(Namespace(), 1, True)
+    assert _should_compute_params_norm(Namespace(), 5, False)
+    assert not _should_compute_params_norm(Namespace(), 6, False)
 
 
 def test_logging_level_config_overrides_environment(monkeypatch, run_config):

@@ -100,3 +100,7 @@ Offline cached-logit distillation remains on its CLI path until
 `cfg.offline_distillation`. This entrypoint does not add a competing cached-logit
 config or fabricate args to enable that feature. Ordinary pretraining needs no
 legacy argument namespace.
+
+This example uses the dataset/config implementation already on `main`. It does
+not introduce data-schema changes or migrate optional CLI-only features such as
+full-dataset training, dataset phase transitions, frozen-teacher mode, or upcycling.

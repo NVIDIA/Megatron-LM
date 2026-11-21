@@ -175,7 +175,7 @@ class TestFP4Param:
     def run_eval_transition(self, args, model_chunks, optimizer, batch):
         input_ids, labels, position_ids, attention_mask, loss_mask = batch
 
-        if should_disable_forward_pre_hook(optimizer):
+        if should_disable_forward_pre_hook(args, optimizer):
             disable_forward_pre_hook(model_chunks, param_sync=True)
 
         model_chunks[0].eval()
@@ -191,7 +191,7 @@ class TestFP4Param:
         eval_loss = eval_output.mean()
         model_chunks[0].train()
 
-        if should_disable_forward_pre_hook(optimizer):
+        if should_disable_forward_pre_hook(args, optimizer):
             enable_forward_pre_hook(model_chunks)
 
         return eval_loss.item()
@@ -269,10 +269,10 @@ class TestFP4Param:
             # CUDA graph: capture after warmup steps (warmup_steps=0 means capture on first iter)
             cuda_graph_warmup_steps = 0
             if cuda_graph_helper is not None and i == cuda_graph_warmup_steps:
-                if should_disable_forward_pre_hook(optimizer):
+                if should_disable_forward_pre_hook(args, optimizer):
                     disable_forward_pre_hook(gpt_model, param_sync=False)
                 cuda_graph_helper.create_cudagraphs()
-                if should_disable_forward_pre_hook(optimizer):
+                if should_disable_forward_pre_hook(args, optimizer):
                     enable_forward_pre_hook(gpt_model)
                     cuda_graph_helper.cuda_graph_set_manual_hooks()
 

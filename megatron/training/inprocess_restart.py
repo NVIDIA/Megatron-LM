@@ -10,7 +10,9 @@ import torch
 
 from megatron.core import rerun_state_machine
 from megatron.training import get_args
-from megatron.training.async_utils import reset_persistent_async_worker
+from megatron.training.async_utils import (
+    reset_persistent_async_worker,
+)
 from megatron.training.global_vars import is_args_initialized
 
 from . import arguments

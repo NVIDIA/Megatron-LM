@@ -298,8 +298,9 @@ class InferenceStateHandoffMixin:
         if self.context.is_hybrid_model:
             if role == "decode" and self.context.mamba_slot_allocator is not None:
                 raise RuntimeError(
-                    "A hybrid decode handoff writes directly into live SSM state; "
-                    "do not configure prefix_caching_mamba_gb on the decode engine"
+                    "A hybrid decode handoff writes directly into live SSM state, but "
+                    "this context allocated a Mamba prefix cache; build it with "
+                    "InferenceConfig.disaggregation_role='decode'"
                 )
         if self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST:
             raise ValueError(
@@ -403,12 +404,20 @@ class InferenceStateHandoffMixin:
                     f"SSM state shape implies {nheads_global} global heads, "
                     f"but model config specifies {configured_nheads}"
                 )
+            # Mamba2 stores recurrent state as [heads, headdim, d_state]; Gated DeltaProduct
+            # stores [heads, d_state, headdim] and packs H value and key conv bands.
+            num_householder = int(getattr(self.context, "gdp_num_householder", 0) or 0)
+            if num_householder > 0:
+                d_state, headdim = int(ssm_shape[-2]), int(ssm_shape[-1])
+            else:
+                headdim, d_state = int(ssm_shape[-2]), int(ssm_shape[-1])
             ssm_dims = SSMStateDims(
                 nheads=nheads_global,
-                headdim=int(ssm_shape[-2]),
-                d_state=int(ssm_shape[-1]),
+                headdim=headdim,
+                d_state=d_state,
                 ngroups=int(model_config.mamba_num_groups),
                 d_conv=int(conv_shape[-1]),
+                num_householder=max(1, num_householder),
             )
             ssm_layout = SSMShardLayout(
                 global_rank=rank,
@@ -1314,6 +1323,11 @@ class InferenceStateHandoffMixin:
                 if first_token in self._terminating_token_ids(request) or stop_word_hit:
                     # Preserve the cause even when the matched string was stripped.
                     request.finish_reason = "stop"
+                if self.context.num_speculative_tokens > 0 and request.generated_tokens:
+                    # The prefill engine's step emitted this token; record it as a collocated
+                    # engine would, after stop-word trimming, so acceptance_step_lengths sums
+                    # to the generated length.
+                    request.acceptance_step_lengths.append(1)
 
             request.num_cached_tokens = len(pending.prompt)
             finished = request.finish_reason == "stop" or (

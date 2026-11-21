@@ -27,7 +27,6 @@ from megatron.core.num_microbatches_calculator import (
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.tensor_parallel.gtp_parallel_layout import GTPParallelLayout
-from megatron.core.tuning import AutotunePolicy
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
 from megatron.training.config.dataset_config import (
@@ -70,13 +69,6 @@ from megatron.training.models.distillation import DistillationConfig, validate_d
 T = TypeVar("T", bound="ConfigContainerBase")
 logger = logging.getLogger(__name__)
 
-_FROZEN_OPTIMIZER_FLAGS = (
-    "use_distributed_optimizer",
-    "overlap_param_gather",
-    "overlap_param_gather_with_optimizer_step",
-)
-
-
 @dataclass(kw_only=True)
 class ConfigContainerBase:
     """
@@ -86,9 +78,6 @@ class ConfigContainerBase:
     """
 
     _finalized: bool = field(default=False, init=False, repr=False, compare=False)
-
-    triton_autotune: AutotunePolicy = field(default_factory=AutotunePolicy)
-    """Kernel tuning policy installed before any runtime warmup or model construction."""
 
     def validate(self) -> None:
         """Check sub-configs without mutation; callers may validate repeatedly."""
@@ -469,14 +458,8 @@ class PretrainConfigContainer(ConfigContainerBase):
         if getattr(self.model, "transformer", None) is None:
             raise ValueError("Training requires model.transformer to be configured")
         optimizer = self._optimizer_with_model_precision()
-        if self.train.freeze_all_layers:
-            # Resolve aliases on the private copy first: Muon derives its layer-wise path
-            # from use_distributed_optimizer, which the frozen policy then disables.
-            optimizer.finalize_optimizer_config()
-            optimizer = replace(optimizer, **dict.fromkeys(_FROZEN_OPTIMIZER_FLAGS, False))
-        # Every optimizer check sees the policy that will run; the live config stays unchanged.
-        effective = replace(self, optimizer=optimizer)
-        ConfigContainerBase.validate(effective)
+        # Validate effective precision without modifying either config or finalizing early.
+        ConfigContainerBase.validate(replace(self, optimizer=optimizer))
         # Config-only topology checks also run when validating a recipe off-cluster.
         # Launch world-size checks remain in the runtime parallel-size helpers.
         transformer = self.model.transformer
@@ -509,14 +492,12 @@ class PretrainConfigContainer(ConfigContainerBase):
                 raise ValueError("GTP sequence sharding uses Megatron DDP, not FSDP")
             if self.dist.use_tp_pp_dp_mapping:
                 raise ValueError("GTP sequence sharding does not support TP-PP-DP mapping")
-        effective._validate_checkpoint()
+        self._validate_checkpoint()
         if self.fault_tolerance.enable_ft_package and not self.checkpoint.save:
             raise ValueError("checkpointing save dir must be set to enable fault tolerance")
         self._validate_distillation()
-        if self.train.freeze_all_layers and transformer.freeze_base_model_for_mtp:
-            raise ValueError("freeze_all_layers cannot be combined with freeze_base_model_for_mtp.")
         global_batch_size, _, _ = self._resolve_batch_sizes()
-        effective._validate_ddp_config()
+        self._validate_ddp_config()
         self._validate_rl_config(global_batch_size)
         optimizer.validate_run(
             ddp_config=self.ddp,
@@ -605,8 +586,12 @@ class PretrainConfigContainer(ConfigContainerBase):
             if self.optimizer.optimizer not in ("sgd", "adam"):
                 raise ValueError("Torch FSDP2 requires the SGD or Adam optimizer.")
         if self.ddp.use_megatron_fsdp:
-            if self.optimizer.optimizer not in ("sgd", "adam"):
-                raise ValueError("Megatron FSDP requires the SGD or Adam optimizer.")
+            if self.optimizer.optimizer not in ("sgd", "adam") and not (
+                self.ddp.megatron_fsdp_version == 2 and self.optimizer.optimizer == "muon"
+            ):
+                raise ValueError(
+                    "Megatron FSDP requires the SGD or Adam optimizer, or Muon with MFSDP v2."
+                )
         if isinstance(self.ddp, TorchFullyShardedDataParallelConfig) or self.ddp.use_megatron_fsdp:
             if os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS") == "1":
                 raise ValueError("FSDP requires CUDA_DEVICE_MAX_CONNECTIONS > 1 or unset.")
@@ -978,15 +963,6 @@ class PretrainConfigContainer(ConfigContainerBase):
                     "falling back to unquantized parameter gathering."
                 )
                 self.ddp.fp4_param_gather = False
-        if self.train.freeze_all_layers:
-            enabled = [name for name in _FROZEN_OPTIMIZER_FLAGS if getattr(self.optimizer, name)]
-            if enabled:
-                logger.warning(
-                    "train.freeze_all_layers: disabling incompatible optimizer settings %s.",
-                    enabled,
-                )
-            for name in enabled:
-                setattr(self.optimizer, name, False)
         self.ddp.overlap_param_gather = self.optimizer.overlap_param_gather
         self.ddp.reuse_grad_buf_for_mxfp8_param_ag = (
             self.optimizer.reuse_grad_buf_for_mxfp8_param_ag

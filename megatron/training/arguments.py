@@ -1020,8 +1020,9 @@ def validate_args(args, defaults={}):
                 "GroupedTensor param buffers."
             )
         # Optimizer compatibility check.
-        assert args.optimizer in ('sgd', 'adam'), \
-            f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
+        assert args.optimizer in ('sgd', 'adam') or (
+            args.megatron_fsdp_version == 2 and args.optimizer == 'muon'
+        ), f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
 
         # Expert parameters may be sharded differently from non-expert parameters, in which
         # case both strategies have to be considered by model-wide checks.
@@ -1628,8 +1629,12 @@ def validate_args(args, defaults={}):
 
     if args.optimizer not in ('sgd', 'adam'):
         assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
-        assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
-        assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
+        if args.use_megatron_fsdp:
+            # The Megatron-FSDP checks above already cover v2, Muon and fsdp_dtensor checkpoints.
+            assert not args.muon_split_qkv, \
+                "MFSDP v2 Muon requires --muon-no-split-qkv."
+        else:
+            assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
@@ -2597,7 +2602,7 @@ def _add_fault_tolerance_args(parser):
 def _add_logging_args(parser):
     from megatron.training.config import LoggerConfig
 
-    log_factory = ArgumentGroupFactory(LoggerConfig, exclude = ["log_throughput_to_tensorboard", "throughput_window_size", "memory_keys", "log_l2_norm_grad_to_tensorboard", "log_runtime_to_tensorboard", "runtime_time_unit", "filter_warnings", "modules_to_filter", "set_level_for_all_loggers", "save_config_filepath", "log_packed_sequence_stats", "dump_param_to_param_group_map"])
+    log_factory = ArgumentGroupFactory(LoggerConfig, exclude = ["log_throughput_to_tensorboard", "throughput_window_size", "memory_keys", "log_l2_norm_grad_to_tensorboard", "log_runtime_to_tensorboard", "runtime_time_unit", "filter_warnings", "modules_to_filter", "set_level_for_all_loggers", "save_config_filepath"])
     group = log_factory.build_group(parser, title="logging")
 
     return parser
@@ -2727,13 +2732,16 @@ def _add_training_args(parser):
                        'options should be specified in commandline.')
 
     # Keep the legacy vision CLI master switch/defaults at their existing boundary.
-    train_factory = ArgumentGroupFactory(
-        TrainingConfig,
-        exclude=["vision_pretraining_type", "phase_transition_iterations",
-                 "deduplicate_dataloader_across_context_parallel"],
-    )
+    train_factory = ArgumentGroupFactory(TrainingConfig, exclude=["vision_pretraining_type"])
     group = train_factory.build_group(parser, "training")
 
+    # Keep this CLI-only until dataset options have their own config dataclass.
+    group.add_argument(
+        "--train-full-dataset",
+        action="store_true",
+        default=False,
+        help="Train for one complete pass over an externally provided dataset.",
+    )
     group.add_argument('--batch-size', type=int, default=None,
                        help='Old batch size parameter, do not use. '
                        'Use --micro-batch-size instead')
@@ -2862,6 +2870,8 @@ def _add_learning_rate_args(parser):
     group.add_argument('--decoupled-min-lr', type=float, default=None,
                        help='Minimum value for learning rate for the input and output layer. The scheduler'
                        'clip values below this threshold')
+    group.add_argument('--freeze-all-layers', action='store_true',
+                       help='Freeze all layers of the model.')
 
     return parser
 
@@ -2934,7 +2944,7 @@ def _add_mixed_precision_args(parser):
 def _add_distributed_args(parser):
     from megatron.training.config import DistributedInitConfig
 
-    dist_init_factory = ArgumentGroupFactory(DistributedInitConfig, exclude=["enable_experimental"])
+    dist_init_factory = ArgumentGroupFactory(DistributedInitConfig)
     group = dist_init_factory.build_group(parser, "distributed init")
 
     group.add_argument('--use-torch-fsdp2', action='store_true', default=False,

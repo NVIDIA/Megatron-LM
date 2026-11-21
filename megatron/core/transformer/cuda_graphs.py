@@ -3040,6 +3040,7 @@ class TECudaGraphHelper:
                         graphs_not_reset += 1
                 layer.te_cuda_graphs = []
                 layer.te_cuda_graph_manual_hooks = []
+                layer._after_te_cuda_graphs_deleted()
 
         log_on_each_pipeline_stage(
             logger=logger,

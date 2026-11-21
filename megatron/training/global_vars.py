@@ -214,7 +214,7 @@ def initialize_runtime_services(
     _set_wandb_writer(args)
     _set_telemetry(args, include_training=training)
 
-    if cfg.dist.enable_experimental:
+    if getattr(args, 'enable_experimental', False):
         set_experimental_flag(True)
 
     if cfg.dist.disable_jit_fuser:

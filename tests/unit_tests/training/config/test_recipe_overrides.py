@@ -16,14 +16,14 @@ def test_overrides_preserve_native_objects_and_leave_finalization_to_startup(run
             "optimizer.lr=3e-4",
             "train.manual_gc=true",
             "train.exit_interval=null",
-            "train.phase_transition_iterations=[2,4]",
+            "profiling.profile_ranks=[2,4]",
         ],
     )
     assert run_config.train.train_iters == 8
     assert run_config.optimizer.lr == 3e-4
     assert run_config.train.manual_gc is True
     assert run_config.train.exit_interval is None
-    assert run_config.train.phase_transition_iterations == [2, 4]
+    assert run_config.profiling.profile_ranks == [2, 4]
     assert run_config.model.transformer is transformer
     assert transformer.activation_func is activation
     assert not run_config._finalized

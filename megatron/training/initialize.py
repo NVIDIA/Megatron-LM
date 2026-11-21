@@ -43,7 +43,10 @@ from megatron.training import (
     get_tensorboard_writer,
     inprocess_restart,
 )
-from megatron.training.argument_utils import core_transformer_config_from_args
+from megatron.training.argument_utils import (
+    _triton_autotune_config_from_args,
+    core_transformer_config_from_args,
+)
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.config import PretrainConfigContainer
 from megatron.training.global_vars import (
@@ -152,7 +155,8 @@ def initialize_megatron(
 
     # Before any Triton kernel runs, including the kernel warm-up before model construction.
     tuning.install(
-        cfg.triton_autotune, deterministic=model_config.deterministic_mode
+        _triton_autotune_config_from_args(args) if args is not None else tuning.AutotunePolicy(),
+        deterministic=model_config.deterministic_mode,
     )
 
     # torch.distributed initialization

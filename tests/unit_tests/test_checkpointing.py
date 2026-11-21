@@ -836,7 +836,6 @@ def test_check_checkpoint_args_uses_config_owner(
         **{name: other},
     )
     owner = getattr(run_config, section)
-    run_config.train.phase_transition_iterations = args.phase_transition_iterations
     if section == "tokenizer":
         run_config.tokenizer.vocab_file = "vocab.json"
         args.max_position_embeddings = run_config.model.seq_length
@@ -857,7 +856,7 @@ def test_check_checkpoint_args_uses_config_owner(
     else:
         saved_owner = vars(checkpoint_args)
         saved_owner[name] = current
-    monkeypatch.setattr("megatron.training.checkpointing.get_args", lambda: args)
+    monkeypatch.setattr("megatron.training.global_vars._GLOBAL_ARGS", args)
     monkeypatch.setattr("megatron.training.checkpointing.get_checkpoint_version", lambda: 3.0)
 
     check_checkpoint_args(checkpoint_args, checkpoint_config=checkpoint_config)
@@ -2084,7 +2083,7 @@ def _stub_loader_to_the_policy(monkeypatch, args, existing, loads):
             loads.append((load_dir, finetune))
         return None, "", False, None
 
-    monkeypatch.setattr(checkpointing, "get_args", lambda: args)
+    monkeypatch.setattr("megatron.training.global_vars._GLOBAL_ARGS", args)
     monkeypatch.setattr(checkpointing, "checkpoint_exists", lambda path: path in existing)
     monkeypatch.setattr(checkpointing, "unwrap_model", lambda value: value)
     monkeypatch.setattr(
@@ -2177,7 +2176,6 @@ def test_the_frozen_layer_load_is_weights_only_at_any_data_position(
     run's own progress tracker: the classification is recorded on the train state, the position
     stays the load's own business, and the namespace receives neither."""
     args = _loader_args(freeze_all_layers=True)
-    run_config.train.freeze_all_layers = True
     train_state = TrainState()
     monkeypatch.setattr(checkpointing, "get_train_state", lambda: train_state)
     run_config.checkpoint.load = "/frozen"

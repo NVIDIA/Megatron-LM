@@ -131,6 +131,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Elementwise; weighted variants reduce the per-token weight grad over ffn (Inductor tree reduction).",
     ),
     KernelEntry(
+        name="fused_swiglu_triton",
+        sources=("megatron/core/fusions/fused_swiglu_triton.py",),
+        tests=(K + "test_fused_activations.py",),
+        kind="triton",
+        notes="Bias-free plain, clamped and router-weighted SwiGLU behind bias_swiglu_impl and "
+        "weighted_bias_swiglu_impl; one row per program or several short rows per program. The "
+        "weighted d_w is a per-row tl.sum over a fixed tile order; no atomics.",
+    ),
+    KernelEntry(
         name="fused_bias_geglu",
         sources=("megatron/core/fusions/fused_bias_geglu.py",),
         tests=(K + "test_fused_activations.py", R + 'test_activation_replay.py'),
@@ -400,7 +409,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_mok_kernels.py",),
         kind="triton",
         notes="Dense routing-map compaction and router-gradient scatter use one CTA per token "
-        "and unique expert indices; replayed with missing routes and side-stream contention.",
+        "and unique expert indices; replayed with missing routes, a strided padding mask and "
+        "side-stream contention. test_moe_kernels.py also replays it with MoELayer's padding mask, "
+        "through a megakernel stand-in, in eager and CUDA-graph replay.",
     ),
     KernelEntry(
         name="mok_runtime",
@@ -442,7 +453,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available; "
         "virtual-expert routing metadata and probability gradients replay under stream contention; "
         "the FlashInfer per-token NVFP4 value pass (moe_training_matches_inference) with recompute "
-        "backward, and its MXFP8 training-stack quantization.",
+        "backward, and its MXFP8 training-stack quantization. The megakernel branch passes the "
+        "padding mask to a stand-in backend that runs MOK route compaction: replayed under stream "
+        "contention against the reference semantics, and in a CUDA graph whose static mask "
+        "changes between replays.",
     ),
     KernelEntry(
         name="moe_experts",
@@ -673,6 +687,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_optimizer_kernels.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
+            "tests/unit_tests/distributed/mfsdp_v2/test_mcore_muon.py",
         ),
         kind="external-lib",
         notes="multi_tensor l2norm / scale (TE, apex or local fallback) and fused Adam; "
@@ -834,6 +849,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="cuda-ext",
         training_path=False,
         exempt_reason="Byte copy for refit; needs NVSHMEM and a multi-GPU RL environment.",
+    ),
+    KernelEntry(
+        name="nccl_m2n_expert_refit",
+        sources=("megatron/core/resharding/copy_services/nccl_m2n_copy_service.py",),
+        tests=(
+            K + "test_refit_expert_staging.py",
+            "tests/unit_tests/resharding/test_nccl_m2n_copy_service.py",
+        ),
+        kind="external-lib",
+        training_path=False,
+        notes="Expert stack views, staging, and foreach writeback replay bit-exactly under "
+        "contention. Native M2N/MXFP8 parity runs in the dedicated GB200 integration bucket.",
     ),
     # ---------------------------------------------------------------- external-library dispatch sites
     # Modules that choose between / call external GPU kernels. Covered by the replay tests of

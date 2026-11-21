@@ -71,12 +71,6 @@ class ModelConfig:
     may be useful when extending Megatron-Core models, e.g. converting to/from HuggingFace.
     Must be serializable."""
 
-    moe_use_upcycling: bool = False
-    """Use the legacy dense-to-MoE upcycling initialization path."""
-
-    moe_upcycling_granularity: int = 1
-    """Ratio of the dense FFN width to each upcycled expert's FFN width."""
-
     # === pre-wrap and post-wrap hooks ===
     pre_wrap_hooks: list[Callable[[list[MegatronModule]], list[MegatronModule]]] = field(default_factory=list)
     """List of functions that are executed before the model is wrapped with DDP/FSDP.
