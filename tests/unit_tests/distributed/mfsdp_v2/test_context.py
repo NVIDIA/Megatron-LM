@@ -25,6 +25,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     SchedulePolicy,
     fully_shard,
     fully_shard_context,
+    fully_shard_optimizer,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
     ExecutionEvent,
@@ -135,6 +136,49 @@ def test_recorded_execution_order(distributed_setup):
         layer.register_full_backward_pre_hook(check_prefetched, prepend=True)
     model.zero_grad(set_to_none=True)
     model(inputs).sum().backward()
+
+
+@pytest.mark.parametrize("prefetch_order", [PrefetchOrder.REGISTRATION, PrefetchOrder.RECORDED])
+def test_repeated_evaluation_between_training_steps(distributed_setup, prefetch_order):
+    """Evaluation before and between updates preserves dense output and update parity."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    torch.manual_seed(2026)
+    model = MultiChildModel(dim=16, num_children=2).to(device)
+    baseline = MultiChildModel(dim=16, num_children=2).to(device)
+    baseline.load_state_dict(model.state_dict())
+    with fully_shard_context(
+        FsdpContext(device=device, runtime_policy=RuntimePolicy(prefetch_order=prefetch_order))
+    ):
+        for layer in model.layers:
+            fully_shard(layer, mesh, _default_placements())
+        fully_shard(model, mesh, _default_placements())
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    fully_shard_optimizer(optimizer)
+    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.1)
+    # Identical inputs on all ranks make the baseline's local gradients equal
+    # the FSDP-averaged gradients without requiring a second distributed model.
+    inputs = torch.randn(2, 16, device=device)
+    for step, eval_microbatches in enumerate((2, 3, 2)):
+        model.eval()
+        baseline.eval()
+        with torch.no_grad():
+            for _ in range(eval_microbatches):
+                torch.testing.assert_close(model(inputs), baseline(inputs))
+        if step == 2:
+            break
+        model.train()
+        baseline.train()
+        optimizer.zero_grad()
+        baseline_optimizer.zero_grad()
+        actual = model(inputs).square().mean()
+        expected = baseline(inputs).square().mean()
+        torch.testing.assert_close(actual, expected)
+        actual.backward()
+        expected.backward()
+        optimizer.step()
+        baseline_optimizer.step()
 
 
 def test_registration_order_rejects_reordered_execution(distributed_setup):
