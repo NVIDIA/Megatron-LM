@@ -40,6 +40,26 @@ def test_factory_rejects_invalid_optimizer_config(optimizer):
         get_megatron_optimizer(config, [])
 
 
+def test_muon_distributed_reshard_wide_requirements():
+    """muon_distributed_reshard_wide only changes TensorParallelMuon's distributed chain: it
+    needs a Muon optimizer and an NS mode that runs that chain, and is rejected where it would
+    be ignored."""
+    ok = dict(optimizer='muon', use_layer_wise_distributed_optimizer=True)
+    reshard = dict(muon_distributed_reshard_wide=True)
+    # Production-like: auto with split-QKV.
+    OptimizerConfig(muon_tp_mode='auto', muon_split_qkv=True, **reshard, **ok).validate()
+    OptimizerConfig(muon_tp_mode='distributed', **reshard, **ok).validate()
+    OptimizerConfig(optimizer='adaptive_muon', muon_tp_mode='auto', **reshard).validate()
+    with pytest.raises(ValueError, match="never runs it"):
+        OptimizerConfig(muon_tp_mode='duplicated', **reshard, **ok).validate()
+    with pytest.raises(ValueError, match="never runs it"):
+        OptimizerConfig(
+            muon_tp_mode='layer_sharded', muon_split_qkv=False, **reshard, **ok
+        ).validate()
+    with pytest.raises(ValueError, match="Muon optimizers"):
+        OptimizerConfig(optimizer='adam', muon_tp_mode='auto', **reshard).validate()
+
+
 def test_paramkey_matches():
     len_1_predicate = ParamPredicate(name="param_len_1", fn=lambda param: len(param.shape) == 1)
     endswith_bias = ParamKey(name="*.bias")

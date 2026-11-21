@@ -25,6 +25,7 @@ from megatron.core.utils import (
     log_single_rank,
 )
 
+from .muon_ns_reshard import cols_to_rows, local_cols, reshard_exchange_bytes, rows_to_cols
 from .optimizer_config import OptimizerConfig, ParamKey, ParamPredicate
 
 try:
@@ -205,14 +206,23 @@ class HardwareProfile:
     bf16_peak_tflops: float  # dense, fp32_matmul_prec = "medium" for now
     bw_intra_gbps: float  # collectives staying inside one NVLink domain
     bw_inter_gbps: float  # collectives crossing domains, over the fabric
+    # Fixed cost per collective (launch, NVLS setup, rank skew). Charged only in the comparison
+    # against the resharded distributed chain (distributed_reshard_wide).
+    collective_latency_s: float = 0.0
 
 
 _PROFILES = {
     # Keys are matched as a substring of the reported device name ("NVIDIA GB200").
     # Both bandwidths are PER GPU. Only run on GB200 & GB300 for now.
     # TODO: May need to add other HW Spec
-    "GB200": HardwareProfile(bf16_peak_tflops=2500.0, bw_intra_gbps=900.0, bw_inter_gbps=100.0),
-    "GB300": HardwareProfile(bf16_peak_tflops=2500.0, bw_intra_gbps=900.0, bw_inter_gbps=100.0),
+    # collective_latency_s: intercept of a 64-rank NVLS all-reduce fit on GB200
+    # (0.5 ms + bytes / 462 GB/s).
+    "GB200": HardwareProfile(
+        bf16_peak_tflops=2500.0, bw_intra_gbps=900.0, bw_inter_gbps=100.0, collective_latency_s=5e-4
+    ),
+    "GB300": HardwareProfile(
+        bf16_peak_tflops=2500.0, bw_intra_gbps=900.0, bw_inter_gbps=100.0, collective_latency_s=5e-4
+    ),
 }
 
 
@@ -235,9 +245,16 @@ def _select_tp_mode(
     communication_crosses_domain: bool,
     profile: Optional[HardwareProfile] = None,
     candidates: tuple[str, ...] = _AUTO_TP_MODES,
+    reshard_rows: Optional[int] = None,
 ) -> str:
     """Cost model for per weight tp_mode selection. Mirrors the op sequence in
     scaled_orthogonalize_fn_with_gtp_remat -- keep in sync.
+
+    ``reshard_rows`` (logical row count) is given only when the distributed chain of a wide
+    weight would run resharded (``muon_ns_reshard``). The distributed candidate is then that
+    chain on ``[reshard_rows, ceil(n / group_size)]`` plus its two all_to_all, and with a
+    profile both candidates also pay ``profile.collective_latency_s`` per collective, so the
+    decision can move either way. Without ``reshard_rows`` no cost changes.
     """
     min_dim, max_dim = min(m, n), max(m, n)
     m_partitioned = (
@@ -250,6 +267,14 @@ def _select_tp_mode(
         * (gram * (min_dim * min_dim * max_dim + min_dim**3) + 2 * min_dim * min_dim * max_dim),
         "distributed": steps * (gram * (n * n * m_partitioned + n**3) + 2 * n * n * m_partitioned),
     }
+    if reshard_rows is not None:
+        # Resharded: the same step on the [reshard_rows, ceil(n / group_size)] dim-1 shard,
+        # Gram over reshard_rows (no transpose).
+        n_partitioned = local_cols(n, group_size)
+        flops["distributed"] = steps * (
+            gram * (reshard_rows * reshard_rows * n_partitioned + reshard_rows**3)
+            + 2 * reshard_rows * reshard_rows * n_partitioned
+        )
     if profile is None:
         return "duplicated" if communication_crosses_domain else min(candidates, key=flops.get)
 
@@ -260,9 +285,19 @@ def _select_tp_mode(
         "duplicated": m * n * elem_size * ring_fraction,  # one all-gather
         "distributed": steps * 2 * n * n * elem_size * ring_fraction,  # gram all-reduce per step
     }
+    if reshard_rows is not None:
+        # Gram all-reduce per step over the short dim + the two all_to_all of the fp32 shard.
+        gram_bytes = steps * 2 * reshard_rows * reshard_rows * elem_size * ring_fraction
+        exchange_bytes = 2 * reshard_exchange_bytes(m_partitioned, n, group_size)
+        num_bytes["distributed"] = gram_bytes + exchange_bytes
     bw = (profile.bw_inter_gbps if communication_crosses_domain else profile.bw_intra_gbps) * 1e9
     peak = profile.bf16_peak_tflops * 1e12
     cost = {mode: flops[mode] / peak + num_bytes[mode] / bw for mode in candidates}
+    if reshard_rows is not None:
+        # One all-gather; `steps` Gram all-reduces, the normalization all-reduce, 2 all_to_all.
+        collectives = {"duplicated": 1, "distributed": steps + 3}
+        for mode in cost:
+            cost[mode] += collectives.get(mode, 0) * profile.collective_latency_s
     return min(candidates, key=cost.get)
 
 
@@ -288,6 +323,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
         use_syrk: bool = False,
+        distributed_reshard_wide: bool = False,
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
@@ -347,6 +383,10 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self._tp_mode_cache: Dict[tuple, str] = {}
         self._hw_profile = _hardware_profile() if tp_mode == "auto" else None
         self._warned_qkv_split_disabled = False
+        # Wide GTP-only distributed chains run on dim-1 shards (Gram over the short dim 0).
+        self.distributed_reshard_wide = distributed_reshard_wide
+        # (logical rows, cols, group_size) of every resharded chain run so far: logged once each.
+        self._reshard_logged: set[tuple[int, int, int]] = set()
 
         weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
         # Use explicit class call instead of super() so that subclasses with
@@ -381,13 +421,17 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         """Re-append ``pad_length`` zero rows to dim 0 (no-op if ``pad_length == 0``)."""
         return torch.nn.functional.pad(t, (0, 0, 0, pad_length)) if pad_length else t
 
-    def _resolve_tp_mode(self, m: int, n: int, group_size: int) -> str:
+    def _resolve_tp_mode(
+        self, m: int, n: int, group_size: int, reshard_rows: Optional[int] = None
+    ) -> str:
         """Cached per-shape mode for tp_mode="auto", dense (GTP) weights only.
 
         communication_crosses_domain=False always: this is only called for dense weights
         (see scaled_orthogonalize_fn_with_gtp_remat), and GTP stays inside one NVLink domain.
+        ``reshard_rows`` (see :meth:`_reshard_rows`): the distributed candidate is the
+        resharded chain with the Gram over that many logical rows.
         """
-        key = (m, n, group_size)
+        key = (m, n, group_size) if reshard_rows is None else (m, n, group_size, reshard_rows)
         if key not in self._tp_mode_cache:
             self._tp_mode_cache[key] = _select_tp_mode(
                 m,
@@ -398,6 +442,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 self.elem_size,
                 communication_crosses_domain=False,
                 profile=self._hw_profile,
+                reshard_rows=reshard_rows,
             )
             log_single_rank(
                 logger,
@@ -406,6 +451,22 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 f"{self._tp_mode_cache[key]}",
             )
         return self._tp_mode_cache[key]
+
+    @staticmethod
+    def _tp_is_sharding_axis(tp_group, partition_dim) -> bool:
+        """Whether TP shards the momentum: ``partition_dim`` set and a TP group of size > 1."""
+        return partition_dim is not None and tp_group is not None and get_pg_size(tp_group) > 1
+
+    def _reshard_rows(self, grad, pad_length, gtp_remat_size, tp_group, partition_dim):
+        """Logical (pad-stripped) row count when the distributed chain of this GTP-sharded
+        momentum runs resharded (:meth:`_orthogonalize_resharded`), else None: the flag is set,
+        GTP is the only sharding axis and the logical matrix is wide (rows < cols)."""
+        if not self.distributed_reshard_wide or grad.dim() != 2:
+            return None
+        if self._tp_is_sharding_axis(tp_group, partition_dim):
+            return None
+        rows = grad.size(0) * gtp_remat_size - pad_length
+        return rows if rows < grad.size(1) else None
 
     def scaled_orthogonalize_fn_with_gtp_remat(
         self, p, grad, tp_group, partition_dim, qkv_split_shapes=None
@@ -420,7 +481,10 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         - **duplicated**: all-gather over GTP, run whole-matrix NS (TP-aware), reshard.
         - **distributed**: distribute NS over GTP via small-Gram all-reduce. When both
           GTP and TP are active, NS is distributed over the larger group to minimize
-          redundant compute; the smaller group is all-gathered beforehand.
+          redundant compute; the smaller group is all-gathered beforehand. With
+          ``distributed_reshard_wide`` a wide GTP-only matrix (logical out < in) is first
+          re-sharded to dim-1 shards so the Gram is over the short dim
+          (:meth:`_orthogonalize_resharded`).
 
         GTP_remat may pad dim 0 for alignment (see gtp_remat_shard_dim0). blockwise and
         duplicated strip the padding before calling scaled_orthogonalize_fn and restore it
@@ -452,6 +516,14 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             and getattr(p, 'is_gtp_weight_remat', False)
         )
         gtp_remat_size = get_pg_size(gtp_remat_group) if gtp_active else 1
+        # Logical rows when the distributed chain of this GTP-sharded weight runs resharded.
+        reshard_rows = (
+            self._reshard_rows(
+                grad, getattr(p, 'pad_length', 0), gtp_remat_size, tp_group, partition_dim
+            )
+            if gtp_active
+            else None
+        )
 
         mode = self.tp_mode
         if mode == "auto":
@@ -462,7 +534,12 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             else:
                 # Scoped to dense (GTP) weights for now; expert weights keep today's default.
                 mode = (
-                    self._resolve_tp_mode(p.shape[0] * gtp_remat_size, p.shape[1], gtp_remat_size)
+                    self._resolve_tp_mode(
+                        p.shape[0] * gtp_remat_size,
+                        p.shape[1],
+                        gtp_remat_size,
+                        reshard_rows=reshard_rows,
+                    )
                     if gtp_active and not is_expert
                     else "duplicated"
                 )
@@ -574,11 +651,14 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         # the other. With GTP as the only sharding axis, the Gram all-reduce is the only
         # communication needed. partition_dim is what says whether TP is a sharding axis here,
         # the same signal scaled_orthogonalize_fn and newton_schulz_tp key off.
-        needs_two_step_communication = (
-            partition_dim is not None and tp_group is not None and get_pg_size(tp_group) > 1
-        )
+        needs_two_step_communication = self._tp_is_sharding_axis(tp_group, partition_dim)
 
         if not needs_two_step_communication:
+            if reshard_rows is not None:
+                # Wide: the dim-0 row shard would put the Gram on the long dim 1.
+                return self._orthogonalize_resharded(
+                    grad, gtp_remat_group, reshard_rows, pad_length
+                )
             # GTP is the only sharding axis: distribute NS over it on the local dim-0 row shard.
             return self.scaled_orthogonalize_fn(
                 grad,
@@ -613,6 +693,37 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         return orthogonalized_grad.narrow(
             smaller_dim, reshard_rank * shard_size, shard_size
         ).contiguous()
+
+    def _orthogonalize_resharded(self, grad, group, rows, pad_length):
+        """Distributed NS of a wide GTP-only matrix on dim-1 shards (Gram over the short dim 0).
+
+        ``grad`` is this rank's ``[R, K]`` dim-0 shard of the padded momentum with ``rows``
+        logical rows. One all_to_all makes it the ``[G R, ceil(K / G)]`` column block, the pad
+        rows are stripped, the chain runs with ``partition_dim=1`` (Gram ``[rows, rows]``), the
+        pad rows come back as zeros and a second all_to_all restores the row shard. Muon's scale
+        uses the logical ``(rows, K)``. See megatron.core.optimizer.muon_ns_reshard.
+        """
+        cols = grad.size(1)
+        group_size = get_pg_size(group)
+        key = (rows, cols, group_size)
+        if key not in self._reshard_logged:
+            self._reshard_logged.add(key)
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"muon distributed reshard: ({rows}, {cols}) group_size={group_size} -> Gram "
+                f"{rows}^2 on [{rows}, {local_cols(cols, group_size)}] dim-1 shards instead of "
+                f"{cols}^2 on [{cols}, {grad.size(0)}] (pad_length={pad_length})",
+            )
+        block = self._strip_pad(rows_to_cols(grad, group), pad_length)
+        result = self.scaled_orthogonalize_fn(
+            block,
+            group,
+            partition_dim=1,
+            tp_mode_this_group="distributed",
+            scale_shape=(rows, cols),
+        )
+        return cols_to_rows(self._restore_pad(result, pad_length), group, cols)
 
     def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Orthogonalize the momentum.
@@ -685,6 +796,8 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         moment2_method: Method for second moment accumulation ("adamuon" or "normuon").
         beta2: The exponential decay rate for second moment.
         eps: Small constant for numerical stability.
+        distributed_reshard_wide: Run the distributed Newton-Schulz chain of a wide GTP-only
+            weight on dim-1 shards; see megatron.core.optimizer.muon_ns_reshard.
     """
 
     def __init__(
@@ -709,6 +822,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         moment2_method: Literal["adamuon", "normuon"] = "adamuon",
         beta2: float = 0.95,
         eps: float = 1e-8,
+        distributed_reshard_wide: bool = False,
     ) -> None:
         TensorParallelMuon.__init__(
             self,
@@ -729,6 +843,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
             pg_collection=pg_collection,
             tp_mode=tp_mode,
             use_syrk=use_syrk,
+            distributed_reshard_wide=distributed_reshard_wide,
         )
         self.scale_mode = scale_mode
         self.extra_scale_factor = extra_scale_factor

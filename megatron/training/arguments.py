@@ -2692,6 +2692,13 @@ def _add_regularization_args(parser):
                        '--muon-fp32-matmul-prec medium. Under --muon-tp-mode '
                        'layer_sharded, unmet Triton/SM/emerging-optimizers '
                        'requirements are rejected at startup.')
+    group.add_argument('--muon-distributed-reshard-wide', action='store_true',
+                       help='Run the distributed Newton-Schulz chain of a wide (out < in) '
+                       'GTP-only weight on dim-1 shards, so the Gram all-reduce is over the '
+                       'short dim. --muon-tp-mode auto then decides every such weight between '
+                       'duplicated and this chain (a decision can move either way). Requires '
+                       '--muon-tp-mode auto or distributed. See '
+                       'OptimizerConfig.muon_distributed_reshard_wide.')
     group.add_argument('--muon-no-concurrent-groups', action='store_false',
                        dest='muon_concurrent_groups',
                        help='Serialize param groups on one CUDA stream under '
