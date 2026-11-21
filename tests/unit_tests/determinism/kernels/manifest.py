@@ -1138,6 +1138,19 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "tests/unit_tests/transformer/experimental_attention_variant/test_dsa_gqa_inference.py, "
         "including empty/ragged requests, causal masks, and graph page-table refresh.",
     ),
+    KernelEntry(
+        name="dsa_flashinfer_inference",
+        sources=("megatron/core/transformer/experimental_attention_variant/dsa_gqa_flashinfer.py",),
+        tests=(K + "test_dsa_gqa_flashinfer.py",),
+        kind="external-lib",
+        training_path=False,
+        notes="FlashInfer DSA indexer scoring, selection and top-k, trtllm-gen token-sparse "
+        "decode, and FA4 union-core prefill of a mixed decode + prefill step "
+        "(dsa_backend='flashinfer'), and the NVFP4 index-key and query quantize-and-write. "
+        "Decode is bit-exact only in batch-invariant mode, which sorts each row's selected "
+        "keys. NVFP4 index keys are rejected in batch-invariant mode: their scores often tie at "
+        "the top-k boundary, and which tied key is selected can vary between runs.",
+    ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(
         name="dsa_tilelang_absorbed_shape_dispatch",

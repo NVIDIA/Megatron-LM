@@ -6,7 +6,7 @@ import operator
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch  # type: ignore
 import torch.nn.functional as F  # type: ignore
@@ -50,6 +50,7 @@ from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide
 from megatron.core.utils import get_pg_rank, get_pg_size, internal_api
 
+from .attention_context.dsa_flashinfer_metadata import FlashInferDSAMetadata
 from .attention_context.dsa_metadata import DSAMetadata
 from .attention_context.mamba_metadata import (
     MAX_INTERMEDIATE_OFFSETS_PER_REQUEST,
@@ -467,7 +468,21 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.dsa_indexer_head_dim = (
             getattr(model_config, "dsa_indexer_head_dim", 0) if self.cache_dsa_indexer_keys else 0
         )
-        self.dsa_metadata: Optional[DSAMetadata] = None
+        self.dsa_metadata: Optional[Union[DSAMetadata, FlashInferDSAMetadata]] = None
+        self.dsa_indexer_key_dtype = "bf16"
+        if self.cache_dsa_indexer_keys:
+            self.dsa_backend = inference_config.dsa_backend
+            if self.dsa_backend not in ("triton", "flashinfer"):
+                raise ValueError(f"Unknown DSA inference backend {self.dsa_backend!r}.")
+            # NVFP4 index keys are quantized at cache-write time; only FlashInfer scores them.
+            self.dsa_indexer_key_dtype = inference_config.dsa_indexer_key_dtype
+            if self.dsa_indexer_key_dtype == "nvfp4" and (
+                self.dsa_backend != "flashinfer" or self.dsa_indexer_head_dim != 128
+            ):
+                raise ValueError(
+                    "NVFP4 DSA index keys need dsa_backend='flashinfer' and an indexer head dim "
+                    "of 128."
+                )
         if self.cache_mla_latent:
             assert (
                 inference_config.block_size_tokens == 64
@@ -488,8 +503,16 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
         else:
             self.num_attention_heads_per_partition = 1
+        if self.cache_dsa_indexer_keys and self.dsa_backend == "flashinfer":
+            # FlashInfer's step plan depends on the query heads (above counts KV heads) and top-k.
+            self.dsa_query_heads = core_divide(model_config.num_attention_heads, tp_size)
+            self.dsa_index_topk = model_config.dsa_indexer_topk
 
         self.batch_invariant_mode = model_config.batch_invariant_mode
+        if self.dsa_indexer_key_dtype == "nvfp4" and self.batch_invariant_mode:
+            from megatron.core.transformer.experimental_attention_variant import dsa_gqa_flashinfer
+
+            raise ValueError(dsa_gqa_flashinfer.NVFP4_BATCH_INVARIANT_ERROR)
         self.num_speculative_tokens = inference_config.num_speculative_tokens
         assert self.num_speculative_tokens < inference_config.block_size_tokens, (
             f"num_speculative_tokens ({self.num_speculative_tokens}) must be < "
@@ -684,10 +707,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             )
         if self.cache_dsa_indexer_keys:
             self.block_size_bytes += (
-                kv_dtype_size_bytes
-                * self.num_attention_layers
+                self.num_attention_layers
                 * self.block_size_tokens
-                * self.dsa_indexer_head_dim
+                * self._dsa_index_key_bytes(kv_dtype_size_bytes)
             )
         assert self.block_size_bytes > 0
 
@@ -1280,7 +1302,22 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 dtype=self.params_dtype,
                 device=torch.cuda.current_device(),
             )
-        if self.cache_dsa_indexer_keys:
+        if self.cache_dsa_indexer_keys and self.dsa_indexer_key_dtype == "nvfp4":
+            from megatron.core.transformer.experimental_attention_variant import dsa_gqa_flashinfer
+
+            dsa_gqa_flashinfer.require_flashinfer_dsa("nvfp4")
+            # Per layer and block: its 64-key pages of packed NVFP4 keys, then their scales.
+            self.dsa_memory_buffer = torch.empty(
+                (
+                    self.num_attention_layers,
+                    *dsa_gqa_flashinfer.nvfp4_index_cache_shape(
+                        self.kv_block_allocator.pool_size, self.block_size_tokens
+                    ),
+                ),
+                dtype=torch.uint8,
+                device=torch.cuda.current_device(),
+            )
+        elif self.cache_dsa_indexer_keys:
             self.dsa_memory_buffer = torch.empty(
                 (
                     self.num_attention_layers,
@@ -1862,9 +1899,20 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             NVLSAllGatherVDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
 
         if self.cache_dsa_indexer_keys:
-            self.dsa_metadata = DSAMetadata(
-                max_requests=self.max_requests, max_tokens=self.max_tokens
-            )
+            if self.dsa_backend == "flashinfer":
+                self.dsa_metadata = FlashInferDSAMetadata(
+                    max_requests=self.max_requests,
+                    max_tokens=self.max_tokens,
+                    max_kv_blocks=self.max_kv_block_count,
+                    block_size_tokens=self.block_size_tokens,
+                    max_sequence_length=self.max_sequence_length,
+                    query_heads=self.dsa_query_heads,
+                    index_topk=self.dsa_index_topk,
+                )
+            else:
+                self.dsa_metadata = DSAMetadata(
+                    max_requests=self.max_requests, max_tokens=self.max_tokens
+                )
 
         # Cache of (input_ids_view, pos_ids_view) keyed by num_tokens. Instead of slicing and
         # unsqueezing on every new inference step (constructing new TensorImpls at 30-60 us),
@@ -2007,7 +2055,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             return
 
         # The early-return paths above preserve addresses and their captured graphs.
-        if self.dsa_metadata is not None:
+        if isinstance(self.dsa_metadata, DSAMetadata):
             self.dsa_metadata.topk_workspace = None
 
         if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
@@ -2295,8 +2343,26 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 self.active_attn_metadata["mha_metadata"].state_data["block_table"],
             )
 
-    def append_dsa_key_cache(self, layer_number: int, key: Tensor) -> None:
-        """Append learned simplified-indexer keys to their paged cache."""
+    def _dsa_index_key_bytes(self, kv_dtype_size_bytes: int) -> int:
+        """Bytes of one cached DSA index key (with its scales, for NVFP4)."""
+        if self.dsa_indexer_key_dtype == "nvfp4":
+            from megatron.core.transformer.experimental_attention_variant import dsa_gqa_flashinfer
+
+            return dsa_gqa_flashinfer.NVFP4_KEY_BYTES + dsa_gqa_flashinfer.NVFP4_SCALES
+        return kv_dtype_size_bytes * self.dsa_indexer_head_dim
+
+    def append_dsa_key_cache(
+        self, layer_number: int, key: Tensor, query: Optional[Tensor] = None
+    ) -> Optional[Tuple[Tensor, Tensor]]:
+        """Append learned simplified-indexer keys to their paged cache.
+
+        With NVFP4 index keys, the keys are quantized as they are written, and the step's indexer
+        queries ``query`` are quantized to NVFP4 in the same launch.
+
+        Returns:
+            With NVFP4 keys, the packed NVFP4 queries ``[T, Di/2]`` and their E4M3 scale bytes
+            ``[T, Di/16]``; otherwise None.
+        """
         assert self.cache_dsa_indexer_keys, "DSA indexer key cache is not enabled."
         attention_layer_number = self.layer_map[layer_number - 1]
         block_idx = self.gpu_view.token_to_block_idx[: self.padded_active_token_count]
@@ -2311,12 +2377,25 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             assert key.size(1) == 1
             key = key.squeeze(1)
 
+        if self.dsa_indexer_key_dtype == "nvfp4":
+            from megatron.core.transformer.experimental_attention_variant import dsa_gqa_flashinfer
+
+            assert query is not None, "NVFP4 DSA index keys quantize the indexer queries too."
+            return dsa_gqa_flashinfer.write_nvfp4_index_keys(
+                key[: self.padded_active_token_count],
+                query.reshape(query.size(0), self.dsa_indexer_head_dim),
+                self.dsa_memory_buffer[attention_layer_number],
+                block_idx,
+                local_kv_seq_idx,
+            )
         self.dsa_memory_buffer[attention_layer_number, block_idx, local_kv_seq_idx] = key[
             : self.padded_active_token_count
         ]
+        return None
 
     def dsa_key_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
-        """Return a layer's learned indexer-key cache and active block table."""
+        """Return a layer's learned indexer-key cache (with NVFP4 index keys, the layer's uint8
+        NVFP4 cache) and active block table."""
         assert self.cache_dsa_indexer_keys, "DSA indexer key cache is not enabled."
         attention_layer_number = self.layer_map[layer_number - 1]
         assert self.active_attn_metadata is not None
@@ -3164,10 +3243,22 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         )
 
         if self.cache_dsa_indexer_keys:
+            # The triton backend's plan also splits off the leading decode requests.
+            extra = {}
+            if isinstance(self.dsa_metadata, DSAMetadata):
+                extra["num_decode_requests"] = attn_dimensions.decode_req_count
+            else:
+                # Only prefill requests can take the FlashInfer plan's prefill tiles, so size them
+                # by the graph's padded prefill count (the step's own when eager), not every request.
+                extra["padded_prefill_requests"] = (
+                    self.padded_batch_dimensions.prefill_req_count
+                    if self.using_cuda_graph_this_step()
+                    else attn_dimensions.prefill_req_count
+                )
             self.dsa_metadata.update(
                 self._cpu_mha_query_lengths[:real_bs].tolist(),
                 self._cpu_mha_kv_seq_lengths[:real_bs].tolist(),
-                num_decode_requests=attn_dimensions.decode_req_count,
+                **extra,
                 padded_tokens=self.padded_active_token_count,
                 padded_requests=padded_bs,
                 decode_only=self.is_decode_only(),

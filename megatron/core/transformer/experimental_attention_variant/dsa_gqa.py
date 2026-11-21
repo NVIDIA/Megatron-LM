@@ -625,7 +625,8 @@ class DSGQACoreAttention(MegatronModule):
         if key.size(0) != hidden_states.size(0):
             if self.config.sequence_parallel:
                 raise NotImplementedError(
-                    "DSA-GQA does not currently support sequence parallelism."
+                    "DSA-GQA supports sequence parallelism in dynamic-batching inference only; "
+                    "training and static inference need sequence_parallel=False."
                 )
             raise NotImplementedError(
                 "DSA-GQA currently supports full-sequence attention only. Decode-time "
@@ -732,8 +733,11 @@ class DSGQACoreAttention(MegatronModule):
         use_indexer_rope: bool = False,
         indexer_input_norm: Optional[_DSAIndexerInputNormSpec] = None,
     ) -> torch.Tensor:
-        """Run paged Triton prefill and Gluon/Triton decode."""
-        from .dsa_gqa_inference import dynamic_sparse_attention
+        """Run sparse attention over the paged caches through the kernels of
+        ``inference_context.dsa_backend``: Megatron's Triton/Gluon kernels
+        (``dsa_gqa_inference``, "triton") or FlashInfer's DSA kernels (``dsa_gqa_flashinfer``,
+        "flashinfer")."""
+        from . import dsa_gqa_flashinfer, dsa_gqa_inference
 
         assert not self.training, "Dynamic DSA-GQA inference only supports eval mode."
         if self.config.dsa_fwd_use_dense_attn:
@@ -756,9 +760,22 @@ class DSGQACoreAttention(MegatronModule):
         index_q, current_index_key = self.indexer.forward_qk_dynamic(
             indexer_hidden_states, use_rope=use_indexer_rope, inference_context=inference_context
         )
-        inference_context.append_dsa_key_cache(provider_layer_number, current_index_key)
+        # With NVFP4 index keys, the write also quantizes the step's indexer queries.
+        nvfp4_query = inference_context.append_dsa_key_cache(
+            provider_layer_number, current_index_key, index_q
+        )
         index_key_cache, _ = inference_context.dsa_key_cache(provider_layer_number)
+        extra = {}
+        if nvfp4_query is not None:
+            index_q, extra["index_query_scales"] = nvfp4_query
 
+        backend = inference_context.dsa_backend
+        if backend == "triton":
+            dynamic_sparse_attention = dsa_gqa_inference.dynamic_sparse_attention
+        elif backend == "flashinfer":
+            dynamic_sparse_attention = dsa_gqa_flashinfer.dynamic_sparse_attention
+        else:
+            raise ValueError(f"Unknown DSA inference backend {backend!r}.")
         return dynamic_sparse_attention(
             query=query,
             key_cache=key_cache,
@@ -768,6 +785,7 @@ class DSGQACoreAttention(MegatronModule):
             inference_context=inference_context,
             index_topk=self.indexer.index_topk,
             softmax_scale=self.softmax_scale,
+            **extra,
         )
 
     def _forward_min_memory(
