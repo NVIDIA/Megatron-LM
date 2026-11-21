@@ -30,8 +30,8 @@ from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 if HAVE_EMERGING_OPTIMIZERS:
+    from emerging_optimizers.legacy_soap import SOAP
     from emerging_optimizers.scalar_optimizers import Lion
-    from emerging_optimizers.soap import SOAP
 
     from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
 else:
@@ -585,6 +585,40 @@ def test_muon_entry_registered_with_dispatcher():
     assert muon_entry.config_to_kwargs is eo_mod._muon_registry_config_to_kwargs
     adaptive_entry = eo_mod._EMERGING_OPTIMIZERS["adaptive_muon"]
     assert adaptive_entry.config_to_kwargs is eo_mod._adaptive_muon_config_to_kwargs
+
+
+@pytest.mark.parametrize("accepts_betas", [False, True])
+def test_default_eopt_kwargs_betas_injection(monkeypatch, accepts_betas):
+    """Registry optimizers get betas iff their constructor declares the parameter."""
+
+    class NoBetas:
+        """Stub optimizer whose constructor has no betas parameter."""
+
+        def __init__(self, params, lr: float) -> None:
+            self.lr = lr
+
+    class WithBetas(NoBetas):
+        """Stub optimizer whose constructor declares a betas parameter."""
+
+        def __init__(self, params, lr: float, betas=(0.9, 0.999)) -> None:
+            super().__init__(params, lr)
+            self.betas = betas
+
+    optimizer_cls = WithBetas if accepts_betas else NoBetas
+    name = "betas_injection_test"
+    monkeypatch.setattr(eo_mod.registry, "get_optimizer_cls", lambda _name: optimizer_cls)
+    monkeypatch.setitem(
+        eo_mod._EMERGING_OPTIMIZERS,
+        name,
+        eo_mod.EmergingOptimizerEntry(optimizer_cls=optimizer_cls),
+    )
+    config = OptimizerConfig(lr=0.02, adam_beta1=0.81, adam_beta2=0.91)
+
+    optimizer, _ = eo_mod._create_emerging_optimizer(config, [], name, [], None)
+
+    assert optimizer.lr == 0.02
+    if accepts_betas:
+        assert optimizer.betas == (0.81, 0.91)
 
 
 @pytest.mark.skipif(
