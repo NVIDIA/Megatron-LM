@@ -324,8 +324,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         kind="torch-op",
         notes="VocabParallelEmbedding (weight[idx] deterministic branch vs F.embedding, and the main_grad "
-        "accumulation of gradient_accumulation_fusion) and local Column/RowParallelLinear "
-        "incl. apex fused_weight_gradient_mlp_cuda gradient-accumulation fusion.",
+        "accumulation of gradient_accumulation_fusion), local Column/RowParallelLinear "
+        "incl. apex fused_weight_gradient_mlp_cuda gradient-accumulation fusion, and the chunked "
+        "LM head (LinearCrossEntropyChunked: per-chunk mixed-output GEMM and cross entropy, one "
+        "linear backward on the assembled logits gradient).",
     ),
     KernelEntry(
         name="vocab_parallel_cross_entropy",

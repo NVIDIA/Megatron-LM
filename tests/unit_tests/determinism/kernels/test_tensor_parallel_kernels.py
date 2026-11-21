@@ -322,6 +322,58 @@ class TestTensorParallelLayers:
         )
         assert outputs["out[0]"].dtype is torch.float32
 
+    @pytest.mark.skipif(
+        te_general_gemm is None, reason="Transformer Engine general_gemm is not available"
+    )
+    @pytest.mark.parametrize("num_chunks", [3, 8])
+    def test_column_parallel_linear_chunked_loss_replays(self, num_chunks):
+        """Replay the chunked LM head (``lm_head_loss_num_chunks``).
+
+        One call runs the mixed-output GEMM and the cross entropy per sequence chunk,
+        differentiates each chunk back to its logits, writes those gradients into one buffer
+        for the whole sequence, and runs the linear backward once on that buffer.
+        """
+        seeded()
+        config = _config(hidden_size=512, num_attention_heads=8)
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        seq, batch, vocab = 2048, 2, 1024
+
+        class ChunkedHead(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = ColumnParallelLinear(
+                    512,
+                    vocab,
+                    config=config,
+                    init_method=init_method_normal(0.02),
+                    bias=False,
+                    output_dtype=torch.float32,
+                )
+                self.register_buffer("labels", torch.randint(0, vocab, (seq, batch)))
+                # The harness backpropagates ones through the per-token loss, and the chunked
+                # head has to be told that gradient up front.
+                self.register_buffer("upstream", torch.ones(batch, seq))
+
+            def forward(self, hidden):
+                def chunk_loss(logits, start, end):
+                    loss = vocab_parallel_cross_entropy(
+                        logits, self.labels[start:end], 0.0, tp_group
+                    )
+                    return loss.transpose(0, 1).contiguous()
+
+                return self.linear.forward_chunked_loss(
+                    hidden, chunk_loss, self.upstream, num_chunks
+                )
+
+        module = ChunkedHead().cuda()
+        x = torch.randn(seq, batch, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+        outputs, grads = assert_module_replays_bit_exact(
+            module, (x,), replays=3, contention=True, what=f"chunked LM head[{num_chunks} chunks]"
+        )
+        assert outputs["out"].shape == (batch, seq)
+        assert any(grad.abs().max() > 0 for grad in grads.values())
+
 
 # --- apex fused layer norm ------------------------------------------------------------------
 
