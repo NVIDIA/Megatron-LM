@@ -88,8 +88,15 @@ def test_mxfp8_shared_expert_config_expresses_bf16_module(monkeypatch, recwarn):
         },
     ],
 )
-def test_mok_accepts_key_supported_configurations(overrides):
-    assert _mok_transformer_config(**overrides).moe_megakernel_backend == "mok"
+@pytest.mark.parametrize("backend", ["mok", "cutemok"])
+def test_mok_accepts_key_supported_configurations(overrides, backend):
+    config = _mok_transformer_config(**{"moe_megakernel_backend": backend, **overrides})
+    assert config.moe_megakernel_backend == backend
+
+
+def test_megakernel_backend_name_is_validated():
+    with pytest.raises(ValueError, match="must be None, 'mok' or 'cutemok'"):
+        _mok_transformer_config(moe_megakernel_backend="cute_mok")
 
 
 def test_native_moe_still_accepts_fp64_router():
@@ -200,15 +207,19 @@ def test_shared_execution_is_independent_of_activation_and_preserves_native_prec
         ),
     ],
 )
-def test_mok_rejects_key_incompatible_configurations(overrides, error):
+@pytest.mark.parametrize("backend", ["mok", "cutemok"])
+def test_mok_rejects_key_incompatible_configurations(overrides, error, backend):
     with pytest.raises(ValueError, match=error):
-        _mok_transformer_config(**overrides)
+        _mok_transformer_config(**{"moe_megakernel_backend": backend, **overrides})
 
 
+@pytest.mark.parametrize("backend", ["mok", "cutemok"])
 @pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
-def test_mok_rejects_per_layer_whole_layer_cuda_graph(cuda_graph_impl):
+def test_mok_rejects_per_layer_whole_layer_cuda_graph(cuda_graph_impl, backend):
     with pytest.raises(ValueError, match="whole-layer CUDA Graph capture"):
-        _mok_transformer_config(cuda_graph_impl=cuda_graph_impl, cuda_graph_modules=[])
+        _mok_transformer_config(
+            moe_megakernel_backend=backend, cuda_graph_impl=cuda_graph_impl, cuda_graph_modules=[]
+        )
 
 
 @pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
@@ -221,10 +232,15 @@ def test_mok_rejects_per_layer_whole_layer_cuda_graph(cuda_graph_impl):
         [CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess],
     ],
 )
-def test_mok_rejects_per_layer_cuda_graph_covering_moe(cuda_graph_impl, cuda_graph_modules):
+@pytest.mark.parametrize("backend", ["mok", "cutemok"])
+def test_mok_rejects_per_layer_cuda_graph_covering_moe(
+    cuda_graph_impl, cuda_graph_modules, backend
+):
     with pytest.raises(ValueError, match="moe/moe_router/moe_preprocess"):
         _mok_transformer_config(
-            cuda_graph_impl=cuda_graph_impl, cuda_graph_modules=cuda_graph_modules
+            moe_megakernel_backend=backend,
+            cuda_graph_impl=cuda_graph_impl,
+            cuda_graph_modules=cuda_graph_modules,
         )
 
 
