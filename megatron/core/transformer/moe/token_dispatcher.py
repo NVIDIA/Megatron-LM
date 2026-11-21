@@ -13,6 +13,7 @@ from megatron.core.fp8_utils import get_fp8_recipe_for_a2a
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
 from megatron.core.jit import jit_fuser
+from megatron.core.ops.moe.fake_deepep import is_fake_process_group, validate_fake_flex_config
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel import (
     all_to_all,
@@ -1073,6 +1074,8 @@ class _HybridEPManager(_DispatchManager):
         self.num_experts = num_experts
         self.config = config
         self.router_topk = router_topk if router_topk is not None else config.moe_router_topk
+        if is_fake_process_group(group):
+            validate_fake_flex_config(config)
         self.permute_fusion = config.moe_permute_fusion
         self.capacity_factor = config.moe_expert_capacity_factor
         # Drop and pad the input to capacity.
@@ -1123,6 +1126,10 @@ class _HybridEPManager(_DispatchManager):
         padding_mask: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
+        if is_fake_process_group(self.group) and (
+            packed_seq_params is not None or (padding_mask is not None and bool(padding_mask.any()))
+        ):
+            raise ValueError("fake HybridEP does not model packed or masked input tokens")
         num_tokens = routing_map.shape[0]
         self._original_num_tokens = num_tokens
 
@@ -1470,6 +1477,8 @@ class _DeepepManager(_DispatchManager):
             num_experts (int): The total number of experts in the group.
             config (TransformerConfig): The configuration for the transformer model.
         """
+        if is_fake_process_group(group):
+            validate_fake_flex_config(config)
         self.group = group
         self.num_local_experts = num_local_experts
         self.config = config

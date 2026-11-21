@@ -2443,6 +2443,9 @@ def get_batch_on_this_tp_rank(
                 _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
 
     else:
+        fake_batch = torch.distributed.get_backend(broadcast_group) == "fake"
+        if fake_batch and (dynamic_cp or has_cu_seqlens):
+            raise ValueError("FakePG TP receivers require fixed-length, unpacked batches")
         if dynamic_cp:
             dynamic_cp_seq_length = torch.tensor(
                 0, dtype=torch.int32, device=torch.cuda.current_device()
@@ -2472,6 +2475,17 @@ def get_batch_on_this_tp_rank(
                 dtype=torch.bool,
                 device=torch.cuda.current_device(),
             )
+
+        if fake_batch:
+            # No TP source exists in a single-rank memory probe. Initialize the
+            # already allocated receive buffers in-place, avoiding invalid token
+            # IDs and empty loss masks without changing their allocation sizes.
+            tokens.zero_()
+            labels.zero_()
+            loss_mask.fill_(1)
+            position_ids.zero_()
+            if attention_mask is not None:
+                attention_mask.zero_()
 
         if dynamic_cp:
             local_cp_size = torch.empty(1, dtype=torch.int32, device=torch.cuda.current_device())
