@@ -13,6 +13,10 @@ import pytest
 import torch
 
 from megatron.core._rank_utils import safe_get_rank
+from megatron.core.extensions.te_cuda_graphs import (
+    TECudaGraphBackwardReloadSyncFunction,
+    TECudaGraphOffloadingInterface,
+)
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_mtp_block_spec,
@@ -23,7 +27,6 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    FineGrainedOffloadingBackwardRecordFunction,
     OffloadTensorGroup,
     OffloadTensorPool,
     PipelineOffloadManager,
@@ -458,10 +461,14 @@ def test_cuda_graph_backward_completion_callback_is_per_graph_task(monkeypatch):
         active_task = task_name
         graph_event = object()
         h2d_stream = object()
+        fake_interface = SimpleNamespace(
+            cuda_graph_event=lambda event=graph_event: event,
+            _manager=SimpleNamespace(h2d_stream=h2d_stream),
+        )
         monkeypatch.setattr(
-            PipelineOffloadManager,
-            "OFFLOAD_MGR",
-            type("Manager", (), {"cuda_graph_event": graph_event, "h2d_stream": h2d_stream})(),
+            TECudaGraphOffloadingInterface,
+            "get_instance",
+            staticmethod(lambda interface=fake_interface: interface),
         )
 
         hidden_states = torch.tensor(2.0, requires_grad=True)
@@ -476,7 +483,7 @@ def test_cuda_graph_backward_completion_callback_is_per_graph_task(monkeypatch):
         )
 
         task_start = len(calls)
-        recorded_input = FineGrainedOffloadingBackwardRecordFunction.apply(hidden_states)
+        recorded_input = TECudaGraphBackwardReloadSyncFunction.apply(hidden_states)
         (recorded_input * weight).backward()
         task_calls = calls[task_start:]
 
