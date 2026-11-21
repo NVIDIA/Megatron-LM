@@ -627,13 +627,16 @@ def test_mhc_h_post_bda_replays_fwd_bwd(backend, with_bias):
     )
 
 
+# (112, 2048) is the short-sequence case: M < 128 and not a power of two, so the cuTile
+# scalar-gradient launch tile is rounded up to a power of two instead of being M itself.
 @pytest.mark.parametrize("backend", [b for b in _MHC_BACKENDS if b != "triton"])
-def test_mhc_proj_rms_compute_h_replays_fwd_bwd(backend):
+@pytest.mark.parametrize("m,k", [(S * B, N * C), (112, 2048)])
+def test_mhc_proj_rms_compute_h_replays_fwd_bwd(backend, m, k):
     """Projection + RMS + compute-h: cuTile fused kernel or the native ``torch.compile`` path."""
     seeded()
     n = N
-    x = _mhc_rand(S * B, n * C)
-    weight = _mhc_rand(n * n + 2 * n, n * C, dtype=torch.float32)
+    x = _mhc_rand(m, k)
+    weight = _mhc_rand(n * n + 2 * n, k, dtype=torch.float32)
     alpha_pre = _mhc_rand(1, dtype=torch.float32)
     alpha_post = _mhc_rand(1, dtype=torch.float32)
     alpha_res = _mhc_rand(1, dtype=torch.float32)
@@ -644,12 +647,13 @@ def test_mhc_proj_rms_compute_h_replays_fwd_bwd(backend):
             x, weight, alpha_pre, alpha_post, alpha_res, bias, n, backend=backend
         )
 
-    assert_replays_bit_exact(
+    _, grads = assert_replays_bit_exact(
         run,
         (x, weight, alpha_pre, alpha_post, alpha_res, bias),
         replays=3,
         what=f"mhc proj_rms_compute_h[{backend}]",
     )
+    assert len(grads) == 6, f"expected a gradient for every input, got {sorted(grads)}"
 
 
 def test_contiguous_thd_rope_and_teacher_replay():
