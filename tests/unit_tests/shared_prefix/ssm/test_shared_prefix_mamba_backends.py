@@ -14,14 +14,14 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-import megatron.core.ssm
+import megatron.core.ssm.shared_prefix
+from megatron.core.datasets.shared_prefix.layout import SharedPrefixTree
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.shared_prefix_layout import SharedPrefixLayout
-from megatron.core.ssm import mamba_shared_prefix
 from megatron.core.ssm.mamba_mixer import MambaMixer, causal_conv1d_fn, mamba_chunk_scan_combined
+from megatron.core.ssm.shared_prefix import mamba_shared_prefix
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -49,7 +49,9 @@ def kernels_present(monkeypatch):
     monkeypatch.setattr(mamba_shared_prefix, "causal_conv1d_fn", object())
     monkeypatch.setattr(mamba_shared_prefix, "mamba_chunk_scan_combined", object())
     for name in ("mamba_ragged", "mamba_ragged_scan"):
-        monkeypatch.setitem(sys.modules, f"megatron.core.ssm.{name}", types.ModuleType(name))
+        monkeypatch.setitem(
+            sys.modules, f"megatron.core.ssm.shared_prefix.{name}", types.ModuleType(name)
+        )
 
 
 def test_ragged_state_fork_is_the_default(monkeypatch):
@@ -89,8 +91,8 @@ def test_ragged_rejects_non_default_ssm_state_dtype(monkeypatch, kernels_present
 
 def test_ragged_kernel_import_failure_fails_validation(monkeypatch, kernels_present):
     monkeypatch.delenv("NRL_SP_MAMBA_IMPL", raising=False)
-    monkeypatch.delattr(megatron.core.ssm, "mamba_ragged_scan", raising=False)
-    monkeypatch.setitem(sys.modules, "megatron.core.ssm.mamba_ragged_scan", None)
+    monkeypatch.delattr(megatron.core.ssm.shared_prefix, "mamba_ragged_scan", raising=False)
+    monkeypatch.setitem(sys.modules, "megatron.core.ssm.shared_prefix.mamba_ragged_scan", None)
     with pytest.raises(RuntimeError, match="NRL_SP_MAMBA_IMPL=state_fork"):
         mamba_shared_prefix._validate_mamba_fork(_fake_mixer())
     monkeypatch.setenv("NRL_SP_MAMBA_IMPL", "state_fork")
@@ -112,7 +114,7 @@ def test_batch_invariant_mode_fails_validation(monkeypatch, kernels_present, imp
 def test_packed_fused_oracle_rejects_grad(monkeypatch):
     """The packed_fused diagnostic is forward-only; with grad enabled it fails before running."""
     monkeypatch.setenv("NRL_SP_MAMBA_IMPL", "packed_fused")
-    layout = SharedPrefixLayout(prefix_len=4, completion_lens=(2, 3))
+    layout = SharedPrefixTree(prefix_len=4, completion_lens=(2, 3))
     with torch.enable_grad(), pytest.raises(NotImplementedError, match="forward-only"):
         mamba_shared_prefix.forward_mamba_layer_shared_prefix(
             SimpleNamespace(training=True), torch.zeros(layout.total_len, 1, 8), layout
@@ -211,7 +213,7 @@ class TestSharedPrefixMambaBackends:
             monkeypatch.delenv("NRL_SP_MAMBA_IMPL", raising=False)
         else:
             monkeypatch.setenv("NRL_SP_MAMBA_IMPL", impl)
-        layout = SharedPrefixLayout(prefix_len=40, completion_lens=(17, 5, 30))
+        layout = SharedPrefixTree(prefix_len=40, completion_lens=(17, 5, 30))
         hidden_states = torch.randn(
             layout.total_len, 1, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True
         )
@@ -243,8 +245,11 @@ def _jit_variants(*kernels):
 
 def _ragged_step(completion_lens):
     """Run the ragged gather and forest-state kernels forward and backward on one small root."""
-    from megatron.core.ssm.mamba_ragged import _RaggedGather, ragged_mamba_layout
-    from megatron.core.ssm.mamba_ragged_scan import _forest_state_bwd, _forest_state_fwd
+    from megatron.core.ssm.shared_prefix.mamba_ragged import _RaggedGather, ragged_mamba_layout
+    from megatron.core.ssm.shared_prefix.mamba_ragged_scan import (
+        _forest_state_bwd,
+        _forest_state_fwd,
+    )
 
     chunk_size, heads, dim = 16, 2, 64
     metadata = ragged_mamba_layout(
@@ -270,7 +275,7 @@ def _ragged_step(completion_lens):
 class TestRaggedMambaKernels:
 
     def test_kernels_compile_once_across_pack_lengths_and_chunk_counts(self):
-        from megatron.core.ssm import mamba_ragged, mamba_ragged_scan
+        from megatron.core.ssm.shared_prefix import mamba_ragged, mamba_ragged_scan
 
         kernels = (
             mamba_ragged._gather_forward,
@@ -289,7 +294,7 @@ class TestRaggedMambaKernels:
     def test_int64_offsets_match_int32(self, monkeypatch, completion_lens):
         import triton.language as tl
 
-        from megatron.core.ssm import mamba_ragged, mamba_ragged_scan
+        from megatron.core.ssm.shared_prefix import mamba_ragged, mamba_ragged_scan
 
         results = []
         for index_dtype in (tl.int32, tl.int64):
@@ -302,7 +307,7 @@ class TestRaggedMambaKernels:
             assert torch.equal(int32_result, int64_result)
 
     def test_gather_backward_matches_index_add_reference(self):
-        from megatron.core.ssm.mamba_ragged import _RaggedGather, ragged_mamba_layout
+        from megatron.core.ssm.shared_prefix.mamba_ragged import _RaggedGather, ragged_mamba_layout
 
         layout = ((70, (5, 33, 0, 64)), (20, (9,)), (16, (1, 2)))
         metadata = ragged_mamba_layout(layout, 16, 4, torch.device("cuda"))
@@ -322,7 +327,7 @@ class TestRaggedMambaKernels:
     def test_index_dtype_switches_to_int64_at_two_to_the_31(self):
         import triton.language as tl
 
-        from megatron.core.ssm import mamba_ragged, mamba_ragged_scan
+        from megatron.core.ssm.shared_prefix import mamba_ragged, mamba_ragged_scan
 
         below = torch.empty(2**31 - 1, device="meta")
         above = torch.empty(2**31 + 1, device="meta")
@@ -337,7 +342,7 @@ class TestRaggedMambaKernels:
         assert mamba_ragged_scan._index_dtype(view) == tl.int64
 
     def test_gather_beyond_int32_offsets(self):
-        from megatron.core.ssm.mamba_ragged import _RaggedGather
+        from megatron.core.ssm.shared_prefix.mamba_ragged import _RaggedGather
 
         _require_free_memory(24 * 2**30)
         width = 8192
@@ -358,7 +363,7 @@ class TestRaggedMambaKernels:
         assert torch.equal(grad_rows.amax(dim=1), pattern)
 
     def test_forest_state_forward_beyond_int32_offsets(self):
-        from megatron.core.ssm.mamba_ragged_scan import _forest_state_fwd
+        from megatron.core.ssm.shared_prefix.mamba_ragged_scan import _forest_state_fwd
 
         _require_free_memory(24 * 2**30)
         heads, dim = 64, 8192

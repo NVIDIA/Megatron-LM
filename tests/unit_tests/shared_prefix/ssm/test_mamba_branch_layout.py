@@ -5,7 +5,10 @@
 import pytest
 import torch
 
-from megatron.core.ssm.mamba_branch_layout import merge_mamba_branches, pack_mamba_branches
+from megatron.core.ssm.shared_prefix.mamba_branch_layout import (
+    merge_mamba_branches,
+    pack_mamba_branches,
+)
 
 
 @pytest.mark.parametrize("tail", [0, 2, 3])

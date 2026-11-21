@@ -61,7 +61,7 @@ else:
     is_gtp_param = None
 
 if TYPE_CHECKING:
-    from megatron.core.ssm.mamba_shared_prefix import MambaSharedPrefixCall
+    from megatron.core.ssm.shared_prefix.mamba_shared_prefix import MambaSharedPrefixCall
 
 from .mamba_context_parallel import MambaContextParallel
 
@@ -667,7 +667,9 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
                     "shared-prefix Mamba only supports static, unpacked training forwards"
                 )
             # Imported here: mamba_shared_prefix imports this module.
-            from megatron.core.ssm.mamba_shared_prefix import forward_mamba_mixer_shared_prefix
+            from megatron.core.ssm.shared_prefix.mamba_shared_prefix import (
+                forward_mamba_mixer_shared_prefix,
+            )
 
             return forward_mamba_mixer_shared_prefix(self, hidden_states, shared_prefix_call)
         in_inference_mode = InferenceMode.is_active()
