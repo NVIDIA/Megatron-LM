@@ -26,7 +26,7 @@ per draft token and no re-read of the running state.
 
 import torch
 
-from .common import HAVE_TRITON, exp, softplus, tl, triton
+from .common import HAVE_TRITON, HAVE_TRITON_LIBDEVICE, exp, libdevice, softplus, tl, triton
 
 
 @triton.heuristics(
@@ -192,10 +192,11 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
 
             if USE_G:
                 if USE_GATE_IN_KERNEL:
-                    # `g` is the raw gate input; GDN's decay is formed here.
+                    # `g` is the raw gate input; GDN's decay is formed here, through
+                    # libdevice, bit for bit the eager gate that GDN prefill forms.
                     if HAS_DT_BIAS:
                         b_g = b_g + b_dt_bias
-                    b_g = -exp(b_A) * softplus(b_g)
+                    b_g = -libdevice.exp(b_A) * softplus(b_g)
                 b_h *= exp(b_g)
 
             b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
@@ -250,10 +251,11 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
             if USE_G:
                 b_g = tl.load(p_g).to(tl.float32)
                 if USE_GATE_IN_KERNEL:
-                    # `g` is the raw gate input; GDN's decay is formed here.
+                    # `g` is the raw gate input; GDN's decay is formed here, through
+                    # libdevice, bit for bit the eager gate that GDN prefill forms.
                     if HAS_DT_BIAS:
                         b_g = b_g + b_dt_bias
-                    b_g = -exp(b_A) * softplus(b_g)
+                    b_g = -libdevice.exp(b_A) * softplus(b_g)
                 b_h *= exp(b_g)
 
             b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
@@ -346,7 +348,8 @@ def fused_recurrent_gated_delta_rule_update(
         compact_output: Store only the last recurrence output for each token.
             Requires fixed-length input and a whole number of steps per token.
         A_log: `[HV]` log decay rates. When given, `g` is the raw gate input and
-            the kernel forms the decay `-exp(A_log) * softplus(g + dt_bias)`.
+            the kernel forms the decay `-exp(A_log) * softplus(g + dt_bias)` in
+            fp32, bit for bit as torch computes it from the same inputs.
         dt_bias: `[HV]` gate bias, used only together with `A_log`.
         use_beta_sigmoid_in_kernel: Whether `beta` is a logit to be passed
             through a sigmoid in-kernel.
@@ -357,6 +360,10 @@ def fused_recurrent_gated_delta_rule_update(
     """
     assert HAVE_TRITON, "fused_recurrent_gated_delta_rule_update requires Triton"
     assert dt_bias is None or A_log is not None, "dt_bias requires A_log"
+    assert A_log is None or HAVE_TRITON_LIBDEVICE, (
+        "the in-kernel gate (A_log) needs `triton.language.extra.libdevice`, which requires "
+        f"Triton >= 3.0; found {getattr(triton, '__version__', 'unknown')}"
+    )
     # The kernel indexes with raw pointer arithmetic and would read garbage from
     # a strided input, so force every tensor argument contiguous.
     q, k, v, beta = q.contiguous(), k.contiguous(), v.contiguous(), beta.contiguous()

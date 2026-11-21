@@ -1,8 +1,8 @@
 # Copyright (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
-# Forked from `fla/utils.py`, `fla/ops/utils/op.py`, `fla/ops/utils/softplus.py`,
-# `fla/ops/utils/index.py` and `fla/modules/l2norm.py` in flash-linear-attention v0.5.1
+# Forked from `fla/utils.py`, `fla/ops/utils/op.py`, `fla/ops/utils/index.py` and
+# `fla/modules/l2norm.py` in flash-linear-attention v0.5.1
 # (https://github.com/fla-org/flash-linear-attention).
 #
 # Licensed under the MIT license; see the LICENSE file in the repository root.
@@ -43,6 +43,23 @@ except ImportError:
     triton.jit = null_decorator
     tl = MagicMock()
     HAVE_TRITON = False
+
+if HAVE_TRITON:
+    # Math that must match torch's eager CUDA ops bit for bit goes through libdevice
+    # rather than `tl`: on fp32 `tl.exp` lowers to `ex2.approx.f32` and `/` to
+    # `div.full.f32`, and `triton.language.math` has no `log1p` at all.
+    # The `triton.language.extra.libdevice` path dates to Triton 3.0 -- 2.x
+    # exposed it as `extra.cuda.libdevice`, which this package does not support.
+    try:
+        from triton.language.extra import libdevice
+
+        HAVE_TRITON_LIBDEVICE = True
+    except ImportError:
+        libdevice = None
+        HAVE_TRITON_LIBDEVICE = False
+else:
+    libdevice = None
+    HAVE_TRITON_LIBDEVICE = False
 
 
 # The Gated Delta Product chunk length is fixed at 64: `solve_tril`
@@ -129,32 +146,22 @@ def exp2(x):
 
 
 # ----------------------------------------------------------------------------
-# `fla.ops.utils.softplus`
+# softplus, for the gate `-exp(A_log) * softplus(a + dt_bias)`
 # ----------------------------------------------------------------------------
-# FLA's NVIDIA softplus is approximate inline PTX; it is copied verbatim so the
-# in-kernel GDN gate stays bitwise identical to upstream.
-_SOFTPLUS_PTX: tl.constexpr = tl.constexpr(
-    "{ .reg .pred p; setp.gt.f32 p, $1, 20.; @p mov.f32 $0, $1;"
-    " @!p mul.f32 $0, $1, 1.4426950408889634; @!p ex2.approx.ftz.f32 $0, $0;"
-    " @!p add.f32 $0, $0, 1.0; @!p lg2.approx.ftz.f32 $0, $0;"
-    " @!p mul.f32 $0, $0, 0.6931471805599453; }"
-)
+@triton.jit
+def softplus(x):
+    """`log1p(exp(x))` in fp32, saturating to the identity above 20 like torch's.
 
-if IS_NVIDIA:
+    Mirrors `F.softplus`'s `(x * beta) > threshold ? x : log1p(exp(x * beta)) / beta`
+    at the default `beta == 1.0`, where the multiply and divide are exact, so a gate
+    formed in-kernel matches the one the eager path forms.
 
-    @triton.jit
-    def softplus(x):
-        """`log(1 + exp(x))` in fp32, saturating to the identity above 20."""
-        return tl.inline_asm_elementwise(
-            asm=_SOFTPLUS_PTX, constraints="=r,r", args=[x], dtype=tl.float32, is_pure=True, pack=1
-        )
-
-else:
-
-    @triton.jit
-    def softplus(x):
-        """`log(1 + exp(x))` in fp32, saturating to the identity above 20."""
-        return tl.where(x < 20.0, tl.math.log(1 + tl.math.exp(x)), x)
+    `log1p` rather than `log(1 + ...)`: rounding `1 + exp(x)` to fp32 first leaves an
+    absolute error of up to 2**-24, about 1e-4 relative where softplus is small
+    (x ~ -7), and flushes the far-negative tail, where `exp(x)` falls below fp32's
+    epsilon, to zero.
+    """
+    return tl.where(x > 20.0, x, libdevice.log1p(libdevice.exp(x)))
 
 
 # ----------------------------------------------------------------------------
