@@ -37,20 +37,13 @@ A cost model can also have a placement guard for the groups above the reference 
 
 A margin that is not a finite number is an error of the cost model, in the Stage 1 layout
 as well. A cost model without a threshold has no guard and is never asked for a margin.
-A caller that validated the threshold before, as the planner does once for a run, passes it
-(``guard_threshold``): a cost model that gives another threshold by then, or none, is in
-error, so that no microbatch is re-packed under another guard than the validated one. The
-two are compared as floats, each converted once with ``float()`` as upstream converts its
-threshold, and the microbatch is priced under the validated one: what a threshold object
-answers when it is compared with another number plays no part.
+As upstream, the threshold is read for every microbatch and converted once with ``float()``.
 
 Differences from upstream (``../ORIGIN.json`` is the provenance record of the port):
 
 - Upstream asks every profile for a guard threshold and a margin; here both are optional.
 - The threshold must be an int or a float, and no boolean; upstream takes whatever
   ``float()`` converts, a boolean excepted.
-- Upstream reads the threshold of its profile anew for every microbatch. Here a caller can
-  pass the threshold it validated, and the cost model is then held to it.
 - Upstream keeps the least margin of a priced layout (``guard_min_margin``); no margin is
   recorded here.
 - The capacity predicate of the runtime (``fits``: padding and the sequences of a group) is
@@ -87,8 +80,6 @@ MEMORY_LPT = "memory_lpt"
 # DynamicUSP's default ``keep_threshold``: a sample whose work exceeds this many times the
 # work per rank of its microbatch is a keep sample.
 DEFAULT_KEEP_THRESHOLD = 8.4
-# Default of ``guard_threshold``: the caller validated no threshold of the placement guard.
-_NOT_VALIDATED = object()
 
 # Outcome of Stage 2 for one microbatch. The four codes after ``ADOPTED`` are DynamicUSP's;
 # a re-packed microbatch has no code there.
@@ -285,14 +276,11 @@ def repack_microbatch(
     costs,
     keep_threshold: float = DEFAULT_KEEP_THRESHOLD,
     fits: Callable[[list, int], bool] | None = None,
-    guard_threshold=_NOT_VALIDATED,
 ):
     """Stage 2 on the Stage 1 layout of one microbatch.
 
     ``groups`` is ``[(first rank, size, [sample ids])]``, covering the DPxCP ranks; the
-    other arguments are the fields of ``_Microbatch``. ``guard_threshold`` is the threshold
-    of the placement guard that the caller validated (None: no guard; see the module
-    docstring). Without the argument the threshold is the one ``costs`` gives now.
+    other arguments are the fields of ``_Microbatch``.
 
     Returns ``(groups, record)``. ``groups`` is None unless the outcome is ``ADOPTED``; then
     it lists the same groups in rank order with their new samples, in the order they were
@@ -307,19 +295,7 @@ def repack_microbatch(
         raise ValueError("stage2_reference_cp_size must be a positive integer")
     if not _finite(constant) or constant < 0.0:
         raise ValueError("stage2_global_constant_ms must be finite and nonnegative")
-    given = getattr(costs, "stage2_guard_threshold", None)
-    current = _threshold(given)
-    if guard_threshold is _NOT_VALIDATED:
-        guard = current
-    else:
-        # The run has one threshold, the validated one: what the cost model gives now is
-        # compared with it as floats, None with None.
-        guard = None if guard_threshold is None else float(guard_threshold)
-        if current != guard:
-            raise ValueError(
-                f"stage2_guard_threshold of the cost model changed: it is {given!r} now, "
-                f"{guard_threshold!r} when it was validated"
-            )
+    guard = _threshold(getattr(costs, "stage2_guard_threshold", None))
     groups = sorted(groups, key=lambda group: group[0])
     sizes = tuple(size for _, size, _ in groups)
     stage1 = [list(ids) for _, _, ids in groups]
@@ -427,7 +403,6 @@ def repack_layout(
     costs,
     keep_threshold: float = DEFAULT_KEEP_THRESHOLD,
     fits: Callable[[list, int], bool] | None = None,
-    guard_threshold=_NOT_VALIDATED,
 ):
     """Stage 2 on every microbatch of the layout of one count, one microbatch at a time.
 
@@ -445,7 +420,7 @@ def repack_layout(
     for groups in layout:
         try:
             repacked, record = repack_microbatch(
-                groups, lengths, tokens, position, costs, keep_threshold, fits, guard_threshold
+                groups, lengths, tokens, position, costs, keep_threshold, fits
             )
         except Exception as error:
             repacked = None

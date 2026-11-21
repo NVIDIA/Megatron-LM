@@ -17,66 +17,20 @@ class TimelineModel:
 
     world_size: int
     ep_size: int
-    layer_count: int
-    forward_non_attention_ms: float = 0.0
-    backward_non_attention_ms: float = 0.0
     iteration_tail_ms: float = 0.0
     first_forward_dp_cp_sync: bool = True
-    program: tuple | None = None  # (forward_ops, backward_ops) for program mode
-
-    def initial_state(self):
-        """Completion times of every EP block (scalar costs) or of every rank (program)."""
-        blocks = self.world_size // self.ep_size
-        return [0.0] * (blocks if self.program is None else self.world_size)
-
-    def makespan(self, state):
-        """Return step completion time including the configured iteration tail."""
-        return max(state) + self.iteration_tail_ms
-
-    def advance(self, state, groups: Sequence[tuple], first: bool):
-        """Apply one microbatch (forward then backward) to a state; returns the new state."""
-        run = self._scalar_phase if self.program is None else self._program_phase
-        forward, backward = (0, 1) if self.program is None else self.program
-        state = run(state, groups, forward)
-        if first and self.first_forward_dp_cp_sync:
-            state = [max(state)] * len(state)
-        return run(state, groups, backward)
+    program: tuple = ()  # (forward_ops, backward_ops)
 
     def evaluate(self, rounds: Sequence[Sequence[tuple]]):
-        """Score all microbatches with the shared forward/backward timeline."""
-        state = self.initial_state()
+        """Step time of the microbatches, forward then backward each, with the iteration tail."""
+        forward, backward = self.program
+        state = [0.0] * self.world_size  # completion time of every rank
         for index, groups in enumerate(rounds):
-            state = self.advance(state, groups, index == 0)
-        return self.makespan(state)
-
-    def _scalar_phase(self, state, groups, phase):
-        e = self.ep_size
-        na = self.forward_non_attention_ms if phase == 0 else self.backward_non_attention_ms
-        spans = []
-        for g in groups:
-            start, cp = g[0], g[1]
-            b0, b1 = start // e, (start + cp - 1) // e
-            spans.append((b0, b1 + 1, g[2 + phase] + na))
-        t = list(state)
-        nb = len(t)
-        layers = self.layer_count
-        done = 0
-        while done < layers:
-            new = [float('-inf')] * nb
-            for b0, b1, cost in spans:
-                s = max(t[b0:b1]) + cost
-                for b in range(b0, b1):
-                    if s > new[b]:
-                        new[b] = s
-            done += 1
-            delta = [a - b for a, b in zip(new, t)]
-            t = new
-            if done < layers and all(d == delta[0] for d in delta):
-                # Every block advanced by the same amount, so the relative offsets are
-                # unchanged and the max-plus recurrence repeats this step exactly.
-                t = [v + (layers - done) * delta[0] for v in t]
-                break
-        return t
+            state = self._program_phase(state, groups, forward)
+            if index == 0 and self.first_forward_dp_cp_sync:
+                state = [max(state)] * len(state)
+            state = self._program_phase(state, groups, backward)
+        return max(state) + self.iteration_tail_ms
 
     def _program_phase(self, state, groups, ops):
         w, e = self.world_size, self.ep_size
@@ -138,25 +92,17 @@ def layer_program(layers, *, recompute_forward: bool = False) -> dict:
                 dict(sync="ep", duration_ms=forward_ms),
             ]
         backward += [dict(sync="ep", duration_ms=backward_ms), dict(sync="cp", cost=backward_cost)]
-    return dict(layer_count=len(layers), forward=forward, backward=backward)
+    return dict(forward=forward, backward=backward)
 
 
 def build_timeline(model, geometry: "RuntimePlanGeometry") -> TimelineModel:
-    """Program-mode timeline from ``model.timing()`` or a scalar timeline when it is None.
+    """Timeline of the execution program that ``model.timing()`` gives.
 
-    A program-mode model may declare ``first_forward_dp_cp_sync`` in ``timing()``: False when
-    only the ranks of one CP group wait for each other. Without it all DPxCP ranks are
-    synchronised after the forward pass of the first microbatch.
+    A model may declare ``first_forward_dp_cp_sync`` in ``timing()``: False when only the
+    ranks of one CP group wait for each other. Without it all DPxCP ranks are synchronised
+    after the forward pass of the first microbatch.
     """
     timing = model.timing()
-    if timing is None:
-        return TimelineModel(
-            geometry.world_size,
-            geometry.ep_size,
-            int(getattr(model, "layer_count", 1)),
-            float(getattr(model, "forward_non_attention_ms", 0.0)),
-            float(getattr(model, "backward_non_attention_ms", 0.0)),
-        )
     (program,) = timing["execution_program"]  # one program: one virtual stage
     ops = tuple(tuple(_freeze_op(op) for op in program[phase]) for phase in ("forward", "backward"))
     sync = timing.get("first_forward_dp_cp_sync", True)
@@ -165,7 +111,6 @@ def build_timeline(model, geometry: "RuntimePlanGeometry") -> TimelineModel:
     return TimelineModel(
         geometry.world_size,
         geometry.ep_size,
-        int(program["layer_count"]),
         iteration_tail_ms=float(timing.get("iteration_tail_ms", 0.0)),
         first_forward_dp_cp_sync=sync,
         program=ops,

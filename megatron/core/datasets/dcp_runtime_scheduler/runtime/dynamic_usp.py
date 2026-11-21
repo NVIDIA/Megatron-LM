@@ -6,23 +6,13 @@ from __future__ import annotations
 
 import copy
 import math
-from collections.abc import Mapping
-from typing import Any
 
-from ..models.solver_section import PIPELINE_SCHEDULES, check_factor_sizes, sample_weight
+from ..models.solver_section import PIPELINE_SCHEDULES, sample_weight
 from .hot_switch import HotSwitchOptions, HotSwitchScheduler, InfeasibleLayout
 from .pipeline import step_time
 from .planner import RuntimePlan, RuntimePlanner, RuntimeScheduleError
-from .stage2 import ADOPTED, PROFILE_EXECUTION_ERROR, _finite, error_text, repack_layout
+from .stage2 import ADOPTED, PROFILE_EXECUTION_ERROR, error_text, repack_layout
 
-# The members of a cost model that Stage 2 reads (``models.base.DcpCostModel``).
-_STAGE2_HOOKS = (
-    "stage2_reference_cp_size",
-    "stage2_global_constant_ms",
-    "stage2_sample_loads",
-    "stage2_empty_group_load",
-    "stage2_group_time",
-)
 # Outcome of a microbatch that Stage 2 re-packed when the re-packed layout of the step could
 # not be scored: the step keeps its Stage 1 layout. DynamicUSP has no such outcome.
 RESCORE_REJECTED = "RESCORE_REJECTED"
@@ -35,31 +25,20 @@ _STAGE2_RECORDED = (ADOPTED, RESCORE_REJECTED, PROFILE_EXECUTION_ERROR)
 _STAGE2_RECORD_LIMIT = 64
 
 
-def _offers_pipeline_step_time(cost_model) -> bool:
-    """True when the cost model has what the step time of several pipeline stages reads."""
-    if not callable(getattr(cost_model, "pipeline_group_times", None)):
-        return False
-    terms = getattr(cost_model, "pipeline_terms", None)
-    if not isinstance(terms, Mapping):
-        return False
-    overhead = terms.get("per_mb_overhead_ms")
-    return _finite(overhead) and overhead >= 0
-
-
 class DynamicUSPRuntimePlanner(RuntimePlanner):
     """Optional solver sharing the existing cost wrapper and padded-input contract.
 
     Both solvers share model injection, validation, pricing and rank-row output; neither
-    inherits the other's search algorithm. Keyword options are those of ``HotSwitchOptions``.
-    The cost model supplies the Stage 1 coefficients, the step time and the Stage 2 members
-    (``models.base.DcpCostModel``).
+    inherits the other's search algorithm. Keyword options are those of ``HotSwitchOptions``
+    except ``pp_multiple``. The cost model supplies the Stage 1 coefficients, the step time
+    and the Stage 2 members (``models.base.DcpCostModel``).
 
     ``pipeline`` is ``(pipeline stages, virtual stages per pipeline stage)`` of the run and
     ``pipeline_schedule`` the name of its schedule (``runtime.pipeline``). None or
     ``"interleaved"`` is DynamicUSP's order, with counts that are multiples of the stages
     (``pp_multiple``), also for one chunk per stage. ``"non_interleaved"`` is Megatron's order
     without virtual pipeline stages: it takes ``(stages, 1)`` only and any count. With one
-    pipeline stage both arguments are checked and not read further.
+    pipeline stage neither argument is read.
 
     Stage 2 is switched by the cost model (``stage2_enabled``, off by default); ``_stage2``
     has the rules and ``last_statistics["stage2"]`` the outcome. Three attributes, which
@@ -72,63 +51,30 @@ class DynamicUSPRuntimePlanner(RuntimePlanner):
         self, geometry, cost_model, *, pipeline=None, pipeline_schedule=None, **options
     ) -> None:
         super().__init__(geometry, cost_model)
-        given = (1, 1) if pipeline is None else pipeline
-        if (
-            not isinstance(given, (tuple, list))
-            or len(given) != 2
-            or any(type(number) is not int or number < 1 for number in given)
-        ):
-            raise ValueError(
-                "pipeline must be (pipeline stages, virtual stages per pipeline stage), two "
-                f"positive integers; got {pipeline!r}"
-            )
-        if pipeline_schedule is not None and pipeline_schedule not in PIPELINE_SCHEDULES:
-            raise ValueError(
-                f"pipeline_schedule must be one of {list(PIPELINE_SCHEDULES)} or None; got "
-                f"{pipeline_schedule!r}"
-            )
         # One pipeline stage has no chunks to interleave: its virtual stages are not read,
-        # and neither is the schedule.
-        self.pipeline = tuple(given) if given[0] > 1 else (1, 1)
+        # and neither is the schedule. The pair and the name are checked where a plan is
+        # replayed (``pipeline.step_time``).
+        self.pipeline = tuple(pipeline) if pipeline is not None and pipeline[0] > 1 else (1, 1)
         stages = self.pipeline[0]
         self.pipeline_schedule = None
         if stages > 1:
             self.pipeline_schedule = pipeline_schedule or PIPELINE_SCHEDULES[0]
         non_interleaved = self.pipeline_schedule == PIPELINE_SCHEDULES[1]
-        if non_interleaved and self.pipeline[1] != 1:
-            raise ValueError(
-                "the non-interleaved pipeline schedule has one model chunk per pipeline stage; "
-                f"got pipeline={pipeline!r}"
-            )
-        if stages > 1 and not _offers_pipeline_step_time(cost_model):
+        if stages > 1 and not callable(getattr(cost_model, "pipeline_group_times", None)):
             raise ValueError(
                 f"the {cost_model.name!r} cost model has no step time for more than one "
-                "pipeline stage (it must offer pipeline_group_times and pipeline_terms); "
+                "pipeline stage (it must offer pipeline_group_times); "
                 f"this run has {stages} pipeline stages"
             )
         # The count multiple (DynamicUSP's ``pp_multiple``) of the search, the incumbent and
         # the capacity fallback: the stages, or 1 on Megatron's non-interleaved schedule.
-        multiple = 1 if non_interleaved else stages
-        if options.setdefault("pp_multiple", multiple) != multiple:
-            if non_interleaved:
-                raise ValueError(
-                    "pp_multiple is 1 on the non-interleaved pipeline schedule, which runs "
-                    f"any count of microbatches; got {options['pp_multiple']!r}"
-                )
-            raise ValueError(
-                f"pp_multiple is the number of pipeline stages, {stages}; got "
-                f"{options['pp_multiple']!r}"
-            )
-        self.count_multiple = multiple
+        self.count_multiple = 1 if non_interleaved else stages
         # Time-balance factors: a table given as a Python option wins over the one the cost
-        # model read from its coefficient file. Keys are CP sizes of the cost model; those
-        # this run cannot form are never read.
+        # model read from its coefficient file and checked against its CP sizes; those this
+        # run cannot form are never read.
         if options.get("tier_time_factors") is None:
             options["tier_time_factors"] = getattr(cost_model, "tier_time_factors", None)
-        self.options = HotSwitchOptions(**options)
-        supported = getattr(cost_model, "supported_cp_sizes", None)
-        if supported is not None:
-            check_factor_sizes(self.options.tier_time_factors or (), supported)
+        self.options = HotSwitchOptions(**options, pp_multiple=self.count_multiple)
         sizes = tuple(
             s
             for s in self.geometry.allowed_cp_sizes
@@ -144,46 +90,12 @@ class DynamicUSPRuntimePlanner(RuntimePlanner):
         self._stage2_reference: int | None = None
         self._stage2_guard: float | None = None
         if self.stage2_enabled:
-            missing = [name for name in _STAGE2_HOOKS if not hasattr(cost_model, name)]
-            # The placement guard is optional: a model with a threshold also has the margin.
-            guard: Any = getattr(cost_model, "stage2_guard_threshold", None)
-            if guard is not None and not hasattr(cost_model, "stage2_guard_margin"):
-                missing.append("stage2_guard_margin")
-            if missing:
-                raise ValueError(
-                    f"the {cost_model.name!r} cost model switches Stage 2 on without "
-                    f"offering {missing}"
-                )
-            threshold: Any = getattr(cost_model, "stage2_keep_threshold", None)
-            try:
-                valid = (
-                    type(threshold) in (int, float) and math.isfinite(threshold) and threshold > 0
-                )
-            except OverflowError:  # an integer beyond the float range
-                valid = False
-            if not valid:
-                raise ValueError(
-                    f"stage2_keep_threshold of the {cost_model.name!r} cost model must be a "
-                    f"finite positive number; got {threshold!r}"
-                )
-            self.stage2_keep_threshold = float(threshold)
-            reference = cost_model.stage2_reference_cp_size
-            if type(reference) is not int or reference < 1:
-                raise ValueError(
-                    f"stage2_reference_cp_size of the {cost_model.name!r} cost model must be "
-                    f"a positive integer; got {reference!r}"
-                )
-            # Kept: the plan statistics record it without asking the model again.
-            self._stage2_reference = reference
-            if guard is not None:
-                # The engine's own test of a threshold: an int or a float, finite, no boolean.
-                if not _finite(guard):
-                    raise ValueError(
-                        f"stage2_guard_threshold of the {cost_model.name!r} cost model must be "
-                        f"a finite number or None; got {guard!r}"
-                    )
-                # Kept as well: the threshold of every plan and of the plan statistics.
-                self._stage2_guard = float(guard)
+            # Read once (``models.base.DcpCostModel``): the plan statistics record these
+            # without asking the model again. The engine checks them for every microbatch.
+            self.stage2_keep_threshold = float(cost_model.stage2_keep_threshold)
+            self._stage2_reference = reference = cost_model.stage2_reference_cp_size
+            guard = getattr(cost_model, "stage2_guard_threshold", None)
+            self._stage2_guard = None if guard is None else float(guard)
             # Stage 2 leaves a microbatch of reference groups alone: with no larger size to
             # form, it has no work in any plan of this run.
             if not any(size > reference for size in self.scheduler.sizes):
@@ -210,19 +122,12 @@ class DynamicUSPRuntimePlanner(RuntimePlanner):
         value = self.costs.pack(values, size, 0)
         if value is None:
             raise RuntimeScheduleError(f"cost model rejected scheduling sample {sample_id}")
-        forward, backward, program = value
-        if self.timeline.program is None:
-            duration = self.timeline.layer_count * (
-                forward
-                + backward
-                + (self.timeline.forward_non_attention_ms + self.timeline.backward_non_attention_ms)
-            )
-        else:
-            duration = sum(
-                program[payload] if kind in ("cp", "ep_mean") else payload
-                for phase in self.timeline.program
-                for kind, payload in phase
-            )
+        program = value[2]
+        duration = sum(
+            program[payload] if kind in ("cp", "ep_mean") else payload
+            for phase in self.timeline.program
+            for kind, payload in phase
+        )
         work = size * duration
         if not math.isfinite(work) or work <= 0:
             raise ValueError("cost model must produce finite positive scheduling work")
@@ -269,7 +174,6 @@ class DynamicUSPRuntimePlanner(RuntimePlanner):
             self.model,
             self.stage2_keep_threshold,
             lambda ids, size: self.costs.fits(tuple(lengths[i] for i in ids), size),
-            self._stage2_guard,
         )
         statistics = dict(stage1_predicted_ms=predicted, stage2_predicted_ms=predicted)
         result, source = (predicted, rounds), "stage1"
@@ -375,9 +279,9 @@ class DynamicUSPRuntimePlanner(RuntimePlanner):
                 weights,
                 lambda ids, size: self.costs.fits(tuple(lengths[i] for i in ids), size),
                 lambda layout: score(self._rounds(layout)),
-                # Most sequences one microbatch holds under the per-group sequence caps.
+                # Most sequences one microbatch holds under the per-group sequence cap.
                 sequences_per_microbatch=max(
-                    self.geometry.world_size // size * self.sequence_limit(size)
+                    self.geometry.world_size // size * self.sequence_cap
                     for size in self.scheduler.sizes
                 ),
             )
@@ -402,21 +306,7 @@ class DynamicUSPRuntimePlanner(RuntimePlanner):
                 best = score(rounds), rounds
                 capacity_fallback = True
 
-        # The step time that scores a count is called DynamicUSP's objective only where it is:
-        # on the interleaved order, and at one pipeline stage when no rank waits for all others
-        # after the first forward pass. The non-interleaved order is Megatron's.
-        if self.pipeline_schedule == PIPELINE_SCHEDULES[1]:
-            objective = "step time of Megatron's non-interleaved pipeline schedule"
-        elif self.pipeline[0] > 1:
-            objective = "step-time objective of the interleaved pipeline schedule"
-        elif self.timeline.first_forward_dp_cp_sync:
-            objective = "step time of the cost model"
-        else:
-            objective = "step-time objective at one pipeline stage"
-        if stage2 is not None:
-            objective += ", Stage 2 on"
         self.last_statistics = dict(
-            algorithm=f"DynamicUSP solve_gbs Stage 1 + {objective}",
             source_commit="1ff97a4ae0beb5e088fadb9e112265bdd194b24d",
             group_sizes=self.scheduler.sizes,
             stage1_weight=(
@@ -435,7 +325,6 @@ class DynamicUSPRuntimePlanner(RuntimePlanner):
             # microbatches that the pipeline schedule cannot run.
             incumbent_unpriced=incumbent_unpriced,
             pack_cost_stats=dict(self.costs.stats),
-            model_sequence_limits=self.model_sequence_limits(),
         )
         if self.pipeline[0] > 1:
             # What scored the counts: the replayed schedule and the step terms of the cost

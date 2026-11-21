@@ -17,19 +17,10 @@ procedure uses:
 
 ## 1. Choose the scheduler type
 
-The runtime file is passed with `--dynamic-cp-runtime-config
-/path/to/runtime.json`. Its `type` selects the cost model and the search
-algorithm together:
-
-- `dcp_benchmark`: packaged attention predictions plus the user's
-  non-attention times, planned by the lightweight planner. The training
-  configuration decides between ordinary GQA and full Qwen3.5-35B-A3B.
-- `dynamic_usp`: a DynamicUSP cost profile planned by the DynamicUSP search.
-  `{"type": "dynamic_usp"}` selects the original profile, which does not
-  read the model configuration. `"hardware": "h100"` selects the calibration
-  measured for full Qwen3-30B-A3B with classic P2P.
-
-There are no other types and no separate solver, model or profile key.
+`type` in the runtime file (`--dynamic-cp-runtime-config /path/to/runtime.json`)
+selects the cost model and the search algorithm together; the README table
+lists the two types, `dcp_benchmark` and `dynamic_usp`, and the cost models of
+each. There are no other types and no separate solver, model or profile key.
 
 ## 2. Check that the configuration is covered
 
@@ -51,11 +42,9 @@ does not establish coverage. Compare it with the README:
 Do not change a model or hardware label to make another configuration fit.
 Report a configuration that no cost model covers.
 
-`hardware` also fixes the NVLink topology the cost model assumes; no key or
-argument sets it. Check the rank placement of the launch against the README
-section "NVLink topology": on `h100` every node runs 8 consecutive ranks, on
-`gb200` all ranks belong to one 72-GPU NVLink domain. Start-up cannot check
-the placement.
+`hardware` also fixes the NVLink topology the cost model assumes. Check the
+rank placement of the launch against the README section "NVLink topology";
+start-up cannot check it.
 
 Decide `max_cp_size` from the README section "CP group sizes": it is required
 when the largest CP group the run can form is not the full DPxCP group, and it
@@ -93,7 +82,7 @@ the NVLink domain says. For the original DynamicUSP profile the line can go on
 with notices. A `calibration` table without `solver.sample_weight`:
 DynamicUSP's published default A, B, C of the Stage 1 sample weight are in
 use. Stage 2 switched on: it is on, or idle. More than one pipeline stage: the
-stages and the pipeline step terms that are not fitted for the run. The README
+stages and the pipeline step terms that are left at their defaults. The README
 sections "Original profile", "Stage 2" and "More than one pipeline stage" say
 what each means.
 

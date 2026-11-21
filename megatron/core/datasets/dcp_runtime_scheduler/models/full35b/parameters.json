@@ -43,12 +43,7 @@
     "cache": {
       "forward_policy": "CP1_ALL_HOT_INDEX;CP_GT1_FIRST_COLD_CONTEXT_PLUS_HOT_INDEX_THEN29HOT",
       "backward_policy": "FIXED_DIAGNOSTIC_FIRST_BACKWARD_HEAD_NO_CACHE_STATE_CLAIM",
-      "observed_cp_sizes": [
-        1,
-        8,
-        16,
-        32
-      ],
+      "observed_cp_sizes": [1, 8, 16, 32],
       "fullCP_observation_claimed": false
     }
   },
@@ -60,61 +55,18 @@
     "solver": "non-negative least squares on columns scaled by their root mean square",
     "full_attention": "calibration packs 0 to 7 of every CP size 1 to 32 (256 packs); held-out packs 8 to 13 (192 packs)",
     "gdn": "heads of the source fit, 512 calibration points each; cold constant from the 496 calibration cold-pass points with CP > 1; held-out points 22 to 29 (256 per head)",
-    "heldout_limits_pct": {
-      "wape_pct": 3.0,
-      "p90_ape_pct": 5.0,
-      "max_ape_pct": 10.0
-    },
+    "heldout_limits_pct": {"wape_pct": 3.0, "p90_ape_pct": 5.0, "max_ape_pct": 10.0},
     "heldout": {
-      "full_attention_forward": {
-        "packs": 192,
-        "mean_ape_pct": 0.58,
-        "p90_ape_pct": 1.23,
-        "max_ape_pct": 2.94,
-        "wape_pct": 0.52
-      },
-      "full_attention_backward": {
-        "packs": 192,
-        "mean_ape_pct": 1.42,
-        "p90_ape_pct": 3.21,
-        "max_ape_pct": 8.19,
-        "wape_pct": 1.11
-      },
-      "gdn_forward": {
-        "packs": 256,
-        "mean_ape_pct": 2.17,
-        "p90_ape_pct": 4.64,
-        "max_ape_pct": 11.37,
-        "wape_pct": 2.12
-      },
-      "gdn_forward_cold_first_layer": {
-        "packs": 248,
-        "mean_ape_pct": 2.38,
-        "p90_ape_pct": 4.91,
-        "max_ape_pct": 9.99,
-        "wape_pct": 2.31
-      },
-      "gdn_backward": {
-        "packs": 256,
-        "mean_ape_pct": 1.78,
-        "p90_ape_pct": 3.83,
-        "max_ape_pct": 6.68,
-        "wape_pct": 1.76
-      }
+      "full_attention_forward": {"packs": 192, "mean_ape_pct": 0.58, "p90_ape_pct": 1.23, "max_ape_pct": 2.94, "wape_pct": 0.52},
+      "full_attention_backward": {"packs": 192, "mean_ape_pct": 1.42, "p90_ape_pct": 3.21, "max_ape_pct": 8.19, "wape_pct": 1.11},
+      "gdn_forward": {"packs": 256, "mean_ape_pct": 2.17, "p90_ape_pct": 4.64, "max_ape_pct": 11.37, "wape_pct": 2.12},
+      "gdn_forward_cold_first_layer": {"packs": 248, "mean_ape_pct": 2.38, "p90_ape_pct": 4.91, "max_ape_pct": 9.99, "wape_pct": 2.31},
+      "gdn_backward": {"packs": 256, "mean_ape_pct": 1.78, "p90_ape_pct": 3.83, "max_ape_pct": 6.68, "wape_pct": 1.76}
     }
   },
-  "accuracy": {
-    "full_attention_heldout_gate_pass": true,
-    "gdn_heldout_gate_pass": false
-  },
+  "accuracy": {"full_attention_heldout_gate_pass": true, "gdn_heldout_gate_pass": false},
   "source_execution_domain": {
-    "expected_runtime_inventory": {
-      "FA_core_API": 11,
-      "FA_module": 11,
-      "GDN_module": 30,
-      "MoE_with_EP": 41,
-      "layer": 41
-    },
+    "expected_runtime_inventory": {"FA_core_API": 11, "FA_module": 11, "GDN_module": 30, "MoE_with_EP": 41, "layer": 41},
     "geometry_policy": {
       "dataset_alignment": 64,
       "declared_max_policy": "FULL_PACK_CAPACITY",

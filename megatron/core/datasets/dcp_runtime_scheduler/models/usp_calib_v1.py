@@ -106,6 +106,11 @@ class USPCalibV1CostModel:
         self._validate_table(self.table)
         try:
             self.solver = parse_solver_section(table, self.supported_cp_sizes)
+            # Stage 2 switch and keep threshold of the table; off without them, as in
+            # DynamicUSP. Its placement guard reads two more fields, on ring tiers only.
+            self.stage2_enabled = self.solver.stage2_enabled
+            self.stage2_keep_threshold = self.solver.stage2_keep_threshold
+            self._load_stage2_guard()
         except ValueError as error:
             raise ValueError(f"{error} (coefficient file {str(path.resolve())!r})") from error
         # Stage 1 weight of a sample: A, B, C of the table, else DynamicUSP's published fit.
@@ -113,21 +118,15 @@ class USPCalibV1CostModel:
         self.sample_weight_coefficients = self.solver.sample_weight or DEFAULT_SAMPLE_WEIGHT
         # Stage 1 time-balance factors of the table; None keeps weight balance.
         self.tier_time_factors = self.solver.tier_time_factors
-        # Stage 2 switch and keep threshold of the table; off without them, as in DynamicUSP.
-        self.stage2_enabled = self.solver.stage2_enabled
-        self.stage2_keep_threshold = self.solver.stage2_keep_threshold
-        # Ring tiers only (the block of that name below): the placement guard of Stage 2.
-        self._load_stage2_guard(path)
         # Added to the slowest group of a microbatch; it only moves the Stage 2 epsilon.
         self.stage2_global_constant_ms = float(table["global"]["C_global_clean_ms"])
         # The step terms of more than one pipeline stage, as the plan statistics record them:
-        # ``default_terms`` names those the table does not give, ``fitted_at`` is its record.
+        # ``default_terms`` names those the table does not give.
         self.pipeline_terms = dict(
             per_mb_overhead_ms=self.solver.per_mb_overhead_ms,
             compute_fwd_share=self.solver.compute_fwd_share,
             comm_fwd_share=self.solver.comm_fwd_share,
             default_terms=list(self.solver.pipeline_default_terms),
-            fitted_at=self.solver.pipeline_fitted_at,
         )
         # A table given with ``calibration`` has no field for the topology it was measured
         # on, so the profile does not know it.
@@ -142,8 +141,11 @@ class USPCalibV1CostModel:
         }
 
     @staticmethod
-    def _validate_table(table):
-        """Check coefficients consumed by the original fixed-shape formulas."""
+    def _validate_table(table, guard=False):
+        """Check coefficients consumed by the original fixed-shape formulas.
+
+        With ``guard`` also the two fields that only the placement guard of Stage 2 reads.
+        """
 
         def field(*keys):
             value = table
@@ -215,6 +217,14 @@ class USPCalibV1CostModel:
                 raise ValueError("DynamicUSP ring beta chunk keys must be unique: " + key)
             coordinates.add(chunk_bytes)
             number(beta[key], "ring.beta_by_chunk_bytes." + key, positive=True)
+        if guard:
+            factors = field("compute", "in_train_overhead_factors", "OF_fa_fwd")
+            if not isinstance(factors, list) or not factors:
+                raise ValueError("DynamicUSP calibration requires a nonempty OF_fa_fwd list")
+            for index, factor in enumerate(factors):
+                label = f"compute.in_train_overhead_factors.OF_fa_fwd[{index}]"
+                number(factor, label, positive=True)
+            coefficient("ring", "in_train_bw_factor", positive=True)
 
     def check_domain(self, geometry, config=None):
         """Validate the parent geometry and CP widths against the upstream profile."""
@@ -359,11 +369,7 @@ class USPCalibV1CostModel:
             iteration_tail_ms=self.table["global"]["C_global_clean_ms"],
             first_forward_dp_cp_sync=False,
             execution_program=[
-                dict(
-                    layer_count=self.layer_count,
-                    forward=forward,
-                    backward=[dict(sync="cp", cost="block_b")] * self.layer_count,
-                )
+                dict(forward=forward, backward=[dict(sync="cp", cost="block_b")] * self.layer_count)
             ],
         )
 
@@ -437,13 +443,11 @@ class USPCalibV1CostModel:
     # ``guard_domain_factor`` are code constants, not keys of the coefficient file.
     _GUARD_THRESHOLD = 0.0
     _GUARD_DOMAIN_FACTOR = 0.4
-    # The two table fields that only the guard reads.
-    _GUARD_FIELDS = ("compute.in_train_overhead_factors.OF_fa_fwd", "ring.in_train_bw_factor")
     # None: this run has no guard (Stage 2 is off, or no CP size of the run is a ring tier).
     stage2_guard_threshold = None
     _stage2_guard_floors = None
 
-    def _load_stage2_guard(self, path):
+    def _load_stage2_guard(self):
         """Give the model its guard when Stage 2 is on and the run can form a ring tier.
 
         Only then are the two guard fields of the table read and checked. The floor of a ring
@@ -453,64 +457,32 @@ class USPCalibV1CostModel:
         long as passing its key-value bytes at the in-train ring bandwidth.
         """
         reference = self.stage2_reference_cp_size
-        ring = sorted(cp for cp in self.geometry.allowed_cp_sizes if cp > reference)
-        if not self.stage2_enabled or not ring:
+        if not self.stage2_enabled or max(self.geometry.allowed_cp_sizes) <= reference:
             return
-        absent = object()
-
-        def field(name):
-            node = self.table
-            for key in name.split("."):
-                if not isinstance(node, dict) or key not in node:
-                    return absent
-                node = node[key]
-            return node
-
-        def positive(value):
-            return _finite(value) and value > 0
-
-        factors, bandwidth_factor = (field(name) for name in self._GUARD_FIELDS)
-        valid = (
-            isinstance(factors, list) and bool(factors) and all(map(positive, factors)),
-            positive(bandwidth_factor),
-        )
-        given = (factors is not absent, bandwidth_factor is not absent)
-        missing = [name for name, has in zip(self._GUARD_FIELDS, given) if not has]
-        invalid = [
-            name for name, has, good in zip(self._GUARD_FIELDS, given, valid) if has and not good
-        ]
-        floors = {}
-        if all(valid):
-            # Upstream's arithmetic, operation by operation. 1920 key-value bytes per token
-            # over 4 x 3 Q heads x head dimension 160 of the synthetic shape is 1.0.
-            try:
-                rate = float(field("compute.fa_additive_law.fwd.P_tflops")) * 1e12 / min(factors)
-                bandwidth = float(field("ring.fits.kv.bw_gbps")) * 1e9
-                bandwidth *= float(bandwidth_factor)
-                floors = {
-                    cp: self._GUARD_DOMAIN_FACTOR
-                    * ((cp // 8) * (1920 / (4.0 * 3 * 160)) * rate / bandwidth)
-                    for cp in self.supported_cp_sizes
-                    if cp > reference
-                }
-            except ArithmeticError:
-                floors = {}
-            if not floors or not all(math.isfinite(floor) for floor in floors.values()):
-                # Upstream's check of its formulas at load rejects such a table as well.
-                invalid = ["the guard floor that the two fields give (it is not finite)"]
-        if missing or invalid:
-            problems = []
-            if missing:
-                problems.append("missing: " + ", ".join(missing))
-            if invalid:
-                problems.append("not valid: " + ", ".join(invalid))
-            raise ValueError(
-                f"solver.stage2.enabled true with CP groups of {ring} ranks (ring tiers) reads "
-                "two more fields of the table for the placement guard of Stage 2: "
-                f"{self._GUARD_FIELDS[0]}, a non-empty list of finite positive numbers, and "
-                f"{self._GUARD_FIELDS[1]}, a finite positive number; {'; '.join(problems)} "
-                f"(coefficient file {str(path.resolve())!r})"
-            )
+        try:
+            self._validate_table(self.table, guard=True)
+        except ValueError as error:
+            # Say why a table that loads with Stage 2 off is refused with it on.
+            raise ValueError(f"{error}, which the ring guard of Stage 2 reads") from error
+        compute, ring = self.table["compute"], self.table["ring"]
+        # Upstream's arithmetic, operation by operation. 1920 key-value bytes per token over
+        # 4 x 3 Q heads x head dimension 160 of the synthetic shape is 1.0.
+        try:
+            rate = float(compute["fa_additive_law"]["fwd"]["P_tflops"]) * 1e12
+            rate /= min(compute["in_train_overhead_factors"]["OF_fa_fwd"])
+            bandwidth = float(ring["fits"]["kv"]["bw_gbps"]) * 1e9
+            bandwidth *= float(ring["in_train_bw_factor"])
+            floors = {
+                cp: self._GUARD_DOMAIN_FACTOR
+                * ((cp // 8) * (1920 / (4.0 * 3 * 160)) * rate / bandwidth)
+                for cp in self.supported_cp_sizes
+                if cp > reference
+            }
+        except ArithmeticError:
+            floors = {}
+        if not floors or not all(map(math.isfinite, floors.values())):
+            # Upstream's check of its formulas at load rejects such a table as well.
+            raise ValueError("DynamicUSP calibration gives no finite Stage 2 guard floor")
         self._stage2_guard_floors = floors
         self.stage2_guard_threshold = self._GUARD_THRESHOLD
 
@@ -531,7 +503,7 @@ class USPCalibV1CostModel:
         self.components.cache_clear()
 
     def metadata(self):
-        """Record the original U8 calibration and its synthetic-shape scope."""
+        """Record the calibration table in use, the source commit and the solver settings."""
         solver = dict(
             sample_weight=dict(
                 zip("ABC", self.sample_weight_coefficients), default=self.sample_weight_is_default
@@ -551,13 +523,6 @@ class USPCalibV1CostModel:
             nvlink_domain_size=self.nvlink_domain_size,
             source_commit="1ff97a4ae0beb5e088fadb9e112265bdd194b24d",
             source_hashes=self.source_hashes,
-            provisional=True,
-            modeled_transport="U8 all-to-all + ring",
-            execution_transport="determined by the training communication configuration",
-            shape=(
-                "upstream synthetic 44-layer shape, 24 Q heads, head_dim=160; "
-                "not a Qwen calibration"
-            ),
             calibration_path=self.calibration_path,
             calibration_sha256=self.calibration_sha256,
             solver=solver,

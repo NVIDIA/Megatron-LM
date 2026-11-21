@@ -138,8 +138,8 @@ def test_h100_refit_file_beside_the_runtime_file_brings_its_own_domain(tmp_path)
     refit['domain']['config']['hidden_dropout'] = 0.1  # The launch is compared with the refit.
     (tmp_path / 'refit.json').write_text(json.dumps(refit))
     spec = _spec(tmp_path, 'h100', file=dict(calibration='refit.json'), hidden_dropout=0.1)
-    limits = worker._initialize_planner(spec).model.pack_limits(8)
-    assert (spec['required_global_batch_size'], limits.max_sample_length) == (64, 8192)
+    limit = worker._initialize_planner(spec).model.max_sample_length
+    assert (spec['required_global_batch_size'], limit) == (64, 8192)
 
 
 @pytest.mark.parametrize(
@@ -158,7 +158,6 @@ def test_runtime_file_and_launch_select_the_cost_model_and_its_limits(tmp_path, 
     domain, batch = spec['nvlink_domain_size'], spec.get('required_global_batch_size')
     assert (spec['model'], solver, sizes, domain, batch) == selected
     assert planner.model.metadata()['nvlink_domain_size'] == domain  # In every plan record.
-    assert prefetch._coverage_error(spec) is None  # The start-up probe prices every CP size.
     assert planner.costs.pack((1024,), 3, 0) is None  # No price for a CP size outside the list.
 
 

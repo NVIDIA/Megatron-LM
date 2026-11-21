@@ -144,24 +144,12 @@ step time against an unscheduled run. All results come from one H100 system.
 
 ## Use
 
-```json
-{
-  "type": "dynamic_usp",
-  "hardware": "h100",
-  "max_cp_size": 8
-}
-```
-
-- `max_cp_size` is required: the calibration ends at CP 8, below DPxCP = 32.
-  It is 8, or a smaller size the run can form.
-- Start-up compares the training configuration with the recipe and names the
-  first setting that differs.
-- Every global batch that training or evaluation schedules holds 256 samples;
-  start-up checks the configured batch sizes.
-- A sample is at most 16384 tokens long. A longer one stops every rank at the
-  step that plans it, with the sample and the limit.
-- A layout of the default heuristic that uses CP 16 or 32 is discarded as the
-  starting point of the search.
+The runtime file and the launch arguments are in the
+[configuration reference](../../mcore-configure-dcp-cost-model/references/model-options.md#measured-h100-calibration);
+the [README section](../../../megatron/core/datasets/dcp_runtime_scheduler/README.md#measured-h100-calibration)
+lists the limits (CP sizes up to 8, 256 samples per global
+batch, samples of at most 16384 tokens). A layout of the default heuristic
+that uses CP 16 or 32 is discarded as the starting point of the search.
 
 ## Content of the coefficient file
 
@@ -195,9 +183,7 @@ Name the refit in the runtime file:
 }
 ```
 
-A relative path is resolved beside the runtime file. The file must not change
-during a run. The
-[calibration skill](../SKILL.md#validate-and-use-the-table) says how to
+The [calibration skill](../SKILL.md#validate-and-use-the-table) says how to
 confirm the file in use from the trace. Check new predictions through the
 loader and the planner against predictions written independently by the fit,
 and keep fit inputs, case lists and reports outside the runtime package.

@@ -7,7 +7,6 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import math
 from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
@@ -19,8 +18,6 @@ from .full35b.gdn_features import features as gdn_features
 from .full35b.geometry import dot, fa_features, pack_geometry
 from .selection import validate_full_qwen35_config
 
-# Values of thd_tail_padding_policy; the unset policy resolves to the first.
-_TAIL_PADDING_POLICIES = ('append_dummy_seq', 'extend_last')
 # Parallel geometry of the measured source: (label in messages, measured value, geometry field).
 _MEASURED_GEOMETRY = (
     ('DPxCP', 32, 'world_size'),
@@ -28,18 +25,6 @@ _MEASURED_GEOMETRY = (
     ('max_seqlen_per_dp_cp_rank', 16384, 'tokens_per_rank'),
     ('dataset_alignment', 64, 'dataset_alignment'),
 )
-
-
-def _duration(value, label):
-    if type(value) not in (int, float):
-        raise ValueError(f'{label} must be finite nonnegative milliseconds')
-    try:
-        valid = math.isfinite(value) and value >= 0
-    except OverflowError:
-        valid = False
-    if not valid:
-        raise ValueError(f'{label} must be finite nonnegative milliseconds')
-    return float(value)
 
 
 class Qwen35FullCostModel:
@@ -51,7 +36,7 @@ class Qwen35FullCostModel:
 
     The features evaluate every pack in the layout of the measured source, where the
     padding tail extends the last sequence. The tail policy the training run executes
-    is not modelled; the metadata reports both.
+    (append_dummy_seq, the only one GDN admits with a fixed per-rank buffer) is not modelled.
     """
 
     name = 'dcp_benchmark_qwen35_full35b'
@@ -64,15 +49,7 @@ class Qwen35FullCostModel:
     non_attention_layer_types = ('gdn', 'gqa')
     non_attention_optional_layer_types = ('mtp',)
 
-    def __init__(
-        self,
-        geometry,
-        *,
-        hardware='gb200',
-        non_attention,
-        first_forward_dp_cp_sync=True,
-        tail_padding='append_dummy_seq',
-    ):
+    def __init__(self, geometry, *, hardware='gb200', non_attention):
         self.geometry = geometry
         if hardware != 'gb200':
             raise ValueError(f'"hardware" must be "gb200" for full Qwen3.5, got {hardware!r}')
@@ -80,14 +57,6 @@ class Qwen35FullCostModel:
         # All 32 ranks of the measured source lie in one NVLink domain, so a CP group has
         # the same price wherever it starts.
         self.nvlink_domain_size = NVLINK_DOMAIN_SIZES[hardware]
-        if type(first_forward_dp_cp_sync) is not bool:
-            raise ValueError('first_forward_dp_cp_sync must be a boolean')
-        self.first_forward_dp_cp_sync = first_forward_dp_cp_sync
-        if tail_padding not in _TAIL_PADDING_POLICIES:
-            raise ValueError(
-                f'tail_padding must be one of {list(_TAIL_PADDING_POLICIES)}, got {tail_padding!r}'
-            )
-        self.executed_tail_padding = tail_padding  # Reported only (see the class docstring).
         root = Path(__file__).with_name('full35b')
         raw = (root / 'parameters.json').read_bytes()
         if hashlib.sha256(raw).hexdigest() != PARAMETERS_SHA256:
@@ -102,7 +71,6 @@ class Qwen35FullCostModel:
         # and full35b/gdn_features.py for the features they multiply).
         self.full_attention = parameters['full_attention']
         self.gdn = parameters['gdn']
-        self.accuracy = parameters['accuracy']
         self.source_execution_domain = parameters['source_execution_domain']
         # The actual order: three GDN layers and one FA layer, ten times, then the FA MTP layer.
         expected = ('gdn', 'gdn', 'gdn', 'fa') * 10 + ('fa',)
@@ -112,7 +80,6 @@ class Qwen35FullCostModel:
             for index, kind in enumerate(expected[:-1])
         ]
         self.layers.append(dict(kind='fa', name=names['mtp']))
-        self.layer_types = expected
         # With CP > 1 the first GDN layer builds the CP context in its forward pass (the
         # cold pass of the measured source); every other GDN forward pass is hot.
         self._cold_layer = self.layers[0]['name']
@@ -127,8 +94,6 @@ class Qwen35FullCostModel:
             },
         }
         self.non_attention = self._non_attention_inputs(non_attention)
-        self.iteration_tail_ms = self.non_attention.get('iteration_tail_ms', 0.0)
-        self.microbatch_ms = self.non_attention.get('microbatch_ms', 0.0)
         self._fixed = {
             phase: {layer['name']: self._layer_duration(phase, layer) for layer in self.layers}
             for phase in ('forward', 'backward')
@@ -139,54 +104,24 @@ class Qwen35FullCostModel:
         self.execution_program = self._execution_program()
 
     def _non_attention_inputs(self, values):
-        if not isinstance(values, dict):
-            raise ValueError('Full Qwen3.5-35B requires explicit non_attention inputs')
-        allowed = {
-            'forward_ms_per_layer',
-            'backward_ms_per_layer',
-            'source',
-            'iteration_tail_ms',
-            'microbatch_ms',
-        }
-        if set(values) - allowed:
-            raise ValueError('Unknown full Qwen3.5-35B non_attention field')
-        result = copy.deepcopy(values)
+        """The times of the runtime file as floats: one per phase, or one per layer type."""
+        result = dict(values)
         result.setdefault('source', 'user-provided fixed non-attention timings')
-        if not isinstance(result['source'], str) or not result['source'].strip():
-            raise ValueError('non_attention source must be nonempty when supplied')
-        names = {layer['name'] for layer in self.layers}
-        for phase in ('forward', 'backward'):
-            key = phase + '_ms_per_layer'
-            if key not in result:
-                raise ValueError(f'Full Qwen3.5-35B requires non_attention.{key}')
+        for key in ('forward_ms_per_layer', 'backward_ms_per_layer'):
             value = result[key]
             if isinstance(value, Mapping):
-                if not value or set(value) - names - {'gdn', 'fa', 'gqa', 'mtp'}:
-                    raise ValueError(f'{key} needs gdn/gqa/mtp layer types or actual layer names')
-                if 'fa' in value and 'gqa' in value:
-                    raise ValueError(f'{key} must use either fa or its gqa alias')
-                result[key] = {name: _duration(v, f'{key}.{name}') for name, v in value.items()}
+                result[key] = {name: float(v) for name, v in value.items()}
             else:
-                result[key] = _duration(value, key)
-        for key in ('iteration_tail_ms', 'microbatch_ms'):
-            if key in result:
-                result[key] = _duration(result[key], key)
+                result[key] = float(value)
         return result
 
     def _layer_duration(self, phase, layer):
         value = self.non_attention[phase + '_ms_per_layer']
-        if isinstance(value, Mapping):
-            kind = layer['kind']
-            if layer['name'] in value:
-                return value[layer['name']]
-            if layer['name'] == self.layers[-1]['name'] and 'mtp' in value:
-                return value['mtp']
-            if kind in value:
-                return value[kind]
-            if kind == 'fa' and 'gqa' in value:
-                return value['gqa']
-            raise ValueError(f'Missing {phase} non-attention timing for {layer["name"]}')
-        return value
+        if not isinstance(value, Mapping):
+            return value
+        if layer is self.layers[-1] and 'mtp' in value:
+            return value['mtp']
+        return value['gdn' if layer['kind'] == 'gdn' else 'gqa']
 
     def check_domain(self, geometry, config=None):
         """Check the measured parallel geometry; model and execution checks live in selection."""
@@ -222,7 +157,6 @@ class Qwen35FullCostModel:
                     cost += self.gdn['first_layer_cold_forward_ms']
                 result[name + ':attention:' + phase] = cost
                 result[name + ':nonattention:' + phase] = self._fixed[phase][name]
-        result['outer_microbatch'] = self.microbatch_ms
         return result
 
     def program_costs(self, lengths, cp, *, ranks=None):
@@ -240,69 +174,35 @@ class Qwen35FullCostModel:
         return sum(values[layer['name'] + ':attention:backward'] for layer in self.layers) / 41
 
     def _execution_program(self):
-        program = layer_program(
-            [
-                (
-                    layer['name'] + ':attention:forward',
-                    self._fixed['forward'][layer['name']],
-                    layer['name'] + ':attention:backward',
-                    self._fixed['backward'][layer['name']],
-                )
-                for layer in self.layers
-            ]
-        )
-        program['backward'].append(dict(sync='local', duration_ms=self.microbatch_ms))
-        return [program]
+        return [
+            layer_program(
+                [
+                    (
+                        layer['name'] + ':attention:forward',
+                        self._fixed['forward'][layer['name']],
+                        layer['name'] + ':attention:backward',
+                        self._fixed['backward'][layer['name']],
+                    )
+                    for layer in self.layers
+                ]
+            )
+        ]
 
     def timing(self):
-        """Use the full model's ordered layer program and only user-supplied tails."""
-        return dict(
-            execution_program=copy.deepcopy(self.execution_program),
-            iteration_tail_ms=self.iteration_tail_ms,
-            first_forward_dp_cp_sync=self.first_forward_dp_cp_sync,
-        )
+        """Use the full model's ordered layer program."""
+        return dict(execution_program=copy.deepcopy(self.execution_program))
 
     def clear(self):
         """Reset the per-global-batch module and program prediction cache."""
         self._program_costs.cache_clear()
 
     def metadata(self):
-        """Report the model scope, the fixed inputs, the source domain and its accuracy gates."""
-        # Held-out gate results of the packaged coefficients (limits and figures: ``fit`` in
-        # full35b/parameters.json).
-        accuracy = dict(self.accuracy)
+        """Report the fixed inputs, the file digests and the tail policy of the measured source."""
         return dict(
             name=self.name,
-            model='Qwen3.5-35B-A3B',
             hardware=self.hardware,
             nvlink_domain_size=self.nvlink_domain_size,
-            layer_count=41,
-            decoder_layer_count=40,
-            mtp_layer_count=1,
-            attention_geometry=[16, 2, 256],
-            layer_kinds=list(self.layer_types),
-            attention_prediction_scope='WHOLE_MODULE_ONLY',
-            whole_attention_module_includes_projections=True,
-            core_prediction_available=False,
-            gdn_feature_schema=self.gdn['feature_schema'],
             non_attention=copy.deepcopy(self.non_attention),
-            non_attention_scope='fixed user times excluding the whole FA/GDN attention module',
-            non_attention_mapping_keys=[
-                *self.non_attention_layer_types,
-                *self.non_attention_optional_layer_types,
-            ],
-            non_attention_density_regression_loaded=False,
-            e2e_residual_fitted=False,
             source_hashes=dict(self.source_hashes),
-            source_execution_domain=copy.deepcopy(self.source_execution_domain),
-            # The features evaluate every pack in the layout of the measured source, whose
-            # tail policy is the first of these two; training executes the second.
             source_tail_padding=self.source_execution_domain['geometry_policy']['tail_padding'],
-            executed_tail_padding=self.executed_tail_padding,
-            scientific_accuracy_passed=bool(accuracy) and all(accuracy.values()),
-            accuracy=accuracy,
-            cache_observed_cp_sizes=list(self.gdn['cache']['observed_cp_sizes']),
-            full_cp_cache_observation_claimed=self.gdn['cache']['fullCP_observation_claimed'],
-            forward_cache_policy=self.gdn['cache']['forward_policy'],
-            backward_cache_policy=self.gdn['cache']['backward_policy'],
         )

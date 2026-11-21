@@ -8,7 +8,6 @@ import os
 import sys
 import time
 import traceback
-from dataclasses import asdict, is_dataclass
 
 
 def _runtime_module(name):
@@ -22,8 +21,6 @@ def _initialize_planner(spec):
     geometry_options['allowed_cp_sizes'] = tuple(sorted(set(geometry_options['allowed_cp_sizes'])))
     geometry = _runtime_module('runtime.planner').RuntimePlanGeometry(**geometry_options)
     schedulers = _runtime_module('runtime.config').SCHEDULERS
-    if spec['type'] not in schedulers:
-        raise ValueError(f"Unknown scheduler type: {spec['type']!r}")
     model = _runtime_module('models').make_model(spec['model'], geometry, **spec['model_options'])
     pinned = spec.get('calibration_sha256')
     if pinned is not None and getattr(model, 'calibration_sha256', None) != pinned:
@@ -50,81 +47,8 @@ def _initialize_planner(spec):
         return _runtime_module('runtime.dynamic_usp').DynamicUSPRuntimePlanner(
             geometry, model, **options
         )
-    if pipeline is not None:
-        raise ValueError(
-            f"Scheduler type {spec['type']!r} plans for one pipeline stage; the specification "
-            f"has {pipeline['stages']}"
-        )
     runtime = _runtime_module('runtime.lightweight')
     return runtime.LightweightRuntimePlanner(geometry, model, runtime.LightweightOptions(**options))
-
-
-def _probe_packs(geometry, cp):
-    """Full CP packs without padding: one sequence across the group, and ``cp`` sequences.
-
-    The second pack holds ``tokens_per_rank`` tokens per sequence, with fewer and longer
-    sequences when the per-group sequence cap is below ``cp``. Nothing is returned when no
-    aligned sequence fits.
-    """
-    packs = []
-    for count in (1, min(cp, geometry.max_group_seqs or cp)):
-        pack = geometry.full_pack(cp, count)
-        if pack is not None and pack not in packs:
-            packs.append(pack)
-    return packs
-
-
-def coverage_gaps(planner):
-    """Allowed CP widths the planner cannot rely on, with the predictor's own reason.
-
-    The planner treats a pack the predictor rejects as unavailable, so a width without
-    parameters would only surface as a failed plan at some training step. A width counts
-    as covered when the model prices one of its full packs on ranks ``0..cp-1`` and also
-    the full pack with the most sequences the planner puts in one group of that width:
-    ``planner.sequence_limit``, the sequence cap lowered to what the model declares it can
-    price. What the probe accepts is therefore what the planner builds.
-    """
-    geometry, model = planner.geometry, planner.model
-    gaps = {}
-
-    def rejection(lengths, cp):
-        try:
-            ranks = list(range(cp))
-            if getattr(model, 'program_costs', None) is not None:
-                model.program_costs(lengths, cp, ranks=ranks)
-            model.forward(lengths, cp, ranks=ranks)
-            model.backward(lengths, cp, ranks=ranks)
-        except ValueError as error:
-            return str(error)
-        return None
-
-    for cp in geometry.allowed_cp_sizes:
-        packs = _probe_packs(geometry, cp)
-        reasons, priced = [], None
-        for lengths in packs:
-            reason = rejection(lengths, cp)
-            if reason is None:
-                priced = lengths
-                break
-            reasons.append(reason)
-        if packs and priced is None:
-            gaps[cp] = reasons[0]
-            continue
-        limit = planner.sequence_limit(cp)
-        if limit < 1:
-            gaps[cp] = 'the cost model declares that it prices no pack of this CP size'
-            continue
-        count = min(limit, geometry.capacity(cp) // geometry.pack_unit(cp))
-        largest = geometry.full_pack(cp, count) if count >= 1 else None
-        if largest is not None and largest != priced:
-            reason = rejection(largest, cp)
-            if reason is not None:
-                gaps[cp] = (
-                    f'{reason} (for a full pack of {count} sequences, the most the planner '
-                    'puts in one group of this size)'
-                )
-    model.clear()
-    return gaps
 
 
 def _solve(planner, spec, lengths, padded, baseline_rows):
@@ -163,12 +87,9 @@ def _solve(planner, spec, lengths, padded, baseline_rows):
     incumbent_rejection = {}
     if baseline_rows is not None:
         # The default heuristic only seeds the search. It does not know the runtime
-        # contract (per-group sequence cap, max_cp_size, the cost model's CP widths),
-        # so a violation discards the seed and never fails the step.
+        # contract, so a violation discards the seed and never fails the step.
         try:
-            planner_module.validate_rows(
-                baseline_rows, dict(enumerate(padded)), geometry, min(geometry.allowed_cp_sizes)
-            )
+            planner_module.validate_rows(baseline_rows, dict(enumerate(padded)), geometry)
         except planner_module.RuntimeScheduleError as error:
             unsupported = sorted(
                 {cp for row in baseline_rows for _, cp, _ in planner_module.decode_groups(row)}
@@ -195,29 +116,16 @@ def _solve(planner, spec, lengths, padded, baseline_rows):
     metadata = getattr(planner.model, 'metadata', None)
     model_metadata = metadata() if callable(metadata) else None
     torch = sys.modules.get('torch')
-    cuda_initialized = bool(torch is not None and torch.cuda.is_initialized())
-    distributed_initialized = bool(torch is not None and torch.distributed.is_initialized())
-    if cuda_initialized or distributed_initialized:
+    if torch is not None and (torch.cuda.is_initialized() or torch.distributed.is_initialized()):
         raise RuntimeError('CPU predictor must not initialize CUDA or distributed')
     return dict(
         rows=plan.rows,
         statistics={**planner.last_statistics, **incumbent_rejection},
         predicted_ms=plan.predicted_ms,
         model_metadata=model_metadata,
-        planner_options=(
-            asdict(planner.options)
-            if is_dataclass(getattr(planner, 'options', None))
-            else spec.get('solver_options', {})
-        ),
-        solver_entry=f'{type(planner).__module__}:{type(planner).__name__}.plan_padded',
         solve_start=started,
         solve_end={'monotonic_ns': time.monotonic_ns(), 'wall_ns': time.time_ns()},
         worker_pid=os.getpid(),
-        worker_cuda_initialized=cuda_initialized,
-        worker_distributed_initialized=distributed_initialized,
-        external_scheduler_imported=any(
-            name == 'dcp_scheduler' or name.startswith('dcp_scheduler.') for name in sys.modules
-        ),
     )
 
 
@@ -237,10 +145,6 @@ def main() -> None:
     try:
         spec = json.loads(sys.stdin.readline())
         planner = _initialize_planner(spec)
-        # Ask the cost model for its pack limits while this process starts: a model may
-        # price packs to answer, which must not use up the first plan's time budget.
-        for cp in planner.geometry.allowed_cp_sizes:
-            planner.sequence_limit(cp)
         for request in sys.stdin:
             try:
                 result = _solve(planner, spec, *json.loads(request))

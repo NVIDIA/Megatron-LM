@@ -702,11 +702,6 @@ class ModelParallelConfig:
         if self.dynamic_cp_runtime_config is not None:
             # The file is read and validated when training starts
             # (data_schedule.validate_dynamic_cp_runtime), not here.
-            if (
-                not isinstance(self.dynamic_cp_runtime_config, str)
-                or not self.dynamic_cp_runtime_config
-            ):
-                raise ValueError("dynamic_cp_runtime_config must be the path of a JSON file.")
             if not self.dynamic_context_parallel:
                 raise ValueError("dynamic_cp_runtime_config requires dynamic context parallelism.")
 

@@ -368,28 +368,17 @@ class HotSwitchScheduler:
     ) -> tuple[float, list[list[Group]]]:
         """Select the lowest-cost layout among the bounded count candidates.
 
-        ``candidate_count`` counts are laid out, starting at the lower bound, as upstream
-        does. Every count is a multiple of ``pp_multiple``, as upstream's are: the lower
-        bound is rounded up to one, and the counts that follow are the next multiples.
-        With the default of one that is every count. Upstream has no limit on the
-        sequences of a group; a ``fits`` predicate with such a limit can reject every count
-        that upstream's bound admits. Two rules keep the window on counts that can hold
-        the samples. They move over the same multiples:
+        ``candidate_count`` counts are laid out from the lower bound on, every one a multiple
+        of ``pp_multiple``, as upstream does. Upstream has no limit on the sequences of a
+        group; two rules of this port keep the window on counts that can hold the samples
+        (in full: ORIGIN.json, the adaptations of dynamic_usp):
 
         - ``sequences_per_microbatch``, the most sequences one microbatch can hold, adds
-          ``ceil(samples / sequences_per_microbatch)``, rounded up to a multiple, to the
-          lower bound. The condition is necessary, so no feasible count is skipped. A
-          raised bound inside upstream's window only skips the counts below it: the window
-          still ends where upstream's ends, so it holds no count that upstream does not
-          try. A raised bound past upstream's window starts a full window of its own.
-        - When every count of the window is rejected for capacity, the search goes on past
-          the window, from one multiple to the next and whatever the rejection, to the
-          first count with a layout, and lays out ``candidate_count`` counts from that one.
-          It tries at most ``4 * candidate_count`` counts past the window to find it, which
-          bounds the planning time, and no count above the number of samples. This rule
-          never acts when a count of the window has a layout, or when one was rejected for
-          another reason than capacity. Upstream raises an error when no count of its
-          window has a layout.
+          ``ceil(samples / sequences_per_microbatch)`` to the lower bound: a necessary
+          condition, so no feasible count is skipped.
+        - When capacity rejects every count of the window, the search goes on past it, over
+          at most ``4 * candidate_count`` counts, to the first count with a layout and lays
+          out a window from that one. Upstream raises an error.
         """
         self.last_candidates = []
         required = self._requirements(tokens, fits)
@@ -449,9 +438,7 @@ class HotSwitchScheduler:
         if all(
             candidate.get("rejection") == "group_capacity" for candidate in self.last_candidates
         ):
-            # Every count of the window was rejected for capacity: search past it for the first
-            # count with a layout, then lay out a full window from that one. A window cut short
-            # by the number of samples leaves no count to search.
+            # A window cut short by the number of samples leaves no count to search.
             for count in counts(window_end, _WINDOWS_PAST_LIMIT * window):
                 if lay_out(count):
                     for later in counts(count + step, window - step):

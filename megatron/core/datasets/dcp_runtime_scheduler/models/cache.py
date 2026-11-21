@@ -14,11 +14,11 @@ class PackCostModel:
     config: object  # dcp_scheduler SchedulerConfig (alignments, tokens_per_rank, ...)
     forward: object  # callable(lengths, cp, ranks=) -> ms per layer
     backward: object
-    program_costs: object | None  # callable(lengths, cp, ranks=) -> {name: ms}
+    program_costs: object  # callable(lengths, cp, ranks=) -> {name: ms}
     # Costs are memoized per group start modulo this period (the planner passes DPxCP for a
     # model that reads rank positions); None when the start does not change the cost.
     placement_period: int | None
-    sequence_limit: object  # callable(cp) -> sequences one pack of that CP size may hold
+    sequence_limit: int  # sequences one pack may hold
     stats: dict = field(default_factory=lambda: dict(calls=0, hits=0, errors=0, signature_hits=0))
     _memo: dict = field(default_factory=dict, repr=False)
     _min_cp: dict = field(default_factory=dict, repr=False)
@@ -34,7 +34,7 @@ class PackCostModel:
 
     def fits(self, lengths, cp):
         """Check the pack against sequence-count and physical-token limits."""
-        if len(lengths) > self.sequence_limit(cp):
+        if len(lengths) > self.sequence_limit:
             return False
         return sum(self.stored(n, cp) for n in lengths) <= self.config.capacity(cp)
 
@@ -52,7 +52,7 @@ class PackCostModel:
         return value
 
     def pack(self, lengths, cp, start):
-        """Exact (forward_ms, backward_ms, program_costs_or_None); None if the predictor rejects."""
+        """Exact (forward_ms, backward_ms, program_costs); None if the predictor rejects."""
         lengths = tuple(int(n) for n in lengths)
         placement = 0 if self.placement_period is None else start % self.placement_period
         key = (lengths, cp, placement)
@@ -62,11 +62,7 @@ class PackCostModel:
         self.stats['calls'] += 1
         ranks = list(range(start, start + cp))
         try:
-            program = (
-                dict(self.program_costs(lengths, cp, ranks=ranks))
-                if self.program_costs is not None
-                else None
-            )
+            program = dict(self.program_costs(lengths, cp, ranks=ranks))
             fwd = float(self.forward(lengths, cp, ranks=ranks))
             value = (fwd, float(self.backward(lengths, cp, ranks=ranks)), program)
         except ValueError:

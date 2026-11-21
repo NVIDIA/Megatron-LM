@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Pack layout and dot product of the full-model prediction source (numerical operations
-# preserved); fa_features returns the features of the one form shared by every CP size.
+# preserved); fa_features (one form for every CP size) and round_work are written anew.
 # isort: skip_file
 # fmt: off
 # ruff: noqa
@@ -26,15 +26,23 @@ def fa_features(point):
     each round sets its duration (round_critical_work_m, 1e6 CP1-equivalent token pairs)."""
     logical,stored,cp=point['logical_lengths'],point['storage_lengths'],point['cp']
     require(sum(stored)==cp*16384 and all(s%(2*cp)==0 and 0<n<=s for n,s in zip(logical,stored,strict=True)), 'invalid FA geometry')
-    if cp==1:round_critical=sum(n*n for n in logical)
-    else:
-        from .cp_round_geometry import build_round_geometries
-        pieces=build_round_geometries(logical,stored,cp);work=[[0]*cp for _ in range(cp)]
-        for item in pieces:work[item.step][item.rank]+=item.cp1_equivalent_sum_squared_tokens
-        round_critical=sum(max(row) for row in work)
+    round_critical=sum(n*n for n in logical) if cp==1 else sum(max(row) for row in round_work(logical,stored,cp))
     return dict(bias=1.,cp_enabled=float(cp>1),extra_rounds=float(cp-1),
         round_critical_work_m=round_critical/1e6,valid_tokens_k=sum(logical)/1e3,
         sequences_x_cp=float(len(logical)*cp))
+
+def round_work(logical,stored,cp):
+    """Work [step][rank] of a TE P2P ring in CP1-equivalent token pairs (twice the attended pairs).
+
+    A sequence is stored in 2*cp chunks; rank r holds chunk r and chunk 2*cp-1-r. In step 0 it
+    runs a causal block on its own tokens; in step s it attends to the keys of rank r-s: all
+    its queries to their first chunk (s <= r) or its second chunk to all their keys (s > r)."""
+    own=[[tuple(min(max(n-i*(s//(2*cp)),0),s//(2*cp)) for i in (r,2*cp-1-r)) for n,s in zip(logical,stored)] for r in range(cp)]
+    work=[[sum((a+b)*(a+b+1) for a,b in own[r]) for r in range(cp)]]
+    for step in range(1,cp):
+        pairs=[zip(own[r],own[(r-step)%cp]) for r in range(cp)]
+        work.append([2*sum((a+b)*c if step<=r else b*(c+d) for (a,b),(c,d) in pairs[r]) for r in range(cp)])
+    return work
 
 def dot(coefficients,features):
     require(set(coefficients)==set(features),'fresh feature/coefficient names differ')

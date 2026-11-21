@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 from collections.abc import Mapping
 from functools import lru_cache
 
@@ -16,35 +15,19 @@ from . import attention
 from .base import NVLINK_DOMAIN_SIZES, uses_p2p
 
 
-def _duration(value, label):
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-        or value < 0
-    ):
-        raise ValueError(f"{label} must be a finite nonnegative number of milliseconds")
-    return float(value)
-
-
 def _layer_duration(non_attention, phase):
     """The user's fixed time of one layer: a number, or a mapping that names ``gqa``."""
     value = non_attention[phase + "_ms_per_layer"]
-    if isinstance(value, Mapping):
-        if "gqa" not in value:
-            raise ValueError("missing non-attention measurement for gqa")
-        value = value["gqa"]
-    return _duration(value, phase + " non-attention")
+    return float(value["gqa"] if isinstance(value, Mapping) else value)
 
 
 class BenchmarkCostModel:
     """Core-attention predictions plus explicit fixed non-attention measurements.
 
     Every layer is a GQA layer. ``models.attention`` predicts the core attention of a CP
-    group (the attention kernel with its context-parallel communication, without the
-    projections) for the forward and the backward pass, at every CP size including 1; the
-    rest of a layer is the user's measurement. No coefficient is refitted, no residual is
-    added, and no missing non-attention time is inferred.
+    group for the forward and the backward pass, at every CP size including 1; the rest of
+    a layer is the user's measurement. No coefficient is refitted, no residual is added,
+    and no missing non-attention time is inferred.
     """
 
     name = "dcp_benchmark"
@@ -68,33 +51,16 @@ class BenchmarkCostModel:
         head_dim,
         non_attention,
         layer_count=1,
-        first_forward_dp_cp_sync=True,
         recompute_forward=False,
     ):
         if not isinstance(hardware, str) or hardware not in NVLINK_DOMAIN_SIZES:
             raise ValueError("hardware must be h100 or gb200; GB300 is not this calibration")
-        for flag in (first_forward_dp_cp_sync, recompute_forward):
-            if type(flag) is not bool:
-                raise ValueError("first_forward_dp_cp_sync and recompute_forward must be booleans")
         self.geometry, self.hardware, self.layer_count = geometry, hardware, layer_count
         self.nvlink_domain_size = NVLINK_DOMAIN_SIZES[hardware]
         self.attention_geometry = (query_heads, kv_heads, head_dim)
-        self.first_forward_dp_cp_sync = first_forward_dp_cp_sync
         self.recompute_forward = recompute_forward
         self.non_attention = dict(non_attention)
         self.non_attention.setdefault("source", "user-provided non-attention times")
-        source = self.non_attention["source"]
-        if not isinstance(source, str) or not source.strip():
-            raise ValueError("source must identify the user-supplied measurements")
-        required = {"forward_ms_per_layer", "backward_ms_per_layer"}
-        if not required <= set(self.non_attention) <= required | {"source", "iteration_tail_ms"}:
-            raise TypeError(
-                "non_attention takes forward_ms_per_layer and backward_ms_per_layer, and "
-                "optionally source and iteration_tail_ms"
-            )
-        self.iteration_tail_ms = _duration(
-            self.non_attention.get("iteration_tail_ms", 0.0), "iteration_tail_ms"
-        )
         layer = (
             "gqa:forward",
             _layer_duration(self.non_attention, "forward"),
@@ -104,9 +70,7 @@ class BenchmarkCostModel:
         self._timing = dict(
             execution_program=[
                 layer_program([layer] * layer_count, recompute_forward=recompute_forward)
-            ],
-            iteration_tail_ms=self.iteration_tail_ms,
-            first_forward_dp_cp_sync=first_forward_dp_cp_sync,
+            ]
         )
         # Price one token with the packaged predictor: an attention geometry without
         # coefficients, a per-rank buffer above what it prices or a changed coefficient file
@@ -213,7 +177,7 @@ class BenchmarkCostModel:
             raise ValueError("The recompute layer program requires all layers to be recomputed")
 
     def metadata(self):
-        """Report the predictor identity and the scope of the user's non-attention times."""
+        """Report the predictor identity, the file digests and the user's non-attention times."""
         return dict(
             name=self.name,
             hardware=self.hardware,
@@ -221,12 +185,5 @@ class BenchmarkCostModel:
             attention_geometry=list(self.attention_geometry),
             layer_count=self.layer_count,
             source_hashes=dict(self.source_hashes),
-            non_attention=dict(self.non_attention, iteration_tail_ms=self.iteration_tail_ms),
-            non_attention_source=self.non_attention["source"],
-            non_attention_scope=(
-                "fixed ms per layer, microbatch and rank; includes projections and EP"
-            ),
-            scope="core attention + fixed non-attention layer program",
-            provisional=True,
-            independent_accuracy_passed=False,
+            non_attention=dict(self.non_attention),
         )

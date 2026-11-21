@@ -23,7 +23,6 @@ SECTIONS = ('plans', 'runtime_sequence_cap', 'pipeline_plans', 'runtime_pipeline
 PLANS = {case['name']: case for section in SECTIONS for case in PINS[section]['cases']}
 PLANS.update((case['name'], case) for case in MEGATRON['plans']['cases'])
 H100 = dict(model='qwen3_h100_p2p', tokens_per_rank=4096, cp_sizes=[1, 2, 4, 8], ep_size=8)
-FITTED_AT = dict(pipeline_parallel=2, virtual_stages=1, schedule='non_interleaved')
 STAGE2_PLANS = STAGE2['plans']['cases'] + STAGE2['ring_guard_plans']['cases']
 
 
@@ -133,11 +132,10 @@ def test_solver_quantities_of_the_original_profile_equal_every_pin(tmp_path):
         assert derived == pytest.approx(factors, rel=1e-12)
     for pinned in PINS['pipeline_group_times']['groups']:
         shares = {key: pinned[key] for key in ('compute_fwd_share', 'comm_fwd_share')}
-        solver = {'pipeline': dict(shares, fitted_at=FITTED_AT)}  # the record changes no time
+        solver = {'pipeline': shares}
         model = _planner(PLANS['A'], tmp_path, solver=solver).model
         times = model.pipeline_group_times(tuple(pinned['lengths']), pinned['cp'])
         assert times == pytest.approx((pinned['forward_ms'], pinned['backward_ms']), rel=1e-12)
-    assert model.pipeline_terms['fitted_at'] == FITTED_AT
 
 
 def test_both_plan_builders_reproduce_the_pinned_order_of_every_stage():
@@ -179,7 +177,7 @@ def test_batch_without_a_layout_is_planned_by_capacity_or_is_a_schedule_error(tm
     plan, statistics = usp.plan(lengths), usp.last_statistics
     assert _trail(statistics['candidates']) == [[n, 'group_capacity'] for n in range(43, 63)]
     assert (statistics['capacity_fallback'], plan.microbatches) == (True, 63)
-    planner.validate_rows(plan.rows, lengths, usp.geometry, 8)
+    planner.validate_rows(plan.rows, lengths, usp.geometry)
     with pytest.raises(planner.RuntimeScheduleError, match='sample 0: .* no allowed CP size fits'):
         usp.plan({0: 8192 + 16})
     # Virtual stages take multiples of the stages; Megatron's order plans these four samples.
@@ -210,7 +208,6 @@ def test_default_layout_is_kept_unless_the_search_is_predicted_faster(tmp_path):
         (dict(solver={'sample_weight': {'A': True, 'B': 2, 'C': 3}}), 'A must be a finite'),
         (dict(solver={'tier_time_factors': {'12': 1.5}}), r'CP sizes of the cost model \[8,'),
         (dict(solver={'pipeline': {'compute_fwd_share': 1.5}}), r'a number in \[0, 1\]'),
-        (dict(solver={'pipeline': {'fitted_at': {}}}), 'fitted_at requires the keys'),
         (dict(solver={'stage2': {'enabled': 1}}), 'stage2.enabled must be true or false'),
         # The measured H100 calibration: one pipeline stage, no Stage 2, its own overhead term.
         (dict(H100, pipeline_parallel=2), 'has no step time for more than one'),

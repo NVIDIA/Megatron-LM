@@ -24,6 +24,7 @@ ValueError, where upstream returns a plan or fails in another way. Upstream limi
 warm-up of a stage to the number of its forward chunks, ``min(warm-up, total)``; that is
 not needed here, because the limit never applies when the count of microbatches is a
 multiple of the stages. At most 32 plans are kept; upstream keeps every plan it has built.
+``step_time`` takes the groups of a microbatch to cover the ranks (upstream checks it).
 
 ``non_interleaved_plan`` is not part of DynamicUSP, which has the one plan builder above:
 it lists the order in which Megatron runs a training step with more than one pipeline
@@ -175,16 +176,6 @@ def non_interleaved_plan(microbatches: int, stages: int) -> tuple:
     return _plan(microbatches, stages, 1, lambda stage: min(stages - stage - 1, microbatches))
 
 
-def _tiles(groups, world_size) -> bool:
-    """True when ``(first rank, end rank, ...)`` groups hold each of the ranks exactly once."""
-    position = 0
-    for first, end, *_ in sorted(groups):
-        if first != position or end <= first:
-            return False
-        position = end
-    return position == world_size
-
-
 def step_time(
     rows: Sequence[Sequence[tuple]],
     world_size: int,
@@ -198,10 +189,9 @@ def step_time(
 
     ``rows[j]`` lists the CP groups of microbatch ``j`` as ``(start, size, forward_ms,
     backward_ms)``: the first rank, the number of ranks and the forward and backward time
-    of the whole model for that group. The groups of a microbatch must hold each of the
-    ``world_size`` ranks exactly once, in any order: as upstream, a microbatch whose
-    groups overlap or leave a rank without a group raises ValueError, and so does a group
-    that ends past the last rank. ``per_mb_overhead_ms`` is added once per microbatch.
+    of the whole model for that group. The groups of a microbatch hold each of the
+    ``world_size`` ranks exactly once, in any order; upstream checks it, the caller does
+    here (``planner.validate_rows``). ``per_mb_overhead_ms`` is added once per microbatch.
 
     ``schedule`` names the plan builder whose order is replayed: ``"interleaved"``
     (``interleaved_plan``) or ``"non_interleaved"`` (``non_interleaved_plan``, which has one
@@ -226,13 +216,6 @@ def step_time(
         ]
         for row in rows
     ]
-    for microbatch, row in enumerate(costs):
-        if not _tiles(row, world_size):
-            raise ValueError(
-                f"the CP groups of microbatch {microbatch} do not hold each of the {world_size} "
-                "DPxCP ranks exactly once; (first rank, number of ranks) of the groups: "
-                f"{[(first, end - first) for first, end, *_ in row]}"
-            )
     ended: dict = {}  # operation -> the time each rank ends it
     last: list = [None] * stages  # per stage: the end times of its latest operation
     for operation, needed, has_previous in plan:

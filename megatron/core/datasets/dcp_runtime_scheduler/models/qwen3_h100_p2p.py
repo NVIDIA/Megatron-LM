@@ -25,7 +25,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from ..runtime.config import _unique_object
-from .base import NVLINK_DOMAIN_SIZES, PackLimits, uses_p2p
+from .base import NVLINK_DOMAIN_SIZES, uses_p2p
 from .solver_section import parse_solver_section
 
 _MODEL_NAME = "qwen3_h100_p2p"
@@ -33,7 +33,7 @@ _HARDWARE = "h100"
 _PROFILE = "classic_p2p"
 _CP_SIZES = (1, 2, 4, 8)
 # Raw bytes of the packaged coefficient file; ORIGIN.json records the same digest.
-PACKAGED_SHA256 = "a031958b1a02cc523d4b0ab3163649f2f42532cd4e6daf6aa459768b99c0027e"
+PACKAGED_SHA256 = "f26acf789ec45031fbb1d799f9796e554d4572e9ab526234bf276c1cbae8b897"
 _SCOPE = "The H100 calibration (Qwen3-30B-A3B, classic P2P)"
 _MISSING = "<unset>"
 _MODEL_CONFIG = {
@@ -136,8 +136,8 @@ class Qwen3H100P2PCostModel:
 
     name = _MODEL_NAME
     hardware = _HARDWARE
-    # Ranks of one H100 node. Every measured CP group lies inside one node, so the price of a
-    # group does not depend on the node; a group that leaves a node is rejected.
+    # Ranks of one H100 node. Every measured CP group lies inside one node, and the scheduler
+    # forms size-aligned groups of at most 8 ranks, so the price does not depend on the node.
     nvlink_domain_size = NVLINK_DOMAIN_SIZES[_HARDWARE]
     placement_invariant = True
     supported_cp_sizes = _CP_SIZES
@@ -165,7 +165,7 @@ class Qwen3H100P2PCostModel:
             self._validate_profile()
         except (KeyError, TypeError, AttributeError, OverflowError) as error:
             raise ValueError("Malformed H100 calibration file") from error
-        self._limits = PackLimits(max_sample_length=self.maximum_length)
+        self.max_sample_length = self.maximum_length  # no pack with a longer sample is priced
 
     def _validate_profile(self):
         data = self.profile
@@ -273,8 +273,7 @@ class Qwen3H100P2PCostModel:
         }
         self.iteration_tail_ms = _nonnegative(self.table["iteration_tail_ms"], "iteration tail")
         # Optional Stage 1 coefficients of the solver. Without them the scheduler derives the
-        # sample weight from this model's step times and balances weight, not time. The
-        # calibration has no Stage 2 sample loads: ``solver.stage2`` can only say "off".
+        # sample weight from this model's step times and balances weight, not time.
         try:
             solver = parse_solver_section(
                 data,
@@ -291,10 +290,6 @@ class Qwen3H100P2PCostModel:
     def required_global_batch_size(self):
         """Samples per global batch that the measured step overhead describes, if declared."""
         return self.domain.get("step_overhead_global_batch_size")
-
-    def pack_limits(self, cp):
-        """Declare the measured sample-length range: no pack with a longer sample is priced."""
-        return self._limits
 
     def check_domain(self, geometry, config=None):
         """Reject geometry, model and execution settings outside the measured recipe."""
@@ -395,20 +390,6 @@ class Qwen3H100P2PCostModel:
             )
         return tuple(features[name] for name in self.feature_names)
 
-    def _check_ranks(self, cp, ranks):
-        if ranks is None:
-            return
-        ranks = tuple(ranks)
-        if (
-            not ranks
-            or len(ranks) != cp
-            or any(type(rank) is not int for rank in ranks)
-            or ranks != tuple(range(ranks[0], ranks[0] + cp))
-            or not self.geometry.supports_group(ranks[0], cp)
-            or ranks[0] // self.nvlink_domain_size != ranks[-1] // self.nvlink_domain_size
-        ):
-            raise ValueError("H100 P2P calibration requires an aligned group inside one H100 node")
-
     @lru_cache(maxsize=65536)
     def _costs(self, lengths, cp):
         features = self._features(lengths, cp)
@@ -422,17 +403,14 @@ class Qwen3H100P2PCostModel:
 
     def forward(self, lengths, cp, *, ranks=None):
         """Predict complete self-attention forward milliseconds per layer and pack."""
-        self._check_ranks(cp, ranks)
         return self._costs(tuple(lengths), cp)[0]
 
     def backward(self, lengths, cp, *, ranks=None):
         """Predict complete self-attention backward milliseconds per layer and pack."""
-        self._check_ranks(cp, ranks)
         return self._costs(tuple(lengths), cp)[1]
 
     def program_costs(self, lengths, cp, *, ranks=None):
         """Return attention times and per-rank forced-balanced EP cost contributions."""
-        self._check_ranks(cp, ranks)
         lengths = tuple(lengths)
         forward, backward = self._costs(lengths, cp)
         load = sum(lengths) / self.geometry.tokens_per_rank / cp
@@ -443,15 +421,12 @@ class Qwen3H100P2PCostModel:
             "rest_b": self.remainder["backward"][0] + self.remainder["backward"][1] * load,
         }
 
-    guide_program_costs = program_costs
-
     def timing(self):
         """Build the measured layer order, per-microbatch overhead and one iteration tail."""
         layers, outer, mean = self.layer_count, self.outer, dict(sync="ep", aggregation="mean")
         forward = [dict(sync="cp", cost="att_f"), dict(mean, cost="rest_f")]
         backward = [dict(mean, cost="rest_b"), dict(sync="cp", cost="att_b")]
         program = dict(
-            layer_count=layers,
             forward=[dict(sync="local", duration_ms=outer["forward"])] + forward * layers,
             backward=backward * layers + [dict(sync="local", duration_ms=outer["backward"])],
         )
@@ -469,7 +444,6 @@ class Qwen3H100P2PCostModel:
             "source_hashes": dict(self.source_hashes),
             "calibration_path": self.calibration_path,
             "calibration_sha256": self.calibration_sha256,
-            "modeled_transport": "classic P2P",
             "source": self.table["source"],
             "domain": self.domain,
             "validation": self.table["validation"],
@@ -481,9 +455,4 @@ class Qwen3H100P2PCostModel:
                 ),
                 "tier_time_factors": self.tier_time_factors,
             },
-            "scope": (
-                "Qwen3-30B-A3B BF16 self-attention under classic P2P context parallelism plus "
-                "valid-token EP mean contributions for forced-balanced routing, per-microbatch "
-                "overhead and one iteration tail, measured on 32 H100"
-            ),
         }

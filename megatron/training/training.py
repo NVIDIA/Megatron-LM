@@ -4849,39 +4849,21 @@ def _check_dynamic_cp_runtime_batch_sizes(spec):
     if required is None:
         return
     cfg = get_run_config()
-    faults = []
+    sizes = {}
     if not cfg.validation.skip_train:
-        schedule = cfg.train.step_batch_size_schedule
-        if schedule is not None or cfg.train.decrease_batch_size_if_needed:
-            # The size that runs, now and at most later, differs from --global-batch-size.
-            running = get_current_running_global_batch_size()
-            largest = get_global_batch_size_upper_bound()
-            if schedule is not None and (running != required or largest != required):
-                faults.append(
-                    f'--step-batch-size-schedule {schedule!r} trains with {running} samples '
-                    f'per global batch now and up to {largest} later'
-                )
-            elif schedule is None and running != required:
-                faults.append(
-                    f'--global-batch-size {cfg.train.global_batch_size} with '
-                    f'--decrease-batch-size-if-needed trains with {running} samples per '
-                    'global batch'
-                )
-        elif cfg.train.global_batch_size != required:
-            faults.append(f'--global-batch-size is {cfg.train.global_batch_size}')
+        # Both are --global-batch-size unless --step-batch-size-schedule or
+        # --decrease-batch-size-if-needed change what runs.
+        sizes['training now'] = get_current_running_global_batch_size()
+        sizes['training at most'] = get_global_batch_size_upper_bound()
     eval_iters = cfg.validation.eval_iters
     counts = eval_iters if isinstance(eval_iters, (list, tuple)) else [eval_iters]
     if cfg.validation.full_validation or any(counts):
         # Resolved when the arguments are finalized: the training value unless set.
         eval_batch_size = cfg.validation.eval_global_batch_size
-        if eval_batch_size is None:
-            eval_batch_size = cfg.train.global_batch_size
-        if eval_batch_size != required:
-            faults.append(
-                f'--eval-global-batch-size (by default --global-batch-size) is {eval_batch_size} '
-                f'and evaluation is enabled (--eval-iters {eval_iters}'
-                + (', --full-validation)' if cfg.validation.full_validation else ')')
-            )
+        sizes['evaluation (--eval-global-batch-size, by default --global-batch-size)'] = (
+            cfg.train.global_batch_size if eval_batch_size is None else eval_batch_size
+        )
+    faults = [f'{name}: {size}' for name, size in sizes.items() if size != required]
     if faults:
         raise ValueError(
             f"The runtime DCP scheduler's {spec['type']!r} cost model ({spec['model']}) was "

@@ -148,17 +148,15 @@ def _train(sim, tmp_path, vpp=2, asynchronous=True, ahead=True, who='', what='',
     [
         (_BENCHMARK, {}, 64, 1, _H100 + '[1, 2, 4, 8, 16, 32, 64], at most 64 sequences per CP'),
         (dict(_BENCHMARK, max_cp_size=4), {}, 12, 1, _H100 + '[1, 2, 4], at most 64 sequences'),
+        (dict(_BENCHMARK, max_cp_size=2), {}, 8, 1, _H100 + '[1, 2], at most 64 sequences'),
         # The dummy tail sequence of the padding takes one of the 64 entries of a pack.
         (_USP, dict(thd_max_packed_sequences=64), 32, 2, 'sizes=[8, 16, 32], at most 63 sequences'),
         (dict(_USP, solver='x'), {}, 32, 1, "unknown key(s) ['solver'] for type 'dynamic_usp'"),
-        (_USP, dict(sequence_packing_scheduler='dp_balanced'), 32, 1, 'requires dynamic context'),
         (_USP, dict(min_dynamic_context_parallel_size=1), 32, 1, 'in (8, 16, 32); got DPxCP=32'),
         (_BENCHMARK, {}, 8, 2, 'only with type "dynamic_usp" without "hardware"'),
         (_BENCHMARK, {}, 12, 1, 'set "max_cp_size": 4 in the runtime configuration'),
         (dict(_BENCHMARK, max_cp_size=64), {}, 128, 1, 'up to 64; this run has DPxCP=128'),
         (_BENCHMARK, dict(num_attention_heads=7), 8, 1, 'this model has (7, 4, 128)'),
-        # An odd per-rank buffer passes the domain check, but a ring has no layout for it.
-        (_BENCHMARK, dict(max_seqlen_per_dp_cp_rank=4097), 8, 1, 'set "max_cp_size": 1 in the'),
     ],
 )
 def test_startup_line_or_refusal(tmp_path, monkeypatch, payload, training, world, stages, outcome):
@@ -207,8 +205,8 @@ _FAULTS = [
     ('stage', 'answer', dict(rows=[[[0]] * 8]).copy, (RuntimeError, 'stages disagree'), None),
     ('stage', 'no worker', lambda: 1 / 0, (RuntimeError, 'ZeroDivisionError'), _ANOTHER),
     ('stage', 'file', {'max_cp_size': 8}, (ValueError, 'stages read different settings'), None),
-    ('rank', 'file', {'max_cp_size': 8}, (ValueError, '1 of 8 DPxCP ranks read a runtime'), None),
-    ('stage rank', 'vpp', None, (ValueError, '1 of 8 DPxCP ranks of this pipeline'), _ANOTHER),
+    ('rank', 'file', {'max_cp_size': 8}, (ValueError, '1 of 8 DPxCP ranks hold other'), None),
+    ('stage rank', 'vpp', None, (ValueError, '1 of 8 DPxCP ranks hold other'), _ANOTHER),
     ('rank', 'tokens', 16, (RuntimeError, 'CP replicas disagree'), None),
     ('all', 'tokens', 8192, (RuntimeScheduleError, 'requires CP >= 9'), None),
     ('all', 'tokens', -8192, (RuntimeError, 'positive integer logical lengths'), None),

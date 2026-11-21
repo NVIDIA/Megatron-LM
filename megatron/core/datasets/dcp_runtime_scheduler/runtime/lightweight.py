@@ -21,7 +21,7 @@ class LightweightOptions:
 
 
 class LightweightRuntimePlanner(RuntimePlanner):
-    """Deterministic first-fit and cost-per-token proposals, scored with the exact timeline.
+    """Deterministic first-fit proposals, scored with the exact timeline.
 
     The deadline is cooperative: one feasible candidate is always scored (two with a default
     layout), and an overrun is reported in the statistics, never hidden.
@@ -43,65 +43,47 @@ class LightweightRuntimePlanner(RuntimePlanner):
     def _fill_pack(self, anchor, pending, cp, storage):
         """All proposal families use the same ordered physical-capacity check."""
         stored = storage[cp]
-        limit = self.sequence_limit(cp)
         capacity = self.geometry.capacity(cp)
         ids, used = [anchor], stored[anchor]
         for i in pending:
-            if len(ids) >= limit:
+            if len(ids) >= self.sequence_cap:
                 break
             if i != anchor and used + stored[i] <= capacity:
                 ids.append(i)
                 used += stored[i]
         return ids, used
 
-    def _expand(self, row, lengths, widths=None, cost_aware=False):
+    def _expand(self, row, lengths):
         world = self.geometry.world_size
         slack = world - sum(group["cp"] for group in row)
-        dp = {0: (0.0, [])}
+        dp = {0: []}  # widths added so far -> the first choice of increments that adds them
         base_start = 0
         for group in row:
             base = group["cp"]
             values = tuple(lengths[i] for i in group["sample_ids"])
             choices = [
                 c - base
-                for c in (widths or self.geometry.allowed_cp_sizes)
+                for c in self.geometry.allowed_cp_sizes
                 if base <= c <= base + slack and self.costs.fits(values, c)
             ]
             next_dp = {}
-            for previous, (work, increments) in dp.items():
+            for previous, increments in dp.items():
                 for delta in choices:
                     if previous + delta <= slack and self.geometry.supports_group(
                         base_start + previous, base + delta
                     ):
-                        score = work + (
-                            self._group_work(values, base + delta) if cost_aware else 0.0
-                        )
-                        key = previous + delta
-                        if key not in next_dp or score < next_dp[key][0]:
-                            next_dp[key] = score, increments + [delta]
+                        next_dp.setdefault(previous + delta, increments + [delta])
             dp = next_dp
             base_start += base
         if slack not in dp:
             return None
         return [
             dict(cp=g["cp"] + delta, sample_ids=list(g["sample_ids"]))
-            for g, delta in zip(row, dp[slack][1])
+            for g, delta in zip(row, dp[slack])
         ]
 
     def _group_work(self, values, cp):
-        guide = getattr(self.model, "guide_program_costs", None)
-        if guide is not None and self.timeline.program is not None:
-            program = guide(values, cp, ranks=tuple(range(cp)))
-            duration = sum(
-                program[payload] if kind in ("cp", "ep_mean") else payload
-                for phase in self.timeline.program
-                for kind, payload in phase
-            )
-            return cp * duration
-        fixed = self.timeline.layer_count * (
-            self.timeline.forward_non_attention_ms + self.timeline.backward_non_attention_ms
-        )
-        return sum(n * n for n in values) / cp + cp * fixed
+        return sum(n * n for n in values) / cp
 
     def _global_pack(self, lengths, floor, width_extra=0, tables=None):
         """Pack tokens globally, then tile whole groups into exact-world rows."""
@@ -120,9 +102,8 @@ class LightweightRuntimePlanner(RuntimePlanner):
             groups.append(dict(cp=cp, sample_ids=ids))
         return self._tile(groups, lengths)
 
-    def _tile(self, groups, lengths, widths=None, cost_aware=False):
+    def _tile(self, groups, lengths):
         groups.sort(key=lambda g: (-g["cp"], -sum(lengths[i] for i in g["sample_ids"])))
-        allowed = widths or self.geometry.allowed_cp_sizes
         rounds = []
         while groups:
             row = [groups.pop(0)]
@@ -139,60 +120,11 @@ class LightweightRuntimePlanner(RuntimePlanner):
             chosen = set(dp[max(dp)])
             row.extend(group for index, group in enumerate(groups) if index in chosen)
             groups = [group for index, group in enumerate(groups) if index not in chosen]
-            expanded = self._expand(row, lengths, widths, cost_aware)
-            if expanded is None:
-                world = self.geometry.world_size
-                keep = self.sequence_limit(world) if world in allowed else 0
-                if keep < 1:
-                    return None
-                ids = row[0]["sample_ids"]
-                groups.extend(row[1:])
-                if len(ids) > keep:
-                    # The full group prices fewer sequences than this pack holds.
-                    groups.append(dict(cp=row[0]["cp"], sample_ids=ids[keep:]))
-                expanded = [dict(cp=world, sample_ids=ids[:keep])]
-                groups.sort(key=lambda g: -g["cp"])
+            expanded = self._expand(row, lengths)
+            if expanded is None:  # start-up geometries: only when DPxCP is not an allowed size
+                return None
             rounds.append(expanded)
         return rounds
-
-    def _cost_pack(self, lengths, tables, ep_aligned=False):
-        """All eligible widths compete on cheap predicted work per useful token.
-
-        EP-aligned is a proposal family, not an exclusion of other CP sizes.
-        The full E2E timeline alone decides whether either family is accepted.
-        """
-        guide = getattr(self.model, "guide_program_costs", None)
-        if guide is None or self.timeline.program is None:
-            return None
-        _, storage = tables
-        widths = tuple(
-            cp
-            for cp in self.geometry.allowed_cp_sizes
-            if not ep_aligned or cp % self.geometry.ep_size == 0
-        )
-        if not widths:
-            return None
-        pending = sorted(lengths, key=lambda i: (-lengths[i], i))
-        groups = []
-        while pending:
-            anchor, best = pending[0], None
-            for cp in widths:
-                used = storage[cp][anchor]
-                if used > self.geometry.capacity(cp):
-                    continue
-                ids, _ = self._fill_pack(anchor, pending, cp, storage)
-                values = tuple(lengths[i] for i in ids)
-                useful = sum(values)
-                key = self._group_work(values, cp) / useful, -useful, cp
-                if best is None or key < best[0]:
-                    best = key, cp, ids
-            if best is None:
-                return None
-            _, cp, ids = best
-            chosen = set(ids)
-            pending = [i for i in pending if i not in chosen]
-            groups.append(dict(cp=cp, sample_ids=ids))
-        return self._tile(groups, lengths, widths, cost_aware=True)
 
     def _pack(self, lengths, floor, tables=None):
         pending = sorted(lengths, key=lambda i: (-lengths[i], i))
@@ -220,36 +152,21 @@ class LightweightRuntimePlanner(RuntimePlanner):
                 raise RuntimeScheduleError("no sequence fits the configured capacity")
             if used < world:
                 # Exact-fill expansion, including non-power-of-two allowed domains.
-                expanded = self._expand(row, lengths)
-                if expanded is None:
-                    # A full-world pack remains feasible; leave unconsumed samples pending.
-                    keep = self.sequence_limit(world) if world in allowed else 0
-                    if keep < 1:
-                        raise RuntimeScheduleError("allowed CP widths cannot fill every rank")
-                    ids = row[0]["sample_ids"]
-                    for group in row[1:]:
-                        pending.extend(group["sample_ids"])
-                    # The full group may price fewer sequences than this pack holds.
-                    pending.extend(ids[keep:])
-                    row = [dict(cp=world, sample_ids=ids[:keep])]
-                    pending.sort(key=lambda i: (-lengths[i], i))
-                else:
-                    row = expanded
+                row = self._expand(row, lengths)
+                if row is None:  # as in _tile
+                    raise RuntimeScheduleError("allowed CP widths cannot fill every rank")
             rounds.append(row)
         return rounds
 
     def _guide(self, rounds, lengths):
         # Candidate ordering only; acceptance ALWAYS uses exact injected E2E costs.
-        guide = getattr(self.model, "guide_program_costs", None)
-        if guide is not None and self.timeline.program is not None:
-            return self.timeline.evaluate(self._costed(rounds, lengths, guide)), len(rounds)
         work = sum(
             sum(lengths[i] ** 2 for i in g["sample_ids"]) / g["cp"] for row in rounds for g in row
         )
         return len(rounds), work
 
     def _work_guide(self, rounds, lengths):
-        # Intrinsic rank-load lower bound; waiting is added by the full guide.
+        # Intrinsic rank-load lower bound; waiting is not counted.
         loads = [0.0] * self.geometry.world_size
         for row in rounds:
             start = 0
@@ -280,7 +197,6 @@ class LightweightRuntimePlanner(RuntimePlanner):
                 proposals.extend(
                     self._global_pack(lengths, floor, extra, tables) for extra in (1, 2, 4)
                 )
-        proposals.extend(self._cost_pack(lengths, tables, aligned) for aligned in (False, True))
         unique = {}  # the first proposal of every distinct layout, in the order proposed
         for rounds in proposals:
             if rounds is not None:
@@ -369,10 +285,6 @@ class LightweightRuntimePlanner(RuntimePlanner):
             candidate_generation_s=generation_s,
             exact_scoring_s=elapsed - generation_s,
             pack_cost_stats=dict(self.costs.stats),
-            model_sequence_limits=self.model_sequence_limits(),
-            algorithm=(
-                "FFD + all-width work/token + EP-aligned proposals + bounded guide "
-                "+ exact E2E acceptance"
-            ),
+            algorithm="FFD + bounded guide + exact E2E acceptance",
         )
         return plan

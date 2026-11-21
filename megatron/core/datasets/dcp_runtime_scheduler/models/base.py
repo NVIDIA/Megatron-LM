@@ -1,10 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Shared cost-model protocol, NVLink domain sizes and geometry-only smoke model."""
+"""Shared cost-model protocol and NVLink domain sizes."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Callable, Protocol, Sequence, runtime_checkable
 
@@ -23,23 +22,6 @@ def uses_p2p(config) -> bool:
     return value == "p2p" or (isinstance(value, list) and value.count("p2p") == len(value) > 0)
 
 
-@dataclass(frozen=True)
-class PackLimits:
-    """What a cost model can price in one pack of a CP size, beyond the planner geometry.
-
-    A model declares it through an optional ``pack_limits(cp)`` method. The planner then
-    builds no pack outside the limits, and the start-up probe prices the largest pack the
-    planner may build. ``None`` means no limit of the model's own; a new kind of limit is
-    one more field here, read where the planner or the worker enforces it.
-    """
-
-    # Largest number of sequences in one pack of this CP size.
-    max_sequences: int | None = None
-    # Longest sample, in logical tokens before any padding, in a pack of this CP size. The
-    # CPU worker rejects a global batch holding a sample that no allowed CP size prices.
-    max_sample_length: int | None = None
-
-
 @runtime_checkable
 class DcpCostModel(Protocol):
     """Callable contract consumed by ``models.cache.PackCostModel`` and the planner.
@@ -49,10 +31,10 @@ class DcpCostModel(Protocol):
 
     Optional members:
 
-    - ``pack_limits(cp) -> PackLimits`` when the model cannot price every pack that the
-      geometry admits; the class attribute ``largest_cp_size`` when it prices CP groups up
-      to that size only; ``required_global_batch_size`` when its step overhead describes
-      one global batch size (start-up and the CPU worker then reject any other).
+    - ``max_sample_length``, the longest sample in logical tokens that the model prices (the
+      CPU worker rejects a longer one); the class attribute ``largest_cp_size`` when it
+      prices CP groups up to that size only; ``required_global_batch_size`` when its step
+      overhead describes one global batch size (start-up and the CPU worker then reject any other).
     - For the DynamicUSP solver: ``sample_weight_coefficients``, the ``(A, B, C)`` of the
       Stage 1 sample weight (absent or None: the weight is derived from the step times),
       with ``sample_weight_is_default`` True when they are the published default, and
@@ -85,14 +67,14 @@ class DcpCostModel(Protocol):
       ranks that holds samples of the logical ``lengths``, possibly none.
 
     A cost model must not change what its Stage 2 members give after the planner was
-    built. Only the guard threshold is checked; the others are read again for every
-    microbatch, and the plan statistics name the reference size read at construction.
+    built: they are read again for every microbatch, and the plan statistics name the
+    reference size and the guard threshold read at construction.
     """
 
     name: str
     source_hashes: dict[str, str]
     nvlink_domain_size: int | None
-    program_costs: Callable[..., dict[str, float]] | None
+    program_costs: Callable[..., dict[str, float]]
 
     def forward(
         self, lengths: tuple[int, ...], cp: int, *, ranks: Sequence[int] | None = None
@@ -104,56 +86,11 @@ class DcpCostModel(Protocol):
     ) -> float:
         """Backward attention ms per layer for one pack."""
 
-    def timing(self) -> dict | None:
-        """Execution program for ``TimelineModel`` (program mode) or None (scalar mode)."""
+    def timing(self) -> dict:
+        """Execution program for ``TimelineModel``."""
 
     def clear(self) -> None:
         """Drop memoized pack costs."""
 
     def check_domain(self, geometry: "RuntimePlanGeometry", config) -> None:
         """Raise ValueError when the geometry/config is outside the calibrated domain."""
-
-
-class QuadraticCostModel:
-    """Geometry-agnostic smoke model: ms = sum((stored/cp)^2)/1e6 + cp_step_ms*(cp-1).
-
-    Scalar timeline (no execution program); test/smoke only.
-    """
-
-    name = "quadratic"
-    nvlink_domain_size = None
-    program_costs = None
-    layer_count = 1
-    forward_non_attention_ms = 1.0
-    backward_non_attention_ms = 2.0
-
-    def __init__(
-        self, geometry: "RuntimePlanGeometry", cp_step_ms: float = 0.05, **_ignored
-    ) -> None:
-        self.geometry = geometry
-        self.cp_step_ms = float(cp_step_ms)
-        self.source_hashes = {"quadratic": f"cp_step_ms={self.cp_step_ms}"}
-
-    def forward(self, lengths, cp, *, ranks=None) -> float:
-        """Predict per-layer forward time for the quadratic smoke model."""
-        cp = int(cp)
-        if not 1 <= cp <= self.geometry.world_size:
-            raise ValueError("cp outside the world")
-        total = 0.0
-        for n in lengths:
-            per_rank = self.geometry.stored_length(int(n), cp) / cp
-            total += per_rank * per_rank
-        return total / 1e6 + self.cp_step_ms * (cp - 1)
-
-    def backward(self, lengths, cp, *, ranks=None) -> float:
-        """Predict per-layer backward time for the quadratic smoke model."""
-        return 2.0 * self.forward(lengths, cp, ranks=ranks)
-
-    def timing(self) -> None:
-        """Use the shared scalar timeline for this smoke model."""
-
-    def clear(self) -> None:
-        """Accept the cache-reset hook for this stateless smoke model."""
-
-    def check_domain(self, geometry, config) -> None:
-        """Accept any geometry supported by the shared smoke-test planner."""

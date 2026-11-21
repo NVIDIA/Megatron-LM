@@ -9,7 +9,6 @@ import pytest
 from megatron.core.datasets import dcp_runtime_worker as worker
 from megatron.core.datasets import dcp_schedule_prefetch as prefetch
 from megatron.core.datasets.data_schedule import DefaultDynamicCPScheduler
-from megatron.core.datasets.dcp_runtime_scheduler.models.base import QuadraticCostModel
 from megatron.core.datasets.dcp_runtime_scheduler.runtime import dynamic_usp, lightweight, planner
 from megatron.core.datasets.dcp_runtime_scheduler.runtime.planner import RuntimeScheduleError
 from megatron.core.datasets.dcp_runtime_scheduler.runtime.timeline import TimelineModel, _freeze_op
@@ -34,8 +33,30 @@ _PLANS = [  # their plan as (CP, samples) per group of every microbatch, and its
 _FROZEN = list(zip(_PACKAGED, _PLANS, strict=True))  # one plan for every packaged scheduler
 
 
+class QuadraticCostModel:
+    """Any geometry: attention ms = sum((stored / cp)^2) / 1e6 + 0.05 (cp - 1); rest 1 + 2 ms."""
+
+    clear = check_domain = Mock()
+    _forward = [dict(sync='cp', cost='f'), dict(sync='ep', duration_ms=1.0)]
+    _backward = [dict(sync='ep', duration_ms=2.0), dict(sync='cp', cost='b')]
+    timing = Mock(return_value=dict(execution_program=[dict(forward=_forward, backward=_backward)]))
+
+    def __init__(self, geometry):
+        self.stored = geometry.stored_length
+
+    def forward(self, lengths, cp, *, ranks=None):
+        return sum((self.stored(n, cp) / cp) ** 2 for n in lengths) / 1e6 + 0.05 * (cp - 1)
+
+    def backward(self, lengths, cp, *, ranks=None):
+        return 2.0 * self.forward(lengths, cp)
+
+    def program_costs(self, lengths, cp, *, ranks=None):
+        return dict(f=self.forward(lengths, cp), b=self.backward(lengths, cp))
+
+
 def _geometry(world=8, capacity=1024, allowed=(1, 2, 4, 8), cap=64, max_cp=None):
     """Size-aligned groups, as the runtime forms them; the dataset pads to 2 x DPxCP."""
+    allowed = tuple(cp for cp in allowed if cp <= (max_cp or world))  # as start-up passes them
     return planner.RuntimePlanGeometry(world, capacity, 2, allowed, 2 * world, cap, True, max_cp)
 
 
@@ -89,7 +110,7 @@ def test_every_rank_gets_a_sample_whatever_the_cp_cap(solver, maximum, values, m
     geometry = _geometry(capacity=4096, max_cp=maximum)
     lengths = dict(enumerate(values))
     plan = solver(geometry, QuadraticCostModel(geometry)).plan(lengths)
-    groups = planner.validate_rows(plan.rows, lengths, geometry, 1)
+    groups = planner.validate_rows(plan.rows, lengths, geometry)
     assert plan.microbatches == microbatches and plan.predicted_ms > 0
     assert all(cp <= maximum for row in groups for _, cp, _ in row)
 
@@ -119,7 +140,7 @@ def test_worker_discards_an_invalid_default_layout_and_still_plans(
 ):
     result = _solve(monkeypatch, solver(geometry, QuadraticCostModel(geometry)), lengths, layout)
     # The plan satisfies the whole contract, the violated constraint included.
-    planner.validate_rows(result['rows'], dict(enumerate(lengths)), geometry, 1)
+    planner.validate_rows(result['rows'], dict(enumerate(lengths)), geometry)
     assert result['statistics']['incumbent_rejection'] == 'default_incumbent_' + reason
 
 
@@ -131,7 +152,7 @@ def test_a_search_without_a_layout_keeps_the_default_layout_or_falls_back_on_cap
     geometry = _geometry()
     scheduler = solver(geometry, QuadraticCostModel(geometry))
     if solver is _LIGHT:
-        for family in ('_pack', '_global_pack', '_cost_pack'):
+        for family in ('_pack', '_global_pack'):
             monkeypatch.setattr(scheduler, family, Mock(return_value=None))
     else:
         failure = dynamic_usp.InfeasibleLayout('no candidate count produced a layout')
@@ -173,7 +194,7 @@ def test_timeline_step_times_of_mixed_cp_layouts_are_frozen():
         for start, cp, f, rest in sizes
     ]
     mean = ((('cp', 'att_f'), ('ep_mean', 'rest_f')), (('ep_mean', 'rest_b'), ('cp', 'att_b')))
-    timeline = TimelineModel(8, 8, 1, iteration_tail_ms=0.25, program=mean)
+    timeline = TimelineModel(8, 8, iteration_tail_ms=0.25, program=mean)
     # Forward: slowest attention 4 + rank-weighted EP mean 4.6875; backward: 2.34375 + 8.
     # The second microbatch starts from the unequal completion times of the first.
     assert [timeline.evaluate([groups] * count) for count in (1, 2)] == [19.28125, 38.3125]
@@ -181,9 +202,7 @@ def test_timeline_step_times_of_mixed_cp_layouts_are_frozen():
     # wait for each other once, after the forward pass of the first microbatch.
     blocks = groups + [(8, 8, 0.0, 0.0, dict(att_b=0.5, rest_f=12.0))]
     fixed = ((('ep_mean', 'rest_f'), ('ep', 0.5)), (('cp', 'att_b'), ('local', 0.25)))
-    timeline = TimelineModel(16, 8, 1, program=fixed)
-    state = [7.0] + [0.0] * 7 + [3.0] + [0.0] * 7
-    assert timeline.makespan(timeline.advance(state, blocks, False)) == 20.4375
+    timeline = TimelineModel(16, 8, program=fixed)
     assert [timeline.evaluate([blocks] * count) for count in (1, 2)] == [20.75, 34.1875]
     with pytest.raises(ValueError, match='explicit mean'):
         _freeze_op({'sync': 'ep', 'cost': 'rest'})

@@ -37,8 +37,7 @@ These are all the keys: another key, a key given twice, a missing required key
 or a value of the wrong type stops training while it starts. Every rank reads
 and checks the file then, and not again: the schema when the arguments are
 parsed and, once the model is built, the file against the model and parallel
-configuration (each cost model's conditions are below) and the cost model's
-parameters for every CP group size the scheduler may form. A failed check stops
+configuration (each cost model's conditions are below). A failed check stops
 training with a message that names what must change; the [configuration
 reference](../../../../skills/mcore-configure-dcp-cost-model/references/model-options.md#when-start-up-rejects-the-configuration)
 lists the messages. When all checks pass, rank 0 prints one line that starts
@@ -50,8 +49,8 @@ Both types require `--dynamic-context-parallel` (hence
 `--calculate-per-token-loss`), a `--min-dynamic-context-parallel-size` that is
 a power of two dividing DPxCP, sequence parallelism off or tensor-parallel size
 1, and one pipeline stage without virtual stages or the conditions of [more
-than one pipeline stage](#more-than-one-pipeline-stage). The runtime file must
-be byte-identical on every rank; a `calibration` file may not change in a run.
+than one pipeline stage](#more-than-one-pipeline-stage). The runtime file, and
+a `calibration` file for the whole run, must be byte-identical on every rank.
 
 ## CP group sizes
 
@@ -122,10 +121,10 @@ that directory, which every rank creates and write-tests at start-up.
 | `lookahead`, `asynchronous` | Whether the batch was planned one step ahead and used as planned; the configured `async`. |
 | `global_lengths`, `padded_lengths` | Sample lengths of the global batch, as read and as stored. |
 | `rows`, `predicted_ms` | The plan (per microbatch and per DPxCP rank, the sample indices of the rank's CP group; neighbouring ranks with the same list form one group) and its predicted time. |
-| `statistics` | Search statistics. `incumbent_rejection` and `incumbent_rejection_detail` say why the default layout was discarded; `model_sequence_limits` lists the CP sizes for which the cost model holds fewer sequences than the cap. For `dynamic_usp`: `candidates` (every microbatch count that was tried, with its predicted time or the reason it has no layout), `selected_incumbent`, `capacity_fallback` and `incumbent_unpriced` (a plan that is not a result of the [search](#dynamic_usp-cost-profiles), and why a default layout was not scored), `stage1_weight` (the sample weight in use: the object `{"A", "B", "C", "default"}` or the string `"cost_model_sample_work"`), `algorithm` (what scores the counts) and, with more than one pipeline stage, `pipeline` (the stages, the virtual stages, the `schedule`, the count multiple and the step terms in use). |
+| `statistics` | Search statistics. `incumbent_rejection` and `incumbent_rejection_detail` say why the default layout was discarded. For `dynamic_usp`: `candidates` (every microbatch count that was tried, with its predicted time or the reason it has no layout), `selected_incumbent`, `capacity_fallback` and `incumbent_unpriced` (a plan that is not a result of the [search](#dynamic_usp-cost-profiles), and why a default layout was not scored), `stage1_weight` (the sample weight in use: the object `{"A", "B", "C", "default"}` or the string `"cost_model_sample_work"`) and, with more than one pipeline stage, `pipeline` (the stages, the virtual stages, the `schedule`, the count multiple and the step terms in use). |
 | `statistics.stage2` | Only with [Stage 2](#stage-2) switched on: `skipped` (why Stage 2 did no work for the plan, else null), `counts` (the outcome of every microbatch; `ADOPTED`: re-packed), `planned` (the layout that the plan is: `stage2`, `stage1` or `default`), `stage1_predicted_ms` and `stage2_predicted_ms`, `microbatches` (a record for each microbatch that was re-packed, failed or is marked `runtime_capacity`, at most 64; `microbatches_omitted` counts the rest), `first_error` and `rescore_error` (a contained error) and `guard_threshold` (the threshold of the ring placement guard). |
-| `model_metadata` | What the cost model loaded: its name, inputs and file digests; `nvlink_domain_size`, the `N` of the [NVLink topology](#nvlink-topology) or null (original profile with a `calibration` table). For `dynamic_usp`, `calibration_path`, `calibration_sha256` and `solver`, the [solver coefficients](#original-profile) in use. For full Qwen3.5, `source_tail_padding` and `executed_tail_padding`. |
-| `pipeline`, `pipeline_terms_are_default`, `pipeline_terms_fitted_at`, `pipeline_agreement_key` | Only with [more than one pipeline stage](#more-than-one-pipeline-stage): the stages, the virtual stages and the count multiple (both 1 for a run without virtual stages); the `solver.pipeline` terms left at their defaults; the `solver.pipeline.fitted_at` record with `matches_run`, `"not recorded"` or null; the key of the lengths and the plan that the stages compared at this step. |
+| `model_metadata` | What the cost model loaded: its name, inputs and file digests; `nvlink_domain_size`, the `N` of the [NVLink topology](#nvlink-topology) or null (original profile with a `calibration` table). For `dynamic_usp`, `calibration_path`, `calibration_sha256` and `solver`, the [solver coefficients](#original-profile) in use. For full Qwen3.5, `source_tail_padding`. |
+| `pipeline`, `pipeline_terms_are_default`, `pipeline_agreement_key` | Only with [more than one pipeline stage](#more-than-one-pipeline-stage): the stages, the virtual stages and the count multiple (both 1 for a run without virtual stages); the `solver.pipeline` terms left at their defaults; the key of the lengths and the plan that the stages compared at this step. |
 
 ## `dcp_benchmark` cost models
 
@@ -152,7 +151,7 @@ of a cost model, not a calibrated product. Start-up admits:
 | `num_attention_heads` / `num_query_groups` / `kv_channels` | 32/4/128, 64/4/128, 16/2/256, 32/2/256, 32/8/128 or 64/8/128 |
 | DPxCP | Up to 64 |
 | CP group sizes | 1 to 64 |
-| `max_seqlen_per_dp_cp_rank` | Any even number of tokens up to 1,048,576; odd: CP group size 1 only (start-up asks for `"max_cp_size": 1`) |
+| `max_seqlen_per_dp_cp_rank` | Up to 1,048,576 tokens. Only an even number trains: an odd one that start-up admits stops the first step with an error about the packed sequence alignment, whatever `max_cp_size` |
 | Parallelism | `tensor_model_parallel_size` 1, `pipeline_model_parallel_size` 1, no virtual pipeline stages |
 | Attention | `attention_backend` `fused`, `cp_comm_type` `p2p`; no multi-latent attention, experimental attention variant or hybrid model |
 | Precision and mode | BF16 without FP8/FP4, `cuda_graph_impl` `none` |
@@ -279,7 +278,7 @@ coefficients of the search; the packaged table has none, so the defaults apply:
 | --- | --- | --- |
 | `solver.sample_weight` | `{"A": a, "B": b, "C": c}`. The Stage 1 weight of a sample of L tokens is `max(1, A*L^2/1e10 + B*L/1e5 + C)`. | A = 7706.03421944, B = 6528.86747592, C = 351.14154099: upstream's published measured fit of the forward cost of one sample in a group of eight ranks, not derived from the packaged table. The start-up line has a notice when it applies to a `calibration` table. |
 | `solver.tier_time_factors` | `{"8": 1.0, "16": f16, "32": f32}`: predicted time per unit of per-rank weight at each CP size, relative to the smallest CP size the run forms. With it Stage 1 balances predicted time instead of weight. Values are at least 1; keys are CP sizes of the profile as plain decimal numbers, and a key above the largest size the run forms is ignored. The factors are used as written and are not rescaled: a run at DPxCP 32 with `--min-dynamic-context-parallel-size 16` needs a table derived for the sizes 16 and 32. A table of ones is off. | Absent: weight balance |
-| `solver.pipeline` | `per_mb_overhead_ms`: overhead per microbatch, added to the predicted step time once for every microbatch. `compute_fwd_share` and `comm_fwd_share`: forward shares of the compute and of the communication time of a group, numbers from 0 to 1; with one pipeline stage they change no prediction, as upstream, and with [more than one](#more-than-one-pipeline-stage) they split every group time into its forward and its backward part. `fitted_at`: `{"pipeline_parallel": P, "virtual_stages": V, "schedule": s}` with `s` `"interleaved"` or `"non_interleaved"`, all three required: the run in which the three terms were fitted; it changes no prediction. | `per_mb_overhead_ms` 0, `compute_fwd_share` 1/3.9, `comm_fwd_share` 0.5; no `fitted_at` |
+| `solver.pipeline` | `per_mb_overhead_ms`: overhead per microbatch, added to the predicted step time once for every microbatch. `compute_fwd_share` and `comm_fwd_share`: forward shares of the compute and of the communication time of a group, numbers from 0 to 1; with one pipeline stage they change no prediction, as upstream, and with [more than one](#more-than-one-pipeline-stage) they split every group time into its forward and its backward part. | `per_mb_overhead_ms` 0, `compute_fwd_share` 1/3.9, `comm_fwd_share` 0.5 |
 | `solver.stage2` | `{"enabled": true}` switches [Stage 2](#stage-2) on. Optional `"keep_threshold"`, a positive number: a sample with more than that many times the mean work per rank of its microbatch is placed first, in an empty group above 8 ranks. | Off; 8.4 |
 
 ### More than one pipeline stage
@@ -293,8 +292,8 @@ coefficients of the search; the packaged table has none, so the defaults apply:
   CP group (`runtime/pipeline.py`): upstream's interleaved order with virtual
   stages, Megatron's order of a training step without. The three
   `solver.pipeline` terms change it; the start-up line says when they are
-  defaults or are not recorded as fitted at the pipeline sizes of the run. The
-  stages count as equal shares of the model, which start-up does not inspect.
+  defaults. The stages count as equal shares of the model, which start-up does
+  not inspect.
 - Every stage plans the same batch in its own CPU process. All ranks compare
   their settings and Python version (major.minor) at start-up and their
   gathered lengths and plans at every step; a difference stops training.

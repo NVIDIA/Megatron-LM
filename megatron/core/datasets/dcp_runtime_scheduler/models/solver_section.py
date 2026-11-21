@@ -12,8 +12,7 @@ The section holds the coefficients of the scheduler that are not group times::
         "sample_weight": {"A": ..., "B": ..., "C": ...},
         "tier_time_factors": {"8": 1.0, "16": 1.1, "32": 1.3},
         "pipeline": {
-            "per_mb_overhead_ms": ..., "compute_fwd_share": ..., "comm_fwd_share": ...,
-            "fitted_at": {"pipeline_parallel": ..., "virtual_stages": ..., "schedule": ...}
+            "per_mb_overhead_ms": ..., "compute_fwd_share": ..., "comm_fwd_share": ...
         },
         "stage2": {"enabled": false, "keep_threshold": 8.4}
     }
@@ -39,8 +38,7 @@ _KEYS = ("sample_weight", "tier_time_factors", "pipeline", "stage2")
 _STAGE2_KEYS = ("enabled", "keep_threshold")
 _WEIGHT_KEYS = ("A", "B", "C")
 _PIPELINE_KEYS = ("per_mb_overhead_ms", "compute_fwd_share", "comm_fwd_share")
-_FITTED_AT_KEYS = ("pipeline_parallel", "virtual_stages", "schedule")
-# Megatron's two pipeline schedules, by the name ``fitted_at`` gives them.
+# Megatron's two pipeline schedules.
 PIPELINE_SCHEDULES = ("interleaved", "non_interleaved")
 
 
@@ -50,9 +48,7 @@ def pipeline_schedule(virtual_stages: int) -> str:
     ``virtual_stages`` is the number of model chunks on a pipeline stage as a planner
     specification gives it: two or more for a run with virtual pipeline stages, for which
     Megatron runs the interleaved schedule, and 1 for a run without, for which it runs the
-    non-interleaved one. This is the one place that turns the number into the name: the
-    planner of the CPU worker, the start-up line and the comparison with ``fitted_at`` of
-    a coefficient file all use it.
+    non-interleaved one.
     """
     return PIPELINE_SCHEDULES[0] if virtual_stages > 1 else PIPELINE_SCHEDULES[1]
 
@@ -61,9 +57,7 @@ def pipeline_schedule(virtual_stages: int) -> str:
 class SolverSection:
     """Validated content of the section; the defaults are those of an absent section."""
 
-    # (A, B, C) when the file gives them.
     sample_weight: tuple | None = None
-    # {CP size: factor} when the file gives them.
     tier_time_factors: dict | None = None
     per_mb_overhead_ms: float = 0.0
     # Forward shares of compute and of communication time: validated and recorded. With one
@@ -72,41 +66,21 @@ class SolverSection:
     comm_fwd_share: float = 0.5
     # The three terms above that the file does not give: for these the defaults apply.
     pipeline_default_terms: tuple = _PIPELINE_KEYS
-    # ``solver.pipeline.fitted_at`` when the file gives it.
-    pipeline_fitted_at: dict | None = None
-    # ``solver.stage2``: off unless the file switches it on.
     stage2_enabled: bool = False
     stage2_keep_threshold: float = DEFAULT_KEEP_THRESHOLD
 
 
-def _object(value, label, keys, record=None, required=False):
-    """``value`` as a JSON object with no key outside ``keys`` and the key ``record``.
-
-    With ``required`` it has every key of ``keys``.
-    """
+def _object(value, label, keys, required=False):
+    """``value`` as a JSON object with no key outside ``keys``; ``required``: with all of them."""
     if not isinstance(value, dict):
         raise ValueError(f"{label} must be a JSON object")
-    allowed = set(keys) if record is None else set(keys) | {record}
-    unknown = sorted(set(value) - allowed, key=str)
+    unknown = sorted(set(value) - set(keys), key=str)
     if unknown:
-        also = "" if record is None else f" and the record {record!r}"
-        raise ValueError(f"Unknown key(s) {unknown} in {label}; allowed keys: {list(keys)}{also}")
+        raise ValueError(f"Unknown key(s) {unknown} in {label}; allowed keys: {list(keys)}")
     missing = [key for key in keys if key not in value]
     if required and missing:
         raise ValueError(f"{label} requires the keys {list(keys)}; missing: {missing}")
     return value
-
-
-def _fitted_at(value) -> dict:
-    """Validated copy of ``solver.pipeline.fitted_at``."""
-    label = "solver.pipeline.fitted_at"
-    record = _object(value, label, _FITTED_AT_KEYS, required=True)
-    for key in ("pipeline_parallel", "virtual_stages"):
-        if type(record[key]) is not int or record[key] < 1:
-            raise ValueError(f"{label}.{key} must be a positive integer")
-    if record["schedule"] not in PIPELINE_SCHEDULES:
-        raise ValueError(f"{label}.schedule must be one of {list(PIPELINE_SCHEDULES)}")
-    return {key: record[key] for key in _FITTED_AT_KEYS}
 
 
 def _number(value, label, low=-math.inf, high=math.inf, kind="a finite number"):
@@ -148,9 +122,7 @@ def parse_solver_section(
     ``cp_sizes`` are the CP sizes of the cost model: ``tier_time_factors`` names no other
     size. A calibration that has its own per-microbatch overhead passes the name of that
     field as ``pipeline_field``, and ``solver.pipeline`` is then rejected. A calibration
-    without Stage 2 sample loads passes ``stage2_offered=False``: ``solver.stage2`` may then
-    only say that Stage 2 is off, so ``"enabled": true`` and a ``keep_threshold`` without
-    ``enabled`` are rejected.
+    without Stage 2 sample loads passes ``stage2_offered=False`` (``_stage2``).
     """
     if "solver" not in table:
         return SolverSection()
@@ -166,9 +138,14 @@ def parse_solver_section(
     if "tier_time_factors" in section:
         try:
             factors = validate_tier_time_factors(section["tier_time_factors"])
-            check_factor_sizes(factors, cp_sizes)
         except ValueError as error:
             raise ValueError(f"solver.{error}") from error
+        other = sorted(set(factors) - set(cp_sizes))
+        if other:
+            raise ValueError(
+                "solver.tier_time_factors keys must be CP sizes of the cost model "
+                f"{list(cp_sizes)}; got {other}"
+            )
         values["tier_time_factors"] = factors
     if "pipeline" in section:
         if pipeline_field is not None:
@@ -176,7 +153,7 @@ def parse_solver_section(
                 "solver.pipeline is not accepted by this calibration: its per-microbatch "
                 f"overhead is {pipeline_field}"
             )
-        pipeline = _object(section["pipeline"], "solver.pipeline", _PIPELINE_KEYS, "fitted_at")
+        pipeline = _object(section["pipeline"], "solver.pipeline", _PIPELINE_KEYS)
         for key, high, kind in (
             ("per_mb_overhead_ms", math.inf, "a finite nonnegative number"),
             ("compute_fwd_share", 1.0, "a number in [0, 1]"),
@@ -187,21 +164,9 @@ def parse_solver_section(
         values["pipeline_default_terms"] = tuple(
             key for key in _PIPELINE_KEYS if key not in pipeline
         )
-        if "fitted_at" in pipeline:
-            values["pipeline_fitted_at"] = _fitted_at(pipeline["fitted_at"])
     if "stage2" in section:
         values.update(_stage2(section["stage2"], stage2_offered))
     return SolverSection(**values)
-
-
-def check_factor_sizes(factors, cp_sizes) -> None:
-    """Reject a ``tier_time_factors`` key that is not a CP size of the cost model."""
-    other = sorted(set(factors) - set(cp_sizes))
-    if other:
-        raise ValueError(
-            f"tier_time_factors keys must be CP sizes of the cost model {list(cp_sizes)}; "
-            f"got {other}"
-        )
 
 
 def sample_weight(length, coefficients) -> float:

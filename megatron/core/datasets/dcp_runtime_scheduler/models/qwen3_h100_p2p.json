@@ -10,12 +10,7 @@
     "ep_size": 8,
     "tokens_per_rank": 4096,
     "dataset_alignment": 64,
-    "cp_sizes": [
-      1,
-      2,
-      4,
-      8
-    ],
+    "cp_sizes": [1, 2, 4, 8],
     "min_logical_length": 1,
     "max_logical_length": 16384,
     "max_group_seqs": 64,
@@ -49,9 +44,7 @@
       "recompute_granularity": null,
       "recompute_method": null,
       "recompute_num_layers": null,
-      "recompute_modules": [
-        "core_attn"
-      ],
+      "recompute_modules": ["core_attn"],
       "cuda_graph_impl": "none",
       "moe_token_dispatcher_type": "flex",
       "moe_flex_dispatcher_backend": "hybridep",
@@ -82,12 +75,7 @@
     "step_overhead_global_batch_size": 256
   },
   "features": {
-    "names": [
-      "bias",
-      "zigzag_max_causal_work",
-      "padded_s2_per_rank",
-      "sequence_count"
-    ],
+    "names": ["bias", "zigzag_max_causal_work", "padded_s2_per_rank", "sequence_count"],
     "token_unit": 4096,
     "zigzag_max_causal_work": "2 * maximum rank sum of valid causal query-key pairs / token_unit^2; ownership uses each sequence's padded physical interval"
   },
@@ -100,10 +88,7 @@
         "transformer_engine_version": "2.14.1",
         "module_measurement": {
           "gradient_accumulation_microbatches": 4,
-          "timed_microbatches": [
-            1,
-            2
-          ],
+          "timed_microbatches": [1, 2],
           "timed_layers": 48,
           "measured_steps_per_case": 20,
           "initial_context_parallel_size": 8,
@@ -163,10 +148,7 @@
             "max_absolute_relative_error": 0.19644557490972803
           }
         },
-        "prediction_sensitivity": {
-          "forward": 0.0005938771182816271,
-          "backward": 0.002917092976675195
-        },
+        "prediction_sensitivity": {"forward": 0.0005938771182816271, "backward": 0.002917092976675195},
         "step_overhead_fit": {
           "batch_count": 3,
           "fitted_rows": 11,
@@ -177,76 +159,27 @@
       },
       "attention": {
         "1": {
-          "forward": [
-            2.12730793428303,
-            0.0,
-            0.0,
-            0.0004239240914361891
-          ],
-          "backward": [
-            1.0306029845025635,
-            0.875900108307262,
-            0.0,
-            0.00170841543475267
-          ]
+          "forward": [2.12730793428303, 0.0, 0.0, 0.0004239240914361891],
+          "backward": [1.0306029845025635, 0.875900108307262, 0.0, 0.00170841543475267]
         },
         "2": {
-          "forward": [
-            3.446497803715239,
-            0.0,
-            0.0,
-            0.0005150091156908953
-          ],
-          "backward": [
-            1.8540716316982837,
-            0.6743267691894416,
-            0.0,
-            4.026050467613545e-05
-          ]
+          "forward": [3.446497803715239, 0.0, 0.0, 0.0005150091156908953],
+          "backward": [1.8540716316982837, 0.6743267691894416, 0.0, 4.026050467613545e-05]
         },
         "4": {
-          "forward": [
-            4.8193701758406196,
-            0.0,
-            0.018548497853986847,
-            0.001985511461360917
-          ],
-          "backward": [
-            3.305029445236436,
-            0.4841677016139169,
-            0.12258936864105967,
-            0.0029387787073995885
-          ]
+          "forward": [4.8193701758406196, 0.0, 0.018548497853986847, 0.001985511461360917],
+          "backward": [3.305029445236436, 0.4841677016139169, 0.12258936864105967, 0.0029387787073995885]
         },
         "8": {
-          "forward": [
-            7.685161770795705,
-            0.0,
-            0.026572334095600617,
-            0.0024149603025550295
-          ],
-          "backward": [
-            6.005560873394247,
-            0.20191854579496202,
-            0.082345209003466,
-            0.003949728981535307
-          ]
+          "forward": [7.685161770795705, 0.0, 0.026572334095600617, 0.0024149603025550295],
+          "backward": [6.005560873394247, 0.20191854579496202, 0.082345209003466, 0.003949728981535307]
         }
       },
       "remainder_ms": {
-        "forward": [
-          5.435122211377207,
-          0.08990617556608711
-        ],
-        "backward": [
-          2.253499527242624,
-          0.39760224705164315
-        ]
+        "forward": [5.435122211377207, 0.08990617556608711],
+        "backward": [2.253499527242624, 0.39760224705164315]
       },
-      "microbatch_overhead_ms": {
-        "forward": 0.0,
-        "backward": 1.1302911411603527
-      },
+      "microbatch_overhead_ms": {"forward": 0.0, "backward": 1.1302911411603527},
       "iteration_tail_ms": 118.4137963013744
     }
   }
