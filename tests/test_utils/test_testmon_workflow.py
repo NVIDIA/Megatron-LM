@@ -245,11 +245,43 @@ def test_producer_publishes_one_h100_testmon_baseline_for_aws_and_gcp_builds(
 @pytest.mark.parametrize(
     "source_ref", ["refs/heads/main", "refs/heads/pull-request/6934", "refs/tags/main"]
 )
-def test_producer_requires_the_main_branch(tmp_path: Path, source_ref: str) -> None:
+def test_producer_requires_the_main_branch(tmp_path: Path, source_ref: str, monkeypatch) -> None:
     workflow = yaml.safe_load((ROOT / ".github/workflows/populate-build-cache.yml").read_text())
     guard = workflow["jobs"]["validate-source"]["steps"][0]["run"]
     result, _ = _run(guard, tmp_path, {"SOURCE_REF": source_ref})
     assert (result.returncode == 0) == (source_ref == "refs/heads/main")
+
+    monkeypatch.syspath_prepend(str(ROOT / ".github/scripts"))
+    publisher = importlib.import_module("publish_unit_testmon")
+    tree, group_sha, landed_sha = "a" * 40, "b" * 40, "c" * 40
+    group = {
+        "event": "merge_group",
+        "head_branch": f"gh-readonly-queue/{source_ref.removeprefix('refs/heads/')}/pr-1",
+        "head_repository": {"full_name": publisher.REPOSITORY},
+        "head_sha": group_sha,
+        "head_commit": {"id": group_sha, "tree_id": tree},
+        "status": "completed",
+        "conclusion": "success",
+    }
+    candidates = [
+        {**group, "head_commit": {"id": group_sha, "tree_id": "d" * 40}},
+        {**group, "head_repository": {"full_name": "fork/Megatron-LM"}},
+        {**group, "conclusion": "failure"},
+        group,
+    ]
+    monkeypatch.setattr(
+        publisher,
+        "api",
+        lambda path: (
+            {"tree": {"sha": tree}}
+            if path == f"git/commits/{landed_sha}"
+            else {"workflow_runs": candidates}
+        ),
+    )
+    # A squash merge can change the commit SHA and preserve the tested tree.
+    assert publisher.find_producer(landed_sha) == (
+        group if source_ref == "refs/heads/main" else None
+    )
 
 
 @pytest.fixture
@@ -632,6 +664,28 @@ def test_merge_queue_label_matches_merge_group_configuration(
     result, outputs = _run_configure(tmp_path, environment, ["Run Merge-Queue jobs", *other_labels])
     assert result.returncode == 0, result.stderr
     assert outputs == baseline
+    mode = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())["jobs"][
+        "configure"
+    ]["outputs"]["unit_testmon_mode"]
+    expression = (
+        mode.removeprefix("${{").removesuffix("}}").replace("&&", "and").replace("||", "or")
+    )
+    for event, target, eligible, expected_mode in (
+        ("merge_group", "refs/heads/main", "false", "baseline"),
+        ("merge_group", "refs/heads/dev", "false", "full"),
+        ("push", "", "false", "full"),
+        ("push", "", "true", "enforce"),
+    ):
+        github = SimpleNamespace(
+            event_name=event, event=SimpleNamespace(merge_group=SimpleNamespace(base_ref=target))
+        )
+        steps = SimpleNamespace(
+            configure=SimpleNamespace(outputs=SimpleNamespace(unit_testmon_eligible=eligible))
+        )
+        assert (
+            eval(expression, {"__builtins__": {}}, {"github": github, "steps": steps})
+            == expected_mode
+        )
     for name, expected in {
         "merge_queue_jobs": "true",
         "scope": "L1",
@@ -1011,7 +1065,9 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
             (ROOT / "tests/test_utils/recipes" / platform / "unit-tests.yaml").read_text()
         )
         assert json.loads(parsed[output]) == [
-            {"bucket": case} for product in recipe["products"] for case in product["test_case"]
+            {"bucket": case, "testmon": product.get("testmon") is not False}
+            for product in recipe["products"]
+            for case in product["test_case"]
         ]
     assert restore["env"]["BUCKETS"] == "${{ inputs.buckets }}"
     assert workflow[True]["workflow_call"]["inputs"]["buckets"]["required"] is True
@@ -1094,7 +1150,7 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
         pytest.param("enforce", "main", "full", "enforce", id="cpu-fallback"),
         pytest.param("enforce", "main", "testmon-disabled", "full", id="testmon-disabled"),
         pytest.param("full", "main", "", "full", id="explicit-full"),
-        pytest.param("full", "", "", "full", id="merge-group-full"),
+        pytest.param("baseline", "main", "", "baseline", id="merge-group-full"),
         pytest.param("enforce", "dev", "preselected", "full", id="unsupported-target"),
     ],
 )
@@ -1108,11 +1164,12 @@ def test_gpu_reselection_respects_full_run_guards(
     inputs = SimpleNamespace(
         unit_testmon_mode=requested_mode, unit_testmon_target_branch=target_branch
     )
-    matrix = SimpleNamespace(mode=cpu_mode)
-    assert (
-        eval(expression, {"__builtins__": {}}, {"inputs": inputs, "matrix": matrix})
-        == expected_mode
-    )
+    for flag in (True, False) if requested_mode == "baseline" else (None,):
+        matrix = SimpleNamespace(mode=cpu_mode, testmon=flag)
+        context = {"inputs": inputs, "matrix": matrix, "toJSON": json.dumps}
+        assert eval(f"({expression})", {"__builtins__": {}}, context) == (
+            "full" if flag is False else expected_mode
+        )
 
 
 @pytest.mark.parametrize(

@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 REPOSITORY = "NVIDIA/Megatron-LM"
@@ -46,26 +47,73 @@ def sha(value: object) -> str:
 
 def latest_baseline() -> tuple[str, str]:
     """Find a completed trusted main producer with a common cache generation."""
-    response = json.loads(
-        run(
-            "gh",
-            "api",
-            f"repos/{REPOSITORY}/actions/workflows/populate-build-cache.yml/"
-            "runs?branch=main&status=completed&per_page=100",
-            "--jq",
-            '{workflow_runs: [.workflow_runs[] | select(.conclusion == "success" or '
-            '.conclusion == "failure")]}',
-        )
-    )
-    for candidate in response["workflow_runs"]:
-        # Retried runs can publish different generations for different buckets.
-        if (
-            candidate["event"] in {"schedule", "workflow_dispatch"}
-            and candidate["head_repository"]["full_name"] == REPOSITORY
-            and candidate["run_attempt"] == 1
-        ):
-            return sha(candidate["head_sha"]), f'{candidate["id"]}-1'
-    raise ValueError("No successful first-attempt main Testmon baseline found")
+    # Cache entries prove that the run actually published data. Build-only
+    # schedules and main pushes without a matching merge group create none.
+    api = f"repos/{REPOSITORY}/actions"
+    seen = set()
+    newest = None
+    page = 1
+    while True:
+        caches = json.loads(
+            run(
+                "gh",
+                "api",
+                f"{api}/caches?ref=refs%2Fheads%2Fmain&key=unit-testmon-v"
+                f"&sort=created_at&direction=desc&per_page=100&page={page}",
+            )
+        )["actions_caches"]
+        for cache in caches:
+            # An older push can finish or retry after a newer push. Prefer the
+            # newer producer. A run cannot start after it creates its caches.
+            if newest and datetime.fromisoformat(cache["created_at"]) < newest[0]:
+                return newest[2:]
+            match = re.fullmatch(
+                r"unit-testmon-v\d+-main-[\w-]+-[a-f0-9]{16}-([1-9]\d*)-([1-9]\d*)", cache["key"]
+            )
+            if not match or match.groups() in seen:
+                continue
+            seen.add(match.groups())
+            run_id, attempt = match.groups()
+            try:
+                producer = json.loads(run("gh", "api", f"{api}/runs/{run_id}"))
+            except subprocess.CalledProcessError as error:
+                if b"HTTP 404" in (error.stderr or b""):
+                    continue  # A deleted run can leave unexpired caches.
+                raise
+            if (
+                producer["head_branch"] != "main"
+                or (producer.get("head_repository") or {}).get("full_name") != REPOSITORY
+                or producer["status"] != "completed"
+                or str(producer["run_attempt"]) != attempt
+            ):
+                continue
+            published = (
+                producer["path"] == ".github/workflows/publish-unit-testmon.yml"
+                and producer["event"] == "push"
+                and producer["conclusion"] == "success"
+            )
+            # The manual GPU matrix (and earlier scheduled matrices) can publish
+            # different generations across buckets after a partial retry.
+            gpu_baseline = (
+                producer["path"] == ".github/workflows/populate-build-cache.yml"
+                and producer["event"] in {"schedule", "workflow_dispatch"}
+                and producer["conclusion"] in {"success", "failure"}
+                and attempt == "1"
+            )
+            if published or gpu_baseline:
+                candidate = (
+                    datetime.fromisoformat(producer["created_at"]),
+                    int(run_id),
+                    sha(producer["head_sha"]),
+                    f"{run_id}-{attempt}",
+                )
+                if newest is None or candidate > newest:
+                    newest = candidate
+        if len(caches) < 100:
+            if newest:
+                return newest[2:]
+            raise ValueError("No published main Testmon baseline found")
+        page += 1
 
 
 def outputs(manifest: dict[str, str]) -> None:
@@ -166,7 +214,7 @@ def restore(args: argparse.Namespace) -> None:
     )
     if original != sha(args.expected_sha) or git("rev-parse", "HEAD") != original:
         raise ValueError("Prepared checkout does not belong to the original tested commit")
-    if not re.fullmatch(r"[1-9][0-9]*-1", manifest["generation"]):
+    if not re.fullmatch(r"[1-9][0-9]*-[1-9][0-9]*", manifest["generation"]):
         raise ValueError("Invalid Testmon baseline generation")
     bundle = str(directory / "checkout.bundle")
     if git("bundle", "list-heads", bundle) != f"{tested} HEAD":

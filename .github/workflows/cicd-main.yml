@@ -220,6 +220,7 @@ jobs:
       sha:            ${{ steps.resolve-sha.outputs.sha }}
       target_branch:  ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref }}
       unit_testmon_eligible: ${{ steps.configure.outputs.unit_testmon_eligible }}
+      unit_testmon_mode: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_ref == 'refs/heads/main' && 'baseline' || steps.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
       unit_test_pr_files_artifact_id: ${{ steps.upload-unit-test-pr-files.outcome == 'success' && steps.upload-unit-test-pr-files.outputs.artifact-id || '' }}
       unit_testmon_checkout_artifact_id: ${{ steps.prepare-testmon-checkout.outputs.sha != '' && steps.upload-unit-test-pr-files.outcome == 'success' && steps.upload-unit-test-pr-files.outputs.artifact-id || '' }}
       unit_testmon_sha: ${{ steps.prepare-testmon-checkout.outputs.sha }}
@@ -1030,7 +1031,8 @@ jobs:
       - name: Parse unit tests
         id: parse-unit-tests
         run: |
-          cat tests/test_utils/recipes/h100/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests.json
+          yq -o json '[.products[] | (.testmon != false) as $enabled | .test_case[] | {"bucket": ., "testmon": $enabled}]' \
+            tests/test_utils/recipes/h100/unit-tests.yaml | jq -c > unit-tests.json
           echo "unit-tests=$(cat unit-tests.json)" | tee -a $GITHUB_OUTPUT
 
   cicd-unit-tests-latest:
@@ -1062,8 +1064,8 @@ jobs:
       runner: ${{ needs.configure.outputs.h100_gpu_runs_on }}
       container-image: ${{ format('{0}/megatron-lm:{1}-{2}', needs.configure.outputs.h100_registry, needs.configure.outputs.sha, needs.configure.outputs.h100_cloud) }}
       sha: ${{ needs.configure.outputs.sha }}
-      unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
-      unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
+      unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_mode }}
+      unit_testmon_target_branch: ${{ github.event.merge_group.base_ref == 'refs/heads/main' && 'main' || needs.configure.outputs.target_branch }}
       unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
       unit_testmon_checkout_artifact_id: ${{ needs.configure.outputs.unit_testmon_checkout_artifact_id }}
 
@@ -1106,7 +1108,8 @@ jobs:
       - name: Parse unit tests
         id: parse-unit-tests
         run: |
-          cat tests/test_utils/recipes/gb200/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests-gb200.json
+          yq -o json '[.products[] | (.testmon != false) as $enabled | .test_case[] | {"bucket": ., "testmon": $enabled}]' \
+            tests/test_utils/recipes/gb200/unit-tests.yaml | jq -c > unit-tests-gb200.json
           echo "unit-tests-gb200=$(cat unit-tests-gb200.json)" | tee -a $GITHUB_OUTPUT
 
   cicd-unit-tests-latest-gb200:
@@ -1141,8 +1144,8 @@ jobs:
       container-image: ${{ needs.cicd-parse-unit-tests-gb200.outputs.container-image }}
       platform: dgx_gb200
       sha: ${{ needs.configure.outputs.sha }}
-      unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
-      unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
+      unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_mode }}
+      unit_testmon_target_branch: ${{ github.event.merge_group.base_ref == 'refs/heads/main' && 'main' || needs.configure.outputs.target_branch }}
       unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
       unit_testmon_checkout_artifact_id: ${{ needs.configure.outputs.unit_testmon_checkout_artifact_id }}
 

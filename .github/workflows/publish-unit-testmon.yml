@@ -1,0 +1,51 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+name: Publish merged unit Testmon baselines
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  publish:
+    if: github.repository == 'NVIDIA/Megatron-LM'
+    runs-on: ubuntu-latest
+    # A queue entry can land before its merge-group CI run finishes.
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Install publisher dependencies
+        run: |
+          python -m pip install PyYAML
+          npm install --prefix "$RUNNER_TEMP/testmon" --no-package-lock --ignore-scripts --no-audit --no-fund @actions/cache@4.0.3
+          # PR runners restore gzip caches. Match their compression and cache version.
+          cache_bin=$(mktemp -d "$RUNNER_TEMP/unit-testmon-gzip.XXXXXX")
+          printf '#!/bin/sh\nexit 1\n' > "$cache_bin/zstd"
+          chmod +x "$cache_bin/zstd"
+          echo "$cache_bin" >> "$GITHUB_PATH"
+      - name: Publish verified Testmon caches for the landed commit
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          script: |
+            const save = `
+              (async () => {
+                const [path, key] = process.argv.slice(1);
+                const cache = require(process.env.RUNNER_TEMP + '/testmon/node_modules/@actions/cache');
+                await cache.saveCache([path], key);
+                const found = await cache.restoreCache([path], key, [], {lookupOnly: true});
+                if (found !== key) throw new Error('Missing published Testmon cache: ' + key);
+              })().catch(error => {console.error(error); process.exitCode = 1;});
+            `;
+            await exec.exec('python', ['.github/scripts/publish_unit_testmon.py'], {
+              env: {...process.env, TESTMON_NODE: process.execPath, TESTMON_SAVE: save},
+            });

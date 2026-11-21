@@ -190,7 +190,9 @@ def test_valid_generation_accepts_optional_image_diagnostics_and_is_read_only(
     assert _snapshot(directory) == before
 
 
-def test_run_and_attempt_generations_share_prefix_and_require_matching_key(generation):
+def test_run_and_attempt_generations_share_prefix_and_require_matching_key(
+    generation, source_tree, monkeypatch
+):
     directory, identity = generation
     keys = []
     for generation_id in ("123-1", "123-2", "456-1"):
@@ -202,6 +204,23 @@ def test_run_and_attempt_generations_share_prefix_and_require_matching_key(gener
     assert len(set(keys)) == 3
     with pytest.raises(ValueError, match="generation"):
         cache.validate_cache(directory, identity, keys[0])
+
+    monkeypatch.syspath_prepend(str(ROOT / ".github/scripts"))
+    publisher = importlib.import_module("publish_unit_testmon")
+    monkeypatch.chdir(source_tree)
+    producer = {"identity": identity, "source_sha": "b" * 40, "generation": "123-2"}
+    (directory / "producer.json").write_text(json.dumps(producer))
+    arguments = (directory, BUCKET, "dgx_h100", "b" * 40, "123-2", "c" * 40, "789-1")
+    with pytest.raises(ValueError, match="producer"):
+        publisher.promote(directory, BUCKET, "dgx_h100", "a" * 40, *arguments[4:])
+    key = publisher.promote(*arguments)
+    assert key == identity["cache_prefix"] + "789-1"
+    landed = cache.validate_cache(source_tree / publisher.CACHE_DIR, identity, key)
+    assert landed["source_sha"] == "c" * 40
+    for phase in cache.PHASES:
+        assert (source_tree / publisher.CACHE_DIR / phase / ".testmondata").read_bytes() == (
+            directory / phase / ".testmondata"
+        ).read_bytes()
 
 
 @pytest.mark.parametrize(
@@ -559,30 +578,37 @@ def test_action_baseline_guard_rejects_untrusted_producers(tmp_path, override, a
     fake_git = tmp_path / "git"
     fake_git.write_text("#!/bin/sh\nprintf '%s\\n' \"$SOURCE_SHA\"\n")
     fake_git.chmod(0o755)
-    result = subprocess.run(
-        [
-            "bash",
-            "-e",
-            "-u",
-            "-o",
-            "pipefail",
-            "-c",
-            _action_script("Validate unit Testmon baseline producer"),
-        ],
-        env={
-            **os.environ,
-            "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
-            "SOURCE_REPOSITORY": "NVIDIA/Megatron-LM",
-            "SOURCE_REF": "refs/heads/main",
-            "SOURCE_EVENT": "schedule",
-            "SOURCE_SHA": "b" * 40,
-            "REQUESTED_SHA": "b" * 40,
-            "TARGET_BRANCH": "main",
-            "SUITE_TAG": "latest",
-            **override,
-        },
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert (result.returncode == 0) is allowed
+    manual = {"SOURCE_EVENT": "workflow_dispatch", "SOURCE_REF": "refs/heads/main"}
+    group = {"SOURCE_EVENT": "merge_group", "SOURCE_REF": "refs/heads/gh-readonly-queue/main/pr-1"}
+    sources = [(manual, allowed), (group, allowed)]
+    if not override:
+        sources.append(({**group, "MERGE_BASE_REF": "refs/heads/dev"}, False))
+        sources.append(({**manual, "SOURCE_EVENT": "schedule"}, False))
+    for source, expected in sources:
+        result = subprocess.run(
+            [
+                "bash",
+                "-e",
+                "-u",
+                "-o",
+                "pipefail",
+                "-c",
+                _action_script("Validate unit Testmon baseline producer"),
+            ],
+            env={
+                **os.environ,
+                "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+                "SOURCE_REPOSITORY": "NVIDIA/Megatron-LM",
+                "MERGE_BASE_REF": "refs/heads/main",
+                "SOURCE_SHA": "b" * 40,
+                "REQUESTED_SHA": "b" * 40,
+                "TARGET_BRANCH": "main",
+                "SUITE_TAG": "latest",
+                **source,
+                **override,
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert (result.returncode == 0) is expected
