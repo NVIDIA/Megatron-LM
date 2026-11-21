@@ -609,14 +609,17 @@ def _linear_forward(
         )
 
     input_shape = input.shape
-    input_2d = input.reshape(-1, input_shape[-1])
+    # TE's general_gemm reads its operands as dense row-major matrices and ignores strides, so a
+    # strided view (e.g. a column slice of the hidden states) must be packed first. contiguous()
+    # returns the tensor itself when it is already dense, so the usual call copies nothing.
+    input_2d = input.reshape(-1, input_shape[-1]).contiguous()
     output = torch.empty(
         (*input_shape[:-1], weight.size(0)), dtype=output_dtype, device=input.device
     )
     # Cross entropy transforms FP32 logits in place. Have TE write through a 2-D view of
     # the final-shaped allocation, then return the owning tensor rather than that view.
     te_general_gemm(
-        weight,
+        weight.contiguous(),
         input_2d,
         out_dtype=output_dtype,
         layout="TN",
