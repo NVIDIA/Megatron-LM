@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 """Causal convolution over contiguous context-parallel sequence shards, and the determinism
-guard the SSM mixers apply to the causal_conv1d backward."""
+guard and channel-last layout rule the SSM mixers apply to causal_conv1d."""
 
 import os
 
@@ -14,6 +14,10 @@ try:
     from causal_conv1d import causal_conv1d_fn
 except ImportError:
     causal_conv1d_fn = None
+
+# causal_conv1d's channel-last kernel loads 8-element vectors along the channels, so the start
+# of its input and the input's batch and token strides must be multiples of this many elements.
+CHANNEL_LAST_ALIGNMENT = 8
 
 
 def _use_causal_conv1d_deterministic_mode():
@@ -58,6 +62,28 @@ def assert_causal_conv1d_deterministic(deterministic_mode):
         "reduce the conv weight and bias gradients with atomicAdd, which is not "
         "bit-reproducible, and ignore CAUSAL_CONV1D_DETERMINISTIC."
     )
+
+
+def ensure_channel_last_alignment(x: torch.Tensor) -> torch.Tensor:
+    """Return ``x`` in a layout that causal_conv1d's channel-last kernel accepts.
+
+    ``x`` is ``[B, L, D]`` with unit channel stride: the input of ``causal_conv1d_cp``, or of
+    ``causal_conv1d_fn`` once transposed to ``[B, D, L]``. Its start and its batch and token
+    strides must be multiples of ``CHANNEL_LAST_ALIGNMENT`` elements. A slice of a wider tensor,
+    such as one group of a fused projection, can break that and is then copied. Otherwise ``x``
+    itself is returned, and the conv reads it in place. Without causal-conv1d, ``x`` is returned
+    as is: the ``F.conv1d`` fallback reads any layout.
+    """
+    if causal_conv1d_fn is None or not (
+        x.storage_offset() % CHANNEL_LAST_ALIGNMENT
+        or x.stride(0) % CHANNEL_LAST_ALIGNMENT
+        or x.stride(1) % CHANNEL_LAST_ALIGNMENT
+    ):
+        return x
+    # Not ``contiguous()``: when B and L are both 1, e.g. a one-token static-batching prefill at
+    # batch size 1, it returns ``x`` unchanged, because torch ignores the strides of size-1
+    # dimensions and the kernel's check does not.
+    return x.clone(memory_format=torch.contiguous_format)
 
 
 def _exchange_initial_states(
@@ -112,7 +138,8 @@ def causal_conv1d_cp(
 
     Args:
         x: Input tensor of shape ``[B, T, D]``. THD callers flatten packed tokens
-            along ``T`` and use ``B=1``.
+            along ``T`` and use ``B=1``. Its layout must pass
+            ``ensure_channel_last_alignment`` unchanged.
         weight: Depthwise weights of shape ``[D, W]``.
         bias: Optional channel-wise bias.
         activation: Optional activation passed to ``causal_conv1d_fn``.
