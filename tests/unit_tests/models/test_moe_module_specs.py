@@ -5,7 +5,9 @@
 import pytest
 
 from megatron.core.models.backends import InferenceSpecProvider, LocalSpecProvider
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_inference_spec
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.moe.moe_layer import MoESubmodules
 from megatron.core.transformer.moe.router import InferenceTopKRouter, TopKRouter
 
@@ -34,3 +36,9 @@ class TestMoeModuleSpecRouter:
         )
         # No router override -> dataclass default.
         assert _router_of(spec) is TopKRouter
+
+    @pytest.mark.parametrize("mla", [False, True])
+    def test_inference_moe_layer_normalizes_before_routing(self, mla):
+        """MoE routers and experts fuse no norm, so the layer must apply one first."""
+        spec = get_gpt_layer_with_inference_spec(num_experts=8, multi_latent_attention=mla)
+        assert spec.submodules.pre_mlp_layernorm is not IdentityOp
