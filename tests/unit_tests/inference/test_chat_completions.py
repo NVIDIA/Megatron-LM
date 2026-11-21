@@ -1733,6 +1733,25 @@ async def test_chat_template_comes_from_the_server_never_the_request(server_temp
             [1, 10, 11],
             id="template-bos-kept",
         ),
+        # Without add_BOS the prompt keeps the template's BOS, as Hugging Face renders it.
+        pytest.param(
+            {"tokenizer": _BosRecordingTokenizer([1, 10, 11])},
+            {},
+            [1, 10, 11],
+            id="template-bos-kept-by-default",
+        ),
+        pytest.param(
+            {"tokenizer": _BosRecordingTokenizer([1, 10, 11])},
+            {"add_BOS": None},
+            [1, 10, 11],
+            id="template-bos-kept-for-null-add-bos",
+        ),
+        pytest.param(
+            {"tokenizer": _BosRecordingTokenizer([10, 11])},
+            {},
+            [10, 11],
+            id="no-bos-added-by-default",
+        ),
     ],
 )
 async def test_chat_prompt_comes_from_the_most_specific_tokenizer(
