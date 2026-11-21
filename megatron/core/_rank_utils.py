@@ -13,6 +13,20 @@ import torch
 from megatron.core._slurm_utils import resolve_slurm_rank, resolve_slurm_world_size
 
 
+def _get_rank_from_environment() -> Optional[int]:
+    """Read the rank from launcher environment variables, without warning.
+
+    Checks RANK (torchrun/torchelastic), then SLURM_PROCID (SLURM).
+
+    Returns:
+        The rank, or None when no launcher variable names one.
+    """
+    if "RANK" in os.environ:
+        return int(os.environ["RANK"])
+
+    return resolve_slurm_rank()
+
+
 def safe_get_rank() -> int:
     """Get the distributed rank safely, even if torch.distributed is not initialized.
 
@@ -29,12 +43,9 @@ def safe_get_rank() -> int:
         return torch.distributed.get_rank()
 
     # If torch.distributed is not initialized, try to read environment variables.
-    if "RANK" in os.environ:
-        return int(os.environ["RANK"])
-
-    slurm_rank = resolve_slurm_rank()
-    if slurm_rank is not None:
-        return slurm_rank
+    env_rank = _get_rank_from_environment()
+    if env_rank is not None:
+        return env_rank
 
     warnings.warn(
         "Could not determine rank from torch.distributed, RANK, or SLURM_PROCID. "
@@ -139,8 +150,8 @@ def warn_single_rank(
     such as deprecated settings and experimental-API notices. Every rank raises those
     identically, so a large job repeats one message thousands of times in a shared log.
 
-    ``safe_get_rank`` reads the RANK or SLURM_PROCID environment variable when torch
-    distributed is not initialized, so this also works at import time.
+    Before torch distributed is initialized, the rank comes from the RANK or SLURM_PROCID
+    environment variable, so this also works at import time.
 
     Args:
         message: The warning message.
@@ -157,14 +168,12 @@ def warn_single_rank(
         # import outside a launcher. Defaulting to rank 0 is the right answer here, and
         # letting that warning through would just swap it for the one being deduplicated.
         #
-        # Only reachable before torch distributed comes up. Entering catch_warnings bumps
-        # the global filter version, which clears every module's __warningregistry__ and
-        # so re-arms warnings that had already printed once. Paying that on a call made
-        # once per bucket per step made this helper multiply the log volume it exists to
-        # cut, so keep it off the initialized path.
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            current_rank = safe_get_rank()
+        # Silencing it with catch_warnings would bump the global filter version, which
+        # clears every module's __warningregistry__ and so re-arms warnings that had
+        # already printed once. Read the environment directly instead, which resolves the
+        # rank the same way safe_get_rank does without ever producing the warning.
+        env_rank = _get_rank_from_environment()
+        current_rank = env_rank if env_rank is not None else 0
 
     should_warn = current_rank == rank if rank is not None else current_rank in _DEFAULT_LOG_RANKS
     if should_warn:
