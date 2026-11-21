@@ -6,6 +6,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -16,7 +17,7 @@ static void check(cublasStatus_t status) {
     throw std::runtime_error("cuBLAS status " + std::to_string(status));
 }
 
-static const std::array<cublasLtMatmulAlgoConfigAttributes_t, 8> attributes = {
+static const std::array<cublasLtMatmulAlgoConfigAttributes_t, 9> attributes = {
     CUBLASLT_ALGO_CONFIG_ID,
     CUBLASLT_ALGO_CONFIG_TILE_ID,
     CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
@@ -24,11 +25,12 @@ static const std::array<cublasLtMatmulAlgoConfigAttributes_t, 8> attributes = {
     CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
     CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING,
     CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION,
+    CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID,
     CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID,
 };
 
 struct Choice {
-  std::array<int, 8> configuration{};
+  std::array<int, 9> configuration{};
   size_t workspace{};
   bool operator==(const Choice &other) const {
     return configuration == other.configuration && workspace == other.workspace;
@@ -85,8 +87,15 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < attributes.size(); ++i) {
       choice.configuration[i] = -1;
       size_t written{};
-      cublasLtMatmulAlgoConfigGetAttribute(
-          &result.algo, attributes[i], &choice.configuration[i], sizeof(int), &written);
+      if (i >= 7) {
+        uint16_t value{};
+        if (cublasLtMatmulAlgoConfigGetAttribute(
+                &result.algo, attributes[i], &value, sizeof(value), &written) == CUBLAS_STATUS_SUCCESS)
+          choice.configuration[i] = value;
+      } else {
+        cublasLtMatmulAlgoConfigGetAttribute(
+            &result.algo, attributes[i], &choice.configuration[i], sizeof(int), &written);
+      }
     }
     if (k > 1 && !(choice == previous)) {
       write_range(out, begin, k - 1, previous);
@@ -104,6 +113,7 @@ int main(int argc, char **argv) {
   metadata << "{\"gpu\":\"" << device.name << "\",\"major\":" << device.major
            << ",\"minor\":" << device.minor << ",\"sm_count\":" << device.multiProcessorCount
            << ",\"cublaslt_version\":" << cublasLtGetVersion()
+           << ",\"configuration_fields\":[\"id\",\"tile\",\"split_k\",\"stages\",\"reduction\",\"swizzle\",\"custom\",\"inner\",\"cluster\"]"
            << ",\"m\":512,\"n\":2048,\"k_min\":1,\"k_max\":65536,\"workspace_limit\":"
            << workspace << ",\"ranges\":" << ranges << ",\"elapsed_seconds\":" << elapsed << "}\n";
   std::cout << "Queried 65536 reduction sizes in " << elapsed << " seconds; " << ranges << " ranges\n";
