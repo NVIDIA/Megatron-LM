@@ -1068,6 +1068,18 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
+        # lm_head_loss_num_chunks > 1: project and score the sequence in chunks, so the full
+        # [s, b, vocab] logits are never allocated.
+        if (
+            getattr(self.config, "lm_head_loss_num_chunks", 1) > 1
+            and not in_inference_mode
+            and inference_context is None
+            and self.can_chunk_lm_head_loss(labels, loss_mask, output_weight, runtime_gather_output)
+        ):
+            return self.compute_chunked_lm_head_loss(
+                hidden_states, labels, loss_mask, output_weight
+            )
+
         # Inference consumes logits in fp32: emit them so when the head can, upcast otherwise.
         emit_fp32 = in_inference_mode and self.lm_head_can_emit_fp32
         logits, _ = self.output_layer(

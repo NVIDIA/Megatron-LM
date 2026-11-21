@@ -142,6 +142,21 @@ class TransformerConfig(ModelParallelConfig):
     [seq, batch, hidden] gradient of the head input is kept and injected into the main backward.
     No recomputation is involved; total FLOPs are unchanged."""
 
+    lm_head_loss_num_chunks: int = 1
+    """Number of sequence chunks the LM head (output projection + cross entropy) runs in.
+    1, the default, projects the whole sequence at once. With N > 1 each head projects, scores
+    and differentiates one N-th of the sequence at a time, so the [seq, batch, vocab] fp32
+    logits only ever exist for one chunk; what is kept per head is their gradient in the
+    activation dtype. The output-layer weight is still gathered once per head and its gradient
+    is still computed by a single GEMM over the whole sequence, so the result is unchanged up
+    to rounding and no work is repeated. With a large vocabulary the logits are the largest
+    allocation of a training step and set its peak memory.
+    Applies to the hybrid model's main head and MTP heads. The gradient to the logits is
+    computed during the forward pass, which needs the loss reduction to be known there, so
+    this requires ``calculate_per_token_loss=True`` and, with MTP, ``mtp_loss_early_backward``
+    and ``mtp_normalize_loss_by_main_tokens`` with cross entropy as the only MTP loss and
+    undetached heads."""
+
     mtp_hybrid_override_pattern: Optional[str] = None
     """DEPRECATED: Use unified hybrid_layer_pattern instead.
     Legacy argument for loading old checkpoints.
@@ -2016,6 +2031,33 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "mtp_normalize_loss_by_main_tokens=True requires calculate_per_token_loss=True."
             )
+
+        if self.lm_head_loss_num_chunks < 1:
+            raise ValueError(
+                f"lm_head_loss_num_chunks must be at least 1, got {self.lm_head_loss_num_chunks}."
+            )
+        if self.lm_head_loss_num_chunks > 1:
+            # The chunked head differentiates each chunk during the forward pass, so it has to
+            # know there how the per-token loss is reduced. Reject the reductions it cannot
+            # know rather than leave some heads unchunked, which would keep the peak memory.
+            if not self.calculate_per_token_loss:
+                raise ValueError(
+                    "lm_head_loss_num_chunks > 1 requires calculate_per_token_loss=True."
+                )
+            if self.mtp_num_layers:
+                unmet = []
+                if not self.mtp_loss_early_backward:
+                    unmet.append("mtp_loss_early_backward=True")
+                if not self.mtp_normalize_loss_by_main_tokens:
+                    unmet.append("mtp_normalize_loss_by_main_tokens=True")
+                if self.mtp_kl_loss_weight > 0 or self.mtp_ce_loss_weight <= 0:
+                    unmet.append("cross entropy as the only MTP loss (no mtp_kl_loss_weight)")
+                if self.mtp_detach_heads:
+                    unmet.append("mtp_detach_heads=False")
+                if unmet:
+                    raise ValueError(
+                        "lm_head_loss_num_chunks > 1 with MTP requires " + ", ".join(unmet) + "."
+                    )
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.
