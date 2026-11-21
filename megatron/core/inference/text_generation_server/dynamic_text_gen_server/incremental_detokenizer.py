@@ -3,14 +3,19 @@
 
 """Incremental detokenization for OpenAI-compatible streaming responses."""
 
+import itertools
 import logging
 from typing import Any
 
-from megatron.core.inference.utils import model_eos_token_ids
+from megatron.core.inference.utils import detokenize_tokens, model_eos_token_ids
 
 logger = logging.getLogger(__name__)
 
 _INVALID_PREFIX_ERROR = "Invalid prefix encountered"
+# The decoder starts from at most this many of the prompt's last kept ids. They are enough to
+# decode the first generated tokens as they read after the prompt (with or without a leading
+# space), and they bound the cost of a long prompt, which would otherwise be decoded in full.
+_PROMPT_CONTEXT_TOKENS = 8
 
 
 class HuggingFaceFastIncrementalDetokenizer:
@@ -21,7 +26,9 @@ class HuggingFaceFastIncrementalDetokenizer:
     until equivalent incremental decoders exist for the other tokenizer backends.
     """
 
-    def __init__(self, tokenizer: Any, prompt_token_ids: list[int]) -> None:
+    def __init__(
+        self, tokenizer: Any, prompt_token_ids: list[int], *, remove_eos: bool = True
+    ) -> None:
         try:
             import tokenizers
             from transformers import PreTrainedTokenizerFast
@@ -50,29 +57,85 @@ class HuggingFaceFastIncrementalDetokenizer:
         # their reasoning and tool-call markers (`<think>`, `</think>`,
         # `<tool_call>`) as special, and the reasoning and tool parsers need them.
         # `DecodeStream(skip_special_tokens=True)` would drop those markers too.
-        self._skipped_token_ids = frozenset(huggingface_tokenizer.all_special_ids) | (
-            model_eos_token_ids(tokenizer)
-        )
-        self._decode_stream = self._new_decode_stream(prompt_token_ids)
+        self._remove_eos = remove_eos
+        self._eos_token_ids = model_eos_token_ids(tokenizer)
+        # An EOS id in the special-tokens map is dropped wherever it is, like any mapped
+        # special token. Other EOS ids are held until a later token shows they are interior,
+        # and only a trailing run is dropped, when `remove_eos` is set.
+        self._skipped_token_ids = frozenset(huggingface_tokenizer.all_special_ids)
+        self._pending_eos_token_ids: list[int] = []
+        # The decoder withholds an incomplete UTF-8 character until a later token
+        # completes it. Track the withheld ids, and the ids of the decoder's last
+        # fragment as their context, so `finish` can flush them like a batch decode.
+        self._withheld_token_ids: list[int] = []
+        self._context_token_ids = self._prompt_context(prompt_token_ids)
+        self._decode_stream = self._new_decode_stream(self._context_token_ids)
         self._text_fragments: list[str] = []
         self._text_length = 0
+        self._finished = False
 
-    def _new_decode_stream(self, prompt_token_ids: list[int] | None = None):
+    def _prompt_context(self, prompt_token_ids: list[int]) -> list[int]:
+        """Return the prompt's last kept ids, trimmed to whole characters at both ends.
+
+        `DecodeStream` takes the text of its starting ids as the prefix to remove only if that
+        text does not end in U+FFFD (a cut character, or a literal one); otherwise its first
+        fragment would repeat that text. A start in the middle of a character can turn a whole
+        run of byte-fallback tokens into U+FFFD, so the context starts on a whole character too.
+        """
+        kept = (
+            token_id
+            for token_id in reversed(prompt_token_ids)
+            if token_id not in self._skipped_token_ids
+        )
+        context = list(itertools.islice(kept, _PROMPT_CONTEXT_TOKENS))[::-1]
+        while context and self._decode_text(context).startswith("\ufffd"):
+            context.pop(0)
+        while context and self._decode_text(context).endswith("\ufffd"):
+            context.pop()
+        return context
+
+    def _decode_text(self, token_ids: list[int]) -> str:
+        return self._native_tokenizer.decode(token_ids, skip_special_tokens=False)
+
+    def _new_decode_stream(self, context_token_ids: list[int] | None = None):
         kwargs = {"skip_special_tokens": False}
-        if prompt_token_ids is not None:
-            kwargs["ids"] = self._kept(prompt_token_ids)
+        if context_token_ids is not None:
+            kwargs["ids"] = context_token_ids
         return self._tokenizers.decoders.DecodeStream(**kwargs)
-
-    def _kept(self, token_ids: list[int]) -> list[int]:
-        return [token_id for token_id in token_ids if token_id not in self._skipped_token_ids]
 
     def update(self, token_ids: list[int]) -> str:
         """Decode token IDs and return only newly stable text."""
+        decode_ids = []
+        for token_id in token_ids:
+            if token_id in self._eos_token_ids:
+                if token_id not in self._skipped_token_ids:
+                    self._pending_eos_token_ids.append(token_id)
+                continue
+            # Any later token, even a filtered one, makes the held EOS ids interior, so only
+            # a trailing run of EOS ids is left for `finish` to apply the removal policy to.
+            decode_ids.extend(self._pending_eos_token_ids)
+            self._pending_eos_token_ids.clear()
+            if token_id not in self._skipped_token_ids:
+                decode_ids.append(token_id)
+        return self._decode(decode_ids)
+
+    def finish(self) -> str:
+        """Resolve buffered EOS tokens and flush text the decoder still withholds."""
+        if self._finished:
+            return ""
+        self._finished = True
+        decode_ids = [] if self._remove_eos else self._pending_eos_token_ids
+        self._pending_eos_token_ids = []
+        return self._decode(decode_ids, flush=True)
+
+    def _decode(self, token_ids: list[int], *, flush: bool = False) -> str:
         fragments = []
-        for token_id in self._kept(token_ids):
+        for token_id in token_ids:
             fragment = self._decode_next(token_id)
             if fragment:
                 fragments.append(fragment)
+        if flush and self._withheld_token_ids:
+            fragments.append(self._withheld_text())
 
         delta = "".join(fragments)
         if delta:
@@ -94,8 +157,23 @@ class HuggingFaceFastIncrementalDetokenizer:
                 token_id,
             )
             self._decode_stream = self._new_decode_stream()
+            self._withheld_token_ids, self._context_token_ids = [], []
             fragment = self._decode_stream.step(self._native_tokenizer, token_id)
+        if fragment:
+            self._context_token_ids = self._withheld_token_ids + [token_id]
+            self._withheld_token_ids = []
+        else:
+            self._withheld_token_ids.append(token_id)
         return fragment or ""
+
+    def _withheld_text(self) -> str:
+        """Decode the withheld ids as a batch decode would, e.g. a cut character as U+FFFD."""
+        context = self._native_tokenizer.decode(self._context_token_ids, skip_special_tokens=False)
+        text = self._native_tokenizer.decode(
+            self._context_token_ids + self._withheld_token_ids, skip_special_tokens=False
+        )
+        self._withheld_token_ids = []
+        return text[len(context) :] if text.startswith(context) else ""
 
     @property
     def text(self) -> str:
@@ -104,5 +182,33 @@ class HuggingFaceFastIncrementalDetokenizer:
 
     @property
     def text_length(self) -> int:
-        """Return the number of emitted characters."""
-        return self._text_length
+        """Return the text offset of the next token: emitted text plus held EOS text."""
+        held_eos_text = self._native_tokenizer.decode(
+            self._pending_eos_token_ids, skip_special_tokens=False
+        )
+        return self._text_length + len(held_eos_text)
+
+
+def detokenize_generated_tokens(
+    tokenizer: Any,
+    prompt_token_ids: list[int],
+    generated_token_ids: list[int],
+    *,
+    remove_eos: bool = True,
+) -> str:
+    """Decode a completed generation with the same prompt context used for streaming.
+
+    Tokenizers may insert or withhold text at the prompt/generation boundary. A
+    prompt-prefilled decoder therefore produces the authoritative generated suffix for
+    Hugging Face fast tokenizers. Non-streaming-only tokenizer backends retain the
+    established generated-token decoding behavior.
+    """
+    try:
+        detokenizer = HuggingFaceFastIncrementalDetokenizer(
+            tokenizer, prompt_token_ids, remove_eos=remove_eos
+        )
+    except (ImportError, TypeError, ValueError):
+        return detokenize_tokens(
+            tokenizer, generated_token_ids, remove_EOD=remove_eos, skip_special_tokens=True
+        )
+    return detokenizer.update(generated_token_ids) + detokenizer.finish()
