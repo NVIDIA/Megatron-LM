@@ -57,16 +57,7 @@ class _CoordinatorRuntime(CoordinatorThread):
         assert self.thread.is_alive(), "coordinator loop exited unexpectedly"
 
     def shutdown(self):
-        if self.thread.is_alive():
-            context = zmq.Context()
-            socket = context.socket(zmq.DEALER)
-            socket.connect(self.address)
-            socket.send(msgpack.packb([Headers.CONNECT.value], use_bin_type=True))
-            if socket.poll(5000) & zmq.POLLIN:
-                socket.recv_multipart()
-                socket.send(msgpack.packb([Headers.SHUTDOWN.value], use_bin_type=True))
-            socket.close(linger=100)
-            context.term()
+        self.pipe.close()  # tells the coordinator to exit
         self.monitor.close(linger=0)
         self.thread.join(timeout=5.0)
         assert not self.thread.is_alive(), "coordinator thread did not stop"

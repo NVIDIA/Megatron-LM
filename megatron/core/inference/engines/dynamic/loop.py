@@ -636,7 +636,7 @@ class EngineLoopMixin:
         return finished_requests
 
     async def shutdown(self):
-        """Shut down the engine and clean up ZMQ resources.
+        """Shut down the engine, clean up ZMQ and reap the coordinator this rank spawned.
 
         Called from the engine loop's finally block after the loop exits.
         """
@@ -668,6 +668,16 @@ class EngineLoopMixin:
             self.world_zmq_communicator.close()
         if not self.zmq_context.closed:
             self.zmq_context.term()
+
+        # Closing the pipe tells the coordinator to exit.
+        proc = self.inference_coordinator_process
+        if proc is not None:
+            self._coordinator_pipe.close()
+            proc.join(10.0)
+            if proc.is_alive():
+                logger.warning("Inference coordinator did not exit; terminating it.")
+                proc.terminate()
+                proc.join()
 
         # Set the stopped state at the very end.
         self._state_events[EngineState.STOPPED].set()

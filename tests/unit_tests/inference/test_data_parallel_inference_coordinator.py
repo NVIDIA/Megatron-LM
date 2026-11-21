@@ -152,6 +152,8 @@ def test_native_disaggregation_rejects_multimodal_without_stopping_coordinator()
         coordinator
     )
     coordinator._handlers = HANDLERS
+    # The spawner keeps the pipe open for the two submissions, then closes it.
+    coordinator.pipe_connection.poll.side_effect = [False, False, True]
     submissions = [
         [
             b"client",
@@ -163,10 +165,7 @@ def test_native_disaggregation_rejects_multimodal_without_stopping_coordinator()
         ]
         for request_id, media in [(7, {"image": [b"image"]}), (8, None)]
     ]
-    coordinator.router_socket.recv_multipart.side_effect = [
-        *submissions,
-        [b"client", msgpack.packb([Headers.SHUTDOWN.value])],
-    ]
+    coordinator.router_socket.recv_multipart.side_effect = submissions
 
     DataParallelInferenceCoordinator.start(coordinator)
 
@@ -613,6 +612,47 @@ def test_case_communicator():
     ctx.term()
 
 
+def _spawn_coordinator(port):
+    """Spawn a coordinator the way the engine does and wait until it listens. The caller keeps
+    the returned pipe end open for as long as the coordinator should live."""
+    spawn_context = multiprocessing.get_context('spawn')
+    pipe_parent, pipe_child = spawn_context.Pipe()
+    ready_event = spawn_context.Event()
+    proc = spawn_context.Process(
+        target=DataParallelInferenceCoordinator.entrypoint,
+        kwargs={
+            "pipe_connection": pipe_child,
+            "ready_event": ready_event,
+            "data_parallel_size": 0,
+            "tokenizer": DummyTokenizer(),
+            "max_requests": 16,
+            "inference_coordinator_port": port,
+            "deterministic_mode": False,
+        },
+    )
+    proc.start()
+    pipe_child.close()
+    # Wait for the coordinator to bind its socket and send the address.
+    while not pipe_parent.poll(timeout=0.1):
+        assert proc.is_alive(), "Coordinator process died during init"
+    dp_addr = pipe_parent.recv()
+    ready_event.wait(timeout=10.0)
+    return proc, pipe_parent, dp_addr
+
+
+def test_coordinator_exits_when_spawner_closes_pipe():
+    """A spawned coordinator exits cleanly once its spawner closes the pipe, with no client."""
+    proc, pipe_parent, _ = _spawn_coordinator(port=None)
+    try:
+        pipe_parent.close()
+        proc.join(timeout=30.0)
+        assert proc.exitcode == 0
+    finally:
+        if proc.is_alive():
+            proc.kill()
+            proc.join()
+
+
 @pytest.fixture(scope="class")
 def coordinator():
     """Launch a single coordinator process for the entire test class.
@@ -629,29 +669,7 @@ def coordinator():
     rank = int(os.environ.get("RANK", "0"))
 
     if rank == 0:
-        spawn_context = multiprocessing.get_context('spawn')
-        pipe_parent, pipe_child = spawn_context.Pipe()
-        ready_event = spawn_context.Event()
-        proc = spawn_context.Process(
-            target=DataParallelInferenceCoordinator.entrypoint,
-            kwargs={
-                "pipe_connection": pipe_child,
-                "ready_event": ready_event,
-                "data_parallel_size": 0,
-                "tokenizer": DummyTokenizer(),
-                "max_requests": 16,
-                "inference_coordinator_port": DEFAULT_PORT,
-                "deterministic_mode": False,
-            },
-        )
-        proc.start()
-
-        # Wait for the coordinator to bind its socket and send the address.
-        while not pipe_parent.poll(timeout=0.1):
-            assert proc.is_alive(), "Coordinator process died during init"
-        dp_addr = pipe_parent.recv()
-        pipe_parent.close()
-        ready_event.wait(timeout=10.0)
+        proc, pipe_parent, dp_addr = _spawn_coordinator(DEFAULT_PORT)
     else:
         proc = None
         # Placeholder: the engine setup broadcasts rank 0's actual address.
@@ -659,16 +677,9 @@ def coordinator():
 
     yield dp_addr
 
-    # Only rank 0 tears down the coordinator process.
+    # Only rank 0 tears down the coordinator process: closing the pipe tells it to exit.
     if rank == 0 and proc is not None and proc.is_alive():
-        ctx = zmq.Context()
-        sock = ctx.socket(zmq.DEALER)
-        sock.connect(dp_addr)
-        sock.send(msgpack.packb([Headers.CONNECT.value], use_bin_type=True))
-        sock.recv()  # CONNECT_ACK
-        sock.send(msgpack.packb([Headers.SHUTDOWN.value], use_bin_type=True))
-        sock.close(linger=1000)
-        ctx.term()
+        pipe_parent.close()
         proc.join(timeout=10.0)
         if proc.is_alive():
             proc.terminate()
@@ -1034,12 +1045,7 @@ class TestCoordinator:
             await cleanup_engine(engine, client)
             process = getattr(engine, "inference_coordinator_process", None)
             if process is not None:
-                if dp_addr is not None:
-                    shutdown_client = InferenceClient(dp_addr)
-                    shutdown_client.start(connect_timeout_seconds=10)
-                    shutdown_client.shutdown_coordinator()
-                    process.join(timeout=10)
-                    shutdown_client.stop()
+                # STOP alone must have reaped the coordinator the engine spawned.
                 alive = process.is_alive()
                 if alive:
                     process.terminate()

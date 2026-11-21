@@ -111,6 +111,30 @@ except ImportError:
     HAVE_TORCH_MEMORY_SAVER = False
 
 
+@pytest.mark.parametrize("coordinator", [None, "cooperative", "wedged"])
+def test_shutdown_reaps_the_spawned_coordinator(coordinator):
+    """shutdown() closes the spawned coordinator's pipe and joins it before reporting STOPPED,
+    terminating one that does not exit; a rank that spawned none has nothing to reap."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.requests, engine._in_custom_gc_mode = {}, False
+    engine.zmq_context = mock.Mock(closed=True)
+    stopped = asyncio.Event()
+    engine._state_events = {EngineState.STOPPED: stopped}
+    proc, pipe = mock.Mock(), mock.Mock()
+    proc.is_alive.return_value = coordinator == "wedged"
+    proc.join.side_effect = lambda *_: stopped.is_set() and pytest.fail("joined after STOPPED")
+    if coordinator is not None:
+        engine.inference_coordinator_process, engine._coordinator_pipe = proc, pipe
+
+    asyncio.run(engine.shutdown())
+
+    assert stopped.is_set()
+    assert pipe.close.call_count == (coordinator is not None)
+    joins = {None: [], "cooperative": [mock.call(10.0)], "wedged": [mock.call(10.0), mock.call()]}
+    assert proc.join.call_args_list == joins[coordinator]
+    assert proc.terminate.call_count == (coordinator == "wedged")
+
+
 class _ImageOnlyCapabilityWrapper:
     supports_text = True
     supports_image = True
