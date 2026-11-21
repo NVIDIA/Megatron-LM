@@ -49,13 +49,13 @@ def main() -> None:
     generation = f"{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
     baseline_generation = os.environ.get("TESTMON_GENERATION", "")
     temporary = Path(os.environ["RUNNER_TEMP"])
-    disabled_buckets = _disabled_buckets(temporary / "unit-tests.yaml")
+    testmon_disabled_buckets = _disabled_buckets(temporary / "unit-tests.yaml")
     if baseline_generation:
         # Either checkout can opt out, including when the baseline predates the recipe flag.
         recipe = (
             Path("tests/test_utils/recipes") / platform.removeprefix("dgx_") / "unit-tests.yaml"
         )
-        disabled_buckets.update(_disabled_buckets(recipe))
+        testmon_disabled_buckets.update(_disabled_buckets(recipe))
     cache_dir = Path("assets_dir/testmon")
     plan = "assets_dir/testmon-plan/plan.json"
     matrix = []
@@ -69,7 +69,7 @@ def main() -> None:
     # Restore sequentially: the path is part of the existing cache version.
     for entry in json.loads(os.environ["BUCKETS"]):
         bucket = entry["bucket"]
-        if bucket in disabled_buckets:
+        if bucket in testmon_disabled_buckets:
             matrix.append({**entry, "mode": "testmon-disabled"})
             summary.append(f"| `{bucket}` | full (Testmon disabled in recipe) | true |")
             continue
