@@ -13,6 +13,7 @@ from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionExecutionContext,
     HyperConnectionResidualConnection,
+    SinglePassMHCState,
 )
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.residual_connection import (
@@ -145,6 +146,7 @@ class HyperConnectionTransformerLayer(
         # local CUDA-graph capture bypasses __call__ after the block was finalized, so it sees
         # None and runs mHC eagerly, like TE capture.
         self._mhc_recompute_context: ResidualStreamRecomputeContext | None = None
+        self._single_pass_state: SinglePassMHCState | None = None
 
     def __call__(self, *args, **kwargs):
         # Remove the context from kwargs because CUDA graphs cannot accept its live manager.
@@ -170,10 +172,12 @@ class HyperConnectionTransformerLayer(
                 legacy_manager, is_block_end=legacy_manager.is_last_layer_in_recompute_block
             )
         self._mhc_recompute_context = context
+        self._single_pass_state = kwargs.pop("mhc_state", None)
         try:
             return super().__call__(*args, **kwargs)
         finally:
             self._mhc_recompute_context = None
+            self._single_pass_state = None
 
     def _residual_recompute_context(
         self, *, is_mlp: bool = False
@@ -234,7 +238,9 @@ class HyperConnectionTransformerLayer(
         # existing mHC norm and offload behavior.
         return apply_module(connection)(
             hidden_states,
-            execution_context=HyperConnectionExecutionContext(owner),
+            execution_context=HyperConnectionExecutionContext(
+                owner, mhc_state=self._single_pass_state
+            ),
             recompute_context=self._residual_recompute_context(is_mlp=is_mlp),
         )
 

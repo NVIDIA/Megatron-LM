@@ -268,6 +268,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Elementwise rotations under timing-based triton.autotune; fwd+bwd replay in sbhd and thd.",
     ),
     KernelEntry(
+        name="fused_mhc_single_pass",
+        sources=("megatron/core/fusions/fused_mhc_single_pass.py",),
+        tests=("tests/unit_tests/fusions/test_fused_mhc_single_pass.py",),
+        kind="triton",
+        notes="Bitwise aggregation and BDA comparisons, per-GPU dispatch, and gradient replay "
+        "through the single-pass chain with and without recompute.",
+    ),
+    KernelEntry(
         name="fused_mhc_kernels",
         sources=(
             "megatron/core/fusions/fused_mhc_kernels.py",

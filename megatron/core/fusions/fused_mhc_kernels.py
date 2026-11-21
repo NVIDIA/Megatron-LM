@@ -20,6 +20,7 @@ Determinism:
   not been certified. The accelerated backends use timing-based autotuning.
 """
 
+import functools
 import logging
 import math
 import os
@@ -32,6 +33,7 @@ import torch
 from torch import Tensor
 
 from megatron.core._rank_utils import log_single_rank, safe_get_rank
+from megatron.core.env_flags import env_flag
 
 logger = logging.getLogger(__name__)
 LOG2E = math.log2(math.e)
@@ -143,6 +145,12 @@ def _cutile_supports_current_device() -> bool:
     return True
 
 
+def _cutile_backward_stream(tensor: Tensor) -> torch.cuda.Stream:
+    """Bind the autograd worker to the CUDA context needed by the cuTile driver."""
+    torch.cuda.set_device(tensor.device)
+    return torch.cuda.current_stream(tensor.device)
+
+
 def is_triton_available() -> bool:
     """Return True if Triton is enabled for supported mHC kernels."""
     return _TRITON_AVAILABLE
@@ -170,6 +178,36 @@ def _backend_uses_triton(backend: MHCBackend) -> bool:
 
 def _backend_uses_cutile(backend: MHCBackend) -> bool:
     return backend in ("auto", "cutile") and is_cutile_available()
+
+
+# MCORE_MHC_SP_CUTILE_PROJ_RMS (read once at import; opt-in, default off). When on, single-pass
+# (V4.1) HyperConnectionModules whose backend policy selects cuTile compute the mapping
+# projection + RMS + coefficient activations with the split-K proj_rms_compute_h kernels in their
+# eps-inside-sqrt variant (inv = rsqrt(mean(x^2) + eps), the V4.1 formula) instead of Inductor
+# + TF32 cuBLAS on an FP32 copy of the residual. Not bit-identical to that path. See
+# HyperConnectionModule._single_pass_coefficients_cutile.
+SINGLE_PASS_CUTILE_PROJ_RMS = env_flag("MCORE_MHC_SP_CUTILE_PROJ_RMS", False)
+_SINGLE_PASS_CUTILE_PROJ_RMS_LOGGED: set[str] = set()
+
+
+def single_pass_cutile_proj_rms_enabled(backend: MHCBackend = "auto") -> bool:
+    """Whether MCORE_MHC_SP_CUTILE_PROJ_RMS routes single-pass mappings to cuTile for a policy."""
+    if not SINGLE_PASS_CUTILE_PROJ_RMS:
+        return False
+    enabled = _backend_uses_cutile(backend)
+    if backend not in _SINGLE_PASS_CUTILE_PROJ_RMS_LOGGED:
+        _SINGLE_PASS_CUTILE_PROJ_RMS_LOGGED.add(backend)
+        log_single_rank(
+            logger,
+            logging.INFO if enabled else logging.WARNING,
+            f"[mHC] MCORE_MHC_SP_CUTILE_PROJ_RMS=1, policy={backend}: single-pass projection+RMS "
+            + (
+                "uses the cuTile split-K proj_rms_compute_h kernels (eps inside the RMS sqrt)"
+                if enabled
+                else "keeps the Inductor path (the policy does not select cuTile here)"
+            ),
+        )
+    return enabled
 
 
 # ============================================================================
@@ -503,12 +541,18 @@ if _TRITON_AVAILABLE:
             )
 
     def _triton_h_post_bda_fwd(
-        h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
+        h_res: Tensor,
+        original_residual: Tensor,
+        h_post: Tensor,
+        x: Tensor,
+        bias: Optional[Tensor],
+        *,
+        output_dtype: torch.dtype | None = None,
     ) -> Tensor:
         s, b, n, C = original_residual.shape
         sb = s * b
         dev = h_res.device
-        out = torch.empty(sb, n, C, dtype=h_res.dtype, device=dev)
+        out = torch.empty(sb, n, C, dtype=output_dtype or h_res.dtype, device=dev)
         hr_flat = h_res.contiguous().view(sb, n, n)
         orig_flat = original_residual.contiguous().view(sb, n, C)
         hp_flat = h_post.contiguous().view(sb, n)
@@ -789,6 +833,26 @@ if _TRITON_AVAILABLE:
             g_bias,
         )
 
+    # ============================================================================
+    # Ordered three-way add (MCORE_MHC_SP_FUSED_GRAD_ADD)
+    # ============================================================================
+
+    @triton.jit
+    def _triton_add_3_sequential_kernel(
+        first_ptr, second_ptr, last_ptr, out_ptr, BLOCK: tl.constexpr
+    ):
+        """out = (first + second) + last over BLOCK elements, rounding after each add.
+
+        Eager PyTorch adds in FP32 and stores the operand dtype, so rounding the partial sum
+        reproduces two sequential adds bit for bit. Callers launch whole blocks only.
+        """
+        offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        first = tl.load(first_ptr + offsets).to(tl.float32)
+        second = tl.load(second_ptr + offsets).to(tl.float32)
+        pair_sum = (first + second).to(out_ptr.dtype.element_ty).to(tl.float32)
+        last = tl.load(last_ptr + offsets).to(tl.float32)
+        tl.store(out_ptr + offsets, (pair_sum + last).to(out_ptr.dtype.element_ty))
+
 
 _TRITON_IMPLS = (
     {
@@ -950,7 +1014,7 @@ if _CUTILE_AVAILABLE:
         hc = original_shape[-1]
         N_batch = grad_output.numel() // (hc * hc)
         dev = grad_output.device
-        stream = torch.cuda.current_stream()
+        stream = _cutile_backward_stream(grad_output)
         grad_input = torch.empty(N_batch, hc, hc, dtype=grad_output.dtype, device=dev)
         go = grad_output.view(N_batch, hc, hc)
         mi = M_init.view(N_batch, hc, hc)
@@ -1067,7 +1131,7 @@ if _CUTILE_AVAILABLE:
     ) -> Tuple[Tensor, Tensor]:
         s, b, n, C = x.shape
         sb = s * b
-        stream = torch.cuda.current_stream()
+        stream = _cutile_backward_stream(grad_output)
         gx = torch.empty(sb, n, C, dtype=x.dtype, device=x.device)
         gh = torch.empty(sb, n, dtype=h_pre.dtype, device=x.device)
         go_flat = grad_output.view(sb, C)
@@ -1245,12 +1309,18 @@ if _CUTILE_AVAILABLE:
     _hpb_bwd_g_hp_hr_best_cfg: dict = {}
 
     def _cutile_h_post_bda_fwd(
-        h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
+        h_res: Tensor,
+        original_residual: Tensor,
+        h_post: Tensor,
+        x: Tensor,
+        bias: Optional[Tensor],
+        *,
+        output_dtype: torch.dtype | None = None,
     ) -> Tensor:
         s, b, n, C = original_residual.shape
         sb = s * b
         stream = torch.cuda.current_stream()
-        out = torch.empty(sb, n, C, dtype=h_res.dtype, device=h_res.device)
+        out = torch.empty(sb, n, C, dtype=output_dtype or h_res.dtype, device=h_res.device)
         hr_flat = h_res.view(sb, n, n)
         orig_flat = original_residual.view(sb, n, C)
         hp_flat = h_post.view(sb, n)
@@ -1283,7 +1353,7 @@ if _CUTILE_AVAILABLE:
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
         s, b, n, C = original_residual.shape
         sb = s * b
-        stream = torch.cuda.current_stream()
+        stream = _cutile_backward_stream(grad_output)
         g_hr = torch.empty(sb, n, n, dtype=h_res.dtype, device=h_res.device)
         g_res = torch.empty(sb, n, C, dtype=original_residual.dtype, device=h_res.device)
         g_hp = torch.empty(sb, n, dtype=h_post.dtype, device=h_res.device)
@@ -1471,12 +1541,15 @@ if _CUTILE_AVAILABLE:
         TILE_SIZE_M: ConstInt,
         TILE_SIZE_N: ConstInt,
         SPLIT_K: ConstInt,
+        EPS_INSIDE_SQRT: ConstInt,
     ):
         """Reduce split-K partial proj/norm, compute r, and apply compute_h activations.
 
         Grid: (ceil(M / TILE_SIZE_M),).
         TILE_SIZE_N = next_power_of_2(N) so one tile covers the full N dimension.
         Alpha_{pre,post,res} are [1] tensors (scalar parameters).
+        EPS_INSIDE_SQRT=0: R = r = sqrt(mean(x^2)), scale 1 / (r + eps).
+        EPS_INSIDE_SQRT=1: R = inv = 1 / sqrt(mean(x^2) + eps) (V4.1 single-pass), scale inv.
         """
         bid_m = ct.bid(0)
         num_bid_m = ct.cdiv(M, TILE_SIZE_M)
@@ -1512,12 +1585,19 @@ if _CUTILE_AVAILABLE:
 
         # 2. Compute r = norm / sqrt(K)
         denom = ct.full((TILE_SIZE_M, 1), K * 1.0, dtype=ct.float32)
-        r_val = ct.sqrt(ct.truediv(r_accum, denom))
+        if EPS_INSIDE_SQRT:
+            # R stores inv = 1 / sqrt(mean(x^2) + eps), the value V4.1 saves for backward.
+            r_val = 1.0 / ct.sqrt(ct.truediv(r_accum, denom) + eps)
+        else:
+            r_val = ct.sqrt(ct.truediv(r_accum, denom))
 
         ct.store(R, index=(bid_m, 0), tile=r_val.astype(R.dtype))
 
         # 3. Apply compute_h directly into split outputs.
-        inv_r_eps = 1.0 / (r_val + eps)
+        if EPS_INSIDE_SQRT:
+            inv_r_eps = r_val
+        else:
+            inv_r_eps = 1.0 / (r_val + eps)
         bias_pre = ct.load(Bias, index=(0, 0), shape=(1, n), padding_mode=PAD_ZERO)
         bias_post = ct.load(Bias, index=(0, 1), shape=(1, n), padding_mode=PAD_ZERO)
         bias_pre = ct.astype(bias_pre, ct.float32)
@@ -1578,9 +1658,13 @@ if _CUTILE_AVAILABLE:
                 return tile_m
         return 1
 
-    def _default_proj_rms_fwd_config(M: int, K: int, TILE_N: int):
+    def _default_proj_rms_fwd_config(M: int, K: int, TILE_N: int, eps_inside_sqrt: bool = False):
         """Static fallback for skinny MHC projection when autotune cache is absent."""
-        split_k = 16 if K >= 16384 else 8 if K >= 8192 else 1
+        # Single-pass (eps-inside-sqrt) launches with M >= 2048 rows already cover the GPU with
+        # split-K 8: on GB300 at the V4.1 64K CP16 shape (M 4096, K 20480) split-K 8 takes
+        # 63.1 us vs 73.3 us for 16 (pinned sweep). Other callers keep their configuration.
+        many_rows = eps_inside_sqrt and M >= 2048
+        split_k = 16 if K >= 16384 and not many_rows else 8 if K >= 8192 else 1
         return _default_tile_m(M), TILE_N, min(128, K), split_k
 
     # Cache the best config across calls (keyed by M, N, K).
@@ -1597,8 +1681,13 @@ if _CUTILE_AVAILABLE:
             if tile_m <= M and M % tile_m == 0:
                 yield tile_m
 
+    @functools.lru_cache(maxsize=None)
     def _default_reduce_compute_h_tile_m(M: int) -> int:
-        """Pick a reduce tile size with enough blocks to cover the GPU."""
+        """Pick a reduce tile size with enough blocks to cover the GPU.
+
+        Cached per M: the device query (an NVML availability check) cost microseconds of host
+        time on every mHC mapping call.
+        """
         try:
             num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
         except Exception:
@@ -1629,6 +1718,7 @@ if _CUTILE_AVAILABLE:
         tile_n: int,
         split_k: int,
         out_dtype: torch.dtype,
+        eps_inside_sqrt: bool = False,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Launch reduce split-K + compute_h kernel.
 
@@ -1636,7 +1726,7 @@ if _CUTILE_AVAILABLE:
             h_pre: [M, n] sigmoid-activated pre weights
             h_post: [M, n] 2*sigmoid-activated post weights
             h_res: [M, n*n] residual logits
-            r: [M, 1]  r = norm / sqrt(K)
+            r: [M, 1]  r = norm / sqrt(K); with eps_inside_sqrt, 1 / sqrt(mean(x^2) + eps)
             proj_reduced: [M, N] reduced projection (for backward)
         """
         dev = proj_acc.device
@@ -1679,6 +1769,7 @@ if _CUTILE_AVAILABLE:
                 tm,
                 tile_n,
                 split_k,
+                int(eps_inside_sqrt),
             )
 
         if cached is not None or not _CUTILE_EXPERIMENTAL_AVAILABLE:
@@ -1715,17 +1806,19 @@ if _CUTILE_AVAILABLE:
         n: int,
         eps: float,
         compute_h_eps: float,
+        eps_inside_sqrt: bool = False,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Fused proj_rms + compute_h forward.
 
         Launches the existing _ct_proj_rms_fwd_kernel (split-K matmul + partial norm),
         then _ct_reduce_compute_h_kernel (reduce + r + activations).
+        eps_inside_sqrt selects the V4.1 RMS 1 / sqrt(mean(x^2) + eps) over 1 / (r + eps).
 
         Returns:
             h_pre: [M, n] activated pre weights
             h_post: [M, n] activated post weights
             h_res: [M, n*n] residual logits
-            r: [M, 1] r = norm / sqrt(K)
+            r: [M, 1] r = norm / sqrt(K); with eps_inside_sqrt, 1 / sqrt(mean(x^2) + eps)
             proj_reduced: [M, N] reduced projection (for backward)
         """
         M, K = x.shape
@@ -1746,7 +1839,7 @@ if _CUTILE_AVAILABLE:
             if cached is not None:
                 tm, tn, tk, split_k = cached
             else:
-                tm, tn, tk, split_k = _default_proj_rms_fwd_config(M, K, TILE_N)
+                tm, tn, tk, split_k = _default_proj_rms_fwd_config(M, K, TILE_N, eps_inside_sqrt)
 
             proj_acc = torch.empty(split_k * M, N, dtype=acc_dtype, device=dev)
             norm_acc = torch.empty(split_k * M, 1, dtype=acc_dtype, device=dev)
@@ -1766,7 +1859,7 @@ if _CUTILE_AVAILABLE:
             configs = [SimpleNamespace(**c) for c in _proj_rms_fwd_autotune_configs(N)]
             configs = [cfg for cfg in configs if cfg.TILE_K <= K and M % cfg.TILE_M == 0]
             if len(configs) == 0:
-                tm, tn, tk, split_k = _default_proj_rms_fwd_config(M, K, TILE_N)
+                tm, tn, tk, split_k = _default_proj_rms_fwd_config(M, K, TILE_N, eps_inside_sqrt)
                 proj_acc = torch.empty(split_k * M, N, dtype=acc_dtype, device=dev)
                 norm_acc = torch.empty(split_k * M, 1, dtype=acc_dtype, device=dev)
                 # Signature placeholder for the cuTile kernel; not read.
@@ -1870,6 +1963,7 @@ if _CUTILE_AVAILABLE:
             TILE_N,
             split_k,
             torch.promote_types(x.dtype, weight.dtype),
+            eps_inside_sqrt,
         )
         return h_pre, h_post, h_res, r, proj_reduced
 
@@ -1902,10 +1996,13 @@ if _CUTILE_AVAILABLE:
         HAS_GRAD_H_POST: ConstInt,
         HAS_GRAD_H_RES: ConstInt,
         HAS_GRAD_R_EXT: ConstInt,
+        EPS_INSIDE_SQRT: ConstInt,
     ):
         """Precompute grad_h, grad_proj, and grad_r_total for downstream backward kernels.
 
         Grid: (ceil(M / TILE_SIZE_M),).
+        GRAD_R_TOTAL is dL/dR for the stored R: r (EPS_INSIDE_SQRT=0) or, with EPS_INSIDE_SQRT=1,
+        inv = 1 / sqrt(mean(x^2) + eps); the grad_x kernels apply dR/dx.
         """
         tile_m_id = ct.bid(0)
 
@@ -1916,8 +2013,14 @@ if _CUTILE_AVAILABLE:
         r_tile = ct.load(R, index=(tile_m_id, 0), shape=(TILE_SIZE_M, 1), padding_mode=PAD_ZERO)
         r_tile = ct.astype(r_tile, ct.float32)
 
-        r_eps = r_tile + eps
-        inv_r_eps = 1.0 / r_eps
+        if EPS_INSIDE_SQRT:
+            # The projection scale is R itself: dL/dR = sum(grad_h * proj * alpha).
+            inv_r_eps = r_tile
+            d_inv_d_r = ct.full((TILE_SIZE_M, 1), 1.0, dtype=ct.float32)
+        else:
+            # The projection scale is 1 / (r + eps): d(scale)/dr = -1 / (r + eps)^2.
+            inv_r_eps = 1.0 / (r_tile + eps)
+            d_inv_d_r = -inv_r_eps * inv_r_eps
         grad_r_from_h = ct.full((TILE_SIZE_M, 1), 0.0, dtype=ct.float32)
 
         # Clear the padded columns once inside this kernel.  Valid columns are
@@ -1943,7 +2046,7 @@ if _CUTILE_AVAILABLE:
         grad_h_pre = gy_pre * sigmoid_pre * (1.0 - sigmoid_pre)
         grad_proj_pre = grad_h_pre * alpha_pre * inv_r_eps
         grad_r_from_h += ct.sum(
-            grad_h_pre * proj_pre * alpha_pre * (-inv_r_eps * inv_r_eps), axis=1, keepdims=True
+            grad_h_pre * proj_pre * alpha_pre * d_inv_d_r, axis=1, keepdims=True
         )
         ct.store(GRAD_H, index=(tile_m_id, 0), tile=grad_h_pre.astype(GRAD_H.dtype))
         ct.store(GRAD_PROJ, index=(tile_m_id, 0), tile=grad_proj_pre.astype(GRAD_PROJ.dtype))
@@ -1967,7 +2070,7 @@ if _CUTILE_AVAILABLE:
         grad_h_post = gy_post * sigmoid_post * (1.0 - sigmoid_post) * 2.0
         grad_proj_post = grad_h_post * alpha_post * inv_r_eps
         grad_r_from_h += ct.sum(
-            grad_h_post * proj_post * alpha_post * (-inv_r_eps * inv_r_eps), axis=1, keepdims=True
+            grad_h_post * proj_post * alpha_post * d_inv_d_r, axis=1, keepdims=True
         )
         ct.store(GRAD_H, index=(tile_m_id, 1), tile=grad_h_post.astype(GRAD_H.dtype))
         ct.store(GRAD_PROJ, index=(tile_m_id, 1), tile=grad_proj_post.astype(GRAD_PROJ.dtype))
@@ -1992,7 +2095,7 @@ if _CUTILE_AVAILABLE:
             proj_res = ct.astype(proj_res, ct.float32)
             grad_proj_res = grad_h_res * alpha_res * inv_r_eps
             grad_r_from_h += ct.sum(
-                grad_h_res * proj_res * alpha_res * (-inv_r_eps * inv_r_eps), axis=1, keepdims=True
+                grad_h_res * proj_res * alpha_res * d_inv_d_r, axis=1, keepdims=True
             )
             ct.store(GRAD_H, index=(tile_m_id, 2 + res_chunk), tile=grad_h_res.astype(GRAD_H.dtype))
             ct.store(
@@ -2027,12 +2130,15 @@ if _CUTILE_AVAILABLE:
         TILE_SIZE_M: ConstInt,
         TILE_SIZE_N: ConstInt,
         TILE_SIZE_K: ConstInt,
+        EPS_INSIDE_SQRT: ConstInt,
     ):
         """Compute grad_x and grad_weight simultaneously.
 
         Grid: (ceil(K / TILE_SIZE_K),).
         Each block handles one K-tile and loops over all M-tiles.
         Per M-tile: computes and stores grad_x, accumulates grad_weight.
+        GRAD_R_TOTAL is dL/dR; dR/dx = x / (R * K) for R = r and -R^3 * x / K for
+        R = 1 / sqrt(mean(x^2) + eps) (EPS_INSIDE_SQRT=1).
         """
         tile_k_id = ct.bid(0)
         NUM_M_TILES = ct.cdiv(M, TILE_SIZE_M)
@@ -2063,9 +2169,15 @@ if _CUTILE_AVAILABLE:
             r_tile = ct.load(R, index=(tile_m_id, 0), shape=(TILE_SIZE_M, 1), padding_mode=PAD_ZERO)
             r_tile = ct.astype(r_tile, ct.float32)
 
-            # grad_x = grad_proj @ weight + grad_r_total * x / (r * K)
-            inv_rK = 1.0 / (r_tile * K)
-            acc_grad_x = (grad_r_total * inv_rK) * ct.astype(x_tile, ct.float32)
+            # grad_x = grad_proj @ weight + grad_r_total * dR/dx
+            if EPS_INSIDE_SQRT:
+                x_coef = ct.truediv(
+                    -(grad_r_total * (r_tile * r_tile * r_tile)),
+                    ct.full((TILE_SIZE_M, 1), K * 1.0, dtype=ct.float32),
+                )
+            else:
+                x_coef = grad_r_total * (1.0 / (r_tile * K))
+            acc_grad_x = x_coef * ct.astype(x_tile, ct.float32)
             acc_grad_x = ct.mma(
                 grad_proj_tile.astype(ct.tfloat32), weight_tile.astype(ct.tfloat32), acc=acc_grad_x
             )
@@ -2099,10 +2211,12 @@ if _CUTILE_AVAILABLE:
         eps: float,
         TILE_SIZE_M: ConstInt,
         TILE_SIZE_N: ConstInt,
+        EPS_INSIDE_SQRT: ConstInt,
     ):
         """Compute per-M-tile scalar-gradient partials.
 
         Grid: (ceil(M / TILE_SIZE_M),).  Each block processes one M-tile.
+        The projection scale is 1 / (R + eps), or R itself with EPS_INSIDE_SQRT=1.
         """
         bid_m = ct.bid(0)
 
@@ -2127,8 +2241,10 @@ if _CUTILE_AVAILABLE:
         r_tile = ct.load(R, index=(bid_m, 0), shape=(TILE_SIZE_M, 1), padding_mode=PAD_ZERO)
         r_tile = ct.astype(r_tile, ct.float32)
 
-        r_eps = r_tile + eps
-        inv_r_eps = 1.0 / r_eps
+        if EPS_INSIDE_SQRT:
+            inv_r_eps = r_tile
+        else:
+            inv_r_eps = 1.0 / (r_tile + eps)
 
         ga_all = grad_h * proj_tile * inv_r_eps
         ga_pre = ct.reshape(ct.sum(ga_all * mask_pre_2d), (1, 1))
@@ -2207,6 +2323,7 @@ if _CUTILE_AVAILABLE:
         N: int,
         K: int,
         TILE_N_SIZE: ConstInt,
+        EPS_INSIDE_SQRT: ConstInt,
     ):
         """Fused backward (small K path) with work-stealing.
 
@@ -2214,6 +2331,7 @@ if _CUTILE_AVAILABLE:
         bid(1)==0: grad_weight via work-stealing over K-tiles, loops M.
         bid(1)==1: grad_x via work-stealing over (M×K) tiles.
         Scalar gradients are computed by the separate partial/reduce kernels.
+        dR/dx as in _ct_fused_grad_x_weight_kernel (EPS_INSIDE_SQRT selects the V4.1 RMS).
         """
         zero_pad = ct.PaddingMode.ZERO
 
@@ -2287,8 +2405,14 @@ if _CUTILE_AVAILABLE:
                     shape=(TILE_DA_SIZE_M, TILE_DA_SIZE_K),
                     padding_mode=zero_pad,
                 )
-                inv_rK = 1.0 / (r_tile * K)
-                accumulator_da = (grad_r_total * inv_rK) * ct.astype(x_tile, ct.float32)
+                if EPS_INSIDE_SQRT:
+                    x_coef = ct.truediv(
+                        -(grad_r_total * (r_tile * r_tile * r_tile)),
+                        ct.full((TILE_DA_SIZE_M, 1), K * 1.0, dtype=ct.float32),
+                    )
+                else:
+                    x_coef = grad_r_total * (1.0 / (r_tile * K))
+                accumulator_da = x_coef * ct.astype(x_tile, ct.float32)
 
                 weight_tile = ct.load(
                     WEIGHT,
@@ -2337,8 +2461,12 @@ if _CUTILE_AVAILABLE:
         n: int,
         eps: float,
         compute_h_eps: float,
+        eps_inside_sqrt: bool = False,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Fused compute_h + proj_rms backward.
+
+        With eps_inside_sqrt, r is the forward's 1 / sqrt(mean(x^2) + eps) and grad_r_ext its
+        gradient.
 
         Returns:
             grad_x: [M, K]
@@ -2353,7 +2481,7 @@ if _CUTILE_AVAILABLE:
         TILE_N = _next_power_of_2(N)
         assert TILE_N <= 256, f"TILE_SIZE_N too large: {TILE_N}"
         dev = x.device
-        stream = torch.cuda.current_stream()
+        stream = _cutile_backward_stream(x)
 
         grad_x = torch.empty_like(x)
         grad_weight = torch.empty_like(weight)
@@ -2403,6 +2531,7 @@ if _CUTILE_AVAILABLE:
                 int(has_grad_h_post),
                 int(has_grad_h_res),
                 has_grad_r_ext_flag,
+                int(eps_inside_sqrt),
             ),
         )
 
@@ -2415,7 +2544,11 @@ if _CUTILE_AVAILABLE:
                 if cached is not None:
                     tm, tn, tk = cached
                 else:
-                    tm, tn, tk = 128, TILE_N, 128
+                    # Single-pass (eps-inside-sqrt) launches with M >= 2048: on GB300 at M 4096,
+                    # K 20480, TILE_K 64 takes 134 us vs 204 us for 128 (pinned sweep). Other
+                    # callers keep TILE_K 128.
+                    tk = 64 if eps_inside_sqrt and M >= 2048 else 128
+                    tm, tn = 128, TILE_N
                 ct.launch(
                     stream,
                     (math.ceil(K / tk),),
@@ -2434,6 +2567,7 @@ if _CUTILE_AVAILABLE:
                         tm,
                         tn,
                         tk,
+                        int(eps_inside_sqrt),
                     ),
                 )
             else:
@@ -2458,6 +2592,7 @@ if _CUTILE_AVAILABLE:
                         cfg.TILE_SIZE_M,
                         cfg.TILE_SIZE_N,
                         cfg.TILE_SIZE_K,
+                        int(eps_inside_sqrt),
                     ),
                     search_space=configs,
                 )
@@ -2485,6 +2620,7 @@ if _CUTILE_AVAILABLE:
                         best.TILE_SIZE_M,
                         best.TILE_SIZE_N,
                         best.TILE_SIZE_K,
+                        int(eps_inside_sqrt),
                     ),
                 )
         else:
@@ -2505,6 +2641,7 @@ if _CUTILE_AVAILABLE:
                     N,
                     K,
                     TILE_N,
+                    int(eps_inside_sqrt),
                 ),
             )
 
@@ -2538,6 +2675,7 @@ if _CUTILE_AVAILABLE:
                 eps,
                 tile_m_scalar,
                 TILE_N,
+                int(eps_inside_sqrt),
             ),
         )
         ct.launch(
@@ -2658,6 +2796,93 @@ def log_fused_mhc_backend_once(backend: MHCBackend = "auto") -> None:
 def fused_add_3(a: Tensor, b: Tensor, c: Tensor) -> Tensor:
     """Add three tensors using the native torch.compile-backed implementation."""
     return native_fused_add_3(a, b, c)
+
+
+_ADD_3_SEQUENTIAL_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+#: (elements per program, warps per program) of the ordered three-way add kernel.
+ADD_3_SEQUENTIAL_LAUNCH_CONFIG = (4096, 8)
+# Specializations launched outside CUDA-graph capture, and those that failed to compile or launch.
+_ADD_3_SEQUENTIAL_WARM_KEYS: set = set()
+_ADD_3_SEQUENTIAL_FAILED_KEYS: set = set()
+
+
+def _eager_add_3_sequential(first: Tensor, second: Tensor, last: Tensor) -> Tensor:
+    return torch.add(first, second).add_(last)
+
+
+def fused_add_3_sequential_with_config(
+    first: Tensor, second: Tensor, last: Tensor, block: int, num_warps: int
+) -> Tensor:
+    """``fused_add_3_sequential`` with an explicit kernel launch shape (for tests and tuning)."""
+    operands = (first, second, last)
+    eligible = (
+        _TRITON_AVAILABLE
+        and 256 <= block <= 65536
+        and block & (block - 1) == 0
+        and num_warps in (1, 2, 4, 8, 16, 32)
+        and first.dtype in _ADD_3_SEQUENTIAL_DTYPES
+        and first.is_cuda
+        and first.device.index == torch.cuda.current_device()
+        and first.numel() >= block
+        and all(
+            type(t) is Tensor
+            and t.dtype == first.dtype
+            and t.shape == first.shape
+            and t.device == first.device
+            and t.is_contiguous()
+            and t.data_ptr() % 16 == 0
+            for t in operands
+        )
+        and not (torch.is_grad_enabled() and any(t.requires_grad for t in operands))
+        and not torch.compiler.is_compiling()
+    )
+    if not eligible:
+        return _eager_add_3_sequential(first, second, last)
+    key = (first.device.index, first.dtype, block, num_warps)
+    capturing = torch.cuda.is_current_stream_capturing()
+    if key in _ADD_3_SEQUENTIAL_FAILED_KEYS or (
+        capturing and key not in _ADD_3_SEQUENTIAL_WARM_KEYS
+    ):
+        # Never compile or load a Triton module inside CUDA-graph capture.
+        return _eager_add_3_sequential(first, second, last)
+    out = torch.empty_like(first, memory_format=torch.contiguous_format)
+    if out.data_ptr() % 16:
+        return _eager_add_3_sequential(first, second, last)
+    num_blocks = first.numel() // block
+    try:
+        _triton_add_3_sequential_kernel[(num_blocks,)](
+            first, second, last, out, BLOCK=block, num_warps=num_warps
+        )
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        if capturing:
+            raise
+        _ADD_3_SEQUENTIAL_FAILED_KEYS.add(key)
+        logger.warning(
+            "[mHC] ordered add-3 kernel %s unavailable (%r); using eager adds", key, error
+        )
+        return _eager_add_3_sequential(first, second, last)
+    if not capturing:
+        _ADD_3_SEQUENTIAL_WARM_KEYS.add(key)
+    done = num_blocks * block
+    if done < first.numel():
+        tail = out.view(-1)[done:]
+        torch.add(first.view(-1)[done:], second.view(-1)[done:], out=tail)
+        tail.add_(last.view(-1)[done:])
+    return out
+
+
+def fused_add_3_sequential(first: Tensor, second: Tensor, last: Tensor) -> Tensor:
+    """Return ``torch.add(first, second).add_(last)`` bit for bit, reading each operand once.
+
+    Eager adds compute in FP32 and round to the operand dtype after each add, which is also how
+    autograd accumulates gradients arriving as ``first``, ``second`` and then ``last``. The Triton
+    kernel keeps both roundings in one pass (one kernel instead of two). Contiguous, 16-byte
+    aligned CUDA BF16/FP16/FP32 tensors of one shape use the kernel; anything else, a
+    specialization first seen inside CUDA-graph capture, or one that failed to compile runs the
+    eager adds, which give the same bits.
+    """
+    block, num_warps = ADD_3_SEQUENTIAL_LAUNCH_CONFIG
+    return fused_add_3_sequential_with_config(first, second, last, block, num_warps)
 
 
 def _get_triton_sinkhorn(backend: MHCBackend = "auto"):
@@ -2805,11 +3030,28 @@ if _CUTILE_AVAILABLE:
             n: int,
             eps: float = 1e-6,
             compute_h_eps: float = 1e-6,
+            eps_inside_sqrt: bool = False,
         ):
-            """Run fused cuTile projection, RMS normalization, and compute_h forward."""
+            """Run fused cuTile projection, RMS normalization, and compute_h forward.
+
+            eps_inside_sqrt selects the V4.1 RMS 1 / sqrt(mean(x^2) + eps), which is then also
+            the fourth output (in place of r); unused outputs then get no zero-filled gradients.
+            """
             h_pre, h_post, h_res, r, proj_reduced = _cutile_proj_rms_compute_h_fwd(
-                x, weight, bias, alpha_pre, alpha_post, alpha_res, n, eps, compute_h_eps
+                x,
+                weight,
+                bias,
+                alpha_pre,
+                alpha_post,
+                alpha_res,
+                n,
+                eps,
+                compute_h_eps,
+                eps_inside_sqrt,
             )
+            if eps_inside_sqrt:
+                # The backward kernels take absent output gradients as None (HAS_GRAD_* flags).
+                ctx.set_materialize_grads(False)
             ctx.save_for_backward(
                 x,
                 weight,
@@ -2826,11 +3068,19 @@ if _CUTILE_AVAILABLE:
             ctx.n = n
             ctx.eps = eps
             ctx.compute_h_eps = compute_h_eps
+            ctx.eps_inside_sqrt = eps_inside_sqrt
             return h_pre, h_post, h_res, r
 
         @staticmethod
         def backward(ctx, grad_h_pre, grad_h_post, grad_h_res, grad_r_ext):
             """Run fused cuTile projection, RMS normalization, and compute_h backward."""
+            if ctx.eps_inside_sqrt:
+                grads = (grad_h_pre, grad_h_post, grad_h_res, grad_r_ext)
+                if all(grad is None for grad in grads):
+                    return (None,) * 10
+                grad_h_pre, grad_h_post, grad_h_res, grad_r_ext = (
+                    None if grad is None else grad.contiguous() for grad in grads
+                )
             (
                 x,
                 weight,
@@ -2865,10 +3115,22 @@ if _CUTILE_AVAILABLE:
                     ctx.n,
                     ctx.eps,
                     ctx.compute_h_eps,
+                    ctx.eps_inside_sqrt,
                 )
             )
 
-            return (grad_x, grad_weight, grad_ap, grad_apo, grad_ar, grad_bias, None, None, None)
+            return (
+                grad_x,
+                grad_weight,
+                grad_ap,
+                grad_apo,
+                grad_ar,
+                grad_bias,
+                None,
+                None,
+                None,
+                None,
+            )
 
 
 class FusedHAggregate(torch.autograd.Function):
@@ -2911,15 +3173,21 @@ class FusedHPostBDA(torch.autograd.Function):
         x: Tensor,
         bias: Optional[Tensor],
         backend: MHCBackend,
+        output_dtype: torch.dtype | None,
     ):
         """Run h_post_bda forward using the best available backend."""
         triton_fwd = _get_triton_h_post_bda_fwd(backend)
+        output_kwargs = {} if output_dtype is None else {"output_dtype": output_dtype}
         if triton_fwd is not None:
-            output = triton_fwd(h_res, original_residual, h_post, x, bias)
+            output = triton_fwd(h_res, original_residual, h_post, x, bias, **output_kwargs)
         elif _backend_uses_cutile(backend):
-            output = _cutile_h_post_bda_fwd(h_res, original_residual, h_post, x, bias)
+            output = _cutile_h_post_bda_fwd(
+                h_res, original_residual, h_post, x, bias, **output_kwargs
+            )
         else:
             output = native_h_post_bda(h_res, original_residual, h_post, x, bias)
+            if output_dtype is not None:
+                output = output.to(output_dtype)
         if bias is not None:
             ctx.save_for_backward(h_res, original_residual, h_post, x, bias)
             ctx.has_bias = True
@@ -2945,7 +3213,7 @@ class FusedHPostBDA(torch.autograd.Function):
             grads = _cutile_h_post_bda_bwd(grad_output, h_res, orig_res, h_post, x, bias)
         else:
             grads = _torch_h_post_bda_bwd(grad_output, h_res, orig_res, h_post, x, bias)
-        return (*grads, None)
+        return (*grads, None, None)
 
 
 def fused_sinkhorn(
@@ -2977,12 +3245,17 @@ def fused_h_post_bda(
     bias: Optional[Tensor],
     *,
     backend: MHCBackend = "auto",
+    output_dtype: torch.dtype | None = None,
 ) -> Tensor:
-    """Compute H_res.T @ residual + H_post * (x + bias) using the backend policy."""
+    """Mix in FP32; optional output_dtype casts on store without a full FP32 output."""
     _validate_mhc_backend(backend)
     if _backend_uses_triton(backend) or _backend_uses_cutile(backend):
-        return FusedHPostBDA.apply(h_res, original_residual, h_post, x, bias, backend)
-    return native_h_post_bda(h_res, original_residual, h_post, x, bias)
+        return FusedHPostBDA.apply(h_res, original_residual, h_post, x, bias, backend, output_dtype)
+    if output_dtype is not None:
+        original_residual, x = original_residual.to(h_res.dtype), x.to(h_res.dtype)
+        bias = None if bias is None else bias.to(h_res.dtype)
+    output = native_h_post_bda(h_res, original_residual, h_post, x, bias)
+    return output.to(output_dtype) if output_dtype is not None else output
 
 
 def fused_proj_rms_compute_h(
@@ -2997,12 +3270,32 @@ def fused_proj_rms_compute_h(
     compute_h_eps: float = 1e-6,
     *,
     backend: MHCBackend = "auto",
+    eps_inside_sqrt: bool = False,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Compute projection, RMS norm, and H outputs using the backend policy."""
+    """Compute projection, RMS norm, and H outputs using the backend policy.
+
+    eps_inside_sqrt=True selects the V4.1 single-pass RMS 1 / sqrt(mean(x^2) + eps) (returned
+    as the fourth output in place of r) and needs the cuTile kernels; outputs follow the
+    promoted x/weight dtype (FP32 for mHC's FP32 parameters).
+    """
     _validate_mhc_backend(backend)
     if _backend_uses_cutile(backend):
         return CutileProjRmsComputeH.apply(
-            x, weight, alpha_pre, alpha_post, alpha_res, bias, n, eps, compute_h_eps
+            x,
+            weight,
+            alpha_pre,
+            alpha_post,
+            alpha_res,
+            bias,
+            n,
+            eps,
+            compute_h_eps,
+            eps_inside_sqrt,
+        )
+    if eps_inside_sqrt:
+        raise ValueError(
+            "fused_proj_rms_compute_h(eps_inside_sqrt=True) needs the cuTile backend, which "
+            f"policy {backend!r} does not select here"
         )
     return _torch_proj_rms_compute_h(
         x, weight, alpha_pre, alpha_post, alpha_res, bias, n, eps, compute_h_eps

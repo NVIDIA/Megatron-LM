@@ -432,7 +432,14 @@ class TestTransformerBlockMHCRecompute:
         Utils.destroy_model_parallel()
 
     @staticmethod
-    def _make_mhc_block(num_layers, num_streams=4, mhc_recompute_layer_num=None):
+    def _make_mhc_block(
+        num_layers,
+        num_streams=4,
+        mhc_recompute_layer_num=None,
+        single_pass=False,
+        *,
+        selective=True,
+    ):
         from megatron.core.models.gpt.gpt_layer_specs import (
             get_gpt_layer_with_transformer_engine_spec,
         )
@@ -450,11 +457,12 @@ class TestTransformerBlockMHCRecompute:
             use_cpu_initialization=True,
             enable_mhc_connections=True,
             mhc_num_residual_streams=num_streams,
+            mhc_single_pass=single_pass,
             mhc_sinkhorn_iterations=5,
             mhc_init_gating_factor=0.01,
             mhc_recompute_layer_num=mhc_recompute_layer_num,
-            recompute_granularity='selective',
-            recompute_modules=['mhc'],
+            recompute_granularity="selective" if selective else None,
+            recompute_modules=["mhc"] if selective else None,
             hidden_dropout=0.0,
             attention_dropout=0.0,
         )
@@ -529,9 +537,12 @@ class TestTransformerBlockMHCRecompute:
         with pytest.raises(ValueError, match="HyperConnectionTransformerLayer"):
             TransformerBlock(config, get_gpt_layer_with_transformer_engine_spec())
 
-    def test_block_forward_input_expand_output_contract(self):
+    @pytest.mark.parametrize("single_pass", [False, True])
+    def test_block_forward_input_expand_output_contract(self, single_pass):
         """Forward exercises ``input_expand`` (pre) and ``output_contract`` (post)."""
-        block, config = self._make_mhc_block(num_layers=2, mhc_recompute_layer_num=2)
+        block, config = self._make_mhc_block(
+            num_layers=2, mhc_recompute_layer_num=2, single_pass=single_pass
+        )
         block.train()
 
         seq_len = 8
@@ -548,10 +559,24 @@ class TestTransformerBlockMHCRecompute:
             f"output_contract should restore original shape, got {tuple(out.shape)} "
             f"vs expected {tuple(hidden_states.shape)}"
         )
-        # Backward should flow through the recompute path without error.
-        out.sum().backward()
-        assert hidden_states.grad is not None
-        assert torch.isfinite(hidden_states.grad).all()
+        cotangent = torch.randn_like(out)
+        out.backward(cotangent)
+        assert hidden_states.grad is not None and torch.isfinite(hidden_states.grad).all()
+
+        if single_pass:
+            eager, _ = self._make_mhc_block(num_layers=2, single_pass=True, selective=False)
+            eager.load_state_dict(block.state_dict())
+            reference_input = hidden_states.detach().clone().requires_grad_()
+            reference = eager(hidden_states=reference_input, attention_mask=attention_mask)
+            reference.backward(cotangent)
+            torch.testing.assert_close(out, reference, rtol=0, atol=0)
+            torch.testing.assert_close(
+                hidden_states.grad, reference_input.grad, rtol=1e-5, atol=1e-6
+            )
+            for name, param in block.named_parameters():
+                expected = eager.get_parameter(name).grad
+                assert param.grad is not None and expected is not None, name
+                torch.testing.assert_close(param.grad, expected, rtol=1e-5, atol=1e-6, msg=name)
 
 
 class _RecordingMHCLayer(torch.nn.Module):

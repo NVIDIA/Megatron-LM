@@ -212,6 +212,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mamba_training_ssm_states_dtype": None,
     "masked_softmax_fusion": True,
     "memory_efficient_layer_norm": False,
+    "mhc_epsilon": 1e-6,
+    "mhc_single_pass": False,
     "mhc_fused_backend": "auto",
     "mhc_init_gating_factor": 0.01,
     "mhc_keep_mappings_in_fp32": False,

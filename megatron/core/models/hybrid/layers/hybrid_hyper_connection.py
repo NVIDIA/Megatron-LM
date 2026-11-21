@@ -10,7 +10,7 @@ from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.hyper_connection import HyperConnectionModule, SinglePassMHCState
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import (
     MegatronModule,
@@ -185,10 +185,14 @@ class HyperConnectionHybridLayer(MegatronModule):
         packed_sequence_cp_metadata: Optional[PackedSequenceCPMetadata] = None,
         mhc_recompute_manager=None,
         input_ids: Optional[Tensor] = None,
+        mhc_state: SinglePassMHCState | None = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Run the wrapped hybrid layer through one layer-boundary mHC update."""
         aggregated, h_res, h_post, residual = self.hyper_connection(
-            hidden_states, mhc_recompute_manager=mhc_recompute_manager, return_residual=True
+            hidden_states,
+            mhc_recompute_manager=mhc_recompute_manager,
+            return_residual=True,
+            **({"mhc_state": mhc_state} if mhc_state is not None else {}),
         )
         fast_path_result = self._call_inner_transformer_layer_without_local_bda(
             aggregated,

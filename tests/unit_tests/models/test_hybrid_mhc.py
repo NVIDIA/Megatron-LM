@@ -14,6 +14,7 @@ from megatron.core.pipeline_parallel.schedules import custom_backward, deallocat
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.hyper_connection import SinglePassMHCState
 from megatron.core.transformer.module import (
     MegatronModule,
     convert_module_to_dtype_except_fp32_marked,
@@ -193,6 +194,27 @@ class TestHybridStackMHC:
             torch.testing.assert_close(
                 stream_grads[..., index, :], torch.full_like(streams[..., index, :], weight)
             )
+
+    def test_single_pass_carries_mix_across_stage_boundary(self):
+        config = _get_config(num_layers=2, mhc_single_pass=True)
+        whole = _get_stack(config, 2).cuda()
+        first = _get_stack(config, 1, post_process=False).cuda()
+        last = _get_stack(config, 1, pre_process=False, pp_layer_offset=1).cuda()
+        first.layers[0].load_state_dict(whole.layers[0].state_dict())
+        last.layers[0].load_state_dict(whole.layers[1].state_dict())
+        hidden = torch.randn(8, 2, config.hidden_size, device="cuda", requires_grad=True)
+        reference = hidden.detach().clone().requires_grad_()
+        expected = whole(reference, attention_mask=None)
+        carry = SinglePassMHCState()
+        last.set_input_tensor(first(hidden, attention_mask=None, mhc_state=carry))
+        actual = last(None, attention_mask=None, mhc_state=carry)
+        torch.testing.assert_close(actual, expected)
+        actual.sum().backward()
+        expected.sum().backward()
+        torch.testing.assert_close(hidden.grad, reference.grad)
+        for stage, original in zip((first, last), whole.layers):
+            for param, ref in zip(stage.layers[0].parameters(), original.parameters()):
+                torch.testing.assert_close(param.grad, ref.grad)
 
     def test_empty_pipeline_stage_preserves_input_after_output_deallocation(self):
         config = _get_config(num_layers=2, deallocate_pipeline_outputs=True)
