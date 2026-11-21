@@ -549,6 +549,27 @@ class TestMXFP8Tensor:
         assert tensor.data.dtype == torch.float8_e4m3fn
         assert tensor.backend == "flashinfer"
 
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(
+        torch.cuda.get_device_capability()[0] < 10,
+        reason="FlashInfer's MXFP8 quantizer requires Blackwell (SM 100+)",
+    )
+    @pytest.mark.parametrize("layout", ["transpose", "row_slice", "column_slice"])
+    def test_flashinfer_reads_strided_input(self, layout):
+        """FlashInfer quantizes the strided views the Triton backend reads by their values."""
+        if not HAVE_FLASHINFER:
+            pytest.skip("FlashInfer not available")
+
+        torch.manual_seed(42)
+        x = TestMxfp8Quantize._make_layout_input(layout, torch.bfloat16)
+        assert not x.is_contiguous()
+        expected = MXFP8Tensor.from_bf16(x.contiguous(), backend="flashinfer")
+
+        tensor = MXFP8Tensor.from_bf16(x, backend="flashinfer")
+
+        assert torch.equal(tensor.data.view(torch.uint8), expected.data.view(torch.uint8))
+        assert torch.equal(tensor.scale, expected.scale)
+
     def test_from_bf16_invalid_backend(self):
         """from_bf16 with invalid backend raises ValueError."""
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
