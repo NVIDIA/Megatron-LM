@@ -275,7 +275,7 @@ class SharedExpertMLP(MLP):
             )
             self.cached_fc1_input = None
 
-            if self.config.use_te_activation_func:
+            if self.config.use_te_activation_func or self._activation_func_is_module:
                 if bias_parallel is not None:
                     intermediate_parallel = intermediate_parallel + bias_parallel
                 intermediate_parallel = self.activation_func(intermediate_parallel)
