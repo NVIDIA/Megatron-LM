@@ -126,6 +126,38 @@ def test_pad_routing_map_does_not_modify_input():
     assert torch.equal(padded.sum(dim=0), torch.tensor([2, 2]))
 
 
+def test_pad_routing_map_pads_each_expert_to_multiple():
+    routing_map = torch.zeros(100, 3, dtype=torch.bool)
+    routing_map[:90, 0] = True
+    routing_map[:5, 1] = True
+    # Expert 2 receives no tokens and must stay empty.
+
+    padded = pad_routing_map(routing_map, pad_multiple=16)
+
+    assert torch.equal(padded.sum(dim=0), torch.tensor([96, 16, 0]))
+    # Padding only ever flips zeros to ones.
+    assert padded[routing_map].all()
+
+
+def test_pad_routing_map_uses_every_remaining_token_when_needed():
+    # Expert 0 needs all 38 remaining tokens to reach 128, which is still feasible.
+    routing_map = torch.zeros(128, 2, dtype=torch.bool)
+    routing_map[:90, 0] = True
+
+    padded = pad_routing_map(routing_map, pad_multiple=128)
+
+    assert torch.equal(padded.sum(dim=0), torch.tensor([128, 0]))
+
+
+def test_pad_routing_map_raises_when_not_enough_tokens():
+    # Expert 0 has 90 of 100 tokens, so it cannot be padded to 128.
+    routing_map = torch.zeros(100, 2, dtype=torch.bool)
+    routing_map[:90, 0] = True
+
+    with pytest.raises(RuntimeError, match="not enough tokens"):
+        pad_routing_map(routing_map, pad_multiple=128)
+
+
 def token_permutation(token_dispatcher, hidden_states, probs, indices):
     hidden_states, probs = token_dispatcher.dispatch_preprocess(hidden_states, indices, probs)
     hidden_states, probs = token_dispatcher.token_dispatch(hidden_states, probs)
