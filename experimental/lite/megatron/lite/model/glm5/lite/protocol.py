@@ -12,6 +12,9 @@ identical to Kimi; the only adaptations are:
   * a ``_validate_parallel_scope`` gate: GLM-5's DSA attention is NOT
     tensor-parallel-capable, so TP>1 / ETP>1 raise ``NotImplementedError``.
     PP / VPP / EP / CP all work (inherited from Kimi).
+
+Beyond Kimi, the optional ``ImplConfig.indexer_topk`` binds indexer top-k
+selectors to the DSA layers (experimental/lite/docs/indexer_topk.md).
 """
 
 from __future__ import annotations
@@ -19,20 +22,21 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
+
 from megatron.lite.model.glm5.config import Glm5Config
 from megatron.lite.model.protocol_utils import (
     add_cross_entropy_fusion,
     add_loss_context_kwargs,
     nested_from_packed,
-    pack_r3_replay_mask as _pack_r3_replay_mask,
-    pack_routed_experts as _pack_routed_experts,
-    router_replay_roots as router_replay_roots,
-    set_cross_entropy_fusion,
 )
+from megatron.lite.model.protocol_utils import pack_r3_replay_mask as _pack_r3_replay_mask
+from megatron.lite.model.protocol_utils import pack_routed_experts as _pack_routed_experts
+from megatron.lite.model.protocol_utils import router_replay_roots as router_replay_roots
+from megatron.lite.model.protocol_utils import set_cross_entropy_fusion
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.parallel.cp import contiguous_slice_for_cp
@@ -42,14 +46,13 @@ from megatron.lite.primitive.parallel.thd import (
     thd_pack_meta,
     unpack_thd_to_nested,
 )
+from megatron.lite.primitive.quantization import QATSpec, apply_qat_to_chunks, normalize_qat_spec
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
-from megatron.lite.primitive.quantization import (
-    QATSpec,
-    apply_qat_to_chunks,
-    normalize_qat_spec,
-)
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
+
+if TYPE_CHECKING:
+    from megatron.lite.primitive.kernels.indexer_topk import IndexerTopKConfig
 
 
 def EXPERT_CLASSIFIER(name: str) -> bool:
@@ -122,15 +125,24 @@ class ImplConfig:
     mtp_loss_scaling_factor: float = 0.1
     mtp_use_repeated_layer: bool | None = None
     qat: QATSpec | dict | None = None
+    # How the DSA layers select their indexer top-k in eval mode with gradients
+    # disabled (experimental/lite/docs/indexer_topk.md). None keeps the upstream
+    # selectors and imports nothing of the indexer top-k package.
+    indexer_topk: IndexerTopKConfig | dict | None = None
 
     def __post_init__(self) -> None:
         if self.dsa_cp_mode not in {"native", "legacy_gather_all"}:
             raise ValueError(
-                "dsa_cp_mode must be 'native' or 'legacy_gather_all', "
-                f"got {self.dsa_cp_mode!r}"
+                "dsa_cp_mode must be 'native' or 'legacy_gather_all', " f"got {self.dsa_cp_mode!r}"
             )
         if self.dsa_indexer_loss_coeff < 0.0:
             raise ValueError("dsa_indexer_loss_coeff must be >= 0")
+        if self.indexer_topk is not None:
+            # Validate only (unknown keys and invalid combinations fail here);
+            # build_model passes the value as given to configure_indexer_topk.
+            from megatron.lite.primitive.kernels.indexer_topk import normalize_indexer_topk_config
+
+            normalize_indexer_topk_config(self.indexer_topk)
 
 
 def build_model_config(source: str | Path | dict, **overrides) -> Glm5Config:
@@ -144,9 +156,7 @@ def build_model_config(source: str | Path | dict, **overrides) -> Glm5Config:
     return cfg
 
 
-def _pack_glm5_thd_forward_kwargs(
-    model: nn.Module, batch: PackedBatch
-) -> dict[str, Any]:
+def _pack_glm5_thd_forward_kwargs(model: nn.Module, batch: PackedBatch) -> dict[str, Any]:
     """Pack GLM5 THD inputs in sequential allgather-CP layout."""
     ps = parallel_state_from_model(model) or ParallelState()
     seq_lens = batch.seq_lens
@@ -174,9 +184,7 @@ def _pack_glm5_thd_forward_kwargs(
         for key in ("input_ids", "labels", "loss_mask", "position_ids"):
             tensor = kwargs[key]
             if tensor is not None:
-                kwargs[key] = contiguous_slice_for_cp(
-                    tensor, ps.cp_rank, ps.cp_size, seq_dim=1
-                )
+                kwargs[key] = contiguous_slice_for_cp(tensor, ps.cp_rank, ps.cp_size, seq_dim=1)
     return kwargs
 
 
@@ -248,9 +256,7 @@ def _validate_parallel_scope(p: ParallelConfig) -> None:
 def _build_dist_opt_optimizer(
     chunks, model_cfg: Glm5Config, impl_cfg: ImplConfig, ps: ParallelState
 ):
-    from megatron.lite.primitive.optimizers.megatron_wrap import (
-        build_dist_opt_training_optimizer,
-    )
+    from megatron.lite.primitive.optimizers.megatron_wrap import build_dist_opt_training_optimizer
 
     return build_dist_opt_training_optimizer(
         chunks,
@@ -275,9 +281,7 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     mtp_enable_train = mtp_enable and bool(impl_cfg.mtp_enable_train)
     if mtp_enable:
         if model_cfg.num_nextn_predict_layers <= 0:
-            raise ValueError(
-                "mtp_enable=True but HF config has no num_nextn_predict_layers."
-            )
+            raise ValueError("mtp_enable=True but HF config has no num_nextn_predict_layers.")
         model_cfg.mtp_loss_scaling_factor = impl_cfg.mtp_loss_scaling_factor
         if impl_cfg.mtp_use_repeated_layer is not None:
             model_cfg.mtp_use_repeated_layer = impl_cfg.mtp_use_repeated_layer
@@ -317,25 +321,23 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     )
 
     if vpp is None:
-        chunks = [
-            Glm5Model(model_cfg, train_cfg, ps, **model_kwargs)
-            .to(torch.bfloat16)
-            .cuda()
-        ]
+        chunks = [Glm5Model(model_cfg, train_cfg, ps, **model_kwargs).to(torch.bfloat16).cuda()]
     else:
         chunks = [
-            Glm5Model(
-                model_cfg,
-                train_cfg,
-                ps,
-                vpp_chunk_id=i,
-                **model_kwargs,
-            )
+            Glm5Model(model_cfg, train_cfg, ps, vpp_chunk_id=i, **model_kwargs)
             .to(torch.bfloat16)
             .cuda()
             for i in range(vpp)
         ]
     set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)
+    indexer_topk_extras: dict[str, Any] = {}
+    if impl_cfg.indexer_topk is not None:
+        from megatron.lite.primitive.modules.attention.indexer_topk import configure_indexer_topk
+
+        # The IndexerTopKInstallation, or None for backend "default" (nothing bound).
+        indexer_topk_extras["indexer_topk"] = configure_indexer_topk(
+            chunks, impl_cfg.indexer_topk, native_format="fp8"
+        )
 
     if recompute_spec:
         for chunk in chunks:
@@ -355,9 +357,7 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     post_model_load_hook = None
     optimizer_backend = "none"
     if impl_cfg.optimizer == "dist_opt":
-        optimizer, finalize_grads = _build_dist_opt_optimizer(
-            chunks, model_cfg, impl_cfg, ps
-        )
+        optimizer, finalize_grads = _build_dist_opt_optimizer(chunks, model_cfg, impl_cfg, ps)
         from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
         from megatron.lite.runtime.megatron_utils import register_training_hooks
 
@@ -371,9 +371,7 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
 
         def _post_model_load_hook():
             from megatron.lite.model.glm5.lite.model import Glm5Layer
-            from megatron.lite.primitive.optimizers.fsdp2 import (
-                build_fsdp2_training_optimizer,
-            )
+            from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
 
             return {
                 "optimizer": build_fsdp2_training_optimizer(
@@ -403,6 +401,7 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
             "optimizer_backend": optimizer_backend,
             "post_model_load_hook": post_model_load_hook,
             "pre_forward_hook": _make_aux_loss_hook(),
+            **indexer_topk_extras,
         },
     )
 
@@ -418,16 +417,12 @@ def load_hf_weights(
 
 
 def export_hf_weights(chunks, model_cfg: Glm5Config, ps: ParallelState, **kwargs):
-    from megatron.lite.model.glm5.lite.checkpoint import (
-        export_hf_weights as export_impl,
-    )
+    from megatron.lite.model.glm5.lite.checkpoint import export_hf_weights as export_impl
 
     yield from export_impl(chunks, model_cfg, ps, **kwargs)
 
 
-def save_hf_weights(
-    chunks, path: str, model_cfg: Glm5Config, ps: ParallelState, **kwargs
-):
+def save_hf_weights(chunks, path: str, model_cfg: Glm5Config, ps: ParallelState, **kwargs):
     from megatron.lite.model.glm5.lite.checkpoint import save_hf_weights as save_impl
 
     save_impl(chunks, path, model_cfg, ps, **kwargs)
