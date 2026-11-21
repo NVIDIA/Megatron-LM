@@ -97,7 +97,9 @@ def _configure_flash_attention_env():
     os.environ['NVTE_UNFUSED_ATTN'] = '0'
 
 
-def _build_flash_attn_bik_model(seq_len: int, vocab_size: int, hidden_size: int = 128) -> GPTModel:
+def _build_flash_attn_bik_model(
+    seq_len: int, vocab_size: int, hidden_size: int = 128, fp32_residual_connection: bool = False
+) -> GPTModel:
     cfg = TransformerConfig(
         num_layers=2,
         hidden_size=hidden_size,
@@ -110,7 +112,7 @@ def _build_flash_attn_bik_model(seq_len: int, vocab_size: int, hidden_size: int 
         normalization="RMSNorm",
         params_dtype=torch.bfloat16,
         attention_backend=AttnBackend.flash,
-        fp32_residual_connection=False,
+        fp32_residual_connection=fp32_residual_connection,
         nccl_all_reduce_for_prefill=False,
     )
     cfg.fp16 = False
@@ -162,9 +164,12 @@ class TestGPTModelBatchInvariant:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def test_forward_batch_invariant(self):
+    @pytest.mark.parametrize("fp32_residual_connection", [False, True])
+    def test_forward_batch_invariant(self, fp32_residual_connection):
         _configure_flash_attention_env()
-        model = _build_flash_attn_bik_model(self.sequence_length, self.vocab_size)
+        model = _build_flash_attn_bik_model(
+            self.sequence_length, self.vocab_size, fp32_residual_connection=fp32_residual_connection
+        )
         model = Float16Module(model.config, model).eval()
         batch_size = 6
         splits = [2, 1, 3]
