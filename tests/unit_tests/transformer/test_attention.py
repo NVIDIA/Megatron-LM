@@ -120,13 +120,11 @@ class TestParallelAttention:
 
     def test_shared_prefix_forest_replaces_core_attention(self, monkeypatch):
         """A shared_prefix_forest argument runs the forest kernel on the layer's CP group."""
-        from megatron.core.shared_prefix_layout import SharedPrefixForestLayout, SharedPrefixLayout
+        from megatron.core.datasets.shared_prefix.layout import SharedPrefixPack, SharedPrefixTree
         from megatron.core.transformer import attention as attention_module
 
         attention = self.parallel_attention.cuda()
-        layout = SharedPrefixForestLayout(
-            (SharedPrefixLayout(4, (3, 5)), SharedPrefixLayout(2, (6,)))
-        )
+        layout = SharedPrefixPack((SharedPrefixTree(4, (3, 5)), SharedPrefixTree(2, (6,))))
         calls = []
 
         def forest_kernel(query, key, value, forest, *, cp_group, scale):

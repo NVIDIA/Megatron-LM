@@ -56,8 +56,8 @@ from megatron.core.utils import (
 )
 
 if TYPE_CHECKING:
+    from megatron.core.datasets.shared_prefix.layout import SharedPrefixPack
     from megatron.core.inference.contexts import BaseInferenceContext
-    from megatron.core.shared_prefix_layout import SharedPrefixForestLayout
 
 logger = logging.getLogger(__name__)
 
@@ -779,7 +779,7 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
         *,
         inference_params: Optional[Any] = None,
-        shared_prefix_forest: Optional[SharedPrefixForestLayout] = None,
+        shared_prefix_forest: Optional[SharedPrefixPack] = None,
     ):
         """
         Perform a forward pass through the attention layer and the layernorms before and after
@@ -806,8 +806,9 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
                 MoE layers use them later in ``_forward_mlp``.
             residual_stream_recompute_context (ResidualStreamRecomputeContext, optional):
                 Call-local ordered replay state for configured residual connections.
-            shared_prefix_forest (SharedPrefixForestLayout, optional): Shared-prefix forest
-                stored in ``hidden_states``. It is passed to self-attention, which then runs the
+            shared_prefix_forest (SharedPrefixPack, optional): The pack stored in
+                ``hidden_states``. A pack is several trees, and a tree is one prompt with its
+                completions. It is passed to self-attention, which then runs the
                 shared-prefix forest attention, only when set.
 
         Returns:

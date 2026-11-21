@@ -702,11 +702,11 @@ def test_self_attention_shared_prefix_branch_replays(attention, monkeypatch, cp_
     layer run on each dense ``[prompt, completion]`` row, which a causal pass over the packed
     forest would not.
     """
+    from megatron.core.datasets.shared_prefix.layout import SharedPrefixPack, SharedPrefixTree
     from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
     from megatron.core.models.gpt.gpt_layer_specs import (
         get_gpt_layer_with_transformer_engine_submodules,
     )
-    from megatron.core.shared_prefix_layout import SharedPrefixForestLayout, SharedPrefixLayout
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
     from megatron.core.transformer import attention as attention_layer
     from megatron.core.transformer.attention import SelfAttention
@@ -739,9 +739,7 @@ def test_self_attention_shared_prefix_branch_replays(attention, monkeypatch, cp_
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
         ).cuda()
-        layout = SharedPrefixForestLayout(
-            (SharedPrefixLayout(64, (80, 80)), SharedPrefixLayout(32, (32, 32)))
-        )
+        layout = SharedPrefixPack((SharedPrefixTree(64, (80, 80)), SharedPrefixTree(32, (32, 32))))
         physical_len = layout.total_len  # 320, a multiple of 2 * CP
         hidden = torch.randn(physical_len, 1, config.hidden_size, device="cuda").bfloat16()
         rotary_table = RotaryEmbedding(kv_channels=config.kv_channels, rotary_percent=1.0).get_emb(

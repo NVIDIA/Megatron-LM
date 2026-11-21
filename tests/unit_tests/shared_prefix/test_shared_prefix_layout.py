@@ -1,15 +1,19 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""SharedPrefixLayout metadata against the dense rows it represents (CPU)."""
+"""SharedPrefixTree and SharedPrefixPack metadata against the dense rows they represent (CPU)."""
 
 import pytest
 import torch
 
-from megatron.core.shared_prefix_layout import SharedPrefixForestLayout, SharedPrefixLayout
+from megatron.core.datasets.shared_prefix.layout import (
+    SharedPrefixPack,
+    SharedPrefixTree,
+    shared_prefix_topology_multiple,
+)
 
 
 def test_layout_prompt_multiplicities_equal_dense_gather_counts():
-    layout = SharedPrefixLayout(3, (2, 5, 1))
+    layout = SharedPrefixTree(3, (2, 5, 1))
     indices = torch.cat(layout.dense_branch_indices("cpu"))
     expected = torch.bincount(indices, minlength=layout.total_len).float()
     torch.testing.assert_close(
@@ -20,12 +24,11 @@ def test_layout_prompt_multiplicities_equal_dense_gather_counts():
 
 def test_cp_local_indices_follow_the_zigzag_split():
     """Rank r of C owns chunks r and 2C-r-1 of 2C; together the ranks own every index once."""
-    assert SharedPrefixLayout.cp_local_indices(8, 2, 0, "cpu").tolist() == [0, 1, 6, 7]
-    assert SharedPrefixLayout.cp_local_indices(8, 2, 1, "cpu").tolist() == [2, 3, 4, 5]
+    assert SharedPrefixTree.cp_local_indices(8, 2, 0, "cpu").tolist() == [0, 1, 6, 7]
+    assert SharedPrefixTree.cp_local_indices(8, 2, 1, "cpu").tolist() == [2, 3, 4, 5]
     for cp_size in (1, 2, 4):
         owned = [
-            SharedPrefixForestLayout.cp_local_indices(16, cp_size, rank, "cpu")
-            for rank in range(cp_size)
+            SharedPrefixPack.cp_local_indices(16, cp_size, rank, "cpu") for rank in range(cp_size)
         ]
         assert all(indices.dtype == torch.long for indices in owned)
         assert torch.equal(torch.cat(owned).sort().values, torch.arange(16))
@@ -42,33 +45,33 @@ def test_cp_local_indices_follow_the_zigzag_split():
 )
 def test_cp_local_indices_reject_invalid_geometry(length, cp_size, cp_rank, match):
     with pytest.raises(ValueError, match=match):
-        SharedPrefixLayout.cp_local_indices(length, cp_size, cp_rank, "cpu")
+        SharedPrefixTree.cp_local_indices(length, cp_size, cp_rank, "cpu")
 
 
-def _two_root_forest():
-    """Roots [3 | 4, 2] and [2 | 2] with per-branch padding (logical 3, 1 and 2)."""
-    return SharedPrefixForestLayout(
+def _two_tree_pack():
+    """Trees [3 | 4, 2] and [2 | 2] with per-branch padding (logical 3, 1 and 2)."""
+    return SharedPrefixPack(
         (
-            SharedPrefixLayout(3, (4, 2), logical_completion_lens=(3, 1), padding_multiple=2),
-            SharedPrefixLayout(2, [2], logical_completion_lens=[2], padding_multiple=2),
+            SharedPrefixTree(3, (4, 2), logical_completion_lens=(3, 1), padding_multiple=2),
+            SharedPrefixTree(2, [2], logical_completion_lens=[2], padding_multiple=2),
         )
     )
 
 
-def test_forest_layout_concatenates_independent_roots():
-    forest = _two_root_forest()
-    assert forest.total_len == 13
-    assert forest.padding_multiple == 2
-    assert [offset for offset, _ in forest.iter_roots()] == [0, 9]
-    assert forest.forest == [(0, 3, [4, 2]), (9, 2, [2])]
-    assert forest.dense_branch_lengths == (7, 5, 4)
-    # Each dense row repeats its own root's prompt and never reaches into another root.
-    assert [branch.tolist() for branch in forest.dense_branch_indices("cpu")] == [
+def test_pack_concatenates_independent_trees():
+    pack = _two_tree_pack()
+    assert pack.total_len == 13
+    assert pack.padding_multiple == 2
+    assert [offset for offset, _ in pack.iter_roots()] == [0, 9]
+    assert pack.forest == [(0, 3, [4, 2]), (9, 2, [2])]
+    assert pack.dense_branch_lengths == (7, 5, 4)
+    # Each dense row repeats its own tree's prompt and never reaches into another tree.
+    assert [branch.tolist() for branch in pack.dense_branch_indices("cpu")] == [
         [0, 1, 2, 3, 4, 5, 6],
         [0, 1, 2, 7, 8],
         [9, 10, 11, 12],
     ]
-    assert forest.padded_position_ids(16, "cpu").tolist() == (
+    assert pack.padded_position_ids(16, "cpu").tolist() == (
         [0, 1, 2, 3, 4, 5, 6, 3, 4] + [0, 1, 2, 3] + [0, 0, 0]
     )
 
@@ -77,56 +80,56 @@ def test_forest_layout_concatenates_independent_roots():
     "exclude_sequence_padding, completion_rows",
     [(False, [1, 1, 1, 1, 1, 1]), (True, [1, 1, 1, 0, 1, 0])],
 )
-def test_forest_multiplicities_count_dense_copies(exclude_sequence_padding, completion_rows):
+def test_pack_multiplicities_count_dense_copies(exclude_sequence_padding, completion_rows):
     """Prompts count once per completion; per-branch padding counts only in the unmasked
     baseline; trailing topology padding never counts."""
-    forest = _two_root_forest()
-    multiplicities = forest.padded_token_multiplicities(
+    pack = _two_tree_pack()
+    multiplicities = pack.padded_token_multiplicities(
         16, "cpu", exclude_sequence_padding=exclude_sequence_padding
     )
     assert multiplicities.tolist() == [2, 2, 2] + completion_rows + [1, 1, 1, 1] + [0, 0, 0]
     if not exclude_sequence_padding:
-        dense_rows = torch.cat(forest.dense_branch_indices("cpu"))
+        dense_rows = torch.cat(pack.dense_branch_indices("cpu"))
         assert multiplicities[:13].tolist() == torch.bincount(dense_rows).tolist()
 
 
-def test_forest_mtp_loss_groups_partition_dense_lengths():
-    roots = _two_root_forest().roots
-    assert SharedPrefixForestLayout(roots).mtp_loss_group_lengths == (12, 4)
-    grouped = SharedPrefixForestLayout(roots, mtp_loss_group_root_counts=[2])
+def test_pack_mtp_loss_groups_partition_dense_lengths():
+    roots = _two_tree_pack().roots
+    assert SharedPrefixPack(roots).mtp_loss_group_lengths == (12, 4)
+    grouped = SharedPrefixPack(roots, mtp_loss_group_root_counts=[2])
     assert grouped.mtp_loss_group_lengths == (16,)
 
 
 def test_layouts_reject_physical_lengths_shorter_than_the_layout():
-    forest = _two_root_forest()
-    for padded in (forest.padded_position_ids, forest.padded_token_multiplicities):
-        with pytest.raises(ValueError, match="shorter than shared-prefix forest"):
+    pack = _two_tree_pack()
+    for padded in (pack.padded_position_ids, pack.padded_token_multiplicities):
+        with pytest.raises(ValueError, match="shorter than the shared-prefix pack"):
             padded(12, "cpu")
-    star = forest.roots[0]
-    for padded in (star.padded_position_ids, star.padded_token_multiplicities):
+    tree = pack.roots[0]
+    for padded in (tree.padded_position_ids, tree.padded_token_multiplicities):
         with pytest.raises(ValueError, match="physical length 8 is shorter than layout 9"):
             padded(8, "cpu")
 
 
 def test_layouts_normalize_fields():
-    """Sequences become tuples and star lengths become ints. ``padding_multiple`` and the MTP
+    """Sequences become tuples and tree lengths become ints. ``padding_multiple`` and the MTP
     group counts are not coerced: they must already be Python ints."""
     import numpy as np
 
-    star = SharedPrefixLayout(
+    tree = SharedPrefixTree(
         np.int64(3), [np.int64(4), 2], logical_completion_lens=[np.int64(3), 2], padding_multiple=2
     )
-    assert star.prefix_len == 3 and star.completion_lens == (4, 2)
-    assert star.logical_completion_lens == (3, 2)
-    lengths = (star.prefix_len, *star.completion_lens, *star.logical_completion_lens)
+    assert tree.prefix_len == 3 and tree.completion_lens == (4, 2)
+    assert tree.logical_completion_lens == (3, 2)
+    lengths = (tree.prefix_len, *tree.completion_lens, *tree.logical_completion_lens)
     assert all(type(length) is int for length in lengths)
-    forest = SharedPrefixForestLayout([star, star], mtp_loss_group_root_counts=[1, 1])
-    assert forest.roots == (star, star)
-    assert forest.mtp_loss_group_root_counts == (1, 1)
+    pack = SharedPrefixPack([tree, tree], mtp_loss_group_root_counts=[1, 1])
+    assert pack.roots == (tree, tree)
+    assert pack.mtp_loss_group_root_counts == (1, 1)
     with pytest.raises(ValueError, match="padding_multiple must be an integer"):
-        SharedPrefixLayout(3, (4,), logical_completion_lens=(4,), padding_multiple=np.int64(2))
+        SharedPrefixTree(3, (4,), logical_completion_lens=(4,), padding_multiple=np.int64(2))
     with pytest.raises(ValueError, match="positive integers"):
-        SharedPrefixForestLayout((star,), mtp_loss_group_root_counts=(np.int64(1),))
+        SharedPrefixPack((tree,), mtp_loss_group_root_counts=(np.int64(1),))
 
 
 @pytest.mark.parametrize(
@@ -145,11 +148,11 @@ def test_layouts_normalize_fields():
         (3, (2,), (2,), 0, "padding_multiple must be positive"),
     ],
 )
-def test_star_layout_rejects_invalid_lengths(
+def test_tree_rejects_invalid_lengths(
     prefix_len, completion_lens, logical_completion_lens, padding_multiple, match
 ):
     with pytest.raises(ValueError, match=match):
-        SharedPrefixLayout(
+        SharedPrefixTree(
             prefix_len,
             completion_lens,
             logical_completion_lens=logical_completion_lens,
@@ -157,24 +160,37 @@ def test_star_layout_rejects_invalid_lengths(
         )
 
 
-_STAR = SharedPrefixLayout(3, (2,))
-_PADDED_STAR = SharedPrefixLayout(3, (2,), logical_completion_lens=(2,), padding_multiple=8)
+_TREE = SharedPrefixTree(3, (2,))
+_PADDED_TREE = SharedPrefixTree(3, (2,), logical_completion_lens=(2,), padding_multiple=8)
 
 
 @pytest.mark.parametrize(
     "roots, counts, match",
     [
-        ((), (), "one or more star layouts"),
-        ((object(),), (), "one or more star layouts"),
-        ((_PADDED_STAR, _STAR), (), "same padding multiple"),
-        ((_STAR, _STAR), "12", "sequence of integers"),
-        ((_STAR, _STAR), 3, "sequence of integers"),
-        ((_STAR, _STAR), (True, 1), "positive integers"),
-        ((_STAR, _STAR), (0, 2), "positive integers"),
-        ((_STAR, _STAR), (1,), "partition every forest root"),
-        ((_STAR, _STAR), (2, 1), "partition every forest root"),
+        ((), (), "one or more SharedPrefixTree roots"),
+        ((object(),), (), "one or more SharedPrefixTree roots"),
+        ((_PADDED_TREE, _TREE), (), "same padding multiple"),
+        ((_TREE, _TREE), "12", "sequence of integers"),
+        ((_TREE, _TREE), 3, "sequence of integers"),
+        ((_TREE, _TREE), (True, 1), "positive integers"),
+        ((_TREE, _TREE), (0, 2), "positive integers"),
+        ((_TREE, _TREE), (1,), "partition every root of the pack"),
+        ((_TREE, _TREE), (2, 1), "partition every root of the pack"),
     ],
 )
-def test_forest_layout_rejects_invalid_roots_and_groups(roots, counts, match):
+def test_pack_rejects_invalid_roots_and_groups(roots, counts, match):
     with pytest.raises(ValueError, match=match):
-        SharedPrefixForestLayout(roots, mtp_loss_group_root_counts=counts)
+        SharedPrefixPack(roots, mtp_loss_group_root_counts=counts)
+
+
+@pytest.mark.parametrize(
+    "tp_size, cp_size, multiple", [(1, 1, 1), (1, 2, 4), (2, 1, 4), (2, 2, 8), (4, 4, 32)]
+)
+def test_topology_multiple(tp_size, cp_size, multiple):
+    assert shared_prefix_topology_multiple(tp_size=tp_size, cp_size=cp_size) == multiple
+
+
+@pytest.mark.parametrize("tp_size, cp_size", [(0, 1), (1, 0), (True, 1), (1, 2.0)])
+def test_topology_multiple_rejects_invalid_sizes(tp_size, cp_size):
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        shared_prefix_topology_multiple(tp_size=tp_size, cp_size=cp_size)
