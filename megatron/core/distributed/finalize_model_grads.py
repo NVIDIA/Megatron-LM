@@ -6,6 +6,9 @@ from typing import Callable, Dict, List, Optional, Union
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+    get_containing_parameter_group,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     uneven_dtensor_to_full_tensor,
 )
@@ -287,6 +290,15 @@ def _allreduce_embedding_grad(
         grad_attr = _get_main_grad_attr(weight)
         orig_grad = getattr(weight, grad_attr)
         if ddp_config.use_megatron_fsdp:
+            if ddp_config.megatron_fsdp_version == 2 and orig_grad is not None:
+                group = get_containing_parameter_group(weight)
+                index = next(
+                    i
+                    for i, parameter in enumerate(group.fsdp_parameters)
+                    if parameter.sharded is weight
+                )
+                # This temporary view shares storage with weight.grad, which stays a local tensor.
+                orig_grad = group.pre_optimizer_main_grad.get_dtensor(index)
             # Expand the uneven (flat-buffer) sharded embedding grad to the full logical gradient
             # so the cross-stage all-reduce below combines matching rows (see _full_embedding_grad).
             grad = _full_embedding_grad(orig_grad)
