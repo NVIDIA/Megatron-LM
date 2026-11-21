@@ -464,9 +464,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             "tests/unit_tests/inference/test_moe_dispatching_and_routing.py",
             K + "test_moe_kernels.py",
+            K + "test_inference_kernels.py",
         ),
         kind="te-wrapper",
-        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert.",
+        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert. "
+        "FlashInfer MXFP8/BF16 experts: top-k=1 side-stream graph replay matches serial.",
     ),
     KernelEntry(
         name="moe_fused_a2a",
