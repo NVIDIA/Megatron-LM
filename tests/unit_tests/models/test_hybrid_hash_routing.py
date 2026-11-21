@@ -553,6 +553,7 @@ def test_chunked_hash_moe_keeps_ids_and_padding_aligned():
         recompute_mlp=False,
     )
     layer._run_mlp_in_chunks = MethodType(TransformerLayer._run_mlp_in_chunks, layer)
+    layer._using_fused_tp_inference = MethodType(TransformerLayer._using_fused_tp_inference, layer)
     hidden_states = torch.randn(4, 2, 8)
     input_ids = torch.arange(8).reshape(2, 4)
     padding_mask = torch.tensor(
