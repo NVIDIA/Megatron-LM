@@ -102,6 +102,11 @@ except ImportError:
 
 from megatron.core.inference.moe import ActivationType as McoreActivationType
 from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe, vllm_fused_moe
+from megatron.core.inference.moe.flashinfer_fused_finalize_mxfp8 import (
+    flashinfer_fused_finalize_mxfp8_moe,
+    prepare_flashinfer_fused_finalize_mxfp8_weights,
+    require_flashinfer_fused_finalize_mxfp8,
+)
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
     FlashInferCutlassMXFP8Weight,
     FlashInferRoutedMXFP8Weight,
@@ -112,6 +117,7 @@ from megatron.core.inference.moe.flashinfer_mxfp8 import (
     prepare_routed_mxfp8_weights,
     require_flashinfer_cutlass_mxfp8,
     require_flashinfer_routed_mxfp8,
+    select_routed_mxfp8_active_rows,
 )
 from megatron.core.inference.moe.flashinfer_nvfp4 import (
     flashinfer_routed_nvfp4_moe,
@@ -1422,6 +1428,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
     - Training: delegates to parent TEGroupedMLP
     - Inference + FlashInfer: CUTLASS fused MoE for BF16 and tanh-clamped MXFP8,
       routed block-scale MoE for other MXFP8 activations and per-token NVFP4
+    - Inference + FlashInfer fused finalize: MXFP8 MoE with the finalize fused into FC2,
+      optionally split across the GPU's CUDA locality domains
     - Inference + torch: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets
     - Inference + vLLM: Triton fused MoE for BF16, MCore scaled grouped GEMM for MXFP8
     """
@@ -1460,6 +1468,15 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     "'flashinfer'."
                 )
             self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
+        self._flashinfer_fused_finalize_weights = None
+        if (
+            self.inference_grouped_gemm_backend
+            == InferenceGroupedGemmBackend.FLASHINFER_FUSED_FINALIZE
+        ):
+            require_flashinfer_fused_finalize_mxfp8()
+            self._flashinfer_activation_type = self._resolve_flashinfer_activation_type(
+                moe_kernel_name="cute_dsl_fused_moe"
+            )
 
         self._mcore_activation_type = self._resolve_mcore_activation_type()
         self._activation_clamp_scale = config.activation_func_tanh_clamp_scale
@@ -1474,15 +1491,23 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _build_flashinfer_clamp_limit(self, device: torch.device) -> None:
         """Allocate the FP32 limit once during inference warmup, before graph capture."""
         if (
-            self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+            self.inference_grouped_gemm_backend
+            in (
+                InferenceGroupedGemmBackend.FLASHINFER,
+                InferenceGroupedGemmBackend.FLASHINFER_FUSED_FINALIZE,
+            )
             and self._activation_clamp_scale is not None
         ):
             self._flashinfer_clamp_limit = torch.full(
                 (1,), self._activation_clamp_scale, dtype=torch.float32, device=device
             )
 
-    def _resolve_flashinfer_activation_type(self):
-        """Map megatron activation config to FlashInfer ActivationType."""
+    def _resolve_flashinfer_activation_type(self, moe_kernel_name: str = "cutlass_fused_moe"):
+        """Map megatron activation config to FlashInfer ActivationType.
+
+        moe_kernel_name is the flashinfer.fused_moe function whose ClampedRelu2 support is
+        checked.
+        """
         assert (
             HAVE_FLASHINFER
         ), "flashinfer-python is required to resolve FlashInfer activation type."
@@ -1498,10 +1523,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
         elif func == squared_relu:
             if self.config.activation_func_tanh_clamp_scale is not None:
                 clamped_relu2 = getattr(ActivationType, "ClampedRelu2", None)
+                moe_fn = getattr(fused_moe, moe_kernel_name, None)
                 if (
                     clamped_relu2 is None
-                    or "clamped_relu2_limit"
-                    not in inspect.signature(fused_moe.cutlass_fused_moe).parameters
+                    or moe_fn is None
+                    or "clamped_relu2_limit" not in inspect.signature(moe_fn).parameters
                 ):
                     raise RuntimeError(
                         "The installed FlashInfer does not provide "
@@ -1595,9 +1621,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _build_concatenated_mxfp8_weights(self):
         """Build contiguous expert stacks after checkpoint loading.
 
-        Torch, vLLM and FlashInfer CUTLASS rebind each per-expert MXFP8Tensor to
-        its stacked view. FlashInfer routed derives a shuffled Major-K stack and makes
-        the canonical tensors write through to it, releasing their storage.
+        Torch, vLLM, FlashInfer CUTLASS and FlashInfer fused finalize rebind each per-expert
+        MXFP8Tensor to its stacked view; fused finalize then derives its execution copy from the
+        stacks. FlashInfer routed derives a shuffled Major-K stack and makes the canonical
+        tensors write through to it, releasing their storage.
         """
 
         use_flashinfer = (
@@ -1651,7 +1678,43 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     elif hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor):
                         w.data.data = stacked_weight.data[i]
                         w.data.scale = stacked_weight.scale[i]
+        if (
+            self.inference_grouped_gemm_backend
+            == InferenceGroupedGemmBackend.FLASHINFER_FUSED_FINALIZE
+        ):
+            self._build_flashinfer_fused_finalize_mxfp8_weights()
         self._uses_mxfp8_weights = True
+
+    @torch.inference_mode(False)
+    @torch.no_grad()
+    def _build_flashinfer_fused_finalize_mxfp8_weights(self, refresh: bool = False):
+        """Derive the fused-finalize execution weights from the stacked canonical MXFP8 weights,
+        without requantization; with refresh=True rewrite them in place (graph-stable
+        addresses)."""
+        new_weights = prepare_flashinfer_fused_finalize_mxfp8_weights(
+            self._fc1_weight,
+            self._fc2_weight,
+            locality_domains=self.config.inference_moe_locality_domains,
+            top_k=self.config.moe_router_topk,
+        )
+        if refresh:
+            weights = self._flashinfer_fused_finalize_weights
+            for name in ('fc1_data', 'fc1_scale', 'fc2_data', 'fc2_scale'):
+                getattr(weights, name).copy_(getattr(new_weights, name))
+            for current_shard, new_shard in zip(
+                weights.locality_domain_weights or [], new_weights.locality_domain_weights or []
+            ):
+                for key in current_shard:
+                    current_shard[key].copy_(new_shard[key])
+        else:
+            self._flashinfer_fused_finalize_weights = new_weights
+            logger.info(
+                "Prepared FlashInfer fused-finalize MXFP8 expert weights: experts=%d hidden=%d "
+                "locality_domains=%s",
+                self.num_local_experts,
+                new_weights.hidden_size,
+                new_weights.locality_domain_weights is not None,
+            )
 
     @torch.inference_mode(False)
     @torch.no_grad()
@@ -1660,6 +1723,14 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         Returns whether derived FlashInfer weights were refreshed.
         """
+        if (
+            self.inference_grouped_gemm_backend
+            == InferenceGroupedGemmBackend.FLASHINFER_FUSED_FINALIZE
+            and self._concatenated_weights_built
+            and self._flashinfer_fused_finalize_weights is not None
+        ):
+            self._build_flashinfer_fused_finalize_mxfp8_weights(refresh=True)
+            return True
         if (
             not self._concatenated_weights_built
             or self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.FLASHINFER
@@ -1859,6 +1930,33 @@ class InferenceGroupedMLP(TEGroupedMLP):
             expert_tp_group=self.tp_group,
         )
 
+    def _flashinfer_fused_finalize_forward(self, hidden_states, routing_map, probs):
+        """FlashInfer fused-finalize MXFP8 MoE for CUDA-graphed inference iterations."""
+        if self._flashinfer_fused_finalize_weights is None:
+            raise RuntimeError(
+                "inference_grouped_gemm_backend='flashinfer_fused_finalize' requires MXFP8 expert "
+                "weights in every MoE layer."
+            )
+        # Same bounded decode prefix as the routed MXFP8 path (inference_flashinfer_mxfp8_
+        # token_capacity): rows past the prefix are invalid (-1) in decode-only graphs.
+        active_rows, _ = select_routed_mxfp8_active_rows(
+            hidden_states.shape[0],
+            token_capacity=self._flashinfer_mxfp8_token_capacity,
+            use_bounded_rows=InferenceMode.use_bounded_mxfp8_rows(),
+        )
+        output = flashinfer_fused_finalize_mxfp8_moe(
+            hidden_states[:active_rows],
+            routing_map[:active_rows],
+            probs[:active_rows],
+            self._flashinfer_fused_finalize_weights,
+            num_experts=self.num_local_experts * self.ep_group.size(),
+            local_expert_offset=self.ep_group.rank() * self.num_local_experts,
+            activation_type=self._flashinfer_activation_type.value,
+            clamped_relu2_limit=self._flashinfer_clamp_limit,
+            out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
+        )
+        return output, None
+
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
         """MCore grouped GEMM for Torch and the vLLM-selected MXFP8 fallback."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
@@ -1947,6 +2045,16 @@ class InferenceGroupedMLP(TEGroupedMLP):
             assert routing_map is not None, "routing_map is required for FlashInfer forward pass."
             assert not self.training, "FlashInfer forward path is only used in inference mode."
             return self._flashinfer_forward(
+                permuted_local_hidden_states, routing_map, permuted_probs
+            )
+        elif (
+            self.inference_grouped_gemm_backend
+            == InferenceGroupedGemmBackend.FLASHINFER_FUSED_FINALIZE
+        ):
+            assert (
+                routing_map is not None
+            ), "routing_map is required for the FlashInfer fused finalize."
+            return self._flashinfer_fused_finalize_forward(
                 permuted_local_hidden_states, routing_map, permuted_probs
             )
         elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH:
