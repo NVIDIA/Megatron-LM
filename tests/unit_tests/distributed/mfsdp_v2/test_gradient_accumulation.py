@@ -58,6 +58,8 @@ def _default_placements() -> Placements:
         (torch.float32, None, torch.float32),
         # Explicit override: reduce in bf16, then accumulate into fp32 main_grad.
         (torch.float32, torch.bfloat16, torch.bfloat16),
+        # FP32 communication is independent of BF16 main-gradient accumulation.
+        (torch.bfloat16, torch.float32, torch.float32),
         # No main_grads_dtype: both main_grad and the reduction follow the parameter dtype.
         (None, None, torch.bfloat16),
     ],

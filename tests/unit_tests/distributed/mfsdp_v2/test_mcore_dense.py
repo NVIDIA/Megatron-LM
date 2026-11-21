@@ -62,6 +62,37 @@ def process_group_collection(distributed_setup):
     destroy_model_parallel()
 
 
+@pytest.mark.parametrize(
+    "grad_reduce_in_fp32,grad_comm_dtype",
+    [(False, None), (False, torch.float32), (True, None), (True, torch.bfloat16)],
+)
+def test_grad_reduction_flag_controls_main_grad_dtype(
+    process_group_collection, grad_reduce_in_fp32, grad_comm_dtype
+):
+    """The adapter resolves main-gradient storage and communication dtypes independently."""
+    config = TransformerConfig(
+        num_layers=1, hidden_size=8, num_attention_heads=1, params_dtype=torch.bfloat16, bf16=True
+    )
+    model = FullyShardedDataParallel(
+        config=config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            grad_reduce_in_fp32=grad_reduce_in_fp32,
+            megatron_fsdp_grad_comm_dtype=grad_comm_dtype,
+            data_parallel_sharding_strategy="optim_grads_params",
+        ),
+        module=torch.nn.Linear(8, 8, device="cuda", dtype=torch.bfloat16),
+        pg_collection=process_group_collection,
+    )
+    expected_dtype = torch.float32 if grad_reduce_in_fp32 else torch.bfloat16
+    assert model.module.parameter_groups
+    for group in model.module.parameter_groups:
+        assert group.main_grad is not None
+        assert group.main_grad.local_buffer.dtype == expected_dtype
+        assert group.grad_comm_dtype == (grad_comm_dtype or expected_dtype)
+
+
 @pytest.mark.launch_on_gb200
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] < 10,
