@@ -5071,11 +5071,23 @@ class TransformerConfig(ModelParallelConfig):
                     "shape. Setting it after import has no effect; relaunch with it set."
                 )
 
-            # Context parallelism routes through TE's FA2 fwd/bwd kernels directly, which
-            # cannot be pinned to another version; dropout is not batch-invariant.
-            assert (
-                self.context_parallel_size == 1
-            ), "Batch invariant mode does not support context parallelism"
+            # Batch-invariant CP must give each query row the same FlashAttention call as CP=1.
+            # Under all-gather CP, TE runs one FA4 call per local query chunk on the gathered
+            # K/V prefix. P2P merges partial outputs through their LSE, so it is not invariant.
+            # Dropout is not batch-invariant.
+            if self.context_parallel_size > 1:
+                cp_comm_types = (
+                    self.cp_comm_type
+                    if isinstance(self.cp_comm_type, list)
+                    else [self.cp_comm_type]
+                )
+                assert all(cp_comm_type == "all_gather" for cp_comm_type in cp_comm_types), (
+                    "Batch invariant mode supports context parallelism only with "
+                    f"cp_comm_type='all_gather' (got {self.cp_comm_type!r})."
+                )
+                assert (
+                    self.hierarchical_context_parallel_sizes is None
+                ), "Batch invariant mode does not support hierarchical context parallelism."
             assert (
                 self.attention_dropout == 0.0
             ), "Batch invariant mode does not support attention dropout"
