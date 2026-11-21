@@ -2398,7 +2398,14 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             )
 
     @pytest.mark.internal
-    def test_mtp_kv_cache_rejects_mla_rotary_embeddings(self):
+    @pytest.mark.parametrize(
+        "position_embedding_type,accepted",
+        [("none", True), ("rope", True), ("learned_absolute", False)],
+    )
+    def test_mtp_kv_cache_position_embeddings_with_mla(self, position_embedding_type, accepted):
+        """MLA applies its own RoPE from the token positions the draft KV plane publishes, and
+        the model builds no other position embedding for it under 'rope'. Learned positions stay
+        unsupported: the commit pass gives the embedding no real positions."""
         self.setup_model(
             torch.float32,
             static=False,
@@ -2409,9 +2416,43 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
         controller = self.text_generation_controller
         assert controller.inference_wrapped_model.inference_context.enable_mtp_kv_cache
-        # MLA's position type is internal: the top-level "none" must not bypass the guard.
-        with mock.patch.object(controller.model_config, "multi_latent_attention", True):
-            with pytest.raises(ValueError, match="MTP KV caching does not support MLA"):
+        language_model = controller._language_model
+        with (
+            mock.patch.object(language_model.config, "multi_latent_attention", True),
+            mock.patch.object(language_model, "position_embedding_type", position_embedding_type),
+        ):
+            if accepted:
+                TextGenerationController(
+                    inference_wrapped_model=controller.inference_wrapped_model,
+                    tokenizer=self.mock_tokenizer,
+                )
+            else:
+                with pytest.raises(
+                    ValueError, match="MTP KV caching requires position_embedding_type='none'"
+                ):
+                    TextGenerationController(
+                        inference_wrapped_model=controller.inference_wrapped_model,
+                        tokenizer=self.mock_tokenizer,
+                    )
+
+    @pytest.mark.internal
+    def test_mla_mtp_head_without_draft_kv_cache_is_rejected(self):
+        """A head with a layer per depth gets no draft KV plane. Without one an MLA head has no
+        cached history to draft from, so the controller refuses it."""
+        self.setup_model(
+            torch.float32,
+            static=False,
+            num_speculative_tokens=2,
+            mtp_num_layers=2,
+            mtp_use_repeated_layer=False,
+            position_embedding_type="none",
+        )
+        controller = self.text_generation_controller
+        assert not controller.inference_wrapped_model.inference_context.enable_mtp_kv_cache
+        # Without MLA, such a head drafts without the plane.
+        assert controller.num_mtp_depths == 2
+        with mock.patch.object(controller._language_model.config, "multi_latent_attention", True):
+            with pytest.raises(ValueError, match="MLA MTP heads need the MTP draft KV cache"):
                 TextGenerationController(
                     inference_wrapped_model=controller.inference_wrapped_model,
                     tokenizer=self.mock_tokenizer,

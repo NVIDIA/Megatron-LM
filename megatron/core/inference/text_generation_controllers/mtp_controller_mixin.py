@@ -155,10 +155,11 @@ class MTPControllerMixin:
 
         One varlen roll-by-one forward over all active requests' committed tokens, so a committed
         position p always holds draft KV = f(h_p^main + emb(t_{p+1})) and never a stale
-        chained-draft-hidden value (the cause of depth-increasing acceptance decay). K/V are pure
-        projections of the input (no RoPE), so only the write positions matter; the output hidden
-        is discarded. `_mtp_decode_commit_segments` and `_mtp_prefill_commit_segments` derive the
-        per-request positions.
+        chained-draft-hidden value (the cause of depth-increasing acceptance decay). K/V depend
+        only on the input and the write position (MLA's RoPE reads it from the context's token
+        positions; other heads have no RoPE), so only the write positions matter; the output
+        hidden is discarded. `_mtp_decode_commit_segments` and `_mtp_prefill_commit_segments`
+        derive the per-request positions.
 
         Returns True if it issued a forward (caller runs a dummy slot otherwise for EP balance).
         """
@@ -401,7 +402,8 @@ class MTPControllerMixin:
             NVLSAllGatherVDispatcher.modify_real_token_count_for_mtp(total)
 
         token_ids = packed_tokens.view(1, -1).to(torch.long)
-        # Positions are unused for attention (no RoPE); the write positions come from the metadata.
+        # Attention takes its positions from the metadata's write maps (MLA's RoPE included), and
+        # MTP KV caching rejects learned position embeddings, so these positions are unused.
         position_ids = torch.zeros_like(token_ids)
         if padded_total > total:
             token_ids = F.pad(token_ids, (0, padded_total - total))
