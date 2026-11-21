@@ -257,6 +257,14 @@ class MlpBuilder(Protocol):
     ) -> MlpInterface: ...
 
 
+class CrossLayerState(Protocol):
+    """Microbatch-owned side inputs supplied to participating attention layers."""
+
+    def attention_kwargs(self, layer_number: int) -> dict[str, Any]:
+        """Return the attention arguments used by this layer."""
+        ...
+
+
 @dataclass
 class TransformerLayerSubmodules:
     """
@@ -671,6 +679,7 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None,
+        cross_layer_state: CrossLayerState | None = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -703,6 +712,11 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
             rotary_pos_cos_sin=rotary_pos_cos_sin,
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
+            **(
+                cross_layer_state.attention_kwargs(self.layer_number)
+                if cross_layer_state is not None
+                else {}
+            ),
             sequence_len_offset=sequence_len_offset,
         )
         nvtx_range_pop(suffix="self_attention")
@@ -776,6 +790,7 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
         padding_mask: Optional[Tensor] = None,
         input_ids: Optional[Tensor] = None,
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+        cross_layer_state: CrossLayerState | None = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -839,6 +854,11 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
                 rotary_pos_cos_sin=rotary_pos_cos_sin,
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
+                **(
+                    cross_layer_state.attention_kwargs(self.layer_number)
+                    if cross_layer_state is not None
+                    else {}
+                ),
                 sequence_len_offset=sequence_len_offset,
             )
         nvtx_range_pop(suffix="self_attention")
