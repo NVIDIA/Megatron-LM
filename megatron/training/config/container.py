@@ -493,6 +493,19 @@ class PretrainConfigContainer(ConfigContainerBase):
             use_torch_fsdp2=isinstance(self.ddp, TorchFullyShardedDataParallelConfig),
             ckpt_format=self.checkpoint.ckpt_format,
         )
+        # A conversion run saves its optimizer under --ckpt-convert-format, which the check above
+        # does not see. A skip_train run builds no optimizer, and --no-save-optim skips its state.
+        if (
+            self.checkpoint.ckpt_convert_format == "torch"
+            and self.checkpoint.save_optim
+            and not self.validation.skip_train
+            and optimizer.uses_layer_wise_distributed_optimizer()
+        ):
+            raise ValueError(
+                "--ckpt-convert-format torch does not save the state of the DistributedOptimizer "
+                "that the LayerWise layouts chain next to the layer-wise optimizer. Use "
+                "--ckpt-convert-format torch_dist, or --no-save-optim to convert the model only."
+            )
         optimizer.validate_model(
             moe_single_grouped_weight=transformer.moe_single_grouped_weight,
             virtual_pipeline_model_parallel_size=transformer.virtual_pipeline_model_parallel_size,
@@ -528,15 +541,24 @@ class PretrainConfigContainer(ConfigContainerBase):
         ):
             # Legacy checkpointing uses Gloo process groups to collect the full distributed
             # optimizer state in the CPU memory of DP rank 0. Emerging optimizers resolve to
-            # the layer-wise path at finalize and save their state separately on each rank.
+            # the layer-wise path at finalize, which rejects the legacy torch format itself
+            # (OptimizerConfig.validate_run).
             assert checkpoint.use_dist_ckpt, (
                 '--use-distributed-optimizer without Gloo process groups requires a distributed '
                 'checkpoint format (--ckpt-format torch_dist, torch_dcp or fsdp_dtensor): the legacy '
                 'torch format gathers the optimizer state through Gloo.'
             )
-            if checkpoint.dist_ckpt_optim_fully_reshardable:
-                assert not checkpoint.distrib_optim_fully_reshardable_mem_efficient, \
-                    '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
+        if (
+            not dist.use_gloo_process_groups
+            and checkpoint.dist_ckpt_optim_fully_reshardable
+            and (
+                self.optimizer.use_distributed_optimizer
+                or self.optimizer.uses_layer_wise_distributed_optimizer()
+            )
+        ):
+            # Both LayerWise layouts have a scalar DistributedOptimizer that saves over Gloo.
+            assert not checkpoint.distrib_optim_fully_reshardable_mem_efficient, \
+                '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
         if self.optimizer.overlap_param_gather and checkpoint.save is not None:
             assert checkpoint.save_params_interval is None, \
                 '--save-params-interval is not supported with --overlap-param-gather'
@@ -796,7 +818,6 @@ class PretrainConfigContainer(ConfigContainerBase):
             not isinstance(self.ddp, TorchFullyShardedDataParallelConfig)
             and not self.ddp.use_megatron_fsdp
             and self.optimizer.use_layer_wise_distributed_optimizer
-            and self.optimizer.use_layer_wise_param_layout
         )
         if transformer is not None:
             transformer.fp8_param = self.ddp.fp8_param_gather

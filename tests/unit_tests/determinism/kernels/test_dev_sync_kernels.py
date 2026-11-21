@@ -23,25 +23,44 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 
 
 def test_nonuniform_tp_mapping_replays(monkeypatch):
-    """Replay the actual CPU integer bincount used to construct NTP shard metadata."""
+    """Replay the NTP shard mapping and the resulting replicated and sharded buffer ranges."""
     from megatron.core.distributed import nonuniform_tp
 
     module = torch.nn.Linear(8, 8, bias=False)
     module.weight.tensor_model_parallel = True
     module.weight.partition_dim = 0
-    config = SimpleNamespace(tp_base=4, tp_spares=1)
+    config = nonuniform_tp.NonuniformTPConfig(tp_base=4, tp_spares=1, num_reduced_tp_dp_ranks=0)
+    ddp = nonuniform_tp.DistributedDataParallelConfig(use_distributed_optimizer=True)
     monkeypatch.setattr(nonuniform_tp.dist, "get_rank", lambda: 0)
     for name in (
         "get_data_parallel_rank",
         "get_context_parallel_rank",
         "get_pipeline_model_parallel_rank",
+        "get_tensor_model_parallel_rank",
     ):
         monkeypatch.setattr(nonuniform_tp.parallel_state, name, lambda: 0)
-    monkeypatch.setattr(nonuniform_tp, "_ntp_get_non_active_ranks", lambda *args: None)
+    monkeypatch.setattr(
+        nonuniform_tp.parallel_state, "get_tensor_model_parallel_world_size", lambda: 4
+    )
 
     def map_shards():
         nonuniform_tp.ntp_map(module, config, num_shards=16)
-        return torch.tensor(module.weight.send_splits), torch.tensor(module.weight.recv_splits)
+        ranges = []
+        for shards in (None, 2):
+            layout = nonuniform_tp._compute_ntp_per_buffer_param_layout(
+                [module.weight],
+                None,
+                2,
+                ddp,
+                config,
+                param_layout=nonuniform_tp.PerBufferParamLayout(num_optimizer_shards=shards),
+            )
+            ranges.append((*layout.side_grad_index_map[module.weight], *layout.bucket_indices[0]))
+        return (
+            torch.tensor(module.weight.send_splits),
+            torch.tensor(module.weight.recv_splits),
+            torch.tensor(ranges),
+        )
 
     assert_replays_bit_exact(map_shards, (), backward=False, what="NTP integer shard mapping")
 

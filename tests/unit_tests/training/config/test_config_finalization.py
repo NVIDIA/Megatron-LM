@@ -233,7 +233,6 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
     assert run_config.rng.te_rng_tracker
 
 
-@pytest.mark.parametrize("use_layer_wise_param_layout", [False, True])
 @pytest.mark.parametrize(
     "optimizer, use_distributed_optimizer, use_layer_wise_distributed_optimizer",
     [
@@ -244,37 +243,27 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
         ("muon", False, True),
     ],
 )
-def test_finalization_resolves_layer_wise_ddp_flag(
+def test_finalization_preserves_distributed_optimizer_intent(
     monkeypatch,
     run_config,
-    use_layer_wise_param_layout,
     optimizer,
     use_distributed_optimizer,
     use_layer_wise_distributed_optimizer,
 ):
-    monkeypatch.setattr(
-        global_vars,
-        "_GLOBAL_ARGS",
-        SimpleNamespace(
-            batch_parallel_size=1, use_layer_wise_param_layout=use_layer_wise_param_layout
-        ),
-    )
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(batch_parallel_size=1))
     run_config.train.micro_batch_size = 1
     run_config.optimizer.optimizer = optimizer
     run_config.optimizer.use_distributed_optimizer = use_distributed_optimizer
     run_config.optimizer.use_layer_wise_distributed_optimizer = use_layer_wise_distributed_optimizer
-    run_config.optimizer.use_layer_wise_param_layout = use_layer_wise_param_layout
     run_config.ddp.use_distributed_optimizer = use_distributed_optimizer
 
     run_config.finalize()
 
     layer_wise = optimizer in ("muon", "dist_muon")
     assert run_config.optimizer.use_layer_wise_distributed_optimizer is layer_wise
-    assert run_config.optimizer.use_distributed_optimizer is (not layer_wise)
-    # Resolve the wrapper's reduce-scatter layout before model construction.
-    assert run_config.ddp.use_distributed_optimizer is (
-        not layer_wise or use_layer_wise_param_layout
-    )
+    assert run_config.optimizer.use_distributed_optimizer is use_distributed_optimizer
+    # Both LayerWise layouts retain DistOpt buffers for their scalar sibling.
+    assert run_config.ddp.use_distributed_optimizer is (use_distributed_optimizer or layer_wise)
 
 
 @pytest.mark.parametrize(

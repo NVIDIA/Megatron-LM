@@ -73,6 +73,7 @@ class PerBufferParamLayout:
     bucket_indices: List[Tuple[int, int]] = field(default_factory=list)
     per_bucket_numel_unpadded: List[int] = field(default_factory=list)
     param_indices: List[int] = field(default_factory=list)
+    num_optimizer_shards: Optional[int] = None
 
 
 @dataclass
@@ -247,8 +248,17 @@ def _compute_ntp_per_buffer_param_layout(
     ddp_config: DistributedDataParallelConfig,
     ntp_config: "NonuniformTPConfig",
     param_indices: Optional[List[int]] = None,
+    *,
+    param_layout=None,
 ) -> PerBufferParamLayout:
     """Compute a buffer layout that includes side_grad storage for healthy core ranks."""
+
+    if param_layout is None:
+        num_optimizer_shards = (
+            data_parallel_world_size if ddp_config.use_distributed_optimizer else None
+        )
+    else:
+        num_optimizer_shards = param_layout.num_optimizer_shards
 
     def _does_param_require_new_bucket(param):
         return getattr(param, "shared_embedding", False)
@@ -265,11 +275,9 @@ def _compute_ntp_per_buffer_param_layout(
 
     def _finalize_bucket(param_end_index, bucket_start_index, bucket_id):
         per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
-        if ddp_config.use_distributed_optimizer:
+        if num_optimizer_shards is not None:
             bucket_end_index = pad_bucket_end(
-                param_end_index,
-                data_parallel_world_size,
-                ddp_config.pad_buckets_for_high_nccl_busbw,
+                param_end_index, num_optimizer_shards, ddp_config.pad_buckets_for_high_nccl_busbw
             )
         else:
             bucket_end_index = param_end_index
@@ -277,7 +285,7 @@ def _compute_ntp_per_buffer_param_layout(
         return bucket_end_index, bucket_id + 1
 
     for param in params[::-1]:
-        if ddp_config.use_distributed_optimizer:
+        if num_optimizer_shards is not None:
             param_start_index = pad_param_start(param_start_index)
 
         if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
@@ -310,12 +318,57 @@ def _compute_ntp_per_buffer_param_layout(
         _finalize_bucket(param_end_index, bucket_start_index, bucket_id)
 
     return PerBufferParamLayout(
+        num_optimizer_shards=num_optimizer_shards,
         param_index_map=param_index_map,
         side_grad_index_map=side_grad_index_map,
         bucket_indices=bucket_indices,
         per_bucket_numel_unpadded=per_bucket_numel_unpadded,
         param_indices=param_indices if param_indices is not None else [],
     )
+
+
+def _extend_layer_wise_layout_for_side_grads(layout, side_sizes, ddp_config):
+    """Keep each whole parameter in the optimizer's chosen bucket and DP shard."""
+    from ..optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+
+    shards = layout.num_optimizer_shards
+    alignment = LayerWiseDistributedOptimizer._shard_divisor(shards, ddp_config)
+    expanded = PerBufferParamLayout(
+        param_index_map=layout.param_index_map.copy(),
+        num_optimizer_shards=shards,
+        param_indices=layout.param_indices,
+    )
+    bucket_params = [[] for _ in layout.bucket_indices]
+    for param, (start, end, bucket) in layout.param_index_map.items():
+        bucket_params[bucket].append((start, end, param))
+
+    base = 0
+    for bucket, ((old_base, old_end), params) in enumerate(
+        zip(layout.bucket_indices, bucket_params)
+    ):
+        old_stride = (old_end - old_base) // shards
+        used = [0] * shards
+        placements = []
+        for start, end, param in sorted(params, key=lambda entry: entry[0]):
+            owner, offset = divmod(start - old_base, old_stride)
+            offset = max(offset, pad_param_start(used[owner]))
+            main_end = offset + end - start
+            used[owner] = main_end + side_sizes[param]
+            placements.append((param, owner, offset, main_end))
+
+        stride = pad_to_divisor(max(old_stride, max(used)), alignment)
+        for param, owner, offset, main_end in placements:
+            shard_start = base + owner * stride
+            end = shard_start + main_end
+            expanded.param_index_map[param] = (shard_start + offset, end, bucket)
+            if side_sizes[param]:
+                expanded.side_grad_index_map[param] = (end, end + side_sizes[param], bucket)
+        expanded.per_bucket_numel_unpadded.append(
+            layout.per_bucket_numel_unpadded[bucket] + sum(side_sizes[p] for _, _, p in params)
+        )
+        expanded.bucket_indices.append((base, base + shards * stride))
+        base += shards * stride
+    return expanded
 
 
 # ======================================================================================
@@ -882,6 +935,9 @@ def _compute_default_per_buffer_param_layout(
         _finalize_bucket(param_start_index, bucket_start_index)
 
     return PerBufferParamLayout(
+        num_optimizer_shards=(
+            data_parallel_world_size if ddp_config.use_distributed_optimizer else None
+        ),
         param_index_map=param_index_map,
         bucket_indices=bucket_indices,
         per_bucket_numel_unpadded=per_bucket_numel_unpadded,
@@ -894,40 +950,49 @@ class NonuniformTPParamAndGradBuffer(_ParamAndGradBuffer):
     Adjusts buffer sizes and keeps optimizer-visible main_grad ranges contiguous.
     """
 
-    def __init__(self, *args, ntp_config: Optional[NonuniformTPConfig] = None, **kwargs):
+    def __init__(
+        self, *args, ntp_config: Optional[NonuniformTPConfig] = None, param_layout=None, **kwargs
+    ):
         self.ntp_config = ntp_config or NonuniformTPConfig()
         ddp_config = args[0] if len(args) > 0 else kwargs['ddp_config']
         params_with_names = args[3] if len(args) > 3 else kwargs['params_with_names']
         data_parallel_group = args[4] if len(args) > 4 else kwargs['data_parallel_group']
         bucket_size = args[5] if len(args) > 5 else kwargs['bucket_size']
         param_indices = args[8] if len(args) > 8 else kwargs['param_indices']
+        param_layout = args[11] if len(args) > 11 else param_layout
         params = [param for param, _ in params_with_names]
 
-        if self.ntp_config.tp_spares > 0:
-            param_layout = _compute_ntp_per_buffer_param_layout(
-                params,
-                bucket_size,
-                data_parallel_group.size(),
-                ddp_config,
-                self.ntp_config,
-                param_indices,
-            )
-        else:
+        if self.ntp_config.tp_spares > 0 and not isinstance(param_layout, PerBufferParamLayout):
+            side_sizes = {p: _ntp_param_numel(p, self.ntp_config) - p.numel() for p in params}
+            if param_layout is None or any(side_sizes.values()):
+                if (
+                    param_layout is not None
+                    and param_layout.num_optimizer_shards is not None
+                    and getattr(params[0], 'is_managed_by_layer_wise_optimizer', False)
+                ):
+                    param_layout = _extend_layer_wise_layout_for_side_grads(
+                        param_layout, side_sizes, ddp_config
+                    )
+                else:
+                    param_layout = _compute_ntp_per_buffer_param_layout(
+                        params,
+                        bucket_size,
+                        data_parallel_group.size(),
+                        ddp_config,
+                        self.ntp_config,
+                        param_indices,
+                        param_layout=param_layout,
+                    )
+        elif param_layout is None:
             param_layout = _compute_default_per_buffer_param_layout(
                 params, bucket_size, ddp_config, data_parallel_group.size()
             )
-        self._ntp_side_grad_index_map = param_layout.side_grad_index_map
-
+        self.num_optimizer_shards = param_layout.num_optimizer_shards
+        self._ntp_side_grad_index_map = getattr(param_layout, 'side_grad_index_map', {})
         self._init_with_param_layout(*args, param_layout=param_layout, **kwargs)
 
         if self.ntp_config.tp_spares > 0:
-            for param in self.params:
-                if not _ntp_should_expand_param_grad(param, self.ntp_config):
-                    continue
-                side_range = self._ntp_side_grad_index_map.get(param)
-                if side_range is None:
-                    continue
-                side_start, side_end, _ = side_range
+            for param, (side_start, side_end, _) in self._ntp_side_grad_index_map.items():
                 side_shape = list(param.data.shape)
                 side_shape[param.partition_dim] = _ntp_extra_partition_dim(param, self.ntp_config)
                 assert torch.Size(side_shape).numel() == side_end - side_start
@@ -989,7 +1054,7 @@ class NonuniformTPParamAndGradBuffer(_ParamAndGradBuffer):
         assert self.numel_unpadded <= self.numel
         if self.has_nvfp4_params:
             assert self.nvfp4_packed_numel_unpadded <= self.nvfp4_packed_numel
-        if self.ddp_config.use_distributed_optimizer:
+        if self.num_optimizer_shards is not None:
             assert self.numel % self.data_parallel_world_size == 0
             if self.has_nvfp4_params:
                 assert self.nvfp4_packed_numel % self.data_parallel_world_size == 0
@@ -1019,7 +1084,7 @@ class NonuniformTPParamAndGradBuffer(_ParamAndGradBuffer):
             mem_alloc_context = nullcontext
 
         with mem_alloc_context():
-            if self.ddp_config.use_distributed_optimizer and any(
+            if self.num_optimizer_shards is not None and any(
                 pgb.is_mxfp8tensor(p) for p in self.params
             ):
                 self.shared_buffer = torch.zeros(
@@ -1036,7 +1101,7 @@ class NonuniformTPParamAndGradBuffer(_ParamAndGradBuffer):
                     self.param_data = self.shared_buffer
                 self.grad_data = self.shared_buffer
             else:
-                if self.ddp_config.use_distributed_optimizer:
+                if self.num_optimizer_shards is not None:
                     numel = self.nvfp4_packed_numel if self.has_nvfp4_params else self.numel
                     self.param_data = torch.zeros(
                         numel,
@@ -1191,12 +1256,12 @@ class NonuniformTPParamAndGradBuffer(_ParamAndGradBuffer):
 
     def _compute_nvfp4_packed_layout(self, params_with_names):
         def _pad_start_of_param(param_start_index: int) -> int:
-            if self.ddp_config.use_distributed_optimizer:
+            if self.num_optimizer_shards is not None:
                 return pad_param_start(param_start_index)
             return param_start_index
 
         def _pad_end_of_bucket(bucket_end_index: int) -> int:
-            if self.ddp_config.use_distributed_optimizer:
+            if self.num_optimizer_shards is not None:
                 return pad_bucket_end(
                     bucket_end_index,
                     self.data_parallel_world_size,
@@ -1328,10 +1393,7 @@ class NonuniformTPDistributedDataParallel(DistributedDataParallel):
             wrapped_groups = []
             old_to_new = {}
             for bucket_group in bucket_groups:
-                if (
-                    self.ddp_config.use_distributed_optimizer
-                    or self.ddp_config.overlap_param_gather
-                ):
+                if bucket_group.param_sync_via_bucket_group:
                     collective_group = bucket_group.intra_distributed_optimizer_instance_group
                     collective_group_size = bucket_group.intra_distributed_optimizer_instance_size
                 else:
@@ -1343,6 +1405,7 @@ class NonuniformTPDistributedDataParallel(DistributedDataParallel):
                     bucket_group.ddp_config,
                     collective_group,
                     collective_group_size,
+                    num_optimizer_shards=bucket_group.num_optimizer_shards,
                     ntp_config=self.ntp_config,
                 )
                 if hasattr(bucket_group, 'inter_distributed_optimizer_instance_group'):

@@ -178,7 +178,6 @@ ARGS:
   fp8_recipe: mxfp8
   fp8_format: e4m3
   fp8_param_gather: true
-  reuse_grad_buf_for_mxfp8_param_ag: true
   moe_router_padding_for_quantization: true
   dsa_kernel_backend: cudnn
   init_method_std: 0.02
@@ -210,4 +209,4 @@ ARGS:
   num_workers: 0
   num_dataset_builder_threads: 1
   pipeline_p2p_fixed_shape: true
-  no_use_layer_wise_param_layout: true
+  second_order_optimizer_grad_collective: all-reduce

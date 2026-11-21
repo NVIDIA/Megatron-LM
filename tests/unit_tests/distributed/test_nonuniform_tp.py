@@ -25,18 +25,19 @@ from megatron.core.distributed.nonuniform_tp import (
     NonuniformTPDistributedDataParallel,
     NonuniformTPParamAndGradBucketGroup,
     NonuniformTPParamAndGradBuffer,
-    _compute_ntp_per_buffer_param_layout,
     compute_uniform_tp_spares_with_parity,
     get_active_ranks_for_dp,
     initialize_nonuniform_tp_process_groups,
     ntp_init,
     ntp_map,
 )
+from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBucketGroup
 from megatron.core.extensions.nonuniform_tp_transformer_engine import (
     initialize_transformer_engine_userbuffers_for_nonuniform_tp,
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.optimizer.param_layout import PerBufferParamLayout
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -160,8 +161,15 @@ class TestNonuniformTPUtilities:
 class TestNonuniformTPBufferLayout:
     """Test NTP gradient-buffer layout compatibility with DDP buffer features."""
 
+    @pytest.mark.parametrize(
+        ("shards", "layer_wise"),
+        [(None, True), (2, False), (2, True)],
+        ids=["compact-layer-wise", "distributed-optimizer", "padded-layer-wise"],
+    )
     @patch('megatron.core.distributed.nonuniform_tp.parallel_state')
-    def test_layout_expands_side_grad_and_pads_for_distributed_optimizer(self, mock_parallel_state):
+    def test_layout_expands_side_grad_and_pads_for_distributed_optimizer(
+        self, mock_parallel_state, shards, layer_wise
+    ):
         """Healthy core ranks need side_grad storage and DistOpt-compatible padding."""
         mock_parallel_state.get_data_parallel_rank.return_value = 1
         mock_parallel_state.get_context_parallel_rank.return_value = 0
@@ -169,7 +177,8 @@ class TestNonuniformTPBufferLayout:
         mock_parallel_state.get_tensor_model_parallel_world_size.return_value = 4
         mock_parallel_state.get_tensor_model_parallel_rank.return_value = 0
 
-        param = torch.nn.Parameter(torch.randn(4, 2))
+        param = torch.nn.Parameter(torch.randn(4, 10))
+        param.is_managed_by_layer_wise_optimizer = layer_wise
         param.tensor_model_parallel = True
         param.partition_dim = 0
         param.send_splits = [[0, 0, 0, 0] for _ in range(4)]
@@ -180,20 +189,48 @@ class TestNonuniformTPBufferLayout:
             tp_base=4, tp_spares=2, non_active_ranks_per_dp={(0, 0, 0): [2, 3]}
         )
 
-        layout = _compute_ntp_per_buffer_param_layout(
-            [param],
-            bucket_size=None,
-            data_parallel_world_size=2,
-            ddp_config=ddp_config,
-            ntp_config=ntp_config,
+        group = Mock()
+        group.size.return_value = 2
+        group.rank.return_value = 0
+        # In the padded LayerWise case the original optimizer placed the weight on DP rank 1.
+        start = 64 if shards and layer_wise else 0
+        layout = PerBufferParamLayout(
+            param_index_map={param: (start, start + 40, 0)},
+            bucket_indices=[(0, 40 if shards is None else 128)],
+            per_bucket_numel_unpadded=[40],
             param_indices=[0],
+            num_optimizer_shards=shards,
         )
-
-        assert layout.param_index_map[param] == (0, 8, 0)
-        assert layout.side_grad_index_map[param] == (8, 16, 0)
-        assert layout.per_bucket_numel_unpadded == [16]
-        assert layout.bucket_indices == [(0, 128)]
-        assert layout.param_indices == [0]
+        with patch('torch.cuda.current_device', return_value='cpu'):
+            buffer = NonuniformTPParamAndGradBuffer(
+                ddp_config,
+                param.dtype,
+                param.dtype,
+                [(param, "weight")],
+                group,
+                None,
+                {param: "weight"},
+                1.0,
+                [0],
+                False,
+                ProcessGroupCollection(tp=group, dp_cp=group),
+                ntp_config=ntp_config,
+                param_layout=layout,
+            )
+        assert buffer.num_optimizer_shards == shards
+        assert (buffer.param_data is None) == (shards is None)
+        # The expanded weight needs 80 elements. A 64-element LayerWise shard must grow
+        # to 128 while retaining its original owner, DP rank 1.
+        start = 128 if shards and layer_wise else 0
+        assert buffer.param_index_map[param] == (start, start + 40, 0)
+        assert buffer._ntp_side_grad_index_map[param] == (start + 40, start + 80, 0)
+        assert buffer.numel_unpadded == 80
+        assert buffer.bucket_indices == [(0, start + 128 if shards else 80)]
+        assert buffer.param_indices == [0]
+        param.side_grad.fill_(3)
+        torch.testing.assert_close(
+            buffer.grad_data[start + 40 : start + 80], torch.full((40,), 3.0)
+        )
 
 
 class TestNonuniformTPParameterResharding:
@@ -387,23 +424,20 @@ class TestNonuniformTPDDPCompatibility:
             def rank(self):
                 return self._rank
 
-        class FakeBucketGroup:
-            def __init__(self, ddp_config):
-                self.buckets = []
-                self.ddp_config = ddp_config
-                self.intra_distributed_optimizer_instance_group = FakeGroup()
-                self.intra_distributed_optimizer_instance_size = 2
-                self.inter_distributed_optimizer_instance_group = 'inter-group'
-                self.communication_stream = 'comm-stream'
-                self.next_param_gather_bucket_group = None
-
         ddp_config = DistributedDataParallelConfig(
             use_distributed_optimizer=True,
             overlap_param_gather=True,
             num_distributed_optimizer_instances=2,
         )
-        first_group = FakeBucketGroup(ddp_config)
-        second_group = FakeBucketGroup(ddp_config)
+        collective_group = FakeGroup()
+        first_group = _ParamAndGradBucketGroup(
+            [], ddp_config, collective_group, 2, num_optimizer_shards=None
+        )
+        second_group = _ParamAndGradBucketGroup(
+            [], ddp_config, collective_group, 2, num_optimizer_shards=2
+        )
+        second_group.inter_distributed_optimizer_instance_group = 'inter-group'
+        second_group.communication_stream = 'comm-stream'
         second_group.next_param_gather_bucket_group = first_group
 
         ntp_ddp = object.__new__(NonuniformTPDistributedDataParallel)
@@ -418,6 +452,10 @@ class TestNonuniformTPDDPCompatibility:
         wrapped_first, wrapped_second = ntp_ddp.bucket_groups
         assert isinstance(wrapped_first, NonuniformTPParamAndGradBucketGroup)
         assert isinstance(wrapped_second, NonuniformTPParamAndGradBucketGroup)
+        assert wrapped_first.num_optimizer_shards is None
+        assert wrapped_first.data_parallel_group is collective_group
+        assert wrapped_second.num_optimizer_shards == 2
+        assert wrapped_second.intra_distributed_optimizer_instance_group is collective_group
         assert wrapped_second.next_param_gather_bucket_group is wrapped_first
         assert wrapped_second.inter_distributed_optimizer_instance_group == 'inter-group'
         assert wrapped_second.communication_stream == 'comm-stream'
