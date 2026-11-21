@@ -242,6 +242,92 @@ def test_checkpoint_compacts_at_consumption_boundary(tmp_path, consumed_offset, 
         }
 
 
+def test_groups_collected_after_rollback_keep_unique_uids(tmp_path):
+    """Groups collected after a rollback must not reuse a recovered survivor's uid.
+
+    Recovery rewrites survivors into the checkpoint's segment under their original
+    uids. A reused uid shares the survivor's consumption marker, so the next
+    compaction would drop the fresh group while it is still queued.
+    """
+    bank = RolloutBank(str(tmp_path))
+    bank.set_collection(4)
+    trained = bank.append(_token_group())
+    bank.mark_consumed(trained, 5)
+    bank.set_collection(5)
+    queued = bank.append(_token_group())
+    bank.close()
+
+    restarted = RolloutBank(str(tmp_path))
+    survivors = restarted.recover(4)
+    assert {group.uid for group in survivors} == {trained, queued}
+    restarted.set_collection(4)
+    restarted.mark_consumed_many([group.uid for group in survivors], 5)
+    restarted.set_collection(5)
+    fresh = restarted.append(_token_group())
+    assert fresh not in {trained, queued}
+
+    # The fresh group is still queued at the next checkpoint, so it must survive it.
+    restarted.checkpoint(5)
+    restarted.close()
+    assert [group.uid for group in RolloutBank(str(tmp_path)).recover(5)] == [fresh]
+
+
+def test_append_after_checkpoint_reopens_current_collection(tmp_path):
+    """A group appended after a checkpoint and before the next collection is banked."""
+    bank = RolloutBank(str(tmp_path))
+    bank.set_collection(3)
+    trained = bank.append(_token_group())
+    bank.mark_consumed(trained, 4)
+    queued = bank.append(_token_group())
+    bank.checkpoint(4)
+
+    late = bank.append(_token_group())
+    assert late not in {trained, queued}
+    bank.close()
+    assert {group.uid for group in RolloutBank(str(tmp_path)).restore(4)} == {queued, late}
+
+
+def test_pipeline_banks_groups_completed_after_a_checkpoint(tmp_path):
+    """The pipeline runs whenever the event loop does, so it can complete a group after
+    a checkpoint compacts the bank and before the next collection selects its segment."""
+    release = asyncio.Event()
+
+    class LateInference(MockInferenceInterface):
+        async def base_generate(self, request):
+            if int(request.prompt[0].content.removeprefix("t")) >= 2:
+                await release.wait()
+            return await super().base_generate(request)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    bank = RolloutBank(str(tmp_path))
+    request = GroupedRolloutRequest(
+        num_groups=2, rollouts_per_group=1, inference_interface=LateInference()
+    )
+    # One batch of generation lag: batch 2 is in flight when batch 1 is consumed.
+    pipeline = RolloutPipeline(
+        MockGenerator(), request, parallel_generation_tasks=2, bank=bank, initial_batch_id=1
+    )
+    groups = pipeline.run()
+    try:
+        bank.set_collection(1)
+        first = [loop.run_until_complete(anext(groups)) for _ in range(2)]
+        bank.mark_consumed_many([group.uid for group in first], 2)
+        bank.checkpoint(2)
+        release.set()  # batch 2 completes before the next collection
+        pipeline.settle(loop)  # as the trainer does before deciding to skip inference
+        second = [loop.run_until_complete(anext(groups)) for _ in range(2)]
+    finally:
+        loop.run_until_complete(groups.aclose())
+        loop.close()
+        asyncio.set_event_loop(None)
+
+    assert sorted(group.rollouts[0].trajectory[0] for group in second) == ["t2", "t3"]
+    bank.close()
+    durable = {group.uid for group in RolloutBank(str(tmp_path)).restore(2)}
+    assert {group.uid for group in second} <= durable
+
+
 def _env_group(env_id, problem_id):
     return RolloutGroup(
         rollouts=[Rollout(trajectory=["cached"], reward=1.0, env_id=env_id, problem_id=problem_id)]
