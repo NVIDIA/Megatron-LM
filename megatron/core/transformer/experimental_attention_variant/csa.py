@@ -1598,6 +1598,7 @@ class CompressedSparseAttention(MegatronModule):
                     indexer.index_topk,
                     indexer.softmax_scale,
                     max_seqlen_q=max_seqlen_q,
+                    deterministic=self.config.deterministic_mode,
                 )
                 nvtx_range_pop("dsv4_cp_indexer_topk")
 
@@ -1611,6 +1612,11 @@ class CompressedSparseAttention(MegatronModule):
 
         use_indexer_loss = (
             training_with_grad and compressed_topk is not None and indexer_loss_coeff > 0
+        )
+        # Match the training reduction order even when no-grad disables the
+        # auxiliary loss. Both paths compact this compressed-first layout.
+        compressed_first = use_indexer_loss or (
+            self.config.deterministic_mode and compressed_topk is not None
         )
 
         # ---- Step 6: concatenate the raw local KV sources -------------------
@@ -1657,7 +1663,7 @@ class CompressedSparseAttention(MegatronModule):
             compressed_topk,
             cu_seqlens_compressed=cu_seqlens_compressed,
             seq_to_rank_row=seq_to_rank_row,
-            for_indexer_loss=use_indexer_loss,
+            for_indexer_loss=compressed_first,
             compressed_rows=compressed_kv_rank_major.shape[0],
             cu_seqlens_unpadded=cu_seqlens_q_unpadded,
             output_alignment=get_flash_mla_topk_alignment(),
@@ -1707,6 +1713,8 @@ class CompressedSparseAttention(MegatronModule):
                 self.window_size,
                 kv_reconstruction_parts,
                 out_rope,
+                # Optional flags follow the existing output-RoPE argument.
+                self.config.deterministic_mode,
             )
             DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                 loss=indexer_loss,
@@ -1728,6 +1736,7 @@ class CompressedSparseAttention(MegatronModule):
             kv_reconstruction_parts=kv_reconstruction_parts,
             q_padding_mask=q_padding_mask,
             out_rope=out_rope,
+            deterministic=self.config.deterministic_mode,
         )
         if training_with_grad and indexer is not None:
             # Zero loss or a pack without compressed keys still needs explicit
