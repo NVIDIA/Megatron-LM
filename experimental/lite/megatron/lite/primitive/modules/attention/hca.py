@@ -1,6 +1,4 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -40,7 +38,7 @@ def split_sinkhorn(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Split the mHC mapping and project ``comb`` to a doubly stochastic matrix."""
     pre, post, comb_logits = _split_mixes(mixes, hc_scale, hc_base, hc_mult)
-    return pre, post, fused_sinkhorn(comb_logits, iters, eps)
+    return pre + eps, post, fused_sinkhorn(comb_logits, iters, eps)
 
 
 class HyperConnection(nn.Module):
@@ -66,13 +64,12 @@ class HyperConnection(nn.Module):
             x = x.unsqueeze(2).expand(*x.shape[:2], self.hc_mult, x.size(-1))
         shape, dtype = x.shape, x.dtype
         xf = x.flatten(2)
-        rms_inv = 1.0 / (xf.norm(dim=-1, keepdim=True) / math.sqrt(xf.shape[-1]) + self.eps)
+        rms_inv = torch.rsqrt(xf.square().mean(dim=-1, keepdim=True) + self.eps)
         mixes = F.linear(xf, self.fn.to(device=x.device, dtype=dtype)) * rms_inv
         pre, post, comb = split_sinkhorn(
             mixes, self.scale, self.base, self.hc_mult, self.sinkhorn_iters, self.eps
         )
-        # ``fused_h_aggregate`` is ``(x * h_pre.unsqueeze(-1)).sum(dim=2)``, the same expression written here, so this is a kernel swap and not a
-        # change of formula -- unlike the Sinkhorn and compute_h helpers next to it, which differ from Core in their regularisation.
+        # ``fused_h_aggregate`` computes ``(x * h_pre.unsqueeze(-1)).sum(dim=2)``.
         xs = xf.view(shape)
         y = fused_h_aggregate(xs, pre)
         return y.to(dtype), post, comb
@@ -82,7 +79,6 @@ class HyperConnection(nn.Module):
         x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor
     ) -> torch.Tensor:
         dtype = x.dtype
-        # Core defines the mixing term as ``h_res.T @ residual`` while this module carries ``comb`` in the opposite orientation, so the
-        # transpose converts between the two conventions rather than being a layout tweak: passing ``comb`` unchanged silently computes a different residual mixing.
-        h_res = comb.to(dtype).transpose(-1, -2).contiguous()
+        # comb[source, destination]; the fused kernel already applies comb.T.
+        h_res = comb.to(dtype).contiguous()
         return fused_h_post_bda(h_res, residual.to(dtype), post.to(dtype), x, None)
