@@ -190,10 +190,11 @@ class _IndexWriter(object):
 
             document_indices (List[int]): The seqyebce indices demarcating the end of each document
         """
-        sequence_pointers = self._sequence_pointers(sequence_lengths)
+        sequence_lengths_array: numpy.ndarray = numpy.asarray(sequence_lengths, dtype=numpy.int32)
+        sequence_pointers = self._sequence_pointers(sequence_lengths_array)
 
         # the number of sequences in the dataset
-        sequence_count = len(sequence_lengths)
+        sequence_count = len(sequence_lengths_array)
         self.idx_writer.write(struct.pack("<Q", sequence_count))
 
         # the number of documents in the dataset
@@ -201,10 +202,10 @@ class _IndexWriter(object):
         self.idx_writer.write(struct.pack("<Q", document_count))
 
         # the number of tokens per sequence
-        self.idx_writer.write(numpy.array(sequence_lengths, dtype=numpy.int32).tobytes(order="C"))
+        self.idx_writer.write(sequence_lengths_array.tobytes(order="C"))
 
         # the byte offsets for all sequences
-        self.idx_writer.write(numpy.array(sequence_pointers, dtype=numpy.int64).tobytes(order="C"))
+        self.idx_writer.write(sequence_pointers.tobytes(order="C"))
 
         # the sequence indices marking the end of each document
         self.idx_writer.write(numpy.array(document_indices, dtype=numpy.int64).tobytes(order="C"))
@@ -215,22 +216,24 @@ class _IndexWriter(object):
 
     def _sequence_pointers(
         self, sequence_lengths: Iterable[Union[int, numpy.integer]]
-    ) -> List[int]:
+    ) -> numpy.ndarray:
         """Build the sequence pointers per the sequence lengths and dtype size
 
         Args:
             sequence_lengths (List[int]): The length of each sequence
 
         Returns:
-            List[int]: The pointer to the beginning of each sequence
+            numpy.ndarray: The pointer to the beginning of each sequence
         """
-        itemsize = numpy.int64(DType.size(self.dtype))
-        curr_ptr = numpy.int64(0)
-        list_ptr = []
-        for length in sequence_lengths:
-            list_ptr.append(curr_ptr.item())
-            curr_ptr += length * itemsize
-        return list_ptr
+        sequence_lengths_array: numpy.ndarray = numpy.asarray(sequence_lengths)
+        sequence_pointers: numpy.ndarray = numpy.empty(
+            len(sequence_lengths_array), dtype=numpy.int64
+        )
+        if sequence_pointers.size > 0:
+            sequence_pointers[0] = 0
+            numpy.cumsum(sequence_lengths_array[:-1], dtype=numpy.int64, out=sequence_pointers[1:])
+            sequence_pointers *= DType.size(self.dtype)
+        return sequence_pointers
 
 
 class _IndexReader(object):
