@@ -5,7 +5,6 @@ from contextlib import nullcontext
 
 from torch import Tensor
 
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.transformer.identity_op import IdentityOp
@@ -17,7 +16,6 @@ from megatron.core.transformer.residual_recompute import ResidualStreamRecompute
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
-    apply_combined_residual_keys,
     load_residual_state,
 )
 from megatron.core.typed_torch import apply_module
@@ -83,14 +81,6 @@ class WideResidualMambaLayer(MambaLayer):
                 f"hidden_size={self.config.hidden_size}, got "
                 f"{self.residual_read.branch_hidden_size}."
             )
-
-    def sharded_state_dict(
-        self, prefix: str = "", sharded_offsets: tuple = (), metadata: dict | None = None
-    ) -> ShardedStateDict:
-        """Build the sharded state dict, using combined residual keys when loading them."""
-        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
-        apply_combined_residual_keys(sharded_state_dict, prefix, metadata)
-        return sharded_state_dict
 
     def _get_residual_connection(self):
         """Return the connection surrounding the Mamba mixer."""

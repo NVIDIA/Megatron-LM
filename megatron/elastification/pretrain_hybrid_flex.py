@@ -221,7 +221,6 @@ def get_batch(data_iterator, vp_stage=None):
         mtp_num_layers=config.mtp_num_layers,
         ignore_virtual=False,
         vp_stage=vp_stage,
-        pp_group=mpu.get_pipeline_model_parallel_group(),
     )
 
     if (

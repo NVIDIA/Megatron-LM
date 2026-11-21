@@ -38,7 +38,7 @@ class MTPSplit:
 
 
 # A hybrid architecture entry is a layer config instance or a bare PipelineSplit/MTPSplit class.
-# Parsing accepts built-in configs and configs with a direct layer_type, validating markers.
+# Parsing enforces the supported config types and marker placement within each section.
 HybridLayerEntry: TypeAlias = TransformerConfig | type[PipelineSplit] | type[MTPSplit]
 
 
@@ -96,16 +96,14 @@ class ParsedHybridConfigList:
 def _validate_layer_config_sequence(
     layer_configs: Sequence[TransformerConfig], section_name: str
 ) -> None:
-    """Validate built-in/custom config contracts and shared attention compatibility."""
+    """Validate exact config types and attention-family compatibility."""
     config_types = set()
     supported_types = set(Symbols.LAYER_CONFIG_MAP.values())
     for index, layer_config in enumerate(layer_configs):
-        custom_layer_type = layer_utils.get_custom_layer_type(layer_config)
-        if type(layer_config) not in supported_types and custom_layer_type is None:
+        if type(layer_config) not in supported_types:
             raise ValueError(
                 f"{section_name} entry {index} has unsupported hybrid layer config type "
-                f"{type(layer_config).__name__}. Expected an exact built-in layer config type "
-                "or a TransformerConfig with a MegatronModule layer_type."
+                f"{type(layer_config).__name__}. Exact built-in layer config types are required."
             )
         config_types.add(type(layer_config))
 

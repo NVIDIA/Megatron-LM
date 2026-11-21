@@ -6,11 +6,9 @@ from typing import List, Optional, Tuple
 import torch
 from torch import Tensor
 
-from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin
 from megatron.core.fp8_utils import is_first_last_bf16_layer
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
 from megatron.core.tensor_parallel.random import MHCCheckpointManager
@@ -27,7 +25,7 @@ from megatron.core.transformer.module import (
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
-class HyperConnectionHybridLayer(TECudaGraphMixin, GraphableMegatronModule):
+class HyperConnectionHybridLayer(GraphableMegatronModule):
     """Layer-boundary mHC wrapper for HybridStack layers.
 
     Hybrid layers already own their local residual paths. For this initial
@@ -47,10 +45,10 @@ class HyperConnectionHybridLayer(TECudaGraphMixin, GraphableMegatronModule):
     which subclasses `TransformerLayer` and only adds new sibling fields,
     keeping all base keys stable.
 
-    CUDA graphs: this wrapper subclasses ``TECudaGraphMixin`` so that, with
+    CUDA graphs: this wrapper subclasses ``GraphableMegatronModule`` so that, with
     ``cuda_graph_impl="transformer_engine"``, wrapped layers are captured per-layer —
     mirroring ``HyperConnectionTransformerLayer`` on the GPT path. Without this, the TE
-    graph discovery (``is_graphable_for_scope``) only inspects the top-level layer and
+    graph discovery (``_layer_is_graphable``) only inspects the top-level layer type and
     silently skips every wrapped layer, so an mHC-enabled HybridStack would run entirely
     eager. Capture modes:
 
@@ -125,6 +123,7 @@ class HyperConnectionHybridLayer(TECudaGraphMixin, GraphableMegatronModule):
         # boundary. Reuse the inner Transformer's interface instead of reaching across
         # modules for its private factory. Only TransformerLayer-backed wrappers can
         # report an offload boundary in ``offload_module_in_cuda_graph``.
+        self.off_interface = layer.off_interface if isinstance(layer, TransformerLayer) else None
         if config.params_dtype is not None:
             convert_module_to_dtype_except_fp32_marked(self.hyper_connection, config.params_dtype)
         if hasattr(layer, 'tp_group'):
@@ -140,41 +139,6 @@ class HyperConnectionHybridLayer(TECudaGraphMixin, GraphableMegatronModule):
                 and isinstance(self.inner_layer.cross_attention, IdentityOp)
             )
         )
-
-    def is_graphable_for_scope(self, modules):
-        """Decide TE graphability from the wrapped layer and the requested scope.
-
-        Non-MoE inner layers are captured as one whole-wrapper graph (mHC aggregate + inner
-        layer + BDA). MoE inner layers use partial capture: the wrapper graphs the
-        deterministic prefix (mHC aggregate + router/preprocess) and runs the expert
-        all-to-all and the mHC BDA eagerly, mirroring ``HyperConnectionTransformerLayer``.
-        """
-        if not modules:
-            return True
-        # Import here to avoid a circular import.
-        from megatron.core.ssm.mamba_layer import MambaLayer
-        from megatron.core.transformer.mlp import MLP
-        from megatron.core.transformer.moe.moe_layer import MoELayer
-
-        inner = self.inner_layer
-        if isinstance(inner, MambaLayer) and CudaGraphModule.mamba in modules:
-            return True
-        if isinstance(inner, TransformerLayer):
-            if isinstance(inner.mlp, MoELayer):
-                # An attention-only scope on an MoE inner layer leaves it eager.
-                return (
-                    CudaGraphModule.moe in modules
-                    or CudaGraphModule.moe_router in modules
-                    or CudaGraphModule.moe_preprocess in modules
-                )
-            if CudaGraphModule.attn in modules and not (
-                isinstance(inner.self_attention, IdentityOp)
-                and isinstance(inner.cross_attention, IdentityOp)
-            ):
-                return True
-            if CudaGraphModule.mlp in modules and isinstance(inner.mlp, MLP):
-                return True
-        return False
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """Use one stream for split attention, and n streams for whole-wrapper capture.
@@ -382,7 +346,7 @@ class HyperConnectionHybridLayer(TECudaGraphMixin, GraphableMegatronModule):
 
     def _get_active_te_cuda_graph_group_tail(self) -> Optional['HyperConnectionHybridLayer']:
         """Return the grouped tail only while this layer is replaying training graphs."""
-        if self.training and getattr(self, 'te_cuda_graphs', None):
+        if self.training and getattr(self, 'cuda_graphs', None):
             return self._get_te_cuda_graph_group_tail()
         return None
 
@@ -429,7 +393,7 @@ class HyperConnectionHybridLayer(TECudaGraphMixin, GraphableMegatronModule):
         # callable. Place the offload events at this outer boundary so every D2H/H2D
         # stream dependency belongs to the graph being captured.
         offload_in_graph = self.offload_module_in_cuda_graph
-        off_interface = self.get_offload_interface()
+        off_interface = self.off_interface
         if offload_in_graph:
             assert off_interface is not None, (
                 "offload_module_in_cuda_graph requires a TransformerLayer-backed "
@@ -583,7 +547,7 @@ class HyperConnectionHybridLayer(TECudaGraphMixin, GraphableMegatronModule):
             output_slot=output_slot,
             return_residual=True,
         )
-        outputs = self._te_cuda_graph_replay_graph(aggregated, **graph_kwargs)
+        outputs = super()._te_cuda_graph_replay(aggregated, **graph_kwargs)
         if isinstance(outputs, Tensor):
             outputs = (outputs,)
         if len(outputs) not in (1, 2):
@@ -609,24 +573,17 @@ class HyperConnectionHybridLayer(TECudaGraphMixin, GraphableMegatronModule):
             return self._replay_mhc_attention_cuda_graph(args, kwargs)
 
         group_tail = self._get_te_cuda_graph_group_tail()
-        # Replay only the graph: delayed expert offload is outside Hybrid CUDA Graph support,
-        # so the mixin's delayed-offload queue handling in _te_cuda_graph_replay is skipped.
-        cuda_graph_output = list(self._te_cuda_graph_replay_graph(*args, **kwargs))
-        padding_mask = kwargs.get("padding_mask")
+        cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **kwargs))
 
         if group_tail is not None:
-            return group_tail._resume_partial_moe_cuda_graph(
-                cuda_graph_output, padding_mask=padding_mask
-            )
+            return group_tail._resume_partial_moe_cuda_graph(cuda_graph_output)
 
         if self._inner_is_partial_moe_capture():
-            return self._resume_partial_moe_cuda_graph(cuda_graph_output, padding_mask=padding_mask)
+            return self._resume_partial_moe_cuda_graph(cuda_graph_output)
 
         return cuda_graph_output[0], None
 
-    def _resume_partial_moe_cuda_graph(
-        self, out: List[Tensor], padding_mask: Optional[Tensor] = None
-    ) -> Tuple[Tensor, Optional[Tensor]]:
+    def _resume_partial_moe_cuda_graph(self, out: List[Tensor]) -> Tuple[Tensor, Optional[Tensor]]:
         """Run the eager expert/BDA tail from captured router/preprocess outputs."""
         assert self._inner_is_partial_moe_capture()
         residual = out.pop()  # n-stream [s, b, n*C] — graph output (see capture)
@@ -636,14 +593,7 @@ class HyperConnectionHybridLayer(TECudaGraphMixin, GraphableMegatronModule):
         # then let the n-stream BDA own the residual — identical to the eager forward
         # (`_call_inner_transformer_layer_without_local_bda` fast path →
         # fused_h_res_h_post_bda), just with the router/preprocess prefix graphed.
-        assert not self.config.overlap_moe_expert_parallel_comm, (
-            "HyperConnectionHybridLayer MoE CUDA-graph capture requires "
-            "overlap_moe_expert_parallel_comm=False."
-        )
-        # The inner layer's residual is the last captured element. The n-stream BDA owns
-        # the residual combine, so drop it before resuming the experts.
-        out.pop()
-        mlp_output_with_bias = self.inner_layer.mlp._te_cuda_graph_resume(out, padding_mask)
+        mlp_output_with_bias = self.inner_layer.resume_moe_experts_after_partial_cudagraph(out)
         hidden_states = self.hyper_connection.fused_h_res_h_post_bda(
             h_res,
             residual,
@@ -707,17 +657,6 @@ class HyperConnectionHybridLayer(TECudaGraphMixin, GraphableMegatronModule):
         input_ids: Optional[Tensor] = None,
         packed_sequence_cp_metadata: Optional[PackedSequenceCPMetadata] = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
-        if layer_utils.get_custom_layer_type(getattr(self.inner_layer, "config", None)) is not None:
-            output = layer_utils.invoke_custom_layer(
-                self.inner_layer,
-                hidden_states,
-                attention_mask=attention_mask,
-                rotary_pos_emb=rotary_pos_emb,
-                packed_seq_params=packed_seq_params,
-                padding_mask=padding_mask,
-                input_ids=input_ids,
-            )
-            return output, None
         # When this wrapper is itself being CUDA-graph captured, the inner layer
         # must run as a plain forward: routing through its ``__call__`` would
         # trigger nested TE graph capture (the inner layer is also a
@@ -783,8 +722,6 @@ class HyperConnectionHybridLayer(TECudaGraphMixin, GraphableMegatronModule):
         GPT mHC path and avoiding a residual add followed by `layer_output - aggregated`.
         """
         if not isinstance(self.inner_layer, TransformerLayer):
-            return None
-        if layer_utils.get_custom_layer_type(self.inner_layer.config) is not None:
             return None
 
         layer = self.inner_layer

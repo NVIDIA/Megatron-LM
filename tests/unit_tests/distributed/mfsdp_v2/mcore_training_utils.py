@@ -5,8 +5,6 @@
 import contextlib
 
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
-from megatron.core.distributed.fsdp.mcore_adapter_v2 import FullyShardedDataParallelV2
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import GradientFinalizationMode
 
 
 # Emulate MCore's training loop without its global state.
@@ -23,14 +21,11 @@ def run_forward_backward_on_microbatches(
     is_data_parallel = isinstance(model, _BaseDataParallel)
     losses = []
     for index in range(num_microbatches):
-        if is_data_parallel and index < num_microbatches - 1:
-            sync_context = model.no_sync()
-        elif isinstance(model, FullyShardedDataParallelV2):
-            sync_context = model.module.context.finalize_gradients(
-                mode=GradientFinalizationMode.REDUCE_OUTER
-            )
-        else:
-            sync_context = contextlib.nullcontext()
+        sync_context = (
+            model.no_sync()
+            if is_data_parallel and index < num_microbatches - 1
+            else contextlib.nullcontext()
+        )
         with sync_context:
             loss = forward_one_microbatch()
             (loss * loss_scale).backward()

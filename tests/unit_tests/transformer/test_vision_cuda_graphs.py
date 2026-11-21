@@ -18,7 +18,6 @@ from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     init_num_microbatches_calculator,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
@@ -27,9 +26,9 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.transformer.cuda_graphs import (
     HAVE_TE_GRAPHS,
     VisionTECudaGraphHelper,
-    _te_cuda_graph_layer_is_graphable,
-    _wrap_te_cuda_graph_for_vision,
-    get_vision_te_cuda_graph_seq_length,
+    _layer_is_graphable,
+    _wrap_graph_for_vision,
+    get_vision_cuda_graph_seq_length,
 )
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
@@ -48,13 +47,13 @@ if not _te_version_ok and __name__ != "__main__":
 
 
 # ---------------------------------------------------------------------------
-# Tests for _te_cuda_graph_layer_is_graphable
+# Tests for _layer_is_graphable
 # ---------------------------------------------------------------------------
 class TestVisionLayerIsGraphable:
     def test_non_transformer_layer_returns_false(self):
         config = SimpleNamespace(cuda_graph_impl="transformer_engine")
         layer = torch.nn.Linear(4, 4)
-        assert _te_cuda_graph_layer_is_graphable(layer, config) is False
+        assert _layer_is_graphable(layer, config) is False
 
     @pytest.mark.flaky
     @pytest.mark.flaky_in_dev
@@ -64,7 +63,7 @@ class TestVisionLayerIsGraphable:
         config = SimpleNamespace(cuda_graph_impl="local")
         layer = MagicMock(spec=TransformerLayer)
         # isinstance check with MagicMock(spec=...) should pass
-        assert _te_cuda_graph_layer_is_graphable(layer, config) is False
+        assert _layer_is_graphable(layer, config) is False
 
     def test_correct_config_with_transformer_layer(self):
         """Real TransformerLayer + cuda_graph_impl='transformer_engine' -> True."""
@@ -85,20 +84,20 @@ class TestVisionLayerIsGraphable:
 
         block = TransformerBlock(config, get_vit_layer_with_transformer_engine_spec())
         layer = block.layers[0]
-        assert _te_cuda_graph_layer_is_graphable(layer, config) is True
+        assert _layer_is_graphable(layer, config) is True
 
         Utils.destroy_model_parallel()
 
 
 # ---------------------------------------------------------------------------
-# Tests for _wrap_te_cuda_graph_for_vision
+# Tests for _wrap_graph_for_vision
 # ---------------------------------------------------------------------------
 class TestWrapGraphForVision:
     def test_filters_none_from_tuple(self):
         def fake_graph(*args, **kwargs):
             return (torch.tensor(1.0), None)
 
-        wrapped = _wrap_te_cuda_graph_for_vision(fake_graph)
+        wrapped = _wrap_graph_for_vision(fake_graph)
         result = wrapped()
         assert result == (torch.tensor(1.0),)
 
@@ -108,7 +107,7 @@ class TestWrapGraphForVision:
         def fake_graph(*args, **kwargs):
             return t
 
-        wrapped = _wrap_te_cuda_graph_for_vision(fake_graph)
+        wrapped = _wrap_graph_for_vision(fake_graph)
         result = wrapped()
         assert result is t
 
@@ -118,7 +117,7 @@ class TestWrapGraphForVision:
         def fake_graph(*args, **kwargs):
             return (a, b)
 
-        wrapped = _wrap_te_cuda_graph_for_vision(fake_graph)
+        wrapped = _wrap_graph_for_vision(fake_graph)
         result = wrapped()
         assert result == (a, b)
 
@@ -126,7 +125,7 @@ class TestWrapGraphForVision:
         def fake_graph(*args, **kwargs):
             return (None, None)
 
-        wrapped = _wrap_te_cuda_graph_for_vision(fake_graph)
+        wrapped = _wrap_graph_for_vision(fake_graph)
         result = wrapped()
         # filtered is empty -> returns original tuple
         assert result == (None, None)
@@ -138,7 +137,7 @@ class TestWrapGraphForVision:
         fake_graph.backward_dw = "bwd_dw_fn"
         fake_graph.reset = "reset_fn"
 
-        wrapped = _wrap_te_cuda_graph_for_vision(fake_graph)
+        wrapped = _wrap_graph_for_vision(fake_graph)
         assert wrapped.backward_dw == "bwd_dw_fn"
         assert wrapped.reset == "reset_fn"
 
@@ -146,51 +145,51 @@ class TestWrapGraphForVision:
         def fake_graph(*args, **kwargs):
             return (torch.tensor(1.0),)
 
-        wrapped = _wrap_te_cuda_graph_for_vision(fake_graph)
+        wrapped = _wrap_graph_for_vision(fake_graph)
         assert not hasattr(wrapped, 'backward_dw')
         assert not hasattr(wrapped, 'reset')
 
 
 # ---------------------------------------------------------------------------
-# Tests for get_vision_te_cuda_graph_seq_length
+# Tests for get_vision_cuda_graph_seq_length
 # ---------------------------------------------------------------------------
 class TestGetVisionCudaGraphSeqLength:
     def test_explicit_max_seq_length(self):
         config = SimpleNamespace(max_vision_cuda_graph_seq_length=2048)
-        assert get_vision_te_cuda_graph_seq_length(config) == 2048
+        assert get_vision_cuda_graph_seq_length(config) == 2048
 
     def test_explicit_max_seq_length_zero_falls_through(self):
         """max_vision_cuda_graph_seq_length=0 is falsy, should fall through."""
         config = SimpleNamespace(max_vision_cuda_graph_seq_length=0)
-        assert get_vision_te_cuda_graph_seq_length(config, default_seq_length=999) == 999
+        assert get_vision_cuda_graph_seq_length(config, default_seq_length=999) == 999
 
     def test_num_position_embeddings_only(self):
         config = SimpleNamespace(num_position_embeddings=1024)
-        assert get_vision_te_cuda_graph_seq_length(config) == 1024
+        assert get_vision_cuda_graph_seq_length(config) == 1024
 
     def test_num_position_embeddings_with_spatial_merge(self):
         config = SimpleNamespace(num_position_embeddings=1024, spatial_merge_size=2)
         # merge_factor = 2**2 = 4, seq = 1024 // 4 = 256
-        assert get_vision_te_cuda_graph_seq_length(config) == 256
+        assert get_vision_cuda_graph_seq_length(config) == 256
 
     def test_spatial_merge_size_3(self):
         config = SimpleNamespace(num_position_embeddings=900, spatial_merge_size=3)
         # merge_factor = 9, seq = 900 // 9 = 100
-        assert get_vision_te_cuda_graph_seq_length(config) == 100
+        assert get_vision_cuda_graph_seq_length(config) == 100
 
     def test_default_seq_length(self):
         config = SimpleNamespace()
-        assert get_vision_te_cuda_graph_seq_length(config) == 4096
+        assert get_vision_cuda_graph_seq_length(config) == 4096
 
     def test_custom_default(self):
         config = SimpleNamespace()
-        assert get_vision_te_cuda_graph_seq_length(config, default_seq_length=512) == 512
+        assert get_vision_cuda_graph_seq_length(config, default_seq_length=512) == 512
 
     def test_explicit_overrides_position_embeddings(self):
         config = SimpleNamespace(
             max_vision_cuda_graph_seq_length=8192, num_position_embeddings=1024
         )
-        assert get_vision_te_cuda_graph_seq_length(config) == 8192
+        assert get_vision_cuda_graph_seq_length(config) == 8192
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +271,6 @@ class TestVisionTECudaGraphHelper:
             post_process=True,
             add_encoder=True,
             add_decoder=True,
-            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         self.llava_model.bfloat16()
 
@@ -383,12 +381,10 @@ class TestVisionTECudaGraphHelper:
         helper.create_cudagraphs()
         assert helper.graphs_created()
 
-        # Each vision layer should have TE CUDA graphs attached.
+        # Each vision layer should have cuda_graphs attached
         for layer in helper.callables:
-            assert hasattr(
-                layer, 'te_cuda_graphs'
-            ), "Layer should have te_cuda_graphs after capture"
-            assert len(layer.te_cuda_graphs) == 1  # 1 microbatch
+            assert hasattr(layer, 'cuda_graphs'), "Layer should have cuda_graphs after capture"
+            assert len(layer.cuda_graphs) == 1  # 1 microbatch
 
         # cudagraph_manager should have been removed during capture
         for layer in helper.callables:
@@ -399,9 +395,9 @@ class TestVisionTECudaGraphHelper:
         helper.delete_cuda_graphs()
         assert not helper.graphs_created()
 
-        # TE CUDA graphs should be empty after delete.
+        # cuda_graphs should be empty after delete
         for layer in helper.callables:
-            assert layer.te_cuda_graphs == [], "te_cuda_graphs should be empty after delete"
+            assert layer.cuda_graphs == [], "cuda_graphs should be empty after delete"
 
     @pytest.mark.skipif(
         not (HAVE_TE_GRAPHS and is_te_min_version("2.7.0")),
@@ -417,9 +413,9 @@ class TestVisionTECudaGraphHelper:
         assert helper.graphs_created()
 
         for layer in helper.callables:
-            assert hasattr(layer, 'te_cuda_graphs')
+            assert hasattr(layer, 'cuda_graphs')
             # PP=1 collapses to 1 microbatch internally
-            assert len(layer.te_cuda_graphs) == helper.num_microbatches
+            assert len(layer.cuda_graphs) == helper.num_microbatches
 
         helper.delete_cuda_graphs()
 
@@ -543,7 +539,6 @@ class TestVisionTECudaGraphHelperPP2:
             post_process=is_last_stage,
             add_encoder=is_first_stage,
             add_decoder=True,
-            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         self.llava_model.bfloat16()
 
@@ -641,16 +636,16 @@ class TestVisionTECudaGraphHelperPP2:
 
         # Each layer should have one graph per microbatch
         for layer in helper.callables:
-            assert hasattr(layer, 'te_cuda_graphs')
+            assert hasattr(layer, 'cuda_graphs')
             assert (
-                len(layer.te_cuda_graphs) == num_mb
-            ), f"Expected {num_mb} graphs per layer, got {len(layer.te_cuda_graphs)}"
+                len(layer.cuda_graphs) == num_mb
+            ), f"Expected {num_mb} graphs per layer, got {len(layer.cuda_graphs)}"
 
         # Cleanup
         helper.delete_cuda_graphs()
         assert not helper.graphs_created()
         for layer in helper.callables:
-            assert layer.te_cuda_graphs == []
+            assert layer.cuda_graphs == []
 
     @pytest.mark.flaky
     @pytest.mark.flaky_in_dev
@@ -703,7 +698,7 @@ if __name__ == "__main__":
     t.test_all_none_returns_original()
     t.test_preserves_te_attributes()
     t.test_missing_te_attributes_not_set()
-    print("_wrap_te_cuda_graph_for_vision tests passed.")
+    print("_wrap_graph_for_vision tests passed.")
 
     t2 = TestGetVisionCudaGraphSeqLength()
     t2.test_explicit_max_seq_length()
@@ -714,7 +709,7 @@ if __name__ == "__main__":
     t2.test_default_seq_length()
     t2.test_custom_default()
     t2.test_explicit_overrides_position_embeddings()
-    print("get_vision_te_cuda_graph_seq_length tests passed.")
+    print("get_vision_cuda_graph_seq_length tests passed.")
 
     # Integration tests (require GPU + distributed init)
     t3 = TestVisionTECudaGraphHelper()

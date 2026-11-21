@@ -18,9 +18,9 @@ from transformer_engine.common.recipe import MXFP8BlockScaling
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
-    GradientFinalizationMode,
     Placements,
     RuntimePolicy,
+    finalize_gradients,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
@@ -242,13 +242,7 @@ def test_grad_comm_dtype_losses_match_baseline(distributed_setup, grad_comm_dtyp
 @pytest.mark.parametrize("sharding", ["replicated", "hsdp", "hfsdp"])
 @pytest.mark.parametrize("set_to_none", [False, True])
 @pytest.mark.parametrize("grad_scale", [1.0, 0.5, 1 / 3])
-@pytest.mark.parametrize(
-    "gradient_finalization_mode",
-    [GradientFinalizationMode.REDUCE_OUTER_AND_WAIT, GradientFinalizationMode.REDUCE_OUTER],
-)
-def test_local_accumulation_matches_reference(
-    distributed_setup, sharding, set_to_none, grad_scale, gradient_finalization_mode
-):
+def test_local_accumulation_matches_reference(distributed_setup, sharding, set_to_none, grad_scale):
     """Scaled singleton-inner accumulation matches dense training, with replicated DP as a control."""
     setup = distributed_setup
     if setup.world_size < 2:
@@ -301,13 +295,7 @@ def test_local_accumulation_matches_reference(
         for _ in range(5):
             optimizer.zero_grad(set_to_none=set_to_none)
             for index, (inputs, targets) in enumerate(microbatches):
-                with context.finalize_gradients(
-                    mode=(
-                        gradient_finalization_mode
-                        if index == num_microbatches - 1
-                        else GradientFinalizationMode.SKIP_OUTER
-                    )
-                ):
+                with finalize_gradients(context, enabled=index == num_microbatches - 1):
                     loss = torch.nn.functional.mse_loss(model(inputs), targets)
                     losses.append(loss.detach())
                     backward_loss = loss / num_microbatches
@@ -319,8 +307,6 @@ def test_local_accumulation_matches_reference(
             if reduce_grads:
                 for parameter in model.parameters():
                     dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG)
-            elif gradient_finalization_mode is GradientFinalizationMode.REDUCE_OUTER:
-                context.finish_grad_sync()
             optimizer.step()
         return losses
 
@@ -362,13 +348,7 @@ def test_local_accumulation_scaling_matches_reference(distributed_setup, grad_co
     inputs = torch.randn(3, 1, 4096, device=setup.device, dtype=torch.bfloat16, generator=generator)
     expected = torch.zeros(8, 4096, device=setup.device)
     for index, x in enumerate(inputs):
-        with context.finalize_gradients(
-            mode=(
-                GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
-                if index == len(inputs) - 1
-                else GradientFinalizationMode.SKIP_OUTER
-            )
-        ):
+        with finalize_gradients(context, enabled=index == len(inputs) - 1):
             model(x).float().sum().backward()
         context.finish_grad_sync()
         expected = expected + x.float() * scale

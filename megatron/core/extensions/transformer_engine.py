@@ -40,11 +40,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_world_size,
     model_parallel_is_initialized,
 )
-from megatron.core.process_groups_config import (
-    ProcessGroupCollection,
-    resolve_gtp_remat_group,
-    warn_global_process_group_fallback,
-)
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.quantization.quant_config import QuantizationConfig
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_observation import suspend_tensor_observations
@@ -2159,8 +2155,7 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
     raise when set non-default — TE will not support them natively, so they
     would have to be implemented in this subclass, which has not been done yet.
 
-    Active only when ``fp8_output_proj=True`` with ``fp8_recipe='mxfp8'``, or with an FP4 model,
-    whose LM head runs under its own MXFP8 autocast.
+    Active only when ``fp8_output_proj=True`` with ``fp8_recipe='mxfp8'``.
     """
 
     def __init__(
@@ -2189,8 +2184,8 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
 
         if not is_mxfp8_output_proj_active(config):
             raise RuntimeError(
-                "TELMHeadColumnParallelLinear is only valid when fp8_output_proj=True, with "
-                "fp8=True and fp8_recipe='mxfp8' or with fp4."
+                "TELMHeadColumnParallelLinear is only valid when fp8_output_proj=True, "
+                "fp8=True, and fp8_recipe='mxfp8'."
             )
         if keep_master_weight_for_test:
             raise ValueError("TE output projection does not support keep_master_weight_for_test.")
@@ -2274,18 +2269,7 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
         if output_dtype is not None and output_dtype != input_.dtype:
             raise ValueError("TE MXFP8 output projection does not support output_dtype.")
 
-        if self.config.fp4:
-            # An FP4 model has no FP8 context: run the LM head under its own MXFP8 autocast.
-            # MXFP8 needs no amax reduction, so no group is passed.
-            lm_head_context = fp8_autocast(
-                enabled=True,
-                fp8_recipe=te.common.recipe.MXFP8BlockScaling(
-                    fp8_format=te.common.recipe.Format.E4M3
-                ),
-            )
-        else:
-            lm_head_context = get_fp8_context(self.config)
-        with lm_head_context:
+        with get_fp8_context(self.config):
             torch.cuda.nvtx.range_push("mxfp8_output_proj_telinear")
             try:
                 output_parallel, output_bias = super().forward(input_)
@@ -2584,23 +2568,22 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             )
 
         if pg_collection is None:
-            warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection(
                 tp=get_tensor_model_parallel_group(check_initialized=False),
                 cp=get_context_parallel_group(check_initialized=False),
                 hcp=get_hierarchical_context_parallel_groups(check_initialized=False),
             )
         else:
-            # ProcessGroupCollection returns None for a group that was never set, so a hasattr
-            # check cannot detect a missing one. cp is only read when context parallelism is on.
-            groups = vars(pg_collection)
-            if groups.get("tp") is None:
-                raise ValueError("TEDotProductAttention pg_collection must have a tp process group")
-            if groups.get("cp") is None and self.config.context_parallel_size > 1:
-                raise ValueError(
-                    "TEDotProductAttention pg_collection must have a cp process group when "
-                    "context_parallel_size > 1"
-                )
+            assert hasattr(
+                pg_collection, "tp"
+            ), "TEDotProductAttention pg_collection must have tp pg"
+            assert hasattr(
+                pg_collection, "cp"
+            ), "TEDotProductAttention pg_collection must have cp pg"
+            if cp_comm_type == "a2a+p2p":
+                assert hasattr(
+                    pg_collection, "hcp"
+                ), "TEDotProductAttention pg_collection must have hierarchical cp pg"
         self._tp_group = pg_collection.tp
 
         if is_te_min_version("0.10.0"):
@@ -2632,14 +2615,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                         "hierarchical cp commucation."
                     )
                     extra_kwargs["cp_comm_type"] = "a2a+p2p"
-                    # The global-group fallbacks and use_mpu_process_groups() carry hcp; a
-                    # collection built for another grid must set it.
-                    if vars(pg_collection).get("hcp") is None:
-                        raise ValueError(
-                            "TEDotProductAttention with cp_comm_type='a2a+p2p' requires "
-                            "pg_collection.hcp (the hierarchical context-parallel groups)"
-                        )
-                    extra_kwargs["cp_group"] = pg_collection.hcp
+                    extra_kwargs["cp_group"] = get_hierarchical_context_parallel_groups(
+                        check_initialized=False
+                    )
                 else:
                     extra_kwargs["cp_comm_type"] = cp_comm_type
 
@@ -3023,7 +3001,6 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             # The comms between TP and EP group is explicitly handled by MoE token dispatcher.
             # So we disable comms by making TE agnostic of model parallel.
             if pg_collection is None:
-                warn_global_process_group_fallback(type(self).__name__)
                 pg_collection = ProcessGroupCollection.use_mpu_process_groups()
             self._pg_collection = pg_collection
             assert is_expert, "TEGroupedLinear only supports expert parallelism"

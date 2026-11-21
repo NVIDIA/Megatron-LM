@@ -55,11 +55,7 @@ class NCCLCopyService(CopyService):
         if group is None:
             raise RuntimeError("NCCLCopyService requires an initialized process group")
         device = torch.device("cuda", torch.cuda.current_device())
-        # Use a public collective that reuses an already connected communicator.
-        # Calling the private eager-connect API twice can create an untracked
-        # communicator on PyTorch versions where eager-connect is not idempotent.
-        token = torch.zeros(1, dtype=torch.int32, device=device)
-        dist.all_reduce(token, group=group)
+        group._get_backend(device).eager_connect_single_device(device)
         self._nccl_connected = True
 
     def set_plan(self, plan, *, transform=None) -> None:

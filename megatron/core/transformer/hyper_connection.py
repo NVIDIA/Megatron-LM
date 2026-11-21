@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
-import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
@@ -74,17 +73,7 @@ def _resolve_mhc_checkpoint(
 def build_mhc_recompute_layer_plan(
     num_layers: int, mhc_recompute_layer_num: Optional[int], use_mhc_recompute: bool
 ) -> Tuple[list[Optional[CheckpointWithoutOutputManager]], list[bool]]:
-    """Deprecated adapter returning per-layer managers and block-end markers.
-
-    Use ``build_residual_stream_recompute_plan`` when recompute is enabled. It returns
-    one context per layer instead of two lists and does not take an enabled flag.
-    """
-    warnings.warn(
-        "build_mhc_recompute_layer_plan is deprecated and will be removed in a future release. "
-        "Use build_residual_stream_recompute_plan when recompute is enabled instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
+    """Build per-layer mHC recompute managers and recompute-block end markers."""
     if not use_mhc_recompute or num_layers == 0:
         return [None] * num_layers, [False] * num_layers
 
@@ -97,13 +86,7 @@ def finalize_mhc_recompute_layer(
     hidden_states: Tensor,
     is_last_in_recompute_block: bool,
 ) -> None:
-    """Deprecated adapter; use ``ResidualStreamRecomputeContext.finalize`` instead."""
-    warnings.warn(
-        "finalize_mhc_recompute_layer is deprecated and will be removed in a future release. "
-        "Use ResidualStreamRecomputeContext.finalize(hidden_states) instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
+    """Finalize mHC recompute state when the current recompute block ends."""
     finalize_recompute_block(mhc_manager, hidden_states, is_last_in_recompute_block)
 
 
@@ -1061,15 +1044,10 @@ class HyperConnectionModule(MegatronModule):
 
 @dataclass(frozen=True)
 class HyperConnectionExecutionContext:
-    """Current mHC parameter owner and BDA fusion setting for one residual operation.
-
-    ``owner_residual_view`` makes an input-residual read carry the owner's residual view
-    for this call only, for callers whose other execution path already carries that view.
-    """
+    """Current mHC parameter owner and BDA fusion setting for one residual operation."""
 
     owner: HyperConnectionModule
     bias_dropout_fusion: bool = False
-    owner_residual_view: bool = False
 
 
 class HyperConnectionResidualConnection(ResidualConnection):
@@ -1128,7 +1106,7 @@ class HyperConnectionResidualConnection(ResidualConnection):
     ) -> tuple[Tensor, ResidualConnectionState]:
         """Share owner invocation and state packing without choosing a replay policy."""
 
-        if self.use_input_residual and not execution_context.owner_residual_view:
+        if self.use_input_residual:
             # Preserve the dedicated Transformer's residual path and three-output owner hooks.
             residual = hidden_states
             branch_input, h_res, h_post = apply_module(execution_context.owner)(

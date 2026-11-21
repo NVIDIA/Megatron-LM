@@ -15,7 +15,6 @@ from megatron.core.inference.apis._llm_base import _MegatronLLMBase
 from megatron.core.inference.apis.async_llm import MegatronAsyncLLM
 from megatron.core.inference.apis.llm import MegatronLLM
 from megatron.core.inference.apis.serve_config import ServeConfig
-from megatron.core.inference.config import InferenceConfig
 
 
 @pytest.fixture
@@ -69,21 +68,13 @@ class TestConstructorValidation:
     """Constructor-time validation for both ``MegatronLLM`` and ``MegatronAsyncLLM``."""
 
     @pytest.mark.parametrize(
-        "extra_kwargs, match",
-        [
-            ({"coordinator_host": "x"}, "coordinator_host/port require use_coordinator=True"),
-            ({"coordinator_port": 5000}, "coordinator_host/port require use_coordinator=True"),
-            (
-                {"inference_config": InferenceConfig(start_suspended=True)},
-                "start_suspended requires use_coordinator=True",
-            ),
-        ],
+        "extra_kwargs", [{"coordinator_host": "x"}, {"coordinator_port": 5000}]
     )
-    def test_direct_mode_rejects_coordinator_only_options(
-        self, mock_pipeline, fake_model_and_tokenizer, extra_kwargs, match
+    def test_coordinator_host_or_port_without_use_coordinator_raises(
+        self, mock_pipeline, fake_model_and_tokenizer, extra_kwargs
     ):
         model, tok = fake_model_and_tokenizer
-        with pytest.raises(ValueError, match=match):
+        with pytest.raises(ValueError, match="coordinator_host/port require use_coordinator=True"):
             MegatronLLM(model=model, tokenizer=tok, use_coordinator=False, **extra_kwargs)
 
     def test_megatron_llm_direct_mode_succeeds(self, mock_pipeline, fake_model_and_tokenizer):

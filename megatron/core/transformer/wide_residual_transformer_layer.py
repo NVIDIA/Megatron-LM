@@ -5,13 +5,12 @@ from __future__ import annotations
 
 from typing import Optional
 
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
-    apply_combined_residual_keys,
     load_residual_state,
 )
 
@@ -56,11 +55,14 @@ class WideResidualTransformerLayer(TransformerLayer):
 
         if config.wide_residual is None:
             raise ValueError("WideResidualTransformerLayer requires wide_residual config.")
-        has_attention, has_mlp = self._validate_residual_branch_layout()
+        if not isinstance(self.cross_attention, IdentityOp):
+            raise NotImplementedError(
+                "WideResidualTransformerLayer does not support cross-attention branches."
+            )
 
         self.residual_read_self_attn = None
         self.residual_write_self_attn = None
-        if has_attention:
+        if not isinstance(self.self_attention, IdentityOp):
             self.residual_read_self_attn = StreamwiseSigmoidWideResidualConnection(
                 config, self.layer_number, "self_attention", operation="read"
             )
@@ -70,7 +72,7 @@ class WideResidualTransformerLayer(TransformerLayer):
 
         self.residual_read_mlp = None
         self.residual_write_mlp = None
-        if has_mlp:
+        if not isinstance(self.mlp, IdentityOp):
             self.residual_read_mlp = StreamwiseSigmoidWideResidualConnection(
                 config, self.layer_number, "mlp", operation="read"
             )
@@ -116,11 +118,3 @@ class WideResidualTransformerLayer(TransformerLayer):
                     f"hidden_size={self.config.hidden_size}, got "
                     f"{connection.branch_hidden_size}."
                 )
-
-    def sharded_state_dict(
-        self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
-    ) -> ShardedStateDict:
-        """Build the sharded state dict, using combined residual keys when loading them."""
-        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
-        apply_combined_residual_keys(sharded_state_dict, prefix, metadata)
-        return sharded_state_dict

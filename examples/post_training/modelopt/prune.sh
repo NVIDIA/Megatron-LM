@@ -32,8 +32,9 @@ if [ -z ${MLM_MODEL_SAVE} ]; then
 fi
 
 if [ -z ${MLM_MODEL_CKPT} ]; then
-    printf "${MLM_ERROR} Variable ${PURPLE}MLM_MODEL_CKPT${WHITE} is not set! Import the Hugging Face checkpoint with Megatron-Bridge first (see README.md).\n"
-    exit 1
+    LOAD_ARGS="--pretrained-model-path ${HF_MODEL_CKPT}"
+else
+    LOAD_ARGS="--load ${MLM_MODEL_CKPT}"
 fi
 
 
@@ -41,7 +42,7 @@ set -ex
 
 ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/prune.py \
     ${MODEL_ARGS} \
-    --load ${MLM_MODEL_CKPT} \
+    ${LOAD_ARGS} \
     --pipeline-model-parallel-size ${PP} \
     --tensor-model-parallel-size ${TP} \
     --tokenizer-model ${TOKENIZER_MODEL} \

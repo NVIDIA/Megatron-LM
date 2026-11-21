@@ -18,12 +18,6 @@ Two stacks are provided, differing only in their Mamba mixer: ``dsa_stack_spec``
 from ``hybrid_stack_spec``, ``gdp_dsa_stack_spec`` from ``gated_delta_product_stack_spec``.
 Both share the same attention layer, so DSA over GQA applies to either unchanged.
 
-Each stack also has the ``inference_optimized`` and wide-residual counterparts that
-``--transformer-impl inference_optimized`` and wide-residual models look up by name
-(``*_inference_stack_spec``, ``wide_residual_*``). The wide-residual stacks wrap the
-DSA-derived stacks, so their MTP layers, which reuse the unwrapped layer selection, keep
-DSA attention as well.
-
 Usage::
 
     --spec megatron.core.transformer.experimental_attention_variant.dsa_layer_specs \
@@ -34,10 +28,7 @@ from dataclasses import replace
 
 from megatron.core.extensions.transformer_engine import TELinear
 from megatron.core.models.hybrid.hybrid_layer_specs import (
-    _get_wide_residual_hybrid_stack_spec,
-    gated_delta_product_inference_stack_spec,
     gated_delta_product_stack_spec,
-    hybrid_inference_stack_spec,
     hybrid_stack_spec,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
@@ -102,14 +93,3 @@ def _with_dsa_gqa_attention(stack_spec: ModuleSpec) -> ModuleSpec:
 
 dsa_stack_spec = _with_dsa_gqa_attention(hybrid_stack_spec)
 gdp_dsa_stack_spec = _with_dsa_gqa_attention(gated_delta_product_stack_spec)
-dsa_inference_stack_spec = _with_dsa_gqa_attention(hybrid_inference_stack_spec)
-gdp_dsa_inference_stack_spec = _with_dsa_gqa_attention(gated_delta_product_inference_stack_spec)
-
-wide_residual_dsa_stack_spec = _get_wide_residual_hybrid_stack_spec(dsa_stack_spec)
-wide_residual_gdp_dsa_stack_spec = _get_wide_residual_hybrid_stack_spec(gdp_dsa_stack_spec)
-wide_residual_dsa_inference_stack_spec = _get_wide_residual_hybrid_stack_spec(
-    dsa_inference_stack_spec
-)
-wide_residual_gdp_dsa_inference_stack_spec = _get_wide_residual_hybrid_stack_spec(
-    gdp_dsa_inference_stack_spec
-)

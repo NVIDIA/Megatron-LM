@@ -51,10 +51,8 @@ from megatron.core.tensor_parallel.gtp_eager_wgrad import (
     clear_eager_wgrad_rings,
 )
 from megatron.core.tensor_parallel.gtp_symmetric_memory import (
-    gtp_symm_pool_ctx,
-    register_external_pool,
+    is_gtp_symm_pool_registered,
     symmetric_wgrad_pool,
-    uses_gtp_symm_pool,
 )
 from megatron.core.utils import ensure_params_ready, log_single_rank, resolve_gtp_pad_for_alignment
 
@@ -705,21 +703,20 @@ def _register_default_prefetch_chains(models):
 
     Dense operators (including both Mamba projections) share a chain. Routed-expert
     FC1/FC2 projections have separate chains, with each local-expert group indivisible.
-    Different process groups and independently scheduled virtual pipeline chunks must never
-    be linked or share gather storage. Capture boundaries are resolved later.
+    Different process groups must never be linked. Capture boundaries are resolved later.
     """
     weights = {}
-    for model_index, model in enumerate(models):
+    for model in models:
         for name, weight in model.named_parameters():
             if is_gtp_param(weight):
-                weights.setdefault(id(weight), (model_index, name, weight))
+                weights.setdefault(id(weight), (name, weight))
     used_names = {
         weight._gtp_prefetch_chain_name
-        for _, _, weight in weights.values()
+        for _, weight in weights.values()
         if hasattr(weight, "_gtp_prefetch_chain_name")
     }
     defaults = defaultdict(list)
-    for model_index, name, weight in weights.values():
+    for name, weight in weights.values():
         if hasattr(weight, "_gtp_prefetch_chain_name") or weight.prefetch_initialized:
             continue
         role = "dense"
@@ -732,8 +729,8 @@ def _register_default_prefetch_chains(models):
                 role = "expert_fc1"
             elif ".linear_fc2." in f".{name}":
                 role = "expert_fc2"
-        defaults[(model_index, role, id(weight.group))].append(weight)
-    for (_, role, _), members in defaults.items():
+        defaults[(role, id(weight.group))].append(weight)
+    for (role, _), members in defaults.items():
         name = f"default_{role}"
         suffix = 0
         while name in used_names:
@@ -750,8 +747,7 @@ def classify_gtp_remat_chains(
     Register default prefetch chains and finalize their captured/eager boundaries.
 
     Explicit registrations take precedence. All other eligible weights use the same
-    registration API, with dense, expert-FC1 and expert-FC2 defaults per process group
-    and model chunk.
+    registration API, with dense, expert-FC1 and expert-FC2 defaults per process group.
     Must be called once AFTER model build + DDP wrap and before the first forward (which
     lazily builds chain links).
     """
@@ -770,20 +766,6 @@ def classify_gtp_remat_chains(
     for model_module in models:
         tag_gtp_params_with_names(model_module)
         classify_gtp_chains(model_module)
-
-
-def move_gtp_weights_to_symm_pool(model) -> None:
-    """Move the all-gather inputs that opted into symmetric memory and that nothing else
-    placed (e.g. frozen or CPU-initialized weights) into their group's registered pool.
-
-    Call once AFTER model build + DDP wrap (DDP places the weights it remaps) and before
-    the first forward.
-    """
-    models = model if isinstance(model, list) else [model]
-    for model_module in models:
-        for param in model_module.parameters():
-            if getattr(param, "needs_nccl_mem", False):
-                _move_weight_to_symm_pool(param, param.group)
 
 
 def gtp_remat_shard_dim0(dim0, gtp_remat_group):
@@ -891,8 +873,6 @@ def _gtp_attach_attrs(
         gtp_shard.chain_id = GTPChain.UNGRAPHED.value
     gtp_shard.group = gtp_remat_group
     gtp_shard.gtp_remat_size = gtp_remat_group.size()
-    # Flag to indicate that this GTP parameter needs symmetric ub backing for GTP all-gather
-    gtp_shard.needs_nccl_mem = uses_gtp_symm_pool(gtp_remat_group, collective="ag")
     if replica_group is not None:
         gtp_shard.gtp_replica_group = replica_group
     global _GTP_PARAMS
@@ -947,41 +927,6 @@ def _gtp_reclass_native_fp8_shard(param):
     return param
 
 
-def _move_weight_to_symm_pool(param, gtp_remat_group):
-    """Swap a weight's storage into the group's registered pool, unless it is already in a
-    symmetric pool, still on CPU, or the group has no "ag" registration.
-
-    Quantized weights are re-homed whole (data + scale tensors) with the same
-    make_empty/copy_from_storage/data-setter sequence TE uses to re-home grouped
-    weights; plain BF16 weights get an empty_like + copy_. The old storage is freed.
-    """
-    if (
-        getattr(param, "is_in_symm_pool", False)
-        or not param.is_cuda
-        or not uses_gtp_symm_pool(gtp_remat_group, collective="ag")
-    ):
-        return
-    quantizer = getattr(param, "_quantizer", None)
-    with torch.no_grad():
-        if quantizer is not None:
-            # Allocate the full quantized layout (data + scales) in the pool, matching the
-            # source tensor's populated buffers so copy_from_storage copies all of them.
-            quantizer.set_usage(**param.get_usages())
-            with gtp_symm_pool_ctx(gtp_remat_group):
-                pooled = quantizer.make_empty(param.shape, dtype=param.dtype, device=param.device)
-            pooled.copy_from_storage(param)
-        else:
-            with gtp_symm_pool_ctx(gtp_remat_group):
-                pooled = torch.empty_like(param)
-            pooled.copy_(param)
-        old = param.data
-        param.data = pooled
-        if hasattr(old, "clear"):
-            # Quantized storage: release the non-pooled buffers immediately.
-            old.clear()
-    param.is_in_symm_pool = True
-
-
 def attach_gtp_to_presharded_module(
     module, gtp_remat_group, pad_length, is_grouped=False, replica_group=None
 ):
@@ -1009,10 +954,6 @@ def attach_gtp_to_presharded_module(
         if param is None or is_gtp_param(param):
             continue
         if isinstance(param, QuantizedTensor):
-            # Quantized parameters are pooled now, before an outside owner can
-            # take part of its storage. Plain BF16 parameters are placed after
-            # wrapping via move_gtp_weights_to_symm_pool.
-            _move_weight_to_symm_pool(param, gtp_remat_group)
             gtp_param = _gtp_reclass_native_fp8_shard(param)
         else:
             gtp_param = _gtp_wrap_bf16_shard(module, name, param)
@@ -1609,11 +1550,9 @@ class GTPShardedParam(torch.nn.Parameter):
             # Chain identity above keeps fc1/fc2 apart; parity alternates consecutive
             # blocks between two buffers.
             key = key + (self._double_buffer_parity(),)
-        elif not reduce_scatter and getattr(self, "_buf_parity", None):
+        elif getattr(self, "_buf_parity", None):
             # Set by _ensure_no_shared_buffer_with. Parity 0 keeps the shared buffer, so
             # only the second weight of an adjacent same-key pair costs an extra allocation.
-            # Gather buffers only: an eager RS output is owned by one ticket at a time (see
-            # release), so adjacent reduce-scatters cannot collide.
             key = key + (self._buf_parity,)
         if recompute:
             # Two components, guarding two different collisions:
@@ -2195,9 +2134,7 @@ class GTPShardedParam(torch.nn.Parameter):
         copy-into-registered-memory path. Deliberately symm-only so behavior off the
         --gtp*-remat-nccl-ub flags is unchanged; ring slots keep the copy fallback in
         _prepare_wgrad_reduce_scatter_inputs."""
-        return self.main_grad.dtype == wgrad_dtype and uses_gtp_symm_pool(
-            self.group, collective="rs"
-        )
+        return self.main_grad.dtype == wgrad_dtype and is_gtp_symm_pool_registered(self.group)
 
     def get_wgrad_tensor(self, *, persistent: bool = False):
         """Return writable logical-shape scratch; ``persistent`` keeps eager pointers fixed.
@@ -2226,7 +2163,7 @@ class GTPShardedParam(torch.nn.Parameter):
             return ring_slot.tensor[: self._unsharded_shape[0]]
 
         # TODO: Merge the ring wgrad slot and symmetric wgrad slot into a single slot.
-        if uses_gtp_symm_pool(self.group, collective="rs"):
+        if is_gtp_symm_pool_registered(self.group):
             # Lifecycle invariant: get_wgrad_tensor -> GEMM -> _prepare consumes the slot -> RS.
             if self._wgrad_symm_slot is not None:
                 raise RuntimeError(
@@ -2260,11 +2197,6 @@ class GTPShardedParam(torch.nn.Parameter):
             self._wgrad_symm_slot = buf
             return buf[: self._unsharded_shape[0]]
         return _wgrad_pool_get(self._unsharded_shape, self.main_grad.dtype, self.device)
-
-    def register_ub_pool(self, pool: torch.cuda.MemPool) -> None:
-        """Register the external pool backing this param's all-gather input on its group."""
-        register_external_pool(pool, self.group)
-        self.is_in_symm_pool = True
 
     def register_grad_accum_hook(
         self, grad_accum_node: torch.autograd.graph.Node | None, hook: Callable[..., None] | None
@@ -2474,7 +2406,7 @@ class GTPShardedParam(torch.nn.Parameter):
         fp32_accumulation = (
             GTP_CONFIG.reduce_scatter_with_fp32_accumulation
             and self.group.size() > 2
-            and not uses_gtp_symm_pool(self.group, collective="rs")
+            and not is_gtp_symm_pool_registered(self.group)
         )
 
         if async_op:
@@ -2582,7 +2514,7 @@ class GTPShardedParam(torch.nn.Parameter):
 
                 # With symmetric memory registration, send the padded parent tensor of the
                 # logical view that get_wgrad_tensor handed the GEMM.
-                if uses_gtp_symm_pool(weight.group, collective="rs"):
+                if is_gtp_symm_pool_registered(weight.group):
                     symm_slot = weight._wgrad_symm_slot
                     weight._wgrad_symm_slot = None
                     if symm_slot is None:
@@ -2911,15 +2843,7 @@ class GTPWeightCache:
             out_shape = param._unsharded_shape_padded
 
         chain_id = getattr(param, "chain_id", GTPChain.UNGRAPHED.value)
-        # All-gather outputs go into the group's registered pool so the gather runs on
-        # symmetric kernels; otherwise (reduce-scatter outputs, or no registration) keep
-        # the CUDA-graph pool routing. Tickets are persistent and first allocated during
-        # eager warmup, so a graphed chain replays stable pool addresses either way.
-        if not reduce_scatter and uses_gtp_symm_pool(param.group, collective="ag"):
-            alloc_ctx = gtp_symm_pool_ctx(param.group)
-        else:
-            alloc_ctx = cuda_graph_pool_allocation(_chain_is_graphed(chain_id))
-        with alloc_ctx:
+        with cuda_graph_pool_allocation(_chain_is_graphed(chain_id)):
             if not isinstance(dtype, torch.dtype):
                 # Use the gather quantizer copy: mutating the param's own quantizer usage
                 # would corrupt the optimizer's quantize_ update direction (frozen weights).
@@ -2996,8 +2920,7 @@ class GTPWeightCache:
         """Release a reusable buffer to the pool while keeping its ticket valid.
 
         Captured reduce-scatter tickets keep exclusive ownership. ``slot.buf`` is never cleared,
-        so every CUDA-graph ticket retains a stable address across replays. Other tickets keep
-        ``slot.buf`` too, except eager reduce-scatter outputs (see below).
+        so every CUDA-graph ticket retains a stable address across replays.
         """
         slot = self._slots[ticket]
         if slot.buf is None:
@@ -3010,12 +2933,6 @@ class GTPWeightCache:
         # which crashes in a boolean context ("Boolean value of Tensor is ambiguous").
         if not any(b is slot.buf for b in self._pool.get(slot.key, [])):
             self._pool[slot.key].append(slot.buf)
-        if slot.reduce_scatter:
-            # Returning an eager RS output to the pool relinquishes this ticket's ownership.
-            # Clear its reference so the next get() must check out a buffer again. Otherwise,
-            # another ticket can acquire this buffer and leave an RS result pending, while
-            # this ticket reuses its stale reference and overwrites that result.
-            slot.buf = None
 
     def clear(self):
         """Drop all buffers; tickets remain valid and lazily re-allocate on next get()."""
@@ -3221,8 +3138,7 @@ def reset_gtp_state():
 
     These class-level dicts survive model teardown, so a GTP model rebuilt in-process would
     inherit stale last_weight pointers / flushed link tables. Call once before the per-chunk
-    classify_gtp_chains loop; resetting inside it would discard earlier chunks' runtime state.
-    No-op on a fresh process.
+    classify_gtp_chains loop (never inside it — chains span chunks). No-op on a fresh process.
     """
     _PREFETCH_CHAIN_METADATA.clear()
     _PREFETCH_CHAIN_METADATA.update(_DEFAULT_PREFETCH_CHAIN_METADATA)

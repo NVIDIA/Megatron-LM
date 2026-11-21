@@ -46,8 +46,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         correction_range_round_to_int (bool): Whether to round dim range bounds to integer.
             Defaults to True
         cp_group (torch.distributed.ProcessGroup, optional): Process group for context parallel.
-            Omitting it is deprecated: the global context-parallel group is used and a
-            FutureWarning is emitted. It becomes required when the fallback is removed.
+            Defaults to None.
     """
 
     # Use a separated cache rather than reusing base RotaryEmbedding for

@@ -56,7 +56,6 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
-    GradientFinalizationMode,
     RuntimePolicy,
     fully_shard_context,
 )
@@ -4032,9 +4031,9 @@ def wrap_model_chunks_with_ddp(
     construction_context = (
         fully_shard_context(
             FsdpContext(
-                gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER,
                 runtime_policy=RuntimePolicy(
                     use_symmetric_memory=ddp_config.nccl_ub,
+                    caller_managed_grad_sync=True,
                     overlap_outer_communication=ddp_config.overlap_outer_communication,
                 )
             )
@@ -4492,15 +4491,9 @@ def setup_model_and_optimizer(
         )
 
         if cfg.model.transformer.gtp_remat_nccl_ub:
-            register_gtp_symm_pool(
-                resolve_gtp_remat_group(pg_collection, is_expert=False),
-                collectives=cfg.model.transformer.gtp_remat_nccl_ub,
-            )
+            register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=False))
         if cfg.model.transformer.gtp_expert_remat_nccl_ub:
-            register_gtp_symm_pool(
-                resolve_gtp_remat_group(pg_collection, is_expert=True),
-                collectives=cfg.model.transformer.gtp_expert_remat_nccl_ub,
-            )
+            register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=True))
 
     model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
@@ -4509,12 +4502,8 @@ def setup_model_and_optimizer(
     # first forward. Placed here (not in get_model) so it also covers the config-container
     # builder path.
     if is_gtp_remat_active(cfg.model.transformer):
-        from megatron.core.tensor_parallel.gtp_api import (
-            classify_gtp_remat_chains,
-            move_gtp_weights_to_symm_pool,
-        )
+        from megatron.core.tensor_parallel.gtp_api import classify_gtp_remat_chains
 
-        move_gtp_weights_to_symm_pool(model)
         classify_gtp_remat_chains(
             model,
             cuda_graph_modules=cfg.model.transformer.cuda_graph_modules,
@@ -5193,14 +5182,7 @@ def train_step(
                 iteration=iteration,
                 pg_collection=metric_pg_collection,
             )
-        # MFSDP v2 chunks share one context. Keep reductions asynchronous until the
-        # schedule's final wait, after all backward work including delayed wgrad.
-        gradient_finalization_context = (
-            model[0].module.context.finalize_gradients(mode=GradientFinalizationMode.REDUCE_OUTER)
-            if isinstance(model[0], FullyShardedDataParallelV2)
-            else nullcontext()
-        )
-        with grad_context, tensor_metric_context, _fb_cm, gradient_finalization_context:
+        with grad_context, tensor_metric_context, _fb_cm:
             losses_reduced = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=forward_backward_data_iterator,
@@ -5275,7 +5257,7 @@ def train_step(
         torch.cuda.empty_cache()
 
     # Vision gradients.
-    if cfg.train.vision_pretraining_type == "dino":
+    if args.vision_pretraining and args.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.cancel_gradients_last_layer(get_train_state().iteration)
 
@@ -5343,7 +5325,7 @@ def train_step(
         )
 
     # Vision momentum.
-    if cfg.train.vision_pretraining_type == "dino":
+    if args.vision_pretraining and args.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.update_momentum(get_train_state().iteration)
 
