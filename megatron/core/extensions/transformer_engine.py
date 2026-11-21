@@ -2436,6 +2436,30 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         if is_te_min_version("0.12.0", check_equality=False):
             self.te_forward_mask_type = True
 
+        # Batch-invariant CP is TE's all-gather CP: each local query chunk runs one FA4 call
+        # (num_splits=1) on the gathered K/V prefix, the same per-row computation as at CP=1.
+        if self.config.batch_invariant_mode and self.config.context_parallel_size > 1:
+            assert cp_comm_type == "all_gather", (
+                "Batch-invariant context parallelism supports only cp_comm_type='all_gather', "
+                f"got {cp_comm_type!r}."
+            )
+            assert is_te_min_version("2.20.0"), (
+                "Batch-invariant all-gather context parallelism needs FlashAttention 4 in TE's "
+                f"context-parallel attention (Transformer-Engine >= 2.20.0), found "
+                f"v{get_te_version()}."
+            )
+            assert self.config.flash_attention_version == 4, (
+                "Batch-invariant all-gather context parallelism supports only "
+                f"flash_attention_version=4, got {self.config.flash_attention_version}."
+            )
+            assert (
+                self.config.softmax_type == "vanilla"
+            ), "Batch-invariant context parallelism supports only softmax_type='vanilla'."
+            assert not (self.config.qk_clip or self.config.log_max_attention_logit), (
+                "Batch-invariant context parallelism does not support qk_clip or "
+                "log_max_attention_logit."
+            )
+
         # This check is important as CP config can be disabled while having a valid CP group
         # Example - Disabling CP for encoder while a valid CP group exists for decoder
         if self.config.context_parallel_size > 1:
