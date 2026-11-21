@@ -163,6 +163,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fused_single_qkv_rope": False,
     "gated_linear_unit": False,
     "gdn_kernel_backend": "fla",
+    "gdn_use_qk_l2norm_in_kernel": False,
     "gdp_cutedsl_kernel": False,
     "gdp_g_clamp_value": None,
     "gdp_num_chunk_states_to_recompute": 2,

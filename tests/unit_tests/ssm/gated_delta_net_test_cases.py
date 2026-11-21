@@ -261,7 +261,8 @@ class GatedDeltaNetModuleTestCases(GatedDeltaNetTestBase):
                 rec_grads[name], base_grads[name]
             ), f"Grad not identical for {name} ({rank=})"
 
-    def test_deterministic_mode(self, monkeypatch):
+    @pytest.mark.parametrize("use_qk_l2norm_in_kernel", [False, True])
+    def test_deterministic_mode(self, monkeypatch, use_qk_l2norm_in_kernel):
         from megatron.core.ssm.gated_delta_net import common
 
         def reject_autotuned_l2norm(*args, **kwargs):
@@ -275,6 +276,7 @@ class GatedDeltaNetModuleTestCases(GatedDeltaNetTestBase):
         det_config = copy.deepcopy(self.transformer_config)
         det_config.deterministic_mode = True
         det_config.gdn_kernel_backend = "torch"
+        det_config.gdn_use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
 
         gdn_spec = get_experimental_attention_variant_module_spec(config=det_config)
 
