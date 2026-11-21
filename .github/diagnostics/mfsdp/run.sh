@@ -16,6 +16,14 @@
 set -euo pipefail
 cd /opt/megatron-lm
 export UV_PROJECT_ENVIRONMENT=/opt/venv
+if [ "${MFSDP_HEURISTIC_SCAN:-false}" = "true" ]; then
+  mkdir -p /workspace/results/heuristic-scan
+  g++ -std=c++17 -O2 /workspace/scan_heuristics.cpp -o /workspace/scan-heuristics \
+    -I/usr/local/cuda/include -L/usr/local/cuda/lib64 -lcublasLt -lcudart
+  /workspace/scan-heuristics /workspace/results/heuristic-scan/choices.tsv
+  sha256sum /usr/local/cuda/lib64/libcublasLt.so.13 > /workspace/results/heuristic-scan/library-sha256.txt
+  exit
+fi
 prefix=${MFS_DP_TRACE_PREFIX:-github}
 snapshot="/workspace/results/$prefix-traced-4/collectives/gemm-snapshot-rank0"
 if [ -f "$snapshot/manifest.json" ]; then

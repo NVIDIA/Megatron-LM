@@ -44,6 +44,10 @@ on:
         description: Optional prior diagnostic run whose captured GEMM should be replayed
         type: string
         default: ""
+      mfsdp_heuristic_scan:
+        description: Query the captured GEMM geometry across K values without training
+        type: boolean
+        default: false
 
 concurrency:
   group: populate-ci-caches-${{ inputs.mfsdp_isolation && github.ref || 'main' }}
@@ -190,6 +194,7 @@ jobs:
           docker pull "$IMAGE"
           docker image inspect --format '{{json .RepoDigests}}' "$IMAGE" > "$stage/image-digests.json"
           docker run --rm --gpus all --runtime nvidia --ipc host --shm-size 30g \
+            -e MFSDP_HEURISTIC_SCAN=${{ inputs.mfsdp_heuristic_scan }} \
             -v "$PWD/mfsdp-source:/opt/megatron-lm" \
             -v "$stage:/workspace" \
             -v /mnt/datadrive/TestData/megatron-lm/artifacts:/mnt/artifacts:ro \
