@@ -1,0 +1,205 @@
+# Shared-prefix packing API
+
+`megatron.rl` owns the reusable shared-prefix packing implementation. It accepts
+ordinary Python row metadata and tensors; it has no dependency on NeMo RL,
+Ray, TransferQueue, a tokenizer, or a training configuration object. Model
+execution (attention, Mamba and the HybridModel forward) belongs to
+`megatron.core`, not to this package.
+
+The canonical data representation is `tree_layout.PackedTreeLayout`: contiguous
+token spans with parent indices, supporting multiple roots and arbitrary depth.
+The current planner emits stars or forests of independent stars, the only shapes
+a star-only execution backend accepts. Arbitrary-depth trajectory-tree execution
+still requires backend work.
+Rows share a prefix only when their group identities **and exact prompt token
+sequences** match. Single-completion groups remain conventional dense units.
+The shard planner requires every prompt group within a logical batch chunk to
+have the same number of rows. Dense-bin reconstruction and dense fallback
+merging can still run one row as a single-completion forest root next to other
+stars: a one-row fragment of a group split across bins, or a merged fallback
+row.
+The representation is independent of the RL objective: GRPO and PPO adapters
+can supply the same row contract without changing their losses or advantages.
+
+## Multi-level representation and execution boundary
+
+`SharedPrefixLayout.tree_layout` and `SharedPrefixForestLayout.tree_layout`
+expose the canonical descriptor. The star builder derives positions, first-token
+predecessors and padding from it; forest composition rebases parent indices;
+model-input lowering reads its node spans. Source-row gather/scatter and MTP
+loss-group metadata remain in the packing wrappers.
+
+For example, a prompt followed by a shared continuation and two independent
+answers is a three-level tree:
+
+```python
+from megatron.rl.tree_layout import PackedTreeLayout
+
+tree = PackedTreeLayout(
+    node_start=(0, 2, 6, 8),
+    node_len=(2, 4, 2, 3),
+    node_parent=(-1, 0, 1, 1),
+    logical_node_len=(2, 2, 2, 3),
+)
+assert tree.path_token_indices(2) == (0, 1, 2, 3, 6, 7)
+assert tree.first_predecessors()[2] == 3  # excludes parent padding at 4, 5
+```
+
+The test-only `build_tree_attention_allow_mask` in
+`tests/unit_tests/rl/shared_prefix/shared_prefix_oracles.py` is a correctness
+oracle for these deeper trees. It permits real ancestor tokens and causal tokens
+within the same node, and isolates sibling branches and unrelated roots. Its use
+does **not** qualify any attention or recurrent kernel for deeper trees. A
+model-execution adapter (NeMo RL's, for example) should call
+`iter_star_roots()`, which rejects deeper trees, interleaved star storage and
+padded prompt roots, before lowering to a star-only backend. Future generalized
+tree execution can reuse the descriptor, path and predecessor contracts while
+adding backend support and generalized source-row/loss mappings.
+
+## Modules
+
+- `tree_layout`: immutable multi-level token-span forests; ancestry, logical
+  positions, predecessor indices, dense path reconstruction, and parent rebasing.
+  It has no Torch or model-runtime dependency.
+- `shared_prefix_packing`: immutable row, star and forest layouts; exact-prefix
+  matching; physical padding; group subdivision and forest packing.
+- `shared_prefix_tensors`: conventional-batch row construction; token gathering,
+  completion/predecessor/scatter maps; TP/CP alignment and zigzag context-parallel
+  tensor shards. It builds no dense attention masks.
+- `shared_prefix_metadata`: group-coherent sharding.
+  `GroupCoherentShardPlan.rank_order_permutation` maps each position of the
+  rank-major concatenation to its source row, the forward permutation that
+  restores source order.
+- `shared_prefix_cost`: backbone plus expanded-token estimates for balancing.
+- `shared_prefix_execution`: execution units and plans; local splitting of each
+  prompt group into execution slots; training and evaluation budgets; dense
+  fallback repacking and MTP-normalization-preserving fallback merging.
+- `shared_prefix_alignment`: real-row splits to a caller-agreed distributed
+  forward count, with conservative or prefix-preserving reconstruction.
+- `shared_prefix_dense_bins`: expanded-row packing followed by shared-prefix
+  reconstruction within aligned dense training bins.
+
+`MAX_SHARED_PREFIX_BRANCHES` (16) is the default number of completions stored
+behind one prompt copy. It is a planning policy, not a kernel limit, and planners
+that take a branch limit default to it. A larger exact-prompt group is split
+into the fewest stars the limit allows, with sizes that differ by at most one:
+17 rows become 9 and 8, and 241 rows become one star of 16 and fifteen of 15. A
+binding token budget can split a group further.
+
+Every module listed above except `shared_prefix_tensors` requires only the
+Python standard library. Tensor materialization additionally requires Torch.
+Importing these modules does not initialize a model or load the optional
+Pydantic generation request API.
+
+## Minimal packing example
+
+```python
+from megatron.rl.shared_prefix_dense_bins import (
+    plan_dense_training_bins,
+    share_prefixes_in_dense_training_bins,
+)
+from megatron.rl.shared_prefix_packing import SharedPrefixRow
+
+rows = [
+    SharedPrefixRow(0, "prompt-a", (10, 11, 12), 2),
+    SharedPrefixRow(1, "prompt-a", (10, 11, 12), 3),
+]
+costs = [row.total_length for row in rows]  # dense lengths 5 and 6
+
+
+def pack(costs):
+    """Stand-in for the caller's deterministic length-only packer."""
+    return [list(range(len(costs)))]
+
+
+dense = plan_dense_training_bins(costs=costs, bin_capacity=12, dense_packer=pack)
+# A distributed caller agrees on the forward count and aligns the dense bins here.
+units = share_prefixes_in_dense_training_bins(
+    rows, dense, costs=costs, padding_multiple=1, bin_capacity=12
+)
+assert len(units) == 1
+assert units[0].physical_length == 8  # prompt once plus both completions
+```
+
+Callers choose their conventional length-only packer and pass its `pack`
+method as `dense_packer` when requesting dense fallback repacking or dense
+training bins. This keeps framework-specific packing algorithm selection out of
+this library. Every model-parallel rank plans its own microbatches, so
+`dense_packer` must be a deterministic, pure function of the costs it receives:
+TP/CP peers that agree on the forward count but not on bin composition would run
+collectives over different tokens. `pack_dense_rows` calls the packer twice and
+rejects differing bins, which catches a non-repeatable packer but not one that
+differs between ranks.
+
+Determinism is not batch invariance. The planners are deterministic functions
+of the local batch, so peers with identical inputs build identical plans. A
+row's layout still depends on the other rows in its batch: which rows share its
+star, which stars share its forest, and how alignment splits its unit. Different
+layouts change logprobs and gradients at BF16 level. The `megatron.core`
+shared-prefix execution in #8156, #8157 and #7914 also rejects
+`batch_invariant_mode`.
+
+## Integration responsibilities
+
+The caller validates its configuration and model capabilities, supplies the
+TP/CP topology and padding multiple, transports metadata with source rows,
+and agrees on a forward count across all participating model ranks. It then
+calls the alignment helpers with that count. No helper launches collectives
+or fabricates dummy training examples.
+
+Each data-parallel replica plans only its own rows. Invalid flag combinations
+are rejected before any row is read, so they fail on every rank alike. A check
+on the rows can fail on one replica while its peers succeed: for example, a row
+longer than the token budget after padding makes
+`plan_shared_prefix_execution_units` raise only on the replica that holds it.
+The caller must carry any local planning error in the same collective that
+agrees on the forward count. Every rank then raises together instead of waiting
+in a model collective. The alignment helpers run after that agreement and have
+their own preconditions:
+
+- Pass them only units that the planners produced under the same token budget
+  and padding multiple.
+- The agreed count must not exceed any rank's number of real rows, because
+  alignment never fabricates rows. Carry the minimum local row count in the same
+  collective, and fail on every rank if it is too small.
+- `align_training_units` cannot split a forest with explicit MTP loss groups,
+  such as one built by `merge_dense_fallbacks`.
+
+TP greater than one requires sequence parallelism. The padding multiple must be
+a multiple of the topology quantum from `get_shared_prefix_physical_alignment`:
+1 at TP1/CP1, 2·CP at TP1 with CP greater than one, and 2·TP·CP whenever TP is
+greater than one. At CP1 this is 2·TP, stricter than the TP alignment of
+conventional sequence packing. `resolve_shared_prefix_physical_padding_multiple`
+returns the quantum when the caller passes no multiple.
+
+Training must fit both the physical shared backbone budget and the expanded
+MTP budget. Physical-only evaluation packing requires uniformly disabling
+MTP in the caller. Dense-bin reconstruction retains one MTP auxiliary-loss
+normalization group per original dense bin. Prefix sharing in MTP itself is
+outside this API's current execution scope.
+
+NeMo RL supplies batch/configuration adapters and worker integration. Its
+shared-prefix code imports `megatron.rl` directly, and only on shared-prefix
+paths; it does not re-export these modules. Install the matching Megatron
+version in **both the driver and model-worker environments** when using
+shared-prefix planning; ordinary dense NeMo imports remain independent of the
+optional Megatron backend.
+
+## Validation scope
+
+The packing tests live in `tests/unit_tests/rl/shared_prefix/` and run in the
+unit-test CI buckets. They need neither a GPU nor torch.distributed. They cover
+exact prompt identity, source-row coverage, causal isolation, physical padding,
+CP shard reconstruction, fallback behavior, execution-count alignment, MTP
+normalization, seeded planning and tensor properties, the signatures NeMo RL
+calls, and the examples in this file. Where `megatron.core` cannot be imported,
+run them without the repository conftest:
+
+```bash
+python -m pytest --noconftest tests/unit_tests/rl/shared_prefix
+```
+
+These tests cover planning only. Model numerics, and the agreement between this
+planner and core execution on the padding quantum and CP ownership, belong with
+the model execution code in `megatron.core`. GPU kernel, distributed model and
+RL convergence qualification are separate gates.
