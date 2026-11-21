@@ -250,55 +250,63 @@ class PrefixCacheBlockState:
         block by its own recency (and reconsidering a parent only once its children
         are gone) is what makes this the optimal LRU generalization.
 
+        Each pop takes the oldest entry, so a leaf with `num_blocks_needed` older
+        leaves is never reached; the heap starts from the oldest leaves only, which
+        keeps the Python work proportional to `num_blocks_needed` rather than to the
+        number of cached blocks.
+
         `None` if fewer than `num_blocks_needed` evictable blocks exist. Callers
         must push the returned blocks back onto the free pool via the allocator
         after `deregister_blocks` clears their state.
         """
         assert self.is_lru, "find_lru_evictable requires LRU eviction policy"
         cached_mask = (self.block_ref_counts == 0) & (self.block_hashes != -1)
-        cached_block_ids = torch.nonzero(cached_mask, as_tuple=True)[0]
-        num_cached = cached_block_ids.numel()
+        num_cached = int(torch.count_nonzero(cached_mask))
         if num_cached < num_blocks_needed:
             return None
         if num_blocks_needed <= 0:
-            return cached_block_ids[:0]
+            return torch.empty(0, dtype=torch.int64)
 
-        ts = self.block_timestamps[cached_block_ids].tolist()
-        bid = cached_block_ids.tolist()
-        parent_global = self.block_parent_id[cached_block_ids].tolist()
-        child_count = self.block_child_count[cached_block_ids].tolist()
+        leaf_ids = torch.nonzero(cached_mask & (self.block_child_count == 0), as_tuple=True)[0]
+        if leaf_ids.numel() > num_blocks_needed:
+            # Stable sort keeps ascending block ids among equal timestamps.
+            order = torch.argsort(self.block_timestamps[leaf_ids], stable=True)
+            leaf_ids = leaf_ids[order[:num_blocks_needed]]
 
-        # Map a cached block's global id to its local index so the peel can find a
-        # parent's slot to decrement. Parents that are not cached (root, or a
-        # parent still in use) are absent and are simply treated as peel roots.
-        global_to_local = {bid[i]: i for i in range(num_cached)}
-        parent_local = [global_to_local.get(p, -1) for p in parent_global]
+        timestamps = self.block_timestamps.numpy()
+        parent_ids = self.block_parent_id.numpy()
+        child_counts = self.block_child_count.numpy()
+        is_cached = cached_mask.numpy()
 
         # Min-heap of currently-evictable leaves keyed by (own timestamp, block
         # id). Block ids are unique, so the tie-break is total and deterministic.
-        heap = [(ts[i], bid[i], i) for i in range(num_cached) if child_count[i] == 0]
+        heap = [(int(timestamps[b]), b) for b in leaf_ids.tolist()]
         heapq.heapify(heap)
 
-        evicted_local: List[int] = []
-        while heap and len(evicted_local) < num_blocks_needed:
-            _, _, i = heapq.heappop(heap)
-            evicted_local.append(i)
-            p = parent_local[i]
-            if p >= 0:
-                child_count[p] -= 1
-                if child_count[p] == 0:
-                    heapq.heappush(heap, (ts[p], bid[p], p))
+        # Parents that are not cached (root, or a parent still in use) are treated
+        # as peel roots; cached parents count down their remaining cached children.
+        remaining_children: Dict[int, int] = {}
+        evicted: List[int] = []
+        while heap and len(evicted) < num_blocks_needed:
+            _, block_id = heapq.heappop(heap)
+            evicted.append(block_id)
+            parent = int(parent_ids[block_id])
+            if parent >= 0 and is_cached[parent]:
+                count = remaining_children.get(parent, int(child_counts[parent])) - 1
+                remaining_children[parent] = count
+                if count == 0:
+                    heapq.heappush(heap, (int(timestamps[parent]), parent))
 
         # A forest is always fully peelable, so the heap always exposes enough
         # leaves to collect num_blocks_needed (guaranteed by the num_cached check
         # above). Falling short means the parent graph is cyclic -- only possible
         # under a block-hash collision, which we treat as a bug.
-        assert len(evicted_local) == num_blocks_needed, (
-            f"leaf peel evicted {len(evicted_local)} of {num_blocks_needed} "
+        assert len(evicted) == num_blocks_needed, (
+            f"leaf peel evicted {len(evicted)} of {num_blocks_needed} "
             f"requested from {num_cached} cached blocks; parent graph is not a "
             f"forest (likely a block-hash collision)"
         )
-        return cached_block_ids[torch.tensor(evicted_local, dtype=torch.int64)]
+        return torch.tensor(evicted, dtype=torch.int64)
 
     def deregister_blocks(self, block_ids: Tensor) -> List[int]:
         """Reset per-block state for `block_ids`; return their hashes.
