@@ -763,6 +763,7 @@ class TestGPTModelTEQuantizationConfig:
         # Keep this after numerical checks: a lost override must fail numerically too.
         assert op_contexts == [False]
 
+    @pytest.mark.launch_on_gb200
     @pytest.mark.parametrize(
         ("transformer_impl", "recipe_storage"),
         [

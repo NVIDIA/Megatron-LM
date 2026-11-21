@@ -429,6 +429,7 @@ def test_score_windows_match_one_window(monkeypatch):
     torch.testing.assert_close(attend(), one_window, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.launch_on_gb200
 @pytest.mark.parametrize(
     "cache_mode,static_pointers",
     [
@@ -565,6 +566,7 @@ def test_native_decode_suspend_resume(native_context_factory, cache_mode, static
         torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.launch_on_gb200
 @pytest.mark.parametrize("decode_only", [True, False])
 @pytest.mark.usefixtures("nondeterministic_decode")
 def test_native_decode_and_mixed_batches_replay_in_cuda_graph(
@@ -700,6 +702,7 @@ def test_native_decode_and_mixed_batches_replay_in_cuda_graph(
         attend(1)
 
 
+@pytest.mark.launch_on_gb200
 @pytest.mark.usefixtures("nondeterministic_decode")
 def test_native_decode_activation_memory_is_bounded(native_context_factory):
     """Thirty-two layers and several graph shapes must not retain per-layer score buffers."""
@@ -821,6 +824,7 @@ def _training_forward(query, index_query, index_keys, keys, values, selected, to
     return scores[0, 0, :length], indices[0, 0], training_output[0, 0], same_support_output[0, 0]
 
 
+@pytest.mark.launch_on_gb200
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("seed", [71, 2026, 17])
 @pytest.mark.parametrize("context", [32768, 262144])
@@ -944,6 +948,7 @@ def test_native_decode_matches_training_kernels_and_graph_refresh(
     )
 
 
+@pytest.mark.launch_on_gb200
 @pytest.mark.parametrize(
     "width,topk", [(516, 512), (4096, 1024), (32772, 2048), (65536, 2048), (131072, 2048)]
 )

@@ -61,6 +61,7 @@ class TestDelayWgradCompute:
     @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
     @pytest.mark.parametrize("shared_expert_intermediate_size", [None, 512])
     @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
+    # The Blackwell-only MXFP8 flags carry launch_on_gb200 (see get_valid_fp8_flags).
     @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
     def test_overlap_dispatch_backward_with_experts_wgrad(
         self, shared_expert_intermediate_size, dispatcher_type, flex_backend, fp8_flag
