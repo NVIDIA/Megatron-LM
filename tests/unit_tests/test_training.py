@@ -26,7 +26,9 @@ from megatron.training.global_vars import (
 )
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 from megatron.training.training import (
+    _add_model_freeze_pre_wrap_hook,
     _consume_embedding_min_norm_metrics,
+    _freeze_all_model_chunks,
     _get_indexer_logging_layer_counts,
     _get_optimizer_param_scheduler_increment,
     _pop_samples_seen,
@@ -185,6 +187,14 @@ def create_test_args():
     return args
 
 
+def test_freeze_hook_appended_to_model_config_without_kd():
+    model_config = Mock(pre_wrap_hooks=[])
+    _add_model_freeze_pre_wrap_hook(
+        model_config, freeze_all_layers=True, freeze_base_model_for_mtp=False
+    )
+    assert model_config.pre_wrap_hooks == [_freeze_all_model_chunks]
+
+
 def test_indexer_logging_counts_only_active_legacy_ratios():
     """Unused ratio-tail entries must not dilute the reported indexer loss."""
     args = SimpleNamespace(
@@ -319,6 +329,8 @@ class TestTraining:
         run_config.validation = ValidationConfig(
             eval_interval=1, eval_iters=1, eval_global_batch_size=1
         )
+        # These providers return iterators, so use the external loader.
+        run_config.data.dataloader.dataloader_type = "external"
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -449,6 +461,8 @@ class TestTraining:
         }
 
     def test_build_train_valid_test_data_iterators_multi_full_validation(self, run_config):
+        # The provider yields iterators: the external loader type, now read from the section.
+        run_config.data.dataloader.dataloader_type = 'external'
         """multiple_validation_sets + full_validation builds a list of iterators
         (one per validation set) and sets cfg.validation.eval_iters to the per-loader
         lengths MAX-reduced across DP ranks."""

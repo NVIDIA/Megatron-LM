@@ -20,6 +20,7 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
 )
+from megatron.training.datasets.utils import get_training_data_sequence_length
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 from megatron.training.state import TrainState
 
@@ -43,7 +44,7 @@ def get_args():
 
 
 def get_run_config():
-    """Return the full pretrain config container."""
+    """Return the active training or inference run config container."""
     _ensure_var_is_initialized(_GLOBAL_RUN_CONFIG, 'run config')
     return _GLOBAL_RUN_CONFIG
 
@@ -235,7 +236,7 @@ def initialize_training_runtime_services(args: Namespace) -> None:
         data_parallel_size=cfg.get_batch_parallel_size(),
         decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
         step_batch_size_schedule=cfg.train.step_batch_size_schedule,
-        seq_length=args.seq_length,
+        seq_length=get_training_data_sequence_length(cfg),
     )
     _set_tensorboard_writer(args)
     _set_one_logger(args)
@@ -570,7 +571,6 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
     cfg = get_run_config()
     resource_attrs = {'dl.local_rank': cfg.dist.local_rank}
     fields = [
-        ('dl.sequence_length', 'seq_length'),
         ('megatron.ckpt_format', 'ckpt_format'),
     ]
     if include_training:
@@ -589,6 +589,13 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
         val = getattr(args, arg_name, None)
         if val is not None:
             resource_attrs[attr] = val
+    # Loader telemetry describes dataset rows, not VLM's expanded model input.
+    if include_training:
+        sequence_length = get_training_data_sequence_length(cfg)
+    else:
+        sequence_length = getattr(args, 'seq_length', None)
+    if sequence_length is not None:
+        resource_attrs['dl.sequence_length'] = sequence_length
 
     # Preserve inference's CLI boundary; training's existing model tags use its config owner.
     if include_training:

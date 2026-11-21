@@ -668,6 +668,10 @@ class CheckpointConfig:
     thread/process that outlives each save. Required when ``async_save`` is set (an asynchronous
     distributed save is rejected without it)."""
 
+    async_write_results_mp_mode: Literal["fork", "spawn", "forkserver"] = "fork"
+    """Multiprocessing start method of the async checkpoint write-results queue. Only applies
+    when using the persistent ckpt worker (``use_persistent_ckpt_worker``)."""
+
     async_ckpt_cpu_priority: int = 10
     """CPU nice value target (0-19, higher = lower priority) for the async checkpoint writer process.
     If it exceeds 19, it will be set to 19. If the current nice value is greater than the target, it will be left unchanged.
@@ -804,8 +808,10 @@ class CheckpointConfig:
     exchange algorithm. Pass it explicitly on the inference command line."""
 
     dist_ckpt_workers: int = 1
-    """Number of workers for distributed checkpointing. Only used for async save.
-    If set to 1, the checkpointing is performed in a single process."""
+    """Number of workers for distributed checkpointing. Only used for async save; a synchronous
+    torch_dist save always uses 1. If set to 1, the checkpointing is performed in a single
+    process. For torch_dist the number of checkpoint files is
+    ``saving ranks * dist_ckpt_workers``."""
 
     override_ckpt_iteration: int | None = None
     """Override the iteration stored in the loaded checkpoint. Also resets
@@ -841,6 +847,11 @@ class CheckpointConfig:
 
         assert self.async_strategy in ["nvrx"], \
             f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx."
+
+        assert self.async_write_results_mp_mode in ["fork", "spawn", "forkserver"], (
+            f"async_write_results_mp_mode {self.async_write_results_mp_mode!r} is not supported. "
+            "Available modes: fork, spawn, forkserver."
+        )
 
         # An asynchronous distributed save needs the persistent checkpoint worker (a legacy torch
         # save cannot be asynchronous at all: save_checkpoint rejects it). Megatron-Bridge makes
