@@ -50,7 +50,11 @@ WORLD = 4
 GTP_SIZES = [2, 4]
 HIDDEN = 256
 NUM_HEADS = 8
-FFN_HIDDEN = 512
+# 320 is deliberately >= 64-aligned but NOT 128-aligned, so linear_fc1 is UNPADDED at
+# GTP_remat=2 and PADDED at GTP_remat=4. That asymmetry is what the real model hits (its GDP
+# in_proj is 61760: 61760 % 64 == 0 but 61760 % 128 == 64), and a uniformly-aligned size would
+# never exercise it.
+FFN_HIDDEN = 320
 # One stack holding every layer kind at once: GDP mixer, attention, MLP.
 LAYER_PATTERN = ["M", "*", "-"]
 NUM_LAYERS = len(LAYER_PATTERN)
@@ -251,3 +255,41 @@ class TestGTPCpuInitialization:
         _requires_multi_gpu(WORLD)
         _requires_mxfp8()
         _run_distributed(_worker_high_precision_init_val, WORLD, gtp_remat_size)
+
+
+def _worker_duplicated_cpu_init(rank, world_size, port, fp8_param, gtp_remat_size):
+    from megatron.core.extensions.transformer_engine import TELinear
+    from megatron.core.fp8_utils import get_fp8_context
+
+    config = _make_config(fp8_param)
+
+    def build(size):
+        pgs = _init_mpu(size)
+        with get_fp8_context(config, is_init=True):
+            layer = TELinear(
+                HIDDEN,
+                FFN_HIDDEN,
+                parallel_mode="duplicated",
+                config=config,
+                init_method=config.init_method,
+                bias=False,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                gtp_remat_group=pgs.gtp_remat,
+            ).cuda()
+        return _full_weights(layer, pgs.gtp_remat)
+
+    reference = build(1)
+    actual = build(gtp_remat_size)
+    for name in reference:
+        torch.testing.assert_close(actual[name], reference[name], rtol=0, atol=0)
+
+
+class TestDuplicatedLinearCpuInitialization:
+    @pytest.mark.parametrize("fp8_param", [False, True])
+    @pytest.mark.parametrize("gtp_remat_size", GTP_SIZES)
+    def test_cpu_init_is_gtp_invariant(self, gtp_remat_size, fp8_param):
+        _requires_multi_gpu(WORLD)
+        if fp8_param:
+            _requires_mxfp8()
+        _run_distributed(_worker_duplicated_cpu_init, WORLD, fp8_param, gtp_remat_size)
