@@ -169,9 +169,11 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
             local_tokens_per_rank = torch.empty(ep_size, dtype=torch.int32, device=device)
             dist.all_gather_into_tensor(local_tokens_per_rank, local_count, group=self.ep_group)
             cls._local_tokens_per_rank = local_tokens_per_rank.tolist()
-            total = local_tokens_per_rank.sum()
-            InferenceAllGatherDispatcherBase._valid_tokens_tensor.copy_(total)
-            InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = int(total.item())
+            # .tolist() above is this path's only device->host sync; derive the total from
+            # the host copy instead of reading local_tokens_per_rank again.
+            total_tokens = sum(cls._local_tokens_per_rank)
+            InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(total_tokens)
+            InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = total_tokens
         else:
             total = ep_size * local_tokens
             InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(total)

@@ -324,7 +324,10 @@ class TestNCCLAllGatherDispatcher:
         - dispatch gathers all slices back to the full global tensor
         - combine reduce-scatters the gathered data, giving each rank ep_size * its_slice
         """
-        from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            InferenceAllGatherDispatcherBase,
+            NCCLAllGatherDispatcher,
+        )
 
         if use_allgather_v and Utils.world_size == 1:
             pytest.skip("Variable-token prefill path requires EP > 1")
@@ -367,6 +370,10 @@ class TestNCCLAllGatherDispatcher:
             return
 
         d_hidden, d_probs = dispatcher.token_dispatch(hidden, probs)
+
+        # update_metadata must publish the global token count on host and device.
+        assert InferenceAllGatherDispatcherBase._host_valid_tokens_estimate == total_tokens
+        assert int(InferenceAllGatherDispatcherBase._valid_tokens_tensor.item()) == total_tokens
 
         assert d_hidden.shape == (total_tokens, hidden_size)
         assert d_probs.shape == (total_tokens, topk)
