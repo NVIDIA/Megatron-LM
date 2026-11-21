@@ -24,6 +24,13 @@ def ceil_div(a, b):
     return (a + b - 1) // b
 
 
+def _skip_without_flashinfer_mxfp8():
+    if not HAVE_FLASHINFER:
+        pytest.skip("FlashInfer not available")
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("FlashInfer's MXFP8 quantizer requires Blackwell (SM 100+)")
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Reference functions from PyTorch
 # https://github.com/pytorch/pytorch/blob/main/torch/testing/_internal/common_quantized.py#L578
@@ -351,10 +358,12 @@ class TestMXFP8Tensor:
         assert scale.dtype == torch.float8_e8m0fnu
         torch.testing.assert_close(scale.view(torch.uint8), scale_bytes)
 
-    @pytest.mark.parametrize("backend", ["triton", "flashinfer"])
+    @pytest.mark.parametrize(
+        "backend", ["triton", pytest.param("flashinfer", marks=pytest.mark.launch_on_gb200)]
+    )
     def test_copy_preserves_storage_and_logical_metadata(self, backend):
-        if backend == "flashinfer" and not HAVE_FLASHINFER:
-            pytest.skip("FlashInfer not available")
+        if backend == "flashinfer":
+            _skip_without_flashinfer_mxfp8()
 
         source = torch.randn(16, 128, device="cuda", dtype=torch.bfloat16)
         tensor = MXFP8Tensor.from_bf16(source, backend=backend)
@@ -533,13 +542,13 @@ class TestMXFP8Tensor:
             tensor.data.view(torch.uint8), ref_data.view(torch.uint8), atol=0, rtol=0
         )
 
+    @pytest.mark.launch_on_gb200
     @pytest.mark.parametrize("M,K", [(16, 128), (64, 256), (128, 2688)])
     def test_from_bf16_flashinfer(self, M, K):
         """from_bf16 with flashinfer backend produces valid output."""
-        from megatron.core.inference.quantization.mxfp8_tensor import HAVE_FLASHINFER, MXFP8Tensor
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
-        if not HAVE_FLASHINFER:
-            pytest.skip("FlashInfer not available")
+        _skip_without_flashinfer_mxfp8()
 
         torch.manual_seed(42)
         x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
@@ -548,6 +557,53 @@ class TestMXFP8Tensor:
         assert tensor.data.shape == (M, K)
         assert tensor.data.dtype == torch.float8_e4m3fn
         assert tensor.backend == "flashinfer"
+
+    @pytest.mark.launch_on_gb200
+    def test_flashinfer_never_returns_unwritten_buffers(self):
+        """The FlashInfer backend quantizes as the Triton backend does, or raises where its
+        kernel cannot run. Below compute capability 10.0, FlashInfer's MXFP8 kernel has no
+        body, and the backend returned output buffers the kernel never wrote."""
+        if not HAVE_FLASHINFER:
+            pytest.skip("FlashInfer not available")
+
+        torch.manual_seed(7)
+        x = torch.randn(256, 384, device="cuda", dtype=torch.bfloat16)
+        expected = MXFP8Tensor.from_bf16(x, backend="triton")
+        # Free NaN-filled blocks of the output sizes for FlashInfer's outputs to reuse.
+        torch.full_like(expected.data.view(torch.uint8), 0xFF)
+        torch.full_like(expected.scale.view(torch.uint8), 0xFF)
+
+        try:
+            tensor = MXFP8Tensor.from_bf16(x, backend="flashinfer")
+        except RuntimeError as error:
+            assert torch.cuda.get_device_capability()[0] < 10, error
+            assert "requires compute capability 10.0" in str(error)
+            return
+        codes, expected_codes = tensor.data.view(torch.uint8), expected.data.view(torch.uint8)
+        differ = (codes != expected_codes).sum().item()
+        assert differ == 0, f"{differ} of {x.numel()} codes differ from the Triton backend's"
+        assert torch.equal(tensor.scale, expected.scale.view(torch.uint8))
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(
+        torch.cuda.get_device_capability()[0] < 10,
+        reason="FlashInfer's MXFP8 quantizer requires Blackwell (SM 100+)",
+    )
+    @pytest.mark.parametrize("layout", ["transpose", "row_slice", "column_slice"])
+    def test_flashinfer_reads_strided_input(self, layout):
+        """FlashInfer quantizes the strided views the Triton backend reads by their values."""
+        if not HAVE_FLASHINFER:
+            pytest.skip("FlashInfer not available")
+
+        torch.manual_seed(42)
+        x = TestMxfp8Quantize._make_layout_input(layout, torch.bfloat16)
+        assert not x.is_contiguous()
+        expected = MXFP8Tensor.from_bf16(x.contiguous(), backend="flashinfer")
+
+        tensor = MXFP8Tensor.from_bf16(x, backend="flashinfer")
+
+        assert torch.equal(tensor.data.view(torch.uint8), expected.data.view(torch.uint8))
+        assert torch.equal(tensor.scale, expected.scale)
 
     def test_from_bf16_invalid_backend(self):
         """from_bf16 with invalid backend raises ValueError."""
