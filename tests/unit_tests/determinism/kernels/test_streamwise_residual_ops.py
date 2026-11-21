@@ -30,8 +30,8 @@ def _padded_controller_logits(values: tuple[float, ...]) -> torch.Tensor:
 @pytest.mark.parametrize("fp32_residual", [False, True], ids=("bf16_residual", "fp32_residual"))
 @pytest.mark.parametrize(
     "stream_width,backward_tile",
-    [(256, (64, 128)), (1024, (16, 512))],
-    ids=("shared_tile", "wide_backward_tile"),
+    [(256, (64, 128)), (1024, (16, 512)), (96, (64, 128))],
+    ids=("shared_tile", "wide_backward_tile", "masked_column_tile"),
 )
 def test_fused_streamwise_read_write_replays_fwd_bwd(
     with_retention, fp32_residual, stream_width, backward_tile
@@ -39,7 +39,8 @@ def test_fused_streamwise_read_write_replays_fwd_bwd(
     """Replay fused outputs and every activation/controller gradient under contention.
 
     A width of 1024 selects the 16 x 512 backward tile; a width of 256 keeps the backward
-    kernels on the forward tile.
+    kernels on the forward tile; a width of 96 runs every kernel on a 128-column tile whose
+    last 32 columns are masked.
     """
 
     seeded()
