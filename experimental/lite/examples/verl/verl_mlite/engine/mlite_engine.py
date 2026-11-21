@@ -733,7 +733,6 @@ class MegatronLiteEngine(BaseEngine):
         loss_function,
         forward_only: bool,
     ) -> dict[str, Any]:
-        runtime_batches = []
         num_micro_batches = len(micro_batches)
         batch_num_tokens = tu.get_non_tensor_data(data=data, key="batch_num_tokens", default=None)
         if batch_num_tokens is None:
@@ -743,34 +742,34 @@ class MegatronLiteEngine(BaseEngine):
         if batch_num_tokens <= 0:
             raise ValueError(f"batch_num_tokens must be positive, got {batch_num_tokens}.")
         loss_scale = self.get_data_parallel_size() * num_micro_batches / float(batch_num_tokens)
-        for micro_idx, micro_batch in enumerate(micro_batches):
-            tu.assign_non_tensor(micro_batch, micro_batch_idx=micro_idx)
-            micro_batch = micro_batch.to(get_device_id())
-            runtime_batches.append(
-                (
+
+        replay_enabled = self.engine_config.router_replay_mode == "R3"
+        if replay_enabled and not all(
+            micro_batch.get("routed_experts", None) is not None
+            for micro_batch in micro_batches
+        ):
+            raise ValueError(
+                "router_replay_mode='R3' requires routed_experts on every "
+                "actor micro-batch in a step."
+            )
+
+        def runtime_batches():
+            for micro_idx, micro_batch in enumerate(micro_batches):
+                tu.assign_non_tensor(micro_batch, micro_batch_idx=micro_idx)
+                micro_batch = micro_batch.to(get_device_id())
+                yield (
                     self._make_runtime_batch(micro_batch),
                     self._make_runtime_loss_context(micro_batch, loss_scale=loss_scale),
                 )
-            )
 
         runtime_loss_fn = None
         reduced_outputs = [] if (loss_function is not None or forward_only) and self.is_mp_src_rank_with_outputs() else None
         if loss_function is not None or forward_only:
             runtime_loss_fn = self._make_runtime_loss_fn(loss_function, num_micro_batches, reduced_outputs)
 
-        replay_specs = [
-            runtime_batch.routed_experts is not None
-            for runtime_batch, _loss_context in runtime_batches
-        ]
-        replay_enabled = self.engine_config.router_replay_mode == "R3"
-        if replay_enabled and not all(replay_specs):
-            raise ValueError(
-                "router_replay_mode='R3' requires routed_experts on every "
-                "actor micro-batch in a step."
-            )
         result = self.runtime.forward_backward(
             self.handle,
-            iter(runtime_batches),
+            runtime_batches(),
             loss_fn=runtime_loss_fn,
             num_microbatches=num_micro_batches,
             forward_only=forward_only,
