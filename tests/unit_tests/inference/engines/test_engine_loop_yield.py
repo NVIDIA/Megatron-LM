@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from megatron.core.inference.config import AsyncScheduleMode
-from megatron.core.inference.engines.dynamic.loop import EngineLoopMixin
+from megatron.core.inference.engines.dynamic.loop import EngineLoopMixin, EPWorkLevel
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     DecodeOnly,
@@ -200,9 +200,7 @@ def test_blocked_expert_parallel_rank_retries_in_every_collective_of_busy_peers(
     after a no-op admission retry, and advances its clocks once per pass, as the
     peer does.
     """
-    engine = _WaitingRequestEngine(
-        admits=False, ep_world_size=2, peer_work=EngineLoopMixin._EP_MODEL_WORK
-    )
+    engine = _WaitingRequestEngine(admits=False, ep_world_size=2, peer_work=EPWorkLevel.MODEL_WORK)
     per_pass = _run_passes(engine, 45)
     assert per_pass == [["no-op step", "dummy"]] * 45
     assert engine.context.step_count == engine.context.prefix_cache_lru_clock == 45
@@ -218,7 +216,7 @@ def test_blocked_expert_parallel_group_idles_between_admission_attempts():
     engine = _WaitingRequestEngine(admits=False, ep_world_size=2, peer_work=0)
     per_pass = _run_passes(engine, 45)
     assert per_pass == [["no-op step", "dummy"], []] * 22 + [["no-op step", "dummy"]]
-    attempt, no_work = EngineLoopMixin._EP_ADMISSION_ATTEMPT, EngineLoopMixin._EP_NO_WORK
+    attempt, no_work = EPWorkLevel.ADMISSION_ATTEMPT, EPWorkLevel.NO_WORK
     assert engine.reported_work == [attempt, no_work] * 22 + [attempt]
     assert engine.idle_passes == 22
 
@@ -226,7 +224,7 @@ def test_blocked_expert_parallel_group_idles_between_admission_attempts():
 def test_blocked_expert_parallel_rank_lets_other_tasks_run():
     async def main():
         engine = _WaitingRequestEngine(
-            admits=False, ep_world_size=2, peer_work=EngineLoopMixin._EP_MODEL_WORK
+            admits=False, ep_world_size=2, peer_work=EPWorkLevel.MODEL_WORK
         )
 
         async def stop():

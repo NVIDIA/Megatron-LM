@@ -41,7 +41,7 @@ from megatron.core.utils import (
 )
 
 from ..async_zmq_communicator import AsyncZMQCommunicator, RankedPubSub
-from .loop import EngineState
+from .loop import EngineState, EPWorkLevel
 from .requests import _PROMPT_PREPARATION_ERROR_FIELD
 
 try:
@@ -379,7 +379,7 @@ class CoordinatorMixin:
         self.tp_ep_rank = get_pg_rank(tp_ep_group)
         self.tp_ep_world_size = get_pg_size(tp_ep_group)
         self._ep_consensus_loop_counter = 0
-        self._last_ep_consensus: tuple[int, bool] = (0, False)
+        self._last_ep_consensus: tuple[EPWorkLevel, bool] = (EPWorkLevel.NO_WORK, False)
         if self.tp_ep_world_size > 1:
             self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
                 self.zmq_context, process_group=tp_ep_group, hostname=hostname
@@ -1073,14 +1073,14 @@ class CoordinatorMixin:
             return _pack(prompt, failed_params)
 
     async def _ep_establish_consensus(
-        self, local_work: int, signal_consensus: bool
-    ) -> tuple[int, bool]:
+        self, local_work: EPWorkLevel, signal_consensus: bool
+    ) -> tuple[EPWorkLevel, bool]:
         """EP all-reduce to share work levels and pause consensus.
 
         All-reduces two integers at once:
-        - local_work: this rank's work level, one of the engine loop's `_EP_*`
-          constants: no work, only an attempt to admit waiting requests, or
-          work that runs the model. It is a level, not a request count.
+        - local_work: this rank's `EPWorkLevel`: no work, only an attempt to
+          admit waiting requests, or work that runs the model. It is a level,
+          not a request count.
         - consensus flag: -1 if this rank wants to pause, 0 otherwise.
 
         Using max for both:
@@ -1122,7 +1122,7 @@ class CoordinatorMixin:
             global_work, global_consensus = local_work, consensus_val
 
         nvtx_range_pop("_ep_establish_consensus")
-        return global_work, global_consensus == -1
+        return EPWorkLevel(global_work), global_consensus == -1
 
     async def _world_barrier(self):
         """World-wide ZMQ all-reduce barrier for global rank consensus.

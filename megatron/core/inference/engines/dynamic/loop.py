@@ -6,7 +6,7 @@ import functools
 import logging
 import warnings
 from datetime import datetime
-from enum import Enum, auto
+from enum import Enum, IntEnum, auto
 from typing import Dict, List, Optional, Tuple, TypedDict
 
 import torch
@@ -59,6 +59,19 @@ class EngineState(Enum):
     RESUMED = auto()  # GPU onloaded, all ranks confirmed; cleared on next SUSPEND
     STOPPING = auto()  # STOP received; futures cancelled; waiting for world barrier
     STOPPED = auto()  # All ranks confirmed; teardown complete
+
+
+class EPWorkLevel(IntEnum):
+    """Work level a rank reports to EP consensus, which takes the max across ranks.
+
+    The values are ordered: a higher level must win the max all-reduce.
+    """
+
+    NO_WORK = 0
+    # Only an attempt to admit waiting requests, which may admit nothing.
+    ADMISSION_ATTEMPT = 1
+    # Work that runs the model.
+    MODEL_WORK = 2
 
 
 class EngineSuspendedError(Exception):
@@ -124,13 +137,6 @@ class EngineLoopMixin:
         EngineState.RESUMED,
         EngineState.STOPPED,
     )
-
-    # Work levels a rank reports to EP consensus, which takes their maximum.
-    _EP_NO_WORK = 0
-    # Only an attempt to admit waiting requests, which may admit nothing.
-    _EP_ADMISSION_ATTEMPT = 1
-    # Work that runs the model.
-    _EP_MODEL_WORK = 2
 
     # Whether the last step ran the model; a step that admits nothing does not.
     _last_step_ran_model = True
@@ -795,18 +801,18 @@ class EngineLoopMixin:
                         self.context.get_active_request_count() > 0 or self.has_admittable_kv_import
                     )
                     if has_model_work:
-                        local_work = self._EP_MODEL_WORK
+                        local_work = EPWorkLevel.MODEL_WORK
                     elif self._should_attempt_admission():
-                        local_work = self._EP_ADMISSION_ATTEMPT
+                        local_work = EPWorkLevel.ADMISSION_ATTEMPT
                     else:
-                        local_work = self._EP_NO_WORK
+                        local_work = EPWorkLevel.NO_WORK
                     local_pending_transfers = (
                         self.pending_kv_import_count + self.pending_kv_push_count
                     )
                     global_work_from_last_consensus, _ = self._last_ep_consensus
                     if (
                         self.tp_ep_world_size == 1
-                        or global_work_from_last_consensus < self._EP_MODEL_WORK
+                        or global_work_from_last_consensus < EPWorkLevel.MODEL_WORK
                         or self._ep_consensus_loop_counter % self.ep_consensus_interval == 0
                     ):
                         # selectively enter ep_establish_consensus if
@@ -834,7 +840,7 @@ class EngineLoopMixin:
                         await self._world_barrier()
                         self.state = EngineState.PAUSED
                         self._state_events[EngineState.PAUSED].set()
-                    elif global_work > self._EP_NO_WORK:
+                    elif global_work > EPWorkLevel.NO_WORK:
                         # At least one EP peer has work: all must participate. A stalled
                         # queue retries while peers run the model, since this rank joins
                         # their collective either way.
@@ -842,7 +848,7 @@ class EngineLoopMixin:
                             self.waiting_request_ids
                             and (
                                 not self._waiting_queue_stalled
-                                or global_work == self._EP_MODEL_WORK
+                                or global_work == EPWorkLevel.MODEL_WORK
                             )
                         ):
                             await self.async_step()
@@ -883,7 +889,7 @@ class EngineLoopMixin:
                     # The cache from the PAUSING phase still has all_pausing=True;
                     # without this reset the next RUNNING iteration would skip
                     # consensus, read the stale flag, and immediately re-pause.
-                    self._last_ep_consensus = (0, False)
+                    self._last_ep_consensus = (EPWorkLevel.NO_WORK, False)
                     # A pause or suspend may have released what blocked the waiting
                     # queue, so the first RUNNING pass tries admission again.
                     self._waiting_queue_stalled = False
