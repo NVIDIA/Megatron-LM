@@ -46,7 +46,7 @@ def repository(tmp_path, monkeypatch):
     git(repo, "remote", "add", "origin", str(repo))
     monkeypatch.chdir(repo)
     monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
-    monkeypatch.setattr(checkout, "latest_baseline", lambda: (baseline, "123-1"))
+    monkeypatch.setattr(checkout, "latest_baseline", lambda: (baseline, "123-2"))
     return repo, baseline
 
 
@@ -116,7 +116,7 @@ def test_complete_pr_delta_excludes_newer_main_and_restores_bundle(
     assert not (consumer / "unrelated.py").exists()
     assert not (consumer / "removed.py").exists()
     assert (consumer / "new.bin").read_bytes() == b"\x00\xff\x80complete binary change"
-    assert github_output.read_text() == f"sha={tested}\nbaseline_sha={baseline}\ngeneration=123-1\n"
+    assert github_output.read_text() == f"sha={tested}\nbaseline_sha={baseline}\ngeneration=123-2\n"
 
 
 def test_conflict_preserves_checkout_and_metadata(repository, capsys):
@@ -139,21 +139,61 @@ def test_conflict_preserves_checkout_and_metadata(repository, capsys):
 
 
 def test_baseline_lookup_excludes_build_only_forks_and_retries(monkeypatch):
-    candidate = {
-        "event": "schedule",
+    manual = {
+        "event": "workflow_dispatch",
+        "path": ".github/workflows/populate-build-cache.yml",
+        "head_branch": "main",
         "head_repository": {"full_name": checkout.REPOSITORY},
         "run_attempt": 1,
-        "id": 123,
+        "created_at": "2026-11-18T12:00:00Z",
         "head_sha": "a" * 40,
+        "status": "completed",
+        "conclusion": "success",
     }
-    candidates = [
-        {**candidate, "event": "push"},
-        {**candidate, "run_attempt": 2},
-        {**candidate, "head_repository": {"full_name": "fork/Megatron-LM"}},
-        candidate,
-    ]
-    monkeypatch.setattr(checkout, "run", lambda *args: json.dumps({"workflow_runs": candidates}))
-    assert checkout.latest_baseline() == ("a" * 40, "123-1")
-    candidates.pop()
-    with pytest.raises(ValueError, match="No successful first-attempt"):
+    publisher = {**manual, "event": "push", "path": ".github/workflows/publish-unit-testmon.yml"}
+    runs = {
+        "100": {**manual, "event": "push"},
+        "101": {**manual, "run_attempt": 2},
+        "102": {**publisher, "head_repository": {"full_name": "fork/Megatron-LM"}},
+        "103": {**publisher, "conclusion": "failure"},
+        "104": {**publisher, "status": "in_progress"},
+        "105": {**publisher, "head_branch": "dev"},
+        "106": {
+            **publisher,
+            "run_attempt": 2,
+            "head_sha": "b" * 40,
+            "created_at": "2026-11-19T12:00:00Z",
+        },
+        "107": manual,
+        "108": publisher,  # A successful run without a published cache.
+        "109": {**publisher, "head_sha": "c" * 40, "created_at": "2026-11-20T12:00:00Z"},
+    }
+    prefix = "unit-testmon-v1-main-dgx_h100-0000000000000000-"
+    entries = {
+        run_id: {
+            "key": f"{prefix}{run_id}-{run['run_attempt']}",
+            "created_at": "2026-11-21T09:00:00Z" if run_id == "106" else run["created_at"],
+        }
+        for run_id, run in runs.items()
+        if run_id != "108"
+    }
+
+    def api(*args):
+        endpoint = args[-1]
+        if "/actions/caches?" in endpoint:
+            assert "ref=refs%2Fheads%2Fmain" in endpoint
+            assert "sort=created_at&direction=desc" in endpoint
+            ordered = sorted(entries.values(), key=lambda row: row["created_at"], reverse=True)
+            return json.dumps({"actions_caches": ordered})
+        return json.dumps(runs[endpoint.rsplit("/", 1)[1]])
+
+    monkeypatch.setattr(checkout, "run", api)
+    # The retry of run 106 wrote its cache after run 109 published newer main code.
+    assert checkout.latest_baseline() == ("c" * 40, "109-1")
+    del entries["109"]
+    assert checkout.latest_baseline() == ("b" * 40, "106-2")
+    del entries["106"]
+    assert checkout.latest_baseline() == ("a" * 40, "107-1")
+    del entries["107"]
+    with pytest.raises(ValueError, match="No published main Testmon baseline"):
         checkout.latest_baseline()

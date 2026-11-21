@@ -125,12 +125,19 @@ def test_dependency_override_tracks_only_selected_packages(monkeypatch):
     )
 
 
-def test_successful_baseline_records_each_phase(project, cache):
-    result = _invoke(project, cache, "baseline", "experimental")
-    assert result.returncode == 0, result.stdout + result.stderr
+def test_successful_baseline_records_each_phase(project, tmp_path):
+    coverage = pytest.importorskip("coverage")
+    pytest.importorskip("pytest_cov")
+    cache = tmp_path / "cache"
     for phase in ("prod", "experimental"):
+        args = ("--cov=app", "--cov-report=") if phase == "prod" else ()
+        result = _invoke(project, cache, "baseline", phase, pytest_args=args)
+        assert result.returncode == 0, result.stdout + result.stderr
         assert (cache / phase / ".testmondata").is_file()
         assert (cache / phase / "metadata.json").is_file()
+    data = coverage.CoverageData(basename=str(project / ".coverage.unit_tests.rank-0"))
+    data.read()
+    assert 2 in data.lines(str(project / "app.py"))
 
 
 def test_failed_baseline_cannot_reuse_old_metadata(project, cache):
@@ -423,14 +430,14 @@ def test_selected_test_failure_does_not_run_full_bucket(tmp_path):
 def test_pr_label_gate(overrides, expected):
     workflow = _source(".github/workflows/cicd-main.yml")
     start = workflow.index("          UNIT_TESTMON_ELIGIBLE=false")
-    end = workflow.index('\n\n          echo "scope=', start)
+    end = workflow.index("\n\n", start)
     gate = textwrap.dedent(workflow[start:end])
     environment = {
         **os.environ,
         "LABELS_VALID": "true",
         "UNIT_TESTMON_REQUESTED": "true",
         "IS_CI_WORKLOAD": "false",
-        "IS_MERGE_GROUP": "false",
+        "MERGE_QUEUE_JOBS": "false",
         "EVENT_NAME": "push",
         "REF": "refs/heads/pull-request/123",
         "HAS_RUN_TESTS": "false",

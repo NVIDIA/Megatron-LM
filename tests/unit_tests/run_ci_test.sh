@@ -253,9 +253,10 @@ run_baseline_tests() {
     mkdir -p "$cache_root"
 
     run_testmon_phase baseline prod \
-        -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target"
+        --cov=megatron/core --cov-report= -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target"
     run_testmon_phase baseline experimental \
         -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "$target"
+    coverage combine -q
     write_testmon_summary "baseline produced"
 }
 

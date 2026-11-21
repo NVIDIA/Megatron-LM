@@ -81,7 +81,8 @@ jobs:
   parse-unit-tests:
     name: Select Testmon cache buckets
     needs: populate-build-cache
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # Merge groups record regular baselines. Manual dispatch remains available for recovery.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
