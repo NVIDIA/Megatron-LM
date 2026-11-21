@@ -34,9 +34,18 @@ def ld_128(ptr, mask, multicast_op: tl.constexpr, reduce_f32: tl.constexpr = Fal
             in the multicast group, sums them, and loads the result into the local register file.
         -   **Hardware:** Uses `multimem.ld_reduce` (Hopper+).
         -   When `reduce_f32=False` (default): bf16x2 addition with f32 accumulation
-            (128 bits = 8 x bf16, 2 per register).
+            (128 bits = 8 x bf16, 2 per register). The rounding of the sum to bf16 is
+            the switch's: measured round-to-nearest-even on H100 (2-8 GPUs), but not on
+            GB200 (2-4 GPUs), where most inexact sums (ties included) come out rounded
+            toward zero, so a result can differ from the nearest-even one by one bf16 ulp.
         -   When `reduce_f32=True`: native f32 addition
-            (128 bits = 4 x fp32, 1 per register).
+            (128 bits = 4 x fp32, 1 per register). Correctly rounded on GB200 at 2 and 4
+            GPUs and on H100 at 2; not on H100 at 4 or 8 GPUs. On GB200 each element's sum
+            was measured to depend only on that element's inputs. On one H100 system a
+            row's sum changed bits between calls that changed its position, the other rows
+            and the timing, which is why batch-invariant mode rejects this reduction on
+            Hopper (see the multicast caveat in docs/user-guide/deterministic-training.md).
+            Larger groups are unmeasured.
 
     Args:
         ptr: Memory pointer to the source buffer.
