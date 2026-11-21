@@ -443,6 +443,8 @@ class DisaggCoordinatorRuntime:
         self._release_prefill(request_id)
         self.scheduler.forget_request(request_id)
         self.requests.pop(request_id, None)
+        # An abort can arrive after decode finished; its reply ends the cancellation too.
+        self.terminating_request_ids.discard(request_id)
 
     def drop_request(self, request_id: int, reason: str, *, source_safe: bool) -> None:
         """Fail a client request and discard its coordinator state."""
