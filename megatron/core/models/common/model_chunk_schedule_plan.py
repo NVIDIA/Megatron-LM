@@ -612,6 +612,9 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         # the EP A2A overlap scheduler, so recompute_granularity alone decides (not
         # re-checking overlap_moe_expert_parallel_comm keeps the schedule unit-testable).
         self.recompute_full = model.config.recompute_granularity == "full"
+        self.pp_bwd_recv_wait_on_comm_stream = (
+            model.config.ep_overlap_pp_bwd_recv_wait_on_comm_stream
+        )
         self._recompute_segments = []
         self._num_decoder_layers = 0
 
@@ -846,8 +849,19 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             b_schedule_plan.record_current_stream()
             assert b_grad is not None
             if pre_backward is not None:
-                pre_backward(b_schedule_plan.vp_stage)
-                b_schedule_plan.record_current_stream()
+                if b_schedule_plan.pp_bwd_recv_wait_on_comm_stream:
+                    # The received gradient only gates the backward chunk, whose first layer
+                    # op (combine backward) runs on the comm stream. Wait for it there, so the
+                    # paired forward layer's pre-dispatch computation is not held behind it.
+                    # Comm-stream work queued after this wait (including the paired forward
+                    # dispatch, which follows combine backward) still waits for the receive.
+                    with torch.cuda.stream(get_comm_stream()):
+                        b_schedule_plan.wait_current_stream()
+                        pre_backward(b_schedule_plan.vp_stage)
+                        b_schedule_plan.record_current_stream()
+                else:
+                    pre_backward(b_schedule_plan.vp_stage)
+                    b_schedule_plan.record_current_stream()
 
             # Before any layer backward: post_process keeps its own graph and detaches
             # its input, and releasing it first avoids co-materializing a large vocab
