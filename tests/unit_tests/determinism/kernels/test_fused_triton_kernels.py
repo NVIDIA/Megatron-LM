@@ -54,11 +54,13 @@ try:
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
         fused_mla_rope_inplace,
         fused_mla_rope_kv_split,
+        fused_mla_rope_kv_split_emb_grad,
         fused_mla_rope_out_of_place,
     )
 except ImportError:
     fused_mla_rope_module = None
     fused_mla_rope_inplace = fused_mla_rope_kv_split = fused_mla_rope_out_of_place = None
+    fused_mla_rope_kv_split_emb_grad = None
 
 pytestmark = pytest.mark.skipif(
     not (torch.cuda.is_available() and HAVE_TRITON), reason="needs a GPU and Triton"
@@ -463,6 +465,50 @@ def test_fused_mla_rope_kv_split_replays_fwd_bwd(layout, heads):
     assert_replays_bit_exact(
         run, (kv, k_pos_emb), replays=3, what=f"fused_mla_rope_kv_split[{layout}]"
     )
+
+
+@pytest.mark.skipif(fused_mla_rope_kv_split is None, reason="fused MLA RoPE unavailable")
+@pytest.mark.parametrize("heads", [32, 12])
+def test_fused_mla_rope_kv_split_emb_grad_replays(heads):
+    """The k_pos_emb-gradient-only launch of the key/value split backward kernel
+    (STORE_D_KV=False), used with use_fused_mla_up_proj_grad_quant."""
+    seeded()
+    k_dim, v_dim, emb_dim = 128, 128, 64
+    dtype = torch.bfloat16
+    seqlen, batch = 2048, 2
+    dk = torch.randn(seqlen, batch, heads, k_dim + emb_dim, device="cuda", dtype=dtype)
+    cos, sin = _yarn_cos_sin(emb_dim, seqlen, dtype)
+
+    def run(dk):
+        return fused_mla_rope_kv_split_emb_grad(dk, cos, sin, emb_dim, k_dim, v_dim)
+
+    assert_replays_bit_exact(
+        run, (dk,), replays=3, backward=False, contention=True, what="kv_split_emb_grad"
+    )
+
+
+@pytest.mark.skipif(fused_mla_rope_kv_split is None, reason="fused MLA RoPE unavailable")
+@pytest.mark.parametrize("block_h", [4, 8, 128])
+def test_fused_mla_rope_kv_split_emb_grad_matches_full_backward(block_h):
+    """At a given BLOCK_H, the k_pos_emb gradient of the d_emb-only launch is the one of the full
+    key/value split backward, bit for bit (12 heads: BLOCK_H 8 leaves a partial head block)."""
+    seeded()
+    heads, k_dim, v_dim, emb_dim = 12, 128, 128, 64
+    dtype = torch.bfloat16
+    seqlen, batch = 512, 2
+    kv = torch.randn(seqlen, batch, heads, k_dim + v_dim, device="cuda", dtype=dtype)
+    k_pos_emb = torch.randn(seqlen, batch, 1, emb_dim, device="cuda", dtype=dtype)
+    grad_k = torch.randn(seqlen, batch, heads, k_dim + emb_dim, device="cuda", dtype=dtype)
+    grad_v = torch.randn(seqlen, batch, heads, v_dim, device="cuda", dtype=dtype)
+    cos, sin = _yarn_cos_sin(emb_dim, seqlen, dtype)
+    with _pinned_block_h(block_h):
+        kv.requires_grad_(True)
+        k_pos_emb.requires_grad_(True)
+        k_out, v_out = fused_mla_rope_kv_split(kv, k_pos_emb, cos, sin, emb_dim, k_dim, v_dim)
+        torch.autograd.backward((k_out, v_out), (grad_k, grad_v))
+        d_emb = fused_mla_rope_kv_split_emb_grad(grad_k, cos, sin, emb_dim, k_dim, v_dim)
+    assert d_emb.shape == k_pos_emb.shape
+    assert torch.equal(d_emb.view(torch.int16), k_pos_emb.grad.view(torch.int16))
 
 
 @pytest.mark.skipif(fused_mla_rope_kv_split is None, reason="fused MLA RoPE unavailable")
