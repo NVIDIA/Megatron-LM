@@ -38,23 +38,28 @@ from megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_i
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints import (
     chat_completions as chat_completions_module,
 )
+from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints import (
+    chat_renderer as chat_renderer_module,
+)
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.chat_completions import (
-    _coerce_to_token_id_list,
     _expanded_prefix_stitching_metadata,
+    _has_previous_turn_tokens,
+    _replace_prefix_tokens,
+    _replace_prefix_tokens_metadata,
+    _serialize_eos_token_ids,
+    _suffix_tokens_after_prefix,
+)
+from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.chat_renderer import (
+    ChatRenderer,
+    _coerce_to_token_id_list,
     _extract_media_url_bytes,
     _extract_multimodal_from_messages,
-    _has_previous_turn_tokens,
     _last_assistant_message,
     _NoRedirectHandler,
     _normalize_tool_calls,
     _redact_token_id_lists_for_logging,
-    _replace_prefix_tokens,
-    _replace_prefix_tokens_metadata,
     _sanitize_messages_for_template,
     _sanitize_tools_for_template,
-    _serialize_eos_token_ids,
-    _suffix_tokens_after_prefix,
-    _TemplateRenderer,
     _tokenize_chat_template_sync,
     _tokenize_with_media_slots,
 )
@@ -197,12 +202,12 @@ def test_extract_media_url_bytes(
 
     def open_(request, timeout):
         assert data is not None, "fetched a URL that should have been refused"
-        assert request.get_header("User-agent") == chat_completions_module._MEDIA_FETCH_USER_AGENT
-        assert timeout == chat_completions_module._MEDIA_FETCH_TIMEOUT_S
+        assert request.get_header("User-agent") == chat_renderer_module._MEDIA_FETCH_USER_AGENT
+        assert timeout == chat_renderer_module._MEDIA_FETCH_TIMEOUT_S
         return response
 
-    monkeypatch.setattr(chat_completions_module.socket, "gethostbyname", resolve)
-    monkeypatch.setattr(chat_completions_module._no_redirect_opener, "open", open_)
+    monkeypatch.setattr(chat_renderer_module.socket, "gethostbyname", resolve)
+    monkeypatch.setattr(chat_renderer_module._no_redirect_opener, "open", open_)
     expectation = pytest.raises(ValueError, match=error) if error else contextlib.nullcontext()
 
     with expectation:
@@ -234,7 +239,7 @@ def test_extract_multimodal_forwards_fetch_limit_to_media_urls(block):
     url = block[block["type"]]["url"]
     messages = [{"role": "user", "content": [block]}]
     with mock.patch.object(
-        chat_completions_module, "_extract_media_url_bytes", return_value=b"media"
+        chat_renderer_module, "_extract_media_url_bytes", return_value=b"media"
     ) as extract:
         _, image_bytes_list, video_bytes_list, _ = _extract_multimodal_from_messages(
             messages, MultimodalPromptConfig(), max_fetch_bytes=123
@@ -249,7 +254,7 @@ async def test_chat_endpoint_bounds_remote_media_by_max_content_length():
     app = build_app(CHAT_PATH, ReplyingClient([]), MAX_CONTENT_LENGTH=2**30)
 
     with mock.patch.object(
-        chat_completions_module, "_extract_multimodal_from_messages", side_effect=ValueError("stop")
+        chat_renderer_module, "_extract_multimodal_from_messages", side_effect=ValueError("stop")
     ) as extract:
         response = await app.test_client().post(CHAT_PATH, json=CHAT_BODY)
 
@@ -927,10 +932,11 @@ def test_media_tokenization_is_synchronous_so_it_can_be_offloaded_whole():
     assert "_tokenize_chat_template_sync" not in inspect.getsource(
         chat_completions_module.chat_completions
     )
-    src = inspect.getsource(_TemplateRenderer.tokenize)
-    assert "_tokenize_chat_template_sync" in src
+    assert "_tokenize_chat_template_sync" in inspect.getsource(ChatRenderer._render_call)
+    src = inspect.getsource(ChatRenderer.tokenize_async)
+    assert "run_in_executor" in src
     for line in src.splitlines():
-        if "_tokenize_chat_template_sync" in line:
+        if "_render_call" in line:
             assert "await" not in line, f"must be dispatched via the executor, got: {line.strip()}"
 
 
@@ -1116,8 +1122,8 @@ def test_apply_parsers_chains_parsers_and_forwards_markers_only_with_tools(tools
     tool = _parser(("answer", {}))
     mapping = {"reasoning": reasoning, "tool": tool}
 
-    with mock.patch.object(chat_completions_module, "PARSER_MAPPING", mapping):
-        text, metadata = chat_completions_module.apply_parsers(
+    with mock.patch.object(chat_renderer_module, "PARSER_MAPPING", mapping):
+        text, metadata = chat_renderer_module.apply_parsers(
             "raw", None, ["reasoning", "tool"], tools_requested, finished=False
         )
 
@@ -1143,9 +1149,9 @@ def test_apply_parsers_chains_parsers_and_forwards_markers_only_with_tools(tools
     ],
 )
 def test_apply_parsers_rejects_bad_parser_lists(mapping, parsers, exc_type, error):
-    with mock.patch.object(chat_completions_module, "PARSER_MAPPING", mapping):
+    with mock.patch.object(chat_renderer_module, "PARSER_MAPPING", mapping):
         with pytest.raises(exc_type, match=error):
-            chat_completions_module.apply_parsers("raw", None, parsers, False)
+            chat_renderer_module.apply_parsers("raw", None, parsers, False)
 
 
 # --- HTTP: prefix stitching ---------------------------------------------------
@@ -1459,7 +1465,7 @@ async def test_multimodal_prefix_stitching_submits_exact_prefix_and_compact_suff
     app, client = _prefix_stitching_app(tokenizer=tokenizer_cls())
 
     with mock.patch.object(
-        chat_completions_module, "_tokenize_chat_template_sync", side_effect=tokenize
+        chat_renderer_module, "_tokenize_chat_template_sync", side_effect=tokenize
     ):
         response = await app.test_client().post(CHAT_PATH, json=request_json)
 
@@ -1479,7 +1485,7 @@ async def test_offloaded_prefix_stitching_metadata_covers_text_and_multimodal_hi
     history = _MEDIA_HISTORY if prefix_has_media else _TEXT_HISTORY
 
     with mock.patch.object(
-        chat_completions_module,
+        chat_renderer_module,
         "_tokenize_chat_template_sync",
         side_effect=_fake_tokenize(history, [30]),
     ):
@@ -1915,7 +1921,7 @@ async def test_chat_response_format(
     parsers = ["p"] if parse_result is not None else []
     app = build_app(CHAT_PATH, client, parsers=parsers, **app_config)
 
-    with mock.patch.object(chat_completions_module, "PARSER_MAPPING", {"p": _parser(parse_result)}):
+    with mock.patch.object(chat_renderer_module, "PARSER_MAPPING", {"p": _parser(parse_result)}):
         response = await app.test_client().post(CHAT_PATH, json={**CHAT_BODY, "n": 2, **body})
 
     assert response.status_code == 200, await response.get_data(as_text=True)
@@ -2235,7 +2241,9 @@ async def test_chat_streaming_builds_a_parser_per_choice(
 ):
     parser = _parser(("<12><13>", {}))
     parser.streaming_markers = ("<tool_call>",)
+    # Marker prefixes are read by the endpoint, the parse itself by the renderer.
     monkeypatch.setattr(chat_completions_module, "PARSER_MAPPING", {"p": parser})
+    monkeypatch.setattr(chat_renderer_module, "PARSER_MAPPING", {"p": parser})
     streaming_parser = mock.Mock(wraps=chat_completions_module.StreamingChatParser)
     monkeypatch.setattr(chat_completions_module, "StreamingChatParser", streaming_parser)
     app = build_streaming_app(CHAT_PATH, ReplyingClient(), monkeypatch, parsers=["p"])

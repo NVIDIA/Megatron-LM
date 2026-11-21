@@ -9,7 +9,7 @@ from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 
 from megatron.core.inference.async_stream import AsyncStream
-from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.chat_completions import (
+from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.chat_renderer import (
     _sanitize_chat_template_kwargs,
     _sanitize_messages_for_template,
 )
