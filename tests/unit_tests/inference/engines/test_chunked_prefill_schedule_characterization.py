@@ -219,6 +219,34 @@ class TestChunkedPrefillScheduleCharacterization(PrefixCachingTestBase):
         assert (final["remaining"], final["computed"], final["skipped"]) == (0, 8, 8)
         assert final["cache_hits"] == 1 and final["cached_tokens"] == 8
 
+    @pytest.mark.parametrize("continuing", [False, True], ids=["new", "continuation"])
+    def test_chunked_prefill_starts_only_when_whole_prompt_fits(self, continuing):
+        """A partial prefill holds its blocks until it finishes, so a new one waits for KV
+        for its whole remaining prompt; a continuation needs room for its next chunk."""
+        context = self._context(max_tokens=4)
+        engine = self._engine(context)
+        allocator = context.kv_block_allocator
+        # 12 prompt tokens fill three 4-token blocks.
+        request = self._request(context, 1, 12)
+        self._queue(engine, request)
+        if continuing:
+            engine.schedule_chunked_prefill()
+            assert self._state(engine, request)["finished"] == 4
+            self._consume_step(context)
+
+        # Leave one free block: enough for one chunk, not for the remaining prompt.
+        assert allocator.allocate_memory_blocks(allocator.pool_avail - 1) is not None
+        engine.schedule_chunked_prefill()
+        state = self._state(engine, request)
+
+        assert state["queue"] == [1]
+        if continuing:
+            assert (state["finished"], state["remaining"], state["chunked_id"]) == (8, 4, 1)
+            assert allocator.pool_avail == 0
+        else:
+            assert (state["finished"], state["remaining"], state["chunked_id"]) == (0, 12, -1)
+            assert state["request_count"] == 0 and allocator.pool_avail == 1
+
     def test_cached_single_token_chunk_uses_last_available_token(self):
         context = self._context(max_tokens=5, prefix=True)
         engine = self._engine(context)
