@@ -10,6 +10,7 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.context_parallel import ContextParallelBatch
+from megatron.core.datasets.shared_prefix.layout import SharedPrefixPack, SharedPrefixTree
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
@@ -24,7 +25,6 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
-from megatron.core.shared_prefix_layout import SharedPrefixForestLayout, SharedPrefixLayout
 from megatron.core.tensor_observation import observe_tensor
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
@@ -712,7 +712,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         padding_mask: Optional[Tensor] = None,
         compute_mtp_loss: bool = True,
         cp_batch: ContextParallelBatch | None = None,
-        shared_prefix_layout: Optional[SharedPrefixLayout | SharedPrefixForestLayout] = None,
+        shared_prefix_layout: Optional[SharedPrefixTree | SharedPrefixPack] = None,
         shared_prefix_exclude_sequence_padding_from_expert_bias: Optional[bool] = None,
         output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
@@ -731,7 +731,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 With ``shared_prefix_layout``, MTP runs only in training mode.
                 Defaults to True.
             cp_batch: Input tensors and packed metadata keyed by CP layout.
-            shared_prefix_layout (SharedPrefixLayout | SharedPrefixForestLayout, optional):
+            shared_prefix_layout (SharedPrefixTree | SharedPrefixPack, optional):
                 Runs this forward on a shared-prefix sequence instead of dense rows. See
                 ``megatron.core.models.hybrid.shared_prefix`` for the input layout, the
                 returned logits and the supported configurations. Defaults to None, which

@@ -27,7 +27,7 @@ Tolerances (whole-tensor relative L2):
 import pytest
 import torch
 
-from megatron.core.shared_prefix_layout import SharedPrefixLayout
+from megatron.core.datasets.shared_prefix.layout import SharedPrefixTree
 from tests.unit_tests.shared_prefix.hybrid.shared_prefix_test_utils import (
     ReplayedRouting,
     TokenProblem,
@@ -72,7 +72,7 @@ def _problem(roots):
     )
 
 
-class _OffByOnePositionStar(SharedPrefixLayout):
+class _OffByOnePositionStar(SharedPrefixTree):
     """A deliberately wrong layout: completion RoPE positions start at P - 1 instead of P."""
 
     def padded_position_ids(self, physical_len, device):

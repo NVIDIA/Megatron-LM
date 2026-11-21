@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from megatron.core.shared_prefix_layout import SharedPrefixLayout
+from megatron.core.datasets.shared_prefix.layout import SharedPrefixTree
 from tests.unit_tests.shared_prefix.ssm.shared_prefix_test_utils import SharedPrefixProblem, rel_l2
 
 # ----------------------------------------------------------------------------- model level
@@ -222,7 +222,7 @@ def _cp_local(length: int) -> Tensor:
     _, _, _, _, cp_rank, cp_size = _parallel_state()
     if cp_size == 1:
         return torch.arange(length)
-    return SharedPrefixLayout.cp_local_indices(length, cp_size, cp_rank, "cpu")
+    return SharedPrefixTree.cp_local_indices(length, cp_size, cp_rank, "cpu")
 
 
 def _sequence_shard(values: Tensor) -> Tensor:

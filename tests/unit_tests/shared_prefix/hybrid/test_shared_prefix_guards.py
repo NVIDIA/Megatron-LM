@@ -9,18 +9,19 @@ import pytest
 import torch
 from packaging.version import Version
 
+from megatron.core.datasets.shared_prefix.layout import SharedPrefixTree
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.hybrid import shared_prefix
 from megatron.core.models.hybrid.shared_prefix import (
     _validate_hybrid_stack,
     forward_hybrid_stack_shared_prefix,
+    validate_shared_prefix_config,
 )
 from megatron.core.ops import _backends
 from megatron.core.ops.attention import shared_prefix as forest_attention
-from megatron.core.shared_prefix_layout import SharedPrefixLayout
-from megatron.core.ssm import mamba_shared_prefix
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.ssm.mamba_mixer import MambaMixer
+from megatron.core.ssm.shared_prefix import mamba_shared_prefix
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.identity_op import IdentityOp
@@ -76,7 +77,7 @@ def _mamba_layer(cp_size, *, contiguous):
 
 
 # Global star [3 | 2 | 5 | 1] is 11 tokens; CP2 pads it to a multiple of 2 * CP.
-_LAYOUT = SharedPrefixLayout(3, (2, 5, 1))
+_LAYOUT = SharedPrefixTree(3, (2, 5, 1))
 _PHYSICAL_LEN = {1: 11, 2: 12}
 
 
@@ -225,7 +226,7 @@ def test_old_or_missing_flash_attn_rejected_before_any_layer(request, monkeypatc
     _validate_hybrid_stack(_stack(_config()), _LAYOUT, physical_len=_PHYSICAL_LEN[1])
 
 
-# Every configuration guard of _validate_hybrid_stack that the other tests do not cover.
+# Every guard of validate_shared_prefix_config that the other tests do not cover.
 _REJECTED_CONFIGS = [
     ({"moe_num_hash_layers": 1}, NotImplementedError, "hash MoE routing"),
     ({"quant_recipe": object()}, NotImplementedError, "quantization recipes"),
@@ -239,8 +240,7 @@ _REJECTED_CONFIGS = [
         "batch-invariant mode",
     ),
     ({"sequence_parallel": True}, NotImplementedError, "sequence parallelism requires TP>1"),
-    ({"tensor_model_parallel_size": 2}, RuntimeError, "tensor-parallel config"),
-    ({"context_parallel_size": 2}, RuntimeError, "context-parallel config"),
+    ({"pipeline_model_parallel_size": 2}, NotImplementedError, "PP1 only"),
     (
         {"recompute_granularity": "full", "recompute_method": "block", "recompute_num_layers": 1},
         NotImplementedError,
@@ -251,6 +251,17 @@ _REJECTED_CONFIGS = [
         ValueError,
         "recompute_num_layers >= 1",
     ),
+    (
+        {"recompute_granularity": "selective", "recompute_modules": ["core_attn"]},
+        NotImplementedError,
+        "selective core-attention recomputation",
+    ),
+    # An unset recompute_modules selects core attention, as TransformerConfig's default does.
+    (
+        {"recompute_granularity": "selective", "recompute_modules": None},
+        NotImplementedError,
+        "selective core-attention recomputation",
+    ),
     ({"fine_grained_activation_offloading": True}, NotImplementedError, "activation offloading"),
     ({"cuda_graph_impl": "local"}, NotImplementedError, "CUDA graphs"),
     ({"fp8": "hybrid"}, NotImplementedError, "fp16/bf16 only"),
@@ -259,6 +270,9 @@ _REJECTED_CONFIGS = [
     ({"attention_dropout": 0.1}, NotImplementedError, "zero dropout"),
     ({"window_size": (128, 0)}, NotImplementedError, "sliding-window attention"),
     ({"softmax_type": "off-by-one"}, NotImplementedError, "vanilla softmax"),
+    ({"multi_latent_attention": True}, NotImplementedError, "multi-latent attention"),
+    ({"qk_clip": True}, NotImplementedError, "QK-clipping"),
+    ({"log_max_attention_logit": True}, NotImplementedError, "QK-clipping/max-logit"),
 ]
 _REJECTED_MOE_CONFIGS = [
     ({"moe_router_force_load_balancing": True}, "forced MoE routing"),
@@ -271,9 +285,15 @@ _REJECTED_MOE_CONFIGS = [
         {"moe_token_dispatcher_type": "flex", "moe_flex_dispatcher_backend": "ncclep"},
         "'ncclep' backend",
     ),
-    # Expert-bias accounting needs logical completion lengths; _LAYOUT has none.
-    ({"moe_router_enable_expert_bias": True}, "explicit physical branch padding"),
 ]
+
+
+def _assert_config_rejected(config, error, message):
+    """The config check rejects the config alone, and the stack check rejects a stack with it."""
+    with pytest.raises(error, match=message):
+        validate_shared_prefix_config(config)
+    with pytest.raises(error, match=message):
+        _validate_hybrid_stack(_stack(config), _LAYOUT, physical_len=_PHYSICAL_LEN[1])
 
 
 @pytest.mark.parametrize(
@@ -282,8 +302,17 @@ _REJECTED_MOE_CONFIGS = [
     ids=lambda case: "-".join(case) if isinstance(case, dict) else None,
 )
 def test_unsupported_stack_config_rejected(overrides, error, message):
-    stack = _stack(_config(**overrides))
-    with pytest.raises(error, match=message):
+    _assert_config_rejected(_config(**overrides), error, message)
+
+
+def test_tensor_parallel_without_sequence_parallel_rejected():
+    """TP greater than one needs sequence parallelism, alone and through the stack validation."""
+    config = _config(tensor_model_parallel_size=2)
+    with pytest.raises(NotImplementedError, match="TP>1 requires sequence parallelism"):
+        validate_shared_prefix_config(config)
+    stack = _stack(config)
+    stack.tp_group = stack.pg_collection.tp = _group(2)
+    with pytest.raises(NotImplementedError, match="TP>1 requires sequence parallelism"):
         _validate_hybrid_stack(stack, _LAYOUT, physical_len=_PHYSICAL_LEN[1])
 
 
@@ -310,12 +339,20 @@ def test_batch_invariant_mode_rejected_before_layer_checks():
     ids=lambda case: "-".join(case) if isinstance(case, dict) else None,
 )
 def test_unsupported_moe_config_rejected(overrides, message):
-    stack = _stack(_config(moe=True, **overrides))
-    with pytest.raises(NotImplementedError, match=message):
-        _validate_hybrid_stack(stack, _LAYOUT, physical_len=_PHYSICAL_LEN[1])
+    _assert_config_rejected(_config(moe=True, **overrides), NotImplementedError, message)
 
 
-def test_unsupported_stack_topology_and_layers_rejected():
+def test_unsupported_stack_topology_layers_and_layout_rejected():
+    """The rules that need the stack's process groups, its layers or the layout."""
+    # A config that disagrees with a process group is reported as that disagreement. The config
+    # check alone would report TP2 without sequence parallelism instead.
+    for field, message in (
+        ("tensor_model_parallel_size", "tensor-parallel config"),
+        ("context_parallel_size", "context-parallel config"),
+    ):
+        stack = _stack(_config(**{field: 2}))
+        with pytest.raises(RuntimeError, match=message):
+            _validate_hybrid_stack(stack, _LAYOUT, physical_len=_PHYSICAL_LEN[1])
     stack = _stack(_config())
     stack.pp_group = _group(2)
     with pytest.raises(NotImplementedError, match="PP1 only"):
@@ -330,12 +367,10 @@ def test_unsupported_stack_topology_and_layers_rejected():
         _validate_hybrid_stack(
             _stack(config, [checkpointed]), _LAYOUT, physical_len=_PHYSICAL_LEN[1]
         )
-    # The attention validation reports QK clipping from the layer's own config.
-    config = _config(qk_clip=True)
-    with pytest.raises(NotImplementedError, match="QK-clipping"):
-        _validate_hybrid_stack(
-            _stack(config, [_attention_layer(config)]), _LAYOUT, physical_len=_PHYSICAL_LEN[1]
-        )
+    # Expert-bias accounting needs logical completion lengths; _LAYOUT has none.
+    stack = _stack(_config(moe=True, moe_router_enable_expert_bias=True))
+    with pytest.raises(NotImplementedError, match="explicit physical branch padding"):
+        _validate_hybrid_stack(stack, _LAYOUT, physical_len=_PHYSICAL_LEN[1])
 
 
 def _bare_mamba_layer(config):
@@ -421,7 +456,7 @@ def _moe_identity_layer(calls):
 
 
 # Branch 1 carries two rows of per-sequence padding; the 9-token star is padded to 12.
-_PADDED_LAYOUT = SharedPrefixLayout(3, (5, 1), logical_completion_lens=(3, 1), padding_multiple=4)
+_PADDED_LAYOUT = SharedPrefixTree(3, (5, 1), logical_completion_lens=(3, 1), padding_multiple=4)
 
 
 # (moe_token_dispatcher_type, moe_flex_dispatcher_backend, padding excluded when unstated)
@@ -499,7 +534,3 @@ def test_hybrid_model_rejects_config_list_before_any_preprocessing():
             None,
             shared_prefix_layout=_LAYOUT,
         )
-
-
-# Run in a fresh interpreter as if einops were not installed (Transformer Engine needs einops, so
-# it is hidden too), import HybridModel, and check that the adapter was not loaded.

@@ -3,14 +3,19 @@
 """Explicit shared-prefix adapter for a HybridStack and the HybridModel that owns it.
 
 This module deliberately does not alter :class:`HybridStack`'s normal ``forward`` path. Call
-``forward_hybrid_stack_shared_prefix`` with a shared-prefix layout (stars ``[P, C_1, ..., C_G]``)
-to opt in. This module validates the stack and runs its layers in order; the layer-specific
-execution lives with the layers. Mamba layers run
-:func:`megatron.core.ssm.mamba_shared_prefix.forward_mamba_layer_shared_prefix`, which calls the
-layer and scans each prefix once, forking its state into the completion branches. Attention
-layers run the exact-backward forest attention in :mod:`megatron.core.ops.attention.shared_prefix`
-after :mod:`megatron.core.transformer.shared_prefix_attention` validates them.
+``forward_hybrid_stack_shared_prefix`` with a shared-prefix layout to opt in. The layout is a
+tree, which is one prompt with its completions stored as ``[P, C_1, ..., C_G]``, or a pack,
+which is several trees in one forward
+(:mod:`megatron.core.datasets.shared_prefix.layout`). This module validates the stack and runs
+its layers in order; the layer-specific execution lives with the layers. Mamba layers run
+:func:`megatron.core.ssm.shared_prefix.mamba_shared_prefix.forward_mamba_layer_shared_prefix`,
+which calls the layer and scans each prefix once, forking its state into the completion
+branches. Attention layers run the exact-backward forest attention in
+:mod:`megatron.core.ops.attention.shared_prefix` after
+:mod:`megatron.core.transformer.shared_prefix_attention` validates them.
 Unsupported topology or model features fail before executing a partial forward.
+``validate_shared_prefix_config`` holds the rules that need only the model configuration, so an
+integration can run it at setup, before it builds a model.
 
 The ``HybridModel``-level pieces live here too, so ``HybridModel.forward`` only dispatches to
 them: ``validate_hybrid_model_shared_prefix`` checks the arguments of a forward call,
@@ -19,10 +24,7 @@ them: ``validate_hybrid_model_shared_prefix`` checks the arguments of a forward 
 
 CP>1 uses the model's standard zigzag sequence shards and sequence-to-head all-to-alls. The
 implemented surface covers TP1 and TP>1 with sequence parallelism, CP1 and CP>1, explicit physical
-padding, MoE expert-bias accounting, and full uniform activation recomputation. The capability
-tokens at the end of this module name these code paths so integrations can require the exact
-conjunction they use; they are contract identifiers, not evidence that a topology has been
-qualified at full-model scale.
+padding, MoE expert-bias accounting, and full uniform activation recomputation.
 """
 
 from typing import TYPE_CHECKING, Optional
@@ -31,11 +33,15 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.datasets.shared_prefix.layout import (
+    SharedPrefixPack,
+    SharedPrefixTree,
+    shared_prefix_topology_multiple,
+)
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.shared_prefix_layout import SharedPrefixForestLayout, SharedPrefixLayout
 from megatron.core.ssm.mamba_layer import MambaLayer
-from megatron.core.ssm.mamba_shared_prefix import (
+from megatron.core.ssm.shared_prefix.mamba_shared_prefix import (
     forward_mamba_layer_shared_prefix,
     validate_mamba_layer_shared_prefix,
 )
@@ -46,6 +52,7 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.moe.moe_utils import router_gating_token_blocks
 from megatron.core.transformer.multi_token_prediction import process_mtp_loss
 from megatron.core.transformer.shared_prefix_attention import validate_shared_prefix_attention
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import make_viewless_tensor
 
@@ -67,7 +74,7 @@ def _has_nonzero_config_value(value) -> bool:
 
 
 def _validate_shared_prefix_physical_length(
-    layout: SharedPrefixLayout | SharedPrefixForestLayout,
+    layout: SharedPrefixTree | SharedPrefixPack,
     physical_len: int,
     *,
     tp_size: int,
@@ -76,13 +83,8 @@ def _validate_shared_prefix_physical_length(
 ) -> None:
     """Validate the global star length against its negotiated topology/padding contract."""
     physical_len = int(physical_len)
-    if tp_size > 1:
-        topology_multiple = 2 * tp_size * cp_size
-    elif cp_size > 1:
-        topology_multiple = 2 * cp_size
-    else:
-        topology_multiple = 1
-    if isinstance(layout, SharedPrefixForestLayout):
+    topology_multiple = shared_prefix_topology_multiple(tp_size=tp_size, cp_size=cp_size)
+    if isinstance(layout, SharedPrefixPack):
         multiple = layout.padding_multiple or topology_multiple
         if physical_len % multiple or not 0 <= physical_len - layout.total_len < multiple:
             raise ValueError("shared-prefix forest must use minimal global topology padding")
@@ -173,108 +175,116 @@ def resolve_exclude_sequence_padding_from_expert_bias(config, requested: bool | 
     )
 
 
-def _validate_hybrid_stack(
-    stack, layout: SharedPrefixLayout | SharedPrefixForestLayout, *, physical_len: int
-) -> None:
-    """Reject unsupported shared-prefix stack features before any layer executes.
+def validate_shared_prefix_config(config: TransformerConfig) -> None:
+    """Reject a model configuration that the shared-prefix forward does not support.
 
-    Only the configuration, process groups, layer types and the global physical star length are
-    inspected, so a caller can run this before the embedding or any other partial forward.
+    Only ``config`` is read, so an integration can run this at setup, before it builds a model
+    or a process group. A shared-prefix forward runs it again as part of its stack validation,
+    which adds the rules that need the built stack, its process groups or the layout.
+
+    The configuration does not hold the layer pattern. The rules on attention settings, such as
+    selective core-attention recomputation and the QK-clip and max-logit statistics, therefore
+    apply to every model, including one without attention layers.
+
+    Args:
+        config: Configuration of the model that will run shared-prefix forwards.
+
+    Raises:
+        NotImplementedError: If ``config`` enables a feature that the shared-prefix forward does
+            not implement.
+        ValueError: If full uniform recomputation is configured without a positive
+            ``recompute_num_layers``.
     """
     # New upstream features must not silently bypass their ordinary execution.
     # These combinations need dedicated shared-layout integrations and GPU tests.
-    if getattr(stack.config, "moe_num_hash_layers", 0):
+    if getattr(config, "moe_num_hash_layers", 0):
         raise NotImplementedError("shared-prefix Hybrid does not yet support hash MoE routing")
-    if getattr(stack.config, "quant_recipe", None) is not None:
+    if getattr(config, "quant_recipe", None) is not None:
         raise NotImplementedError("shared-prefix Hybrid does not yet support quantization recipes")
-    if getattr(stack.config, "wide_residual", None) is not None:
+    if getattr(config, "wide_residual", None) is not None:
         raise NotImplementedError("shared-prefix Hybrid does not yet support wide residual streams")
-    if getattr(stack.config, "enable_mhc_connections", False):
+    if getattr(config, "enable_mhc_connections", False):
         raise NotImplementedError("shared-prefix Hybrid does not yet support mHC connections")
-    if getattr(stack.config, "attn_logit_softcapping", None) is not None:
+    if getattr(config, "attn_logit_softcapping", None) is not None:
         raise NotImplementedError("shared-prefix attention does not yet support logit softcapping")
     # The shared forward runs on the build-time CP group and takes no packed_seq_params, so it
     # cannot follow the group a dynamic-CP scheduler picks for a microbatch.
-    if getattr(stack.config, "dynamic_context_parallel", False):
+    if getattr(config, "dynamic_context_parallel", False):
         raise NotImplementedError(
             "shared-prefix Hybrid does not yet support dynamic context parallelism"
         )
-    # A custom layer is called through its own adapter with inputs the shared forward lacks.
-    if getattr(stack, "_has_custom_layers", False):
-        raise NotImplementedError("shared-prefix Hybrid does not yet support custom hybrid layers")
     # Batch-invariant mode promises bitwise training/inference agreement. Shared-prefix attention
     # runs FlashAttention 2 passes although this mode pins version 3 or 4, and shared-prefix Mamba
     # applies its gate to the rounded scan output instead of inside the scan.
-    if getattr(stack.config, "batch_invariant_mode", False):
+    if getattr(config, "batch_invariant_mode", False):
         raise NotImplementedError(
             "shared-prefix Hybrid does not yet support batch-invariant mode: its attention runs "
             "FlashAttention 2 and its Mamba layers gate after the scan output is rounded"
         )
-    tp_size = stack.tp_group.size()
-    sequence_parallel = bool(stack.config.sequence_parallel)
+    tp_size = config.tensor_model_parallel_size
+    sequence_parallel = bool(config.sequence_parallel)
     if tp_size > 1 and not sequence_parallel:
         raise NotImplementedError("shared-prefix Hybrid TP>1 requires sequence parallelism")
     if tp_size == 1 and sequence_parallel:
         raise NotImplementedError("shared-prefix Hybrid sequence parallelism requires TP>1")
-    if stack.config.tensor_model_parallel_size != tp_size:
-        raise RuntimeError(
-            "shared-prefix Hybrid tensor-parallel config does not match its process group"
-        )
-    if stack.pg_collection.tp.size() != tp_size:
-        raise RuntimeError("shared-prefix Hybrid tensor-parallel groups disagree on their size")
-    if stack.pp_group.size() != 1:
+    if config.pipeline_model_parallel_size != 1:
         raise NotImplementedError("shared-prefix Hybrid adapter currently supports PP1 only")
-    cp_group = stack.pg_collection.cp
-    cp_size = cp_group.size()
-    if stack.config.context_parallel_size != cp_size:
-        raise RuntimeError(
-            "shared-prefix Hybrid context-parallel config does not match its process group"
-        )
-    if stack.config.recompute_granularity == "full":
-        if stack.config.recompute_method != "uniform":
+    if config.recompute_granularity == "full":
+        if config.recompute_method != "uniform":
             raise NotImplementedError(
-                'shared-prefix Hybrid full recomputation currently supports only the uniform '
-                'method'
+                "shared-prefix Hybrid full recomputation currently supports only the uniform "
+                "method"
             )
-        if not isinstance(stack.config.recompute_num_layers, int) or (
-            stack.config.recompute_num_layers < 1
-        ):
+        if not isinstance(config.recompute_num_layers, int) or config.recompute_num_layers < 1:
             raise ValueError(
                 "shared-prefix Hybrid uniform recomputation requires recompute_num_layers >= 1"
             )
-    if stack.config.fine_grained_activation_offloading:
+    # SelfAttention checkpoints its core attention under this condition. TransformerConfig
+    # replaces an unset recompute_modules by ["core_attn"].
+    if config.recompute_granularity == "selective" and (
+        config.recompute_modules is None or "core_attn" in config.recompute_modules
+    ):
+        raise NotImplementedError(
+            "shared-prefix forest attention does not yet support selective "
+            "core-attention recomputation"
+        )
+    if config.fine_grained_activation_offloading:
         raise NotImplementedError(
             "shared-prefix Hybrid adapter does not support fine-grained activation offloading"
         )
-    if stack.config.cuda_graph_impl != "none":
+    if config.cuda_graph_impl != "none":
         raise NotImplementedError("shared-prefix Hybrid adapter does not support CUDA graphs")
-    if stack.config.fp8 or stack.config.fp4:
+    if config.fp8 or config.fp4:
         raise NotImplementedError("shared-prefix Hybrid adapter currently supports fp16/bf16 only")
-    _validate_shared_prefix_physical_length(
-        layout, physical_len, tp_size=tp_size, cp_size=cp_size, sequence_parallel=sequence_parallel
-    )
-    if stack.config.attention_dropout != 0.0 or stack.config.hidden_dropout != 0.0:
+    if config.attention_dropout != 0.0 or config.hidden_dropout != 0.0:
         raise NotImplementedError("shared-prefix Hybrid adapter currently requires zero dropout")
-    window_size = stack.config.window_size
+    window_size = config.window_size
     if window_size is not None and tuple(window_size) != (-1, -1):
         raise NotImplementedError(
             "shared-prefix Hybrid adapter does not support sliding-window attention"
         )
-    if stack.config.softmax_type != "vanilla":
+    if config.softmax_type != "vanilla":
         raise NotImplementedError("shared-prefix forest attention supports only vanilla softmax")
+    if config.multi_latent_attention:
+        raise NotImplementedError(
+            "shared-prefix Hybrid forward does not support multi-latent attention"
+        )
+    if config.qk_clip or config.log_max_attention_logit:
+        raise NotImplementedError(
+            "shared-prefix forest attention does not yet produce QK-clipping/max-logit statistics"
+        )
 
-    num_moe_experts = stack.config.num_moe_experts
-    expert_bias_enabled = bool(getattr(stack.config, "moe_router_enable_expert_bias", False))
+    num_moe_experts = config.num_moe_experts
     if num_moe_experts is not None and num_moe_experts > 0:
-        if stack.config.moe_router_force_load_balancing:
+        if config.moe_router_force_load_balancing:
             raise NotImplementedError(
                 "shared-prefix Hybrid adapter does not support randomized forced MoE routing"
             )
-        if stack.config.moe_router_force_biased is not None:
+        if config.moe_router_force_biased is not None:
             raise NotImplementedError(
                 "shared-prefix Hybrid adapter does not support randomized forced MoE router bias"
             )
-        load_balancing = stack.config.moe_router_load_balancing_type
+        load_balancing = config.moe_router_load_balancing_type
         load_balancing_types = (
             [load_balancing] if isinstance(load_balancing, str) else load_balancing
         )
@@ -285,7 +295,7 @@ def _validate_hybrid_stack(
                 "shared-prefix Hybrid adapter does not support MoE router load balancing type "
                 f"{load_balancing!r}"
             )
-        aux_loss_coeffs = stack.config.moe_aux_loss_coeff
+        aux_loss_coeffs = config.moe_aux_loss_coeff
         if isinstance(load_balancing, str):
             aux_loss_coeffs = [aux_loss_coeffs]
         # As in TopKRouter.get_aux_loss_coeff, a coefficient paired with "none" adds no loss.
@@ -296,29 +306,22 @@ def _validate_hybrid_stack(
             raise NotImplementedError(
                 "shared-prefix Hybrid adapter does not support MoE auxiliary router loss"
             )
-        if _has_nonzero_config_value(stack.config.moe_z_loss_coeff):
+        if _has_nonzero_config_value(config.moe_z_loss_coeff):
             raise NotImplementedError(
                 "shared-prefix Hybrid adapter does not support MoE router z-loss"
             )
-        if _has_nonzero_config_value(stack.config.moe_input_jitter_eps):
+        if _has_nonzero_config_value(config.moe_input_jitter_eps):
             raise NotImplementedError(
                 "shared-prefix Hybrid adapter does not support MoE input jitter"
             )
-        if expert_bias_enabled and any(
-            root.logical_completion_lens is None for _, root in layout.iter_roots()
-        ):
+        if config.moe_expert_capacity_factor is not None:
             raise NotImplementedError(
-                "shared-prefix MoE expert-bias accounting requires explicit physical "
-                "branch padding and logical completion lengths"
-            )
-        if stack.config.moe_expert_capacity_factor is not None:
-            raise NotImplementedError(
-                'shared-prefix Hybrid adapter does not support MoE expert capacity or token '
-                'dropping'
+                "shared-prefix Hybrid adapter does not support MoE expert capacity or token "
+                "dropping"
             )
         # Both flex backends can drop tokens over the per-rank budget. A dropped prompt row
         # would remove its expert contribution from every completion that shares it.
-        if stack.config.moe_expert_rank_capacity_factor is not None:
+        if config.moe_expert_rank_capacity_factor is not None:
             raise NotImplementedError(
                 "shared-prefix Hybrid adapter does not support MoE expert rank capacity or "
                 "token dropping: the per-rank budget counts physical star rows, and a dropped "
@@ -328,8 +331,8 @@ def _validate_hybrid_stack(
         # needs the same size on every rank. Shared-prefix forwards are unpacked, and their
         # length changes with every microbatch and differs across ranks.
         if (
-            stack.config.moe_token_dispatcher_type == "flex"
-            and stack.config.moe_flex_dispatcher_backend == "ncclep"
+            config.moe_token_dispatcher_type == "flex"
+            and config.moe_flex_dispatcher_backend == "ncclep"
         ):
             raise NotImplementedError(
                 "shared-prefix Hybrid adapter does not support the flex dispatcher's 'ncclep' "
@@ -337,16 +340,67 @@ def _validate_hybrid_stack(
                 "while shared-prefix microbatches change length"
             )
         # Replay targets are recorded per dense row; shared-prefix routes physical star rows.
-        if stack.config.moe_enable_routing_replay:
+        if config.moe_enable_routing_replay:
             raise NotImplementedError(
                 "shared-prefix Hybrid adapter does not support MoE routing replay: replay "
                 "targets are indexed by dense rows, while a shared-prefix forward routes "
                 "physical star rows that store each prompt once"
             )
-        if getattr(stack.config, "mlp_chunks_for_training", 1) != 1:
+        if getattr(config, "mlp_chunks_for_training", 1) != 1:
             raise NotImplementedError(
                 "shared-prefix Hybrid MoE adapter does not support training MLP chunking"
             )
+
+
+def _validate_hybrid_stack(
+    stack, layout: SharedPrefixTree | SharedPrefixPack, *, physical_len: int
+) -> None:
+    """Reject unsupported shared-prefix stack features before any layer executes.
+
+    Only the configuration, process groups, layer types and the global physical star length are
+    inspected, so a caller can run this before the embedding or any other partial forward. The
+    rules that need only the configuration are those of :func:`validate_shared_prefix_config`.
+    """
+    config = stack.config
+    tp_size = stack.tp_group.size()
+    cp_size = stack.pg_collection.cp.size()
+    # These run before the config rules, which would report a config that disagrees with the
+    # process groups as an unsupported TP/SP combination.
+    if config.tensor_model_parallel_size != tp_size:
+        raise RuntimeError(
+            "shared-prefix Hybrid tensor-parallel config does not match its process group"
+        )
+    if stack.pg_collection.tp.size() != tp_size:
+        raise RuntimeError("shared-prefix Hybrid tensor-parallel groups disagree on their size")
+    if config.context_parallel_size != cp_size:
+        raise RuntimeError(
+            "shared-prefix Hybrid context-parallel config does not match its process group"
+        )
+    validate_shared_prefix_config(config)
+    # A custom layer is called through its own adapter with inputs the shared forward lacks.
+    if getattr(stack, "_has_custom_layers", False):
+        raise NotImplementedError("shared-prefix Hybrid does not yet support custom hybrid layers")
+    if stack.pp_group.size() != 1:
+        raise NotImplementedError("shared-prefix Hybrid adapter currently supports PP1 only")
+    _validate_shared_prefix_physical_length(
+        layout,
+        physical_len,
+        tp_size=tp_size,
+        cp_size=cp_size,
+        sequence_parallel=bool(config.sequence_parallel),
+    )
+    num_moe_experts = config.num_moe_experts
+    expert_bias_enabled = bool(getattr(config, "moe_router_enable_expert_bias", False))
+    if (
+        expert_bias_enabled
+        and num_moe_experts is not None
+        and num_moe_experts > 0
+        and any(root.logical_completion_lens is None for _, root in layout.iter_roots())
+    ):
+        raise NotImplementedError(
+            "shared-prefix MoE expert-bias accounting requires explicit physical "
+            "branch padding and logical completion lengths"
+        )
 
     for layer in stack.layers:
         if isinstance(layer, MambaLayer):
@@ -382,7 +436,7 @@ def _validate_hybrid_stack(
 def forward_hybrid_stack_shared_prefix(
     stack,
     hidden_states: Tensor,
-    layout: SharedPrefixLayout | SharedPrefixForestLayout,
+    layout: SharedPrefixTree | SharedPrefixPack,
     *,
     rotary_pos_emb: Tensor | tuple[Tensor, Tensor] | None = None,
     position_embedding_type: str = "rope",
@@ -472,11 +526,9 @@ def forward_hybrid_stack_shared_prefix(
                 "shared-prefix token multiplicity ownership does not match the local hidden rows"
             )
 
-    # Self-attention takes the layout as a forest; a single star is a forest with one root.
+    # Self-attention takes the layout as a pack; a single tree becomes a pack of one tree.
     attention_forest = (
-        layout
-        if isinstance(layout, SharedPrefixForestLayout)
-        else SharedPrefixForestLayout((layout,))
+        layout if isinstance(layout, SharedPrefixPack) else SharedPrefixPack((layout,))
     )
 
     @router_gating_token_blocks()
@@ -523,47 +575,9 @@ def forward_hybrid_stack_shared_prefix(
     )
 
 
-# Capability tokens are contract identifiers: each names a code path that MCore implements and
-# guards. They are not qualification evidence for a topology or a model.
-# The legacy scalar remains the CP1 negotiation surface. CP-aware integrations must negotiate
-# against the collection so installing the CP track cannot regress existing CP1 runs.
-# ``SHARED_PREFIX_CP_TRAINING_CAPABILITY`` is advertised independently so integrations can retain
-# the CP1 fast path while requiring the CP>1 Hybrid forward/backward contract.
-SHARED_PREFIX_TRAINING_CAPABILITY = "hybrid_star_cp1_tp1_v1"
-SHARED_PREFIX_CP_TRAINING_CAPABILITY = "hybrid_star_cp_v1"
-SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY = "hybrid_star_explicit_physical_padding_v1"
-SHARED_PREFIX_MOE_EXPERT_BIAS_CAPABILITY = "hybrid_star_moe_expert_bias_v1"
-SHARED_PREFIX_FULL_RECOMPUTE_CAPABILITY = "hybrid_star_full_uniform_recompute_v1"
-SHARED_PREFIX_TP_SP_TRAINING_CAPABILITY = "hybrid_star_cp1_tp_sp_v1"
-SHARED_PREFIX_CP_TP_SP_TRAINING_CAPABILITY = "hybrid_star_cp_tp_sp_v1"
-# Target-model feature: Nemotron-H attention is positionless while Mamba remains
-# state-positioned by sequence order.
-SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY = "hybrid_star_positionless_attention_v1"
-# MTP predictor feature: reconstruct dense attention/MLP or attention/MoE heads from
-# the shared-prefix physical layout on the implemented TP/CP topologies.
-SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY = "hybrid_star_mtp_dense_heads_v1"
-SHARED_PREFIX_GROUP_EXECUTION_CAPABILITY = "hybrid_forest_stable_router_v1"
-# Topology and feature capabilities are independent so integrations can negotiate their exact
-# conjunction without inferring support from a broader aggregate token.
-SHARED_PREFIX_TRAINING_CAPABILITIES = frozenset(
-    {
-        SHARED_PREFIX_TRAINING_CAPABILITY,
-        SHARED_PREFIX_CP_TRAINING_CAPABILITY,
-        SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY,
-        SHARED_PREFIX_MOE_EXPERT_BIAS_CAPABILITY,
-        SHARED_PREFIX_FULL_RECOMPUTE_CAPABILITY,
-        SHARED_PREFIX_TP_SP_TRAINING_CAPABILITY,
-        SHARED_PREFIX_CP_TP_SP_TRAINING_CAPABILITY,
-        SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY,
-        SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY,
-        SHARED_PREFIX_GROUP_EXECUTION_CAPABILITY,
-    }
-)
-
-
 def validate_hybrid_model_shared_prefix(
     model: "HybridModel",
-    layout: SharedPrefixLayout | SharedPrefixForestLayout,
+    layout: SharedPrefixTree | SharedPrefixPack,
     *,
     input_ids: Optional[Tensor],
     decoder_input: Optional[Tensor],
@@ -597,7 +611,7 @@ def validate_hybrid_model_shared_prefix(
       model gathers neither the sequence across CP nor the vocabulary across TP.
     * MTP runs only in training mode and never changes the returned logits. It rebuilds the
       dense branches from ``input_ids`` and requires ``loss_mask``; it rejects ``decoder_input``
-      and ``mtp_input_mask``, and a forest layout also requires ``calculate_per_token_loss``.
+      and ``mtp_input_mask``, and a pack also requires ``calculate_per_token_loss``.
     * Models built from ``hybrid_layer_config_list`` are rejected.
     """
     if cp_batch is not None:
@@ -649,22 +663,15 @@ def validate_hybrid_model_shared_prefix(
                 "shared-prefix Hybrid MTP does not support mtp_input_mask; pass "
                 "compute_mtp_loss=False to skip MTP"
             )
-        # Every forest normalizes MTP per loss group (one group per root by
+        # Every pack normalizes MTP per loss group (one group per tree by
         # default), which process_mtp_loss supports only with per-token loss.
-        if (
-            isinstance(layout, SharedPrefixForestLayout)
-            and not model.config.calculate_per_token_loss
-        ):
+        if isinstance(layout, SharedPrefixPack) and not model.config.calculate_per_token_loss:
             raise NotImplementedError(
                 "shared-prefix forest MTP loss groups require calculate_per_token_loss=True"
             )
     if model.position_embedding_type not in ('rope', 'none'):
         raise NotImplementedError(
             "shared-prefix Hybrid forward supports only RoPE or positionless attention"
-        )
-    if model.config.multi_latent_attention:
-        raise NotImplementedError(
-            "shared-prefix Hybrid forward does not support multi-latent attention"
         )
     tp_size = model.pg_collection.tp.size()
     cp_size = model.pg_collection.cp.size()
@@ -680,7 +687,7 @@ def validate_hybrid_model_shared_prefix(
             )
         sequence_shards = tp_size if model.config.sequence_parallel else 1
         physical_len = decoder_input.shape[0] * cp_size * sequence_shards
-    # Topology (TP/SP/CP/PP), layer types, MoE features and the physical length.
+    # The config rules, topology (TP/SP/CP/PP), layer types and the physical length.
     _validate_hybrid_stack(model.decoder, layout, physical_len=physical_len)
     if tp_size > 1 and (not model.parallel_output or runtime_gather_output):
         raise NotImplementedError(
@@ -690,7 +697,7 @@ def validate_hybrid_model_shared_prefix(
 
 
 def hybrid_shared_prefix_rotary_pos_emb(
-    model: "HybridModel", layout: SharedPrefixLayout | SharedPrefixForestLayout, physical_len: int
+    model: "HybridModel", layout: SharedPrefixTree | SharedPrefixPack, physical_len: int
 ) -> Tensor:
     """RoPE rows for this CP rank's shard: every branch continues its prefix's positions."""
     cp_group = model.pg_collection.cp
@@ -707,7 +714,7 @@ def hybrid_shared_prefix_rotary_pos_emb(
 
 def _canonicalize_shared_prefix_cp_sequence(
     local_tensor: Tensor,
-    layout: SharedPrefixLayout | SharedPrefixForestLayout,
+    layout: SharedPrefixTree | SharedPrefixPack,
     physical_len: int,
     cp_group: torch.distributed.ProcessGroup,
     *,
@@ -743,7 +750,7 @@ def _validate_shared_prefix_mtp_star(
     global_hidden_states: Tensor,
     global_input_ids: Tensor,
     global_loss_mask: Tensor,
-    layout: SharedPrefixLayout | SharedPrefixForestLayout,
+    layout: SharedPrefixTree | SharedPrefixPack,
     *,
     cp_size: int,
     cp_rank: int,
@@ -796,7 +803,7 @@ def _validate_shared_prefix_mtp_star(
 
 
 def _shared_prefix_mtp_branch_indices(
-    layout: SharedPrefixLayout | SharedPrefixForestLayout,
+    layout: SharedPrefixTree | SharedPrefixPack,
     device: torch.device | str,
     *,
     cp_size: int = 1,
@@ -815,9 +822,7 @@ def _shared_prefix_mtp_branch_indices(
     dense_positions = []
     for indices in layout.dense_branch_indices(device):
         if cp_size > 1:
-            positions = SharedPrefixLayout.cp_local_indices(
-                indices.numel(), cp_size, cp_rank, device
-            )
+            positions = SharedPrefixTree.cp_local_indices(indices.numel(), cp_size, cp_rank, device)
             indices = indices.index_select(0, positions)
         else:
             positions = torch.arange(indices.numel(), device=device, dtype=torch.long)
@@ -890,7 +895,7 @@ class _FixedOrderRowGather(torch.autograd.Function):
 def _gather_shared_prefix_mtp_rows(
     global_hidden_states: Tensor,
     packed_indices: Tensor,
-    layout: SharedPrefixLayout | SharedPrefixForestLayout,
+    layout: SharedPrefixTree | SharedPrefixPack,
 ) -> Tensor:
     """Gather dense MTP branch rows of one canonical star with a reproducible backward."""
     # A prompt row is copied at most once per dense branch of its root; every other
@@ -918,7 +923,7 @@ def _pack_shared_prefix_mtp_branches(
     global_hidden_states: Tensor,
     global_input_ids: Tensor,
     global_loss_mask: Tensor,
-    layout: SharedPrefixLayout | SharedPrefixForestLayout,
+    layout: SharedPrefixTree | SharedPrefixPack,
     *,
     cp_size: int = 1,
     cp_rank: int = 0,
@@ -953,10 +958,7 @@ def _pack_shared_prefix_mtp_branches(
 
 
 def _shared_prefix_mtp_padding_mask(
-    layout: SharedPrefixLayout | SharedPrefixForestLayout,
-    packed_position_ids: Tensor,
-    *,
-    cp_size: int = 1,
+    layout: SharedPrefixTree | SharedPrefixPack, packed_position_ids: Tensor, *, cp_size: int = 1
 ) -> Tensor:
     """Per-sequence padding of the packed dense MTP branches, ``True`` at padding rows.
 
@@ -1009,7 +1011,7 @@ def forward_hybrid_mtp_shared_prefix(
     hidden_states: Tensor,
     input_ids: Tensor,
     loss_mask: Tensor,
-    layout: SharedPrefixLayout | SharedPrefixForestLayout,
+    layout: SharedPrefixTree | SharedPrefixPack,
     output_weight: Optional[Tensor],
     exclude_sequence_padding_from_expert_bias: Optional[bool] = None,
 ) -> Tensor:
@@ -1197,7 +1199,7 @@ def forward_hybrid_mtp_shared_prefix(
         ),
         loss_group_lengths=(
             tuple(length // cp_size for length in layout.mtp_loss_group_lengths)
-            if isinstance(layout, SharedPrefixForestLayout)
+            if isinstance(layout, SharedPrefixPack)
             else None
         ),
     )

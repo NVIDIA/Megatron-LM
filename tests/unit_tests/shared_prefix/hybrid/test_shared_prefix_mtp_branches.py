@@ -12,12 +12,12 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from megatron.core.datasets.shared_prefix.layout import SharedPrefixPack, SharedPrefixTree
 from megatron.core.models.hybrid.shared_prefix import (
     _fixed_order_copy_contributors,
     _gather_shared_prefix_mtp_rows,
     _shared_prefix_mtp_branch_indices,
 )
-from megatron.core.shared_prefix_layout import SharedPrefixForestLayout, SharedPrefixLayout
 from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 from tests.unit_tests.test_utilities import Utils
 
@@ -33,7 +33,7 @@ def _star(prefix_len, logical_lens):
     physical = tuple(
         _round_up(prefix_len + length, _PADDING_MULTIPLE) - prefix_len for length in logical_lens
     )
-    return SharedPrefixLayout(
+    return SharedPrefixTree(
         prefix_len,
         physical,
         logical_completion_lens=tuple(logical_lens),
@@ -42,7 +42,7 @@ def _star(prefix_len, logical_lens):
 
 
 def _forest():
-    return SharedPrefixForestLayout((_star(13, (5, 17, 9)), _star(6, (11, 3))))
+    return SharedPrefixPack((_star(13, (5, 17, 9)), _star(6, (11, 3))))
 
 
 def _brute_force_contributors(indices, num_rows, copies):
@@ -115,7 +115,7 @@ def test_fixed_order_row_gather_backward_is_bitwise_reproducible_on_cuda():
     # Prompt rows copied once per branch: index_select's BF16 atomic backward differs
     # run to run at this size; the fixed-order gather must not.
     prompt, completions = 64, (208, 264, 336, 192)
-    layout = SharedPrefixLayout(prompt, completions)
+    layout = SharedPrefixTree(prompt, completions)
     indices = torch.cat(layout.dense_branch_indices("cuda"))
     generator = torch.Generator(device="cuda").manual_seed(5)
     value = torch.randn(
@@ -282,9 +282,7 @@ class TestSharedPrefixMTPModel:
     def test_forest_mtp_requires_per_token_loss_before_running(self, explicit_groups):
         model = self._model(calculate_per_token_loss=False)
         roots = (_star(16, (9, 23)), _star(8, (5,)))
-        layout = SharedPrefixForestLayout(
-            roots, mtp_loss_group_root_counts=(2,) if explicit_groups else ()
-        )
+        layout = SharedPrefixPack(roots, mtp_loss_group_root_counts=(2,) if explicit_groups else ())
         with patch(
             "megatron.core.models.hybrid.shared_prefix.forward_hybrid_stack_shared_prefix",
             side_effect=_ReachedBackbone,

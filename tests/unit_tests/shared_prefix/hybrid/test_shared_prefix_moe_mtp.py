@@ -1,19 +1,19 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Behavior of the shared-prefix MoE and MTP capabilities.
+"""Behavior of shared-prefix MoE expert-bias accounting and MTP.
 
-``hybrid_star_moe_expert_bias_v1``: a shared prompt row stands for G dense rows, so a real
-``TopKRouter`` must count it G times in ``local_tokens_per_expert`` (and every branch token
-once), including when the MoE layer recomputes its forward in backward.
+MoE expert bias: a shared prompt row stands for G dense rows, so a real ``TopKRouter`` must
+count it G times in ``local_tokens_per_expert`` (and every branch token once), including when
+the MoE layer recomputes its forward in backward.
 
-``hybrid_star_mtp_dense_heads_v1``: the MTP heads run on the dense branches reconstructed from
-the star, with ``loss_group_lengths`` preserving the per-forward token-count normalization.
+MTP: the MTP heads run on the dense branches reconstructed from the star, with
+``loss_group_lengths`` preserving the per-forward token-count normalization.
 """
 
 import pytest
 import torch
 
-from megatron.core.shared_prefix_layout import SharedPrefixForestLayout, SharedPrefixLayout
+from megatron.core.datasets.shared_prefix.layout import SharedPrefixPack, SharedPrefixTree
 from tests.unit_tests.shared_prefix.hybrid.shared_prefix_test_utils import (
     ReplayedRouting,
     TokenProblem,
@@ -195,7 +195,7 @@ def test_mtp_branch_packing_reassembles_dense_branches(cp_size):
         )
         offset = 0
         for row, seen in zip(problem.rows, covered):
-            local = SharedPrefixLayout.cp_local_indices(row.dense_len, cp_size, cp_rank, "cpu")
+            local = SharedPrefixTree.cp_local_indices(row.dense_len, cp_size, cp_rank, "cpu")
             span = slice(offset, offset + local.numel())
             expected_ids = ids[0, row.star_indices()][local]
             assert torch.equal(packed_ids[0, span], expected_ids)
@@ -207,7 +207,7 @@ def test_mtp_branch_packing_reassembles_dense_branches(cp_size):
         assert offset == packed_ids.shape[1]
     assert all(seen.all() for seen in covered)
     # One loss group per root by default: dense lengths of that root's branches.
-    assert isinstance(layout, SharedPrefixForestLayout)
+    assert isinstance(layout, SharedPrefixPack)
     assert layout.mtp_loss_group_lengths == (
         sum(row.dense_len for row in problem.rows if row.root == 0),
         sum(row.dense_len for row in problem.rows if row.root == 1),
@@ -250,7 +250,7 @@ def _expected_mtp_weights(problem, groups, depths, factor, cp_size, cp_rank) -> 
     def owned(length):
         if cp_size == 1:
             return torch.arange(length)
-        return SharedPrefixLayout.cp_local_indices(length, cp_size, cp_rank, "cpu")
+        return SharedPrefixTree.cp_local_indices(length, cp_size, cp_rank, "cpu")
 
     # rolled[row][k]: the row's whole loss mask rolled k + 1 times.
     rolled = []
@@ -290,7 +290,7 @@ def _check_grouped_mtp_normalization(monkeypatch, root_counts):
     model = build_hybrid_model(MTP_PATTERN, torch.bfloat16, calculate_per_token_loss=True)
     problem = SharedPrefixProblem(MTP_GROUPED_FOREST, padding_multiple=8, topology_multiple=8)
     tokens = TokenProblem(problem, vocab_size=2048, seed=1)
-    layout = SharedPrefixForestLayout(
+    layout = SharedPrefixPack(
         problem.layout(forest=True).roots, mtp_loss_group_root_counts=root_counts
     )
 
