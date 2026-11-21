@@ -272,6 +272,7 @@ class T5Model(LanguageModule):
                 pre_process=self.pre_process,
                 post_process=self.post_process,
                 pg_collection=pg_collection,
+                name="encoder",
             )
         else:
             self.encoder = None
@@ -284,6 +285,7 @@ class T5Model(LanguageModule):
                 pre_process=self.pre_process,
                 post_process=self.post_process,
                 pg_collection=pg_collection,
+                name="decoder",
             )
         else:
             self.decoder = None

@@ -7,11 +7,8 @@ from contextlib import nullcontext
 import torch
 
 from megatron.core.enums import Fp4Recipe
-from megatron.core.fp8_utils import (
-    _get_custom_recipe,
-    _get_grouped_quantized_recipe,
-    _unwrap_parameter_data,
-)
+from megatron.core.fp8_utils import _get_grouped_quantized_recipe, _unwrap_parameter_data
+from megatron.core.quantization.custom_recipe import get_cached_custom_recipe
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 
@@ -229,16 +226,23 @@ if HAVE_TE:
                         Transformer Engine. Please make sure you are using TE version 
                         >= 2.7.0.dev0.""")
             elif config.fp4_recipe == Fp4Recipe.custom:
-                fp4_recipe = _get_custom_recipe(config.fp4_quantizer_factory)
+                assert config.fp4_quantizer_factory is not None
+                fp4_recipe = get_cached_custom_recipe(
+                    config,
+                    config.fp4_quantizer_factory,
+                    fp8_dpa=config.fp8_dot_product_attention,
+                    fp8_mha=config.fp8_multi_head_attention,
+                )
             else:
                 raise ValueError(
                     "NVFP4BlockScaling and custom are the only supported FP4 recipes. "
                     "Please make sure you are using a compatible TE version >= 2.7.0.dev0."
                 )
         else:
-            raise ValueError("""FP4 support requires TransformerEngine version >= 2.7.0.dev0
-                for NVFP4BlockScaling.""")
-
+            raise ValueError(
+                "FP4 support requires TransformerEngine version >= 2.7.0.dev0 "
+                "for NVFP4BlockScaling."
+            )
         # Set recipe attrs
         if fp4_recipe is not None and config.fp4_recipe_attrs is not None:
             for key, val in config.fp4_recipe_attrs.items():

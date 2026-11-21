@@ -29,6 +29,7 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.ops.norm.torch_norm import LayerNormBuilder
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.utils import is_quantization_enabled
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
@@ -518,7 +519,7 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
             if "layernorm" in self.config.recompute_modules:
                 if not isinstance(self.input_layernorm, IdentityOp):
                     self.recompute_input_layernorm = True
-                    if self.config.fp8 or self.config.fp4:
+                    if is_quantization_enabled(self.config):
                         self.self_attention.set_for_recompute_input_layernorm()
 
                 can_recompute_pre_mlp_layernorm = not isinstance(self.pre_mlp_layernorm, IdentityOp)
@@ -533,7 +534,7 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
                     )
                 if can_recompute_pre_mlp_layernorm:
                     self.recompute_pre_mlp_layernorm = True
-                    if self.config.fp8 or self.config.fp4:
+                    if is_quantization_enabled(self.config):
                         if isinstance(self.mlp, MoELayer):
                             self.mlp.set_for_recompute_pre_mlp_layernorm()
                         else:
@@ -592,14 +593,12 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
 
     def get_inner_quantization_context(self) -> AbstractContextManager:
         """Return the quantization context for fine-grained layer execution."""
-        if self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed:
-            from megatron.core.fp8_utils import get_fp8_context  # to avoid circular import
+        if is_quantization_enabled(self.config) and not (
+            self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
+        ):
+            from megatron.core.quantization.te_recipe import get_quantization_context
 
-            return get_fp8_context(self.config, self.layer_number - 1)
-        if self.config.fp4:
-            from megatron.core.fp4_utils import get_fp4_context  # to avoid circular import
-
-            return get_fp4_context(self.config, self.layer_number - 1)
+            return get_quantization_context(self.config, self.layer_number - 1)
         return nullcontext()
 
     def create_mcore_cudagraph_manager(self, config):

@@ -18,8 +18,6 @@ from megatron.core.context_parallel.sequence_roll import roll_contiguous, roll_c
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
-from megatron.core.fp4_utils import get_fp4_context
-from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, get_backend
 from megatron.core.ops.mtp_kl_loss import vocab_parallel_kl_div, vocab_parallel_log_normalizer
@@ -30,6 +28,8 @@ from megatron.core.process_groups_config import (
     ProcessGroupCollection,
     warn_global_process_group_fallback,
 )
+from megatron.core.quantization.te_recipe import get_quantization_context
+from megatron.core.quantization.utils import is_quantization_enabled
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
@@ -1846,10 +1846,10 @@ class MultiTokenPredictionLayer(MegatronModule):
 
     def get_inner_quantization_context(self) -> AbstractContextManager:
         """Return the quantization context for fine-grained MTP execution."""
-        if self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed:
-            return get_fp8_context(self.config)
-        if self.config.fp4:
-            return get_fp4_context(self.config)
+        if is_quantization_enabled(self.config) and not (
+            self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
+        ):
+            return get_quantization_context(self.config)
         return nullcontext()
 
     def _get_embeddings(
@@ -2088,15 +2088,10 @@ class MultiTokenPredictionLayer(MegatronModule):
         else:
             rng_context = nullcontext()
 
-        # Unlike transformer_block.py which needs to support mixed-precision in
-        # different layers, currently MTP only uses a global quantization context.
-        # FP8 and FP4 are mutually exclusive.
-        if self.config.fp8:
-            quantization_context = get_fp8_context(self.config)
-            transformer_layer_quantization_context = get_fp8_context(self.config)
-        elif self.config.fp4:
-            quantization_context = get_fp4_context(self.config)
-            transformer_layer_quantization_context = get_fp4_context(self.config)
+        # Unlike TransformerBlock, MTP uses one global quantization recipe.
+        if is_quantization_enabled(self.config):
+            quantization_context = get_quantization_context(self.config)
+            transformer_layer_quantization_context = get_quantization_context(self.config)
         else:
             quantization_context = nullcontext()
             transformer_layer_quantization_context = nullcontext()
@@ -2105,10 +2100,8 @@ class MultiTokenPredictionLayer(MegatronModule):
             with quantization_context:
                 hidden_states = self._concat_embeddings(hidden_states, decoder_input)
 
-            # Use a separate quantization context for the transformer layer. This is to ensure
-            # that when the transformer layer is cudagraphed, the
-            # FP8GlobalStateManager.is_first_fp8_module() is True so that the fp8 weight caching
-            # can be triggered correctly.
+            # Use a separate context for the transformer layer so TE sees it as
+            # the first quantized module and can trigger its weight cache.
             with transformer_layer_quantization_context:
                 if self.is_hybrid_mtp:
                     hidden_states = self.mtp_model_layer(
@@ -2304,7 +2297,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         # the inner context entered inside ``_proj_and_transformer_layer``
         # is sufficient.
         if self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed:
-            outer_quantization_context = get_fp8_context(self.config)
+            outer_quantization_context = get_quantization_context(self.config)
         else:
             outer_quantization_context = nullcontext()
 

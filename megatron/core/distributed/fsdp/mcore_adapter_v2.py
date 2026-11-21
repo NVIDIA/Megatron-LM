@@ -449,6 +449,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 "MFSDP v2 per-token loss has not been tested with PP>1 "
                 "or multiple optimizer instances."
             )
+        if config.custom_recipe is not None:
+            raise ValueError("MFSDP v2 does not currently support custom quantization recipes.")
         if config.fp4 or ddp_config.fp4_param_gather:
             raise ValueError("MFSDP v2 does not currently support FP4.")
         if config.fp8 and config.fp8_recipe != "mxfp8":

@@ -17,11 +17,15 @@ import torch
 import torch.nn as nn
 
 from megatron.core import tensor_parallel
-from megatron.core.fp8_utils import get_fp8_align_size, get_fp8_disabled_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.te_recipe import (
+    get_quantization_alignment,
+    get_quantization_disabled_context,
+)
+from megatron.core.quantization.utils import is_quantization_enabled
 from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.ssm.mamba_context_parallel import (
     _all_to_all_cp2hp,
@@ -102,7 +106,7 @@ def _kda_fp8_disabled(config: TransformerConfig) -> bool:
 def _build_with_kda_fp8_disabled(fp8_config, module_spec, *args, **kwargs):
     """Build a KDA projection without quantized parameter initialization when requested."""
     init_context = (
-        get_fp8_disabled_context(fp8_config, is_init=True)
+        get_quantization_disabled_context(fp8_config, is_init=True)
         if _kda_fp8_disabled(fp8_config)
         else nullcontext()
     )
@@ -299,11 +303,12 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim * 2
         self.in_proj_dim = self.in_proj_qkvg_dim + self.in_proj_extra_dim
 
-        if self.config.fp8 and not _kda_fp8_disabled(self.config):
-            fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
-            assert self.in_proj_dim % fp8_align_size == 0, (
-                "For FP8, the innermost dimension of the GDN layer "
-                "input projection output tensor must be a multiple of 16."
+        if is_quantization_enabled(self.config) and not _kda_fp8_disabled(self.config):
+            quantization_alignment = get_quantization_alignment(self.config)
+            assert self.in_proj_dim % quantization_alignment == 0, (
+                "For quantized execution, the innermost dimension of the GDN layer "
+                "input projection output tensor must be a multiple of "
+                f"{quantization_alignment}."
             )
         self.in_proj = _build_with_kda_fp8_disabled(
             self.config,
@@ -499,7 +504,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
                 )
                 return self.forward_post_core_attn(norm_out)
 
-            if self.config.fp8 or self.config.fp4:
+            if is_quantization_enabled(self.config):
                 from megatron.core.extensions.transformer_engine import te_checkpoint
 
                 return te_checkpoint(

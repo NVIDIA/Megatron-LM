@@ -238,6 +238,7 @@ class RADIOViTModel(VisionModule):
             post_process=False,
             pg_collection=self.pg_collection,
             vp_stage=self.vp_stage,
+            name="decoder",
         )
 
         if self.force_eval_mode:

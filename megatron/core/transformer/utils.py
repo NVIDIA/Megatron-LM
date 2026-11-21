@@ -14,6 +14,7 @@ import torch
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict, StateDict
 from megatron.core.jit import jit_fuser
+from megatron.core.quantization.utils import is_quantization_enabled
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.utils import (
     get_pg_rank,
@@ -630,7 +631,7 @@ def precision_aware_checkpoint(
     Returns:
         The output of ``function``.
     """
-    if config.fp8 or config.fp4:
+    if is_quantization_enabled(config):
         # Imported lazily to avoid a circular import.
         from megatron.core.extensions.transformer_engine import te_checkpoint
 
