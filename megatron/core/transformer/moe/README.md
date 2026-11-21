@@ -421,6 +421,40 @@ replay are covered in `tests/unit_tests/determinism/kernels/test_moe_kernels.py`
 loading and initialization parity are covered by
 `test_te_grouped_linear_virtual_expert_checkpoint` in the neighboring `test_te_wrappers.py`.
 
+#### DeepEP v2 settings and uneven inputs
+
+These settings apply to `--moe-flex-dispatcher-backend deepepv2`. Their defaults keep the
+backend's existing behaviour.
+
+| Argument | Default | Effect |
+|----------|---------|--------|
+| `--moe-deepepv2-num-max-tokens-per-rank N` | unset | One token bound for every rank, passed to the buffer and to every dispatch. A rank with more than `N` tokens raises an error. |
+| `--moe-deepepv2-pad-uneven-dispatch-inputs` | off | Uses the largest token count in the dispatcher group as the bound: one MAX all-reduce and a host sync per dispatch. Not together with a fixed bound. |
+| `--moe-deepepv2-num-allocated-qps N` | `0` | RDMA queue pairs for the buffer. `0` lets DeepEP choose. |
+| `--no-moe-deepepv2-allow-hybrid-mode` | hybrid mode allowed | Requests DeepEP's direct mode. |
+| `--no-moe-deepepv2-deterministic` | deterministic | Lets DeepEP use its non-deterministic algorithms. |
+
+DeepEP v2 needs the same `num_max_tokens_per_rank` on every rank, and building its buffer is a
+collective. By default each rank passes its local token count. The first build raises an error if
+the counts differ, but counts that diverge later are not detected and can hang. Whenever counts can
+differ across ranks, for example with packed THD inputs, either set a fixed bound that covers every
+rank (no per-step cost, but the buffer is sized for `N` tokens) or turn on padding (one sync per
+dispatch; the buffer grows to the largest count seen, and each growth rebuilds it on every rank).
+Sequence packing requires one of the two.
+
+On AWS EFA:
+
+- **QP count.** The automatic count depends on the DeepEP build. Upstream DeepEP allocates 65 or
+  129 QPs in hybrid mode and 17 in direct mode. The
+  [amazon-contributing/DeepEP](https://github.com/amazon-contributing/DeepEP) fork resolves the
+  hybrid-mode count from NCCL's GIN resources and clamps an explicit count. If the automatic count
+  does not work on your EFA setup, set `--moe-deepepv2-num-allocated-qps`.
+- **NCCL.** One reported EFA setup used `NCCL_GIN_TYPE=5` and `NCCL_SYM_GIN_KERNELS_ENABLE=0`
+  ([awslabs/awsome-distributed-ai#1265](https://github.com/awslabs/awsome-distributed-ai/pull/1265)).
+  These settings have not been checked with other NCCL versions.
+- **HybridEP.** HybridEP also uses the `deep_ep` Python module, so replacing it with DeepEP v2 can
+  make the `hybridep` backend unavailable.
+
 ### Upcycling
 Use `--moe-use-upcycling` to enable upcycling, which loads the dense model from the `--load` directory, converts it to an MoE model at runtime, and starts training. The converted model is saved to the `--save` path before training begins. Upcycling is built on distributed checkpointing, supporting parallel modes different from existing dense checkpoints, such as arbitrary expert parallelism during upcycling.
 
