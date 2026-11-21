@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import contextlib
 import copy
 from unittest import mock
 
@@ -16,8 +17,14 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.attention import Attention, SelfAttention
+from megatron.core.transformer.attention import (
+    Attention,
+    SelfAttention,
+    SelfAttentionSubmodules,
+    _fa4_can_split_kv,
+)
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.parallel_test_utils import _test_parallel_attention_correctness
@@ -907,3 +914,71 @@ class TestFlashMLASoftcapRejected:
                 block_table=torch.zeros(2, 4, dtype=torch.int32),
                 is_decode_only=True,
             )
+
+
+class TestFlashAttention4NumSplits:
+    """FA4 is asked to split the KV sequence only where it can.
+
+    As of flash-attn-4 4.0.0b36, FA4 splits KV only on SM100/SM110; its Hopper forward asserts
+    against split-KV, which dynamic inference triggers past ~512 KV tokens, or at any length
+    under CUDA graphs.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fresh_device_cache(self):
+        _fa4_can_split_kv.cache_clear()
+        # Attention needs real tensor- and context-parallel groups; a single rank's suffice.
+        Utils.initialize_model_parallel(1, 1)
+        yield
+        Utils.destroy_model_parallel()
+        _fa4_can_split_kv.cache_clear()
+
+    @pytest.mark.parametrize("is_decode_only", [False, True], ids=["prefill", "decode"])
+    @pytest.mark.parametrize("batch_invariant_mode", [False, True])
+    @pytest.mark.parametrize(
+        "capability",
+        [(8, 0), (9, 0), (10, 0), (11, 0), (12, 0)],
+        ids=["sm80", "sm90", "sm100", "sm110", "sm120"],
+    )
+    def test_fa4_num_splits(self, capability, batch_invariant_mode, is_decode_only):
+        """FA4's split heuristic (num_splits=0) runs only on SM100/SM110 and not batch-invariant."""
+        config = TransformerConfig(
+            num_layers=1, hidden_size=128, num_attention_heads=4, flash_attention_version=4
+        )
+        submodules = SelfAttentionSubmodules(
+            linear_qkv=IdentityOp, core_attention=IdentityOp, linear_proj=IdentityOp
+        )
+        attn = SelfAttention(
+            config,
+            submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"]),
+        ).eval()
+        attn.batch_invariant_mode = batch_invariant_mode
+        kernel = mock.Mock(return_value=(torch.zeros(2, 4, 8), torch.zeros(4, 2)))
+        with contextlib.ExitStack() as stack:
+            # Fake the compute capability of the device the (CPU) test tensors stand for.
+            stack.enter_context(mock.patch("torch.cuda.is_available", return_value=True))
+            stack.enter_context(
+                mock.patch("torch.cuda.get_device_capability", return_value=capability)
+            )
+            stack.enter_context(mock.patch("megatron.core.transformer.attention.HAVE_FA4", True))
+            stack.enter_context(
+                mock.patch("megatron.core.transformer.attention.flash_attn4_varlen_func", kernel)
+            )
+            attn.flash_decode_and_prefill(
+                q=torch.zeros(2, 1, 4, 8),
+                k=torch.zeros(2, 256, 4, 8),
+                v=torch.zeros(2, 256, 4, 8),
+                max_seqlen_q=1 if is_decode_only else 2,
+                max_seqlen_k=1024,
+                cu_seqlens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
+                cu_seqlens_k=torch.tensor([0, 2, 4], dtype=torch.int32),
+                seqlens_k=torch.tensor([2, 2], dtype=torch.int32),
+                block_table=torch.zeros(2, 4, dtype=torch.int32),
+                is_decode_only=is_decode_only,
+            )
+        kernel.assert_called_once()
+        can_split = capability[0] in (10, 11) and not batch_invariant_mode
+        assert kernel.call_args.kwargs["num_splits"] == (0 if can_split else 1)
