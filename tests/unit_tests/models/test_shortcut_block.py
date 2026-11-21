@@ -779,7 +779,7 @@ def _overlap_block_stub(cuda_graph_impl: str):
         _combine_input_keepalive=None,
         _get_a2a_overlap_stream=lambda: stream,
     )
-    block._skip_stream_use_marks = lambda: ShortcutMoEBlock._skip_stream_use_marks(block)
+    block._skip_dispatch_output_marks = lambda: ShortcutMoEBlock._skip_dispatch_output_marks(block)
     return block, stream
 
 
@@ -792,25 +792,28 @@ def _overlap_block_stub(cuda_graph_impl: str):
         ("none", False, False),
     ],
 )
-def test_stream_use_marks_are_skipped_only_in_full_iteration_capture(
+def test_dispatch_output_marks_are_skipped_only_in_full_iteration_capture(
     monkeypatch, cuda_graph_impl, capturing, expected
 ):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
     block, _ = _overlap_block_stub(cuda_graph_impl)
-    assert ShortcutMoEBlock._skip_stream_use_marks(block) is expected
+    assert ShortcutMoEBlock._skip_dispatch_output_marks(block) is expected
 
 
 @pytest.mark.parametrize("capturing", [False, True], ids=["eager", "full_iteration_capture"])
-def test_overlap_stream_use_marks_follow_full_iteration_capture(monkeypatch, capturing):
-    """During a full-iteration capture the allocator holds every block marked with
-    ``record_stream`` until the capture ends, so the marks are dropped; the combine input is
-    kept alive by a reference instead until the side stream has been joined."""
+def test_overlap_stream_use_marks(monkeypatch, capturing):
+    """Which tensors shared between the main and the side stream get a ``record_stream`` mark.
+
+    The dispatch outputs are marked except during a full-iteration capture, where the allocator
+    would hold every marked block until the capture ends. The combine input is never marked:
+    in every mode a reference keeps it alive until the side stream has been joined, which
+    protects it without making the allocator hold the block past that point."""
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
     recorded = []
     monkeypatch.setattr(
         torch.Tensor, "record_stream", lambda tensor, stream: recorded.append((tensor, stream))
     )
-    block, side_stream = _overlap_block_stub("full_iteration")
+    block, _ = _overlap_block_stub("full_iteration")
     main_stream = torch.cuda.current_stream()
 
     dispatched_input = torch.ones(8, device="cuda")
@@ -828,17 +831,12 @@ def test_overlap_stream_use_marks_follow_full_iteration_capture(monkeypatch, cap
     recorded.clear()
     expert_output = torch.ones(8, device="cuda")
     combined = ShortcutMoEBlock._launch_combine(block, expert_output, async_op=True)
-    if capturing:
-        assert not recorded
-        assert block._combine_input_keepalive is expert_output
-    else:
-        assert len(recorded) == 1
-        assert recorded[0][0] is expert_output and recorded[0][1] == side_stream
-        assert block._combine_input_keepalive is None
+    assert not recorded
+    assert block._combine_input_keepalive is expert_output
 
     recorded.clear()
     assert ShortcutMoEBlock._wait_combine(block, combined) is combined
-    # Joining the side stream ends the need for the reference in either mode.
+    # Joining the side stream ends the need for the reference.
     assert block._combine_input_keepalive is None
     assert len(recorded) == 1 and recorded[0][0] is combined
     torch.testing.assert_close(combined, torch.full_like(expert_output, 2))
