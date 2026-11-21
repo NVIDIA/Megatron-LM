@@ -65,14 +65,12 @@ We recommend passing `--dtype bf16` for training or finetuning. Inference can be
 
 ### Huggingface format
 
-The HF checkpoints can be converted to Megatron format by using Megatron-Bridge's checkpoint converter for HF format [see script](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/examples/conversion/convert_checkpoints.py).
+The HF checkpoints can be converted to Megatron format by using Megatron Bridge's [checkpoint conversion workflow](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/docs/bridge-guide.md#convenience-workflows-commands).
 
 ```
-python Megatron-Bridge/examples/conversion/convert_checkpoints.py import \
+Megatron-Bridge/scripts/conversion/convert.sh import \
   --hf-model meta-llama/Llama-2-7B \
-  --megatron-path ./checkpoints/llama2_7b \
-  --torch-dtype bfloat16 \
-  --device-map auto
+  --megatron-path ./checkpoints/llama2_7b
 ```
 
 After this conversion, we are ready to load the checkpoints into a Megatron GPT model.
@@ -196,14 +194,12 @@ We recommend passing `--dtype bf16` for training or finetuning. Inference can be
 
 ### Huggingface format
 
-The HF checkpoints can be converted to Megatron format by using Megatron-Bridge's checkpoint converter for HF format [see script](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/examples/conversion/convert_checkpoints.py).
+The HF checkpoints can be converted to Megatron format by using Megatron Bridge's [checkpoint conversion workflow](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/docs/bridge-guide.md#convenience-workflows-commands).
 
 ```
-python Megatron-Bridge/examples/conversion/convert_checkpoints.py import \
+Megatron-Bridge/scripts/conversion/convert.sh import \
   --hf-model meta-llama/Llama-3.2-1B \
-  --megatron-path ./checkpoints/llama3_2_1b \
-  --torch-dtype bfloat16 \
-  --device-map auto
+  --megatron-path ./checkpoints/llama3_2_1b
 ```
 
 After this conversion, we are ready to load the checkpoints into a Megatron GPT model.
@@ -292,14 +288,12 @@ Users must first apply for access to download the Mistral-7b checkpoints through
 
 ## Convert checkpoint format
 
-The HF checkpoints can be converted to Megatron format by using Megatron-Bridge's checkpoint converter for HF format [see script](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/examples/conversion/convert_checkpoints.py).
+The HF checkpoints can be converted to Megatron format by using Megatron Bridge's [checkpoint conversion workflow](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/docs/bridge-guide.md#convenience-workflows-commands).
 
 ```
-python Megatron-Bridge/examples/conversion/convert_checkpoints.py import \
+Megatron-Bridge/scripts/conversion/convert.sh import \
   --hf-model mistralai/Mistral-7B-Instruct-v0.3 \
-  --megatron-path ./checkpoints/mistral_7b \
-  --torch-dtype bfloat16 \
-  --device-map auto
+  --megatron-path ./checkpoints/mistral_7b
 ```
 
 After this conversion, we are ready to load the checkpoints into a Megatron GPT model.
