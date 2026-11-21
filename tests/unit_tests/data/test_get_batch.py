@@ -522,6 +522,14 @@ def test_hybrid_thd_forward_prebuilds_batch_metadata_once(monkeypatch):
     cp_batch = ContextParallelBatch.from_single_layout("contiguous", batch, expected_params)
 
     monkeypatch.setattr(pretrain_hybrid, "get_args", lambda: args)
+    # forward_step reads the packing scheduler from the run config; this batch has none.
+    monkeypatch.setattr(
+        pretrain_hybrid,
+        "get_run_config",
+        lambda: SimpleNamespace(
+            model=SimpleNamespace(transformer=SimpleNamespace(sequence_packing_scheduler=None))
+        ),
+    )
     monkeypatch.setattr(pretrain_hybrid, "get_timers", MagicMock(return_value=MagicMock()))
     monkeypatch.setattr(pretrain_hybrid, "get_batch", MagicMock(return_value=cp_batch))
     finalize = MagicMock(side_effect=lambda params: params)
