@@ -577,6 +577,23 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             model_param, param_range.start, param_range.end
                         )
 
+                    if (
+                        shard_model_param is None
+                        and config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+                    ):
+                        # Quantized params cannot be sharded for TE FusedAdam.
+                        raise ValueError(
+                            f"Quantized {type(model_param).__name__} params need MCore-managed "
+                            "FP32 main params, but the precision-aware optimizer config gives TE "
+                            f"FusedAdam the master weights (fp8_recipe={config.fp8_recipe!r}, "
+                            f"main_params_dtype={config.main_params_dtype}, "
+                            f"optimizer_cpu_offload={config.optimizer_cpu_offload}, "
+                            f"resolved_fp8_param_gather={config.resolved_fp8_param_gather}, "
+                            f"resolved_fp4_param_gather={config.resolved_fp4_param_gather}). Set "
+                            "ddp_config.fp8_param_gather / fp4_param_gather to match "
+                            "TransformerConfig.fp8_param / fp4_param."
+                        )
+
                     # Generate main param.
                     if not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                         # If we use FP8 params to initialize FP32 main params (compared to using the
@@ -876,6 +893,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 raise ValueError("embedding_min_norm is not supported with Megatron FSDP")
             # Megatron-FSDP will manage optimizer weights and gradients.
             return
+
+        # The config must be resolved for this model's DDP config, or unresolved (None).
+        for name in ("fp8_param_gather", "fp4_param_gather"):
+            resolved = getattr(config, f"resolved_{name}")
+            ddp_value = getattr(self.ddp_config, name)
+            assert resolved in (None, ddp_value), (
+                f"OptimizerConfig resolved with {name}={resolved} for a model whose "
+                f"ddp_config.{name} is {ddp_value}"
+            )
 
         self._cudagraphed_grad_copy = None
         if (
@@ -1241,6 +1267,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.optimizer.load_state_dict(state_dict)
             return
 
+        if 'param_state' in state_dict:
+            self._check_loaded_param_remainders(state_dict)
+
         if len(self.optimizer.state) == 0:
             if isinstance(self.optimizer, HybridDeviceOptimizer):
                 self.optimizer.dummy_step()
@@ -1315,7 +1344,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 for key in self.optimizer_state_keys
                             }
                             if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
-                                if self.config.store_param_remainders and self.config.bf16:
+                                if (
+                                    self._stores_param_remainders()
+                                    and model_param.dtype == torch.bfloat16
+                                ):
                                     tensors["master_param"] = init_shard(torch.int16)
                                 else:
                                     tensors["master_param"] = init_shard(
@@ -1525,6 +1557,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     continue
 
                 if k == "param":
+                    if (
+                        self._stores_param_remainders()
+                        and sharded_model_param.dtype == torch.bfloat16
+                        and v.dtype != torch.int16
+                    ):
+                        v = self._param_remainders_from_fp32(v)
                     self.optimizer.set_scaled_state(sharded_model_param, "master_param", v)
                 else:
                     self.optimizer.set_scaled_state(sharded_model_param, k, v)
@@ -1551,6 +1589,25 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if not isinstance(tensors[source_key], torch.Tensor):
                     continue
                 dst_tensors[key].copy_(tensors[source_key])
+
+    @staticmethod
+    def _param_remainders_from_fp32(remainders: torch.Tensor) -> torch.Tensor:
+        """Restore the int16 dtype of param remainders loaded through FP32 buffers.
+
+        The DP-zero and fully reshardable formats gather the parameter state in FP32 buffers,
+        which hold the int16 remainders exactly, but TE FusedAdam only accepts them as int16.
+        Values that are not int16 integers are FP32 master weights instead, which the cast would
+        silently truncate.
+        """
+        remainders_int16 = remainders.to(torch.int16)
+        if not torch.equal(remainders_int16.to(remainders.dtype), remainders):
+            raise RuntimeError(
+                "The distributed optimizer checkpoint stores full main params, but this run uses "
+                "int16 param remainders of the FP32 master weights. Set "
+                "--no-store-param-remainders to match the checkpoint, or skip loading the "
+                "optimizer state with --no-load-optim."
+            )
+        return remainders_int16
 
     def get_parameter_state_dp_reshardable(self):
         """Get internal representation of parameter state without any copies and modifications.
@@ -1617,7 +1674,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         Returns:
             dict or None: optimizer state dict on DP rank 0, or all ranks if return_on_all_ranks.
-                Returns None on non-zero DP ranks when return_on_all_ranks=False.
+                Returns None on non-zero DP ranks when return_on_all_ranks=False. Also records
+                whether the "param" state holds param remainders.
         """
         # Data parallelism variables.
         if use_gloo_comm:
@@ -1630,7 +1688,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_global_ranks = torch.distributed.get_process_group_ranks(data_parallel_group)
 
         # Collect param states.
-        state = {"buckets_coalesced": True}
+        state = {
+            "buckets_coalesced": True,
+            "param_state_param_remainders": self._stores_param_remainders(),
+        }
         for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
 
             # Iterate grad buffers (by data type).
@@ -1923,7 +1984,74 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         state_dict['param_state'] = param_state
         state_dict['param_state_sharding_type'] = sharding_type
+        state_dict['param_state_param_remainders'] = self._stores_param_remainders()
         return state_dict
+
+    def _stores_param_remainders(self) -> bool:
+        """Whether the "param" optimizer state is int16 param remainders instead of main params."""
+        return bool(
+            self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+            and self.config.resolved_store_param_remainders
+        )
+
+    def _check_loaded_param_remainders(self, state_dict: dict) -> None:
+        """Raise if the checkpoint's param remainders flag differs from this run's.
+
+        dist-checkpointing casts loaded tensors to this run's dtypes, so int16 remainders would
+        load as FP32 main params (or the reverse) without an error.
+        """
+        error = self._param_remainders_mismatch(state_dict.get('param_state_param_remainders'))
+        if error is not None:
+            raise RuntimeError(error)
+
+    def _param_remainders_mismatch(self, stored: Optional[bool]) -> Optional[str]:
+        """The error for a checkpoint whose param remainders flag is stored (None: legacy
+        checkpoint without it) if it differs from this run's, else None."""
+        if stored is None:
+            stored = self._legacy_checkpoint_has_param_remainders()
+        current = self._stores_param_remainders()
+        if stored == current:
+            return None
+
+        def describe(remainders):
+            if remainders:
+                return "int16 param remainders of the FP32 master weights"
+            return "full main params"
+
+        if not stored:
+            fix = "Set --no-store-param-remainders to match the checkpoint"
+        elif (
+            self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+            and self.config._param_remainders_supported()
+            and not self.config.optimizer_cuda_graph
+        ):
+            fix = "Set --store-param-remainders to match the checkpoint"
+        else:
+            fix = (
+                "This run cannot store param remainders: they need the precision-aware optimizer "
+                "to own the FP32 master weights of BF16 params, without --optimizer-cpu-offload or "
+                "--optimizer-cuda-graph. Resume with the configuration the checkpoint was saved "
+                "with"
+            )
+        return (
+            f"The distributed optimizer checkpoint stores {describe(stored)}, but this run uses "
+            f"{describe(current)}. Loading it would silently corrupt the master weights. {fix}, "
+            "or skip loading the optimizer state with --no-load-optim."
+        )
+
+    def _legacy_checkpoint_has_param_remainders(self) -> bool:
+        """Infer the param remainders flag of a legacy checkpoint, which does not store it.
+
+        Legacy versions stored param remainders wherever they used the precision-aware optimizer,
+        unless store_param_remainders was False. They did not record that setting, so assume it
+        was this run's. The CUDA graph is ignored: legacy versions could not combine it with param
+        remainders.
+        """
+        return bool(
+            self.config._use_te_precision_aware_optimizer_legacy()
+            and self.config._param_remainders_supported()
+            and self.config.store_param_remainders is not False
+        )
 
     def _param_groups_to_param2group_meta(
         self, param_groups: list[dict[str, Any]]
@@ -2663,6 +2791,24 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
           buffers. (e.g., one buffer each for main_param, exp_avg, and
           exp_avg_sq).
         """
+
+        # Check the param remainders flag first. Only DP rank 0 holds the state, so it broadcasts
+        # the result: all ranks must raise together or the others hang in the scatter.
+        error = [None]
+        if self.data_parallel_group.rank() == 0 and state_dict is not None:
+            # The splitting code expects only buffer entries and buckets_coalesced. Remove the
+            # marker from a local copy so retries still validate the caller's checkpoint.
+            state_dict = state_dict.copy()
+            error[0] = self._param_remainders_mismatch(
+                state_dict.pop('param_state_param_remainders', None)
+            )
+        torch.distributed.broadcast_object_list(
+            error,
+            src=torch.distributed.get_global_rank(self.data_parallel_group, 0),
+            group=self.data_parallel_group,
+        )
+        if error[0] is not None:
+            raise RuntimeError(error[0])
 
         # Selectively load from a legacy checkpoint. The legacy format was used
         # prior to Feb 13, 2024.

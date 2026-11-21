@@ -1775,6 +1775,12 @@ def validate_args(args, defaults={}):
         ),
     )
 
+    if args.store_param_remainders is not None and not args.use_precision_aware_optimizer:
+        warn_rank_0(
+            '--store-param-remainders only applies with --use-precision-aware-optimizer; '
+            'ignoring it.'
+        )
+
     # Local checkpointing and replication prerequisites, the async-save worker requirement and a
     # replication jump without replication are checked by CheckpointConfig.validate().
 
@@ -3527,6 +3533,14 @@ def _add_experimental_args(parser):
                        help='Use the precision-aware optimizer in TransformerEngine, which allows '
                        'setting the main params and optimizer states to lower precision, such as '
                        'fp16, bf16 and fp8.')
+    group.add_argument('--store-param-remainders', action=argparse.BooleanOptionalAction,
+                       default=None,
+                       help='Store only the low 16 bits of each FP32 master weight (the BF16 param holds the '
+                        'rest), saving memory. Needs --use-precision-aware-optimizer, BF16 params and FP32 main '
+                        'params. Default on, except with a non-delayed --fp8-recipe and FP32 main params, for '
+                        'compatibility with existing checkpoints. No effect with --fp8-param-gather and a '
+                        'non-delayed --fp8-recipe. Disabled with --optimizer-cpu-offload, --optimizer-cuda-graph '
+                        'and Megatron-FSDP.')
     group.add_argument('--main-grads-dtype', default='fp32', choices=['fp32', 'bf16'],
                        help='Dtype of main grads when enabling precision-aware-optimizer.')
     group.add_argument('--main-params-dtype', default='fp32', choices=['fp32', 'fp16'],
