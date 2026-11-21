@@ -182,6 +182,10 @@ these kernels' tuning keys, keeping the config with the smallest worst-case
 slowdown: one `*` entry per kernel, plus an entry for each swept shape whose own
 best config beats `*` there by more than 5%. They were measured on `sm103`; the
 `sm100` entries are copies that have not been measured on that architecture.
+The `sm103` entries for the in-tree GDP/GDN prefill, Mamba2 SSD, causal-conv1d
+varlen, fused pre-gated-delta-rule and DSA min-memory kernels come from the same
+kind of sweep, driven through each kernel's entry point at model-sized shapes;
+they have no `sm100` copies.
 
 ## Diagnostics and configuration reference
 
