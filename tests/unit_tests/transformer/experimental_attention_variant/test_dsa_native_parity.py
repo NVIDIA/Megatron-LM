@@ -20,6 +20,34 @@ from tests.unit_tests.transformer.experimental_attention_variant.dsa_native_pari
     run_absorbed_mla_dsa_parity,
 )
 
+# Frontend version reported while a test-local fake replaces the cuDNN DSA namespace.
+_FAKE_NAMESPACE_FRONTEND_VERSION = (1, 21)
+
+
+@pytest.fixture(autouse=True)
+def _fake_dsa_namespaces_report_a_legacy_frontend(monkeypatch):
+    """Report a legacy cuDNN frontend version whenever a fake DSA namespace is installed.
+
+    The fakes in this file model the frontend <= 1.25 wrappers: no ``q_causal_offsets`` and
+    the bottom-right causal default. ``_cudnn_frontend_version`` reads the installed
+    ``cudnn`` package, so on a host with frontend >= 1.26 the version gates would otherwise
+    describe a different frontend than the namespace the code under test calls. The real
+    namespace keeps reporting the installed version.
+    """
+    installed_version = dsa_cudnn_kernels._cudnn_frontend_version
+    try:
+        from cudnn import DSA as real_namespace
+    except ImportError:
+        real_namespace = None
+
+    def frontend_version():
+        namespace = dsa_cudnn_kernels._cudnn_dsa
+        if namespace is not None and namespace is not real_namespace:
+            return _FAKE_NAMESPACE_FRONTEND_VERSION
+        return installed_version()
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_frontend_version", frontend_version)
+
 
 # Disabled in dev (flaky_in_dev) and LTS (flaky) CI: this real-kernel cuDNN/flash_mla
 # case fails with a CUDA error in CI (deterministic, not truly flaky). Re-enable once the
@@ -1580,7 +1608,9 @@ def test_cudnn_sparse_loss_uses_selected_topk_scores(monkeypatch):
             loss_coeff,
             grad_loss,
             block_I,
+            topk_indices_global,
         ):
+            assert topk_indices_global is True
             seen["index_score"] = index_score
             return {
                 "d_index_q": torch.zeros_like(q_indexer),
@@ -1686,7 +1716,9 @@ def test_cudnn_sparse_loss_masks_invalid_query_rows_for_backward(monkeypatch):
             loss_coeff,
             grad_loss,
             block_I,
+            topk_indices_global,
         ):
+            assert topk_indices_global is True
             seen["attn_score"] = attn_score
             seen["index_score"] = index_score
             seen["topk_indices"] = topk_indices
@@ -1771,7 +1803,9 @@ def test_cudnn_sparse_loss_reduces_attention_target_across_tp(monkeypatch):
             loss_coeff,
             grad_loss,
             block_I,
+            topk_indices_global,
         ):
+            assert topk_indices_global is True
             del index_score, topk_indices, sm_scale, loss_coeff, grad_loss, block_I
             seen["attn_score"] = attn_score.detach().clone()
             return {
@@ -1836,7 +1870,9 @@ def test_cudnn_sparse_backward_uses_batch_major_topk_indices_for_batched_kv(monk
             loss_coeff,
             grad_loss,
             block_I,
+            topk_indices_global,
         ):
+            assert topk_indices_global is True
             seen["topk_indices"] = topk_indices
             seen["loss_coeff"] = loss_coeff
             seen["grad_loss"] = grad_loss
@@ -2241,7 +2277,9 @@ def test_cudnn_sparse_indexer_backward_chunks_sequence_and_preserves_scaling(mon
             loss_coeff,
             grad_loss,
             block_I,
+            topk_indices_global,
         ):
+            assert topk_indices_global is True
             del attn_score, index_score, topk_indices, sm_scale, grad_loss, block_I
             call_value = len(calls) + 1
             calls.append((q_indexer.size(1), loss_coeff))
