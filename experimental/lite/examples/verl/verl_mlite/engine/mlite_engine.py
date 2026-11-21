@@ -6,12 +6,25 @@ from __future__ import annotations
 import math
 import os
 import weakref
+from contextlib import contextmanager
 from enum import Enum
 from types import SimpleNamespace
 from typing import Any
 
 import torch
 import torch.distributed as dist
+from tensordict import TensorDict
+from verl.trainer.config import CheckpointConfig
+from verl.utils import tensordict_utils as tu
+from verl.utils.device import get_device_id, get_device_name
+from verl.utils.memory_utils import aggressive_empty_cache
+from verl.workers.config import HFModelConfig, OptimizerConfig
+from verl_mlite import qat_export
+from verl_mlite.compat import _patch_bucketed_weight_sender, load_verl_engine_api
+from verl_mlite.optimizer_memory import prewarm_grad_stats_groups as _prewarm_grad_stats_groups
+from verl_mlite.optimizer_memory import release_inactive_cuda_cache as _release_inactive_cuda_cache
+from verl_mlite.optimizer_memory import release_post_backward_cache as _release_post_backward_cache
+
 from megatron.lite.model import resolve_model_type_from_hf
 from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
 from megatron.lite.primitive.modules import router_replay
@@ -21,15 +34,6 @@ from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 from megatron.lite.runtime.contracts import LossContext, PackedBatch
 from megatron.lite.runtime.contracts.config import OptimizerConfig as MegatronLiteOptimizerConfig
 from megatron.lite.runtime.contracts.config import ParallelConfig, RuntimeConfig
-from tensordict import TensorDict
-
-from verl.trainer.config import CheckpointConfig
-from verl.utils import tensordict_utils as tu
-from verl.utils.device import get_device_id, get_device_name
-from verl.utils.memory_utils import aggressive_empty_cache
-from verl.workers.config import HFModelConfig, OptimizerConfig
-from verl_mlite import qat_export
-from verl_mlite.compat import _patch_bucketed_weight_sender, load_verl_engine_api
 
 try:
     # Recent VERL wraps per-step metric values in a Metric aggregator that
@@ -42,7 +46,7 @@ from .config import MegatronLiteEngineConfig
 
 _patch_bucketed_weight_sender()
 
-BaseEngine, BaseEngineCtx, EngineRegistry, postprocess_batch_func, prepare_micro_batches = (
+(BaseEngine, BaseEngineCtx, EngineRegistry, postprocess_batch_func, prepare_micro_batches) = (
     load_verl_engine_api()
 )
 
@@ -282,6 +286,13 @@ class MegatronLiteEngine(BaseEngine):
     def is_optimizer_offload_enabled(self) -> bool:
         return self.engine_config.optimizer_offload
 
+    @property
+    def _release_grads(self) -> bool:
+        return (
+            bool(getattr(self.engine_config, "grad_offload", False))
+            and not self.is_param_offload_enabled
+        )
+
     def initialize(self):
         if self.engine_config.full_determinism:
             from verl.workers.engine.utils import enable_full_determinism
@@ -304,11 +315,19 @@ class MegatronLiteEngine(BaseEngine):
                 self.handle._optimizer, self._mlite_config.optimizer
             )
 
+        # Initialize the optimizer's *actual* GN groups while rollout is still
+        # asleep. First-use NCCL allocations can otherwise OOM after actor bwd.
+        if self.handle._optimizer is not None and self.device_name == "cuda":
+            _release_inactive_cuda_cache()
+            _prewarm_grad_stats_groups(
+                self.handle._optimizer, torch.device("cuda", torch.cuda.current_device())
+            )
+
         self.to(
             device="cpu",
             model=self.is_param_offload_enabled,
             optimizer=self.is_optimizer_offload_enabled,
-            grad=self.is_param_offload_enabled,
+            grad=self.is_param_offload_enabled or self._release_grads,
         )
 
     def train_mode(self, **kwargs):
@@ -325,6 +344,8 @@ class MegatronLiteEngine(BaseEngine):
 
     def optimizer_step(self):
         self._require_initialized()
+        if self.device_name == "cuda":
+            _release_inactive_cuda_cache()
         _, grad_norm, _ = self.runtime.optimizer_step(self.handle)
         return grad_norm
 
@@ -385,10 +406,7 @@ class MegatronLiteEngine(BaseEngine):
             for key in ("limit", "include_mtp_only", "include_local_prefixes")
             if key in kwargs
         }
-        export_kwargs.update(
-            buffer_max_size_bytes=2 * 1024**3,
-            cpu=False,
-        )
+        export_kwargs.update(buffer_max_size_bytes=2 * 1024**3, cpu=False)
         if self.engine_config.resync_format is not None:
             export_kwargs["target"] = self.engine_config.resync_format
             if self.engine_config.resync_config:
@@ -400,6 +418,14 @@ class MegatronLiteEngine(BaseEngine):
             export_kwargs["target"] = "vllm"
         if self.engine_config.export_dtype:
             export_kwargs["export_dtype"] = self.engine_config.export_dtype
+        if self._resolve_model_name() == "deepseek_v41":
+            # Offline HF save defaults to BF16 + complete frozen row shards.
+            # Live vLLM reload instead consumes native release codes/scales;
+            # frozen Engram is already loaded from that release on receivers.
+            target = export_kwargs.setdefault("target", "vllm")
+            if target not in ("release", "vllm"):
+                raise ValueError("DS4.1 rollout resync requires native release weights")
+            export_kwargs["include_frozen"] = False
         weights = self.runtime.export_weights(self.handle, **export_kwargs)
         if self.engine_config.qat.get("enable", False):
             weights = qat_export.export_qat_weights(weights, self.engine_config.qat)
@@ -434,6 +460,9 @@ class MegatronLiteEngine(BaseEngine):
 
     def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
         self._require_initialized()
+        if self._release_grads and not model:
+            # VERL marks the training boundary with optimizer=True when params stay resident.
+            grad = grad or optimizer
         if model or not (optimizer or grad):
             super().to(device=device, model=model, optimizer=optimizer, grad=grad)
         self.runtime.to(self.handle, device, model=model, optimizer=optimizer, grad=grad)
@@ -494,6 +523,7 @@ class MegatronLiteEngine(BaseEngine):
         finally:
             if reload_params_for_save:
                 self.to(device="cpu", model=True, optimizer=False, grad=False)
+            aggressive_empty_cache(force_sync=True)
 
     def _save_hf_checkpoint(self, local_path: str) -> None:
         proto = self.handle._extras.get("protocol")
@@ -662,6 +692,13 @@ class MegatronLiteEngine(BaseEngine):
         offload_fraction = override.get(
             "offload_fraction", override.get("optimizer_offload_fraction")
         )
+        chunked = bool(override.get("chunked_optimizer_state_offload"))
+        if chunked:
+            if self.is_param_offload_enabled:
+                raise ValueError(
+                    "Chunked optimizer offload currently requires resident model buffers"
+                )
+            offload_fraction = 0.0
         if offload_fraction is None and override.get("optimizer_cpu_offload"):
             offload_fraction = 1.0
         if offload_fraction is None and self.is_optimizer_offload_enabled:
@@ -702,6 +739,8 @@ class MegatronLiteEngine(BaseEngine):
             offload_fraction=offload_fraction,
             use_precision_aware_optimizer=override.get("use_precision_aware_optimizer"),
             decoupled_weight_decay=override.get("decoupled_weight_decay"),
+            chunked_state_offload=chunked or None,
+            state_offload_chunk_size_mb=override.get("optimizer_state_offload_chunk_size_mb"),
         )
 
     @staticmethod
@@ -754,9 +793,15 @@ class MegatronLiteEngine(BaseEngine):
             )
 
         runtime_loss_fn = None
-        reduced_outputs = [] if (loss_function is not None or forward_only) and self.is_mp_src_rank_with_outputs() else None
+        reduced_outputs = (
+            []
+            if (loss_function is not None or forward_only) and self.is_mp_src_rank_with_outputs()
+            else None
+        )
         if loss_function is not None or forward_only:
-            runtime_loss_fn = self._make_runtime_loss_fn(loss_function, num_micro_batches, reduced_outputs)
+            runtime_loss_fn = self._make_runtime_loss_fn(
+                loss_function, num_micro_batches, reduced_outputs
+            )
 
         replay_specs = [
             runtime_batch.routed_experts is not None
@@ -768,14 +813,15 @@ class MegatronLiteEngine(BaseEngine):
                 "router_replay_mode='R3' requires routed_experts on every "
                 "actor micro-batch in a step."
             )
-        result = self.runtime.forward_backward(
-            self.handle,
-            iter(runtime_batches),
-            loss_fn=runtime_loss_fn,
-            num_microbatches=num_micro_batches,
-            forward_only=forward_only,
-            router_replay={"action": "replay"} if replay_enabled else None,
-        )
+        with self._runtime_cache_boundaries(forward_only=forward_only):
+            result = self.runtime.forward_backward(
+                self.handle,
+                iter(runtime_batches),
+                loss_fn=runtime_loss_fn,
+                num_microbatches=num_micro_batches,
+                forward_only=forward_only,
+                router_replay={"action": "replay"} if replay_enabled else None,
+            )
         if reduced_outputs is not None:
             return postprocess_batch_func(output_lst=reduced_outputs, indices=indices, data=data)
         metrics = dict(result.metrics)
@@ -787,13 +833,52 @@ class MegatronLiteEngine(BaseEngine):
             # Pass Metric aggregators through unchanged (reduce_metrics folds them);
             # list-wrap plain scalars as the legacy contract expects.
             "metrics": {
-                key: value
-                if isinstance(value, list)
-                or (_VerlMetric is not None and isinstance(value, _VerlMetric))
-                else [value]
+                key: (
+                    value
+                    if isinstance(value, list)
+                    or (_VerlMetric is not None and isinstance(value, _VerlMetric))
+                    else [value]
+                )
                 for key, value in metrics.items()
             },
         }
+
+    @contextmanager
+    def _runtime_cache_boundaries(self, *, forward_only):
+        # Retain old-LP admission once; post-bwd reclamation is separately opt-in.
+        release = (
+            not forward_only
+            and self.device_name == "cuda"
+            and self.engine_config.pp == 1
+            and self.engine_config.impl == "vllm"
+            and self._resolve_model_name() == "deepseek_v41"
+        )
+        if not release:
+            yield
+            return
+        _release_inactive_cuda_cache()
+        policy = getattr(self.engine_config, "post_backward_cache_policy", "off")
+        if policy == "off":
+            yield
+            return
+        free_gib = getattr(self.engine_config, "post_backward_cache_free_gib", 4.0)
+        extras = self.handle._extras
+        had_hook = "post_backward_hook" in extras
+        previous = extras.get("post_backward_hook")
+
+        def completed():
+            _release_post_backward_cache(policy, free_gib)
+            if previous is not None:
+                previous()
+
+        extras["post_backward_hook"] = completed
+        try:
+            yield
+        finally:
+            if had_hook:
+                extras["post_backward_hook"] = previous
+            else:
+                extras.pop("post_backward_hook", None)
 
     def _make_runtime_batch(self, micro_batch: TensorDict) -> PackedBatch:
         """Flatten a jagged no-padding batch to a model-agnostic ``PackedBatch``.
@@ -820,7 +905,7 @@ class MegatronLiteEngine(BaseEngine):
         return PackedBatch(
             input_ids=input_ids.values().contiguous(),
             labels=input_ids.values().contiguous(),
-            loss_mask=None if loss_mask is None else loss_mask.values().contiguous().float(),
+            loss_mask=(None if loss_mask is None else loss_mask.values().contiguous().float()),
             seq_lens=input_ids.offsets().diff().to(dtype=torch.int64),
             routed_experts=routed_experts,
             r3_replay_mask=(
@@ -829,10 +914,7 @@ class MegatronLiteEngine(BaseEngine):
         )
 
     def _make_runtime_loss_context(
-        self,
-        micro_batch: TensorDict,
-        *,
-        loss_scale: float,
+        self, micro_batch: TensorDict, *, loss_scale: float
     ) -> LossContext:
         return LossContext(
             temperature=float(self._scalar_temperature(micro_batch)),
@@ -905,15 +987,10 @@ class MegatronLiteEngine(BaseEngine):
         micro_batch: TensorDict, input_ids: torch.Tensor
     ) -> torch.Tensor:
         """Build the R3 mask while inputs are still jagged."""
-        return router_replay.build_r3_replay_mask(
-            input_ids, micro_batch["response_mask"]
-        )
+        return router_replay.build_r3_replay_mask(input_ids, micro_batch["response_mask"])
 
     def _build_verl_model_output(
-        self,
-        *,
-        raw_output: dict[str, torch.Tensor],
-        runtime_batch: PackedBatch,
+        self, *, raw_output: dict[str, torch.Tensor], runtime_batch: PackedBatch
     ) -> dict[str, torch.Tensor]:
         log_probs = raw_output.get("log_probs")
         if log_probs is None:

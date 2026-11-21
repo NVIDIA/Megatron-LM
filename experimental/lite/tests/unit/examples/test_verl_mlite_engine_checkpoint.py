@@ -247,7 +247,9 @@ def test_hf_model_only_save_uses_protocol_and_writes_hf_metadata(tmp_path, monke
         {
             "model_cfg": model_cfg,
             "model_chunks": chunks,
-            "protocol": SimpleNamespace(save_hf_weights=lambda *args: export_calls.append(args)),
+            "protocol": SimpleNamespace(
+                save_hf_weights=lambda *args, **kwargs: export_calls.append((args, kwargs))
+            ),
         }
     )
     monkeypatch.setattr(
@@ -258,6 +260,8 @@ def test_hf_model_only_save_uses_protocol_and_writes_hf_metadata(tmp_path, monke
     engine.save_checkpoint(str(tmp_path), global_step=1)
 
     hf_path = str(tmp_path / "huggingface")
-    assert export_calls == [(chunks, hf_path, model_cfg, engine.handle._parallel_state)]
+    assert export_calls == [
+        ((chunks, hf_path, model_cfg, engine.handle._parallel_state), {"export_dtype": "bfloat16"})
+    ]
     assert metadata_calls == [("config", hf_path), ("tokenizer", hf_path), ("processor", hf_path)]
     assert hf_config.auto_map == {"AutoModel": "modeling.Model"}

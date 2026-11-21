@@ -7,6 +7,7 @@ from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
+
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.protocols import ExpertClassifierFn, default_expert_classifier
 from megatron.lite.runtime.contracts.loss import split_loss_context, use_loss_context
@@ -22,6 +23,7 @@ def run_microbatch_loop(
     pre_forward_hook: Callable[[torch.Tensor], None] | None = None,
     loss_fn: Callable | None = None,
     forward_only: bool = False,
+    post_backward_hook: Callable[[], None] | None = None,
 ):
     """Run forward-backward over microbatches with loss accumulation.
 
@@ -45,6 +47,8 @@ def run_microbatch_loop(
             ``infer_batch``). The caller (verl) runs the forward under ``no_grad`` so the
             loss has no ``grad_fn``; calling ``.backward()`` then raises. Mirrors the
             pipeline path, which already threads ``forward_only`` to skip backward.
+        post_backward_hook: Optional callback immediately after each successful
+            backward, including the final microbatch. Never called in forward-only mode.
     """
     last_out = None
     all_metrics: list[dict] = []
@@ -64,10 +68,14 @@ def run_microbatch_loop(
                 loss, metrics = loss_fn(out, batch, loss_context)
             if not forward_only:
                 (loss / num_microbatches).backward()
+                if post_backward_hook is not None:
+                    post_backward_hook()
             out["loss"] = loss.detach()
             all_metrics.append(metrics)
         elif not forward_only:
             (out["loss"] / num_microbatches).backward()
+            if post_backward_hook is not None:
+                post_backward_hook()
         last_out = out
     if last_out is not None and all_metrics:
         last_out["_loss_fn_metrics"] = all_metrics
