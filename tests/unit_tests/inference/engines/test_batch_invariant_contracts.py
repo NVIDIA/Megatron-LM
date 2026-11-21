@@ -17,7 +17,7 @@ from tests.unit_tests.inference.engines import batch_invariant_test_utils as fix
     [
         ({"params_dtype": torch.float16}, "BF16 model parameters"),
         ({"flash_attention_version": 2}, "flash-attention-version 3 or 4"),
-        ({"context_parallel_size": 2}, "does not support context parallelism"),
+        ({"context_parallel_size": 2, "cp_comm_type": "p2p"}, "cp_comm_type='a2a'"),
         ({"attention_dropout": 0.1}, "does not support attention dropout"),
     ],
 )
