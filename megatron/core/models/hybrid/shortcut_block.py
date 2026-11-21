@@ -158,8 +158,7 @@ class ShortcutMoEBlock(MegatronModule):
         super().__init__(compute_layer.config)
 
         self.overlap_mode = overlap_a2a
-        # Holds the combine input alive across the overlapped combine during a full-iteration
-        # CUDA graph capture (see _skip_stream_use_marks).
+        # Holds the combine input alive across the overlapped combine (see _launch_combine).
         self._combine_input_keepalive = None
         self.layer_number = compute_layer.layer_number
         self.attn_layer_idx = compute_layer.layer_number - 1
@@ -383,17 +382,21 @@ class ShortcutMoEBlock(MegatronModule):
             )
         return output[0] if isinstance(output, tuple) else output
 
-    def _skip_stream_use_marks(self) -> bool:
+    def _skip_dispatch_output_marks(self) -> bool:
         """True while a full-iteration CUDA graph is being captured.
 
         ``record_stream`` tells the allocator that a tensor is used on a second stream, so its
         memory is not reused before that stream is done. During a capture the allocator cannot
-        check, and it holds every such block until the capture ends. The dispatch outputs and
-        combine inputs of all MoE layers then stay reserved in the graph's pool at once.
+        check, and it holds every such block until the capture ends. The dispatch outputs of all
+        MoE layers then stay reserved in the graph's pool at once, so the marks are left out
+        there.
 
-        The marks are not needed here, because both streams are joined around each use:
-        the side stream starts every dispatch and combine by waiting on the main stream, and
-        the main stream waits on the side stream before it takes their results.
+        They stay everywhere else. A dispatch output is allocated on the side stream and read on
+        the main stream, and the side stream starts the next dispatch after waiting only for
+        that layer's route_ready_event, not for the whole main stream. Without the mark, reuse
+        is safe only as long as nothing on the main stream reads an earlier dispatch output
+        after that event, which holds for the buffer lifetimes of today's schedule but is not
+        enforced here. The mark makes it hold regardless.
         """
         return (
             self.config.cuda_graph_impl == "full_iteration"
@@ -423,7 +426,7 @@ class ShortcutMoEBlock(MegatronModule):
         assert self.overlap_mode
 
         torch.cuda.current_stream().wait_stream(self._get_a2a_overlap_stream())
-        if not self._skip_stream_use_marks():
+        if not self._skip_dispatch_output_marks():
             dispatched_input.record_stream(torch.cuda.current_stream())
             dispatched_probs.record_stream(torch.cuda.current_stream())
         return dispatched_input, dispatched_probs
@@ -449,13 +452,14 @@ class ShortcutMoEBlock(MegatronModule):
 
         combine_stream = self._get_a2a_overlap_stream()
         combine_stream.wait_stream(torch.cuda.current_stream())
-        if self._skip_stream_use_marks():
-            # The main stream keeps computing while the combine reads ``output``. Hold a
-            # reference until _wait_combine has joined the side stream, so the memory cannot
-            # be handed back to the main stream before the combine has finished with it.
-            self._combine_input_keepalive = output
-        else:
-            output.record_stream(combine_stream)
+        # The main stream keeps computing while the combine reads ``output``. Hold a reference
+        # until _wait_combine has joined the side stream: ``output`` belongs to the main stream,
+        # so its memory can then only be reused by work that is ordered after the combine.
+        # This replaces ``output.record_stream(combine_stream)``. The mark would give the same
+        # protection, but the allocator would keep the block until the GPU has caught up with
+        # the free, long after the join made it safe, and during a CUDA graph capture until
+        # the capture ends.
+        self._combine_input_keepalive = output
         with torch.cuda.stream(combine_stream):
             return self.moe_layer.mlp.combine(output)
 
