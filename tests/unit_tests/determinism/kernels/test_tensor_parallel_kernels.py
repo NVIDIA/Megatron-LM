@@ -77,6 +77,63 @@ class TestTensorParallelLayers:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.parametrize("declare_boundary", [False, True])
+    def test_gtp_dynamic_accumulation_replays(self, declare_boundary, monkeypatch):
+        """Changing accumulation windows replay both widened GEMMs and reduced grads exactly."""
+        from megatron.core.tensor_parallel import generalized_tensor_parallelism as gtp
+        from megatron.core.tensor_parallel.layers import (
+            linear_with_grad_accumulation_and_async_allreduce,
+        )
+
+        group = torch.distributed.group.WORLD
+        if not gtp.HAVE_TE or group.size() < 2:
+            pytest.skip("Requires GTP and at least two ranks")
+        seeded(1234 + group.rank())
+        monkeypatch.setattr(gtp.GTP_CONFIG, "async_reduction", False)
+        monkeypatch.setattr(gtp.GTP_CONFIG, "weight_prefetch", False)
+        model = torch.nn.Module()
+        # Keep every shard nonempty under GTP's 16-row alignment.
+        model.output_layer = torch.nn.Linear(
+            64, 16 * group.size(), bias=False, device="cuda", dtype=torch.bfloat16
+        )
+        gtp.wrap_module_params_gtp(model.output_layer, ["weight"], group)
+        gtp.classify_gtp_remat_chains(model)
+        weight = model.output_layer.weight
+        weight.main_grad = torch.zeros_like(weight, dtype=torch.float32)
+        x = torch.randn(16, 1, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+        def run_windows(inputs):
+            results = []
+            for count in (2, 4, 1):
+                weight.main_grad.zero_()
+                weight.grad = None
+                for index in range(count):
+                    output = linear_with_grad_accumulation_and_async_allreduce(
+                        inputs * (index + 1),
+                        weight,
+                        None,
+                        False,
+                        False,
+                        False,
+                        tp_group=group,
+                        gtp_remat_size=group.size(),
+                    )
+                    if declare_boundary and index == count - 1:
+                        gtp.finalize_gtp_forward_counts(model)
+                    output.sum().backward()
+                gtp.wait_for_gtp_grad_reduction_on_current_stream()
+                results.append(weight.main_grad.detach().clone())
+            return results
+
+        try:
+            outputs, _ = assert_replays_bit_exact(
+                run_windows, (x,), backward=False, replays=3, what="GTP dynamic accumulation"
+            )
+            assert all(torch.count_nonzero(value) > 0 for value in outputs.values())
+        finally:
+            gtp.reset_gtp_state()
+            gtp._GTP_PARAMS.clear()
+
     @pytest.mark.parametrize(
         "deterministic_branch", [True, False], ids=["weight_index", "F.embedding"]
     )

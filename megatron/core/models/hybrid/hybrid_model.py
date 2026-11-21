@@ -10,6 +10,7 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.context_parallel import ContextParallelBatch
+from megatron.core.datasets.shared_prefix.layout import SharedPrefixPack, SharedPrefixTree
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
@@ -419,6 +420,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
 
         # Validate the full architecture, including MTP heads on other pipeline stages.
+        if self.config.mtp_kl_loss_weight > 0 and (
+            self.config.mtp_num_layers is None or self.config.mtp_num_layers <= 0
+        ):
+            raise ValueError("MTP KL loss requires positive mtp_num_layers")
         if self.mtp_num_depths > 0 and any(
             getattr(layer_config, "overlap_moe_expert_parallel_comm", False)
             for layer_config in mtp_overlap_configs
@@ -707,6 +712,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         padding_mask: Optional[Tensor] = None,
         compute_mtp_loss: bool = True,
         cp_batch: ContextParallelBatch | None = None,
+        shared_prefix_layout: Optional[SharedPrefixTree | SharedPrefixPack] = None,
+        shared_prefix_exclude_sequence_padding_from_expert_bias: Optional[bool] = None,
         output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
     ) -> Any:
@@ -721,8 +728,18 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 objective. Disabling it skips the MTP branch while leaving its parameters
                 loaded. This does not control speculative decoding. On post-process stages,
                 ``labels`` still determine whether the model returns loss or logits.
+                With ``shared_prefix_layout``, MTP runs only in training mode.
                 Defaults to True.
             cp_batch: Input tensors and packed metadata keyed by CP layout.
+            shared_prefix_layout (SharedPrefixTree | SharedPrefixPack, optional):
+                Runs this forward on a shared-prefix sequence instead of dense rows. See
+                ``megatron.core.models.hybrid.shared_prefix`` for the input layout, the
+                returned logits and the supported configurations. Defaults to None, which
+                leaves the normal path unchanged.
+            shared_prefix_exclude_sequence_padding_from_expert_bias (bool, optional): Expert-bias
+                padding convention of a shared-prefix forward; see
+                ``resolve_exclude_sequence_padding_from_expert_bias`` in that module. Requires
+                ``shared_prefix_layout``. Defaults to None.
             output_processor (Callable, optional): Caller-provided post-decoder hook. When set,
                 it receives the decoder output and output-layer/loss helpers, and its return
                 value is returned directly. The default output projection, logits/loss
@@ -732,6 +749,37 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
+
+        # Validate a shared-prefix request before any preprocessing or partial forward runs.
+        shared_prefix_physical_len = None
+        if shared_prefix_layout is not None:
+            # Imported here: the adapter loads the Mamba modules and requires einops, which
+            # models that never pass a layout must not need.
+            from megatron.core.models.hybrid import shared_prefix
+
+            shared_prefix_physical_len = shared_prefix.validate_hybrid_model_shared_prefix(
+                self,
+                shared_prefix_layout,
+                input_ids=input_ids,
+                decoder_input=decoder_input,
+                attention_mask=attention_mask,
+                labels=labels,
+                loss_mask=loss_mask,
+                mtp_input_mask=mtp_input_mask,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+                cp_batch=cp_batch,
+                inference_context=inference_context,
+                inference_params=inference_params,
+                output_processor=output_processor,
+                compute_mtp_loss=compute_mtp_loss,
+                runtime_gather_output=runtime_gather_output,
+            )
+        elif shared_prefix_exclude_sequence_padding_from_expert_bias is not None:
+            raise ValueError(
+                "shared_prefix_exclude_sequence_padding_from_expert_bias requires "
+                "shared_prefix_layout"
+            )
 
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
@@ -822,7 +870,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
 
         rotary_pos_emb = None
-        if self.position_embedding_type == 'rope' and hasattr(self, 'rotary_pos_emb'):
+        if shared_prefix_layout is not None and self.position_embedding_type == 'rope':
+            rotary_pos_emb = shared_prefix.hybrid_shared_prefix_rotary_pos_emb(
+                self, shared_prefix_layout, shared_prefix_physical_len
+            )
+        elif self.position_embedding_type == 'rope' and hasattr(self, 'rotary_pos_emb'):
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                 inference_context, self.decoder, decoder_input, self.config, packed_seq_params
             )
@@ -893,18 +945,31 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             else nullcontext()
         )
         with backbone_context:
-            decoder_output = self.decoder(
-                hidden_states=decoder_input,
-                attention_mask=attention_mask,
-                inference_context=inference_context,
-                rotary_pos_emb=decoder_rotary_pos_emb,
-                packed_seq_params=packed_seq_params,
-                padding_mask=padding_mask,
-                padding_mask_by_layout=padding_mask_by_layout,
-                packed_seq_params_by_layout=packed_seq_params_by_layout,
-                cp_layout_plan=cp_layout_plan,
-                input_ids=hash_input_ids,
-            )
+            if shared_prefix_layout is not None:
+                decoder_output = shared_prefix.forward_hybrid_stack_shared_prefix(
+                    self.decoder,
+                    decoder_input,
+                    shared_prefix_layout,
+                    rotary_pos_emb=rotary_pos_emb,
+                    position_embedding_type=self.position_embedding_type,
+                    exclude_sequence_padding_from_expert_bias=(
+                        shared_prefix_exclude_sequence_padding_from_expert_bias
+                    ),
+                    validated_physical_len=shared_prefix_physical_len,
+                )
+            else:
+                decoder_output = self.decoder(
+                    hidden_states=decoder_input,
+                    attention_mask=attention_mask,
+                    inference_context=inference_context,
+                    rotary_pos_emb=decoder_rotary_pos_emb,
+                    packed_seq_params=packed_seq_params,
+                    padding_mask=padding_mask,
+                    padding_mask_by_layout=padding_mask_by_layout,
+                    packed_seq_params_by_layout=packed_seq_params_by_layout,
+                    cp_layout_plan=cp_layout_plan,
+                    input_ids=hash_input_ids,
+                )
         if isinstance(decoder_output, tuple):
             hidden_states, mhc_multistream = decoder_output
         else:
@@ -928,6 +993,22 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         mtp_forward_ran = (
             self.mtp_process and not (in_inference_mode or is_spec_decode) and compute_mtp_loss
         )
+        if shared_prefix_layout is not None:
+            # Shared-prefix MTP attaches its own loss and is training-only: an eval-mode
+            # shared-prefix forward skips it, as compute_mtp_loss=False would.
+            if mtp_forward_ran and self.training:
+                hidden_states = shared_prefix.forward_hybrid_mtp_shared_prefix(
+                    self,
+                    hidden_states=hidden_states,
+                    input_ids=input_ids,
+                    loss_mask=loss_mask,
+                    layout=shared_prefix_layout,
+                    output_weight=output_weight,
+                    exclude_sequence_padding_from_expert_bias=(
+                        shared_prefix_exclude_sequence_padding_from_expert_bias
+                    ),
+                )
+            mtp_forward_ran = False
         mtp_hidden_states = hidden_states
         mtp_inputs = None
         if mtp_forward_ran:

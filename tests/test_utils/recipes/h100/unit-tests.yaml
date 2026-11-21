@@ -373,6 +373,14 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  # KDA's autotuning matrix takes about 19 minutes; keep it out of the broad SSM bucket.
+  - test_case: [tests/unit_tests/ssm/test_kda.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/ssm/**/*.py]
     products:
       - environment: [lts, dev]
@@ -442,6 +450,16 @@ products:
     products:
       # Operator-level bit-exact kernel tests. tag: [latest] only for the same
       # reason as correctness/ above.
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  # Shared-prefix execution: the Hybrid model tests set up 8-rank parallel state many
+  # times, so they run apart from the catch-all bucket below. tag: [latest] only, since
+  # legacy refs do not have the directory.
+  - test_case: [tests/unit_tests/shared_prefix/**/*.py]
+    products:
       - environment: [lts, dev]
         tag: [latest]
         scope: [unit-tests]

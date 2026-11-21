@@ -42,7 +42,8 @@ megatron/core/ops/
 │   ├── dsa/               modules.py, layout/masking, kernels/, TileLang & cuDNN adapters
 │   ├── csa/               modules.py
 │   ├── mla.py             absorbed MLA
-│   └── dsv4.py            DeepSeek-v4 hybrid attention
+│   ├── dsv4.py            DeepSeek-v4 hybrid attention
+│   └── shared_prefix.py   shared-prefix forest attention
 ├── loss/                  vocab-parallel cross entropy and select_cross_entropy()
 └── norm/                  norm builder protocols, Torch and Apex norm modules
 ```
@@ -62,6 +63,7 @@ below; until then its module carries the availability checks it had before the m
 | `attention/csa` | `modules.py` with compressor/indexer/attention modules and reference kernels |
 | `attention/mla.py` | Absorbed MLA operation and its projection/layout helpers |
 | `attention/dsv4.py` | DeepSeek-v4 hybrid attention operation |
+| `attention/shared_prefix.py` | Shared-prefix forest attention: FlashAttention 2 varlen passes with an exact backward, and its context-parallel transforms |
 | `loss` | `backends.py` (`select_cross_entropy` and the `CrossEntropyTarget` contract), eager and `jit_fuser` vocab-parallel cross entropy |
 | `norm` | `torch_norm.py` (builder protocols, `WrappedTorchNorm`, `L2Norm`) and Apex's `FusedLayerNorm` |
 

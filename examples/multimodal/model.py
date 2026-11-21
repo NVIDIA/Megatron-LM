@@ -21,6 +21,7 @@ from layer_specs import (
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.spec_utils import import_module
 from megatron.core.utils import log_single_rank
 from megatron.training import get_args, get_tokenizer, print_rank_0
@@ -58,6 +59,11 @@ def model_provider(
             f"got {type(cfg.model).__name__}"
         )
     use_te = args.use_te
+
+    if pg_collection is None:
+        # Resolve the global grid here, so megatron/core receives explicit groups; this example
+        # trains a single model on it.
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     print_rank_0('building a multimodal model ...')
 

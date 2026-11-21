@@ -12,6 +12,7 @@ from pathlib import Path
 import torch
 
 from megatron.core.config import set_experimental_flag
+from megatron.core.model_parallel_config import normalize_gtp_nccl_ub
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
@@ -1019,8 +1020,9 @@ def validate_args(args, defaults={}):
                 "GroupedTensor param buffers."
             )
         # Optimizer compatibility check.
-        assert args.optimizer in ('sgd', 'adam'), \
-            f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
+        assert args.optimizer in ('sgd', 'adam') or (
+            args.megatron_fsdp_version == 2 and args.optimizer == 'muon'
+        ), f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
 
         # Expert parameters may be sharded differently from non-expert parameters, in which
         # case both strategies have to be considered by model-wide checks.
@@ -1395,14 +1397,21 @@ def validate_args(args, defaults={}):
                 "buffer via replace_raw_data is unsupported)."
             )
 
+        for attr in ("gtp_remat_nccl_ub", "gtp_expert_remat_nccl_ub"):
+            setattr(args, attr, normalize_gtp_nccl_ub(getattr(args, attr, None)))
+
+        gtp_ub_collectives = (args.gtp_remat_nccl_ub or []) + (args.gtp_expert_remat_nccl_ub or [])
+
         # GTP symmetric memory registers pools with symmetric=True (NVLS needs symmetric
         # windows), which contradicts --disable-symmetric-registration.
-        if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(args, 'gtp_expert_remat_nccl_ub', False):
+        if gtp_ub_collectives:
             assert not getattr(args, 'disable_symmetric_registration', False), (
                 "--gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub require symmetric window registration and "
                 "cannot be combined with --disable-symmetric-registration."
             )
-            if getattr(args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False):
+            if "rs" in gtp_ub_collectives and getattr(
+                args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False
+            ):
                 print_rank_0(
                     "WARNING: --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub take precedence over "
                     "--gtp-remat-reduce-scatter-with-fp32-accumulation on their groups: NVLS "
@@ -1600,8 +1609,12 @@ def validate_args(args, defaults={}):
 
     if args.optimizer not in ('sgd', 'adam'):
         assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
-        assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
-        assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
+        if args.use_megatron_fsdp:
+            # The Megatron-FSDP checks above already cover v2, Muon and fsdp_dtensor checkpoints.
+            assert not args.muon_split_qkv, \
+                "MFSDP v2 Muon requires --muon-no-split-qkv."
+        else:
+            assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
@@ -1618,6 +1631,22 @@ def validate_args(args, defaults={}):
             if args.dist_ckpt_optim_fully_reshardable:
                 assert not args.distrib_optim_fully_reshardable_mem_efficient, \
                     '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
+
+        # Other optimizers (e.g. Muon) with the distributed optimizer take the layer-wise path,
+        # which builds a separate DistributedOptimizer for their non-matrix parameters unless
+        # --no-use-layer-wise-param-layout is set. Its memory-efficient fully reshardable save
+        # gathers over Gloo as well.
+        if (
+            args.optimizer not in ('sgd', 'adam')
+            and (args.use_distributed_optimizer or args.optimizer == 'dist_muon')
+            and getattr(args, 'use_layer_wise_param_layout', True)
+            and args.dist_ckpt_optim_fully_reshardable
+        ):
+            assert not args.distrib_optim_fully_reshardable_mem_efficient, (
+                '--distrib-optim-fully-reshardable-mem-efficient needs Gloo process groups for '
+                'the DistributedOptimizer of the layer-wise optimizer. Drop '
+                '--disable-gloo-process-groups or pass --no-use-layer-wise-param-layout.'
+            )
 
     if args.fake_process_group:
         assert args.moe_token_dispatcher_type != "flex", "Fake process group is not supported with flex token dispatcher."
@@ -3025,7 +3054,7 @@ def _add_distributed_args(parser):
                        choices=['no_shard', 'optim'],
                        help='Sharding strategy for the outer expert data-parallel group in MFSDP v2. '
                             'Valid values are "no_shard" (HSDP) and "optim" (HFSDP). '
-                            'Defaults to --outer-dp-sharding-strategy when omitted.')
+                            'Defaults to --outer-dp-sharding-strategy, or "no_shard" if only dense parameters have an outer axis.')
     group.add_argument('--hfsdp-param-gather-overlap', action='store_true',
                        help='Pipeline HFSDP parameter all-gathers across DP-Outer and DP-Inner. '
                             'DP-Outer is prefetched one FSDP unit beyond the existing '
@@ -3049,6 +3078,9 @@ def _add_distributed_args(parser):
                        help='If set, enable full sharding in megatron-fsdp Hybrid Sharded Data Parallel (HSDP) mode.')
     group.add_argument('--num-distributed-optimizer-instances', type=int, default=1,
                        help='Number of Distributed Optimizer copies across Data Parallel domain.')
+    group.add_argument('--expert-num-distributed-optimizer-instances', type=int, default=None,
+                       help='Number of Distributed Optimizer copies across the expert Data Parallel domain. '
+                            'Defaults to --num-distributed-optimizer-instances; only MFSDP v2 supports a different value.')
     group.add_argument('--torch-fsdp2-no-reshard-after-forward', action='store_false', dest='torch_fsdp2_reshard_after_forward',
                        help='Whether to reshard weights after forward pass when using PyTorch FSDP2. '
                        'Set to enable FSDP ZeRO-2.')

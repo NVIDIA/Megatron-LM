@@ -20,6 +20,7 @@ from megatron.core.transformer.attention import Attention, SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.packed_seq_test_utils import make_test_packed_seq_params
 from tests.unit_tests.transformer.parallel_test_utils import _test_parallel_attention_correctness
 
 pytestmark = pytest.mark.usefixtures("run_config")
@@ -52,6 +53,9 @@ class TestParallelAttention:
             self.transformer_config,
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
 
     def teardown_method(self):
@@ -66,6 +70,96 @@ class TestParallelAttention:
             assert num_weights == 82816
         else:
             assert num_weights == 66304
+
+    @pytest.mark.parametrize('missing_group', ['tp', 'cp'])
+    def test_constructor_rejects_omitted_process_group(self, missing_group):
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        delattr(pg_collection, missing_group)
+        with pytest.raises(ValueError, match=f'must have {missing_group} process group'):
+            SelfAttention(
+                self.transformer_config,
+                get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+                layer_number=1,
+                pg_collection=pg_collection,
+            )
+
+    def test_constructor_rejects_none_process_groups(self):
+        """A group that is present but None is as unusable as an omitted one."""
+        submodules = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
+
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        pg_collection.tp = None
+        with pytest.raises(ValueError, match='non-None tp process group'):
+            SelfAttention(
+                self.transformer_config, submodules, layer_number=1, pg_collection=pg_collection
+            )
+
+        # cp may be None only while context parallelism is off for the module.
+        context_parallel_config = copy.copy(self.transformer_config)
+        context_parallel_config.context_parallel_size = 2
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        pg_collection.cp = None
+        with pytest.raises(ValueError, match='non-None cp process group'):
+            SelfAttention(
+                context_parallel_config, submodules, layer_number=1, pg_collection=pg_collection
+            )
+
+    def test_constructor_requires_dp_group_for_test_mode_qk_layernorm(self):
+        """The realtime consistency check reads the DP group; fail at build, not on first forward."""
+        test_mode_config = copy.copy(self.transformer_config)
+        test_mode_config.test_mode = True
+        test_mode_config.qk_layernorm = True
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        with pytest.raises(ValueError, match='requires a dp process group'):
+            SelfAttention(
+                test_mode_config,
+                get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+                layer_number=1,
+                pg_collection=pg_collection,
+            )
+
+    def test_shared_prefix_forest_replaces_core_attention(self, monkeypatch):
+        """A shared_prefix_forest argument runs the forest kernel on the layer's CP group."""
+        from megatron.core.datasets.shared_prefix.layout import SharedPrefixPack, SharedPrefixTree
+        from megatron.core.transformer import attention as attention_module
+
+        attention = self.parallel_attention.cuda()
+        layout = SharedPrefixPack((SharedPrefixTree(4, (3, 5)), SharedPrefixTree(2, (6,))))
+        calls = []
+
+        def forest_kernel(query, key, value, forest, *, cp_group, scale):
+            calls.append((forest, cp_group, scale))
+            return query.new_zeros(query.shape[0], 1, query.shape[2] * query.shape[3])
+
+        def core_attention(*args, **kwargs):
+            raise AssertionError("core attention ran instead of the forest kernel")
+
+        monkeypatch.setattr(attention_module, "flash_composed_forest_attention_cp", forest_kernel)
+        monkeypatch.setattr(attention.core_attention, "forward", core_attention)
+        hidden_states = torch.ones(
+            (layout.total_len, 1, attention.config.hidden_size), dtype=torch.bfloat16
+        ).cuda()
+        output, _ = attention(hidden_states, None, shared_prefix_forest=layout)
+        assert output.shape == hidden_states.shape
+        head_dim = attention.config.kv_channels
+        assert calls == [(layout.forest, attention.pg_collection.cp, head_dim**-0.5)]
+
+        # The forest owns the attention mask, and a forest is not THD packing.
+        mask = torch.ones((1, 1, layout.total_len, layout.total_len), dtype=bool).cuda()
+        with pytest.raises(ValueError, match="does not accept a mask"):
+            attention(hidden_states, mask, shared_prefix_forest=layout)
+        with pytest.raises(NotImplementedError, match="static, unpacked training"):
+            attention(
+                hidden_states,
+                None,
+                packed_seq_params=make_test_packed_seq_params(cu_seqlens=[0, 12, layout.total_len]),
+                shared_prefix_forest=layout,
+            )
+        # The pass plan is built on the host for every forest, so stream capture is refused.
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        with pytest.raises(NotImplementedError, match="captured in a CUDA graph"):
+            attention(hidden_states, None, shared_prefix_forest=layout)
+        assert len(calls) == 1
 
     def test_cpu_forward(self):
         # we can't currently do this because the global memory buffer is on GPU
@@ -146,6 +240,9 @@ class TestParallelAttention:
             transformer_config,
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
         config = checkpointed_parallel_attention.config
 
@@ -196,6 +293,9 @@ class TestClipQK:
             transformer_config,
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
 
         with pytest.raises(ValueError, match="qk_clip option needs to be enabled"):
@@ -216,6 +316,9 @@ class TestClipQK:
             transformer_config,
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
 
         with pytest.raises(ValueError, match="current_max_attn_logits is None"):
@@ -236,6 +339,9 @@ class TestClipQK:
             transformer_config,
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
         attention.cuda()
 
@@ -270,6 +376,9 @@ class TestClipQK:
             transformer_config,
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
         attention.cuda()
 
@@ -305,6 +414,9 @@ class TestClipQK:
             transformer_config,
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
         attention.cuda()
 
@@ -339,6 +451,9 @@ class TestClipQK:
             transformer_config,
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
         attention.cuda()
 
@@ -563,7 +678,14 @@ def test_qk_layernorm_from_config_fallback():
         )
         base = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
         submodules = replace(base, q_layernorm=None, k_layernorm=None)
-        attn = SelfAttention(config, submodules, layer_number=1)
+        attn = SelfAttention(
+            config,
+            submodules,
+            layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
+        )
         assert isinstance(attn.q_layernorm, te_pytorch.LayerNorm)
         assert isinstance(attn.k_layernorm, te_pytorch.LayerNorm)
     finally:
@@ -589,7 +711,14 @@ def test_qk_l2_norm_from_config_fallback():
         )
         base = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
         submodules = replace(base, q_layernorm=None, k_layernorm=None)
-        attn = SelfAttention(config, submodules, layer_number=1)
+        attn = SelfAttention(
+            config,
+            submodules,
+            layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
+        )
         assert isinstance(attn.q_layernorm, L2Norm)
         assert isinstance(attn.k_layernorm, L2Norm)
     finally:
@@ -612,7 +741,14 @@ def test_qk_layernorm_spec_config_mismatch_raises():
         base = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
         submodules = replace(base, q_layernorm=L2Norm, k_layernorm=L2Norm)
         with pytest.raises(ValueError, match="qk_layernorm"):
-            SelfAttention(config, submodules, layer_number=1)
+            SelfAttention(
+                config,
+                submodules,
+                layer_number=1,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                    required_pgs=['tp', 'cp', 'dp']
+                ),
+            )
     finally:
         Utils.destroy_model_parallel()
 

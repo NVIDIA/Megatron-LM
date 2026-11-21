@@ -1200,6 +1200,32 @@ def test_load_checkpoint(
             assert new_opt_param_scheduler.state_dict() == {"opt_param_scheduler": "dummy2"}
 
 
+@pytest.mark.parametrize("strict", [False, True])
+def test_checkpoint_model_load_errors_propagate(
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, strict
+):
+    """Non-strict keys do not make checkpoint loading errors recoverable."""
+    args = create_ckpt_load_args
+    args.ckpt_format = "torch"
+    args.use_distributed_optimizer = False
+    args.use_dist_ckpt = False
+    args.fp16 = False
+    args.bf16 = False
+    with TempNamedDir(tmp_path_dist_ckpt / "load_error", sync=True) as ckpt_dir:
+        args.load = ckpt_dir
+        args.save = ckpt_dir
+        args.save_tokenizer_assets = False
+        set_args(args)
+        model = MockModel(TransformerConfig(num_layers=1, kv_channels=1))
+        sync_checkpoint_config(args)
+        save_checkpoint(0, [model], None, None, 0)
+        error = RuntimeError("checkpoint extra state could not be loaded")
+        with mock.patch.object(model, "load_state_dict", side_effect=error):
+            with pytest.raises(RuntimeError) as caught:
+                load_checkpoint([model], None, None, strict=strict, restore_training_state=False)
+        assert caught.value is error
+
+
 def test_load_checkpoint_stream_ckpt_dequant_refuses_optimizer(create_ckpt_load_args):
     """The streaming dequantize load is weights-only (inference): the loaded state dict holds
     the re-quantized params, so `load_checkpoint` must refuse any optimizer up front, before
@@ -2020,6 +2046,50 @@ def _stub_loader_to_the_policy(monkeypatch, args, existing, loads):
         checkpointing, "_otel_managed_span", lambda *a, **k: contextlib.nullcontext()
     )
     monkeypatch.setattr(checkpointing, "_load_base_checkpoint", base_load)
+
+
+@pytest.mark.parametrize("non_persistent_type", ["global", "local"])
+@pytest.mark.parametrize("selection", ["inherited", "cleared", "explicit"])
+def test_per_load_selectors_reach_both_checkpoint_reads(
+    monkeypatch, run_config, non_persistent_type, selection
+):
+    """Teacher selectors override both reads without changing the student's run section."""
+    checkpoint = run_config.checkpoint
+    checkpoint.load = "/student"
+    checkpoint.ckpt_format = "torch_dist"
+    checkpoint.ckpt_step = 50
+    checkpoint.pretrained_checkpoint = "/student-fallback"
+    checkpoint.non_persistent_ckpt_type = non_persistent_type
+    original = vars(checkpoint).copy()
+    overrides = {
+        "inherited": {},
+        "cleared": dict(ckpt_step=None, pretrained_checkpoint=None, non_persistent_ckpt_type=None),
+        "explicit": dict(
+            ckpt_step=7, pretrained_checkpoint="/teacher-fallback", non_persistent_ckpt_type=None
+        ),
+    }[selection]
+    args = _loader_args()
+    reads = []
+    _stub_loader_to_the_policy(monkeypatch, args, ("/teacher",), [])
+
+    def base_load(directory, run_args, *, rank0, checkpoint, finetune, **kwargs):
+        reads.append((directory, rank0, checkpoint))
+        assert finetune is True
+        for name in ("ckpt_step", "pretrained_checkpoint", "non_persistent_ckpt_type"):
+            assert getattr(checkpoint, name) == overrides.get(name, original[name])
+        return None, "", False, None
+
+    monkeypatch.setattr(checkpointing, "_load_base_checkpoint", base_load)
+    assert load_checkpoint(
+        [object()], None, None, load_dir="/teacher", finetune=True, **overrides
+    ) == (0, 0)
+    assert [(directory, rank0) for directory, rank0, _ in reads] == [
+        ("/teacher", True),
+        ("/teacher", False),
+    ]
+    assert reads[0][2] is reads[1][2]
+    assert vars(checkpoint) == original
+    assert vars(args) == vars(_loader_args())
 
 
 def test_only_the_primary_load_records_the_finetune_classification(

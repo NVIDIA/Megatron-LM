@@ -109,11 +109,32 @@ R = "tests/unit_tests/context_parallel/runtime/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
+        name="mtp_kl_loss",
+        sources=("megatron/core/ops/mtp_kl_loss.py",),
+        tests=(K + "test_mtp_kl_loss.py",),
+        kind="torch.compile",
+        notes="MTP KD local sum-exp/KL reductions and recomputed student gradient; no teacher gradient.",
+    ),
+    KernelEntry(
         name="csa_output_rope_reconstruction",
         sources=("megatron/core/ops/attention/csa/output_rope.py",),
         tests=(K + "test_csa_output_rope.py",),
         kind="triton",
         notes="Alias-safe output/gradient reconstruction, SBHD B>1 and THD/CP positions.",
+    ),
+    # Shared-prefix composed attention.
+    KernelEntry(
+        name="shared_prefix_composed_attention",
+        sources=("megatron/core/ops/attention/shared_prefix.py",),
+        tests=(K + "test_shared_prefix_attention.py",),
+        kind="external-lib",
+        notes="Native FlashAttention varlen forward and private backward (called by keyword, "
+        "flash-attn >= 2.7.0), eager online-softmax merge and FP32 K/V index_add_ "
+        "accumulation. Exact output/gradient replay needs only "
+        "torch.use_deterministic_algorithms(True): the backward passes "
+        "deterministic=torch.are_deterministic_algorithms_enabled() to FlashAttention. Forest "
+        "errors vs FP64 are bounded by 2x the dense-branch FlashAttention error. CP1/2/4 tests "
+        "use real NCCL all-to-all, including replicated GQA KV heads.",
     ),
     # ---------------------------------------------------------------- fused elementwise (jit_fuser / torch.compile)
     KernelEntry(
@@ -171,18 +192,26 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_fused_activations.py",),
         kind="torch.compile",
         notes="squared_relu/quick_gelu/fast_gelu/tanh_soft_clamp/situ/situ_glu, openai/erf GELU, "
-        "L2Norm._norm (row reduction).",
+        "L2Norm._norm (row reduction), and eager unfused_fast_gelu for variable-length projections.",
     ),
     KernelEntry(
         name="attention_kernels_and_dispatch",
         sources=("megatron/core/transformer/attention.py",),
-        tests=(K + "test_fused_activations.py", K + "test_runtime_cp_attention.py"),
+        tests=(
+            K + "test_fused_activations.py",
+            K + "test_runtime_cp_attention.py",
+            K + "test_shared_prefix_attention.py",
+        ),
         kind="dispatch",
         notes="Attention._apply_output_gate is replayed in test_fused_activations.py. "
         "Packed SelfAttention dispatch through RoPE and TE attention is replayed with runtime "
         "CP1/CP2/CP4, including input/parameter gradients and CP-state restoration, in "
         "test_runtime_cp_attention.py. The dynamic-inference flash_decode_and_prefill "
-        "dispatch (FA2 prefill/decode) is replayed there with a config-driven softmax_scale.",
+        "dispatch (FA2 prefill/decode) is replayed there with a config-driven softmax_scale. "
+        "The shared-prefix branch (a shared_prefix_forest argument selects the forest kernel "
+        "in megatron/core/ops/attention/shared_prefix.py instead of core attention) is "
+        "replayed through a real SelfAttention at CP1/CP2 in test_shared_prefix_attention.py, "
+        "which asserts that the forest kernel runs on every forward.",
     ),
     KernelEntry(
         name="fused_vocab_parallel_cross_entropy",
@@ -393,7 +422,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_mok_kernels.py",),
         kind="triton",
         notes="Dense routing-map compaction and router-gradient scatter use one CTA per token "
-        "and unique expert indices; replayed with missing routes and side-stream contention.",
+        "and unique expert indices; replayed with missing routes, a strided padding mask and "
+        "side-stream contention. test_moe_kernels.py also replays it with MoELayer's padding mask, "
+        "through a megakernel stand-in, in eager and CUDA-graph replay.",
     ),
     KernelEntry(
         name="mok_runtime",
@@ -435,7 +466,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available; "
         "virtual-expert routing metadata and probability gradients replay under stream contention; "
         "the FlashInfer per-token NVFP4 value pass (moe_training_matches_inference) with recompute "
-        "backward, and its MXFP8 training-stack quantization.",
+        "backward, and its MXFP8 training-stack quantization. The megakernel branch passes the "
+        "padding mask to a stand-in backend that runs MOK route compaction: replayed under stream "
+        "contention against the reference semantics, and in a CUDA graph whose static mask "
+        "changes between replays.",
     ),
     KernelEntry(
         name="moe_experts",
@@ -518,6 +552,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "JSON-table choices; every candidate of each config-invariant kernel must give "
         "bit-identical outputs; SSM replay runs the real SSM autotuners through runtime "
         "pinning, with autotune caching on and off.",
+    ),
+    KernelEntry(
+        name="triton_block_pointer_compat",
+        sources=("docker/common/triton_block_ptr_compat.py",),
+        tests=(K + "test_triton_block_ptr_compat.py",),
+        kind="dispatch",
+        notes="CI-installed tl.make_block_ptr/advance/load/store adapter. The image's actual "
+        "lowering is exercised by strided, boundary-masked, transposed and 3-D copy replay, "
+        "including FP8 padding, and by H100/Blackwell offline compilation.",
     ),
     # ---------------------------------------------------------------- SSM
     KernelEntry(
@@ -651,16 +694,19 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/optimizer/clip_grads.py",
             "megatron/core/optimizer/__init__.py",
             "megatron/core/optimizer/optimizer.py",
+            "megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py",
             "megatron/training/utils/common_utils.py",
         ),
         tests=(
             K + "test_optimizer_kernels.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
+            "tests/unit_tests/distributed/mfsdp_v2/test_mcore_muon.py",
         ),
         kind="external-lib",
         notes="multi_tensor l2norm / scale (TE, apex or local fallback) and fused Adam; "
         "optimizer.py (gradient unscaling) and training/utils/common_utils.py (param / grad norm "
-        "logging) launch the same multi_tensor kernels through multi_tensor_applier.",
+        "logging) launch the same multi_tensor kernels through multi_tensor_applier. "
+        "Hybrid CPU/GPU Adam replay also covers overlapped parameter and gradient copies.",
     ),
     KernelEntry(
         name="tensor_metric_l2",
@@ -747,11 +793,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/inference/test_ep_invariant_ordered_rsv.py",
             "tests/unit_tests/inference/test_moe_dispatching_and_routing.py",
             K + "test_inference_kernels.py",
+            "tests/unit_tests/transformer/moe/test_moe_batch_invariant.py",
         ),
         kind="triton",
         training_path=False,
         notes="Batch-invariant paths replay bit-exactly; the atomic default unpermute is the negative control. "
-        "ordered_reduce_scatter_v (multi-rank) is not replayed here.",
+        "Ordinary vLLM MoE also covers parallel alignment, tiled slot reduction, and decode/prefill hints. "
+        "ordered_reduce_scatter_v (multi-rank) is not replayed here. The BF16 expert GEMM "
+        "(torch grouped_mm) is checked row-invariant in test_moe_batch_invariant.py.",
     ),
     KernelEntry(
         name="batch_invariant_kernels",
@@ -760,7 +809,6 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_inference_kernels.py",
             K + "test_te_wrappers.py",
             "tests/unit_tests/transformer/test_te_layers_batch_invariant.py",
-            "tests/unit_tests/inference/test_batch_invariant_deepgemm_stride.py",
         ),
         kind="triton",
     ),
@@ -825,6 +873,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
             C + "test_ssm_conv1d.py",
             K + "test_ssm_kernels.py",
             "tests/unit_tests/inference/engines/test_batch_invariant_mamba_prefix_caching.py",
+            K + "test_shared_prefix_mamba_kernels.py",
+            "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_module_call.py",
             R + 'test_ssm_replay.py',
         ),
         kind="dispatch",
@@ -834,7 +884,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "selective_state_update, ReplaySSM spec decode). Module-level replay: "
         "test_ssm_conv1d.py::TestMambaMixerDeterminism; "
         "kernels replayed piecewise in test_ssm_kernels.py. Runtime helper projections, "
-        "convolution and CP collectives are replayed in runtime/test_ssm_replay.py.",
+        "convolution and CP collectives are replayed in runtime/test_ssm_replay.py. The "
+        "shared-prefix branch (the "
+        "shared_prefix_call argument that forward_mamba_layer_shared_prefix passes through "
+        "MambaLayer.forward) hands the mixer half to mamba_shared_prefix; its ragged and packed "
+        "scans are replayed through a real MambaMixer in test_shared_prefix_mamba_kernels.py, and "
+        "test_shared_prefix_mamba_module_call.py checks that the branch runs through the layer "
+        "and mixer module calls.",
     ),
     KernelEntry(
         name="ssm_runtime_cp_collectives",
@@ -846,6 +902,67 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="dispatch",
         notes="Runtime CP1/2/4/1 helper views replay the actual head-exchange collectives, "
         "parameter-sliced convolution and backward without mutating the build-time helper.",
+    ),
+    # Shared-prefix Mamba: the ragged state-fork forest, the chunk-aligned packed recurrence
+    # and the NRL_SP_MAMBA_IMPL dispatch that selects them.
+    KernelEntry(
+        name="ssm_mamba_ragged_forest",
+        sources=(
+            "megatron/core/ssm/shared_prefix/mamba_ragged.py",
+            "megatron/core/ssm/shared_prefix/mamba_ragged_scan.py",
+        ),
+        tests=(
+            K + "test_shared_prefix_mamba_kernels.py",
+            "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_backends.py",
+            "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_numerics.py",
+        ),
+        kind="triton",
+        notes="_RaggedGather forward/backward (one owner per input element, fixed-order FP32 "
+        "sibling sum, no atomics), channel-last causal_conv1d_fn with seq_idx, and the forest "
+        "state-passing kernels around the private mamba_ssm SSD kernels, whose ddt/dD/ddA "
+        "atomics need MAMBA_DETERMINISTIC=1 (negative control without it). Replayed kernel by "
+        "kernel (star and forest, D per head and per head-dim, save_intermediates on/off "
+        "bitwise equal) and through a real MambaMixer's parameters. "
+        "test_shared_prefix_mamba_backends.py checks int32 and int64 offsets bitwise, the "
+        "gather backward against index_add_ and compile reuse across lengths; "
+        "test_shared_prefix_mamba_numerics.py compares the layer with dense rows and checks "
+        "eval == train forward bitwise.",
+    ),
+    KernelEntry(
+        name="ssm_mamba_sequence_packing",
+        sources=("megatron/core/ssm/shared_prefix/mamba_sequence_packing.py",),
+        tests=(
+            K + "test_shared_prefix_mamba_kernels.py",
+            "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_numerics.py",
+        ),
+        kind="dispatch",
+        notes="Pads every sequence to a scan-chunk boundary and calls causal_conv1d_fn and "
+        "mamba_chunk_scan_combined with seq_idx; scan_mamba_packed_recurrence is replayed "
+        "through a real MambaMixer's parameters in test_shared_prefix_mamba_kernels.py, and "
+        "the packed_recurrence backend is compared with dense rows in "
+        "test_shared_prefix_mamba_numerics.py.",
+    ),
+    KernelEntry(
+        name="ssm_mamba_shared_prefix_dispatch",
+        sources=("megatron/core/ssm/shared_prefix/mamba_shared_prefix.py",),
+        tests=(
+            K + "test_shared_prefix_mamba_kernels.py",
+            "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_backends.py",
+            "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_numerics.py",
+            "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_module_call.py",
+        ),
+        kind="dispatch",
+        notes="forward_mamba_layer_shared_prefix routes every Mamba layer through "
+        "NRL_SP_MAMBA_IMPL: the default ragged forest (mamba_ragged), the packed recurrence "
+        "(mamba_sequence_packing), the opt-in state_fork/replay_prefix helpers, which call "
+        "causal_conv1d_fn and mamba_chunk_scan_combined directly, or the packed_fused "
+        "diagnostic oracle. The ragged and packed scans are replayed in "
+        "test_shared_prefix_mamba_kernels.py. test_shared_prefix_mamba_backends.py covers the "
+        "selector and dispatch; test_shared_prefix_mamba_numerics.py compares the four "
+        "differentiable backends (not packed_fused) with dense rows and checks eval == train "
+        "bitwise; test_shared_prefix_mamba_module_call.py checks that the layer runs through "
+        "MambaLayer.__call__ and MambaMixer.__call__. The state_fork/replay_prefix helpers have "
+        "no bit-exact backward replay.",
     ),
     KernelEntry(
         name="ssm_gated_delta_product",

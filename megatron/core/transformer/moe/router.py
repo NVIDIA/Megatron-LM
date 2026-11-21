@@ -12,7 +12,7 @@ from megatron.core.inference.moe.sigmoid_topk import HAVE_TRITON as HAVE_SIGMOID
 from megatron.core.inference.moe.sigmoid_topk import is_sigmoid_topk_supported, sigmoid_topk_routing
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
@@ -45,6 +45,75 @@ from megatron.core.utils import log_single_rank
 logger = logging.getLogger(__name__)
 
 _HYBRIDEP_INT16_EXPERT_LIMIT = 1 << 15
+
+
+def _expert_bias_token_counts(
+    routing_map: torch.Tensor,
+    padding_mask: Optional[torch.Tensor] = None,
+    token_multiplicities: Optional[torch.Tensor] = None,
+    *,
+    num_experts: Optional[int] = None,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Count routed tokens per expert for boolean maps or dense top-k expert indices.
+
+    Counts are added in place to ``out`` (the expert-bias buffer) or to a new int64 tensor.
+    Padding and invalid (-1) dense routes contribute zero, with no data-dependent shapes.
+    Shared-prefix prompt rows pass ``token_multiplicities``: the number of logical copies
+    each row replaces. Without them, the kernels are the upstream expert-bias kernels.
+    """
+    use_dense_indices = routing_map.dtype != torch.bool
+    if padding_mask is not None:
+        padding_mask = padding_mask.reshape(-1)
+        if padding_mask.shape[0] != routing_map.shape[0]:
+            raise ValueError(
+                f"MoE padding mask must contain one value per routed token: "
+                f"{tuple(padding_mask.shape)} vs routing map {tuple(routing_map.shape)}"
+            )
+    if out is None:
+        if not use_dense_indices:
+            num_experts = routing_map.shape[-1]
+        elif num_experts is None or num_experts < 1:
+            raise ValueError("Dense expert indices require an explicit positive num_experts")
+        out = torch.zeros(num_experts, dtype=torch.int64, device=routing_map.device)
+    if token_multiplicities is not None:
+        token_multiplicities = token_multiplicities.reshape(-1)
+        if token_multiplicities.shape[0] != routing_map.shape[0]:
+            raise ValueError("MoE token multiplicities must contain one value per routed token")
+        if token_multiplicities.device != routing_map.device:
+            raise ValueError("MoE token multiplicities must be on the routing-map device")
+        # Accumulate in the count dtype (int64 for the expert-bias buffer) so large logical
+        # counts stay exact; multiplicities are small integers in any input dtype.
+        token_multiplicities = token_multiplicities.to(out.dtype)
+
+    if not use_dense_indices:
+        if padding_mask is not None:
+            routing_map = routing_map & (~padding_mask).unsqueeze(-1)
+        if token_multiplicities is not None:
+            routing_map = routing_map * token_multiplicities.unsqueeze(-1)
+        out += routing_map.sum(dim=0)
+        return out
+
+    # Fixed-shape counting: keep every [num_tokens, topk] slot and give padding tokens and
+    # invalid (-1) routes a zero weight instead of filtering rows, which would be a
+    # data-dependent shape (nonzero + host sync) inside the compiled expert-bias update and
+    # inside the moe_router CUDA graph scope.
+    expert_indices = routing_map.reshape(-1).to(torch.long)
+    if token_multiplicities is None:
+        token_counts = torch.ones_like(expert_indices, dtype=out.dtype)
+    else:
+        token_counts = token_multiplicities.unsqueeze(-1).expand_as(routing_map).reshape(-1)
+    if padding_mask is not None:
+        valid = (~padding_mask).unsqueeze(-1).expand(-1, routing_map.shape[-1])
+        token_counts = token_counts * valid.reshape(-1).to(token_counts.dtype)
+    invalid_routes = expert_indices < 0
+    expert_indices = expert_indices.masked_fill(invalid_routes, 0)
+    token_counts = token_counts.masked_fill(invalid_routes, 0)
+    if torch.are_deterministic_algorithms_enabled():
+        out.index_add_(0, expert_indices, token_counts)
+    else:
+        out.scatter_add_(0, expert_indices, token_counts)
+    return out
 
 
 @dataclass(frozen=True)
@@ -436,7 +505,10 @@ class TopKRouter(Router):
         return scores, map
 
     def quantile_balancing(
-        self, logits: torch.Tensor, dense_output: bool = False
+        self,
+        logits: torch.Tensor,
+        dense_output: bool = False,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply quantile-balancing (QB) routing to the logits tensor.
 
@@ -449,6 +521,7 @@ class TopKRouter(Router):
             logits (torch.Tensor): The logits tensor, shape ``[num_tokens, num_experts]``.
             dense_output (bool): Return selected probabilities and expert IDs as
                 ``[num_tokens, topk]`` tensors.
+            packed_seq_params: Context-parallel metadata for the current pack.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Routing probabilities and either a boolean
@@ -487,6 +560,17 @@ class TopKRouter(Router):
         # The DP reduction and qb_beta update run at the global-batch boundary in
         # finalize_model_grads._update_router_qb_beta.
         gather_group = self.tp_cp_group
+        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+            # DCP can put unrelated packs inside a static TP/CP group. Gather
+            # only this pack; include TP when sequence parallelism shards its tokens.
+            gather_group = resolve_cp_group(self.cp_group, packed_seq_params)
+            if self.config.sequence_parallel and self.tp_group.size() > 1:
+                gather_group = resolve_tp_cp_group(
+                    self.tp_cp_group,
+                    packed_seq_params,
+                    sequence_parallel=True,
+                    tp_group=self.tp_group,
+                )
         gather_size = gather_group.size() if gather_group is not None else 1
 
         should_update_beta = self.training and torch.is_grad_enabled()
@@ -982,7 +1066,10 @@ class TopKRouter(Router):
 
     @jit_fuser
     def _apply_expert_bias(
-        self, routing_map: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
+        self,
+        routing_map: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        token_multiplicities: Optional[torch.Tensor] = None,
     ):
         """
         Update expert bias and tokens_per_expert
@@ -990,35 +1077,12 @@ class TopKRouter(Router):
         """
         if self.enable_expert_bias and torch.is_grad_enabled():
             with torch.no_grad():
-                use_dense_indices = routing_map.dtype != torch.bool
-                if padding_mask is not None:
-                    flat_mask = padding_mask.reshape(-1)
-                    assert (
-                        flat_mask.shape[0] == routing_map.shape[0]
-                    ), f"padding_mask flat {flat_mask.shape} vs routing_map {routing_map.shape}"
-                    if not use_dense_indices:
-                        routing_map = routing_map & (~flat_mask).unsqueeze(-1)
-                if use_dense_indices:
-                    # Fixed-shape counting: keep every [num_tokens, topk] slot and give padding
-                    # tokens and invalid (-1) routes a zero weight instead of filtering rows,
-                    # which would be a data-dependent shape (nonzero + host sync) inside this
-                    # compiled function and inside the moe_router CUDA graph scope.
-                    expert_indices = routing_map.reshape(-1).to(torch.long)
-                    token_counts = torch.ones_like(
-                        expert_indices, dtype=self.local_tokens_per_expert.dtype
-                    )
-                    if padding_mask is not None:
-                        valid = (~flat_mask).unsqueeze(-1).expand(-1, routing_map.shape[-1])
-                        token_counts = token_counts * valid.reshape(-1).to(token_counts.dtype)
-                    invalid_routes = expert_indices < 0
-                    expert_indices = expert_indices.masked_fill(invalid_routes, 0)
-                    token_counts = token_counts.masked_fill(invalid_routes, 0)
-                    if torch.are_deterministic_algorithms_enabled():
-                        self.local_tokens_per_expert.index_add_(0, expert_indices, token_counts)
-                    else:
-                        self.local_tokens_per_expert.scatter_add_(0, expert_indices, token_counts)
-                else:
-                    self.local_tokens_per_expert += routing_map.sum(dim=0)
+                _expert_bias_token_counts(
+                    routing_map,
+                    padding_mask=padding_mask,
+                    token_multiplicities=token_multiplicities,
+                    out=self.local_tokens_per_expert,
+                )
 
     def _hash_routing(
         self, logits: torch.Tensor, input_ids: torch.Tensor, dense_output: bool = False
@@ -1091,6 +1155,7 @@ class TopKRouter(Router):
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        token_multiplicities: Optional[torch.Tensor] = None,
     ):
         """Top-k routing function
 
@@ -1100,6 +1165,9 @@ class TopKRouter(Router):
                 `True` marks padding. Defaults to None.
             input_ids (torch.Tensor, optional): Token IDs with shape [batch, sequence].
                 Required when this is a hash-routing layer.
+            token_multiplicities (torch.Tensor, optional): Logical token count per flattened
+                sequence-first row, counted that many times in ``local_tokens_per_expert`` for
+                expert-bias updates. Passed only when set. Defaults to None.
 
         Returns:
             probs (torch.Tensor): Routing probabilities shaped [num_tokens, topk] for
@@ -1154,7 +1222,9 @@ class TopKRouter(Router):
             assert (
                 padding_mask is None
             ), "Quantile balancing routing does not support padding masks yet."
-            probs, routing_map = self.quantile_balancing(logits, dense_output=dense_output)
+            probs, routing_map = self.quantile_balancing(
+                logits, dense_output=dense_output, packed_seq_params=packed_seq_params
+            )
         else:
             # TE capability controls the implementation, not the requested output format.
             fused = self.config.moe_router_fusion and (
@@ -1275,7 +1345,9 @@ class TopKRouter(Router):
                 )
 
         # Optionally apply expert bias
-        self._apply_expert_bias(routing_map, padding_mask=padding_mask)
+        self._apply_expert_bias(
+            routing_map, padding_mask=padding_mask, token_multiplicities=token_multiplicities
+        )
 
         return probs, routing_map
 
@@ -1291,6 +1363,7 @@ class TopKRouter(Router):
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        token_multiplicities: Optional[torch.Tensor] = None,
     ):
         """
         Forward pass of the router.
@@ -1306,6 +1379,9 @@ class TopKRouter(Router):
                 `True` marks padding. Defaults to None.
             input_ids (torch.Tensor, optional): Token IDs with shape [batch, sequence].
                 Required when this is a hash-routing layer.
+            token_multiplicities (torch.Tensor, optional): Logical token count per flattened
+                sequence-first row, counted that many times in ``local_tokens_per_expert`` for
+                expert-bias updates. Passed only when set. Defaults to None.
         """
         self._maintain_float32_expert_bias()
 
@@ -1354,12 +1430,16 @@ class TopKRouter(Router):
                 logits, self.config.moe_router_force_biased, self.layer_number
             )
 
-        probs, routing_map = self.routing(
-            logits,
-            padding_mask=padding_mask,
-            input_ids=input_ids,
-            packed_seq_params=packed_seq_params,
-        )
+        routing_kwargs = {
+            "padding_mask": padding_mask,
+            "input_ids": input_ids,
+            "packed_seq_params": packed_seq_params,
+        }
+        # Forward shared-prefix multiplicities only when set, so replacement routing callables
+        # with the upstream signature keep working on the default path.
+        if token_multiplicities is not None:
+            routing_kwargs["token_multiplicities"] = token_multiplicities
+        probs, routing_map = self.routing(logits, **routing_kwargs)
 
         return probs, routing_map
 
@@ -1544,6 +1624,7 @@ class InferenceTopKRouter(TopKRouter):
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        token_multiplicities: Optional[torch.Tensor] = None,
     ):
         """Simplified forward pass for inference - returns dense tensors only.
 
@@ -1551,6 +1632,9 @@ class InferenceTopKRouter(TopKRouter):
             input (torch.Tensor): Input tensor of shape [seq_length, bsz, hidden_size].
             padding_mask (torch.Tensor, optional): Not used in inference.
             input_ids (torch.Tensor, optional): Token IDs used by hash routing.
+            token_multiplicities (torch.Tensor, optional): Shared-prefix expert-bias count
+                weights, forwarded to the training fallback. Not used in inference, which
+                does not update expert bias.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]:
@@ -1560,7 +1644,11 @@ class InferenceTopKRouter(TopKRouter):
 
         if not InferenceMode.is_active():
             return super().forward(
-                input, padding_mask, input_ids, packed_seq_params=packed_seq_params
+                input,
+                padding_mask,
+                input_ids,
+                packed_seq_params=packed_seq_params,
+                token_multiplicities=token_multiplicities,
             )
 
         return self._forward(input, padding_mask, input_ids)
