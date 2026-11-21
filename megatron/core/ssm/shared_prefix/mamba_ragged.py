@@ -17,7 +17,7 @@ import torch
 import triton
 import triton.language as tl
 
-from megatron.core.shared_prefix_layout import SharedPrefixForestLayout, SharedPrefixLayout
+from megatron.core.datasets.shared_prefix.layout import SharedPrefixPack, SharedPrefixTree
 from megatron.core.ssm.mamba_mixer import MAMBA_HAS_STATE_DTYPE, MambaMixer, causal_conv1d_fn
 
 # einops is optional for megatron-core; mamba-ssm, which the shared-prefix paths require,
@@ -204,9 +204,7 @@ def ragged_mamba_layout(
 
 
 def scan_mamba_ragged_forest(
-    mixer: MambaMixer,
-    recurrent: torch.Tensor,
-    layout: SharedPrefixLayout | SharedPrefixForestLayout,
+    mixer: MambaMixer, recurrent: torch.Tensor, layout: SharedPrefixTree | SharedPrefixPack
 ) -> torch.Tensor:
     """Scan one canonical forest, retaining autograd through every state fork.
 
@@ -219,7 +217,7 @@ def scan_mamba_ragged_forest(
     if causal_conv1d_fn is None:
         raise ImportError("Ragged Mamba requires causal_conv1d")
 
-    from megatron.core.ssm.mamba_ragged_scan import mamba_chunk_scan_forest
+    from megatron.core.ssm.shared_prefix.mamba_ragged_scan import mamba_chunk_scan_forest
 
     if recurrent.ndim != 3 or recurrent.shape[1] != 1:
         raise ValueError("Ragged Mamba requires [sequence, 1, recurrent channels]")

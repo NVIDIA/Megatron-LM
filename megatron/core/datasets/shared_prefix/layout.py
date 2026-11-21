@@ -1,5 +1,9 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Token layouts for independent shared-prefix hybrid execution groups."""
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""Token layouts of shared-prefix forwards.
+
+A tree is one prompt with its completions. Its tokens are stored as the prompt once,
+followed by each completion. A pack is several trees concatenated in one forward.
+"""
 
 from __future__ import annotations
 
@@ -11,9 +15,45 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
+def shared_prefix_topology_multiple(*, tp_size: int, cp_size: int) -> int:
+    """Return the smallest padding multiple that a parallel topology accepts.
+
+    The padded length of a forward must be a multiple of this number. Context parallelism
+    gives each rank two chunks of the sequence, so the number is ``2 * cp_size`` without tensor
+    parallelism. With tensor parallelism, sequence parallelism splits the tokens of each
+    context-parallel rank evenly over the tensor-parallel ranks, and the number is
+    ``2 * tp_size * cp_size``. This also holds for ``cp_size == 1``, where ordinary sequence
+    packing only needs a multiple of ``tp_size``.
+
+    Args:
+        tp_size: Tensor-parallel size.
+        cp_size: Context-parallel size.
+
+    Returns:
+        1 when both sizes are 1, ``2 * cp_size`` when only ``tp_size`` is 1, and
+        ``2 * tp_size * cp_size`` otherwise.
+
+    Raises:
+        ValueError: If a size is not a positive integer.
+    """
+    if isinstance(tp_size, bool) or not isinstance(tp_size, int) or tp_size < 1:
+        raise ValueError(f"tp_size must be a positive integer, got {tp_size!r}")
+    if isinstance(cp_size, bool) or not isinstance(cp_size, int) or cp_size < 1:
+        raise ValueError(f"cp_size must be a positive integer, got {cp_size!r}")
+    if tp_size == 1:
+        return 1 if cp_size == 1 else 2 * cp_size
+    return 2 * tp_size * cp_size
+
+
 @dataclass(frozen=True)
-class SharedPrefixLayout:
-    """One exact-prompt star packed as ``[prefix, completion_1, ..., completion_G]``."""
+class SharedPrefixTree:
+    """A tree: one prompt with its completions.
+
+    The tokens are stored as ``[prefix, completion_1, ..., completion_G]``. The prefix is the
+    prompt, stored once. ``completion_lens`` are the stored completion lengths, which include
+    the padding of each completion. ``logical_completion_lens``, when given, are the lengths
+    without that padding.
+    """
 
     prefix_len: int
     completion_lens: Sequence[int]
@@ -54,11 +94,11 @@ class SharedPrefixLayout:
 
     @property
     def total_len(self) -> int:
-        """Return the physical token count of this star."""
+        """Return the physical token count of this tree."""
         return self.prefix_len + sum(self.completion_lens)
 
-    def iter_roots(self) -> Iterator[tuple[int, SharedPrefixLayout]]:
-        """Yield canonical offsets and independent prompt stars."""
+    def iter_roots(self) -> Iterator[tuple[int, SharedPrefixTree]]:
+        """Yield this tree with token offset 0, as :meth:`SharedPrefixPack.iter_roots` does."""
         yield 0, self
 
     @property
@@ -68,7 +108,7 @@ class SharedPrefixLayout:
 
     @property
     def forest(self) -> list[tuple[int, int, list[int]]]:
-        """Represent this star as a root and its completion lengths."""
+        """Return this tree as one ``(offset, prefix_len, completion_lens)`` entry."""
         return [(0, self.prefix_len, list(self.completion_lens))]
 
     def completion_slices(self) -> tuple[slice, ...]:
@@ -81,7 +121,7 @@ class SharedPrefixLayout:
         return tuple(slices)
 
     def dense_branch_indices(self, device: torch.device | str) -> tuple[Tensor, ...]:
-        """Return global-star indices for conventional prompt-completion sequences.
+        """Return token indices of this tree for conventional prompt-completion sequences.
 
         MTP's token shifts are defined on an ordinary causal sequence and must
         never cross between sibling completion branches.  These indices provide
@@ -98,7 +138,7 @@ class SharedPrefixLayout:
         )
 
     def position_ids(self, device: torch.device | str) -> Tensor:
-        """Prefix-continued RoPE positions for the packed star."""
+        """Prefix-continued RoPE positions for the tokens of this tree."""
         pieces = [torch.arange(self.prefix_len, device=device, dtype=torch.long)]
         pieces.extend(
             torch.arange(self.prefix_len, self.prefix_len + length, device=device, dtype=torch.long)
@@ -107,7 +147,7 @@ class SharedPrefixLayout:
         return torch.cat(pieces)
 
     def padded_position_ids(self, physical_len: int, device: torch.device | str) -> Tensor:
-        """Return global star positions plus inert positions for trailing CP padding."""
+        """Return the positions of this tree plus inert positions for trailing CP padding."""
         physical_len = int(physical_len)
         if physical_len < self.total_len:
             raise ValueError(
@@ -187,25 +227,27 @@ class SharedPrefixLayout:
 
 
 @dataclass(frozen=True)
-class SharedPrefixForestLayout:
-    """Independent prompt stars concatenated into one hybrid forward.
+class SharedPrefixPack:
+    """A pack: several trees concatenated into one forward.
 
-    Each branch retains its ordinary dense padding. Only the complete forest
-    receives topology padding; roots need no individual alignment because the
+    ``roots`` holds the trees in token order. The trees are independent of each other.
+
+    Each branch retains its ordinary dense padding. Only the complete pack
+    receives topology padding; trees need no individual alignment because the
     Mamba CP transform restores canonical token order before scanning them.
 
-    ``mtp_loss_group_root_counts`` partitions consecutive roots into the original
+    ``mtp_loss_group_root_counts`` partitions consecutive trees into the original
     independently normalized MTP forwards. Empty counts preserve one group per
-    root. Grouping loss normalization never joins causal sequences.
+    tree. Grouping loss normalization never joins causal sequences.
     """
 
-    roots: tuple[SharedPrefixLayout, ...]
+    roots: tuple[SharedPrefixTree, ...]
     mtp_loss_group_root_counts: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "roots", tuple(self.roots))
-        if not self.roots or any(not isinstance(root, SharedPrefixLayout) for root in self.roots):
-            raise ValueError("a shared-prefix forest requires one or more star layouts")
+        if not self.roots or any(not isinstance(root, SharedPrefixTree) for root in self.roots):
+            raise ValueError("a shared-prefix pack requires one or more SharedPrefixTree roots")
         if len({root.padding_multiple for root in self.roots}) != 1:
             raise ValueError("all shared-prefix roots must use the same padding multiple")
         if isinstance(self.mtp_loss_group_root_counts, (str, bytes)):
@@ -219,12 +261,12 @@ class SharedPrefixForestLayout:
         ):
             raise ValueError("MTP loss group root counts must be positive integers")
         if counts and sum(counts) != len(self.roots):
-            raise ValueError("MTP loss group root counts must partition every forest root")
+            raise ValueError("MTP loss group root counts must partition every root of the pack")
         object.__setattr__(self, "mtp_loss_group_root_counts", counts)
 
     @property
     def total_len(self) -> int:
-        """Return the physical token count across all independent stars."""
+        """Return the physical token count across all trees."""
         return sum(root.total_len for root in self.roots)
 
     @property
@@ -234,15 +276,15 @@ class SharedPrefixForestLayout:
 
     @property
     def dense_branch_lengths(self) -> tuple[int, ...]:
-        """Return dense branch lengths in forest order."""
+        """Return dense branch lengths in pack order."""
         return tuple(length for root in self.roots for length in root.dense_branch_lengths)
 
     @property
     def mtp_loss_group_lengths(self) -> tuple[int, ...]:
         """Global dense-expanded token lengths of consecutive MTP loss groups.
 
-        Ordinary per-branch padding is included; forest-only topology padding
-        never enters MTP. Each length is divided by CP size after branch packing.
+        Ordinary per-branch padding is included; the topology padding after the last
+        tree never enters MTP. Each length is divided by CP size after branch packing.
         """
         counts = self.mtp_loss_group_root_counts or (1,) * len(self.roots)
         lengths = []
@@ -254,8 +296,8 @@ class SharedPrefixForestLayout:
             start += count
         return tuple(lengths)
 
-    def iter_roots(self) -> Iterator[tuple[int, SharedPrefixLayout]]:
-        """Yield each root with its global token offset."""
+    def iter_roots(self) -> Iterator[tuple[int, SharedPrefixTree]]:
+        """Yield each tree with the offset of its first token in the pack."""
         offset = 0
         for root in self.roots:
             yield offset, root
@@ -263,14 +305,14 @@ class SharedPrefixForestLayout:
 
     @property
     def forest(self) -> list[tuple[int, int, list[int]]]:
-        """Return root offsets and lengths for the attention forest."""
+        """Return one ``(offset, prefix_len, completion_lens)`` entry per tree."""
         return [
             (offset, root.prefix_len, list(root.completion_lens))
             for offset, root in self.iter_roots()
         ]
 
     def dense_branch_indices(self, device: torch.device | str) -> tuple[Tensor, ...]:
-        """Return independent dense branches without crossing root boundaries."""
+        """Return independent dense branches without crossing tree boundaries."""
         return tuple(
             indices + offset
             for offset, root in self.iter_roots()
@@ -278,13 +320,13 @@ class SharedPrefixForestLayout:
         )
 
     def position_ids(self, device: torch.device | str) -> Tensor:
-        """Return per-branch positions in physical forest order."""
+        """Return per-branch positions in physical pack order."""
         return torch.cat([root.position_ids(device) for root in self.roots])
 
     def padded_position_ids(self, physical_len: int, device: torch.device | str) -> Tensor:
-        """Extend forest positions to the requested physical length."""
+        """Extend pack positions to the requested physical length."""
         if physical_len < self.total_len:
-            raise ValueError("physical length is shorter than shared-prefix forest")
+            raise ValueError("physical length is shorter than the shared-prefix pack")
         return F.pad(self.position_ids(device), (0, physical_len - self.total_len))
 
     def padded_token_multiplicities(
@@ -294,9 +336,9 @@ class SharedPrefixForestLayout:
         *,
         exclude_sequence_padding: bool = False,
     ) -> Tensor:
-        """Count logical token copies represented by each physical forest row."""
+        """Count logical token copies represented by each physical token of the pack."""
         if physical_len < self.total_len:
-            raise ValueError("physical length is shorter than shared-prefix forest")
+            raise ValueError("physical length is shorter than the shared-prefix pack")
         weights = torch.cat(
             [
                 root.padded_token_multiplicities(
@@ -307,4 +349,4 @@ class SharedPrefixForestLayout:
         )
         return F.pad(weights, (0, physical_len - self.total_len))
 
-    cp_local_indices = staticmethod(SharedPrefixLayout.cp_local_indices)
+    cp_local_indices = staticmethod(SharedPrefixTree.cp_local_indices)

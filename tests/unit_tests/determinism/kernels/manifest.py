@@ -907,7 +907,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     # and the NRL_SP_MAMBA_IMPL dispatch that selects them.
     KernelEntry(
         name="ssm_mamba_ragged_forest",
-        sources=("megatron/core/ssm/mamba_ragged.py", "megatron/core/ssm/mamba_ragged_scan.py"),
+        sources=(
+            "megatron/core/ssm/shared_prefix/mamba_ragged.py",
+            "megatron/core/ssm/shared_prefix/mamba_ragged_scan.py",
+        ),
         tests=(
             K + "test_shared_prefix_mamba_kernels.py",
             "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_backends.py",
@@ -927,7 +930,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="ssm_mamba_sequence_packing",
-        sources=("megatron/core/ssm/mamba_sequence_packing.py",),
+        sources=("megatron/core/ssm/shared_prefix/mamba_sequence_packing.py",),
         tests=(
             K + "test_shared_prefix_mamba_kernels.py",
             "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_numerics.py",
@@ -941,7 +944,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="ssm_mamba_shared_prefix_dispatch",
-        sources=("megatron/core/ssm/mamba_shared_prefix.py",),
+        sources=("megatron/core/ssm/shared_prefix/mamba_shared_prefix.py",),
         tests=(
             K + "test_shared_prefix_mamba_kernels.py",
             "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_backends.py",

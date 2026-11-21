@@ -23,7 +23,7 @@ from functools import cached_property
 import torch
 from torch import Tensor
 
-from megatron.core.shared_prefix_layout import SharedPrefixForestLayout, SharedPrefixLayout
+from megatron.core.datasets.shared_prefix.layout import SharedPrefixPack, SharedPrefixTree
 
 
 def round_up(value: int, multiple: int) -> int:
@@ -145,16 +145,20 @@ class SharedPrefixProblem:
         """Return the longest dense row."""
         return max(row.dense_len for row in self.rows)
 
-    def layout(self, forest: bool) -> SharedPrefixLayout | SharedPrefixForestLayout:
-        """Build the layout under test; ``forest=False`` requires exactly one root."""
-        stars = []
+    def layout(self, forest: bool) -> SharedPrefixTree | SharedPrefixPack:
+        """Build the layout under test.
+
+        ``forest=True`` returns a pack of every tree. ``forest=False`` returns the single tree and
+        requires exactly one root.
+        """
+        trees = []
         for root, (prefix_len, logical_lens) in enumerate(self.roots):
             physical = tuple(row.physical_len for row in self.rows if row.root == root)
             if self.padding_multiple is None:
-                stars.append(SharedPrefixLayout(prefix_len, physical))
+                trees.append(SharedPrefixTree(prefix_len, physical))
             else:
-                stars.append(
-                    SharedPrefixLayout(
+                trees.append(
+                    SharedPrefixTree(
                         prefix_len,
                         physical,
                         logical_completion_lens=tuple(logical_lens),
@@ -162,9 +166,9 @@ class SharedPrefixProblem:
                     )
                 )
         if forest:
-            return SharedPrefixForestLayout(tuple(stars))
-        assert len(stars) == 1, "a plain star layout has exactly one root"
-        return stars[0]
+            return SharedPrefixPack(tuple(trees))
+        assert len(trees) == 1, "a single SharedPrefixTree layout has exactly one root"
+        return trees[0]
 
     def token_keys(self) -> tuple[Tensor, list[Tensor], int]:
         """Canonical token identities for MoE routing replay, for model-level callers.
@@ -391,7 +395,9 @@ def shared_mamba_layer_forward(layer, hidden_states: Tensor, layout, backend: st
     An unknown backend name fails (``_shared_prefix_mamba_impl`` raises ValueError) instead of
     silently running the default backend.
     """
-    from megatron.core.ssm.mamba_shared_prefix import forward_mamba_layer_shared_prefix
+    from megatron.core.ssm.shared_prefix.mamba_shared_prefix import (
+        forward_mamba_layer_shared_prefix,
+    )
 
     previous = os.environ.get("NRL_SP_MAMBA_IMPL")
     os.environ["NRL_SP_MAMBA_IMPL"] = backend

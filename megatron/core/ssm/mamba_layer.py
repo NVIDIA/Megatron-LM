@@ -37,7 +37,7 @@ from megatron.core.typed_torch import apply_module
 from megatron.core.utils import deprecate_inference_params
 
 if TYPE_CHECKING:
-    from megatron.core.ssm.mamba_shared_prefix import MambaSharedPrefixCall
+    from megatron.core.ssm.shared_prefix.mamba_shared_prefix import MambaSharedPrefixCall
 
 
 @dataclass

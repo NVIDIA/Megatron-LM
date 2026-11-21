@@ -3,10 +3,10 @@
 """Bit-exact replay of the shared-prefix Mamba kernels.
 
 Covers the ragged state-fork forest (the ``_RaggedGather`` Triton kernels in
-``megatron/core/ssm/mamba_ragged.py`` and the forest state-passing kernels plus the reused
-``mamba_ssm`` SSD kernels in ``mamba_ragged_scan.py``) kernel by kernel, and replays the ragged
-forest and the chunk-aligned packed recurrence (``mamba_sequence_packing.py``) with a real
-``MambaMixer``'s parameters.
+``megatron/core/ssm/shared_prefix/mamba_ragged.py`` and the forest state-passing kernels plus
+the reused ``mamba_ssm`` SSD kernels in ``mamba_ragged_scan.py``) kernel by kernel, and replays
+the ragged forest and the chunk-aligned packed recurrence (``mamba_sequence_packing.py``) with a
+real ``MambaMixer``'s parameters.
 
 The ragged gather backward sums every copy of an input row in a fixed order in FP32, and the
 forest state kernels walk siblings in a fixed order; neither uses atomics. The intra-chunk SSD
@@ -19,7 +19,7 @@ here, as ``--deterministic-mode`` does.
 import pytest
 import torch
 
-from megatron.core.shared_prefix_layout import SharedPrefixForestLayout, SharedPrefixLayout
+from megatron.core.datasets.shared_prefix.layout import SharedPrefixPack, SharedPrefixTree
 from tests.unit_tests.determinism.correctness.test_ssm_conv1d import (
     _build_mixer,
     requires_deterministic_conv1d,
@@ -66,8 +66,8 @@ def mamba_deterministic(monkeypatch):
 
 
 def _layout(roots):
-    layouts = [SharedPrefixLayout(prefix_len=p, completion_lens=lens) for p, lens in roots]
-    return layouts[0] if len(layouts) == 1 else SharedPrefixForestLayout(roots=tuple(layouts))
+    layouts = [SharedPrefixTree(prefix_len=p, completion_lens=lens) for p, lens in roots]
+    return layouts[0] if len(layouts) == 1 else SharedPrefixPack(roots=tuple(layouts))
 
 
 # --- kernels ---------------------------------------------------------------------------------
@@ -76,7 +76,7 @@ def _layout(roots):
 @pytest.mark.parametrize("roots", _ROOTS)
 def test_ragged_gather_replays(roots):
     """The halo/tail gather is a pure copy; its backward owns each input element once."""
-    from megatron.core.ssm.mamba_ragged import _RaggedGather, ragged_mamba_layout
+    from megatron.core.ssm.shared_prefix.mamba_ragged import _RaggedGather, ragged_mamba_layout
 
     seeded()
     meta = ragged_mamba_layout(roots, _CHUNK, _CONV_WIDTH, torch.device("cuda"))
@@ -106,7 +106,7 @@ def test_ragged_gather_replays(roots):
 
 def _forest_scan_case(roots, d_has_hdim=False):
     """Seeded forest-scan inputs on ~4k scan tokens, plus the layout boundaries they use."""
-    from megatron.core.ssm.mamba_ragged import ragged_mamba_layout
+    from megatron.core.ssm.shared_prefix.mamba_ragged import ragged_mamba_layout
 
     seeded()
     meta = ragged_mamba_layout(roots, _CHUNK, _CONV_WIDTH, torch.device("cuda"))
@@ -129,7 +129,7 @@ def _forest_scan_case(roots, d_has_hdim=False):
 
 
 def _forest_scan(meta, save_intermediates=False):
-    from megatron.core.ssm.mamba_ragged_scan import mamba_chunk_scan_forest
+    from megatron.core.ssm.shared_prefix.mamba_ragged_scan import mamba_chunk_scan_forest
 
     def fn(x, dt, A, B, C, D, dt_bias):
         return mamba_chunk_scan_forest(
@@ -234,7 +234,7 @@ class TestSharedPrefixMambaScans:
         ``padding`` appends physical tokens past the layout, which the scan folds into the
         last sibling.
         """
-        from megatron.core.ssm.mamba_ragged import scan_mamba_ragged_forest
+        from megatron.core.ssm.shared_prefix.mamba_ragged import scan_mamba_ragged_forest
 
         mixer = _build_mixer()
         layout = _layout(roots)
@@ -252,7 +252,9 @@ class TestSharedPrefixMambaScans:
 
     def test_packed_recurrence_replays(self):
         """Every sequence starts on a chunk boundary; conv and scan reset on ``seq_idx``."""
-        from megatron.core.ssm.mamba_sequence_packing import scan_mamba_packed_recurrence
+        from megatron.core.ssm.shared_prefix.mamba_sequence_packing import (
+            scan_mamba_packed_recurrence,
+        )
 
         lengths = (300, 1, 129, 1024, 1500, 7, 128, 1000)
         mixer = _build_mixer()

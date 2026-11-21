@@ -3,11 +3,13 @@
 """Shared-prefix Mamba execution: one prefix scan whose state forks into every completion.
 
 A shared-prefix layout stores each prompt once, followed by its completions
-(:mod:`megatron.core.shared_prefix_layout`). :func:`forward_mamba_layer_shared_prefix` runs one
+(:mod:`megatron.core.datasets.shared_prefix.layout`). A tree is one prompt with its completions,
+and a pack is several trees in one forward. :func:`forward_mamba_layer_shared_prefix` runs one
 ``MambaLayer`` on that layout: the prefix is scanned once and its convolution and SSM state are
 forked, differentiably, into every completion branch, including at CP>1 through
 sequence-to-head collectives. ``NRL_SP_MAMBA_IMPL`` selects the implementation; the default,
-``ragged_state_fork``, uses the ragged forest kernels in :mod:`megatron.core.ssm.mamba_ragged`.
+``ragged_state_fork``, uses the ragged forest kernels in
+:mod:`megatron.core.ssm.shared_prefix.mamba_ragged`.
 
 The layer runs through its normal module call: a per-call :class:`MambaSharedPrefixCall`, passed
 as the ``shared_prefix_call`` argument of ``MambaLayer.forward`` and on to ``MambaMixer.forward``,
@@ -26,15 +28,18 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.datasets.shared_prefix.layout import SharedPrefixPack, SharedPrefixTree
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.shared_prefix_layout import SharedPrefixForestLayout, SharedPrefixLayout
-from megatron.core.ssm.mamba_branch_layout import merge_mamba_branches, pack_mamba_branches
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.ssm.mamba_mixer import (
     MAMBA_HAS_STATE_DTYPE,
     MambaMixer,
     causal_conv1d_fn,
     mamba_chunk_scan_combined,
+)
+from megatron.core.ssm.shared_prefix.mamba_branch_layout import (
+    merge_mamba_branches,
+    pack_mamba_branches,
 )
 
 # einops is optional for megatron-core; mamba-ssm, which the shared-prefix paths require,
@@ -101,7 +106,7 @@ def _validate_mamba_fork(mixer: MambaMixer) -> None:
     if implementation.startswith("ragged_state_fork"):
         try:
             # Ragged imports private mamba_ssm SSD kernels; fail before any layer runs.
-            from megatron.core.ssm import (  # pylint: disable=unused-import
+            from megatron.core.ssm.shared_prefix import (  # pylint: disable=unused-import
                 mamba_ragged,
                 mamba_ragged_scan,
             )
@@ -263,7 +268,7 @@ def _scan_mamba_projected_segment(
 
 
 def _scan_mamba_shared_prefix_root(
-    mixer: MambaMixer, projected: Tensor, layout: SharedPrefixLayout, *, replay_prefix: bool
+    mixer: MambaMixer, projected: Tensor, layout: SharedPrefixTree, *, replay_prefix: bool
 ) -> Tensor:
     """Scan recurrent fields for one root, retaining the established chunk boundary."""
     physical_len = projected.shape[0]
@@ -319,7 +324,7 @@ class MambaSharedPrefixCall:
     that the mixer served it.
     """
 
-    layout: SharedPrefixLayout | SharedPrefixForestLayout
+    layout: SharedPrefixTree | SharedPrefixPack
     replay_prefix: bool = False
     packed_recurrence: bool = False
     ragged_state_fork: bool = False
@@ -361,12 +366,12 @@ def forward_mamba_mixer_shared_prefix(
         )
 
     if call.ragged_state_fork:
-        from megatron.core.ssm.mamba_ragged import scan_mamba_ragged_forest
+        from megatron.core.ssm.shared_prefix.mamba_ragged import scan_mamba_ragged_forest
 
         packed_y = scan_mamba_ragged_forest(mixer, projected, layout)
     elif call.packed_recurrence:
         # Keep optional convolution/scan dependencies lazy for non-Mamba models.
-        from megatron.core.ssm.mamba_forest_replay import scan_mamba_forest_replay
+        from megatron.core.ssm.shared_prefix.mamba_forest_replay import scan_mamba_forest_replay
 
         packed_y = scan_mamba_forest_replay(mixer, projected, layout)
     else:
@@ -390,7 +395,7 @@ def forward_mamba_mixer_shared_prefix(
 def _forward_mamba_layer_shared_prefix_cp_impl(
     layer: MambaLayer,
     hidden_states: Tensor,
-    layout: SharedPrefixLayout | SharedPrefixForestLayout,
+    layout: SharedPrefixTree | SharedPrefixPack,
     *,
     replay_prefix: bool,
     packed_recurrence: bool = False,
@@ -424,7 +429,7 @@ def _forward_mamba_layer_shared_prefix_cp_impl(
 
 
 def _forward_mamba_layer_shared_prefix_cp_state_fork(
-    layer: MambaLayer, hidden_states: Tensor, layout: SharedPrefixLayout | SharedPrefixForestLayout
+    layer: MambaLayer, hidden_states: Tensor, layout: SharedPrefixTree | SharedPrefixPack
 ) -> Tensor:
     """Optimized CP Mamba: fork at a scan-chunk boundary and replay the prompt tail."""
     return _forward_mamba_layer_shared_prefix_cp_impl(
@@ -433,7 +438,7 @@ def _forward_mamba_layer_shared_prefix_cp_state_fork(
 
 
 def _forward_mamba_layer_shared_prefix_cp_replay(
-    layer: MambaLayer, hidden_states: Tensor, layout: SharedPrefixLayout
+    layer: MambaLayer, hidden_states: Tensor, layout: SharedPrefixTree
 ) -> Tensor:
     """Parity baseline: rescan each prefix per branch without an explicit state boundary."""
     return _forward_mamba_layer_shared_prefix_cp_impl(
@@ -442,7 +447,7 @@ def _forward_mamba_layer_shared_prefix_cp_replay(
 
 
 def _forward_mamba_layer_shared_prefix_cp_packed_fused_oracle(
-    layer: MambaLayer, hidden_states: Tensor, layout: SharedPrefixLayout
+    layer: MambaLayer, hidden_states: Tensor, layout: SharedPrefixTree
 ) -> Tensor:
     """Diagnostic dense replay through Mamba's unchanged packed fused path.
 
@@ -634,7 +639,7 @@ def _forward_mamba_layer_shared_prefix_cp_packed_fused_oracle(
 
 
 def forward_mamba_layer_shared_prefix(
-    layer: MambaLayer, hidden_states: Tensor, layout: SharedPrefixLayout | SharedPrefixForestLayout
+    layer: MambaLayer, hidden_states: Tensor, layout: SharedPrefixTree | SharedPrefixPack
 ) -> Tensor:
     """Run one Mamba layer with the implementation selected by ``NRL_SP_MAMBA_IMPL``.
 
@@ -683,7 +688,7 @@ def forward_mamba_layer_shared_prefix(
             packed_recurrence=implementation == "packed_recurrence" or layer.training,
         )
     if implementation == "packed_fused":
-        if isinstance(layout, SharedPrefixForestLayout):
+        if isinstance(layout, SharedPrefixPack):
             raise NotImplementedError(
                 "packed_fused diagnostic supports one root; use another backend for forests"
             )

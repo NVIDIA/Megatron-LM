@@ -7,9 +7,9 @@ from functools import lru_cache
 import torch
 from torch import Tensor
 
-from megatron.core.shared_prefix_layout import SharedPrefixForestLayout, SharedPrefixLayout
+from megatron.core.datasets.shared_prefix.layout import SharedPrefixPack, SharedPrefixTree
 from megatron.core.ssm.mamba_mixer import MambaMixer
-from megatron.core.ssm.mamba_sequence_packing import scan_mamba_packed_recurrence
+from megatron.core.ssm.shared_prefix.mamba_sequence_packing import scan_mamba_packed_recurrence
 
 
 @lru_cache(maxsize=32)
@@ -83,7 +83,7 @@ class _ExpandForest(torch.autograd.Function):
 
 
 def scan_mamba_forest_replay(
-    mixer: MambaMixer, projected: Tensor, layout: SharedPrefixLayout | SharedPrefixForestLayout
+    mixer: MambaMixer, projected: Tensor, layout: SharedPrefixTree | SharedPrefixPack
 ) -> Tensor:
     """Expand recurrence fields only; run all roots in a single packed scan.
 

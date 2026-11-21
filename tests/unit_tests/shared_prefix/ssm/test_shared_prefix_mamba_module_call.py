@@ -12,17 +12,17 @@ runs each differentiable backend on a real layer.
 import pytest
 import torch
 
+from megatron.core.datasets.shared_prefix.layout import SharedPrefixTree
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.shared_prefix_layout import SharedPrefixLayout
-from megatron.core.ssm import mamba_shared_prefix
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.ssm.mamba_mixer import MambaMixer, causal_conv1d_fn, mamba_chunk_scan_combined
+from megatron.core.ssm.shared_prefix import mamba_shared_prefix
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.shared_prefix.ssm.shared_prefix_test_utils import build_local_mamba_layer
 from tests.unit_tests.test_utilities import Utils
 
-_LAYOUT = SharedPrefixLayout(prefix_len=3, completion_lens=(2, 5, 1))
+_LAYOUT = SharedPrefixTree(prefix_len=3, completion_lens=(2, 5, 1))
 _HIDDEN = 8
 
 # The request flags each NRL_SP_MAMBA_IMPL value (None: the default) sets for a training layer.
@@ -210,7 +210,7 @@ class TestSharedPrefixMambaModuleCalls:
         for name, module in submodules.items():
             module.register_forward_pre_hook(lambda m, args, name=name: events.append(name))
         # The prompt crosses the 128-token scan chunk, so state forking splits it.
-        layout = SharedPrefixLayout(prefix_len=150, completion_lens=(17, 5, 30))
+        layout = SharedPrefixTree(prefix_len=150, completion_lens=(17, 5, 30))
         mamba_shared_prefix.validate_mamba_layer_shared_prefix(layer, tp_size=1, cp_size=1)
         hidden_states = torch.randn(
             layout.total_len, 1, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True
