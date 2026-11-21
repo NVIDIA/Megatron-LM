@@ -4,6 +4,7 @@
 # repo: https://github.com/pytorch/pytorch
 from __future__ import annotations
 
+import logging
 import os
 import warnings
 from functools import partial
@@ -30,6 +31,7 @@ from megatron.core.utils import (
     get_pg_size,
     get_tensor_model_parallel_group_if_none,
     is_torch_min_version,
+    log_single_rank,
     make_tp_sharded_tensor_for_checkpoint,
     prepare_input_tensors_for_wgrad_compute,
 )
@@ -46,6 +48,8 @@ from .mappings import (
 )
 from .random import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from .utils import VocabUtility
+
+logger = logging.getLogger(__name__)
 
 _grad_accum_fusion_available = True
 try:
@@ -1106,6 +1110,160 @@ def linear_with_grad_accumulation_and_async_allreduce(
 linear_with_grad_accumulation_and_async_allreduce.warned = False
 
 
+_lm_head_chunking_messages = set()
+
+
+def log_lm_head_chunking_once(message: str) -> None:
+    """Say once whether, and if not why not, an LM head runs chunked.
+
+    ``lm_head_loss_num_chunks`` is validated when the config is built, but some conditions are
+    only known at run time; without this a head that fell back would be indistinguishable in
+    the log from one that is chunked.
+    """
+    if message not in _lm_head_chunking_messages:
+        _lm_head_chunking_messages.add(message)
+        log_single_rank(logger, logging.INFO, message)
+
+
+def lm_head_chunk_bounds(seq_len: int, num_chunks: int) -> List[Tuple[int, int]]:
+    """Split ``range(seq_len)`` into at most ``num_chunks`` contiguous [start, end) slices."""
+    num_chunks = max(1, min(num_chunks, seq_len))
+    step = -(-seq_len // num_chunks)
+    return [(start, min(start + step, seq_len)) for start in range(0, seq_len, step)]
+
+
+class LinearCrossEntropyChunked(torch.autograd.Function):
+    """Output projection fused with its loss, projected one sequence chunk at a time.
+
+    The plain path materialises the logits of the whole sequence, [s, b, vocab], and their
+    gradient. Here the weight is obtained once, exactly as in
+    ``LinearWithGradAccumulationAndAsyncCommunication.forward``, and each chunk of the sequence
+    is then projected, scored by ``chunk_loss_fn`` and differentiated back to its logits before
+    the next chunk is projected. The logits therefore only ever exist for one chunk. Their
+    gradient is kept for the whole sequence, in the input dtype, and backward hands it to the
+    unchanged linear backward as its ``grad_output``. So the weight is gathered once per
+    direction and the weight gradient is computed and accumulated by a single backward call,
+    as for the plain path.
+
+    The gradient to the logits is computed during forward, so the gradient of the final loss
+    with respect to the returned per-token loss must be known there: ``upstream``. Backward
+    checks the gradient that arrives against it.
+    """
+
+    # Verify the first few backward calls outside CUDA graph capture, then stop: the comparison
+    # synchronises with the GPU.
+    checks_left = 8
+
+    @staticmethod
+    @custom_fwd
+    def forward(
+        ctx,
+        input,
+        weight,
+        bias,
+        gradient_accumulation_fusion,
+        allreduce_dgrad,
+        sequence_parallel,
+        tp_group,
+        gtp_remat_size,
+        output_dtype,
+        upstream,
+        chunk_loss_fn,
+        num_chunks,
+    ):
+        """Return the per-token loss, [b, s].
+
+        With sequence parallelism ``input`` is this rank's slice of the sequence. It is gathered
+        once, as in the plain forward, and the chunks run over the gathered sequence, so ``s`` and
+        the chunk bounds refer to the full sequence, like the labels do.
+
+        Args beyond the plain linear's:
+            upstream: Gradient of the final loss w.r.t. the returned loss, [b, s]. None when no
+                gradient is needed (evaluation): the chunks are then only scored.
+            chunk_loss_fn: ``(logits, start, end) -> loss``, with logits [end - start, b, vocab]
+                and loss [b, end - start].
+            num_chunks: Number of sequence chunks.
+        """
+        # Same bookkeeping as LinearWithGradAccumulationAndAsyncCommunication.forward, whose
+        # backward this function reuses.
+        if gradient_accumulation_fusion and hasattr(weight, "main_grad"):
+            main_grad = weight.main_grad
+        else:
+            main_grad = None
+        ctx.save_for_backward(input, weight)
+
+        if gtp_remat_size > 1:
+            weight = weight.all_gather_and_prefetch(fwd=True)
+
+        ctx.main_grad = main_grad
+        ctx.use_bias = bias is not None
+        ctx.gradient_accumulation_fusion = gradient_accumulation_fusion
+        ctx.allreduce_dgrad = allreduce_dgrad
+        ctx.sequence_parallel = sequence_parallel
+        ctx.wgrad_deferral_limit = None
+        ctx.grad_output_buffer = None
+        ctx.tp_group = tp_group
+        ctx.gtp_remat_size = gtp_remat_size
+        ctx.input_dtype = input.dtype
+
+        if sequence_parallel:
+            dim_size = list(input.size())
+            dim_size[0] = dim_size[0] * tp_group.size()
+            total_input = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
+            dist_all_gather_func(total_input, input, group=tp_group)
+        else:
+            total_input = input
+
+        losses = []
+        dlogits = None
+        for start, end in lm_head_chunk_bounds(total_input.shape[0], num_chunks):
+            logits = _linear_forward(total_input[start:end], weight, bias, output_dtype)
+            if upstream is None:
+                losses.append(chunk_loss_fn(logits, start, end))
+                continue
+            with torch.enable_grad():
+                logits.requires_grad_(True)
+                loss = chunk_loss_fn(logits, start, end)
+                (grad,) = torch.autograd.grad(loss, logits, upstream[:, start:end].to(loss.dtype))
+            if dlogits is None:
+                dlogits = torch.empty(
+                    (total_input.shape[0], *grad.shape[1:]), dtype=input.dtype, device=grad.device
+                )
+            # Casts to the input dtype, which the linear backward would otherwise do itself.
+            dlogits[start:end].copy_(grad)
+            losses.append(loss.detach())
+            del logits, loss, grad
+
+        # Not through save_for_backward: these are dropped as soon as backward has read them,
+        # rather than when the graph is freed.
+        ctx.dlogits = dlogits
+        ctx.upstream = upstream
+        return torch.cat(losses, dim=1)
+
+    @staticmethod
+    @custom_bwd
+    def backward(ctx, grad_loss):
+        """Run the plain linear backward on the logits gradient computed in forward."""
+        dlogits, upstream = ctx.dlogits, ctx.upstream
+        ctx.dlogits = None
+        ctx.upstream = None
+        if dlogits is None:
+            raise RuntimeError("LinearCrossEntropyChunked: backward without a forward gradient.")
+        cls = LinearCrossEntropyChunked
+        if cls.checks_left > 0 and not torch.cuda.is_current_stream_capturing():
+            cls.checks_left -= 1
+            if not torch.allclose(grad_loss.to(upstream.dtype), upstream, rtol=1e-4, atol=0.0):
+                raise RuntimeError(
+                    "Chunked LM head: the gradient that reached the per-token loss differs from "
+                    "the one its forward used. The loss is not reduced the way the chunked head "
+                    "assumes; set lm_head_loss_num_chunks back to 1."
+                )
+        grad_input, grad_weight, grad_bias, *_ = (
+            LinearWithGradAccumulationAndAsyncCommunication.backward(ctx, dlogits)
+        )
+        return (grad_input, grad_weight, grad_bias) + (None,) * 9
+
+
 class ColumnParallelLinear(torch.nn.Module):
     """Linear layer with column parallelism.
 
@@ -1351,6 +1509,71 @@ class ColumnParallelLinear(torch.nn.Module):
             return linear_with_frozen_weight(input, weight, *args, **kwargs)
         else:
             return linear_with_grad_accumulation_and_async_allreduce(input, weight, *args, **kwargs)
+
+    def supports_chunked_loss(
+        self, weight: Optional[torch.Tensor] = None, runtime_gather_output: Optional[bool] = None
+    ) -> bool:
+        """Whether ``forward_chunked_loss`` covers this layer's configuration."""
+        weight = self.weight if weight is None else weight
+        gather_output = (
+            self.gather_output if runtime_gather_output is None else runtime_gather_output
+        )
+        offloading = self.config._cpu_offloading_context
+        return (
+            weight is not None
+            and weight.requires_grad
+            and not self.explicit_expert_comm
+            and not self.config.defer_embedding_wgrad_compute
+            and not (offloading is not None and offloading.inside_context)
+            # The loss is not a vocabulary partition that could be gathered.
+            and not (gather_output and self.tp_group.size() > 1)
+        )
+
+    def forward_chunked_loss(
+        self,
+        input_: torch.Tensor,
+        chunk_loss_fn: Callable[[torch.Tensor, int, int], torch.Tensor],
+        upstream: Optional[torch.Tensor],
+        num_chunks: int,
+        weight: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Project ``input_`` and score it with ``chunk_loss_fn`` one sequence chunk at a time.
+
+        Equivalent to ``chunk_loss_fn(self.forward(input_)[0], 0, s)`` for a loss that treats
+        every token independently, without materialising the logits of the whole sequence. See
+        ``LinearCrossEntropyChunked`` for the arguments. Requires ``supports_chunked_loss``.
+        Under sequence parallelism ``input_`` is the local slice, and the chunk bounds and the
+        returned loss cover the full sequence.
+
+        Returns:
+            The per-token loss, [b, s].
+        """
+        weight = self.weight if weight is None else weight
+        assert self.supports_chunked_loss(weight, runtime_gather_output=False)
+        bias = self.bias if not self.skip_bias_add else None
+        if self.allreduce_dgrad or self.sequence_parallel or self.disable_grad_reduce:
+            input_parallel = input_
+        else:
+            input_parallel = copy_to_tensor_model_parallel_region(input_, group=self.tp_group)
+        if self.gtp_remat_size > 1:
+            # One use of the weight and one backward, however many chunks: count it the way
+            # linear_with_grad_accumulation_and_async_allreduce does for the plain head, or
+            # GTP's gradient accumulation sees a backward without its forward.
+            weight.record_wgrad_forward()
+        return LinearCrossEntropyChunked.apply(
+            input_parallel,
+            weight,
+            bias,
+            self.gradient_accumulation_fusion,
+            self.allreduce_dgrad,
+            self.sequence_parallel,
+            self.tp_group,
+            self.gtp_remat_size,
+            self.output_dtype,
+            upstream,
+            chunk_loss_fn,
+            num_chunks,
+        )
 
     def forward(
         self,

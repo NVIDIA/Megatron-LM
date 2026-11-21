@@ -40,6 +40,7 @@ from megatron.core.tensor_parallel.inference_layers import (
     inference_all_gather_from_tensor_model_parallel_region,
     is_inference_column_parallel_linear,
 )
+from megatron.core.tensor_parallel.layers import log_lm_head_chunking_once
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
@@ -1387,6 +1388,51 @@ def process_mtp_loss(
             kd_loss.detach().sum() if kd_loss is not None else None,
         )
 
+    def _mtp_head_loss_chunked(
+        head_hidden: Tensor, head_labels: Tensor, layer_loss_mask: Tensor, upstream: Tensor
+    ):
+        """CE-only ``_mtp_head_loss`` that projects and scores one sequence chunk at a time.
+
+        Used with ``lm_head_loss_num_chunks > 1``. ``upstream`` is the gradient the early backward
+        will send to the unmasked per-token CE loss; see ``LinearCrossEntropyChunked``.
+        """
+        chunk_counts = []
+
+        def _chunk_loss(logits: Tensor, start: int, end: int) -> Tensor:
+            if scale_logits_fn is not None:
+                logits = scale_logits_fn(logits)
+            chunk_labels = head_labels[:, start:end]
+            chunk_mask = layer_loss_mask[:, start:end]
+            preds = None
+            if is_training and not loss_returns_argmax:
+                # Before the loss: native CE overwrites the logits.
+                chunk_counts.append(
+                    _compute_mtp_acceptance_counts(
+                        logits, chunk_labels, chunk_mask, tp_group=tp_group
+                    )
+                )
+            if loss_returns_argmax:
+                loss, preds = compute_language_model_loss(chunk_labels, logits, return_argmax=True)
+                chunk_counts.append(
+                    _compute_mtp_acceptance_counts(
+                        logits, chunk_labels, chunk_mask, tp_group=tp_group, preds=preds
+                    )
+                )
+            else:
+                loss = compute_language_model_loss(chunk_labels, logits)
+            return loss
+
+        ce_loss = output_layer.forward_chunked_loss(
+            head_hidden, _chunk_loss, upstream, config.lm_head_loss_num_chunks, weight=output_weight
+        )
+        ce_loss = layer_loss_mask * ce_loss
+        head_loss = getattr(config, "mtp_ce_loss_weight", 1.0) * ce_loss
+        correct = total = None
+        if is_training:
+            correct = torch.stack([counts[0] for counts in chunk_counts]).sum()
+            total = torch.stack([counts[1] for counts in chunk_counts]).sum()
+        return head_loss, correct, total, ce_loss.detach().sum(), None
+
     # Early backward: fwd(head) -> bwd(head) per depth so at most one head's logits/softmax is
     # resident at a time. Needs a live graph and cannot run inside CUDA-graph capture/warmup.
     early_backward = False
@@ -1465,9 +1511,68 @@ def process_mtp_loss(
         # In early-backward mode the head runs on a detached leaf so its backward stops at the
         # head input; the resulting gradient is re-injected into the main graph below.
         head_input = head_hidden.detach().requires_grad_(True) if early_backward else head_hidden
-        mtp_loss, correct, total, ce_sum, kd_sum = _mtp_head_loss(
-            mtp_layer_number, head_input, mtp_labels, layer_loss_mask
-        )
+        # lm_head_loss_num_chunks > 1: project and score this head in sequence chunks. Limited
+        # to early backward, which releases the head's logits gradient at once, and to the
+        # reduction whose scale does not depend on token counts computed after the head. The
+        # config rejects what it can at build time; the rest is only known here, and a head
+        # that falls back to the plain path says so once.
+        num_chunks = getattr(config, "lm_head_loss_num_chunks", 1)
+        chunk_head = False
+        if num_chunks > 1 and torch.is_grad_enabled():
+            supports_chunked_loss = getattr(output_layer, "supports_chunked_loss", None)
+            if not early_backward:
+                blocker = (
+                    "their early backward is not running (mtp_loss_early_backward is off, or a "
+                    "per-layer CUDA graph is warming up or capturing)"
+                )
+            elif not ce_enabled or kd_enabled:
+                blocker = "cross entropy is not their only loss"
+            elif not (
+                config.calculate_per_token_loss
+                and getattr(config, "mtp_normalize_loss_by_main_tokens", False)
+            ):
+                blocker = (
+                    "their loss is not normalized by the main token count "
+                    "(calculate_per_token_loss with mtp_normalize_loss_by_main_tokens)"
+                )
+            elif is_observing_tensor("mtp_logits"):
+                blocker = "the MTP logits are being observed"
+            elif supports_chunked_loss is None or not supports_chunked_loss(output_weight, False):
+                blocker = (
+                    "the output layer does not support it here (frozen or detached weight, "
+                    "deferred embedding wgrad or CPU offloading)"
+                )
+            else:
+                blocker = None
+            chunk_head = blocker is None
+            if chunk_head:
+                log_lm_head_chunking_once(
+                    f"MTP heads: projecting and scoring the sequence in {num_chunks} chunks "
+                    "(lm_head_loss_num_chunks)."
+                )
+            else:
+                log_lm_head_chunking_once(
+                    f"MTP heads: lm_head_loss_num_chunks={num_chunks} is set but the MTP heads "
+                    f"are NOT chunked, because {blocker}."
+                )
+        if chunk_head:
+            # The early backward below sends ones * main_loss_backward_scale to
+            # mtp_loss_scale * head_loss, and head_loss is ce_weight * mask * CE.
+            chunk_upstream = layer_loss_mask.to(torch.float32) * (
+                getattr(config, "mtp_ce_loss_weight", 1.0)
+                * config.mtp_loss_scaling_factor
+                / config.mtp_num_layers
+            )
+            chunk_upstream = chunk_upstream * MTPLossAutoScaler.main_loss_backward_scale.to(
+                device=chunk_upstream.device, dtype=chunk_upstream.dtype
+            )
+            mtp_loss, correct, total, ce_sum, kd_sum = _mtp_head_loss_chunked(
+                head_input, mtp_labels, layer_loss_mask, chunk_upstream
+            )
+        else:
+            mtp_loss, correct, total, ce_sum, kd_sum = _mtp_head_loss(
+                mtp_layer_number, head_input, mtp_labels, layer_loss_mask
+            )
 
         # CP ranks own disjoint parts of the same examples. Use their combined
         # counts so moving a target across a CP boundary cannot change its weight,
