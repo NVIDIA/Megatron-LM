@@ -779,35 +779,17 @@ def _overlap_block_stub(cuda_graph_impl: str):
         _combine_input_keepalive=None,
         _get_a2a_overlap_stream=lambda: stream,
     )
-    block._skip_dispatch_output_marks = lambda: ShortcutMoEBlock._skip_dispatch_output_marks(block)
     return block, stream
-
-
-@pytest.mark.parametrize(
-    "cuda_graph_impl,capturing,expected",
-    [
-        ("full_iteration", True, True),
-        ("full_iteration", False, False),
-        ("local", True, False),
-        ("none", False, False),
-    ],
-)
-def test_dispatch_output_marks_are_skipped_only_in_full_iteration_capture(
-    monkeypatch, cuda_graph_impl, capturing, expected
-):
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
-    block, _ = _overlap_block_stub(cuda_graph_impl)
-    assert ShortcutMoEBlock._skip_dispatch_output_marks(block) is expected
 
 
 @pytest.mark.parametrize("capturing", [False, True], ids=["eager", "full_iteration_capture"])
 def test_overlap_stream_use_marks(monkeypatch, capturing):
     """Which tensors shared between the main and the side stream get a ``record_stream`` mark.
 
-    The dispatch outputs are marked except during a full-iteration capture, where the allocator
-    would hold every marked block until the capture ends. The combine input is never marked:
-    in every mode a reference keeps it alive until the side stream has been joined, which
-    protects it without making the allocator hold the block past that point."""
+    The dispatch outputs are marked in every mode: they belong to the side stream, whose next
+    dispatch does not wait for the whole main stream. The combine input is never marked: a
+    reference keeps it alive until the side stream has been joined, which protects it without
+    making the allocator hold the block past that point."""
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
     recorded = []
     monkeypatch.setattr(
@@ -820,13 +802,10 @@ def test_overlap_stream_use_marks(monkeypatch, capturing):
     dispatched_probs = torch.ones(8, device="cuda")
     returned = ShortcutMoEBlock._wait_dispatch(block, dispatched_input, dispatched_probs)
     assert returned[0] is dispatched_input and returned[1] is dispatched_probs
-    if capturing:
-        assert not recorded
-    else:
-        assert [(t is dispatched_input or t is dispatched_probs, s) for t, s in recorded] == [
-            (True, main_stream),
-            (True, main_stream),
-        ]
+    assert [(t is dispatched_input or t is dispatched_probs, s) for t, s in recorded] == [
+        (True, main_stream),
+        (True, main_stream),
+    ]
 
     recorded.clear()
     expert_output = torch.ones(8, device="cuda")
