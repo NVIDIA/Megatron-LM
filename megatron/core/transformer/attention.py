@@ -11,6 +11,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.datasets.shared_prefix.layout import SharedPrefixPack
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
@@ -29,7 +30,6 @@ from megatron.core.process_groups_config import (
     ProcessGroupCollection,
     warn_global_process_group_fallback,
 )
-from megatron.core.shared_prefix_layout import SharedPrefixForestLayout
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
@@ -1427,7 +1427,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_sequence_cp_metadata=None,
-        shared_prefix_forest: Optional[SharedPrefixForestLayout] = None,
+        shared_prefix_forest: Optional[SharedPrefixPack] = None,
     ) -> Tensor:
         """
         Run the QKV input projection and core attention, stopping before linear_proj.
@@ -1448,8 +1448,9 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             packed_seq_params (Optional[PackedSeqparams]): Parameters used for THD format.
             sequence_len_offset (Optional[int]): Sequence length offset used for
                 inference CUDA graphs.
-            shared_prefix_forest (Optional[SharedPrefixForestLayout]): Shared-prefix forest
-                stored in this single packed sequence. When set, the exact shared-prefix forest
+            shared_prefix_forest (Optional[SharedPrefixPack]): The pack stored in this single
+                packed sequence. A pack is several trees, and a tree is one prompt with its
+                completions. When set, the exact shared-prefix forest
                 attention replaces core attention; the caller first checks the layer with
                 ``shared_prefix_attention.validate_shared_prefix_attention``.
 
