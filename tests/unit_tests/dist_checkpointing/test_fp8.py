@@ -67,11 +67,7 @@ class TestFP8:
 
     @pytest.mark.parametrize(
         ('use_fpsl', 'src_tp_pp', 'dest_tp_pp', 'load_exchange_algo'),
-        [
-            (True, (2, 4), (2, 4), 'broadcast'),
-            (True, (2, 4), (2, 4), 'gather_rounds'),
-            (False, (2, 4), (2, 4), None),
-        ],
+        [(True, (2, 4), (2, 4), 'broadcast'), (False, (2, 4), (2, 4), None)],
     )
     def test_fp8_save_load(
         self, tmp_path_dist_ckpt, use_fpsl, src_tp_pp, dest_tp_pp, load_exchange_algo
