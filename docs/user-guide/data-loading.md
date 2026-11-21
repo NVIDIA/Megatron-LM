@@ -114,6 +114,32 @@ Four-GPU topology variants of the command above are TP2×CP2 (add
 not four. Confirm that the workload actually triggers VPP alignment; requesting
 VPP alone does not prove that microbatches were split.
 
+### Revalidation on dev `6559f64c2` (2026-11-21)
+
+The metrics source at `e3311dba7` was rebased onto upstream dev `6559f64c2`,
+preserving #9585's planner and hybrid metadata preparation. DCP estimates still
+use the final VPP-aligned schedule's padded lengths. The existing FLOPs helper
+continues using real token lengths. Enabling statistics preserves the legacy
+metadata on each TP rank: TP0 keeps its original values and TP peers retain the
+existing FP32 rounding, while new DCP summaries use FP64.
+
+The focused CPU selection passed 21 tests, including a squared-sum regression
+at 16,777,217, actual VPP alignment, weighted windows/reset, rerun, skipped and
+aborted steps, and evaluation exclusion. A four-A6000 BF16 TP2×CP2 pair restored
+the same checkpoint, RNG, seed and aligned data. Five updates matched bitwise in
+final schedules, microbatch counts, legacy FLOPs return values and training
+inputs, losses, gradients and updated parameters. With log interval 2, stdout
+and TensorBoard emitted DCP metrics once at iterations 2, 4 and 6 only when
+enabled; evaluation did not contribute. VPP assembly is unchanged from upstream,
+so PP/VPP real training was not repeated in this rebase.
+
+[November 21 source, logs and replay records](https://github.com/WEIXILIN0307/Megatron-LM/tree/3c658a1cf4d3caa86be93adc4bff2e373670299d/validation/dcp-stats-rebase-20261121)
+retain the regression before the fix, passing CPU tests, training audits,
+checkpoint hashes, environment and exact commands. The acceptance CSV now follows
+the updated mock-dataset contract, which directly specifies content-token lengths;
+no attention compatibility patch was used. No throughput or observation-cost
+benchmark was rerun for this source. Timing results below are historical.
+
 ### Revalidation after updating dev (2026-11-03)
 
 After rebasing on dev `7b66fcc08`, 134 focused tests per rank passed on four
@@ -132,12 +158,12 @@ and stdout/TensorBoard contained no DCP metrics.
 
 This dev baseline already handles aligned eager THD padding metadata. It rejects
 DCP with `--deterministic-mode`, so that flag was omitted; the observed equality
-is not a guarantee of determinism for other runs. The current-source timing and
+is not a guarantee of determinism for other runs. The November 3 timing and
 DP2 logging-window results are recorded below.
 [Rebase records and replay commands](https://github.com/Pinoeer-kingxi/Megatron-LM/tree/evidence/dcp-stats-rebase-20261103/validation/dcp-stats-rebase-20261103)
 retain the source/checkpoint hashes, environment, tests, training logs and audits.
 
-### Current-source timing and DP2 logging windows (2026-11-03)
+### Historical timing and DP2 logging windows on `79bf7b6bc` (2026-11-03)
 
 The same runtime source (`79bf7b6bc` on dev `7b66fcc08`) also passed a
 four-GPU DP2×CP2 off/on comparison with TP1/PP1. This topology has **four DP×CP
@@ -151,7 +177,7 @@ reset, and the final partial window was not emitted. The existing first-iteratio
 stdout report at resumed iteration 2 did not reset the window or add a TensorBoard
 event. The focused four-rank regression again passed 134 tests per rank.
 
-The current-source benchmark used two A6000 GPUs, the existing training interval
+The benchmark on `79bf7b6bc` used two A6000 GPUs, the existing training interval
 timer, stdout/TensorBoard at interval 1, and 2,560 effective tokens per update.
 Each arm restored the same checkpoint and ran 100 updates, discarding ten warmups.
 Three repetitions rotated the fixed-CP/DCP-off/DCP-on order. Correctness hashing
@@ -170,12 +196,11 @@ diagnostics measured statistics at 40–41 µs/step and accumulator updates at
 13 µs/step; those runs are excluded from the benchmark. Disabled diagnostic runs
 made no statistics or accumulator-update calls.
 
-[Current-source benchmark and DP2 replay records](https://github.com/WEIXILIN0307/Megatron-LM/tree/c9ccb11527135f1ee6351e84447cecd1f64ea855/validation/dcp-stats-acceptance-20261103)
+[November 3 benchmark and DP2 replay records](https://github.com/WEIXILIN0307/Megatron-LM/tree/c9ccb11527135f1ee6351e84447cecd1f64ea855/validation/dcp-stats-acceptance-20261103)
 include commands, environment/source/checkpoint hashes, raw logs and TensorBoard
 events, independent verifiers, GPU telemetry and a SHA256 manifest. They also
 retain the invalid initial checkpoint-mount attempts, explicitly excluded from
-all reported results. The later publication changes documentation only; the
-runtime code is the tested source above. A repository functional-test recipe and
+all reported results. The November 3 documentation publication changed no runtime code. A repository functional-test recipe and
 upstream CI remain separate from these manual acceptance runs.
 
 ### Historical A6000 acceptance (2026-10-22)
