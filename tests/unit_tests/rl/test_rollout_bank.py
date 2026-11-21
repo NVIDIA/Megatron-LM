@@ -242,6 +242,36 @@ def test_checkpoint_compacts_at_consumption_boundary(tmp_path, consumed_offset, 
         }
 
 
+def test_groups_collected_after_rollback_keep_unique_uids(tmp_path):
+    """Groups collected after a rollback must not reuse a recovered survivor's uid.
+
+    Recovery rewrites survivors into the checkpoint's segment under their original
+    uids. A reused uid shares the survivor's consumption marker, so the next
+    compaction would drop the fresh group while it is still queued.
+    """
+    bank = RolloutBank(str(tmp_path))
+    bank.set_collection(4)
+    trained = bank.append(_token_group())
+    bank.mark_consumed(trained, 5)
+    bank.set_collection(5)
+    queued = bank.append(_token_group())
+    bank.close()
+
+    restarted = RolloutBank(str(tmp_path))
+    survivors = restarted.recover(4)
+    assert {group.uid for group in survivors} == {trained, queued}
+    restarted.set_collection(4)
+    restarted.mark_consumed_many([group.uid for group in survivors], 5)
+    restarted.set_collection(5)
+    fresh = restarted.append(_token_group())
+    assert fresh not in {trained, queued}
+
+    # The fresh group is still queued at the next checkpoint, so it must survive it.
+    restarted.checkpoint(5)
+    restarted.close()
+    assert [group.uid for group in RolloutBank(str(tmp_path)).recover(5)] == [fresh]
+
+
 def _env_group(env_id, problem_id):
     return RolloutGroup(
         rollouts=[Rollout(trajectory=["cached"], reward=1.0, env_id=env_id, problem_id=problem_id)]

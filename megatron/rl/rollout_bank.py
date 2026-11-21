@@ -355,7 +355,7 @@ class RolloutBank:
             if segment_created:
                 _fsync_directory(generation_dir)
             self._truncate_torn_ledger_tail(self._seg_dir)
-            self._seq = self._next_sequence(self._seg_dir, seg)
+            self._seq = self._next_sequence(generation_dir, manifest["segments"], seg)
             self._tok_off = self._file_size(_TOKENS_BIN)
             self._lp_off = self._file_size(_LOGPROBS_BIN)
             self._mask_off = self._file_size(_MASKS_BIN)
@@ -367,13 +367,20 @@ class RolloutBank:
                 self._bytes_written += self._segment_sidecar_bytes(self._seg_dir)
                 self._maybe_warn_over_cap()
 
-    def _next_sequence(self, seg_dir: str, seg: str) -> int:
-        """Return the next unused sequence number in ``seg``."""
+    def _next_sequence(self, generation_dir: str, segments: list[str], seg: str) -> int:
+        """Return the next unused sequence number for uids of ``seg``.
+
+        Compaction and recovery rewrite surviving groups into the checkpoint's
+        segment under their original uids, so uids of ``seg`` can live in any
+        segment of the generation. Scan them all, or a group collected after a
+        rollback would reuse a survivor's uid and share its consumption marker.
+        """
         next_seq = 0
-        for record in self._read_ledger(seg_dir):
-            uid_seg, separator, uid_seq = record.get("uid", "").partition("/")
-            if separator and uid_seg == seg and uid_seq.isdigit():
-                next_seq = max(next_seq, int(uid_seq) + 1)
+        for name in {*segments, seg}:
+            for record in self._read_ledger(os.path.join(generation_dir, name)):
+                uid_seg, separator, uid_seq = record.get("uid", "").partition("/")
+                if separator and uid_seg == seg and uid_seq.isdigit():
+                    next_seq = max(next_seq, int(uid_seq) + 1)
         return next_seq
 
     def _truncate_torn_ledger_tail(self, seg_dir: str) -> None:
