@@ -150,6 +150,15 @@ async def test_inference_client_connect_handshake_rejects_unexpected_reply():
         client._connect_with_inference_coordinator()
 
 
+async def test_stopped_client_cannot_confirm_source_safety():
+    """stop() clears local bookkeeping, which must not read as a remote acknowledgement."""
+    client, _, _ = _make_client()
+    stream = client.add_request_with_kv_handoff_streaming([1, 2], SamplingParams(), {}, [10])
+    client.stop()
+    with pytest.raises(RuntimeError, match="stopped before source safety"):
+        client.abort_request_and_wait(stream.request_id)
+
+
 async def test_add_request_with_kv_handoff_returns_future():
     """Non-streaming handoffs use the normal final-reply future path."""
     client, _, fake_socket = _make_client()
