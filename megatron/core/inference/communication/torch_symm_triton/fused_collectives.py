@@ -152,7 +152,7 @@ def _multimem_reduce_scatter_residual_add_kernel(
         for thread_offset in range(0, numel_per_token, BLOCK_SIZE):
             offsets = program_offset + thread_offset + tid
 
-            # BLOCK_SIZE is sized from the whole per-rank shard, capped at 1024.
+            # BLOCK_SIZE is one token's row rounded up to a power of 2, capped at 1024.
             #   if BLOCK_SIZE > numel_per_token -   deactivates the extra threads.
             #   if BLOCK_SIZE < numel_per_token -   deactivates threads of the last window
             #                                       [thread_offset, thread_offset + BLOCK_SIZE)
@@ -254,28 +254,25 @@ def fused_multimem_rs_add_norm_ag(
         input_tensor.numel() % numel_per_thread == 0
     ), "The number of elements must be 128-bit aligned."
 
-    num_threads = triton.cdiv(input_tensor.numel() // numel_per_thread, symm_mem_hdl.world_size)
+    hsize = input_tensor.size(-1)
+    num_tokens = input_tensor.numel() // hsize
 
-    if num_threads < MAX_BLOCK_SIZE:
-        block_size = 1
-        while block_size < num_threads:
-            block_size *= 2
-        num_warps = block_size // WARP_SIZE
-        num_blocks = 1
-    else:
-        block_size = MAX_BLOCK_SIZE
-        num_warps = MAX_BLOCK_SIZE // WARP_SIZE
-        num_blocks = min(triton.cdiv(num_threads, MAX_BLOCK_SIZE), MAX_NUM_BLOCKS)
+    # One token per block, as in the variable-count collectives: each block processes its
+    # tokens one after another, so sizing blocks from the whole shard would run several
+    # tokens in series with most threads idle.
+    numel_per_token = triton.cdiv(hsize, numel_per_thread)
+    block_size = min(triton.next_power_of_2(numel_per_token), MAX_BLOCK_SIZE)
+    num_warps = max(1, block_size // WARP_SIZE)
+    num_blocks = min(triton.cdiv(num_tokens, symm_mem_hdl.world_size), MAX_NUM_BLOCKS)
     SYMM_MEM_KERNEL_CONFIG.check_num_blocks(num_blocks)
 
-    hsize = input_tensor.size(-1)
     _multimem_reduce_scatter_residual_add_kernel[(num_blocks, 1, 1)](
         residual_output_tensor.data_ptr(),
         residual_input_tensor.data_ptr(),
         rms_norm_weights.data_ptr(),
         symm_mem_hdl.multicast_ptr,
         symm_mem_hdl.signal_pad_ptrs_dev,
-        input_tensor.numel() // hsize,
+        num_tokens,
         eps=eps,
         HIDDEN_SIZE=hsize,
         BLOCK_SIZE=block_size,
