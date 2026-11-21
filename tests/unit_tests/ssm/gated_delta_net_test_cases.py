@@ -354,6 +354,39 @@ class GatedDeltaNetModuleTestCases(GatedDeltaNetTestBase):
             assert gdn.A_log.shape == (gdn.num_value_heads // self.tp_size,)
             assert gdn.dt_bias.shape == (gdn.num_value_heads // self.tp_size,)
 
+    def test_in_proj_separate_grad_norm_tagging(self):
+        if self.tp_size != 1 or self.cp_size != 1 or self.sp_size != 1:
+            pytest.skip("Tagging is independent of parallel layout; cover the single-rank case.")
+
+        assert all(
+            getattr(param, "grad_norm_group", None) is None
+            for param in self.gdn.in_proj.parameters()
+        )
+
+        config = copy.deepcopy(self.transformer_config)
+        config.gated_delta_net_separate_grad_norm = True
+        spec = get_experimental_attention_variant_module_spec(config=config)
+        pg_collection = ProcessGroupCollection(
+            tp=parallel_state.get_tensor_model_parallel_group(),
+            cp=parallel_state.get_context_parallel_group(),
+        )
+        gdn = spec.module(
+            config,
+            submodules=spec.submodules,
+            layer_number=1,
+            bias=False,
+            conv_bias=False,
+            conv_init=1.0,
+            use_qk_l2norm=True,
+            A_init_range=(1, 16),
+            pg_collection=pg_collection,
+        )
+
+        assert all(
+            getattr(param, "grad_norm_group", None) == 'gated_delta_net'
+            for param in gdn.in_proj.parameters()
+        )
+
     def test_out_norm_params_marked_for_tp_grad_sum(self):
         # out_norm's parameters are shared by every value head, but TP splits the heads,
         # so each rank's gradient for them is only a partial sum. They must be tagged so

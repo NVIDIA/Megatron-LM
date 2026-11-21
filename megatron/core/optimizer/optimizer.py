@@ -270,8 +270,9 @@ def find_saved_param_group(identifier: tuple, saved_groups: Dict[tuple, Dict]) -
 
 
 MTP_GRAD_NORM_GROUP = 'mtp'
+GDN_GRAD_NORM_GROUP = 'gated_delta_net'
 GRAD_NORM_GROUP_ATTR = 'grad_norm_group'
-SEPARATE_GRAD_NORM_GROUPS = (MTP_GRAD_NORM_GROUP,)
+SEPARATE_GRAD_NORM_GROUPS = (MTP_GRAD_NORM_GROUP, GDN_GRAD_NORM_GROUP)
 
 
 def _get_param_grad_norm_group(param: torch.nn.Parameter) -> Optional[str]:
