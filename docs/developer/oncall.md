@@ -79,3 +79,39 @@ iteration time, or memory usage. Even improvements will cause CI to fail!
   - Find link in #megatron-core-pipeline-alerts-main channel description
   - You will need to join the `nemo-fw-eng` DL
 - Setup the GitLab MCP server with Codex
+
+### GitLab non-test failure alerts
+
+Scheduled root pipelines run `health:non_test_failures` in `.post`, even after
+earlier failures. It reports failed jobs in every stage except `test`,
+`integration_tests`, and `functional_tests`. Build jobs named `test:*` are included
+because selection uses their stage. Failed non-test trigger jobs are included;
+test child pipelines are not traversed.
+
+The observer uses the latest job attempts, including `allow_failure` jobs.
+Successful retries, absent stages, skipped, canceled, and unstarted manual jobs
+do not alert. Cerno consolidates failures into one Slack message with pipeline
+and job links, sent to channel `C074W9J7S0N` with group `S06GU680R3N` mentioned.
+Routing is configured in [`.gitlab/cerno-health.yml`](../../.gitlab/cerno-health.yml),
+independently of test summaries and Linear reconciliation. No DMs are enabled.
+
+The job installs pinned Cerno in an independent Python image. It has no `needs`
+or artifact dependencies, so it can run when the pipeline's utility image fails
+to build. `PAT` authenticates the Cerno install, `PROJECT_ACCESS_TOKEN_MCORE`
+provides read access to pipeline metadata, and `ALERTMANAGER_TOKEN` must have
+access to the Slack channel. Secret values remain in CI variables.
+
+Inspect the job's `pipeline_health.json` artifact for failures and delivery
+receipts. API and delivery errors produce a nonzero observer exit; the observer
+has `allow_failure: true` and does not change the pipeline gate. A completely
+canceled or stuck pipeline, or an observer that cannot start, needs an external
+watchdog. Retrying the observer sends another snapshot of current failures.
+
+To preview a pipeline without sending Slack messages, use the same Cerno revision
+as [the observer](../../.gitlab/stages/07.health.yml) and set `RO_API_TOKEN` to a
+read-capable GitLab token:
+
+```bash
+python tests/test_utils/python_scripts/notify_ci_failures.py \
+  --pipeline-id <pipeline-id> --config .gitlab/cerno-health.yml --dry-run
+```
