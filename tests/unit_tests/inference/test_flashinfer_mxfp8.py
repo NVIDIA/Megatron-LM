@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
 from types import SimpleNamespace
 
 import pytest
@@ -293,6 +294,80 @@ def test_flashinfer_clamped_relu2_rejects_unsupported_options(overrides, message
     kwargs.update(overrides)
     with pytest.raises(ValueError, match=message):
         _make_bounded_mxfp8_config(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("parallel", "moe_ffn_hidden_size", "shard"),
+    [
+        # Expert TP defaults to TP.
+        ({"tensor_model_parallel_size": 2, "expert_tensor_parallel_size": None}, 1920, 960),
+        ({"expert_tensor_parallel_size": 2}, 1920, 960),
+        ({"expert_tensor_parallel_size": 4}, 384, 96),
+    ],
+)
+def test_flashinfer_cutlass_mxfp8_rejects_unaligned_expert_tp_shards(
+    parallel, moe_ffn_hidden_size, shard
+):
+    """A 128-aligned FFN whose expert-TP shards are not is rejected when configured, rather than
+    when the first forward packs the shard's CUTLASS MXFP8 weights."""
+    assert moe_ffn_hidden_size % 128 == 0 and shard % 128
+    with pytest.raises(ValueError, match="per-rank FFN dimensions divisible by 128"):
+        _make_bounded_mxfp8_config(
+            **parallel,
+            moe_ffn_hidden_size=moe_ffn_hidden_size,
+            activation_func_tanh_clamp_scale=16.0,
+            inference_flashinfer_mxfp8_token_capacity=None,
+        )
+
+
+@pytest.mark.parametrize("expert_tensor_parallel_size", [1, 2])
+def test_flashinfer_cutlass_mxfp8_accepts_aligned_expert_tp_shards(
+    monkeypatch, expert_tensor_parallel_size
+):
+    """Each expert-TP rank's FC1 [E, F/ETP, H] and FC2 [E, H, F/ETP] shards pack."""
+    monkeypatch.setattr(flashinfer_mxfp8_module, "HAVE_FLASHINFER_CUTLASS_MXFP8", True)
+    config = _make_bounded_mxfp8_config(
+        expert_tensor_parallel_size=expert_tensor_parallel_size,
+        moe_ffn_hidden_size=256,
+        activation_func_tanh_clamp_scale=16.0,
+        inference_flashinfer_mxfp8_token_capacity=None,
+    )
+    shard = config.moe_ffn_hidden_size // config.expert_tensor_parallel_size
+    for rows, cols in ((shard, config.hidden_size), (config.hidden_size, shard)):
+        weight = MXFP8Tensor(
+            data=torch.zeros(2, rows, cols, dtype=torch.float8_e4m3fn),
+            scale=torch.full((2, rows * cols // 32), 127, dtype=torch.uint8).view(
+                torch.float8_e8m0fnu
+            ),
+            backend="triton",
+        )
+        assert prepare_cutlass_mxfp8_weights(weight).logical_rows == rows
+
+
+def test_flashinfer_cutlass_mxfp8_experts_reject_a_resharded_config(monkeypatch):
+    """RL builds its inference model from a copy of the training config whose expert TP it changes
+    after validation. The experts check the shard they are built with, before any forward."""
+    from megatron.core.transformer.moe import experts as experts_module
+
+    config = _make_bounded_mxfp8_config(
+        moe_ffn_hidden_size=1920,
+        activation_func_tanh_clamp_scale=16.0,
+        inference_flashinfer_mxfp8_token_capacity=None,
+    )
+    inference_config = copy.deepcopy(config)
+    inference_config.expert_tensor_parallel_size = 2
+    monkeypatch.setattr(
+        experts_module.TEGroupedMLP,
+        "__init__",
+        lambda self, *args, **kwargs: torch.nn.Module.__init__(self),
+    )
+
+    with pytest.raises(ValueError, match="per-rank FFN dimensions divisible by 128"):
+        experts_module.InferenceGroupedMLP(
+            num_local_experts=1, config=inference_config, submodules=None
+        )
+    # The training layout's 1920-wide shard is aligned.
+    config.validate_flashinfer_cutlass_mxfp8_expert_shapes()
 
 
 def test_flashinfer_clamp_limit_remains_fp32_after_module_conversion():
