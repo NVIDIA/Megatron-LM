@@ -45,23 +45,33 @@ class EngineEventReporter:
     def _run(self) -> None:
         context = None
         socket = None
+        # `start()` takes the readiness item, so the queue's emptiness cannot tell a
+        # startup failure from a later one.
+        started = False
         try:
             context = zmq.Context()
             socket = context.socket(zmq.PUSH)
             socket.setsockopt(zmq.LINGER, 0)
             socket.connect(self.parent_address)
             self._ready.put(True)
+            started = True
             while True:
                 event = self._events.get()
                 if event is None:
                     break
                 kind, payload = event
-                socket.send(msgpack.packb([kind, payload], use_bin_type=True))
+                try:
+                    frame = msgpack.packb([kind, payload], use_bin_type=True)
+                except Exception:
+                    # One event the parent cannot receive must not silence later ones.
+                    logging.exception("Dropping engine event %r that cannot be serialized", kind)
+                    continue
+                socket.send(frame)
         except Exception as exc:
-            if self._ready.empty():
-                self._ready.put(exc)
-            else:
+            if started:
                 logging.exception("Engine event reporter failed")
+            else:
+                self._ready.put(exc)
         finally:
             if socket is not None:
                 socket.close()
@@ -106,6 +116,9 @@ class EngineEventReceiver:
     def _run(self) -> None:
         context = None
         socket = None
+        # `start()` takes the readiness item, so the queue's emptiness cannot tell a
+        # startup failure from a later one.
+        started = False
         try:
             context = zmq.Context()
             socket = context.socket(zmq.PULL)
@@ -116,17 +129,28 @@ class EngineEventReceiver:
             else:
                 socket.bind(f"tcp://{self.bind_host}:{self.bind_port}")
             self._ready.put(socket.getsockopt_string(zmq.LAST_ENDPOINT))
+            started = True
             while not self._stop.is_set():
                 try:
-                    kind, payload = msgpack.unpackb(socket.recv(), raw=False)
+                    frame = socket.recv()
                 except zmq.Again:
                     continue
-                self.callback(str(kind), payload)
+                # A malformed message, or a failure handling one, must not stop the
+                # readiness, KV and progress events that follow it.
+                try:
+                    kind, payload = msgpack.unpackb(frame, raw=False)
+                except Exception:
+                    logging.exception("Ignoring a malformed engine event")
+                    continue
+                try:
+                    self.callback(str(kind), payload)
+                except Exception:
+                    logging.exception("Failed to handle engine event %r", kind)
         except Exception as exc:
-            if self._ready.empty():
-                self._ready.put(exc)
-            else:
+            if started:
                 logging.exception("Engine event receiver failed")
+            else:
+                self._ready.put(exc)
         finally:
             if socket is not None:
                 socket.close()
