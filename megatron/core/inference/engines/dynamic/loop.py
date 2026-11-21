@@ -578,15 +578,19 @@ class EngineLoopMixin:
         frameworks like pytriton).
         """
         try:
-            # Check if there's already a running event loop
-            asyncio.get_running_loop()
-            # We're inside a running loop - run in a separate thread
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(asyncio.run, coro)
-                return future.result()
+            running_loop = asyncio.get_running_loop()
         except RuntimeError:
-            # No running loop - safe to use run_until_complete
+            running_loop = None
+        # Run the coroutine outside the exception handler, so its own errors propagate
+        # unchained and a RuntimeError it raises is not mistaken for a missing loop.
+        if running_loop is None:
+            # No running loop - safe to use run_until_complete.
             return self._loop.run_until_complete(coro)
+
+        # We're inside a running loop - run in a separate thread.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(asyncio.run, coro)
+            return future.result()
 
     def step_modern(self) -> DynamicInferenceEngineStepResult:
         """Synchronous wrapper for `self.async_step`."""
