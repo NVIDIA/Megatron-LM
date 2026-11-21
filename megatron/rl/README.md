@@ -58,7 +58,7 @@ Off-policy generation requires `--rl-partial-rollouts`. The lag itself is set wi
 ```
 
 Useful values:
-- `L = -1`: the minimum — a single unit of generation work in flight at a time (effectively serial, mostly useful for testing; only distinguishable from `L = 0` at submission granularity `G` or `R`, see below).
+- `L = -1`: the minimum — a single unit of generation work in flight at a time (effectively serial, mostly useful for testing; only distinguishable from `L = 0` at submission granularity `R`, since `B` and `G` submission keep a whole batch in flight, see below).
 - `L = 0`: fill exactly one training step's worth of generation capacity. The inference engine is never ahead of the trainer.
 - `L = 1, 2, …`: the engine runs this many steps ahead. Higher L = more throughput, more staleness. Fractional values are allowed.
 
@@ -101,11 +101,11 @@ Rules of thumb:
 Under the hood, the lag controls how many submission units ("tasks") are in flight simultaneously:
 
 ```
-tasks              = max(1, round((L + 1) * P * G / unit))   # in-flight units of generation work
-rollouts_in_flight = tasks * unit                             # total concurrent inference requests
+tasks              = max(min_tasks, round((L + 1) * P * G / unit))   # in-flight units of generation work
+rollouts_in_flight = tasks * unit                                     # total concurrent inference requests
 ```
 
-where `unit` is the number of rollouts per submission unit (`P * G` for `B`, `G` for `G`, `1` for `R`). You generally don't need to think about this — pick an `L` (or let autotune pick one), or set `--rl-max-inflight-requests` to cap the total in-flight rollout requests directly (`(L + 1) * P * G`; mutually exclusive with `--rl-generation-lag`) — then check the gate capacity in the startup log to confirm the resulting task count is what you expected.
+where `unit` is the number of rollouts per submission unit (`P * G` for `B`, `G` for `G`, `1` for `R`), and `min_tasks` is one batch of units for `B` and `G` (`1` and `P`) and `1` for `R`: `B` and `G` slots return only when the trainer consumes a banked batch, so fewer than a batch of them could never bank one. You generally don't need to think about this — pick an `L` (or let autotune pick one), or set `--rl-max-inflight-requests` to cap the total in-flight rollout requests directly (`(L + 1) * P * G`; mutually exclusive with `--rl-generation-lag`; a cap below one batch holds only with `R` submission) — then check the gate capacity in the startup log to confirm the resulting task count is what you expected.
 
 ## Examples
 See `examples/rl` for demonstrations of:

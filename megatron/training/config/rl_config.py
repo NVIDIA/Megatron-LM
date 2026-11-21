@@ -37,16 +37,18 @@ class RLConfig:
     rl_generation_lag: float | None = None
     """Number of trainer batches of rollout generation lag to allow. The number of in-flight trainer
     batches is this value plus one. May be fractional or negative; the minimum of -1 keeps a single
-    unit of generation work in flight. If omitted, the lag is autotuned to the inference engine's
-    request capacity when rl_partial_rollouts is set, and is 0 otherwise. Requires
-    rl_partial_rollouts when greater than 0. Mutually exclusive with rl_max_inflight_requests; both
-    are accepted only when they agree, which is the case when a normalized config is reloaded."""
+    unit of generation work in flight, except that group submission keeps a whole batch of groups.
+    If omitted, the lag is autotuned to the inference engine's request capacity when
+    rl_partial_rollouts is set, and is 0 otherwise. Requires rl_partial_rollouts when greater
+    than 0. Mutually exclusive with rl_max_inflight_requests; both are accepted only when they
+    agree, which is the case when a normalized config is reloaded."""
 
     rl_max_inflight_requests: int | None = None
     """Maximum number of inference requests RL generation may keep in flight: equivalent to
     (rl_generation_lag + 1) training batches of grpo_prompts_per_step * grpo_group_size requests
     each. Requires rl_partial_rollouts when above one training batch; mutually exclusive with
-    rl_generation_lag."""
+    rl_generation_lag. Batch and group submission keep at least one training batch in flight, so a
+    cap below one batch holds only with rollout submission."""
 
     rl_submission_granularity: SubmissionGranularity = "B"
     """Granularity for submitting rollout generation work. R submits individual rollouts
