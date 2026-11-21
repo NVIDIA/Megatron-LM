@@ -8,7 +8,11 @@ import torch
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
-from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
+from megatron.training.models.hybrid import (
+    HybridModelBuilder,
+    HybridModelConfig,
+    resolve_hybrid_stack_spec,
+)
 from megatron.training.models.transforms import ModelTransformConfig
 
 # ---------------------------------------------------------------------------
@@ -26,6 +30,19 @@ def _make_hybrid_config(**kwargs):
     defaults = dict(transformer=_make_transformer(), vocab_size=32000)
     defaults.update(kwargs)
     return HybridModelConfig(**defaults)
+
+
+@pytest.mark.parametrize(
+    "modelopt",
+    [{"transformations": ModelTransformConfig()}, {"restore_modelopt_state": True}],
+    ids=["transformations", "restore_modelopt_state"],
+)
+def test_liger_rejects_modelopt_hybrid_specs(modelopt):
+    transformer = _make_transformer(
+        rmsnorm_impl="liger", normalization="RMSNorm", transformer_impl="transformer_engine"
+    )
+    with pytest.raises(ValueError, match="rmsnorm_impl='liger' is not supported by ModelOpt"):
+        resolve_hybrid_stack_spec(_make_hybrid_config(transformer=transformer, **modelopt))
 
 
 # =============================================================================

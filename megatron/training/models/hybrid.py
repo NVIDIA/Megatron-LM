@@ -146,6 +146,9 @@ def resolve_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:
     """Return the configured stack spec, or the default one for the transformer config."""
     if model_config.hybrid_stack_spec is not None:
         return model_config.hybrid_stack_spec
+    modelopt = model_config.transformations is not None or model_config.restore_modelopt_state
+    if model_config.transformer.rmsnorm_impl != "native" and modelopt:
+        raise ValueError("rmsnorm_impl='liger' is not supported by ModelOpt Hybrid specs.")
     use_wide_residual = model_config.transformer.wide_residual is not None
     if model_config.transformations is not None:
         _check_modelopt_spec_supported(use_wide_residual)

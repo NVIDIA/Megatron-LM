@@ -848,6 +848,15 @@ class TransformerConfig(ModelParallelConfig):
     use_kitchen: bool = False
     """Use the kitchen extension for transformer quantization."""
 
+    rmsnorm_impl: Literal["native", "liger"] = "native"
+    """Kernel for the RMSNorm modules built by `TENorm`. HybridModel only; GPTModel rejects it.
+
+    "liger" uses Liger-Kernel for every such RMSNorm (layer, QK, final and MTP norms); norms
+    fused into a Transformer Engine linear and Mamba's gated norm are unchanged. It is not a
+    speedup: Liger is usually slower than the native norms. Requires `normalization="RMSNorm"`
+    and `transformer_impl="transformer_engine"`; see `__post_init__` for the other restrictions.
+    """
+
     use_kitchen_attention: bool = False
     """Use the kitchen extension for attention (instead of TE's attention)."""
 
@@ -1906,6 +1915,25 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+        if self.rmsnorm_impl not in ("native", "liger"):
+            raise ValueError(
+                f"rmsnorm_impl must be 'native' or 'liger', not {self.rmsnorm_impl!r}."
+            )
+        for unsupported, requirement in (
+            (self.normalization != "RMSNorm", "normalization='RMSNorm'"),
+            (
+                self.transformer_impl != "transformer_engine",
+                "transformer_impl='transformer_engine'",
+            ),
+            (
+                self.fused_residual_rmsnorm,
+                "fused_residual_rmsnorm=False (Liger has no residual fusion)",
+            ),
+            (self.use_kitchen, "use_kitchen=False"),
+            (self.experimental_attention_variant is not None, "no experimental_attention_variant"),
+        ):
+            if self.rmsnorm_impl == "liger" and unsupported:
+                raise ValueError(f"rmsnorm_impl='liger' requires {requirement}.")
         self._validate_cp_layouts()
 
         for name in ("mtp_ce_loss_weight", "mtp_kl_loss_weight"):
