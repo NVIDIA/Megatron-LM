@@ -382,27 +382,6 @@ class ShortcutMoEBlock(MegatronModule):
             )
         return output[0] if isinstance(output, tuple) else output
 
-    def _skip_dispatch_output_marks(self) -> bool:
-        """True while a full-iteration CUDA graph is being captured.
-
-        ``record_stream`` tells the allocator that a tensor is used on a second stream, so its
-        memory is not reused before that stream is done. During a capture the allocator cannot
-        check, and it holds every such block until the capture ends. The dispatch outputs of all
-        MoE layers then stay reserved in the graph's pool at once, so the marks are left out
-        there.
-
-        They stay everywhere else. A dispatch output is allocated on the side stream and read on
-        the main stream, and the side stream starts the next dispatch after waiting only for
-        that layer's route_ready_event, not for the whole main stream. Without the mark, reuse
-        is safe only as long as nothing on the main stream reads an earlier dispatch output
-        after that event, which holds for the buffer lifetimes of today's schedule but is not
-        enforced here. The mark makes it hold regardless.
-        """
-        return (
-            self.config.cuda_graph_impl == "full_iteration"
-            and torch.cuda.is_current_stream_capturing()
-        )
-
     def _launch_dispatch(
         self, hidden_states: torch.Tensor, probs: torch.Tensor, async_op: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -426,9 +405,16 @@ class ShortcutMoEBlock(MegatronModule):
         assert self.overlap_mode
 
         torch.cuda.current_stream().wait_stream(self._get_a2a_overlap_stream())
-        if not self._skip_dispatch_output_marks():
-            dispatched_input.record_stream(torch.cuda.current_stream())
-            dispatched_probs.record_stream(torch.cuda.current_stream())
+        # The dispatch outputs are allocated on the side stream and read on the main stream,
+        # and the side stream starts the next dispatch after waiting only for that layer's
+        # route_ready_event, not for the whole main stream. The join above therefore does not
+        # order a later reuse of this memory after the main stream's reads; the mark does.
+        # During a full-iteration CUDA graph capture the allocator holds marked blocks until
+        # the capture ends unless it runs with graph_capture_record_stream_reuse:True
+        # (PYTORCH_CUDA_ALLOC_CONF), which that mode needs anyway for the marks autograd adds
+        # in the backward pass.
+        dispatched_input.record_stream(torch.cuda.current_stream())
+        dispatched_probs.record_stream(torch.cuda.current_stream())
         return dispatched_input, dispatched_probs
 
     def _dispatch_and_compute_routed_experts(
