@@ -604,6 +604,34 @@ class TestTEWrappers:
             module, (x,), replays=3, contention=True, what="TERowParallelLinear"
         )
 
+    @pytest.mark.parametrize(
+        "layer_name", ["TEColumnParallelLinear", "TELayerNormColumnParallelLinear"]
+    )
+    def test_unsupported_buffer_name_disables_tp_comm_overlap_for_that_layer_only(self, layer_name):
+        """A layer whose userbuffer name TE does not know must not change overlap elsewhere."""
+        config = _config(tp_comm_overlap=True)
+
+        def build(tp_comm_buffer_name: str) -> torch.nn.Module:
+            return getattr(te_ext, layer_name)(
+                HIDDEN,
+                FFN,
+                config=config,
+                init_method=init_method_normal(0.02),
+                gather_output=False,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name=tp_comm_buffer_name,
+            )
+
+        with pytest.warns(UserWarning, match="q_up_proj"):
+            unsupported = build("q_up_proj")
+        supported = build("fc1")
+
+        assert config.tp_comm_overlap is True
+        assert unsupported.ub_name is None
+        assert supported.ub_name == "fc1"
+
     @pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
     @pytest.mark.parametrize("zero_centered_gamma", [False, True])
     def test_te_layernorm_column_parallel_linear_replays(self, normalization, zero_centered_gamma):

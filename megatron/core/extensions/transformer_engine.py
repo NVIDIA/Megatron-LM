@@ -563,6 +563,24 @@ def _get_extra_te_kwargs(config: TransformerConfig):
     return extra_transformer_engine_kwargs
 
 
+def _use_tp_comm_overlap(config: TransformerConfig, tp_comm_buffer_name: Optional[str]) -> bool:
+    """Return whether a TE linear layer overlaps its TP communication with its GEMM.
+
+    Transformer Engine registers user buffers for a fixed set of names only. A layer with
+    another name runs without overlap. All layers share ``config``, so it is not modified.
+    """
+    if not config.tp_comm_overlap:
+        return False
+    if tp_comm_buffer_name and tp_comm_buffer_name not in ["qkv", "proj", "fc1", "fc2"]:
+        warnings.warn(
+            f"The user buffer name {tp_comm_buffer_name} is not supported in "
+            "Transformer Engine. Disabling TP communication overlap "
+            "for this layer."
+        )
+        return False
+    return True
+
+
 def condition_init_method(config, init_method):
     """Condition TE init_method on config.perform_initialization."""
     return init_method if config.perform_initialization else (lambda w: None)
@@ -1366,20 +1384,10 @@ class TELinear(te.pytorch.Linear):
             else:
                 raise RuntimeError("Only TE with version >=2.3.0 supports delay_wgrad_compute now.")
 
-        if (
-            self.config.tp_comm_overlap
-            and tp_comm_buffer_name
-            and tp_comm_buffer_name not in ["qkv", "proj", "fc1", "fc2"]
-        ):
-            self.config.tp_comm_overlap = False
-            warnings.warn(
-                f"The user buffer name {tp_comm_buffer_name} is not supported in"
-                "Transformer Engine. Disabling TP communication overlap "
-                "for this layer."
-            )
+        tp_comm_overlap = _use_tp_comm_overlap(self.config, tp_comm_buffer_name)
 
         if is_te_min_version("0.8.0"):
-            if self.config.tp_comm_overlap and parallel_mode != "duplicated":
+            if tp_comm_overlap and parallel_mode != "duplicated":
                 if is_te_min_version("1.5.0"):
                     # Use old overlap flags if they were supplied instead
                     extra_kwargs["ub_overlap_ag"] = (
@@ -1647,7 +1655,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             )
 
         if is_te_min_version("0.8.0"):
-            if self.config.tp_comm_overlap:
+            if _use_tp_comm_overlap(self.config, tp_comm_buffer_name):
                 extra_kwargs["ub_bulk_wgrad"] = self.config.tp_comm_bulk_wgrad
                 extra_kwargs["ub_bulk_dgrad"] = self.config.tp_comm_bulk_dgrad
                 if is_te_min_version("1.5.0", check_equality=False):
