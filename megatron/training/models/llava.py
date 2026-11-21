@@ -73,3 +73,19 @@ class LLaVAModelConfig:
 
     tp_comm_overlap_cfg: str | dict[str, Any] | None = None
     """Transformer Engine user-buffer overrides, as a YAML path or dictionary."""
+
+    def validate(self) -> None:
+        """The language execution width is an input of the application, never a data default."""
+        bound = self.transformer.max_seq_length_per_sample
+        if bound is None:
+            raise ValueError(
+                "LLaVA requires transformer.max_seq_length_per_sample, the resolved text + image + "
+                "padding width (--decoder-seq-length or --max-seq-length-per-sample); it is not "
+                "derived from the text-only dataset length"
+            )
+        if (
+            self.position_embedding_type == "learned_absolute"
+            and isinstance(self.seq_length, int)  # None until the CLI's required capacity is read
+            and self.seq_length < bound
+        ):
+            raise ValueError("LLaVA position capacity must cover max_seq_length_per_sample")
