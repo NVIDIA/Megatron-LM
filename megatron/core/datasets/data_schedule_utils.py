@@ -199,18 +199,19 @@ def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.
     original_seq_lens = []
     padded_seq_lens = []
     for sample in batch:
-        for sub_sample in range(sample["cu_seqlens"].shape[0] - 1):
-            sub_sample_dict = {}
-            start_idx = sample["cu_seqlens"][sub_sample]
-            end_idx = sample["cu_seqlens"][sub_sample + 1]
+        # SFTDataset pads cu_seqlens to seq_length + 1 entries, so read them once
+        # instead of indexing the tensor for every entry.
+        cu_seqlens = sample["cu_seqlens"].tolist()
+        for start_idx, end_idx in zip(cu_seqlens[:-1], cu_seqlens[1:]):
             if end_idx - start_idx == 0:
                 continue
+            sub_sample_dict = {}
             for key in ["tokens", "labels", "loss_mask", "position_ids"]:
                 sub_sample_dict[key] = sample[key][start_idx:end_idx]
             # Since sft_dataset.py does not provide cu_seqlens_original,
             # we assume original_seq_len equals padded_seq_len here.
             # Ideally the dataset should define the pre-padding seq_len.
-            seq_len = (end_idx - start_idx).item()
+            seq_len = end_idx - start_idx
             original_seq_lens.append(seq_len)
             padded_seq_lens.append(seq_len)
             batch_unpacked.append(sub_sample_dict)
