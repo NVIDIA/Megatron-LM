@@ -173,8 +173,8 @@ def _conv_silu_project_kernel(
         safe_x_s = tl.minimum(tl.maximum(x_s, 0), seq_len - 1)
         x_ptr = (
             qkvzba_ptr
-            + safe_x_s[:, None] * qkvzba_s_stride
-            + batch_id * qkvzba_b_stride
+            + safe_x_s[:, None].to(tl.int64) * qkvzba_s_stride
+            + batch_id.to(tl.int64) * qkvzba_b_stride
             + chan[None, :] * qkvzba_c_stride
         )
         x_val = tl.load(x_ptr, mask=x_mask[:, None], other=0.0).to(tl.float32)
@@ -184,8 +184,8 @@ def _conv_silu_project_kernel(
             safe_boundary_s = tl.maximum(boundary_s, 0)
             boundary_ptr = (
                 left_boundary_ptr
-                + safe_boundary_s[:, None] * left_boundary_s_stride
-                + batch_id * left_boundary_b_stride
+                + safe_boundary_s[:, None].to(tl.int64) * left_boundary_s_stride
+                + batch_id.to(tl.int64) * left_boundary_b_stride
                 + chan[None, :] * left_boundary_c_stride
             )
             boundary_val = tl.load(boundary_ptr, mask=boundary_mask[:, None], other=0.0).to(
@@ -217,9 +217,9 @@ def _conv_silu_project_kernel(
             )
             silu_save_ptrs = (
                 silu_save_ptr
-                + batch_id * silu_save_b_stride
+                + batch_id.to(tl.int64) * silu_save_b_stride
                 + silu_save_chan[None, :] * silu_save_c_stride
-                + s_offs[:, None] * silu_save_s_stride
+                + s_offs[:, None].to(tl.int64) * silu_save_s_stride
             )
             tl.store(
                 silu_save_ptrs, silu_out.to(silu_save_ptr.dtype.element_ty), mask=s_mask[:, None]
@@ -242,8 +242,8 @@ def _conv_silu_project_kernel(
         write_ptr = (
             out_ptr
             + group_id * out_group_dim_stride
-            + batch_id * out_b_stride
-            + s_offs[:, None] * out_s_stride
+            + batch_id.to(tl.int64) * out_b_stride
+            + s_offs[:, None].to(tl.int64) * out_s_stride
             + v_head * out_h_stride
             + chan_off[None, :]
         )
@@ -358,8 +358,8 @@ def _conv_silu_project_thd_kernel(
         safe_x_s = tl.minimum(tl.maximum(x_s, 0), seq_len - 1)
         x_ptr = (
             qkvzba_ptr
-            + safe_x_s[:, None] * qkvzba_s_stride
-            + batch_id * qkvzba_b_stride
+            + safe_x_s[:, None].to(tl.int64) * qkvzba_s_stride
+            + batch_id.to(tl.int64) * qkvzba_b_stride
             + chan[None, :] * qkvzba_c_stride
         )
         x_val = tl.load(x_ptr, mask=x_mask[:, None], other=0.0).to(tl.float32)
@@ -375,8 +375,8 @@ def _conv_silu_project_thd_kernel(
             safe_boundary_s = tl.maximum(boundary_s, 0)
             boundary_ptr = (
                 left_boundary_ptr
-                + safe_boundary_s[:, None] * left_boundary_s_stride
-                + batch_id * left_boundary_b_stride
+                + safe_boundary_s[:, None].to(tl.int64) * left_boundary_s_stride
+                + batch_id.to(tl.int64) * left_boundary_b_stride
                 + chan[None, :] * left_boundary_c_stride
             )
             boundary_val = tl.load(boundary_ptr, mask=boundary_mask[:, None], other=0.0).to(
@@ -401,9 +401,9 @@ def _conv_silu_project_thd_kernel(
             )
             silu_save_ptrs = (
                 silu_save_ptr
-                + batch_id * silu_save_b_stride
+                + batch_id.to(tl.int64) * silu_save_b_stride
                 + silu_save_chan[None, :] * silu_save_c_stride
-                + s_offs[:, None] * silu_save_s_stride
+                + s_offs[:, None].to(tl.int64) * silu_save_s_stride
             )
             tl.store(
                 silu_save_ptrs, silu_out.to(silu_save_ptr.dtype.element_ty), mask=s_mask[:, None]
@@ -421,8 +421,8 @@ def _conv_silu_project_thd_kernel(
         write_ptr = (
             out_ptr
             + group_id * out_group_dim_stride
-            + batch_id * out_b_stride
-            + s_offs[:, None] * out_s_stride
+            + batch_id.to(tl.int64) * out_b_stride
+            + s_offs[:, None].to(tl.int64) * out_s_stride
             + v_head * out_h_stride
             + chan_off[None, :]
         )
@@ -467,14 +467,14 @@ def _compute_g_and_beta_kernel(
 
     alpha_ptr = (
         qkvzba_ptr
-        + s_offs[:, None] * qkvzba_s_stride
-        + pid_b * qkvzba_b_stride
+        + s_offs[:, None].to(tl.int64) * qkvzba_s_stride
+        + pid_b.to(tl.int64) * qkvzba_b_stride
         + (alpha_channel_offset + h_offs[None, :]) * qkvzba_c_stride
     )
     beta_ptr = (
         qkvzba_ptr
-        + s_offs[:, None] * qkvzba_s_stride
-        + pid_b * qkvzba_b_stride
+        + s_offs[:, None].to(tl.int64) * qkvzba_s_stride
+        + pid_b.to(tl.int64) * qkvzba_b_stride
         + (beta_channel_offset + h_offs[None, :]) * qkvzba_c_stride
     )
 
@@ -490,12 +490,15 @@ def _compute_g_and_beta_kernel(
     beta_sig = tl.sigmoid(beta)
 
     g_ptr = (
-        g_out_ptr + pid_b * g_b_stride + s_offs[:, None] * g_s_stride + h_offs[None, :] * g_h_stride
+        g_out_ptr
+        + pid_b.to(tl.int64) * g_b_stride
+        + s_offs[:, None].to(tl.int64) * g_s_stride
+        + h_offs[None, :] * g_h_stride
     )
     beta_out_ptr_calc = (
         beta_out_ptr
-        + pid_b * beta_b_stride
-        + s_offs[:, None] * beta_s_stride
+        + pid_b.to(tl.int64) * beta_b_stride
+        + s_offs[:, None].to(tl.int64) * beta_s_stride
         + h_offs[None, :] * beta_h_stride
     )
     tl.store(g_ptr, g.to(g_out_ptr.dtype.element_ty), mask=mask)
@@ -571,15 +574,15 @@ def _qk_l2norm_repeat_backward_kernel(
         v_head = head_id * REPEAT + r
         dq_ptrs = (
             dq_ptr
-            + batch_id * dq_b_stride
-            + s_offs[:, None] * dq_s_stride
+            + batch_id.to(tl.int64) * dq_b_stride
+            + s_offs[:, None].to(tl.int64) * dq_s_stride
             + v_head * dq_h_stride
             + chan_off[None, :]
         )
         dk_ptrs = (
             dk_ptr
-            + batch_id * dk_b_stride
-            + s_offs[:, None] * dk_s_stride
+            + batch_id.to(tl.int64) * dk_b_stride
+            + s_offs[:, None].to(tl.int64) * dk_s_stride
             + v_head * dk_h_stride
             + chan_off[None, :]
         )
@@ -588,9 +591,9 @@ def _qk_l2norm_repeat_backward_kernel(
 
     silu_ptrs = (
         silu_bf16_ptr
-        + batch_id * silu_b_stride
+        + batch_id.to(tl.int64) * silu_b_stride
         + chan[None, :] * silu_c_stride
-        + s_offs[:, None] * silu_s_stride
+        + s_offs[:, None].to(tl.int64) * silu_s_stride
     )
     silu_bf16 = tl.load(silu_ptrs, mask=s_mask[:, None], other=0.0).to(tl.float32)
 
@@ -602,9 +605,9 @@ def _qk_l2norm_repeat_backward_kernel(
 
     d_silu_ptrs = (
         d_silu_bf16_ptr
-        + batch_id * d_silu_b_stride
+        + batch_id.to(tl.int64) * d_silu_b_stride
         + chan[None, :] * d_silu_c_stride
-        + s_offs[:, None] * d_silu_s_stride
+        + s_offs[:, None].to(tl.int64) * d_silu_s_stride
     )
     tl.store(d_silu_ptrs, d_silu.to(d_silu_bf16_ptr.dtype.element_ty), mask=s_mask[:, None])
 
@@ -646,8 +649,8 @@ def _v_layout_to_conv_kernel(
     # Read dv at (batch, s, head, chan).
     dv_ptrs = (
         dv_ptr
-        + batch_id * dv_b_stride
-        + s_offs[:, None] * dv_s_stride
+        + batch_id.to(tl.int64) * dv_b_stride
+        + s_offs[:, None].to(tl.int64) * dv_s_stride
         + head_id * dv_h_stride
         + chan_off[None, :]
     )
@@ -657,9 +660,9 @@ def _v_layout_to_conv_kernel(
     d_silu_chan = v_channel_offset + head_id * HEAD_DIM + chan_off
     d_silu_ptrs = (
         d_silu_conv_ptr
-        + batch_id * d_silu_b_stride
+        + batch_id.to(tl.int64) * d_silu_b_stride
         + d_silu_chan[None, :] * d_silu_c_stride
-        + s_offs[:, None] * d_silu_s_stride
+        + s_offs[:, None].to(tl.int64) * d_silu_s_stride
     )
     tl.store(d_silu_ptrs, dv_val, mask=s_mask[:, None])
 
@@ -702,8 +705,8 @@ def _z_layout_to_qkvzba_kernel(
     # Read dgate at (batch, s, head, chan).
     dgate_ptrs = (
         dgate_ptr
-        + batch_id * dgate_b_stride
-        + s_offs[:, None] * dgate_s_stride
+        + batch_id.to(tl.int64) * dgate_b_stride
+        + s_offs[:, None].to(tl.int64) * dgate_s_stride
         + head_id * dgate_h_stride
         + chan_off[None, :]
     )
@@ -713,8 +716,8 @@ def _z_layout_to_qkvzba_kernel(
     d_qkvzba_chan = z_channel_offset + head_id * HEAD_DIM + chan_off
     d_qkvzba_ptrs = (
         d_qkvzba_ptr
-        + s_offs[:, None] * d_qkvzba_s_stride
-        + batch_id * d_qkvzba_b_stride
+        + s_offs[:, None].to(tl.int64) * d_qkvzba_s_stride
+        + batch_id.to(tl.int64) * d_qkvzba_b_stride
         + d_qkvzba_chan[None, :] * d_qkvzba_c_stride
     )
     tl.store(d_qkvzba_ptrs, dgate_val, mask=s_mask[:, None])
@@ -743,8 +746,8 @@ def _load_virtual_conv_input(
     safe_src = tl.minimum(tl.maximum(src, 0), seq_len - 1)
     local_ptr = (
         qkvzba_ptr
-        + safe_src[:, None] * qkvzba_s_stride
-        + batch_id * qkvzba_b_stride
+        + safe_src[:, None].to(tl.int64) * qkvzba_s_stride
+        + batch_id.to(tl.int64) * qkvzba_b_stride
         + chan[None, :] * qkvzba_c_stride
     )
     local_val = tl.load(local_ptr, mask=local_mask[:, None] & chan_mask[None, :], other=0.0).to(
@@ -756,8 +759,8 @@ def _load_virtual_conv_input(
         safe_boundary_s = tl.maximum(boundary_s, 0)
         boundary_ptr = (
             left_boundary_ptr
-            + safe_boundary_s[:, None] * left_boundary_s_stride
-            + batch_id * left_boundary_b_stride
+            + safe_boundary_s[:, None].to(tl.int64) * left_boundary_s_stride
+            + batch_id.to(tl.int64) * left_boundary_b_stride
             + chan[None, :] * left_boundary_c_stride
         )
         boundary_val = tl.load(
@@ -895,8 +898,8 @@ def _conv_silu_boundary_backward_kernel(
                 safe_tap_src = tl.minimum(tl.maximum(tap_src, 0), seq_len - 1)
                 x_base_ptrs = (
                     qkvzba_ptr
-                    + safe_tap_src[:, None] * qkvzba_s_stride
-                    + pid_b * qkvzba_b_stride
+                    + safe_tap_src[:, None].to(tl.int64) * qkvzba_s_stride
+                    + pid_b.to(tl.int64) * qkvzba_b_stride
                     + chan[None, :] * qkvzba_c_stride
                 )
                 x_base = tl.load(
@@ -911,9 +914,9 @@ def _conv_silu_boundary_backward_kernel(
             base_silu_grad = base_sig * (1.0 + base_acc * (1.0 - base_sig))
         d_silu_ptrs = (
             d_silu_ptr
-            + pid_b * d_silu_b_stride
+            + pid_b.to(tl.int64) * d_silu_b_stride
             + chan[None, :] * d_silu_c_stride
-            + tl.minimum(tl.maximum(t, 0), seq_len - 1)[:, None] * d_silu_s_stride
+            + tl.minimum(tl.maximum(t, 0), seq_len - 1)[:, None].to(tl.int64) * d_silu_s_stride
         )
         d_silu = tl.load(
             d_silu_ptrs, mask=source_contributes[:, None] & chan_mask[None, :], other=0.0
@@ -954,8 +957,8 @@ def _conv_silu_boundary_backward_kernel(
 
     d_boundary_ptrs = (
         d_left_boundary_ptr
-        + boundary_s[:, None] * d_left_boundary_s_stride
-        + pid_b * d_left_boundary_b_stride
+        + boundary_s[:, None].to(tl.int64) * d_left_boundary_s_stride
+        + pid_b.to(tl.int64) * d_left_boundary_b_stride
         + chan[None, :] * d_left_boundary_c_stride
     )
     tl.store(
@@ -966,8 +969,8 @@ def _conv_silu_boundary_backward_kernel(
     if APPLY_MAIN_CORRECTION:
         d_qkvzba_ptrs = (
             d_qkvzba_ptr
-            + src[:, None] * d_qkvzba_s_stride
-            + pid_b * d_qkvzba_b_stride
+            + src[:, None].to(tl.int64) * d_qkvzba_s_stride
+            + pid_b.to(tl.int64) * d_qkvzba_b_stride
             + chan[None, :] * d_qkvzba_c_stride
         )
         local_store_mask = source_mask & is_local_source & (src < seq_len)
@@ -1047,14 +1050,14 @@ def _g_beta_backward_kernel(
     # ----- Forward recompute -----
     alpha_ptr = (
         qkvzba_ptr
-        + s_offs[:, None] * qkvzba_s_stride
-        + pid_b * qkvzba_b_stride
+        + s_offs[:, None].to(tl.int64) * qkvzba_s_stride
+        + pid_b.to(tl.int64) * qkvzba_b_stride
         + (alpha_channel_offset + h_offs[None, :]) * qkvzba_c_stride
     )
     beta_ptr = (
         qkvzba_ptr
-        + s_offs[:, None] * qkvzba_s_stride
-        + pid_b * qkvzba_b_stride
+        + s_offs[:, None].to(tl.int64) * qkvzba_s_stride
+        + pid_b.to(tl.int64) * qkvzba_b_stride
         + (beta_channel_offset + h_offs[None, :]) * qkvzba_c_stride
     )
     alpha = tl.load(alpha_ptr, mask=mask, other=0.0).to(tl.float32)
@@ -1072,14 +1075,14 @@ def _g_beta_backward_kernel(
     # ----- Load upstream gradients -----
     d_g_ptrs = (
         d_g_ptr
-        + pid_b * d_g_b_stride
-        + s_offs[:, None] * d_g_s_stride
+        + pid_b.to(tl.int64) * d_g_b_stride
+        + s_offs[:, None].to(tl.int64) * d_g_s_stride
         + h_offs[None, :] * d_g_h_stride
     )
     d_beta_out_ptrs = (
         d_beta_out_ptr
-        + pid_b * d_beta_b_stride
-        + s_offs[:, None] * d_beta_s_stride
+        + pid_b.to(tl.int64) * d_beta_b_stride
+        + s_offs[:, None].to(tl.int64) * d_beta_s_stride
         + h_offs[None, :] * d_beta_h_stride
     )
     d_g = tl.load(d_g_ptrs, mask=mask, other=0.0).to(tl.float32)
@@ -1098,14 +1101,14 @@ def _g_beta_backward_kernel(
     # ----- Store per-element grads back to d_qkvzba -----
     d_alpha_ptrs = (
         d_qkvzba_ptr
-        + s_offs[:, None] * qkvzba_s_stride
-        + pid_b * qkvzba_b_stride
+        + s_offs[:, None].to(tl.int64) * qkvzba_s_stride
+        + pid_b.to(tl.int64) * qkvzba_b_stride
         + (alpha_channel_offset + h_offs[None, :]) * qkvzba_c_stride
     )
     d_beta_ptrs = (
         d_qkvzba_ptr
-        + s_offs[:, None] * qkvzba_s_stride
-        + pid_b * qkvzba_b_stride
+        + s_offs[:, None].to(tl.int64) * qkvzba_s_stride
+        + pid_b.to(tl.int64) * qkvzba_b_stride
         + (beta_channel_offset + h_offs[None, :]) * qkvzba_c_stride
     )
     tl.store(d_alpha_ptrs, d_alpha.to(d_qkvzba_ptr.dtype.element_ty), mask=mask)
@@ -1181,14 +1184,14 @@ def _finalize_pre_gdr_backward_kernel(
         qkvzba_s = seq_len - boundary + boundary_s
         d_qkvzba_ptrs = (
             d_qkvzba_ptr
-            + qkvzba_s * d_qkvzba_s_stride
-            + batch_id * d_qkvzba_b_stride
+            + qkvzba_s.to(tl.int64) * d_qkvzba_s_stride
+            + batch_id.to(tl.int64) * d_qkvzba_b_stride
             + chan * d_qkvzba_c_stride
         )
         d_right_boundary_ptrs = (
             d_right_boundary_ptr
-            + boundary_s * d_right_boundary_s_stride
-            + batch_id * d_right_boundary_b_stride
+            + boundary_s.to(tl.int64) * d_right_boundary_s_stride
+            + batch_id.to(tl.int64) * d_right_boundary_b_stride
             + chan * d_right_boundary_c_stride
         )
         d_qkvzba_val = tl.load(d_qkvzba_ptrs, mask=boundary_mask, other=0.0).to(tl.float32)
