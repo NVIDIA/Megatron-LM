@@ -2,7 +2,7 @@
 
 
 from dataclasses import dataclass
-from typing import NoReturn, Optional, Union
+from typing import NoReturn, Optional, Protocol, Union
 
 import torch
 
@@ -50,6 +50,65 @@ else:
 def _q_rms_norm(q: torch.Tensor, eps: float) -> torch.Tensor:
     """Fused RMS normalization for query tensor (no learnable weight)."""
     return q * torch.rsqrt(q.square().mean(-1, keepdim=True) + eps)
+
+
+class _GroupedOutputProjectionContext(Protocol):
+    """State supplied by autograd and saved by the grouped projection."""
+
+    groups: int
+    x_shape: torch.Size
+    needs_input_grad: tuple[bool, ...]
+
+    @property
+    def saved_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return tensors stored by ``save_for_backward``."""
+        ...
+
+    def save_for_backward(self, *tensors: torch.Tensor) -> None:
+        """Save tensors for the backward pass."""
+        ...
+
+
+class _GroupedOutputProjection(torch.autograd.Function):
+    """Per-group projection ``y[..., g, :] = x[..., g, :] @ w[g].T`` without layout copies.
+
+    Same math as ``einsum("...gd,grd->...gr")`` + reshape, but each batched GEMM reads and
+    writes the token-major ``[tokens, groups, dim]`` layout through strides, so neither the
+    output nor the input/weight gradients need a transpose copy.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: _GroupedOutputProjectionContext, x: torch.Tensor, weight: torch.Tensor, groups: int
+    ) -> torch.Tensor:
+        """x: [s, b, groups * d]; weight: [groups * r, d]. Returns [s, b, groups * r]."""
+        x3 = x.reshape(-1, groups, x.size(-1) // groups)
+        w3 = weight.view(groups, -1, x3.size(-1))
+        y = x.new_empty(x3.size(0), groups, w3.size(1))
+        torch.bmm(x3.transpose(0, 1), w3.transpose(1, 2), out=y.transpose(0, 1))
+        ctx.save_for_backward(x3, weight)
+        ctx.groups = groups
+        ctx.x_shape = x.shape
+        return y.view(*x.shape[:-1], -1)
+
+    @staticmethod
+    def backward(
+        ctx: _GroupedOutputProjectionContext, grad_y: torch.Tensor
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, None]:
+        """Writes both gradients straight into contiguous buffers."""
+        x3, weight = ctx.saved_tensors
+        groups = ctx.groups
+        w3 = weight.view(groups, -1, x3.size(-1))
+        gy = grad_y.reshape(x3.size(0), groups, w3.size(1)).transpose(0, 1)
+        grad_x = grad_w = None
+        if ctx.needs_input_grad[0]:
+            grad_x = x3.new_empty(x3.shape)
+            torch.bmm(gy, w3, out=grad_x.transpose(0, 1))
+            grad_x = grad_x.view(ctx.x_shape)
+        if ctx.needs_input_grad[1]:
+            grad_w = weight.new_empty(weight.shape)
+            torch.bmm(gy.transpose(1, 2), x3.transpose(0, 1), out=grad_w.view(w3.shape))
+        return grad_x, grad_w, None
 
 
 @dataclass
@@ -522,14 +581,9 @@ class DSv4HybridAttention(Attention):
             core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), -1)
 
         # Grouped output
-        core_attn_out = core_attn_out.view(
-            core_attn_out.size(0), core_attn_out.size(1), self.output_projection_local_groups, -1
+        core_attn_out = _GroupedOutputProjection.apply(
+            core_attn_out, self.linear_o_group_proj, self.output_projection_local_groups
         )
-        wo_a_weight = self.linear_o_group_proj.view(
-            self.output_projection_local_groups, self.config.output_projection_lora_rank, -1
-        )
-        core_attn_out = torch.einsum("...gd,grd->...gr", core_attn_out, wo_a_weight)
-        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
         # =================
         # Output. [sq, b, h]
