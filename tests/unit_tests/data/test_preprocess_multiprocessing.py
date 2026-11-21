@@ -14,6 +14,50 @@ import pytest
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 
 
+def test_worker_sweep_rejects_consecutive_invalid_counts(tmp_path):
+    """An all-invalid sweep must fail before any partition is processed."""
+    root = Path(__file__).resolve().parents[3]
+    command = [
+        sys.executable,
+        '-m',
+        'tools.preprocess_data',
+        '--input',
+        str(tmp_path / 'unused.jsonl'),
+        '--output-prefix',
+        str(tmp_path / 'tokens'),
+        '--tokenizer-type',
+        'NullTokenizer',
+        '--vocab-size',
+        '32',
+        '--append-eod',
+        '--workers',
+        '4',
+        '--partitions',
+        '4',
+        '--find-optimal-num-workers',
+        '--workers-to-check',
+        '1',
+        '3',
+    ]
+    env = dict(os.environ)
+    env['PYTHONPATH'] = os.pathsep.join(filter(None, [str(root), env.get('PYTHONPATH')]))
+    try:
+        result = subprocess.run(
+            command, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout or ''
+        if isinstance(output, bytes):
+            output = output.decode(errors='replace')
+        raise AssertionError(
+            'Invalid worker count reached partition processing instead of being rejected: '
+            + output[-500:]
+        ) from exc
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert 'Please, provide valid number of workers' in result.stderr
+    assert 'Processing data with 3 workers.' not in result.stdout
+
+
 @pytest.mark.parametrize('start_method', multiprocessing.get_all_start_methods())
 @pytest.mark.parametrize('keep_sequential_samples', [False, True])
 def test_partitioned_preprocessing(tmp_path, start_method, keep_sequential_samples):
