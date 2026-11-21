@@ -391,6 +391,37 @@ class TextGenerationController(MTPControllerMixin):
         """
         self._get_stop_word_finished_ids_callback = callback
 
+    def _try_allocate_symmetric_logits_buffer(self, arena_key, shape, dtype, device):
+        """`shape` (`[..., vocab]`) from its own symmetric arena as (tensor, handle), or None."""
+        from megatron.core.inference.communication.torch_symm_triton import is_device_nvls_capable
+        from megatron.core.inference.symmetric_memory import (
+            HAVE_TORCH_SYMM_MEM,
+            HAVE_TRITON,
+            SymmetricMemoryManager,
+        )
+
+        if getattr(self.model_config, "inference_disable_triton_nvls_kernels", False):
+            return None
+        if not (HAVE_TORCH_SYMM_MEM and HAVE_TRITON):
+            return None
+        if not is_device_nvls_capable(torch.device(device)):
+            return None
+        tp_group = self.inference_wrapped_model.tp_group
+        element_size = torch.tensor([], dtype=dtype).element_size()
+        # Shard rows must stay 128-bit aligned for the multicast store.
+        if (self.vocab_size // get_pg_size(tp_group)) * element_size % 16 != 0:
+            return None
+
+        size_mb = -(-torch.Size(shape).numel() * element_size // (1024 * 1024)) + 1
+        arena = SymmetricMemoryManager.get_buffer(
+            arena_key, process_group=tp_group, size_mb=size_mb
+        )
+        allocation = arena.maybe_get_tensor(list(shape), dtype)
+        if allocation["tensor"] is None:
+            return None
+        allocation["tensor"].zero_()
+        return allocation["tensor"], allocation["handle"]
+
     def _init_dynamic_sampling_tensors(self):
         """Initialize tensors needed for dynamic sampling."""
         context = self.inference_wrapped_model.inference_context
@@ -412,9 +443,32 @@ class TextGenerationController(MTPControllerMixin):
 
         # Initialize bookkeeping tensors.
         if self._enable_cuda_graph:
-            self._all_logits_cuda = torch.zeros(
-                (1, max_logits, self.vocab_size), dtype=logits_dtype, device=device
-            )
+            symmetric = None
+            if get_pg_size(self.inference_wrapped_model.tp_group) > 1:
+                # Under TP, prefer a symmetric-memory buffer: each rank then multicast-stores
+                # its logits shard straight into its column block, gather and transpose fused,
+                # no copy. Otherwise a plain buffer and the in-forward copy.
+                symmetric = self._try_allocate_symmetric_logits_buffer(
+                    "tp_logits", (1, max_logits, self.vocab_size), logits_dtype, device
+                )
+            if symmetric is not None:
+                self._all_logits_cuda, context.logits_buffer_multicast_handle = symmetric
+                # A head that cannot emit fp32 emits its compute dtype.
+                # Its shards are gathered in that dtype and upcast into the buffer on arrival.
+                if getattr(self._language_model, "lm_head_can_emit_fp32", None) is False:
+                    staging = self._try_allocate_symmetric_logits_buffer(
+                        "tp_logits_staging",
+                        (max_logits, self.vocab_size),
+                        self.model_config.params_dtype,
+                        device,
+                    )
+                    if staging is not None:
+                        context.logits_staging_buffer = staging[0]
+                        context.logits_staging_multicast_handle = staging[1]
+            else:
+                self._all_logits_cuda = torch.zeros(
+                    (1, max_logits, self.vocab_size), dtype=logits_dtype, device=device
+                )
             context.logits_output_buffer = self._all_logits_cuda
         else:
             self._all_logits_cuda = None
