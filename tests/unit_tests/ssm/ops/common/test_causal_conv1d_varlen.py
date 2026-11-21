@@ -269,3 +269,150 @@ class TestCausalConv1dVarlenCarryStates:
             torch.randn(0, 3, device="cuda"), cu_seqlens, previous
         )
         torch.testing.assert_close(got, previous)
+
+
+def _tokens_past_int32(row_size):
+    """The fewest tokens whose last row starts at or past 2**31 elements."""
+    return -(-(2**31) // row_size) + 1
+
+
+class TestInt32TokenOffsets:
+    """Token offsets at the int32 limit, at Nemotron-H 8B's sizes (TP 1).
+
+    A prefill step's token offset is token * row size. The ``large`` cases (opt in with
+    ``-m large``; up to 9 GiB of device memory) put the last request's rows past 2**31
+    elements, and that request must give the same result as when it runs on its own. The
+    small cases run the same checks far below the limit.
+    """
+
+    @pytest.mark.parametrize(
+        "tokens",
+        [
+            pytest.param(1000, id="small"),
+            pytest.param(_tokens_past_int32(10240) - 1, marks=pytest.mark.large, id="crosses"),
+            pytest.param(_tokens_past_int32(10240), marks=pytest.mark.large, id="starts-past"),
+        ],
+    )
+    def test_conv_requests_match_their_own_runs(self, tokens):
+        """The conv over 10,240 channels: at 209,717 tokens the last row starts past 2**31
+        elements; at 209,716 it starts below and ends past."""
+        torch.manual_seed(0)
+        dim, width, tail = 10240, 4, 300
+        head = tokens - tail
+        x = torch.randn(tokens, dim, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(dim, width, device="cuda", dtype=torch.bfloat16)
+        bias = torch.randn(dim, device="cuda", dtype=torch.bfloat16)
+        initial_states = torch.randn(2, dim, width - 1, device="cuda", dtype=torch.bfloat16)
+        cu_seqlens = torch.tensor([0, head, tokens], dtype=torch.int32, device="cuda")
+
+        out = causal_conv1d_varlen_fn(x, weight, bias, cu_seqlens, initial_states)
+
+        for request, (start, length) in enumerate([(0, 64), (head, tail)]):
+            alone = causal_conv1d_varlen_fn(
+                x[start : start + length],
+                weight,
+                bias,
+                torch.tensor([0, length], dtype=torch.int32, device="cuda"),
+                initial_states[request : request + 1],
+            )
+            torch.testing.assert_close(out[start : start + length], alone, rtol=0, atol=0)
+
+    @pytest.mark.parametrize(
+        "tokens",
+        [
+            pytest.param(1000, id="small"),
+            pytest.param(_tokens_past_int32(18560), marks=pytest.mark.large, id="starts-past"),
+        ],
+    )
+    def test_carry_reads_a_projection_slice(self, tokens):
+        """MambaMixer hands the carry its conv input as a column slice of the in_proj output,
+        so the token stride is the in_proj row (18,560 elements): at 115,706 tokens the last
+        row starts past 2**31 elements."""
+        torch.manual_seed(0)
+        d_inner, dim, nheads, width = 8192, 10240, 128, 4
+        projection = torch.randn(
+            tokens, d_inner + dim + nheads, device="cuda", dtype=torch.bfloat16
+        )
+        x = projection[:, d_inner : d_inner + dim]
+        head = tokens - 2
+        cu_seqlens = torch.tensor([0, head, tokens], dtype=torch.int32, device="cuda")
+        previous_states = torch.randn(2, dim, width, device="cuda", dtype=torch.bfloat16)
+
+        got = causal_conv1d_varlen_carry_states(x, cu_seqlens, previous_states)
+
+        # A long slice takes its last d_conv tokens; the 2-token slice keeps 2 columns.
+        expected = torch.stack(
+            [x[head - width : head].T, torch.cat([previous_states[1, :, 2:], x[head:].T], dim=1)]
+        )
+        torch.testing.assert_close(got, expected, rtol=0, atol=0)
+
+
+class TestInt32RequestOffsets:
+    """Request offsets at the int32 limit, at Nemotron-H 8B's conv (10,240 channels, width 4).
+
+    A request's state offset is request * state stride. One token per request keeps the
+    inputs small; the ``large`` cases (opt in with ``-m large``; up to 9 GiB of device
+    memory) put the last request's state at or past 2**31 elements, and the cases one
+    request smaller just below it.
+    """
+
+    @pytest.mark.parametrize(
+        "requests, layout",
+        [
+            pytest.param(1000, "contiguous", id="small"),
+            pytest.param(1000, "cache-slice", id="small-cache-slice"),
+            pytest.param(69906, "contiguous", marks=pytest.mark.large, id="below"),
+            pytest.param(69907, "contiguous", marks=pytest.mark.large, id="past"),
+            pytest.param(52430, "cache-slice", marks=pytest.mark.large, id="past-cache-slice"),
+        ],
+    )
+    def test_conv_reads_each_requests_initial_state(self, requests, layout):
+        """Contiguous (requests, 10240, 3) states reach 2**31 elements at 69,907 requests;
+        MambaMixer's slice of the conv-state cache rows, ``states[:, :, 1:]`` (request stride
+        40,960), at 52,430."""
+        torch.manual_seed(0)
+        dim, width = 10240, 4
+        x = torch.randn(requests, dim, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(dim, width, device="cuda", dtype=torch.bfloat16)
+        bias = torch.randn(dim, device="cuda", dtype=torch.bfloat16)
+        columns = width - 1 if layout == "contiguous" else width
+        states = torch.randn(requests, dim, columns, device="cuda", dtype=torch.bfloat16)
+        initial_states = states if layout == "contiguous" else states[:, :, 1:]
+        cu_seqlens = torch.arange(requests + 1, dtype=torch.int32, device="cuda")
+
+        out = causal_conv1d_varlen_fn(x, weight, bias, cu_seqlens, initial_states)
+
+        for request in (0, requests - 2, requests - 1):
+            alone = causal_conv1d_varlen_fn(
+                x[request : request + 1],
+                weight,
+                bias,
+                torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+                initial_states[request : request + 1],
+            )
+            torch.testing.assert_close(out[request : request + 1], alone, rtol=0, atol=0)
+
+    @pytest.mark.parametrize(
+        "requests",
+        [
+            pytest.param(1000, id="small"),
+            pytest.param(52429, marks=pytest.mark.large, id="below"),
+            pytest.param(52430, marks=pytest.mark.large, id="past"),
+        ],
+    )
+    def test_carry_updates_each_requests_state(self, requests):
+        """(requests, 10240, 4) states reach 2**31 elements at 52,430 requests."""
+        torch.manual_seed(0)
+        dim, width = 10240, 4
+        x = torch.randn(requests, dim, device="cuda", dtype=torch.bfloat16)
+        previous_states = torch.randn(requests, dim, width, device="cuda", dtype=torch.bfloat16)
+        cu_seqlens = torch.arange(requests + 1, dtype=torch.int32, device="cuda")
+
+        got = causal_conv1d_varlen_carry_states(x, cu_seqlens, previous_states)
+
+        # Each 1-token slice keeps the last 3 columns of its request's state.
+        for request in (0, requests - 2, requests - 1):
+            expected = torch.cat(
+                [previous_states[request, :, 1:], x[request : request + 1].T], dim=1
+            )
+            torch.testing.assert_close(got[request], expected, rtol=0, atol=0)
