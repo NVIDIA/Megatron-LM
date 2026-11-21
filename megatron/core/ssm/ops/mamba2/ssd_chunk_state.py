@@ -16,6 +16,9 @@ except:
     raise ImportError("Triton version 3.0.0 or higher is required")
 
 if TRITON3:
+    # Keep log(exp(dt) + 1), unlike the decode kernel's log1p in mamba_ssm.py: batch-invariant
+    # inference must reproduce mamba_ssm's training scan bit for bit, and that package's
+    # _chunk_cumsum_fwd_kernel uses this form (test_batch_invariant_decode.py checks the parity).
 
     @triton.jit
     def softplus(dt):  # pylint: disable=C0116
