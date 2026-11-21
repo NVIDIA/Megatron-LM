@@ -290,20 +290,15 @@ def get_actual_sequence_lengths(sequences: torch.Tensor, pad_token: int) -> List
     if len(sequences.shape) != 2:
         raise ValueError(f"Expected 2D tensor, got shape {sequences.shape}")
 
-    actual_lengths = []
+    sequence_length = sequences.shape[1]
+    if sequence_length == 0:
+        return [0] * sequences.shape[0]
 
-    # Find actual length of each sequence by locating where padding starts
-    for seq in sequences:
-        # Find the last non-padding token
-        non_pad_mask = seq != pad_token
-        if non_pad_mask.any():
-            # Get the position of the last non-padding token
-            actual_length = non_pad_mask.nonzero(as_tuple=True)[0][-1].item() + 1
-        else:
-            actual_length = 0  # All padding
-        actual_lengths.append(actual_length)
-
-    return actual_lengths
+    # The first non-padding token from the right locates the true end, including
+    # sequences with interior padding. Transfer all lengths together.
+    has_token, offset_from_end = (sequences != pad_token).flip([1]).max(dim=1)
+    lengths = (sequence_length - offset_from_end).masked_fill(~has_token, 0)
+    return lengths.tolist()
 
 
 def create_empty_bins(
