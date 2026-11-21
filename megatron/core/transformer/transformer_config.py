@@ -1940,7 +1940,9 @@ class TransformerConfig(ModelParallelConfig):
             if self.enable_mhc_connections:
                 raise ValueError("wide_residual and enable_mhc_connections are mutually exclusive.")
             if (
-                self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph
+                self.cuda_graph_impl not in ("none", "full_iteration")
+                or self.enable_cuda_graph
+                or self.external_cuda_graph
             ) and not (
                 self.cuda_graph_impl == "local"
                 and not self.enable_cuda_graph
@@ -1951,8 +1953,9 @@ class TransformerConfig(ModelParallelConfig):
                 == InferenceCudaGraphScope.block
             ):
                 raise NotImplementedError(
-                    "wide_residual supports CUDA graphs only with cuda_graph_impl='local' "
-                    "and inference_cuda_graph_scope='block'."
+                    "wide_residual supports CUDA graphs only with "
+                    "cuda_graph_impl='full_iteration', or cuda_graph_impl='local' with "
+                    "inference_cuda_graph_scope='block'."
                 )
             if self.pipeline_model_parallel_size > 1:
                 raise NotImplementedError(
@@ -3370,10 +3373,11 @@ class TransformerConfig(ModelParallelConfig):
                         "norms, and writes. Fine-grained activation offloading will skip "
                         f"{sorted(replay_owned_norms)} only on connected branches."
                     )
-            if self.cuda_graph_impl != "none":
+            if self.cuda_graph_impl not in ("none", "full_iteration"):
                 raise ValueError(
-                    "'residual_stream' recomputation requires cuda_graph_impl='none' because "
-                    "its Python checkpoint manager remains outside CUDA graph capture."
+                    "'residual_stream' recomputation requires cuda_graph_impl='none' or "
+                    "'full_iteration': its Python checkpoint manager spans layers, so it cannot "
+                    "sit outside a per-layer CUDA graph, but a whole-step graph captures it."
                 )
         elif self.residual_stream_recompute_num_layers is not None:
             raise ValueError(
@@ -4358,15 +4362,37 @@ class TransformerConfig(ModelParallelConfig):
 
         assert not (
             self.moe_shortcut_connection
-            and self.cuda_graph_impl != "none"
+            and self.cuda_graph_impl not in ("none", "full_iteration")
             and not (
                 self.cuda_graph_impl == "local"
                 and self.inference_cuda_graph_scope == InferenceCudaGraphScope.block
             )
         ), (
             "moe_shortcut_connection supports CUDA graphs only with "
-            "cuda_graph_impl='local' and inference_cuda_graph_scope='block'."
+            "cuda_graph_impl='full_iteration', or cuda_graph_impl='local' with "
+            "inference_cuda_graph_scope='block'."
         )
+
+        if (
+            self.cuda_graph_impl == "full_iteration"
+            and self.num_moe_experts is not None
+            and self.moe_megakernel_backend is None
+        ):
+            if self.moe_token_dispatcher_type == "allgather":
+                raise ValueError(
+                    "Full-iteration CUDA graphs do not support the AllGather "
+                    "dispatcher because it copies routing metadata to the CPU."
+                )
+
+            if self.moe_token_dispatcher_type == "alltoall" and not (
+                self.moe_expert_capacity_factor is not None
+                and self.moe_pad_expert_input_to_capacity
+            ):
+                raise ValueError(
+                    "Full-iteration CUDA graphs with the AlltoAll dispatcher "
+                    "require expert capacity and padding to capacity, because "
+                    "the variable-size path synchronizes routing metadata with the CPU."
+                )
 
         if self.cuda_graph_impl != "none":
 

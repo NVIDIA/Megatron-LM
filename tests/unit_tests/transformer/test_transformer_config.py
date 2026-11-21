@@ -437,6 +437,65 @@ def test_shortcut_rejects_incompatible_configurations(overrides, error, message)
         )
 
 
+def test_shortcut_accepts_full_iteration_cuda_graphs():
+    """A whole-step graph holds the overlapped dispatch and combine of every MoE layer."""
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_router_topk=1,
+        moe_router_pre_softmax=True,
+        moe_shortcut_connection=True,
+        moe_expert_capacity_factor=1.0,
+        moe_pad_expert_input_to_capacity=True,
+        cuda_graph_impl="full_iteration",
+    )
+    assert config.cuda_graph_impl == "full_iteration"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"moe_token_dispatcher_type": "allgather"}, "do not support the AllGather"),
+        ({"moe_token_dispatcher_type": "alltoall"}, "require expert capacity and padding"),
+        (
+            {"moe_token_dispatcher_type": "alltoall", "moe_expert_capacity_factor": 1.0},
+            "require expert capacity and padding",
+        ),
+    ],
+)
+def test_full_iteration_cuda_graphs_reject_host_synchronizing_dispatchers(overrides, message):
+    """AllGather and unpadded AlltoAll copy routing metadata to the CPU, which a graph cannot."""
+    with pytest.raises(ValueError, match=message):
+        TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            num_moe_experts=2,
+            moe_router_topk=1,
+            moe_router_pre_softmax=True,
+            cuda_graph_impl="full_iteration",
+            **overrides,
+        )
+
+
+def test_full_iteration_cuda_graphs_accept_padded_alltoall_dispatcher():
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_router_topk=1,
+        moe_router_pre_softmax=True,
+        moe_token_dispatcher_type="alltoall",
+        moe_expert_capacity_factor=1.0,
+        moe_pad_expert_input_to_capacity=True,
+        cuda_graph_impl="full_iteration",
+    )
+    assert config.moe_pad_expert_input_to_capacity
+
+
 def test_shortcut_accepts_local_block_cuda_graphs():
     config = TransformerConfig(
         num_layers=2,
