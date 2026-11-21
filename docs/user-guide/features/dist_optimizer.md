@@ -21,6 +21,14 @@ Theoretical memory savings depend on the data types of the model parameters (`pa
 
 This distributed optimizer uses contiguous buffers for parameters and main gradients. Model gradients copy into the main gradients as soon as they finish computing.
 
+To reduce the GPU memory peak while these buffers are allocated, set
+`ddp_cpu_staging=True` in `DistributedDataParallelConfig` together with
+`use_distributed_optimizer=True`. Plain BF16 CUDA parameters temporarily move to
+CPU, then return to GPU as views of the contiguous parameter buffer. This option
+is disabled by default and trades temporary host memory and synchronous device
+copies for less overlap between old parameter storage and new buffers. FP32,
+quantized and grouped parameters retain their existing initialization path.
+
 Models may retain selected parameters in `fp32` alongside `fp16` or `bf16` weights,
 as mHC does. Optimizer checkpoint lookups follow the main-parameter group order
 (native `fp32` shards, then low-precision master shards), independently of the
