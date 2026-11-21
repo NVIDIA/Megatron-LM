@@ -87,7 +87,6 @@ try:
     from transformer_engine.pytorch.module.base import get_dummy_wgrad
     from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
     from transformer_engine.pytorch.tensor import MXFP8TensorStorage, NVFP4TensorStorage
-    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
     from transformer_engine.pytorch.utils import (
         nvtx_range_pop,
         nvtx_range_push,
@@ -110,7 +109,6 @@ except (ImportError, ModuleNotFoundError):
     get_dummy_wgrad = MagicMock()
     QuantizedTensor = MagicMock()
     MXFP8TensorStorage = NVFP4TensorStorage = MagicMock()
-    MXFP8Quantizer = MagicMock()
     nvtx_range_pop = nvtx_range_push = round_up_to_nearest_multiple = MagicMock()
     HAVE_TE = False
 
@@ -935,12 +933,14 @@ def _gtp_reclass_native_fp8_shard(param):
     param._quantizer = native_quantizer
     # Gather uses a SEPARATE quantizer copy for its per-direction set_usage; reusing the param's own
     # would leave rowwise=False after a bwd gather, freezing the rowwise data the forward reads. The
-    # copy also keeps MXFP8 scales compact for byte-concat scale all-gather.
+    # copy also keeps the scales compact (never GEMM-swizzled) for every format: the scale
+    # all-gather byte-concatenates the shards' compact scales, so a gather output marked as
+    # GEMM-swizzled would be misread by the GEMM (NaN with NVFP4 on TE >= #3817).
     gather_q = None
     if native_quantizer is not None:
         gather_q = native_quantizer.copy()
         gather_q.internal = False
-        gather_q.optimize_for_gemm = not isinstance(gather_q, MXFP8Quantizer)
+        gather_q.optimize_for_gemm = False
     param._gtp_gather_quantizer = gather_q
     param.quantized = param
     return param
