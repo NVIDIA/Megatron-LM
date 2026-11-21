@@ -13,7 +13,7 @@ try:
 except ImportError:
     HAVE_PACKAGING = False
 
-NVRX_MIN_VERSION = "0.7.1"
+NVRX_MIN_VERSION = "0.7.1rc5"
 
 
 def has_nvrx_async_support() -> bool:
