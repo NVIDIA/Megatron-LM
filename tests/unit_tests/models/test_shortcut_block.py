@@ -767,3 +767,55 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
     assert calls["offload_entered"] and calls["offload_exited"]
     assert calls["forced_released_tensors"][0] is calls["offload_input"]
     assert hidden_states.grad is not None
+
+
+def _overlap_block_stub(cuda_graph_impl: str):
+    """The few attributes the overlap stream helpers read, without building a model."""
+    stream = torch.cuda.Stream()
+    block = SimpleNamespace(
+        config=SimpleNamespace(cuda_graph_impl=cuda_graph_impl),
+        overlap_mode=True,
+        moe_layer=SimpleNamespace(mlp=SimpleNamespace(combine=lambda output: output * 2)),
+        _combine_input_keepalive=None,
+        _get_a2a_overlap_stream=lambda: stream,
+    )
+    return block, stream
+
+
+@pytest.mark.parametrize("capturing", [False, True], ids=["eager", "full_iteration_capture"])
+def test_overlap_stream_use_marks(monkeypatch, capturing):
+    """Which tensors shared between the main and the side stream get a ``record_stream`` mark.
+
+    The dispatch outputs are marked in every mode: they belong to the side stream, whose next
+    dispatch does not wait for the whole main stream. The combine input is never marked: a
+    reference keeps it alive until the side stream has been joined, which protects it without
+    making the allocator hold the block past that point."""
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    recorded = []
+    monkeypatch.setattr(
+        torch.Tensor, "record_stream", lambda tensor, stream: recorded.append((tensor, stream))
+    )
+    block, _ = _overlap_block_stub("full_iteration")
+    main_stream = torch.cuda.current_stream()
+
+    dispatched_input = torch.ones(8, device="cuda")
+    dispatched_probs = torch.ones(8, device="cuda")
+    returned = ShortcutMoEBlock._wait_dispatch(block, dispatched_input, dispatched_probs)
+    assert returned[0] is dispatched_input and returned[1] is dispatched_probs
+    assert [(t is dispatched_input or t is dispatched_probs, s) for t, s in recorded] == [
+        (True, main_stream),
+        (True, main_stream),
+    ]
+
+    recorded.clear()
+    expert_output = torch.ones(8, device="cuda")
+    combined = ShortcutMoEBlock._launch_combine(block, expert_output, async_op=True)
+    assert not recorded
+    assert block._combine_input_keepalive is expert_output
+
+    recorded.clear()
+    assert ShortcutMoEBlock._wait_combine(block, combined) is combined
+    # Joining the side stream ends the need for the reference.
+    assert block._combine_input_keepalive is None
+    assert len(recorded) == 1 and recorded[0][0] is combined
+    torch.testing.assert_close(combined, torch.full_like(expert_output, 2))

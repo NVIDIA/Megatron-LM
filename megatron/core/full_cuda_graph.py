@@ -4,6 +4,8 @@
 
 import gc
 import logging
+import os
+import re
 from collections.abc import Callable, Iterable, Sequence
 from typing import Optional
 
@@ -25,6 +27,49 @@ logger = logging.getLogger(__name__)
 # tools/debug_cuda_graph_pool_memory*.py).
 _shared_graph_pool = None
 _shared_capture_stream = None
+
+_ALLOCATOR_REUSE_SETTING = re.compile(r"graph_capture_record_stream_reuse\s*:\s*(\w+)")
+_warned_allocator_holds_marked_blocks = False
+
+
+def allocator_reuses_marked_blocks_during_capture() -> bool:
+    """Whether the CUDA allocator runs with ``graph_capture_record_stream_reuse:True``.
+
+    A block marked with ``Tensor.record_stream`` is used on more than one stream. During a CUDA
+    graph capture the allocator cannot tell when such a block is free again, and by default it
+    holds every one of them until the capture ends. With this setting it works that out from
+    the captured graph and reuses them during the capture.
+
+    Read from the allocator's settings string, which reflects ``PYTORCH_CUDA_ALLOC_CONF`` (or
+    ``PYTORCH_ALLOC_CONF``) and a later ``torch.cuda.memory._set_allocator_settings``. The last
+    occurrence wins, as in the allocator's own parser.
+    """
+    get_settings = getattr(torch._C, "_accelerator_getAllocatorSettings", None)
+    if get_settings is not None:
+        settings = get_settings()
+    else:
+        settings = os.environ.get(
+            "PYTORCH_ALLOC_CONF", os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+        )
+    values = _ALLOCATOR_REUSE_SETTING.findall(settings or "")
+    return bool(values) and values[-1].lower() == "true"
+
+
+def _warn_once_if_allocator_holds_marked_blocks() -> None:
+    """Point out, at the first capture, an allocator setting that costs graph-pool memory."""
+    global _warned_allocator_holds_marked_blocks
+    if _warned_allocator_holds_marked_blocks or allocator_reuses_marked_blocks_during_capture():
+        return
+    _warned_allocator_holds_marked_blocks = True
+    logger.warning(
+        'Capturing a full-iteration CUDA graph without graph_capture_record_stream_reuse:True '
+        'in PYTORCH_CUDA_ALLOC_CONF. Every block marked with record_stream during the capture '
+        'stays reserved until the capture ends, and the graph keeps that memory for good. '
+        'Autograd marks gradients that cross streams, and overlapped MoE dispatch marks its '
+        'outputs, so this can add many GiB to the graph memory pool. If this PyTorch build '
+        'supports the setting, add it, for example '
+        'PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,graph_capture_record_stream_reuse:True.'
+    )
 
 
 def get_shared_capture_stream():
@@ -306,6 +351,7 @@ class FullCudaGraphWrapper:
         curr_iteration = self.curr_iter(training_str)
         if curr_iteration == self.cuda_graph_warmup_steps:
             logger.info(f'Capture CUDA graph for {training_str}!!!')
+            _warn_once_if_allocator_holds_marked_blocks()
             if hasattr(torch.autograd.graph, 'set_override_stale_capture_stream'):
                 torch.autograd.graph.set_override_stale_capture_stream(True)
             else:
@@ -340,6 +386,17 @@ class FullCudaGraphWrapper:
                 FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(
                     *args, **kwargs
                 )
+                if not training:
+                    # A forward-only step never reaches finalize_model_grads, which is where
+                    # the GTP side streams are otherwise joined into the capturing stream.
+                    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+                    if HAVE_GTP:
+                        from megatron.core.tensor_parallel.gtp_api import (
+                            wait_for_gtp_all_gather_on_current_stream,
+                        )
+
+                        wait_for_gtp_all_gather_on_current_stream()
             torch.cuda.synchronize()
             torch.distributed.barrier()
             logger.info(f'CUDA graph capture done for {training_str}!!!')

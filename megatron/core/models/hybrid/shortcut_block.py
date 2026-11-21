@@ -158,6 +158,8 @@ class ShortcutMoEBlock(MegatronModule):
         super().__init__(compute_layer.config)
 
         self.overlap_mode = overlap_a2a
+        # Holds the combine input alive across the overlapped combine (see _launch_combine).
+        self._combine_input_keepalive = None
         self.layer_number = compute_layer.layer_number
         self.attn_layer_idx = compute_layer.layer_number - 1
         self.attn_local_idx = attn_local_idx
@@ -403,6 +405,14 @@ class ShortcutMoEBlock(MegatronModule):
         assert self.overlap_mode
 
         torch.cuda.current_stream().wait_stream(self._get_a2a_overlap_stream())
+        # The dispatch outputs are allocated on the side stream and read on the main stream,
+        # and the side stream starts the next dispatch after waiting only for that layer's
+        # route_ready_event, not for the whole main stream. The join above therefore does not
+        # order a later reuse of this memory after the main stream's reads; the mark does.
+        # During a full-iteration CUDA graph capture the allocator holds marked blocks until
+        # the capture ends unless it runs with graph_capture_record_stream_reuse:True
+        # (PYTORCH_CUDA_ALLOC_CONF), which that mode needs anyway for the marks autograd adds
+        # in the backward pass.
         dispatched_input.record_stream(torch.cuda.current_stream())
         dispatched_probs.record_stream(torch.cuda.current_stream())
         return dispatched_input, dispatched_probs
@@ -428,13 +438,21 @@ class ShortcutMoEBlock(MegatronModule):
 
         combine_stream = self._get_a2a_overlap_stream()
         combine_stream.wait_stream(torch.cuda.current_stream())
-        output.record_stream(combine_stream)
+        # The main stream keeps computing while the combine reads ``output``. Hold a reference
+        # until _wait_combine has joined the side stream: ``output`` belongs to the main stream,
+        # so its memory can then only be reused by work that is ordered after the combine.
+        # This replaces ``output.record_stream(combine_stream)``. The mark would give the same
+        # protection, but the allocator would keep the block until the GPU has caught up with
+        # the free, long after the join made it safe, and during a CUDA graph capture until
+        # the capture ends.
+        self._combine_input_keepalive = output
         with torch.cuda.stream(combine_stream):
             return self.moe_layer.mlp.combine(output)
 
     def _wait_combine(self, combined_output: torch.Tensor) -> torch.Tensor:
         """Wait for the asynchronous combine and return its output on the main stream."""
         torch.cuda.current_stream().wait_stream(self._get_a2a_overlap_stream())
+        self._combine_input_keepalive = None
         combined_output.record_stream(torch.cuda.current_stream())
         return combined_output
 
