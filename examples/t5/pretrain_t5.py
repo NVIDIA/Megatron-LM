@@ -24,9 +24,10 @@ from megatron.core.models.T5.t5_spec import (
     get_t5_encoder_with_local_block_spec,
     get_t5_encoder_with_transformer_engine_block_spec,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
-from megatron.training.arguments import parse_and_validate_args
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.vocab_utils import model_vocab_size
 from megatron.training.global_vars import (
     get_run_config,
@@ -90,6 +91,8 @@ def model_provider(
     Returns:
         T5Model: The returned T5 model
     """
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     cfg = get_run_config()
 
@@ -143,6 +146,7 @@ def model_provider(
         relative_attention_max_distance=cfg.model.relative_attention_max_distance,
         add_encoder=add_encoder,
         add_decoder=add_decoder,
+        pg_collection=pg_collection,
     )
 
     return model
@@ -218,8 +222,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples: int):
 
     config = T5MaskedWordPieceDatasetConfig(
         random_seed=cfg.rng.seed,
-        sequence_length=args.encoder_seq_length,
-        sequence_length_decoder=args.decoder_seq_length,
+        sequence_length=cfg.model.encoder_seq_length,
+        sequence_length_decoder=cfg.model.decoder_seq_length,
         blend=get_blend_from_list(args.data_path),
         blend_per_split=[
             get_blend_from_list(args.train_data_path),
