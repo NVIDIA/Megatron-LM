@@ -30,6 +30,7 @@ from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
+from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
@@ -107,6 +108,11 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
             # provide a pre-backward unshard hook. Since DSAttention also calls the indexer method
             # directly, recurse from the enclosing DSAttention boundary for both passes.
             recurse_types.append(DSAttention)
+
+        if config.fused_single_qkv_rope and config.qk_layernorm:
+            # The fused QKV split + QK-norm + RoPE kernel reads both norm weights without calling
+            # the norm modules, so gather them (both passes) from the SelfAttention boundary.
+            recurse_types.append(SelfAttention)
 
         if config.overlap_moe_expert_parallel_comm and any_sharding_strategy_in(
             ddp_config, ["optim_grads_params"]
