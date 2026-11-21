@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import codecs
 from typing import Dict, List, Optional, Union
 
 from .abstract_tokenizer import MegatronTokenizerTextAbstract
@@ -127,6 +128,18 @@ class ByteLevelTokenizer(MegatronTokenizerTextAbstract):
     def add_special_tokens(self, special_tokens: Union[list, dict]) -> None:
         """Adds special tokens to the tokenizer."""
         raise NotImplementedError("This method is not supported for byte-level tokenizers.")
+
+    def offsets(self, ids: list[int], text: str) -> list[int]:
+        """Return character offsets using the same byte filtering as ids_to_text."""
+        decoder = codecs.getincrementaldecoder('utf-8')(errors='ignore')
+        offsets = []
+        offset = 0
+        for token_id in ids:
+            # ids_to_text strips trailing whitespace.
+            offsets.append(min(offset, len(text)))
+            if token_id < self.special_start:
+                offset += len(decoder.decode(bytes([token_id])))
+        return offsets
 
     @property
     def pad_id(self):
