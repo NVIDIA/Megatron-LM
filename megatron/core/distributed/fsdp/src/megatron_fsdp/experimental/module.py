@@ -38,6 +38,7 @@ from .parameter_group import (
     FsdpParameterGroup,
     effective_dtype,
     get_containing_parameter_group,
+    latest_model_weight_sync_generation,
 )
 from .phase import Phase
 from .placement import BlockAtomic, RowAtomic, ShardLayout
@@ -359,9 +360,29 @@ class FsdpModule:
         # weights serve both phases already.
         if phase is Phase.BACKWARD and self._schedule_policy.unshard_all_planes_in_backward:
             phase = None
-        with torch.cuda.stream(self.context.allgather_stream):
+        context = self.context
+        allgather_stream = context.allgather_stream
+        outer_allgather_stream = None
+        if context.outer_allgather_stream is not allgather_stream:
+            stale_generations = [
+                group.model_weight_sync_generation
+                for group in self._parameter_groups
+                if group.model_weight_is_stale
+            ]
+            if stale_generations:
+                outer_allgather_stream = context.outer_allgather_stream
+                # Fork once per weight sync, at its first stale unshard. The all-gather
+                # stream already waits for the stream that synced the weights (the root
+                # sync before unsharding), and nothing that the DP-outer gathers depend
+                # on is queued on it later, so forking again from it would only
+                # serialize them behind DP-inner gathers. The edge also joins any
+                # active CUDA-graph capture.
+                if max(stale_generations) > context.outer_allgather_fork_generation:
+                    outer_allgather_stream.wait_stream(allgather_stream)
+                    context.outer_allgather_fork_generation = latest_model_weight_sync_generation()
+        with torch.cuda.stream(allgather_stream):
             for group in self._parameter_groups:
-                group.unshard_parameters(phase)
+                group.unshard_parameters(phase, outer_allgather_stream=outer_allgather_stream)
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""

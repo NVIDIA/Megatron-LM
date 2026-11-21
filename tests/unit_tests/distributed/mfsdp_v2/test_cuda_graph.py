@@ -17,6 +17,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     RuntimePolicy,
     fully_shard,
     fully_shard_context,
+    fully_shard_optimizer,
 )
 
 logger = logging.getLogger(__name__)
@@ -206,3 +207,76 @@ def test_local_accumulation_captures_full_iteration(distributed_setup):
     torch.testing.assert_close(torch.stack(losses), torch.stack(reference_losses))
     for parameter, reference_parameter in zip(model.parameters(), reference_model.parameters()):
         torch.testing.assert_close(parameter.to_local(), reference_parameter.to_local())
+
+
+def test_hfsdp_outer_allgather_overlap_captures_full_iteration(distributed_setup):
+    """Graph replay matches eager HFSDP training with the DP-outer all-gather on its own stream.
+
+    The optimizer shards weights across DP-outer, so every iteration's first forward refreshes
+    compute weights with a DP-outer all-gather. With overlap_outer_communication that gather
+    runs on a separate stream, which must join the capture and rejoin the all-gather stream.
+    """
+    device = distributed_setup.device
+    world_size = distributed_setup.world_size
+    if world_size < 4 or world_size % 2 != 0:
+        pytest.skip("Requires an even number of at least 4 ranks for a 2-D DP mesh.")
+    mesh = init_device_mesh(device.type, (2, world_size // 2))
+    placements = Placements(
+        dp_axes=[0, 1],
+        parameter=[Replicate(), Shard(0)],
+        gradient=[Partial("avg"), Shard(0)],
+        optimizer=[Shard(0), Shard(0)],
+    )
+    torch.manual_seed(1234)
+    model = NestedModel(dim=_HIDDEN, num_children=2).to(device)
+    reference_model = NestedModel(dim=_HIDDEN, num_children=2).to(device)
+    reference_model.load_state_dict(model.state_dict())
+    optimizers = []
+    for candidate in (model, reference_model):
+        with fully_shard_context(
+            FsdpContext(
+                device=device, runtime_policy=RuntimePolicy(overlap_outer_communication=True)
+            )
+        ):
+            for layer in candidate.layers:
+                fully_shard(layer, mesh=mesh, placements=placements)
+            fully_shard(candidate, mesh=mesh, placements=placements)
+        optimizer = torch.optim.SGD(candidate.parameters(), lr=0.25, foreach=False)
+        fully_shard_optimizer(optimizer)
+        optimizers.append(optimizer)
+    optimizer, reference_optimizer = optimizers
+    static_input = torch.eye(_HIDDEN, device=device)
+    static_target = torch.zeros_like(static_input)
+
+    def train_iteration(model, optimizer) -> torch.Tensor:
+        optimizer.zero_grad(set_to_none=False)
+        loss = torch.nn.functional.mse_loss(model(static_input), static_target)
+        loss.backward()
+        optimizer.step()
+        return loss.detach()
+
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        for _ in range(3):
+            train_iteration(model, optimizer)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        static_loss = train_iteration(model, optimizer)
+    torch.cuda.current_stream().wait_stream(capture_stream)
+
+    for _ in range(3):
+        train_iteration(reference_model, reference_optimizer)
+
+    losses = []
+    reference_losses = []
+    for _ in range(5):
+        graph.replay()
+        losses.append(static_loss.clone())
+        reference_losses.append(train_iteration(reference_model, reference_optimizer))
+    torch.testing.assert_close(torch.stack(losses), torch.stack(reference_losses), rtol=0, atol=0)
+    for parameter, reference_parameter in zip(model.parameters(), reference_model.parameters()):
+        torch.testing.assert_close(
+            parameter.to_local(), reference_parameter.to_local(), rtol=0, atol=0
+        )

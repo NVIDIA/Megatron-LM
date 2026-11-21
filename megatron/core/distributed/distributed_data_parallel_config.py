@@ -119,8 +119,10 @@ class DistributedDataParallelConfig:
     """Megatron-FSDP implementation version. Valid values are 1 and 2."""
 
     overlap_outer_communication: bool = False
-    """Overlap MFSDP v2's last-microbatch outer-DP gradient reduction with inner-DP
-    reductions on a separate CUDA stream."""
+    """Run MFSDP v2's outer-DP communication on separate CUDA streams: the last-microbatch
+    outer-DP gradient reduction overlaps inner-DP reductions, and the first-microbatch
+    outer-DP all-gather that refreshes compute weights after an optimizer step overlaps
+    inner-DP all-gathers."""
 
     use_custom_fsdp: bool = False
     """
