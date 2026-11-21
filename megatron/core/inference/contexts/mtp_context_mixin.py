@@ -9,6 +9,7 @@ attention metadata without disturbing the main forward's state.
 """
 
 import contextlib
+import math
 from typing import List, Optional, Tuple
 
 import torch
@@ -211,6 +212,38 @@ class MTPContextMixin:
         """
         depth = self.num_speculative_tokens
         return max(depth + 1, 2 * depth if self.enable_mtp_kv_cache else 0)
+
+    def mtp_peak_block_count(self, prompt_length: int, num_tokens_to_generate: int) -> int:
+        """KV blocks a request holds at its peak with the draft KV cache, for the submission check.
+
+        Mirrors the reservations admission and decode make, so a request that passes the check
+        can be scheduled once the pool is free:
+          * Every admission, whether the first prefill or the re-admission of a checkpoint after
+            an eviction or a RECOMPUTE suspend, holds the prompt's blocks plus the reserve block
+            of `_mtp_prefill_reserve_blocks` when the prompt's last token lies within
+            `num_speculative_tokens + 1` of a block end. A checkpoint's prompt holds every
+            generated token but the last, and the count only grows with the prompt.
+          * Every decode step holds `_decode_kv_lookahead_tokens` past the committed tokens,
+            which are at most the prompt and all generated tokens but the last two.
+
+        Args:
+            prompt_length (int): Prompt tokens.
+            num_tokens_to_generate (int): Tokens the request may generate.
+
+        Returns:
+            (int): The largest block count any step of the request holds.
+        """
+        block_size = self.block_size_tokens
+        longest_prompt = prompt_length + max(num_tokens_to_generate - 1, 0)
+        blocks = math.ceil(longest_prompt / block_size)
+        if (longest_prompt - 1) % block_size >= block_size - 1 - self.num_speculative_tokens:
+            blocks += 1
+        if num_tokens_to_generate > 1:
+            committed = prompt_length + num_tokens_to_generate - 2
+            blocks = max(
+                blocks, math.ceil((committed + self._decode_kv_lookahead_tokens) / block_size)
+            )
+        return blocks
 
     def _mtp_next_decode_block_counts(self, request_slice: slice) -> Tensor:
         """Blocks needed to cover verification and drafting after full acceptance."""
