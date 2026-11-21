@@ -11,6 +11,8 @@ Tests the following functionality:
 5. TransformerConfig 'mhc' in recompute_modules option
 """
 
+from collections.abc import Callable, Iterable
+
 import pytest
 import torch
 
@@ -21,6 +23,62 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
+
+def _parameter_gradients(module):
+    """Snapshot every original parameter, rejecting missing gradient paths."""
+    parameters = dict(module.named_parameters())
+    assert parameters
+    gradients = {}
+    for name, parameter in parameters.items():
+        assert parameter.grad is not None, f"Missing gradient for {name}"
+        gradients[name] = parameter.grad.detach().clone()
+    return gradients
+
+
+def _assert_parameter_gradients_close(module, expected, **kwargs):
+    torch.testing.assert_close(_parameter_gradients(module), expected, **kwargs)
+
+
+def _weighted_loss(outputs, weights):
+    # Uniform sums can hide changes to the doubly stochastic residual mixing map.
+    return sum((output * weight).sum() for output, weight in zip(outputs, weights, strict=True))
+
+
+def _discard_and_check_outputs(
+    manager: CheckpointWithoutOutputManager,
+    boundary: torch.Tensor,
+    *,
+    live_tensors: Iterable[torch.Tensor] = (),
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Verify the discard and return a hook that checks the rebuilt values during backward.
+
+    The manager installs its rebuild hook first, so the caller's check sees the restored outputs.
+    """
+    outputs = [
+        output.detach()
+        for checkpoint in manager.checkpoints
+        for output in checkpoint.outputs
+        if isinstance(output, torch.Tensor)
+    ]
+    assert outputs, "The real mHC path must register replay work"
+    assert all(output.untyped_storage().size() > 0 for output in outputs)
+    expected = [output.clone() for output in outputs]
+    live = [tensor.detach() for tensor in (boundary, *live_tensors)]
+
+    manager.discard_all_outputs_and_register_unified_recompute(boundary)
+
+    assert all(output.untyped_storage().size() == 0 for output in outputs)
+    assert all(tensor.untyped_storage().size() > 0 for tensor in live)
+
+    def check_reconstruction(grad: torch.Tensor) -> torch.Tensor:
+        assert all(output.untyped_storage().size() > 0 for output in outputs)
+        assert all(tensor.untyped_storage().size() > 0 for tensor in live)
+        for output, original in zip(outputs, expected, strict=True):
+            torch.testing.assert_close(output, original)
+        return grad
+
+    return check_reconstruction
 
 
 class TestHyperConnectionModuleCheckpoint:
@@ -76,9 +134,7 @@ class TestHyperConnectionModuleCheckpoint:
         assert hybrid_output[3].shape == hidden_states.shape
 
     def test_forward_normal_vs_checkpoint_correctness(self):
-        """
-        Test that _forward_with_checkpoint produces the same outputs as _forward_normal.
-        """
+        """Real aggregate replay preserves values and every input/parameter gradient."""
         hidden_size = 64
         num_streams = 4
         seq_len = 8
@@ -103,10 +159,12 @@ class TestHyperConnectionModuleCheckpoint:
         torch.cuda.manual_seed(42)
         aggregated_ref, h_res_ref, h_post_ref, residual_ref = module._forward_normal(hidden_states)
         mixed_ref = module.apply_h_res(h_res_ref, residual)
-        loss_ref = aggregated_ref.sum() + mixed_ref.sum() + h_post_ref.sum()
-        loss_ref.backward()
+        weights = [torch.randn_like(output) for output in (aggregated_ref, mixed_ref, h_post_ref)]
+        _weighted_loss((aggregated_ref, mixed_ref, h_post_ref), weights).backward()
         grad_hidden_ref = hidden_states.grad.clone()
         grad_residual_ref = residual.grad.clone()
+        parameter_grads_ref = _parameter_gradients(module)
+        module.zero_grad(set_to_none=True)
 
         # Forward with checkpoint
         torch.manual_seed(42)
@@ -116,13 +174,23 @@ class TestHyperConnectionModuleCheckpoint:
             module._forward_with_checkpoint(hidden_states_ckpt, manager)
         )
         mixed_ckpt = module.apply_h_res(h_res_ckpt, residual_ckpt)
-        # Calculate loss before discarding outputs
-        loss_ckpt = aggregated_ckpt.sum() + mixed_ckpt.sum() + h_post_ckpt.sum()
-
-        # Register unified recompute hook
-        manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
-
-        # Backward pass
+        torch.testing.assert_close(
+            (aggregated_ckpt, h_res_ckpt, h_post_ckpt, residual_ckpt_out, mixed_ckpt),
+            (aggregated_ref, h_res_ref, h_post_ref, residual_ref, mixed_ref),
+        )
+        loss_ckpt = _weighted_loss((aggregated_ckpt, mixed_ckpt, h_post_ckpt), weights)
+        check_reconstruction = _discard_and_check_outputs(
+            manager,
+            loss_ckpt,
+            live_tensors=(
+                hidden_states_ckpt,
+                residual_ckpt,
+                residual_ckpt_out,
+                h_res_ckpt,
+                h_post_ckpt,
+            ),
+        )
+        loss_ckpt.register_hook(check_reconstruction)
         loss_ckpt.backward()
         grad_hidden_ckpt = hidden_states_ckpt.grad.clone()
         grad_residual_ckpt = residual_ckpt.grad.clone()
@@ -138,6 +206,7 @@ class TestHyperConnectionModuleCheckpoint:
             f"Checkpoint: {grad_residual_ckpt}\n"
             f"Reference: {grad_residual_ref}"
         )
+        _assert_parameter_gradients_close(module, parameter_grads_ref, atol=1e-5, rtol=1e-5)
 
     def test_apply_h_post_with_checkpoint(self):
         """
@@ -189,9 +258,7 @@ class TestHyperConnectionModuleCheckpoint:
         assert torch.allclose(grad_h_post_ckpt, grad_h_post_ref, atol=1e-5)
 
     def test_forward_with_manager_parameter(self):
-        """
-        Test forward() method with mhc_recompute_manager parameter.
-        """
+        """The public module call must enter the real checkpoint path when given a manager."""
         hidden_size = 64
         num_streams = 4
         seq_len = 8
@@ -210,28 +277,35 @@ class TestHyperConnectionModuleCheckpoint:
         # Reference: forward without manager (uses _forward_normal)
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        aggregated_ref, h_res_ref, h_post_ref = module.forward(
-            hidden_states, mhc_recompute_manager=None
-        )
-        loss_ref = aggregated_ref.sum() + h_res_ref.sum() + h_post_ref.sum()
-        loss_ref.backward()
+        aggregated_ref, h_res_ref, h_post_ref = module(hidden_states, mhc_recompute_manager=None)
+        weights = [torch.randn_like(output) for output in (aggregated_ref, h_res_ref, h_post_ref)]
+        _weighted_loss((aggregated_ref, h_res_ref, h_post_ref), weights).backward()
         grad_hidden_ref = hidden_states.grad.clone()
+        parameter_grads_ref = _parameter_gradients(module)
+        module.zero_grad(set_to_none=True)
 
         # With manager (uses _forward_with_checkpoint)
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
         manager = CheckpointWithoutOutputManager()
-        aggregated_ckpt, h_res_ckpt, h_post_ckpt = module.forward(
+        aggregated_ckpt, h_res_ckpt, h_post_ckpt = module(
             hidden_states_ckpt, mhc_recompute_manager=manager
         )
-        loss_ckpt = aggregated_ckpt.sum() + h_res_ckpt.sum() + h_post_ckpt.sum()
+        torch.testing.assert_close(
+            (aggregated_ckpt, h_res_ckpt, h_post_ckpt), (aggregated_ref, h_res_ref, h_post_ref)
+        )
+        loss_ckpt = _weighted_loss((aggregated_ckpt, h_res_ckpt, h_post_ckpt), weights)
 
-        manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
+        check_reconstruction = _discard_and_check_outputs(
+            manager, loss_ckpt, live_tensors=(hidden_states_ckpt, h_res_ckpt, h_post_ckpt)
+        )
+        loss_ckpt.register_hook(check_reconstruction)
         loss_ckpt.backward()
         grad_hidden_ckpt = hidden_states_ckpt.grad.clone()
 
         # Verify gradients match
         assert torch.allclose(grad_hidden_ckpt, grad_hidden_ref, atol=1e-5)
+        _assert_parameter_gradients_close(module, parameter_grads_ref, atol=1e-5, rtol=1e-5)
 
 
 class TestMHCBlockRecomputeIntegration:
@@ -255,7 +329,7 @@ class TestMHCBlockRecomputeIntegration:
         batch_size = 2
         n_channels = num_streams * hidden_size
 
-        # Create multiple HyperConnection modules (simulating multiple layers)
+        # Compose real mHC modules, including checkpointed nonterminal BDA operations.
         config = TransformerConfig(
             num_layers=4,
             hidden_size=hidden_size,
@@ -267,9 +341,27 @@ class TestMHCBlockRecomputeIntegration:
             mhc_init_gating_factor=0.01,
         )
 
-        modules = [
+        modules = torch.nn.ModuleList(
             HyperConnectionModule(config=config, layer_number=i + 1).cuda() for i in range(3)
-        ]
+        )
+
+        def forward(hidden_states, residual, manager=None):
+            mappings = []
+            for index, module in enumerate(modules):
+                aggregated, h_res, h_post = module(hidden_states, mhc_recompute_manager=manager)
+                mappings.extend((h_res, h_post))
+                hidden_states = module.fused_h_res_h_post_bda(
+                    h_res,
+                    residual,
+                    h_post,
+                    (0.1 * aggregated, None),
+                    dropout_prob=0.0,
+                    training=True,
+                    fused=False,
+                    manager=manager if index < len(modules) - 1 else None,
+                )
+                residual = hidden_states
+            return hidden_states, mappings
 
         # Create input tensors
         hidden_states_ref = torch.randn(
@@ -286,19 +378,13 @@ class TestMHCBlockRecomputeIntegration:
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
 
-        h = hidden_states_ref
-        r = residual_ref
-        for module in modules:
-            agg, h_res, h_post = module.forward(h, mhc_recompute_manager=None)
-            agg, _ = module.apply_h_post((0.1 * agg, None), h_post, manager=None)
-            mixed = module.apply_h_res(h_res, r)  # Apply h_res to get mixed [s, b, n*C]
-            h = agg + mixed
-            r = h
-
-        loss_ref = h.sum()
-        loss_ref.backward()
+        output_ref, mappings_ref = forward(hidden_states_ref, residual_ref)
+        weight = torch.randn_like(output_ref)
+        _weighted_loss((output_ref,), (weight,)).backward()
         grad_hidden_ref = hidden_states_ref.grad.clone()
         grad_residual_ref = residual_ref.grad.clone()
+        parameter_grads_ref = _parameter_gradients(modules)
+        modules.zero_grad(set_to_none=True)
 
         # With checkpoint using single manager
         torch.manual_seed(42)
@@ -306,18 +392,15 @@ class TestMHCBlockRecomputeIntegration:
 
         manager = CheckpointWithoutOutputManager()
 
-        h = hidden_states_ckpt
-        r = residual_ckpt
-        for module in modules:
-            agg, h_res, h_post = module.forward(h, mhc_recompute_manager=manager)
-            agg, _ = module.apply_h_post((0.1 * agg, None), h_post, manager=manager)
-            mixed = module.apply_h_res(h_res, r)  # Apply h_res to get mixed [s, b, n*C]
-            h = agg + mixed
-            r = h
-
-        loss_ckpt = h.sum()
-        manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
-        loss_ckpt.backward()
+        output_ckpt, mappings_ckpt = forward(hidden_states_ckpt, residual_ckpt, manager)
+        torch.testing.assert_close(output_ckpt, output_ref)
+        torch.testing.assert_close(mappings_ckpt, mappings_ref)
+        check_reconstruction = _discard_and_check_outputs(
+            manager, output_ckpt, live_tensors=(hidden_states_ckpt, residual_ckpt, *mappings_ckpt)
+        )
+        output_ckpt.register_hook(check_reconstruction)
+        # The terminal BDA output must remain usable after earlier outputs are discarded.
+        _weighted_loss((output_ckpt,), (weight,)).backward()
 
         grad_hidden_ckpt = hidden_states_ckpt.grad.clone()
         grad_residual_ckpt = residual_ckpt.grad.clone()
@@ -329,13 +412,10 @@ class TestMHCBlockRecomputeIntegration:
         assert torch.allclose(
             grad_residual_ckpt, grad_residual_ref, atol=1e-4
         ), f"Chained HyperConnection residual gradients mismatch"
+        _assert_parameter_gradients_close(modules, parameter_grads_ref, atol=1e-4, rtol=1e-5)
 
     def test_partial_checkpoint_last_layer_not_checkpointed(self):
-        """
-        Test that when is_last_layer_in_block=True, the final output is NOT checkpointed.
-        This simulates the TransformerBlock behavior where the last layer's MLP BDA
-        serves as the hook_tensor for unified recompute.
-        """
+        """The real terminal BDA stays live while its aggregate input is replayed."""
         hidden_size = 64
         num_streams = 4
         seq_len = 8
@@ -367,47 +447,58 @@ class TestMHCBlockRecomputeIntegration:
         # Reference
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        aggregated_ref, h_res_ref, h_post_ref = module.forward(
+        aggregated_ref, h_res_ref, h_post_ref = module(
             hidden_states_ref, mhc_recompute_manager=None
         )
-        aggregated_ref, _ = module.apply_h_post(
-            (0.1 * aggregated_ref, None), h_post_ref, manager=None
+        output_ref = module.fused_h_res_h_post_bda(
+            h_res_ref,
+            residual_ref,
+            h_post_ref,
+            (0.1 * aggregated_ref, None),
+            dropout_prob=0.0,
+            training=True,
+            fused=False,
         )
-        mixed_ref = module.apply_h_res(
-            h_res_ref, residual_ref
-        )  # Apply h_res to get mixed [s, b, n*C]
-        # Simulate BDA that is NOT checkpointed (last layer)
-        output_ref = aggregated_ref + 0.5 * mixed_ref
-        loss_ref = output_ref.sum()
-        loss_ref.backward()
+        weight = torch.randn_like(output_ref)
+        _weighted_loss((output_ref,), (weight,)).backward()
         grad_hidden_ref = hidden_states_ref.grad.clone()
+        grad_residual_ref = residual_ref.grad.clone()
+        parameter_grads_ref = _parameter_gradients(module)
+        module.zero_grad(set_to_none=True)
 
         # With manager - checkpoint everything except final output
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
         manager = CheckpointWithoutOutputManager()
-        aggregated_ckpt, h_res_ckpt, h_post_ckpt = module.forward(
+        aggregated_ckpt, h_res_ckpt, h_post_ckpt = module(
             hidden_states_ckpt, mhc_recompute_manager=manager
         )
-
-        aggregated_ckpt, _ = module.apply_h_post(
-            (0.1 * aggregated_ckpt, None), h_post_ckpt, manager=manager
+        output_ckpt = module.fused_h_res_h_post_bda(
+            h_res_ckpt,
+            residual_ckpt,
+            h_post_ckpt,
+            (0.1 * aggregated_ckpt, None),
+            dropout_prob=0.0,
+            training=True,
+            fused=False,
         )
-        mixed_ckpt = module.apply_h_res(
-            h_res_ckpt, residual_ckpt
-        )  # Apply h_res to get mixed [s, b, n*C]
-        # Simulate BDA that is NOT checkpointed (last layer) - this is the hook_tensor
-        output_ckpt = aggregated_ckpt + 0.5 * mixed_ckpt
-
-        # Register unified recompute on the output (which is not checkpointed)
-        manager.discard_all_outputs_and_register_unified_recompute(output_ckpt)
-
-        loss_ckpt = output_ckpt.sum()
-        loss_ckpt.backward()
+        torch.testing.assert_close(
+            (aggregated_ckpt, h_res_ckpt, h_post_ckpt, output_ckpt),
+            (aggregated_ref, h_res_ref, h_post_ref, output_ref),
+        )
+        check_reconstruction = _discard_and_check_outputs(
+            manager,
+            output_ckpt,
+            live_tensors=(hidden_states_ckpt, residual_ckpt, h_res_ckpt, h_post_ckpt),
+        )
+        output_ckpt.register_hook(check_reconstruction)
+        _weighted_loss((output_ckpt,), (weight,)).backward()
         grad_hidden_ckpt = hidden_states_ckpt.grad.clone()
 
         # Verify gradients match
         assert torch.allclose(grad_hidden_ckpt, grad_hidden_ref, atol=1e-5)
+        torch.testing.assert_close(residual_ckpt.grad, grad_residual_ref, atol=1e-5, rtol=1e-5)
+        _assert_parameter_gradients_close(module, parameter_grads_ref, atol=1e-5, rtol=1e-5)
 
 
 class TestTransformerConfigRecomputeMhc:
