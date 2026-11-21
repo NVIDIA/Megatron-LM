@@ -30,7 +30,7 @@ from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
-from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import ensure_params_ready, nvtx_range_pop, nvtx_range_push
 
 from .csa_utils import cp_utils, packed_layout
 from .csa_utils.fused_sparse_attention import (
@@ -654,6 +654,8 @@ class Compressor(MegatronModule):
         ratio = self.compress_ratio
         kv, score = self._project(x)
         kv = kv.reshape(total_comp, ratio, 1, -1)
+        # forward_packed is called directly, bypassing this module's forward pre-hook.
+        ensure_params_ready([self.ape])
         score = score.reshape(total_comp, ratio, 1, -1) + self.ape.view(1, ratio, 1, -1)
         if self.overlap:
             is_first = compressed_group_ids == 0
