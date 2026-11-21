@@ -1,0 +1,186 @@
+{
+  "commit": "a55b345f20462182b2c4bb00fbc488a414dd5961",
+  "scope": "CPU schedulers with paired costs, benchmark predictors and the full Qwen3.5-35B model",
+  "adaptations": [
+    "remove historical heads/schema compatibility/report production",
+    "retain the selected numerical operations and coefficient values",
+    "extract only runtime parameters; original validation reports remain in the source repository",
+    "remove unused offline adapters and signature estimates; share the sequence-cap implementation",
+    "share solver pack filling, guide/exact layout pricing, input validation and result construction; remove unused offline plan fields",
+    "group cost models and coefficient files under models; share RuntimePlanner without one solver inheriting the other; move scoring timeline into runtime; formulas and parameters unchanged",
+    "Remove the old five-layer Qwen3.5 runtime proxy and replace the exported layout with the full 40 decoder layers plus one MTP layer",
+    "remove the rank rotation of the lightweight solver: it acts only on a cost model that declares pack costs independent of the ranks (placement_invariant), and neither cost model bound to this solver declares it"
+  ],
+  "source_python_sha256": {
+    "runtime/lightweight.py": "86720aded0f19a6a45d4fb10752ed7228a12ddb9c4dd41d78d9087df4d85cc17",
+    "runtime/planner.py": "ffdb09978204a006314b71fd5ce1599ee417d89daa166b9bd54de29700243d53",
+    "runtime/cost_model.py": "a659e35598e35e0f74038b4c27f20da1b9ff8e944c56eb65808ad052763087a0",
+    "runtime/sched/costs.py": "c26d469c1deff529dec8f526c946f08d003c6e50a0c507dbe35386dab87f16d9",
+    "runtime/sched/timeline.py": "6c0723afc72531e4cac128cf2785fec94118ca6ba78bb27333e0d68a73296aae"
+  },
+  "runtime_parameters_sha256": {
+    "models/usp_calib_v1.json": "d25989552ab9700f07261231fa13d66672d98684435fff57838442ca12c19cd7",
+    "models/qwen3_h100_p2p.json": "a031958b1a02cc523d4b0ab3163649f2f42532cd4e6daf6aa459768b99c0027e",
+    "models/attention_gb200.json": "a943dd39f20ed91ef164d383528822df4aed9d494218970a4a30b5e9d4bbec4b",
+    "models/attention_h100.json": "b715dd1f4853c240e46ec74dd46aeefd5f6a8d40dfeeef825bc67c4ef2453388",
+    "models/full35b/parameters.json": "2b2e7a5adbcabed37ef5994a456af7b1d50c9ae0bfbe0ebfdc9005eb5d57e64d",
+    "models/full35b/manifest.json": "53f8cbfa63b6179e818be0463cde7e78157779aea75f620a0929131593818a47"
+  },
+  "dynamic_usp": {
+    "project": "DynamicUSP",
+    "commit": "1ff97a4ae0beb5e088fadb9e112265bdd194b24d",
+    "scope": "solve_gbs, bound as scheduler type dynamic_usp: the Stage 1 allocation, the search over a window of microbatch counts, the Stage 1 sample weight, the step-time objective that scores every count, Stage 2 (off by default), and the original usp_calib_v1 group-time model with its table. The objective is ported for one pipeline stage and for the interleaved schedule of more than one; a run with more than one pipeline stage and no virtual pipeline stages is scored with Megatron's own order, which is not ported. A calibration measured for classic P2P with the DynamicUSP calibration procedure is selected by hardware; it is planned at one pipeline stage and without Stage 2",
+    "ported": [
+      "gbs/allocator.py and gbs/placement.py: the aligned power-of-two Stage 1 allocation with its sample and rank tie-breaks, short-sample packing, column offset, tier affinity and heavy-middle order; with tier_time_factors it balances predicted time instead of weight: in the group size of a long sample, in the load that picks its microbatch, in the budget for packing short samples into a wide group and in the choice of the group that takes a sample no empty group can hold",
+      "gbs/bounds.py and gbs/search.py: the lower bound on the microbatch count from token capacity and rank slots, the window of candidate_count counts that starts there, and the choice of the count with the lowest score, the smaller count on a tie; with pp_multiple the bound is rounded up to a multiple of it and the window holds that count and the next multiples",
+      "gbs/config.py: candidate_count, pp_multiple, the three placement switches, keep_candidate_layouts and the tier_time_factors table with its value rules (finite numbers of at least 1, a size without an entry counts as 1, a table of ones is off); tier_time_factors_from_profile as derive_tier_time_factors of the original-profile cost model",
+      "models.py and validation.py: outlier_threshold and pack_shorts_into_long_groups with their defaults and checks, and the rejection of pack_shorts_into_long_groups=False with a minimum group size above one",
+      "weights.py: empirical_joint_weight as the Stage 1 sample weight max(1, A*L^2/1e10 + B*L/1e5 + C) of a sample of L tokens, and its published constants as the default A, B, C of the original profile",
+      "objectives/pipeline.py: the step time with coupled groups. At one pipeline stage it is written as a program of the runtime timeline: microbatches run one after the other, only the ranks of one group wait for each other, the step ends when the last rank finishes, and per_mb_overhead_ms is added for every microbatch. At more than one it is runtime/pipeline.py: the interleaved one-forward-one-backward plan (interleaved_plan) and its replay (simulate) on the forward and backward time of every group, which compute_fwd_share and comm_fwd_share split (group_time). The defaults and value rules of the three terms; the two shares change no score at one pipeline stage, as upstream",
+      "profiles/usp_calib_v1.py and profiles/calib_table_v1.json: the default group-time formulas (compute, all-to-all, ring) of the fixed 44-layer, 24-Q-head, d160, U8 all-to-all plus ring profile, the table unchanged as models/usp_calib_v1.json, the required schema version v1.1 and the rejection of NaN and Infinity anywhere in a table; for Stage 2, the work of a sample and its load at every group size (prepare_sample), the load of an empty group and the exact group time (evaluate_group)",
+      "stage2/solver.py, stage2/allocators.py, stage2/evaluator.py, stage2/model.py, api.py and models.py: Stage 2 as runtime/stage2.py, off by default. The samples of each microbatch of the chosen count are placed again on its fixed CP groups, keep samples (keep_threshold, default 8.4) first, and the new assignment is taken when the slowest group of the microbatch gets faster by the numeric epsilon; an error keeps the Stage 1 assignment (fallback mode)",
+      "profiles/usp_calib_v1.py, stage2/allocators.py, stage2/evaluator.py and stage2/solver.py: the ring placement guard of Stage 2 for groups above the reference size 8, with upstream's threshold 0.0 and its option guard_domain_factor at the default 0.4. It acts at upstream's three places: a sample joins such a group only if the margin of the group stays at least min(margin before, threshold), a finished construction with such a group below the threshold is dropped, and the Stage 1 layout is priced without the test"
+    ],
+    "adaptations": [
+      "the coefficients of the scheduler are read from an optional solver section of the coefficient file (sample_weight, tier_time_factors, pipeline, stage2); upstream takes them as Python arguments. solver.pipeline.fitted_at, the record of the run in which the step terms were fitted, has no upstream counterpart and changes no score. Upstream has no default sample weight: without solver.sample_weight the original profile uses the constants published in weights.py, a measured fit that is not derived from the packaged table",
+      "tier_time_factors keys must be CP sizes of the cost model; a key for a size the run cannot form is accepted and never read, and the factors are used as written, not rescaled, so a table with a key below the smallest size of the run stays relative to a size the run does not form. A JSON string key is converted to an integer when it consists of at most nine ASCII digits without a leading zero. Upstream takes integer keys only and checks them against the group sizes of the topology",
+      "remove head and communication-specific constraints; the caller supplies the legal group sizes",
+      "group capacity is the physical-capacity predicate of the runtime: every sequence padded to the dataset alignment, 2 x DPxCP, and to twice the CP size, and at most min(thd_max_packed_sequences, 64) sequences per group, fewer when the cost model declares it. Upstream counts unpadded tokens and has no sequence limit",
+      "capacity and the count lower bound use the padded length of a sample; the Stage 1 weight A, B, C and the group times of the original profile use its logical length. Upstream uses one token count for both; the two agree for lengths that are multiples of 2 x DPxCP",
+      "the count lower bound adds ceil(samples / most sequences one microbatch can hold), a necessary condition under the sequence limit. Where this term raises the bound to a count inside upstream's window, the counts below it are skipped and the window ends where upstream's ends, so the window holds no count that upstream does not try; where it raises the bound past upstream's window, a window of candidate_count counts starts at the bound. When every count of the window is rejected for group capacity the search goes on past the window, count by count and whatever the rejection, to the first count with a layout and lays out candidate_count counts from that one; it looks for that count among at most 4 x candidate_count counts past the window and at no count above the number of samples, and yields no layout when none of them has one. A window with a rejection for another reason is not extended. Upstream raises an error when no count of its window has a layout. With more than one pipeline stage and virtual pipeline stages every count is a multiple of the pipeline-parallel size (pp_multiple), also that of the default layout and of the capacity-only layout, and these rules move over the multiples; without virtual pipeline stages the multiple is 1 and any count is planned",
+      "candidate counts are always scored with the step time; upstream's selection without an objective, which takes the smallest feasible count, is not offered",
+      "the predicted step time adds global.C_global_clean_ms once per step; upstream's objective leaves this constant out, and it changes no comparison",
+      "the layout of the default dynamic-CP heuristic is scored with the same step time and kept unless the search result is predicted faster; when the search yields no layout (no count with a layout, or a cost-model rejection of a candidate) and no default layout was priced, a capacity-only layout is used. Neither exists in DynamicUSP; the plan statistics selected_incumbent and capacity_fallback mark such plans",
+      "outlier_threshold 1.0, candidate_count 4, short-sample packing and the three placement rules keep the upstream library defaults and are not settable from the runtime file; two of the four upstream example problems use outlier_threshold 1.3",
+      "the options of the upstream profile are fixed at their defaults: all 44 layers replayed, FA cache on, communication terms on, four backward ring chunks, no c_seg term, forward-KV exposed fraction 0.87 for a ring of four and 0 for a ring of two",
+      "table fields that the port does not read are not required and not checked, and ring beta keys that do not end in MB are ignored; upstream requires its complete schema. A key given twice in one object of a table is rejected; upstream's table loader keeps the last value. Upstream's formula preflight is not run when a table is loaded: a table whose formulas give no valid time for a group is reported by the start-up check of the CP sizes or when that group is priced, as a pack the cost model rejects",
+      "the original profile is accepted for DPxCP 8, 16 or 32 only; upstream has no such limit",
+      "the original profile reads neither the training model configuration nor the tensor- and expert-parallel sizes, so it does not check that a table was measured for the run",
+      "more than one pipeline stage is accepted for the original profile only. As upstream, the stages count as equal shares of the model and start-up does not check the model. A run without virtual pipeline stages is scored with the order in which Megatron runs a training step, which upstream does not have (non_interleaved_plan in runtime/pipeline.py: the plan builder shared with interleaved_plan, at one chunk per stage and with the warm-up count of forward_backward_pipelining_without_interleaving of megatron/core/pipeline_parallel/schedules.py): stage r of P first runs min(P - r - 1, n) warm-up forward microbatches of n, and any n is planned (pp_multiple 1), where upstream's one plan builder, at one chunk per stage, gives 2 (P - r - 1) warm-up forward microbatches, all n when n equals P, and takes multiples of P only. Both orders are one-forward-one-backward and give the same step time for identical microbatches. The replay keeps times per DPxCP rank instead of per smallest group size, with the same result for the layouts upstream accepts",
+      "Stage 2 is switched by solver.stage2 of the coefficient file (upstream: Stage2Policy of the problem) and offered by the original profile only. As upstream, the layout after Stage 2 is the search result; the port scores it again with the step time, which upstream does not, and compares that score with the default layout (when it cannot be scored the Stage 1 layout is kept, outcome RESCORE_REJECTED)",
+      "the differences inside Stage 2 (the capacity predicate of the runtime on every placement, two sizes of a sample, no raise mode and the others) are listed in the module docstring of runtime/stage2.py",
+      "the ring guard of Stage 2: the two table fields that only it reads, compute.in_train_overhead_factors.OF_fa_fwd and ring.in_train_bw_factor, are required and checked only when Stage 2 is on and the run can form a CP size above 8, where upstream requires them in every table. The threshold must be an int or a float, no boolean; it is validated once, when the planner is built, and read again for every microbatch, where it must still be that number, compared as floats (a cost model that then gives another threshold, or none, fails Stage 2 for that microbatch); a cost model without one has no guard; upstream's metric guard_min_margin is not recorded (module docstrings of runtime/stage2.py and models/usp_calib_v1.py)"
+    ],
+    "not_included": [
+      "of Stage 2: the usp_first_principles profile, which is upstream's default Stage 2 profile, the choice of a profile by name with profile_params, the feature preflight of a profile (missing_features) and the raise mode (on_error)",
+      "upstream's order for one model chunk per pipeline stage (its virtual_stages 1) in a training run: a run with more than one pipeline stage and no virtual pipeline stages is scored with Megatron's order instead (adaptations). Upstream's order remains in the Python interface of the planner (pipeline=(P, 1) without pipeline_schedule) and in the upstream results pinned for it",
+      "the rho LUT of the forward-KV exposed fraction (ring.fwdkv_exposure_frac_by_rho, read upstream with ring_use_rho_lut) and the constructor options of the upstream profile; an exposed fraction fitted by the calibration procedure has no place in the coefficient file",
+      "allow_empty_groups, the uncoupled objective and unit_ranks, the judge diagnostics, the single-microbatch entry point, the legacy allocator, the command-line interface, the error codes of upstream's count search, and the weights length_weight and usp_calib_v1_compute_weight"
+    ],
+    "fidelity": "Compared offline with upstream solve_gbs and PipelineCostModel(USPCalibV1Profile(), pipeline_parallel=1) on random batches with the original profile: where upstream returns a plan, for lengths that are multiples of 2 x DPxCP, upstream layouts that hold, at every count of its window, at most as many sequences per group as the runtime allows (64 unless thd_max_packed_sequences or the cost model lowers it; the comparison ran at 64) and no default layout, the Stage 1 weights, every candidate layout and the chosen plan are equal, and every candidate score equals the upstream objective plus C_global up to rounding. This holds as well where the sequence term raises the count lower bound: under these conditions the raised bound lies inside upstream's window, upstream rejects every count below it, and the runtime tries the other counts of that window and no further count. Two such batches are pinned, one at DPxCP 16 with CP 8 only and the default options and one at DPxCP 32 with candidate_count 2. A bound raised past upstream's window is outside these conditions: upstream then has no plan, or each of its layouts holds more sequences in a group than the runtime allows. Under the same conditions the comparison was repeated with more than one pipeline stage (pp_multiple, and PipelineCostModel at the pipeline sizes of the run) and with Stage 2 switched on: the chosen count, the layout after Stage 2 and the outcome of every microbatch are equal, except where the capacity predicate of the runtime rejects a placement inside Stage 2 (records marked runtime_capacity). With Stage 2 on, upstream ran unmodified, with the ring guard of its profile. The order of a run without virtual pipeline stages has no upstream reference: offline it was compared with Megatron's schedule function, executed once per pipeline stage (1 to 6 stages), with a transcription of its three loops (1 to 16 stages, 1 to 100 microbatches) and with a closed form for identical microbatches; unit tests compare it with pinned results of an independent replay (9 orders and 57 step times, equal bit for bit). Offline, its plans were compared with unmodified upstream solve_gbs at pp_multiple 1 whose objective was given that order in the harness process: of 5,000 random problems at 2, 4 and 8 pipeline stages, with Stage 2 off and on, the 4,545 where upstream has a plan inside the sequence limit of the runtime have equal candidate scores and plans. The comparisons ran on CPython 3.12, the project's interpreter, on which plans are defined; an older one rounds the built-in sum of floats differently, and a plan was seen to differ there (README.md names the cases). More than one pipeline stage, with or without virtual pipeline stages, has not been run on GPUs with NCCL process groups, and its predicted step time was not compared with a measured step. The upstream source is not part of this package and no test imports it; results of upstream runs are pinned in tests/unit_tests/datasets/dcp_usp_frozen_plans.json and dcp_usp_stage2_pins.json. dcp_non_interleaved_pins.json pins the order without virtual pipeline stages and is not upstream output: an independent replay of Megatron's order, and whole plans of the unmodified upstream solver whose objective was given that order",
+    "source_python_sha256": {
+      "api.py": "cbde93811d60de0a56fce34b4d35cc9701abe9646ed421f528ab90c0780ad094",
+      "gbs/allocator.py": "7f9e3da37e6d613a46d504f2677a6e9c8a920af9b393f729ab6222647fbc2a8a",
+      "gbs/bounds.py": "8ec1410c93b9760b394c5ccaef03a0713ba61e602a55848e1a829a89136ff3ee",
+      "gbs/config.py": "d765a0a819d6bfec4efc20bb444467cbfb8ea0ff455f14b4d33e0140ad5201e0",
+      "gbs/placement.py": "c3d33039a108e72caa67abc632c89f78d706e1b1b83e0da2ca8e2b150f06ed1b",
+      "gbs/search.py": "f3235b85347b2e111b219722969c5bef562f253c5ce9e67410d56f5eeec2aa9e",
+      "models.py": "232c59f69a3d360c7c118077826b38e1a710737f328825feb85852b5b91276c7",
+      "objectives/pipeline.py": "e9cadd486cc395286dd8e3b16c4d009ae93e0fad7ce5290e826779d1eaa499d9",
+      "profiles/usp_calib_v1.py": "a2dbcff0099936e283b2386783861d7191c5319e1cf9e22a8bff30f33207329d",
+      "stage2/allocators.py": "62ba148198d5a06c4983c0ebd6b562446ea55cbf2c5f2527f7598521e3dc4bee",
+      "stage2/evaluator.py": "440724bfb98422ba49063814cab347f7a8003dd608b9949f72c157ba8246f8b9",
+      "stage2/model.py": "b02b2497165a29b3ea5b72c2e6a24b573a33d4cc4e8dceabbf0e7f533eb18e79",
+      "stage2/solver.py": "726746fc7f62af929047782a244c671f82edf5e8aa52303f3695318a11684859",
+      "validation.py": "6e4c673d776f3f352720b8c558b5b2980ce9d546f1b52095794cd07eb937b99c",
+      "weights.py": "d5a5196018f1de6f2bfe4c3cf81df952bbdda44d7652f546b7c4412f4bc0e7f9"
+    },
+    "source_files_sha256": {
+      "profiles/calib_table_v1.json": "d25989552ab9700f07261231fa13d66672d98684435fff57838442ca12c19cd7"
+    },
+    "measured_calibrations": {
+      "h100": {
+        "parameters": "models/qwen3_h100_p2p.json",
+        "model": "models/qwen3_h100_p2p.py",
+        "methodology": {
+          "project": "DynamicUSP",
+          "commit": "18eb0f53dbdb3a13b19e49c02fd1782178947c9a",
+          "path": "skills/hot-switch-calibration/SKILL.md",
+          "adaptations": [
+            "Measure complete P2P self-attention forward/backward per layer for CP 1, 2, 4 and 8 instead of U8 all-to-all and ring coefficients for CP 8, 16 and 32",
+            "Use actual per-sequence physical padding and the maximum valid zigzag causal work of a rank",
+            "Model non-attention work with rank-weighted EP8 mean contributions",
+            "Fit a per-microbatch overhead and one iteration tail on recorded global batches",
+            "The Stage 1 sample weight of the procedure (A, B, C) was not fitted. Unless the coefficient file gives solver.sample_weight, the weight of a sample is the CP size times the predicted time of one microbatch that holds this sample alone in the smallest CP group that fits it; this definition is not part of DynamicUSP and jumps where a sample needs the next CP size",
+            "The step model synchronises the ranks of each expert-parallel block in every layer, where non-attention work is averaged over the block, and all ranks after the forward pass of the first microbatch; the DynamicUSP objective, and the original profile here, synchronise only the ranks of one CP group",
+            "The Stage 1 time-balance factors were not derived; solver.tier_time_factors of the coefficient file is used when given. solver.pipeline is rejected: the overhead per microbatch is profiles.classic_p2p.microbatch_overhead_ms"
+          ]
+        },
+        "recipe": {
+          "model": "Full Qwen3-30B-A3B, 48 layers, BF16",
+          "hardware": "32 NVIDIA H100 80GB HBM3 across four eight-GPU nodes",
+          "parallelism": "TP1, PP1, EP8, classic P2P context parallelism with CP 1, 2, 4 or 8 inside one node",
+          "tokens_per_rank": 4096,
+          "global_batch_size": 256,
+          "moe": "flex/hybridep with variable-token padding and forced-balanced routing",
+          "execution": "eager fused attention, no activation recomputation"
+        },
+        "measurements": {
+          "module_fitting_cases": 60,
+          "module_heldout_cases": 14,
+          "measured_steps_per_case": 20,
+          "step_overhead_batches": 3,
+          "step_overhead_rows": 11
+        }
+      }
+    }
+  },
+  "benchmark_predictors": {
+    "attention": {
+      "module": "models/attention.py",
+      "parameters": {
+        "gb200": "models/attention_gb200.json",
+        "h100": "models/attention_h100.json"
+      },
+      "source": "Two time models of NVIDIA's DCP attention benchmark (unpublished). Ring terms: the component calibration of its simulation of the P2P context-parallel ring attention of Transformer Engine, rank by rank and step by step. Causal block: its single-GPU calibration of a whole causal attention call, which its own record marks as not independently validated",
+      "source_coefficient_files_sha256": {
+        "gb200": {
+          "forward_components": "9d5860203c4b0f53fd5c4d70284173e085675c84b854c8bbf0fec0313a4e390b",
+          "backward_kernel": "82e0ed5c6c6a326f88b324754f621021c7654d745c4f0c87809f44d82739fffd",
+          "helpers": "123663249469a0f59ae8448b643c3c8ffecb427fe856488e442c842410b545ab",
+          "exchange_intra": "c7e6e99a68bfb0f93e3fcdba8fa14391a439de38831dbd7a7490df75e56c255a",
+          "device": "d55ae98b07ea4728e988122237e4f595f5dd6fc370f20952a6082797cea2aee6",
+          "causal_block": "6ef754c4f464c06f9933dc9f17a8b3b2d6cda17d97e5f5a41c4517ab943257cc"
+        },
+        "h100": {
+          "forward_components": "c46009f4dd377225dbbd58362c1ac0198f3879b6707d353915c5ce423efbde29",
+          "backward_kernel": "6e8c9980db7683245d4121f1741876d394fadb43ca709d6358e2174fe46fced5",
+          "helpers": "e17ac3961e8d5f81cab6a945d5e8146529d7f5e153a689a0a1e1efd97417a6a1",
+          "exchange_intra": "cd0dd7cb08fe56cf814d892a4ee4358132b6b3a2e9a52578dcbabb324b8ad006",
+          "exchange_cross": "1b492faf69bbee6e34ed0d949d575a22720632d62500bfd8b8601718b0f9408c",
+          "device": "2b60b9374666d52e27e4b1a531ed744be16baa032d9eb775725737db5ccd4bb7",
+          "causal_block": "e75c1bb14bd1bb40b2711ff62182f5c953b999a7189a97ecbd76dfccd31644e2"
+        }
+      },
+      "adaptations": [
+        "Derived from the source models and written anew for this package. It follows the control flow of the P2P context-parallel ring attention of Transformer Engine; no Transformer Engine code is copied",
+        "Every coefficient of the two parameter files is copied unchanged from the source coefficient files; nothing is refitted and no residual is added. The NVLink domain size is read from models/base.py",
+        "The causal block (step 0 of every ring member, and the whole call at CP size 1) is priced by the single-GPU calibration with its job queue, in place of the causal block of the ring calibration; its kernel programs are data of the parameter files and its input limits (64 sequences, three buffer sizes) are not enforced",
+        "In the other steps one attention kernel at a time on a GPU replaces the simulation of thread blocks that compete for SMs, and a forward kernel takes whole rounds of average query tiles instead of a queue of individual tiles; exchange blocks hold no SM",
+        "One forward/backward pair with all ring members started together, and its steady state, replaces the repeated pairs of the benchmark",
+        "Extensions that the ring model refuses: a step without valid query tokens (an empty kernel) and payload sizes between and beyond the measured points (interpolated; the last slope continues beyond the largest)",
+        "A ring of more than 1024 members and a buffer of more than 2**20 tokens per rank are refused",
+        "Bind each attention query to CP * tokens_per_rank storage and actual contiguous physical ranks",
+        "Require user-supplied fixed non-attention F/B times; no token regression, automatic measurement or E2E residual"
+      ],
+      "scope": "BF16 eager fused GQA with P2P context parallelism: core attention (the kernel with its ring communication, without projections), forward and backward, for H100 and GB200, six attention geometries, CP sizes 1 to 64 and any even number of tokens per rank up to 2**20 (compared with measurements at 4096, 8192 and 16384 only); a GB200 ring inside one NVLink domain; runtime adapter TP1/PP1/VPP1",
+      "accuracy": "An example cost model, checked on development data only (not blind). Mean error against measured core-attention times: GB200, 108 packs at CP 2 to 4: forward 11.1 %, backward 6.7 %; H100, 144 packs at CP 2 to 16: forward 8.7 %, backward 3.8 %; CP 1, 432 measurements of 216 packs: forward 3.3 %, backward 2.9 %, equal to the single-GPU model of the benchmark. Forward plus backward of the 108 and the 144 packs: 6.4 % and 5.0 % against the sum of the two separately measured times, 7.0 % and 6.3 % against the measured time of a forward/backward pair. The prediction falls short more as the CP size grows (H100, CP 17 to 64 at 4096 tokens per rank: forward 30 % low). Mean forward deviation from the ring source model above CP 1: GB200 3.3 % on the 108 packs (CP 2: 3.9 %) and 5.3 % on 360 scheduler queries at CP 2 to 64; H100 3.9 % on the 144 packs (CP 2: 7.6 %) and 2.3 % on 360 queries; largest 23.8 %. Backward: 1.2 % to 1.8 %, largest 25.0 %. README.md lists the limits"
+    }
+  },
+  "full_qwen35": {
+    "source_snapshot": "cost-model candidate of the full Qwen3.5-35B-A3B experiment of NVIDIA's DCP attention benchmark (unpublished); source_candidate_sha256 is the digest of its descriptor",
+    "source_candidate_sha256": "a268249ab9c342db393d1be0f321f88891a7fa0545b52e23460c0c58c3c26284",
+    "packaged_manifest": "models/full35b/manifest.json",
+    "scope": "Full Qwen3.5-35B-A3B 40 decoder + 1 MTP; 30 GDN and 11 FA whole attention modules",
+    "calibrated_domain": "GB200, DPxCP 32, expert_model_parallel_size 32, 16384 tokens per rank, native CP transport, CP sizes 1 to 32",
+    "non_attention": "Required fixed user F/B times excluding whole attention modules; no fitted density service or E2E residual loaded",
+    "scientific_accuracy_passed": false,
+    "original_runtime_admission": false,
+    "adaptations": [
+      "Merge the per-CP FA-v1 tables into one form over the CP size, fitted on the calibration packs of the source; keep the GDN-v2 hot forward and backward heads; state the per-layer cache mapping as a rule",
+      "Compose the actual 41-layer program with the user's fixed non-attention times",
+      "Select from normal training model configuration under the paired dcp_benchmark route",
+      "Apply the parameters to classic P2P with power-of-two CP sizes and the append_dummy_seq tail policy"
+    ]
+  }
+}
