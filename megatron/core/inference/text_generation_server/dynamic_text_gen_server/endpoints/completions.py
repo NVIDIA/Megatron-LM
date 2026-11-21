@@ -180,7 +180,9 @@ def format_completions_response(
         add_moe_routing_to_choice(choice_data, result, prompt_len)
         choices.append(choice_data)
 
-    usage = build_usage(prompt_tokens_counts, total_completion_tokens, cached_tokens_counts)
+    usage = build_usage(
+        prompt_tokens_counts, total_completion_tokens, cached_tokens_counts, shared_prompt=False
+    )
     return build_response(response_uid, "text_completion", choices, usage, response_metadata)
 
 
