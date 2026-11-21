@@ -2,6 +2,8 @@
 
 """Compatibility coverage for optional DSA backend hook kwargs."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from megatron.core import utils as core_utils
@@ -17,7 +19,7 @@ def _run_split_hook(
 ):
     marker = object()
     result = dsa_kernels.run_fused_qk_topk(
-        object(),
+        SimpleNamespace(dsa_kernel_backend="tilelang"),
         marker,
         marker,
         marker,
