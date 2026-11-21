@@ -192,6 +192,211 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @torch.inference_mode()
+    def test_async_chunked_prefix_reuse_executes_routed_mxfp8(self, monkeypatch):
+        """Real scheduler features and routed MXFP8 execute on the same engine steps."""
+        from megatron.core.inference.moe import flashinfer_mxfp8
+        from megatron.core.transformer.moe import experts
+        from tests.unit_tests.inference.engines.test_dynamic_engine import DynamicEngineTestConfig
+
+        if int(os.environ.get("WORLD_SIZE", "1")) < 4:
+            pytest.skip("The routed MXFP8 scheduler witness requires four EP ranks.")
+        if not flashinfer_mxfp8.HAVE_FLASHINFER_ROUTED_MXFP8:
+            pytest.skip("FlashInfer routed MXFP8 is unavailable.")
+        if torch.cuda.get_device_capability()[0] < 10:
+            pytest.skip("FlashInfer routed MXFP8 requires Blackwell.")
+
+        observations = {False: [], True: []}
+        state = {"env": None, "event": None, "in_async_forward": False}
+        real_async_forward = TextGenerationController._run_async_sched_forward
+        real_routed = experts.flashinfer_routed_mxfp8_moe
+        real_quantize = flashinfer_mxfp8.quantize_routed_mxfp8_input
+
+        def tracked_async_forward(controller, input_ids, position_ids):
+            state["in_async_forward"] = True
+            try:
+                return real_async_forward(controller, input_ids, position_ids)
+            finally:
+                state["in_async_forward"] = False
+
+        def tracked_quantize(hidden_states, padded_hidden_size):
+            data, scale = real_quantize(hidden_states, padded_hidden_size)
+            event = state["event"]
+            if event is not None:
+                event["quantized_rows"] = hidden_states.shape[0]
+                event["payload_dtype"] = data.dtype
+                event["scale_dtype"] = scale.dtype
+                event["nonzero_payload"] = torch.count_nonzero(data.view(torch.uint8)).item()
+                event["nonzero_scale"] = torch.count_nonzero(scale).item()
+            return data, scale
+
+        def tracked_routed(*args, **kwargs):
+            env = state["env"]
+            context = env.engine.context
+            active_ids = context.request_ids[
+                context.paused_request_count : context.total_request_count
+            ].tolist()
+            event = {
+                "async_forward": state["in_async_forward"],
+                "chunked_request": context.chunked_prefill_request_id,
+                "active_requests": len(active_ids),
+                "matched_prefix_blocks": max(
+                    (
+                        env.engine.get_request(request_id).num_matched_prefix_blocks
+                        for request_id in active_ids
+                    ),
+                    default=0,
+                ),
+                "continued_chunk_tokens": max(
+                    (
+                        env.engine.get_request(request_id).finished_chunk_token_count
+                        for request_id in active_ids
+                    ),
+                    default=0,
+                ),
+                "num_prefill_requests": context.num_prefill_requests,
+                "input_rows": args[0].shape[0],
+                "token_capacity": kwargs["token_capacity"],
+                "bounded_rows": kwargs["use_bounded_rows"],
+                "fc1_payload_nonzero": torch.count_nonzero(args[3].data.view(torch.uint8)).item(),
+                "fc1_scale_nonzero": torch.count_nonzero(args[3].scale).item(),
+                "fc2_payload_nonzero": torch.count_nonzero(args[4].data.view(torch.uint8)).item(),
+                "fc2_scale_nonzero": torch.count_nonzero(args[4].scale).item(),
+            }
+            state["event"] = event
+            try:
+                output = real_routed(*args, **kwargs)
+            finally:
+                state["event"] = None
+            event["finite_output"] = torch.isfinite(output).all().item()
+            observations[context.enable_prefix_caching].append(event)
+            return output
+
+        monkeypatch.setattr(
+            TextGenerationController, "_run_async_sched_forward", tracked_async_forward
+        )
+        monkeypatch.setattr(flashinfer_mxfp8, "quantize_routed_mxfp8_input", tracked_quantize)
+        monkeypatch.setattr(experts, "flashinfer_routed_mxfp8_moe", tracked_routed)
+
+        results = {}
+        for enable_prefix_caching in (False, True):
+            config = DynamicEngineTestConfig(
+                num_requests=0,
+                model_provider="gpt",
+                transformer_impl="inference_optimized",
+                expert_model_parallel_size=4,
+                use_moe_layer_spec=True,
+                moe_ffn_hidden_size=128,
+                inference_moe_token_dispatcher_type="nvls",
+                moe_router_dtype="fp32",
+                mxfp8=True,
+                inference_flashinfer_mxfp8_token_capacity=37,
+                enable_prefix_caching=enable_prefix_caching,
+                enable_chunked_prefill=True,
+                async_sched_mode=AsyncScheduleMode.ASYNC,
+                num_tokens_to_generate=4,
+                max_sequence_length=1280,
+                context_block_size_tokens=256,
+                context_max_tokens=384,
+                context_max_requests=4,
+                materialize_only_last_token_logits=False,
+                top_k=1,
+                top_p=0.0,
+            )
+            env = self._build_test_env(config)
+            state["env"] = env
+            prompt = torch.arange(1024, dtype=torch.int64, device="cuda") % (config.vocab_size - 1)
+
+            completed = {}
+
+            def capture_completions(step):
+                for request in step["finished_requests"]:
+                    assert request.request_id not in completed
+                    assert request.status == Status.COMPLETED
+                    assert len(request.generated_tokens) == 4
+                    completed[request.request_id] = list(request.generated_tokens)
+
+            for request_id in range(2):
+                env.engine.add_request(
+                    request_id=request_id,
+                    prompt=prompt.clone(),
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=4, termination_id=-1, top_k=1, top_p=0.0
+                    ),
+                )
+                step = env.engine.step_modern()
+                capture_completions(step)
+                if request_id == 0:
+                    # Resolve/hash the primer chunk before request 1 is admitted. The
+                    # longer prompt leaves request 0 in chunked prefill for coactivation.
+                    capture_completions(env.engine.step_modern())
+
+            while env.engine.has_unfinished_requests():
+                step = env.engine.step_modern()
+                capture_completions(step)
+            assert not env.engine.has_unfinished_requests()
+            assert env.engine.context.total_request_count == 0
+            assert completed.keys() == {0, 1}
+            results[enable_prefix_caching] = completed
+
+            if enable_prefix_caching:
+                assert env.engine._prefix_cache_hits > 0
+                assert env.engine._prefill_tokens_skipped > 0
+            self._release_ep_resources()
+            Utils.destroy_model_parallel()
+
+        assert results[True].keys() == results[False].keys() == {0, 1}
+        assert all(len(tokens) == 4 for tokens in results[True].values())
+        assert results[True] == results[False]
+        coactive = [
+            event
+            for event in observations[True]
+            if event["async_forward"]
+            and event["continued_chunk_tokens"] > 0
+            and event["active_requests"] == 2
+            and event["matched_prefix_blocks"] > 0
+            and event["num_prefill_requests"] > 0
+        ]
+        assert coactive, observations[True]
+        assert all(event["input_rows"] > event["token_capacity"] == 37 for event in coactive)
+        assert all(not event["bounded_rows"] for event in coactive)
+        assert all(event["quantized_rows"] == event["input_rows"] for event in coactive)
+        assert all(event["payload_dtype"] == torch.float8_e4m3fn for event in coactive)
+        assert all(event["scale_dtype"] == torch.uint8 for event in coactive)
+        assert all(event["nonzero_payload"] > 0 for event in coactive)
+        assert all(event["nonzero_scale"] > 0 for event in coactive)
+        assert all(event["fc1_payload_nonzero"] > 0 for event in coactive)
+        assert all(event["fc1_scale_nonzero"] > 0 for event in coactive)
+        assert all(event["fc2_payload_nonzero"] > 0 for event in coactive)
+        assert all(event["fc2_scale_nonzero"] > 0 for event in coactive)
+        assert all(event["finite_output"] for event in coactive)
+
+        for enable_prefix_caching in (False, True):
+            decode = [
+                event
+                for event in observations[enable_prefix_caching]
+                if event["async_forward"]
+                and event["bounded_rows"]
+                and event["active_requests"] > 0
+                and event["num_prefill_requests"] == 0
+            ]
+            assert decode, observations[enable_prefix_caching]
+            assert all(event["input_rows"] > event["token_capacity"] == 37 for event in decode)
+            assert all(event["quantized_rows"] == event["token_capacity"] for event in decode)
+            assert all(event["payload_dtype"] == torch.float8_e4m3fn for event in decode)
+            assert all(event["scale_dtype"] == torch.uint8 for event in decode)
+            assert all(event["nonzero_payload"] > 0 for event in decode)
+            assert all(event["nonzero_scale"] > 0 for event in decode)
+            assert all(event["fc1_payload_nonzero"] > 0 for event in decode)
+            assert all(event["fc1_scale_nonzero"] > 0 for event in decode)
+            assert all(event["fc2_payload_nonzero"] > 0 for event in decode)
+            assert all(event["fc2_scale_nonzero"] > 0 for event in decode)
+            assert all(event["finite_output"] for event in decode)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.parametrize("materialize_only_last_token_logits", [False, True])
     @pytest.mark.parametrize("sequence_parallel", [False, True])
     @pytest.mark.parametrize("ep_size", [1, 2])
