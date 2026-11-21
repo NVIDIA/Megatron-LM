@@ -420,16 +420,28 @@ def weighted_bias_quick_geglu_impl(
     """
     Token-wise-weighted bias quick_geglu fusion.
         input: [num_selected_experts * seq_len, hidden_size * 2]
-        bias: None
+        bias: None, or a tensor broadcastable to ``input``
         weights: [num_selected_experts * seq_len, 1]
         fp8_input_store: bool
         linear_offset: float
+        clamp_value: None, or the limit applied to the gate and linear halves
         output: [num_selected_experts * seq_len, hidden_size]
+
+    When ``clamp_value`` is set the bias is added before the clamps, i.e.
+    ``quick_geglu(clamp(input + bias)) * weights``, matching the unfused path and the GPT-OSS
+    reference. Bias addition and clamping do not commute.
     """
     ori_shape = input.shape
+    ori_dtype = input.dtype
     paged_stash_source = input
     assert len(ori_shape) in [2, 3]
     if clamp_value is not None:
+        if bias is not None:
+            # The clamps must see the biased activations, so add the bias here (once) and let
+            # autograd carry the bias gradient through the clamps. The fused kernel then runs
+            # on the already-biased input without a second bias.
+            input = input + bias
+            bias = None
         x_glu, x_linear = input.chunk(2, -1)
         input = torch.cat(
             (
@@ -449,5 +461,7 @@ def weighted_bias_quick_geglu_impl(
         )
     else:
         output = WeightedQuickGeGLUFunction.apply(input, weights, fp8_input_store, linear_offset)
+    # Adding a higher-precision bias above can promote the input; keep the caller's dtype.
+    output = output.to(ori_dtype)
 
     return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
