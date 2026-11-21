@@ -142,7 +142,7 @@ async def test_abort_deadline_does_not_cancel_eventual_safe_release():
     ack = asyncio.get_running_loop().create_future()
     engine.client = SimpleNamespace(abort_request_and_wait=MagicMock(return_value=ack))
     engine._release_completed_handoff = AsyncMock()
-    engine._request_ids["dynamo-request"] = 4
+    engine._request_ids["dynamo-request"] = {4}
     release = asdict(HandoffRelease("tcp://prefill:5000", "prefill", 7))
     engine._schedule_cleanup(engine._release_aborted_handoff(4, release))
     with pytest.raises(TimeoutError):
