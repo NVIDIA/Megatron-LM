@@ -300,29 +300,21 @@ class MaskedWordPieceDataset(MegatronDataset):
         if self.config.masking_use_longer_ngrams:
             nprobs = nprobs[::-1]
 
-        # Create a nested list of depth 3
-        #   layer 1: the candidate dimension
-        #   layer 2: the N-gram dimension
-        #   layer 3: the token dimension
-        candidate_ngrams = [
-            [candidates[idx : idx + n] for n in ngram_nvals] for idx in range(len(candidates))
-        ]
-        numpy_random_state.shuffle(candidate_ngrams)
+        # RandomState.shuffle draws from the length only, so shuffling the
+        # positions matches shuffling the prebuilt N-gram lists.
+        candidate_order = list(range(len(candidates)))
+        numpy_random_state.shuffle(candidate_order)
+        n_ngrams = len(ngram_nvals)
+        p_ngrams = nprobs[:n_ngrams] / nprobs[:n_ngrams].sum(keepdims=True)
 
         masked_token_ids = list(token_ids)
         masked_positions_and_labels = []
         masked_spans = []
         masked_indices = set()
-        for candidate_idx in range(len(candidate_ngrams)):
-            n_ngrams = len(candidate_ngrams[candidate_idx])
-
+        for candidate_idx in candidate_order:
             # Stop when we hit our desired number of maskings
             if len(masked_positions_and_labels) >= n_maskings:
                 break
-
-            # Do nothing for candidates with no ngrams
-            if not candidate_ngrams[candidate_idx]:
-                continue
 
             # Choose the initial value of N
             if self.config.masking_use_geometric_distribution:
@@ -332,11 +324,10 @@ class MaskedWordPieceDataset(MegatronDataset):
                 p = 0.2
                 n = min(numpy_random_state.geometric(p), self.config.masking_max_ngram)
             else:
-                p = nprobs[:n_ngrams] / nprobs[:n_ngrams].sum(keepdims=True)
-                n = numpy_random_state.choice(ngram_nvals[:n_ngrams], p=p)
+                n = numpy_random_state.choice(ngram_nvals, p=p_ngrams)
 
             while True:
-                ngram_indices = sum(candidate_ngrams[candidate_idx][n - 1], [])
+                ngram_indices = sum(candidates[candidate_idx : candidate_idx + n], [])
                 n = n - 1
                 # Success: masking this N-gram puts us below the desired number of maskings
                 if n_maskings >= len(masked_positions_and_labels) + len(ngram_indices):
@@ -369,27 +360,20 @@ class MaskedWordPieceDataset(MegatronDataset):
 
         assert len(masked_positions_and_labels) <= n_maskings
 
-        numpy_random_state.shuffle(candidate_ngrams)
+        numpy_random_state.shuffle(candidate_order)
 
         if self.config.masking_do_permutation:
             n_swappings = n_maskings
 
             permuted_indices = set()
-            for candidate_idx in range(len(candidate_ngrams)):
-                n_ngrams = len(candidate_ngrams[candidate_idx])
-
+            for candidate_idx in candidate_order:
                 if len(permuted_indices) >= n_swappings:
                     break
 
-                # Do nothing for candidates with no ngrams
-                if not candidate_ngrams[candidate_idx]:
-                    continue
-
-                p = nprobs[:n_ngrams] / nprobs[:n_ngrams].sum(keepdims=True)
-                n = numpy.random.choice(ngram_nvals[:n_ngrams], p=p)
+                n = numpy.random.choice(ngram_nvals, p=p_ngrams)
 
                 while True:
-                    ngram_indices = sum(candidate_ngrams[candidate_idx][n - 1], [])
+                    ngram_indices = sum(candidates[candidate_idx : candidate_idx + n], [])
                     n = n - 1
                     # Success: swapping this N-gram puts us below the desired number of swappings
                     if n_swappings >= len(permuted_indices) + len(ngram_indices):
