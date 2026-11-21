@@ -10,15 +10,23 @@ from megatron.core.activations import squared_relu
 from megatron.core.inference.moe import flashinfer_mxfp8 as flashinfer_mxfp8_module
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
     HAVE_FLASHINFER_ROUTED_MXFP8,
+    HAVE_TRITON,
     FlashInferCutlassMXFP8Weight,
+    FlashInferRoutedMXFP8Weight,
     flashinfer_cutlass_mxfp8_moe,
+    flashinfer_routed_mxfp8_moe,
     prepare_cutlass_mxfp8_weights,
     select_routed_mxfp8_active_rows,
 )
+from megatron.core.inference.quantization.mxfp8_quantize import quantize_routed_mxfp8_input
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+requires_cuda_triton = pytest.mark.skipif(
+    not (torch.cuda.is_available() and HAVE_TRITON), reason="CUDA and triton required"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -34,6 +42,10 @@ def _mxfp8_weight():
         scale=torch.empty(1, dtype=torch.uint8),
         backend="triton",
     )
+
+
+def _valid(n: int) -> torch.Tensor:
+    return torch.tensor([n], dtype=torch.int32, device="cuda")
 
 
 def test_inference_mode_tracks_bounded_mxfp8_rows():
@@ -111,25 +123,7 @@ def test_prepare_cutlass_mxfp8_weights_rejects_noncontiguous_shared_storage(monk
         prepare_cutlass_mxfp8_weights(weight)
 
 
-def test_cutlass_mxfp8_uses_full_rows_and_preserves_output_buffer(monkeypatch):
-    monkeypatch.setattr(flashinfer_mxfp8_module, "HAVE_FLASHINFER_CUTLASS_MXFP8", True)
-    captured = {}
-
-    def fake_quantize(hidden_states, is_sf_swizzled_layout, alignment):
-        captured["quantize"] = (hidden_states.shape, is_sf_swizzled_layout, alignment)
-        return hidden_states.to(torch.float8_e4m3fn), torch.zeros(512, dtype=torch.uint8)
-
-    def fake_cutlass(input, selected_experts, final_scales, *args, **kwargs):
-        captured["selected_experts"] = selected_experts
-        captured["final_scales"] = final_scales
-        captured["kwargs"] = kwargs
-        return [torch.full(input.shape, 2.0, dtype=torch.bfloat16)]
-
-    monkeypatch.setattr(flashinfer_mxfp8_module, "mxfp8_quantize", fake_quantize, raising=False)
-    monkeypatch.setattr(flashinfer_mxfp8_module, "cutlass_fused_moe", fake_cutlass, raising=False)
-
-    experts, hidden_size, intermediate_size = 2, 128, 128
-
+def _cutlass_mxfp8_weights(experts=2, hidden_size=128, intermediate_size=128):
     def make_weight(rows, cols):
         return FlashInferCutlassMXFP8Weight(
             data=torch.zeros(experts, rows, cols, dtype=torch.float8_e4m3fn),
@@ -139,38 +133,123 @@ def test_cutlass_mxfp8_uses_full_rows_and_preserves_output_buffer(monkeypatch):
             logical_cols=cols,
         )
 
-    fc1 = make_weight(intermediate_size, hidden_size)
-    fc2 = make_weight(hidden_size, intermediate_size)
-    hidden_states = torch.ones(8, hidden_size, dtype=torch.bfloat16)
-    routing_map = torch.zeros(8, 2, dtype=torch.int64)
-    probabilities = torch.full((8, 2), 0.5, dtype=torch.float32)
-    output = torch.full((8, hidden_size), -1.0, dtype=torch.bfloat16)
+    return make_weight(intermediate_size, hidden_size), make_weight(hidden_size, intermediate_size)
+
+
+def _run_cutlass_mxfp8(monkeypatch, *, out, valid_tokens=None):
+    """Call `flashinfer_cutlass_mxfp8_moe` on fake kernels and check the arguments both branches share.
+
+    The quantizer the branch must not use raises. The kernel records its arguments and writes 2.0
+    into the first two rows of `output` when it gets one, else returns bf16 rows of 2.0. Returns
+    (result, captured).
+    """
+    monkeypatch.setattr(flashinfer_mxfp8_module, "HAVE_FLASHINFER_CUTLASS_MXFP8", True)
+    captured = {}
+
+    def fake_quantize(hidden_states, is_sf_swizzled_layout, alignment):
+        captured["quantize"] = (hidden_states.shape, is_sf_swizzled_layout, alignment)
+        return hidden_states.to(torch.float8_e4m3fn), torch.zeros(512, dtype=torch.uint8)
+
+    def fake_quantize_rows(hidden_states, n_rows):
+        captured["quantize_rows"] = (hidden_states.shape, n_rows)
+        return hidden_states.to(torch.float8_e4m3fn), torch.zeros(512, dtype=torch.float8_e8m0fnu)
+
+    def wrong_quantizer(*args, **kwargs):
+        raise AssertionError("this branch must not use that quantizer")
+
+    def fake_cutlass(input, selected_experts, final_scales, fc1, fc2, output_dtype, **kwargs):
+        captured.update(
+            input=input,
+            selected_experts=selected_experts,
+            final_scales=final_scales,
+            output_dtype=output_dtype,
+            kwargs=kwargs,
+        )
+        if kwargs.get("output") is not None:
+            kwargs["output"][:2].fill_(2.0)
+            return [kwargs["output"]]
+        return [torch.full(input.shape, 2.0, dtype=torch.bfloat16)]
+
+    bounded = valid_tokens is not None
+    monkeypatch.setattr(
+        flashinfer_mxfp8_module,
+        "mxfp8_quantize",
+        wrong_quantizer if bounded else fake_quantize,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        flashinfer_mxfp8_module,
+        "mxfp8_quantize_rows",
+        fake_quantize_rows if bounded else wrong_quantizer,
+    )
+    monkeypatch.setattr(flashinfer_mxfp8_module, "cutlass_fused_moe", fake_cutlass, raising=False)
+    fc1, fc2 = _cutlass_mxfp8_weights()
+    clamp_limit = torch.tensor([16.0], dtype=torch.float32)
 
     result = flashinfer_cutlass_mxfp8_moe(
-        hidden_states,
-        routing_map,
-        probabilities,
+        torch.ones(8, 128, dtype=torch.bfloat16),
+        torch.zeros(8, 2, dtype=torch.int64),
+        torch.full((8, 2), 0.5, dtype=torch.float32),
         fc1,
         fc2,
         ep_size=4,
         ep_rank=1,
         activation_type=12,
-        out=output,
-        activation_clamp_limit=torch.tensor([16.0], dtype=torch.float32),
+        out=out,
+        activation_clamp_limit=clamp_limit,
+        valid_tokens=valid_tokens,
     )
 
-    assert result is output
-    assert torch.equal(output, torch.full_like(output, 2.0))
-    assert captured["quantize"] == ((8, hidden_size), True, 32)
+    kwargs = captured["kwargs"]
+    assert captured["input"].dtype == torch.float8_e4m3fn
     assert captured["selected_experts"].dtype == torch.int32
-    assert captured["selected_experts"].shape == (8, 2)
-    assert captured["final_scales"].shape == (8, 2)
-    assert captured["kwargs"]["use_mxfp8_act_scaling"] is True
-    assert captured["kwargs"]["swizzled_input_sf"] is True
-    assert captured["kwargs"]["ep_size"] == 4
-    assert captured["kwargs"]["ep_rank"] == 1
-    assert torch.equal(captured["kwargs"]["clamped_relu2_limit"], torch.tensor([16.0]))
-    assert "swiglu_limit" not in captured["kwargs"]
+    assert captured["selected_experts"].shape == captured["final_scales"].shape == (8, 2)
+    assert kwargs["use_mxfp8_act_scaling"] is True and kwargs["swizzled_input_sf"] is True
+    assert kwargs["ep_size"] == 4 and kwargs["ep_rank"] == 1
+    assert kwargs["clamped_relu2_limit"] is clamp_limit and "swiglu_limit" not in kwargs
+    assert all(
+        got is want
+        for got, want in zip(
+            kwargs["quant_scales"], [fc1.scale, fc1.input_scale, fc2.scale, fc2.input_scale]
+        )
+    )
+    return result, captured
+
+
+def test_cutlass_mxfp8_uses_full_rows_and_preserves_output_buffer(monkeypatch):
+    """Without valid_tokens: FlashInfer's quantizer over every row, bf16 result copied into `out`."""
+    out = torch.full((8, 128), -1.0, dtype=torch.bfloat16)
+    result, captured = _run_cutlass_mxfp8(monkeypatch, out=out)
+    assert result is out and torch.equal(out, torch.full_like(out, 2.0))
+    assert captured["quantize"] == ((8, 128), True, 32)
+    assert captured["output_dtype"] is torch.bfloat16
+    assert "output" not in captured["kwargs"] and "num_active_tokens" not in captured["kwargs"]
+
+
+def test_cutlass_mxfp8_bounds_the_live_rows(monkeypatch):
+    """With valid_tokens: MCore's row-bounded quantizer, then the kernel finalizes fp32 in place."""
+    valid_tokens = torch.tensor([2], dtype=torch.int32)
+    out = torch.full((8, 128), 7.0, dtype=torch.float32)
+    result, captured = _run_cutlass_mxfp8(monkeypatch, out=out, valid_tokens=valid_tokens)
+    assert result is out and torch.all(out[:2] == 2.0) and torch.all(out[2:] == 7.0)
+    shape, n_rows = captured["quantize_rows"]
+    assert shape == (8, 128) and n_rows is valid_tokens
+    assert captured["output_dtype"] is torch.float32
+    kwargs = captured["kwargs"]
+    assert kwargs["output"] is out and kwargs["num_active_tokens"] is valid_tokens
+    assert kwargs["input_sf"].dtype == torch.uint8 and kwargs["input_sf"].numel() == 512
+
+
+@pytest.mark.parametrize("bad_out", ["missing", "bf16", "short", "strided"])
+def test_cutlass_mxfp8_bounded_rows_need_an_fp32_buffer(monkeypatch, bad_out):
+    out = {
+        "missing": None,
+        "bf16": torch.empty(8, 128, dtype=torch.bfloat16),
+        "short": torch.empty(4, 128, dtype=torch.float32),
+        "strided": torch.empty(128, 8, dtype=torch.float32).t(),
+    }[bad_out]
+    with pytest.raises(ValueError, match="contiguous fp32"):
+        _run_cutlass_mxfp8(monkeypatch, out=out, valid_tokens=torch.tensor([2], dtype=torch.int32))
 
 
 def _make_bounded_mxfp8_config(**overrides):
@@ -412,7 +491,7 @@ def test_bounded_flashinfer_mxfp8_config_rejects_invalid_configuration(overrides
 def test_missing_routed_mxfp8_capability_has_precise_error(monkeypatch):
     from megatron.core.inference.moe import flashinfer_mxfp8
 
-    monkeypatch.setattr(flashinfer_mxfp8, "HAVE_FLASHINFER_ROUTED_MXFP8", False)
+    monkeypatch.setattr(flashinfer_mxfp8_module, "HAVE_FLASHINFER_ROUTED_MXFP8", False)
     monkeypatch.setattr(
         flashinfer_mxfp8,
         "_FLASHINFER_ROUTED_MXFP8_IMPORT_ERROR",
@@ -420,7 +499,7 @@ def test_missing_routed_mxfp8_capability_has_precise_error(monkeypatch):
     )
 
     with pytest.raises(RuntimeError, match="requires FlashInfer >= 0.6.4"):
-        flashinfer_mxfp8.require_flashinfer_routed_mxfp8()
+        flashinfer_mxfp8_module.require_flashinfer_routed_mxfp8()
 
 
 def test_flashinfer_mxfp8_refresh_reports_noop_before_weight_build():
@@ -448,6 +527,177 @@ def test_flashinfer_mxfp8_refresh_skips_bf16_expert_weights():
     )
 
     assert InferenceGroupedMLP.refresh_flashinfer_mxfp8_weights(grouped_mlp) is False
+
+
+@requires_cuda_triton
+@pytest.mark.parametrize(
+    ("rows", "valid", "hidden", "padded"),
+    [(37, 21, 160, 256), (64, 64, 2688, 2688), (8, 0, 96, 128)],
+)
+def test_quantize_routed_mxfp8_input_matches_the_mcore_quantizer(rows, valid, hidden, padded):
+    torch.manual_seed(0)
+    hidden_states = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+
+    data, scale = quantize_routed_mxfp8_input(hidden_states, padded, _valid(valid))
+
+    assert data.shape == (rows, padded) and data.dtype == torch.float8_e4m3fn
+    assert scale.shape == (rows, padded // 32) and scale.dtype == torch.uint8
+    if valid:
+        expected = MXFP8Tensor.from_bf16(hidden_states[:valid], backend="triton")
+        expected_scale = flashinfer_mxfp8_module._unshuffle_cublas_scale(
+            expected.scale, valid, hidden
+        )
+        assert torch.equal(data[:valid, :hidden].view(torch.uint8), expected.data.view(torch.uint8))
+        assert torch.equal(scale[:valid, : hidden // 32], expected_scale)
+    # Padding columns of live rows are zero data with a zero scale exponent.
+    assert not data[:valid, hidden:].view(torch.uint8).any()
+    assert not scale[:valid, hidden // 32 :].any()
+
+
+def _routed_weight(logical_rows, logical_cols, device="cpu"):
+    padded_rows, padded_cols = -(-logical_rows // 128) * 128, -(-logical_cols // 128) * 128
+    return FlashInferRoutedMXFP8Weight(
+        data=torch.empty(2, padded_rows, padded_cols, dtype=torch.float8_e4m3fn, device=device),
+        scale=torch.empty(2, padded_rows * padded_cols // 32, dtype=torch.uint8, device=device),
+        logical_rows=logical_rows,
+        logical_cols=logical_cols,
+        padded_rows=padded_rows,
+        padded_cols=padded_cols,
+    )
+
+
+@pytest.mark.parametrize(
+    ("token_capacity", "use_bounded_rows", "launched_rows"),
+    [(None, False, 16), (8, False, 16), (8, True, 8)],
+    ids=["no-host-bound", "host-bound-inactive", "host-bound-active"],
+)
+def test_flashinfer_routed_mxfp8_moe_composes_the_host_and_device_bounds(
+    monkeypatch, token_capacity, use_bounded_rows, launched_rows
+):
+    """The host bound sets the rows the kernels launch on; the device count rides along."""
+    rows, valid, topk, hidden, intermediate = 16, 6, 2, 160, 128
+    hidden_states = torch.randn(rows, hidden, dtype=torch.bfloat16)
+    routing_map = torch.randint(0, 8, (rows, topk), dtype=torch.int64)
+    probs = torch.rand(rows, topk)
+    valid_tokens = torch.tensor([valid], dtype=torch.int32)
+    seen = {}
+
+    def fake_quantize(x, padded_cols, count):
+        seen["quantized_rows"], seen["quantize_count"] = x.shape[0], count
+        return torch.empty(x.shape[0], padded_cols, dtype=torch.uint8), torch.empty(x.shape[0], 8)
+
+    def fake_pack(routing, weights, count):
+        seen["packed_rows"], seen["pack_count"] = routing.shape[0], count
+        return torch.empty(routing.shape[0] * topk, dtype=torch.int32)
+
+    def fake_kernel(**kwargs):
+        seen.update(kwargs)
+        kwargs["output"][:valid] = 1.0
+
+    monkeypatch.setattr(flashinfer_mxfp8_module, "HAVE_FLASHINFER_ROUTED_MXFP8", True)
+    monkeypatch.setattr(flashinfer_mxfp8_module, "quantize_routed_mxfp8_input", fake_quantize)
+    monkeypatch.setattr(flashinfer_mxfp8_module, "pack_routed_mxfp8_routing", fake_pack)
+    monkeypatch.setattr(flashinfer_mxfp8_module, "trtllm_fp8_block_scale_routed_moe", fake_kernel)
+    layout = SimpleNamespace(MajorK=SimpleNamespace(value=0))
+    monkeypatch.setattr(flashinfer_mxfp8_module, "WeightLayout", layout, raising=False)
+    monkeypatch.setattr(
+        flashinfer_mxfp8_module, "Fp8QuantizationType", SimpleNamespace(MxFp8=None), raising=False
+    )
+    out = torch.full((rows, hidden), 7.0)
+
+    returned = flashinfer_routed_mxfp8_moe(
+        hidden_states,
+        routing_map,
+        probs,
+        _routed_weight(intermediate, hidden),
+        _routed_weight(hidden, intermediate),
+        num_experts=8,
+        local_expert_offset=2,
+        activation_type=6,
+        out=out,
+        token_capacity=token_capacity,
+        use_bounded_rows=use_bounded_rows,
+        valid_tokens=valid_tokens,
+    )
+
+    assert returned is out
+    # Every kernel in the path launches on the host-bounded prefix ...
+    assert seen["quantized_rows"] == seen["packed_rows"] == launched_rows
+    assert seen["hidden_states"].shape[0] == launched_rows
+    assert seen["output"].shape == (launched_rows, hidden)
+    assert seen["output"].data_ptr() == out.data_ptr()
+    if launched_rows == rows:
+        assert seen["output"] is out
+    # ... and every one of them still receives the device count.
+    assert seen["quantize_count"] is seen["pack_count"] is seen["num_active_tokens"] is valid_tokens
+    assert torch.all(out[:valid] == 1.0) and torch.all(out[valid:] == 7.0)
+
+
+@requires_cuda_triton
+def test_flashinfer_routed_mxfp8_moe_hands_the_kernel_live_rows_and_the_device_count(monkeypatch):
+    """Quantize and pack only the live rows; the kernel gets the device count and finalizes in place."""
+    rows, valid, topk, hidden, intermediate = 16, 10, 2, 160, 128
+    torch.manual_seed(3)
+    hidden_states = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    routing_map = torch.randint(0, 8, (rows, topk), device="cuda", dtype=torch.int64)
+    probs = torch.rand(rows, topk, device="cuda")
+    valid_tokens, seen = _valid(valid), {}
+
+    def fake_kernel(**kwargs):
+        seen.update(kwargs)
+        kwargs["output"][:valid] = 1.0
+        return kwargs["output"]
+
+    def weight(logical_rows, logical_cols):
+        padded_rows, padded_cols = -(-logical_rows // 128) * 128, -(-logical_cols // 128) * 128
+        return FlashInferRoutedMXFP8Weight(
+            data=torch.empty(2, padded_rows, padded_cols, dtype=torch.float8_e4m3fn),
+            scale=torch.empty(2, padded_rows * padded_cols // 32, dtype=torch.uint8),
+            logical_rows=logical_rows,
+            logical_cols=logical_cols,
+            padded_rows=padded_rows,
+            padded_cols=padded_cols,
+        )
+
+    monkeypatch.setattr(flashinfer_mxfp8_module, "HAVE_FLASHINFER_ROUTED_MXFP8", True)
+    monkeypatch.setattr(flashinfer_mxfp8_module, "trtllm_fp8_block_scale_routed_moe", fake_kernel)
+    layout = SimpleNamespace(MajorK=SimpleNamespace(value=0))
+    monkeypatch.setattr(flashinfer_mxfp8_module, "WeightLayout", layout, raising=False)
+    monkeypatch.setattr(
+        flashinfer_mxfp8_module, "Fp8QuantizationType", SimpleNamespace(MxFp8=None), raising=False
+    )
+    out = torch.full((rows, hidden), 7.0, device="cuda")
+
+    returned = flashinfer_routed_mxfp8_moe(
+        hidden_states,
+        routing_map,
+        probs,
+        weight(intermediate, hidden),
+        weight(hidden, intermediate),
+        num_experts=8,
+        local_expert_offset=2,
+        activation_type=6,
+        valid_tokens=valid_tokens,
+        out=out,
+    )
+
+    assert returned is out and seen["output"] is out and seen["num_active_tokens"] is valid_tokens
+    assert (
+        seen["do_finalize"] is True and seen["local_expert_offset"] == 2 and seen["top_k"] == topk
+    )
+    quantized = MXFP8Tensor.from_bf16(hidden_states[:valid], backend="triton")
+    assert seen["hidden_states"].shape == (rows, 256)
+    assert torch.equal(
+        seen["hidden_states"][:valid, :hidden].view(torch.uint8), quantized.data.view(torch.uint8)
+    )
+    assert torch.equal(
+        seen["hidden_states_scale"][:valid, : hidden // 32],
+        flashinfer_mxfp8_module._unshuffle_cublas_scale(quantized.scale, valid, hidden),
+    )
+    weight_bits = probs.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF
+    assert torch.equal(seen["topk_ids"][:valid], ((routing_map.int() << 16) | weight_bits)[:valid])
+    assert torch.all(seen["topk_ids"][valid:] == -1 << 16)
+    assert torch.all(out[:valid] == 1.0) and torch.all(out[valid:] == 7.0)
 
 
 def _blackwell_or_newer() -> bool:
@@ -514,6 +764,7 @@ def test_flashinfer_routed_mxfp8_is_batch_invariant(local_expert_offset):
             num_experts=num_experts,
             local_expert_offset=local_expert_offset,
             activation_type=6,
+            valid_tokens=_valid(num_tokens),
         )[target_row]
 
     with torch.no_grad():
@@ -531,53 +782,155 @@ def test_flashinfer_routed_mxfp8_is_batch_invariant(local_expert_offset):
         assert torch.count_nonzero(output_alone).item() == 0
 
 
-@pytest.mark.parametrize("clamp_scale", [None, 16.0])
-def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch, clamp_scale):
+@pytest.mark.parametrize(
+    ("mxfp8_format", "has_rsv", "ep_size", "etp_size", "clamp_scale"),
+    [
+        ("routed", True, 4, 1, None),
+        ("cutlass", True, 4, 1, 16.0),
+        ("cutlass", False, 4, 1, 16.0),
+        ("cutlass", True, 1, 1, 16.0),
+        (None, True, 4, 1, None),
+        (None, True, 4, 1, 16.0),
+        (None, False, 4, 1, None),
+        (None, False, 4, 1, 16.0),
+        (None, True, 1, 2, None),
+        (None, True, 1, 1, None),
+    ],
+    ids=[
+        "mxfp8-routed",
+        "mxfp8-cutlass-bounded",
+        "mxfp8-cutlass-no-nvls-buffer",
+        "mxfp8-cutlass-single-rank",
+        "bf16-bounded",
+        "bf16-bounded-clamped",
+        "bf16-no-nvls-buffer",
+        "bf16-no-nvls-buffer-clamped",
+        "bf16-expert-tp-only",
+        "bf16-single-rank",
+    ],
+)
+def test_flashinfer_forward_dispatch(
+    monkeypatch, mxfp8_format, has_rsv, ep_size, etp_size, clamp_scale
+):
+    """The kernel gets the device count and the fp32 buffer whenever the NVLS dispatcher gathers
+    across ranks (expert parallel or expert tensor parallel), and neither otherwise; the routed
+    MXFP8 kernel always gets the count. The bf16 and CUTLASS MXFP8 calls always carry the clamp
+    limit: the model-wide tensor for a tanh-clamped activation, else None.
+    """
     from megatron.core.transformer.moe import experts
 
-    expected = torch.empty(4, 8, dtype=torch.bfloat16)
-    captured = {}
-    clamped_relu2 = object()
+    valid_tokens, calls, rank = torch.tensor([3], dtype=torch.int32), {}, min(1, ep_size - 1)
+    rsv = torch.empty(4, 8) if has_rsv else None
+    kernel_output = torch.empty(4, 8, dtype=torch.bfloat16)
+    activation = SimpleNamespace(value=6)
+    clamp_limit = torch.tensor([16.0], dtype=torch.float32)
 
-    def cutlass_fused_moe(*args, **kwargs):
-        captured["output"] = kwargs["output"]
-        captured.update(kwargs)
-        return (expected,)
+    def routed(*args, **kwargs):
+        calls["routed"] = kwargs
+        return rsv
+
+    def cutlass(*args, **kwargs):
+        calls["cutlass"] = dict(kwargs, args=args)
+        return [kwargs["output"] if kwargs.get("output") is not None else kernel_output]
+
+    def cutlass_mxfp8(*args, **kwargs):
+        calls["cutlass_mxfp8"] = kwargs
+        return kwargs["out"] if kwargs["out"] is not None else kernel_output
 
     monkeypatch.setattr(experts, "HAVE_FLASHINFER", True)
     monkeypatch.setattr(
-        experts, "ActivationType", SimpleNamespace(ClampedRelu2=clamped_relu2), raising=False
+        experts, "ActivationType", SimpleNamespace(ClampedRelu2=activation), raising=False
+    )
+    monkeypatch.setattr(experts, "flashinfer_routed_mxfp8_moe", routed)
+    monkeypatch.setattr(experts, "flashinfer_cutlass_mxfp8_moe", cutlass_mxfp8)
+    monkeypatch.setattr(experts, "cutlass_fused_moe", cutlass)
+    monkeypatch.setattr(
+        experts, "fused_moe", SimpleNamespace(cutlass_fused_moe=cutlass), raising=False
     )
     monkeypatch.setattr(
-        experts, "fused_moe", SimpleNamespace(cutlass_fused_moe=cutlass_fused_moe), raising=False
+        experts.InferenceAllGatherDispatcherBase,
+        "_valid_tokens",
+        classmethod(lambda cls: valid_tokens),
+    )
+    monkeypatch.setattr(
+        experts.NVLSAllGatherVDispatcher, "_get_rsv_tensor", classmethod(lambda cls: rsv)
+    )
+    routed_weight = FlashInferRoutedMXFP8Weight(
+        data=torch.empty(2, 128, 128, dtype=torch.float8_e4m3fn),
+        scale=torch.empty(2, 512, dtype=torch.uint8),
+        logical_rows=128,
+        logical_cols=128,
+        padded_rows=128,
+        padded_cols=128,
+    )
+    cutlass_weight = FlashInferCutlassMXFP8Weight(
+        data=torch.empty(2, 128, 128, dtype=torch.float8_e4m3fn),
+        scale=torch.empty(2, 128, 1, dtype=torch.int32),
+        input_scale=torch.ones(2),
+        logical_rows=128,
+        logical_cols=128,
+    )
+    weight = {"routed": routed_weight, "cutlass": cutlass_weight, None: None}[mxfp8_format]
+    grouped_mlp = SimpleNamespace(
+        config=SimpleNamespace(expert_tensor_parallel_size=etp_size),
+        _uses_mxfp8_weights=mxfp8_format is not None,
+        _nvfp4_weights=None,
+        _fc1_weight=weight,
+        _fc2_weight=weight,
+        _flashinfer_activation_type=activation,
+        _activation_clamp_scale=clamp_scale,
+        _flashinfer_clamp_limit=clamp_limit if clamp_scale is not None else None,
+        _flashinfer_mxfp8_token_capacity=None,
+        _nvls_dispatcher=True,
+        num_local_experts=2,
+        ep_group=SimpleNamespace(size=lambda: ep_size, rank=lambda: rank),
     )
 
-    grouped_mlp = SimpleNamespace(
-        _uses_mxfp8_weights=False,
-        _nvfp4_weights=None,
-        _fc1_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
-        _fc2_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
-        _flashinfer_activation_type=clamped_relu2,
-        _activation_clamp_scale=clamp_scale,
-        _flashinfer_clamp_limit=torch.tensor([16.0], dtype=torch.float32),
-        _nvls_dispatcher=True,
-        ep_group=SimpleNamespace(size=lambda: 2, rank=lambda: 0),
-    )
     output, bias = experts.InferenceGroupedMLP._flashinfer_forward(
         grouped_mlp,
         torch.empty(4, 8, dtype=torch.bfloat16),
         torch.zeros(4, 1, dtype=torch.int64),
-        torch.zeros(4, 1, dtype=torch.float32),
+        torch.zeros(4, 1),
     )
 
-    assert output is expected
     assert bias is None
-    assert captured["output"] is None
-    if clamp_scale is not None:
-        assert torch.equal(captured["clamped_relu2_limit"], torch.tensor([clamp_scale]))
+    bounded = has_rsv and ep_size * etp_size > 1
+    if mxfp8_format == "routed":
+        routed = calls["routed"]
+        assert output is rsv and set(calls) == {"routed"}
+        assert routed["valid_tokens"] is valid_tokens and routed["out"] is rsv
+        assert routed["token_capacity"] is None and routed["use_bounded_rows"] is False
+        assert routed["num_experts"] == 2 * ep_size and routed["local_expert_offset"] == 2 * rank
+        return
+    if mxfp8_format == "cutlass":
+        cutlass_mxfp8 = calls["cutlass_mxfp8"]
+        assert set(calls) == {"cutlass_mxfp8"} and cutlass_mxfp8["out"] is rsv
+        assert cutlass_mxfp8["activation_clamp_limit"] is clamp_limit
+        assert cutlass_mxfp8["ep_size"] == ep_size and cutlass_mxfp8["ep_rank"] == rank
+        if bounded:
+            # Live rows quantized, computed and finalized fp32 in place in the RSV buffer.
+            assert output is rsv and cutlass_mxfp8["valid_tokens"] is valid_tokens
+        else:
+            # Every row, bf16 result copied into the buffer when there is one.
+            assert cutlass_mxfp8["valid_tokens"] is None
+            assert output is (rsv if has_rsv else kernel_output)
+        return
+    cutlass = calls["cutlass"]
+    assert (
+        set(calls) == {"cutlass"} and cutlass["ep_size"] == ep_size and cutlass["ep_rank"] == rank
+    )
+    assert cutlass["args"][1].dtype == torch.int32
+    assert cutlass["clamped_relu2_limit"] is (clamp_limit if clamp_scale is not None else None)
+    assert "swiglu_limit" not in cutlass
+    if bounded:
+        # The kernel finalizes fp32 in place over the live rows of the reduce-scatter buffer.
+        assert output is rsv and cutlass["output"] is rsv and cutlass["args"][5] is torch.float32
+        assert cutlass["num_active_tokens"] is valid_tokens
     else:
-        assert "clamped_relu2_limit" not in captured
-    assert "swiglu_limit" not in captured
+        # No NVLS buffer, or a single rank whose dispatcher never reads it: the kernel's bf16
+        # rows go back to token_combine unchanged.
+        assert output is kernel_output and cutlass["args"][5] is torch.bfloat16
+        assert cutlass["output"] is None and "num_active_tokens" not in cutlass
 
 
 def test_flashinfer_nvls_clears_routing_before_metadata_fence(monkeypatch):

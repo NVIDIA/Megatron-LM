@@ -34,7 +34,7 @@ from megatron.core.inference.quantization.utils import (
     resolve_mxfp8_backend,
 )
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.transformer.moe.batch_invariant import unpermute_with_bf16_rank_partials
+from megatron.core.transformer.moe.batch_invariant import unpermute_with_kernel_rank_partials
 from megatron.core.transformer.utils import precision_aware_checkpoint
 from megatron.core.typed_torch import apply_module
 
@@ -105,20 +105,25 @@ def _value_pass(layer: MoELayer, hidden_states: torch.Tensor, padding_mask, inpu
     )
     rows = expert_value_pass(layer.experts, dispatched_input, tokens_per_expert)
     rows = layer.combine(dispatcher.combine_preprocess(rows))
+    nvfp4 = layer.experts._nvfp4_recipe is not None
     # The routed MXFP8 kernel weighs routes by BF16 probabilities, per-token NVFP4 by FP32.
-    if layer.experts._nvfp4_recipe is None:
+    if not nvfp4:
         probs = probs.to(torch.bfloat16)
     # The inverse map lists a token's routes in expert order; reorder it to top-k order.
     route_rows = dispatcher.batch_invariant_inverse_permutation_mapping[0].gather(
         1, top_indices.argsort(dim=1).argsort(dim=1)
     )
-    output = unpermute_with_bf16_rank_partials(
+    # Generation's per-rank partial:
+    # the per-token NVFP4 kernel returns bf16 rows that the engine copies into its fp32 buffer;
+    # the routed MXFP8 kernel finalizes fp32 straight into that buffer.
+    output = unpermute_with_kernel_rank_partials(
         rows,
         route_rows,
         top_indices,
         probs.float(),
         layer.config.num_moe_experts,
         dispatcher.ep_size,
+        rank_partial_dtype=torch.bfloat16 if nvfp4 else torch.float32,
     )
     return _postprocess(layer, output, shared_expert_output), None
 
@@ -242,8 +247,11 @@ def expert_value_pass(experts: InferenceGroupedMLP, hidden_states, tokens_per_ex
     )
     if mxfp8_weights is not None:
         output = flashinfer_routed_mxfp8_moe(hidden_states, routes, probs, *mxfp8_weights, **kwargs)
-    else:
-        output = flashinfer_routed_nvfp4_moe(hidden_states, routes, probs, nvfp4_weights, **kwargs)
+        # The kernel finalizes in fp32. Each row is one route at weight 1.0, so an fp32 row
+        # holds exactly its bf16 FC2 row and the cast back is lossless; it keeps the
+        # all-to-all combine in bf16.
+        return output[:num_rows].to(hidden_states.dtype)
+    output = flashinfer_routed_nvfp4_moe(hidden_states, routes, probs, nvfp4_weights, **kwargs)
     return output[:num_rows]
 
 
