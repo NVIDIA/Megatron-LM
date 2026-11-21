@@ -200,8 +200,198 @@ class StaticBufferLoader:
 
     static_buffers: dict = {'training': [], 'validation': []}
 
+    # State of the batched staging path (load_microbatches). Like static_buffers, it is kept on
+    # the class so that all wrapper instances of a stage share it. All are keyed by stage.
+    # {key: (CUDA tensor [num_microbatches, ...], its row views)}; the row views are the static
+    # buffers of that key.
+    stacked_buffers: dict = {'training': {}, 'validation': {}}
+    # {key: pinned host tensor} that host inputs are stacked into before one H2D copy.
+    pinned_buffers: dict = {'training': {}, 'validation': {}}
+    # Event after the last copy out of the pinned host tensors.
+    staging_done_event: dict = {'training': None, 'validation': None}
+    # Event after the last graph replay, which is the last reader of the static buffers.
+    consumed_event: dict = {'training': None, 'validation': None}
+
     def __init__(self):
         self.stream = torch.cuda.Stream()
+
+    @staticmethod
+    def unwrap_inputs(inputs):
+        """Return the input dict of one microbatch, as __call__ accepts it."""
+        if isinstance(inputs, tuple) and isinstance(inputs[0], dict):
+            inputs = inputs[0]
+        assert isinstance(inputs, dict)
+        return inputs
+
+    @staticmethod
+    def _has_cuda_tensor(src):
+        if isinstance(src, torch.Tensor):
+            return src.is_cuda
+        if isinstance(src, (tuple, list)):
+            return any(StaticBufferLoader._has_cuda_tensor(i) for i in src)
+        if isinstance(src, dict):
+            return any(StaticBufferLoader._has_cuda_tensor(i) for i in src.values())
+        return False
+
+    @staticmethod
+    def _stackable_keys(batches):
+        """Return the top-level keys that hold, in every microbatch, a plain contiguous tensor
+        with the same shape, dtype and device (host or the current CUDA device)."""
+        keys = []
+        for key, first in batches[0].items():
+            if (
+                type(first) is not torch.Tensor
+                or first.layout != torch.strided
+                or first.requires_grad
+                or not (
+                    first.device.type == "cpu"
+                    or (first.is_cuda and first.device.index == torch.cuda.current_device())
+                )
+            ):
+                continue
+            if all(
+                type(inputs.get(key)) is torch.Tensor
+                and inputs[key].shape == first.shape
+                and inputs[key].dtype == first.dtype
+                and inputs[key].device == first.device
+                and inputs[key].is_contiguous()
+                and not inputs[key].requires_grad
+                for inputs in batches
+            ):
+                keys.append(key)
+        return keys
+
+    def load_microbatches(self, batches, stage):
+        """Copy the inputs of all microbatches of one step into the static buffers.
+
+        The static buffers end up with the same bytes as calling ``self(batches[b], stage, b)``
+        for every microbatch b in order. The differences are in how the copies are issued:
+
+        - All copies run under one switch to the staging stream, with one wait in each direction.
+        - Each top-level tensor key that has the same shape, dtype and device in every microbatch
+          is backed by one contiguous [num_microbatches, ...] CUDA tensor. The static buffer of
+          microbatch b is row b of that tensor, so one copy per key fills all microbatches. Host
+          inputs are first stacked into a pinned host tensor that is reused across steps.
+        - If a graph replay was the last reader of the static buffers, all inputs are host
+          tensors and no buffer is allocated, the staging stream waits only for that replay
+          instead of all work queued on the current stream, so the copies can overlap that work.
+
+        Args:
+            batches: One input dict (or a tuple whose first item is the dict) per microbatch.
+            stage: 'training' or 'validation'.
+
+        Returns:
+            The static buffer dicts of the microbatches, in microbatch order.
+        """
+        assert stage in ['training', 'validation']
+        batches = [self.unwrap_inputs(inputs) for inputs in batches]
+        num_microbatches = len(batches)
+        buffers = StaticBufferLoader.static_buffers[stage]
+        consumed_event = StaticBufferLoader.consumed_event[stage]
+        StaticBufferLoader.consumed_event[stage] = None
+        if num_microbatches == 0:
+            return []
+        if 0 < len(buffers) < num_microbatches:
+            # Buffers that the per-microbatch path created for fewer microbatches.
+            return [self(batches[b], stage, b) for b in range(num_microbatches)]
+
+        first_call = len(buffers) == 0
+        allocated = first_call
+        if first_call:
+            stacked = {}
+            for key in self._stackable_keys(batches):
+                first = batches[0][key]
+                stacked_tensor = torch.empty(
+                    (num_microbatches, *first.shape), dtype=first.dtype, device="cuda"
+                )
+                stacked[key] = (stacked_tensor, stacked_tensor.unbind(0))
+            StaticBufferLoader.stacked_buffers[stage] = stacked
+            StaticBufferLoader.pinned_buffers[stage] = {}
+            StaticBufferLoader.staging_done_event[stage] = None
+            stack_keys = list(stacked)
+        else:
+            stacked = StaticBufferLoader.stacked_buffers[stage]
+            stack_keys = []
+            for key in self._stackable_keys(batches):
+                if key not in stacked:
+                    continue
+                stacked_tensor, rows = stacked[key]
+                first = batches[0][key]
+                # Use the stacked copy only while the static buffers are still its row views.
+                if (
+                    len(rows) >= num_microbatches
+                    and stacked_tensor.shape[1:] == first.shape
+                    and stacked_tensor.dtype == first.dtype
+                    and all(buffers[b].get(key) is rows[b] for b in range(num_microbatches))
+                ):
+                    stack_keys.append(key)
+            # Same as the per-microbatch path: add the keys that are new in this step.
+            for inputs, static in zip(batches, buffers):
+                for key, value in inputs.items():
+                    if key not in static:
+                        if isinstance(value, torch.Tensor):
+                            static[key] = torch.empty_like(value, device="cuda")
+                            allocated = True
+                        else:
+                            static[key] = value
+
+        host_keys = [key for key in stack_keys if batches[0][key].device.type == "cpu"]
+        pinned = StaticBufferLoader.pinned_buffers[stage]
+        if host_keys:
+            staging_done = StaticBufferLoader.staging_done_event[stage]
+            if staging_done is not None:
+                # The pinned host tensors are free once the previous copies out of them are done.
+                staging_done.synchronize()
+            for key in host_keys:
+                stacked_tensor = stacked[key][0]
+                if key not in pinned or pinned[key].shape != stacked_tensor.shape:
+                    pinned[key] = torch.empty(
+                        stacked_tensor.shape, dtype=stacked_tensor.dtype, pin_memory=True
+                    )
+                torch.stack([inputs[key] for inputs in batches], out=pinned[key][:num_microbatches])
+
+        # The early wait orders the copies only after the readers of the static buffers. It is
+        # not safe for inputs made on the current stream, nor for buffers just allocated on it.
+        if (
+            consumed_event is not None
+            and not allocated
+            and not any(self._has_cuda_tensor(inputs) for inputs in batches)
+        ):
+            self.stream.wait_event(consumed_event)
+        else:
+            self.stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.stream):
+            stack_key_set = set(stack_keys)
+            if first_call:
+                for b, inputs in enumerate(batches):
+                    buffers.append(
+                        {
+                            key: (
+                                stacked[key][1][b]
+                                if key in stack_key_set
+                                else copy_tensors_in_struct(value)
+                            )
+                            for key, value in inputs.items()
+                        }
+                    )
+            else:
+                for inputs, static in zip(batches, buffers):
+                    clone_tensors_in_struct(
+                        static,
+                        {key: value for key, value in inputs.items() if key not in stack_key_set},
+                    )
+            for key in stack_keys:
+                target = stacked[key][0][:num_microbatches]
+                if key in host_keys:
+                    target.copy_(pinned[key][:num_microbatches], non_blocking=True)
+                else:
+                    torch.stack([inputs[key] for inputs in batches], out=target)
+            if host_keys:
+                staging_done = torch.cuda.Event()
+                staging_done.record(self.stream)
+                StaticBufferLoader.staging_done_event[stage] = staging_done
+        torch.cuda.current_stream().wait_stream(self.stream)
+        return buffers[:num_microbatches]
 
     def __call__(self, inputs, stage, microbatch):
         assert stage in ['training', 'validation']
@@ -241,14 +431,92 @@ class FullCudaGraphWrapper:
     cuda_graph = {'training': None, 'validation': None}
     result = {'training': None, 'validation': None}
 
-    def __init__(self, forward_backward_func, cuda_graph_warmup_steps=1, use_single_mempool=False):
+    def __init__(
+        self,
+        forward_backward_func,
+        cuda_graph_warmup_steps=1,
+        use_single_mempool=False,
+        batched_input_staging=False,
+    ) -> None:
         self.forward_backward_func = forward_backward_func
         self.static_loader = StaticBufferLoader()
         self.cuda_graph_warmup_steps = cuda_graph_warmup_steps
         self.use_single_mempool = use_single_mempool
+        self.batched_input_staging = batched_input_staging
+
+    @staticmethod
+    def _merge_chunk_inputs(chunk_inputs):
+        """Merge the inputs that the model chunks read for each microbatch.
+
+        All chunks stage microbatch b into the same static buffer b, in chunk order, so for each
+        top-level key the last chunk that has the key decides the final contents. Returns one
+        merged dict per microbatch, or None if a value is a nested container or the chunks
+        disagree on the type, shape, dtype or strides of a key; then the merged dicts might not
+        give the same static buffers as staging every chunk in order.
+        """
+        if len(chunk_inputs) == 1:
+            return chunk_inputs[0]
+        merged = []
+        for per_chunk in zip(*chunk_inputs):
+            result = {}
+            for inputs in per_chunk:
+                for key, value in inputs.items():
+                    if isinstance(value, (tuple, list, dict)):
+                        return None
+                    if key in result:
+                        previous = result[key]
+                        if isinstance(previous, torch.Tensor) != isinstance(value, torch.Tensor):
+                            return None
+                        if isinstance(value, torch.Tensor) and (
+                            previous.shape != value.shape
+                            or previous.dtype != value.dtype
+                            or previous.stride() != value.stride()
+                        ):
+                            return None
+                    result[key] = value
+            merged.append(result)
+        return merged
+
+    def _batched_data_read(self, data_iterator, model, training, num_microbatches):
+        """Same as data_read, but stage each microbatch once with batched copies.
+
+        The iterators are advanced exactly as in data_read, and the static buffers hold the same
+        bytes after the call.
+        """
+        stage = 'training' if training else 'validation'
+        if not isinstance(model, list) or len(model) == 1:
+            assert not isinstance(data_iterator, list) or len(data_iterator) == 1
+            iterators = [data_iterator if not isinstance(data_iterator, list) else data_iterator[0]]
+        else:
+            assert isinstance(data_iterator, list) and len(data_iterator) == len(model)
+            iterators = data_iterator
+        # Read in the order of data_read: all microbatches of chunk 0, then of chunk 1, and so on.
+        chunk_inputs = [
+            (
+                None
+                if iterator is None
+                else [
+                    StaticBufferLoader.unwrap_inputs(next(iterator))
+                    for _ in range(num_microbatches)
+                ]
+            )
+            for iterator in iterators
+        ]
+        present = [inputs for inputs in chunk_inputs if inputs is not None]
+        buffers = []
+        if present:
+            merged = self._merge_chunk_inputs(present)
+            if merged is not None:
+                buffers = self.static_loader.load_microbatches(merged, stage)
+            else:
+                for inputs in present:
+                    buffers = [self.static_loader(x, stage, b) for b, x in enumerate(inputs)]
+        return [None if inputs is None else iter(list(buffers)) for inputs in chunk_inputs]
 
     def data_read(self, data_iterator, model, training, num_microbatches):
         """Read all microbatch inputs from Dataloader and copy to static buffers."""
+        if self.batched_input_staging:
+            return self._batched_data_read(data_iterator, model, training, num_microbatches)
         if not isinstance(model, list) or len(model) == 1:
             assert not isinstance(data_iterator, list) or len(data_iterator) == 1
             iterator0 = data_iterator if not isinstance(data_iterator, list) else data_iterator[0]
@@ -356,6 +624,11 @@ class FullCudaGraphWrapper:
             caller_stream.wait_stream(warmup_stream)
         else:
             FullCudaGraphWrapper.cuda_graph[training_str].replay()
+            if self.batched_input_staging:
+                # The replay is the last reader of the static buffers until the next step.
+                consumed_event = torch.cuda.Event()
+                consumed_event.record()
+                StaticBufferLoader.consumed_event[training_str] = consumed_event
         self.next_iter(training_str)
         # Validate before returning to the training loop's rerun/update decision.
         get_rerun_state_machine().run_deferred_validations(training_str)
@@ -380,6 +653,7 @@ class FullCudaGraphWrapper:
                 FullCudaGraphWrapper.cuda_graph['training'] = None
             FullCudaGraphWrapper.result['training'] = None
             FullCudaGraphWrapper.curr_iteration['training'] = 0
+            StaticBufferLoader.consumed_event['training'] = None
             get_rerun_state_machine().clear_deferred_validations("training")
         if stage is None or stage == 'validation':
             if FullCudaGraphWrapper.cuda_graph['validation'] is not None:
@@ -387,6 +661,7 @@ class FullCudaGraphWrapper:
                 FullCudaGraphWrapper.cuda_graph['validation'] = None
             FullCudaGraphWrapper.result['validation'] = None
             FullCudaGraphWrapper.curr_iteration['validation'] = 0
+            StaticBufferLoader.consumed_event['validation'] = None
             get_rerun_state_machine().clear_deferred_validations("validation")
         if captured:
             symmetric_wgrad_pool.reset_completed_reuse_events()
