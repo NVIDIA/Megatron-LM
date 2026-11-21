@@ -279,6 +279,13 @@ def _selective_scan_update_kernel(
         out_s_ptrs = out_ptrs + s * stride_out_seq
         tl.store(out_s_ptrs, out, mask=offs_m < dim)
 
+        # A serial decode runs one launch per token and the next launch reloads
+        # the state rounded to the cache dtype, so fold the same rounding into
+        # the accumulator after each token: snapshots, the final state, and
+        # every later token's output then match one-token-at-a-time decode bit
+        # for bit.
+        state = state.to(state_ptrs.dtype.element_ty).to(tl.float32)
+
     # After processing all sequence steps, persist the final state back to HBM
     tl.store(state_ptrs, state, mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate))
 
