@@ -121,6 +121,22 @@ class MuonExcludedMatrixModel(nn.Module):
         return self.muon(F.relu(self.scalar(x)))
 
 
+class ExpertOnlyModel(nn.Module):
+    """Model whose parameters are all expert-parallel."""
+
+    def __init__(self):
+        super().__init__()
+        self.experts = nn.ModuleList([nn.Linear(10, 8), nn.Linear(8, 5)])
+        for param in self.parameters():
+            # ``allreduce = False`` marks a parameter as expert-parallel: the optimizer puts it
+            # in the expert list instead of the dense one. With every parameter marked, the
+            # model has no dense parameter, so no dp_cp rank owns one, rank 0 included.
+            param.allreduce = False
+
+    def forward(self, x):
+        return self.experts[1](F.relu(self.experts[0](x)))
+
+
 @pytest.mark.skipif(
     int(os.getenv('WORLD_SIZE', '1')) == 1, reason="Multi-rank test requires WORLD_SIZE > 1"
 )
@@ -706,6 +722,17 @@ class TestLayerWiseOptimizer:
         This will be insufficient when world size > 2.
         """
         self._run_parameter_update_test(use_param_layout=use_param_layout, model_class=TinyModel)
+
+    def test_parameter_updates_expert_parallel_parameters_only(self):
+        """Test LayerWiseDistributedOptimizer on a model without any dense parameter.
+
+        Every parameter of the model is expert-parallel, so dp_cp rank 0 owns zero dense
+        parameters (as does every other rank) and only the expert list has anything to
+        all-gather. The step used to raise IndexError on every rank: ``allgather_params()``
+        read the device and dtype from rank 0's first dense parameter. The legacy
+        ``allgather_params()`` path only runs without a parameter layout.
+        """
+        self._run_parameter_update_test(use_param_layout=False, model_class=ExpertOnlyModel)
 
     def test_broadcast_vs_allgather(self):
         """Test LayerWiseDistributedOptimizer allgather code agains broadcast code."""
