@@ -1,0 +1,136 @@
+# Speed and memory regression test for Megatron-FSDP v2 on a DeepSeek-style MoE proxy, one GB200 node.
+# The layout is a one-node version of DeepSeek V4 Flash training (EP64, outer DP 2): EP 2 and two
+# distributed-optimizer instances, ZeRO-3 inner and ZeRO-1 outer (HFSDP). Dense parameters shard over
+# an inner DP of 2; experts have an inner DP of 1. 8 microbatches per step exercise accumulation and
+# the deferred outer reduction; FP32 main grads and gradient communication, with an MTP layer.
+# Like the *_memory_speed tests, it compares the median iteration time of the steady steps and the
+# memory against golden values; mock data keeps it independent of datasets.
+ENV_VARS:
+  # run_ci_test.sh always exports this (yq prints "null" for a missing key,
+  # which fails determinism.py's validator), so it must be set explicitly.
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  NCCL_NVLS_ENABLE: 0
+  NCCL_DEBUG: VERSION
+MODEL_ARGS:
+  # Precision
+  --bf16: true
+  --megatron-fsdp-main-grads-dtype: fp32
+  --megatron-fsdp-grad-comm-dtype: fp32
+  # Distributed args
+  --distributed-timeout-minutes: 60
+  --tensor-model-parallel-size: 1
+  --pipeline-model-parallel-size: 1
+  --expert-model-parallel-size: 2
+  --context-parallel-size: 1
+  --expert-tensor-parallel-size: 1
+  --overlap-grad-reduce: true
+  --overlap-param-gather: true
+  # FSDP args
+  --use-megatron-fsdp: true
+  --megatron-fsdp-version: 2
+  --data-parallel-sharding-strategy: "optim_grads_params"
+  --num-distributed-optimizer-instances: 2
+  --outer-dp-sharding-strategy: "optim"
+  --deterministic-mode: true
+  --ckpt-format: "fsdp_dtensor"
+  --no-gradient-accumulation-fusion: true
+  # Training args
+  --use-mcore-models: true
+  --sequence-parallel: true
+  --disable-bias-linear: true
+  --micro-batch-size: 1
+  --global-batch-size: 32
+  --train-iters: 25
+  --exit-interval: 25
+  --exit-duration-in-mins: 60
+  --no-check-for-nan-in-loss-and-grad: true
+  --no-rope-fusion: true
+  --manual-gc: true
+  --manual-gc-interval: 100
+  --transformer-impl: transformer_engine
+  # Data args
+  --mock-data: true
+  --tokenizer-type: NullTokenizer
+  --vocab-size: 131072
+  --seq-length: 4096
+  --data-cache-path: ${DATA_CACHE_PATH}
+  --split: 949,50,1
+  # Network: 12 layers - 2 dense, 10 MoE - and one MTP layer
+  --num-layers: 12
+  --hidden-size: 2048
+  --ffn-hidden-size: 8192
+  --num-attention-heads: 16
+  --kv-channels: 128
+  --max-position-embeddings: 4096
+  --position-embedding-type: rope
+  --rotary-base: 10000
+  --make-vocab-size-divisible-by: 64
+  --normalization: RMSNorm
+  --norm-epsilon: 1e-6
+  --swiglu: true
+  --untie-embeddings-and-output-weights: true
+  --multi-latent-attention: true
+  --mtp-num-layers: 1
+  --mtp-loss-scaling-factor: 0.1
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+  --clip-grad: 1.0
+  --weight-decay: 0.1
+  --qk-layernorm: true
+  # Learning rate args
+  --lr-warmup-fraction: .01
+  --lr: 0.00015
+  --min-lr: 1.0e-5
+  --lr-decay-style: cosine
+  --adam-beta1: 0.9
+  --adam-beta2: 0.95
+  # MoE args (DeepSeek-style)
+  --num-experts: 32
+  --moe-layer-freq: ([0]*2+[1]*10)
+  --moe-ffn-hidden-size: 1024
+  --moe-shared-expert-intermediate-size: 1024
+  --moe-router-load-balancing-type: seq_aux_loss
+  --moe-router-topk: 4
+  --moe-token-dispatcher-type: alltoall
+  --moe-router-pre-softmax: true
+  --moe-grouped-gemm: true
+  --moe-aux-loss-coeff: 1e-4
+  --moe-router-group-topk: 2
+  --moe-router-num-groups: 4
+  --moe-router-topk-scaling-factor: 2.0
+  --moe-router-score-function: sigmoid
+  --moe-router-enable-expert-bias: true
+  --moe-router-bias-update-rate: 1e-3
+  --moe-router-dtype: fp32
+  --moe-permute-fusion: true
+  # MLA args (DeepSeek-style)
+  --q-lora-rank: 512
+  --kv-lora-rank: 256
+  --qk-head-dim: 128
+  --qk-pos-emb-head-dim: 64
+  --v-head-dim: 128
+  --rotary-scaling-factor: 1.0
+  --mscale: 1.0
+  --mscale-all-dim: 1.0
+  # Validation, checkpointing, logging
+  --eval-iters: 0
+  --eval-interval: 1000
+  --save-interval: 10000
+  --init-method-std: 0.02
+  --log-timers-to-tensorboard: true
+  --log-memory-to-tensorboard: true
+  --log-num-zeros-in-grad: true
+  --log-params-norm: true
+  --log-throughput: true
+  --log-interval: 1
+  --timing-log-level: 0
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+TEST_TYPE: regular
+METRICS:
+  - "iteration-time"
+  - "lm loss"
+  - "mtp_1 loss"
+  - "mem-allocated-bytes"
+  - "mem-max-allocated-bytes"
+LAUNCHER: ft_launcher
