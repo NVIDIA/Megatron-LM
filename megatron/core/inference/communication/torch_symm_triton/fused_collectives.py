@@ -238,7 +238,7 @@ def fused_multimem_rs_add_norm_ag(
     # of at most max_num_blocks blocks, or the barrier overflows the signal pad or hangs.
     # See kernel_config.py.
     WARP_SIZE = SYMM_MEM_KERNEL_CONFIG.warp_size
-    MAX_NUM_BLOCKS = SYMM_MEM_KERNEL_CONFIG.max_num_blocks
+    MAX_NUM_BLOCKS = SYMM_MEM_KERNEL_CONFIG.grid_limit()
     MAX_BLOCK_SIZE = SYMM_MEM_KERNEL_CONFIG.max_block_size
     BYTES_PER_THREAD = 16
 
