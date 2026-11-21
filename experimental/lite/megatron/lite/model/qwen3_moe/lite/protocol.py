@@ -16,6 +16,9 @@ Protocol convention (what runtime calls):
     vocab_size(model_cfg) -> int                     — benchmark metadata
   Escape hatch:
     create_runtime(hf_path, cfg) -> Runtime          — fully override runtime
+
+ChunkedEP configuration, supported combinations, and measurements:
+``experimental/lite/examples/bench/chunked_ep.md``.
 """
 
 from __future__ import annotations
@@ -42,6 +45,12 @@ from megatron.lite.model.qwen3_moe.common import is_expert_param
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.model.qwen3_moe.lite.checkpoint import EXPERT_CLASSIFIER, PLACEMENT_FN
 from megatron.lite.model.qwen3_moe.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
+from megatron.lite.model.qwen3_moe.lite.chunked_ep import (
+    Qwen3ChunkedEP,
+    release_chunked_ep,
+    validate_chunked_ep_mtp,
+    validate_qwen3_ep_chunk_recompute_composition,
+)
 from megatron.lite.model.qwen3_moe.lite.model import MTPLossAutoScaler, Qwen3MoEModel
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.modules.lora import (
@@ -49,6 +58,9 @@ from megatron.lite.primitive.modules.lora import (
     freeze_non_lora_params,
     normalize_lora_config,
     trainable_param_stats,
+)
+from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
+    validate_ep_chunk_overlap_config,
 )
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.quantization import (
@@ -86,6 +98,10 @@ class ImplConfig:
     recompute: list[str] = field(default_factory=list)
     offload: list[str] = field(default_factory=list)
     use_deepep: bool = False
+    enable_ep_chunk_overlap: bool = False
+    ep_chunk_max_token_rows_per_rank: int | None = None
+    ep_chunk_count: int = 2
+    ep_chunk_full_recompute: bool = False
     use_thd: bool = False
     cross_entropy_fusion: bool = False
     router_aux_loss_coef: float | None = None
@@ -125,6 +141,7 @@ def _validate_meta_parameters(model: torch.nn.Module) -> None:
 # ---------------------------------------------------------------------------
 
 MODULE_MAP = {
+    "attn": lambda layer: layer.attn,
     "core_attn": lambda layer: layer.attn.core_attn,
     "experts": lambda layer: layer.moe.experts,
     "moe": lambda layer: layer.moe,
@@ -214,6 +231,23 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
 
     Model owns all construction. Runtime just consumes the ModelBundle.
     """
+    validate_chunked_ep_mtp(
+        enable_ep_chunk_overlap=impl_cfg.enable_ep_chunk_overlap, mtp_enable=impl_cfg.mtp_enable
+    )
+    validate_qwen3_ep_chunk_recompute_composition(
+        enable_ep_chunk_overlap=impl_cfg.enable_ep_chunk_overlap,
+        ep_chunk_full_recompute=impl_cfg.ep_chunk_full_recompute,
+        recompute_modules=impl_cfg.recompute,
+    )
+    if impl_cfg.enable_ep_chunk_overlap:
+        validate_ep_chunk_overlap_config(
+            impl_cfg.enable_ep_chunk_overlap,
+            use_deepep=impl_cfg.use_deepep,
+            ep_size=impl_cfg.parallel.ep,
+            topk=model_cfg.num_experts_per_tok,
+            max_token_rows_per_rank=impl_cfg.ep_chunk_max_token_rows_per_rank,
+            chunk_count=impl_cfg.ep_chunk_count,
+        )
     p = impl_cfg.parallel
     lora_config = normalize_lora_config(impl_cfg.lora)
 
@@ -241,7 +275,11 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     deterministic = impl_cfg.deterministic
 
     # ── build chunks ──
-    recompute_spec = parse_recompute_spec(impl_cfg.recompute)
+    recompute_spec = parse_recompute_spec(
+        []
+        if impl_cfg.enable_ep_chunk_overlap and impl_cfg.ep_chunk_full_recompute
+        else impl_cfg.recompute
+    )
     model_kwargs: dict[str, Any] = dict(
         use_deepep=impl_cfg.use_deepep,
         fp8=False,
@@ -251,6 +289,15 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         mtp_enable=mtp_enable,
         mtp_enable_train=mtp_enable_train,
         mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
+        chunked_ep=(
+            Qwen3ChunkedEP(
+                max_input_rows=impl_cfg.ep_chunk_max_token_rows_per_rank,
+                chunk_count=impl_cfg.ep_chunk_count,
+                full_recompute=impl_cfg.ep_chunk_full_recompute,
+            )
+            if impl_cfg.enable_ep_chunk_overlap
+            else None
+        ),
         lora_config=lora_config,
         attention_backend=("magi" if impl_cfg.attention_backend_override == "magi" else "te"),
     )
@@ -369,6 +416,9 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
             "pre_forward_hook": _pre_forward_hook,
             "optimizer_backend": optimizer_backend,
             "post_model_load_hook": post_model_load_hook,
+            "before_model_offload": (
+                (lambda: release_chunked_ep(chunks)) if impl_cfg.enable_ep_chunk_overlap else None
+            ),
             "lora_config": lora_config,
             "lora_stats": lora_stats,
         },

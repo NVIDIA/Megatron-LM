@@ -81,14 +81,14 @@ class Experts(nn.Module):
             raise NotImplementedError(f"etp_size={ps.etp_size} unsupported; use 1.")
         self.etp_group = ps.etp_group if ps.etp_size > 1 else None
         self.swiglu_limit = float(getattr(config, "swiglu_limit", 0.0) or 0.0)
-        self.fc1 = te.GroupedLinear(
+        self.fc1 = self._make_linear(
             self.num_local_experts,
             config.hidden_size,
             config.moe_intermediate_size * 2 // ps.etp_size,
             bias=False,
             params_dtype=torch.bfloat16,
         )
-        self.fc2 = te.GroupedLinear(
+        self.fc2 = self._make_linear(
             self.num_local_experts,
             config.moe_intermediate_size // ps.etp_size,
             config.hidden_size,
@@ -128,6 +128,9 @@ class Experts(nn.Module):
                         return grad
 
                     param.register_hook(_ar)
+
+    def _make_linear(self, *args, **kwargs):
+        return te.GroupedLinear(*args, **kwargs)
 
     def forward(
         self,
