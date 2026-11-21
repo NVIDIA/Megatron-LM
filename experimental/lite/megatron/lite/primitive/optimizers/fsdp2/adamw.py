@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import inspect
+from bisect import bisect_left, insort
 from collections.abc import Callable, Iterable
 from typing import Any
 
@@ -207,27 +208,184 @@ class FP32AdamW:
         for group in self.param_groups:
             group_lr = float(group.get("lr", self.lr))
             group_weight_decay = float(group.get("weight_decay", self.weight_decay))
+            cohort = []
+            cohort_numel = 0
+            cohort_ranges: list[tuple[int, int]] = []
             for param in group["params"]:
                 grad = param.grad
                 if grad is None:
                     continue
-                state = self.state[param]
-                state["step"] = int(state["step"]) + 1
-                param_step = int(state["step"])
-                bias_correction1 = 1.0 - beta1**param_step
-                bias_correction2_sqrt = (1.0 - beta2**param_step) ** 0.5
-                group_step_size = group_lr / bias_correction1
-                master = state["master_param"]
-                exp_avg = state["exp_avg"]
-                exp_avg_sq = state["exp_avg_sq"]
-                if group_weight_decay != 0.0:
-                    master.mul_(1.0 - group_lr * group_weight_decay)
-                grad = self._prepare_grad(grad, master)
-                exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
-                denom = exp_avg_sq.sqrt().div_(bias_correction2_sqrt).add_(self.eps)
-                master.addcdiv_(exp_avg.to(dtype=torch.float32), denom, value=-group_step_size)
-                self._copy_master_to_param(param, master)
+                candidate = self._foreach_candidate(param, grad)
+                if candidate is not None:
+                    ranges = self._local_storage_ranges(candidate[1:])
+                    step = int(self.state[param]["step"])
+                    if cohort and (
+                        step != int(self.state[cohort[0][0]]["step"])
+                        or param.device != cohort[0][0].device
+                        or param.device_mesh is not cohort[0][0].device_mesh
+                        or param.placements != cohort[0][0].placements
+                        or cohort_numel + candidate[2].numel() > 1 << 22
+                        or len(cohort) >= 128
+                        or self._ranges_overlap(ranges, cohort_ranges)
+                    ):
+                        self._step_cohort(cohort, group_lr, group_weight_decay, beta1, beta2)
+                        cohort = []
+                        cohort_numel = 0
+                        cohort_ranges.clear()
+                    cohort.append(candidate)
+                    cohort_numel += candidate[2].numel()
+                    for interval in ranges:
+                        insort(cohort_ranges, interval)
+                else:
+                    self._step_cohort(cohort, group_lr, group_weight_decay, beta1, beta2)
+                    cohort = []
+                    cohort_numel = 0
+                    cohort_ranges.clear()
+                    self._step_one_param(param, grad, group_lr, group_weight_decay, beta1, beta2)
+            self._step_cohort(cohort, group_lr, group_weight_decay, beta1, beta2)
+
+    def _foreach_candidate(
+        self, param: nn.Parameter, grad: torch.Tensor
+    ) -> (
+        tuple[nn.Parameter, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        | None
+    ):
+        if self.cpu_update or self._model_param_dtype(param) is None:
+            return None
+        state = self.state[param]
+        tensors = (param, grad, state["master_param"], state["exp_avg"], state["exp_avg_sq"])
+        if not all(is_dtensor_like(tensor) for tensor in tensors):
+            return None
+        if any(
+            tensor.device_mesh is not param.device_mesh or tensor.placements != param.placements
+            for tensor in tensors[1:]
+        ):
+            return None
+        if any(
+            type(placement).__name__ not in {"Shard", "Replicate"} for placement in param.placements
+        ):
+            return None
+        locals_ = tuple(to_local_tensor(tensor) for tensor in tensors)
+        if any(
+            local.device.type != "cuda"
+            or local.dtype != torch.float32
+            or local.shape != locals_[0].shape
+            or not local.is_contiguous()
+            for local in locals_
+        ):
+            return None
+        numel = locals_[0].numel()
+        if numel == 0 or numel > 1 << 20:
+            return None
+        ranges = sorted(self._local_storage_ranges(locals_))
+        if any(left[1] > right[0] for left, right in zip(ranges, ranges[1:])):
+            return None
+        return (param, *locals_)
+
+    @staticmethod
+    def _local_storage_ranges(tensors: Iterable[torch.Tensor]) -> tuple[tuple[int, int], ...]:
+        return tuple(
+            (tensor.data_ptr(), tensor.data_ptr() + tensor.numel() * tensor.element_size())
+            for tensor in tensors
+        )
+
+    @staticmethod
+    def _ranges_overlap(
+        ranges: Iterable[tuple[int, int]], existing_ranges: list[tuple[int, int]]
+    ) -> bool:
+        for start, end in ranges:
+            index = bisect_left(existing_ranges, (start, end))
+            if index and existing_ranges[index - 1][1] > start:
+                return True
+            if index < len(existing_ranges) and existing_ranges[index][0] < end:
+                return True
+        return False
+
+    def _step_cohort(
+        self,
+        cohort: list[
+            tuple[
+                nn.Parameter, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+            ]
+        ],
+        lr: float,
+        weight_decay: float,
+        beta1: float,
+        beta2: float,
+    ) -> None:
+        if not cohort:
+            return
+        if len(cohort) == 1:
+            param = cohort[0][0]
+            self._step_one_param(param, param.grad, lr, weight_decay, beta1, beta2)
+            return
+
+        step = int(self.state[cohort[0][0]]["step"]) + 1
+        bias_correction1 = 1.0 - beta1**step
+        bias_correction2_sqrt = (1.0 - beta2**step) ** 0.5
+        group_step_size = lr / bias_correction1
+        for param, *_ in cohort:
+            self.state[param]["step"] = step
+        grads = [
+            to_local_tensor(self._prepare_grad(item[0].grad, self.state[item[0]]["master_param"]))
+            for item in cohort
+        ]
+        # Eligibility has already checked these local views and their storage ranges.
+        masters = [item[3] for item in cohort]
+        exp_avgs = [item[4] for item in cohort]
+        exp_avg_sqs = [item[5] for item in cohort]
+        master_wrappers = [self.state[item[0]]["master_param"] for item in cohort]
+        avg_wrappers = [self.state[item[0]]["exp_avg"] for item in cohort]
+        sq_wrappers = [self.state[item[0]]["exp_avg_sq"] for item in cohort]
+        # Local writes bypass DTensor's wrapper mutation tracking. Invalidate
+        # saved wrappers after each successful write, just as the scalar path does.
+        if weight_decay != 0.0:
+            torch._foreach_mul_(masters, 1.0 - lr * weight_decay)
+            torch.autograd.graph.increment_version(master_wrappers)
+        torch._foreach_mul_(exp_avgs, beta1)
+        torch.autograd.graph.increment_version(avg_wrappers)
+        torch._foreach_add_(exp_avgs, grads, alpha=1.0 - beta1)
+        torch.autograd.graph.increment_version(avg_wrappers)
+        torch._foreach_mul_(exp_avg_sqs, beta2)
+        torch.autograd.graph.increment_version(sq_wrappers)
+        torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1.0 - beta2)
+        torch.autograd.graph.increment_version(sq_wrappers)
+        denoms = torch._foreach_sqrt(exp_avg_sqs)
+        # Foreach scalar division can round differently from Tensor.div_.
+        for denom in denoms:
+            denom.div_(bias_correction2_sqrt)
+        torch._foreach_add_(denoms, self.eps)
+        torch._foreach_addcdiv_(masters, exp_avgs, denoms, value=-group_step_size)
+        torch.autograd.graph.increment_version(master_wrappers)
+        for param, *_ in cohort:
+            self._copy_master_to_param(param, self.state[param]["master_param"])
+
+    def _step_one_param(
+        self,
+        param: nn.Parameter,
+        grad: torch.Tensor,
+        lr: float,
+        weight_decay: float,
+        beta1: float,
+        beta2: float,
+    ) -> None:
+        state = self.state[param]
+        state["step"] = int(state["step"]) + 1
+        param_step = int(state["step"])
+        bias_correction1 = 1.0 - beta1**param_step
+        bias_correction2_sqrt = (1.0 - beta2**param_step) ** 0.5
+        group_step_size = lr / bias_correction1
+        master = state["master_param"]
+        exp_avg = state["exp_avg"]
+        exp_avg_sq = state["exp_avg_sq"]
+        if weight_decay != 0.0:
+            master.mul_(1.0 - lr * weight_decay)
+        grad = self._prepare_grad(grad, master)
+        exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+        exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+        denom = exp_avg_sq.sqrt().div_(bias_correction2_sqrt).add_(self.eps)
+        master.addcdiv_(exp_avg.to(dtype=torch.float32), denom, value=-group_step_size)
+        self._copy_master_to_param(param, master)
 
     def _prepare_grad(self, grad: torch.Tensor, master: torch.Tensor) -> torch.Tensor:
         # No .to(float32): add_()/addcmul_() promote into the FP32 accumulators, so a
@@ -533,9 +691,7 @@ def dtensor_from_local(
     # original global shape/stride so the round-trip is exact for any dim not
     # divisible by the mesh size.
     if shape is not None:
-        return DTensor.from_local(
-            local_tensor, device_mesh, placements, shape=shape, stride=stride
-        )
+        return DTensor.from_local(local_tensor, device_mesh, placements, shape=shape, stride=stride)
     return DTensor.from_local(local_tensor, device_mesh, placements)
 
 
