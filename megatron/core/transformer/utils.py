@@ -94,7 +94,8 @@ def get_linear_layer(rows, columns, init_method, perform_initialization=True):
 
 def get_default_causal_mask(sq: int) -> torch.Tensor:
     """Return the causal upper triangular mask for softmax input."""
-    return torch.triu(torch.ones(sq, sq, device="cuda"), diagonal=1).bool()
+    positions = torch.arange(sq, device="cuda")
+    return positions[None, :] > positions[:, None]
 
 
 def get_sliding_window_causal_mask(sq, skv, window_size):
