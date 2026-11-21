@@ -43,6 +43,7 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     set_batch_invariant_mode,
     te_supports_batch_invariant_attention,
 )
+from megatron.core.tuning import AutotunePolicy, active_policy, install
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.inference.contexts.test_dynamic_prefix_caching import (
     TestPrefixCacheRealEngineMatrix as _PrefixEngineHarness,
@@ -747,20 +748,21 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
     def _run_session(
         cls, case: _ChunkCase, *, chunked: bool, stop_tokens: Optional[tuple[int, ...]] = None
     ) -> _Session:
-        manager = (
-            set_batch_invariant_mode(True)
-            if case.name == "mamba-batch-invariant"
-            else nullcontext()
-        )
+        batch_invariant = case.name == "mamba-batch-invariant"
+        manager = set_batch_invariant_mode(True) if batch_invariant else nullcontext()
         deterministic = torch.are_deterministic_algorithms_enabled()
+        policy = active_policy()
         try:
-            torch.use_deterministic_algorithms(
-                deterministic or case.name == "mamba-batch-invariant"
-            )
+            torch.use_deterministic_algorithms(deterministic or batch_invariant)
+            if batch_invariant:
+                # Batch-invariant Mamba layers require their SSM kernels pinned.
+                install(AutotunePolicy(mode="pinned"))
             with manager:
                 return cls._run_session_impl(case, chunked=chunked, stop_tokens=stop_tokens)
         finally:
             torch.use_deterministic_algorithms(deterministic)
+            if batch_invariant:
+                install(policy or AutotunePolicy(mode="auto"))
 
     @classmethod
     def _run_session_impl(
