@@ -103,6 +103,45 @@ class TestCausalConv1dUpdate:
 
         torch.testing.assert_close(result, expected, atol=1e-4, rtol=1e-4)
 
+    @pytest.mark.parametrize(
+        "silu_activation, applies_silu",
+        [(True, True), ("silu", True), ("swish", True), (False, False), (None, False)],
+    )
+    def test_activation_forms(self, silu_activation, applies_silu):
+        """A bool, or causal_conv1d's activation names, select SiLU or no activation."""
+        torch.manual_seed(42)
+        B, seq_len, D, width = 2, 1, 64, 4
+        x = torch.randn(B, seq_len, D, device="cuda", dtype=torch.float32)
+        conv_state_triton = torch.randn(B, D, width, device="cuda", dtype=torch.float32)
+        conv_state_ref = conv_state_triton.clone()
+        weight = torch.randn(D, width, device="cuda", dtype=torch.float32)
+        bias = torch.randn(D, device="cuda", dtype=torch.float32)
+
+        result = causal_conv1d_update(
+            x,
+            conv_state_triton,
+            weight,
+            bias=bias,
+            silu_activation=silu_activation,
+            conv_state_indices=None,
+        )
+        expected = causal_conv1d_update_ref(
+            x, conv_state_ref, weight, bias=bias, silu_activation=applies_silu
+        )
+
+        torch.testing.assert_close(result, expected, atol=1e-4, rtol=1e-4)
+
+    def test_rejects_unknown_activation(self):
+        B, D, width = 2, 64, 4
+        x = torch.randn(B, 1, D, device="cuda", dtype=torch.float32)
+        conv_state = torch.randn(B, D, width, device="cuda", dtype=torch.float32)
+        weight = torch.randn(D, width, device="cuda", dtype=torch.float32)
+
+        with pytest.raises(ValueError, match="silu_activation"):
+            causal_conv1d_update(
+                x, conv_state, weight, bias=None, silu_activation="gelu", conv_state_indices=None
+            )
+
     def test_2d_input(self):
         """Test that 2D input (B, D) is handled correctly and returns 2D output."""
         torch.manual_seed(42)
