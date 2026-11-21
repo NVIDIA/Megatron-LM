@@ -81,7 +81,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.utils import InferenceMode
+from megatron.core.inference.utils import DeferredFullGC, InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_inference_spec,
@@ -1974,7 +1974,7 @@ class DynamicInferenceEngineTestBase:
             assert engine.state == EngineState.SUSPENDED
             assert engine.capture_stats is None
             assert not engine.context.is_tensor_state_allocated
-            assert not engine._in_custom_gc_mode
+            assert not DeferredFullGC.is_active()
             assert not InferenceMode.is_active()
             assert not engine._state_events[EngineState.RUNNING].is_set()
             assert engine._state_events[EngineState.PAUSED].is_set()
@@ -1982,7 +1982,7 @@ class DynamicInferenceEngineTestBase:
             engine.resume()
             assert engine.state == EngineState.RUNNING
             assert InferenceMode.is_active()
-            assert engine._in_custom_gc_mode == (test_config.gc_mode != "default")
+            assert DeferredFullGC.is_active() == (test_config.gc_mode != "default")
 
         # Add requests to engine.
         env.mem_usage["start"] = torch.cuda.memory_stats()
@@ -2509,56 +2509,38 @@ def test_first_resume_reencodes_media_queued_before_the_weights():
     assert request.image_embeddings is fresh
 
 
-def test_collect_gc_while_idle_freezes_only_after_a_drained_step():
-    """The coordinator loop idles before the first request; that idle is not the first drain."""
-    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
-    engine.gc_mode = "freeze_overlap"
-    engine._in_custom_gc_mode = True
-    engine._gc_freeze_pending = True
-    engine._gc_mode_entry_step = 3
-    engine.context = types.SimpleNamespace(step_count=3)
-    engine.controller = types.SimpleNamespace(_overlap_gc=False, _trigger_gc_now=mock.Mock())
-    engine._freeze_gc_after_first_request_drain = mock.Mock()
-
-    engine._collect_gc_while_idle(drained=True)
-    engine._freeze_gc_after_first_request_drain.assert_not_called()
-
-    engine.context.step_count = 4
-    engine._collect_gc_while_idle(drained=False)
-    engine._freeze_gc_after_first_request_drain.assert_not_called()
-    engine._collect_gc_while_idle(drained=True)
-    engine._freeze_gc_after_first_request_drain.assert_called_once_with()
-
-    # Once the first-drain freeze has switched to overlap mode, idle time collects due garbage,
-    # paused or not.
-    engine._gc_freeze_pending = False
-    engine.controller._overlap_gc = True
-    engine._collect_gc_while_idle(drained=False)
-    engine._collect_gc_while_idle(drained=True)
-    assert engine.controller._trigger_gc_now.call_count == 2
-
-
-def test_shutdown_exits_custom_gc_mode_once():
-    """A stopped engine restores process-wide GC even if it was never suspended."""
+def test_gc_mode_defers_full_collections_until_idle_or_shutdown():
+    """`defer_full` stops automatic full collections while the engine serves; a due one runs
+    when the engine idles, and a stopped engine restores them even if it was never suspended."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine._staging_tasks = set()
     engine.requests = {}
     engine.zmq_context = types.SimpleNamespace(closed=True)
     engine._state_events = {EngineState.STOPPED: asyncio.Event()}
-    engine.gc_mode = "freeze"
-    engine._in_custom_gc_mode = True
-    engine._gc_freeze_pending = True
-    engine.controller = types.SimpleNamespace(_overlap_gc=False)
+    engine.gc_mode = "defer_full"
+    thresholds = gc.get_threshold()
+    try:
+        engine._enter_custom_gc_mode()
+        assert gc.get_threshold() == (*thresholds[:2], DeferredFullGC.DEFERRED_THRESHOLD)
 
-    with mock.patch.object(gc, "unfreeze") as unfreeze, mock.patch.object(gc, "collect"):
-        asyncio.run(engine.shutdown())
-        assert engine.state == EngineState.STOPPED
-        assert not engine._in_custom_gc_mode
-        assert not engine._gc_freeze_pending
-        unfreeze.assert_called_once_with()
-        # Suspend already exited the mode: shutdown must not unfreeze again.
-        engine._exit_custom_gc_mode()
-        unfreeze.assert_called_once_with()
+        with mock.patch.object(gc, "collect", return_value=0) as collect:
+            # One is due once more middle collections have run than the replaced threshold.
+            with mock.patch.object(gc, "get_count", return_value=(0, 0, thresholds[2])):
+                engine._collect_gc_while_idle()
+            collect.assert_not_called()
+            with mock.patch.object(gc, "get_count", return_value=(0, 0, thresholds[2] + 1)):
+                engine._collect_gc_while_idle()
+            collect.assert_called_once_with()
+
+            asyncio.run(engine.shutdown())
+            assert engine.state == EngineState.STOPPED
+            assert gc.get_threshold() == thresholds
+            assert collect.call_count == 2
+            # The mode is exited once: a later exit, as shutdown after a suspend, does nothing.
+            engine._exit_custom_gc_mode()
+            assert collect.call_count == 2
+    finally:
+        DeferredFullGC.unset_active()
 
 
 def test_add_request_defaults_sampling_params():
@@ -4501,7 +4483,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 kv_cache_management_mode=kv_cache_management_mode,
                 static_kv_memory_pointers=(kv_cache_management_mode == "persist"),
                 start_suspended=True,
-                gc_mode="freeze",
+                gc_mode="defer_full",
             )
             first_capture = env.engine.capture_stats
             assert first_capture is not None
@@ -4510,13 +4492,13 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
             # Later cycles follow the normal rule: PERSIST keeps the graphs, RECOMPUTE recaptures.
             env.engine.suspend()
-            assert not env.engine._in_custom_gc_mode
+            assert not DeferredFullGC.is_active()
             env.engine.resume()
-            assert env.engine._in_custom_gc_mode
+            assert DeferredFullGC.is_active()
             kept = env.engine.capture_stats is first_capture
             assert kept == (kv_cache_management_mode == "persist")
         finally:
-            gc.unfreeze()
+            DeferredFullGC.unset_active()
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -6963,73 +6945,43 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize("gc_mode", ["freeze", "freeze_overlap"])
     @torch.inference_mode()
-    def test_gc_mode_releases_frozen_garbage_on_suspend(self, gc_mode):
-        """Frozen cyclic garbage, including its CUDA memory, is released by suspend.
-
-        Scheduled collection starts only when the engine first drains after setup or resume.
-        """
-        was_enabled = gc.isenabled()
-        overlap = gc_mode == "freeze_overlap"
-        # Collections move immortal objects into the generation that gc.freeze() uses.
-        gc.unfreeze()
-        gc.collect()
-        immortal_count = gc.get_freeze_count()
+    def test_gc_mode_releases_deferred_garbage_on_suspend(self):
+        """Full collections stay off while the engine serves; cyclic garbage that outlived the
+        young generations, including its CUDA memory, is released by suspend."""
+        thresholds = gc.get_threshold()
+        deferred = (*thresholds[:2], DeferredFullGC.DEFERRED_THRESHOLD)
         try:
-            env = self._build_test_env(DynamicEngineTestConfig(gc_mode=gc_mode))
+            env = self._build_test_env(DynamicEngineTestConfig(gc_mode="defer_full"))
             engine = env.engine
-            assert gc.get_freeze_count() > immortal_count
-            assert engine._gc_freeze_pending
-            assert not engine.controller._overlap_gc
-            assert gc.isenabled() is was_enabled
+            assert gc.get_threshold() == deferred
 
-            # A CUDA tensor in a reference cycle that is alive when the heap is frozen.
+            for request in env.requests:
+                engine._add_request(request)
+            while engine.has_unfinished_requests():
+                self._run_step(env)
+            assert all(request.status == Status.COMPLETED for request in env.requests)
+            assert gc.get_threshold() == deferred
+
+            # A CUDA tensor in a reference cycle that a young collection has promoted: only a
+            # full collection reclaims it.
             cycle = [torch.ones(1 << 20, device="cuda")]
             cycle_bytes = cycle[0].untyped_storage().nbytes()
             cycle_tensor = weakref.ref(cycle[0])
             cycle.append(cycle)
-            engine._collect_and_freeze_gc()
+            gc.collect(1)
             del cycle
-            gc.collect()
-            assert cycle_tensor() is not None
 
-            half = len(env.requests) // 2
-            for request in env.requests[:half]:
-                engine._add_request(request)
-            while engine.has_unfinished_requests():
-                self._run_step(env)
-            assert not engine._gc_freeze_pending
-            assert engine.controller._overlap_gc is overlap
-            assert gc.isenabled() is (was_enabled and not overlap)
-
-            with mock.patch.object(
-                engine.controller, "_trigger_gc_now", wraps=engine.controller._trigger_gc_now
-            ) as trigger_gc_now:
-                for request in env.requests[half:]:
-                    engine._add_request(request)
-                while engine.has_unfinished_requests():
-                    self._run_step(env)
-            assert all(request.status == Status.COMPLETED for request in env.requests)
-            assert trigger_gc_now.called is overlap
-
-            gc.collect()
             allocated = torch.cuda.memory_allocated()
             engine.suspend()
-            # Earlier engines kept alive by pending event-loop callbacks may be released too.
             assert cycle_tensor() is None
             assert allocated - torch.cuda.memory_allocated() >= cycle_bytes
-            assert gc.get_freeze_count() == immortal_count
-            assert gc.isenabled() is was_enabled
-            assert not engine.controller._overlap_gc
+            assert gc.get_threshold() == thresholds
 
             engine.resume()
-            assert gc.get_freeze_count() > immortal_count
-            assert not engine.controller._overlap_gc
-            assert engine._gc_freeze_pending
+            assert gc.get_threshold() == deferred
         finally:
-            gc.unfreeze()
-            (gc.enable if was_enabled else gc.disable)()
+            DeferredFullGC.unset_active()
 
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
