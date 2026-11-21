@@ -35,3 +35,7 @@ In the layout string, stages are split by `|`. Replicated stages or layers use m
 * `L`: loss calculation layer
 
 **Note:** Empty stages are allowed, for example `E||t|L` (the second stage is empty).
+
+## Choosing a Balanced Layout
+
+The slowest stage sets the step time, so the layout should give each stage a similar amount of work. Unit costs are uneven: the loss stage includes the output layer, and each MTP layer adds a transformer block and a pass through the output layer. `tools/pipeline_layout_planner` fits per-unit costs from two short profiling runs (`--timing-log-level 2 --timing-log-option all`), simulates the 1F1B schedule for every layout this validator accepts, and prints the fastest layout that fits in memory. Refer to [tools/pipeline_layout_planner/README.md](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/pipeline_layout_planner/README.md).
