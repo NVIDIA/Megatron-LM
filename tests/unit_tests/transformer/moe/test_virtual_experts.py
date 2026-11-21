@@ -15,6 +15,7 @@ synthetic; no dataset or custom launcher is required.
 import gc
 import os
 from contextlib import nullcontext
+from copy import deepcopy
 from dataclasses import replace
 from functools import partialmethod
 from types import SimpleNamespace
@@ -355,6 +356,8 @@ def test_virtual_expert_hybrid_training_parity(monkeypatch, egtp_size):
         }
     )
 
+    reference_step_states = {}
+
     def train(virtual):
         gtp.reset_gtp_state()
         gtp._GTP_PARAMS.clear()
@@ -516,6 +519,28 @@ def test_virtual_expert_hybrid_training_parity(monkeypatch, egtp_size):
             for step in range(2):
                 optimizer.zero_grad()
                 model.zero_grad_buffer()
+                if step:
+                    # Compare each step from the same master weights and Adam state. Otherwise,
+                    # tolerated update differences can cross MXFP8 quantization boundaries and
+                    # compound into unrelated gradient differences in the next forward.
+                    if virtual:
+                        parameters, optimizer_states = reference_step_states[step]
+                        with torch.no_grad():
+                            for parameter, reference in zip(optimizer.get_parameters(), parameters):
+                                parameter.copy_(reference)
+                        for child, state in zip(optimizer.chained_optimizers, optimizer_states):
+                            child.optimizer.load_state_dict(deepcopy(state))
+                    else:
+                        reference_step_states[step] = (
+                            [
+                                parameter.detach().clone()
+                                for parameter in optimizer.get_parameters()
+                            ],
+                            [
+                                deepcopy(child.optimizer.state_dict())
+                                for child in optimizer.chained_optimizers
+                            ],
+                        )
                 for child in optimizer.chained_optimizers:
                     child._copy_main_params_to_param_buffer()
                 model.set_is_first_microbatch()
