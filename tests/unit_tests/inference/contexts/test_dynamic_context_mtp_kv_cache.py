@@ -1289,8 +1289,10 @@ class TestMtpSpareBlockLifecycle:
         context.prepare_requests()
         assert context.request_kv_block_counts[0] == 2
         assert context.request_to_kv_block_ids[0, 1] == held[0]
-        assert torch.count_nonzero(context.memory_buffer[1, :, held[0]]) == 0
         self._assert_main_token_mapping(context)
+        # The publish ahead of the forward zeroes the newly granted page.
+        context.transfer_bookkeeping_to_gpu()
+        assert torch.count_nonzero(context.memory_buffer[1, :, held[0]]) == 0
         context.kv_block_allocator.release_memory_blocks(held[1:])
 
     @pytest.mark.parametrize("depth", [2, 7])
