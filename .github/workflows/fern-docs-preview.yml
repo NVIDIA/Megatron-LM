@@ -1,0 +1,147 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# workflow_run loads this workflow from the default branch. Never execute PR
+# actions or scripts in this workflow, or consume artifacts from the requester.
+name: Fern docs (preview)
+
+on:
+  workflow_run:
+    workflows: ['Fern docs (preview request)']
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+
+concurrency:
+  group: fern-preview-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+jobs:
+  resolve:
+    if: >-
+      github.repository == 'NVIDIA/Megatron-LM' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      startsWith(github.event.workflow_run.head_branch, 'pull-request/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      pr-number: ${{ steps.request.outputs.pr-number }}
+      source-sha: ${{ steps.request.outputs.source-sha }}
+      head-sha: ${{ steps.request.outputs.head-sha }}
+    steps:
+      - name: Checkout trusted workflow code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - name: Resolve current synchronized PR
+        id: request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/fern_docs_preview.py resolve
+
+  validate:
+    needs: resolve
+    if: needs.resolve.outputs.pr-number != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout trusted workflow code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - name: Set up trusted Fern CLI
+        uses: ./.github/actions/setup-fern
+
+      - name: Checkout preview sources
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.resolve.outputs.source-sha }}
+          path: preview-source
+          persist-credentials: false
+
+      - name: Prepare preview sources
+        run: python3 .github/scripts/fern_docs_preview.py prepare
+
+      - name: Validate preview revision without Fern credentials
+        working-directory: preview-source/fern
+        run: |
+          fern check
+          fern docs md check
+          fern docs broken-links --strict
+
+  publish:
+    name: Preview PR ${{ needs.resolve.outputs.pr-number }} at ${{ needs.resolve.outputs.source-sha }}
+    needs: [resolve, validate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: fern-preview
+      url: ${{ steps.preview.outputs.url }}
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+    steps:
+      - name: Checkout trusted workflow code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - name: Set up trusted Fern CLI
+        uses: ./.github/actions/setup-fern
+
+      - name: Checkout approved preview sources
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.resolve.outputs.source-sha }}
+          path: preview-source
+          persist-credentials: false
+
+      - name: Prepare preview sources
+        run: python3 .github/scripts/fern_docs_preview.py prepare
+
+      - name: Recheck PR after approval
+        id: current
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_HEAD_SHA: ${{ needs.resolve.outputs.head-sha }}
+        run: python3 .github/scripts/fern_docs_preview.py current
+
+      - name: Generate preview
+        if: steps.current.outputs.current == 'true'
+        id: preview
+        uses: ./.github/actions/preview-fern
+        with:
+          preview-id: megatron-lm-pr-${{ needs.resolve.outputs.pr-number }}
+          working-directory: preview-source/fern
+          token: ${{ secrets.FERN_TOKEN }}
+
+      - name: Update preview comment if the PR is still current
+        if: steps.current.outputs.current == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_HEAD_SHA: ${{ needs.resolve.outputs.head-sha }}
+          PREVIEW_URL: ${{ steps.preview.outputs.url }}
+        run: python3 .github/scripts/fern_docs_preview.py comment
