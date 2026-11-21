@@ -342,6 +342,38 @@ def test_attn_target_pads_small_head_count(monkeypatch):
     assert target.shape == indices.shape
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_real_attn_target_accepts_strided_bshd_views():
+    """The sparse-loss path passes [s, b] -> [b, s] views without a copy; check bit-exactness."""
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("cuDNN DSA requires SM90+")
+    try:
+        from cudnn import DSA  # noqa: F401
+    except ImportError:
+        pytest.skip("cuDNN DSA is unavailable")
+
+    torch.manual_seed(7)
+    device = torch.device("cuda")
+    # 64 heads so the kernel sees q itself rather than a head-padded copy; K is sliced from a
+    # larger buffer like ``kv_full[kv_offset:]``.
+    seqlen_q, batch, heads, dim, seqlen_k, topk, kv_offset = 256, 2, 64, 512, 256, 128, 32
+    query_sbhd = torch.randn(seqlen_q, batch, heads, dim, device=device, dtype=torch.bfloat16)
+    kv_full = torch.randn(kv_offset + seqlen_k, batch, dim, device=device, dtype=torch.bfloat16)
+    q_view = query_sbhd.permute(1, 0, 2, 3)
+    k_view = kv_full[kv_offset:].permute(1, 0, 2)
+    assert not q_view.is_contiguous() and not k_view.is_contiguous()
+    lse = torch.rand(batch, seqlen_q, heads, device=device) * 4 + 8
+    indices = torch.rand(batch, seqlen_q, seqlen_k, device=device).argsort(-1)[..., :topk]
+    indices = indices.to(torch.int32)
+    indices[:, :, -5:] = -1
+    args = (lse, indices, dim**-0.5, heads)
+
+    expected = fused_csa._compute_attn_target(q_view.contiguous(), k_view.contiguous(), *args)
+    actual = fused_csa._compute_attn_target(q_view, k_view, *args)
+
+    assert torch.equal(actual, expected)
+
+
 def test_dense_kl_ignores_ratio_masked_negative_infinity_scores():
     attn_score = torch.tensor([[[1.0, 0.0, 0.0]]])
     attn_l1norm = torch.tensor([[1.0]])
