@@ -9,6 +9,11 @@ import pytest
 import torch
 from packaging.version import Version
 
+from megatron.core.datasets.shared_prefix.inputs import (
+    build_shared_prefix_inputs,
+    shard_shared_prefix_inputs_for_context_parallel,
+    shared_prefix_topology_multiple,
+)
 from megatron.core.datasets.shared_prefix.layout import SharedPrefixTree
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.hybrid import shared_prefix
@@ -371,6 +376,36 @@ def test_unsupported_stack_topology_layers_and_layout_rejected():
     stack = _stack(_config(moe=True, moe_router_enable_expert_bias=True))
     with pytest.raises(NotImplementedError, match="explicit physical branch padding"):
         _validate_hybrid_stack(stack, _LAYOUT, physical_len=_PHYSICAL_LEN[1])
+
+
+@pytest.mark.parametrize("tp_size, cp_size", [(1, 1), (1, 2), (2, 1), (2, 4)])
+def test_stack_validation_accepts_built_inputs(tp_size, cp_size):
+    """The stack validation accepts the layout and padded length that the input builder makes."""
+    config = _config(
+        cp_size=cp_size,
+        moe=True,
+        moe_router_enable_expert_bias=True,
+        tensor_model_parallel_size=tp_size,
+        sequence_parallel=tp_size > 1,
+    )
+    stack = _stack(config, cp_size=cp_size)
+    stack.tp_group = stack.pg_collection.tp = _group(tp_size)
+    topology_multiple = shared_prefix_topology_multiple(tp_size=tp_size, cp_size=cp_size)
+    # Rows of 5, 7 and 4 tokens: one tree with a 3-token prompt, then a pack of two trees.
+    input_ids = torch.arange(1, 8).repeat(3, 1)
+    for prompt_lengths, tree_sizes in (([3, 3, 3], (3,)), ([3, 3, 2], (2, 1))):
+        for padding_multiple in (topology_multiple, 3 * topology_multiple):
+            inputs = build_shared_prefix_inputs(
+                input_ids,
+                input_lengths=torch.tensor([5, 7, 4]),
+                prompt_lengths=torch.tensor(prompt_lengths),
+                tree_sizes=tree_sizes,
+                padding_multiple=padding_multiple,
+            )
+            shard = shard_shared_prefix_inputs_for_context_parallel(
+                inputs, cp_rank=0, cp_size=cp_size, tp_size=tp_size
+            )
+            _validate_hybrid_stack(stack, inputs.layout, physical_len=shard.padded_total_length)
 
 
 def _bare_mamba_layer(config):

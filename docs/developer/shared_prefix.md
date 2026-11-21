@@ -7,15 +7,16 @@ initialization, and default execution settings remain in place, and importing
 `HybridModel` does not load the shared-prefix adapter.
 
 Model execution is split by owner. `megatron.core.datasets.shared_prefix.layout`
-describes the packed layout.
+describes the packed layout. `megatron.core.datasets.shared_prefix.inputs` builds
+that layout and the packed tensors of one forward from ordinary padded rows.
 `megatron.core.models.hybrid.shared_prefix` validates a model configuration and a
 `HybridStack`, and runs the stack's layers in order. Each layer type keeps its own
 execution: `megatron.core.ssm.shared_prefix.mamba_shared_prefix` and the ragged
 Mamba kernels under `megatron.core.ssm.shared_prefix` fork the prefix state,
 `megatron.core.ops.attention.shared_prefix` runs the forest attention, and
 `megatron.core.transformer.shared_prefix_attention` checks that a self-attention
-layer can run it. Callers build the layout and own their configuration, batch
-transport, distributed coordination, and RL objective.
+layer can run it. Callers choose which rows share a forward and own their
+configuration, batch transport, distributed coordination, and RL objective.
 
 The stack passes each layer its shared-prefix input as a keyword argument of the
 layer call. Self-attention layers receive the layout as `shared_prefix_forest`.
@@ -63,6 +64,35 @@ Transformer Engine and the inference engine.
 Under `torch.use_deterministic_algorithms(True)`, which `--deterministic-mode`
 enables, the backward uses FlashAttention's deterministic kernel; no other switch
 is needed for bit-exact attention replay.
+
+## Inputs of one forward
+
+A row is one sequence of a padded batch: a prompt followed by a completion.
+`build_shared_prefix_inputs` packs the rows of one forward. It takes the token
+rows (`input_ids`), the length of each row, the prompt length of each row, the
+number of rows of each tree, and a padding multiple. The rows of a tree are
+consecutive, and the function checks that they start with the same prompt tokens.
+The optional `mtp_loss_group_tree_counts` gives the sizes of consecutive groups
+of trees whose MTP loss is normalized together. It becomes the
+`mtp_loss_group_root_counts` of the pack.
+
+The function returns a `SharedPrefixForwardInputs`. This object holds the layout
+that `HybridModel.forward` takes as `shared_prefix_layout`, the packed tokens,
+their position ids, and the index maps between the packed sequence and the rows.
+The layout is a `SharedPrefixTree` for a forward with one tree and an empty
+`mtp_loss_group_tree_counts`, and a `SharedPrefixPack` otherwise.
+`gather_shared_prefix_token_aligned` gathers another per-token tensor, such as a
+loss mask, into the packed order.
+`shard_shared_prefix_inputs_for_context_parallel` pads the packed sequence and
+selects the tokens of one CP rank.
+`shard_shared_prefix_token_aligned_for_context_parallel` pads a gathered tensor
+in the same way and selects the tokens of the same CP rank.
+
+Each row, prompt included, is stored with a length that is a multiple of the
+padding multiple. The packed sequence is padded to the same multiple. The padding
+multiple must be a multiple of the topology multiple.
+`resolve_shared_prefix_padding_multiple` checks a caller's multiple against this
+rule and returns the topology multiple when the caller passes none.
 
 ## Mamba state forking
 
@@ -223,8 +253,12 @@ replaces:
 - `tests/unit_tests/shared_prefix/hybrid/test_shared_prefix_guards.py` and
   `tests/unit_tests/shared_prefix/test_shared_prefix_layout.py`: the explicit
   guards, with the configuration rules checked both without a stack and through
-  the stack validation, the layout metadata, and the order of Mamba module hooks,
-  on CPU.
+  the stack validation, the stack validation of forwards built by
+  `build_shared_prefix_inputs`, the layout metadata, and the order of Mamba module
+  hooks, on CPU.
+- `tests/unit_tests/shared_prefix/test_shared_prefix_inputs.py`: the inputs of
+  one forward, on CPU. A toy attention model gives the same outputs on the packed
+  sequence as on the dense rows, and the CP shards reassemble the padded sequence.
 
 In FP32, shared and dense execution differ only in summation order. The layer
 tests bound that difference at 1e-5 relative L2 for MoE and 5e-5 for Mamba. Their
