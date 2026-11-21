@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from megatron.core.inference.config import CudaGraphSizingDistribution
+from megatron.core.inference.engines.dynamic.loop import EPWorkLevel
 from megatron.core.transformer.cuda_graphs import _CudagraphReplayNode
 from tests.unit_tests.inference import test_coordinator_features_pairwise as features
 from tests.unit_tests.inference import test_coordinator_schedule_pairwise as schedule
@@ -99,7 +100,9 @@ async def test_routed_idle_expert_progress(monkeypatch, interval, synchronous):
             return result
 
         async def observed_consensus(work, *args, **kwargs):
-            if work and h.engine._last_ep_consensus[0]:
+            # Consensus after model work is cached for the interval. A cached admission
+            # attempt is refreshed on the next pass, so it is not recorded.
+            if work and h.engine._last_ep_consensus[0] == EPWorkLevel.MODEL_WORK:
                 cadence.append(h.engine._ep_consensus_loop_counter)
             return await consensus(work, *args, **kwargs)
 

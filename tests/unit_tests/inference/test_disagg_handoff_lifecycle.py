@@ -41,6 +41,7 @@ from megatron.core.inference.disaggregation.pending_handoff_imports import (
     PendingSSMImport,
 )
 from megatron.core.inference.disaggregation.transfer_backends.base import TransferStartError
+from megatron.core.inference.engines.dynamic.loop import EPWorkLevel
 from megatron.core.inference.engines.dynamic_engine import (
     DynamicInferenceEngine,
     EngineState,
@@ -2178,13 +2179,14 @@ def test_idle_prefill_without_expert_parallelism_skips_dummy_forward(handoff_loo
 def test_idle_expert_parallel_rank_keeps_amortized_consensus_dummy_forward(handoff_loop):
     """EP>1 ranks still reuse consensus within the interval and join busy peers."""
     dummy_forward = mock.Mock()
+    # The busy peer runs the model; this rank only attempts to admit its waiting prompt.
     engine = _CoordinatorLoopPrefillEngine(
-        ep_world_size=2, peer_work=1, iterations=4, dummy_forward=dummy_forward
+        ep_world_size=2, peer_work=EPWorkLevel.MODEL_WORK, iterations=4, dummy_forward=dummy_forward
     )
 
     _run_coordinator_loop(engine, handoff_loop)
 
-    assert engine.all_reduce_inputs == [1]
+    assert engine.all_reduce_inputs == [EPWorkLevel.ADMISSION_ATTEMPT]
     assert engine.step_calls == 1
     assert dummy_forward.call_count == 3
     assert engine.context.step_count == 3
