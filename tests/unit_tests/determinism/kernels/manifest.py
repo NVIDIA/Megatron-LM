@@ -959,6 +959,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "(kernel replayed in test_optimizer_kernels.py).",
     ),
     KernelEntry(
+        name="fp8_inference_padding",
+        sources=("megatron/core/fp8_utils.py",),
+        tests=(K + "test_te_wrappers.py",),
+        kind="dispatch",
+        training_path=False,
+        notes="prepare_model_for_fp8_inference pads TE linear inputs with TE's Fp8Padding / "
+        "Fp8Unpadding; with sequence parallelism it pads each rank's chunk and leaves the "
+        "all-gather (column) or reduce-scatter (row) to the TE module. Replayed at TP=2 with "
+        "tensorwise FP8 by test_te_linear_fp8_inference_padding_sequence_parallel_replays.",
+    ),
+    KernelEntry(
         name="inference_mxfp8_quantization",
         sources=(
             "megatron/core/inference/quantization/mxfp8_tensor.py",

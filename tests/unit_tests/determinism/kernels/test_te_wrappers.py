@@ -25,7 +25,7 @@ import megatron.core.extensions.transformer_engine as te_ext
 from megatron.core import parallel_state
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE, TEFusedMLP, mark_grouped_tensor
-from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
+from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor, prepare_model_for_fp8_inference
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
@@ -1016,6 +1016,76 @@ class TestTEWrappers:
             raise
         assert len(scaled[1]) == 3  # Replay covers dQ, dK, and dV.
         assert not bytes_equal(default[0]["out"], scaled[0]["out"])
+
+
+# --- FP8 inference padding under sequence parallelism ------------------------------------------
+
+
+@pytest.mark.parametrize("parallel_mode", ["column", "row"])
+def test_te_linear_fp8_inference_padding_sequence_parallel_replays(parallel_mode):
+    """prepare_model_for_fp8_inference pads each rank's sequence chunk and leaves the
+    sequence-parallel all-gather (column) or reduce-scatter (row) to TE. Replay that path at
+    TP=2 with tensorwise FP8 on chunks that need padding."""
+    Utils.initialize_distributed()
+    if torch.distributed.get_world_size() % 2:
+        pytest.skip("requires a world size divisible by TP=2")
+    if torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("FP8 needs SM 8.9 or newer")
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        seeded()
+        config = _config(
+            tensor_model_parallel_size=2,
+            sequence_parallel=True,
+            fp8="e4m3",
+            fp8_recipe=Fp8Recipe.tensorwise,
+        )
+        common = dict(
+            config=config,
+            init_method=init_method_normal(0.02),
+            bias=False,
+            skip_bias_add=False,
+            is_expert=False,
+            tp_group=parallel_state.get_tensor_model_parallel_group(),
+        )
+        # Rows per rank: not a multiple of the 16-row FP8 alignment, so every chunk is padded.
+        chunk = TOKENS // 4 + 4
+        if parallel_mode == "column":
+            module = TEColumnParallelLinear(HIDDEN, FFN, gather_output=False, **common)
+            x = torch.randn(chunk, 2, HIDDEN, device="cuda", dtype=torch.bfloat16)
+            out_shape = (2 * chunk, 2, FFN // 2)
+        else:
+            module = TERowParallelLinear(FFN, HIDDEN, input_is_parallel=True, **common)
+            x = torch.randn(2 * chunk, 2, FFN // 2, device="cuda", dtype=torch.bfloat16)
+            out_shape = (chunk, 2, HIDDEN)
+
+        te_rows = []
+        te_forward = module.forward
+
+        def recording_forward(inp, *args, **kwargs):
+            te_rows.append(inp.shape[0])
+            return te_forward(inp, *args, **kwargs)
+
+        module.forward = recording_forward
+        prepare_model_for_fp8_inference(module.eval())
+
+        def fn(x):
+            with torch.no_grad(), get_fp8_context(config):
+                return module(x)[0]
+
+        outputs, _ = assert_replays_bit_exact(
+            fn,
+            (x,),
+            replays=3,
+            backward=False,
+            contention=True,
+            what=f"FP8-padded TE {parallel_mode}-parallel linear",
+        )
+        assert te_rows and min(te_rows) > x.shape[0], "the wrapper did not pad the FP8 input"
+        assert outputs["out"].shape == out_shape
+    finally:
+        Utils.destroy_model_parallel()
 
 
 # --- fused RoPE --------------------------------------------------------------------------------
