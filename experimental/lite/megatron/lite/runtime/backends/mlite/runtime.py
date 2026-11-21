@@ -356,6 +356,9 @@ class MegatronLiteRuntime(RuntimeBase):
 
     def save_checkpoint(self, handle: ModelHandle, path: str, **kwargs) -> None:
         from megatron.lite.primitive.ckpt import save_training_checkpoint
+        from megatron.lite.primitive.optimizers.megatron_wrap import sync_overlapped_params
+
+        sync_overlapped_params(handle._extras.get("model_chunks", [handle._model]))
 
         step = kwargs.pop("step", None)
         if step is None:
@@ -410,7 +413,10 @@ class MegatronLiteRuntime(RuntimeBase):
         )
 
     def export_weights(self, handle: ModelHandle, **kwargs) -> Iterator[tuple[str, torch.Tensor]]:
+        from megatron.lite.primitive.optimizers.megatron_wrap import sync_overlapped_params
+
         model_chunks = handle._extras.get("model_chunks", [handle._model])
+        sync_overlapped_params(model_chunks)
         proto = handle._extras.get("protocol")
         model_cfg = handle._extras.get("model_cfg")
         ps = handle._parallel_state
