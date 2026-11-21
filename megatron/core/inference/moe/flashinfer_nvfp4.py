@@ -101,10 +101,14 @@ class FlashInferRoutedNVFP4Weights:
 
 
 def _global_encode_scale(weight: torch.Tensor) -> torch.Tensor:
-    """Return the one-element NVFP4 global encode scale for a weight matrix."""
+    """Return the one-element NVFP4 global encode scale for a weight matrix.
+
+    An all-zero matrix takes 1. A NaN weight makes the scale NaN, so the matrix dequantizes
+    to NaN: E2M1 codes cannot hold a NaN and FlashInfer's block maxima skip it.
+    """
     amax = weight.abs().amax().float().reshape(1)
     encode = (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / amax
-    return torch.where(amax > 0, encode, torch.ones_like(encode))
+    return torch.where(amax == 0, torch.ones_like(encode), encode)
 
 
 def _zero_pad(weight: torch.Tensor, padded_rows: int, padded_cols: int) -> torch.Tensor:
