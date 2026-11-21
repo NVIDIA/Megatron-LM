@@ -9,6 +9,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin
 from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import MHCCheckpointManager
@@ -16,7 +17,6 @@ from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mhc_recompute import MHCRecomputeArenaSlot, MHCRecomputeSlotMetadata
-from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     HyperConnectionTransformerLayer,
@@ -82,13 +82,13 @@ class TestHybridMHCAttentionGraphSplit:
         assert inputs["attention_mask"] is mask
 
     def test_mlp_wrapper_stays_eager(self, hybrid_split_wrapper):
-        from megatron.core.transformer.cuda_graphs import _layer_is_graphable
+        from megatron.core.transformer.cuda_graphs import _te_cuda_graph_layer_is_graphable
 
         wrapper = hybrid_split_wrapper
         wrapper.inner_layer.self_attention = IdentityOp()
         wrapper.inner_layer.mlp = torch.nn.Linear(4, 4)
         assert not wrapper._uses_mhc_recompute_attn_cuda_graph_split()
-        assert not _layer_is_graphable(wrapper, wrapper.config)
+        assert not _te_cuda_graph_layer_is_graphable(wrapper, wrapper.config)
 
     @pytest.mark.parametrize("mla_recompute", [False, True])
     def test_split_keeps_static_input_liveness_validation(
@@ -182,7 +182,7 @@ class TestHybridMHCAttentionGraphSplit:
         wrapper.hyper_connection.fused_h_res_h_post_bda.side_effect = (
             lambda h_res, residual, h_post, output, **kwargs: residual + output[0].repeat(1, 1, 2)
         )
-        monkeypatch.setattr(GraphableMegatronModule, "_te_cuda_graph_replay", replay)
+        monkeypatch.setattr(TECudaGraphMixin, "_te_cuda_graph_replay_graph", replay)
         for microbatch in range(2):
             wrapper.current_microbatch = microbatch
             slot = SimpleNamespace(writer=slots[microbatch])
@@ -335,7 +335,13 @@ def packed_split_layer(hybrid_split_wrapper, request, monkeypatch):
         layer._forward_mhc_attention_post_cuda_graph = Mock(return_value=(residual, None))
         layer._forward_mlp = Mock(return_value=residual)
     layer.config = config
+    # register_te_cuda_graph() is bypassed above; mirror its padding-mask graph state.
+    graph_layer = layer.inner_layer if request.param == "hybrid" else layer
+    graph_layer._te_cuda_graph_padding_mask_shape_seen = None
+    graph_layer._te_cuda_graph_padding_mask_shape = None
     layer.off_interface = Mock()
+    # Graph replay owns the TE graph offload lifecycle through get_offload_interface().
+    layer.get_offload_interface = lambda: layer.off_interface
     return layer, producer, attention
 
 
@@ -373,7 +379,7 @@ class TestMHCAttentionGraphSplitTHD:
     def test_replay_does_not_allocate_a_dense_thd_attention_mask(
         self, packed_split_layer, monkeypatch
     ):
-        import megatron.core.transformer.transformer_layer as layer_module
+        import megatron.core.transformer.transformer_layer_mixins as layer_module
 
         layer, _, _ = packed_split_layer
         te = ModuleType("transformer_engine")
@@ -431,7 +437,7 @@ class TestMHCAttentionGraphSplitTHD:
             graph_reads.append(kwargs["cu_seqlens_q"].clone())
             return (aggregate * 2,)
 
-        monkeypatch.setattr(GraphableMegatronModule, "_te_cuda_graph_replay", replay)
+        monkeypatch.setattr(TECudaGraphMixin, "_te_cuda_graph_replay_graph", replay)
         for boundary in (3, 5):
             packed = _cpu_packed_metadata(boundary)
             if not with_padded_seqlens:
@@ -468,10 +474,11 @@ class TestMHCAttentionGraphSplitTHD:
     ):
         layer, producer, _ = packed_split_layer
         slots = (torch.empty(8, 1, 4), torch.empty(8, 1, 4))
-        layer.cuda_graphs = [object(), object()]
+        layer.te_cuda_graphs = [object(), object()]
         layer._te_cuda_graph_static_hidden_inputs = slots
         layer._te_cuda_graph_static_hidden_input_ptrs = tuple(slot.data_ptr() for slot in slots)
         layer.current_microbatch = 1
+        layer.te_cuda_graph_current_microbatch = 1
         arena_slot = SimpleNamespace(writer=slots[0])
         layer._mhc_recompute_manager = SimpleNamespace(
             mhc_arena=SimpleNamespace(bind_external_slot=Mock(return_value=arena_slot))
@@ -502,7 +509,7 @@ class TestMHCAttentionGraphSplitTHD:
 
         producer.side_effect = produce
         layer._decompose_packed_seq_params_to_kwargs = decompose_retained_invocation
-        monkeypatch.setattr(GraphableMegatronModule, "_te_cuda_graph_replay", replay)
+        monkeypatch.setattr(TECudaGraphMixin, "_te_cuda_graph_replay_graph", replay)
         layer._te_cuda_graph_replay(
             torch.ones(8, 1, 8),
             packed_seq_params=_cpu_packed_metadata(),
@@ -524,6 +531,7 @@ class TestMHCAttentionGraphSplitTHD:
         layer.config = hybrid_split_wrapper.config
         layer.config.delay_offload_until_cuda_graph = True
         layer.off_interface = Mock()
+        layer.get_offload_interface = lambda: layer.off_interface
         packed = _cpu_packed_metadata()
 
         def replay_impl(args, kwargs, context):
@@ -674,7 +682,7 @@ def test_gpu_mhc_split_replay_matches_eager(hybrid, mla_recompute, packed):
             _set_capture_end()
         for layer_index, layer in enumerate(callables):
             indices = [slot * len(callables) + layer_index for slot in range(2)]
-            layer.cuda_graphs = [graphs[index] for index in indices]
+            layer.te_cuda_graphs = [graphs[index] for index in indices]
             layer.set_te_cuda_graph_static_hidden_inputs(
                 [sample_args[index][0] for index in indices]
             )
@@ -687,6 +695,7 @@ def test_gpu_mhc_split_replay_matches_eager(hybrid, mla_recompute, packed):
                 manager = MHCCheckpointManager()
                 for layer_index, layer in enumerate(layers):
                     layer.current_microbatch = microbatch
+                    layer.te_cuda_graph_current_microbatch = microbatch
                     manager.is_last_layer_in_recompute_block = layer_index == len(layers) - 1
                     hidden, _ = layer(
                         hidden, mhc_recompute_manager=manager, **packed_inputs[microbatch]

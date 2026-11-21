@@ -42,6 +42,7 @@ from megatron.core.transformer.module import (
     MegatronModule,
     mark_keep_in_fp32,
 )
+from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
@@ -762,16 +763,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         return layer_managers, is_recompute_block_end
 
-    @staticmethod
-    def _finalize_mhc_recompute_layer(
-        mhc_manager: Optional[MHCCheckpointManager],
-        hidden_states: Tensor,
-        is_last_in_recompute_block: bool,
-    ) -> None:
-        """Finalize MHC recompute state for the current layer when block ends."""
-        if mhc_manager is not None and is_last_in_recompute_block:
-            mhc_manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
-
     def forward(
         self,
         hidden_states: Union[Tensor, WrappedTensor],
@@ -926,6 +917,17 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         mhc_layer_managers, mhc_is_last_in_recompute_block = self._build_mhc_recompute_layer_plan(
             use_mhc_recompute
         )
+        # Transport the shared residual-stream recompute contract, but keep the
+        # MHCCheckpointManager per block: its mHC arena backs the attention-only
+        # CUDA-graph split's direct-write aggregate slot.
+        mhc_layer_contexts: List[Optional[ResidualStreamRecomputeContext]] = [None] * len(
+            self.layers
+        )
+        for layer_index, mhc_manager in enumerate(mhc_layer_managers):
+            if mhc_manager is not None:
+                mhc_layer_contexts[layer_index] = ResidualStreamRecomputeContext(
+                    manager=mhc_manager, is_block_end=mhc_is_last_in_recompute_block[layer_index]
+                )
 
         with rng_context, outer_quantization_context:
             # Forward pass.
@@ -969,18 +971,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     else:
                         inner_quantization_context = nullcontext()
 
-                    mhc_manager = mhc_layer_managers[l_no]
-                    if mhc_manager is not None:
-                        mhc_manager.is_last_layer_in_recompute_block = (
-                            mhc_is_last_in_recompute_block[l_no]
-                        )
-
-                    # Only thread mhc_recompute_manager when the layer is mHC and a
-                    # manager actually exists. Plain TransformerLayer (and its
-                    # MoETransformerLayer subclass) doesn't accept this kwarg, and
-                    # its CUDA-graph machinery rejects unrecognized non-tensor kwargs.
+                    mhc_context = mhc_layer_contexts[l_no]
+                    # Contexts exist only while mHC replay is active; then every layer receives
+                    # one. HyperConnectionTransformerLayer removes it before CUDA-graph dispatch.
                     extra_layer_kwargs = (
-                        {"mhc_recompute_manager": mhc_manager} if mhc_manager is not None else {}
+                        {"residual_stream_recompute_context": mhc_context}
+                        if mhc_context is not None
+                        else {}
                     )
                     if attn_res_state is not None:
                         if is_attn_res_block_start(
@@ -1009,11 +1006,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             **extra_layer_kwargs,
                         )
                     observe_layer_residuals(layer, residual_accumulator, hidden_states)
-                    self._finalize_mhc_recompute_layer(
-                        mhc_manager=mhc_manager,
-                        hidden_states=hidden_states,
-                        is_last_in_recompute_block=mhc_is_last_in_recompute_block[l_no],
-                    )
+                    if mhc_context is not None:
+                        mhc_context.finalize(hidden_states)
 
                     if (
                         torch.is_grad_enabled()

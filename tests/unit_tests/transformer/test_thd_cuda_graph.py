@@ -202,6 +202,7 @@ def test_hybrid_padding_mask_sp_scatter_uses_model_tp_group(monkeypatch, input_p
             freeze_base_model_for_mtp=False,
         ),
         hybrid_layer_config_list=None,
+        _has_custom_layers=False,
         pre_process=input_path != "pipeline",
         post_process=False,
         embedding=FakeEmbedding(),
@@ -1287,7 +1288,7 @@ class TestDecomposeReconstruct:
         kw = {'packed_seq_params': psp, 'other': 'kept'}
         layer._decompose_packed_seq_params_to_kwargs(kw)
         assert 'packed_seq_params' not in kw and 'cu_seqlens_q' in kw
-        layer._reconstruct_packed_seq_params_from_kwargs(kw)
+        layer._reconstruct_packed_graph_inputs(kw)
         r = kw['packed_seq_params']
         assert r.qkv_format == 'thd' and r.max_seqlen_q == 128
         assert r.pad_between_seqs is True
@@ -1315,7 +1316,7 @@ class TestDecomposeReconstruct:
         kw = {'packed_seq_params': psp}
 
         layer._decompose_packed_seq_params_to_kwargs(kw)
-        layer._reconstruct_packed_seq_params_from_kwargs(kw)
+        layer._reconstruct_packed_graph_inputs(kw)
 
         reconstructed = kw['packed_seq_params']
         assert reconstructed.pad_between_seqs is True
@@ -1330,7 +1331,7 @@ class TestDecomposeReconstruct:
         keys = set(kw.keys())
         layer._decompose_packed_seq_params_to_kwargs(kw)
         assert set(kw.keys()) == keys
-        layer._reconstruct_packed_seq_params_from_kwargs(kw)
+        layer._reconstruct_packed_graph_inputs(kw)
         assert set(kw.keys()) == keys
 
 
@@ -1354,7 +1355,7 @@ class TestStaticInputs:
 
         assert static_inputs["padding_mask"].shape == (1, 128)
         assert not static_inputs["padding_mask"].any()
-        assert layer._cuda_graph_padding_mask_shape == (1, 128)
+        assert layer._te_cuda_graph_padding_mask_shape == (1, 128)
         mask = static_inputs["padding_mask"]
         assert layer._te_cuda_graph_padding_mask(mask, mask.device) is mask
         torch.testing.assert_close(layer._te_cuda_graph_padding_mask(None, mask.device), mask)
@@ -1369,6 +1370,9 @@ class TestStaticInputs:
         layer.config.context_parallel_size = 2
         layer.config.sequence_packing_scheduler = "dp_balanced" if packed else None
         layer.config.cuda_graph_impl = "transformer_engine"
+        # The layer was built without TE CUDA graphs; initialize the graph state that
+        # construction with cuda_graph_impl="transformer_engine" would have registered.
+        layer.register_te_cuda_graph()
         layer.config.moe_num_hash_layers = 1
         layer.is_moe_layer = True
         layer.mlp.router = torch.nn.Identity()
@@ -1803,6 +1807,7 @@ class TestGraphDynamicRouteMetadataArena:
         import transformer_engine.pytorch.graph as te_graph
 
         from megatron.core import parallel_state
+        from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin
         from megatron.core.transformer.cuda_graphs import (
             TECudaGraphHelper,
             _set_capture_end,
@@ -1844,10 +1849,10 @@ class TestGraphDynamicRouteMetadataArena:
             def rank():
                 return 0
 
-        class RouteToyLayer(GraphableMegatronModule):
+        class RouteToyLayer(TECudaGraphMixin, GraphableMegatronModule):
             def __init__(self, layer_number):
                 # A tiny test-only Graphable module avoids constructing a full TransformerLayer,
-                # while exercising GraphableMegatronModule's real TE replay/slot selection.
+                # while exercising TECudaGraphMixin's real TE replay/slot selection.
                 torch.nn.Module.__init__(self)
                 self.config = config
                 self.pg_collection = SimpleNamespace(cp=LocalCPGroup())
@@ -1860,8 +1865,9 @@ class TestGraphDynamicRouteMetadataArena:
                 self.bias = torch.nn.Parameter(
                     torch.linspace(-0.2, 0.1, 4, device="cuda") + 0.05 * layer_number
                 )
-                self.cuda_graphs = []
-                self.cuda_graph_manual_hooks = []
+                self.te_cuda_graphs = []
+                self.te_cuda_graph_manual_hooks = []
+                self.te_cuda_graph_current_microbatch = 0
                 self._te_cuda_graph_route_replay_state = None
 
             @staticmethod
@@ -1872,13 +1878,14 @@ class TestGraphDynamicRouteMetadataArena:
                 # Exercise the production rank check and staged-slot tag plumbing.
                 return TransformerLayer._decompose_packed_seq_params_to_kwargs(self, kwargs)
 
-            def _te_cuda_graph_replay(self, *args, **kwargs):
-                # The production replay wrapper owns PackedSeqParams decomposition.
-                return TransformerLayer._te_cuda_graph_replay(self, *args, **kwargs)
-
-            def _te_cuda_graph_replay_impl(self, args, kwargs, context):
-                assert context is None
-                return GraphableMegatronModule._te_cuda_graph_replay(self, *args, **kwargs)
+            def _te_cuda_graph_prepare_replay(self, hidden_states, *args, **kwargs):
+                # As in TransformerLayer, replay preparation owns PackedSeqParams
+                # decomposition and pins the staged route slot before graph selection.
+                kwargs = dict(kwargs)
+                self._decompose_packed_seq_params_to_kwargs(kwargs)
+                return TECudaGraphMixin._te_cuda_graph_prepare_replay(
+                    self, hidden_states, *args, **kwargs
+                )
 
             def forward(
                 self,
@@ -2044,8 +2051,8 @@ class TestGraphDynamicRouteMetadataArena:
                         sample_kwargs[graph_idx]["dsa_cp_graph_layout_buffer"].data_ptr(),
                         sample_kwargs[graph_idx]["dsa_cp_graph_route_buffer"].data_ptr(),
                     ) == arena_ptrs
-                graph_layers[0].cuda_graphs.append(graphed[slot * 2])
-                graph_layers[1].cuda_graphs.append(graphed[slot * 2 + 1])
+                graph_layers[0].te_cuda_graphs.append(graphed[slot * 2])
+                graph_layers[1].te_cuda_graphs.append(graphed[slot * 2 + 1])
 
             arena_ptrs = tuple(tuple(owner.data_ptr() for owner in pair) for pair in arenas)
             suffixes = tuple(
@@ -2106,7 +2113,7 @@ class TestGraphDynamicRouteMetadataArena:
                 for layer in graph_layers:
                     # Simulate checkpoint recompute after the global layer state advanced to
                     # another slot. The staged invocation must still select its retained graph.
-                    layer.current_microbatch = replay_idx + 1
+                    layer.te_cuda_graph_current_microbatch = replay_idx + 1
                     graph_output = layer(graph_output, packed_seq_params=staged)
                     assert layer._te_cuda_graph_route_replay_state is None
                 # TE returns a detached view of its recyclable static output. With
@@ -2199,7 +2206,7 @@ class TestGraphDynamicRouteMetadataArena:
                 if hasattr(graph, "reset"):
                     graph.reset()
             for layer in graph_layers:
-                layer.cuda_graphs.clear()
+                layer.te_cuda_graphs.clear()
             block.clear_te_cuda_graph_route_metadata_arenas()
 
 

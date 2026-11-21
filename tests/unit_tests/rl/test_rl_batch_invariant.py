@@ -11,6 +11,13 @@ from megatron.rl.rl_utils import selective_log_softmax, vocab_parallel_selective
 from tests.unit_tests.test_utilities import Utils
 
 
+@pytest.fixture(scope="module", autouse=True)
+def select_local_cuda_device():
+    """Select the rank's GPU before PyTorch caches a CUDA graph capture stream."""
+    if torch.cuda.is_available():
+        torch.cuda.set_device(Utils.local_rank % torch.cuda.device_count())
+
+
 def test_selective_log_softmax_batch_invariant():
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False

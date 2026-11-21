@@ -109,7 +109,7 @@ def add_multimodal_extra_args(parser):
         "--thumbnail-area-threshold",
         type=float,
         default=0.8,
-        help="Maximum area percentage (0.0-1.0) of resized image relative to thumbnail area for which to add thumbnail. Default 0.8 (80%)",
+        help="Maximum area percentage (0.0-1.0) of resized image relative to thumbnail area for which to add thumbnail. Default 0.8 (80%%)",
     )
     group.add_argument(
         "--dataloader-seq-length",
@@ -132,13 +132,13 @@ def add_multimodal_extra_args(parser):
         "--lr-data-range-start",
         type=float,
         default=0,
-        help="Start of the learning rate range as percentage (0-100) of the full training schedule. 0% means start from the beginning of the training schedule. E.g. setting to 10, means start at 10% of the training schedule (the dataloader still starts from the beginning of the dataset, but assume that corresponds to 10% of the training schedule).",
+        help="Start of the learning rate range as percentage (0-100) of the full training schedule. 0%% means start from the beginning of the training schedule. E.g. setting to 10, means start at 10%% of the training schedule (the dataloader still starts from the beginning of the dataset, but assume that corresponds to 10%% of the training schedule).",
     )
     group.add_argument(
         "--lr-data-range-end",
         type=float,
         default=100,
-        help="End of the learning rate range as percentage (0-100) of the full training schedule. 100% means the end of the training schedule. E.g. setting to 90, means end at 90% of the training schedule (the dataloader still ends at the end of the dataset, but assume that corresponds to 90% of the training schedule).",
+        help="End of the learning rate range as percentage (0-100) of the full training schedule. 100%% means the end of the training schedule. E.g. setting to 90, means end at 90%% of the training schedule (the dataloader still ends at the end of the dataset, but assume that corresponds to 90%% of the training schedule).",
     )
     group.add_argument(
         "--num-frames",
@@ -312,8 +312,8 @@ def add_multimodal_extra_args(parser):
         action="store_true",
         default=False,
         help=(
-            "When --use-tiling is True, find the aspect ratio to use based on the original ",
-            "image aspect ratio and the area covered by the tiles.",
+            "When --use-tiling is True, find the aspect ratio to use based on the original "
+            "image aspect ratio and the area covered by the tiles."
         ),
     )
     group.add_argument(
@@ -551,12 +551,6 @@ def add_multimodal_extra_args(parser):
         action="store_true",
         default=False,
         help="Use the new dataloader path.",
-    )
-    group.add_argument(
-        "--decoder-tp-comm-overlap",
-        action="store_true",
-        default=False,
-        help="Enable tensor parallel communication overlap in the decoder.",
     )
     group.add_argument(
         "--freeze-vision-projection",

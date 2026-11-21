@@ -57,3 +57,20 @@ def test_prefill_skips_logits_when_supported():
 
         assert result == "modern-result"
         assert calls == [("model", "input-ids", True)]
+
+
+def test_calibration_scripts_import_inspect():
+    """The scripts must bind ``inspect`` themselves; ``_load_helper`` injects it for the helper."""
+    for relative_path in (
+        "examples/post_training/modelopt/quantize.py",
+        "examples/post_training/modelopt/prune.py",
+    ):
+        source_path = Path(__file__).parents[3] / relative_path
+        source_tree = ast.parse(source_path.read_text(), filename=source_path)
+        imported = {
+            alias.asname or alias.name
+            for node in source_tree.body
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        assert "inspect" in imported, relative_path

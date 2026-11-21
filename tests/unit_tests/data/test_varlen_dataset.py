@@ -1342,6 +1342,10 @@ def test_sbhd_get_batch_returns_dataset_padding_mask(monkeypatch):
     monkeypatch.setattr(pretrain_gpt.mpu, "get_tensor_model_parallel_rank", lambda: 1)
     monkeypatch.setattr(pretrain_gpt.mpu, "get_tensor_model_parallel_src_rank", lambda: 0)
     monkeypatch.setattr(pretrain_gpt.mpu, "get_tensor_model_parallel_group", lambda: None)
+    # NOTE(nightly-sync 2026-11-18): main's 45c2e7193 (#6293) makes get_batch read the global
+    # pipeline group for MTP placement when no pg_collection is passed; stub it as that commit
+    # does for the hybrid entrypoint in test_get_batch.py.
+    monkeypatch.setattr(pretrain_gpt.mpu, "get_pipeline_model_parallel_group", lambda: None)
     monkeypatch.setattr(pretrain_gpt.mpu, "is_pipeline_first_stage", lambda: False)
     monkeypatch.setattr(pretrain_gpt.mpu, "is_pipeline_last_stage", lambda: False)
     monkeypatch.setattr(pretrain_gpt, "get_context_parallel_group", lambda: None)
