@@ -4,7 +4,7 @@ import asyncio
 
 from pydantic import BaseModel
 
-from ..generation_api import GenericGenerationArgs
+from .. import GenericGenerationArgs
 from ..inference.api import (
     InferenceRequest,
     InferenceResponse,
