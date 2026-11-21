@@ -46,7 +46,8 @@ the first `-` or `E`. Source GPT layer 1 maps to the next pair, and so on.
 The pattern can also describe execution layout. A `|` marks a pipeline segment
 boundary, and `/` introduces a repeated Multi-Token Prediction (MTP) pattern.
 For example, `*-*-|*-*-` places four GPT-equivalent blocks across two pipeline
-segments. Separators do not count as layers.
+segments. Separators do not count as layers. Square brackets mark which layers
+the EP-overlap scheduler runs together. See [Bracketed layer groups](#bracketed-layer-groups).
 
 HybridModel provides the following benefits:
 
@@ -67,6 +68,27 @@ These capabilities do not imply an automatic throughput or quality improvement.
 An architecture-preserving `*-` or `*E` migration should be validated for
 numerical equivalence, and a pattern that adds another layer family should be
 treated as a new architecture and benchmarked independently.
+
+### Bracketed layer groups
+
+With `--overlap-moe-expert-parallel-comm`, square brackets mark consecutive
+layers that share one 1F1B schedule entry. For example, `[M*E]` groups Mamba,
+attention and MoE so the scheduler can overlap one microbatch's MoE all-to-all
+with another microbatch's compute. An unbracketed layer gets its own entry.
+
+`[*E][*E]` and `*E*E` both register four physical layers under `decoder.layers`.
+They have the same eager forward path, module names and layer numbers. You can
+load a checkpoint saved with either pattern into the other and use different
+groupings on the trainer and receiver during live weight refit. FP8 layer ranges
+and hash-routed MoE thresholds refer to the physical layer numbers.
+
+Groups have the following constraints:
+
+- A group cannot be empty or nested, cannot span a `|` pipeline boundary, and
+  cannot appear in an MTP pattern.
+- An MoE layer must be the last layer of its group.
+- EP overlap requires built-in layers. It does not support MTP, mHC connections,
+  wide residual streams or MoE shortcut connections.
 
 ## 2. How to Convert a Checkpoint
 

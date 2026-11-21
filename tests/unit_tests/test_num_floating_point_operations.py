@@ -1185,7 +1185,10 @@ class TestDSAFlopsHelpers:
             seqlen_squared_sum_in_batch=sum_sq,
         ) == pytest.approx(expected, rel=1e-15)
 
-    @pytest.mark.parametrize("pattern, num_indexer_layers", [(None, 2), ("D-D-|D-D-/D-/D-", 4)])
+    @pytest.mark.parametrize(
+        "pattern, num_indexer_layers",
+        [(None, 2), ("D-D-|D-D-/D-/D-", 4), ("[D-][D-]|[D-][D-]/D-/D-", 4)],
+    )
     @pytest.mark.parametrize("loss_coeff", [0.0, 0.01])
     @pytest.mark.parametrize("sparse_loss", [False, True])
     def test_indexer_training_terms(self, pattern, num_indexer_layers, loss_coeff, sparse_loss):
@@ -1193,7 +1196,7 @@ class TestDSAFlopsHelpers:
 
         Standard decoder layer 1 and MTP layer 1 compute an index. The hybrid
         main pattern computes at positions 1 and 5, plus position 1 in each MTP depth.
-        Pipeline separators must not affect that numbering.
+        Pipeline separators and bracketed groups must not affect that numbering.
         """
         args, cfg = _make_hybrid_dsa_args(loss_coeff, sparse_loss)
         args.hybrid_layer_pattern = pattern
