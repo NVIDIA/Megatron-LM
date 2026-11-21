@@ -659,6 +659,7 @@ def exchange_loaded_tensors_gather_object(
 
 def exchange_loaded_objects_gather_object(
     loaded_objects: Dict[_ShardId, Any],
+    process_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Dict[_ShardId, Any]:
     """Exchange the objects loaded by different ranks with a simple all_gather_object call.
 
@@ -670,8 +671,10 @@ def exchange_loaded_objects_gather_object(
         Dict[_ShardId, Any]: dictionary mapping shard ids to objects needed by this rank to
          load a given state dict.
     """
-    all_loaded_objects_list = [None] * torch.distributed.get_world_size()
-    torch.distributed.all_gather_object(all_loaded_objects_list, loaded_objects, group=None)
+    all_loaded_objects_list = [None] * torch.distributed.get_world_size(group=process_group)
+    torch.distributed.all_gather_object(
+        all_loaded_objects_list, loaded_objects, group=process_group
+    )
     all_loaded_objects_list = cast(List[Dict[_ShardId, Any]], all_loaded_objects_list)
     all_loaded_objects = reduce(lambda x, y: {**x, **y}, all_loaded_objects_list)
 
