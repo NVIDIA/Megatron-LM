@@ -37,3 +37,9 @@ class BertModelConfig:
 
     tp_comm_overlap_cfg: str | dict[str, Any] | None = None
     """Transformer Engine user-buffer overrides, as a YAML path or dictionary."""
+
+    def validate(self) -> None:
+        """BERT's provider always constructs learned absolute position embeddings."""
+        bound = self.transformer.max_seq_length_per_sample
+        if bound is not None and self.seq_length < bound:
+            raise ValueError("BERT position capacity must cover max_seq_length_per_sample")
