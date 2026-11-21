@@ -41,6 +41,20 @@ class KDALayerConfig(GDNLayerConfig):
 
     def validate_kda(self) -> None:
         """Validate KDA-specific dimensions, including configs copied with from_config."""
+        if self.kda_backend not in ("fla", "cudnn"):
+            raise ValueError(f"kda_backend must be 'fla' or 'cudnn', got {self.kda_backend!r}.")
+        if (
+            self.kda_backend == "cudnn"
+            and self.context_parallel_size > 1
+            and self.linear_cp_mode is not None
+            and self.linear_cp_mode != "chunkwise"
+        ):
+            raise ValueError("cuDNN KDA context parallelism requires linear_cp_mode='chunkwise'.")
+        if self.kda_backend == "cudnn" and self.linear_key_head_dim not in (64, 128):
+            raise ValueError(
+                "cuDNN KDA requires equal key/value head dimensions of 64 or 128, "
+                f"got {self.linear_key_head_dim}."
+            )
         if self.gdn_conv_pad_alignment is not None and self.gdn_conv_pad_alignment <= 0:
             raise ValueError(
                 "gdn_conv_pad_alignment must be positive when set for KDA, got "

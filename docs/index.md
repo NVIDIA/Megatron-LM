@@ -66,6 +66,7 @@ models/index
 :caption: Advanced Features
 
 user-guide/deterministic-training
+user-guide/features/kda-backends
 user-guide/features/moe
 user-guide/features/megatron_fsdp
 user-guide/features/dist_optimizer
