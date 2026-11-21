@@ -24,6 +24,84 @@ from tests.unit_tests.determinism.kernels.harness import (
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("backend", ["local", "te"])
+def test_cross_attention_explicit_tp_replays_bit_exact(backend):
+    """Replay Q/KV gathers and their backward on TP groups distinct from the MPU grid."""
+    from megatron.core import parallel_state
+    from megatron.core.hyper_comm_grid import HyperCommGrid
+    from megatron.core.models.T5.t5_spec import (
+        decoder_model_with_local_spec,
+        decoder_model_with_transformer_engine_default_spec,
+    )
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.attention import CrossAttention
+    from megatron.core.transformer.enums import AttnMaskType
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from tests.unit_tests.test_utilities import Utils
+
+    if Utils.world_size < 4 or Utils.world_size % 2:
+        pytest.skip("crossed TP2 groups require an even world size of at least four")
+    if backend == "te":
+        pytest.importorskip("transformer_engine")
+        spec = decoder_model_with_transformer_engine_default_spec()
+    else:
+        spec = decoder_model_with_local_spec()
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+    grid = HyperCommGrid([Utils.world_size // 2, 2, 1], ["dp", "tp", "cp"])
+    try:
+        groups = ProcessGroupCollection(tp=grid.create_pg("tp"), cp=grid.create_pg("cp"))
+        tp_ranks = torch.distributed.get_process_group_ranks(groups.tp)
+        assert tp_ranks != torch.distributed.get_process_group_ranks(
+            parallel_state.get_tensor_model_parallel_group()
+        )
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            tensor_model_parallel_size=2,
+            sequence_parallel=True,
+            gradient_accumulation_fusion=False,
+            add_bias_linear=False,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            deterministic_mode=True,
+        )
+        attention = CrossAttention(
+            config,
+            spec.submodules.cross_attention.submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.no_mask,
+            pg_collection=groups,
+        ).cuda()
+        # Replicas carry different sequences; each TP rank receives its own sequence shard.
+        seeded(1000 + min(tp_ranks))
+
+        def local_input(sequence_length):
+            full = torch.randn(sequence_length, 2, config.hidden_size, device="cuda")
+            return full.chunk(2, dim=0)[groups.tp.rank()].contiguous().requires_grad_()
+
+        _, gradients = assert_module_replays_bit_exact(
+            attention,
+            dict(
+                hidden_states=local_input(64), key_value_states=local_input(96), attention_mask=None
+            ),
+            replays=3,
+            contention=True,
+            what=f"{backend} cross attention with explicit TP",
+        )
+        assert "in.hidden_states" in gradients and "in.key_value_states" in gradients
+        assert any("linear_q.weight" in name for name in gradients)
+        assert any("linear_kv.weight" in name for name in gradients)
+    finally:
+        torch.cuda.synchronize()
+        grid.destroy()
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
 def test_zigzag_shard_preserves_each_packed_sequence(cp_size):
     """CPU check of the test input layout, including unequal sequence lengths."""
