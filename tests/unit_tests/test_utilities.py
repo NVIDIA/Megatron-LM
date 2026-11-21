@@ -2,6 +2,7 @@
 import gc
 import os
 from argparse import Namespace
+from contextlib import contextmanager
 from datetime import timedelta
 from typing import Literal
 
@@ -304,6 +305,27 @@ class Utils:
 
             torch.distributed.barrier()
         Utils.inited = True
+
+    @staticmethod
+    @contextmanager
+    def interleaved_group(size):
+        """Yield this rank's TP group, interleaving its members across WORLD."""
+        if size <= 0 or Utils.world_size % size:
+            raise ValueError(f"group size {size} must be a positive divisor of {Utils.world_size}")
+        Utils.initialize_distributed()
+        stride = Utils.world_size // size
+        group = None
+        for offset in range(stride):
+            ranks = list(range(offset, Utils.world_size, stride))
+            candidate = torch.distributed.new_group(ranks)
+            if Utils.rank in ranks:
+                group = candidate
+        assert group is not None, "rank must belong to an interleaved group"
+        try:
+            yield group
+        finally:
+            torch.distributed.barrier()
+            torch.distributed.destroy_process_group(group)
 
     @staticmethod
     def set_world_size(world_size=None, rank=None):

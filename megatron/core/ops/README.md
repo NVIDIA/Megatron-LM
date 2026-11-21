@@ -242,6 +242,12 @@ Say DSA gains a third fused backend, `flashinfer`, next to `tilelang` and `cudnn
    `reference.py` for the new hooks, and run the existing DSA suites with the new
    backend name.
 
+## Liger vocab-parallel cross entropy
+
+Install `liger-kernel>=0.8.5` (the dev image has it) and select
+`--cross-entropy-loss-fusion --cross-entropy-fusion-impl liger`. It is rejected with
+full-iteration CUDA graphs, which have not been verified with it.
+
 ## Adding a cross-entropy or normalization backend
 
 These two families are chosen through `BackendSpecProvider` (see Selection
