@@ -1,0 +1,54 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Preview Fern docs
+description: Generate a named Fern preview and expose its validated URL
+
+inputs:
+  preview-id:
+    description: Stable preview ID within the Megatron Fern site
+    required: true
+  working-directory:
+    description: Directory containing the Fern configuration to preview
+    required: false
+    default: ./fern
+  token:
+    description: Fern organization token
+    required: true
+
+outputs:
+  url:
+    description: Published preview URL
+    value: ${{ steps.preview.outputs.url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Generate preview
+      id: preview
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        FERN_TOKEN: ${{ inputs.token }}
+        PREVIEW_ID: ${{ inputs.preview-id }}
+      run: |
+        set -euo pipefail
+        : "${FERN_TOKEN:?Set FERN_TOKEN before generating previews.}"
+        LOG_FILE=$(mktemp)
+        trap 'rm -f "$LOG_FILE"' EXIT
+        fern generate --docs --preview --id "$PREVIEW_ID" 2>&1 | tee "$LOG_FILE"
+        URL=$(python3 "$GITHUB_WORKSPACE/.github/scripts/fern_docs_preview.py" url "$LOG_FILE")
+        echo "url=$URL" >> "$GITHUB_OUTPUT"
+        echo "### Fern preview: <$URL>" >> "$GITHUB_STEP_SUMMARY"
