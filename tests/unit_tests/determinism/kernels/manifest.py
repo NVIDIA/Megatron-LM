@@ -109,6 +109,13 @@ R = "tests/unit_tests/context_parallel/runtime/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
+        name="mtp_kl_loss",
+        sources=("megatron/core/ops/mtp_kl_loss.py",),
+        tests=(K + "test_mtp_kl_loss.py",),
+        kind="torch.compile",
+        notes="MTP KD local sum-exp/KL reductions and recomputed student gradient; no teacher gradient.",
+    ),
+    KernelEntry(
         name="csa_output_rope_reconstruction",
         sources=("megatron/core/ops/attention/csa/output_rope.py",),
         tests=(K + "test_csa_output_rope.py",),
@@ -393,7 +400,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_mok_kernels.py",),
         kind="triton",
         notes="Dense routing-map compaction and router-gradient scatter use one CTA per token "
-        "and unique expert indices; replayed with missing routes and side-stream contention.",
+        "and unique expert indices; replayed with missing routes, a strided padding mask and "
+        "side-stream contention. test_moe_kernels.py also replays it with MoELayer's padding mask, "
+        "through a megakernel stand-in, in eager and CUDA-graph replay.",
     ),
     KernelEntry(
         name="mok_runtime",
@@ -435,7 +444,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available; "
         "virtual-expert routing metadata and probability gradients replay under stream contention; "
         "the FlashInfer per-token NVFP4 value pass (moe_training_matches_inference) with recompute "
-        "backward, and its MXFP8 training-stack quantization.",
+        "backward, and its MXFP8 training-stack quantization. The megakernel branch passes the "
+        "padding mask to a stand-in backend that runs MOK route compaction: replayed under stream "
+        "contention against the reference semantics, and in a CUDA graph whose static mask "
+        "changes between replays.",
     ),
     KernelEntry(
         name="moe_experts",
@@ -518,6 +530,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "JSON-table choices; every candidate of each config-invariant kernel must give "
         "bit-identical outputs; SSM replay runs the real SSM autotuners through runtime "
         "pinning, with autotune caching on and off.",
+    ),
+    KernelEntry(
+        name="triton_block_pointer_compat",
+        sources=("docker/common/triton_block_ptr_compat.py",),
+        tests=(K + "test_triton_block_ptr_compat.py",),
+        kind="dispatch",
+        notes="CI-installed tl.make_block_ptr/advance/load/store adapter. The image's actual "
+        "lowering is exercised by strided, boundary-masked, transposed and 3-D copy replay, "
+        "including FP8 padding, and by H100/Blackwell offline compilation.",
     ),
     # ---------------------------------------------------------------- SSM
     KernelEntry(
@@ -651,6 +672,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/optimizer/clip_grads.py",
             "megatron/core/optimizer/__init__.py",
             "megatron/core/optimizer/optimizer.py",
+            "megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py",
             "megatron/training/utils/common_utils.py",
         ),
         tests=(
@@ -661,7 +683,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="external-lib",
         notes="multi_tensor l2norm / scale (TE, apex or local fallback) and fused Adam; "
         "optimizer.py (gradient unscaling) and training/utils/common_utils.py (param / grad norm "
-        "logging) launch the same multi_tensor kernels through multi_tensor_applier.",
+        "logging) launch the same multi_tensor kernels through multi_tensor_applier. "
+        "Hybrid CPU/GPU Adam replay also covers overlapped parameter and gradient copies.",
     ),
     KernelEntry(
         name="tensor_metric_l2",
@@ -748,11 +771,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/inference/test_ep_invariant_ordered_rsv.py",
             "tests/unit_tests/inference/test_moe_dispatching_and_routing.py",
             K + "test_inference_kernels.py",
+            "tests/unit_tests/transformer/moe/test_moe_batch_invariant.py",
         ),
         kind="triton",
         training_path=False,
         notes="Batch-invariant paths replay bit-exactly; the atomic default unpermute is the negative control. "
-        "ordered_reduce_scatter_v (multi-rank) is not replayed here.",
+        "Ordinary vLLM MoE also covers parallel alignment, tiled slot reduction, and decode/prefill hints. "
+        "ordered_reduce_scatter_v (multi-rank) is not replayed here. The BF16 expert GEMM "
+        "(torch grouped_mm) is checked row-invariant in test_moe_batch_invariant.py.",
     ),
     KernelEntry(
         name="batch_invariant_kernels",
@@ -761,7 +787,6 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_inference_kernels.py",
             K + "test_te_wrappers.py",
             "tests/unit_tests/transformer/test_te_layers_batch_invariant.py",
-            "tests/unit_tests/inference/test_batch_invariant_deepgemm_stride.py",
         ),
         kind="triton",
     ),
@@ -815,6 +840,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="cuda-ext",
         training_path=False,
         exempt_reason="Byte copy for refit; needs NVSHMEM and a multi-GPU RL environment.",
+    ),
+    KernelEntry(
+        name="nccl_m2n_expert_refit",
+        sources=("megatron/core/resharding/copy_services/nccl_m2n_copy_service.py",),
+        tests=(
+            K + "test_refit_expert_staging.py",
+            "tests/unit_tests/resharding/test_nccl_m2n_copy_service.py",
+        ),
+        kind="external-lib",
+        training_path=False,
+        notes="Expert stack views, staging, and foreach writeback replay bit-exactly under "
+        "contention. Native M2N/MXFP8 parity runs in the dedicated GB200 integration bucket.",
     ),
     # ---------------------------------------------------------------- external-library dispatch sites
     # Modules that choose between / call external GPU kernels. Covered by the replay tests of

@@ -785,8 +785,10 @@ A weight can be kept **out** of a chain by setting `weight.prefetch_initialized 
 
 **Production defaults require no user calls.** After DDP wrapping,
 `classify_gtp_remat_chains` registers dense, grouped-expert FC1, and grouped-expert FC2
-chains per process group, preserving explicit overrides and skipping replicated weights.
-Both Mamba projections stay in the dense chain.
+chains per process group and model chunk, preserving explicit overrides and skipping
+replicated weights. Both Mamba projections stay in their chunk's dense chain.
+Virtual pipeline chunks execute forward and backward independently; separate default
+chains prevent one chunk's gather from overwriting another chunk's live weight buffer.
 
 For a custom chain, register after parameter wrapping and before classification/warmup:
 
@@ -870,16 +872,29 @@ The chain stays a plain linear list — one slot per weight, no branching. MTP i
 
 - **Per-consume gradients accumulate.** Every consume produces its own wgrad and its own reduce-scatter, and the weight's `main_grad` ends up holding their sum — which is its true gradient. A weight keeps only one reduce-scatter in flight at a time, so an outstanding one is completed and accumulated before the next begins.
 
-  **`output_layer` is the exception**: its consumes sum into one buffer *before* the collective —
-  **one reduce-scatter per iteration**, not one per consume per microbatch. The count is learned
-  in iteration 1; the backward fence closes the window and fires DDP grad-ready once. **Off under
-  `--step-batch-size-schedule`**, where a rising count fires grad-ready twice and drops a
-  contribution. It is the only opt-in — TE-backed weights (`eh_proj`, the replayed layer) never
-  reach the hook.
+  **`output_layer` is the exception**: eligible linear uses accumulate before the collective,
+  producing **one reduce-scatter per accumulation window**. The non-pipeline schedule calls
+  `finalize_gtp_forward_counts(model)` after its last forward and before its last backward.
+  `WgradAccumulationWindow` tracks outstanding uses: each counted forward adds one,
+  and each backward removes one. Closing the forward window allows reduction when
+  that count reaches zero, including repeated MTP heads, with compute left to overlap.
+  Counts never depend on the global microbatch calculator or a previous iteration.
+  Grad-disabled or unexpected forwards select an explicit `FENCE_ONLY` state until
+  finalization resets the window; counters never double as fallback flags.
+
+  Custom loops can call the same API, or omit it and flush at the final GTP fence. Both
+  paths require `finalize_model_grads` (or the equivalent GTP fence before DDP finalization
+  and optimizer use). The fallback, also used by the combined MoE schedule, loses backward
+  overlap. Disconnected forwards, recomputation, and grad-disabled uses can select this
+  fallback. The early path requires at most one backward per counted forward; further
+  forwards or backwards after an early reduction raise an error.
+
+  Pipeline-parallel and CUDA-graphed weights retain per-consume reduction. TE-backed weights
+  never reach this accumulation hook.
 
 - **The deferred finalize is conditional.** Normally a weight finalizes its chain *successor's* reduce-scatter, hiding that latency behind the next backward. Once backward stops following chain order, the successor may not have started one yet, so the finalize runs only when something is actually in flight.
 
-The first rule always applies. The other two apply only under `async_reduction`; with it off, every wgrad reduce-scatters and accumulates inline.
+Output-layer accumulation is independent of `async_reduction`. Deferred finalization applies only when that option is on; with it off, each issued reduce-scatter completes inline.
 
 > Both hazards are **silent**. A stale gather keeps the loss finite and merely wrong, and a dropped reduce-scatter trains on an incomplete gradient — neither raises. The state guard that would catch the first (`check_param_states`) is off outside debug builds.
 
