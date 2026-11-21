@@ -111,8 +111,7 @@ def test_dcp_schedule_stats_window_and_reset():
     assert window.metrics() == {}
 
 
-@pytest.mark.parametrize('enabled', [False, True])
-def test_dcp_schedule_stats_tp_metadata(monkeypatch, enabled):
+def test_dcp_schedule_stats_tp_metadata(monkeypatch):
     monkeypatch.setattr(data_schedule, 'mtp_on_this_pipeline_rank', lambda *a, **k: False)
     monkeypatch.setattr(torch.distributed, 'all_reduce', lambda *a, **kw: None)
 
@@ -123,12 +122,16 @@ def test_dcp_schedule_stats_tp_metadata(monkeypatch, enabled):
 
     lengths = [(0, 1048579), (1, 513)]
     schedule = [[[0], [1]]]
-    expected = compute_schedule_stats(schedule, lengths)
+    padded_work = [1048579**2, 513**2]
     samples = [
         {
-            k: None
-            for k in data_schedule.DpBalancedScheduler(1, 1, 1, None).get_required_sample_keys()
+            **{
+                k: None
+                for k in data_schedule.DpBalancedScheduler(1, 1, 1, None).get_required_sample_keys()
+            },
+            'original_seq_len': torch.tensor([length]),
         }
+        for length in (4096, 1)
     ]
     config = SimpleNamespace(
         virtual_pipeline_model_parallel_size=None,
@@ -149,39 +152,49 @@ def test_dcp_schedule_stats_tp_metadata(monkeypatch, enabled):
         assert dtype == (torch.float64 if enabled else torch.float32)
         if group.rank() == 0:
             wire[:] = values
+            # The real broadcast returns the source's original Python values.
+            return values
         return torch.tensor(wire, dtype=dtype).tolist()
 
     monkeypatch.setattr(data_schedule, 'broadcast_scalars', broadcast)
-    monkeypatch.setattr(
-        data_schedule, 'compute_schedule_stats', mock.Mock(wraps=compute_schedule_stats)
-    )
-    results = []
-    for rank in (0, 1):
-        scheduler = data_schedule.DpBalancedScheduler(1, 1, 2, None)
-        monkeypatch.setattr(scheduler, 'get_groups_and_subsamples', lambda *a: schedule)
-        stats = {'stale': 1} if enabled else None
-        result = scheduler.run(
-            iter(samples) if rank == 0 else None,
-            1,
-            Group(),
-            Group(rank),
-            Group(0, 1),
-            Group(),
-            'cpu',
-            config,
-            schedule_stats=stats,
-        )
-        assert len(result) == 4
-        results.append(stats)
-    assert data_schedule.compute_schedule_stats.call_count == int(enabled)
-    if enabled:
-        for stats in results:
-            assert 'stale' not in stats
-            assert stats['balance_numerator'] == expected['balance_numerator']
-            assert stats['balance_denominator'] == expected['balance_denominator']
-            assert stats['cp_sample_counts'] == {1: 2, 2: 0}
-        assert results[0]['rank_work'] == expected['rank_work']
-        assert 'rank_work' not in results[1]
+    compute = mock.Mock(wraps=compute_schedule_stats)
+    monkeypatch.setattr(data_schedule, 'compute_schedule_stats', compute)
+    legacy_fields = {}
+    for enabled in (False, True):
+        compute.reset_mock()
+        results = []
+        legacy_fields[enabled] = []
+        for rank in (0, 1):
+            scheduler = data_schedule.DpBalancedScheduler(1, 1, 2, None)
+            monkeypatch.setattr(scheduler, 'get_groups_and_subsamples', lambda *a: schedule)
+            stats = {'stale': 1} if enabled else None
+            result = scheduler.run(
+                iter(samples) if rank == 0 else None,
+                1,
+                Group(),
+                Group(rank),
+                Group(0, 1),
+                Group(),
+                'cpu',
+                config,
+                schedule_stats=stats,
+            )
+            assert len(result) == 4
+            # 4096**2 + 1**2 = 16,777,217: TP0 retains the exact real-token
+            # square sum; only its TP peer receives the existing FP32 rounding.
+            assert result[1:] == (1, 4097, 16777217 if rank == 0 else 16777216)
+            legacy_fields[enabled].append(result[1:])
+            results.append(stats)
+        assert compute.call_count == int(enabled)
+        if enabled:
+            for stats in results:
+                assert 'stale' not in stats
+                assert stats['balance_numerator'] == sum(padded_work)
+                assert stats['balance_denominator'] == 2 * max(padded_work)
+                assert stats['cp_sample_counts'] == {1: 2, 2: 0}
+            assert results[0]['rank_work'] == [padded_work]
+            assert 'rank_work' not in results[1]
+    assert legacy_fields[False] == legacy_fields[True]
 
 
 def test_dcp_schedule_stats_cli_switch():

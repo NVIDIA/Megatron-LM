@@ -421,8 +421,13 @@ class DpBalancedScheduler(BasePackingScheduler):
                     for c in range(1, total_dcp_gpus + 1)
                 ]
             )
-            # Preserve long-sequence squared sums and summaries on TP peers.
+            # Preserve precision for DCP summaries without changing legacy FLOPs.
             metadata = broadcast_scalars(metadata, tp_group, dev, dtype=torch.float64)
+            if tp_group.rank() != 0:
+                # TP0 keeps its original values; peers used to receive FP32 metadata.
+                metadata[:3] = torch.tensor(
+                    metadata[:3], dtype=torch.float32, device='cpu'
+                ).tolist()
             schedule_stats.update(
                 balance_numerator=metadata[3],
                 balance_denominator=metadata[4],
