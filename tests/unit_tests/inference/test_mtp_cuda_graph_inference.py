@@ -530,6 +530,7 @@ class TestMTPCudaGraphInference:
             context.active_request_metadata["temperature"][:active_request_count] = 1.0
             context.active_request_metadata["top_k"][:active_request_count] = 1
             context.active_request_metadata["top_p"][:active_request_count] = 0.0
+            context.active_request_metadata["is_greedy"][:active_request_count] = True
 
             ctrl._compute_serial_mtp_and_sample()
 
@@ -632,6 +633,7 @@ class TestMTPCudaGraphInference:
                 context.active_request_metadata["temperature"][:active_request_count] = 1.0
                 context.active_request_metadata["top_k"][:active_request_count] = 1
                 context.active_request_metadata["top_p"][:active_request_count] = 0.0
+                context.active_request_metadata["is_greedy"][:active_request_count] = True
 
                 ctrl._compute_serial_mtp_and_sample()
                 # CUDA graph replay is asynchronous, and this test reuses the controller's
@@ -1417,6 +1419,7 @@ class TestMtpKvCacheIdleExpertParallelRank:
         context.active_request_metadata["temperature"][:active_request_count] = 1.0
         context.active_request_metadata["top_k"][:active_request_count] = 1
         context.active_request_metadata["top_p"][:active_request_count] = 0.0
+        context.active_request_metadata["is_greedy"][:active_request_count] = True
 
         token_count = context.padded_active_token_count
         context.mtp_decoder_hidden_states = torch.randn(
@@ -1771,6 +1774,7 @@ class TestMTPBlockScopeCudaGraph:
             context.active_request_metadata["temperature"][:active_request_count] = 1.0
             context.active_request_metadata["top_k"][:active_request_count] = 1
             context.active_request_metadata["top_p"][:active_request_count] = 0.0
+            context.active_request_metadata["is_greedy"][:active_request_count] = True
 
             ctrl._compute_serial_mtp_and_sample()
 

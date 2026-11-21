@@ -1,11 +1,13 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import math
 import warnings
 from dataclasses import dataclass
 from typing import List, Optional
 
-# Floor applied to temperature everywhere it divides logits to avoid inf/NaN.
-MIN_SAMPLING_TEMPERATURE = 1e-6
+# A temperature below this decodes greedily: its limit is the argmax, and dividing logits by
+# a much smaller one overflows fp32.
+GREEDY_TEMPERATURE = 1e-6
 
 
 def is_no_op_top_k(top_k):
@@ -71,6 +73,11 @@ class SamplingParams:
     # Optional request-local RNG; independent of dynamic batch position.
     seed: Optional[int] = None
 
+    # Greedy decoding: the lowest-index argmax of the logits, ignoring temperature, top_k and
+    # top_p. Set it directly, or pass a temperature of 0 (below GREEDY_TEMPERATURE) or top_k=1;
+    # `_normalize_filters` derives it from those, and once set it stays set.
+    is_greedy: bool = False
+
     def __post_init__(self):
         """Validate parameters and maintain backward compatibility.
 
@@ -94,7 +101,30 @@ class SamplingParams:
             raise ValueError("seed must be a nonnegative int64 or null")
 
     def _normalize_filters(self):
-        """Map no-op filter values to the disabled sentinels (top_k=0, top_p=0.0)."""
+        """Derive `is_greedy`, and map no-op filter values to the disabled sentinels (top_k=0,
+        top_p=0.0).
+
+        A temperature below GREEDY_TEMPERATURE (the limit of temperature -> 0 is the argmax) or
+        top_k=1 (top-1 keeps only the argmax) is greedy. top_p is never consulted, so a disabled
+        top-p spelled 0.0 or 1.0 cannot change whether a request is greedy. A greedy request's
+        filters read top_k=1 without top-p, as the HTTP front ends have always set them; its
+        temperature is kept. The samplers read only `is_greedy`: the context gives greedy
+        requests neutral sampling metadata.
+
+        A top_k at or above the vocabulary is a no-op too; the engine, which knows the
+        vocabulary, disables it when it admits the request.
+        """
+        try:
+            temperature = float(self.temperature)
+        except (TypeError, ValueError):
+            temperature = math.nan
+        if not math.isfinite(temperature) or temperature < 0.0:
+            raise ValueError(f"temperature must be a finite number >= 0, got {self.temperature!r}")
+        if temperature < GREEDY_TEMPERATURE or self.top_k == 1:
+            self.is_greedy = True
+        if self.is_greedy:
+            self.top_k = 1
+            self.top_p = 0.0
         if is_no_op_top_p(self.top_p):
             self.top_p = 0.0
         if is_no_op_top_k(self.top_k):

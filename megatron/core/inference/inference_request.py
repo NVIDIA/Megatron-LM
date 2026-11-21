@@ -775,6 +775,10 @@ class DynamicInferenceEvent:
         return cls(**init_obj)
 
 
+# The sampling metadata of a greedy request: the neutral values of a padding row.
+_GREEDY_SAMPLING_METADATA = {"temperature": 1.0, "top_k": 0, "top_p": 0.0}
+
+
 @experimental_api
 @dataclass(kw_only=True)
 class DynamicInferenceRequest(InferenceRequest):
@@ -1036,8 +1040,12 @@ class DynamicInferenceRequest(InferenceRequest):
                     "in its sampling_params. Defaulting to -1."
                 )
             sp.termination_id = -1
+        # A greedy request takes its argmax, so its sampling columns are neutral, as for a
+        # padding row: its filters never select another request's kernel, and no zero
+        # temperature reaches a division.
+        neutral = _GREEDY_SAMPLING_METADATA if sp.is_greedy else {}
         return [
-            -1 if field == "seed" and sp.seed is None else getattr(sp, field)
+            (-1 if field == "seed" and sp.seed is None else neutral.get(field, getattr(sp, field)))
             for field, _ in self.get_metadata_types()
         ]
 
@@ -1059,6 +1067,7 @@ class DynamicInferenceRequest(InferenceRequest):
             ("skip_prompt_log_probs", torch.bool),
             ("top_n_logprobs", torch.int32),
             ("seed", torch.int64),
+            ("is_greedy", torch.bool),
         ]
 
     def add_event(

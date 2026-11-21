@@ -8,7 +8,7 @@ import torch
 from megatron.core.inference.sampling.torch_sampling import TorchSampling
 
 
-def _make_context(temperature, top_k, top_p, *, paused_request_count=0):
+def _make_context(temperature, top_k, top_p, *, is_greedy=None, paused_request_count=0):
     """Minimal stand-in for `DynamicInferenceContext` covering the fields
     `log_probs_kernel` reads: `total_request_count`, `paused_request_count`,
     and `active_request_metadata`."""
@@ -16,7 +16,14 @@ def _make_context(temperature, top_k, top_p, *, paused_request_count=0):
     return SimpleNamespace(
         total_request_count=num_requests + paused_request_count,
         paused_request_count=paused_request_count,
-        active_request_metadata={"temperature": temperature, "top_k": top_k, "top_p": top_p},
+        active_request_metadata={
+            "temperature": temperature,
+            "top_k": top_k,
+            "top_p": top_p,
+            "is_greedy": (
+                torch.zeros(num_requests, dtype=torch.bool) if is_greedy is None else is_greedy
+            ),
+        },
     )
 
 
@@ -89,6 +96,7 @@ def test_uniform_top_one_sampling_with_speculative_row_mapping():
         torch.tensor([0.5, 1.0, 2.0]),
         torch.ones(request_count, dtype=torch.long),
         torch.zeros(request_count),
+        is_greedy=torch.ones(request_count, dtype=torch.bool),
     )
     sampling = TorchSampling(rng=torch.Generator(), vocab_size=257)
     logits = torch.randn(12, 257, device="cuda", dtype=torch.bfloat16)
@@ -109,3 +117,21 @@ def test_uniform_top_one_sampling_with_speculative_row_mapping():
 
     assert result is output
     torch.testing.assert_close(result, logits[gather].argmax(dim=-1), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_temperature_scaling_runs_in_fp32(dtype):
+    """The sampler scales fp32(logits) / T whatever the logits' dtype.
+
+    Engine paths supply fp32 logits; direct callers can still pass bf16/fp16 logits. Divided in
+    bf16, LM-head-like rows (max logit 15-30) at T = 0.7 move ~2% of the sampling mass.
+    """
+    generator = torch.Generator().manual_seed(0)
+    logits = torch.randn(8, 32000, generator=generator, dtype=torch.float64) * 2.5
+    logits[:, :50] = 8 + 17 * torch.rand(8, 50, generator=generator, dtype=torch.float64)
+    logits = logits.to(dtype)
+
+    scaled = TorchSampling.filter_logits(logits, 0.7, 0, 0.0)
+
+    assert scaled.dtype == torch.float32
+    assert torch.equal(scaled, logits.float() / 0.7)

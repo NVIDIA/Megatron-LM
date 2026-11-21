@@ -30,7 +30,7 @@ from megatron.core.inference.inference_request import (
     ResumedGeneration,
     Status,
 )
-from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.sampling_params import SamplingParams, is_no_op_top_k
 from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
 
 logger = logging.getLogger(__name__)
@@ -385,6 +385,12 @@ class RequestIntakeMixin:
         if not self._resolve_generation_budget(request):
             request.status = Status.FAILED
             request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
+        # A top_k at or above the vocabulary keeps every token: like top_p >= 1.0 in
+        # SamplingParams, it is the disabled filter. Only the engine knows the vocabulary, and
+        # the samplers apply a top_k only below it.
+        top_k = request.sampling_params.top_k
+        if not is_no_op_top_k(top_k) and top_k >= self.controller.vocab_size:
+            request.sampling_params.top_k = 0
         if request.sampling_params.termination_id is None:
             try:
                 eod = self.controller.tokenizer.eod
