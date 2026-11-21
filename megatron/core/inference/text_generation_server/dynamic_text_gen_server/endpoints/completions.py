@@ -197,7 +197,7 @@ try:
         tokenizer = current_app.config['tokenizer']
 
         req = await request.get_json(force=True)
-        if req is None:
+        if not isinstance(req, dict):
             return "Invalid or missing JSON body", 400
 
         # Opaque metadata forwarded to the engine's payload stager. Keys starting
