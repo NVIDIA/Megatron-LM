@@ -65,18 +65,17 @@ spec:
         TEST_PATH="/opt/megatron-lm-legacy/"
     fi
 
-    LAUNCHER=$(python3 /opt/megatron-lm/tests/test_utils/unit_test_launchers.py {platforms} "$BUCKET")
-    case "$LAUNCHER" in
-      tests/test_utils/run_batch_invariant_fp8.sh)
-        bash "$TEST_PATH/$LAUNCHER" \
+    case "$BUCKET" in
+      tests/unit_tests/inference/test_batch_invariant_fp8.py)
+        bash "$TEST_PATH/tests/test_utils/run_batch_invariant_fp8.sh" \
           h100 "$ENVIRONMENT" "$UNIT_TEST_REPEAT" "{assets_dir}/logs/1/"
         ;;
-      tests/test_utils/run_disagg_pairwise.sh)
-        bash "$TEST_PATH/$LAUNCHER" \
+      tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py|tests/unit_tests/inference/test_disagg_transfer_pairwise.py)
+        bash "$TEST_PATH/tests/test_utils/run_disagg_pairwise.sh" \
           "$ENVIRONMENT" "$UNIT_TEST_REPEAT" "$BUCKET" "{assets_dir}/logs/1/"
         ;;
       *)
-        bash "$TEST_PATH/$LAUNCHER" \
+        bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
           --tag $TAG \
           --environment $ENVIRONMENT \
           --bucket $BUCKET \
@@ -157,6 +156,7 @@ products:
         time_limit: [1800]
   # This file runs in isolated one-rank processes; other buckets exclude it.
   - test_case: [tests/unit_tests/inference/test_batch_invariant_fp8.py]
+    testmon: false
     products:
       - environment: [lts, dev]
         tag: [latest]
@@ -284,6 +284,7 @@ products:
         n_repeat: [1]
         time_limit: [1800]
   - test_case: [tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py]
+    testmon: false
     products:
       - environment: [lts, dev]
         tag: [latest]
@@ -291,6 +292,7 @@ products:
         n_repeat: [1]
         time_limit: [1800]
   - test_case: [tests/unit_tests/inference/test_disagg_transfer_pairwise.py]
+    testmon: false
     products:
       - environment: [lts, dev]
         tag: [latest]
