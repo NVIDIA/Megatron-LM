@@ -1311,7 +1311,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # Paged attention can read masked V tails; initialize only newly private pages.
         if self.cache_mla_latent or len(block_ids) == 0:
             return
-        block_ids = torch.as_tensor(block_ids, dtype=torch.int64, device=self.memory_buffer.device)
+        device = self.memory_buffer.device
+        block_ids = torch.as_tensor(block_ids, dtype=torch.int64)
+        if block_ids.device != device:
+            # A blocking H2D copy from pageable memory synchronizes the stream, stalling the
+            # host behind all queued GPU work (e.g. the in-flight async-scheduled forward).
+            # Stage through pinned memory; the caching host allocator keeps the staging
+            # buffer alive until the copy completes.
+            block_ids = block_ids.pin_memory().to(device, non_blocking=True)
         self.memory_buffer[1].index_fill_(1, block_ids, 0)
 
     def _allocate_mamba_states(self):
