@@ -6,7 +6,7 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 source "${SCRIPT_DIR}/conf/arguments.sh"
 
 # Extra arguments of this script
-MLM_DEFAULT_ARGS="--finetune --auto-detect-ckpt-format --export-te-mcore-model"
+MLM_DEFAULT_ARGS="--finetune --auto-detect-ckpt-format"
 MLM_EXTRA_ARGS="--sequence-parallel"
 
 
