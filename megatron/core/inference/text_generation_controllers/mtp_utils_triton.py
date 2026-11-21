@@ -21,146 +21,7 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Kernel 1: KV-cache rewind for speculative decoding
-# ---------------------------------------------------------------------------
-@triton.jit
-def _rewind_kv_cache_kernel(
-    # Per-request input (read-only)
-    ACCEPTED_COUNTS_PTR,
-    PREFILL_STATUS_PTR,
-    # Per-request state (read-write, updated in-place)
-    LAST_KV_BLOCK_OFFSET_PTR,
-    KV_LENGTH_OFFSETS_PTR,
-    KV_BLOCK_COUNTS_PTR,
-    LAST_KV_BLOCK_ID_PTR,
-    # 2-D table [N, max_blocks] (read-write)
-    KV_BLOCK_IDS_PTR,
-    # Per-request outputs
-    BLOCKS_TO_RELEASE_PTR,
-    REMOVE_MASK_PTR,
-    # Strides / limits
-    kv_block_ids_stride,
-    max_blocks_minus_1,
-    num_active_requests,
-    # Compile-time constants
-    NUM_SPEC_TOKENS: tl.constexpr,
-    BLOCK_SIZE_TOKENS: tl.constexpr,
-):
-    """Rewind KV-cache bookkeeping for one request after speculative verification.
-
-    Grid: may be padded beyond active requests for CUDA-graph compatibility.
-    Each program handles exactly one request.  Programs with
-    `pid >= num_active_requests` are padding and produce safe no-op outputs.
-    """
-    pid = tl.program_id(0)
-
-    # Padding programs: write safe defaults and skip all state mutation.
-    if pid >= num_active_requests:
-        tl.store(BLOCKS_TO_RELEASE_PTR + pid, 0)
-        tl.store(REMOVE_MASK_PTR + pid, False)
-        return
-
-    # --- Load per-request scalars ---
-    accepted = tl.load(ACCEPTED_COUNTS_PTR + pid)
-    prefill = tl.load(PREFILL_STATUS_PTR + pid)
-    last_offset = tl.load(LAST_KV_BLOCK_OFFSET_PTR + pid)
-    kv_length = tl.load(KV_LENGTH_OFFSETS_PTR + pid)
-    block_count = tl.load(KV_BLOCK_COUNTS_PTR + pid)
-    last_block_id = tl.load(LAST_KV_BLOCK_ID_PTR + pid)
-
-    # --- Compute rewind (zero for prefill requests) ---
-    num_to_rewind = tl.where(prefill == 1, 0, NUM_SPEC_TOKENS - accepted)
-    diff = last_offset - num_to_rewind
-    remove = diff < 0
-
-    # Python-style modulo: ((diff % M) + M) % M  to handle negative diff
-    new_offset = ((diff % BLOCK_SIZE_TOKENS) + BLOCK_SIZE_TOKENS) % BLOCK_SIZE_TOKENS
-    tl.store(LAST_KV_BLOCK_OFFSET_PTR + pid, new_offset)
-    tl.store(KV_LENGTH_OFFSETS_PTR + pid, kv_length - num_to_rewind)
-
-    # Save current last block id (will be released by caller if remove is True)
-    tl.store(BLOCKS_TO_RELEASE_PTR + pid, last_block_id)
-
-    # Decrement block count when a block boundary was crossed
-    new_block_count = tl.where(remove, block_count - 1, block_count)
-    tl.store(KV_BLOCK_COUNTS_PTR + pid, new_block_count)
-
-    # Gather previous block id from the 2-D table
-    kv_row_base = pid.to(tl.int64) * kv_block_ids_stride
-    prev_idx = tl.maximum(new_block_count - 1, 0)
-    prev_block_id = tl.load(KV_BLOCK_IDS_PTR + kv_row_base + prev_idx)
-
-    # Conditionally update last block id
-    tl.store(LAST_KV_BLOCK_ID_PTR + pid, tl.where(remove, prev_block_id, last_block_id))
-
-    # Clear released block entry via scatter
-    scatter_idx = tl.minimum(new_block_count, max_blocks_minus_1)
-    current_val = tl.load(KV_BLOCK_IDS_PTR + kv_row_base + scatter_idx)
-    tl.store(KV_BLOCK_IDS_PTR + kv_row_base + scatter_idx, tl.where(remove, -1, current_val))
-
-    # Output remove mask for the caller (to release blocks outside this kernel)
-    tl.store(REMOVE_MASK_PTR + pid, remove)
-
-
-def rewind_kv_cache(
-    accepted_counts,
-    prefill_status,
-    last_kv_block_offset,
-    kv_length_offsets,
-    kv_block_counts,
-    last_kv_block_id,
-    kv_block_ids,
-    num_speculative_tokens,
-    block_size_tokens,
-    num_active_requests=None,
-):
-    """Launch the KV-cache rewind Triton kernel.
-
-    Args:
-        num_active_requests: Number of real (non-padding) requests. When the
-            grid is padded beyond this count, the kernel skips padding
-            programs so stale data in padding slots cannot corrupt
-            bookkeeping.  Defaults to `accepted_counts.shape[0]` (no
-            padding).
-
-    Returns:
-        (blocks_to_release, remove_mask) — same semantics as the original
-        torch.compile'd `_rewind_kv_cache` (KV-cache portion only; Mamba
-        state updates are handled separately by the caller).
-    """
-    N = accepted_counts.shape[0]
-    if num_active_requests is None:
-        num_active_requests = N
-    if N == 0:
-        return (
-            torch.empty(0, device=accepted_counts.device, dtype=last_kv_block_id.dtype),
-            torch.empty(0, device=accepted_counts.device, dtype=torch.bool),
-        )
-
-    blocks_to_release = torch.empty_like(last_kv_block_id)
-    remove_mask = torch.empty(N, device=accepted_counts.device, dtype=torch.bool)
-
-    _rewind_kv_cache_kernel[(N,)](
-        accepted_counts,
-        prefill_status,
-        last_kv_block_offset,
-        kv_length_offsets,
-        kv_block_counts,
-        last_kv_block_id,
-        kv_block_ids,
-        blocks_to_release,
-        remove_mask,
-        kv_block_ids_stride=kv_block_ids.stride(0),
-        max_blocks_minus_1=kv_block_ids.shape[1] - 1,
-        num_active_requests=num_active_requests,
-        NUM_SPEC_TOKENS=num_speculative_tokens,
-        BLOCK_SIZE_TOKENS=block_size_tokens,
-    )
-    return blocks_to_release, remove_mask
-
-
-# ---------------------------------------------------------------------------
-# Kernel 2: Verify speculative tokens
+# Kernel 1: Verify speculative tokens
 # ---------------------------------------------------------------------------
 @triton.jit
 def _verify_speculative_tokens_kernel(
@@ -253,7 +114,7 @@ def verify_speculative_tokens(
 
 
 # ---------------------------------------------------------------------------
-# Kernel 3: Prepare speculative tokens for next forward pass
+# Kernel 2: Prepare speculative tokens for next forward pass
 # ---------------------------------------------------------------------------
 @triton.jit
 def _prepare_next_forward_pass_kernel(
@@ -356,7 +217,7 @@ def prepare_next_forward_pass(
 
 
 # ---------------------------------------------------------------------------
-# Kernel 4: Mamba state selective copy (eliminates temporary allocations)
+# Kernel 3: Mamba state selective copy (eliminates temporary allocations)
 # ---------------------------------------------------------------------------
 @triton.jit
 def _mamba_state_selective_copy_kernel(
