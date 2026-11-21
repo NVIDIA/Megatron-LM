@@ -376,7 +376,8 @@ Requirements and limits:
 - Use EP sizes 2–64, up to 8,192 experts evenly divided across EP ranks, top-k from 1 to
   min(32, number of experts), and expert tensor parallel size 1.
 - All layers must share one EP topology. Local token counts must be equal across EP ranks and
-  remain fixed after each layer's first forward.
+  remain fixed after each layer's first forward. With a padding mask, only valid routes count
+  toward virtual-expert placement and dispatch. Ranks may have different numbers of valid tokens.
 - Use per-expert parameters with grouped-tensor GEMM, fused gradient accumulation, FP32 router
   probabilities, and BF16 or native MXFP8 weights. The op fuser is optional. MXFP8 additionally
   requires `--fp8-param --fp8-param-gather --reuse-grad-buf-for-mxfp8-param-ag` with the

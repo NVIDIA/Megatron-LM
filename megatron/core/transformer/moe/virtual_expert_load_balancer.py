@@ -72,9 +72,10 @@ def _is_gtp(parameter) -> bool:
 class VirtualExpertPlan:
     """One forward's routes and in-flight state, retained until its backward finishes.
 
-    ``virtual_experts`` holds int16 [tokens, topk] runtime ids; ``experts_to_copy`` holds
-    int32 [EP, local_experts] semantic ids (-1 for unused slots). Repeated MTP forwards
-    retain separate plans through their layer-output hooks. ``ready`` joins the planner stream."""
+    ``virtual_experts`` holds int16 [tokens, topk] runtime ids (-1 for padding).
+    ``experts_to_copy`` holds int32 [EP, local_experts] semantic ids (-1 for unused slots).
+    Repeated MTP forwards retain separate plans through their layer-output hooks.
+    ``ready`` joins the planner stream."""
 
     virtual_experts: torch.Tensor
     experts_to_copy: torch.Tensor
@@ -90,9 +91,9 @@ def plan_virtual_expert_routes(
 ) -> VirtualExpertPlan:
     """Plan deterministic virtual-expert placement for one EP group and map this rank's routes.
 
-    ``top_indices`` are the router's ``[num_tokens, topk]`` expert ids; every rank must route the
-    same number of tokens. The histograms are the only cross-rank input and the planner kernel
-    exchanges them itself, so every rank computes the same placement.
+    All ranks supply the same ``[num_tokens, topk]`` shape. A -1 in ``top_indices`` marks an
+    inactive route and stays -1 in the output. The planner exchanges histograms of valid IDs
+    so every rank computes the same placement even when their valid route counts differ.
     ``alignment`` rounds global expert counts once and balances blocks; only real routes are
     remapped. It is a per-call specialization, never a property of the shared workspace.
     """
