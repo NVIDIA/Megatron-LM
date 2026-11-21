@@ -73,9 +73,10 @@ def _multimem_all_gather_v_kernel(
             local_tokens for all lower-ranked ranks). Fixed address; value set each step.
         ep_max_tokens_ptr: pointer to a scalar int32 CUDA tensor holding the
             maximum local_tokens across all EP ranks for this iteration. Fixed address;
-            value set each step. CTAs with pid >= this value exit immediately. Safe
+            value set each step. CTAs with pid >= max(this value, 1) exit immediately. Safe
             because the value is identical on all ranks, so paired CTAs on every rank
             exit together — the barrier for those CTAs is never entered on any rank.
+            CTA 0 always runs the barrier, as in _multimem_all_gatherv_3tensor_kernel.
         output_byte_offset: byte offset of this tensor within the symmetric memory buffer.
         HIDDEN_SIZE: hidden dimension, i.e. number of elements per token row (constexpr).
         BLOCK_SIZE: threads per block (constexpr, capped at 1024).
@@ -92,16 +93,19 @@ def _multimem_all_gather_v_kernel(
     # Exit before the barrier if this CTA's pid exceeds the iteration maximum.
     # ep_max_tokens is the max over all EP ranks, so all ranks agree on
     # which CTAs exit — the barrier slots for those CTAs are never touched on any rank.
+    # CTA 0 stays even when no rank has tokens (see _multimem_all_gatherv_3tensor_kernel).
     ep_max_tokens = tl.load(ep_max_tokens_ptr)
-    if pid >= ep_max_tokens:
+    if pid >= tl.maximum(ep_max_tokens, 1):
         return
 
     tid = tl.arange(0, BLOCK_SIZE)
-    rank_token_offset = tl.load(rank_token_offset_ptr)
+    # int64 token indices: the row offsets, in 8-byte units, reach 2**31 once a buffer holds
+    # 16 GiB of rows.
+    rank_token_offset = tl.load(rank_token_offset_ptr).to(tl.int64)
 
     numel_per_token = tl.cdiv(HIDDEN_SIZE, NUMEL_PER_THREAD)
 
-    for token_offset in range(pid, local_tokens, tl.num_programs(axis=0)):
+    for token_offset in range(pid.to(tl.int64), local_tokens, tl.num_programs(axis=0)):
         for channel_offset in range(0, numel_per_token, BLOCK_SIZE):
             local_offsets = token_offset * numel_per_token + channel_offset + tid
 
@@ -214,11 +218,13 @@ def _multimem_reduce_scatter_v_kernel(
     sync_threads()
 
     tid = tl.arange(0, BLOCK_SIZE)
-    rank_token_offset = tl.load(rank_token_offset_ptr)
+    # int64 token indices: the row offsets, in 8-byte units, reach 2**31 once a buffer holds
+    # 16 GiB of rows.
+    rank_token_offset = tl.load(rank_token_offset_ptr).to(tl.int64)
 
     numel_per_token = tl.cdiv(HIDDEN_SIZE, NUMEL_PER_THREAD)
 
-    for token_offset in range(pid, local_tokens, tl.num_programs(axis=0)):
+    for token_offset in range(pid.to(tl.int64), local_tokens, tl.num_programs(axis=0)):
         program_offset = token_offset * numel_per_token
 
         for channel_offset in range(0, numel_per_token, BLOCK_SIZE):
@@ -403,7 +409,8 @@ def _multimem_all_gatherv_3tensor_kernel(
         rank_token_offset_ptr: pointer to a scalar int32 CUDA tensor holding this rank's
             write offset in the global output (prefix sum over lower-ranked EP ranks).
         ep_max_tokens_ptr: pointer to a scalar int32 CUDA tensor holding the maximum
-            local_tokens across all EP ranks. CTAs with pid >= this value exit immediately.
+            local_tokens across all EP ranks. CTAs with pid >= max(this value, 1) exit
+            immediately; CTA 0 runs the barrier even when no rank has tokens.
         HIDDEN_SIZE_0/1/2: hidden dimension (elements per token row) for each tensor (constexpr).
         BLOCK_SIZE: threads per block — max of the three per-tensor block sizes (constexpr).
         NUMEL_PER_THREAD_0/1/2: elements per thread per load/store for each tensor (constexpr).
@@ -413,18 +420,25 @@ def _multimem_all_gatherv_3tensor_kernel(
     """
     pid = tl.program_id(axis=0)
 
+    # CTAs past the largest token count of the step exit before the barrier; ep_max_tokens is
+    # the same on every rank, so paired CTAs exit together. CTA 0 stays even when no rank has
+    # tokens, so every dispatch synchronizes the group: the dispatcher relies on this barrier
+    # to keep the next step's fused_metadata_update store into a peer's metadata buffer from
+    # landing before the peer has read this step's counts.
     ep_max_tokens = tl.load(ep_max_tokens_ptr)
-    if pid >= ep_max_tokens:
+    if pid >= tl.maximum(ep_max_tokens, 1):
         return
 
     tid = tl.arange(0, BLOCK_SIZE)
-    rank_token_offset = tl.load(rank_token_offset_ptr)
+    # int64 token indices: the row offsets, in 8-byte units, reach 2**31 once a buffer holds
+    # 16 GiB of rows.
+    rank_token_offset = tl.load(rank_token_offset_ptr).to(tl.int64)
 
     numel_per_token_0 = tl.cdiv(HIDDEN_SIZE_0, NUMEL_PER_THREAD_0)
     numel_per_token_1 = tl.cdiv(HIDDEN_SIZE_1, NUMEL_PER_THREAD_1)
     numel_per_token_2 = tl.cdiv(HIDDEN_SIZE_2, NUMEL_PER_THREAD_2)
 
-    for token_offset in range(pid, local_tokens, tl.num_programs(axis=0)):
+    for token_offset in range(pid.to(tl.int64), local_tokens, tl.num_programs(axis=0)):
         # --- Tensor 0 ---
         for channel_offset in range(0, numel_per_token_0, BLOCK_SIZE):
             local_offsets = token_offset * numel_per_token_0 + channel_offset + tid
@@ -543,8 +557,9 @@ def multimem_all_gather_v(
             into it each step before kernel launch.
         ep_max_tokens: pre-allocated scalar int32 CUDA tensor. The dispatcher writes
             the maximum local_tokens across all EP ranks into it each step. CTAs with
-            pid >= ep_max_tokens exit immediately — safe because all ranks agree on
-            this value, so the corresponding CTAs exit on every rank simultaneously.
+            pid >= max(ep_max_tokens, 1) exit immediately — safe because all ranks agree on
+            this value, so the corresponding CTAs exit on every rank simultaneously. CTA 0
+            always runs the barrier, so the all-gather synchronizes the group in every step.
         per_rank_max_tokens: static int set at model init. Determines the CTA grid size
             as min(per_rank_max_tokens, MAX_NUM_BLOCKS). Typically > MAX_NUM_BLOCKS so
             we always launch MAX_NUM_BLOCKS CTAs.
@@ -594,7 +609,7 @@ def multimem_all_gather_v(
     num_warps = max(1, block_size // WARP_SIZE)
 
     # All ranks launch the same fixed number of CTAs. CTAs with
-    # pid >= ep_max_tokens exit immediately at kernel entry.
+    # pid >= max(ep_max_tokens, 1) exit immediately at kernel entry.
     num_blocks = min(per_rank_max_tokens, MAX_NUM_BLOCKS)
     SYMM_MEM_KERNEL_CONFIG.check_num_blocks(num_blocks)
 
@@ -662,7 +677,9 @@ def multimem_all_gatherv_3tensor(
             this rank's token offset (prefix sum over lower-ranked EP ranks) each step.
         ep_max_tokens: pre-allocated scalar int32 CUDA tensor. The dispatcher writes the
             maximum local_tokens across all EP ranks each step. CTAs with
-            pid >= ep_max_tokens exit immediately — safe because all ranks agree.
+            pid >= max(ep_max_tokens, 1) exit immediately — safe because all ranks agree.
+            CTA 0 always runs the barrier, so every dispatch synchronizes the group, even
+            in a step in which no rank has tokens.
         per_rank_max_tokens: static int set at model init. Determines the CTA grid size as
             min(per_rank_max_tokens, MAX_NUM_BLOCKS).
         output_byte_offset_0/1/2: byte offset of each tensor within its symmetric memory

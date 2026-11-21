@@ -59,6 +59,11 @@ def _fused_metadata_kernel(
     via multicast store, barriers, then reads all ranks' values from the
     local buffer and computes [valid_tokens, rank_token_offset, ep_max_tokens].
 
+    The store lands in every peer's buffer, so it must not overtake a peer's read of
+    the previous step's counts. The kernel has no barrier after its read for that: the
+    dispatch all-gather-v that follows every update (multimem_all_gatherv_3tensor)
+    barriers in CTA 0 even when no rank has tokens, and orders the next update's store.
+
     Args:
         local_tokens: scalar int32, this rank's token count.
         local_buf_ptr: pointer to the local symmetric memory buffer (for reads).
