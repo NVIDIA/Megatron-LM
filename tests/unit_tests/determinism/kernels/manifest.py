@@ -599,6 +599,27 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "with Triton's autotune cache enabled and disabled.",
     ),
     KernelEntry(
+        name="ssm_gdp_batch_invariant",
+        sources=(
+            "megatron/core/ssm/ops/gdp/batch_invariant.py",
+            "megatron/core/ssm/ops/gdp/batch_invariant_conv.py",
+        ),
+        tests=(K + "test_gdp_batch_invariant.py",),
+        kind="triton",
+        notes="Shared canonical GDP and conv4 forward; deterministic differentiated recurrence.",
+    ),
+    KernelEntry(
+        name="ssm_gdp_batch_invariant_mixer",
+        sources=("megatron/core/ssm/ops/gdp/batch_invariant_mixer.py",),
+        tests=(
+            K + "test_gdp_batch_invariant.py",
+            "tests/unit_tests/ssm/test_gdp_batch_invariant.py",
+            "tests/unit_tests/inference/engines/test_batch_invariant_mamba_prefix_caching.py",
+        ),
+        kind="dispatch",
+        notes="Shared normalization, convolution, cache, and recurrence paths for the GDP mixer.",
+    ),
+    KernelEntry(
         name="ssm_gdp_kernels",
         sources=(
             "megatron/core/ssm/ops/gdp/chunk.py",
@@ -888,7 +909,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="ssm_gated_delta_product",
         sources=("megatron/core/ssm/gated_delta_product.py",),
-        tests=(K + "test_ssm_kernels.py", R + 'test_ssm_replay.py'),
+        tests=(
+            K + "test_ssm_kernels.py",
+            K + "test_gdp_batch_invariant.py",
+            "tests/unit_tests/ssm/test_gdp_batch_invariant.py",
+            R + "test_ssm_replay.py",
+        ),
         kind="dispatch",
         notes="Dispatches FLA chunk_gated_delta_product / l2_norm, the CuTeDSL gdp_attn kernel "
         "(gdp_cutedsl_kernel; not in the CI container, uncovered), causal_conv1d and the Megatron "
