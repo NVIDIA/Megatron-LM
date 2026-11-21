@@ -231,18 +231,34 @@ class RequestIntakeMixin:
                 continue
             snapshots.append(
                 LiveRequestSnapshot.from_record(
-                    entry.record,
-                    # The blocks hold the routing of every token that ran forward; a request
-                    # still in prefill has none that is complete.
-                    routing_indices=(
-                        self._routing_from_blocks(request) if request.generated_tokens else None
-                    ),
+                    entry.record, routing_indices=self._snapshot_routing(request)
                 )
             )
         return snapshots
 
-    def _routing_from_blocks(self, request: DynamicInferenceRequest) -> Optional[np.ndarray]:
-        """A resident request's expert routing, read from its blocks as its completion reads it."""
+    def _snapshot_routing(self, request: DynamicInferenceRequest) -> Optional[np.ndarray]:
+        """The routing a snapshot carries for a request's current segment, if complete.
+
+        The blocks hold the routing of every token that ran forward; a request still in prefill
+        has none that is complete. A detected stop the client does not keep can remove every
+        token a finished prefill generated, so such a request is read once its prefill is done.
+        """
+        if request.generated_tokens:
+            return self._routing_from_blocks(request)
+        if request.finish_reason is not None and request.remaining_prompt_length == 0:
+            return self._routing_from_blocks(request, require_finished_prefill=True)
+        return None
+
+    def _routing_from_blocks(
+        self, request: DynamicInferenceRequest, *, require_finished_prefill: bool = False
+    ) -> Optional[np.ndarray]:
+        """A resident request's expert routing, read from its blocks as its completion reads it.
+
+        Args:
+            request: The request's current segment.
+            require_finished_prefill: Read nothing while the segment's last prefill chunk has
+                yet to be consumed, as when its forward is still in flight.
+        """
         routing_replay = self.context.kv_block_allocator.routing_replay
         if not routing_replay.has_data():  # routing replay off: nothing was recorded
             return None
@@ -250,6 +266,8 @@ class RequestIntakeMixin:
             return None
         index = self.context.get_index_of_request(request.request_id)
         if index < 0:
+            return None
+        if require_finished_prefill and self.context.request_in_prefill_status_tensor[index] == 1:
             return None
         total_tokens = len(request.prompt_tokens) + len(request.generated_tokens)
         return routing_replay.reconstruct_routing_from_blocks(
