@@ -189,9 +189,6 @@ class BertModel(LanguageModule):
 
         Default if you dont set any NVTE_ATTN flag will it will just use the fused path for transformer engine version >= 1.7 and unfused path for other
 
-        Args:
-            transformer_layer_spec (ModuleSpec): The transformer layer spec
-
         Returns:
             str: A string showing the format of the attn mask dimensions
         """

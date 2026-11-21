@@ -536,7 +536,7 @@ def t5_extended_attention_mask(attention_mask_list: List[Tensor]) -> List[Tensor
     to [batch size, 1, seq_len, seq_len]
 
     Args:
-        attention_mask (Tensor): The input attention mask
+        attention_mask_list (List[Tensor]): The input attention masks
 
     Returns:
         Tensor: The extended binary attention mask
