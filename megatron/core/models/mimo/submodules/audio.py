@@ -47,4 +47,6 @@ class AudioModalitySubmodules(ModalitySubmodules):
 
     def decode(self, embeddings, data_batch: Dict):
         """Decode embeddings into audio data."""
-        raise NotImplementedError("Audio decoding not implemented yet")
+        raise NotImplementedError(
+            "Audio decoding is not implemented; no decoder is registered under self.decoders"
+        )
