@@ -1,0 +1,78 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: "{test_case}_{environment}_{platforms}_{tag}"
+  model: unit-tests
+  nodes: 1
+  build: mcore-pyt-{environment}
+  gpus: 8
+  platforms: dgx_h100
+  script_setup: |
+    set -euo pipefail
+    unset https_proxy
+    umask 077
+    printf '%s\n' "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" >> "$HOME/.netrc"
+    trap 'rm -f "$HOME/.netrc"; unset RO_API_TOKEN' EXIT
+
+    # Checkout latest
+    cd /opt
+    rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+    git fetch origin $MCORE_MR_COMMIT
+    git checkout $MCORE_MR_COMMIT
+    git rev-parse HEAD
+
+    rm -f "$HOME/.netrc"
+    unset RO_API_TOKEN
+  script: |-
+    rm -f "${{HOME}}/.netrc"
+    unset RO_API_TOKEN
+    set -euo pipefail
+    ls
+
+    TAG={tag}
+    ENVIRONMENT={environment}
+    BUCKET="{test_case}"
+    UNIT_TEST_REPEAT={n_repeat}
+    export NVTE_FLASH_ATTN_V4=0
+
+    # Each case marked large in the bucket runs in its own torchrun on one rank,
+    # or two for the files that run_ci_test.sh's large_test_ranks names.
+    bash /opt/megatron-lm/tests/unit_tests/run_ci_test.sh \
+      --tag $TAG \
+      --environment $ENVIRONMENT \
+      --bucket "$BUCKET" \
+      --unit-test-repeat $UNIT_TEST_REPEAT \
+      --log-dir {assets_dir}/logs/1/ \
+      --large
+
+products:
+  # Unit tests marked large, which need several GiB of device memory each. Every other
+  # unit-test launch deselects them. The scope is this recipe's own, so no PR,
+  # merge-queue, nightly or Testmon baseline selection includes these buckets; the
+  # "Run large unit tests" label or the workflow_dispatch input runs them.
+  - test_case: [tests/unit_tests/inference/**/*.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests-large]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/ssm/**/*.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests-large]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/transformer/**/*.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests-large]
+        n_repeat: [1]
+        time_limit: [1800]

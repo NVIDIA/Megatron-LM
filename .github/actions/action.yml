@@ -66,6 +66,10 @@ inputs:
     description: "Git ref to check out. Must match the SHA used by the upstream parse step so recipes don't diverge between scheduling and execution."
     required: false
     default: ""
+  unit_test_scope:
+    description: "Recipe scope of a unit-test bucket: unit-tests, or unit-tests-large for the tests marked large."
+    required: false
+    default: "unit-tests"
   unit_testmon_mode:
     description: "Unit-test mode: full, enforce, preselected (CPU plan), or baseline (main producer only)."
     required: false
@@ -339,7 +343,7 @@ runs:
         uv cache clean
         uv sync --no-cache --only-group test
         uv run python tests/test_utils/python_scripts/launch_nemo_run_workload.py \
-          --scope unit-tests \
+          --scope "${{ inputs.unit_test_scope }}" \
           --model unit-tests \
           --test-case "${{ inputs.test_case }}" \
           --environment dev \

@@ -21,6 +21,11 @@ on:
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
+    inputs:
+      run_large_unit_tests:
+        description: Also run the unit tests marked large (several GiB of device memory each)
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.event.merge_group.head_ref || github.ref }}
@@ -207,6 +212,7 @@ jobs:
       mbridge_suite:  ${{ steps.configure.outputs.mbridge_suite }}
       run_mbridge:    ${{ steps.configure.outputs.run_mbridge }}
       run_nemo_rl:    ${{ steps.configure.outputs.run_nemo_rl }}
+      run_large_unit_tests: ${{ steps.configure.outputs.run_large_unit_tests }}
       run_functional: ${{ steps.configure.outputs.run_functional }}
       run_h100_functional: ${{ steps.configure.outputs.run_h100_functional }}
       h100_cloud: ${{ steps.configure.outputs.h100_cloud }}
@@ -267,6 +273,7 @@ jobs:
           IS_MERGE_GROUP: ${{ needs.pre-flight.outputs.is_merge_group }}
           EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
+          DISPATCH_LARGE_UNIT_TESTS: ${{ inputs.run_large_unit_tests }}
           FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
           ENABLE_SELECTIVE_UNIT_TESTS: ${{ vars.ENABLE_SELECTIVE_UNIT_TESTS }}
           H100_TRAFFIC_MODE: ${{ env.H100_RUNNER_TRAFFIC_MODE }}
@@ -297,6 +304,7 @@ jobs:
           HAS_LTS=$(echo "$LABELS"            | jq 'any(. == "container::lts")')
           HAS_MBRIDGE=$(echo "$LABELS"        | jq 'any(. == "Run MBridge tests")')
           HAS_NEMO_RL=$(echo "$LABELS"        | jq 'any(. == "Run NeMoRL tests")')
+          HAS_LARGE_UNIT_TESTS=$(echo "$LABELS" | jq 'any(. == "Run large unit tests")')
           HAS_UNIT_TESTMON=$(echo "$LABELS"   | jq 'any(. == "Run selective unit tests")')
           HAS_DISABLE_UNIT_TESTMON=$(echo "$LABELS" | jq 'any(. == "Disable selective unit tests")')
           MERGE_QUEUE_JOBS=$IS_MERGE_GROUP
@@ -437,6 +445,16 @@ jobs:
             RUN_NEMO_RL=false
           fi
 
+          # Large unit-test gating: tests marked large need several GiB of device
+          # memory each, so they run only on request, with the `Run large unit tests`
+          # label or the dispatch input. Merge queue validation skips them.
+          if { [ "$HAS_LARGE_UNIT_TESTS" == "true" ] || [ "${DISPATCH_LARGE_UNIT_TESTS:-false}" == "true" ]; } \
+            && [ "$MERGE_QUEUE_JOBS" != "true" ]; then
+            RUN_LARGE_UNIT_TESTS=true
+          else
+            RUN_LARGE_UNIT_TESTS=false
+          fi
+
           # Cadence: trigger-driven test selection axis (see filter_by_cadence
           # in tests/test_utils/python_scripts/recipe_parser.py).
           # Full-test labels bypass cadence outside merge-queue mode.
@@ -497,6 +515,7 @@ jobs:
           echo "mbridge_suite=$MBRIDGE_SUITE"   | tee -a $GITHUB_OUTPUT
           echo "run_mbridge=$RUN_MBRIDGE"       | tee -a $GITHUB_OUTPUT
           echo "run_nemo_rl=$RUN_NEMO_RL"       | tee -a $GITHUB_OUTPUT
+          echo "run_large_unit_tests=$RUN_LARGE_UNIT_TESTS" | tee -a $GITHUB_OUTPUT
           echo "run_functional=$RUN_FUNCTIONAL" | tee -a $GITHUB_OUTPUT
           echo "run_h100_functional=$RUN_H100_FUNCTIONAL" | tee -a $GITHUB_OUTPUT
           echo "h100_cloud=$H100_CLOUD" | tee -a $GITHUB_OUTPUT
@@ -534,6 +553,7 @@ jobs:
           | \`dev\` | \`$DEV\` |
           | \`run_mbridge\` | \`$RUN_MBRIDGE\` |
           | \`run_nemo_rl\` | \`$RUN_NEMO_RL\` |
+          | \`run_large_unit_tests\` | \`$RUN_LARGE_UNIT_TESTS\` |
           | \`run_functional\` | \`$RUN_FUNCTIONAL\` |
           | \`run_h100_functional\` | \`$RUN_H100_FUNCTIONAL\` |
           | \`h100_cloud\` | \`$H100_CLOUD\` |
@@ -581,6 +601,7 @@ jobs:
           - **\`cadence\`**: per-test trigger filter (recipe \`cadence:\` field). Recipes default to \`[pr, nightly, mergegroup]\`.
           - **\`run_mbridge\`**: whether to trigger the Megatron-Bridge downstream CI. Merge-queue mode enables its L1 suite; ordinary PRs opt in with _Run MBridge tests_.
           - **\`run_nemo_rl\`**: whether to trigger the NeMo RL downstream CI. Off for merge queue validation; PR authors can opt in by adding the _Run NeMoRL tests_ label.
+          - **\`run_large_unit_tests\`**: whether to run the unit tests marked \`large\`, one process per case. Off for merge queue validation; PR authors can opt in by adding the _Run large unit tests_ label.
           SUMMARY
 
       - name: Get changed files for mandatory unit tests
@@ -1067,6 +1088,73 @@ jobs:
       unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
       unit_testmon_checkout_artifact_id: ${{ needs.configure.outputs.unit_testmon_checkout_artifact_id }}
 
+  # Unit tests marked large run only on request (see run_large_unit_tests in
+  # configure). Nemo_CICD_Test neither needs nor counts these jobs.
+  cicd-parse-unit-tests-large:
+    runs-on: ubuntu-latest
+    outputs:
+      unit-tests-large: ${{ steps.parse-unit-tests.outputs.unit-tests-large }}
+    needs:
+      - pre-flight
+      - configure
+      - cicd-wait-in-queue
+      - cicd-container-build
+    if: |
+      needs.pre-flight.result != 'cancelled'
+      && needs.configure.result != 'cancelled'
+      && needs.cicd-wait-in-queue.result != 'cancelled'
+      && needs.cicd-container-build.result != 'cancelled'
+      && needs.configure.outputs.run_large_unit_tests == 'true'
+      && github.event_name != 'merge_group'
+      && (
+        success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+      )
+      && !cancelled()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.configure.outputs.sha }}
+      - name: Parse unit tests
+        id: parse-unit-tests
+        run: |
+          cat tests/test_utils/recipes/h100/unit-tests-large.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests-large.json
+          echo "unit-tests-large=$(cat unit-tests-large.json)" | tee -a $GITHUB_OUTPUT
+
+  cicd-unit-tests-large:
+    needs:
+      - is-not-external-contributor
+      - pre-flight
+      - configure
+      - cicd-wait-in-queue
+      - cicd-container-build
+      - cicd-parse-unit-tests-large
+    name: Large unit tests (H100)
+    if: |
+      needs.is-not-external-contributor.result != 'cancelled'
+      && needs.pre-flight.result != 'cancelled'
+      && needs.configure.result != 'cancelled'
+      && needs.cicd-wait-in-queue.result != 'cancelled'
+      && needs.cicd-container-build.result != 'cancelled'
+      && needs.cicd-parse-unit-tests-large.result == 'success'
+      && (
+        success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+      )
+      && !cancelled()
+    uses: ./.github/workflows/_unit-tests.yml
+    with:
+      buckets: ${{ needs.cicd-parse-unit-tests-large.outputs.unit-tests-large }}
+      scope: unit-tests-large
+      runner: ${{ needs.configure.outputs.h100_gpu_runs_on }}
+      container-image: ${{ format('{0}/megatron-lm:{1}-{2}', needs.configure.outputs.h100_registry, needs.configure.outputs.sha, needs.configure.outputs.h100_cloud) }}
+      sha: ${{ needs.configure.outputs.sha }}
+      # Every large case runs; Testmon neither selects nor records them.
+      unit_testmon_mode: full
+
   cicd-parse-unit-tests-gb200:
     runs-on: ubuntu-latest
     outputs:
@@ -1522,6 +1610,8 @@ jobs:
               and .name != "merge-queue-notification"
               and .name != "cicd-mbridge-testing"
               and .name != "cicd-nemo-rl-testing"
+              and .name != "cicd-parse-unit-tests-large"
+              and (.name | startswith("Large unit tests (H100)") | not)
             )] | length
           ') || BAD_JOBS=0
 
@@ -1534,6 +1624,8 @@ jobs:
                 and .name != "merge-queue-notification"
                 and .name != "cicd-mbridge-testing"
                 and .name != "cicd-nemo-rl-testing"
+                and .name != "cicd-parse-unit-tests-large"
+                and (.name | startswith("Large unit tests (H100)") | not)
               ) | .name + " → " + .conclusion
             '
             FAILED=true
