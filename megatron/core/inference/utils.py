@@ -59,6 +59,17 @@ def get_language_model(model: torch.nn.Module) -> torch.nn.Module:
     return model if language_model is None else language_model
 
 
+def release_model_inference_buffers(model: torch.nn.Module) -> int:
+    """Drop the inference buffers that were sized from the inference context."""
+    called = 0
+    for module in model.modules():
+        release = getattr(module, "release_inference_buffers", None)
+        if callable(release):
+            release()
+            called += 1
+    return called
+
+
 def lm_head_can_emit(output_layer: torch.nn.Module, dtype: torch.dtype) -> bool:
     """Whether the LM head `output_layer` can emit logits in `dtype`."""
     if dtype == output_layer.config.params_dtype:
