@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """General utilities."""
-
 import json
 import os
 import sys
@@ -64,7 +63,7 @@ def _compute_norm_2(params_list):
     if len(params_list) > 0:
         dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
         norm, _ = multi_tensor_applier(
-            multi_tensor_l2norm, dummy_overflow_buf, [params_list], False
+            multi_tensor_l2norm, dummy_overflow_buf, [params_list], False,
         )
         return norm * norm
     return torch.zeros((1,), dtype=torch.float32, device='cuda')
@@ -136,13 +135,13 @@ def calc_params_l2_norm(
 
     # 8 buckets: 4 categories × (non-sharded, sharded optimizer main_param).
     # Each category needs different reduction groups.
-    params_data = []  # Dense, non-sharded
-    sharded_params_data = []  # Dense, sharded → reduce over dp_cp
-    gtp_params_data = []  # GTP_remat, non-sharded
-    gtp_sharded_params_data = []  # GTP_remat, sharded → reduce over dp_cp
-    moe_params_data = []  # MoE, non-sharded
-    moe_sharded_params_data = []  # MoE, sharded → reduce over expert_dp
-    moe_gtp_params_data = []  # MoE-GTP_remat, non-sharded
+    params_data = []                # Dense, non-sharded
+    sharded_params_data = []        # Dense, sharded → reduce over dp_cp
+    gtp_params_data = []            # GTP_remat, non-sharded
+    gtp_sharded_params_data = []    # GTP_remat, sharded → reduce over dp_cp
+    moe_params_data = []            # MoE, non-sharded
+    moe_sharded_params_data = []    # MoE, sharded → reduce over expert_dp
+    moe_gtp_params_data = []        # MoE-GTP_remat, non-sharded
     moe_gtp_sharded_params_data = []  # MoE-GTP_remat sharded → expert_dp
 
     if pg_collection is None:
@@ -150,7 +149,9 @@ def calc_params_l2_norm(
         egtp_rank = mpu.get_expert_gtp_weight_remat_rank()
         tp_group = mpu.get_tensor_model_parallel_group()
         expert_tp_group = mpu.get_expert_tensor_parallel_group()
-        dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True, with_gtp_remat=False)
+        dp_cp_group = mpu.get_data_parallel_group(
+            with_context_parallel=True, with_gtp_remat=False
+        )
         expert_dp_group = mpu.get_expert_data_parallel_group(with_gtp_remat=False)
         expert_gtp_group = mpu.get_expert_gtp_weight_remat_group()
         dense_reduce_group = mpu.get_model_parallel_group()
@@ -199,9 +200,7 @@ def calc_params_l2_norm(
                 if data is None:
                     continue
                 if is_gtp:
-                    (moe_gtp_sharded_params_data if is_sharded else moe_gtp_params_data).append(
-                        data
-                    )
+                    (moe_gtp_sharded_params_data if is_sharded else moe_gtp_params_data).append(data)
                 else:
                     (moe_sharded_params_data if is_sharded else moe_params_data).append(data)
             else:
@@ -234,8 +233,14 @@ def calc_params_l2_norm(
     # Reduce over the gtp_remat-EXCLUDED replicate group (with_gtp_remat=False): the model-parallel
     # reduce below already spans the gtp_remat axis, so a gtp_remat-inclusive group here would
     # over-count by gtp_remat. No-op for non-GTP_remat runs.
-    _sum_reduce(sharded_norm_2, dp_cp_group)
-    _sum_reduce(gtp_sharded_norm_2, dp_cp_group)
+    _sum_reduce(
+        sharded_norm_2,
+        dp_cp_group,
+    )
+    _sum_reduce(
+        gtp_sharded_norm_2,
+        dp_cp_group,
+    )
     _sum_reduce(moe_sharded_norm_2, expert_dp_group)
     _sum_reduce(moe_gtp_sharded_norm_2, expert_dp_group)
 
@@ -291,9 +296,7 @@ def _calc_mimo_params_l2_norm(
         if name not in pg_collection.keys():
             continue
 
-        module_chunks_on_rank = [
-            _get_mimo_module(model_chunk, name) for model_chunk in model_chunks
-        ]
+        module_chunks_on_rank = [_get_mimo_module(model_chunk, name) for model_chunk in model_chunks]
         # With PP > 1, all stages must enter the module collectives even if one stage
         # owns no trainable parameters. A PP=1 module can be skipped locally.
         if pg_collection[name].pp.size() == 1 and not any(
@@ -474,16 +477,14 @@ def check_adlr_autoresume_termination(iteration, model, optimizer, opt_param_sch
         sys.exit(0)
 
 
-def get_ltor_masks_and_position_ids(
-    data,
-    eod_token,
-    pad_token,
-    reset_position_ids,
-    reset_attention_mask,
-    eod_mask_loss,
-    pad_mask_loss,
-    create_attention_mask=True,
-):
+def get_ltor_masks_and_position_ids(data,
+                                    eod_token,
+                                    pad_token,
+                                    reset_position_ids,
+                                    reset_attention_mask,
+                                    eod_mask_loss,
+                                    pad_mask_loss,
+                                    create_attention_mask=True):
     """Build masks and position id for left to right model.
 
     Args:
@@ -503,9 +504,8 @@ def get_ltor_masks_and_position_ids(
     Returns:
         Tuple of (attention_mask or None, loss_mask, position_ids).
     """
-    assert (
-        create_attention_mask or not reset_attention_mask
-    ), "reset_attention_mask requires the attention mask to be created."
+    assert create_attention_mask or not reset_attention_mask, \
+        "reset_attention_mask requires the attention mask to be created."
 
     # Extract batch size and sequence length.
     micro_batch_size, seq_length = data.size()
@@ -541,9 +541,7 @@ def get_ltor_masks_and_position_ids(
         for b in range(micro_batch_size):
 
             # Find indecies where EOD token is.
-            eod_index = (
-                position_ids[b, data[b] == eod_token] & position_ids[b, data[b] == pad_token]
-            )
+            eod_index = position_ids[b, data[b] == eod_token] & position_ids[b, data[b] == pad_token]
             # Detach indecies from positions if going to modify positions.
             if reset_position_ids:
                 eod_index = eod_index.clone()
@@ -654,9 +652,10 @@ def is_first_or_last_pipeline_stage(vp_stage):
     ignore_virtual = True
     if vp_stage is not None:
         ignore_virtual = False
-    return mpu.is_pipeline_first_stage(
-        ignore_virtual=ignore_virtual, vp_stage=vp_stage
-    ) or mpu.is_pipeline_last_stage(ignore_virtual=ignore_virtual, vp_stage=vp_stage)
+    return (
+        mpu.is_pipeline_first_stage(ignore_virtual=ignore_virtual, vp_stage=vp_stage)
+        or mpu.is_pipeline_last_stage(ignore_virtual=ignore_virtual, vp_stage=vp_stage)
+    )
 
 
 def get_device_arch_version():
@@ -724,7 +723,7 @@ def to_empty_if_meta_device(module: torch.nn.Module, *, device: torch.device, re
     accidently overwrite buffers with precomputed values during construction. Given the
     goal is to only materialize those tensors on meta device, this function checks the
     device first and only move the tensor to the destination if it is not on meta device.
-
+   
     Args:
         module: The target module to apply this transformation.
         device: The desired device of the parameters
@@ -739,7 +738,9 @@ def to_empty_if_meta_device(module: torch.nn.Module, *, device: torch.device, re
         else:
             return tensor.to(device)
 
-    return module._apply(lambda t: _empty_like_if_meta(t, device=device), recurse=recurse)
+    return module._apply(
+        lambda t: _empty_like_if_meta(t, device=device), recurse=recurse
+    )
 
 
 def get_nvtx_range():
@@ -776,7 +777,6 @@ def has_nvrx_installed():
     """Checks if nvidia-resiliency-ext is installed."""
     try:
         import nvidia_resiliency_ext
-
         return True
     except (ImportError, ModuleNotFoundError):
         return False
@@ -805,7 +805,5 @@ def get_local_rank_preinit() -> int:
     if slurm_local_rank is not None:
         return slurm_local_rank
 
-    warnings.warn(
-        "Could not determine local rank from LOCAL_RANK or SLURM_LOCALID. Defaulting to local rank 0."
-    )
+    warnings.warn("Could not determine local rank from LOCAL_RANK or SLURM_LOCALID. Defaulting to local rank 0.")
     return 0

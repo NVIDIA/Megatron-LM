@@ -109,9 +109,7 @@ def test_shared_layer_releases_storage(distributed_setup):
     model(x).sum().backward()
     assert len(completions) == 2
     # Each use contributes 8 to every weight gradient.
-    torch.testing.assert_close(
-        layer.weight.grad.full_tensor(), torch.full((4, 4), 16.0, device=device)
-    )
+    torch.testing.assert_close(layer.weight.grad, torch.full_like(layer.weight.grad, 16.0))
     torch.testing.assert_close(x.grad, torch.full_like(x, 16.0))
 
 

@@ -205,4 +205,4 @@ def test_local_accumulation_captures_full_iteration(distributed_setup):
         reference_losses.append(train_iteration(reference_model, reference_optimizer))
     torch.testing.assert_close(torch.stack(losses), torch.stack(reference_losses))
     for parameter, reference_parameter in zip(model.parameters(), reference_model.parameters()):
-        torch.testing.assert_close(parameter.to_local(), reference_parameter.to_local())
+        torch.testing.assert_close(parameter, reference_parameter)

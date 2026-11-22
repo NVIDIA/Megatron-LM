@@ -228,7 +228,7 @@ def test_mhc_training_matches_reference(process_group_collection, recompute_mhc,
             if expected is not None:
                 assert parameter.grad is not None, name
                 torch.testing.assert_close(
-                    parameter.grad.to_local(),
+                    parameter.grad,
                     expected[reference_slices[name]],
                     msg=lambda detail: f"{name}: {detail}",
                 )
@@ -238,5 +238,5 @@ def test_mhc_training_matches_reference(process_group_collection, recompute_mhc,
         assert success
         for name, parameter in parameters.items():
             torch.testing.assert_close(
-                parameter.to_local(), reference_parameters[name][reference_slices[name]], msg=name
+                parameter, reference_parameters[name][reference_slices[name]], msg=name
             )

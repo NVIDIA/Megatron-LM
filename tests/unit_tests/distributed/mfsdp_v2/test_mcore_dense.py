@@ -218,7 +218,7 @@ def test_mxfp8_recompute_matches_no_recompute(
 
         (loss,) = run_forward_backward_on_microbatches(model, forward)
         grads = {
-            name: parameter.grad.to_local().clone()
+            name: parameter.grad.clone()
             for name, parameter in model.named_parameters()
             if parameter.grad is not None
         }
