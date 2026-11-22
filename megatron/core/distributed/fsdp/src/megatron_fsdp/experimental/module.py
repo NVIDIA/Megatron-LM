@@ -281,16 +281,17 @@ class FsdpModule:
         if self.is_root():
             context.allgather_stream.wait_stream(context.current_stream())
 
+        # No-grad evaluation has no backward events, so gather on demand without
+        # recording or advancing the training trace. Training-mode no-grad calls
+        # still participate: reentrant activation checkpointing uses those calls.
+        is_evaluating = not cast(nn.Module, self).training and not torch.is_grad_enabled()
+        if context.is_recording_execution_order and not is_evaluating:
+            # Include recomputation so replay prefetches its forward weight planes.
+            context.execution_order.append(ExecutionEvent(cast(nn.Module, self), Phase.FORWARD))
+
         def should_prefetch() -> bool:
-            """Record training calls or prefetch using the established execution order."""
-            # No-grad evaluation has no backward events, so gather on demand without
-            # recording or advancing the training trace. Training-mode no-grad calls
-            # still participate: reentrant activation checkpointing uses those calls.
-            if not cast(nn.Module, self).training and not torch.is_grad_enabled():
-                return False
-            if context.is_recording_execution_order:
-                # Include recomputation so replay prefetches its forward weight planes.
-                context.execution_order.append(ExecutionEvent(cast(nn.Module, self), Phase.FORWARD))
+            """Whether this call can prefetch using the established training trace."""
+            if is_evaluating or context.is_recording_execution_order:
                 return False
             if context.prefetch_order is PrefetchOrder.RECORDED:
                 return True
