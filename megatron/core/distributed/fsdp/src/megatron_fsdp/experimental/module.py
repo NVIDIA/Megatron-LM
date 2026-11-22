@@ -292,6 +292,9 @@ class FsdpModule:
                 return False
             # Evaluation usually runs forward only, so it needs a different execution
             # order from the training trace, which includes backward events.
+            # Disabling prefetch may slow evaluation by losing all-gather/compute overlap.
+            # TODO: Use a separate forward-only execution order to restore that overlap.
+            # Related evaluation-cursor fix: https://github.com/NVIDIA/Megatron-LM/pull/9372
             if not cast(nn.Module, self).training:
                 return False
             if context.prefetch_order is PrefetchOrder.RECORDED:
