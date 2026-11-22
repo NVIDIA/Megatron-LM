@@ -152,8 +152,36 @@ def test_baseline_lookup_excludes_build_only_forks_and_retries(monkeypatch):
         {**candidate, "head_repository": {"full_name": "fork/Megatron-LM"}},
         candidate,
     ]
-    monkeypatch.setattr(checkout, "run", lambda *args: json.dumps({"workflow_runs": candidates}))
+    publishers, published_jobs = [], {}
+    producer = {"head_repository": {"full_name": checkout.REPOSITORY}, "id": 789}
+
+    def fake_run(*args):
+        url = args[2]
+        if "publish-testmon-cache.yml" in url:
+            return json.dumps({"workflow_runs": publishers})
+        if url.endswith("/jobs?per_page=100"):
+            return json.dumps(published_jobs.get(url.split("/")[-2], 0))
+        if "cicd-main.yml" in url:
+            return json.dumps({"workflow_runs": [producer]})
+        return json.dumps({"workflow_runs": candidates})
+
+    monkeypatch.setattr(checkout, "run", fake_run)
     assert checkout.latest_baseline() == ("a" * 40, "123-1")
+
+    # Published merge-group baselines win; forks and empty publishers are skipped.
+    publisher = {"head_repository": {"full_name": checkout.REPOSITORY}, "head_sha": "b" * 40}
+    publishers.extend(
+        [
+            {**publisher, "id": 455, "head_repository": {"full_name": "fork/Megatron-LM"}},
+            {**publisher, "id": 456},
+            {**publisher, "id": 457, "head_sha": "c" * 40},
+        ]
+    )
+    published_jobs.update({"455": 1, "457": 1})
+    assert checkout.latest_baseline() == ("c" * 40, "789-1")
+    published_jobs.clear()
+    assert checkout.latest_baseline() == ("a" * 40, "123-1")
+
     candidates.pop()
     with pytest.raises(ValueError, match="No successful first-attempt"):
         checkout.latest_baseline()

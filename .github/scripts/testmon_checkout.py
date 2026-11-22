@@ -44,8 +44,57 @@ def sha(value: object) -> str:
     return value
 
 
+def published_baseline() -> tuple[str, str] | None:
+    """Find the latest main commit whose merge-group baselines were published."""
+    try:
+        publishers = json.loads(
+            run(
+                "gh",
+                "api",
+                f"repos/{REPOSITORY}/actions/workflows/publish-testmon-cache.yml/"
+                "runs?branch=main&event=push&status=completed&per_page=100",
+            )
+        )
+    except subprocess.CalledProcessError:
+        # The publisher workflow may not exist on main yet.
+        return None
+    for publisher in publishers["workflow_runs"]:
+        if publisher["head_repository"]["full_name"] != REPOSITORY:
+            continue
+        # Commits without merge-group artifacts complete without publishing anything.
+        published = json.loads(
+            run(
+                "gh",
+                "api",
+                f'repos/{REPOSITORY}/actions/runs/{publisher["id"]}/jobs?per_page=100',
+                "--jq",
+                '[.jobs[] | select((.name | startswith("Publish ")) and .conclusion == "success")]'
+                " | length",
+            )
+        )
+        if not published:
+            continue
+        source = sha(publisher["head_sha"])
+        producers = json.loads(
+            run(
+                "gh",
+                "api",
+                f"repos/{REPOSITORY}/actions/workflows/cicd-main.yml/"
+                f"runs?event=merge_group&head_sha={source}&per_page=100",
+            )
+        )
+        for producer in producers["workflow_runs"]:
+            if producer["head_repository"]["full_name"] == REPOSITORY:
+                # The publisher only accepts first-attempt merge-group artifacts.
+                return source, f'{producer["id"]}-1'
+    return None
+
+
 def latest_baseline() -> tuple[str, str]:
-    """Find a completed trusted main producer with a common cache generation."""
+    """Prefer published merge-group baselines, then the scheduled main producer."""
+    published = published_baseline()
+    if published:
+        return published
     response = json.loads(
         run(
             "gh",
