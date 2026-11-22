@@ -35,7 +35,7 @@ from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_c
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import log_single_rank
+from megatron.core.utils import log_single_rank, unwrap_model
 
 __all__ = ["FullyShardedDataParallelV2"]
 
@@ -324,33 +324,22 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
         """Expose global DTensor views only at the checkpoint boundary."""
         state_dict = super().state_dict_for_save_checkpoint(prefix=prefix, keep_vars=keep_vars)
-        for name, parameter in named_checkpoint_parameters(self.module):
+        for name, parameter in named_checkpoint_parameters(unwrap_model(self.module)):
             key = prefix + name
             if key in state_dict:
                 state_dict[key] = parameter
         return state_dict
 
     def load_state_dict(self, state_dict, strict=True):
-        """
-        Load the state dictionary into the module.
-        """
-        custom_state_dict = {}
+        """Copy checkpoint views back into local runtime parameters."""
+        local_state_dict = state_dict.copy()
         for key, value in state_dict.items():
-            if self.config.fp8 and key.endswith('._extra_state'):
-                # Skip extra state keys
-                continue
-            custom_state_dict[f"module.{key}"] = value
-
-        if self.config.fp8 or self.config.gated_linear_unit:
-            strict = False
-            log_single_rank(
-                logger,
-                logging.WARNING,
-                "Loading state_dict with strict=False due to fp8 configuration. "
-                "This is expected as some keys may not match exactly.",
-            )
-
-        self.module.load_state_dict(custom_state_dict, strict=strict)
+            if isinstance(value, DTensor):
+                local_state_dict[key] = value.to_local()
+        if hasattr(state_dict, "_metadata"):
+            local_state_dict._metadata = state_dict._metadata
+        super().load_state_dict(local_state_dict, strict=strict)
+        sync_model_weights_from_main_weights(self.module.parameters())
 
     @staticmethod
     def _validate_config(

@@ -45,6 +45,9 @@ from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistLoadShardedStrategy,
     TorchDistSaveShardedStrategy,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.checkpoint import (
+    named_checkpoint_parameters,
+)
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.optimizer.distrib_optimizer import get_legacy_grad_dtypes
@@ -1885,6 +1888,11 @@ def generate_state_dict(
             )
         else:  # torch, torch_dcp, fsdp_dtensor
             model_sd = model[i].state_dict_for_save_checkpoint()
+            if args.use_megatron_fsdp and args.megatron_fsdp_version == 2:
+                # Save and load-template construction both reach here after unwrap_model().
+                for name, parameter in named_checkpoint_parameters(model[i]):
+                    if name in model_sd:
+                        model_sd[name] = parameter
 
         state_dict[key] = model_sd
 

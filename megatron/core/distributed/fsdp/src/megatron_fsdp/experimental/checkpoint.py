@@ -37,9 +37,8 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.distributed.tensor import DTensor
 
-from .module import FsdpModule
 from .optimizer import init_optimizer_state
-from .parameter_group import sync_model_weights_from_main_weights
+from .parameter_group import get_containing_parameter_group, sync_model_weights_from_main_weights
 from .uneven_dtensor import attach_uneven_dtensor_metadata
 
 __all__ = ["save_checkpoint", "load_checkpoint"]
@@ -48,12 +47,16 @@ __all__ = ["save_checkpoint", "load_checkpoint"]
 def named_checkpoint_parameters(model: torch.nn.Module) -> Iterator[tuple[str, DTensor]]:
     """Yield FQNs and checkpoint views directly from the model's FSDP parameter groups."""
     checkpoint_parameters: dict[torch.nn.Parameter, DTensor] = {}
-    for module in model.modules():
-        if not isinstance(module, FsdpModule):
+    # Unwrapping the FSDP root (e.g. Float16Module) can hide owning modules, but the
+    # parameters still identify their groups.
+    for parameter in model.parameters():
+        if parameter in checkpoint_parameters:
             continue
-        for group in module.parameter_groups:
-            for index, parameter in enumerate(group.fsdp_parameters):
-                checkpoint_parameters[parameter.sharded] = group.main_weight.get_dtensor(index)
+        group = get_containing_parameter_group(parameter)
+        if group is None:
+            continue
+        for index, fsdp_parameter in enumerate(group.fsdp_parameters):
+            checkpoint_parameters[fsdp_parameter.sharded] = group.main_weight.get_dtensor(index)
     # Use the model's names so aliases of both parameters and modules appear in the checkpoint.
     for fqn, parameter in model.named_parameters(remove_duplicate=False):
         if parameter in checkpoint_parameters:
