@@ -209,8 +209,13 @@ def test_moe_norm_flag_reaches_transformer_config():
 def test_gtp_userbuffer_flags_preserve_cli_contract(name):
     parser = ArgumentParser()
     add_megatron_arguments(parser)
-    assert getattr(parser.parse_args([]), name) is False
-    assert getattr(parser.parse_args(["--" + name.replace("_", "-")]), name) is True
+    flag = "--" + name.replace("_", "-")
+    assert getattr(parser.parse_args([]), name) is None
+    # A bare flag parses to []; validate_args expands it to both collectives.
+    assert getattr(parser.parse_args([flag]), name) == []
+    assert getattr(parser.parse_args([flag, "rs"]), name) == ["rs"]
+    with pytest.raises(SystemExit):
+        parser.parse_args([flag, "foo"])
 
 
 def test_moe_backend_arguments():
@@ -1807,6 +1812,30 @@ def test_legacy_checkpoint_gloo_requirement_uses_effective_optimizer(monkeypatch
     args.ckpt_format = "torch"
     args.use_layer_wise_param_layout = False
     with pytest.raises(AssertionError) if optimizer in ("adam", "sgd") else nullcontext():
+        validate_args(args)
+
+
+@pytest.mark.parametrize("use_layer_wise_param_layout", [False, True])
+@pytest.mark.parametrize("optimizer", ["adam", "muon", "dist_muon"])
+def test_mem_efficient_reshardable_checkpoint_gloo_requirement(
+    monkeypatch, optimizer, use_layer_wise_param_layout
+):
+    """Every optimizer that builds a DistributedOptimizer needs Gloo for the mem-efficient
+    fully reshardable format, including the one the layer-wise path builds for Muon."""
+    args = _minimal_training_args(monkeypatch)
+    args.optimizer = optimizer
+    args.use_distributed_optimizer = True
+    args.use_gloo_process_groups = False
+    args.ckpt_format = "torch_dist"
+    args.dist_ckpt_optim_fully_reshardable = True
+    args.distrib_optim_fully_reshardable_mem_efficient = True
+    args.use_layer_wise_param_layout = use_layer_wise_param_layout
+    builds_distributed_optimizer = optimizer == "adam" or use_layer_wise_param_layout
+    with (
+        pytest.raises(AssertionError, match="fully-reshardable-mem-efficient")
+        if builds_distributed_optimizer
+        else nullcontext()
+    ):
         validate_args(args)
 
 
