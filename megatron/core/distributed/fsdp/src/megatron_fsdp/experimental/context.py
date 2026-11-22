@@ -63,9 +63,6 @@ class FsdpContext:
     # Runs the post-optimizer DP-outer all-gather that refreshes model_weight.
     # Aliases allgather_stream unless DP-outer overlap is enabled.
     outer_allgather_stream: torch.cuda.Stream
-    # Weight-sync generation at which outer_allgather_stream last forked from
-    # allgather_stream; see FsdpModule._unshard_parameter_groups.
-    outer_allgather_fork_generation: int
     use_symmetric_memory: bool
     # Prefetch uses construction order unless execution-order recording is enabled.
     execution_order: ExecutionOrder
@@ -148,7 +145,6 @@ class FsdpContext:
         self.outer_allgather_stream = (
             torch.cuda.Stream(device) if overlap_outer_communication else self.allgather_stream
         )
-        self.outer_allgather_fork_generation = 0
 
     @property
     def gradient_finalization_mode(self) -> GradientFinalizationMode:
@@ -287,6 +283,20 @@ class FsdpContext:
         self.current_stream().wait_stream(self.inner_reduction_stream)
         if self.outer_reduction_stream is not self.inner_reduction_stream:
             self.current_stream().wait_stream(self.outer_reduction_stream)
+
+    def pre_forward(self) -> None:
+        """Order the all-gather streams after compute, including the optimizer step.
+
+        Call on the root before its first unshard of a forward. Compute weights are
+        synced from main weights on the current stream, so this orders the forward's
+        gathers after that sync and forks the all-gather streams into any active
+        CUDA-graph capture. The DP-outer all-gather stream forks here rather than from
+        the all-gather stream, so DP-outer gathers never queue behind DP-inner gathers.
+        """
+        current_stream = self.current_stream()
+        self.allgather_stream.wait_stream(current_stream)
+        if self.outer_allgather_stream is not self.allgather_stream:
+            self.outer_allgather_stream.wait_stream(current_stream)
 
     def pre_backward(self) -> None:
         """Fork the reduce-scatter stream into any active CUDA-graph capture.

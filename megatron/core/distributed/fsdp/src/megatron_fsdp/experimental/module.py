@@ -38,7 +38,6 @@ from .parameter_group import (
     FsdpParameterGroup,
     effective_dtype,
     get_containing_parameter_group,
-    latest_model_weight_sync_generation,
 )
 from .phase import Phase
 from .placement import BlockAtomic, RowAtomic, ShardLayout
@@ -279,7 +278,7 @@ class FsdpModule:
         torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
 
         if self.is_root():
-            context.allgather_stream.wait_stream(context.current_stream())
+            context.pre_forward()
 
         # TODO: Recomputation gathers MXFP8 rowwise planes on demand, because backward
         # prefetch gathers only columnwise planes. Thw two planes can be prefetched at once.
@@ -298,11 +297,9 @@ class FsdpModule:
                 ``phase``, which must then be FORWARD or BACKWARD.
 
         External schedulers invoking this directly (rather than through the
-        automatic ``pre_forward`` hook) must first synchronize the all-gather
-        stream on the root by calling
-        ``context.allgather_stream.wait_stream(context.current_stream())``
-        before this when ``self.is_root()``; the automatic forward path
-        performs that root sync in ``pre_forward()`` immediately before this.
+        automatic ``pre_forward`` hook) must first call ``context.pre_forward()``
+        before this when ``self.is_root()``; the automatic forward path makes
+        that call in ``pre_forward()`` immediately before this.
         """
         with self._nvtx_range("unshard"):
             compute_stream = self.context.current_stream()
@@ -362,24 +359,13 @@ class FsdpModule:
             phase = None
         context = self.context
         allgather_stream = context.allgather_stream
-        outer_allgather_stream = None
-        if context.outer_allgather_stream is not allgather_stream:
-            stale_generations = [
-                group.model_weight_sync_generation
-                for group in self._parameter_groups
-                if group.model_weight_is_stale
-            ]
-            if stale_generations:
-                outer_allgather_stream = context.outer_allgather_stream
-                # Fork once per weight sync, at its first stale unshard. The all-gather
-                # stream already waits for the stream that synced the weights (the root
-                # sync before unsharding), and nothing that the DP-outer gathers depend
-                # on is queued on it later, so forking again from it would only
-                # serialize them behind DP-inner gathers. The edge also joins any
-                # active CUDA-graph capture.
-                if max(stale_generations) > context.outer_allgather_fork_generation:
-                    outer_allgather_stream.wait_stream(allgather_stream)
-                    context.outer_allgather_fork_generation = latest_model_weight_sync_generation()
+        # Groups use this stream only for stale weights. FsdpContext.pre_forward() has
+        # already ordered it after the weight sync.
+        outer_allgather_stream = (
+            context.outer_allgather_stream
+            if context.outer_allgather_stream is not allgather_stream
+            else None
+        )
         with torch.cuda.stream(allgather_stream):
             for group in self._parameter_groups:
                 group.unshard_parameters(phase, outer_allgather_stream=outer_allgather_stream)

@@ -51,22 +51,6 @@ else:
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
-# Bumped whenever a sync leaves compute weights stale. Unshard callers that run
-# the DP-outer all-gather on a separate stream compare it to decide when that
-# stream must fork again from the all-gather stream.
-_model_weight_sync_generation = 0
-
-
-def latest_model_weight_sync_generation() -> int:
-    """Generation of the most recent sync that left compute weights stale."""
-    return _model_weight_sync_generation
-
-
-def _next_model_weight_sync_generation() -> int:
-    global _model_weight_sync_generation
-    _model_weight_sync_generation += 1
-    return _model_weight_sync_generation
-
 
 def _contains_any_placement_type(
     *placement_groups: tuple[Placement, ...], placement_types: type | tuple[type, ...]
@@ -123,8 +107,6 @@ class FsdpParameterGroup:
     # sync_model_weight_from_main_weight() updates only this rank's optimizer-layout
     # view; the remaining model_weight slices must be all-gathered before compute.
     _model_weight_is_stale: bool
-    # Generation of the sync that last left model_weight stale; 0 if never stale.
-    model_weight_sync_generation: int
     main_grad: DBuffer | None
     # Optimizer-layout view into main_grad storage, avoiding a second allocation.
     # This is None exactly when main_grad is None.
@@ -366,7 +348,6 @@ class FsdpParameterGroup:
                         device=self.main_weight.device,
                     )
         self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
-        self.model_weight_sync_generation = 0
         self.sync_model_weight_from_main_weight()
         unsharded_placements = (Replicate(),) * self.mesh.ndim
         if self.model_weight.can_redistribute_locally(unsharded_placements):
@@ -479,15 +460,6 @@ class FsdpParameterGroup:
         self._model_weight_is_stale = (
             self.post_optimizer_model_weight.placements != self.model_weight.placements
         )
-        if self._model_weight_is_stale:
-            # Tells unshard callers that a new stream fork is needed; see
-            # FsdpModule._unshard_parameter_groups.
-            self.model_weight_sync_generation = _next_model_weight_sync_generation()
-
-    @property
-    def model_weight_is_stale(self) -> bool:
-        """Whether compute weights need the post-optimizer DP-outer all-gather."""
-        return self._model_weight_is_stale
 
     @property
     def is_rowwise_unsharded(self) -> bool:
@@ -513,8 +485,8 @@ class FsdpParameterGroup:
 
         With ``outer_allgather_stream``, the post-optimizer DP-outer all-gather that
         refreshes stale compute weights runs on that stream instead, so it overlaps
-        DP-inner all-gathers of earlier groups. The caller must have made that stream
-        wait for the stream where the weights were last synced from main weights.
+        DP-inner all-gathers of earlier groups. The caller must have ordered that stream
+        after the weight sync, which ``FsdpContext.pre_forward()`` does on the root.
         """
         requested_phases = (Phase.FORWARD, Phase.BACKWARD) if phase is None else (phase,)
         missing_phases = tuple(p for p in requested_phases if p not in self._unshard_events)
