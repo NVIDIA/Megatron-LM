@@ -1192,6 +1192,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/optimizer/test_layer_sharded_muon.py",
             "tests/unit_tests/optimizer/test_layer_sharded_e2e_parity.py",
             "tests/unit_tests/optimizer/test_muon_grouped_projection.py",
+            K + "test_optimizer_kernels.py",
         ),
         kind="dispatch",
         notes="LayerShardedMuon._run_ns calls emerging-optimizers newton_schulz on the assembled "
@@ -1202,7 +1203,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "test_batched_matches_unbatched, test_concurrent_groups_match_serial_bitwise, "
         "test_exchange_plan_cache_bitwise_and_reused) and the e2e parity module against "
         "TensorParallelMuon duplicated mode. test_grouped_muon_replays also checks grouped "
-        "weights and momentum under stream contention for both optimizer implementations. "
+        "weights and momentum under stream contention for both optimizer implementations, and "
+        "test_mla_per_head_muon_replays the TensorParallelMuon per-head split whose MLA slice "
+        "pattern is batched per pattern position. "
         "The CI container's emerging-optimizers runs the "
         "GEMM path; the SYRK paths are exercised only where the stack supports them.",
     ),
