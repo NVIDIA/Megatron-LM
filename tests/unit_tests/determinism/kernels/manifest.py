@@ -337,7 +337,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="tensor_parallel_random_share_storage",
-        sources=("megatron/core/tensor_parallel/random.py",),
+        sources=("megatron/core/activation_policy/recompute/checkpointing.py",),
         kind="cuda-ext",
         exempt_reason="load_inline extension aliases tensor storage on the host; no GPU compute.",
     ),

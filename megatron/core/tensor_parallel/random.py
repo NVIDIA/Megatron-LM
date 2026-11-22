@@ -26,8 +26,6 @@ from megatron.core.utils import is_te_min_version, is_torch_min_version
 
 try:
     import transformer_engine  # pylint: disable=unused-import
-    from transformer_engine.pytorch.distributed import activation_recompute_forward
-    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
 
     HAVE_TE = True
 except ModuleNotFoundError:
