@@ -686,7 +686,7 @@ def initialize_model_parallel(
     min_dynamic_context_parallel_size: int = 1,
     gtp_remat_num_sequence_shards: int = 1,
     expert_num_distributed_optimizer_instances: Optional[int] = None,
-    create_all_gather_group: bool = False,
+    create_separate_param_all_gather_groups: bool = False,
 ) -> "ProcessGroupCollection":
     """Initialize model data parallel groups.
 
@@ -838,14 +838,14 @@ def initialize_model_parallel(
             Same as ``num_distributed_optimizer_instances``, for the expert data-parallel
             domain. Defaults to ``num_distributed_optimizer_instances``.
 
-        create_all_gather_group (bool, default = False):
+        create_separate_param_all_gather_groups (bool, default = False):
             Create separate dense and, when EP > 1, expert all-gather communicators
             over the inner shard ranks. Include them in the returned collection.
             This creates communicators; parameter-gather overlap is configured separately.
 
     Returns:
         ProcessGroupCollection containing the initialized ordinary groups and optional
-        all-gather groups. The AG fields are None when create_all_gather_group is False;
+        all-gather groups. The AG fields are None when create_separate_param_all_gather_groups is False;
         expt_dp_ag is also None when EP is 1. Retain this collection and pass it to model
         components. Ordinary groups still use the existing single-grid MPU bootstrap;
         no AG handles are stored in MPU globals. Callers may ignore the return value,
@@ -1806,7 +1806,7 @@ def initialize_model_parallel(
     from .process_groups_config import ProcessGroupCollection
 
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-    if create_all_gather_group:
+    if create_separate_param_all_gather_groups:
         pg_collection.dp_cp_ag, pg_collection.expt_dp_ag = create_all_gather_groups(
             for_expert_parallelism=expert_model_parallel_size > 1,
             timeout=timeout,
@@ -1824,7 +1824,7 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
     instance these are the full data parallel groups. This enables overlapping
     all-gather operations with reduce-scatter operations. Megatron-FSDP v1 rejects
     separate AG groups with HSDP and HFSDP.
-    Prefer initialize_model_parallel(create_all_gather_group=True) for standard bootstrap
+    Prefer initialize_model_parallel(create_separate_param_all_gather_groups=True) for standard bootstrap
     and retain its returned collection. This helper always creates new, caller-owned groups;
     do not call it again to retrieve groups already created by the initializer.
 

@@ -690,7 +690,7 @@ def test_valid_dynamic_cp_group_sizes():
 def test_separate_all_gather_group(create_on_init):
     """Initialization returns ordinary groups plus optional AG groups without AG globals."""
     pg_collection = Utils.initialize_model_parallel(
-        context_parallel_size=world_size, create_all_gather_group=create_on_init
+        context_parallel_size=world_size, create_separate_param_all_gather_groups=create_on_init
     )
     assert isinstance(pg_collection, ProcessGroupCollection)
     assert pg_collection.tp is ps.get_tensor_model_parallel_group()
@@ -716,7 +716,7 @@ def test_expert_all_gather_group(create_on_init):
     pg_collection = Utils.initialize_model_parallel(
         pipeline_model_parallel_size=2,
         expert_model_parallel_size=2,
-        create_all_gather_group=create_on_init,
+        create_separate_param_all_gather_groups=create_on_init,
     )
     assert isinstance(pg_collection, ProcessGroupCollection)
     assert pg_collection.expt_dp is ps.get_expert_data_parallel_group(with_gtp_remat=False)

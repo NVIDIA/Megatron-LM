@@ -142,7 +142,7 @@ class DistributedInitConfig:
     use_gloo_process_groups: bool = field(default=True, metadata={"argparse_meta": {"arg_names": ["--disable-gloo-process-groups"]}})
     """If enabled, create Gloo process groups for communications."""
 
-    create_all_gather_group: bool = False
+    create_separate_param_all_gather_groups: bool = False
     """Create separate parameter all-gather communicators over dense and, when EP > 1,
     expert weight-replica ranks. Initialization includes these groups in its returned
     ProcessGroupCollection. Parameter-gather overlap is configured separately.

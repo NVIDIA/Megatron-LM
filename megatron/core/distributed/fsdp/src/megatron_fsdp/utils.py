@@ -583,7 +583,7 @@ class FSDPDistributedIndex:
         if self.use_hybrid_fsdp and (fsdp_group_ag is not None or expt_fsdp_group_ag is not None):
             raise ValueError(
                 "[Megatron-FSDP] Separate all-gather groups are not supported with HSDP or HFSDP. "
-                "Disable separate AG groups (dist.create_all_gather_group=False)."
+                "Disable separate AG groups (dist.create_separate_param_all_gather_groups=False)."
             )
         self.expt_device_mesh = expt_device_mesh
 

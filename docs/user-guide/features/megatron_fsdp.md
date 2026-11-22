@@ -185,9 +185,10 @@ unset CUDA_DEVICE_MAX_CONNECTIONS
 
 #### Separate Parameter All-Gather Groups
 
-Set `dist.create_all_gather_group = True` before distributed initialization to
-create separate dense and, when expert parallelism is enabled, expert parameter
-all-gather communicators. The command-line option is `--create-all-gather-group`.
+Set `dist.create_separate_param_all_gather_groups = True` before distributed
+initialization to create separate dense and, when expert parallelism is enabled,
+expert parameter all-gather communicators. The command-line option is
+`--create-separate-param-all-gather-groups`.
 Retain the resulting `ProcessGroupCollection` and pass it to model/FSDP
 construction. Parameter-gather overlap is configured separately.
 
@@ -199,14 +200,17 @@ bootstrap, so this return interface does not introduce independent per-model gri
 
 The setting has moved from `DistributedDataParallelConfig` to
 `DistributedInitConfig`. Update programmatic or YAML configurations that use
-`ddp.create_all_gather_group` to use `dist.create_all_gather_group`; the DDP field
-has been removed. The command-line option keeps the same spelling.
+`ddp.create_all_gather_group` to use
+`dist.create_separate_param_all_gather_groups`; the DDP field has been removed.
+Replace `--create-all-gather-group` with
+`--create-separate-param-all-gather-groups`; the old spelling is not retained.
 
 With multiple distributed optimizer instances, Core creates separate AG groups
 over the inner shard ranks for dense and expert parameters. Megatron-FSDP v1
 currently supports using separate AG groups only without HSDP or HFSDP. Keep
-`dist.create_all_gather_group=False` for either hybrid mode; caller-supplied AG
-groups are also rejected. Hybrid support is deferred to a future change.
+`dist.create_separate_param_all_gather_groups=False` for either hybrid mode;
+caller-supplied AG groups are also rejected. Hybrid support is deferred to a future
+change.
 
 ### 🤖 Megatron-Core
 

@@ -119,7 +119,7 @@ def test_groups_match_inner_shards(topology):
     )
     if expert_dp_size % topology.get("num_distributed_optimizer_instances", 1):
         pytest.skip("Topology requires a larger world size.")
-    with initialized_groups(create_all_gather_group=True, **topology) as pg:
+    with initialized_groups(create_separate_param_all_gather_groups=True, **topology) as pg:
         assert_matching_communicators(pg.dp_cp_ag, pg.intra_dp_cp)
         if topology.get("expert_model_parallel_size", 1) > 1:
             assert_matching_communicators(pg.expt_dp_ag, pg.intra_expt_dp)
@@ -145,7 +145,7 @@ def test_gtp_hsdp_remains_unsupported(enabled, cp):
             gtp_remat_size=2,
             context_parallel_size=cp,
             num_distributed_optimizer_instances=2,
-            create_all_gather_group=enabled,
+            create_separate_param_all_gather_groups=enabled,
             create_gloo_process_groups=False,
         )
     Utils.destroy_model_parallel()
@@ -166,7 +166,7 @@ def test_training_matches_reference(enabled, expert, instances, outer_strategy):
     if dist.get_world_size() // (2 if expert else 1) % instances:
         pytest.skip("Optimizer instances must divide expert DP size.")
     with initialized_groups(
-        create_all_gather_group=enabled,
+        create_separate_param_all_gather_groups=enabled,
         expert_model_parallel_size=2 if expert else 1,
         num_distributed_optimizer_instances=instances,
     ) as pg:
@@ -181,7 +181,7 @@ def test_training_matches_reference(enabled, expert, instances, outer_strategy):
 @pytest.mark.parametrize("ag_source", ["core", "dense-only", "expert-only", "unused-expert"])
 def test_hybrid_rejects_separate_ag(outer_strategy, ag_source):
     with initialized_groups(
-        create_all_gather_group=ag_source == "core",
+        create_separate_param_all_gather_groups=ag_source == "core",
         expert_model_parallel_size=2,
         num_distributed_optimizer_instances=2,
     ) as pg:

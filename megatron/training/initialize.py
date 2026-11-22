@@ -472,7 +472,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
     # (skipped when caller owns model-parallel setup)
     if device_count > 0 and not skip_model_parallel_init:
         if mpu.model_parallel_is_initialized():
-            if cfg.dist.create_all_gather_group:
+            if cfg.dist.create_separate_param_all_gather_groups:
                 raise RuntimeError(
                     "Retain the collection from the first initialization and skip model-parallel init when reusing AG groups."
                 )
@@ -495,7 +495,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 model_config.virtual_pipeline_model_parallel_size,
                 pipeline_model_parallel_comm_backend=model_config.pipeline_model_parallel_comm_backend,
                 use_sharp=cfg.dist.use_sharp,
-                create_all_gather_group=cfg.dist.create_all_gather_group,
+                create_separate_param_all_gather_groups=cfg.dist.create_separate_param_all_gather_groups,
                 gtp_remat_size=model_config.gtp_weight_remat_size,
                 expert_gtp_remat_size=model_config.expert_gtp_weight_remat_size,
                 gtp_remat_num_sequence_shards=model_config.gtp_remat_num_sequence_shards,

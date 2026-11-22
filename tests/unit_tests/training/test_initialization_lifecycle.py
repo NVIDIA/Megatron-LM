@@ -216,7 +216,7 @@ def test_distributed_initialization_prefers_config_to_args(
     arguments.add_megatron_arguments(parser)
     # Explicit config wins over opposite CLI values; CLI-derived config reaches bootstrap.
     cli_ag = dist_ag if ag_source == "cli" else not dist_ag
-    args = parser.parse_args(["--create-all-gather-group"] if cli_ag else [])
+    args = parser.parse_args(["--create-separate-param-all-gather-groups"] if cli_ag else [])
     args.rank, args.world_size = 0, 999
     # These topology values are normally resolved by validate_args.
     args.gtp_weight_remat_size = args.expert_gtp_weight_remat_size = 1
@@ -236,12 +236,12 @@ def test_distributed_initialization_prefers_config_to_args(
         high_priority_stream_groups=["tp"],
         use_tp_pp_dp_mapping=True,
         nccl_communicator_config_path="owned.yaml",
-        create_all_gather_group=dist_ag,
+        create_separate_param_all_gather_groups=dist_ag,
     )
     if ag_source == "cli":
-        run_config.dist.create_all_gather_group = _default_config_from_args(
+        run_config.dist.create_separate_param_all_gather_groups = _default_config_from_args(
             DistributedInitConfig, args
-        ).create_all_gather_group
+        ).create_separate_param_all_gather_groups
     monkeypatch.setattr(initialize, "get_args", lambda: args)
     monkeypatch.setattr(initialize, "print_rank_0", Mock())
     monkeypatch.setattr(initialize.torch.cuda, "device_count", lambda: 2)
@@ -279,7 +279,7 @@ def test_distributed_initialization_prefers_config_to_args(
     assert kwargs["order"] == "tp-cp-ep-pp-dp"
     assert kwargs["high_priority_stream_groups"] == ["tp"]
     assert kwargs["use_sharp"] is True
-    assert kwargs["create_all_gather_group"] is dist_ag
+    assert kwargs["create_separate_param_all_gather_groups"] is dist_ag
     assert kwargs["gtp_remat_num_sequence_shards"] == 1
     assert kwargs["sharp_enabled_group"] == "dp_replica"
     assert kwargs["create_gloo_process_groups"] is False
@@ -867,7 +867,7 @@ def test_get_model_requires_retained_ag_groups_only_for_wrapped_models(
 ):
     from megatron.training import training
 
-    run_config.dist.create_all_gather_group = True
+    run_config.dist.create_separate_param_all_gather_groups = True
     monkeypatch.setattr(training, "get_args", lambda: Namespace())
     monkeypatch.setattr(training, "has_nvidia_modelopt", False)
     groups = ProcessGroupCollection()
