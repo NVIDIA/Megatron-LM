@@ -43,6 +43,9 @@ from megatron.core.transformer.experimental_attention_variant.dsa_layout import 
 from megatron.core.transformer.experimental_attention_variant.dsa_logging import (
     DSAIndexerLossLoggingHelper,
 )
+from megatron.core.transformer.experimental_attention_variant.head_batched_matmul import (
+    head_batched_matmul,
+)
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -310,7 +313,7 @@ def _run_sparse_attention(
                 key_positions=key_positions,
             )
         assert output is not None
-        output = torch.einsum("sbhc,hdc->sbhd", output, up_v_weight).contiguous()
+        output = head_batched_matmul(output, up_v_weight.transpose(1, 2))
         output = output.view(output.size(0), output.size(1), -1)
         return output
 

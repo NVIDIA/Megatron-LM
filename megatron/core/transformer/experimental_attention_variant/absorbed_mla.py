@@ -49,6 +49,9 @@ from megatron.core.transformer.attention_output_gate import (
     apply_elementwise_attention_output_gate_before_cast,
 )
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant.head_batched_matmul import (
+    head_batched_matmul,
+)
 from megatron.core.transformer.mla_qk_norm_config import QKNormConfigResolver
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module, get_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -109,8 +112,7 @@ def _apply_absorbed_v_up_projection(
     core_attn_out = core_attn_out.view(
         *core_attn_out.shape[:-1], num_attention_heads_per_partition, kv_lora_rank
     )
-    core_attn_out = torch.einsum("...nc,ndc->...nd", core_attn_out, v_up_weight)
-    core_attn_out = core_attn_out.contiguous()
+    core_attn_out = head_batched_matmul(core_attn_out, v_up_weight.transpose(1, 2))
     return core_attn_out.view(*core_attn_out.shape[:-2], -1)
 
 
@@ -750,8 +752,7 @@ class AbsorbedMLASelfAttention(Attention):
             k_up_weight, _ = self._get_kv_up_weights()
 
             if not self.use_rope:
-                q_absorbed = torch.einsum("...nd,ndk->...nk", q, k_up_weight)
-                q_absorbed = q_absorbed.contiguous()
+                q_absorbed = head_batched_matmul(q, k_up_weight)
                 assert q_absorbed.size(-1) == self.config.kv_lora_rank
             elif use_fused_rope:
                 # q_no_pe: [num_tokens, n, qk_head_dim]
@@ -762,7 +763,7 @@ class AbsorbedMLASelfAttention(Attention):
 
                 # Absorb k_up_weight into q_no_pe
                 # q_absorbed: [num_tokens, n, kv_lora_rank]
-                q_absorbed = torch.einsum("...nd,ndk->...nk", q_no_pe, k_up_weight)
+                q_absorbed = head_batched_matmul(q_no_pe, k_up_weight)
                 assert q_absorbed.ndim == q.ndim
                 assert q_absorbed.shape[:-1] == q.shape[:-1]
                 assert q_absorbed.size(-1) == self.config.kv_lora_rank
@@ -787,8 +788,7 @@ class AbsorbedMLASelfAttention(Attention):
 
                 # Absorb k_up_weight into q_no_pe
                 # q_absorbed: [num_tokens, n, kv_lora_rank]
-                q_absorbed = torch.einsum("...nd,ndk->...nk", q_no_pe, k_up_weight)
-                q_absorbed = q_absorbed.contiguous()
+                q_absorbed = head_batched_matmul(q_no_pe, k_up_weight)
                 assert q_absorbed.ndim == q.ndim
                 assert q_absorbed.shape[:-1] == q.shape[:-1]
                 assert q_absorbed.size(-1) == self.config.kv_lora_rank
