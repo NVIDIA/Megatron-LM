@@ -290,8 +290,9 @@ class FsdpModule:
             """Whether this call can prefetch using the established training trace."""
             if context.is_recording_execution_order:
                 return False
-            # No-grad evaluation has no backward events. Training-mode no-grad
-            # calls still participate in the trace for reentrant checkpointing.
+            # Neither condition alone identifies forward-only evaluation.
+            # eval() still allows backward; reentrant checkpointing uses no_grad()
+            # for its initial training forward. Require both to bypass the training trace.
             if not cast(nn.Module, self).training and not torch.is_grad_enabled():
                 return False
             if context.prefetch_order is PrefetchOrder.RECORDED:
