@@ -39,7 +39,9 @@ async def _serve() -> None:
             "NCCL handoff across independent worker process groups is not supported"
         )
     engine_class = DynamoDynamicInferenceEngine if disaggregated else DynamicInferenceEngine
-    engine = get_dynamic_inference_engine(engine_class=engine_class)
+    engine = get_dynamic_inference_engine(
+        engine_class=engine_class, disaggregation_role=args.role if disaggregated else None
+    )
 
     replica_group = (
         engine.pg_collection.expt_dp
