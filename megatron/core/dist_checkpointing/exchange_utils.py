@@ -165,7 +165,7 @@ def distribute_shards_to_ranks(
         ),
     ):
         # assign greedily to the least occupied rank
-        size, rank = min((size, rank) for size, rank in rank_sizes if rank in shard_ranks)
+        size, rank = min(rank_sizes[r] for r in shard_ranks)
 
         shard_to_saving_rank[shard_id] = rank
         rank_sizes[rank] = (size + shard_to_size[shard_id], rank)
