@@ -399,6 +399,18 @@
   "required": false,
   "type": "str"
  },
+ "persistent_workers": {
+  "action": "_StoreFalseAction",
+  "choices": null,
+  "const": false,
+  "default": true,
+  "nargs": 0,
+  "option_strings": [
+   "--no-persistent-workers"
+  ],
+  "required": false,
+  "type": null
+ },
  "phase_transition_iterations": {
   "action": "_StoreAction",
   "choices": null,
@@ -410,6 +422,18 @@
   ],
   "required": false,
   "type": "str"
+ },
+ "pin_memory": {
+  "action": "_StoreFalseAction",
+  "choices": null,
+  "const": false,
+  "default": true,
+  "nargs": 0,
+  "option_strings": [
+   "--no-pin-memory"
+  ],
+  "required": false,
+  "type": null
  },
  "reset_attention_mask": {
   "action": "_StoreTrueAction",
