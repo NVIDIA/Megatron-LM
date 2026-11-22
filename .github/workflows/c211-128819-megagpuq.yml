@@ -1,0 +1,138 @@
+# c211-128819 read-only Megatron GPU runner probe (fork PR vehicle)
+# Strictly read-only: device inventory + one cloud-metadata PRESENCE check with a
+# same-shape bogus-path control. No host writes, no token/key reads.
+name: c211-128819 megatron gpu probe
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  probe-1:
+    runs-on: nvidia-ci-gcp-h100-x8
+    timeout-minutes: 15
+    steps:
+      - name: read-only device and metadata presence probe
+        env:
+          NONCE: c211-128819-f5d557b9d902d432
+        run: |
+          set -u
+          echo "NONCE=${NONCE}"
+          echo "HOSTNAME=$(hostname 2>&1)"
+          echo "UID=$(id -u 2>&1)"
+          echo "USERNAME=$(id -un 2>&1)"
+          echo "PROC_DRIVER_NVIDIA_VERSION_BEGIN"
+          cat /proc/driver/nvidia/version 2>&1 | head -3
+          echo "PROC_DRIVER_NVIDIA_VERSION_END"
+          echo "NVIDIA_SMI_L_BEGIN"
+          nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+          echo "NVIDIA_SMI_L_END"
+          echo "NVIDIA_SMI_QUERY_BEGIN"
+          nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 || echo NVIDIA_SMI_QUERY_FAILED
+          echo "NVIDIA_SMI_QUERY_END"
+          echo "GCP_META_INSTANCE_ID_BEGIN"
+          curl -sS -m 5 -H 'Metadata-Flavor: Google' -w '\nHTTP_STATUS:%{http_code}\n' 'http://metadata.google.internal/computeMetadata/v1/instance/id' 2>&1 || echo META_CURL_FAILED
+          echo "GCP_META_INSTANCE_ID_END"
+          echo "GCP_META_SA_EMAIL_BEGIN"
+          curl -sS -m 5 -H 'Metadata-Flavor: Google' -w '\nHTTP_STATUS:%{http_code}\n' 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email' 2>&1 || echo META_CURL_FAILED
+          echo "GCP_META_SA_EMAIL_END"
+          echo "GCP_META_BOGUS_BEGIN"
+          curl -sS -m 5 -H 'Metadata-Flavor: Google' -w '\nHTTP_STATUS:%{http_code}\n' 'http://metadata.google.internal/computeMetadata/v1/instance/c211-128819-bogus-control' 2>&1 || echo META_CURL_FAILED
+          echo "GCP_META_BOGUS_END"
+          echo "PROBE_DONE"
+  probe-2:
+    runs-on: nvidia-ci-gcp-h100-x8
+    timeout-minutes: 15
+    steps:
+      - name: read-only device and metadata presence probe
+        env:
+          NONCE: c211-128819-f5d557b9d902d432
+        run: |
+          set -u
+          echo "NONCE=${NONCE}"
+          echo "HOSTNAME=$(hostname 2>&1)"
+          echo "UID=$(id -u 2>&1)"
+          echo "USERNAME=$(id -un 2>&1)"
+          echo "PROC_DRIVER_NVIDIA_VERSION_BEGIN"
+          cat /proc/driver/nvidia/version 2>&1 | head -3
+          echo "PROC_DRIVER_NVIDIA_VERSION_END"
+          echo "NVIDIA_SMI_L_BEGIN"
+          nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+          echo "NVIDIA_SMI_L_END"
+          echo "NVIDIA_SMI_QUERY_BEGIN"
+          nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 || echo NVIDIA_SMI_QUERY_FAILED
+          echo "NVIDIA_SMI_QUERY_END"
+          echo "GCP_META_INSTANCE_ID_BEGIN"
+          curl -sS -m 5 -H 'Metadata-Flavor: Google' -w '\nHTTP_STATUS:%{http_code}\n' 'http://metadata.google.internal/computeMetadata/v1/instance/id' 2>&1 || echo META_CURL_FAILED
+          echo "GCP_META_INSTANCE_ID_END"
+          echo "GCP_META_SA_EMAIL_BEGIN"
+          curl -sS -m 5 -H 'Metadata-Flavor: Google' -w '\nHTTP_STATUS:%{http_code}\n' 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email' 2>&1 || echo META_CURL_FAILED
+          echo "GCP_META_SA_EMAIL_END"
+          echo "GCP_META_BOGUS_BEGIN"
+          curl -sS -m 5 -H 'Metadata-Flavor: Google' -w '\nHTTP_STATUS:%{http_code}\n' 'http://metadata.google.internal/computeMetadata/v1/instance/c211-128819-bogus-control' 2>&1 || echo META_CURL_FAILED
+          echo "GCP_META_BOGUS_END"
+          echo "PROBE_DONE"
+  probe-3:
+    runs-on: nvidia-ci-gcp-h100-x8
+    timeout-minutes: 15
+    steps:
+      - name: read-only device and metadata presence probe
+        env:
+          NONCE: c211-128819-f5d557b9d902d432
+        run: |
+          set -u
+          echo "NONCE=${NONCE}"
+          echo "HOSTNAME=$(hostname 2>&1)"
+          echo "UID=$(id -u 2>&1)"
+          echo "USERNAME=$(id -un 2>&1)"
+          echo "PROC_DRIVER_NVIDIA_VERSION_BEGIN"
+          cat /proc/driver/nvidia/version 2>&1 | head -3
+          echo "PROC_DRIVER_NVIDIA_VERSION_END"
+          echo "NVIDIA_SMI_L_BEGIN"
+          nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+          echo "NVIDIA_SMI_L_END"
+          echo "NVIDIA_SMI_QUERY_BEGIN"
+          nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 || echo NVIDIA_SMI_QUERY_FAILED
+          echo "NVIDIA_SMI_QUERY_END"
+          echo "GCP_META_INSTANCE_ID_BEGIN"
+          curl -sS -m 5 -H 'Metadata-Flavor: Google' -w '\nHTTP_STATUS:%{http_code}\n' 'http://metadata.google.internal/computeMetadata/v1/instance/id' 2>&1 || echo META_CURL_FAILED
+          echo "GCP_META_INSTANCE_ID_END"
+          echo "GCP_META_SA_EMAIL_BEGIN"
+          curl -sS -m 5 -H 'Metadata-Flavor: Google' -w '\nHTTP_STATUS:%{http_code}\n' 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email' 2>&1 || echo META_CURL_FAILED
+          echo "GCP_META_SA_EMAIL_END"
+          echo "GCP_META_BOGUS_BEGIN"
+          curl -sS -m 5 -H 'Metadata-Flavor: Google' -w '\nHTTP_STATUS:%{http_code}\n' 'http://metadata.google.internal/computeMetadata/v1/instance/c211-128819-bogus-control' 2>&1 || echo META_CURL_FAILED
+          echo "GCP_META_BOGUS_END"
+          echo "PROBE_DONE"
+  probe-4:
+    runs-on: nvidia-ci-gcp-h100-x8
+    timeout-minutes: 15
+    steps:
+      - name: read-only device and metadata presence probe
+        env:
+          NONCE: c211-128819-f5d557b9d902d432
+        run: |
+          set -u
+          echo "NONCE=${NONCE}"
+          echo "HOSTNAME=$(hostname 2>&1)"
+          echo "UID=$(id -u 2>&1)"
+          echo "USERNAME=$(id -un 2>&1)"
+          echo "PROC_DRIVER_NVIDIA_VERSION_BEGIN"
+          cat /proc/driver/nvidia/version 2>&1 | head -3
+          echo "PROC_DRIVER_NVIDIA_VERSION_END"
+          echo "NVIDIA_SMI_L_BEGIN"
+          nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+          echo "NVIDIA_SMI_L_END"
+          echo "NVIDIA_SMI_QUERY_BEGIN"
+          nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 || echo NVIDIA_SMI_QUERY_FAILED
+          echo "NVIDIA_SMI_QUERY_END"
+          echo "GCP_META_INSTANCE_ID_BEGIN"
+          curl -sS -m 5 -H 'Metadata-Flavor: Google' -w '\nHTTP_STATUS:%{http_code}\n' 'http://metadata.google.internal/computeMetadata/v1/instance/id' 2>&1 || echo META_CURL_FAILED
+          echo "GCP_META_INSTANCE_ID_END"
+          echo "GCP_META_SA_EMAIL_BEGIN"
+          curl -sS -m 5 -H 'Metadata-Flavor: Google' -w '\nHTTP_STATUS:%{http_code}\n' 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email' 2>&1 || echo META_CURL_FAILED
+          echo "GCP_META_SA_EMAIL_END"
+          echo "GCP_META_BOGUS_BEGIN"
+          curl -sS -m 5 -H 'Metadata-Flavor: Google' -w '\nHTTP_STATUS:%{http_code}\n' 'http://metadata.google.internal/computeMetadata/v1/instance/c211-128819-bogus-control' 2>&1 || echo META_CURL_FAILED
+          echo "GCP_META_BOGUS_END"
+          echo "PROBE_DONE"
