@@ -2348,6 +2348,27 @@ class ChainedOptimizer(MegatronOptimizer):
 
             # All members share this config (asserted in __init__).
             use_decoupled_grad = self._uses_decoupled_grad(parameters)
+            main_params = []
+            params_by_grad_norm_group = {}
+            for p in parameters:
+                grad_norm_group = _get_param_grad_norm_group(p)
+                if _is_separate_grad_norm_group(grad_norm_group):
+                    params_by_grad_norm_group.setdefault(grad_norm_group, []).append(p)
+                else:
+                    main_params.append(p)
+
+            # Decide on skipping before clipping, so the DSA indexer path below applies it too.
+            grad_norm_skip_threshold = optimizer.config.grad_norm_skip_threshold
+            if (
+                main_params
+                and math.isfinite(grad_norm_skip_threshold)
+                and grad_norm > grad_norm_skip_threshold
+            ):
+                log_single_rank(
+                    logger, logging.INFO, "skipping grad norm because it's too large %s", grad_norm
+                )
+                should_skip_update = True
+
             if optimizer.config.dsa_indexer_clip_grad is not None:
                 indexer_clip_grad = optimizer.config.dsa_indexer_clip_grad
                 indexer_params, non_indexer_params = optimizer.get_dsa_split_parameters()
@@ -2366,15 +2387,6 @@ class ChainedOptimizer(MegatronOptimizer):
                         use_decoupled_grad=use_decoupled_grad,
                     )
                 continue
-            main_params = []
-            params_by_grad_norm_group = {}
-            for p in parameters:
-                grad_norm_group = _get_param_grad_norm_group(p)
-                if _is_separate_grad_norm_group(grad_norm_group):
-                    params_by_grad_norm_group.setdefault(grad_norm_group, []).append(p)
-                else:
-                    main_params.append(p)
-
             if optimizer.config.clip_grad > 0.0:
                 if main_params:
                     clip_grad_by_total_norm_fp32(
@@ -2393,17 +2405,6 @@ class ChainedOptimizer(MegatronOptimizer):
                         total_norm=group_grad_norm,
                         use_decoupled_grad=use_decoupled_grad,
                     )
-
-            grad_norm_skip_threshold = optimizer.config.grad_norm_skip_threshold
-            if (
-                main_params
-                and math.isfinite(grad_norm_skip_threshold)
-                and grad_norm > grad_norm_skip_threshold
-            ):
-                log_single_rank(
-                    logger, logging.INFO, "skipping grad norm because it's too large %s", grad_norm
-                )
-                should_skip_update = True
 
         # Count the zeros in the grads.
         num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None
