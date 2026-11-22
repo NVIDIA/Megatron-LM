@@ -1351,6 +1351,57 @@ def test_load_checkpoint_override_opt_param_scheduler(
         assert loaded_flops_none == num_floating_point_operations_so_far
 
 
+def test_override_ckpt_iteration_with_distributed_optimizer(
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, run_config
+):
+    """--override-ckpt-iteration sets the resume iteration even when the distributed
+    optimizer reads its parameter state from a non-distributed (torch) checkpoint."""
+    args = create_ckpt_load_args
+    args.ckpt_format = "torch"
+    args.use_distributed_optimizer = True
+    args.use_dist_ckpt = False
+    run_config.optimizer.use_distributed_optimizer = True
+    run_config.train.global_batch_size = 4
+    train_state = TrainState()
+
+    with (
+        mock.patch(
+            "megatron.training.checkpointing.get_train_state", return_value=train_state
+        ) as get_train_state,
+        TempNamedDir(
+            tmp_path_dist_ckpt / "test_override_ckpt_iteration_dist_opt", sync=True
+        ) as ckpt_dir,
+    ):
+        args.load = ckpt_dir
+        args.save = ckpt_dir
+        args.save_tokenizer_assets = False
+        set_args(args)
+
+        config = TransformerConfig(num_layers=1, kv_channels=1)
+        optimizer = MockOptimizer({"optimizer": "optimizer_state"})
+        opt_param_scheduler = MockOptParamScheduler({"opt_param_scheduler": "scheduler_state"})
+        sync_checkpoint_config(args)
+        save_checkpoint(123, [MockModel(config)], optimizer, opt_param_scheduler, 456)
+
+        args.override_ckpt_iteration = 7
+        new_optimizer = MockOptimizer({"optimizer": "dummy"})
+        train_state = TrainState()
+        get_train_state.return_value = train_state
+        sync_checkpoint_config(args)
+        with mock.patch.object(new_optimizer, "load_parameter_state") as load_parameter_state:
+            loaded_iter, _ = load_checkpoint(
+                [MockModel(config)],
+                new_optimizer,
+                MockOptParamScheduler({"opt_param_scheduler": "dummy"}),
+                restore_training_state=True,
+            )
+
+        assert loaded_iter == train_state.iteration == 7
+        assert train_state.consumed_train_samples == 7 * run_config.train.global_batch_size
+        # The optimizer state still comes from the checkpoint that was loaded.
+        assert "iter_0000123" in load_parameter_state.call_args.args[0]
+
+
 @pytest.mark.parametrize("load_rerun_mode", [RerunMode.DISABLED, RerunMode.VALIDATE_RESULTS])
 def test_strict_load_idle_rerun_checkpoint(
     init_model_parallel, tmp_path_dist_ckpt, create_ckpt_load_args, load_rerun_mode

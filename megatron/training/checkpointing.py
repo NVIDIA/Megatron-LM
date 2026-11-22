@@ -3687,10 +3687,14 @@ def load_checkpoint(
                 # legacy text tracker otherwise).
                 # This code should not be reached when reading from a non_persistent checkpoint
                 assert not is_torch_dist
-                iteration, release, _ = _resolve_load_iteration(
+                # Use separate names: `iteration` may already hold --override-ckpt-iteration,
+                # and it is returned to the caller as the resume iteration.
+                optim_iteration, optim_release, _ = _resolve_load_iteration(
                     load_dir, ckpt_step=checkpoint.ckpt_step
                 )
-                model_checkpoint_name = get_checkpoint_name(load_dir, iteration, release)
+                model_checkpoint_name = get_checkpoint_name(
+                    load_dir, optim_iteration, optim_release
+                )
                 optim_checkpoint_name = get_distributed_optimizer_checkpoint_name(
                     model_checkpoint_name
                 )
