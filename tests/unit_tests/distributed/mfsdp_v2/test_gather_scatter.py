@@ -60,6 +60,7 @@ def test_gather_scatter_round_trip(subgroup, placement, distributed_setup):
             pytest.skip("Needs four ranks to test the noncontiguous subgroup [1, 3].")
         mesh = DeviceMesh(device.type, [1, 3])
         if mesh.get_coordinate() is None:
+            assign_owner_work([])  # Planning is collective over all ranks.
             pytest.skip("Rank is outside the test subgroup [1, 3].")
     else:
         mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
