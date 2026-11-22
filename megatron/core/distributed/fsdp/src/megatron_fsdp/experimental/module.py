@@ -281,22 +281,23 @@ class FsdpModule:
         if self.is_root():
             context.allgather_stream.wait_stream(context.current_stream())
 
-        # No-grad evaluation has no backward events, so gather on demand without
-        # recording or advancing the training trace. Training-mode no-grad calls
-        # still participate: reentrant activation checkpointing uses those calls.
-        if not cast(nn.Module, self).training and not torch.is_grad_enabled():
-            prefetch = False
-        elif context.is_recording_execution_order:
-            # Recomputation is recorded as a forward event too, so later passes prefetch
-            # the planes it needs.
-            context.execution_order.append(ExecutionEvent(cast(nn.Module, self), Phase.FORWARD))
-            prefetch = False
-        elif context.prefetch_order is PrefetchOrder.RECORDED:
-            prefetch = True
-        else:
+        def should_prefetch() -> bool:
+            """Record training calls or prefetch using the established execution order."""
+            # No-grad evaluation has no backward events, so gather on demand without
+            # recording or advancing the training trace. Training-mode no-grad calls
+            # still participate: reentrant activation checkpointing uses those calls.
+            if not cast(nn.Module, self).training and not torch.is_grad_enabled():
+                return False
+            if context.is_recording_execution_order:
+                # Include recomputation so replay prefetches its forward weight planes.
+                context.execution_order.append(ExecutionEvent(cast(nn.Module, self), Phase.FORWARD))
+                return False
+            if context.prefetch_order is PrefetchOrder.RECORDED:
+                return True
             # A REGISTRATION order has no recomputation events.
-            prefetch = not is_recomputing
-        self.unshard(Phase.FORWARD, prefetch=prefetch)
+            return not is_recomputing
+
+        self.unshard(Phase.FORWARD, prefetch=should_prefetch())
 
     def unshard(self, phase: Phase | None = None, prefetch: bool = False) -> None:
         """Unshard this FsdpModule's parameter groups immediately.
