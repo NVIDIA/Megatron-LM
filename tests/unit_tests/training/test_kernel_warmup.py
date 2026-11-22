@@ -311,6 +311,7 @@ def pretrain_until_warmup(monkeypatch, run_config):
         # no-ops here.
         cfg = Namespace(
             model=model_config,
+            data=Namespace(dataset=None),
             fault_tolerance=run_config.fault_tolerance,
             checkpoint=run_config.checkpoint,
             train=Namespace(micro_batch_size=9),
@@ -335,6 +336,7 @@ def test_pretrain_passes_model_config_and_runtime_batch(
     config, _ = configuration(tp_group, torch.bfloat16)
     config.context_parallel_size = 2
     config.activation_func_fp8_input_store = True
+    config.max_seq_length_per_sample = 16  # the training sequence length (--seq-length)
     model_config = model_cls(
         transformer=config,
         seq_length=4096,
@@ -342,13 +344,11 @@ def test_pretrain_passes_model_config_and_runtime_batch(
         should_pad_vocab=pad_vocab,
         logit_dtype=torch.float32,
     )
-    # Model settings and the microbatch size come from the config container; the training
-    # sequence length is the one input still read from args (the container has no dataset
-    # config yet). args carries only what pretrain() reads before the warmup call.
+    # Model settings, the microbatch size and the sample length (the container's; for this
+    # loader-only run the transformer config's per-sample maximum) come from the config
+    # container. args carries only what pretrain() reads before the warmup call.
     args = Namespace(
-        seq_length=16,
-        fine_grained_activation_offloading=False,
-        tensor_model_parallel_size=tp_group.size(),
+        fine_grained_activation_offloading=False, tensor_model_parallel_size=tp_group.size()
     )
     passed_config, passed_group, inputs = pretrain_until_warmup(args, model_config, tp_group)
     multiple = 128 * tp_group.size()
