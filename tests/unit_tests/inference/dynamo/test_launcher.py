@@ -87,6 +87,19 @@ def test_external_launch_accepts_deployment_managed_engine():
     assert config.parent_event_port == 5556
 
 
+def test_streaming_interval_defaults_to_every_token_and_must_be_positive():
+    assert parse_args(_argv()).streaming_interval == 1
+
+    argv = _argv()
+    split = argv.index("--")
+    argv[split:split] = ["--streaming-interval", "32"]
+    assert parse_args(argv).streaming_interval == 32
+
+    argv[split + 1] = "0"
+    with pytest.raises(SystemExit):
+        parse_args(argv)
+
+
 def test_disaggregated_role_requires_coordinator_address():
     argv = _argv()
     argv[1] = "prefill"
