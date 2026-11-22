@@ -285,10 +285,8 @@ class FsdpModule:
         # recording or advancing the training trace. Training-mode no-grad calls
         # still participate: reentrant activation checkpointing uses those calls.
         if not cast(nn.Module, self).training and not torch.is_grad_enabled():
-            self.unshard(Phase.FORWARD)
-            return
-
-        if context.is_recording_execution_order:
+            prefetch = False
+        elif context.is_recording_execution_order:
             # Recomputation is recorded as a forward event too, so later passes prefetch
             # the planes it needs.
             context.execution_order.append(ExecutionEvent(cast(nn.Module, self), Phase.FORWARD))
