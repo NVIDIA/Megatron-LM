@@ -98,7 +98,7 @@ def test_mxfp8_parameters(process_group_collection):
         module=block,
         pg_collection=process_group_collection,
     )
-    # FSDP installs DTensor shards; check the parameters used for compute.
+    # FSDP installs local shards; check the parameters used for compute.
     parameters = []
     for module in model.module.modules():
         if not isinstance(module, FsdpModule):
@@ -218,7 +218,7 @@ def test_mxfp8_recompute_matches_no_recompute(
 
         (loss,) = run_forward_backward_on_microbatches(model, forward)
         grads = {
-            name: parameter.grad.to_local().clone()
+            name: parameter.grad.clone()
             for name, parameter in model.named_parameters()
             if parameter.grad is not None
         }
@@ -278,7 +278,7 @@ def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(process_grou
     parameters = dict(wrapped.module.named_parameters())
     assert parameters
     for name, parameter in parameters.items():
-        local_parameter = parameter.to_local()
+        local_parameter = parameter
 
         # Some parameters use module-specific initializers, so only check those
         # initialized by the configured init method.
@@ -405,7 +405,7 @@ def test_unpadded_shards_pack_parameter_groups_without_padding(process_group_col
     assert group.shard_layout is ShardLayout.UNPADDED
     # Weight and bias share one bf16 group and pack back to back without padding.
     assert group.main_weight.layout.size == sum(
-        parameter.sharded.numel() for parameter in group.fsdp_parameters
+        parameter.unsharded.numel() for parameter in group.fsdp_parameters
     )
 
     with pytest.raises(ValueError, match="incompatible with nccl_ub"):
@@ -836,8 +836,8 @@ def test_gradient_clipping_reaches_global_norm(
     parameters = [
         parameter for parameter in optimizer.get_parameters() if parameter.grad is not None
     ]
-    assert all(isinstance(parameter.grad, DTensor) for parameter in parameters)
-    expected_pre_clip_norm = global_norm([p.grad.to_local() for p in parameters])
+    assert all(not isinstance(parameter.grad, DTensor) for parameter in parameters)
+    expected_pre_clip_norm = global_norm([p.grad for p in parameters])
     assert (
         expected_pre_clip_norm > clip_grad
     ), "Test gradients must exceed the clipping threshold to exercise clipping."
@@ -847,7 +847,7 @@ def test_gradient_clipping_reaches_global_norm(
     assert success
     torch.testing.assert_close(pre_clip_norm.item(), expected_pre_clip_norm)
     torch.testing.assert_close(
-        global_norm([p.grad.to_local() for p in parameters]), clip_grad, rtol=1e-3, atol=0
+        global_norm([p.grad for p in parameters]), clip_grad, rtol=1e-3, atol=0
     )
 
 

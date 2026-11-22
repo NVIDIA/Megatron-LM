@@ -415,7 +415,7 @@ class FsdpParameterGroup:
             setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
 
             sharded_parameter = nn.Parameter(
-                self.main_weight.get_dtensor(index), requires_grad=parameter.requires_grad
+                self.main_weight.get_tensor_view(index), requires_grad=parameter.requires_grad
             )
             copy_parameter_attributes(parameter, sharded_parameter)
             if main_grad_dtype:
@@ -670,7 +670,7 @@ class FsdpParameterGroup:
                 destination.copy_(grad)
                 if self.grad_scale != 1:
                     destination.mul_(self.grad_scale)
-        self._install_sharded_grads(self.main_grad)
+        self._install_sharded_grads(self.pre_optimizer_main_grad)
 
     def _has_sharded_grads(self) -> bool:
         """Whether installed .grad views select accumulation instead of overwrite.
@@ -710,9 +710,9 @@ class FsdpParameterGroup:
         """Reduce a packed partial gradient across DP-inner and accumulate into main_grad.
 
         main_grad rests at the DP-outer-Partial accumulation placement, accumulating
-        each backward through the standard zero_grad contract, and ``.grad`` binds to
-        it. The last-microbatch DP-outer reduction is applied separately by
-        ``reduce_outer_gradients``; the caller (``_reduce_gradient_groups``)
+        each backward through the standard zero_grad contract. ``.grad`` stays bound
+        to the optimizer-sized view. The last-microbatch DP-outer reduction fills
+        that view in ``reduce_outer_gradients``; the caller (``_reduce_gradient_groups``)
         decides when and on which stream to run it, which is what lets the DP-outer
         reduction overlap the next group's DP-inner reduction.
         """
@@ -739,7 +739,7 @@ class FsdpParameterGroup:
             else:
                 self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
 
-        self._install_sharded_grads(self.main_grad)
+        self._install_sharded_grads(self.pre_optimizer_main_grad)
 
     def reduce_outer_gradients(self) -> None:
         """Finalize the deferred DP-outer reduction into the optimizer-layout view.
@@ -766,7 +766,7 @@ class FsdpParameterGroup:
     def _install_sharded_grads(self, grad_buffer: DBuffer) -> None:
         """Bind each sharded parameter's ``.grad`` to the given reduced gradient buffer."""
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            fsdp_parameter.sharded.grad = grad_buffer.get_dtensor(index)
+            fsdp_parameter.sharded.grad = grad_buffer.get_tensor_view(index)
 
 
 def get_containing_parameter_group(parameter: nn.Parameter) -> FsdpParameterGroup | None:

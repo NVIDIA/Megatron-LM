@@ -373,5 +373,5 @@ def test_local_accumulation_scaling_matches_reference(distributed_setup, grad_co
         context.finish_grad_sync()
         expected = expected + x.float() * scale
 
-    actual = model.weight.grad.to_local().reshape(8, 4096)
+    actual = model.weight.grad.reshape(8, 4096)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)

@@ -163,9 +163,5 @@ class TestMFSDPv2EPOverlapCudaGraph:
             model.named_parameters(), reference_model.named_parameters()
         ):
             torch.testing.assert_close(
-                parameter.to_local(),
-                reference_parameter.to_local(),
-                rtol=0,
-                atol=0,
-                msg=lambda m: f"{name}: {m}",
+                parameter, reference_parameter, rtol=0, atol=0, msg=lambda m: f"{name}: {m}"
             )

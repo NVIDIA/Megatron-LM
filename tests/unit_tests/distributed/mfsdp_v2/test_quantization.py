@@ -169,9 +169,9 @@ def _check_recompute_matches_no_recompute(distributed_setup, recipe, build, use_
             loss = output.float().square().mean()
             loss.backward()
             losses.append(loss.detach())
-            grads.append([parameter.grad.to_local().clone() for parameter in model.parameters()])
+            grads.append([parameter.grad.clone() for parameter in model.parameters()])
             optimizer.step()
-        weights = [parameter.to_local().clone() for parameter in model.parameters()]
+        weights = [parameter.clone() for parameter in model.parameters()]
         return losses, grads, weights
 
     expected_losses, expected_grads, expected_weights = train(*build(None))

@@ -535,7 +535,7 @@ def _omit_empty_local_shards(param_groups: List[Dict]) -> List[Dict]:
     """Drop empty local shards from MFSDP v2 param groups."""
     for param_group in param_groups:
         param_group['params'] = [
-            parameter for parameter in param_group['params'] if parameter.to_local().numel() > 0
+            parameter for parameter in param_group['params'] if parameter.numel() > 0
         ]
     return [param_group for param_group in param_groups if param_group['params']]
 
