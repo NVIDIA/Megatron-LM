@@ -203,6 +203,42 @@ def test_mla_forward_flops_with_optional_query_projection(q_lora_rank, expected)
     )
 
 
+@pytest.mark.parametrize("q_lora_rank,mla_flops", [(None, 2222), (3, 2092)])
+def test_hybrid_flops_count_mla_layers(q_lora_rank, mla_flops):
+    """Each MLA ('+') layer in a hybrid pattern adds one MLA forward/backward."""
+    transformer_kwargs = dict(
+        transformer_cls=MLATransformerConfig,
+        experimental_attention_variant=None,
+        linear_attention_freq=None,
+        multi_latent_attention=True,
+        attention_output_gate=False,
+        apply_rope_fusion=False,
+        num_moe_experts=None,
+        num_query_groups=2,
+        q_lora_rank=q_lora_rank,
+        kv_lora_rank=4,
+        qk_head_dim=2,
+        qk_pos_emb_head_dim=2,
+        v_head_dim=3,
+    )
+
+    def flops(pattern):
+        config = _make_config(num_layers=len(pattern), **transformer_kwargs)
+        config = HybridModelConfig(
+            transformer=config.transformer, hybrid_layer_pattern=pattern, vocab_size=32
+        )
+        return num_floating_point_operations(
+            config,
+            batch_size=1,
+            sequence_length=8,
+            total_real_tokens_in_batch=5,
+            seqlen_squared_sum_in_batch=13,
+        )
+
+    # mla_flops is the forward estimate from test_mla_forward_flops_with_optional_query_projection.
+    assert flops("+-+-") - flops("--") == 2 * 3 * mla_flops
+
+
 @pytest.mark.parametrize(
     "layer_type,overrides,expected",
     [
