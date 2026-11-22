@@ -749,7 +749,7 @@ def _pipeline_tokens_from_batch(
     """Return one microbatch's tokens on ``device``, right-padded to the sequence capacity.
 
     Packed (THD) rows may be shorter than the capacity; they are zero-padded to it, the fixed
-    pipeline activation length (``seq_length``).
+    pipeline activation length (``max_seq_length_per_sample``).
     """
     if "tokens" not in batch:
         raise RuntimeError("Engram data batches must contain token IDs.")

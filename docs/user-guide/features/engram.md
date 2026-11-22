@@ -299,7 +299,8 @@ The tables' optimizer state follows the checkpoint format:
   `--attention-cp-layout` set to different layouts the memory must then sit on contiguous
   layers: a zigzag layer of such a stack gets a packed row in a padded per-sequence zigzag,
   which the memory does not follow. With pipeline parallelism packed rows require
-  `--pad-packed-seq-alignment max` and `--max-seqlen-per-dp-cp-rank` equal to `--seq-length`.
+  `--pad-packed-seq-alignment max` and `--max-seqlen-per-dp-cp-rank` equal to the packed row
+  width (`--max-seq-length-per-sample` when it is set, `--seq-length` otherwise).
   `--dataloader-inter-document-masking` with context parallelism requires `--sft`.
 - Activation recomputation replays the memory from the token IDs, on every rank of a row group
   together. A model that calls the module itself can replay the fusion alone, see

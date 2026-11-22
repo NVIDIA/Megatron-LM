@@ -151,6 +151,18 @@ def test_packed_sequence_detection_matches_the_dataset_packing_rule():
             sft=True, pipeline_model_parallel_size=2, max_seqlen_per_dp_cp_rank=512, seq_length=512
         )
     )
+    # --sft packs its rows to --max-seq-length-per-sample when that is set, so the capacity
+    # must follow it and not --seq-length.
+    pack_width_args = dict(
+        sft=True, pipeline_model_parallel_size=2, seq_length=256, max_seq_length_per_sample=512
+    )
+    assert _validate_packed_sequence_args(
+        _packed_args(max_seqlen_per_dp_cp_rank=512, **pack_width_args)
+    )
+    with pytest.raises(ValueError, match=r"packed row width \(512\)"):
+        _validate_packed_sequence_args(
+            _packed_args(max_seqlen_per_dp_cp_rank=256, **pack_width_args)
+        )
 
 
 def test_inter_document_masking_follows_the_pretrain_hybrid_cp_split():
@@ -419,11 +431,11 @@ def test_from_args_checks_the_layer_pattern_against_packed_rows(tmp_path):
         context_parallel_size=2, linear_cp_layout="contiguous", num_layers=2
     )
 
-    def arguments(layer_id):
+    def arguments(layer_id, **overrides):
         artifact = write_tokenizer_map(
             tmp_path / f"map_{layer_id}.json", vocab_size=16, layer_ids=(layer_id,)
         )
-        return _packed_args(
+        values = dict(
             sft=True,
             context_parallel_size=2,
             seq_length=64,
@@ -443,10 +455,19 @@ def test_from_args_checks_the_layer_pattern_against_packed_rows(tmp_path):
             engram_embedding_lr_multiplier=1.0,
             engram_embedding_weight_decay=0.0,
         )
+        values.update(overrides)
+        return _packed_args(**values)
 
     with pytest.raises(ValueError, match="run in the zigzag context-parallel layout"):
         EngramConfig.from_args(arguments(1), mixed)
     assert EngramConfig.from_args(arguments(2), mixed).layer_ids == (2,)
+    # --sft packs rows to --max-seq-length-per-sample when it is set, so the convolution history
+    # (9 positions here) is checked against that width: a contiguous slice of a 64-token row
+    # over two ranks holds it, that of a 16-token row does not.
+    wide_rows = arguments(2, seq_length=16, max_seq_length_per_sample=64)
+    assert EngramConfig.from_args(wide_rows, mixed).layer_ids == (2,)
+    with pytest.raises(ValueError, match="a row of 16 tokens over 2 context-parallel ranks"):
+        EngramConfig.from_args(arguments(2, seq_length=8, max_seq_length_per_sample=16), mixed)
 
 
 def test_unset_linear_cp_layout_is_treated_as_zigzag(tmp_path):

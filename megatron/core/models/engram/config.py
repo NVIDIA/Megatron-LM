@@ -192,6 +192,18 @@ _DYNAMIC_CONTEXT_PARALLEL_UNSUPPORTED = (
 )
 
 
+def _dataset_row_length(args: Any) -> int | None:
+    """Return the width of the rows the dataset emits, as ``validate_args`` resolves it.
+
+    The --sft dataset packs its rows to --max-seq-length-per-sample when that is set; every
+    other row holds --seq-length tokens.
+    """
+    row_length = None
+    if getattr(args, "sft", False):
+        row_length = getattr(args, "max_seq_length_per_sample", None)
+    return row_length if row_length is not None else getattr(args, "seq_length", None)
+
+
 def _validate_packed_sequence_args(args: Any) -> bool:
     """Return whether rows are packed sequences, rejecting packing setups Engram cannot follow.
 
@@ -233,13 +245,16 @@ def _validate_packed_sequence_args(args: Any) -> bool:
             "per-sequence zigzag, while Engram partitions packed zigzag rows per document."
         )
     if packed_sequences and args.pipeline_model_parallel_size > 1:
-        if args.max_seqlen_per_dp_cp_rank != args.seq_length:
-            # The prefetch pads tokens to seq_length while pad_sequence_for_thd pads to
-            # max_seqlen_per_dp_cp_rank; the identical-padding invariant needs equality.
+        row_length = _dataset_row_length(args)
+        if args.max_seqlen_per_dp_cp_rank != row_length:
+            # Pipeline activations and the prefetched tokens have the dataset's row width, and
+            # --pad-packed-seq-alignment max targets max_seqlen_per_dp_cp_rank, so the two
+            # capacities must agree.
             raise ValueError(
                 "Engram with packed sequences and pipeline parallelism requires "
-                f"--max-seqlen-per-dp-cp-rank ({args.max_seqlen_per_dp_cp_rank}) to equal "
-                f"--seq-length ({args.seq_length})."
+                f"--max-seqlen-per-dp-cp-rank ({args.max_seqlen_per_dp_cp_rank}) to equal the "
+                f"packed row width ({row_length}): --max-seq-length-per-sample when it is set, "
+                "--seq-length otherwise."
             )
     return packed_sequences
 
@@ -401,7 +416,7 @@ class EngramConfig:
         config.validate_startup(
             transformer_config,
             packed_sequences=packed_sequences,
-            sequence_length=getattr(args, "seq_length", None),
+            sequence_length=_dataset_row_length(args),
             hybrid_layer_pattern=getattr(args, "hybrid_layer_pattern", None),
             use_fsdp=bool(
                 getattr(args, "use_torch_fsdp2", False) or getattr(args, "use_megatron_fsdp", False)
@@ -650,7 +665,7 @@ class EngramConfig:
                 (--sft or the varlen dataset); rows that only carry document boundaries
                 (--dataloader-inter-document-masking) are not.
             use_fsdp: Whether the model is wrapped with FSDP.
-            sequence_length: Training sequence length, when known.
+            sequence_length: Width of the rows the dataset emits, when known.
             hybrid_layer_pattern: The hybrid layer pattern, when known; it gives the type, and
                 with it the context-parallel layout, of every layer that carries a memory.
         """
@@ -769,9 +784,9 @@ class EngramConfig:
                 if chunk_length < self.conv_history_length:
                     raise ValueError(
                         "Engram with context parallelism requires each zigzag chunk to own at "
-                        f"least {self.conv_history_length} positions, but seq_length "
-                        f"{sequence_length} over {context_parallel_size} context-parallel ranks "
-                        f"gives {chunk_length}."
+                        f"least {self.conv_history_length} positions, but a row of "
+                        f"{sequence_length} tokens over {context_parallel_size} context-parallel "
+                        f"ranks gives {chunk_length}."
                     )
             if CONTIGUOUS_CP_LAYOUT in layouts:
                 # A contiguous slice, packed or not, fetches its convolution history from the
@@ -780,9 +795,9 @@ class EngramConfig:
                 if slice_length < self.conv_history_length:
                     raise ValueError(
                         "Engram with context parallelism requires each contiguous slice to own "
-                        f"at least {self.conv_history_length} positions, but seq_length "
-                        f"{sequence_length} over {context_parallel_size} context-parallel ranks "
-                        f"gives {slice_length}."
+                        f"at least {self.conv_history_length} positions, but a row of "
+                        f"{sequence_length} tokens over {context_parallel_size} context-parallel "
+                        f"ranks gives {slice_length}."
                     )
         # Virtual pipeline parallelism needs no check: the tokens a layer hashes depend on the
         # microbatch, never on the model chunk.
@@ -794,8 +809,8 @@ class EngramConfig:
             if local_sequence_length < self.conv_history_length:
                 raise ValueError(
                     "Engram with sequence parallelism requires each tensor-parallel rank to own "
-                    f"at least {self.conv_history_length} positions, but seq_length "
-                    f"{sequence_length} over {tensor_parallel_size} ranks gives "
+                    f"at least {self.conv_history_length} positions, but a row of "
+                    f"{sequence_length} tokens over {tensor_parallel_size} ranks gives "
                     f"{local_sequence_length}."
                 )
 
