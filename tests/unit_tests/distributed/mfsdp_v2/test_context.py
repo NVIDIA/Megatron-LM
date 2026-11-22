@@ -154,9 +154,10 @@ def test_repeated_evaluation_between_training_steps(distributed_setup, prefetch_
     model(inputs).sum().backward()
 
     model.eval()
+    # Evaluation must leave the trace untouched with or without autograd enabled.
     with torch.no_grad():
-        for _ in range(2):
-            model(inputs)
+        model(inputs)
+    model(inputs)
 
     model.train()
     model.zero_grad(set_to_none=True)
