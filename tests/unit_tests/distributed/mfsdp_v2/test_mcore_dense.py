@@ -405,7 +405,7 @@ def test_unpadded_shards_pack_parameter_groups_without_padding(process_group_col
     assert group.shard_layout is ShardLayout.UNPADDED
     # Weight and bias share one bf16 group and pack back to back without padding.
     assert group.main_weight.layout.size == sum(
-        parameter.sharded.numel() for parameter in group.fsdp_parameters
+        parameter.unsharded.numel() for parameter in group.fsdp_parameters
     )
 
     with pytest.raises(ValueError, match="incompatible with nccl_ub"):

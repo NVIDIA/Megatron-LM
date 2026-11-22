@@ -1847,7 +1847,8 @@ def generate_state_dict(
     checkpoint section: the format shapes the template, and all three are recorded in the
     persisted arguments.
     """
-    checkpoint = get_run_config().checkpoint
+    cfg = get_run_config()
+    checkpoint = cfg.checkpoint
     if ckpt_format is None:
         ckpt_format = checkpoint.ckpt_format
     saved_policy = dict(ckpt_format=ckpt_format, save=save, verify_integrity=verify_integrity)
@@ -1863,7 +1864,7 @@ def generate_state_dict(
     )
     # Preserve the resolved vocabulary for checkpoint-args readers without updating runtime args
     # (#8401); the projection above is already a copy of the namespace.
-    padded_vocab_size = get_run_config().tokenizer.padded_vocab_size
+    padded_vocab_size = cfg.tokenizer.padded_vocab_size
     if getattr(args, 'padded_vocab_size', None) != padded_vocab_size:
         state_dict['args'].padded_vocab_size = padded_vocab_size
     state_dict['checkpoint_version'] = 3.1
@@ -1888,7 +1889,7 @@ def generate_state_dict(
             )
         else:  # torch, torch_dcp, fsdp_dtensor
             model_sd = model[i].state_dict_for_save_checkpoint()
-            if args.use_megatron_fsdp and args.megatron_fsdp_version == 2:
+            if cfg.ddp.use_megatron_fsdp and cfg.ddp.megatron_fsdp_version == 2:
                 # Save and load-template construction both reach here after unwrap_model().
                 for name, parameter in named_checkpoint_parameters(model[i]):
                     if name in model_sd:
