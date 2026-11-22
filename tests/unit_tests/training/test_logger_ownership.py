@@ -424,11 +424,12 @@ def test_moe_metric_names_match_load_balancing_type(
 
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
-    args = parser.parse_args(['--micro-batch-size', '1', '--num-layers', '2', '--num-experts', '4'])
+    args = parser.parse_args(['--micro-batch-size', '1', '--num-layers', '2'])
     args.data_parallel_size = args.world_size = args.gtp_weight_remat_size = 1
     args.dsa_indexer_loss_coeff = None
+    run_config.model.transformer.num_moe_experts = 4
     # validate_args stores a single load balancing type as a string.
-    args.moe_router_load_balancing_type = load_balancing_type
+    run_config.model.transformer.moe_router_load_balancing_type = load_balancing_type
     run_config.logger = LoggerConfig(log_interval=100)
     run_config.train.micro_batch_size = 1
     tracker = Mock()
