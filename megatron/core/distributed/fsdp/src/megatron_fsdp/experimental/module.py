@@ -290,7 +290,8 @@ class FsdpModule:
             """Whether this call can prefetch using the established training trace."""
             if context.is_recording_execution_order:
                 return False
-            # Evaluation gathers on demand instead of consuming the training trace.
+            # Evaluation usually runs forward only, so it needs a different execution
+            # order from the training trace, which includes backward events.
             if not cast(nn.Module, self).training:
                 return False
             if context.prefetch_order is PrefetchOrder.RECORDED:
