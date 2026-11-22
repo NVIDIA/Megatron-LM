@@ -1874,7 +1874,7 @@ def generate_state_dict(
             'data_parallel_size': (
                 cfg.get_data_parallel_size()
                 if isinstance(cfg, PretrainConfigContainer)
-                else mpu.get_data_parallel_world_size()
+                else mpu.get_data_parallel_world_size(with_gtp_remat=False)
             ),
         }
     if iteration is not None:
@@ -3163,7 +3163,8 @@ def load_checkpoint(
         )
         run_dp = (
             cfg.get_data_parallel_size()
-            if isinstance(cfg, PretrainConfigContainer) else args.data_parallel_size
+            if isinstance(cfg, PretrainConfigContainer)
+            else mpu.get_data_parallel_world_size(with_gtp_remat=False)
         )
         mismatch_msg = '(TP, PP) mismatch after resume ({} vs {} from checkpoint)'.format(
             run_tp_pp, ckpt_tp_pp

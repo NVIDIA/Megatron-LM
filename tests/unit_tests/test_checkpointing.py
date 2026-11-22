@@ -1615,6 +1615,8 @@ def test_checkpoint_load_without_microbatch_calculator(
                     args, model_cfg=run_config.model, build_model_config=False
                 ),
             )
+            # Runtime topology, not CLI metadata, supplies inference/conversion DP size.
+            del args.data_parallel_size
         if is_inference:
             with mock.patch(
                 "megatron.training.checkpointing.get_rerun_state_machine",
