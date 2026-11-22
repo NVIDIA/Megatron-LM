@@ -20,7 +20,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 class _ForwardEngine(EngineLoopMixin):
     """Just enough engine state for one legacy-mode `async_forward`."""
 
-    def __init__(self, controller_result):
+    def __init__(self, controller_result) -> None:
         self.state = EngineState.RUNNING
         self.logging_step_interval = 0
         self.context = SimpleNamespace(
@@ -72,7 +72,7 @@ class _WaitingRequestEngine(EngineLoopMixin):
     peers, `peer_work` is the largest work level the peers report.
     """
 
-    def __init__(self, admits, ep_world_size=1, peer_work=0):
+    def __init__(self, admits, ep_world_size=1, peer_work=0) -> None:
         self.state = EngineState.RUNNING
         self.context = SimpleNamespace(
             get_active_request_count=lambda: 0, step_count=0, prefix_cache_lru_clock=0
@@ -172,6 +172,41 @@ def test_coordinator_loop_retries_a_blocked_request_after_each_idle_pass():
     assert (engine.steps, engine.idle_passes) == (3, 3)
 
 
+def test_standalone_loop_yields_and_retries_after_capacity_is_released():
+    async def main():
+        engine = _WaitingRequestEngine(admits=False)
+        engine._cond = asyncio.Condition()
+        engine._poll_pending_kv_imports = lambda: None
+        engine._poll_pending_kv_pushes = lambda: None
+        admitted = asyncio.Event()
+        inner_step = engine.async_step
+
+        async def step():
+            await inner_step()
+            if engine.admits:
+                admitted.set()
+
+        engine.async_step = step
+        task = asyncio.create_task(EngineLoopMixin.run_engine.__wrapped__(engine))
+        try:
+            # The blocked step must yield, or this test task never resumes.
+            await asyncio.sleep(0)
+            assert engine.steps == 1
+            assert engine.waiting_request_ids == [1]
+            # Releasing capacity lets the same queued request be admitted on retry.
+            engine.admits = True
+            await asyncio.wait_for(admitted.wait(), timeout=1)
+            assert engine.steps == 2
+            assert engine.waiting_request_ids == []
+            assert engine.context.step_count == 2
+            assert engine.context.prefix_cache_lru_clock == 2
+        finally:
+            task.cancel()
+            await task
+
+    asyncio.run(main())
+
+
 def _run_passes(engine, count):
     """Run the coordinator loop for `count` passes; return each pass's events."""
 
@@ -243,7 +278,7 @@ def test_blocked_expert_parallel_rank_lets_other_tasks_run():
 class _ReleasesAFailedImportEngine(_WaitingRequestEngine):
     """Starts with a failed KV import to release and no waiting request."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__(admits=True)
         self.waiting_request_ids = []
         self.has_admittable_kv_import = True
@@ -283,7 +318,7 @@ def test_unpausing_retries_a_stalled_queue_at_once():
 class _MaxAllReduce:
     """An all-reduce of (work, consensus) by max across ranks, matched by call order."""
 
-    def __init__(self, size):
+    def __init__(self, size) -> None:
         self.size = size
         self.rounds = []
         self.calls = [0] * size
@@ -318,7 +353,7 @@ class _ExpertParallelRank(_WaitingRequestEngine):
         decode_steps=0,
         pause_at_pass=None,
         stop_after=30,
-    ):
+    ) -> None:
         super().__init__(admits=not blocked, ep_world_size=2)
         self.rank = rank
         self.all_reduce, self.barrier = collectives
