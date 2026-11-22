@@ -297,9 +297,12 @@ def test_checkpoint_replay_reuses_first_call_topk(tp, cp, stash, indexer_call_lo
         config.dsa_indexer_reuse_checkpoint_topk = False
         baseline = _checkpointed_step(attention, inputs, grad_output_seed=7)
         assert indexer_call_log["dense"] == [False, True]
-        assert indexer_call_log["from_topk"] == 0
+        # Without reuse the replay selects again, with scores, and its loss reads the
+        # sparse attention's LSE after the attention: one stored-top-k loss call.
+        assert indexer_call_log["from_topk"] == 1
 
         indexer_call_log["dense"].clear()
+        indexer_call_log["from_topk"] = 0
         warnings = []
         monkeypatch.setattr(
             dsa_module,
@@ -321,6 +324,8 @@ def test_checkpoint_replay_reuses_first_call_topk(tp, cp, stash, indexer_call_lo
             assert warnings == []
         else:
             assert indexer_call_log["dense"] == [False, True]
+            # With the scored selection declined, the replay falls back to the fused top-k
+            # with its own loss.
             assert indexer_call_log["from_topk"] == 0
             assert warnings == [(1, "its first call stored no top-k scores")]
 
@@ -331,6 +336,58 @@ def test_checkpoint_replay_reuses_first_call_topk(tp, cp, stash, indexer_call_lo
         # Atomic accumulation in the sparse backward kernels differs run to run, and
         # reuse also changes the slot order inside the selected set (fp32 reduction
         # order), so values agree to rounding.
+        torch.testing.assert_close(loss, baseline_loss, rtol=1e-4, atol=1e-7)
+        for name, grad in grads.items():
+            _assert_similar(grad, baseline_grads[name], label=name, eps=1e-4)
+    finally:
+        DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+        Utils.destroy_model_parallel()
+
+
+def test_trained_sparse_loss_reads_the_attention_lse(monkeypatch):
+    """The trained sparse indexer loss reuses the main sparse attention's LSE.
+
+    Without the deferral the loss runs the sparse attention forward once more for its LSE.
+    Both orders compute the same attention; the loss and the gradients agree to rounding (the
+    deferred loss reads the selected set in index order).
+    """
+    _skip_if_cudnn_dsa_unavailable(1)
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+    try:
+        model_parallel_cuda_manual_seed(1234)
+        torch.manual_seed(1234)
+        DSAIndexerLossAutoScaler.set_loss_scale(torch.ones((), device="cuda"))
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
+        config = _make_config(tp=1, cp=1)
+        config.dsa_indexer_reuse_checkpoint_topk = False
+        attention = _make_attention(config, pg_collection)
+        inputs = _make_inputs(config, tp_rank=0, cp_rank=0, cp=1)
+
+        forwards = []
+        sparse_forward = dsa_cudnn_kernels._run_sparse_attention_forward
+
+        def counting_forward(*args, **kwargs):
+            forwards.append(1)
+            return sparse_forward(*args, **kwargs)
+
+        monkeypatch.setattr(dsa_cudnn_kernels, "_run_sparse_attention_forward", counting_forward)
+        deferred = _checkpointed_step(attention, inputs, grad_output_seed=7)
+        # The first (no-grad) call and the replay each run the attention once.
+        assert len(forwards) == 2
+
+        forwards.clear()
+        monkeypatch.setattr(
+            dsa_kernels,
+            "fused_absorbed_sparse_attention_decline_reason",
+            lambda *_args, **_kwargs: "forced off by the test",
+        )
+        eager_loss = _checkpointed_step(attention, inputs, grad_output_seed=7)
+        # The replay's loss runs its own sparse attention forward for the LSE.
+        assert len(forwards) == 3
+
+        output, loss, grads = deferred
+        baseline_output, baseline_loss, baseline_grads = eager_loss
+        torch.testing.assert_close(output, baseline_output, rtol=0, atol=0)
         torch.testing.assert_close(loss, baseline_loss, rtol=1e-4, atol=1e-7)
         for name, grad in grads.items():
             _assert_similar(grad, baseline_grads[name], label=name, eps=1e-4)

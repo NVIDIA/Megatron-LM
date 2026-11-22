@@ -441,12 +441,15 @@ def run_sparse_indexer_loss_from_topk(
     pg_collection: ProcessGroupCollection,
     query_valid_rows: Optional[Tensor] = None,
     calculate_per_token_loss: bool = False,
+    lse: Optional[Tensor] = None,
 ) -> Optional[Tensor]:
     """Optional sparse indexer-loss hook for an already selected top-k set.
 
     Consumes the output of ``run_fused_qk_topk_with_scores`` instead of rerunning the
     dense indexer and top-k. Returns a graph-connected loss whose backward produces the
-    indexer ``q``/``k``/``weights`` gradients, or None when the backend declines.
+    indexer ``q``/``k``/``weights`` gradients, or None when the backend declines. ``lse`` is
+    the ``[sq, b, np]`` LSE that ``run_fused_absorbed_sparse_attention`` returned for these
+    same ids; a backend that takes it skips its own sparse-attention forward for the target.
     """
     fn = _resolve_fused_hook(config, "run_sparse_indexer_loss_from_topk")
     if fn is None:
@@ -466,6 +469,7 @@ def run_sparse_indexer_loss_from_topk(
         pg_collection=pg_collection,
         query_valid_rows=query_valid_rows,
         calculate_per_token_loss=calculate_per_token_loss,
+        **filter_kwargs_for_callable(fn, {"lse": lse} if lse is not None else {}),
     )
     if result is None:
         _log_declined_hook(config, "run_sparse_indexer_loss_from_topk", "backend returned None")
@@ -545,6 +549,23 @@ def run_fused_qk_topk_with_loss(
     if result is None:
         _log_declined_hook(config, "run_fused_qk_topk_with_loss", "backend returned None")
     return result
+
+
+def fused_absorbed_sparse_attention_decline_reason(
+    config: TransformerConfig, query: Tensor, key: Tensor
+) -> Optional[str]:
+    """Why the backend's fused absorbed sparse attention would decline, or None if it runs.
+
+    Host facts only (the backend's ``fused_absorbed_sparse_attention_decline_reason`` hook),
+    so a caller can learn before selecting whether ``return_lse=True`` will get an LSE.
+    """
+    fn = _resolve_fused_hook(config, "fused_absorbed_sparse_attention_decline_reason")
+    if fn is None:
+        return (
+            f"DSA kernel backend {_get_dsa_kernel_backend(config)!r} reports no fused absorbed "
+            "sparse attention"
+        )
+    return fn(query, key, int(getattr(config, "kv_lora_rank", 0) or 0))
 
 
 def run_fused_absorbed_sparse_attention(
@@ -685,6 +706,7 @@ def run_fused_dsa_attention(
 
 
 __all__ = [
+    "fused_absorbed_sparse_attention_decline_reason",
     "run_fused_absorbed_sparse_attention",
     "run_fused_dsa_attention",
     "run_fused_qk_topk",

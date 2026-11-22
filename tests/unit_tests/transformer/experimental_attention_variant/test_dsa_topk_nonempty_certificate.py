@@ -731,7 +731,9 @@ def test_shared_certificate_is_bitwise_identical_on_cudnn(
                 recompute=recompute,
                 share_certificate=share_certificate,
             )
-            assert len(reused_topk_losses) == int(recompute == "full-reuse-topk")
+            # The producer's sparse indexer loss runs after the attention from its LSE, through
+            # the stored-top-k loss, under every recompute mode (once per step).
+            assert len(reused_topk_losses) == 1
             # Before certificates were shared, every consumer call received False.
             consumer_flags = [share_certificate] * _CONSUMERS
             forward_flags = [True] + consumer_flags

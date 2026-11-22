@@ -5852,6 +5852,8 @@ class DSAttention(MegatronModule):
             )
 
         indexer_loss = None
+        # Selected-score payload of a sparse indexer loss that runs after the sparse attention.
+        deferred_loss_topk_scores = None
 
         def reject_mxfp8_reference_fallback(what: str) -> None:
             if not use_fused_kernels:
@@ -6020,7 +6022,25 @@ class DSAttention(MegatronModule):
                 )
         elif use_indexer_loss:
             assert q is not None and k is not None and weights is not None
-            finish_cp_kv_gather()
+            # The sparse indexer loss reads the LSE of the main sparse attention over the
+            # selected ids. When that attention runs fused (and so returns its LSE), the loss
+            # runs after it (deferred_loss_topk_scores) instead of running the attention
+            # forward a second time for the LSE. Host facts only: the key's shape stands in
+            # while its CP gather is in flight.
+            defer_sparse_loss = (
+                sparse_indexer_loss
+                and absorbed_mla
+                and use_fused_kernels
+                and indexer_loss_coeff > 0
+                and dsa_kernels.fused_absorbed_sparse_attention_decline_reason(
+                    self.config,
+                    query,
+                    key if cp_kv_gather is None else cp_kv_gather.key_shape_twin(key),
+                )
+                is None
+            )
+            if not defer_sparse_loss:
+                finish_cp_kv_gather()
             # ===================================
             # Attach indexer topk and loss
             # ===================================
@@ -6043,23 +6063,28 @@ class DSAttention(MegatronModule):
                             f"{stashed_key_len} and rows {tuple(stashed_indices.shape[:2])}, "
                             f"replay key length {skv} and rows {(b, sq)}."
                         )
-                    stashed_loss = dsa_kernels.run_sparse_indexer_loss_from_topk(
-                        self.config,
-                        q,
-                        k,
-                        weights,
-                        topk_indices=stashed_indices,
-                        topk_length=stashed_length,
-                        topk_scores=stashed_scores,
-                        query=query.detach(),
-                        key=key.detach(),
-                        softmax_scale=self.softmax_scale,
-                        loss_coeff=indexer_loss_coeff,
-                        pg_collection=self.pg_collection,
-                        query_valid_rows=query_valid_rows,
-                        calculate_per_token_loss=self.config.calculate_per_token_loss,
-                    )
-                    if stashed_loss is None:
+                    stashed_loss = None
+                    if defer_sparse_loss:
+                        # The stored selection's loss runs after the sparse attention.
+                        deferred_loss_topk_scores = stashed_scores
+                    else:
+                        stashed_loss = dsa_kernels.run_sparse_indexer_loss_from_topk(
+                            self.config,
+                            q,
+                            k,
+                            weights,
+                            topk_indices=stashed_indices,
+                            topk_length=stashed_length,
+                            topk_scores=stashed_scores,
+                            query=query.detach(),
+                            key=key.detach(),
+                            softmax_scale=self.softmax_scale,
+                            loss_coeff=indexer_loss_coeff,
+                            pg_collection=self.pg_collection,
+                            query_valid_rows=query_valid_rows,
+                            calculate_per_token_loss=self.config.calculate_per_token_loss,
+                        )
+                    if stashed_loss is None and deferred_loss_topk_scores is None:
                         reuse_failure = "the kernel backend declined the stored top-k"
                     else:
                         topk_indices = stashed_indices
@@ -6069,6 +6094,39 @@ class DSAttention(MegatronModule):
                 if reuse_failure is not None:
                     _warn_dsa_checkpoint_topk_reuse_fallback(self.layer_number, reuse_failure)
 
+            if (
+                defer_sparse_loss
+                and sparse_indexer_loss
+                and fused_bounds is not None
+                and topk_indices is None
+            ):
+                starts_i32, ends_i32 = fused_bounds
+                block_size = int(getattr(self, "fused_indexer_block_size", 8192))
+                fused_topk_with_scores = dsa_kernels.run_fused_qk_topk_with_scores(
+                    self.config,
+                    q,
+                    k,
+                    weights,
+                    self.index_topk,
+                    starts_i32,
+                    ends_i32,
+                    block_size=max(1, block_size),
+                    use_relu=self.config.dsa_indexer_scoring_relu,
+                    use_local_indexer_varlen=use_local_indexer_varlen,
+                    single_packed_thd_sequence=single_packed_thd_sequence,
+                    local_packed_cp_rank=cp_rank,
+                    local_packed_cp_query_start=local_packed_cp_query_start,
+                    local_packed_cp_query_len=local_packed_cp_query_len,
+                    packed_seq_params=packed_seq_params,
+                    cp_size=cp_size,
+                    varlen_is_plain_causal=varlen_is_plain_causal,
+                    query=query,
+                    key=key if cp_kv_gather is None else cp_kv_gather.key_shape_twin(key),
+                )
+                if fused_topk_with_scores is not None:
+                    topk_indices, topk_length, deferred_loss_topk_scores = fused_topk_with_scores
+            if topk_indices is None:
+                finish_cp_kv_gather()
             if sparse_indexer_loss and fused_bounds is not None and topk_indices is None:
                 starts_i32, ends_i32 = fused_bounds
                 block_size = int(getattr(self, "fused_indexer_block_size", 8192))
@@ -6101,14 +6159,16 @@ class DSAttention(MegatronModule):
                 if fused_topk_with_loss is not None:
                     topk_indices, topk_length, indexer_loss = fused_topk_with_loss
 
-            if topk_indices is None or indexer_loss is None:
+            if topk_indices is None or (indexer_loss is None and deferred_loss_topk_scores is None):
+                finish_cp_kv_gather()
                 reject_mxfp8_reference_fallback("indexer top-k and loss")
+                deferred_loss_topk_scores = None
                 topk_indices, indexer_loss = compute_indexer_loss_with_reference_path()
             # No TP-local top-k slicing here: the guard above forbids the indexer loss
             # under sequence-local TP query shards, so the top-k rows are already global.
 
-            # Save indexer loss for logging.
-            if indexer_loss_coeff > 0:
+            # Save indexer loss for logging (a deferred loss is saved after the attention).
+            if indexer_loss_coeff > 0 and deferred_loss_topk_scores is None:
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                     loss=indexer_loss,
                     raw_loss=indexer_loss / indexer_loss_coeff,
@@ -6287,10 +6347,51 @@ class DSAttention(MegatronModule):
             varlen_ends=varlen_ends,
             key_positions=key_positions,
             all_topk_rows_nonempty=all_topk_rows_nonempty,
-            # The cuDNN KPool teacher reads the attention's own LSE; asked for only then, so
-            # every other call is unchanged. The output is the same either way.
-            **({"return_lse": True} if kpool_cudnn_loss else {}),
+            # The cuDNN KPool teacher and a deferred sparse indexer loss read the attention's
+            # own LSE; asked for only then, so every other call is unchanged. The output is the
+            # same either way.
+            **(
+                {"return_lse": True}
+                if kpool_cudnn_loss or deferred_loss_topk_scores is not None
+                else {}
+            ),
         )
+
+        if deferred_loss_topk_scores is not None:
+            output, attention_lse = output
+            indexer_loss = dsa_kernels.run_sparse_indexer_loss_from_topk(
+                self.config,
+                q,
+                k,
+                weights,
+                topk_indices=topk_indices,
+                topk_length=topk_length,
+                topk_scores=deferred_loss_topk_scores,
+                query=query.detach(),
+                key=key.detach(),
+                softmax_scale=self.softmax_scale,
+                loss_coeff=indexer_loss_coeff,
+                pg_collection=runtime_pg_collection,
+                query_valid_rows=query_valid_rows,
+                calculate_per_token_loss=self.config.calculate_per_token_loss,
+                lse=attention_lse,
+            )
+            del attention_lse, deferred_loss_topk_scores
+            if indexer_loss is None:
+                raise RuntimeError(
+                    f"DSA layer {self.layer_number}: the kernel backend declined the sparse "
+                    "indexer loss of a top-k it selected with scores."
+                )
+            DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+                loss=indexer_loss,
+                raw_loss=indexer_loss / indexer_loss_coeff,
+                layer_number=self.layer_number,
+                num_layers=max(
+                    self.layer_number, self.config.num_layers + (self.config.mtp_num_layers or 0)
+                ),
+                reduce_group=indexer_reduce_group,
+                avg_group=indexer_avg_group,
+            )
 
         if kpool_cudnn_loss:
             output, attention_lse = output
