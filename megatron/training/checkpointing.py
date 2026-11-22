@@ -375,7 +375,10 @@ def check_checkpoint_args(
                 f'the input argument value ({args_value}).'
             )
     if cfg.tokenizer.vocab_file:
-        _compare('max_position_embeddings', config_section='model', config_name='seq_length')
+        # This is a parameter-shape constraint for learned position tables, not
+        # a context-length restriction on RoPE/YaRN checkpoint reuse.
+        if getattr(cfg.model, 'position_embedding_type', 'learned_absolute') == 'learned_absolute':
+            _compare('max_position_embeddings', config_section='model', config_name='seq_length')
         _compare('make_vocab_size_divisible_by', config_section='model')
         if not use_dist_ckpt:
             _compare('padded_vocab_size', config_section='tokenizer')

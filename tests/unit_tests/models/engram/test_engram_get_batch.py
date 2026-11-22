@@ -5,8 +5,7 @@
 Middle pipeline stages build no dataset unless rows are packed, so they must take the row
 without advancing their data iterator and split it over context parallelism exactly like the
 hidden states. Each case runs the real get_batch in spawned Gloo processes on CPU; only the
-arguments, the run config, the parallel-state getters and, where noted, the prefetch wrapper
-are stubbed. The cases spawn their own one- and two-process worlds instead of using the
+run config, the parallel-state getters and, where noted, the prefetch wrapper are stubbed. The cases spawn their own one- and two-process worlds instead of using the
 torchrun world, so the CP and PP groups have the sizes each case needs whatever the CI world
 size.
 """
@@ -73,12 +72,13 @@ def _stub_get_batch(*, cp_size, pp_size, cp_group, first_or_last, pp_first, pp_l
 
     Returns the transformer config get_batch reads, whose ``engram_enabled`` the cases toggle.
     """
-    args = SimpleNamespace(
-        sft=sft,
-        dataloader_inter_document_masking=False,
-        create_attention_mask_in_dataloader=False,
-        micro_batch_size=MICRO_BATCH_SIZE,
-        seq_length=SEQ_LENGTH,
+    # The data section's predicates, as megatron.training.config.DataConfig derives them from
+    # the dataset: SFT rows carry cu_seqlens and are not balanced per sequence over CP.
+    data = SimpleNamespace(
+        dataset=SimpleNamespace(sequence_length=SEQ_LENGTH),
+        has_cu_seqlens=lambda: sft,
+        use_per_sequence_balancing=lambda: False,
+        creates_attention_mask=lambda: False,
     )
     # get_batch reads the parallel layout and the Engram switch from the run config.
     config = SimpleNamespace(
@@ -94,9 +94,12 @@ def _stub_get_batch(*, cp_size, pp_size, cp_group, first_or_last, pp_first, pp_l
         tensor_model_parallel_size=1,
         engram_enabled=True,
     )
-    run_config = SimpleNamespace(model=SimpleNamespace(transformer=config))
+    run_config = SimpleNamespace(
+        model=SimpleNamespace(transformer=config),
+        data=data,
+        train=SimpleNamespace(micro_batch_size=MICRO_BATCH_SIZE),
+    )
     tp_group = _own_group()
-    pretrain_hybrid.get_args = lambda: args
     pretrain_hybrid.get_run_config = lambda: run_config
     pretrain_hybrid.mtp_on_this_rank_func = lambda **_kwargs: False
     pretrain_hybrid.is_first_or_last_pipeline_stage = first_or_last
