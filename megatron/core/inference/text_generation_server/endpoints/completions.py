@@ -31,7 +31,7 @@ def detokenize(prompt, tok) -> list[str]:
         if all(isinstance(item, str) for item in prompt):
             return prompt
         elif all(isinstance(item, int) for item in prompt):
-            return [tok.detokenize(prompt[0])]
+            return [tok.detokenize(prompt)]
         elif all(  # list[list[int]]
             isinstance(item, list) and all(isinstance(subitem, int) for subitem in item)
             for item in prompt
@@ -178,9 +178,14 @@ class MegatronCompletions(Resource):
             truncated_generation = prompt_plus_generation[str_trunc_start_idx:str_trunc_end_idx]
 
             # TODO(sasatheesh): handle cases where truncated_generation is not a full token
-            tok_idx_end = np.searchsorted(tok_offsets, len(truncated_generation))
+            # tok_offsets are character offsets into the whole prompt_plus_generation.
+            tok_idx_end = np.searchsorted(tok_offsets, str_trunc_end_idx)
 
-            truncated_generation_logprobs = output_log_probs[batch_idx][tok_idx_start:tok_idx_end]
+            # output_log_probs[batch_idx][i] scores token i + 1 (the first token has no
+            # log-prob), so prepend None to align log-probs with tokens.
+            truncated_generation_logprobs = ([None] + output_log_probs[batch_idx])[
+                tok_idx_start:tok_idx_end
+            ]
             truncated_generation_tokens = tokens[batch_idx][tok_idx_start:tok_idx_end]
             truncated_generation_topk_logprobs = (
                 logprobs_topk[batch_idx][tok_idx_start:tok_idx_end]
@@ -195,7 +200,7 @@ class MegatronCompletions(Resource):
                     "index": batch_idx,
                     "text": truncated_generation,
                     "logprobs": {
-                        "token_logprobs": [None] + truncated_generation_logprobs,
+                        "token_logprobs": truncated_generation_logprobs,
                         "tokens": [
                             tokenizer.detokenize([tk]) for tk in truncated_generation_tokens
                         ],
