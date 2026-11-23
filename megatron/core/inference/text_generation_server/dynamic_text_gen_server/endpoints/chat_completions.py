@@ -484,7 +484,13 @@ def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None
                         "Media types in one message must use the same content-part separator."
                     )
                 separator = separators.pop()
-            msg_copy["content"] = separator.join(chunk for chunk in text_chunks if chunk)
+                msg_copy["content"] = separator.join(chunk for chunk in text_chunks if chunk)
+            elif msg_copy.get("role") == "tool":
+                # vLLM joins the text parts of a tool result with newlines, whatever the
+                # template's content format.
+                msg_copy["content"] = "\n".join(text_chunks)
+            else:
+                msg_copy["content"] = "".join(text_chunks)
         elif isinstance(content, dict):
             msg_copy["content"] = str(content.get("text", ""))
         elif content is None:

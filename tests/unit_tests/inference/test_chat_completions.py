@@ -652,6 +652,34 @@ def test_sanitize_messages_leaves_reasoning_of_other_roles_alone():
     assert _sanitize_messages_for_template([message]) == [message]
 
 
+@pytest.mark.parametrize(
+    "content, expected",
+    [
+        pytest.param(
+            [{"type": "text", "text": "18 C, sunny"}, {"type": "text", "text": "Wind: 12 km/h"}],
+            "18 C, sunny\nWind: 12 km/h",
+            id="text-parts",
+        ),
+        pytest.param(["a", {"type": "text", "text": ""}, {"text": "b"}], "a\n\nb", id="every-part"),
+        pytest.param([{"type": "text", "text": "only"}], "only", id="one-part"),
+        pytest.param([], "", id="no-parts"),
+        pytest.param("as a string", "as a string", id="string"),
+        pytest.param(None, "", id="none"),
+    ],
+)
+def test_sanitize_messages_joins_tool_result_text_parts_with_newlines(content, expected):
+    tool = {"role": "tool", "tool_call_id": "call_1", "content": content}
+    user = {"role": "user", "content": content}
+
+    sanitized_tool, sanitized_user = _sanitize_messages_for_template([tool, user])
+
+    assert sanitized_tool == {**tool, "content": expected}
+    # Other roles keep joining text parts without a separator.
+    assert sanitized_user["content"] == (
+        expected.replace("\n", "") if isinstance(content, list) else expected
+    )
+
+
 def test_sanitize_messages_coerces_tool_call_arguments_to_mappings():
     calls = [
         {"function": {"name": "a", "arguments": '{"x": 1}'}},
