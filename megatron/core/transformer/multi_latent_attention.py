@@ -31,7 +31,10 @@ from megatron.core.packed_seq_params import resolve_cp_group
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
@@ -290,6 +293,8 @@ class MultiLatentAttention(Attention):
         is_mtp_layer: bool = False,
         name: str | None = None,
     ) -> None:
+        if config.context_parallel_size > 1 and config.attention_cp_layout == "contiguous":
+            raise ValueError("MultiLatentAttention does not support contiguous attention CP.")
         # TODO(nschank): Restructure so that the Attention initializer knows which specific
         # submodules it will construct, so that MLASelfAttentionSubmodules honors that interface.
         super().__init__(
@@ -742,6 +747,7 @@ class MLASelfAttention(MultiLatentAttention):
         name: str | None = None,
     ):
         if pg_collection is None:
+            warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
         super().__init__(
@@ -1595,6 +1601,7 @@ class FusedMLASelfAttention(MLASelfAttention):
         name: str | None = None,
     ):
         if pg_collection is None:
+            warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
         MultiLatentAttention.__init__(

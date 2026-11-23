@@ -1,17 +1,17 @@
-<!---
+{/*
    Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
    NVIDIA CORPORATION and its licensors retain all intellectual property
    and proprietary rights in and to this software, related documentation
    and any modifications thereto. Any use, reproduction, disclosure or
    distribution of this software and related documentation without an express
    license agreement from NVIDIA CORPORATION is strictly prohibited.
--->
+*/}
 
 # Llama, Mistral and other Llama-like model support in Megatron-LM
 
 NOTE: In order to simplify code we now only support converting llama-3.x and mistral checkpoints downloaded from Hugging Face. For converting other models, see [Megatron Bridge](models/index.md).
 
-The Llama-2 and Llama-3.x family of models are an open-source set of pretrained & finetuned (for chat) models that have achieved strong results across a wide set of benchmarks. At their times of release, both Llama-2 and Llama-3 models achieved among the best results for open-source models, and were competitive with leading closed-source models (see <https://arxiv.org/pdf/2307.09288.pdf>).
+The Llama-2 and Llama-3.x family of models are an open-source set of pretrained & finetuned (for chat) models that have achieved strong results across a wide set of benchmarks. At their times of release, both Llama-2 and Llama-3 models achieved among the best results for open-source models, and were competitive with leading closed-source models (see [https://arxiv.org/pdf/2307.09288.pdf](https://arxiv.org/pdf/2307.09288.pdf)).
 
 Similarly, [Mistral-7b](https://mistral.ai/news/announcing-mistral-7b/) is an open-source model with pretrained and finetuned (for chat) variants that achieve strong benchmark results.
 
@@ -105,7 +105,7 @@ If loading for either inference or finetuning, use the following arguments:
 
 ### Launch Huggingface
 
-Huggingface checkpoints can be launched with: <https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py>
+Huggingface checkpoints can be launched with: [https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py](https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py)
 
 ## Benchmark results
 
@@ -346,5 +346,5 @@ Many models such as Yi-34B and Qwen2.x use the Llama architecture and may be con
 
 It is not expected that the megatron and Huggingface implementations of llama3.x and mistral models will produce numerically identical results. There are multiple points where small numerical differences are expected. This is a non-exhaustive list:
 
-1. TransformerEngine (TE) uses the model params_dtype inside RMSNorm whereas the Huggingface implementation uses fp32. See for details: <https://github.com/NVIDIA/TransformerEngine/issues/1132>
+1. TransformerEngine (TE) uses the model params_dtype inside RMSNorm whereas the Huggingface implementation uses fp32. See for details: [https://github.com/NVIDIA/TransformerEngine/issues/1132](https://github.com/NVIDIA/TransformerEngine/issues/1132)
 2. Huggingface `transformers` implements the q, k and v projections in self-attention as separate GEMMs whereas Megatron core combines them into a single GEMM for efficiency. This leads to small numerical differences.

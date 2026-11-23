@@ -350,12 +350,13 @@ def _forward(case, model, experts):
         hook.remove()
 
 
-def _forward_with_fp32_intermediates(case, model, experts, monkeypatch):
-    """Keep the unfused MXFP8 reference's intermediates at the fused kernel's precision.
+def _forward_with_fp32_intermediates(case, model, experts, monkeypatch, *, precision):
+    """Keep the unfused reference's intermediates at the fused kernel's precision.
 
-    This is forward-only: parameters and MXFP8 quantizers are unchanged, while FC1,
-    SwiGLU and FC2 keep FP32 intermediates until the final BF16 output. Casting an
-    already rounded BF16 result to FP32 would not recover the lost precision.
+    This is forward-only: FC1 and SwiGLU keep FP32 intermediates. The BF16 kernel
+    rounds the activation before FC2; MXFP8 quantizes it directly from FP32. Both
+    paths add FC2's scaled bias before the final BF16 cast. Casting an already
+    rounded BF16 result to FP32 would not recover the lost precision.
     """
     from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU
 
@@ -373,8 +374,40 @@ def _forward_with_fp32_intermediates(case, model, experts, monkeypatch):
             return original_linear(op, **kwargs)
         assert not torch.is_grad_enabled() and not torch.is_autocast_enabled()
         assert kwargs["dtype"] == torch.bfloat16
-        assert kwargs["with_quantized_compute"] and kwargs["out_buffer"] is None
+        assert kwargs["out_buffer"] is None
         is_fc2 = op is ops[2]
+        if precision == "bf16":
+            assert not kwargs["with_quantized_compute"]
+            assert kwargs["input_"].dtype == torch.bfloat16 and op.has_bias
+            splits = kwargs["split_sizes"].tolist()
+            weights = (
+                op.weight.rowwise_data.reshape(op.num_groups, op.out_features, op.in_features)
+                if op.single_grouped_weight
+                else [getattr(op, f"weight{idx}") for idx in range(op.num_groups)]
+            )
+            biases = (
+                op.bias.rowwise_data.reshape(op.num_groups, op.out_features)
+                if op.single_grouped_bias
+                else [getattr(op, f"bias{idx}") for idx in range(op.num_groups)]
+            )
+            scales = kwargs["scales"]
+            scale_splits = (
+                torch.split(scales, splits) if scales is not None else [None] * len(splits)
+            )
+            outputs = []
+            for input_, weight, bias, scale in zip(
+                torch.split(kwargs["input_"], splits), weights, biases, scale_splits
+            ):
+                assert weight.dtype == torch.bfloat16
+                output = torch.mm(input_, weight.T, out_dtype=torch.float32)
+                bias = bias.float()
+                if scale is not None:
+                    bias = scale.float().unsqueeze(-1) * bias
+                outputs.append(output + bias)
+            output = torch.cat(outputs)
+            calls.append("fc2" if is_fc2 else "fc1")
+            return (output.bfloat16() if is_fc2 else output), ()
+        assert precision == "mxfp8" and kwargs["with_quantized_compute"]
         assert kwargs["input_"].dtype == (torch.float32 if is_fc2 else torch.bfloat16)
         # Override after TE checks grouped-path eligibility using the BF16 parameters.
         # FC2 must also keep FP32, or it would round the activation before quantizing it.
@@ -390,11 +423,13 @@ def _forward_with_fp32_intermediates(case, model, experts, monkeypatch):
             return original_activation(op, input_, scales)
         assert not torch.is_grad_enabled() and not torch.is_autocast_enabled()
         assert input_.dtype == torch.float32
-        # The fused MXFP8 activation rounds router probabilities to BF16 too.
-        output = original_activation(op, input_, scales.bfloat16().float())
+        # Only the fused MXFP8 activation rounds router probabilities to BF16.
+        if precision == "mxfp8":
+            scales = scales.bfloat16().float()
+        output = original_activation(op, input_, scales)
         assert output.dtype == torch.float32
         calls.append("activation")
-        return output
+        return output.bfloat16() if precision == "bf16" else output
 
     with monkeypatch.context() as reference:
         reference.setattr(GroupedLinear, "_fuser_forward_grouped_tensor", linear_fp32)
@@ -404,7 +439,7 @@ def _forward_with_fp32_intermediates(case, model, experts, monkeypatch):
     return output, losses
 
 
-def _assert_execution_plan(experts, *, fused):
+def _assert_execution_plan(experts, *, fused_op=None):
     """An op-fuser configuration flag alone does not prove the fused kernel ran."""
     (sequence,) = experts._fused_ops
     selected = [
@@ -413,12 +448,12 @@ def _assert_execution_plan(experts, *, fused):
         for op, indices in group._forward_ops
     ]
     expected = (
-        [("GroupedMLP_CuTeGEMMGLU", (0, 1, 2))]
-        if fused
+        [(fused_op, (0, 1, 2))]
+        if fused_op is not None
         else [("GroupedLinear", (0,)), ("ScaledSwiGLU", (1,)), ("GroupedLinear", (2,))]
     )
     assert selected == expected, (
-        f"Expected {expected}, got {selected}. Fused MXFP8 requires a GB200 container "
+        f"Expected {expected}, got {selected}. Fused grouped MLP requires a GB200 container "
         "with native TE/cuDNN grouped-MLP fusion support."
     )
 
@@ -434,13 +469,17 @@ def test_canonical_checkpoint_matches_interleaved_ddp(
 
     Both execution layouts load the same independently checked canonical checkpoint.
     Nonzero FC1/FC2 biases participate in all four weight/bias storage combinations.
-    MXFP8 op-fuser cases require actual joint fusion and an FP32-intermediate reference.
+    Jointly fused cases require an FP32-intermediate reference with matching cast boundaries.
     The negative control bypasses only the load conversion and must break expert output.
     Optimizer moments are deliberately not restored when changing the execution layout.
     """
     numerics._skip_if_unsupported(precision)
+    fused_op = None
     if precision == "mxfp8" and use_op_fuser:
         _enable_native_glu_fusion(monkeypatch)
+        fused_op = "GroupedMLP_CuTeGEMMGLU"
+    elif use_op_fuser and numerics._bf16_grouped_mlp_fusion_supported():
+        fused_op = "GroupedMLP_CuTeGEMMGLUBf16"
     canonical = _canonical_parameters()
     with TempNamedDir(tmp_path_dist_ckpt / "canonical_glu_checkpoint", sync=True) as directory:
         _save_canonical_checkpoint(moe_case, directory, canonical)
@@ -456,14 +495,14 @@ def test_canonical_checkpoint_matches_interleaved_ddp(
             load=True,
         )
         _assert_parameters(experts, canonical)
-        if precision == "mxfp8" and use_op_fuser:
+        if fused_op is not None:
             reference_output, reference_losses = _forward_with_fp32_intermediates(
-                moe_case, model, experts, monkeypatch
+                moe_case, model, experts, monkeypatch, precision=precision
             )
         else:
             reference_output, reference_losses = _forward(moe_case, model, experts)
         if use_op_fuser:
-            _assert_execution_plan(experts, fused=False)
+            _assert_execution_plan(experts)
         del experts, model, optimizer, scheduler
 
         model, optimizer, scheduler, experts = _setup_model(
@@ -480,7 +519,7 @@ def test_canonical_checkpoint_matches_interleaved_ddp(
         _assert_parameters(experts, expected_runtime)
         actual_output, actual_losses = _forward(moe_case, model, experts)
         if use_op_fuser:
-            _assert_execution_plan(experts, fused=precision == "mxfp8")
+            _assert_execution_plan(experts, fused_op=fused_op)
         tolerance = 5e-3 if precision == "bf16" else 5e-2
         torch.testing.assert_close(actual_output, reference_output, rtol=tolerance, atol=tolerance)
         torch.testing.assert_close(actual_losses, reference_losses, rtol=tolerance, atol=tolerance)
