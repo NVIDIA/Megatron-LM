@@ -23,33 +23,3 @@ def get_lsq_config_overrides(
     if lsq_scale_lr is None or lsq_scale_lr == base_lr:
         return {}
     return {ParamKey(name=LSQ_SCALE_PARAM_NAMES): ParamGroupOverride(max_lr=lsq_scale_lr)}
-
-
-def install_lsq_optimizer_overrides(lsq_scale_lr: float):
-    """Wrap megatron.training.training.get_standard_config_overrides to add LSQ overrides.
-
-    ``lsq_scale_lr`` comes from the model being built (``ModelTransformConfig.lsq_scale_lr``),
-    not from the run config, which may not hold that model (e.g. Flextron builds its own).
-
-    setup_model_and_optimizer() looks the function up by module global at call time, so this
-    takes effect if installed before the optimizer is built (it is called from the model
-    builder, which runs inside get_model()). Same pattern as
-    megatron/elastification/pretrain_hybrid_flex.py. Idempotent: the builder runs once per
-    model chunk.
-    """
-    import megatron.training.training as training
-
-    orig = training.get_standard_config_overrides
-    if getattr(orig, "_lsq_wrapped", False):
-        return
-
-    def get_standard_config_overrides(config):
-        config_overrides = orig(config)
-        config_overrides = {
-            **(config_overrides or {}),
-            **get_lsq_config_overrides(lsq_scale_lr, base_lr=config.lr),
-        }
-        return config_overrides
-
-    get_standard_config_overrides._lsq_wrapped = True
-    training.get_standard_config_overrides = get_standard_config_overrides

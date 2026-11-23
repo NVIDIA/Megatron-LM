@@ -2,10 +2,11 @@
 
 """Unit tests for --lsq-scale-lr and the LSQ scale-param handling in model_hooks."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-import megatron.training.training as training
 from megatron.core.optimizer import (
     OptimizerConfig,
     _get_param_groups,
@@ -13,10 +14,8 @@ from megatron.core.optimizer import (
 )
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
 from megatron.post_training.model_hooks import _propagate_expert_allreduce_to_lsq_params, lsq_hook
-from megatron.post_training.optimizer import (
-    get_lsq_config_overrides,
-    install_lsq_optimizer_overrides,
-)
+from megatron.post_training.optimizer import get_lsq_config_overrides
+from megatron.training.config.optimizer_config import build_optimizer_config_overrides
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -37,13 +36,8 @@ class _Linear(torch.nn.Module):
 def _toy_model():
     model = torch.nn.Module()
     model.linear = _Linear()
+    model.config = SimpleNamespace(use_mup=False)
     return model
-
-
-@pytest.fixture
-def restore_optimizer_config_override_fn(monkeypatch):
-    """Restore training.get_standard_config_overrides after the test wraps it."""
-    monkeypatch.setattr(training, "get_standard_config_overrides", get_standard_config_overrides)
 
 
 def test_no_override_when_unset():
@@ -63,43 +57,25 @@ def test_override_when_set():
     assert override == {"max_lr": 1e-4}
 
 
-def test_install_is_idempotent(restore_optimizer_config_override_fn):
-    install_lsq_optimizer_overrides(1e-4)
-    wrapped = training.get_standard_config_overrides
-    install_lsq_optimizer_overrides(1e-4)
-    assert training.get_standard_config_overrides is wrapped
-
-
-@pytest.mark.parametrize(
-    "lsq_scale_lr, expected_lsq_lr",
-    [
-        pytest.param(1e-4, 1e-4, id="scale-lr-differs-from-config-lr"),
-        pytest.param(3e-5, None, id="scale-lr-equals-config-lr"),
-    ],
-)
-def test_wrapped_config_adds_lsq_override(
-    restore_optimizer_config_override_fn, lsq_scale_lr, expected_lsq_lr
-):
+@pytest.mark.parametrize("scale_lr", [1e-4, 3e-5])
+def test_lsq_hook_uses_model_settings_without_leaking_to_another_run(scale_lr):
     config = OptimizerConfig(lr=3e-5, min_lr=0.0)
-    base_overrides = training.get_standard_config_overrides(config)
-    install_lsq_optimizer_overrides(lsq_scale_lr)
-    overrides = training.get_standard_config_overrides(config)
-    if expected_lsq_lr is None:
-        assert overrides == base_overrides
+    first, second = [_toy_model()], [_toy_model()]
+    lsq_hook(scale_lr)(first)
+    lsq_hook(scale_lr)(first)
+    resolved = build_optimizer_config_overrides(config, first)
+    standard = get_standard_config_overrides(config)
+    assert build_optimizer_config_overrides(config, second) == standard
+    for key, value in standard.items():
+        assert resolved[key] == value
+    extra = set(resolved) - set(standard)
+    if scale_lr == config.lr:
+        assert not extra
     else:
-        for key, value in base_overrides.items():
-            assert overrides[key] == value
-        added_keys = set(overrides) - set(base_overrides)
-        assert len(added_keys) == 1
-        assert overrides[added_keys.pop()] == {"max_lr": expected_lsq_lr}
-
-
-def test_lsq_hook_uses_the_built_models_scale_lr(restore_optimizer_config_override_fn):
-    # The LR comes from the model's own transformations, not the run config (which Flextron
-    # leaves without a model).
-    lsq_hook(1e-4)([_toy_model()])
-    overrides = training.get_standard_config_overrides(OptimizerConfig(lr=3e-5, min_lr=0.0))
-    assert {"max_lr": 1e-4} in overrides.values()
+        assert len(extra) == 1
+        assert resolved[extra.pop()] == {"max_lr": scale_lr}
+    lsq_hook(None)(first)
+    assert build_optimizer_config_overrides(config, first) == standard
 
 
 def test_propagate_expert_allreduce_to_lsq_params():

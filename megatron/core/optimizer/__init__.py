@@ -92,6 +92,24 @@ from .optimizer_config import (
 logger = logging.getLogger(__name__)
 
 
+def merge_config_overrides(
+    *overrides: Optional[Dict[ParamKey, ParamGroupOverride]]
+) -> Dict[ParamKey, ParamGroupOverride]:
+    """Compose mappings without silently replacing fields on identical selectors.
+
+    Different selectors may also overlap on a parameter; _get_param_groups performs the
+    same conflict check after matching them. Inputs are not modified.
+    """
+    result: Dict[ParamKey, ParamGroupOverride] = {}
+    for mapping in overrides:
+        for key, value in (mapping or {}).items():
+            try:
+                result[key] = combine_param_group_overrides([result.get(key), value])
+            except ValueError as error:
+                raise ValueError(f"Conflicting optimizer overrides for {key}: {error}") from error
+    return result
+
+
 def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, ParamGroupOverride]:
     """Get standard config overrides for the optimizer, handling decoupled LR and common wd skips.
 

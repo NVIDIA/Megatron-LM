@@ -11,8 +11,8 @@ from megatron.training.config.offline_distillation_config import (
     OfflineDistillationConfig,
 )
 from megatron.training.config.optimizer_config import (
-    OptimizerConfigOverrideContext,
-    OptimizerConfigOverrideProvider,
+    OptimizerConfigOverrideHook,
+    OptimizerConfigOverrides,
 )
 from megatron.training.config.resilience_config import (
     FaultInjectorConfig,

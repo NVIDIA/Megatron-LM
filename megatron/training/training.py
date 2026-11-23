@@ -82,8 +82,6 @@ from megatron.core.optimizer import (
     OptimizerConfig,
     ParamKey,
     get_megatron_optimizer,
-    get_mup_config_overrides,
-    get_standard_config_overrides,
 )
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import (
@@ -159,11 +157,11 @@ from megatron.training.checkpointing import (
     save_grads,
 )
 from megatron.training.config import (
-    OptimizerConfigOverrideContext,
     TrainingConfig,
     ValidationConfig,
 )
 from megatron.training.config.container import PretrainConfigContainer
+from megatron.training.config.optimizer_config import build_optimizer_config_overrides
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.training.datasets.utils import get_training_data_sequence_length
 from megatron.training.initialize import (
@@ -2659,31 +2657,13 @@ def setup_model_and_optimizer(
         optimizer, opt_param_scheduler = None, None
     else:
         optim_cfg = cfg.optimizer
-        override_provider = cfg.optimizer_config_override_provider
-        optim_cfg_overrides = (
-            override_provider.build_config_overrides(
-                OptimizerConfigOverrideContext(
-                    optimizer_config=optim_cfg, scheduler_config=cfg.scheduler, model=model
-                )
-            )
-            if override_provider is not None
-            else None
+        optim_cfg_overrides = build_optimizer_config_overrides(
+            optim_cfg,
+            model,
+            cfg.optimizer_config_overrides,
+            mode=cfg.optimizer_config_overrides_mode,
         )
-        if optim_cfg_overrides is None:
-            optim_cfg_overrides = get_standard_config_overrides(optim_cfg)
         optim_cfg.timers = timers
-        if cfg.model.transformer.use_mup:
-            model_config_source = (
-                unwrapped_model[0] if isinstance(unwrapped_model, list) else unwrapped_model
-            )
-            model_config = get_model_config(model_config_source)
-            mup_overrides = get_mup_config_overrides(
-                config=optim_cfg,
-                mup_width_mult=model_config.mup_width_mult,
-                optimizer_type=optim_cfg.optimizer,
-            )
-            if mup_overrides:
-                optim_cfg_overrides = {**(optim_cfg_overrides or {}), **mup_overrides}
 
         optimizer = get_megatron_optimizer(
             optim_cfg,

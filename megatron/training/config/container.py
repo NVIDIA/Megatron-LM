@@ -5,7 +5,7 @@ import os
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from dataclasses import is_dataclass, replace
-from typing import Any, Mapping, Type, TypeVar
+from typing import Any, Literal, Mapping, Type, TypeVar
 
 try:
     import yaml
@@ -37,7 +37,10 @@ from megatron.training.config.dataset_config import (
 from megatron.training.config.inference_config import InferenceSetupConfig
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
 from megatron.training.config.offline_distillation_config import OfflineDistillationConfig
-from megatron.training.config.optimizer_config import OptimizerConfigOverrideProvider
+from megatron.training.config.optimizer_config import (
+    OptimizerConfigOverrideHook,
+    OptimizerConfigOverrides,
+)
 from megatron.training.config.resilience_config import (
     FaultToleranceConfig,
     RerunStateMachineConfig,
@@ -299,9 +302,12 @@ class PretrainConfigContainer(ConfigContainerBase):
     model: ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoBuildConfig
     optimizer: OptimizerConfig
     scheduler: SchedulerConfig
-    optimizer_config_override_provider: OptimizerConfigOverrideProvider | None = None
-    """Build recipe-specific parameter groups after the model is constructed.
-    ``None`` preserves the standard optimizer overrides and automatic muP handling."""
+    optimizer_config_overrides: OptimizerConfigOverrides | OptimizerConfigOverrideHook | None = None
+    """Core mapping or callable receiving optimizer_config and the constructed model.
+    An empty contribution in extend mode preserves the standard optimizer rules."""
+    optimizer_config_overrides_mode: Literal["extend", "replace"] = "extend"
+    """Whether custom overrides extend or replace standard WD/decoupled-LR rules.
+    Enabled model features (muP/LSQ) are composed in either mode; conflicting fields raise."""
     data: DataConfig = field(default_factory=DataConfig)
     """The dataset config, the loader settings and the dataset class. The GPT entry points build
     their datasets from it (``gpt_data_config_from_args``); every other entry point carries the
@@ -323,6 +329,19 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     offline_distillation: OfflineDistillationConfig | None = None
     """Offline logits KD: exactly one of teacher_save or student_load. None disables it."""
+
+    def to_dict(self, **section_overrides: Mapping[str, Any]) -> dict[str, Any]:
+        """Serialize recipe mappings without using dataclass objects as YAML keys."""
+        result = super().to_dict(**section_overrides)
+        if isinstance(self.optimizer_config_overrides, dict) and self.optimizer_config_overrides:
+            from megatron.training.config.optimizer_config import (
+                serialize_optimizer_config_overrides,
+            )
+
+            result["optimizer_config_overrides"] = serialize_optimizer_config_overrides(
+                self.optimizer_config_overrides
+            )
+        return result
 
     def get_model_world_size(self) -> int:
         """Return ranks in the model grid, which may be a subset of the launch."""

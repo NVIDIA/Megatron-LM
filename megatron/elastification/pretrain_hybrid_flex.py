@@ -543,37 +543,6 @@ if __name__ == "__main__":
     # Optionally enable inprocess restart on pretrain
     pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
 
-    # Restore router LR multiplier (Bug 4 fix): monkey-patch get_megatron_optimizer_config
-    # to inject a per-parameter LR override for router params via config_overrides.
-    # Main branch removed the scale_lr_cond parameter from pretrain(); this achieves the same.
-    import megatron.training.training as _mtt
-    from megatron.core.optimizer.optimizer_config import ParamKey, ParamWithNamePredicate
-    from megatron.core.optimizer_param_scheduler import ParamGroupOverride
-
-    _orig_get_opt_cfg_overrides = _mtt.get_standard_config_overrides
-
-    def _patched_get_opt_cfg_overrides(config):
-        config_overrides = _orig_get_opt_cfg_overrides(config)
-        args = _mtt.get_args()
-        cfg = _mtt.get_run_config()
-
-        lr_mult = getattr(args, 'lr_mult_router', 1.0)
-        if lr_mult != 1.0:
-            router_key = ParamKey(
-                with_name_predicate=ParamWithNamePredicate(
-                    name="router_pp",
-                    fn=lambda p, name: 'router_pp' in name,
-                )
-            )
-            router_override = ParamGroupOverride(
-                max_lr=cfg.optimizer.lr * lr_mult,
-                min_lr=cfg.optimizer.min_lr * lr_mult,
-            )
-            config_overrides = {**(config_overrides or {}), router_key: router_override}
-        return config_overrides
-
-    _mtt.get_standard_config_overrides = _patched_get_opt_cfg_overrides
-
     # `pretrain()` no longer accepts extra_args_provider / args_defaults; parse
     # args up-front instead (see pretrain_mamba.py for the same pattern).
     args = parse_and_validate_args(
@@ -584,6 +553,18 @@ if __name__ == "__main__":
     full_config = pretrain_cfg_container_from_args(
         args, data_cfg=flex_data_config_from_args(args)
     )
+    # Use the per-run recipe hook instead of patching the training module's factory.
+    router_lr_mult = getattr(args, "lr_mult_router", 1.0)
+    if router_lr_mult != 1.0:
+        from megatron.core.optimizer.optimizer_config import ParamKey
+
+        full_config.optimizer_config_overrides = {
+            ParamKey(name="*router_pp*"): {
+                "max_lr": full_config.optimizer.lr * router_lr_mult,
+                "min_lr": full_config.optimizer.min_lr * router_lr_mult,
+            }
+        }
+
     if has_nvidia_modelopt and getattr(args, "export_kd_teacher_load", None):
         full_config.distillation = distillation_config_from_args(
             args, apply_modelopt_model_config(hybrid_config_from_args(args), args)
