@@ -2142,7 +2142,7 @@ def get_tensor_shapes(
     Returns [()] for dynamic shape exchange, or computed shapes for fixed sequence lengths
     and packed THD inputs padded to max_seqlen_per_dp_cp_rank.
     """
-    tensor_shapes = []
+    tensor_shapes: list[tuple[int, ...]] = []
 
     use_fixed_packed_shape = config.variable_seq_lengths and config.pipeline_p2p_fixed_shape
     if config.variable_seq_lengths and not use_fixed_packed_shape:

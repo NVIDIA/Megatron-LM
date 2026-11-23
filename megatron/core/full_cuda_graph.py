@@ -241,7 +241,7 @@ class FullCudaGraphWrapper:
     curr_iteration = {'training': 0, 'validation': 0}
     cuda_graph = {'training': None, 'validation': None}
     result = {'training': None, 'validation': None}
-    _prepared_batch_layout = {}
+    _prepared_batch_layout: dict = {}
 
     def __init__(self, forward_backward_func, cuda_graph_warmup_steps=1, use_single_mempool=False):
         self.forward_backward_func = forward_backward_func
