@@ -1881,13 +1881,14 @@ class TransformerConfig(ModelParallelConfig):
         if self.linear_cp_mode == "chunkwise" and self.linear_cp_layout != "contiguous":
             raise ValueError("linear_cp_mode='chunkwise' requires linear_cp_layout='contiguous'.")
         if (
-            self.context_parallel_size > 1
-            and self.attention_cp_layout == "contiguous"
+            self.attention_cp_layout == "contiguous"
             and self.experimental_attention_variant != "dsv4_hybrid"
-        ):
-            raise ValueError(
-                "attention_cp_layout='contiguous' is not yet supported with context parallelism."
+            and (
+                self.dynamic_context_parallel
+                or (self.context_parallel_size > 1 and self.sequence_packing_scheduler is not None)
             )
+        ):
+            raise ValueError("Contiguous attention CP does not support dynamic CP.")
         if (
             self.context_parallel_size > 1
             and self.linear_cp_layout != self.attention_cp_layout
@@ -4302,25 +4303,57 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.moe_megakernel_backend == "mok":
             if self.cuda_graph_impl in ("local", "transformer_engine"):
-                # Empty modules mean whole-layer capture here, not full_iteration.
-                # Per-layer replay needs per-microbatch ownership or recomputation
-                # of MOK's saved schedule/activations; this bridge has no stash integration.
-                if not self.cuda_graph_modules:
-                    raise ValueError(
-                        "MOK does not support per-layer whole-layer CUDA Graph capture"
-                    )
-                if any(
-                    scope in self.cuda_graph_modules
-                    for scope in (
-                        CudaGraphModule.moe,
-                        CudaGraphModule.moe_router,
-                        CudaGraphModule.moe_preprocess,
-                    )
-                ):
+                if CudaGraphModule.moe_preprocess in self.cuda_graph_modules:
                     raise ValueError(
                         "MOK does not support per-layer CUDA Graph scopes containing "
-                        "moe/moe_router/moe_preprocess"
+                        "moe_preprocess"
                     )
+                if CudaGraphModule.moe_router in self.cuda_graph_modules:
+                    # That graph would end between the router and the megakernel. The graph of a
+                    # MOK layer contains both or neither.
+                    raise ValueError(
+                        "MOK does not support the moe_router CUDA Graph scope; capture the MoE "
+                        "layer with the moe scope or whole-layer capture (empty "
+                        "cuda_graph_modules) and cuda_graph_impl='transformer_engine', or leave "
+                        "the MoE layer out of the CUDA Graph"
+                    )
+                # With the moe scope, or with empty modules (whole-layer capture here, not
+                # full_iteration), the graph covers the router and the megakernel, and its output
+                # is the layer output: MOK has static shapes and no host synchronization after
+                # warm-up. Only the TE implementation refreshes MOK's weight views eagerly before
+                # each replay (TECudaGraphTransformerLayerMixin._before_te_cuda_graph_replay).
+                if not self.cuda_graph_modules:
+                    graph_scope = "whole-layer CUDA Graph capture (empty cuda_graph_modules)"
+                elif CudaGraphModule.moe in self.cuda_graph_modules:
+                    graph_scope = "the moe CUDA Graph scope"
+                else:
+                    graph_scope = None
+                if graph_scope is not None:
+                    if self.cuda_graph_impl != "transformer_engine":
+                        raise ValueError(
+                            f"MOK supports {graph_scope} only with "
+                            "cuda_graph_impl='transformer_engine'"
+                        )
+                    if self.pipeline_model_parallel_size > 1:
+                        # Validated only without pipeline parallelism, where each microbatch's
+                        # backward runs before the next microbatch replays the layer's graph.
+                        # Pipeline schedules keep several microbatches in flight, and per-layer
+                        # MOK replay has not been validated there.
+                        raise ValueError(
+                            f"MOK with {graph_scope} requires pipeline_model_parallel_size=1"
+                        )
+                    if self.recompute_granularity == "selective" and "moe" in (
+                        self.recompute_modules or []
+                    ):
+                        raise ValueError(
+                            f"MOK does not support {graph_scope} with 'moe' in recompute_modules"
+                        )
+                    if not is_te_min_version("2.19.0"):
+                        # Older TE clones every returned parameter gradient on replay; MOK returns
+                        # full-size gradient sentinels for its routed weights.
+                        raise ValueError(
+                            f"MOK with {graph_scope} requires Transformer Engine >= 2.19"
+                        )
             elif self.cuda_graph_impl not in ("none", "full_iteration"):
                 raise ValueError(f"MOK does not support cuda_graph_impl={self.cuda_graph_impl!r}")
 
@@ -4390,8 +4423,10 @@ class TransformerConfig(ModelParallelConfig):
                         self.moe_expert_capacity_factor is None
                         or not self.moe_pad_expert_input_to_capacity
                     ):
+                        # A megakernel backend has static shapes without drop-and-pad.
                         assert (
                             CudaGraphModule.moe not in self.cuda_graph_modules
+                            or self.moe_megakernel_backend is not None
                         ), 'moe cuda graph is only supported with drop-padding MoE.'
                         if self.moe_token_dispatcher_type == 'alltoall' and (
                             self.moe_expert_capacity_factor is not None
