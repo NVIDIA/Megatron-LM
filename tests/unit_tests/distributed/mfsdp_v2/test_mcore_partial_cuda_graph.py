@@ -164,8 +164,8 @@ def _build_moe_model(config, process_groups, hybrid, capture_modules, strategy, 
     return model, optimizer
 
 
-def _train_moe_step(model, optimizer, batch):
-    """Return actual LM loss, gradients, updated weights, and Adam moments."""
+def _train_moe_step(model, optimizer, batch, *, snapshot=True):
+    """Train one step and optionally return its loss and training state."""
     model.train()
     model.zero_grad_buffer()
     optimizer.zero_grad()
@@ -180,9 +180,11 @@ def _train_moe_step(model, optimizer, batch):
     losses = run_forward_backward_on_microbatches(
         model, forward, num_microbatches=2, loss_scale=0.5
     )
-    gradients = [p.grad.to_local().detach().cpu() for p in model.parameters()]
+    gradients = [p.grad.to_local().detach().cpu() for p in model.parameters()] if snapshot else []
     success, _, _ = optimizer.step()
     assert success
+    if not snapshot:
+        return
     return (
         torch.stack(losses).cpu(),
         gradients,
@@ -326,7 +328,7 @@ def test_partial_capture_rollback(process_groups, cleanup_fails, monkeypatch):
             config, process_groups, False, list(PARTIAL_SCOPES), "optim_grads_params", graphs
         )
         for batch in batches[:3]:
-            _train_moe_step(model, optimizer, batch)
+            _train_moe_step(model, optimizer, batch, snapshot=False)
         return model, optimizer
 
     if not cleanup_fails:
