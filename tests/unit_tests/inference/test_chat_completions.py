@@ -39,7 +39,6 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endp
     chat_completions as chat_completions_module,
 )
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.chat_completions import (
-    _chat_template_source,
     _coerce_to_token_id_list,
     _expanded_prefix_stitching_metadata,
     _extract_media_url_bytes,
@@ -55,7 +54,6 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endp
     _sanitize_tools_for_template,
     _serialize_eos_token_ids,
     _suffix_tokens_after_prefix,
-    _template_takes_content_parts,
     _TemplateRenderer,
     _tokenize_chat_template_sync,
     _tokenize_with_media_slots,
@@ -543,12 +541,11 @@ _SLOT_TEXT = [{"type": "text", "text": "__S0__"}]
         pytest.param(None, [], None, "", None, id="none"),
         pytest.param(5, [], None, "5", None, id="number"),
         # Bare strings and any dict with `text` are kept; other blocks and values are dropped.
-        # Without media, the text parts are joined with newlines (a string-content template).
         pytest.param(
             ["a", {"type": "text", "text": "b"}, {"text": "c"}, {"type": "image_url"}, 7],
             [],
             None,
-            "a\nb\nc",
+            "abc",
             None,
             id="mixed-list",
         ),
@@ -559,15 +556,6 @@ _SLOT_TEXT = [{"type": "text", "text": "__S0__"}]
             "question\n__VIDEO__",
             None,
             id="configured-part-separator",
-        ),
-        # A message with media keeps its media separator.
-        pytest.param(
-            [{"type": "text", "text": "question"}, {"type": "text", "text": "__VIDEO__"}],
-            [("__VIDEO__", "video", 0)],
-            MultimodalPromptConfig(),
-            "question__VIDEO__",
-            None,
-            id="media-keeps-its-separator",
         ),
         pytest.param(
             [
@@ -617,101 +605,6 @@ def test_sanitize_messages_flattens_content_to_a_string(
             [_user(content)], media_slots=media_slots, prompt_config=prompt_config
         )
         assert sanitized["content"] == expected
-
-
-_PARTS = [{"type": "text", "text": "a"}, "", {"type": "text", "text": "b"}]
-
-
-def test_sanitize_messages_passes_text_parts_to_a_parts_template():
-    (sanitized,) = _sanitize_messages_for_template(
-        [_user(copy.deepcopy(_PARTS))], template_takes_content_parts=True
-    )
-    assert sanitized["content"] == [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]
-
-    # A message with media is lowered to a string either way.
-    (sanitized,) = _sanitize_messages_for_template(
-        [_user([{"type": "text", "text": "q"}, {"type": "text", "text": "__VIDEO__"}])],
-        media_slots=[("__VIDEO__", "video", 0)],
-        prompt_config=MultimodalPromptConfig(),
-        template_takes_content_parts=True,
-    )
-    assert sanitized["content"] == "q__VIDEO__"
-
-
-@pytest.mark.parametrize(
-    "template, expected",
-    [
-        pytest.param("{% for m in messages %}{{ m['content'] }}{% endfor %}", False, id="string"),
-        pytest.param(
-            "{% for m in messages %}{% for p in m.content %}{{ p.text }}{% endfor %}{% endfor %}",
-            True,
-            id="iterates-content",
-        ),
-        pytest.param(
-            "{% for m in messages %}{% if m['content'] is string %}{{ m['content'] }}"
-            "{% else %}{% for p in m['content'] | selectattr('type', 'equalto', 'text') %}"
-            "{{ p['text'] }}{% endfor %}{% endif %}{% endfor %}",
-            True,
-            id="handles-both",
-        ),
-        pytest.param(
-            "{% for m in messages %}{% set c = m['content'] %}{% for p in c %}{{ p.text }}"
-            "{% endfor %}{% endfor %}",
-            True,
-            id="through-an-alias",
-        ),
-        pytest.param(
-            "{% macro r(c) %}{% for p in c %}{{ p.text }}{% endfor %}{% endmacro %}"
-            "{% for m in messages %}{{ r(m.content | default('')) }}{% endfor %}",
-            True,
-            id="through-a-macro",
-        ),
-        pytest.param(
-            "{% macro r(c) %}{% for p in c %}{{ p }}{% endfor %}{% endmacro %}"
-            "{% for m in messages %}{{ r(m.tool_calls) }}{{ m.content }}{% endfor %}",
-            False,
-            id="macro-over-another-field",
-        ),
-        pytest.param(
-            "{% for m in messages %}{% for t in m.tool_calls %}{{ t }}{% endfor %}{% endfor %}",
-            False,
-            id="iterates-another-field",
-        ),
-        pytest.param(
-            "{% for m in messages %}{% generation %}{% for p in m.content %}{{ p.text }}"
-            "{% endfor %}{% endgeneration %}{% endfor %}",
-            True,
-            id="transformers-generation-tag",
-        ),
-        pytest.param("{% for m in messages %}{{ m.content }", False, id="unparsable"),
-        pytest.param(None, False, id="no-template"),
-    ],
-)
-def test_template_takes_content_parts(template, expected):
-    assert _template_takes_content_parts(template) is expected
-
-
-def test_template_content_format_is_detected_once_per_template():
-    template = "{% for m in messages %}{% for p in m.content %}{{ p.text }}{% endfor %}{% endfor %}"
-    _template_takes_content_parts.cache_clear()
-    with mock.patch.object(
-        chat_completions_module,
-        "_chat_template_environment",
-        wraps=chat_completions_module._chat_template_environment,
-    ) as environment:
-        assert _template_takes_content_parts(template) is True
-        assert _template_takes_content_parts(template) is True
-    assert environment.call_count == 1
-
-
-def test_chat_template_source_prefers_the_server_template():
-    tokenizer = SimpleNamespace(chat_template="tokenizer")
-    assert _chat_template_source(tokenizer, {"chat_template": "server"}, None) == "server"
-    assert _chat_template_source(tokenizer, {}, None) == "tokenizer"
-    # Named templates resolve the way apply_chat_template resolves them.
-    named = SimpleNamespace(get_chat_template=lambda template, tools=None: template or "default")
-    assert _chat_template_source(named, {}, None) == "default"
-    assert _chat_template_source(SimpleNamespace(chat_template={"default": "t"}), {}, None) is None
 
 
 @pytest.mark.parametrize(
