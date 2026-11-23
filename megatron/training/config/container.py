@@ -37,6 +37,7 @@ from megatron.training.config.dataset_config import (
 from megatron.training.config.inference_config import InferenceSetupConfig
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
 from megatron.training.config.offline_distillation_config import OfflineDistillationConfig
+from megatron.training.config.optimizer_config import OptimizerConfigOverrideProvider
 from megatron.training.config.resilience_config import (
     FaultToleranceConfig,
     RerunStateMachineConfig,
@@ -298,6 +299,9 @@ class PretrainConfigContainer(ConfigContainerBase):
     model: ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoBuildConfig
     optimizer: OptimizerConfig
     scheduler: SchedulerConfig
+    optimizer_config_override_provider: OptimizerConfigOverrideProvider | None = None
+    """Build recipe-specific parameter groups after the model is constructed.
+    ``None`` preserves the standard optimizer overrides and automatic muP handling."""
     data: DataConfig = field(default_factory=DataConfig)
     """The dataset config, the loader settings and the dataset class. The GPT entry points build
     their datasets from it (``gpt_data_config_from_args``); every other entry point carries the

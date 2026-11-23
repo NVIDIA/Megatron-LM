@@ -10,6 +10,10 @@ from megatron.training.config.offline_distillation_config import (
     LogitsSaveConfig,
     OfflineDistillationConfig,
 )
+from megatron.training.config.optimizer_config import (
+    OptimizerConfigOverrideContext,
+    OptimizerConfigOverrideProvider,
+)
 from megatron.training.config.resilience_config import (
     FaultInjectorConfig,
     FaultToleranceConfig,

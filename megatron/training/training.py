@@ -158,7 +158,11 @@ from megatron.training.checkpointing import (
     save_checkpoint,
     save_grads,
 )
-from megatron.training.config import TrainingConfig, ValidationConfig
+from megatron.training.config import (
+    OptimizerConfigOverrideContext,
+    TrainingConfig,
+    ValidationConfig,
+)
 from megatron.training.config.container import PretrainConfigContainer
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.training.datasets.utils import get_training_data_sequence_length
@@ -2655,7 +2659,18 @@ def setup_model_and_optimizer(
         optimizer, opt_param_scheduler = None, None
     else:
         optim_cfg = cfg.optimizer
-        optim_cfg_overrides = get_standard_config_overrides(optim_cfg)
+        override_provider = cfg.optimizer_config_override_provider
+        optim_cfg_overrides = (
+            override_provider.build_config_overrides(
+                OptimizerConfigOverrideContext(
+                    optimizer_config=optim_cfg, scheduler_config=cfg.scheduler, model=model
+                )
+            )
+            if override_provider is not None
+            else None
+        )
+        if optim_cfg_overrides is None:
+            optim_cfg_overrides = get_standard_config_overrides(optim_cfg)
         optim_cfg.timers = timers
         if cfg.model.transformer.use_mup:
             model_config_source = (
