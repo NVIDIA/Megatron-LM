@@ -71,7 +71,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--recipe", required=True, help="Config factory as module:function")
     parser.add_argument(
-        "--forward-step", help="MLM forward step as module:function; defaults to GPT/Hybrid's step"
+        "--forward-step", help="MLM forward step as module:function; defaults to llm_step"
     )
     parser.add_argument(
         "--dry-run", action="store_true", help="Validate and display config without runtime setup"
@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> None:
     options = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
 
-    # Direct script execution must also find repository-root forward steps and recipes.
+    # Direct script execution must also find the source-checkout package.
     root = str(Path(__file__).resolve().parents[1])
     if root not in sys.path:
         sys.path.insert(0, root)
@@ -104,10 +104,8 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("VLM recipes require an explicit --forward-step")
     step = options.forward_step
     if step is None:
-        if isinstance(config.model, HybridModelConfig):
-            step = "pretrain_hybrid:forward_step"
-        elif isinstance(config.model, GPTModelConfig):
-            step = "pretrain_gpt:forward_step"
+        if isinstance(config.model, (GPTModelConfig, HybridModelConfig)):
+            step = "megatron.bridge.training.llm_step:forward_step"
         else:
             raise TypeError("Default forward steps require a GPTModelConfig or HybridModelConfig")
     forward_step = _load_callable(step)
