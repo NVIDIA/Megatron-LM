@@ -42,8 +42,8 @@ version = "1.0.0+9edee0c"
 
 [[manifest.dependency-metadata]]
 name = "flashinfer-jit-cache"
-version = "0.7.2.post1+cu130"
-requires-dist = ["flashinfer-jit-cache-sm80==0.7.2.post1", "flashinfer-jit-cache-sm89==0.7.2.post1", "flashinfer-jit-cache-sm90a==0.7.2.post1", "flashinfer-jit-cache-sm100a==0.7.2.post1", "flashinfer-jit-cache-sm103a==0.7.2.post1", "flashinfer-jit-cache-sm110a==0.7.2.post1 ; platform_machine == 'aarch64'", "flashinfer-jit-cache-sm120f==0.7.2.post1", "flashinfer-jit-cache-sm121a==0.7.2.post1 ; platform_machine == 'aarch64'"]
+version = "0.7.5.post1+cu130"
+requires-dist = ["flashinfer-jit-cache-sm80==0.7.5.post1", "flashinfer-jit-cache-sm89==0.7.5.post1", "flashinfer-jit-cache-sm90a==0.7.5.post1", "flashinfer-jit-cache-sm100a==0.7.5.post1", "flashinfer-jit-cache-sm103a==0.7.5.post1", "flashinfer-jit-cache-sm110a==0.7.5.post1 ; platform_machine == 'aarch64'", "flashinfer-jit-cache-sm120f==0.7.5.post1", "flashinfer-jit-cache-sm121a==0.7.5.post1 ; platform_machine == 'aarch64'"]
 
 [[manifest.dependency-metadata]]
 name = "transformer-engine"
@@ -1498,7 +1498,7 @@ source = { git = "https://github.com/deepseek-ai/FlashMLA?rev=nv_dev#b7643bd5452
 
 [[package]]
 name = "flashinfer-jit-cache"
-version = "0.7.2.post1+cu130"
+version = "0.7.5.post1+cu130"
 source = { registry = "https://flashinfer.ai/whl/cu130" }
 dependencies = [
     { name = "flashinfer-jit-cache-sm100a", marker = "sys_platform == 'linux'" },
@@ -1511,83 +1511,83 @@ dependencies = [
     { name = "flashinfer-jit-cache-sm90a", marker = "sys_platform == 'linux'" },
 ]
 wheels = [
-    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:8449156043036d240f3581c25e6883810f7ea6d656f56e78183b39eee9066877" },
-    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:5a0a92ce56e11c19cec31948a4828b245314377eb587fe17307730b096225500" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.5.post1/flashinfer_jit_cache-0.7.5.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:fdb225569a567e593b97cbb7db59228d00c54ee3d6e5b988edd264848252ea17" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.5.post1/flashinfer_jit_cache-0.7.5.post1+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:833d4836fc2f4722797b2630c55795e56e51efce1cedc81105cc2c1ec668cfb1" },
 ]
 
 [[package]]
 name = "flashinfer-jit-cache-sm100a"
-version = "0.7.2.post1+cu130"
+version = "0.7.5.post1+cu130"
 source = { registry = "https://flashinfer.ai/whl/cu130" }
 wheels = [
-    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm100a-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:ed6c128c4033de6fb6edbd1743a008ee70d9a3d4c8d1b60b45d821bd7e4143a2" },
-    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm100a-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:2d118fdb9a4a403ae22c08192830885eb27aba6d363ffa9c88758c7a51d1c126" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.5.post1/flashinfer_jit_cache_sm100a-0.7.5.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:e51e8abc4601fba9b9d86ac68b3bf864a9774e29807037ac779701629425ba80" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.5.post1/flashinfer_jit_cache_sm100a-0.7.5.post1+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:cd65be4765f0bd741b95fc823f0df01f71fa67dd9f318f215c13e995dcc2a2cd" },
 ]
 
 [[package]]
 name = "flashinfer-jit-cache-sm103a"
-version = "0.7.2.post1+cu130"
+version = "0.7.5.post1+cu130"
 source = { registry = "https://flashinfer.ai/whl/cu130" }
 wheels = [
-    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm103a-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:8883759aaf289b8d494f714bb28766c9bef2e84fe6115d439d10e2417a8c7ae3" },
-    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm103a-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:c9c8430cd8c49d80edc44af820d4817c1c1b99cbe738c40034b41a44403ec5c7" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.5.post1/flashinfer_jit_cache_sm103a-0.7.5.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:19b120700b6b3dabae8303b3903ffecd7e226ceff14210eeb0427c8c28970a5a" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.5.post1/flashinfer_jit_cache_sm103a-0.7.5.post1+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:c62067f124f0a88baf8ecf286e1891090f0c8a0849d0c0d478bee62b060a63c1" },
 ]
 
 [[package]]
 name = "flashinfer-jit-cache-sm110a"
-version = "0.7.2.post1+cu130"
+version = "0.7.5.post1+cu130"
 source = { registry = "https://flashinfer.ai/whl/cu130" }
 wheels = [
-    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm110a-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:ff08fecf03bec168d37c8518c679e2332ba77d79824e806cc3cdd67c4f6b7a75" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.5.post1/flashinfer_jit_cache_sm110a-0.7.5.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:ca3847305a5ffc4b735cd755f505ef15467515614426eedd70f50b31e8345c60" },
 ]
 
 [[package]]
 name = "flashinfer-jit-cache-sm120f"
-version = "0.7.2.post1+cu130"
+version = "0.7.5.post1+cu130"
 source = { registry = "https://flashinfer.ai/whl/cu130" }
 wheels = [
-    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm120f-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:1d3582708053a70b383c6d4df842a18c86f19518e230eaff6c1f689ce279dda5" },
-    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm120f-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:ab05a6e987bf79e18594d43ccc89ccdc8dbeacb3241c031ede8bc054a2baa9a7" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.5.post1/flashinfer_jit_cache_sm120f-0.7.5.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:430612196a42424734d36eec8ff4ca57aad54831ccc249dff54a7686cac079fa" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.5.post1/flashinfer_jit_cache_sm120f-0.7.5.post1+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:b22be3d11706a38745446fe6cdb699ac0428f72dbf2f384e7d63f5ddbffd2a75" },
 ]
 
 [[package]]
 name = "flashinfer-jit-cache-sm121a"
-version = "0.7.2.post1+cu130"
+version = "0.7.5.post1+cu130"
 source = { registry = "https://flashinfer.ai/whl/cu130" }
 wheels = [
-    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm121a-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:bcbd9b7d51cefcaaac9629cec260d37e253f6a8493876d045b6869ddf42b49c7" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.5.post1/flashinfer_jit_cache_sm121a-0.7.5.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:b11f581c79a055d8cbca301d50f1a4d73e53b3956d4a4634ead3e76d9d843300" },
 ]
 
 [[package]]
 name = "flashinfer-jit-cache-sm80"
-version = "0.7.2.post1+cu130"
+version = "0.7.5.post1+cu130"
 source = { registry = "https://flashinfer.ai/whl/cu130" }
 wheels = [
-    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm80-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:f84fd89aac415b9cf79494e5606a307ecff2e421bcff132b62c6dba88f447a3b" },
-    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm80-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:b5076a39be7b63d15df44ecdfb9ce5be7206d39629b6d317b06d6e314f0b4cd6" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.5.post1/flashinfer_jit_cache_sm80-0.7.5.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:32daa13b28dbf94bf335622145e8cf0f7e8d3299f72e1fc33b4aa7b099222cb0" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.5.post1/flashinfer_jit_cache_sm80-0.7.5.post1+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:708619ce9386e21ef287966563bedcfa81b9663e1556476d82a559298f4ff917" },
 ]
 
 [[package]]
 name = "flashinfer-jit-cache-sm89"
-version = "0.7.2.post1+cu130"
+version = "0.7.5.post1+cu130"
 source = { registry = "https://flashinfer.ai/whl/cu130" }
 wheels = [
-    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm89-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:18fa31a010e3942a00ed4b6ffb4def344b5e10fc1ff9f56a538ce646bc316a7c" },
-    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm89-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:61ae80c3a78f20ebd8ef350bfe16bde947242bb9ac93f1cafb63e26c04c009dc" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.5.post1/flashinfer_jit_cache_sm89-0.7.5.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:ca29401c609809225fcebd24b4ca96c865ccbc98b56873e712a9516dbb80bb7d" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.5.post1/flashinfer_jit_cache_sm89-0.7.5.post1+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:97c0ad31d037c2a5c96b68eaddea0f058fbefb60f72108148a6f5bb1ac7e2522" },
 ]
 
 [[package]]
 name = "flashinfer-jit-cache-sm90a"
-version = "0.7.2.post1+cu130"
+version = "0.7.5.post1+cu130"
 source = { registry = "https://flashinfer.ai/whl/cu130" }
 wheels = [
-    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm90a-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:3bd375e978255d3215ee69da3434ca4b9dcce7a2d655c5d3445cd048fcc62096" },
-    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm90a-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:52e5cc064b52290dad2f8889ee0eb5cd59621dfac8351841e4b3987d42d034a3" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.5.post1/flashinfer_jit_cache_sm90a-0.7.5.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:dbfd667459726a745f7b00b12d4eadf3cbb1278861da5361e130e120c5db3f18" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.5.post1/flashinfer_jit_cache_sm90a-0.7.5.post1+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:22eb39e429036752d134f56ec3c45857b207c4c5b5c8355c1d9d97bf43802cb7" },
 ]
 
 [[package]]
 name = "flashinfer-python"
-version = "0.7.2.post1"
+version = "0.7.5.post1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apache-tvm-ffi" },
@@ -1595,6 +1595,7 @@ dependencies = [
     { name = "cuda-python" },
     { name = "cuda-tile" },
     { name = "einops" },
+    { name = "filelock" },
     { name = "nccl-extensions" },
     { name = "nccl4py" },
     { name = "ninja" },
@@ -1603,14 +1604,15 @@ dependencies = [
     { name = "nvidia-cutlass-dsl" },
     { name = "nvidia-ml-py" },
     { name = "packaging" },
+    { name = "portalocker", extra = ["win32"] },
     { name = "requests" },
     { name = "tabulate" },
     { name = "torch", marker = "sys_platform == 'never'" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/05/76/1a42eafe2a3cd26924e485fb85bc635a2a41fcb14f453a8c037214b32940/flashinfer_python-0.7.2.post1.tar.gz", hash = "sha256:af60319898dcfd552ba12a34165b9dd46c0bbd83d48ce665b1df6bd6ae77e9f1", size = 51431554, upload-time = "2026-10-23T18:49:35.84Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b4/f9/01d2632feb9fcdbd8c64305200921d03b1716327d08113d058609f90b38d/flashinfer_python-0.7.5.post1.tar.gz", hash = "sha256:27d2b6b32eef26fbabd2c933ebe951951187c81ea5380e689c2ddb41cf279505", size = 129858986, upload-time = "2026-11-20T19:49:48.873Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b6/ad/da1fc7644b28ab82db922021955a0c85c8d6b3b1d6db224a13ef65cef85e/flashinfer_python-0.7.2.post1-py3-none-any.whl", hash = "sha256:bfdc18b9e1e4d8d0730fe4343dc0e284cd0c160086de80f99888bc4867922d49", size = 62052965, upload-time = "2026-10-23T18:49:31.516Z" },
+    { url = "https://files.pythonhosted.org/packages/27/04/237904de973a8550ec5678a291bb4ebecc18c01db213c3a6ab3ccccdc85e/flashinfer_python-0.7.5.post1-py3-none-any.whl", hash = "sha256:aadc64681cca35e1ef4e0471a46ec49190a5e32f15d74b48b06bd2972ed5dd61", size = 124292222, upload-time = "2026-11-20T19:49:40.086Z" },
 ]
 
 [[package]]
@@ -2805,18 +2807,18 @@ requires-dist = [
     { name = "fastapi", marker = "extra == 'dev'", specifier = "~=0.50" },
     { name = "flash-attn-4", extras = ["cu13"], marker = "extra == 'dev'", specifier = "==4.0.0b27" },
     { name = "flash-linear-attention", marker = "extra == 'ssm'", specifier = "==0.5.1" },
-    { name = "flashinfer-jit-cache", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
-    { name = "flashinfer-jit-cache-sm100a", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
-    { name = "flashinfer-jit-cache-sm103a", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
-    { name = "flashinfer-jit-cache-sm110a", marker = "platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
-    { name = "flashinfer-jit-cache-sm120f", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
-    { name = "flashinfer-jit-cache-sm121a", marker = "platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
-    { name = "flashinfer-jit-cache-sm80", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
-    { name = "flashinfer-jit-cache-sm89", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
-    { name = "flashinfer-jit-cache-sm90a", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
-    { name = "flashinfer-python", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1" },
-    { name = "flashinfer-python", marker = "extra == 'dev'", specifier = ">=0.7.2,<0.8.0" },
-    { name = "flashinfer-python", marker = "extra == 'inference'", specifier = ">=0.7.2,<0.8.0" },
+    { name = "flashinfer-jit-cache", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.5.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm100a", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.5.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm103a", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.5.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm110a", marker = "platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.5.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm120f", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.5.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm121a", marker = "platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.5.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm80", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.5.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm89", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.5.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm90a", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.5.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-python", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.5.post1" },
+    { name = "flashinfer-python", marker = "extra == 'dev'", specifier = ">=0.7.5.post1,<0.8.0" },
+    { name = "flashinfer-python", marker = "extra == 'inference'", specifier = ">=0.7.5.post1,<0.8.0" },
     { name = "flask-restful", marker = "extra == 'mlm'" },
     { name = "flask-restful", marker = "extra == 'training'" },
     { name = "gigatoken", marker = "extra == 'inference'", specifier = "==0.11.0" },
@@ -4219,6 +4221,20 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/f9/e2/3e91f31a7d2b083fe6ef3fa267035b518369d9511ffab804f839851d2779/pluggy-1.6.0.tar.gz", hash = "sha256:7dcc130b76258d33b90f61b658791dede3486c3e6bfb003ee5c9bfb396dd22f3", size = 69412, upload-time = "2025-05-15T12:30:07.975Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/54/20/4d324d65cc6d9205fabedc306948156824eb9f0ee1633355a8f7ec5c66bf/pluggy-1.6.0-py3-none-any.whl", hash = "sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746", size = 20538, upload-time = "2025-05-15T12:30:06.134Z" },
+]
+
+[[package]]
+name = "portalocker"
+version = "4.4.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/7f/d9/586fb0510fdfbd95a86f9d5c5046463aca41a55f6573d1a5a082a62e0acb/portalocker-4.4.2.tar.gz", hash = "sha256:7ac85bb2aa3c7873bf2ac72586fc6154afa4671ac786994a16617a6b7ccb3e5e", size = 310698, upload-time = "2026-10-28T00:24:58.214Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e8/43/bca094221a0f9f592fe1e982d090a92075aa302ecaa92c94cc6268a39b2c/portalocker-4.4.2-py3-none-any.whl", hash = "sha256:e661b91af34fc1806740f8e0e42990fe55cd85cbae55675ac48a400a9656a51b", size = 129702, upload-time = "2026-10-28T00:24:56.625Z" },
+]
+
+[package.optional-dependencies]
+win32 = [
+    { name = "pywin32", marker = "sys_platform == 'win32'" },
 ]
 
 [[package]]

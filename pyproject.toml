@@ -119,7 +119,7 @@ dev = [
     "megatron-energon[av_decode]~=7.0",
     "av",
     "Pillow>=13.0.0",
-    "flashinfer-python>=0.7.2,<0.8.0",
+    "flashinfer-python>=0.7.5.post1,<0.8.0",
     "flash-attn-4[cu13]==4.0.0b27",
     "nvidia-cudnn-frontend[cutedsl]==1.33.0",
     "wget",
@@ -145,24 +145,25 @@ inference = [
     "orjson",
     "pyzmq",
     "quart",
-    "flashinfer-python>=0.7.2,<0.8.0",
+    # >=0.7.5.post1: first release with the DSA kernels (flashinfer.sdsa, flashinfer.token_sparse).
+    "flashinfer-python>=0.7.5.post1,<0.8.0",
     # flashinfer-jit-cache ships pre-compiled CUTLASS MoE kernels and must match
     # flashinfer-python exactly; bump both together. The wheels are CUDA-major
     # specific and only published on flashinfer.ai (cu130 to match the dev image).
     # The pin must also satisfy the dev group's flashinfer-python range.
-    "flashinfer-python==0.7.2.post1; sys_platform == 'linux'",
-    "flashinfer-jit-cache==0.7.2.post1; sys_platform == 'linux'",
+    "flashinfer-python==0.7.5.post1; sys_platform == 'linux'",
+    "flashinfer-jit-cache==0.7.5.post1; sys_platform == 'linux'",
     # flashinfer-jit-cache is split into per-arch packages that also live only on
     # flashinfer.ai. uv only applies [tool.uv.sources] to direct dependencies, so
     # each one is listed here (same pin) and routed to the flashinfer index below.
-    "flashinfer-jit-cache-sm80==0.7.2.post1; sys_platform == 'linux'",
-    "flashinfer-jit-cache-sm89==0.7.2.post1; sys_platform == 'linux'",
-    "flashinfer-jit-cache-sm90a==0.7.2.post1; sys_platform == 'linux'",
-    "flashinfer-jit-cache-sm100a==0.7.2.post1; sys_platform == 'linux'",
-    "flashinfer-jit-cache-sm103a==0.7.2.post1; sys_platform == 'linux'",
-    "flashinfer-jit-cache-sm110a==0.7.2.post1; sys_platform == 'linux' and platform_machine == 'aarch64'",
-    "flashinfer-jit-cache-sm120f==0.7.2.post1; sys_platform == 'linux'",
-    "flashinfer-jit-cache-sm121a==0.7.2.post1; sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "flashinfer-jit-cache-sm80==0.7.5.post1; sys_platform == 'linux'",
+    "flashinfer-jit-cache-sm89==0.7.5.post1; sys_platform == 'linux'",
+    "flashinfer-jit-cache-sm90a==0.7.5.post1; sys_platform == 'linux'",
+    "flashinfer-jit-cache-sm100a==0.7.5.post1; sys_platform == 'linux'",
+    "flashinfer-jit-cache-sm103a==0.7.5.post1; sys_platform == 'linux'",
+    "flashinfer-jit-cache-sm110a==0.7.5.post1; sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "flashinfer-jit-cache-sm120f==0.7.5.post1; sys_platform == 'linux'",
+    "flashinfer-jit-cache-sm121a==0.7.5.post1; sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
 
 otel = [
@@ -290,16 +291,16 @@ requires-dist = ["torch", "packaging", "ninja"]
 # Keep this in sync with the flashinfer-jit-cache pin in the inference extra.
 [[tool.uv.dependency-metadata]]
 name = "flashinfer-jit-cache"
-version = "0.7.2.post1+cu130"
+version = "0.7.5.post1+cu130"
 requires-dist = [
-    "flashinfer-jit-cache-sm80==0.7.2.post1",
-    "flashinfer-jit-cache-sm89==0.7.2.post1",
-    "flashinfer-jit-cache-sm90a==0.7.2.post1",
-    "flashinfer-jit-cache-sm100a==0.7.2.post1",
-    "flashinfer-jit-cache-sm103a==0.7.2.post1",
-    "flashinfer-jit-cache-sm110a==0.7.2.post1; platform_machine == 'aarch64'",
-    "flashinfer-jit-cache-sm120f==0.7.2.post1",
-    "flashinfer-jit-cache-sm121a==0.7.2.post1; platform_machine == 'aarch64'",
+    "flashinfer-jit-cache-sm80==0.7.5.post1",
+    "flashinfer-jit-cache-sm89==0.7.5.post1",
+    "flashinfer-jit-cache-sm90a==0.7.5.post1",
+    "flashinfer-jit-cache-sm100a==0.7.5.post1",
+    "flashinfer-jit-cache-sm103a==0.7.5.post1",
+    "flashinfer-jit-cache-sm110a==0.7.5.post1; platform_machine == 'aarch64'",
+    "flashinfer-jit-cache-sm120f==0.7.5.post1",
+    "flashinfer-jit-cache-sm121a==0.7.5.post1; platform_machine == 'aarch64'",
 ]
 
 [tool.uv.sources]
