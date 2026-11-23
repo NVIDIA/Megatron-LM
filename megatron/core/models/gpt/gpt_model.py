@@ -137,6 +137,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             )
         if config.rmsnorm_impl != "native":
             raise ValueError("rmsnorm_impl='liger' is supported only by HybridModel.")
+        if config.context_parallel_size > 1 and config.attention_cp_layout == "contiguous":
+            raise ValueError("GPTModel does not support contiguous attention CP.")
         super().__init__(config=config, pg_collection=pg_collection)
         # MTP depth is model-wide; non-MTP pipeline stages still freeze their backbone.
         if self.config.mtp_kl_loss_weight > 0 and (
