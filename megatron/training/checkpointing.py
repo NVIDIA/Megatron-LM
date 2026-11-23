@@ -90,6 +90,7 @@ from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_succe
 from .utils import append_to_progress_log, is_last_rank, print_rank_0, print_rank_last, warn_rank_0
 
 try:
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
         preprocess_state_dict_for_uneven_dtensor,
     )
@@ -2034,14 +2035,13 @@ def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
         if 'optimizer' in state_dict:
             state_dict['optimizer'] = optimizer_state_dict
 
-    if (
-        config.gated_linear_unit
-        and config.activation_func is torch.nn.functional.silu
-    ):
-        apply(handle_swiglu_in_state_dict)
-    # Split a fused MLA q/kv down-projection (mla_down_proj_fusion) back into the unfused
-    # layout used on disk. No-op for unfused models.
-    apply(handle_mla_down_proj_in_state_dict)
+    # V1's fused-parameter conversions require its wrapper and flat-shard metadata.
+    # V2 checkpoints retain the native fused DTensors for both saving and loading.
+    if not isinstance(model, FsdpModule):
+        if config.gated_linear_unit and config.activation_func is torch.nn.functional.silu:
+            apply(handle_swiglu_in_state_dict)
+        # Split a fused MLA q/kv down-projection back into the unfused layout used on disk.
+        apply(handle_mla_down_proj_in_state_dict)
     if config.num_moe_experts:
         state_dict['model'] = handle_experts_in_state_dict(
             state_dict['model'], config.num_moe_experts
