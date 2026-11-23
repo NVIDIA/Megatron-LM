@@ -1208,7 +1208,9 @@ class MegatronFSDP(torch.nn.Module):
                 # instead of a tensor post-accumulate hook: the tensor hook is skipped when fused wgrad
                 # returns None, while the node hook still runs and lets FSDP process the gradient already
                 # in main_grad. The delayed-wgrad callback remains on its existing path.
-                grad_acc = torch.autograd.graph.get_gradient_edge(param).node
+                # FSDP may have released the parameter storage before hook registration.
+                param_tmp = param.as_strided((0,), (1,))
+                grad_acc = param_tmp.grad_fn.next_functions[0][0]
                 self.grad_acc_nodes.append(grad_acc)
                 self.grad_acc_hooks[f"grad_acc and reduce for {self.param_to_name[param]}"] = (
                     grad_acc.register_hook(
