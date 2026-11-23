@@ -1,7 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from dataclasses import dataclass
 from itertools import repeat
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -15,6 +16,22 @@ from megatron.core.inference.inference_request import (
 from megatron.core.utils import internal_api
 
 from .requests import RequestEntry
+
+
+@dataclass(frozen=True)
+class DeferredFinish:
+    """What `detect_deferred_finish` decided for one row's new tokens."""
+
+    eos_mid_block_hit: bool = False
+    stop_word_hit: bool = False
+    eos_trim: int = 0
+    length_trim: int = 0
+    stop_word_trim: int = 0
+
+    @property
+    def finishes(self) -> bool:
+        """Whether the row ends; the next step then finishes it."""
+        return self.stop_word_hit or self.eos_mid_block_hit
 
 
 @internal_api
@@ -309,22 +326,14 @@ class StepPostProcessingMixin:
                 if request_id in self.stop_word_being_finished_ids:
                     semantic_terminal_position = -1
             if request_id != consumed_chunked_prefill_request_id:
-                tokens, request_log_probs, eos_mid_block_hit = self._truncate_at_mid_block_eos(
-                    request, tokens, request_log_probs, top_n_logprobs, req_idx
-                )
-
-                # Skip appending token for requests being finished due to stop words
-                # (they already have their final token from the previous step)
-                # If the request already has more tokens, then we only append as much as is necessary
-                if (
-                    len(request.generated_tokens) + len(tokens)
-                    >= request.sampling_params.num_tokens_to_generate
-                ):
-                    keep = request.sampling_params.num_tokens_to_generate - len(
-                        request.generated_tokens
+                being_finished = request_id in self.stop_word_being_finished_ids
+                if being_finished:
+                    deferred_finish = None
+                    eos_mid_block_hit = False
+                else:
+                    deferred_finish = self.detect_deferred_finish(
+                        request, self.requests[request_id].record, tokens
                     )
-                    num_tokens_before_trim = len(tokens)
-                    tokens = tokens[:keep]
                     # Drop only the excess *trailing* log probs / top-n so the counts stay
                     # in sync. We must trim from the end, not the front: on a prefill step
                     # request_log_probs covers the whole prompt and is laid out as
@@ -332,17 +341,9 @@ class StepPostProcessingMixin:
                     # (e.g. [:keep] with keep == 0 when num_tokens_to_generate == 0) would
                     # discard the prompt log probs that echo+logprobs requests need. In a
                     # decode step all entries are generated, so trailing == front-equivalent.
-                    num_dropped = num_tokens_before_trim - len(tokens)
-                    if num_dropped > 0:
-                        if request_log_probs is not None:
-                            request_log_probs = request_log_probs[:-num_dropped]
-                        if top_n_logprobs is not None and req_idx in top_n_logprobs:
-                            top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_dropped]
-                if eos_mid_block_hit:
-                    eos_mid_block_hit = bool(tokens) and tokens[-1] in self._terminating_token_ids(
-                        request
+                    tokens, request_log_probs, eos_mid_block_hit = self._truncate_at_mid_block_eos(
+                        request, tokens, request_log_probs, top_n_logprobs, req_idx, deferred_finish
                     )
-                if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
                     first_token_event = None
@@ -389,14 +390,13 @@ class StepPostProcessingMixin:
                 # appended token. The check truncates generated_tokens in-place and
                 # returns how many trailing tokens were removed so we can also trim
                 # the corresponding log probs below.
-                num_new_tokens = (
-                    len(tokens) if request_id not in self.stop_word_being_finished_ids else 0
-                )
+                num_new_tokens = 0 if being_finished else len(tokens)
                 stop_word_hit, num_stop_word_trim, num_stop_word_prompt_score_trim = (
                     self._check_stop_words_for_request_post_append(
                         request,
                         record=self.requests[request_id].record,
                         num_new_tokens=num_new_tokens,
+                        deferred_finish=deferred_finish,
                     )
                 )
 
@@ -817,6 +817,7 @@ class StepPostProcessingMixin:
         request_log_probs: Optional[list],
         top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]],
         req_idx: int,
+        deferred_finish: Optional[DeferredFinish] = None,
     ) -> Tuple[list, Optional[list], bool]:
         """Drop everything a speculative step emitted after an EOS.
 
@@ -837,22 +838,27 @@ class StepPostProcessingMixin:
             request_log_probs (Optional[list]): This step's log probs, or None.
             top_n_logprobs (Optional[Dict]): Per-request top-n log probs, or None.
             req_idx (int): This request's index into `top_n_logprobs`.
+            deferred_finish (Optional[DeferredFinish]): The verdict `detect_deferred_finish` gave.
 
         Returns:
             Tuple[list, Optional[list], bool]: Truncated tokens, truncated log probs,
             and whether an EOS was found (the caller defers the finish by a step).
         """
-        eos_idx = self._find_mid_block_eos(request, tokens)
-        if eos_idx is None:
-            return tokens, request_log_probs, False
-
-        num_trim = len(tokens) - (eos_idx + 1)
+        if deferred_finish is None:
+            eos_idx = self._find_mid_block_eos(request, tokens)
+            if eos_idx is None:
+                return tokens, request_log_probs, False
+            num_trim = len(tokens) - (eos_idx + 1)
+            eos_mid_block_hit = True
+        else:
+            num_trim = deferred_finish.eos_trim + deferred_finish.length_trim
+            eos_mid_block_hit = deferred_finish.eos_mid_block_hit
         if num_trim > 0:
             if request_log_probs is not None:
                 request_log_probs = request_log_probs[:-num_trim]
             if top_n_logprobs is not None and req_idx in top_n_logprobs:
                 top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_trim]
-        return tokens[: eos_idx + 1], request_log_probs, True
+        return tokens[: len(tokens) - num_trim], request_log_probs, eos_mid_block_hit
 
     def _find_mid_block_eos(
         self, request: DynamicInferenceRequest, tokens: list[int]
@@ -888,12 +894,112 @@ class StepPostProcessingMixin:
                 return idx
         return None
 
+    def detect_deferred_finish(
+        self,
+        request: DynamicInferenceRequest,
+        record_or_tokens: Union[DynamicInferenceRequestRecord, Sequence[int]],
+        new_tokens: Sequence[int],
+    ) -> DeferredFinish:
+        """Decide from a row's new tokens whether it ends, without touching the request.
+
+        Applies the mid-block EOS scan, the `num_tokens_to_generate` cut and the stop-word
+        match, in that order, to the request's trailing history plus `new_tokens`.
+
+        Args:
+            request: The row's request.
+            record_or_tokens: The request's record, or its trailing generated tokens.
+            new_tokens: The tokens the step produced for this row, none appended yet.
+
+        Returns:
+            DeferredFinish: Whether the row ends, and the trims bookkeeping applies.
+        """
+        tokens = list(new_tokens)
+        eos_idx = self._find_mid_block_eos(request, tokens)
+        eos_mid_block_hit = eos_idx is not None
+        eos_trim = len(tokens) - (eos_idx + 1) if eos_mid_block_hit else 0
+        kept = tokens[: eos_idx + 1] if eos_mid_block_hit else tokens
+
+        if isinstance(record_or_tokens, DynamicInferenceRequestRecord):
+            generated_count = len(record_or_tokens[-1].generated_tokens)
+        else:
+            generated_count = len(record_or_tokens)
+        length_trim = 0
+        if generated_count + len(kept) >= request.sampling_params.num_tokens_to_generate:
+            keep = request.sampling_params.num_tokens_to_generate - generated_count
+            num_tokens_before_trim = len(kept)
+            kept = kept[:keep]
+            length_trim = num_tokens_before_trim - len(kept)
+        if eos_mid_block_hit:
+            eos_mid_block_hit = bool(kept) and kept[-1] in self._terminating_token_ids(request)
+
+        stop_word_hit = False
+        stop_word_trim = 0
+        if request.stop_word_ids and kept:
+            # Only the longest stop's suffix of the history can take part in a match that
+            # ends in this burst.
+            history = self._trailing_generated_tokens(
+                record_or_tokens, max(map(len, request.stop_word_ids)) - 1
+            )
+            matched_stop = self._match_stop_word(request.stop_word_ids, history + kept, len(kept))
+            if matched_stop is not None:
+                trailing_token_count, stop_len = matched_stop
+                stop_word_hit = True
+                stop_word_trim = (
+                    trailing_token_count
+                    if request.sampling_params.detokenize_stop_sequence
+                    else trailing_token_count + stop_len
+                )
+        return DeferredFinish(
+            eos_mid_block_hit=eos_mid_block_hit,
+            stop_word_hit=stop_word_hit,
+            eos_trim=eos_trim,
+            length_trim=length_trim,
+            stop_word_trim=stop_word_trim,
+        )
+
+    @staticmethod
+    def _trailing_generated_tokens(
+        record_or_tokens: Union[DynamicInferenceRequestRecord, Sequence[int]], count: int
+    ) -> list[int]:
+        """The last `count` generated tokens of a request, oldest first, as a new list."""
+        if count <= 0:
+            return []
+        if not isinstance(record_or_tokens, DynamicInferenceRequestRecord):
+            return list(record_or_tokens[-count:])
+        tokens: list[int] = []
+        for segment in reversed(record_or_tokens.requests):
+            take = min(count - len(tokens), len(segment.generated_tokens))
+            if take > 0:
+                tokens[:0] = segment.generated_tokens[-take:]
+            if len(tokens) == count:
+                break
+        return tokens
+
+    @staticmethod
+    def _match_stop_word(
+        stop_word_ids: List[List[int]], generated_tokens: Sequence[int], endpoint_count: int
+    ) -> Optional[Tuple[int, int]]:
+        """Find the stop sequence ending at one of the last `endpoint_count` positions."""
+        matched_stop = None
+        for stop_word in stop_word_ids:
+            stop_len = len(stop_word)
+            if len(generated_tokens) < stop_len:
+                continue
+            for trailing_token_count in range(endpoint_count):
+                end_idx = -trailing_token_count if trailing_token_count > 0 else None
+                if list(generated_tokens[-stop_len - trailing_token_count : end_idx]) == stop_word:
+                    candidate = (trailing_token_count, stop_len)
+                    if matched_stop is None or candidate > matched_stop:
+                        matched_stop = candidate
+        return matched_stop
+
     def _check_stop_words_for_request_post_append(
         self,
         request: DynamicInferenceRequest,
         *,
         record: Optional[DynamicInferenceRequestRecord] = None,
         num_new_tokens: Optional[int] = None,
+        deferred_finish: Optional[DeferredFinish] = None,
     ) -> Tuple[bool, int, int]:
         """Check if a request should stop due to stop words (after token is appended).
 
@@ -915,6 +1021,7 @@ class StepPostProcessingMixin:
             num_new_tokens: Number of tokens appended in the current step. The
                 returned trim count is limited to these tokens so the caller can
                 trim pending log-probability results without deleting prompt data.
+            deferred_finish: The verdict `detect_deferred_finish` gave.
 
         Returns:
             Tuple of (stop_word_hit, num_new_tokens_trimmed,
@@ -939,14 +1046,27 @@ class StepPostProcessingMixin:
         engine_call = num_new_tokens is not None
         endpoint_count = num_new_tokens if engine_call else self.num_speculative_tokens + 1
         pending_token_count = num_new_tokens if engine_call else len(request.generated_tokens)
-        generated_tokens = []
-        suffix_length = max(map(len, request.stop_word_ids)) + max(0, endpoint_count - 1)
-        for segment in reversed(segments):
-            take = min(suffix_length - len(generated_tokens), len(segment.generated_tokens))
-            if take > 0:
-                generated_tokens[:0] = segment.generated_tokens[-take:]
-            if len(generated_tokens) == suffix_length:
-                break
+        if deferred_finish is None:
+            suffix_length = max(map(len, request.stop_word_ids)) + max(0, endpoint_count - 1)
+            matched_stop = StepPostProcessingMixin._match_stop_word(
+                request.stop_word_ids,
+                StepPostProcessingMixin._trailing_generated_tokens(
+                    record if record is not None else request.generated_tokens, suffix_length
+                ),
+                endpoint_count,
+            )
+            if matched_stop is None:
+                return False, 0, 0
+            trailing_token_count, stop_len = matched_stop
+            total_trim = (
+                trailing_token_count
+                if request.sampling_params.detokenize_stop_sequence
+                else trailing_token_count + stop_len
+            )
+        elif deferred_finish.stop_word_hit:
+            total_trim = deferred_finish.stop_word_trim
+        else:
+            return False, 0, 0
         tpot_is_token_aligned = {
             id(segment): len(segment.tpot) == len(segment.generated_tokens) for segment in segments
         }
@@ -990,33 +1110,6 @@ class StepPostProcessingMixin:
             if segment.generated_length is not None:
                 segment.generated_length = len(segment.generated_tokens)
 
-        matched_stop = None
-        for stop_word_ids in request.stop_word_ids:
-            stop_len = len(stop_word_ids)
-            if len(generated_tokens) < stop_len:
-                continue
-            # Search every endpoint produced in this step before mutating state.
-            # A larger trailing-token count means this stop completed earlier;
-            # at the same endpoint, prefer the longer stop sequence.
-            for trailing_token_count in range(endpoint_count):
-                end_idx = -trailing_token_count if trailing_token_count > 0 else None
-                if (
-                    list(generated_tokens[-stop_len - trailing_token_count : end_idx])
-                    == stop_word_ids
-                ):
-                    candidate = (trailing_token_count, stop_len)
-                    if matched_stop is None or candidate > matched_stop:
-                        matched_stop = candidate
-
-        if matched_stop is None:
-            return False, 0, 0
-
-        trailing_token_count, stop_len = matched_stop
-        total_trim = (
-            trailing_token_count
-            if request.sampling_params.detokenize_stop_sequence
-            else trailing_token_count + stop_len
-        )
         pending_trim = min(total_trim, pending_token_count)
         if pending_trim > 0:
             trim_segment_tail(request, pending_trim, trim_stored_scores=False)

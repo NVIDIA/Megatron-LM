@@ -3,6 +3,7 @@
 """Unit tests for token stops, stop words, and dynamic inference finish metadata."""
 
 import asyncio
+import random
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import List, Optional
@@ -12,6 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from megatron.core.inference.engines.dynamic.post_process import DeferredFinish
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, RequestEntry
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
@@ -748,3 +750,215 @@ def test_postprocess_completion_and_deferred_stop(tokens, budget, expected, kept
         assert not engine.requests
 
     asyncio.run(run())
+
+
+def _deferred_request(generated_tokens, stop_word_ids=None, **sampling_kwargs):
+    return DynamicInferenceRequest(
+        request_id=1,
+        prompt_tokens=torch.tensor([1, 2, 3]),
+        sampling_params=SamplingParams(
+            **{
+                "num_tokens_to_generate": 64,
+                "termination_id": -1,
+                "detokenize_stop_sequence": True,
+                **sampling_kwargs,
+            }
+        ),
+        generated_tokens=list(generated_tokens),
+        stop_word_ids=stop_word_ids,
+    )
+
+
+class TestDeferredFinish:
+    """`detect_deferred_finish`: the pass's finish decision as a function of the tokens."""
+
+    def test_verdict_matches_the_post_append_check(self):
+        """On random histories, stop words and bursts, the verdict taken before the append
+        equals the check upstream runs after it, and applying the verdict leaves the same
+        request state as matching in place."""
+        rng = random.Random(7)
+        engine = _stop_metadata_engine()
+        for _ in range(300):
+            history = [rng.randint(3, 6) for _ in range(rng.randint(0, 5))]
+            burst = [rng.randint(3, 6) for _ in range(rng.randint(1, 3))]
+            stops = [
+                [rng.randint(3, 6) for _ in range(rng.randint(1, 2))]
+                for _ in range(rng.randint(0, 2))
+            ] or None
+            detokenize = rng.random() < 0.5
+            engine.num_speculative_tokens = len(burst) - 1
+
+            def appended():
+                request = _deferred_request(
+                    history + burst, stops, detokenize_stop_sequence=detokenize
+                )
+                return request, DynamicInferenceRequestRecord.from_request(request)
+
+            request, record = appended()
+            expected = engine._check_stop_words_for_request_post_append(
+                request, record=record, num_new_tokens=len(burst)
+            )
+            verdict = engine.detect_deferred_finish(
+                _deferred_request(history, stops, detokenize_stop_sequence=detokenize),
+                history,
+                burst,
+            )
+            assert verdict.stop_word_hit == expected[0]
+            assert (verdict.eos_mid_block_hit, verdict.eos_trim, verdict.length_trim) == (0, 0, 0)
+            applied, applied_record = appended()
+            result = engine._check_stop_words_for_request_post_append(
+                applied, record=applied_record, num_new_tokens=len(burst), deferred_finish=verdict
+            )
+            assert (result, applied.generated_tokens) == (expected, request.generated_tokens)
+
+    @pytest.mark.parametrize(
+        "request_kwargs, new_tokens, expected",
+        [
+            pytest.param(
+                dict(generated_tokens=[10], termination_id=2),
+                [50, 2, 52],
+                DeferredFinish(eos_mid_block_hit=True, eos_trim=1),
+                id="eos-inside-the-burst",
+            ),
+            pytest.param(
+                dict(generated_tokens=[10], termination_id=2),
+                [11, 2, 52],
+                DeferredFinish(eos_mid_block_hit=True, eos_trim=2),
+                id="earliest-eos-wins",
+            ),
+            pytest.param(
+                dict(generated_tokens=[5], stop_token_ids=[9]),
+                [9],
+                DeferredFinish(eos_mid_block_hit=True),
+                id="stop-id-ends-a-single-token",
+            ),
+            pytest.param(
+                dict(generated_tokens=[10, 12, 13], num_tokens_to_generate=4, termination_id=2),
+                [50, 2, 52],
+                DeferredFinish(eos_trim=1, length_trim=1),
+                id="length-cut-takes-the-eos-back-out",
+            ),
+            pytest.param(
+                dict(generated_tokens=[], num_tokens_to_generate=0),
+                [7],
+                DeferredFinish(length_trim=1),
+                id="zero-budget",
+            ),
+            pytest.param(
+                dict(generated_tokens=[10], stop_word_ids=[[52]], termination_id=2),
+                [50, 2, 52],
+                DeferredFinish(eos_mid_block_hit=True, eos_trim=1),
+                id="stop-after-the-cut-is-no-hit",
+            ),
+            pytest.param(
+                dict(generated_tokens=[10], stop_word_ids=[[51]]),
+                [50, 51, 52],
+                DeferredFinish(stop_word_hit=True, stop_word_trim=1),
+                id="stop-inside-the-kept-burst",
+            ),
+        ],
+    )
+    def test_detect_deferred_finish(self, request_kwargs, new_tokens, expected):
+        """The EOS cut, then the length cut, then the stop-word match on what is kept."""
+        engine = _stop_metadata_engine()
+        engine.num_speculative_tokens = 2
+        request = _deferred_request(**request_kwargs)
+        verdict = engine.detect_deferred_finish(request, request.generated_tokens, new_tokens)
+        assert verdict == expected
+
+    def test_stop_sequence_across_checkpoint_segments(self):
+        """A stop that starts in an older segment and ends in the new token is found, and the
+        trim applied from the verdict leaves the state the in-place match leaves."""
+        engine = _stop_metadata_engine()
+        engine.num_speculative_tokens = 0
+
+        def checkpointed(appended=()):
+            record = DynamicInferenceRequestRecord.from_request(
+                _deferred_request([7, 8], [[8, 9]], detokenize_stop_sequence=False)
+            )
+            record.checkpoint()
+            record[-1].generated_tokens.extend(appended)
+            return record
+
+        pending = checkpointed()
+        verdict = engine.detect_deferred_finish(pending[-1], pending, [9])
+        assert verdict == DeferredFinish(stop_word_hit=True, stop_word_trim=2)
+        results = []
+        for deferred_finish in (verdict, None):
+            record = checkpointed(appended=[9])
+            results.append(
+                (
+                    engine._check_stop_words_for_request_post_append(
+                        record[-1], record=record, num_new_tokens=1, deferred_finish=deferred_finish
+                    ),
+                    [segment.generated_tokens for segment in record.requests],
+                    record[-1].prompt_tokens.tolist(),
+                )
+            )
+        # One stop token was pending, the other stored in the older segment with its copy at
+        # the end of the cumulative prompt; one prompt score is left to trim.
+        assert results[0] == results[1] == ((True, 1, 1), [[7], []], [1, 2, 3, 7])
+
+    def test_bookkeeping_applies_the_verdict_to_tokens_scores_and_the_channel(self):
+        """EOS and stop-word trims from one verdict leave tokens, log probs and top-n aligned,
+        and the row reaches the stop-word channel."""
+
+        async def run():
+            engine = _stop_metadata_engine()
+            engine.controller.tokenizer = SimpleNamespace(detokenize=lambda ids: str(ids[0]))
+            engine.finished_request_count = engine.evicted_request_count = 0
+            engine.track_generated_token_events = False
+            engine.num_speculative_tokens = 3
+            engine._spec_steps = 0
+            engine._spec_tokens_proposed_per_pos = torch.zeros(3, dtype=torch.long)
+            engine._spec_tokens_accepted_per_pos = torch.zeros(3, dtype=torch.long)
+            engine.stop_word_finished_request_ids = set()
+            engine.context = SimpleNamespace(
+                kv_block_allocator=object(),
+                remove_vlm_request_data=lambda _: None,
+                chunked_prefill_request_id=-1,
+            )
+            request = _deferred_request(
+                [10],
+                [[21]],
+                termination_id=2,
+                return_log_probs=True,
+                skip_prompt_log_probs=True,
+                top_n_logprobs=1,
+            )
+            request.generated_log_probs = [-0.1]
+            request.generated_top_n_logprobs = [{"10": -0.1}]
+            request.add_event_add_engine()
+            engine.requests = {
+                1: RequestEntry(
+                    record=DynamicInferenceRequestRecord.from_request(request),
+                    future=asyncio.get_running_loop().create_future(),
+                )
+            }
+            top_n = {
+                0: [(torch.tensor([-0.1]), torch.tensor([token])) for token in (20, 21, 2, 30)]
+            }
+            active, finished = engine.post_process_requests(
+                request_ids=torch.tensor([1]),
+                finished_request_ids=torch.tensor([], dtype=torch.long),
+                evict_request_ids=None,
+                step_time=0.0,
+                sample=torch.tensor([30]),
+                accepted_tokens=torch.tensor([[20, 21, 2]]),
+                log_probs=[[-0.2, -0.3, -0.4, -0.5]],
+                top_n_logprobs=top_n,
+                consumed_chunked_prefill_request_id=-1,
+            )
+            # The EOS cut drops the 30; the stop word [21] keeps itself and drops the EOS after it.
+            assert (active, finished) == ([1], [])
+            assert request.generated_tokens == [10, 20, 21]
+            assert request.generated_log_probs == pytest.approx([-0.1, -0.2, -0.3])
+            assert [list(top) for top in request.generated_top_n_logprobs] == [
+                ["10"],
+                ["20"],
+                ["21"],
+            ]
+            assert request.finish_reason == "stop"
+            assert engine.stop_word_finished_request_ids == {1}
+
+        asyncio.run(run())
