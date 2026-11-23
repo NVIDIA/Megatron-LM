@@ -18,6 +18,7 @@ from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.schedules import deallocate_output_tensor
 from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -163,6 +164,66 @@ def test_hybrid_ep_overlap_rejects_custom_layers_at_construction():
                 max_sequence_length=8,
                 pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_empty_intermediate_overlap_chunk_preserves_received_input():
+    """Pseudo-deallocating a sent activation must preserve its received input and gradient."""
+    if Utils.world_size < 4:
+        pytest.skip("PP=2 with EP=2 requires four ranks")
+    Utils.initialize_model_parallel(
+        pipeline_model_parallel_size=2,
+        virtual_pipeline_model_parallel_size=2,
+        expert_model_parallel_size=2,
+    )
+    try:
+        config = MLATransformerConfig(
+            num_layers=4,
+            hidden_size=16,
+            num_attention_heads=2,
+            pipeline_model_parallel_size=2,
+            virtual_pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.bfloat16,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            expert_model_parallel_size=2,
+            num_moe_experts=2,
+            moe_token_dispatcher_type="alltoall",
+            overlap_moe_expert_parallel_comm=True,
+            deallocate_pipeline_outputs=True,
+        )
+        groups = ProcessGroupCollection.use_mpu_process_groups()
+        # Each PP rank owns one empty intermediate chunk in this VPP-major pattern.
+        model = HybridModel(
+            config=config,
+            hybrid_layer_pattern="[*E]|||[*E]",
+            vp_stage=1 - groups.pp.rank(),
+            pg_collection=groups,
+            pre_process=False,
+            post_process=False,
+            vocab_size=32,
+            max_sequence_length=4,
+        )
+        expected = torch.arange(
+            4 * 2 * config.hidden_size, device="cuda", dtype=config.pipeline_dtype
+        ).reshape(4, 2, config.hidden_size)
+        received = expected.clone().requires_grad_()
+        model.set_input_tensor(received)
+        set_streams()
+        plan = model.build_schedule_plan(input_ids=None, position_ids=None, attention_mask=None)
+        assert plan.num_layers() == 0
+        output = TransformerModelChunkSchedulePlan.run(plan, None)
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+        deallocate_output_tensor(output, config.deallocate_pipeline_outputs)
+        assert output.numel() == 1
+        assert output is not received
+        torch.testing.assert_close(received, expected, rtol=0, atol=0)
+
+        upstream_grad = expected.flip(0) - 5
+        TransformerModelChunkSchedulePlan.run(None, plan, b_grad=upstream_grad)
+        torch.testing.assert_close(received.grad, upstream_grad, rtol=0, atol=0)
     finally:
         Utils.destroy_model_parallel()
 

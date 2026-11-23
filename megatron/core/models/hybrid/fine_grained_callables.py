@@ -469,6 +469,9 @@ class HybridEmbeddingNode(PreProcessNode):
             if model.hybrid_layer_config_list is not None and model._decoder_uses_mla
             else _rotary_embedding(model, state.decoder_input, state.packed_seq_params)
         )
+        if not model.pre_process and not model.post_process and len(model.decoder.layers) == 0:
+            # The pipeline can deallocate the sent output while backward still needs the input.
+            state.decoder_input = state.decoder_input.clone()
         return state.decoder_input
 
 
