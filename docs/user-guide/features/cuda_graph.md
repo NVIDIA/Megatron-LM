@@ -178,27 +178,19 @@ remove those TE hooks.
 
 #### Focused validation and prerequisites
 
-The core training, stream-policy and MCore failure tests run on this PR alone:
+The focused suite checks MoE training parity, communication stream policies, graph
+deletion and recapture, and MCore capture failure recovery:
 
 ```bash
-python -m torch.distributed.run --nproc-per-node=2 -m pytest -q --experimental \
-  tests/unit_tests/distributed/mfsdp_v2/test_mcore_partial_cuda_graph.py \
-  -k "not dropout_rng and not delete_recapture"
-```
-
-The full suite additionally exercises train/eval/train and native SwiGLU checkpoint
-restore. These require [#9372](https://github.com/NVIDIA/Megatron-LM/pull/9372) and
-[#9374](https://github.com/NVIDIA/Megatron-LM/pull/9374), respectively. Before they merge,
-apply their pinned changes on a throwaway validation branch from this PR:
-
-```bash
-git switch -c validate-mfsdp-partial-graphs
-git fetch https://github.com/NVIDIA/Megatron-LM.git pull/9372/head pull/9374/head
-git cherry-pick --no-commit 41103622852c379074ad993cf592fb799df65a21 \
-  2886280662e31c1678e9ceb5bb4c94a2c09304e9
-python -m torch.distributed.run --nproc-per-node=2 -m pytest -q --experimental \
+python -m torch.distributed.run --standalone --nproc-per-node=2 -m pytest -q --experimental \
   tests/unit_tests/distributed/mfsdp_v2/test_mcore_partial_cuda_graph.py
 ```
+
+Training across evaluation and native SwiGLU checkpoint restore rely on the separate
+fixes in [#9372](https://github.com/NVIDIA/Megatron-LM/pull/9372) and
+[#9374](https://github.com/NVIDIA/Megatron-LM/pull/9374), respectively. The
+[recorded composition tests](https://github.com/WEIXILIN0307/Megatron-LM/tree/db2c35aa762f7956aecffe43a7b896dd2a8737d3/mfsdp-v2-core-split-20261112/review-20261115)
+pin the revisions that were used to validate those paths.
 
 Use four ranks to also exercise EP=2 with expert-DP=2. These tests use small real
 GPT/Hybrid MoE modules and synthetic tokens; real-text timing/trace evidence is linked
