@@ -820,9 +820,24 @@ class TestGraphedCommitPass:
         )
         kv_writes = []
 
-        def compute_mtp_kv_write(**kwargs):
-            kv_writes.append(kwargs)
-            model.all_forwards.append(("mtp_kv_write", kwargs))
+        def compute_mtp_kv_write(
+            hidden_states,
+            next_token_ids,
+            position_ids,
+            eager=False,
+            cache_key=None,
+            mtp_inference_context=None,
+        ):
+            call = dict(
+                hidden_states=hidden_states,
+                next_token_ids=next_token_ids,
+                position_ids=position_ids,
+                eager=eager,
+                cache_key=cache_key,
+                mtp_inference_context=mtp_inference_context,
+            )
+            kv_writes.append(call)
+            model.all_forwards.append(("mtp_kv_write", call))
 
         model.compute_mtp_kv_write = compute_mtp_kv_write
         model.kv_write_calls = kv_writes

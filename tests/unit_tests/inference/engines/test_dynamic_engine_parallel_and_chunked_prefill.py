@@ -754,10 +754,11 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             record(gpu_view, meta.padded_count)
             return result
 
-        def write_commit_step_metadata(gpu_view, *args, **kw):
+        def write_commit_step_metadata(gpu_view, accepted_counts, base_positions, num_slots):
             # `num_slots` rows per request slot; unused and padding rows go to the dummy block.
-            result = originals["write_commit_step_metadata"](gpu_view, *args, **kw)
-            num_slots = kw["num_slots"] if "num_slots" in kw else args[2]
+            result = originals["write_commit_step_metadata"](
+                gpu_view, accepted_counts, base_positions, num_slots=num_slots
+            )
             record(gpu_view, meta.padded_count * num_slots)
             return result
 
