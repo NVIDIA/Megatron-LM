@@ -72,13 +72,10 @@ def test_initial_stash_releases_eager_cache_without_changing_live_tensors(monkey
     monkeypatch.setattr(PagedStashManager, "get_instance", lambda: manager)
     paged_stash_reset()
 
-    # Earlier tests may leave a live tensor in a cached segment with a large free remainder.
-    # The allocator would carve the eager tensor out of that remainder, and empty_cache() never
-    # returns a segment that still holds a live block. Requesting more than all cached free
-    # memory forces the eager tensor into a segment of its own, which empty_cache() can return.
-    cached_free = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
-    eager_bytes = max(2**26, (cached_free // 2**21 + 1) * 2**21)
+    # Larger than everything still reserved, so no existing segment can hold it. A segment kept
+    # by a live tensor from an earlier test would otherwise stay reserved after the flush.
     reserved_without_eager = torch.cuda.memory_reserved()
+    eager_bytes = reserved_without_eager + 2**26
     eager = torch.empty(eager_bytes, device="cuda", dtype=torch.uint8)
     assert (
         torch.cuda.memory_reserved() - reserved_without_eager >= eager_bytes

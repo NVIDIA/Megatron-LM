@@ -2912,12 +2912,12 @@ def _nvtx_range_get_func_path():
     Returns:
         str: Module path and function name joined by a dot
     """
-    # Get the caller's caller frame (go back 2 frames)
+    # Get the caller's caller frame (go back 2 frames). The frame itself holds both names:
+    # inspect.getframeinfo and inspect.getmodule would scan the code's line table and stat
+    # the source file on every call, which a forward pass makes hundreds of times.
     frame = inspect.currentframe().f_back.f_back
-    caller_func = inspect.getframeinfo(frame).function
-    module = inspect.getmodule(frame)
 
-    return f"{module.__name__}.{caller_func}"
+    return f"{frame.f_globals['__name__']}.{frame.f_code.co_name}"
 
 
 def nvtx_range_push(msg=None, suffix=None) -> None:
