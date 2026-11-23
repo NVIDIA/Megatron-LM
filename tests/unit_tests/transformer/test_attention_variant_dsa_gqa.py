@@ -1212,6 +1212,50 @@ def _dsa_gqa_core_attention(indexer_loss_coeff, layer_number):
     )
 
 
+@pytest.mark.parametrize("kpool", [1, 4])
+def test_dsa_gqa_core_attention_rejects_kpool(kpool):
+    """The simplified indexer has no pool compression, so a KPool config must not reach it.
+
+    TransformerConfig rejects simplified + KPool; this covers a config whose dsa_indexer_kpool
+    changed after construction, which skips that validation.
+    """
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=32,
+        num_attention_heads=4,
+        num_query_groups=1,
+        kv_channels=8,
+        experimental_attention_variant="dsa",
+        dsa_indexer_mode="simplified",
+        add_bias_linear=False,
+        dsa_indexer_topk=4,
+        dsa_kernel_backend="reference",
+    )
+    config.rotary_percent = 0.0
+    config.dsa_indexer_kpool = kpool
+    linear = ModuleSpec(module=_PlainIndexerLinear)
+    indexer = ModuleSpec(
+        module=SimplifiedDSGQAIndexer,
+        submodules=SimplifiedDSGQAIndexerSubmodules(linear_q=linear, linear_k=linear),
+    )
+
+    def build():
+        return DSGQACoreAttention(
+            config,
+            DSGQAAttentionSubmodules(indexer=indexer),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type="self",
+            pg_collection=SimpleNamespace(tp=_DummyTPGroup(), cp=None),
+        )
+
+    if kpool > 1:
+        with pytest.raises(ValueError, match="does not support KPool"):
+            build()
+    else:
+        assert isinstance(build(), DSGQACoreAttention)
+
+
 def _run_dsa_gqa_training_forward(core):
     seqlen, batch_size = 8, 2
     query = torch.randn(seqlen, batch_size, 4, 8, device="cuda")
