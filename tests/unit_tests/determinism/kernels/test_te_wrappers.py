@@ -357,6 +357,7 @@ class TestTEWrappers:
         if "zero_tensor" in inspect.signature(get_dummy_wgrad).parameters:
             assert head.weight.grad._is_zerotensor()
 
+    @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 and NVFP4 require Blackwell")
     @pytest.mark.parametrize("fp8_param", [False, True], ids=["bf16-param", "mxfp8-param"])
     def test_fp4_model_mxfp8_linear_replays(self, fp8_param):

@@ -1228,6 +1228,28 @@ class _ParamAndGradBuffer:
         self.param_nccl_mem_pool: Optional["torch.cuda.MemPool"] = None
         self.nccl_grad_pool_is_separate: bool = self.nccl_ub and self.ddp_config.grad_buffer_offload
         has_mxfp8_params = any(is_mxfp8tensor(p) or is_grouped_mxfp8tensor(p) for p in self.params)
+        if self.ddp_config.fp4_param_gather:
+            other_quantized = [
+                name
+                for param, name in params_with_names
+                if _param_uses_quantized_storage(param)
+                and not (
+                    is_nvfp4tensor(param)
+                    or is_grouped_nvfp4tensor(param)
+                    or is_mxfp8tensor(param)
+                    or is_grouped_mxfp8tensor(param)
+                )
+            ]
+            if other_quantized:
+                # The FP4 optimizer path re-quantizes NVFP4 params from their main params and
+                # stages MXFP8 params through the grad buffer; a param in another quantized
+                # format (e.g. tensorwise FP8 from a quant_recipe entry) would get its FP32
+                # main param copied straight into its uint8 storage.
+                raise ValueError(
+                    "With fp4_param_gather, quantized params must be NVFP4 or MXFP8; found other "
+                    f"quantized params: {other_quantized[:4]}. Use fp8_quantization_recipe mxfp8 "
+                    "for quant_recipe entries that set fp8_param in an FP4 model."
+                )
         if (
             self.ddp_config.fp4_param_gather
             and has_mxfp8_params
@@ -1896,6 +1918,32 @@ class _ParamAndGradBuffer:
             self.grad_data_size = 0
 
 
+def _fp8_buckets_in_layer_order(fp8_buffers):
+    """Return (bucket, buffer) pairs of the fp8 (uint8) buffers in one bucket sequence.
+
+    With several fp8 buffers (NVFP4 experts and MXFP8 non-expert linears on the same
+    data-parallel group), the buckets are merged in the model's parameter order, like the buckets
+    of a single buffer: each buffer's buckets run from its last params to its first, so sorting
+    by the highest param index of each bucket, descending, interleaves the buffers layer by
+    layer and keeps the forward param all-gather prefetch on the next layer that needs it. The
+    param indices of both buffers count params of the same (high-precision) dtype, so they are
+    comparable.
+    """
+    fp8_buckets = [(bucket, buffer) for buffer in fp8_buffers for bucket in buffer.buckets]
+    if len(fp8_buffers) < 2 or len({buffer.params[0].dtype for buffer in fp8_buffers}) != 1:
+        return fp8_buckets
+    param_index = {}
+    for buffer in fp8_buffers:
+        if len(buffer.param_indices) != len(buffer.params):
+            return fp8_buckets
+        param_index.update(zip(buffer.params, buffer.param_indices))
+    return sorted(
+        fp8_buckets,
+        key=lambda item: max(param_index[param] for param in item[0].params),
+        reverse=True,
+    )
+
+
 def partition_buckets(
     buffers: List[_ParamAndGradBuffer],
     force_single_bucket_group: bool = False,
@@ -2028,7 +2076,7 @@ def partition_buckets(
                 for bucket in buffer.buckets:
                     non_fp8_buckets.append(bucket)
 
-        fp8_buckets = [(bucket, buffer) for buffer in fp8_buffers for bucket in buffer.buckets]
+        fp8_buckets = _fp8_buckets_in_layer_order(fp8_buffers)
         bucket_groups = []
         for fp8_bucket_idx, (bucket, buffer) in enumerate(fp8_buckets):
             if fp8_bucket_idx == len(fp8_buckets) - 1:

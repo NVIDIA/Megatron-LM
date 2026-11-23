@@ -251,7 +251,10 @@ class TestFP4Param:
 
         set_args(args)
         torch.manual_seed(_SEED)
-        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+        ep_size = kwargs.get("expert_model_parallel_size", 1)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size, expert_model_parallel_size=ep_size
+        )
         input_ids, labels, position_ids, attention_mask, loss_mask = self.get_batch(
             self.seq_length, self.micro_batch_size
         )
@@ -266,6 +269,7 @@ class TestFP4Param:
                 ModelType.encoder_or_decoder, self.model_provider
             )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
+        assert ps.get_expert_model_parallel_world_size() == ep_size
 
         dense_mxfp8 = args.te_precision_config_file is not None
         num_fp4_params = 0
@@ -577,7 +581,10 @@ class TestFP4Param:
         )
         set_args(args)
         torch.manual_seed(_SEED)
-        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size,
+            expert_model_parallel_size=kwargs.get("expert_model_parallel_size", 1),
+        )
         model_parallel_cuda_manual_seed(_SEED)
         model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
             ModelType.encoder_or_decoder, self.model_provider

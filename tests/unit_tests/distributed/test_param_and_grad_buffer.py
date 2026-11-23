@@ -1272,6 +1272,7 @@ def _nvfp4_and_mxfp8_supported():
         return False
 
 
+@pytest.mark.launch_on_gb200
 @pytest.mark.skipif(not _nvfp4_and_mxfp8_supported(), reason="Requires NVFP4 and MXFP8 support")
 @pytest.mark.parametrize("reuse_grad_buf_for_mxfp8_param_ag", [True, False])
 def test_fp4_model_mxfp8_and_nvfp4_params_get_separate_buffers(
@@ -1368,4 +1369,97 @@ def test_fp4_model_mxfp8_and_nvfp4_params_get_separate_buffers(
     assert len(grouped_buckets) == len(all_buckets)
     assert set(map(id, grouped_buckets)) == set(map(id, all_buckets))
 
+    Utils.destroy_model_parallel()
+
+
+def _fp4_model_ddp_config(**overrides):
+    kwargs = dict(
+        grad_reduce_in_fp32=True,
+        use_distributed_optimizer=True,
+        overlap_grad_reduce=True,
+        overlap_param_gather=True,
+        fp4_param_gather=True,
+        reuse_grad_buf_for_mxfp8_param_ag=True,
+        bucket_size=None,
+    )
+    kwargs.update(overrides)
+    return DistributedDataParallelConfig(**kwargs)
+
+
+def _make_fp4_model_ddp(model, ddp_config):
+    all_params = [p for p in model.parameters() if p.requires_grad]
+    full_param_layout = DistributedOptimizer.compute_full_param_layout(
+        all_params,
+        None,
+        parallel_state.get_data_parallel_world_size(
+            with_context_parallel=True, partial_data_parallel=True
+        ),
+        ddp_config,
+    )
+    return DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1),
+        ddp_config=ddp_config,
+        module=model,
+        full_param_layout=full_param_layout,
+    )
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(not _nvfp4_and_mxfp8_supported(), reason="Requires NVFP4 and MXFP8 support")
+def test_fp4_model_fp8_buckets_follow_layer_order():
+    """At EP=1 the NVFP4 expert and MXFP8 attention buckets are merged in layer order (last layer
+    first, as within one buffer), so the forward param all-gather prefetch alternates between
+    them the way forward does."""
+    import transformer_engine.pytorch as te
+    from transformer_engine.common.recipe import MXFP8BlockScaling, NVFP4BlockScaling
+    from transformer_engine.pytorch.fp8 import fp8_model_init
+
+    Utils.initialize_model_parallel()
+    hidden = 256
+    model = torch.nn.Module()
+    for layer in range(2):
+        with fp8_model_init(enabled=True, recipe=MXFP8BlockScaling()):
+            model.add_module(
+                f"qkv{layer}", te.Linear(hidden, hidden, bias=False, params_dtype=torch.bfloat16)
+            )
+        with fp8_model_init(enabled=True, recipe=NVFP4BlockScaling()):
+            model.add_module(
+                f"expert{layer}", te.Linear(hidden, hidden, bias=False, params_dtype=torch.bfloat16)
+            )
+    model.norm = torch.nn.LayerNorm(hidden, device="cuda", dtype=torch.bfloat16)
+
+    # A small bucket size gives every weight its own bucket.
+    ddp_model = _make_fp4_model_ddp(model, _fp4_model_ddp_config(bucket_size=1000))
+    fp8_weights = {
+        id(getattr(model, name).weight): name for name in ("qkv0", "expert0", "qkv1", "expert1")
+    }
+    order = []
+    for group in ddp_model.bucket_groups:
+        names = {
+            fp8_weights[id(p)] for b in group.buckets for p in b.params if id(p) in fp8_weights
+        }
+        assert len(names) <= 1
+        order.extend(names)
+    assert order == ["expert1", "qkv1", "expert0", "qkv0"]
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(not _nvfp4_and_mxfp8_supported(), reason="Requires NVFP4 and MXFP8 support")
+def test_fp4_param_gather_rejects_other_quantized_params():
+    """With fp4_param_gather only NVFP4 and MXFP8 params can be refreshed from the main params;
+    a tensorwise FP8 param (e.g. from an earlier quant_recipe matcher) is rejected up front."""
+    import transformer_engine.pytorch as te
+    from transformer_engine.common.recipe import DelayedScaling, NVFP4BlockScaling
+    from transformer_engine.pytorch.fp8 import fp8_model_init
+
+    Utils.initialize_model_parallel()
+    hidden = 256
+    model = torch.nn.Module()
+    with fp8_model_init(enabled=True, recipe=NVFP4BlockScaling()):
+        model.expert_fc = te.Linear(hidden, hidden, bias=False, params_dtype=torch.bfloat16)
+    with fp8_model_init(enabled=True, recipe=DelayedScaling()):
+        model.tensorwise_fc = te.Linear(hidden, hidden, bias=False, params_dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="quantized params must be NVFP4 or MXFP8"):
+        _make_fp4_model_ddp(model, _fp4_model_ddp_config())
     Utils.destroy_model_parallel()

@@ -517,6 +517,34 @@ def _get_fp8_autocast_recipe_for_quant_params(
     return recipe if recipe.override_nonquantized_autocast else None
 
 
+def _get_fused_linears_quant_recipe(linear_fc1, linear_fc2, what: str):
+    """Precision override recipe (or None) for a fused op sequence running linear_fc1 and
+    linear_fc2.
+
+    Op-fuser paths call the TE ops directly, so they must apply the linears' quant_recipe
+    override themselves. Resolve it from the linears' current train/eval mode; the whole sequence
+    runs under one recipe, so both linears must resolve to the same override.
+    """
+    fc1_recipe = _get_fp8_autocast_recipe_for_quant_params(
+        getattr(linear_fc1, "te_quant_params", None), linear_fc1.training
+    )
+    fc2_recipe = _get_fp8_autocast_recipe_for_quant_params(
+        getattr(linear_fc2, "te_quant_params", None), linear_fc2.training
+    )
+    if fc1_recipe != fc2_recipe:
+        raise ValueError(
+            f"{what} requires the same precision override for linear_fc1 and linear_fc2. "
+            "Apply the override to both linears."
+        )
+    return fc1_recipe
+
+
+def _get_fused_linears_quant_context(linear_fc1, linear_fc2, what: str):
+    """Context applying :func:`_get_fused_linears_quant_recipe` (nullcontext without one)."""
+    recipe = _get_fused_linears_quant_recipe(linear_fc1, linear_fc2, what)
+    return nullcontext() if recipe is None else _get_fp8_autocast_for_quant_recipe(recipe)
+
+
 def _get_fp8_autocast_for_quant_params(qparams: TEQuantizationParams | None, training: bool):
     recipe = _get_fp8_autocast_recipe_for_quant_params(qparams, training)
     return nullcontext() if recipe is None else _get_fp8_autocast_for_quant_recipe(recipe)
@@ -3625,8 +3653,15 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         def forward(self, hidden_states: torch.Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
             """Forward."""
 
+            # The fused ops bypass the linear wrappers' forward, which would apply a quant_recipe
+            # override; apply it here for the whole sequence (it must match for both linears).
+            quant_context = _get_fused_linears_quant_context(
+                self.linear_fc1, self.linear_fc2, f"{self.__class__.__name__}"
+            )
+
             # Apply fused impl
-            out = self._get_fused_impl()(hidden_states)
+            with quant_context:
+                out = self._get_fused_impl()(hidden_states)
 
             # Return bias tensor if requested
             bias = None
@@ -3847,6 +3882,19 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
             if get_tensor_model_parallel_world_size() > 1:
                 return super().forward(hidden_states, **kwargs)
+
+            # This path picks its own recipe below and bypasses the linear wrappers, so it
+            # cannot apply a quant_recipe precision override.
+            if (
+                _get_fused_linears_quant_recipe(
+                    self.linear_fc1, self.linear_fc2, self.__class__.__name__
+                )
+                is not None
+            ):
+                raise ValueError(
+                    f"{self.__class__.__name__} does not support a quant_recipe precision "
+                    "override on linear_fc1/linear_fc2; use TEFusedMLP or the unfused MLP."
+                )
 
             orig_shape = hidden_states.shape
             hidden_size = hidden_states.size(-1)

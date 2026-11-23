@@ -60,6 +60,7 @@ from ..fp8_utils import (
     get_grouped_quantized_members,
     is_float8tensor,
     is_grouped_tensor_with_quantized_storage,
+    is_mxfp8tensor,
     quantize_param_shard,
 )
 from ..full_cuda_graph import FullIterationGradCopy
@@ -116,6 +117,25 @@ def get_legacy_grad_dtypes(sharded_keys) -> Dict[str, str]:
         for param_dtype, found in grad_dtypes.items()
         if len(found) == 1
     }
+
+
+def _check_reuse_grad_buf_config(ddp_config, config) -> None:
+    """Reject a DDP config that reuses the grad buffer for the MXFP8 param all-gather while the
+    optimizer config does not.
+
+    With that mismatch the optimizer never stages its main params into the grad buffer, and the
+    param all-gather quantizes whatever the grad buffer holds.
+    """
+    if ddp_config.use_megatron_fsdp:
+        return
+    if (
+        ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+        and not config.reuse_grad_buf_for_mxfp8_param_ag
+    ):
+        raise ValueError(
+            "DistributedDataParallelConfig.reuse_grad_buf_for_mxfp8_param_ag is set but "
+            "OptimizerConfig.reuse_grad_buf_for_mxfp8_param_ag is not; set both."
+        )
 
 
 def _is_trailing_padding_only_shard(
@@ -557,12 +577,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
 
                     # Generate sharded model param.
-                    if (
-                        cls._is_distopt_quantized_param(model_param)
-                        and config.fp8_recipe != "delayed"
-                    ) or is_nvfp4tensor(model_param):
+                    if cls._quantized_param_lacks_flat_view(model_param, config.fp8_recipe):
                         # MXFP8Tensor, BlockwiseQTensor, grouped quantized tensors, and NVFP4Tensor
-                        # don't support view(-1).
+                        # don't support view(-1): it would dequantize the whole tensor.
                         shard_model_param = None
                     else:
                         shard_model_param = model_param.detach().view(-1)[
@@ -851,6 +868,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.ddp_config = self.model_chunks[0].ddp_config
         for model_chunk in self.model_chunks:
             assert self.ddp_config == model_chunk.ddp_config
+        _check_reuse_grad_buf_config(self.ddp_config, config)
         self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
         # Retained only between loading-template creation and load_state_dict().
         self._checkpoint_version_for_load = None
@@ -1435,6 +1453,23 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def _is_grouped_quantized_tensor(tensor: torch.Tensor) -> bool:
         """Check if tensor is a TE GroupedTensor using quantized storage."""
         return is_grouped_tensor_with_quantized_storage(tensor)
+
+    @classmethod
+    def _quantized_param_lacks_flat_view(cls, model_param: torch.Tensor, fp8_recipe) -> bool:
+        """Whether a quantized model param has no cheap flat view for its shard.
+
+        Decided by the param's own type, not only by the global fp8_recipe: an FP4 model whose
+        quant_recipe gives some linears MXFP8 params has the default "delayed" fp8_recipe.
+        """
+        if is_nvfp4tensor(model_param):
+            return True
+        if not cls._is_distopt_quantized_param(model_param):
+            return False
+        return (
+            fp8_recipe != "delayed"
+            or is_mxfp8tensor(model_param)
+            or cls._is_grouped_quantized_tensor(model_param)
+        )
 
     @classmethod
     def _is_distopt_quantized_param(cls, tensor: torch.Tensor) -> bool:
@@ -2813,134 +2848,38 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.optimizer._sync_hdo_state_to_sub_optimizers()
 
     def split_state_dict_if_needed(self, state_dict):
-        """
-        When "--fp8-param-gather" is disabled, weights and biases are stored in the same
-        `_ParamAndGradBuffer`. So, when saving a checkpoint, the optimizer's main parameters are
-        saved in a single continuous tensor (this also applies to "exp_avg" and "exp_avg_sq").
+        """Check that a dp_zero parameter state matches this run's parameter-buffer layout.
 
-        However, when "--fp8-param-gather" is enabled, weights(in fp8 dtype) and biases(in bf16/fp16
-        dtype) are stored in separate `_ParamAndGradBuffer`. Therefore, when we enabled
-        "--fp8-param-gather", and want to load a checkpoint saved without "--fp8-param-gather", we
-        need to split the weights(fp8) and biases(bf16/fp16) in the static_dict into two separate
-        tensors.
+        A dp_zero checkpoint stores one flat tensor per parameter buffer, laid out with the
+        bucketing and padding of the run that saved it. Quantized parameters (fp8 / fp4 param
+        gather) live in their own torch.uint8 buffers, and an FP4 model whose quant_recipe gives
+        some linears MXFP8 parameters has two of them (NVFP4 and MXFP8). A checkpoint saved with a
+        different set of buffers (for example without fp8/fp4 param gather, or with NVFP4 experts
+        but BF16 non-expert linears) cannot be split into this run's buffers from the flat
+        tensors alone: the per-parameter padding of the saving run is not recorded. Such
+        checkpoints must be loaded with a resharding format (dp_reshardable or
+        fully_reshardable), which store the state per parameter.
         """
-        # Skip if there is no fp8 buffers.
-        fp8_gbuf_indices = []
-        for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
-            for dtype, _ in gbuf_range_maps.items():
-                if self._is_distopt_quantized_param(self.buffers[gbuf_idx].params[0]):
-                    fp8_gbuf_indices.append(gbuf_idx)
-        if len(fp8_gbuf_indices) == 0:
+        if not any(buffer.param_dtype == torch.uint8 for buffer in self.buffers):
             return
 
-        dtype_to_gbuf_idx = {}
-        for key in state_dict.keys():
-            if key != 'buckets_coalesced':
-                for dtype in state_dict[key].keys():
-                    assert dtype not in dtype_to_gbuf_idx
-                    if isinstance(dtype, str) and dtype.startswith('param_torch:uint8'):
-                        # If the `state_dict`` already contains a torch.uint8 buffer, we assumed
-                        # that the fp8 weights and fp16/bf16 biases in the checkpoint are already
-                        # separated. In this case, no action is required, so we can return directly.
-                        return
-                    dtype_to_gbuf_idx[dtype] = key
-
-        # 1. Replace the gbuf_idx in the checkpoint with the new gbuf_idx.
-        # 2. Copy the non-tensor data (i.e., the "buckets_coalesced") to `new_state_dict`.
-        new_state_dict = {'buckets_coalesced': state_dict['buckets_coalesced']}
-        for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
-            for dtype, _ in gbuf_range_maps.items():
-                if not self._is_distopt_quantized_param(self.buffers[gbuf_idx].params[0]):
-                    new_state_dict[gbuf_idx] = state_dict[dtype_to_gbuf_idx[dtype]]
-
-        for fp8_gbuf_idx in fp8_gbuf_indices:
-            # Note that `self.buffers[fp8_gbuf_idx].params[0].dtype` is the dummy dtype of
-            # `Float8Tensor`, not torch.uint8.
-            non_fp8_dtype_key = _get_dtype_key(self.buffers[fp8_gbuf_idx].params[0].dtype)
-
-            # Iterate through all buffers to find the one that needs to be split.
-            non_fp8_gbuf_idx = None
-            for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
-                for dtype, _ in gbuf_range_maps.items():
-                    if dtype == non_fp8_dtype_key:
-                        non_fp8_gbuf_idx = gbuf_idx
-            assert non_fp8_gbuf_idx is not None
-
-            # We need the fp8_flags to determine the order of weight (fp8) and bias (fp16/bf16) in
-            # the buffer.
-            index_to_fp8_map = {}
-            for index in self.buffers[fp8_gbuf_idx].param_indices:
-                assert index not in index_to_fp8_map
-                index_to_fp8_map[index] = True
-            for index in self.buffers[non_fp8_gbuf_idx].param_indices:
-                assert index not in index_to_fp8_map
-                index_to_fp8_map[index] = False
-            param_indices = (
-                self.buffers[fp8_gbuf_idx].param_indices
-                + self.buffers[non_fp8_gbuf_idx].param_indices
+        checkpoint_layout = sorted(
+            (key, tuple(sorted(state_dict[key].keys())))
+            for key in state_dict.keys()
+            if key != 'buckets_coalesced'
+        )
+        run_layout = sorted(
+            (gbuf_idx, tuple(sorted(gbuf_range_maps.keys())))
+            for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges)
+        )
+        if checkpoint_layout != run_layout:
+            raise ValueError(
+                "The dp_zero optimizer checkpoint was saved with a different parameter-buffer "
+                f"layout ({checkpoint_layout}) than this run ({run_layout}), e.g. with a different "
+                "fp8/fp4 param gather setting or different quantized parameter formats. Load it "
+                "with a resharding distributed-optimizer checkpoint format (dp_reshardable or "
+                "fully_reshardable) instead."
             )
-            assert min(param_indices) == 0
-            assert max(param_indices) == len(param_indices) - 1
-            fp8_flags = []
-            for i in range(len(param_indices)):
-                fp8_flags.append(index_to_fp8_map[i])
-
-            fp8_buffer = self.buffers[fp8_gbuf_idx]
-            non_fp8_buffer = self.buffers[non_fp8_gbuf_idx]
-
-            fp8_idx = len(fp8_buffer.params) - 1
-            non_fp8_idx = len(non_fp8_buffer.params) - 1
-            offsets, fp8_offsets, non_fp8_offsets = [0], [0], [0]
-
-            # Because the parameters in `_ParamAndGradBuffer` are traversed in reverse order, the
-            # flag here also needs to be traversed in reverse order.
-            for fp8_flag in fp8_flags[::-1]:
-                if fp8_flag:
-                    numel = fp8_buffer.params[fp8_idx].nelement()
-                    fp8_idx -= 1
-                    offsets.append(offsets[-1] + numel)
-                    fp8_offsets.append(fp8_offsets[-1] + numel)
-                else:
-                    numel = non_fp8_buffer.params[non_fp8_idx].nelement()
-                    non_fp8_idx -= 1
-                    offsets.append(offsets[-1] + numel)
-                    non_fp8_offsets.append(non_fp8_offsets[-1] + numel)
-
-            # Split the target buffer into two separate buffers.
-            fp8_state_dict, non_fp8_state_dict = {}, {}
-            for key in ('param',) + self.optimizer_state_keys:
-                tensor = state_dict[non_fp8_gbuf_idx][non_fp8_param_and_grad_dtype][key]
-                fp8_tensor = torch.empty([fp8_offsets[-1]], dtype=tensor.dtype)
-                non_fp8_tensor = torch.empty([non_fp8_offsets[-1]], dtype=tensor.dtype)
-
-                fp8_idx, non_fp8_idx = 0, 0
-                for i in range(len(offsets) - 1):
-                    if fp8_flags[-(i + 1)]:
-                        fp8_tensor[fp8_offsets[fp8_idx] : fp8_offsets[fp8_idx + 1]].copy_(
-                            tensor[offsets[i] : offsets[i + 1]]
-                        )
-                        fp8_idx += 1
-                    else:
-                        non_fp8_tensor[
-                            non_fp8_offsets[non_fp8_idx] : non_fp8_offsets[non_fp8_idx + 1]
-                        ].copy_(tensor[offsets[i] : offsets[i + 1]])
-                        non_fp8_idx += 1
-
-                fp8_state_dict[key] = fp8_tensor
-                non_fp8_state_dict[key] = non_fp8_tensor
-
-            fp8_state_dict['numel_unpadded'] = fp8_offsets[-1]
-            non_fp8_state_dict['numel_unpadded'] = non_fp8_offsets[-1]
-
-            # Add the two separate buffers into `new_state_dict`.
-            fp8_dtype_key = _get_dtype_key(torch.uint8)
-            new_state_dict[fp8_gbuf_idx] = {fp8_dtype_key: fp8_state_dict}
-            new_state_dict[non_fp8_gbuf_idx] = {non_fp8_dtype_key: non_fp8_state_dict}
-
-        # Inplace update state_dict
-        state_dict.clear()
-        for key, value in new_state_dict.items():
-            state_dict[key] = value
 
     def load_parameter_state(self, filename: str, *, update_legacy_format=False):
         """Load the distributed parameter state from disk.

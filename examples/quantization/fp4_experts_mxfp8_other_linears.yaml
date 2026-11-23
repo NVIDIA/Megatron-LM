@@ -8,6 +8,10 @@
 # (param_storage_follows_model_init). To keep BF16 parameters plus an MXFP8 weight cache instead,
 # drop fp8_param and param_storage_follows_model_init.
 #
+# The fused dense MLP (TEFusedMLP) runs its op sequence under the MXFP8 override too. The
+# grouped-GEMM fused paths that pick their own recipe (use_grouped_gemm_for_shared_expert, and
+# TEFusedMLPWithGroupedLinear) reject the override; use the unfused shared expert with this file.
+#
 # Matchers are tried in order; the first match wins.
 configs:
   global_recipe:

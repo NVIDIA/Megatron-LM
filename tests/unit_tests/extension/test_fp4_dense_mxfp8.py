@@ -26,7 +26,10 @@ from megatron.core.fp8_utils import is_mxfp8tensor
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import OptimizerConfig
-from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.distrib_optimizer import (
+    DistributedOptimizer,
+    _check_reuse_grad_buf_config,
+)
 from megatron.core.quantization.quant_config import MatchContext, RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -215,6 +218,7 @@ class TestReuseGradBufWithPrecisionAwareOptimizer:
 
 
 @pytest.mark.internal
+@pytest.mark.launch_on_gb200
 @pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine not installed")
 @pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 and NVFP4 require Blackwell (SM >= 10)")
 class TestFp4DenseMxfp8Model:
@@ -332,3 +336,183 @@ class TestFp4DenseMxfp8Model:
         for name, module in self._dense_linears(model).items():
             assert module.fp8_meta["recipe"].mxfp8(), name
             assert module.weight.grad is not None or hasattr(module.weight, "main_grad"), name
+
+
+class TestReuseGradBufConfigMismatch:
+    """DDP reusing the grad buffer for the MXFP8 param all-gather needs the optimizer to stage its
+    main params there too; a mismatch is rejected when the optimizer is built."""
+
+    @staticmethod
+    def _ddp_config(reuse):
+        return DistributedDataParallelConfig(
+            use_distributed_optimizer=True,
+            fp4_param_gather=True,
+            reuse_grad_buf_for_mxfp8_param_ag=reuse,
+        )
+
+    def test_rejects_ddp_reuse_without_optimizer_reuse(self):
+        with pytest.raises(ValueError, match="OptimizerConfig.reuse_grad_buf_for_mxfp8_param_ag"):
+            _check_reuse_grad_buf_config(
+                self._ddp_config(True), SimpleNamespace(reuse_grad_buf_for_mxfp8_param_ag=False)
+            )
+
+    @pytest.mark.parametrize("reuse", [False, True])
+    def test_accepts_matching_settings(self, reuse):
+        _check_reuse_grad_buf_config(
+            self._ddp_config(reuse), SimpleNamespace(reuse_grad_buf_for_mxfp8_param_ag=reuse)
+        )
+
+
+class TestDpZeroCheckpointLayout:
+    """A dp_zero optimizer checkpoint stores one padded flat tensor per param buffer; one saved
+    with a different set of buffers cannot be split into this run's buffers and is rejected."""
+
+    # This run: NVFP4 experts, MXFP8 non-expert linears (both uint8) and BF16 params.
+    RUN = [("param_torch:uint8", torch.uint8)] * 2 + [("param_torch:bfloat16", torch.bfloat16)]
+
+    @classmethod
+    def _optimizer(cls, run):
+        return SimpleNamespace(
+            buffers=[SimpleNamespace(param_dtype=dtype) for _, dtype in run],
+            gbuf_ranges=[{key: None} for key, _ in run],
+        )
+
+    @staticmethod
+    def _state(keys):
+        state = {'buckets_coalesced': True}
+        state.update({i: {key: {}} for i, key in enumerate(keys)})
+        return state
+
+    def test_same_layout_loads(self):
+        state = self._state([key for key, _ in self.RUN])
+        DistributedOptimizer.split_state_dict_if_needed(self._optimizer(self.RUN), state)
+        assert set(state) == {'buckets_coalesced', 0, 1, 2}
+
+    @pytest.mark.parametrize(
+        "saved",
+        [
+            ["param_torch:bfloat16"],  # all-BF16 params
+            ["param_torch:uint8", "param_torch:bfloat16"],  # NVFP4 experts, BF16 dense
+        ],
+        ids=["all-bf16", "nvfp4-experts-bf16-dense"],
+    )
+    def test_different_layout_is_rejected(self, saved):
+        with pytest.raises(ValueError, match="different parameter-buffer layout"):
+            DistributedOptimizer.split_state_dict_if_needed(
+                self._optimizer(self.RUN), self._state(saved)
+            )
+
+    def test_no_quantized_buffers_is_unchanged(self):
+        run = [("param_torch:bfloat16", torch.bfloat16)]
+        DistributedOptimizer.split_state_dict_if_needed(
+            self._optimizer(run), self._state(["param_torch:uint8", "param_torch:bfloat16"])
+        )
+
+
+@pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine not installed")
+class TestFusedPathsApplyQuantRecipe:
+    """Fused op paths bypass the linear wrappers that apply a quant_recipe override."""
+
+    @staticmethod
+    def _linear(override):
+        return SimpleNamespace(te_quant_params=override, training=True, te_return_bias=False)
+
+    @pytest.fixture
+    def entered(self, monkeypatch):
+        import megatron.core.extensions.transformer_engine as te_ext
+
+        entered = []
+
+        class Recorder:
+            def __init__(self, recipe):
+                self.recipe = recipe
+
+            def __enter__(self):
+                entered.append(self.recipe)
+
+            def __exit__(self, *exc):
+                entered.append(None)
+
+        monkeypatch.setattr(
+            te_ext, "_get_fp8_autocast_recipe_for_quant_params", lambda qparams, training: qparams
+        )
+        monkeypatch.setattr(te_ext, "_get_fp8_autocast_for_quant_recipe", Recorder)
+        return entered
+
+    def test_fused_mlp_runs_under_the_override(self, entered):
+        from megatron.core.extensions.transformer_engine import TEFusedMLP
+
+        def fused_impl(x):
+            entered.append("impl")
+            return x
+
+        module = SimpleNamespace(
+            linear_fc1=self._linear("mxfp8"),
+            linear_fc2=self._linear("mxfp8"),
+            _get_fused_impl=lambda: fused_impl,
+        )
+        x = torch.ones(2)
+        out, bias = TEFusedMLP.forward(module, x)
+        assert out is x and bias is None
+        assert entered == ["mxfp8", "impl", None]
+
+    def test_fused_mlp_without_override(self, entered):
+        from megatron.core.extensions.transformer_engine import TEFusedMLP
+
+        module = SimpleNamespace(
+            linear_fc1=self._linear(None),
+            linear_fc2=self._linear(None),
+            _get_fused_impl=lambda: (lambda x: x),
+        )
+        TEFusedMLP.forward(module, torch.ones(2))
+        assert entered == []
+
+    def test_fused_mlp_rejects_different_overrides(self, entered):
+        from megatron.core.extensions.transformer_engine import TEFusedMLP
+
+        module = SimpleNamespace(
+            linear_fc1=self._linear("mxfp8"),
+            linear_fc2=self._linear(None),
+            _get_fused_impl=lambda: (lambda x: x),
+        )
+        with pytest.raises(ValueError, match="same precision override"):
+            TEFusedMLP.forward(module, torch.ones(2))
+
+    def test_fused_shared_expert_rejects_override(self, monkeypatch):
+        import megatron.core.transformer.moe.shared_experts as shared_experts
+
+        monkeypatch.setattr(
+            shared_experts,
+            "_get_fp8_autocast_recipe_for_quant_params",
+            lambda qparams, training: qparams,
+        )
+        module = SimpleNamespace(
+            _fused_grouped_swiglu_recipe=None,
+            linear_fc1=self._linear("mxfp8"),
+            linear_fc2=self._linear("mxfp8"),
+            config=SimpleNamespace(fp8=None, fp4="e2m1"),
+        )
+        with pytest.raises(ValueError, match="does not support a quant_recipe precision override"):
+            shared_experts.FusedSharedExpertMLP._get_fused_grouped_swiglu_recipe(module)
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine not installed")
+@pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 and NVFP4 require Blackwell (SM >= 10)")
+def test_mxfp8_param_shard_has_no_flat_view_under_delayed_recipe():
+    """An FP4 run's fp8_recipe defaults to delayed; MXFP8 params from the quant_recipe must still
+    skip the flat view (which would dequantize and keep the whole matrix)."""
+    import transformer_engine.pytorch as te
+    from transformer_engine.common.recipe import DelayedScaling, MXFP8BlockScaling
+
+    with fp8_model_init(enabled=True, recipe=MXFP8BlockScaling()):
+        mxfp8_weight = te.Linear(256, 256, bias=False, params_dtype=torch.bfloat16).weight
+    with fp8_model_init(enabled=True, recipe=DelayedScaling()):
+        fp8_weight = te.Linear(256, 256, bias=False, params_dtype=torch.bfloat16).weight
+    bf16_weight = torch.nn.Parameter(torch.zeros(4, 4, device="cuda", dtype=torch.bfloat16))
+    lacks_view = DistributedOptimizer._quantized_param_lacks_flat_view
+    assert is_mxfp8tensor(mxfp8_weight)
+    assert lacks_view(mxfp8_weight, "delayed")
+    assert not lacks_view(fp8_weight, "delayed")
+    assert lacks_view(fp8_weight, "tensorwise")
+    assert not lacks_view(bf16_weight, "delayed")

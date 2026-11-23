@@ -136,6 +136,10 @@ def test_all_layer_configs_route_to_matching_specs(monkeypatch, layer_pattern, e
     expected_layer_numbers = list(range(6, 6 + len(layer_pattern)))
     assert [kwargs["layer_number"] for _, kwargs in build_calls] == expected_layer_numbers
     assert [layer.layer_number for layer in block.layers] == expected_layer_numbers
+    # Every layer gets its name, so quant_recipe matchers see its submodules.
+    assert [kwargs.get("name") for _, kwargs in build_calls] == [
+        f"decoder.layers.{i}" for i in range(len(layer_pattern))
+    ]
 
 
 def test_cp_layouts_are_selected_by_layer_config_type(monkeypatch):
