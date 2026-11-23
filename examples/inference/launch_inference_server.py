@@ -29,10 +29,10 @@ from megatron.inference.utils import (
     add_inference_args,
     get_inference_config_from_model_and_args,
     get_model_for_inference,
+    inference_config_from_args,
 )
 from megatron.training import get_args, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
-from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.global_vars import get_run_config, get_tokenizer, set_run_config
 
 
@@ -135,7 +135,7 @@ def main():
     )
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
-    set_run_config(inference_cfg_container_from_args(args))
+    set_run_config(inference_config_from_args(args))
     initialize_megatron()
 
     args = get_args()

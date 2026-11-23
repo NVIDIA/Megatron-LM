@@ -94,6 +94,14 @@ def _skip_if_unsupported(precision: str) -> None:
         pytest.skip(_NO_NVFP4_REASON)
 
 
+def _bf16_grouped_mlp_fusion_supported() -> bool:
+    """Require the real hardware and cuDNN capability check when TE exposes BF16 fusion."""
+    from transformer_engine.pytorch.ops.fused import grouped_mlp
+
+    fused_cls = getattr(grouped_mlp, "GroupedMLP_CuTeGEMMGLUBf16", None)
+    return fused_cls is not None and fused_cls.is_supported()
+
+
 class TestMoESingleGroupedWeightNumerics:
     """Numerical parity tests for MoE single grouped weights under DistOpt."""
 
@@ -333,7 +341,11 @@ class TestMoESingleGroupedWeightNumerics:
         assert num_checked > 0, f"Did not find any {precision} grouped params to verify"
 
     def assert_execution_path_is_exercised(
-        self, model, use_transformer_engine_op_fuser: bool, after_forward: bool = False
+        self,
+        model,
+        use_transformer_engine_op_fuser: bool,
+        after_forward: bool = False,
+        precision: str | None = None,
     ):
         grouped_mlps = [
             module for module in model.modules() if module.__class__.__name__ == "TEGroupedMLP"
@@ -347,6 +359,19 @@ class TestMoESingleGroupedWeightNumerics:
                 (module._fused_ops is not None) == use_transformer_engine_op_fuser
                 for module in grouped_mlps
             ), "Unexpected TEGroupedMLP fused-op construction state"
+            if (
+                use_transformer_engine_op_fuser
+                and precision == "bf16"
+                and _bf16_grouped_mlp_fusion_supported()
+            ):
+                for module in grouped_mlps:
+                    (sequence,) = module._fused_ops
+                    selected = [
+                        (type(op).__name__, tuple(indices))
+                        for group in sequence._module_groups
+                        for op, indices in group._forward_ops
+                    ]
+                    assert selected == [("GroupedMLP_CuTeGEMMGLUBf16", (0, 1, 2))], selected
 
     def run_training_case(
         self,
@@ -403,7 +428,7 @@ class TestMoESingleGroupedWeightNumerics:
             losses.append(loss.detach().float().cpu())
 
         self.assert_execution_path_is_exercised(
-            model[0], use_transformer_engine_op_fuser, after_forward=True
+            model[0], use_transformer_engine_op_fuser, after_forward=True, precision=precision
         )
         return torch.stack(losses)
 
@@ -736,10 +761,13 @@ class TestMoESingleGroupedWeightNumerics:
     )
     @pytest.mark.parametrize("gradient_accumulation_fusion", [False, True])
     def test_single_grouped_weight_parity_with_primary_param_gather(
-        self, precision, gradient_accumulation_fusion
+        self, precision, gradient_accumulation_fusion, monkeypatch
     ):
         """Compare single vs discrete MoE weights with primary param gather enabled if applicable."""
         _skip_if_unsupported(precision)
+        if precision == "bf16" and _bf16_grouped_mlp_fusion_supported():
+            # Tolerance-based parity exercises the fused BF16 scale-gradient atomics.
+            monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")
         self.run_parity_case(
             precision=precision,
             primary_param_gather=True,
@@ -765,10 +793,13 @@ class TestMoESingleGroupedWeightNumerics:
     )
     @pytest.mark.parametrize("gradient_accumulation_fusion", [False, True])
     def test_single_grouped_weight_parity_without_primary_param_gather(
-        self, precision, gradient_accumulation_fusion
+        self, precision, gradient_accumulation_fusion, monkeypatch
     ):
         """Compare single vs discrete MoE weights when primary weights stay BF16."""
         _skip_if_unsupported(precision)
+        if precision == "bf16" and _bf16_grouped_mlp_fusion_supported():
+            # Tolerance-based parity exercises the fused BF16 scale-gradient atomics.
+            monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")
         self.run_parity_case(
             precision=precision,
             primary_param_gather=False,
