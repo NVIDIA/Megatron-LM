@@ -294,43 +294,58 @@ class FsdpMuon(Muon):
     def _compute_momentum_inputs(
         self, fsdp_group: FsdpParameterGroup, tensor_to_optimizer_group_index: dict[int, int]
     ) -> DBuffer:
-        """Apply local weight decay, update momentum, and build inputs for orthogonalization."""
+        """Apply local weight decay, update momentum, and build inputs for orthogonalization.
+
+        Tensors sharing an optimizer group are updated together with foreach kernels, a few
+        launches per group instead of a few per tensor.
+        """
         buffer: DBuffer = fsdp_group.main_weight
         momentum_inputs: DBuffer = DBuffer(
             buffer.mesh, buffer.placements, buffer.layout, buffer.dtype, buffer.device
         )
+        by_optimizer_group: dict[int, list[int]] = {}
         for i, group_index in tensor_to_optimizer_group_index.items():
+            by_optimizer_group.setdefault(group_index, []).append(i)
+        for group_index, indices in by_optimizer_group.items():
             group: dict[str, Any] = self.param_groups[group_index]
-            param: DTensor = cast(DTensor, fsdp_group.fsdp_parameters[i].sharded)
-            assert isinstance(param.grad, DTensor)
-            state: dict[str, Any] = self.state[param]
-            if not state:
-                state["momentum_buffer"] = torch.zeros_like(param)
-            local_input: torch.Tensor = momentum_inputs.get_tensor_view(i)
-            momentum: torch.Tensor = state["momentum_buffer"].to_local()
-            grad: torch.Tensor = param.grad.to_local().to(momentum.dtype).reshape(momentum.shape)
+            weights: list[torch.Tensor] = []
+            momenta: list[torch.Tensor] = []
+            grads: list[torch.Tensor] = []
+            local_inputs: list[torch.Tensor] = []
+            for i in indices:
+                param: DTensor = cast(DTensor, fsdp_group.fsdp_parameters[i].sharded)
+                assert isinstance(param.grad, DTensor)
+                state: dict[str, Any] = self.state[param]
+                if not state:
+                    state["momentum_buffer"] = torch.zeros_like(param)
+                momentum: torch.Tensor = state["momentum_buffer"].to_local()
+                momenta.append(momentum)
+                grads.append(param.grad.to_local().to(momentum.dtype).reshape(momentum.shape))
+                weights.append(param.to_local())
+                local_inputs.append(momentum_inputs.get_tensor_view(i).view_as(momentum))
             # Match EO's decay before momentum without calling its private helper.
             weight_decay: float = group["weight_decay"]
             if weight_decay != 0:
-                weight: torch.Tensor = param.to_local()
                 lr: float = group["lr"]
                 match self.weight_decay_method:
                     case "decoupled":
-                        weight.add_(weight, alpha=-(weight_decay * lr))
+                        torch._foreach_add_(weights, weights, alpha=-(weight_decay * lr))
                     case "independent":
-                        weight.add_(weight, alpha=-weight_decay)
+                        torch._foreach_add_(weights, weights, alpha=-weight_decay)
                     case "l2":
-                        grad.add_(weight, alpha=weight_decay)
+                        torch._foreach_add_(grads, weights, alpha=weight_decay)
                     case "palm":
-                        weight.add_(weight, alpha=-(weight_decay * lr * lr))
+                        torch._foreach_add_(weights, weights, alpha=-(weight_decay * lr * lr))
                     case _:
                         raise ValueError(f"Invalid weight decay method: {self.weight_decay_method}")
             # EO's OrthogonalizedOptimizer.step implements momentum inline, without a helper.
-            momentum.lerp_(grad, 1 - group["momentum"])
+            torch._foreach_lerp_(momenta, grads, 1 - group["momentum"])
             if self.nesterov:
-                torch.lerp(grad, momentum, group["momentum"], out=local_input.view_as(momentum))
+                # lerp(grad, momentum, momentum coefficient), written in place.
+                torch._foreach_copy_(local_inputs, grads)
+                torch._foreach_lerp_(local_inputs, momenta, group["momentum"])
             else:
-                local_input.copy_(momentum.reshape(local_input.shape))
+                torch._foreach_copy_(local_inputs, momenta)
         return momentum_inputs
 
     def _orthogonalize_updates(
