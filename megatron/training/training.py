@@ -2766,9 +2766,6 @@ def setup_model_and_optimizer(
                         checkpointing_context=checkpointing_context,
                         restore_training_state=True,
                         record_finetune=True,
-                        skip_load_to_model_and_opt=HAVE_FSDP2
-                        and isinstance(cfg.ddp, TorchFullyShardedDataParallelConfig)
-                        and cfg.checkpoint.ckpt_format == "torch_dist",
                         tp_group=ckpt_pgc.tp if ckpt_pgc is not None else None,
                         pp_group=ckpt_pgc.pp if ckpt_pgc is not None else None,
                         # Replica_id must match the save path (see save_checkpoint_and_time): use

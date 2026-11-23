@@ -183,7 +183,6 @@ class TestDefaultCheckpointManager:
             opt_param_scheduler=Mock(),
             checkpointing_context={"load_strategy": object()},
             strict=False,
-            skip_load_to_model_and_opt=True,
             restore_training_state=True,
             record_finetune=True,
             checkpoint_group=object(),
@@ -204,7 +203,7 @@ class TestDefaultCheckpointManager:
             ctx.opt_param_scheduler,
             strict=False,
             checkpointing_context=ctx.checkpointing_context,
-            skip_load_to_model_and_opt=True,
+            skip_load_to_model_and_opt=False,
             checkpoint_group=ctx.checkpoint_group,
             rng_state_key_prefix="encoder.",
             model_sharded_state_dict_modifier=ctx.model_sharded_state_dict_modifier,
@@ -230,6 +229,32 @@ class TestDefaultCheckpointManager:
         for ctx in (save_ctx, load_ctx):
             assert ctx.train_state is train_state
             assert ctx.config is config
+
+    @pytest.mark.parametrize(
+        "ckpt_format, fsdp2_ddp, expected",
+        [
+            ("torch_dist", True, True),
+            ("torch_dist", False, False),
+            ("torch", True, False),
+        ],
+    )
+    def test_load_skips_load_state_dict_only_for_fsdp2_torch_dist(
+        self, ckpt_format, fsdp2_ddp, expected
+    ):
+        from megatron.core.distributed import TorchFullyShardedDataParallelConfig
+
+        ddp = TorchFullyShardedDataParallelConfig() if fsdp2_ddp else Mock()
+        ctx = cm.CheckpointLoadContext(
+            model=[], optimizer=None, opt_param_scheduler=None, config=SimpleNamespace(ddp=ddp)
+        )
+        config = SimpleNamespace(custom_manager_class=None, ckpt_format=ckpt_format)
+
+        with patch(
+            "megatron.training.checkpointing.load_checkpoint", return_value=(0, 0)
+        ) as load_checkpoint:
+            cm.DefaultCheckpointManager(config).load(ctx)
+
+        assert load_checkpoint.call_args.kwargs["skip_load_to_model_and_opt"] is expected
 
     @pytest.mark.parametrize("blocking, terminate", [(False, False), (True, True)])
     def test_finalize_forwards_blocking_and_terminate(self, blocking, terminate):

@@ -97,7 +97,6 @@ class CheckpointLoadContext:
         opt_param_scheduler: The optimizer parameter scheduler (may be ``None``).
         checkpointing_context: The run's persistent checkpointing context.
         strict: Whether to enforce strict key matching (see ``torch.nn.Module.load_state_dict``).
-        skip_load_to_model_and_opt: Load metadata only; skip loading into the model and optimizer.
         restore_training_state: Restore optimizer, scheduler, rerun and data progress (training
             resume must opt in).
         record_finetune: Record whether finetune semantics applied on the train state; the primary
@@ -116,7 +115,6 @@ class CheckpointLoadContext:
     opt_param_scheduler: Any
     checkpointing_context: Optional[dict[str, Any]] = None
     strict: bool = True
-    skip_load_to_model_and_opt: bool = False
     restore_training_state: bool = False
     record_finetune: bool = False
     tp_group: Optional["torch.distributed.ProcessGroup"] = None
@@ -206,7 +204,7 @@ class DefaultCheckpointManager:
             ctx.opt_param_scheduler,
             strict=ctx.strict,
             checkpointing_context=ctx.checkpointing_context,
-            skip_load_to_model_and_opt=ctx.skip_load_to_model_and_opt,
+            skip_load_to_model_and_opt=self._loads_in_place(ctx),
             tp_group=ctx.tp_group,
             pp_group=ctx.pp_group,
             dp_cp_group=ctx.dp_cp_group,
@@ -218,6 +216,22 @@ class DefaultCheckpointManager:
             restore_training_state=ctx.restore_training_state,
             record_finetune=ctx.record_finetune,
         )
+
+    def _loads_in_place(self, ctx: CheckpointLoadContext) -> bool:
+        """Whether the native loader restores tensors in place, so ``load_state_dict`` is skipped.
+
+        This is the torch FSDP2 + ``torch_dist`` resume. It is specific to the native loader, so it
+        stays here instead of being part of the context a custom manager implements.
+        """
+        if ctx.config is None or self.checkpoint_config.ckpt_format != "torch_dist":
+            return False
+        try:
+            from megatron.core.distributed import TorchFullyShardedDataParallel  # noqa: F401
+        except ImportError:
+            return False
+        from megatron.core.distributed import TorchFullyShardedDataParallelConfig
+
+        return isinstance(ctx.config.ddp, TorchFullyShardedDataParallelConfig)
 
     def finalize_async_saves(self, blocking: bool = False, terminate: bool = False) -> None:
         """Finalize pending asynchronous saves with ``maybe_finalize_async_save``."""
