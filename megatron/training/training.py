@@ -2962,6 +2962,10 @@ def _get_samples_seen_in_iteration(losses_reduced, args, pg_collection):
     """Return the global sample count and synchronize it across pipeline stages."""
     cfg = get_run_config()
     local_samples_seen = _pop_samples_seen(losses_reduced)
+    pipeline_parallel = get_pg_size(pg_collection.pp) > 1
+    if local_samples_seen is None and not pipeline_parallel:
+        # Nothing to reduce and no stage to hear from: skip the device round trip.
+        return _scheduled_samples_in_iteration(cfg)
     is_last_stage = is_pp_last_stage(pg_collection.pp)
 
     if is_last_stage and local_samples_seen is not None:
@@ -2974,9 +2978,12 @@ def _get_samples_seen_in_iteration(losses_reduced, args, pg_collection):
             group=mpu.get_data_parallel_group(with_context_parallel=False),
         )
     else:
-        samples_seen = torch.tensor([-1], dtype=torch.int64, device=torch.cuda.current_device())
+        # Not torch.tensor([-1]), which is a blocking pageable host-to-device copy.
+        samples_seen = torch.full(
+            (1,), -1, dtype=torch.int64, device=torch.cuda.current_device()
+        )
 
-    if get_pg_size(pg_collection.pp) > 1:
+    if pipeline_parallel:
         torch.distributed.broadcast(
             samples_seen, src=get_pp_last_rank(pg_collection.pp), group=pg_collection.pp
         )
@@ -2984,6 +2991,11 @@ def _get_samples_seen_in_iteration(losses_reduced, args, pg_collection):
     samples_seen_value = samples_seen.item()
     if samples_seen_value >= 0:
         return int(samples_seen_value)
+    return _scheduled_samples_in_iteration(cfg)
+
+
+def _scheduled_samples_in_iteration(cfg):
+    """Return the sample count the batch schedule implies for one iteration."""
     return get_num_microbatches() * cfg.train.micro_batch_size * cfg.get_batch_parallel_size()
 
 
