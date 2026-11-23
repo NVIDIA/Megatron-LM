@@ -255,14 +255,21 @@ def test_grad_comm_dtype_losses_match_baseline(distributed_setup, grad_comm_dtyp
 
 
 @pytest.mark.parametrize("capture", [False, True], ids=["eager", "graph"])
-def test_gradient_staging_matches_reference(distributed_setup, monkeypatch, capture):
+@pytest.mark.parametrize("grad_staging_on_compute", [False, True], ids=["inner", "compute"])
+def test_gradient_staging_matches_reference(
+    distributed_setup, monkeypatch, capture, grad_staging_on_compute
+):
     """Delayed RS and allocator reuse preserve mixed-group gradients and optimizer updates."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = nn.Sequential(*(MixedLayer(device) for _ in range(3)))
     reference = deepcopy(model).float()
     with fully_shard_context(
-        FsdpContext(device=device, gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER)
+        FsdpContext(
+            device=device,
+            runtime_policy=RuntimePolicy(grad_staging_on_compute=grad_staging_on_compute),
+            gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER,
+        )
     ) as context:
         for layer in model:
             fully_shard(
@@ -283,12 +290,20 @@ def test_gradient_staging_matches_reference(distributed_setup, monkeypatch, capt
     torch.manual_seed(73 + distributed_setup.rank)
     inputs = torch.randn(3, 4, 8, device=device)
     reduce_gradients = FsdpParameterGroup.reduce_inner_gradients
+    allocate_partial_grad_buffer = FsdpParameterGroup.allocate_partial_grad_buffer
+    stream = torch.cuda.Stream(device)
+    allocation_stream = stream if grad_staging_on_compute else context.inner_reduction_stream
+
+    def checked_allocate(group):
+        assert torch.cuda.current_stream(device) == allocation_stream
+        return allocate_partial_grad_buffer(group)
 
     def delayed_reduce(group, partial_grad):
         torch.cuda._sleep(1_000_000)
         return reduce_gradients(group, partial_grad)
 
     monkeypatch.setattr(FsdpParameterGroup, "reduce_inner_gradients", delayed_reduce)
+    monkeypatch.setattr(FsdpParameterGroup, "allocate_partial_grad_buffer", checked_allocate)
 
     def train():
         optimizer.zero_grad(set_to_none=False)
@@ -332,7 +347,6 @@ def test_gradient_staging_matches_reference(distributed_setup, monkeypatch, capt
                 actual.detach().full_tensor(), expected.detach(), rtol=1e-5, atol=1e-6
             )
 
-    stream = torch.cuda.Stream(device)
     stream.wait_stream(torch.cuda.current_stream(device))
     for _ in range(2):
         with torch.cuda.stream(stream):

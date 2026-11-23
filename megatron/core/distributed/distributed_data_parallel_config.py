@@ -319,6 +319,11 @@ class DistributedDataParallelConfig:
     Only effective with ``outer_dp_sharding_strategy='optim'``.
     """
 
+    fsdp_grad_staging_on_compute: bool = False
+    """Stage packed gradient reduction inputs on the compute stream and release
+    them using CUDA completion events. Requires Megatron-FSDP v2.
+    """
+
     @property
     def param_sync_via_bucket_group(self) -> bool:
         """Whether DP parameter synchronization is dispatched through DDP bucket groups.
@@ -433,6 +438,11 @@ class DistributedDataParallelConfig:
                 raise ValueError("overlap_outer_communication requires Megatron-FSDP.")
             if self.megatron_fsdp_version != 2:
                 raise ValueError("overlap_outer_communication requires Megatron-FSDP v2.")
+
+        if self.fsdp_grad_staging_on_compute and not (
+            self.use_megatron_fsdp and self.megatron_fsdp_version == 2
+        ):
+            raise ValueError("fsdp_grad_staging_on_compute requires Megatron-FSDP v2.")
 
         if self.nccl_ub and not is_torch_min_version("2.11.0a0"):
             if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):

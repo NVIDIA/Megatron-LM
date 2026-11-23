@@ -50,3 +50,6 @@ class RuntimePolicy:
     Recording currently requires the ordinary module hooks; combined 1F1B
     bypasses them. Discard the context if the recorded pass raises.
     """
+
+    grad_staging_on_compute: bool = False
+    """Allocate packed reduction inputs on compute and release them with CUDA events."""

@@ -432,8 +432,10 @@ class FsdpModule:
         if context.is_recording_execution_order:
             context.execution_order.append(ExecutionEvent(cast(nn.Module, self), Phase.BACKWARD))
         if self.is_root():
+            is_first_root = not context._post_backward_hook_registered
+            context.register_post_backward_hook()
             # Retire inputs from the previous backward before the first root unshards.
-            if context.register_post_backward_hook():
+            if is_first_root and context.grad_staging_on_compute:
                 context._release_grad_buffers()
             context.pre_backward()
 
@@ -462,8 +464,7 @@ class FsdpModule:
         with self._nvtx_range("reduce_gradients"):
             context = self.context
             inner_reduction_stream = context.inner_reduction_stream
-            current_stream = context.current_stream()
-            buffers = []
+            buffers: list[torch.Tensor] | None = [] if context.grad_staging_on_compute else None
             for group in self._parameter_groups:
                 if not group.requires_grad:
                     continue
@@ -484,7 +485,8 @@ class FsdpModule:
                     context.outer_reduction_stream.wait_stream(inner_reduction_stream)
                 with torch.cuda.stream(context.outer_reduction_stream):
                     group.reduce_outer_gradients()
-            context._retain_grad_buffers(buffers, current_stream, cast(nn.Module, self))
+            if buffers:
+                context._retain_grad_buffers(buffers, context.current_stream())
 
     def _accumulate_local_gradients(self, group: FsdpParameterGroup) -> None:
         """Accumulate on compute without waiting for other groups' inner reductions."""
@@ -498,17 +500,22 @@ class FsdpModule:
         self.context.inner_reduction_stream.wait_stream(self.context.current_stream())
 
     def _reduce_inner_gradients(
-        self, group: FsdpParameterGroup, buffers: list[torch.Tensor]
+        self, group: FsdpParameterGroup, buffers: list[torch.Tensor] | None
     ) -> None:
-        """Pack on compute and retain the input through inner reduction."""
+        """Pack on compute and enqueue reduction on the inner reduction stream."""
         context = self.context
         current_stream = context.current_stream()
         inner_reduction_stream = context.inner_reduction_stream
-        if not buffers:
-            # One retained module plus this module bounds staging to two batches.
-            context._release_grad_buffers(keep=1)
-        partial_grad = group.allocate_partial_grad_buffer()
-        buffers.append(partial_grad.local_buffer)
+        if buffers is None:
+            with torch.cuda.stream(inner_reduction_stream):
+                partial_grad = group.allocate_partial_grad_buffer()
+            current_stream.wait_stream(inner_reduction_stream)
+        else:
+            if not buffers:
+                # One retained module plus this module bounds staging to two batches.
+                context._release_grad_buffers(keep=1)
+            partial_grad = group.allocate_partial_grad_buffer()
+            buffers.append(partial_grad.local_buffer)
         group.copy_gradients_to_partial_buffer(partial_grad)
         inner_reduction_stream.wait_stream(current_stream)
         with torch.cuda.stream(inner_reduction_stream):

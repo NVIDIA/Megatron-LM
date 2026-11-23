@@ -907,6 +907,11 @@ def validate_args(args, defaults={}):
         "parameters sharded. Use DDP or --use-distributed-optimizer instead."
     )
 
+    if getattr(args, "fsdp_grad_staging_on_compute", False) and not (
+        args.use_megatron_fsdp and args.megatron_fsdp_version == 2 and not args.use_torch_fsdp2
+    ):
+        raise ValueError("--fsdp-grad-staging-on-compute requires Megatron-FSDP v2.")
+
     if args.use_torch_fsdp2:
         assert is_torch_min_version("2.4.0"), \
             'FSDP2 requires PyTorch >= 2.4.0 with FSDP 2 support.'
@@ -3018,6 +3023,13 @@ def _add_distributed_args(parser):
                        help='Use distributed optimizer.')
     group.add_argument('--megatron-fsdp-version', type=int, default=1, choices=[1, 2],
                        help='Megatron-FSDP implementation version. Defaults to 1.')
+    group.add_argument(
+        "--fsdp-grad-staging-on-compute",
+        action="store_true",
+        help="Allocate packed gradient reduction inputs on the compute stream "
+        "and manage their lifetime with CUDA completion events. "
+        "Requires Megatron-FSDP v2.",
+    )
     group.add_argument('--overlap-outer-communication', action='store_true',
                        help="Overlap outer-DP and inner-DP gradient reductions "
                             "with Megatron-FSDP v2.")
