@@ -202,8 +202,9 @@ def test_fused_adam_step_replays(monkeypatch, rmsnorm_weight_decay_mult):
 
 
 @pytest.mark.parametrize("gradient_dtype", [torch.float32, torch.bfloat16])
-def test_hybrid_adam_step_replays(gradient_dtype: torch.dtype) -> None:
-    """Replay both owners, mixed dtypes and a skipped update with transfer overlap."""
+@pytest.mark.parametrize("rounding_mode", ["nearest", "stochastic"])
+def test_hybrid_adam_step_replays(gradient_dtype: torch.dtype, rounding_mode: str) -> None:
+    """Replay mixed-dtype Adam steps and BF16 writeback with transfer overlap."""
     seeded()
     initial = [
         torch.randn(65536, device="cuda", dtype=dtype)
@@ -211,7 +212,7 @@ def test_hybrid_adam_step_replays(gradient_dtype: torch.dtype) -> None:
     ]
     gradients = [torch.randn_like(value, dtype=gradient_dtype) for value in initial]
 
-    def run_steps():
+    def run_steps(seed: int = 1234):
         params = [torch.nn.Parameter(value.clone()) for value in initial]
         optimizer = HybridDeviceOptimizer(
             params,
@@ -220,6 +221,8 @@ def test_hybrid_adam_step_replays(gradient_dtype: torch.dtype) -> None:
             gpu_optimizer_cls=Adam,
             param_update_in_fp32=True,
             overlap_cpu_optimizer_d2h_h2d=True,
+            main_params_rounding=rounding_mode,
+            main_params_rounding_seed=seed,
             lr=0.01,
         )
         assert len(optimizer.gpu_params_map_cpu_copy) == 2
@@ -246,6 +249,15 @@ def test_hybrid_adam_step_replays(gradient_dtype: torch.dtype) -> None:
             assert bytes_equal(
                 left, right
             ), f"Hybrid Adam tensor {index} differs on replay {replay}"
+
+    if rounding_mode == "stochastic":
+        # A different seed must affect BF16 writeback on both owners.
+        different_seed = run_steps(seed=1235)
+        for index, value in enumerate(initial):
+            if value.dtype == torch.bfloat16:
+                assert not bytes_equal(
+                    reference[index], different_seed[index]
+                ), f"BF16 parameter {index} did not change with the rounding seed"
 
 
 @pytest.mark.parametrize("non_owner_has_main_param", [False, True])
