@@ -39,7 +39,7 @@ spec:
     cd /opt/megatron-lm
     : "${{RUN_NAME:?Set a stable RUN_NAME for this release run}}"
     # Read only the data blend from the pinned internal baseline recipe.
-    DATA_BLEND=$(python - <<'PYCODE'
+    DATA_BLEND=$(timeout 120s python - <<'PYCODE'
     import json
     from pathlib import Path
     import yaml
@@ -50,9 +50,15 @@ spec:
     blend = blend.replace('\\${{{{DATA_PATH}}}}', '/mnt/nmt4/tokens-shuffle')
     if '$' in blend:
         raise ValueError('Unresolved variable in baseline data blend')
+    # Each node checks the data mount before launching any training ranks.
+    for prefix in blend.strip('[]').split()[1::2]:
+        for suffix in ('.idx', '.bin'):
+            with Path(prefix + suffix).open('rb') as dataset_file:
+                dataset_file.read(1)
     print(json.dumps(blend))
     PYCODE
     )
+    echo "Dataset visibility checks passed on this node."
     PERSISTENT_DIR=/lustre/fsw/coreai_dlalgo_mcore/$RUN_NAME/{model}/{test_case}
     : "${{WANDB_EXPERIMENT:?Set a stable WANDB_EXPERIMENT for this release run}}"
     : "${{WANDB_SAVE_PATH:=$PERSISTENT_DIR/wandb}}"
