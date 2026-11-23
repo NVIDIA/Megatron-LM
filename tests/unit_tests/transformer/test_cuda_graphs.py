@@ -161,6 +161,41 @@ def test_failed_capture_restores_global_state(monkeypatch, has_te_modules, failu
     assert torch.autograd.function.FunctionCtx.save_for_backward is original_save
 
 
+@pytest.mark.parametrize("freeze_gc", [False, True])
+@pytest.mark.parametrize("gc_enabled", [True, False])
+@pytest.mark.parametrize("capture_fails", [False, True])
+def test_no_gc_during_capture_restores_collection_state(
+    monkeypatch, freeze_gc, gc_enabled, capture_fails
+):
+    """Automatic collection is off inside a capture and returns to its prior state after it,
+    also when the capture raises; FREEZE_GC freezes the heap for the capture only."""
+    monkeypatch.setattr(cuda_graphs_module, "FREEZE_GC", freeze_gc)
+    freeze_events = []
+    monkeypatch.setattr(gc, "freeze", lambda: freeze_events.append("freeze"))
+    monkeypatch.setattr(gc, "unfreeze", lambda: freeze_events.append("unfreeze"))
+    was_enabled = gc.isenabled()
+    if gc_enabled:
+        gc.enable()
+    else:
+        gc.disable()
+    try:
+        capture_error = RuntimeError("injected capture failure")
+        try:
+            with cuda_graphs_module.no_gc_during_capture():
+                assert not gc.isenabled()
+                if capture_fails:
+                    raise capture_error
+        except RuntimeError as error:
+            assert error is capture_error
+        assert gc.isenabled() == gc_enabled
+        assert freeze_events == (["freeze", "unfreeze"] if freeze_gc else [])
+    finally:
+        if was_enabled:
+            gc.enable()
+        else:
+            gc.disable()
+
+
 class TestCudaGraphSavedTensorObserver:
     @pytest.fixture
     def record(self):
@@ -2559,6 +2594,44 @@ class TestInlineCaptureManager:
         assert torch.equal(eager_out, graph_out_2)
         assert len(mgr.cudagraph_runners) == 1
         assert mgr.cudagraph_runners[0].fwd_graph_recorded
+
+    @torch.inference_mode()
+    def test_capture_runs_without_automatic_gc(self, monkeypatch):
+        """No automatic collection can run while Megatron captures a graph (here the inline
+        capture, and the RNG probe the first capture runs): one could free tensors of
+        unreachable objects, such as a released engine's pinned host buffers, mid-capture."""
+        config = self._make_config()
+        module = _SimpleModule(config).cuda().eval()
+        x = torch.randn(4, config.hidden_size, device="cuda")
+        # Run eagerly first: cuBLAS cannot create its handle inside a capture.
+        module.my_op(x)
+        CudaGraphManager(
+            config,
+            base_module=module,
+            function_name="my_op",
+            inline_capture=True,
+            num_warmup_steps=0,
+            need_backward=False,
+        )
+        gc_enabled_in_capture = []
+        enter, exit_ = torch.cuda.graph.__enter__, torch.cuda.graph.__exit__
+
+        def spy_enter(graph):
+            gc_enabled_in_capture.append(gc.isenabled())
+            return enter(graph)
+
+        def spy_exit(graph, *exc_info):
+            gc_enabled_in_capture.append(gc.isenabled())
+            return exit_(graph, *exc_info)
+
+        monkeypatch.setattr(torch.cuda.graph, "__enter__", spy_enter)
+        monkeypatch.setattr(torch.cuda.graph, "__exit__", spy_exit)
+        assert gc.isenabled()
+
+        module.my_op(x)
+
+        assert gc_enabled_in_capture and not any(gc_enabled_in_capture)
+        assert gc.isenabled()
 
     @torch.inference_mode()
     def test_eager_bypass(self):
