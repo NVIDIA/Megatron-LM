@@ -673,10 +673,10 @@ class TestMtpDraftStepMetadata:
     DUMMY_BLOCK = 999
     SENTINEL = -7
 
-    def _make_metadata(self, block_size_tokens, num_cols):
+    def _make_metadata(self, block_size_tokens, num_cols, max_requests=MAX_REQUESTS):
         meta = MTPMetadata(
             enabled=True,
-            max_requests=self.MAX_REQUESTS,
+            max_requests=max_requests,
             max_kv_block_count=num_cols,
             block_size_tokens=block_size_tokens,
             dummy_block_idx=self.DUMMY_BLOCK,
@@ -687,8 +687,8 @@ class TestMtpDraftStepMetadata:
         meta.allocate(device=DEVICE)
         return meta
 
-    def _make_gpu_view(self, num_cols):
-        r, s = self.MAX_REQUESTS, self.SENTINEL
+    def _make_gpu_view(self, num_cols, max_requests=MAX_REQUESTS):
+        r, s = max_requests, self.SENTINEL
 
         def full(n, dtype):
             return torch.full((n,), s, dtype=dtype, device=DEVICE)
@@ -754,14 +754,15 @@ class TestMtpDraftStepMetadata:
         num_cols,
         start_positions,
         num_depths,
+        max_requests=MAX_REQUESTS,
     ):
         block_table_src = torch.randint(
-            0, 500, (self.MAX_REQUESTS, num_cols), dtype=torch.int32, device=DEVICE
+            0, 500, (max_requests, num_cols), dtype=torch.int32, device=DEVICE
         )
-        ref_meta = self._make_metadata(block_size_tokens, num_cols)
-        tri_meta = self._make_metadata(block_size_tokens, num_cols)
-        ref_view = self._make_gpu_view(num_cols)
-        tri_view = self._make_gpu_view(num_cols)
+        ref_meta = self._make_metadata(block_size_tokens, num_cols, max_requests)
+        tri_meta = self._make_metadata(block_size_tokens, num_cols, max_requests)
+        ref_view = self._make_gpu_view(num_cols, max_requests)
+        tri_view = self._make_gpu_view(num_cols, max_requests)
         for meta in (ref_meta, tri_meta):
             meta.begin_decode(
                 active_request_count=active_request_count,
@@ -797,6 +798,37 @@ class TestMtpDraftStepMetadata:
             num_cols,
             start_positions,
             num_depths=12,
+        )
+
+    @pytest.mark.parametrize(
+        "active_request_count, padded_count, num_cols",
+        [
+            # Many row tiles, a partial last column tile, and a scan over several chunks.
+            (3001, 3072, 130),
+            # Padding fills whole row tiles and a whole scan chunk.
+            (1000, 2048, 33),
+            # Two column tiles, padded count not a power of two.
+            (37, 40, 256),
+            # Widest row tiles; the scan carries its total across eight chunks.
+            (8192, 8192, 8),
+        ],
+    )
+    def test_matches_reference_large(self, active_request_count, padded_count, num_cols):
+        # Shapes the kernel splits across several programs (row and column tiles) and scans in
+        # several steps; the reference is shape-agnostic.
+        block_size_tokens = 16
+        torch.manual_seed(padded_count + num_cols)
+        start_positions = torch.randint(
+            0, block_size_tokens * num_cols - 4, (padded_count,), dtype=torch.int32, device=DEVICE
+        )
+        self._run_draft_loop(
+            active_request_count,
+            padded_count,
+            block_size_tokens,
+            num_cols,
+            start_positions,
+            num_depths=3,
+            max_requests=padded_count,
         )
 
     def test_block_boundary_crossing(self):
