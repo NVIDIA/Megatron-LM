@@ -237,9 +237,14 @@ def test_create_group_default_ranks(distributed_without_model_parallel):
 
 @pytest.mark.parametrize("owner", ["runner", "full_iteration", "optimizer"])
 def test_destroy_releases_captured_collective(distributed_without_model_parallel, owner):
-    from megatron.core.full_cuda_graph import FullCudaGraphWrapper
+    from megatron.core.full_cuda_graph import FullCudaGraphWrapper, FullIterationGradCopy
     from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
-    from megatron.core.transformer.cuda_graphs import _CudaGraphRunner
+    from megatron.core.transformer.cuda_graphs import (
+        _CudagraphGlobalRecord,
+        _CudaGraphRunner,
+        capture_constants,
+        register_capture_constant,
+    )
     from megatron.core.transformer.module import MegatronModule
 
     baseline = set(torch.distributed.distributed_c10d._world.pg_map)
@@ -251,7 +256,8 @@ def test_destroy_releases_captured_collective(distributed_without_model_parallel
         torch.distributed.all_reduce(value, group=group)
     stream.synchronize()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
+    with capture_constants(graph), torch.cuda.graph(graph, stream=stream):
+        register_capture_constant(value)
         torch.distributed.all_reduce(value, group=group)
     graph.replay()
     torch.cuda.synchronize()
@@ -263,6 +269,8 @@ def test_destroy_releases_captured_collective(distributed_without_model_parallel
         # Simulate a capture that never reached the record/flag updates.
         runner.fwd_graph = graph
     elif owner == "full_iteration":
+        grad_copy = FullIterationGradCopy()
+        grad_copy.forward_backward_graph = graph
         FullCudaGraphWrapper.cuda_graph['training'] = graph
         FullCudaGraphWrapper.curr_iteration['training'] = 3
     else:
@@ -276,6 +284,7 @@ def test_destroy_releases_captured_collective(distributed_without_model_parallel
     if owner == "runner":
         assert runner.fwd_graph is None
     elif owner == "full_iteration":
+        assert grad_copy.forward_backward_graph not in _CudagraphGlobalRecord.capture_constants
         assert FullCudaGraphWrapper.cuda_graph['training'] is None
         assert FullCudaGraphWrapper.curr_iteration['training'] == 0
     else:
