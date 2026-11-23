@@ -255,9 +255,9 @@ def test_grad_comm_dtype_losses_match_baseline(distributed_setup, grad_comm_dtyp
 
 
 @pytest.mark.parametrize("capture", [False, True], ids=["eager", "graph"])
-@pytest.mark.parametrize("grad_staging_on_compute", [False, True], ids=["inner", "compute"])
+@pytest.mark.parametrize("stage_on_compute", [False, True], ids=["inner", "compute"])
 def test_gradient_staging_matches_reference(
-    distributed_setup, monkeypatch, capture, grad_staging_on_compute
+    distributed_setup, monkeypatch, capture, stage_on_compute
 ):
     """Delayed RS and allocator reuse preserve mixed-group gradients and optimizer updates."""
     device = distributed_setup.device
@@ -267,7 +267,7 @@ def test_gradient_staging_matches_reference(
     with fully_shard_context(
         FsdpContext(
             device=device,
-            runtime_policy=RuntimePolicy(grad_staging_on_compute=grad_staging_on_compute),
+            runtime_policy=RuntimePolicy(grad_staging_on_compute_stream=stage_on_compute),
             gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER,
         )
     ) as context:
@@ -292,7 +292,7 @@ def test_gradient_staging_matches_reference(
     reduce_gradients = FsdpParameterGroup.reduce_inner_gradients
     allocate_partial_grad_buffer = FsdpParameterGroup.allocate_partial_grad_buffer
     stream = torch.cuda.Stream(device)
-    allocation_stream = stream if grad_staging_on_compute else context.inner_reduction_stream
+    allocation_stream = stream if stage_on_compute else context.inner_reduction_stream
 
     def checked_allocate(group):
         assert torch.cuda.current_stream(device) == allocation_stream

@@ -83,7 +83,9 @@ def _mb(num_bytes: int) -> str:
 def test_grad_buffer_release_orders_reuse_on_allocation_stream(distributed_setup):
     """Retain inputs, then order reuse on their allocator even when release runs elsewhere."""
     device = distributed_setup.device
-    context = FsdpContext(device=device, runtime_policy=RuntimePolicy(grad_staging_on_compute=True))
+    context = FsdpContext(
+        device=device, runtime_policy=RuntimePolicy(grad_staging_on_compute_stream=True)
+    )
     allocation_stream = torch.cuda.Stream(device)
     allocation_stream.wait_stream(torch.cuda.current_stream(device))
     with torch.cuda.stream(allocation_stream):

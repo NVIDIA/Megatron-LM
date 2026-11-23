@@ -51,5 +51,5 @@ class RuntimePolicy:
     bypasses them. Discard the context if the recorded pass raises.
     """
 
-    grad_staging_on_compute: bool = False
+    grad_staging_on_compute_stream: bool = False
     """Allocate packed reduction inputs on compute and release them with CUDA events."""
