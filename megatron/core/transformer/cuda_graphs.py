@@ -805,7 +805,10 @@ class _CudagraphGlobalRecord:
             te_set_capture_end()
             cls._te_capture_started = False
 
-        torch.cuda.set_stream(torch.cuda.default_stream())
+        # Train on the default stream from here on (see CudaGraphManager.__init__).
+        default_stream = torch.cuda.default_stream()
+        default_stream.wait_stream(torch.cuda.current_stream())
+        torch.cuda.set_stream(default_stream)
 
         # Return capture time and memory usage.
         return capture_stats
@@ -1500,7 +1503,10 @@ class _CudaGraphRunner(torch.nn.Module):
                     capture_comm_context as capture_comms,
                     capture_constants(self.fwd_graph),
                     torch.cuda.graph(
-                        self.fwd_graph, pool=self.mempool, capture_error_mode="thread_local"
+                        self.fwd_graph,
+                        pool=self.mempool,
+                        stream=CudaGraphManager.global_capture_stream,
+                        capture_error_mode="thread_local",
                     ),
                 ):
 
@@ -1639,7 +1645,9 @@ class _CudaGraphRunner(torch.nn.Module):
             capture_comm_context as capture_comms,
             _preserve_parameter_grads_during_backward_capture(self),
             capture_constants(self.bwd_graph),
-            torch.cuda.graph(self.bwd_graph, pool=self.mempool),
+            torch.cuda.graph(
+                self.bwd_graph, pool=self.mempool, stream=CudaGraphManager.global_capture_stream
+            ),
         ):
 
             grad_inputs = torch.autograd.grad(
@@ -1997,6 +2005,9 @@ class CudaGraphManager(torch.nn.Module):
     """A global mempool for when 'cuda_graph_use_single_mempool' is used."""
     global_mempool = None
 
+    """The stream local CUDA graphs warm up and capture on."""
+    global_capture_stream = None
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -2065,13 +2076,18 @@ class CudaGraphManager(torch.nn.Module):
         # Therefore modules will always execute in the same order, so cudagraphs
         # can both be reused and share a single mempool.
         self.reuse_cudagraphs = self.pg_collection.pp.size() == 1
-        if CudaGraphManager.global_mempool is None:
-            self._initialize_mempool()
-            # Cudagraph stream capture requires no operations on the default stream prior to the
-            # capture, so change to a side stream.
-            stream = torch.cuda.Stream()
-            stream.wait_stream(torch.cuda.current_stream())
-            torch.cuda.set_stream(stream)
+        self._initialize_mempool()
+        if CudaGraphManager.global_capture_stream is None:
+            # Capture on the stream DDP is initialized on, so the AccumulateGrad nodes DDP retains
+            # carry the capturing stream.
+            from megatron.core.full_cuda_graph import get_shared_capture_stream
+
+            CudaGraphManager.global_capture_stream = get_shared_capture_stream()
+            # Run the rest of model, optimizer and DDP construction, the eager iterations and the
+            # warmup before capture on this stream. Training returns to the default stream after
+            # capture, whose allocator cache then holds no long-lived state to fragment it.
+            CudaGraphManager.global_capture_stream.wait_stream(torch.cuda.current_stream())
+            torch.cuda.set_stream(CudaGraphManager.global_capture_stream)
 
         # Enable one hook for the eager recording phase. Repeated manager construction is
         # idempotent, and graph creation removes the hook before capture begins.
@@ -3040,6 +3056,7 @@ class TECudaGraphHelper:
                         graphs_not_reset += 1
                 layer.te_cuda_graphs = []
                 layer.te_cuda_graph_manual_hooks = []
+                layer._after_te_cuda_graphs_deleted()
 
         log_on_each_pipeline_stage(
             logger=logger,

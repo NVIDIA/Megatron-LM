@@ -2416,14 +2416,10 @@ class TestGTPReplicatedBias:
 _NO_CALCULATOR = object()
 
 
-class TestWgradAccumBatchScheduleGate:
-    """Pre-RS wgrad accumulation stays off when num_microbatches can change mid-run.
+class TestWgradAccumBatchSchedule:
+    """Accumulation requires PP1, regardless of the global batch calculator."""
 
-    A rising consume count double-fires DDP grad-ready and drops that iteration's last
-    consume (see _is_last_expected_consume). CPU-only: the gate is decided at tagging time.
-    """
-
-    def _tag_output_layer(self, monkeypatch, schedule):
+    def _tag_output_layer(self, monkeypatch, schedule, pipeline_size):
         """Enabled flag for one output_layer param, under the calculator production builds."""
         from types import SimpleNamespace
 
@@ -2438,22 +2434,24 @@ class TestWgradAccumBatchScheduleGate:
                 data_parallel_size=1,
                 step_batch_size_schedule=schedule,
             )
-        # The stub stands in for a GTPShardedParam; only the name drives the decision.
+        # Only the parameter name and pipeline size drive eligibility.
         monkeypatch.setattr(gtp_module, "is_gtp_param", lambda p: True)
         param = SimpleNamespace()
         try:
             gtp_module.tag_gtp_params_with_names(
-                SimpleNamespace(named_parameters=lambda: [("module.output_layer.weight", param)])
+                SimpleNamespace(
+                    config=SimpleNamespace(pipeline_model_parallel_size=pipeline_size),
+                    named_parameters=lambda: [("module.output_layer.weight", param)],
+                )
             )
         finally:
             nmb.destroy_num_microbatches_calculator()
         return param._wgrad_accum_enabled
 
     @pytest.mark.parametrize(
-        "schedule, enabled",
-        # "THRESHOLD:BS THRESHOLD:BS ..." is what --step-batch-size-schedule takes.
-        [(None, True), ("0:16 1000:32", False), (_NO_CALCULATOR, True)],
-        ids=["fixed-batch", "step-schedule", "no-calculator"],
+        "schedule, pipeline_size, enabled",
+        [(None, 1, True), ("0:16 1000:32", 1, True), (_NO_CALCULATOR, 1, True), (None, 2, False)],
+        ids=["fixed-batch", "step-schedule", "no-calculator", "pipeline"],
     )
-    def test_gate(self, monkeypatch, schedule, enabled):
-        assert self._tag_output_layer(monkeypatch, schedule) is enabled
+    def test_accumulation_enabled(self, monkeypatch, schedule, pipeline_size, enabled):
+        assert self._tag_output_layer(monkeypatch, schedule, pipeline_size) is enabled

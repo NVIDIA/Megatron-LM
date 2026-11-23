@@ -299,6 +299,7 @@ def _assert_bitwise_parity(actual, expected, name):
 
 @requires_hybridep
 @pytest.mark.launch_on_gb200
+@pytest.mark.flaky_in_dev  # https://github.com/NVIDIA/Megatron-LM/issues/9647
 @pytest.mark.usefixtures("mxfp8_grouped_mlp")
 @pytest.mark.parametrize(
     'egtp_size',

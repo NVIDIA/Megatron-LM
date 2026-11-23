@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Unit tests for megatron/core/post_training/modelopt/checkpointing.py.
+"""Unit tests for megatron/core/dist_checkpointing/strategies/modelopt.py.
 
 Skipped automatically when modelopt is not installed.
 """

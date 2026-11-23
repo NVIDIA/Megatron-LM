@@ -121,7 +121,7 @@ def test_straggler_setup_uses_native_config(
 ):
     args = training.get_args()
     for config_field in fields(StragglerDetectionConfig):
-        delattr(args, config_field.name)
+        monkeypatch.delattr(args, config_field.name, raising=False)
     run_config.straggler = (
         None
         if enabled is None
