@@ -19,9 +19,7 @@ except ImportError:
     _HAVE_FLASHINFER = False
 
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
-    HAVE_FLASHINFER_CUTLASS_MXFP8,
     HAVE_FLASHINFER_ROUTED_MXFP8,
-    prepare_cutlass_mxfp8_weights,
     prepare_routed_mxfp8_weights,
 )
 
@@ -284,33 +282,11 @@ class TestMXFP8ReshardTransform:
             assert buf.scale.data_ptr() == scale_ptr
             assert buf.backend == "triton"
 
-    @pytest.mark.parametrize(
-        ("clamp_scale", "rows", "prepare_weights"),
-        [
-            pytest.param(
-                None,
-                96,
-                prepare_routed_mxfp8_weights,
-                marks=pytest.mark.skipif(
-                    not HAVE_FLASHINFER_ROUTED_MXFP8, reason="test requires FlashInfer routed MXFP8"
-                ),
-                id="routed",
-            ),
-            pytest.param(
-                16.0,
-                128,
-                prepare_cutlass_mxfp8_weights,
-                marks=pytest.mark.skipif(
-                    not HAVE_FLASHINFER_CUTLASS_MXFP8,
-                    reason="test requires FlashInfer CUTLASS MXFP8",
-                ),
-                id="cutlass-clamped",
-            ),
-        ],
+    @pytest.mark.skipif(
+        not HAVE_FLASHINFER_ROUTED_MXFP8, reason="test requires FlashInfer routed MXFP8"
     )
-    def test_flashinfer_moe_buffers_refresh_in_place(
-        self, clamp_scale, rows, prepare_weights, monkeypatch
-    ):
+    @pytest.mark.parametrize(("clamp_scale", "rows"), [(None, 96), (16.0, 128)])
+    def test_flashinfer_moe_buffers_refresh_in_place(self, clamp_scale, rows, monkeypatch):
         """Refit updates FlashInfer weights in place without changing graph addresses."""
         from megatron.core.inference.moe import InferenceGroupedGemmBackend
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
@@ -348,15 +324,6 @@ class TestMXFP8ReshardTransform:
             grouped_mlp._fc2_weight.scale.data_ptr(),
         )
 
-        if clamp_scale is not None:
-            for linear_name, buf_name in InferenceGroupedMLP._EXPERT_WEIGHT_GROUPS:
-                stack = getattr(grouped_mlp, buf_name)
-                for i in range(num_experts):
-                    canonical = buffers[f"{linear_name}.weight{i}"]
-                    assert getattr(getattr(grouped_mlp, linear_name), f"weight{i}") is canonical
-                    assert canonical.data.data_ptr() == stack.data[i].data_ptr()
-                    assert canonical.scale.data_ptr() == stack.scale[i].data_ptr()
-
         transform = MXFP8ReshardTransform(
             convertible_params=set(buffers), persistent_buffers=buffers, backend="triton"
         )
@@ -365,43 +332,26 @@ class TestMXFP8ReshardTransform:
             new_data = torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda")
             new_values[name] = new_data
             transform.finalize_recv(name, (slice(None), slice(None)), [new_data])
-            if clamp_scale is not None:
-                linear_name, expert_name = name.split(".")
-                stack = getattr(
-                    grouped_mlp, "_fc1_weight" if linear_name == "linear_fc1" else "_fc2_weight"
-                )
-                expert_idx = int(expert_name.removeprefix("weight"))
-                quantized = MXFP8Tensor.from_bf16(new_data, backend="triton")
-                assert torch.equal(stack.data[expert_idx], quantized.data)
-                assert torch.equal(
-                    stack.scale[expert_idx].view(torch.uint8).reshape(-1),
-                    quantized.scale.view(torch.uint8),
-                )
-
-        # Refits must be visible immediately, without restacking or refresh copies: CUTLASS
-        # shares the canonical storage and routed weights are written through.
+        # Refits write through to routed storage without restacking or refresh copies.
         with monkeypatch.context() as patch:
 
             def forbidden_stack(*args, **kwargs):
                 pytest.fail("refit must not restack FlashInfer weights")
 
             patch.setattr(grouped_mlp, "_stack_mxfp8_linear_weight", forbidden_stack)
-            assert InferenceGroupedMLP.refresh_flashinfer_mxfp8_weights(grouped_mlp) is (
-                clamp_scale is None
-            )
+            assert InferenceGroupedMLP.refresh_flashinfer_mxfp8_weights(grouped_mlp)
 
         for linear_name, flashinfer_weight in (
             ("linear_fc1", grouped_mlp._fc1_weight),
             ("linear_fc2", grouped_mlp._fc2_weight),
         ):
-            if clamp_scale is None:
-                # Canonical storage is released; only the routed copy holds the weights.
-                assert buffers[f"{linear_name}.weight0"].data.untyped_storage().nbytes() == 1
+            # Canonical storage is released; only the routed copy holds the weights.
+            assert buffers[f"{linear_name}.weight0"].data.untyped_storage().nbytes() == 1
             canonical = [
                 MXFP8Tensor.from_bf16(new_values[f"{linear_name}.weight{i}"], backend="triton")
                 for i in range(num_experts)
             ]
-            expected = prepare_weights(
+            expected = prepare_routed_mxfp8_weights(
                 MXFP8Tensor(
                     data=torch.stack([w.data for w in canonical]),
                     scale=torch.stack([w.scale for w in canonical]),

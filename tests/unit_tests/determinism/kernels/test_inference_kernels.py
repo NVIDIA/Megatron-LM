@@ -58,7 +58,7 @@ def test_flashinfer_clamped_relu2_replays(precision, ep_rank):
     ):
         pytest.skip("requires FlashInfer #5696")
 
-    from megatron.core.inference.moe.flashinfer_mxfp8 import prepare_cutlass_mxfp8_weights
+    from megatron.core.inference.moe.flashinfer_mxfp8 import prepare_routed_mxfp8_weights
     from megatron.core.inference.moe.fused_moe import ActivationType as MCoreActivationType
     from megatron.core.inference.moe.fused_moe import mcore_fused_moe
     from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
@@ -86,7 +86,7 @@ def test_flashinfer_clamped_relu2_replays(precision, ep_rank):
             )
         canonical_weights.append(weights)
         execution_weights.append(
-            prepare_cutlass_mxfp8_weights(weights) if precision == "mxfp8" else weights
+            prepare_routed_mxfp8_weights(weights) if precision == "mxfp8" else weights
         )
     clamp_scale = 0.5
     module = SimpleNamespace(
@@ -96,7 +96,14 @@ def test_flashinfer_clamped_relu2_replays(precision, ep_rank):
         _fc2_weight=execution_weights[1],
         _flashinfer_activation_type=ActivationType.ClampedRelu2,
         _activation_clamp_scale=clamp_scale,
-        _flashinfer_clamp_limit=torch.full((1,), clamp_scale, device="cuda", dtype=torch.float32),
+        _flashinfer_clamp_limit=torch.full(
+            (local_experts if precision == "mxfp8" else 1,),
+            clamp_scale,
+            device="cuda",
+            dtype=torch.float32,
+        ),
+        num_local_experts=local_experts,
+        _flashinfer_mxfp8_token_capacity=None,
         _nvls_dispatcher=False,
         ep_group=SimpleNamespace(size=lambda: 2, rank=lambda: ep_rank),
     )
@@ -128,13 +135,13 @@ def test_flashinfer_clamped_relu2_replays(precision, ep_rank):
         routing_map=routing,
         activation_clamp_scale=clamp_scale,
     )
-    # MCore materializes BF16 FC1 output; CUTLASS applies the activation to FP32
+    # MCore materializes BF16 FC1 output; FlashInfer applies the activation to FP32
     # accumulators. MXFP8 additionally rounds/requantizes the activated values.
     # Check aggregate relative error as well as elementwise error near zero.
     rtol, atol, relative_l2 = (0.1, 0.03, 0.06) if precision == "mxfp8" else (0.02, 0.01, 0.02)
     difference = expected.float() - reference.float()
     error_l2 = torch.linalg.vector_norm(difference) / torch.linalg.vector_norm(reference.float())
-    # CUTLASS returns BF16; MCore's unpermute returns FP32. Compare values in
+    # FlashInfer returns BF16; MCore's unpermute returns FP32. Compare values in
     # FP32 without rounding the reference down or relaxing numerical tolerances.
     assert expected.dtype == torch.bfloat16
     torch.testing.assert_close(expected.float(), reference.float(), rtol=rtol, atol=atol)
