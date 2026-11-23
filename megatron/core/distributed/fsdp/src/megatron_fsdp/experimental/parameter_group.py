@@ -473,7 +473,7 @@ class FsdpParameterGroup:
         return buffer.is_rowwise_allocated
 
     def unshard_parameters(
-        self, phase: Phase | None = None, *, outer_allgather_stream: torch.cuda.Stream | None = None
+        self, phase: Phase | None = None, *, outer_allgather_stream: torch.cuda.Stream
     ) -> None:
         """Prepare this group's Parameters for the requested compute phase.
 
@@ -483,10 +483,11 @@ class FsdpParameterGroup:
         Reuse existing events so compute never waits for a later prefetch when its
         weights are already available.
 
-        With ``outer_allgather_stream``, the post-optimizer DP-outer all-gather that
-        refreshes stale compute weights runs on that stream instead, so it overlaps
-        DP-inner all-gathers of earlier groups. The caller must have ordered that stream
-        after the weight sync, which ``FsdpContext.pre_forward()`` does on the root.
+        The post-optimizer DP-outer all-gather that refreshes stale compute weights
+        runs on ``outer_allgather_stream``. It is the all-gather stream by default; a
+        separate stream lets it overlap DP-inner all-gathers of earlier groups. The
+        caller must have ordered that stream after the weight sync, which
+        ``FsdpContext.pre_forward()`` does on the root.
         """
         requested_phases = (Phase.FORWARD, Phase.BACKWARD) if phase is None else (phase,)
         missing_phases = tuple(p for p in requested_phases if p not in self._unshard_events)
@@ -494,18 +495,13 @@ class FsdpParameterGroup:
             return
 
         if self._model_weight_is_stale:
-            if outer_allgather_stream is None:
+            allgather_stream = torch.cuda.current_stream()
+            with torch.cuda.stream(outer_allgather_stream):
+                # Writes the persistent model_weight in place; no allocation.
                 self.post_optimizer_model_weight.redistribute(
                     self.model_weight.placements, out=self.model_weight
                 )
-            else:
-                allgather_stream = torch.cuda.current_stream()
-                with torch.cuda.stream(outer_allgather_stream):
-                    # Writes the persistent model_weight in place; no allocation.
-                    self.post_optimizer_model_weight.redistribute(
-                        self.model_weight.placements, out=self.model_weight
-                    )
-                allgather_stream.wait_stream(outer_allgather_stream)
+            allgather_stream.wait_stream(outer_allgather_stream)
             self._model_weight_is_stale = False
 
         if self._unsharded_model_weight.is_alias_of(self.model_weight):

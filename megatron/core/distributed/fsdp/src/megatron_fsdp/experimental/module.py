@@ -358,17 +358,13 @@ class FsdpModule:
         if phase is Phase.BACKWARD and self._schedule_policy.unshard_all_planes_in_backward:
             phase = None
         context = self.context
-        allgather_stream = context.allgather_stream
-        # Groups use this stream only for stale weights. FsdpContext.pre_forward() has
-        # already ordered it after the weight sync.
-        outer_allgather_stream = (
-            context.outer_allgather_stream
-            if context.outer_allgather_stream is not allgather_stream
-            else None
-        )
-        with torch.cuda.stream(allgather_stream):
+        # Groups use the DP-outer stream only for stale weights. FsdpContext.pre_forward()
+        # has already ordered it after the weight sync.
+        with torch.cuda.stream(context.allgather_stream):
             for group in self._parameter_groups:
-                group.unshard_parameters(phase, outer_allgather_stream=outer_allgather_stream)
+                group.unshard_parameters(
+                    phase, outer_allgather_stream=context.outer_allgather_stream
+                )
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
