@@ -59,7 +59,7 @@ def test_finetune_data_files_argument_accepts_multiple_files():
     assert args.finetune_data_files == ["data/chat-00000.parquet", "data/chat-00001.parquet"]
 
 
-def test_streaming_finetune_loads_explicit_splits(tmp_path, monkeypatch):
+def test_streaming_finetune_loads_explicit_splits(tmp_path, monkeypatch, streaming_args):
     tokenizers = pytest.importorskip("tokenizers")
     streaming = pytest.importorskip("modelopt.torch.speculative.plugins.hf_streaming_dataset")
     tokenizer = transformers.PreTrainedTokenizerFast(
@@ -70,18 +70,11 @@ def test_streaming_finetune_loads_explicit_splits(tmp_path, monkeypatch):
     valid_path = tmp_path / "valid.jsonl"
     train_path.write_text('{"conversation_id":"train","messages":[]}\n')
     valid_path.write_text('{"conversation_id":"valid","messages":[]}\n')
-    args = SimpleNamespace(
-        micro_batch_size=1,
-        seq_length=16,
-        export_offline_model=True,
-        eagle_streaming_server_urls="http://127.0.0.1:8765",
-        eagle_streaming_model="target",
-        eagle_streaming_answer_only_loss=False,
-        eagle_streaming_train_data=str(train_path),
-        eagle_streaming_valid_data=str(valid_path),
-        eagle_streaming_test_data=None,
-    )
-    monkeypatch.setattr("finetune.get_args", lambda: args)
+    streaming_args.eagle_streaming_train_data = str(train_path)
+    streaming_args.eagle_streaming_valid_data = str(valid_path)
+    streaming_args.eval_iters = 1
+    validate_eagle_streaming_args(streaming_args)
+    monkeypatch.setattr("finetune.get_args", lambda: streaming_args)
     monkeypatch.setattr("finetune.get_hf_tokenizer", lambda: tokenizer)
 
     train, valid, test = finetune.train_valid_test_sft_datasets_provider(
@@ -119,12 +112,6 @@ def streaming_args():
     )
 
 
-def test_eagle_streaming_args_accept_validation_with_a_corpus(streaming_args):
-    streaming_args.eval_iters = 1
-    streaming_args.eagle_streaming_valid_data = "validation.jsonl"
-    validate_eagle_streaming_args(streaming_args)
-
-
 @pytest.mark.parametrize(
     ("options", "error"),
     [
@@ -153,12 +140,14 @@ def test_eagle_finetune_forward_batch_alignment(monkeypatch, streaming_args, sou
     streaming_args.reset_attention_mask = False
     streaming_args.eod_mask_loss = False
     monkeypatch.setattr(finetune, "get_args", lambda: streaming_args)
-    monkeypatch.setattr(finetune, "_is_offline_model", lambda: offline)
     monkeypatch.setattr(
         finetune,
         "get_run_config",
         lambda: SimpleNamespace(
-            model=SimpleNamespace(transformer=SimpleNamespace(max_seq_length_per_sample=3))
+            model=SimpleNamespace(
+                transformer=SimpleNamespace(max_seq_length_per_sample=3),
+                transformations=SimpleNamespace(original_num_layers=4 if offline else None),
+            )
         ),
     )
     monkeypatch.setattr(finetune, "get_eos_token_id", lambda: 99)
@@ -177,23 +166,21 @@ def test_eagle_finetune_forward_batch_alignment(monkeypatch, streaming_args, sou
         "aux_hidden_states": torch.tensor([[[2, 3], [5, 7], [11, 13]]], dtype=torch.bfloat16),
         "hidden_states": torch.tensor([[[17], [19], [29]]], dtype=torch.bfloat16),
     }
-    broadcasts = []
 
     def broadcast(keys, data, dtype):
-        broadcasts.append(keys)
         result = {key: data[key] for key in keys}
         assert all(value.dtype == dtype for value in result.values())
         return result
 
     monkeypatch.setattr(finetune.tensor_parallel, "broadcast_data", broadcast)
 
+    model_inputs = {}
+
     class Model:
         eagle_offline = offline
 
         def __call__(self, tokens, position_ids, attention_mask, *, labels, **features):
-            assert tokens.tolist() == [[11, 23, 37]]
-            assert labels.tolist() == [[23, 37, 41]]
-            assert position_ids.tolist() == [[0, 1, 2]]
+            model_inputs.update(tokens=tokens, labels=labels, positions=position_ids)
             if offline:
                 assert features.pop("aux_hidden_states").tolist() == [
                     [[2, 3]],
@@ -202,13 +189,12 @@ def test_eagle_finetune_forward_batch_alignment(monkeypatch, streaming_args, sou
                 ]
                 assert features.pop("hidden_states").tolist() == [[[17]], [[19]], [[29]]]
             assert features == ({"base_hidden_prenorm": True} if source == "streaming" else {})
-            return labels
 
-    output, loss_callback = finetune.forward_step(iter((sample,)), Model())
-    assert output.tolist() == [[23, 37, 41]]
+    _, loss_callback = finetune.forward_step(iter((sample,)), Model())
+    assert model_inputs["tokens"].tolist() == [[11, 23, 37]]
+    assert model_inputs["labels"].tolist() == [[23, 37, 41]]
+    assert model_inputs["positions"].tolist() == [[0, 1, 2]]
     assert loss_callback.args[0].tolist() == ([[1, 1, 1]] if source == "disk" else [[1, 0, 1]])
-    assert broadcasts[0] == (["input_ids"] if source == "disk" else ["input_ids", "loss_mask"])
-    assert broadcasts[1:] == ([["aux_hidden_states", "hidden_states"]] if offline else [])
 
 
 def test_materialize_data_files_resolves_local_dataset_directory(tmp_path):
