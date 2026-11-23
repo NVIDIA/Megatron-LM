@@ -1180,8 +1180,11 @@ def forward_backward_pipelining_with_interleaving(
 
     model_type = get_model_type(model[0])
 
-    tensor_shape = [seq_length, micro_batch_size, _get_pipeline_hidden_size(config)]
-    tensor_shape[0] = tensor_shape[0] // cp_group.size()
+    if config.variable_seq_lengths and config.pipeline_p2p_fixed_shape:
+        tensor_shape = [config.max_seqlen_per_dp_cp_rank, 1, _get_pipeline_hidden_size(config)]
+    else:
+        tensor_shape = [seq_length, micro_batch_size, _get_pipeline_hidden_size(config)]
+        tensor_shape[0] = tensor_shape[0] // cp_group.size()
     if config.sequence_parallel:
         tensor_shape[0] = tensor_shape[0] // tp_group.size()
 
@@ -2136,25 +2139,32 @@ def get_tensor_shapes(
 ):
     """Determine tensor shapes for pipeline communication.
 
-    Returns [()] for variable_seq_lengths mode (shapes exchanged dynamically),
-    or computed shapes for fixed sequence length mode.
+    Returns [()] for dynamic shape exchange, or computed shapes for fixed sequence lengths
+    and packed THD inputs padded to max_seqlen_per_dp_cp_rank.
     """
     tensor_shapes = []
 
-    if config.variable_seq_lengths:
+    use_fixed_packed_shape = config.variable_seq_lengths and config.pipeline_p2p_fixed_shape
+    if config.variable_seq_lengths and not use_fixed_packed_shape:
         # Shapes exchanged dynamically during P2P communication
         tensor_shapes.append(())
         return tensor_shapes
 
     # Fixed sequence lengths - compute shape
-    effective_seq_length = decoder_seq_length if decoder_seq_length is not None else seq_length
-    effective_seq_length = effective_seq_length // cp_group.size()
+    if use_fixed_packed_shape:
+        # Packing flattens samples to batch 1; capacity is already CP-local.
+        effective_seq_length = config.max_seqlen_per_dp_cp_rank
+        effective_micro_batch_size = 1
+    else:
+        effective_seq_length = decoder_seq_length if decoder_seq_length is not None else seq_length
+        effective_seq_length = effective_seq_length // cp_group.size()
+        effective_micro_batch_size = micro_batch_size
 
     if config.sequence_parallel:
         effective_seq_length = effective_seq_length // tp_group.size()
 
     tensor_shapes.append(
-        (effective_seq_length, micro_batch_size, _get_pipeline_hidden_size(config))
+        (effective_seq_length, effective_micro_batch_size, _get_pipeline_hidden_size(config))
     )
     return tensor_shapes
 
@@ -2235,6 +2245,11 @@ def forward_backward_pipelining_without_interleaving(
             if not config.variable_seq_lengths:
                 raise ValueError(
                     "config.variable_seq_lengths=True required for multi-module pipelines"
+                )
+            if config.pipeline_p2p_fixed_shape:
+                raise ValueError(
+                    "pipeline_p2p_fixed_shape does not support multi-module pipelines; "
+                    "their boundary shapes require dynamic shape exchange"
                 )
             if pg_collection.has_language_model():
                 cp_size = pg_collection.get_language_model_cp_size()
