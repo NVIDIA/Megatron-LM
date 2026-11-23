@@ -200,7 +200,7 @@ class DeepSeekV41Adapter:
                         get_cuda_rng_tracker,
                         self.pg_collection.tp,
                         hidden_states,
-                        *region.inputs.pack(values),
+                        *region.reads.pack(values),
                         use_reentrant=False,
                     )
                     hidden_states, values = region.restore_result(result, values)
@@ -210,6 +210,9 @@ class DeepSeekV41Adapter:
                 slot, slots = self._next_slot[graph_key]
                 hidden_states, values = graph.run(hidden_states, values, slot=slot)
                 self._next_slot[graph_key] = ((slot + 1) % slots, slots)
+            # A region keeps the fields it only read; retire those the next boundary drops.
+            retired = {f.key for f in region.reads.fields} - {f.key for f in region.writes.fields}
+            values = {key: value for key, value in values.items() if key not in retired}
             csa, mhc, _ = codec.restore(values, layer_id + 1)
             objective = values.pop('indexer_loss', None)
             context.cross_layer_state, context.mhc_state, context.values = csa, mhc, values
