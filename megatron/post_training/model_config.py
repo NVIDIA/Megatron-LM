@@ -57,6 +57,8 @@ def distillation_config_from_args(
             teacher_transformations,
             qad_train_target=None,
             lsq_scale_lr=None,
+            lsq_scale_min_lr=None,
+            lsq_scale_wd_mult=None,
         )
     if isinstance(student_model_config, HybridModelConfig):
         teacher_model = hybrid_config_from_args(teacher_args)
@@ -240,6 +242,8 @@ def apply_modelopt_model_config(
         moe_grouped_gemm=not disable_moe_grouped_gemm,
         qad_train_target=qad_train_target,
         lsq_scale_lr=getattr(args, "lsq_scale_lr", None),
+        lsq_scale_min_lr=getattr(args, "lsq_scale_min_lr", None),
+        lsq_scale_wd_mult=getattr(args, "lsq_scale_wd_mult", None),
         original_num_layers=original_num_layers,
     )
     return model_config

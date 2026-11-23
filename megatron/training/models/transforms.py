@@ -28,7 +28,16 @@ class ModelTransformConfig:
     """Select the trainable portion of an MTP model."""
 
     lsq_scale_lr: float | None = None
-    """Enable optimizer overrides for learned quantization scales."""
+    """Peak LR for learned quantization scales; None inherits the base LR."""
+
+    lsq_scale_min_lr: float | None = None
+    """Minimum LR for learned quantization scales; None inherits the base minimum."""
+
+    lsq_scale_wd_mult: float | None = None
+    """Weight-decay multiplier for learned quantization scales; zero disables decay.
+
+    None retains the existing standard parameter policy.
+    """
 
     original_num_layers: int | None = None
     """Offline speculative decoding: the base model's layer count. The model is built with

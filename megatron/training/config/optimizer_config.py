@@ -77,10 +77,18 @@ def build_optimizer_config_overrides(
     # The LSQ hook records the actual setting on the model without a process-global patch.
     from megatron.post_training.optimizer import get_lsq_config_overrides
 
-    lsq = [
-        get_lsq_config_overrides(getattr(chunk, "_lsq_scale_lr", None), base_lr=optimizer_config.lr)
-        for chunk in model_chunks
-    ]
+    lsq = []
+    for chunk in model_chunks:
+        scale_wd_mult = getattr(chunk, "_lsq_scale_wd_mult", None)
+        lsq.append(
+            get_lsq_config_overrides(
+                getattr(chunk, "_lsq_scale_lr", None),
+                base_lr=optimizer_config.lr,
+                scale_min_lr=getattr(chunk, "_lsq_scale_min_lr", None),
+                base_min_lr=optimizer_config.min_lr,
+                scale_wd_mult=1.0 if scale_wd_mult is None else scale_wd_mult,
+            )
+        )
     combined = merge_config_overrides(standard, mup, *lsq, custom)
     # Validate overlapping selectors before removing no-op fields: explicitly asking
     # for the base LR must still conflict with a matching muP/custom LR rule.

@@ -2,6 +2,7 @@
 
 """Unit tests for --lsq-scale-lr and the LSQ scale-param handling in model_hooks."""
 
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +15,7 @@ from megatron.core.optimizer import (
 )
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
 from megatron.core.optimizer.optimizer_config import ParamKey
+from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.post_training.model_hooks import _propagate_expert_allreduce_to_lsq_params, lsq_hook
 from megatron.post_training.optimizer import get_lsq_config_overrides
 from megatron.training.config.optimizer_config import build_optimizer_config_overrides
@@ -80,6 +82,21 @@ def test_shared_scale_policy_only_emits_differences(
     )
     scale_key = ParamKey(name=("*_amax_pre", "*_amax_post"))
     assert overrides == ({scale_key: expected} if expected else {})
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"scale_min_lr": -1.0},
+        {"scale_min_lr": float("nan")},
+        {"scale_wd_mult": float("inf")},
+        {"scale_wd_mult": -0.5},
+        {"scale_min_lr": 2e-3},
+    ],
+)
+def test_invalid_scale_policy(kwargs):
+    with pytest.raises(ValueError, match="LSQ"):
+        get_lsq_config_overrides(None, base_lr=1e-3, base_min_lr=1e-4, **kwargs)
 
 
 @pytest.mark.parametrize("scale_lr", [1e-4, 3e-5])
@@ -159,3 +176,82 @@ class TestLSQParamGroups:
         # The two groups must stay distinguishable when a checkpoint is loaded.
         identities = [tuple(g.get(k) for k in param_group_identifier_keys) for g in groups]
         assert len(set(identities)) == len(identities)
+
+    @pytest.mark.parametrize("scale_min_lr,scale_wd_mult", [(2e-4, None), (None, 0.0), (2e-4, 0.5)])
+    def test_scale_schedule_and_adam_resume(self, scale_min_lr, scale_wd_mult):
+        config = OptimizerConfig(lr=1e-3, min_lr=1e-4, weight_decay=0.1)
+
+        def build():
+            model = _toy_model()
+            lsq_hook(None, scale_min_lr=scale_min_lr, scale_wd_mult=scale_wd_mult)([model])
+            overrides = build_optimizer_config_overrides(config, [model])
+            groups = _get_param_groups([model], config, overrides)
+            optimizer = torch.optim.AdamW(groups, lr=config.lr)
+            scheduler = OptimizerParamScheduler(
+                optimizer,
+                init_lr=0.0,
+                max_lr=config.lr,
+                min_lr=config.min_lr,
+                lr_warmup_steps=2,
+                lr_decay_steps=8,
+                lr_decay_style="linear",
+                start_wd=0.1,
+                end_wd=0.1,
+                wd_incr_steps=8,
+                wd_incr_style="constant",
+            )
+            return model, optimizer, scheduler
+
+        model, optimizer, scheduler = build()
+        scale = model.linear.weight_quantizer._amax_pre
+        group = next(g for g in optimizer.param_groups if any(p is scale for p in g["params"]))
+        assert group["min_lr"] == (scale_min_lr if scale_min_lr is not None else config.min_lr)
+        assert group["wd_mult"] == (scale_wd_mult if scale_wd_mult is not None else 1.0)
+        identities = [
+            tuple(g.get(k) for k in param_group_identifier_keys) for g in optimizer.param_groups
+        ]
+        assert len(identities) == len(set(identities)) == 2
+        scheduler.step(2)
+        assert group["lr"] == pytest.approx(1e-3)
+        assert group["weight_decay"] == pytest.approx(0.1 * group["wd_mult"])
+
+        def step(module, opt, schedule):
+            for i, param in enumerate(module.parameters()):
+                param.grad = torch.full_like(param, 0.25 * (i + 1))
+            opt.step()
+            schedule.step(1)
+
+        step(model, optimizer, scheduler)
+        restored, resumed_optimizer, resumed_scheduler = build()
+        restored.load_state_dict(deepcopy(model.state_dict()))
+        resumed_optimizer.load_state_dict(deepcopy(optimizer.state_dict()))
+        resumed_scheduler.load_state_dict(scheduler.state_dict())
+        for _ in range(3):
+            step(model, optimizer, scheduler)
+            step(restored, resumed_optimizer, resumed_scheduler)
+        for expected, actual in zip(model.parameters(), restored.parameters()):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            for key in ("exp_avg", "exp_avg_sq"):
+                torch.testing.assert_close(
+                    resumed_optimizer.state[actual][key],
+                    optimizer.state[expected][key],
+                    rtol=0,
+                    atol=0,
+                )
+        scheduler.step(8 - scheduler.num_steps)
+        assert group["lr"] == pytest.approx(group["min_lr"])
+
+    def test_scale_policy_does_not_leak_between_models(self):
+        config = OptimizerConfig(lr=1e-3, min_lr=1e-4)
+        first, second = [_toy_model()], [_toy_model()]
+        lsq_hook(None, scale_min_lr=2e-4, scale_wd_mult=0.0)(first)
+        assert build_optimizer_config_overrides(config, first) != get_standard_config_overrides(
+            config
+        )
+        assert build_optimizer_config_overrides(config, second) == get_standard_config_overrides(
+            config
+        )
+        lsq_hook(None)(first)
+        assert build_optimizer_config_overrides(config, first) == get_standard_config_overrides(
+            config
+        )

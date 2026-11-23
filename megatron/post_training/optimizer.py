@@ -2,6 +2,8 @@
 
 """Optimizer param-group overrides for scale-learning QAD (LSQ)."""
 
+import math
+
 from megatron.core.optimizer import ParamKey
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 
@@ -30,9 +32,23 @@ def get_lsq_config_overrides(
         base_min_lr: Minimum learning rate in the optimizer configuration.
         scale_wd_mult: Weight-decay multiplier for the scales.
 
+    Raises:
+        ValueError: If a scale setting is negative/nonfinite or the LR bounds are inverted.
+
     Returns:
         Scale-specific contributions, without standard weight-decay or decoupled-LR rules.
     """
+    for name, value in (
+        ("max_lr", lsq_scale_lr),
+        ("min_lr", scale_min_lr),
+        ("wd_mult", scale_wd_mult),
+    ):
+        if value is not None and (not math.isfinite(value) or value < 0):
+            raise ValueError(f"LSQ {name} must be finite and nonnegative, got {value}.")
+    maximum = lsq_scale_lr if lsq_scale_lr is not None else base_lr
+    minimum = scale_min_lr if scale_min_lr is not None else base_min_lr
+    if maximum is not None and minimum is not None and minimum > maximum:
+        raise ValueError("LSQ minimum learning rate must not exceed its maximum learning rate.")
     override = ParamGroupOverride()
     if lsq_scale_lr is not None and lsq_scale_lr != base_lr:
         override["max_lr"] = lsq_scale_lr

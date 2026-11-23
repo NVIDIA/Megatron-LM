@@ -126,6 +126,18 @@ def add_modelopt_args(parser):
         help='Optional separate learning rate for LSQ scale (amax) parameters. If unset, they '
         'use the base learning rate.',
     )
+    group.add_argument(
+        "--lsq-scale-min-lr",
+        type=float,
+        default=None,
+        help="Minimum learning rate for LSQ scale parameters; defaults to --min-lr.",
+    )
+    group.add_argument(
+        "--lsq-scale-wd-mult",
+        type=float,
+        default=None,
+        help="LSQ scale weight-decay multiplier; zero disables decay. Unset retains standard rules.",
+    )
 
     # Deprecated aliases of the core architecture arguments
     group.add_argument(

@@ -28,6 +28,8 @@ _NON_MODELOPT_OPTION_OVERRIDES = (
     {"qad_train_target": "base"},
     {"freeze_base_for_mtp": True},
     {"lsq_scale_lr": 1e-4},
+    {"lsq_scale_min_lr": 1e-6},
+    {"lsq_scale_wd_mult": 0.0},
     {"qk_l2_norm": True},
     {"export_offline_model": True},
 )
@@ -71,6 +73,7 @@ def test_should_use_modelopt_config(
 @pytest.mark.parametrize("kd", [False, True])
 def test_whole_run_yaml_roundtrip(tmp_path, hybrid, training, kd):
     args = make_modelopt_test_args(
+        extra_argv=("--lsq-scale-min-lr", "1e-6", "--lsq-scale-wd-mult", "0.0"),
         hybrid_layer_pattern="M*" if hybrid else None,
         export_kd_teacher_load=str(tmp_path) if kd else None,
     )
