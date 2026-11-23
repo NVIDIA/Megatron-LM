@@ -60,6 +60,7 @@ from ..distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
 from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
+from . import cute_dsl_multi_tensor
 from .distrib_optimizer import DistributedOptimizer
 from .emerging_optimizers import (
     _EMERGING_OPTIMIZERS,
@@ -688,6 +689,14 @@ def _get_megatron_optimizer_based_on_param_groups(
                     kwargs.update({"store_param_remainders": config.store_param_remainders})
 
             optimizer = adam_cls(**kwargs)
+            if (
+                config.use_cute_dsl_multi_tensor
+                and hasattr(optimizer, "multi_tensor_adam")
+                and cute_dsl_multi_tensor.enable()
+            ):
+                optimizer.multi_tensor_adam = cute_dsl_multi_tensor.adam_impl(
+                    optimizer.multi_tensor_adam
+                )
 
             def init_state_fn(opt, config=None):
                 for group in opt.param_groups:

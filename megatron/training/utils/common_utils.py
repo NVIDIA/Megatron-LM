@@ -38,6 +38,7 @@ except ImportError:
 from megatron.core import mpu
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
+from megatron.core.optimizer import cute_dsl_multi_tensor
 from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
@@ -52,6 +53,8 @@ from megatron.core.utils import (
 )
 from megatron.training import get_adlr_autoresume, get_args, get_timers, get_train_state
 from megatron.training.global_vars import get_run_config
+
+multi_tensor_l2norm = cute_dsl_multi_tensor.l2norm_impl(multi_tensor_l2norm)
 
 
 def _compute_norm_2(params_list):

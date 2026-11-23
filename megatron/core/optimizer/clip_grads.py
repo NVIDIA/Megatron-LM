@@ -46,6 +46,9 @@ except ImportError:
         multi_tensor_scale_impl = local_multi_tensor_scale
         multi_tensor_scale_tensor_impl = None
 
+from . import cute_dsl_multi_tensor
+
+l2_norm_impl = cute_dsl_multi_tensor.l2norm_impl(l2_norm_impl)
 
 from ..tensor_parallel import (
     gtp_local_pad_zero_count,

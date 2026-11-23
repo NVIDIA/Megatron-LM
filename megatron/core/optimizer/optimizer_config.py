@@ -451,6 +451,11 @@ class OptimizerConfig:
     optimizer_cuda_graph: bool = False
     """If true, enables CUDA graph for optimizer step."""
 
+    use_cute_dsl_multi_tensor: bool = False
+    """If true, run the fp32 multi-tensor Adam and L2-norm calls as one persistent CuTe DSL
+    launch per tensor list instead of Transformer Engine's chunked launches. Needs an SM100+
+    GPU and ``nvidia-cutlass-dsl``; falls back to Transformer Engine otherwise."""
+
     def validate(self) -> None:
         """Check optimizer-local settings without modifying the config."""
 
