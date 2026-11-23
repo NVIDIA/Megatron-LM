@@ -27,7 +27,7 @@ from megatron.core.transformer.multi_latent_attention import (
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import init_method_normal, scaled_init_method_normal
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, defer_parameter_gathers
 
 
 class MockCoreAttention(torch.nn.Module):
@@ -474,9 +474,14 @@ def test_functionality(tp_cp: List[int], qkv_format: str, down_proj_use_column_p
     for name, param in absorbed_mla.named_parameters():
         if param.grad is not None:
             param.grad.zero_()
-    absorbed_outputs, _ = absorbed_mla(
-        hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
-    )
+    with defer_parameter_gathers(
+        absorbed_mla,
+        absorbed_mla.linear_kv_up_proj.parameters(),
+        enabled=tp_cp == [1, 1] and qkv_format == 'sbhd' and not down_proj_use_column_parallel,
+    ):
+        absorbed_outputs, _ = absorbed_mla(
+            hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+        )
     absorbed_outputs.backward(grads)
 
     for name, param in standard_mla.named_parameters():

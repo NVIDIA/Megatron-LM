@@ -2,7 +2,10 @@
 import gc
 import os
 from argparse import Namespace
+from contextlib import contextmanager
 from datetime import timedelta
+from functools import partial
+from types import SimpleNamespace
 from typing import Literal
 
 import torch
@@ -33,6 +36,52 @@ _NVTE_ATTN_ENV_VARS = (
     'NVTE_FLASH_ATTN_V3',
     'NVTE_FLASH_ATTN_V4',
 )
+
+
+@contextmanager
+def defer_parameter_gathers(model, parameters, *, enabled=True):
+    """Poison independent parameter buffers until DDP's real forward hooks publish them."""
+    if not enabled:
+        yield
+        return
+
+    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+    from megatron.core.utils import PARAM_READY_CALLBACK_ATTR
+
+    pending = {p: p.detach().clone() for p in parameters}
+    original_callbacks = {p: getattr(p, PARAM_READY_CALLBACK_ATTR, None) for p in pending}
+
+    @torch.no_grad()
+    def publish(param, **unused):
+        if param in pending:
+            param.copy_(pending.pop(param))
+
+    ddp = DistributedDataParallel.__new__(DistributedDataParallel)
+    torch.nn.Module.__init__(ddp)
+    ddp.module = model
+    ddp.use_forward_hook = True
+    ddp.remove_forward_pre_hook_handles = {}
+    ddp.ddp_config = DistributedDataParallelConfig(overlap_param_gather=True)
+    ddp.overlap_param_gather_with_optimizer_step = False
+    ddp.param_to_bucket_group = {}
+    for param in pending:
+        callback = partial(publish, param)
+        ddp.param_to_bucket_group[param] = SimpleNamespace(finish_param_sync=callback)
+        setattr(param, PARAM_READY_CALLBACK_ATTR, callback)
+        with torch.no_grad():
+            param.fill_(float("nan"))
+    try:
+        ddp.enable_forward_pre_hook()
+        yield
+        assert not pending, "A direct parameter read never reached its readiness boundary"
+    finally:
+        ddp.disable_forward_pre_hook(param_sync=False)
+        for param, callback in original_callbacks.items():
+            publish(param)
+            if callback is None:
+                delattr(param, PARAM_READY_CALLBACK_ATTR)
+            else:
+                setattr(param, PARAM_READY_CALLBACK_ATTR, callback)
 
 
 class TestModel(torch.nn.Module):

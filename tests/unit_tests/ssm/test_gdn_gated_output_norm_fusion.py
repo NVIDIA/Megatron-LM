@@ -17,7 +17,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, defer_parameter_gathers
 
 
 def _config(**overrides):
@@ -182,7 +182,14 @@ def test_split_forward_matches_monolithic(model_parallel, packed, pre_fusion, po
     model.config.gdn_gated_output_norm_fusion = post_fusion
     hidden, dy, metadata = _inputs(packed)
     expected, reference_grads = _run(model, hidden, dy, metadata)
-    actual, grads = _run(model, hidden, dy, metadata, staged=True)
+    params = [
+        *model.parameters(recurse=False),
+        *model.conv1d.parameters(),
+        *model.out_norm.parameters(),
+    ]
+    # Cover the unfused and fully fused boundaries on one input layout each.
+    with defer_parameter_gathers(model, params, enabled=not packed and pre_fusion == post_fusion):
+        actual, grads = _run(model, hidden, dy, metadata, staged=True)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     _assert_close(actual, expected, grads, reference_grads)
 

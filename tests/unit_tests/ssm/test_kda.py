@@ -22,7 +22,7 @@ from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import Float16Module
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, defer_parameter_gathers
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
 from tests.unit_tests.transformer.test_multi_latent_attention import (
     make_test_packed_seq_params,
@@ -169,7 +169,10 @@ def test_kda_forward_backward(two_stage_gates):
             dtype=torch.bfloat16,
             requires_grad=True,
         )
-        output, bias = kda(hidden_states, None)
+        with defer_parameter_gathers(
+            kda, [*kda.conv1d.parameters(), *norm_params], enabled=not two_stage_gates
+        ):
+            output, bias = kda(hidden_states, None)
         assert bias is None
         assert output.shape == hidden_states.shape
         assert output.dtype == hidden_states.dtype

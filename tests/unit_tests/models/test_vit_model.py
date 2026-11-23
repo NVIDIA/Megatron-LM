@@ -4,12 +4,54 @@ import pytest
 import torch
 
 from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.vision.vit_model import (
+    KimiViTModel,
     Pixtral2DRotaryEmbedding,
+    QwenVLViTModel,
+    ViTModel,
     _dynamic_patch_grid_lists,
 )
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.test_utilities import Utils, defer_parameter_gathers
+
+
+@pytest.mark.parametrize("model_cls", [ViTModel, QwenVLViTModel, KimiViTModel])
+def test_dynamic_patches_wait_for_projection(model_cls):
+    """Packed patches bypass both patch_embed and its projection's forward hooks."""
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=2,
+            use_cpu_initialization=True,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+        )
+        kwargs = {}
+        if model_cls is QwenVLViTModel:
+            kwargs = dict(out_hidden_size=16, num_pos_per_side=2)
+        elif model_cls is KimiViTModel:
+            kwargs = dict(pos_embed_height=2, pos_embed_width=2)
+        model = model_cls(
+            config,
+            get_gpt_layer_with_transformer_engine_spec(),
+            patch_dim=2,
+            img_h=4,
+            img_w=4,
+            **kwargs,
+        ).cuda()
+        patches = torch.randn(1, 4, 12, device="cuda", requires_grad=True)
+        reference = model(patches, imgs_sizes=[(4, 4)])
+        with defer_parameter_gathers(model, model.patch_embed.proj.parameters()):
+            actual = model(patches, imgs_sizes=[(4, 4)])
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+        actual.square().mean().backward()
+        assert torch.isfinite(patches.grad).all()
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize(

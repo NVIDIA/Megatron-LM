@@ -24,6 +24,7 @@ from megatron.core.models.audio.nemo_transformer_audio_model import (
     NemoTransformerAudioModel,
 )
 from megatron.core.models.audio.nemo_transformer_encoder import StackingSubsampling
+from tests.unit_tests.test_utilities import defer_parameter_gathers
 
 
 def _rope_config(**overrides) -> NemoTransformerAudioConfig:
@@ -247,6 +248,20 @@ def test_rope_left_context_preserves_checkpoint_state_dict():
 
     windowed.load_state_dict(unlimited.state_dict(), strict=True)
     assert windowed.encoder.layers[0].attn.causal_window_size == (3, 0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_rope_packed_block_waits_for_qkv():
+    model = NemoTransformerAudioModel(_rope_config()).cuda().bfloat16().eval()
+    block = model.encoder.layers[0]
+    hidden = torch.randn(4, 16, dtype=torch.bfloat16, device="cuda")
+    cu_seqlens = torch.tensor([0, 4], dtype=torch.int32, device="cuda")
+    block.attn.rope.extend_pe(4, hidden.device, hidden.dtype)
+    with torch.no_grad():
+        expected = block.forward_packed(hidden, cu_seqlens, max_seqlen=4, is_causal=False)
+        with defer_parameter_gathers(block, block.attn.w_qkv.parameters()):
+            actual = block.forward_packed(hidden, cu_seqlens, max_seqlen=4, is_causal=False)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
