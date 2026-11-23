@@ -1771,13 +1771,10 @@ def test_legacy_checkpoint_gloo_requirement_uses_effective_optimizer(monkeypatch
         validate_args(args)
 
 
-@pytest.mark.parametrize("use_layer_wise_param_layout", [False, True])
 @pytest.mark.parametrize("optimizer", ["adam", "muon", "dist_muon"])
-def test_mem_efficient_reshardable_checkpoint_gloo_requirement(
-    monkeypatch, optimizer, use_layer_wise_param_layout
-):
+def test_mem_efficient_reshardable_checkpoint_gloo_requirement(monkeypatch, optimizer):
     """Every optimizer that builds a DistributedOptimizer needs Gloo for the mem-efficient
-    fully reshardable format, including the one the layer-wise path builds for Muon."""
+    fully reshardable format, including the one both LayerWise layouts build for Muon."""
     args = _minimal_training_args(monkeypatch)
     args.optimizer = optimizer
     args.use_distributed_optimizer = True
@@ -1785,13 +1782,7 @@ def test_mem_efficient_reshardable_checkpoint_gloo_requirement(
     args.ckpt_format = "torch_dist"
     args.dist_ckpt_optim_fully_reshardable = True
     args.distrib_optim_fully_reshardable_mem_efficient = True
-    args.use_layer_wise_param_layout = use_layer_wise_param_layout
-    builds_distributed_optimizer = optimizer == "adam" or use_layer_wise_param_layout
-    with (
-        pytest.raises(AssertionError, match="fully-reshardable-mem-efficient")
-        if builds_distributed_optimizer
-        else nullcontext()
-    ):
+    with pytest.raises(AssertionError, match="fully-reshardable-mem-efficient"):
         validate_args(args)
 
 
