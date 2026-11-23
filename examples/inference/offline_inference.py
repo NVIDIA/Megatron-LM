@@ -48,11 +48,11 @@ from megatron.inference.utils import (
     add_inference_args,
     get_inference_config_from_model_and_args,
     get_model_for_inference,
+    inference_config_from_args,
 )
 from megatron.training import initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.global_vars import get_tokenizer, set_run_config
-from megatron.training.argument_utils import inference_cfg_container_from_args
 
 
 def add_offline_inference_args(parser: ArgumentParser) -> ArgumentParser:
@@ -268,7 +268,7 @@ def main():
         extra_args_provider=add_offline_inference_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
-    set_run_config(inference_cfg_container_from_args(args))
+    set_run_config(inference_config_from_args(args))
     initialize_megatron()
     _validate_high_level_api_args(args)
 

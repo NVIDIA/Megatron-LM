@@ -10,6 +10,7 @@ from packaging.version import Version as PkgVersion
 from pytest_mock import mocker
 
 import megatron.core.parallel_state as ps
+from megatron.core import process_groups_config
 from megatron.core.datasets.t5_dataset import T5MaskedWordPieceDataset
 from megatron.core.models.T5.t5_model import T5Model
 from megatron.core.models.T5.t5_spec import (
@@ -132,6 +133,7 @@ class TestT5Model:
 def test_constructor_process_groups(mocker, explicit_pg_collection):
     """T5 and LanguageModule must agree on the caller's process-group collection."""
     clear_nvte_env_vars()
+    mocker.patch.object(process_groups_config, "_warned_global_process_group_fallbacks", set())
     mocker.patch("torch.distributed.is_initialized", return_value=True)
     pg_collection = ProcessGroupCollection(
         tp=mocker.sentinel.tp,
@@ -147,7 +149,7 @@ def test_constructor_process_groups(mocker, explicit_pg_collection):
 
     config = TransformerConfig(num_layers=2, hidden_size=16, num_attention_heads=4)
     # An empty pipeline stage exercises both constructors without constructing GPU layers.
-    model = T5Model(
+    t5_kwargs = dict(
         config=config,
         encoder_config=config,
         transformer_encoder_layer_spec=None,
@@ -160,6 +162,11 @@ def test_constructor_process_groups(mocker, explicit_pg_collection):
         add_decoder=False,
         pg_collection=pg_collection if explicit_pg_collection else None,
     )
+    if explicit_pg_collection:
+        model = T5Model(**t5_kwargs)
+    else:
+        with pytest.warns(FutureWarning, match="T5Model was called without `pg_collection`"):
+            model = T5Model(**t5_kwargs)
 
     assert model.pg_collection is pg_collection
     assert model.tp_group is pg_collection.tp

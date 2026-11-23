@@ -53,29 +53,22 @@ def shell_environment(tmp_path: Path) -> dict[str, str]:
         pytest.skip("Workflow shell validation requires jq")
     binaries = tmp_path / "bin"
     binaries.mkdir()
-    # CI provides yq. Use PyYAML for that extraction locally and execute the
-    # actual producer/build shell and jq programs unchanged.
+    # CI provides yq. Parse YAML locally and execute the workflow query with jq.
     yq = binaries / "yq"
     yq.write_text(
         f"#!{sys.executable}\n"
-        "import json, sys, yaml\n"
+        "import json, subprocess, sys, yaml\n"
         "assert sys.argv[1:3] == ['-o', 'json']\n"
-        "if len(sys.argv) == 5:\n"
-        "    assert sys.argv[3] == '[.products[].test_case[]]'\n"
-        "else:\n"
-        "    assert sys.argv[3] == "
-        "'[.products[].test_case[] | { \"bucket\": .}] | sort_by(.model, .test_case)'\n"
         "with open(sys.argv[4]) if len(sys.argv) == 5 else sys.stdin as stream:\n"
         "    recipe = yaml.safe_load(stream)\n"
-        "cases = [case for product in recipe['products'] for case in product['test_case']]\n"
-        "print(json.dumps(cases if len(sys.argv) == 5 else [{'bucket': case} for case in cases]))\n"
+        "subprocess.run(['jq', sys.argv[3]], input=json.dumps(recipe), text=True, check=True)\n"
     )
     yq.chmod(0o755)
     for platform in ("h100", "gb200"):
         relative = Path("tests/test_utils/recipes") / platform / "unit-tests.yaml"
         destination = tmp_path / relative
         destination.parent.mkdir(parents=True)
-        destination.symlink_to(ROOT / relative)
+        shutil.copyfile(ROOT / relative, destination)
     return {"PATH": f"{binaries}{os.pathsep}{os.environ['PATH']}"}
 
 
@@ -138,12 +131,41 @@ def test_producer_consumes_the_actual_build_matrix(
                 / "unit-tests.yaml"
             ).read_text()
         )
-        buckets = [case for product in recipe["products"] for case in product["test_case"]]
+        buckets = [
+            case
+            for product in recipe["products"]
+            if product.get("testmon") is not False
+            for case in product["test_case"]
+        ]
         assert [entry["bucket"] for entry in entries] == buckets
         assert all(
             entry["runner"] == runner and entry["image"] == f"{registry}/megatron-lm:{sha}-{cloud}"
             for entry in entries
         )
+
+
+def test_producer_filters_recipe_opt_out(tmp_path, shell_environment):
+    recipe = tmp_path / "tests/test_utils/recipes/h100/unit-tests.yaml"
+    producer = _step("populate-build-cache.yml", "parse-unit-tests", "matrix")
+    environment = {
+        **shell_environment,
+        "BUILDS": json.dumps(
+            {"include": [{"cloud": "aws-h100", "registry": "test", "runner": "h100"}]}
+        ),
+        "SOURCE_SHA": "a" * 40,
+    }
+    products = [
+        {"test_case": ["default.py"]},
+        {"test_case": ["enabled.py"], "testmon": True},
+        {"test_case": ["disabled.py"], "testmon": False},
+    ]
+    for expected_buckets in (["default.py", "enabled.py"], []):
+        recipe.write_text(json.dumps({"products": products}))
+        result, outputs = _run(producer["run"], tmp_path, environment)
+        assert result.returncode == 0, result.stderr
+        assert [entry["bucket"] for entry in json.loads(outputs["matrix"])] == expected_buckets
+        for product in products:
+            product["testmon"] = False
 
 
 def test_producer_rejects_an_unsupported_built_platform(
@@ -205,7 +227,12 @@ def test_producer_publishes_one_h100_testmon_baseline_for_aws_and_gcp_builds(
         recipe = yaml.safe_load(
             (ROOT / "tests/test_utils/recipes" / bucket_file / "unit-tests.yaml").read_text()
         )
-        expected_buckets = [case for product in recipe["products"] for case in product["test_case"]]
+        expected_buckets = [
+            case
+            for product in recipe["products"]
+            if product.get("testmon") is not False
+            for case in product["test_case"]
+        ]
         entries = [entry for entry in matrix if entry["platform"] == platform]
         assert [entry["bucket"] for entry in entries] == expected_buckets
         assert all(
@@ -1001,10 +1028,6 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
     assert workflow["jobs"]["run"]["strategy"]["matrix"]["include"] == (
         "${{ fromJSON(needs.select.outputs.matrix || inputs.buckets) }}"
     )
-    assert workflow["jobs"]["run"]["steps"][-1]["with"]["unit_testmon_mode"] == (
-        "${{ inputs.unit_testmon_mode == 'enforce' && "
-        "inputs.unit_testmon_target_branch == 'main' && 'enforce' || 'full' }}"
-    )
     assert "unit_testmon_plan_artifact" not in workflow["jobs"]["run"]["steps"][-1]["with"]
 
     # CPU failures stop GPU scheduling; full-suite requests bypass selection.
@@ -1069,6 +1092,7 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
     [
         pytest.param("enforce", "main", "preselected", "enforce", id="cpu-selected"),
         pytest.param("enforce", "main", "full", "enforce", id="cpu-fallback"),
+        pytest.param("enforce", "main", "testmon-disabled", "full", id="testmon-disabled"),
         pytest.param("full", "main", "", "full", id="explicit-full"),
         pytest.param("full", "", "", "full", id="merge-group-full"),
         pytest.param("enforce", "dev", "preselected", "full", id="unsupported-target"),
@@ -1129,9 +1153,8 @@ def test_grouped_cpu_selection(
     dataset.write_text("")
     recipe = tmp_path / "tests/test_utils/recipes/h100/unit-tests.yaml"
     recipe.parent.mkdir(parents=True)
-    recipe.write_text(
-        json.dumps({"products": [{"test_case": [entry["bucket"] for entry in buckets]}]})
-    )
+    products = [{"test_case": [entry["bucket"] for entry in buckets]}]
+    recipe.write_text(json.dumps({"products": products}))
     selected = unit_tests / "selected/test_case.py"
     selected.parent.mkdir()
     selected.write_text("def test_case(): pass\n")
@@ -1188,8 +1211,32 @@ for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
         capture_output=True,
         text=True,
     )
+    disabled = []
+    if scenario in {"mixed", "pinned"}:
+        disabled.append({"bucket": "tests/unit_tests/test_opt_out.py", "timeout": 20})
+        if scenario == "pinned":
+            disabled.append({"bucket": "tests/unit_tests/test_prepared_opt_out.py", "timeout": 25})
+        environment["BUCKETS"] = json.dumps([*buckets, *disabled])
+    opt_outs = [
+        {"test_case": [entry["bucket"]], "testmon": index != 0}
+        for index, entry in enumerate(disabled)
+    ]
+    recipe.write_text(json.dumps({"products": [*products, *opt_outs]}))
+    planner = Path(".github/scripts/select_unit_tests.py")
+    (tmp_path / planner).parent.mkdir(parents=True)
+    (tmp_path / planner).symlink_to(ROOT / planner)
+    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
+    stage = next(
+        step for step in workflow["jobs"]["select"]["steps"] if step["name"] == "Save CPU planner"
+    )
+    subprocess.run(["bash", "-eu", "-c", stage["run"]], cwd=tmp_path, env=environment, check=True)
+    if scenario == "pinned":
+        # Each checkout disables a different bucket. Both must bypass Testmon.
+        for product in opt_outs:
+            product["testmon"] = not product["testmon"]
+        recipe.write_text(json.dumps({"products": [*products, *opt_outs]}))
     spec = importlib.util.spec_from_file_location(
-        "select_unit_tests", ROOT / ".github/scripts/select_unit_tests.py"
+        "select_unit_tests", tmp_path / "select_unit_tests.py"
     )
     assert spec is not None and spec.loader is not None
     selector = importlib.util.module_from_spec(spec)
@@ -1265,6 +1312,9 @@ for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
     assert restores == len(buckets)
     outputs = dict(line.split("=", 1) for line in (tmp_path / "outputs").read_text().splitlines())
     matrix = json.loads(outputs["matrix"])
+    for entry in reversed(disabled):
+        assert matrix.pop() == {**entry, "mode": "testmon-disabled"}
+        assert all(upload["plan"]["bucket"] != entry["bucket"] for upload in uploads)
     assert outputs["has_tests"] == str(scenario != "empty").lower()
     assert [entry["bucket"] for entry in matrix] == [
         entry["bucket"] for entry in buckets if entry["bucket"] != "tests/unit_tests/empty/**/*.py"

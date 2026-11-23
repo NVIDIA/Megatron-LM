@@ -14,6 +14,7 @@ import torch
 
 from megatron.core.datasets.utils import Split
 from megatron.training import global_vars
+from megatron.training.config import DataloaderConfig
 from megatron.training.datasets import data_samplers
 
 
@@ -60,13 +61,13 @@ class _WorkerDataset(torch.utils.data.Dataset):
 def test_data_loader_workers(monkeypatch, start_method, split, collate_path, exit_signal_handler):
     variable_length = collate_path in ('varlen', 'dynamic_cp', 'packing')
     batch_size = 1 if collate_path == 'full_validation' else 2
-    args = SimpleNamespace(
-        dataloader_type='single',
-        num_workers=1,
-        use_varlen_dataset=collate_path in ('varlen', 'sbhd'),
-        varlen_sbhd_validation=collate_path == 'sbhd',
-    )
     cfg = SimpleNamespace(
+        # The loader reads the data section: its loader settings and the collate predicate (the
+        # varlen family without SBHD validation yields unpacked samples).
+        data=SimpleNamespace(
+            dataloader=DataloaderConfig(dataloader_type='single', num_workers=1),
+            yields_unpacked_samples=lambda: collate_path == 'varlen',
+        ),
         model=SimpleNamespace(
             transformer=SimpleNamespace(
                 dynamic_context_parallel=collate_path == 'dynamic_cp',
@@ -80,7 +81,6 @@ def test_data_loader_workers(monkeypatch, start_method, split, collate_path, exi
             eval_micro_batch_size=2, full_validation=collate_path == 'full_validation'
         ),
     )
-    monkeypatch.setattr(data_samplers, 'get_args', lambda: args)
     monkeypatch.setattr(data_samplers, 'get_run_config', lambda: cfg)
     monkeypatch.setattr(data_samplers.mpu, 'get_data_parallel_rank', lambda: 0)
     monkeypatch.setattr(data_samplers.mpu, 'get_data_parallel_world_size', lambda: 1)

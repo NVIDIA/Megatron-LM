@@ -579,7 +579,7 @@ def test_partial_capture_failure_retry(process_groups, hybrid, failure, monkeypa
                         assert getattr(module, name) == original_hooks[name], (module, name)
                 for layer in layers:
                     assert not layer._fsdp_cuda_graph_capturing
-                    assert not layer.cuda_graphs
+                    assert not layer.te_cuda_graphs
                     assert all(
                         not group._retain_unsharded_storage for group in layer.parameter_groups
                     )
@@ -692,7 +692,7 @@ def test_partial_capture_delete_recapture(process_groups, hybrid, tmp_path_dist_
                     if index in (4, 7, 10):
                         helper.delete_cuda_graphs()
                         for layer in helper.flattened_callables:
-                            assert not layer.cuda_graphs
+                            assert not layer.te_cuda_graphs
                             for group in layer.parameter_groups:
                                 assert not group._retain_unsharded_storage
                                 if not group._unsharded_model_weight.is_alias_of(
