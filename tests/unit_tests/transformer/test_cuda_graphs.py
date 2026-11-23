@@ -164,24 +164,31 @@ def test_release_all_cuda_graphs_releases_runner_without_capture_records(
 
 @pytest.mark.internal
 @pytest.mark.launch_on_gb200
+@pytest.mark.parametrize(
+    "also_recorded", [False, True], ids=["live-only", "overlapping-registries"]
+)
 def test_release_all_cuda_graphs_synchronizes_before_releasing_graphs(
-    isolated_cuda_graph_record, monkeypatch
+    isolated_cuda_graph_record, monkeypatch, also_recorded
 ):
     events = []
+    reset_runner = cuda_graphs_module._reset_cuda_graph_runner
 
-    class Graph:
-        def reset(self):
-            events.append("reset")
+    def record_reset(runner):
+        events.append("reset")
+        reset_runner(runner)
 
-    runner, _ = _runner_with_created_graphs()
-    runner.fwd_graph = Graph()
-    runner.bwd_graph = None
+    runner, graph_refs = _runner_with_created_graphs()
+    if also_recorded:
+        _CudagraphGlobalRecord.captured_runners.add(runner)
+        _CudagraphGlobalRecord.cudagraph_record.append((runner, "fwd", (), {}))
+    monkeypatch.setattr(cuda_graphs_module, "_reset_cuda_graph_runner", record_reset)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("synchronize"))
 
     # A replay may still read the graph's external constants until the device is idle.
     release_all_cuda_graphs()
 
-    assert events[:2] == ["synchronize", "reset"]
+    assert events == ["synchronize", "reset"]
+    _assert_runner_released(runner, graph_refs)
 
 
 @pytest.mark.internal
@@ -193,11 +200,13 @@ def test_delete_cuda_graphs_releases_created_training_graphs(isolated_cuda_graph
     _CudagraphGlobalRecord.captured_runners.add(training_runner)
     inference_runner, inference_graph_refs = _runner_with_created_graphs()
     _CudagraphGlobalRecord.cudagraph_inference_record.append((inference_runner, "fwd", (), {}))
+    unrecorded_runner, _ = _runner_with_created_graphs()
 
     delete_cuda_graphs()
 
     _assert_runner_released(training_runner, training_graph_refs)
     _assert_runner_released(inference_runner, inference_graph_refs)
+    assert unrecorded_runner.cudagraph_created
     assert len(_CudagraphGlobalRecord.captured_runners) == 0
     assert CudaGraphManager.global_mempool is None
 

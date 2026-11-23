@@ -887,23 +887,18 @@ def _reset_cuda_graph_runner(runner):
     runner._gtp_fwd_params_to_ensure_ready = ()
 
 
-def delete_cuda_graphs():
-    """Delete the graphs of recorded and captured runners and reset the global capture state.
-
-    This includes every runner that started a capture since the last call, so the
-    training graphs that 'create_cudagraphs' created are deleted too; for example, an
-    inference engine's suspend releases them.
-    """
+def _delete_cuda_graphs(*, include_all_runners: bool) -> None:
+    runners = set(_CudagraphGlobalRecord.captured_runners)
+    for record in chain(
+        _CudagraphGlobalRecord.cudagraph_record, _CudagraphGlobalRecord.cudagraph_inference_record
+    ):
+        runners.add(record[0])
+    if include_all_runners:
+        runners.update(_CudagraphGlobalRecord.all_runners)
+        if not runners and CudaGraphManager.global_mempool is None:
+            return
 
     _CudagraphGlobalRecord._disable_saved_tensors_observer()
-
-    # Reset runners.
-    runners = set(_CudagraphGlobalRecord.captured_runners)
-    for record in [
-        *_CudagraphGlobalRecord.cudagraph_record,
-        *_CudagraphGlobalRecord.cudagraph_inference_record,
-    ]:
-        runners.add(record[0])
     if runners:
         # Replay can still be using external constants when graph destruction is requested.
         torch.cuda.synchronize()
@@ -925,6 +920,16 @@ def delete_cuda_graphs():
     CudaGraphManager.global_mempool = None
 
 
+def delete_cuda_graphs():
+    """Delete the graphs of recorded and captured runners and reset the global capture state.
+
+    This includes every runner that started a capture since the last call, so the
+    training graphs that 'create_cudagraphs' created are deleted too; for example, an
+    inference engine's suspend releases them.
+    """
+    _delete_cuda_graphs(include_all_runners=False)
+
+
 def release_all_cuda_graphs():
     """Release the graphs of every live runner and reset the global capture state.
 
@@ -934,16 +939,7 @@ def release_all_cuda_graphs():
     model-parallel teardown must release every graph first. Does nothing if no runner
     is alive and no graph memory pool exists.
     """
-    runners = list(_CudagraphGlobalRecord.all_runners)
-    if not runners and CudaGraphManager.global_mempool is None:
-        return
-    if runners:
-        # As in 'delete_cuda_graphs': a replay can still be using the external
-        # constants that resetting a runner releases.
-        torch.cuda.synchronize()
-    for runner in runners:
-        _reset_cuda_graph_runner(runner)
-    delete_cuda_graphs()
+    _delete_cuda_graphs(include_all_runners=True)
 
 
 register_model_parallel_teardown(TeardownStage.RELEASE_CUDA_GRAPHS, release_all_cuda_graphs)
