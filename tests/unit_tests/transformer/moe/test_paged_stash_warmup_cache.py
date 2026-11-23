@@ -65,11 +65,9 @@ def test_initial_stash_releases_eager_cache_without_changing_live_tensors(monkey
     manager = _manager(lambda: stash.append(torch.empty(2**21, device="cuda", dtype=torch.uint8)))
     monkeypatch.setattr(PagedStashManager, "get_instance", lambda: manager)
     paged_stash_reset()
-    # Use a fresh native pool so the eager allocation cannot share a segment with another
-    # test's live tensors. Release the pool while eager is still live, then free the tensor
-    # so its reserved segment can only be reclaimed by the warmup reset.
-    with torch.cuda.use_mem_pool(torch.cuda.MemPool()):
-        eager = torch.empty(2**26, device="cuda", dtype=torch.uint8)
+    # Larger than everything still reserved, so no existing segment can hold it. A segment kept
+    # by a live tensor from an earlier test would otherwise stay reserved after the flush.
+    eager = torch.empty(torch.cuda.memory_reserved() + 2**26, device="cuda", dtype=torch.uint8)
     del eager
     torch.cuda.synchronize()
     before = torch.cuda.memory_reserved()
