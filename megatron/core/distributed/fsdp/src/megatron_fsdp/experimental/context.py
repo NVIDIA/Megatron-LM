@@ -346,8 +346,8 @@ class FsdpContext:
             module, callback = self._delayed_post_backward_callbacks.pop()
             callback(module)
 
-    def register_post_backward_hook(self) -> None:
-        """Retire previous gradient inputs and register the autograd completion callback.
+    def register_post_backward_hook(self) -> bool:
+        """Register the autograd completion callback and return whether it was queued.
 
         Multiple FSDP roots can share this context. Waiting for the
         reduce-scatter stream in each root's ``post_backward()`` would prevent
@@ -357,17 +357,14 @@ class FsdpContext:
 
         if self._post_backward_hook_registered:
             # Another root sharing this context already queued the completion wait.
-            return
+            return False
         self._post_backward_hook_registered = True
 
         # TODO(wujingyue): Switch to torch.autograd.graph.queue_callback() when Megatron-LM
         # requires a PyTorch version that includes it:
         # https://github.com/pytorch/pytorch/pull/193958
         torch.autograd.Variable._execution_engine.queue_callback(self.post_backward)
-
-        # Release the previous autograd backward's inputs once, before the first root
-        # unshards. The guard above skips this drain for sibling roots in the same backward.
-        self._release_grad_buffers()
+        return True
 
 
 def _collect_backward_order(

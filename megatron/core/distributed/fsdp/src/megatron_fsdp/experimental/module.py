@@ -432,7 +432,9 @@ class FsdpModule:
         if context.is_recording_execution_order:
             context.execution_order.append(ExecutionEvent(cast(nn.Module, self), Phase.BACKWARD))
         if self.is_root():
-            context.register_post_backward_hook()
+            # Retire inputs from the previous backward before the first root unshards.
+            if context.register_post_backward_hook():
+                context._release_grad_buffers()
             context.pre_backward()
 
         self.unshard(Phase.BACKWARD, prefetch=not context.is_recording_execution_order)
