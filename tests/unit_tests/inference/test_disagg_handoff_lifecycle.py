@@ -471,7 +471,17 @@ def test_setup_applies_role_specific_pinning_and_graph_gating(engine_cls, role):
     assert _Backend.names[-2] != _Backend.names[-1]
 
 
-def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache():
+# Two heads with headdim 4, d_state 5 and one group. Mamba2 stores recurrent state as
+# [heads, headdim, d_state] and conv channels [x | B | C]; Gated DeltaProduct stores
+# [heads, d_state, headdim] and packs H value and H key bands plus the query band.
+@pytest.mark.parametrize(
+    "gdp_num_householder, recurrent_shape, conv_width, planner_householder",
+    [(0, (2, 4, 5), 18, 1), (1, (2, 5, 4), 18, 1), (3, (2, 5, 4), 44, 3)],
+    ids=["mamba2", "gdp-h1", "gdp-h3"],
+)
+def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache(
+    gdp_num_householder, recurrent_shape, conv_width, planner_householder
+):
     class _Backend:
         instances = []
 
@@ -503,10 +513,21 @@ def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache():
         hidden_size_per_attention_head=1,
         block_size_tokens=4,
         mamba_slot_allocator=object(),
+        gdp_num_householder=gdp_num_householder,
     )
     model_config = SimpleNamespace(
         num_query_groups=1, num_attention_heads=1, mamba_num_heads=2, mamba_num_groups=1
     )
+
+    def assert_ssm_layouts():
+        # Assert the dimensions explicitly: for H = 1 the conv width alone cannot tell a
+        # swapped headdim/d_state apart.
+        for backend in _Backend.instances[1:]:
+            dims = backend.kwargs["ssm_layout"].dims
+            assert (dims.nheads, dims.headdim, dims.d_state) == (2, 4, 5)
+            assert dims.num_householder == planner_householder
+            assert backend.kwargs["ssm_layout"].conv_dim_local == conv_width
+
     engine.controller = SimpleNamespace(
         inference_wrapped_model=SimpleNamespace(model=SimpleNamespace(config=model_config))
     )
@@ -529,13 +550,14 @@ def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache():
         _Backend.instances.clear()
         engine.context.mamba_slot_allocator = None
         engine.context.max_requests = 8
-        engine.context.mamba_conv_states = torch.empty(1, 9, 18, 3)
-        engine.context.mamba_ssm_states = torch.empty(1, 9, 2, 4, 5)
+        engine.context.mamba_conv_states = torch.empty(1, 9, conv_width, 3)
+        engine.context.mamba_ssm_states = torch.empty(1, 9, *recurrent_shape)
         engine.setup_kv_transfer("decode")
 
     assert _Backend.instances[1].kwargs["memory_buffer"] is engine.context.mamba_conv_states
     assert _Backend.instances[2].kwargs["memory_buffer"] is engine.context.mamba_ssm_states
     assert [backend.kwargs["expected_num_blocks"] for backend in _Backend.instances[1:]] == [9, 9]
+    assert_ssm_layouts()
 
     _Backend.instances.clear()
     engine.context.mamba_slot_allocator = object()
@@ -549,6 +571,7 @@ def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache():
     assert _Backend.instances[1].kwargs["memory_buffer"] is engine.context.mamba_conv_states
     assert _Backend.instances[2].kwargs["memory_buffer"] is engine.context.mamba_ssm_states
     assert [backend.kwargs["expected_num_blocks"] for backend in _Backend.instances[1:]] == [9, 9]
+    assert_ssm_layouts()
 
 
 def test_handoff_salt_is_used_for_lookup_and_retained_after_import(handoff_loop):
@@ -1235,25 +1258,28 @@ def test_transfer_polling_defers_batch_mutation_to_scheduling(handoff_loop):
     finalize.assert_called_once_with(pending)
 
 
+@pytest.mark.parametrize("num_speculative_tokens", [0, 2], ids=["no-mtp", "mtp-2"])
 @pytest.mark.parametrize(
-    "num_tokens_to_generate, termination_id, stop_word_ids, extra_eos_token_id_set, "
-    "stop_token_ids, expected_tokens, expected_reason",
+    "num_tokens_to_generate, termination_id, stop_word_ids, detokenize_stop_sequence, "
+    "extra_eos_token_id_set, stop_token_ids, expected_tokens, expected_reason",
     [
-        (0, -1, None, (), None, [], "length"),
-        (1, -1, None, (), None, [55], "length"),
-        (3, 55, None, (), None, [55], "stop"),
-        (3, -1, [[55]], (), None, [], "stop"),
+        (0, -1, None, False, (), None, [], "length"),
+        (1, -1, None, False, (), None, [55], "length"),
+        (3, 55, None, False, (), None, [55], "stop"),
+        (3, -1, [[55]], False, (), None, [], "stop"),
+        (3, -1, [[55]], True, (), None, [55], "stop"),
         # Declared by the model's generation_config but not the request's
         # termination_id: the imported prefill's token 55 must still stop here
         # rather than resuming decode past it.
-        (3, 2, None, (2, 55), None, [55], "stop"),
-        (1, -1, None, (), [55], [55], "stop"),
+        (3, 2, None, False, (2, 55), None, [55], "stop"),
+        (1, -1, None, False, (), [55], [55], "stop"),
     ],
     ids=[
         "sequence-limit",
         "generation-limit",
         "termination-token",
         "stripped-stop-word",
+        "retained-stop-word",
         "declared-eos",
         "stop-at-budget",
     ],
@@ -1263,12 +1289,15 @@ def test_handoff_finishes_without_an_extra_decode_step(
     num_tokens_to_generate,
     termination_id,
     stop_word_ids,
+    detokenize_stop_sequence,
     extra_eos_token_id_set,
     stop_token_ids,
     expected_tokens,
     expected_reason,
+    num_speculative_tokens,
 ):
     engine = _HandoffHarness(handoff_loop, extra_eos_token_id_set=extra_eos_token_id_set)
+    engine.context.num_speculative_tokens = num_speculative_tokens
     blocks = engine.context.kv_block_allocator.allocate_memory_blocks(2).tolist()
     request_future = handoff_loop.create_future()
     request = DynamicInferenceRequest(
@@ -1278,6 +1307,7 @@ def test_handoff_finishes_without_an_extra_decode_step(
             num_tokens_to_generate=num_tokens_to_generate,
             termination_id=termination_id,
             stop_token_ids=stop_token_ids,
+            detokenize_stop_sequence=detokenize_stop_sequence,
         ),
     )
     request.add_event_add_engine()
@@ -1313,7 +1343,8 @@ def test_handoff_finishes_without_an_extra_decode_step(
         cached_prefix_block_count=0,
         handle=None,
         future=handoff_loop.create_future(),
-        resume_tokens=[55],
+        # The sampled token followed by the prefill engine's MTP proposals.
+        resume_tokens=[55, 56, 57][: num_speculative_tokens + 1],
     )
 
     with (
@@ -1330,6 +1361,11 @@ def test_handoff_finishes_without_an_extra_decode_step(
     admit.assert_not_called()
     complete.assert_called_once_with(7)
     assert request.generated_tokens == expected_tokens
+    # Only a token that survives stop-word trimming counts as an accepted step.
+    expected_steps = [1] if num_speculative_tokens > 0 and expected_tokens else []
+    assert request.acceptance_step_lengths == expected_steps
+    if num_speculative_tokens > 0:
+        assert sum(request.acceptance_step_lengths) == len(request.generated_tokens)
     assert request_future.result().finish_reason == expected_reason
     assert request.sampling_params.num_tokens_to_generate == num_tokens_to_generate
     assert engine.context.kv_block_allocator.pc_state.block_ref_counts[blocks].tolist() == [0, 0]
