@@ -1560,13 +1560,24 @@ def test_legacy_checkpoint_gloo_requirement_uses_effective_optimizer(monkeypatch
         validate_args(args)
 
 
-@pytest.mark.parametrize("optimizer", ["adam", "muon", "dist_muon"])
-def test_mem_efficient_reshardable_checkpoint_gloo_requirement(monkeypatch, optimizer):
+@pytest.mark.parametrize(
+    ("optimizer", "distributed", "layer_wise"),
+    [
+        ("adam", True, False),
+        ("muon", True, False),
+        ("dist_muon", False, False),
+        ("muon", False, True),
+    ],
+)
+def test_mem_efficient_reshardable_checkpoint_gloo_requirement(
+    monkeypatch, optimizer, distributed, layer_wise
+):
     """Every optimizer that builds a DistributedOptimizer needs Gloo for the mem-efficient
     fully reshardable format, including the one the layer-wise path builds for Muon."""
     args = _minimal_training_args(monkeypatch)
     args.optimizer = optimizer
-    args.use_distributed_optimizer = True
+    args.use_distributed_optimizer = distributed
+    args.use_layer_wise_distributed_optimizer = layer_wise
     args.use_gloo_process_groups = False
     args.ckpt_format = "torch_dist"
     args.dist_ckpt_optim_fully_reshardable = True

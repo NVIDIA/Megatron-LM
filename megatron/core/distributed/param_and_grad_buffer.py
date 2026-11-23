@@ -208,6 +208,8 @@ class _ParamAndGradBucket:
         ]
 
 
+# DDP bucket groups and the optimizer-owned compact gather share these staging and copy-back
+# rules so that all ranks publish the same parameter values with either dispatch path.
 def _compact_param_gather_uses_grad_buffer(config) -> bool:
     """Whether a compact LayerWise all-gather receives into ``bucket.grad_data``.
 

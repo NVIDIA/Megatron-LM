@@ -404,9 +404,9 @@ class MegatronOptimizer(ABC):
     def _sync_unbuffered_model_params(self) -> None:
         """Gather the model params that this optimizer publishes without DDP bucket groups.
 
-        Called by :meth:`ChainedOptimizer.quantize_and_sync_model_params_from_main_params`
-        after every member has staged its params. DDP skips the bucket groups of such params
-        (see ``_ParamAndGradBucketGroup.param_sync_via_bucket_group``).
+        :meth:`ChainedOptimizer.quantize_and_sync_model_params_from_main_params` calls this
+        temporary hook after every member has staged its params. Compact LayerWise then
+        publishes the params DDP skips in ``_ParamAndGradBucketGroup.param_sync_via_bucket_group``.
         """
         return
 
@@ -556,8 +556,8 @@ class MegatronOptimizer(ABC):
         return True
 
     @torch.no_grad()
-    def get_grad_norm(self):
-        """Compute and return grad norm."""
+    def get_grad_norm(self) -> Union[float, torch.Tensor]:
+        """Return the gradient norm as a float or a single-element device tensor."""
         grads_for_norm = self.get_grads_for_grad_norm()
         total_norm = get_grad_norm_fp32(
             grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
@@ -1254,8 +1254,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         init_state_fn (Callable, optional): function to initialize state in the optimizer.
     """
 
-    # Set by LayerWiseDistributedOptimizer for its children on the compact layout (see
-    # _copy_main_params_to_model_params_via_bf16).
+    # Temporary compact LayerWise policy: its children stage through BF16 so their local
+    # updates use the same rounding as the subsequent whole-parameter gather.
     quantize_from_bf16_master = False
 
     def __init__(
@@ -2232,7 +2232,13 @@ class ChainedOptimizer(MegatronOptimizer):
         return self.chained_optimizers[0].get_grad_stats_parallel_group()
 
     @torch.no_grad()
-    def get_grad_norm(self):
+    def get_grad_norm(self) -> Union[float, torch.Tensor]:
+        """Return the norm across all children.
+
+        Across distinct grad-stats groups, tensor-valued child norms produce a
+        single-element FP64 device tensor in eager execution and CUDA graphs.
+        Clipping consumes it on the device. Reading it as a Python scalar synchronizes.
+        """
         if len(self.chained_optimizers) == 1:
             return self.chained_optimizers[0].get_grad_norm()
         if self.grads_states_parallel_group_is_shared():

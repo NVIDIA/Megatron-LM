@@ -60,7 +60,7 @@ def get_grad_norm_fp32(
     grads_for_norm: Union[List[torch.Tensor], torch.Tensor],
     norm_type: Union[int, float] = 2,
     grad_stats_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-) -> float:
+) -> Union[float, torch.Tensor]:
     """Calculate the p-norm of gradients in FP32 precision.
 
     This function is adapted from `torch.nn.utils.clip_grad.clip_grad_norm_`
@@ -78,7 +78,7 @@ def get_grad_norm_fp32(
             used for reducing gradient statistics (e.g., norms and zero counts).
 
     Returns:
-        float: The total norm of the parameters, treated as a single vector.
+        The total norm as a Python float or a single-element device tensor.
     """
 
     if isinstance(grads_for_norm, torch.Tensor):
@@ -147,7 +147,7 @@ def get_grad_norm_fp32(
 def clip_grad_by_total_norm_fp32(
     parameters: Union[List[torch.Tensor], torch.Tensor],
     max_norm: Union[int, float],
-    total_norm: float,
+    total_norm: Union[float, torch.Tensor],
     use_decoupled_grad: bool = False,
 ):
     """Clips the gradients of an iterable of parameters in FP32 by total norm.
@@ -159,7 +159,7 @@ def clip_grad_by_total_norm_fp32(
             Tensors or a single Tensor that will have gradients normalized.
         max_norm (Union[int, float]): The maximum permissible total norm
             of the gradients.
-        total_norm (float): The current total norm of the gradients.
+        total_norm: The current gradient norm as a float or a single-element tensor.
         use_decoupled_grad (bool, optional): Whether to read from the
             '.decoupled_grad' attribute instead of the standard '.grad'.
             Defaults to False.

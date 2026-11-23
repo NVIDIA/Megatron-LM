@@ -1020,6 +1020,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                         f"Quantized params on the {self.param_layout} LayerWise layout need the "
                         "bf16 FP32 master copies (OptimizerConfig.bf16=True)."
                     )
+                # Temporary ownership marker: the compact gather requantizes this parameter
+                # on every rank, so the child optimizer skips its local quantization.
                 param.requantized_by_layer_wise_gather = True
 
     def shard_params(self, optimizers, full_param_layouts=None, param_sort_keys=None):

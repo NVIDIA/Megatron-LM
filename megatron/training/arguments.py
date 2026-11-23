@@ -13,6 +13,7 @@ import torch
 
 from megatron.core.config import set_experimental_flag
 from megatron.core.model_parallel_config import normalize_gtp_nccl_ub
+from megatron.core.optimizer.optimizer_config import resolve_layer_wise_distributed_optimizer
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
@@ -1644,6 +1645,11 @@ def validate_args(args, defaults={}):
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
+        _, use_layer_wise = resolve_layer_wise_distributed_optimizer(
+            args.optimizer,
+            args.use_distributed_optimizer,
+            getattr(args, 'use_layer_wise_distributed_optimizer', False),
+        )
         if args.use_distributed_optimizer and args.optimizer in ('sgd', 'adam'):
             # If using distributed optimizer, must use distributed checkpointing.
             # Legacy checkpointing uses Gloo process groups to collect full distributed
@@ -1654,22 +1660,13 @@ def validate_args(args, defaults={}):
                 'torch format gathers the optimizer state through Gloo.'
             )
 
-            if args.dist_ckpt_optim_fully_reshardable:
-                assert not args.distrib_optim_fully_reshardable_mem_efficient, \
-                    '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
-
-        # Other optimizers (e.g. Muon) with the distributed optimizer take the layer-wise path,
-        # which builds a separate DistributedOptimizer for their non-matrix parameters.
-        # Its memory-efficient fully reshardable save gathers over Gloo as well.
-        if (
-            args.optimizer not in ('sgd', 'adam')
-            and (args.use_distributed_optimizer or args.optimizer == 'dist_muon')
-            and args.dist_ckpt_optim_fully_reshardable
+        # LayerWise also builds a DistributedOptimizer for its non-matrix parameters.
+        if args.dist_ckpt_optim_fully_reshardable and (
+            args.use_distributed_optimizer or use_layer_wise
         ):
             assert not args.distrib_optim_fully_reshardable_mem_efficient, (
-                '--distrib-optim-fully-reshardable-mem-efficient needs Gloo process groups for '
-                'the DistributedOptimizer of the layer-wise optimizer. Drop '
-                '--disable-gloo-process-groups.'
+                '--distrib-optim-fully-reshardable-mem-efficient requires Gloo process groups. '
+                'Drop --disable-gloo-process-groups.'
             )
 
     if args.fake_process_group:
@@ -1733,7 +1730,8 @@ def validate_args(args, defaults={}):
     if args.freeze_all_layers:
         if args.use_distributed_optimizer:
             warn_rank_0(
-                '--freeze-all-layers incompatible with use_distributed_optimizer. Disabling use_distributed_optimizer.'
+                '--freeze-all-layers disables --use-distributed-optimizer. '
+                'For Muon, this also disables LayerWise when selected through that flag.'
             )
             args.use_distributed_optimizer = False
         if args.overlap_param_gather:
