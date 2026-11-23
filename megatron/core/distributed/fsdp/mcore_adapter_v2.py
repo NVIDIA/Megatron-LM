@@ -186,12 +186,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         FullyShardedDataParallelV2._validate_config(
             config, ddp_config, module, pg_collection, disable_bucketing
         )
-        active_context = current_fully_shard_context()
-        if config.overlap_moe_expert_parallel_comm and (
-            ddp_config.fsdp_grad_staging_on_compute
-            or (active_context is not None and active_context.grad_staging_on_compute)
-        ):
-            raise ValueError("Compute-stream gradient staging requires MoE EP overlap to be disabled.")
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
@@ -286,6 +280,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # Join the caller's ambient context when one is active (VPP chunks); otherwise
         # open and finalize our own. MCore's finalize_model_grads() owns the wait
         # after the schedule completes, including delayed wgrad and custom 1F1B work.
+        active_context = current_fully_shard_context()
         if active_context is None:
             construction_context = fully_shard_context(
                 FsdpContext(

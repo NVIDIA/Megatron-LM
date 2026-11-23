@@ -19,7 +19,7 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import NamedTuple
-from weakref import WeakKeyDictionary
+from weakref import ReferenceType, WeakKeyDictionary, ref
 
 import torch
 from torch import nn
@@ -59,6 +59,7 @@ class _GradReductionInputs(NamedTuple):
     buffers: tuple[torch.Tensor, ...]
     done: torch.cuda.Event
     allocation_stream: torch.cuda.Stream
+    producer: ReferenceType[nn.Module]
 
 
 class FsdpContext:
@@ -295,13 +296,13 @@ class FsdpContext:
             self._release_grad_buffers()
 
     def _retain_grad_buffers(
-        self, buffers: list[torch.Tensor], allocation_stream: torch.cuda.Stream
+        self, buffers: list[torch.Tensor], allocation_stream: torch.cuda.Stream, producer: nn.Module
     ) -> None:
         """Keep packed inputs alive through inner reduction and local accumulation."""
         if buffers:
             done = self.inner_reduction_stream.record_event()
             self._pending_grad_buffers.append(
-                _GradReductionInputs(tuple(buffers), done, allocation_stream)
+                _GradReductionInputs(tuple(buffers), done, allocation_stream, ref(producer))
             )
 
     def _release_grad_buffers(self, *, keep: int = 0) -> None:
@@ -309,6 +310,15 @@ class FsdpContext:
         while len(self._pending_grad_buffers) > keep:
             batch = self._pending_grad_buffers.popleft()
             batch.allocation_stream.wait_event(batch.done)
+
+    def _release_oldest_grad_buffer_if(self, predicate: Callable[[nn.Module], bool]) -> None:
+        """Release the oldest staged batch if its producer matches the predicate."""
+        pending = self._pending_grad_buffers
+        if not pending:
+            return
+        producer = pending[0].producer()
+        if producer is not None and predicate(producer):
+            self._release_grad_buffers(keep=len(pending) - 1)
 
     def pre_backward(self) -> None:
         """Fork the reduce-scatter stream into any active CUDA-graph capture.
