@@ -365,7 +365,8 @@ class FsdpContext:
         # https://github.com/pytorch/pytorch/pull/193958
         torch.autograd.Variable._execution_engine.queue_callback(self.post_backward)
 
-        # Only the first root retires inputs from the preceding backward.
+        # Release the previous autograd backward's inputs once, before the first root
+        # unshards. The guard above skips this drain for sibling roots in the same backward.
         self._release_grad_buffers()
 
 
