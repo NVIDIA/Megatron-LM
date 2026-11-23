@@ -188,6 +188,7 @@ hybrid_stack_spec = ModuleSpec(
                         # (TELinear parallel_mode="duplicated") so MXFP8 quantizes the
                         # globally aligned output dimension.
                         beta_proj=TELinear,
+                        beta_proj_column=TEColumnParallelLinear,
                         out_norm=TENorm,
                         # Separate F-decay / output-gate projections; only built when
                         # config.kda_two_stage_gates=True (GLM-5.3-Flash, latent = head dim) or
@@ -477,6 +478,7 @@ hybrid_inference_stack_spec = ModuleSpec(
                         # Beta is replicated across TP (TELinear parallel_mode="duplicated"),
                         # matching the training spec.
                         beta_proj=TELinear,
+                        beta_proj_column=InferenceColumnParallelLinear,
                         # Separate F-decay / output-gate projections; only built when
                         # config.kda_two_stage_gates=True or kda_f_lora_rank /
                         # kda_gate_lora_rank is set, else IdentityOp.

@@ -359,6 +359,9 @@ class TransformerConfig(ModelParallelConfig):
     scalar gate per attention head and is currently supported only by Multi-Latent Attention.
     """
 
+    mla_output_gate_sigmoid_fp32: bool = True
+    """Compute MLA output-gate sigmoid in FP32, including its saved backward value."""
+
     attention_output_gate_fusion: bool = False
     """Fuse the elementwise ``attention_output_gate`` of Multi-Latent Attention (the FP32
     sigmoid, its cast to the activation dtype and the multiply) into one Triton kernel per
@@ -671,6 +674,27 @@ class TransformerConfig(ModelParallelConfig):
     kda_f_lora_rank: Optional[int] = None
     """Rank of KDA's bias-free low-rank F-decay projection; None keeps it full-rank."""
 
+    kda_qk_norm_in_kernel: bool = False
+    """Normalize Q and K inside FLA KDA rather than in the input preparation."""
+
+    kda_transpose_state_layout: bool = False
+    """Use the value-major recurrent-state layout in the FLA KDA kernel."""
+
+    kda_beta_proj_column_parallel: bool = False
+    """Shard the beta projection by head instead of replicating it for FP8 alignment."""
+
+    kda_split_qkv_projections: bool = False
+    """Use separate Q/K/V parameters and GEMMs, preserving per-projection BF16 dgrad rounding."""
+
+    kda_conv_in_fp32: bool = False
+    """Keep KDA convolution weights and their gradients in FP32, including under BF16 casting."""
+
+    kda_fused_norm_gate: bool = False
+    """Use FLA's fused output RMSNorm and sigmoid gate, rounding only their final product.
+    False retains the direct-gate path's intermediate RMSNorm rounding. Two-stage gates
+    already use this fused operation. Cannot be combined with gdn_gated_output_norm_fusion,
+    which preserves the intermediate rounding instead."""
+
     kda_gate_lora_rank: Optional[int] = None
     """Rank of KDA's bias-free low-rank output gate; None keeps it full-rank.
 
@@ -710,6 +734,10 @@ class TransformerConfig(ModelParallelConfig):
     will be set to megatron.core.utils.scaled_init_method_normal(init_method_std) which is torch nn
     init normal with mean=0.0 and std=init_method_std / math.sqrt(2.0 * num_layers).
     Note: this does not control vocab readout/unembedding initialization."""
+
+    scale_attention_output_init: bool = True
+    """Use output_layer_init_method for MLA and gated-delta attention output projections.
+    False uses init_method, leaving feed-forward output initialization unchanged."""
 
     init_method_std: float = 0.02
     """Standard deviation of the zero mean normal for the default initialization method, not used if
@@ -1818,6 +1846,9 @@ class TransformerConfig(ModelParallelConfig):
     Options:
 
     - 'eager': a memory-lean custom autograd Function built from plain PyTorch ops.
+    - 'torch': ordinary autograd with normalized keys and explicit source-axis reductions.
+      Preserves that evaluation order for checkpoint migrations; materializes all sources
+      in FP32 and uses more activation memory than 'eager'.
     - 'compile': a plain PyTorch forward wrapped in torch.compile, with AOTAutograd generating
       its backward and one specialization per depth arity; falls back to the eager custom
       Function with a warning if compilation is unavailable.
@@ -1827,6 +1858,18 @@ class TransformerConfig(ModelParallelConfig):
     The eager loop is CPU-dispatch-bound — measured ~3-4 ms of CPU wall per aggregation on GB200
     at small hidden sizes — so 'fla' is the default, with 'compile' as the dependency-free
     optimized path."""
+
+    attn_res_fp32_params: bool = True
+    """Keep pseudo-query and key-normalization parameters in FP32. When false, use params_dtype."""
+
+    attn_res_single_source_param_grad: bool = True
+    """Connect unused single-source parameters to zero gradients. False preserves None gradients."""
+
+    attn_res_query_init: Literal["zero", "linear"] = "zero"
+    """Initialize depth scores uniformly (zero query) or with the nn.Linear distribution."""
+
+    attn_res_query_as_matrix: bool = False
+    """Store the pseudo-query as a [1, hidden_size] linear weight, preserving optimizer grouping."""
 
     attn_res_norm_fusion: bool = False
     """Fuse the RMSNorm that consumes each AttnRes aggregation (the sublayer's input_layernorm
@@ -2416,9 +2459,9 @@ class TransformerConfig(ModelParallelConfig):
                 "enable_attention_residuals requires attn_res_block_layers to be a "
                 f"positive integer, got {self.attn_res_block_layers!r}."
             )
-        if self.attn_res_impl not in ("eager", "compile", "fla"):
+        if self.attn_res_impl not in ("eager", "torch", "compile", "fla"):
             raise ValueError(
-                "attn_res_impl must be 'eager', 'compile', or 'fla', "
+                "attn_res_impl must be 'eager', 'torch', 'compile', or 'fla', "
                 f"got {self.attn_res_impl!r}."
             )
         norm_offload_modules = set()
@@ -2495,8 +2538,16 @@ class TransformerConfig(ModelParallelConfig):
             )
         if self.cuda_graph_impl != "none":
             unsupported.append(f"cuda_graph_impl={self.cuda_graph_impl!r}")
-        if self.recompute_granularity == "full":
-            unsupported.append("recompute_granularity='full'")
+        if self.recompute_granularity == "full" and (
+            not self.is_hybrid_model
+            or self.virtual_pipeline_model_parallel_size is not None
+            or self.context_parallel_size > 1
+            or self.dynamic_context_parallel
+            or self.mtp_num_layers
+        ):
+            unsupported.append(
+                "full AttnRes recomputation requires a Hybrid trunk without VPP, CP, or MTP"
+            )
         if self.overlap_moe_expert_parallel_comm:
             unsupported.append("overlap_moe_expert_parallel_comm")
         if self.fused_residual_rmsnorm:
@@ -2739,6 +2790,10 @@ class TransformerConfig(ModelParallelConfig):
                 "gated_attention_proj_granularity; use 'elementwise'."
             )
         if self.attention_output_gate_fusion:
+            if not self.mla_output_gate_sigmoid_fp32:
+                raise ValueError(
+                    "attention_output_gate_fusion requires mla_output_gate_sigmoid_fp32."
+                )
             if not self.attention_output_gate:
                 raise ValueError("attention_output_gate_fusion requires attention_output_gate.")
             if self.gated_attention_proj_granularity != 'elementwise':

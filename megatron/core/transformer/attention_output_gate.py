@@ -35,12 +35,18 @@ def validate_attention_output_gate_shapes(
 
 
 def apply_attention_output_gate(
-    core_attn_out: torch.Tensor, gate: torch.Tensor, granularity: str, *, cast_mode: str
+    core_attn_out: torch.Tensor,
+    gate: torch.Tensor,
+    granularity: str,
+    *,
+    cast_mode: str,
+    sigmoid_in_fp32: bool = True,
 ) -> torch.Tensor:
     """Apply an elementwise or per-head sigmoid gate to attention output channels.
 
-    Sigmoid always runs in FP32. ``cast_mode='before'`` casts its scale to the
-    input dtype before multiplying (MLA and scalar head gates). ``'after'``
+    Sigmoid runs in FP32 by default. ``sigmoid_in_fp32=False`` keeps the gate
+    dtype, including the saved sigmoid value used by backward. ``cast_mode='before'``
+    casts its scale to the input dtype before multiplying (MLA and scalar head gates). ``'after'``
     multiplies with the FP32 scale and casts the product to the input dtype
     (regular attention). ``'none'`` leaves the scale and product in their
     natural dtypes so the caller can apply its own final cast (KDA).
@@ -63,7 +69,7 @@ def apply_attention_output_gate(
     if granularity == 'headwise':
         core_attn_out = core_attn_out.view(*output_shape[:-1], gate.size(-1), -1)
 
-    scale = torch.sigmoid(gate.float())
+    scale = torch.sigmoid(gate.float() if sigmoid_in_fp32 else gate)
     if cast_mode == 'before':
         scale = scale.to(output_dtype)
     if granularity == 'headwise':

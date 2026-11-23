@@ -35,7 +35,7 @@ from megatron.core.models.hybrid.shortcut_block import (
 )
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.recompute import checkpointed_forward
+from megatron.core.recompute import checkpointed_attn_res_hybrid_forward, checkpointed_forward
 from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_observation import is_observing_tensor, observe_layer_residuals
@@ -901,7 +901,25 @@ class HybridStack(MegatronModule):
         )
 
         with outer_fp8_context:
-            if self.config.recompute_granularity == 'full' and self.training:
+            if (
+                self.config.recompute_granularity == 'full'
+                and self.training
+                and self.config.enable_attention_residuals
+            ):
+                assert attn_res_state is not None
+                hidden_states, sources = checkpointed_attn_res_hybrid_forward(
+                    self,
+                    hidden_states,
+                    tuple(attn_res_state.graph_sources),
+                    attention_mask=attention_mask,
+                    rotary_pos_emb=rotary_pos_emb,
+                    packed_seq_params=packed_seq_params,
+                    padding_mask=padding_mask,
+                    input_ids=input_ids,
+                    use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
+                )
+                attn_res_state.graph_sources = list(sources)
+            elif self.config.recompute_granularity == 'full' and self.training:
                 hidden_states = checkpointed_forward(
                     self,
                     hidden_states=hidden_states,

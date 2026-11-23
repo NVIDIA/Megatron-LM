@@ -276,3 +276,82 @@ def checkpointed_forward(
         return hidden_states, intermediate_hidden_states
 
     return hidden_states
+
+
+def checkpointed_attn_res_hybrid_forward(
+    stack: MegatronModule,
+    hidden_states: Tensor,
+    sources: Tuple[Tensor, ...],
+    *,
+    attention_mask: Optional[Tensor],
+    rotary_pos_emb,
+    packed_seq_params: Optional[PackedSeqParams],
+    padding_mask: Optional[Tensor],
+    input_ids: Optional[Tensor],
+    use_inner_quantization_context: bool,
+) -> Tuple[Tensor, Tuple[Tensor, ...]]:
+    """Checkpoint Hybrid entries with every depth source as an explicit tensor.
+
+    A chunk creates its own source list on both forward and recomputation. New
+    block sources are returned through checkpoint outputs, so later chunks and
+    the output head retain their gradient edges. No stage cache is mutated
+    inside the checkpoint function.
+    """
+    config = stack.config
+
+    def custom(start, end):
+        def forward(partial, *depth_sources):
+            values = list(depth_sources)
+            for index in range(start, end):
+                layer = stack.layers[index]
+                if layer.attn_res_is_block_start:
+                    # Distributed checkpointing resizes its first input after forward.
+                    # Keep the live depth source on separate storage in that mode.
+                    values.append(
+                        partial.clone() if config.distribute_saved_activations else partial
+                    )
+                context = nullcontext()
+                layer_config = stack._execution_layer_config_list[index]
+                if use_inner_quantization_context:
+                    if layer_config.fp8:
+                        context = get_fp8_context(layer_config, layer.layer_number - 1)
+                    elif layer_config.fp4:
+                        context = get_fp4_context(layer_config, layer.layer_number - 1)
+                with context:
+                    partial = layer(
+                        partial,
+                        attention_mask=attention_mask,
+                        rotary_pos_emb=rotary_pos_emb,
+                        packed_seq_params=packed_seq_params,
+                        padding_mask=padding_mask,
+                        input_ids=input_ids,
+                        attn_res_sources=tuple(values),
+                    )
+            return partial, *values
+
+        return forward
+
+    total = len(stack.layers)
+    step = config.recompute_num_layers if config.recompute_method == "uniform" else 1
+    for start in range(0, total, step):
+        end = min(start + step, total)
+        run = custom(start, end)
+        checkpoint = config.recompute_method == "uniform" or start < config.recompute_num_layers
+        # Reentrant checkpointing needs a gradient-bearing input to retain the
+        # parameter graph. Frozen embeddings can leave the first chunk without one.
+        checkpoint = checkpoint and any(t.requires_grad for t in (hidden_states, *sources))
+        if checkpoint:
+            hidden_states = make_viewless_tensor(hidden_states, requires_grad=True, keep_graph=True)
+            result = precision_aware_checkpoint(
+                run,
+                config,
+                stack.pg_collection.tp,
+                hidden_states,
+                *sources,
+                distribute_saved_activations=config.distribute_saved_activations,
+            )
+        else:
+            result = run(hidden_states, *sources)
+        hidden_states, *returned_sources = result
+        sources = tuple(returned_sources)
+    return hidden_states, sources

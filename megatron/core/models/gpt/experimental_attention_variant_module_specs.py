@@ -72,6 +72,7 @@ def get_gated_delta_net_module_spec(
             submodules=KimiDeltaAttentionSubmodules(
                 in_proj=backend.column_parallel_linear(),
                 beta_proj=backend.linear(),
+                beta_proj_column=backend.column_parallel_linear(),
                 f_proj=backend.column_parallel_linear(),
                 f_a_proj=backend.linear(),
                 f_b_proj=backend.column_parallel_linear(),

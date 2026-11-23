@@ -299,7 +299,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/utils.py",
             "megatron/core/ops/norm/torch_norm.py",
         ),
-        tests=(K + "test_fused_activations.py",),
+        tests=(K + "test_fused_activations.py", K + "test_kimi_precision_controls.py"),
         kind="torch.compile",
         notes="squared_relu/quick_gelu/fast_gelu/tanh_soft_clamp/situ/situ_glu, openai/erf GELU, "
         "L2Norm._norm (row reduction).",
@@ -352,7 +352,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="attention_residual_aggregation",
         sources=("megatron/core/transformer/attention_residual.py",),
-        tests=(K + "test_attn_res_aggregation.py", K + "test_dev_sync_kernels.py"),
+        tests=(
+            K + "test_attn_res_aggregation.py",
+            K + "test_dev_sync_kernels.py",
+            K + "test_kimi_precision_controls.py",
+        ),
         kind="torch.compile",
         notes="AttentionResidual depth-softmax aggregation (fp32 statistics, RMSNorm keys) on "
         "its three attn_res_impl backends: the eager memory-lean custom Function (gemv "
@@ -759,6 +763,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ssm/gated_delta_net/kda.py",
         ),
         tests=(
+            K + "test_dev_sync_kernels.py",
             K + "test_ssm_kernels.py",
             K + "test_gated_norm.py",
             C + "test_hybrid_model.py",
@@ -1044,6 +1049,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/experimental_attention_variant/absorbed_mla.py",
         ),
         tests=(
+            K + "test_kimi_precision_controls.py",
             K + "test_fused_triton_kernels.py",
             K + "test_te_wrappers.py",
             R + 'test_mla_replay.py',

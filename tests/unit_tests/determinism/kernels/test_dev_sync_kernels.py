@@ -327,7 +327,8 @@ def test_kda_recurrence_replays():
     )
 
 
-def test_kda_low_rank_projection_replays():
+@pytest.mark.parametrize("separate_qkv", [False, True])
+def test_kda_low_rank_projection_replays(separate_qkv):
     """Replay KimiDeltaAttention through its bias-free low-rank F-decay / output-gate path.
 
     ``kda_f_lora_rank`` / ``kda_gate_lora_rank`` take the layer off the legacy fused
@@ -369,6 +370,12 @@ def test_kda_low_rank_projection_replays():
             linear_num_value_heads=4,
             kda_f_lora_rank=f_rank,
             kda_gate_lora_rank=gate_rank,
+            kda_beta_proj_column_parallel=separate_qkv,
+            kda_split_qkv_projections=separate_qkv,
+            kda_conv_in_fp32=separate_qkv,
+            kda_fused_norm_gate=separate_qkv,
+            kda_qk_norm_in_kernel=separate_qkv,
+            kda_transpose_state_layout=separate_qkv,
             normalization="RMSNorm",
             add_bias_linear=False,
             bf16=True,
@@ -393,7 +400,13 @@ def test_kda_low_rank_projection_replays():
         assert not module.use_legacy_fused_projections
         assert module.in_proj_split_names == ["query", "key", "value"]
         assert module.in_proj_dim == 2 * module.qk_dim + module.v_dim
-        assert module.in_proj.weight.shape == (module.in_proj_dim, config.hidden_size)
+        projection_names = ("q_proj", "k_proj", "v_proj") if separate_qkv else ("in_proj",)
+        if separate_qkv:
+            assert not hasattr(module, "in_proj")
+            for name, width in zip(projection_names, (module.qk_dim, module.qk_dim, module.v_dim)):
+                assert getattr(module, name).weight.shape == (width, config.hidden_size)
+        else:
+            assert module.in_proj.weight.shape == (module.in_proj_dim, config.hidden_size)
         assert module.f_a_proj.weight.shape == (f_rank, config.hidden_size)
         assert module.f_b_proj.weight.shape == (module.qk_dim, f_rank)
         assert module.g_a_proj.weight.shape == (gate_rank, config.hidden_size)
@@ -423,7 +436,28 @@ def test_kda_low_rank_projection_replays():
         assert fused_pre_kda.call_count == 0
         assert outputs["out[0]"].shape == hidden_states.shape
         assert "in[0]" in grads
-        for name in ("in_proj", "f_a_proj", "f_b_proj", "g_a_proj", "g_b_proj", "beta_proj"):
+        from megatron.core.packed_seq_params import PackedSeqParams
+
+        boundaries = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
+        packed = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=boundaries,
+            cu_seqlens_kv=boundaries,
+            max_seqlen_q=64,
+            max_seqlen_kv=64,
+        )
+        with pytest.raises(
+            ValueError, match="convolution fallback does not support sequence boundaries"
+        ):
+            module(hidden_states, None, packed_seq_params=packed)
+        for name in (
+            *projection_names,
+            "f_a_proj",
+            "f_b_proj",
+            "g_a_proj",
+            "g_b_proj",
+            "beta_proj",
+        ):
             assert f"chunk0.{name}.weight" in grads, name
         for name in ("chunk0.conv1d.weight", "chunk0.A_log", "chunk0.dt_bias"):
             assert name in grads, name

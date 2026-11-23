@@ -325,21 +325,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
                 "For FP8, the innermost dimension of the GDN-family layer "
                 "input projection output tensor must be a multiple of 16."
             )
-        self.in_proj = _build_with_kda_fp8_disabled(
-            self.config,
-            submodules.in_proj,
-            self.hidden_size,
-            self.in_proj_dim,
-            config=self.config,
-            init_method=self.config.init_method,
-            gather_output=False,
-            bias=bias,
-            skip_bias_add=False,
-            is_expert=False,
-            tp_comm_buffer_name="fc1",
-            tp_group=self.pg_collection.tp,
-            name=(name + ".in_proj") if name is not None else None,
-        )
+        self._build_input_projection(submodules, bias=bias, name=name)
 
         # Conv1d for QKV
         self.conv_dim = self.qk_dim * 2 + self.v_dim
@@ -407,7 +393,11 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             self.v_dim,
             self.hidden_size,
             config=self.config,
-            init_method=self.config.output_layer_init_method,
+            init_method=(
+                self.config.output_layer_init_method
+                if self.config.scale_attention_output_init
+                else self.config.init_method
+            ),
             bias=bias,
             input_is_parallel=True,
             skip_bias_add=True,
@@ -456,6 +446,25 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             and (self.config.linear_cp_mode == "headwise" or self.cp_size == 1)
             and type(self).forward_pre_attn_and_core_attn
             is not TwoStageAttentionLayer.forward_pre_attn_and_core_attn
+        )
+
+    def _build_input_projection(self, submodules, *, bias: bool, name: str | None) -> None:
+        """Build input projections; variants may retain separate logical parameters."""
+        self._input_projection_names = ("in_proj",)
+        self.in_proj = _build_with_kda_fp8_disabled(
+            self.config,
+            submodules.in_proj,
+            self.hidden_size,
+            self.in_proj_dim,
+            config=self.config,
+            init_method=self.config.init_method,
+            gather_output=False,
+            bias=bias,
+            skip_bias_add=False,
+            is_expert=False,
+            tp_comm_buffer_name="fc1",
+            tp_group=self.pg_collection.tp,
+            name=(name + ".in_proj") if name is not None else None,
         )
 
     def _get_in_proj_dim(self) -> int:
@@ -761,18 +770,18 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
 
         # At this point the TP sharding is correctly defined for each tensor, but some of the
         # tensors must be additionally split into separate parts
-        in_proj_dim_local_tp = self.in_proj_dim // self.tp_size
-        assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim_local_tp, (
-            in_proj_dim_local_tp,
-            sharded_state_dict[f"{prefix}in_proj.weight"],
-        )
+        if "in_proj" in self._input_projection_names:
+            in_proj_dim_local_tp = self.in_proj_dim // self.tp_size
+            assert (
+                sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim_local_tp
+            ), (in_proj_dim_local_tp, sharded_state_dict[f"{prefix}in_proj.weight"])
 
-        sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
-            sharded_state_dict[f"{prefix}in_proj.weight"],
-            list(self.in_proj_split_sections),
-            self.in_proj_split_names,
-            0,
-        )
+            sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
+                sharded_state_dict[f"{prefix}in_proj.weight"],
+                list(self.in_proj_split_sections),
+                self.in_proj_split_names,
+                0,
+            )
 
         conv_layer_name_list = ["conv1d.weight"]
         assert (
@@ -799,7 +808,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         These modules consume the input-layernorm output directly; variants with additional
         projections (KDA) extend the list.
         """
-        return [self.in_proj]
+        return [getattr(self, name) for name in self._input_projection_names]
 
     def set_for_recompute_input_layernorm(self) -> None:
         """Prepare the layer for recomputing the input layernorm (needed under FP8/FP4).
@@ -826,7 +835,8 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
 
     def _backward_in_proj(self):
         """Computes weight gradients of input projection layer."""
-        self.in_proj.backward_dw()
+        for name in self._input_projection_names:
+            getattr(self, name).backward_dw()
 
     def _backward_out_proj(self):
         """Computes weight gradients of output projection layer."""

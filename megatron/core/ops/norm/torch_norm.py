@@ -32,6 +32,46 @@ class LayerNormBuilder(Protocol):
     ) -> LayerNormInterface: ...
 
 
+class TorchRMSNorm(torch.nn.Module):
+    """FP32 RMS statistics with an explicit cast boundary before affine scaling.
+
+    ``cast_before_affine`` preserves models that materialize normalized activations
+    in their input dtype before multiplying the learned weight. The default casts
+    only after the affine multiplication.
+    """
+
+    returns_residual = False
+
+    def __init__(
+        self,
+        *,
+        config: TransformerConfig,
+        hidden_size: int,
+        eps: float,
+        cast_before_affine: bool = False,
+    ):
+        super().__init__()
+        self.eps = eps
+        self.cast_before_affine = cast_before_affine
+        self.zero_centered_gamma = config.layernorm_zero_centered_gamma
+        device = 'cpu' if config.use_cpu_initialization else torch.cuda.current_device()
+        initial = torch.zeros if self.zero_centered_gamma else torch.ones
+        self.weight = torch.nn.Parameter(
+            initial(hidden_size, dtype=config.params_dtype, device=device)
+        )
+        self.weight.sequence_parallel = config.sequence_parallel
+        self.weight.is_rmsnorm_weight = True
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalize the final dimension and apply the learned RMS scale."""
+        values = x.float()
+        normalized = values * torch.rsqrt(values.square().mean(dim=-1, keepdim=True) + self.eps)
+        weight = self.weight + 1 if self.zero_centered_gamma else self.weight
+        if self.cast_before_affine:
+            return normalized.to(x.dtype) * weight
+        return (normalized * weight.float()).to(x.dtype)
+
+
 class WrappedTorchNorm:
     """
     A conditional wrapper to initialize an instance of PyTorch's

@@ -18,6 +18,7 @@ from megatron.core.inference.moe.flashinfer_mxfp8 import (
 )
 from megatron.core.inference.moe.flashinfer_nvfp4 import require_flashinfer_routed_nvfp4
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.ops.norm.torch_norm import LayerNormBuilder
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.enums import CudaGraphModule
@@ -196,6 +197,8 @@ class MoESubmodules:
     experts: ExpertsBuilder
     shared_experts: SharedExpertsBuilder | None = None
     router: RouterBuilder = TopKRouter
+    fc2_norm: LayerNormBuilder | None = None
+    """Optional norm before the latent up projection; None selects Transformer Engine."""
 
 
 class BaseMoELayer(MegatronModule, ABC):
@@ -367,7 +370,8 @@ class MoELayer(BaseMoELayer):
                 **linear_gtp_kwargs,
             )
             if self.config.moe_use_norm_before_up_proj:
-                self.fc2_norm = TENorm(
+                norm_builder = submodules.fc2_norm or TENorm
+                self.fc2_norm = norm_builder(
                     config=self.config,
                     hidden_size=self.config.moe_latent_size,
                     eps=self.config.layernorm_epsilon,

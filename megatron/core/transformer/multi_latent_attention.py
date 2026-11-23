@@ -438,7 +438,11 @@ class MultiLatentAttention(Attention):
             self.query_projection_size,
             self.config.hidden_size,
             config=self.config,
-            init_method=not_none(self.config.output_layer_init_method),
+            init_method=not_none(
+                self.config.output_layer_init_method
+                if self.config.scale_attention_output_init
+                else self.config.init_method
+            ),
             bias=self.config.add_bias_linear,
             input_is_parallel=True,
             skip_bias_add=True,
@@ -743,6 +747,10 @@ class MultiLatentAttention(Attention):
     ) -> torch.Tensor:
         """Apply an MLA output gate with the configured projection granularity."""
         granularity = self.config.gated_attention_proj_granularity
+        if not self.config.mla_output_gate_sigmoid_fp32:
+            return apply_attention_output_gate(
+                core_attn_out, gate, granularity, cast_mode='before', sigmoid_in_fp32=False
+            )
         if granularity == 'headwise':
             # Retain the existing fused headwise entry point.
             return self._apply_mla_headwise_output_gate(core_attn_out, gate)

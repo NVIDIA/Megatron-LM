@@ -2193,6 +2193,40 @@ class TestMoEModules:
             finally:
                 torch.utils.deterministic.fill_uninitialized_memory = prev_fill
 
+    def test_moe_latent_norm_builder_replays(self):
+        """Replay a custom latent normalization builder through the real dispatcher."""
+        from functools import partial
+
+        from megatron.core.ops.norm.torch_norm import TorchRMSNorm
+
+        if not HAVE_TE:
+            pytest.skip("Latent projections require Transformer Engine")
+        self._init()
+        seeded()
+        config = _moe_config(
+            hidden_size=128,
+            num_attention_heads=2,
+            ffn_hidden_size=256,
+            normalization="RMSNorm",
+            moe_latent_size=64,
+            moe_use_norm_before_up_proj=True,
+            moe_token_dispatcher_type="alltoall",
+            bias_activation_fusion=False,
+        )
+        spec = get_gpt_layer_with_transformer_engine_spec(
+            num_experts=8, moe_grouped_gemm=True
+        ).submodules.mlp
+        submodules = get_submodules(spec)
+        submodules.fc2_norm = partial(TorchRMSNorm, cast_before_affine=True)
+        layer = MoELayer(config, submodules).cuda().train()
+        layer.set_layer_number(0)
+        assert isinstance(layer.fc2_norm, TorchRMSNorm)
+        hidden = torch.randn(129, 1, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        with deterministic_algorithms(True):
+            assert_module_replays_bit_exact(
+                layer, (hidden,), replays=3, contention=True, what="MoE latent norm builder"
+            )
+
     @pytest.mark.parametrize("recompute", [False, True], ids=["no_recompute", "moe_recompute"])
     def test_moe_layer_replay_topk_idx_replays(self, recompute):
         """Routing replay through ``MoELayer.forward(replay_topk_idx=...)``, which chunked MLPs

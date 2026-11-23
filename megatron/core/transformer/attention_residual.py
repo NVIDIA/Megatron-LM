@@ -38,6 +38,7 @@ This module contains:
 
 import functools
 import logging
+import math
 from typing import List, Optional, Sequence, Tuple
 
 import torch
@@ -554,7 +555,7 @@ def _attn_res_autograd_math(pseudo_query, key_norm_weight, eps, values):
     every fp32 value upcast until backward, so eager execution instead uses
     :class:`_AttnResAggregation` and its explicit recomputation policy below.
     """
-    q = (pseudo_query * key_norm_weight).float()  # [h]
+    q = pseudo_query.float() * key_norm_weight.float()  # [h]
     values32 = [value.float() for value in values]
     dots = torch.stack([torch.matmul(value, q) for value in values32])  # [n, ...]
     rstds = torch.stack(
@@ -568,6 +569,21 @@ def _attn_res_autograd_math(pseudo_query, key_norm_weight, eps, values):
     return out32.to(values[0].dtype)
 
 
+def _attn_res_normalized_math(pseudo_query, key_norm_weight, eps, values):
+    """Normalize keys before scoring, with explicit FP32 source-axis reductions.
+
+    Factoring the inverse RMS out of the dot product is mathematically equivalent
+    but can change a BF16 rounding decision. Keep the evaluation order explicit
+    for models trained with normalized-key scoring.
+    """
+    sources = torch.stack(list(values), dim=-2).float()
+    keys = sources * torch.rsqrt(sources.square().mean(dim=-1, keepdim=True) + eps)
+    query = pseudo_query.float() * key_norm_weight.float()
+    scores = (keys * query).sum(dim=-1)
+    probabilities = torch.softmax(scores, dim=-1)
+    return (probabilities.unsqueeze(-1) * sources).sum(dim=-2).to(values[0].dtype)
+
+
 def _attn_res_fwd_math(pseudo_query, key_norm_weight, eps, values):
     """Memory-lean custom-Function forward math and saved statistics.
 
@@ -576,7 +592,7 @@ def _attn_res_fwd_math(pseudo_query, key_norm_weight, eps, values):
     without recording this internal graph, so only the returned scalar
     statistics are retained for the explicit backward.
     """
-    q = (pseudo_query * key_norm_weight).float()  # [h]
+    q = pseudo_query.float() * key_norm_weight.float()  # [h]
 
     dots = []
     rstds = []
@@ -603,7 +619,7 @@ def _attn_res_bwd_math(pseudo_query, key_norm_weight, alpha, dots, rstds, grad_o
     references plus per-token statistics. The dq reduction stays a gemv so the
     parameter gradients are deterministic.
     """
-    q = (pseudo_query * key_norm_weight).float()  # [h]
+    q = pseudo_query.float() * key_norm_weight.float()  # [h]
     hidden_size = values[0].shape[-1]
     g32 = grad_output.float()
 
@@ -746,9 +762,23 @@ class AttentionResidual(MegatronModule):
             )
         self.recompute = recompute
         self._checkpoint = None
-        # Zero init is mandatory: uniform initial attention weights.
-        self.pseudo_query = mark_keep_in_fp32(nn.Parameter(torch.zeros(config.hidden_size)))
-        self.key_norm_weight = mark_keep_in_fp32(nn.Parameter(torch.ones(config.hidden_size)))
+        # The default zero query starts with uniform depth weights.
+        dtype = torch.float32 if config.attn_res_fp32_params else config.params_dtype
+        query_shape = (
+            (1, config.hidden_size) if config.attn_res_query_as_matrix else (config.hidden_size,)
+        )
+        self.pseudo_query = nn.Parameter(torch.zeros(query_shape, dtype=dtype))
+        if config.attn_res_query_init == "linear":
+            nn.init.kaiming_uniform_(self.pseudo_query.view(1, -1), a=math.sqrt(5))
+        elif config.attn_res_query_init != "zero":
+            raise ValueError(
+                f"Unsupported attention-residual query initialization: {config.attn_res_query_init}"
+            )
+        self.key_norm_weight = nn.Parameter(torch.ones(config.hidden_size, dtype=dtype))
+        if config.attn_res_fp32_params:
+            mark_keep_in_fp32(self.pseudo_query)
+            mark_keep_in_fp32(self.key_norm_weight)
+        self.single_source_param_grad = config.attn_res_single_source_param_grad
         if config.sequence_parallel:
             setattr(self.pseudo_query, 'sequence_parallel', True)
             setattr(self.key_norm_weight, 'sequence_parallel', True)
@@ -775,8 +805,10 @@ class AttentionResidual(MegatronModule):
             # A one-source softmax is identically one. Keep explicit zero
             # parameter gradients for DDP's grad-ready accounting, without
             # introducing fused-backward cancellation noise at block 0.
-            zero = (pseudo_query.sum() + key_norm_weight.sum()) * 0.0
-            out = values[0] + zero.to(values[0].dtype)
+            out = values[0]
+            if self.single_source_param_grad:
+                zero = (pseudo_query.sum() + key_norm_weight.sum()) * 0.0
+                out = out + zero.to(out.dtype)
             if output_norm_weight is not None:
                 out = self._output_norm(out, output_norm_weight)
             return out
@@ -794,6 +826,8 @@ class AttentionResidual(MegatronModule):
             )
         if output_norm_weight is not None:
             raise RuntimeError("AttnRes norm fusion is only implemented for attn_res_impl='fla'.")
+        if self.impl == 'torch':
+            return _attn_res_normalized_math(pseudo_query, key_norm_weight, self.eps, values)
         if self.impl == 'compile':
             compiled_attn_res = _get_compiled_attn_res()
             if compiled_attn_res is not None:
@@ -835,14 +869,14 @@ class AttentionResidual(MegatronModule):
             self._checkpoint = CheckpointWithoutOutput()
             out = self._checkpoint.checkpoint(
                 self._aggregate_unpacked,
-                self.pseudo_query,
+                self.pseudo_query.reshape(-1),
                 self.key_norm_weight,
                 output_norm_weight,
                 *values,
             )
         else:
             out = self._aggregate(
-                self.pseudo_query, self.key_norm_weight, output_norm_weight, values
+                self.pseudo_query.reshape(-1), self.key_norm_weight, output_norm_weight, values
             )
         nvtx_range_pop(msg=f"attn_res.aggregate_n{len(values)}")
         return out

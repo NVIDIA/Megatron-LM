@@ -59,6 +59,7 @@ class KimiDeltaAttentionSubmodules(GatedDeltaNetSubmodules):
     """Submodules used by Kimi Delta Attention."""
 
     beta_proj: ModuleSpec | type = IdentityOp
+    beta_proj_column: ModuleSpec | type = IdentityOp
 
     # Optional separate F-decay and output-gate projections: full-rank (f_proj / g_proj)
     # or low-rank two-stage (f_a_proj -> f_b_proj / g_a_proj -> g_b_proj).
@@ -115,6 +116,11 @@ class KimiDeltaAttention(_GDNBase):
         # Non-hybrid models build KDA from a plain TransformerConfig, which has no
         # two-stage gate setting, so read it with a direct-gate default.
         self.two_stage_gates = getattr(config, "kda_two_stage_gates", False)
+        if config.kda_fused_norm_gate and config.gdn_gated_output_norm_fusion:
+            raise ValueError(
+                "kda_fused_norm_gate and gdn_gated_output_norm_fusion select different "
+                "intermediate rounding and cannot be enabled together."
+            )
         if self.two_stage_gates and (
             config.kda_f_lora_rank is not None or config.kda_gate_lora_rank is not None
         ):
@@ -149,7 +155,8 @@ class KimiDeltaAttention(_GDNBase):
             is_mtp_layer=is_mtp_layer,
         )
 
-        self.in_proj.weight.qkv_layout = self._get_in_proj_qkv_layout()
+        if not self.config.kda_split_qkv_projections:
+            self.in_proj.weight.qkv_layout = self._get_in_proj_qkv_layout()
 
         # Separate F-decay projection. Two-stage gates (GLM-5.3-Flash) pin the latent width
         # to the head dimension and follow ``bias``; the Kimi-K3 low-rank projections use the
@@ -206,27 +213,38 @@ class KimiDeltaAttention(_GDNBase):
 
         # KDA keeps beta in a separate projection so its checkpoint layout remains
         # independent from the Q/K/V(/F/G) projection. Beta has only one scalar per key
-        # head. Keep this small projection replicated across TP ranks so MXFP8 quantizes the
-        # globally aligned output dimension rather than a potentially unaligned local shard
+        # head. By default keep this projection replicated across TP ranks so MXFP8
+        # quantizes the globally aligned output rather than an unaligned local shard
         # (for example, 96 / TP2 = 48). Under sequence parallelism it consumes this rank's
         # sequence shard like the other projections and _forward_compute all-to-alls its
         # narrow output into the head-parallel layout, so the replicated weight only sees
         # local tokens and its gradient is completed by the sequence-parallel
         # parameter-gradient all-reduce (the duplicated TELinear sets the
         # ``sequence_parallel`` parameter attribute).
+        if self.config.kda_beta_proj_column_parallel:
+            beta_spec = submodules.beta_proj_column
+            if beta_spec is IdentityOp:
+                raise ValueError(
+                    "Column-parallel KDA beta requires a beta_proj_column module spec."
+                )
+            beta_kwargs = dict(
+                gather_output=False, tp_group=self.pg_collection.tp, tp_comm_buffer_name="fc1"
+            )
+        else:
+            beta_spec = submodules.beta_proj
+            beta_kwargs = dict(parallel_mode="duplicated", skip_weight_param_allocation=False)
         self.beta_proj = _build_with_kda_fp8_disabled(
             self.config,
-            submodules.beta_proj,
+            beta_spec,
             self.hidden_size,
             self.num_key_heads,
             config=self.config,
             init_method=self.config.init_method,
-            parallel_mode="duplicated",
             bias=bias,
             skip_bias_add=False,
-            skip_weight_param_allocation=False,
             is_expert=False,
             name=(name + ".beta_proj") if name is not None else None,
+            **beta_kwargs,
         )
 
         # Separate output-gate projection, laid out like the F-decay projection above.
@@ -282,6 +300,11 @@ class KimiDeltaAttention(_GDNBase):
         # FP32 through model casting, optimizer construction, and checkpointing.
         mark_keep_in_fp32(self.dt_bias)
         mark_keep_in_fp32(self.A_log)
+        if self.config.kda_conv_in_fp32:
+            self.conv1d.float()
+            mark_keep_in_fp32(self.conv1d.weight)
+            if self.conv1d.bias is not None:
+                mark_keep_in_fp32(self.conv1d.bias)
 
         # Pass raw g to FLA and let the KDA kernel apply A_log and dt_bias.
         self.use_gate_in_kernel = True
@@ -295,9 +318,11 @@ class KimiDeltaAttention(_GDNBase):
                 "Pre-GDR fusion is non-deterministic, but deterministic_mode=True. "
                 "Disable gdn_pre_gated_delta_rule_fusion or deterministic_mode."
             )
-        if self.two_stage_gates and self.gdn_pre_gated_delta_rule_fusion:
+        if (
+            self.two_stage_gates or self.config.kda_qk_norm_in_kernel
+        ) and self.gdn_pre_gated_delta_rule_fusion:
             raise NotImplementedError(
-                "gdn_pre_gated_delta_rule_fusion is not supported with kda_two_stage_gates: "
+                "gdn_pre_gated_delta_rule_fusion does not support in-kernel KDA QK normalization: "
                 "the fused pre-GDR path applies QK L2 normalization before the kernel, while "
                 "two-stage gates normalize inside the KDA kernel."
             )
@@ -343,6 +368,35 @@ class KimiDeltaAttention(_GDNBase):
         self.a_log_dim = self.num_k_heads_local_tp
         self.gate_params_dtype = torch.float32
         self.gated_delta_rule = chunk_kda
+
+    def _build_input_projection(self, submodules, *, bias: bool, name: str | None) -> None:
+        """Keep separate Q/K/V GEMMs when the model requires their rounding semantics."""
+        if not self.config.kda_split_qkv_projections:
+            return super()._build_input_projection(submodules, bias=bias, name=name)
+        if self.use_legacy_fused_projections:
+            raise ValueError(
+                "Separate KDA Q/K/V projections require separate decay and output gates."
+            )
+        self._input_projection_names = ("q_proj", "k_proj", "v_proj")
+        for projection_name, width in zip(
+            self._input_projection_names, (self.qk_dim, self.qk_dim, self.v_dim)
+        ):
+            projection = _build_with_kda_fp8_disabled(
+                self.config,
+                submodules.in_proj,
+                self.hidden_size,
+                width,
+                config=self.config,
+                init_method=self.config.init_method,
+                gather_output=False,
+                bias=bias,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name="fc1",
+                tp_group=self.pg_collection.tp,
+                name=f"{name}.{projection_name}" if name is not None else None,
+            )
+            self.add_module(projection_name, projection)
 
     def _get_in_proj_qkv_layout(self) -> QKVLayout:
         """Describe KDA's rank-major packed input projection for Muon splitting."""
@@ -436,7 +490,7 @@ class KimiDeltaAttention(_GDNBase):
 
         x_dtype = x.dtype
         x = x.reshape(-1, self.value_head_dim)
-        if self.two_stage_gates:
+        if self.two_stage_gates or self.config.kda_fused_norm_gate:
             # Round only after both normalization and sigmoid gating.
             gate = gate.reshape(-1, self.value_head_dim)
             weight = self.out_norm.weight
@@ -695,7 +749,16 @@ class KimiDeltaAttention(_GDNBase):
                 packed_seq_params,
             )
         else:
-            qkv, _ = self._proj(self.in_proj, hidden_states)
+            if self.config.kda_split_qkv_projections:
+                qkv = torch.cat(
+                    [
+                        self._proj(getattr(self, name), hidden_states)[0]
+                        for name in self._input_projection_names
+                    ],
+                    dim=-1,
+                )
+            else:
+                qkv, _ = self._proj(self.in_proj, hidden_states)
             qkv_or_qkvfg, thd_cp_a2a_inv = a2a_cp_to_hp(
                 qkv,
                 self.in_proj_split_sections,
@@ -734,7 +797,10 @@ class KimiDeltaAttention(_GDNBase):
                 packed_seq_params,
             )
         beta, _ = self._proj(self.beta_proj, hidden_states)
-        if self.config.sequence_parallel:
+        if self.config.kda_beta_proj_column_parallel:
+            # The column-parallel projection already returns full sequence and local heads.
+            pass
+        elif self.config.sequence_parallel:
             # The replicated projection ran on this rank's sequence shard. Exchange its
             # [S/TP, B, H_k] output for the head-parallel [S, B, H_k/TP] layout with one
             # all-to-all of the beta values: H_k columns instead of all-gathering the
@@ -833,7 +899,9 @@ class KimiDeltaAttention(_GDNBase):
             **kernel_inputs,
             initial_state=None,
             output_final_state=False,
-            use_qk_l2norm_in_kernel=self.two_stage_gates and self.use_qk_l2norm,
+            use_qk_l2norm_in_kernel=(self.two_stage_gates or self.config.kda_qk_norm_in_kernel)
+            and self.use_qk_l2norm,
+            transpose_state_layout=self.config.kda_transpose_state_layout,
             use_gate_in_kernel=self.use_gate_in_kernel,
             safe_gate=getattr(self.config, "kda_safe_gate", False),
             lower_bound=getattr(self.config, "kda_lower_bound", None),
@@ -971,9 +1039,10 @@ class KimiDeltaAttention(_GDNBase):
             else None
         )
         if self.config.deterministic_mode or causal_conv1d is None:
+            projection_dtype = qkv.dtype
             qkv = qkv.transpose(1, 2).contiguous()
             conv_out = F.conv1d(
-                input=qkv,
+                input=qkv.to(conv1d_weight.dtype),
                 weight=conv1d_weight,
                 bias=conv1d_bias,
                 stride=self.conv1d.stride,
@@ -981,7 +1050,7 @@ class KimiDeltaAttention(_GDNBase):
                 dilation=self.conv1d.dilation,
                 groups=self.conv_dim_local_tp // cp_size_headwise,
             )
-            qkv = self.act_fn(conv_out[..., :kernel_seq_len])
+            qkv = self.act_fn(conv_out[..., :kernel_seq_len]).to(projection_dtype)
             qkv = qkv.transpose(1, 2).contiguous()
         else:
             if self.activation not in ("silu", "swish"):
@@ -1024,7 +1093,7 @@ class KimiDeltaAttention(_GDNBase):
         A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=cp_group_headwise)
         dt_bias_local_cp = get_parameter_local_cp(self.dt_bias, dim=0, cp_group=cp_group_headwise)
 
-        if self.two_stage_gates:
+        if self.two_stage_gates or self.config.kda_qk_norm_in_kernel:
             query_key, value = torch.split(
                 qkv,
                 [
