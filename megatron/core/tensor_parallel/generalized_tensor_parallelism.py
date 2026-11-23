@@ -57,7 +57,12 @@ from megatron.core.tensor_parallel.gtp_symmetric_memory import (
     uses_gtp_symm_pool,
 )
 from megatron.core.tensor_parallel.gtp_wgrad_accumulation import WgradAccumulationWindow
-from megatron.core.utils import ensure_params_ready, log_single_rank, resolve_gtp_pad_for_alignment
+from megatron.core.utils import (
+    ensure_params_ready,
+    is_te_min_version,
+    log_single_rank,
+    resolve_gtp_pad_for_alignment,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1117,7 +1122,7 @@ def dequantize_gtp_native_fp8(param):
     from megatron.core.fp8_utils import dequantize_fp8_tensor
 
     # TE #3393 enables subclass dispatch in 2.20; prerelease builds may lack the fix.
-    if _te_version >= Version("2.20"):
+    if is_te_min_version("2.20"):
         return dequantize_fp8_tensor(param)
 
     sub_cls = type(param)
@@ -1136,7 +1141,7 @@ def gtp_native_fp8_load_context(module):
     TE >= 2.20 accepts GTP subclasses directly. Earlier versions temporarily need
     the base FP8 class, as in :func:`dequantize_gtp_native_fp8`.
     """
-    if _te_version >= Version("2.20"):
+    if is_te_min_version("2.20"):
         yield
         return
 

@@ -112,7 +112,7 @@ def test_native_fp8_compatibility_preserves_class(monkeypatch, te_version, nativ
     weight = GTPWeight()
     weight.fail = False
     module = SimpleNamespace(parameters=lambda **kwargs: [weight])
-    monkeypatch.setattr(gtp, "_te_version", Version(te_version))
+    monkeypatch.setattr("megatron.core.utils._te_version", Version(te_version))
     monkeypatch.setattr("megatron.core.fp8_utils.is_float8tensor", lambda p: p is weight)
 
     assert torch.equal(dequantize_gtp_native_fp8(weight), payload)
@@ -134,7 +134,7 @@ def test_native_fp8_compatibility_preserves_class(monkeypatch, te_version, nativ
 def test_gtp_fp8_checkpoint_casts_replay(monkeypatch, legacy):
     """Replay checkpoint casts bit-exactly while preserving GTP identity and storage."""
     _requires_mxfp8()
-    if not legacy and gtp._te_version < Version("2.20"):
+    if not legacy and not gtp.is_te_min_version("2.20"):
         pytest.skip("native subclass dispatch requires TE >= 2.20")
 
     import transformer_engine_torch as tex
@@ -151,7 +151,7 @@ def test_gtp_fp8_checkpoint_casts_replay(monkeypatch, legacy):
     original_quantizer = weight._quantizer
     storage_ptr = weight._rowwise_data.data_ptr()
     module = SimpleNamespace(parameters=lambda **kwargs: [weight])
-    monkeypatch.setattr(gtp, "_te_version", Version("2.19" if legacy else "2.20"))
+    monkeypatch.setattr("megatron.core.utils._te_version", Version("2.19" if legacy else "2.20"))
 
     for _ in range(3):
         with torch.no_grad(), gtp_native_fp8_load_context(module):
@@ -324,13 +324,13 @@ def _worker_native_fp8_dcp_load_copy(rank, world_size, port):
         with torch.no_grad():
             lin.weight.copy_(probe_bf16)
     except Exception as e:  # noqa: BLE001
-        assert gtp._te_version < Version("2.20"), "released TE >= 2.20 must accept subclasses"
+        assert not gtp.is_te_min_version("2.20"), "released TE >= 2.20 must accept subclasses"
         assert "MXFP8" in str(e) or "IsMXFP8Tensor" in str(e), str(e)
     assert is_gtp_fp8(lin.weight), "bare copy_ must leave the GTP subclass intact"
 
     # (2) Under the context the copy always lands, on every TE version.
     with torch.no_grad(), gtp_native_fp8_load_context(lin):
-        if gtp._te_version >= Version("2.20"):
+        if gtp.is_te_min_version("2.20"):
             assert is_gtp_fp8(lin.weight), "modern TE must retain the GTP class during loading"
         lin.weight.copy_(target_bf16)
     assert is_gtp_fp8(lin.weight), "load context must reclass back to the GTP subclass"
