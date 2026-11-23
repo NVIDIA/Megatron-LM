@@ -3686,6 +3686,10 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT
                 )
 
+        def _checkpoint_glu_interleave_size(self) -> int | None:
+            # TP > 1 uses the ordinary noninterleaved TEFusedMLP implementation.
+            return 32 if get_pg_size(self.tp_group) == 1 else None
+
         def _reset_fused_impl(self) -> None:
             """Discard both cached execution views."""
             super()._reset_fused_impl()

@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from megatron.core.activations import situ_glu, squared_relu, tanh_soft_clamp
 from megatron.core.dist_checkpointing import ShardedTensor
+from megatron.core.dist_checkpointing.glu import permute_glu_rows
 from megatron.core.dist_checkpointing.mapping import (
     ReplicaId,
     ShardedStateDict,
@@ -406,6 +407,10 @@ class MLP(MegatronModule):
         return output, output_bias
 
     # pylint: disable=missing-function-docstring
+    def _checkpoint_glu_interleave_size(self) -> int | None:
+        """Return the FC1 row layout used by this implementation."""
+        return None
+
     def sharded_state_dict(
         self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
@@ -426,6 +431,7 @@ class MLP(MegatronModule):
                             singleton_local_shards,
                             tp_group=self.tp_group,
                             dp_group=metadata['dp_cp_group'],
+                            glu_interleave_size=self._checkpoint_glu_interleave_size(),
                         )
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict
@@ -481,6 +487,8 @@ def apply_swiglu_sharded_factory(
     singleton_local_shards: bool = False,
     tp_group: torch.distributed.ProcessGroup | None = None,
     dp_group: torch.distributed.ProcessGroup | None = None,
+    *,
+    glu_interleave_size: int | None = None,
 ):
     # We must split the tensor into 2 parts, each sharded separately.
     # This requires a ShardedTensorFactory which `chunk`s during saving
@@ -495,6 +503,13 @@ def apply_swiglu_sharded_factory(
         original_sh_ten.global_offset[swiglu_shard_axis + prepend_axis_num] % local_axis_size == 0
     )
     axis_frag = original_sh_ten.axis_fragmentations[swiglu_shard_axis + prepend_axis_num]
+    if glu_interleave_size is not None and (
+        isinstance(glu_interleave_size, bool)
+        or not isinstance(glu_interleave_size, int)
+        or glu_interleave_size <= 0
+        or local_axis_size % (2 * glu_interleave_size)
+    ):
+        raise ValueError('GLU interleave size must divide each local gate/up half.')
 
     # Only FSDP2 supports torch_dist ShardedTensor. (Add other DP sharding algos here if needed.)
     is_torch_fsdp2_param = getattr(original_sh_ten, "is_torch_fsdp2_param", False)
@@ -507,6 +522,8 @@ def apply_swiglu_sharded_factory(
 
     source_param = getattr(original_sh_ten.data, "_gtp_dequant_src", original_sh_ten.data)
     gtp_size = getattr(source_param, "gtp_remat_size", 1)
+    if glu_interleave_size is not None and (is_dp_sharded or gtp_size > 1):
+        raise NotImplementedError('Interleaved GLU checkpoints do not support FSDP2 or GTP.')
     if gtp_size > 1 and not is_dp_sharded:
         from megatron.core.tensor_parallel.gtp_ckpt_util import make_gtp_swiglu_sharded_factory
 
@@ -536,6 +553,11 @@ def apply_swiglu_sharded_factory(
             w_key = key
             v_key = key
 
+        if flattened_range is not None:
+            raise NotImplementedError('Flattened GLU checkpoint tensors are not supported.')
+
+        if glu_interleave_size is not None:
+            t = permute_glu_rows(t, glu_interleave_size, interleave=False)
         tensor_w, tensor_v = torch.chunk(t, 2, dim=swiglu_shard_axis)
         return [
             ShardedTensor.from_rank_offsets(
@@ -611,13 +633,20 @@ def apply_swiglu_sharded_factory(
             )
         ]
 
-    # Construct a ShardedTensorFactory.
+    def merge_fn(parts):
+        tensor = cat_with_oom_fallback(parts)
+        if glu_interleave_size is not None:
+            tensor = permute_glu_rows(tensor, glu_interleave_size, interleave=True)
+        return tensor
+
+    # Keep the original parameter identity: optimizer factories are derived from
+    # this factory and therefore apply exactly the same layout to masters/moments.
     sh_ten_factory_build_function = dp_sh_ten_build_fn if is_dp_sharded else sh_ten_build_fn
     return ShardedTensorFactory(
         original_sh_ten.key,
         original_sh_ten.data,
         sh_ten_factory_build_function,
-        cat_with_oom_fallback,
+        merge_fn,
         original_sh_ten.replica_id,
         flattened_range=original_sh_ten.flattened_range,
     )

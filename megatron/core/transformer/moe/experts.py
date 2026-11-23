@@ -1368,6 +1368,7 @@ class TEGroupedMLP(MegatronModule):
                                 singleton_local_shards,
                                 tp_group=self.tp_group,
                                 dp_group=metadata['dp_cp_group'],
+                                glu_interleave_size=self.config.moe_mlp_glu_interleave_size,
                             )
             if singleton_local_shards:
                 replace_prefix_for_sharding(sub_sd, '', f'{prefix}experts.')

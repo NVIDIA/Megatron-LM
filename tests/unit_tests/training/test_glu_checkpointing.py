@@ -8,6 +8,7 @@ from copy import deepcopy
 import pytest
 import torch
 
+from megatron.core.dist_checkpointing.glu import glu_checkpoint_metadata
 from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
 from megatron.training.ckpt.glu_checkpointing import (
     prepare_glu_checkpoint_for_load,
@@ -312,6 +313,9 @@ def test_saved_activation_configs_enable_glu_conversion_and_guards(
         torch.testing.assert_close(saved["model"][key], tensor, rtol=0, atol=0)
 
     # Resolve the saved activation flags as well as the current config on optimizer resume.
+    checkpoint['glu_checkpoint_metadata'] = glu_checkpoint_metadata(
+        config, optimizer_uses_model_layout=False
+    )
     validate_glu_optimizer_layout(checkpoint, _args(routed=2, shared=2), loading_optimizer=True)
     with pytest.raises(ValueError):
         validate_glu_optimizer_layout(checkpoint, _args(), loading_optimizer=True)
@@ -401,6 +405,9 @@ def test_optimizer_layout_switch_requires_weights_only_load(source_size, target_
     source = {component: source_size}
     target = {component: target_size}
     checkpoint = {"args": _args(**source), "optimizer": {}}
+    checkpoint['glu_checkpoint_metadata'] = glu_checkpoint_metadata(
+        checkpoint['args'], optimizer_uses_model_layout=False
+    )
 
     with pytest.raises(ValueError):
         validate_glu_optimizer_layout(checkpoint, _args(**target), loading_optimizer=True)
@@ -409,7 +416,39 @@ def test_optimizer_layout_switch_requires_weights_only_load(source_size, target_
 
 def test_optimizer_resume_accepts_matching_runtime_layout():
     checkpoint = {"args": _args(routed=2, shared=4), "optimizer": {}}
+    checkpoint['glu_checkpoint_metadata'] = glu_checkpoint_metadata(
+        checkpoint['args'], optimizer_uses_model_layout=False
+    )
     validate_glu_optimizer_layout(checkpoint, _args(routed=2, shared=4), loading_optimizer=True)
+
+
+def test_native_factory_results_are_not_converted_again():
+    runtime = _interleaved(_canonical((16, 3)), 2)
+    checkpoint = {'model': {ROUTED + 'weight0': runtime}, 'optimizer': {'moment': runtime.clone()}}
+    snapshot = runtime.clone()
+    assert (
+        prepare_glu_checkpoint_for_save(checkpoint, _args(routed=2), use_factories=True)
+        is checkpoint
+    )
+    assert (
+        prepare_glu_checkpoint_for_load(checkpoint, _args(routed=2), use_factories=True)
+        is checkpoint
+    )
+    torch.testing.assert_close(runtime, snapshot, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('model_space', [False, True])
+def test_native_save_metadata_declares_optimizer_layout(run_config, model_space):
+    from megatron.training.checkpointing import _build_sharded_state_dict_metadata
+
+    run_config.optimizer.use_distributed_optimizer = True
+    run_config.checkpoint.dist_ckpt_optim_fully_reshardable = model_space
+    run_config.model.transformer.gated_linear_unit = True
+    run_config.model.transformer.moe_mlp_glu_interleave_size = 2
+    metadata = _build_sharded_state_dict_metadata(dp_cp_group=object(), ckpt_format='torch_dist')
+    assert metadata['glu_checkpoint_layout'] == 'contiguous'
+    assert metadata['glu_optimizer_layout'] == ('contiguous' if model_space else 'runtime')
+    assert metadata['glu_runtime_layout']['routed'] == 2
 
 
 @pytest.mark.parametrize(
@@ -418,6 +457,9 @@ def test_optimizer_resume_accepts_matching_runtime_layout():
 )
 def test_interleaved_optimizer_resharding_rejects_tp_or_etp_change(source, target):
     checkpoint = {"args": source, "optimizer": {}}
+    checkpoint['glu_checkpoint_metadata'] = glu_checkpoint_metadata(
+        source, optimizer_uses_model_layout=False
+    )
 
     with pytest.raises(ValueError):
         validate_glu_optimizer_layout(checkpoint, target, loading_optimizer=True)
@@ -430,7 +472,7 @@ def test_contiguous_optimizer_does_not_add_new_tp_resharding_restriction():
 
 
 @pytest.mark.parametrize("config_format", ["args-dict", "bridge-dict", "bridge-namespace"])
-def test_existing_checkpoint_config_describes_optimizer_only(config_format):
+def test_marked_checkpoint_describes_model_and_optimizer_layouts(config_format):
     source = _args(routed=2, shared=4)
     if config_format == "args-dict":
         checkpoint = {"args": vars(source)}
@@ -440,6 +482,9 @@ def test_existing_checkpoint_config_describes_optimizer_only(config_format):
         checkpoint = {"cfg": Namespace(model=source)}
     canonical = _canonical((16, 3))
     checkpoint["model"] = {ROUTED + "weight0": canonical}
+    checkpoint['glu_checkpoint_metadata'] = glu_checkpoint_metadata(
+        source, optimizer_uses_model_layout=False
+    )
 
     validate_glu_optimizer_layout(checkpoint, source, loading_optimizer=True)
     target = _args(routed=4, shared=4, tp=2, etp=2)
@@ -513,6 +558,9 @@ def test_adam_update_and_resume_match_canonical_and_uninterrupted_training(
     )
     for key, parameter in reference.items():
         torch.testing.assert_close(checkpoint["model"][key], parameter)
+    checkpoint['glu_checkpoint_metadata'] = glu_checkpoint_metadata(
+        args, optimizer_uses_model_layout=False
+    )
     validate_glu_optimizer_layout(checkpoint, args, loading_optimizer=True)
     loaded = prepare_glu_checkpoint_for_load(checkpoint, args)
     resumed = {key: torch.nn.Parameter(loaded["model"][key].clone()) for key in source}
