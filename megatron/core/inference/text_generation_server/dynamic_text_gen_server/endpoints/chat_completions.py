@@ -492,15 +492,15 @@ def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None
         elif not isinstance(content, str):
             msg_copy["content"] = str(content)
 
-        # vLLM returns an assistant turn's reasoning as `reasoning` (`reasoning_content` is its
-        # older name), and clients send the turn back as they received it. Chat templates read
-        # `reasoning_content`, so accept either; an explicit `reasoning_content` wins.
-        if (
-            msg_copy.get("role") == "assistant"
-            and msg_copy.get("reasoning_content") is None
-            and isinstance(msg_copy.get("reasoning"), str)
-        ):
-            msg_copy["reasoning_content"] = msg_copy["reasoning"]
+        # An assistant turn's reasoning may arrive as `reasoning` (vLLM's name) or
+        # `reasoning_content` (its older name, which chat templates read). As vLLM does, take
+        # `reasoning` when both are set, and give the template the turn under both names.
+        if msg_copy.get("role") == "assistant":
+            reasoning = msg_copy.get("reasoning")
+            if reasoning is None:
+                reasoning = msg_copy.get("reasoning_content")
+            if reasoning is not None:
+                msg_copy["reasoning"] = msg_copy["reasoning_content"] = reasoning
 
         tool_calls = msg_copy.get("tool_calls")
         if isinstance(tool_calls, list):

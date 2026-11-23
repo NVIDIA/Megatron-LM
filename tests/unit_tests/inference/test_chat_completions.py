@@ -610,24 +610,42 @@ def test_sanitize_messages_flattens_content_to_a_string(
 @pytest.mark.parametrize(
     "message, expected",
     [
+        pytest.param({"role": "assistant", "content": "a", "reasoning": "why"}, "why", id="reasoning"),
         pytest.param(
-            {"role": "assistant", "content": "a", "reasoning": "why"}, "why", id="reasoning-alias"
+            {"role": "assistant", "content": "a", "reasoning_content": "why"},
+            "why",
+            id="reasoning-content",
         ),
         pytest.param(
             {"role": "assistant", "content": "a", "reasoning": "new", "reasoning_content": "old"},
-            "old",
-            id="explicit-reasoning-content-wins",
+            "new",
+            id="reasoning-wins",
         ),
-        pytest.param({"role": "user", "content": "a", "reasoning": "why"}, None, id="user-turn"),
+        pytest.param(
+            {"role": "assistant", "content": "a", "reasoning": None, "reasoning_content": "old"},
+            "old",
+            id="null-reasoning",
+        ),
+        pytest.param(
+            {"role": "assistant", "content": "a", "reasoning": ""}, "", id="empty-reasoning"
+        ),
+        pytest.param({"role": "assistant", "content": "a"}, None, id="no-reasoning"),
     ],
 )
-def test_sanitize_messages_reads_reasoning_as_reasoning_content(message, expected):
+def test_sanitize_messages_gives_assistant_reasoning_under_both_names(message, expected):
     original = copy.deepcopy(message)
 
     (sanitized,) = _sanitize_messages_for_template([message])
 
+    assert sanitized.get("reasoning") == expected
     assert sanitized.get("reasoning_content") == expected
     assert message == original
+
+
+def test_sanitize_messages_leaves_reasoning_of_other_roles_alone():
+    message = {"role": "user", "content": "a", "reasoning": "why"}
+
+    assert _sanitize_messages_for_template([message]) == [message]
 
 
 def test_sanitize_messages_coerces_tool_call_arguments_to_mappings():
