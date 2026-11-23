@@ -374,22 +374,16 @@ def test_partial_capture_rollback(process_groups, cleanup_fails, monkeypatch):
                 layer.reshard = reshard
                 raise RuntimeError("controlled reshard failure")
 
-            with monkeypatch.context() as patch:
-                patch.setattr(te_graph, "make_graphed_callables", fail)
+            # Use TE's real caller-hook rejection as the primary failure.
+            with (
+                layer.register_forward_pre_hook(lambda *_: None) as handle,
+                monkeypatch.context() as patch,
+            ):
                 patch.setattr(layer, "reshard", fail_on_capture_exit)
-                with pytest.raises(RuntimeError, match="controlled capture failure") as error:
+                with pytest.raises(RuntimeError, match="Modules must not have hooks") as error:
                     helper.create_cudagraphs()
-            assert any("controlled reshard failure" in note for note in error.value.__notes__)
-        else:
-            # TE rejects caller hooks. The capture context must leave them in place.
-            layer = layers[0]
-            handle = layer.register_forward_pre_hook(lambda *_: None)
-            try:
-                with pytest.raises(RuntimeError, match="Modules must not have hooks"):
-                    helper.create_cudagraphs()
+                assert any("controlled reshard failure" in note for note in error.value.__notes__)
                 assert handle.id in layer._forward_pre_hooks
-            finally:
-                handle.remove()
 
         for method, inject_failure in failures:
             with monkeypatch.context() as patch:
