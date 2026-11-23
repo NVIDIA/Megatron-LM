@@ -1130,7 +1130,10 @@ class _ChatRequestOptions:
 
 
 def _streaming_chat_parsers(parsers, options, n):
-    """One `StreamingChatParser` per choice, or `None` when no parsers are configured."""
+    """One `StreamingChatParser` per choice, or `None` when no parsers are configured.
+
+    With tools requested, whitespace-only content is held back until it is followed by text or
+    the stream ends, and dropped if a tool call follows, as vLLM streams it."""
     if not parsers:
         return None
     marker_prefixes = (
@@ -1162,6 +1165,7 @@ def _streaming_chat_parsers(parsers, options, n):
             parse_streaming_text,
             marker_prefixes=marker_prefixes,
             named_tool_choice=options.is_named_tool_choice,
+            drop_whitespace_before_tool_calls=options.tools_requested,
         )
         for _ in range(n)
     ]
@@ -1245,10 +1249,13 @@ def format_chat_response(batch_results, sampling_params, tokenizer, options, *, 
             # absent final content from an empty assistant message and otherwise
             # continue the episode after a reasoning-only completion.
             content = None
-        elif normalized_tool_calls and _strips_content_with_tool_calls(parsers):
-            # Match vLLM's tool parsers: a tool-call turn's content is stripped, and absent
-            # when only whitespace remains.
-            content = (message_text or "").strip() or None
+        elif normalized_tool_calls:
+            # As in vLLM, a tool-call turn has no content when only whitespace surrounds the
+            # calls, whatever the tool parser; tool parsers that opt in also strip it.
+            content = message_text or ""
+            if _strips_content_with_tool_calls(parsers):
+                content = content.strip()
+            content = content if content.strip() else None
         else:
             content = message_text if message_text is not None else ""
 

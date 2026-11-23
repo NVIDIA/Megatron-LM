@@ -5,8 +5,9 @@ from typing import Any
 class BaseParser:
     """Base class for text parsers."""
 
-    # Tool parsers set this to strip a non-streamed turn's content when it carries tool calls
-    # (and drop it when only whitespace remains), as vLLM's tool parsers do.
+    # Tool parsers set this to strip the content of a non-streamed turn that carries tool calls,
+    # as vLLM's qwen3_coder parser does (vLLM's DeepSeek V3.2/V4 and Kimi K2 parsers do not).
+    # Whitespace-only content of such a turn is dropped for every parser.
     strip_content_with_tool_calls: bool = False
 
     @staticmethod

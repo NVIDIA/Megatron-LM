@@ -136,12 +136,25 @@ def _safe_content_prefix(content, markers):
 class StreamingChatParser:
     """Convert accumulated parser output into stable OpenAI chat deltas."""
 
-    def __init__(self, parse, *, marker_prefixes=(), named_tool_choice=False):
+    def __init__(
+        self,
+        parse,
+        *,
+        marker_prefixes=(),
+        named_tool_choice=False,
+        drop_whitespace_before_tool_calls=False,
+    ):
+        """`drop_whitespace_before_tool_calls` holds back content that is only whitespace until
+        text follows or the stream ends, and drops it once a tool call starts. This is how
+        vLLM streams a tool-call turn; content already streamed is never taken back."""
         self._parse = parse
         self._marker_prefixes = tuple(marker_prefixes)
         self._named_tool_choice = named_tool_choice
-        # Retain emitted content/reasoning prefixes and stable per-tool IDs and emission flags.
+        self._drop_whitespace_before_tool_calls = drop_whitespace_before_tool_calls
+        # Retain emitted (or dropped) content/reasoning prefixes and stable per-tool IDs and
+        # emission flags.
         self._content_sent = ""
+        self._content_has_text = False
         self._reasoning_sent = ""
         self._tool_arguments_sent = []
         self._tool_ids = []
@@ -188,9 +201,20 @@ class StreamingChatParser:
         )
         if safe_content.startswith(self._content_sent):
             content_delta = safe_content[len(self._content_sent) :]
+            if (
+                content_delta
+                and self._drop_whitespace_before_tool_calls
+                and not self._content_has_text
+                and not content_delta.strip()
+            ):
+                if tool_calls:
+                    self._content_sent = safe_content
+                if tool_calls or not finished:
+                    content_delta = ""
             if content_delta:
                 deltas.append({"content": content_delta})
                 self._content_sent = safe_content
+                self._content_has_text = self._content_has_text or bool(content_delta.strip())
 
         for index, call in enumerate(tool_calls):
             while len(self._tool_ids) <= index:

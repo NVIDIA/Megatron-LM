@@ -289,6 +289,67 @@ def test_streaming_chat_parser_emits_reasoning_under_both_field_names():
     assert parser.parse("thinking") == [{"reasoning": "king", "reasoning_content": "king"}]
 
 
+_CALL = {"function": {"name": "f", "arguments": "{}"}}
+
+
+def _content_after_each_step(steps, *, drop_whitespace_before_tool_calls):
+    """Feed (content, tool_calls, finished) parse results in order; return each step's content."""
+    results = iter(steps)
+
+    def parse(text, finished=False):
+        content, tool_calls, _ = next(results)
+        return content, {"tool_calls": tool_calls} if tool_calls else {}
+
+    parser = StreamingChatParser(
+        parse, drop_whitespace_before_tool_calls=drop_whitespace_before_tool_calls
+    )
+    return [
+        "".join(delta.get("content", "") for delta in parser.parse("", finished=finished))
+        for _, _, finished in steps
+    ]
+
+
+@pytest.mark.parametrize(
+    "steps, expected",
+    [
+        # Whitespace-only content waits for what follows it.
+        pytest.param(
+            [("\n", [], False), ("\n", [_CALL], True)], ["", ""], id="dropped-before-a-call"
+        ),
+        pytest.param(
+            [("\n", [], False), ("\n\nOK", [], False), ("\n\nOK", [], True)],
+            ["", "\n\nOK", ""],
+            id="sent-with-the-text-after-it",
+        ),
+        pytest.param(
+            [("\n", [], False), (" \n", [], False), (" \n", [], True)],
+            ["", "", " \n"],
+            id="sent-when-the-turn-ends-without-calls",
+        ),
+        # Once text was streamed, whitespace streams as it comes; it can't be taken back.
+        pytest.param(
+            [("OK", [], False), ("OK\n\n", [], False), ("OK\n\n", [_CALL], True)],
+            ["OK", "\n\n", ""],
+            id="kept-after-text",
+        ),
+        # Text after dropped whitespace streams without it.
+        pytest.param(
+            [("\n", [], False), ("\n", [_CALL], False), ("\nDone", [_CALL], True)],
+            ["", "", "Done"],
+            id="text-after-dropped-whitespace",
+        ),
+    ],
+)
+def test_streaming_chat_parser_holds_whitespace_before_tool_calls(steps, expected):
+    assert _content_after_each_step(steps, drop_whitespace_before_tool_calls=True) == expected
+
+
+def test_streaming_chat_parser_streams_whitespace_without_tools():
+    steps = [("\n", [], False), ("\n", [_CALL], True)]
+
+    assert _content_after_each_step(steps, drop_whitespace_before_tool_calls=False) == ["\n", ""]
+
+
 def test_streaming_chat_parser_emits_structured_stable_tool_call_deltas():
     tools = [
         {
