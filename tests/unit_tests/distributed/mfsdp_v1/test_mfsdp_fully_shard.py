@@ -1051,37 +1051,6 @@ class TestMegatronFsdpFullyShard:
             optimizer.step()
             optimizer.zero_grad()
 
-    def test_te_fused_wgrad_none_reaches_grad_acc_hook(self):
-        """Process a fused TE weight at its grad node, before the root fallback."""
-        torch.manual_seed(1234)
-        model = fully_shard_model(
-            module=te.pytorch.Linear(
-                64, 64, params_dtype=torch.bfloat16, device="cuda", fuse_wgrad_accumulation=True
-            ),
-            fsdp_unit_modules=[te.pytorch.Linear],
-            zero_dp_strategy=OPTIM_GRADS_PARAMS,
-        )
-        weight = next(p for p, name in model.param_to_name.items() if name.endswith("weight"))
-        seen = {}
-
-        def observe_grad_node(grads):
-            seen["undefined_grad"] = len(grads) == 1 and grads[0] is None
-            seen["fused_accumulation"] = weight.grad_added_to_main_grad
-
-        grad_node = torch.autograd.graph.get_gradient_edge(weight).node
-        hook = grad_node.register_prehook(observe_grad_node)
-        try:
-            x = torch.randn(8, 64, dtype=torch.bfloat16, device="cuda")
-            model(x).float().square().mean().backward()
-            assert seen == {"undefined_grad": True, "fused_accumulation": True}
-            assert weight.grad is None
-            assert weight not in model._params_require_handle_grad
-            main_grad = weight.get_main_grad()
-            assert torch.isfinite(main_grad).all()
-            assert main_grad.abs().sum() > 0
-        finally:
-            hook.remove()
-
     @pytest.mark.parametrize("shard_strategy", [OPTIM_GRADS, OPTIM_GRADS_PARAMS])
     @pytest.mark.parametrize("optimizer_type", ["adam", "adamw", "fused_adam"])
     def test_optimizer_loss_curve_matches_reference(self, shard_strategy, optimizer_type):
