@@ -2554,6 +2554,16 @@ class TECudaGraphHelper:
                         uses_mla = False
                     elif config_type in (MLALayerConfig, DSALayerConfig, CSALayerConfig):
                         uses_mla = True
+                if transformer_module.position_embedding_type == 'mrope' and not uses_mla:
+                    # Capture the tensor input; replay provides the actual position embeddings.
+                    position_ids = torch.zeros(
+                        (3, self.micro_batch_size, self.seq_length),
+                        device=transformer_input.device,
+                        dtype=torch.long,
+                    )
+                    return transformer_module.rotary_pos_emb(
+                        position_ids, transformer_module.mrope_section
+                    )
                 if transformer_module.position_embedding_type == 'rope' and not uses_mla:
                     rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(
                         None, transformer_module.decoder, transformer_input, self.config, None
