@@ -143,7 +143,8 @@ class ShortcutMoEBlock(MegatronModule):
             cls._parallel_stream = torch.cuda.Stream(priority=-1)
         return cls._parallel_stream
 
-    # Inference uses all-gather/reduce-scatter on the same MoE stream.
+    # Inference reuses this stream only for routed expert compute; its collectives stay on
+    # the calling stream.
     _get_moe_overlap_stream = _get_a2a_overlap_stream
 
     def __init__(
