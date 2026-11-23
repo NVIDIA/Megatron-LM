@@ -38,8 +38,7 @@ class _FsdpGroupAssignment:
     fsdp_group: FsdpParameterGroup
     tensor_to_optimizer_group_index: dict[int, int]
     tensor_to_owner_rank: dict[int, int]
-    # The layout is fixed, so the ranges are cached here instead of being recomputed, once per rank,
-    # on every gather and scatter of every step.
+    # The layout is fixed, so the ranges are computed once instead of on every gather and scatter.
     rank_ranges: dict[int, Range]
 
     @cached_property
@@ -353,58 +352,43 @@ class FsdpMuon(Muon):
     def _compute_momentum_inputs(
         self, fsdp_group: FsdpParameterGroup, tensor_to_optimizer_group_index: dict[int, int]
     ) -> DBuffer:
-        """Apply local weight decay, update momentum, and build inputs for orthogonalization.
-
-        Tensors sharing an optimizer group are updated together with foreach kernels, a few
-        launches per group instead of a few per tensor.
-        """
+        """Apply local weight decay, update momentum, and build inputs for orthogonalization."""
         buffer: DBuffer = fsdp_group.main_weight
         momentum_inputs: DBuffer = DBuffer(
             buffer.mesh, buffer.placements, buffer.layout, buffer.dtype, buffer.device
         )
-        by_optimizer_group: dict[int, list[int]] = {}
         for i, group_index in tensor_to_optimizer_group_index.items():
-            by_optimizer_group.setdefault(group_index, []).append(i)
-        for group_index, indices in by_optimizer_group.items():
             group: dict[str, Any] = self.param_groups[group_index]
-            weights: list[torch.Tensor] = []
-            momenta: list[torch.Tensor] = []
-            grads: list[torch.Tensor] = []
-            local_inputs: list[torch.Tensor] = []
-            for i in indices:
-                param: DTensor = cast(DTensor, fsdp_group.fsdp_parameters[i].sharded)
-                assert isinstance(param.grad, DTensor)
-                state: dict[str, Any] = self.state[param]
-                if not state:
-                    state["momentum_buffer"] = torch.zeros_like(param)
-                momentum: torch.Tensor = state["momentum_buffer"].to_local()
-                momenta.append(momentum)
-                grads.append(param.grad.to_local().to(momentum.dtype).reshape(momentum.shape))
-                weights.append(param.to_local())
-                local_inputs.append(momentum_inputs.get_tensor_view(i).view_as(momentum))
+            param: DTensor = cast(DTensor, fsdp_group.fsdp_parameters[i].sharded)
+            assert isinstance(param.grad, DTensor)
+            state: dict[str, Any] = self.state[param]
+            if not state:
+                state["momentum_buffer"] = torch.zeros_like(param)
+            local_input: torch.Tensor = momentum_inputs.get_tensor_view(i)
+            momentum: torch.Tensor = state["momentum_buffer"].to_local()
+            grad: torch.Tensor = param.grad.to_local().to(momentum.dtype).reshape(momentum.shape)
             # Match EO's decay before momentum without calling its private helper.
             weight_decay: float = group["weight_decay"]
             if weight_decay != 0:
+                weight: torch.Tensor = param.to_local()
                 lr: float = group["lr"]
                 match self.weight_decay_method:
                     case "decoupled":
-                        torch._foreach_add_(weights, weights, alpha=-(weight_decay * lr))
+                        weight.add_(weight, alpha=-(weight_decay * lr))
                     case "independent":
-                        torch._foreach_add_(weights, weights, alpha=-weight_decay)
+                        weight.add_(weight, alpha=-weight_decay)
                     case "l2":
-                        torch._foreach_add_(grads, weights, alpha=weight_decay)
+                        grad.add_(weight, alpha=weight_decay)
                     case "palm":
-                        torch._foreach_add_(weights, weights, alpha=-(weight_decay * lr * lr))
+                        weight.add_(weight, alpha=-(weight_decay * lr * lr))
                     case _:
                         raise ValueError(f"Invalid weight decay method: {self.weight_decay_method}")
             # EO's OrthogonalizedOptimizer.step implements momentum inline, without a helper.
-            torch._foreach_lerp_(momenta, grads, 1 - group["momentum"])
+            momentum.lerp_(grad, 1 - group["momentum"])
             if self.nesterov:
-                # lerp(grad, momentum, momentum coefficient), written in place.
-                torch._foreach_copy_(local_inputs, grads)
-                torch._foreach_lerp_(local_inputs, momenta, group["momentum"])
+                torch.lerp(grad, momentum, group["momentum"], out=local_input.view_as(momentum))
             else:
-                torch._foreach_copy_(local_inputs, momenta)
+                local_input.copy_(momentum.reshape(local_input.shape))
         return momentum_inputs
 
     def _orthogonalize_updates(
