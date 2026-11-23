@@ -17,6 +17,7 @@ from megatron.core.tensor_parallel.random import (
     prime_cuda_rng_states_for_graph_capture,
 )
 from megatron.core.transformer.cuda_graphs import capture_constants
+from megatron.core.utils import get_model_config
 
 logger = logging.getLogger(__name__)
 
@@ -240,6 +241,7 @@ class FullCudaGraphWrapper:
     curr_iteration = {'training': 0, 'validation': 0}
     cuda_graph = {'training': None, 'validation': None}
     result = {'training': None, 'validation': None}
+    _prepared_batch_layout = {}
 
     def __init__(self, forward_backward_func, cuda_graph_warmup_steps=1, use_single_mempool=False):
         self.forward_backward_func = forward_backward_func
@@ -280,6 +282,41 @@ class FullCudaGraphWrapper:
                     data_list.append(None)
         return data_list
 
+    def _read_prepared_batches(self, kwargs, stage, prepare_batch):
+        """Prepare each virtual chunk's inputs before entering CUDA graph capture."""
+        model = kwargs['model']
+        data_iterator = kwargs['data_iterator']
+        chunks = model if isinstance(model, list) else [model]
+        iterators = data_iterator if isinstance(data_iterator, list) else [data_iterator]
+        num_microbatches = kwargs['num_microbatches']
+        if len(chunks) != len(iterators) or any(iterator is None for iterator in iterators):
+            raise ValueError('Prepared THD graphs require an input iterator per virtual chunk')
+        batches = [
+            [prepare_batch(next(iterator), chunk) for _ in range(num_microbatches)]
+            for chunk, iterator in zip(chunks, iterators)
+        ]
+        layout = [
+            [
+                {
+                    name: (value.shape, value.dtype) if isinstance(value, torch.Tensor) else value
+                    for name, value in batch.items()
+                }
+                for batch in chunk_batches
+            ]
+            for chunk_batches in batches
+        ]
+        if FullCudaGraphWrapper._prepared_batch_layout.setdefault(stage, layout) != layout:
+            raise ValueError('Prepared THD graph input layout changed. Reset the graph first.')
+        return [
+            iter(
+                [
+                    self.static_loader(batch, stage, chunk_index * num_microbatches + microbatch)
+                    for microbatch, batch in enumerate(chunk_batches)
+                ]
+            )
+            for chunk_index, chunk_batches in enumerate(batches)
+        ]
+
     def __call__(self, *args, **kwargs):
         assert len(args) == 0, 'forward_backward_func does not accept positional args'
         assert all(
@@ -298,11 +335,19 @@ class FullCudaGraphWrapper:
         num_microbatches = kwargs['num_microbatches']
 
         training = not kwargs['forward_only']
-        data_iterator = kwargs['data_iterator']
-        data_list = self.data_read(data_iterator, model, training, num_microbatches)
-        kwargs['data_iterator'] = data_list
-
         training_str = 'training' if training else 'validation'
+        prepare_batch = getattr(
+            kwargs.get('forward_step_func'), 'prepare_batch_for_cuda_graph', None
+        )
+        chunk = model[0] if isinstance(model, list) else model
+        if prepare_batch is not None and get_model_config(chunk).sequence_packing_scheduler:
+            kwargs['data_iterator'] = self._read_prepared_batches(
+                kwargs, training_str, prepare_batch
+            )
+        else:
+            kwargs['data_iterator'] = self.data_read(
+                kwargs['data_iterator'], model, training, num_microbatches
+            )
         curr_iteration = self.curr_iter(training_str)
         if curr_iteration == self.cuda_graph_warmup_steps:
             logger.info(f'Capture CUDA graph for {training_str}!!!')
@@ -380,6 +425,8 @@ class FullCudaGraphWrapper:
                 FullCudaGraphWrapper.cuda_graph['training'] = None
             FullCudaGraphWrapper.result['training'] = None
             FullCudaGraphWrapper.curr_iteration['training'] = 0
+            if FullCudaGraphWrapper._prepared_batch_layout.pop('training', None) is not None:
+                self.static_loader.static_buffers['training'].clear()
             get_rerun_state_machine().clear_deferred_validations("training")
         if stage is None or stage == 'validation':
             if FullCudaGraphWrapper.cuda_graph['validation'] is not None:
@@ -387,6 +434,8 @@ class FullCudaGraphWrapper:
                 FullCudaGraphWrapper.cuda_graph['validation'] = None
             FullCudaGraphWrapper.result['validation'] = None
             FullCudaGraphWrapper.curr_iteration['validation'] = 0
+            if FullCudaGraphWrapper._prepared_batch_layout.pop('validation', None) is not None:
+                self.static_loader.static_buffers['validation'].clear()
             get_rerun_state_machine().clear_deferred_validations("validation")
         if captured:
             symmetric_wgrad_pool.reset_completed_reuse_events()
