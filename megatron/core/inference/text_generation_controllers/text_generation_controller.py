@@ -278,6 +278,16 @@ class _AsyncScheduleLogProbsTransfer:
     gpu_result: _AsyncScheduleLogProbsGPUResult
 
 
+def _ban_token_ids(logits: Tensor, banned_token_ids: Optional[Tensor]) -> None:
+    """In place: make the `banned_token_ids` impossible to sample from `logits` `[..., vocab]`.
+
+    Done on the logits themselves, before any sampling or log-prob step reads them, so the
+    sampler, the returned log probs and speculative verification all see the same distribution.
+    """
+    if banned_token_ids is not None:
+        logits[..., banned_token_ids] = float("-inf")
+
+
 # pylint: disable=line-too-long
 class TextGenerationController(MTPControllerMixin):
     """The text generation controller (the main sampling loop)
@@ -298,6 +308,9 @@ class TextGenerationController(MTPControllerMixin):
     # Inference consumes logits in fp32, so they are held and broadcast in fp32.
     # The LM head emits them in fp32 when it can; otherwise they are upcast out of the model.
     _logits_dtype: torch.dtype = torch.float32
+
+    # Ids that are never sampled (see `_banned_token_ids`), or None for no ban.
+    _banned_token_ids_cuda: Optional[Tensor] = None
 
     def __init__(self, inference_wrapped_model: AbstractModelInferenceWrapper, tokenizer):
         self.inference_wrapped_model = inference_wrapped_model
@@ -391,6 +404,50 @@ class TextGenerationController(MTPControllerMixin):
         """
         self._get_stop_word_finished_ids_callback = callback
 
+    def _media_token_ids(self) -> List[int]:
+        """Token ids of the model's image/video placeholders, which it must never sample.
+
+        A media placeholder is never valid model output, and one the model samples comes back in
+        the next turn's prompt, where it is read as a real image/video placeholder. The ids are the
+        tokenizer ids the prompt contract maps images and videos to, and the model's own
+        pre-expanded media token. Both need the wrapper to have a prompt contract.
+        """
+        wrapper = self.inference_wrapped_model
+        if wrapper.multimodal_prompt_config is None:
+            return []
+        token_ids = set()
+        for modality in ("image", "video"):
+            for resolve in (
+                lambda name: wrapper.resolve_media_token_id(self.tokenizer, name),
+                wrapper.get_preexpanded_media_token_id,
+            ):
+                try:
+                    token_id = int(resolve(modality))
+                except (NotImplementedError, ValueError, AttributeError, RuntimeError):
+                    # This model or tokenizer has no such token for this modality.
+                    continue
+                if 0 <= token_id < self.vocab_size:
+                    token_ids.add(token_id)
+        return sorted(token_ids)
+
+    def _banned_token_ids(self) -> List[int]:
+        """Every id the model must never sample: its media placeholders and the configured ids."""
+        configured = list(
+            self.inference_wrapped_model.inference_context.config.banned_token_ids or []
+        )
+        out_of_range = [token_id for token_id in configured if not 0 <= token_id < self.vocab_size]
+        if out_of_range:
+            raise ValueError(
+                f"banned_token_ids {out_of_range} are outside the model's vocabulary "
+                f"[0, {self.vocab_size})."
+            )
+        # TODO(@cspades): Banning generated media tokens is fundamentally a WAR. Ideally, we
+        # should just mask out generated media placeholder tokens, but the infrastructure
+        # required to implement that is complex when considering prefix-stitching, offloading,
+        # or tokenizing in segments to have clear boundaries for prompt and generation for
+        # multi-turn chats. vLLM currently does not handle generated media tokens at all.
+        return sorted({*self._media_token_ids(), *configured})
+
     def _init_dynamic_sampling_tensors(self):
         """Initialize tensors needed for dynamic sampling."""
         context = self.inference_wrapped_model.inference_context
@@ -406,6 +463,13 @@ class TextGenerationController(MTPControllerMixin):
 
         device = torch.cuda.current_device()
         logits_dtype = self._logits_dtype
+
+        banned_token_ids = self._banned_token_ids()
+        self._banned_token_ids_cuda = (
+            torch.tensor(banned_token_ids, dtype=torch.int64, device=device)
+            if banned_token_ids
+            else None
+        )
 
         self._sampling_backend = context.config.sampling_backend
         self._enable_cuda_graph = self.model_config.cuda_graph_impl == "local"
@@ -966,6 +1030,9 @@ class TextGenerationController(MTPControllerMixin):
             has_images = (
                 image_token_mask is not None
                 and image_embeddings is not None
+                # Whether scheduled tokens have any embeddings to inject.
+                # This mask is sliced to this step's tokens and indexes
+                # the full image_embeddings with non-negative ints.
                 and (image_token_mask >= 0).any()
             )
         else:
@@ -1017,6 +1084,15 @@ class TextGenerationController(MTPControllerMixin):
             assert logits.data_ptr() == self._all_logits_cuda.data_ptr()
         else:
             self._all_logits_cuda = logits
+
+        if self._banned_token_ids_cuda is not None:
+            # Without a CUDA graph these logits are an inference tensor, which can only be
+            # modified in place under inference mode.
+            with torch.inference_mode():
+                # Annihilate banned token ID logits.
+                _ban_token_ids(
+                    self._all_logits_cuda[:, :logits_seq_len, :], self._banned_token_ids_cuda
+                )
 
         # The forward is queued on the GPU. Collect now, while it runs, instead of letting
         # automatic collection start right before the next launch.

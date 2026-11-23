@@ -658,6 +658,12 @@ class InferenceConfig:
     multimodal_prompt_config: Optional[MultimodalPromptConfig] = None
     """Optional per-engine overrides for the inference wrapper's media prompt contract."""
 
+    banned_token_ids: Optional[List[int]] = None
+    """
+    Token ids the model must never sample, e.g. the media token of a text-only wrapper. The model's
+    own image/video placeholder tokens are always banned, whether or not they are listed here.
+    """
+
     use_flashinfer_fused_rope: Optional[bool] = False
     """
     If True, use flashinfer's fused rope implementation.
