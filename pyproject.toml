@@ -368,6 +368,11 @@ markers = [
 ]
 
 [tool.coverage.run]
+# Python 3.12's sys.monitoring tracer: it stops reporting code outside the measured source after
+# the first event, so imports and library code run near full speed (the default C tracer slowed
+# test-process startup by about 30% and inference test buckets by about 15%). Testmon builds its
+# own Coverage without this file, so its per-test contexts keep the default tracer.
+core = "sysmon"
 concurrency = ["thread", "multiprocessing"]
 omit = [
     "/tmp/*",
