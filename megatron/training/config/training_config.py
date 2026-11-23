@@ -830,7 +830,7 @@ class CheckpointConfig:
     """Fully qualified class name for a custom CheckpointManager implementation.
     When set, checkpoint operations will instantiate and delegate to this class instead of the default
     checkpoint manager. The custom class must implement the `CheckpointManager` protocol
-    defined in `megatron.training.checkpointing`.
+    defined in `megatron.training.checkpoint_manager`.
     Example: ``'mypackage.checkpoint.MyCheckpointManager'``
     """
 
