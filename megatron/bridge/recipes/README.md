@@ -50,6 +50,20 @@ the runner does not supply synthetic image inputs or a default VLM step.
 config, initializing distributed services, building datasets, or training.
 It is not a substitute for runtime validation against the actual GPU topology.
 
+`megatron.bridge.training.vlm_step.forward_step` adapts Bridge's shared VLM step.
+The model owns the vision encoder (HF or Megatron), visual embedding insertion,
+multimodal positions, and context-parallel slicing. The step passes visual model
+kwargs and collator-provided packed metadata through, and uses the model's
+returned local loss mask when present. It shares the masked loss with `llm_step`;
+there is no Qwen-specific step or encoder-backend switch.
+
+The VLM step retains Bridge's loader contract: matching, full-sequence batches
+on every model-parallel rank, with `visual_inputs` as normalized tensor kwargs
+or an object exposing `normalized_for_model()`. Padding/packing belongs in the
+collator. **The current recipe API's GPT dataset provider does not yet supply
+that VLM data pipeline.** This step alone does not enable end-to-end VLM recipes;
+their dataset/loader integration through `cfg.data` remains separate.
+
 Dataset selection stays in `cfg.data`. The runner neither synchronizes sequence
 lengths nor finalizes the config: both remain under the existing framework
 ownership rules. It calls `megatron.training.api.pretrain`, which delegates to

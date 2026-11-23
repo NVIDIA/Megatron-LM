@@ -17,19 +17,14 @@
 
 from __future__ import annotations
 
-import inspect
 import math
 
 import torch
-from packaging.version import Version as PkgVersion
 
-import megatron.core
 from megatron.core import mpu, parallel_state
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_batch_on_this_cp_rank
-
-_MIN_MCORE_THD_CP_VERSION = PkgVersion("0.18.0")
 
 
 def get_thd_cp_partition_indices(
@@ -50,30 +45,14 @@ def get_thd_cp_partition_indices(
     Returns:
         Long tensor containing this CP rank's indices into the full stream.
 
-    Raises:
-        RuntimeError: If the installed Megatron-Core version does not expose
-            THD partitioning through ``get_batch_on_this_cp_rank``.
     """
-    mcore_version = PkgVersion(megatron.core.__version__)
-    supports_thd_partitioning = (
-        "is_hybrid_cp" in inspect.signature(get_batch_on_this_cp_rank).parameters
-    )
-    if mcore_version < _MIN_MCORE_THD_CP_VERSION or not supports_thd_partitioning:
-        raise RuntimeError(
-            "THD context-parallel partitioning requires Megatron-Core >= 0.18.0 with "
-            "get_batch_on_this_cp_rank(..., is_hybrid_cp=...); "
-            f"found {megatron.core.__version__}. Please upgrade Megatron-Core."
-        )
-
     cu_seqlens = cu_seqlens.to(device=device)
     index_batch = {
         "tokens": torch.arange(total_tokens, device=device, dtype=torch.long).unsqueeze(0),
         "cu_seqlens": cu_seqlens.unsqueeze(0) if cu_seqlens.dim() == 1 else cu_seqlens,
         "cu_seqlens_padded": None,
     }
-    partitioned_batch = get_batch_on_this_cp_rank(
-        index_batch, is_hybrid_cp=False, cp_group=cp_group
-    )
+    partitioned_batch = get_batch_on_this_cp_rank(index_batch, dynamic_cp=False, cp_group=cp_group)
     return partitioned_batch["tokens"].squeeze(0).to(device=device, dtype=torch.long)
 
 
