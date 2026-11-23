@@ -206,6 +206,29 @@ def test_load_args_preserves_runtime_hybridep_routing_map_mode(
     assert restored_args.moe_hybridep_routing_map_mode == expected_mode
 
 
+def test_load_args_ignores_retired_upcycling_options():
+    """Old checkpoint metadata restores the MoE architecture without requesting conversion."""
+    args = SimpleNamespace(
+        load="checkpoint",
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    checkpoint_args = SimpleNamespace(
+        num_experts=8, moe_ffn_hidden_size=64, moe_use_upcycling=True, moe_upcycling_granularity=2
+    )
+    state_dict = {"args": checkpoint_args, "iteration": 7}
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state_dict, "checkpoint", False, CheckpointType.LEGACY),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.num_experts == 8
+    assert restored_args.moe_ffn_hidden_size == 64
+    assert not hasattr(restored_args, "moe_use_upcycling")
+    assert not hasattr(restored_args, "moe_upcycling_granularity")
+
+
 def test_maybe_save_dataloader_state_uses_explicit_process_groups(tmp_path):
     """Dataloader checkpoints use the supplied module groups and canonical model-parallel path.
 

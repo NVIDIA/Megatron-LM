@@ -889,62 +889,96 @@ def test_native_gtp_sequence_sharding_validates_cross_config_inputs(
         run_config.validate()
 
 
-def test_callback_upcycling_uses_temporary_dense_config(monkeypatch, run_config):
+@pytest.mark.parametrize(
+    "num_experts,checkpoint_field,legacy_upcycling",
+    [
+        (None, None, False),
+        (2, None, False),
+        (2, "load", True),
+        (None, "pretrained_checkpoint", False),
+    ],
+)
+def test_setup_preserves_model_and_checkpoint_progress(
+    monkeypatch, run_config, num_experts, checkpoint_field, legacy_upcycling
+):
+    """Dense/MoE startup uses the requested model and ordinary checkpoint progress."""
     from megatron.training import training
+    from megatron.training.state import TrainState
 
-    parser = ArgumentParser()
-    arguments.add_megatron_arguments(parser)
-    args = parser.parse_args([])
-    args.skip_train = True
-    run_config.validation.skip_train = True
-    args.moe_use_upcycling = True
-    args.moe_upcycling_granularity = 2
-    args.num_experts = 2
-    args.expert_model_parallel_size = 1
-    args.ffn_hidden_size = 64
+    args = SimpleNamespace(
+        logits_save_dir=None, logits_load_dir=None, dump_param_to_param_group_map=None
+    )
+    if legacy_upcycling:
+        # Old serialized namespaces must not trigger a second model build or conversion.
+        args.moe_use_upcycling = True
+        args.moe_upcycling_granularity = 2
     run_config.model = GPTModelConfig(
         transformer=TransformerConfig(
-            num_layers=2,
-            hidden_size=32,
-            num_attention_heads=4,
-            ffn_hidden_size=64,
-            num_moe_experts=2,
+            num_layers=2, hidden_size=32, num_attention_heads=4, num_moe_experts=num_experts
         ),
         seq_length=16,
         vocab_size=128,
     )
+    if checkpoint_field is not None:
+        setattr(run_config.checkpoint, checkpoint_field, "checkpoint")
+    state = TrainState()
+    model = [SimpleNamespace()]
+    optimizer, scheduler = Mock(), Mock()
+    build = Mock(return_value=model)
     monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "get_train_state", lambda: state)
     monkeypatch.setattr(training, "get_timers", Mock())
     monkeypatch.setattr(training, "get_one_logger", lambda: None)
     monkeypatch.setattr(training, "has_nvidia_modelopt", False)
-    monkeypatch.setattr(training, "unwrap_model", lambda model: model)
-    monkeypatch.setattr(training, "checkpoint_exists", lambda path: False)
-    # This setup stub builds no process groups for the new startup memory reports.
-    monkeypatch.setattr(training, "_get_model_pg_collection", lambda model_chunk: None)
-    monkeypatch.setattr(training, "report_memory", lambda *args, **kwargs: None)
-    monkeypatch.setattr(torch.distributed, "barrier", Mock())
-    built_configs = []
-
-    class ReachedDenseModel(Exception):
-        pass
-
-    def build(*unused, config, **kwargs):
-        built_configs.append(config)
-        if len(built_configs) == 2:
-            raise ReachedDenseModel
-        return [SimpleNamespace()]
-
     monkeypatch.setattr(training, "get_model", build)
-    with pytest.raises(ReachedDenseModel):
-        training.setup_model_and_optimizer(
-            Mock(), model_provider_func=Mock(), cfg_container=run_config
+    monkeypatch.setattr(training, "unwrap_model", lambda value: value)
+    monkeypatch.setattr(training, "get_megatron_optimizer", Mock(return_value=optimizer))
+    monkeypatch.setattr(training, "get_optimizer_param_scheduler", lambda value: scheduler)
+    monkeypatch.setattr(training, "_get_model_pg_collection", lambda value: None)
+    monkeypatch.setattr(training, "report_memory", Mock())
+    monkeypatch.setattr(training, "get_num_microbatches", lambda: 1)
+    monkeypatch.setattr(training, "get_current_global_batch_size", lambda: 1)
+    update = Mock()
+    save = Mock()
+    monkeypatch.setattr(training, "update_num_microbatches", update)
+    monkeypatch.setattr(training, "save_checkpoint", save)
+
+    def restore(loaded_model, loaded_optimizer, loaded_scheduler, **kwargs):
+        assert (loaded_model, loaded_optimizer, loaded_scheduler) == (model, optimizer, scheduler)
+        assert kwargs["restore_training_state"] is True
+        assert kwargs["record_finetune"] is True
+        state.consumed_train_samples = 56
+        return 7, 123.0
+
+    load = Mock(side_effect=restore)
+    monkeypatch.setattr(training, "load_checkpoint", load)
+    result = training.setup_model_and_optimizer(
+        Mock(), model_provider_func=Mock(), cfg_container=run_config
+    )
+
+    assert result == (model, optimizer, scheduler)
+    build.assert_called_once()
+    assert build.call_args.kwargs["config"] is run_config.model.transformer
+    assert run_config.model.transformer.num_moe_experts == num_experts
+    save.assert_not_called()
+    if checkpoint_field is None:
+        load.assert_not_called()
+        update.assert_not_called()
+        assert state.iteration == state.resume_iteration == 0
+        assert (
+            state.num_floating_point_operations_so_far
+            == state.resume_num_floating_point_operations
+            == 0
         )
-    assert built_configs[0] is run_config.model.transformer
-    assert built_configs[1].num_moe_experts is None
-    assert built_configs[1].expert_model_parallel_size == 1
-    assert built_configs[1].ffn_hidden_size == 128
-    assert run_config.model.transformer.num_moe_experts == 2
-    assert run_config.model.transformer.ffn_hidden_size == 64
+    else:
+        load.assert_called_once()
+        update.assert_called_once_with(consumed_samples=56, verbose=True)
+        assert state.iteration == state.resume_iteration == 7
+        assert (
+            state.num_floating_point_operations_so_far
+            == state.resume_num_floating_point_operations
+            == 123.0
+        )
 
 
 @pytest.mark.parametrize("family", ["bert", "t5"])

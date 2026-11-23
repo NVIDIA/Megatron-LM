@@ -353,7 +353,7 @@ class TestTraining:
             verify_integrity=verify_integrity,
         )
         # The namespace carries no checkpoint settings: the section owns them.
-        args = SimpleNamespace(logits_save_dir=None, logits_load_dir=None, moe_use_upcycling=False)
+        args = SimpleNamespace(logits_save_dir=None, logits_load_dir=None)
 
         def load_checkpoint(*unused_args, **kwargs):
             # The source checkpoint is loaded under the run's own policy.

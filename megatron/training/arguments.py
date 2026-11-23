@@ -1746,16 +1746,6 @@ def validate_args(args, defaults={}):
             args.cuda_graph_impl == "none"
         ), "Pipeline-parallel microbatched inference is incompatible with CUDA graphs"
 
-    # MoE upcycling check
-    if args.moe_use_upcycling:
-        assert args.save is not None, "When using upcycling, the --save option must be specified."
-        if not args.no_load_optim:
-            args.no_load_optim = True
-            warn_rank_0('enabling --no-load-optim for upcycling.')
-        if not args.no_load_rng:
-            args.no_load_rng = True
-            warn_rank_0('enabling --no-load-rng for upcycling.')
-
     # --skip-train checks.
     if args.skip_train and not args.no_load_optim:
         args.no_load_optim = True
@@ -3355,9 +3345,6 @@ def _add_moe_args(parser):
                             'where 1 indicates an expert layer and 0 indicates a dense layer. '
                             'Examples: "([0]+[1]*23)": 1 dense layer followed by 23 expert layers, '
                             '"([1]*3+[0]*2)*2": Three expert layers followed by two dense layers, repeated twice.')
-    group.add_argument('--moe-use-upcycling', action='store_true',
-                       help='Load a checkpoint of a dense model, convert it into an MoE model, and save the converted model to the path specified by --save. '
-                       'Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.')
     # Router arguments
     group.add_argument('--moe-router-load-balancing-type', nargs='+', type=str,
                        choices=['aux_loss', 'seq_aux_loss', 'global_aux_loss', 'sinkhorn', 'quantile_balancing', 'none'],
@@ -3373,9 +3360,6 @@ def _add_moe_args(parser):
     # Token dispatcher arguments
     # MoE communication overlap arguments
 
-    group.add_argument('--moe-upcycling-granularity', type=int, default=1,
-                       help='This param sepecifics how many times smaller is the expert hidden size compared with the original dense FFN hidden size. '
-                       'For using granular upcycling strategy, please set this param as a positive integer. If this param is set to 1, it means using the default upcycling strategy.')
     return parser
 
 def _add_mla_args(parser):

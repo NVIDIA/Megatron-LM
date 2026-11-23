@@ -80,10 +80,8 @@ For the latest features and architectures, please refer to the [MCore dev roadma
 ### Developer Experience
 - ✅ MoE Model Zoo with pre-training best practices
 - ✅ Distributed Checkpointing for MoE models
-- ✅ Upcycling Support for model scaling
 - ✅ MCore2HF Converter for ecosystem compatibility
 - ✅ Layer-wise logging for detailed monitoring
-- ✅ Runtime Upcycling capabilities
 
 ## Quick Start Guide
 
@@ -421,12 +419,22 @@ replay are covered in `tests/unit_tests/determinism/kernels/test_moe_kernels.py`
 loading and initialization parity are covered by
 `test_te_grouped_linear_virtual_expert_checkpoint` in the neighboring `test_te_wrappers.py`.
 
-### Upcycling
-Use `--moe-use-upcycling` to enable upcycling, which loads the dense model from the `--load` directory, converts it to an MoE model at runtime, and starts training. The converted model is saved to the `--save` path before training begins. Upcycling is built on distributed checkpointing, supporting parallel modes different from existing dense checkpoints, such as arbitrary expert parallelism during upcycling.
+### Loading converted MoE checkpoints
 
-In addition to the default upcycling strategy, we also support granular upcycling strategy which is a more state-of-the-art upcycling strategy from [our recent research work](https://arxiv.org/abs/2410.07524). For the default upcycling strategy, we duplicate the existing MLP to multiple experts, with each expert starting from a copy of the MLP. For the granular upcycling strategy, we use `--moe-upcycling-granularity` to specify how many times smaller is the expert hidden size compared with the original dense FFN hidden size. For using granular upcycling strategy, please set `--moe-upcycling-granularity` as a positive integer. If this param is set to 1, it means using the default upcycling strategy.
+Runtime dense-to-MoE upcycling is no longer supported. The `--moe-use-upcycling`
+and `--moe-upcycling-granularity` options and the
+`megatron.core.transformer.moe.upcycling_utils` conversion API have been removed.
+Launch scripts must remove these options. This release does not provide a
+replacement dense-to-MoE converter.
 
-Note: The MoE model structure is defined through script arguments. All MoE-related arguments (such as `--num-experts`) can be customized; however, other model structure arguments must be consistent with those of the dense model. For granular upcycling strategy, the moe's FFN hidden size should be set as dense FFN hidden size divided by `--moe-upcycling-granularity`.
+Existing converted MoE checkpoints can still be loaded with `--load` and the
+matching MoE model configuration through the normal checkpoint-loading path.
+Conversion snapshots without optimizer state still require the appropriate
+weights-only or finetuning load options; loading them does not create saved
+optimizer state.
+Loading a dense checkpoint into a different MoE architecture does not convert it.
+For conversion, retain a prior version with a working upcycling path and validate
+the resulting checkpoint before moving to this version.
 
 ## Training Optimizations
 MoE training faces three fundamental performance bottlenecks: **Memory Wall**, **Communication Wall**, and **Compute Efficiency Wall**. The following optimizations address each of these challenges.
@@ -803,8 +811,6 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | Argument | Description | Default |
 |----------|-------------|---------|
 | --moe-layer-recompute | Recompute MoE layer | False |
-| --moe-use-upcycling | Enable upcycling | False |
-| --moe-upcycling-granularity | Upcycling granularity | 1 |
 
 ### Miscellaneous
 | Argument | Description | Default |

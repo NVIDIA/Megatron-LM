@@ -127,7 +127,6 @@ from megatron.core.rerun_state_machine import (
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.module import Float16Module
-from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
 from megatron.core.transformer.moe.router_trace import get_moe_router_tracer, init_moe_router_tracer
@@ -152,7 +151,6 @@ from megatron.training.callbacks import (
     normalize_callbacks,
 )
 from megatron.training.checkpointing import (
-    checkpoint_exists,
     get_loaded_iteration,
     load_checkpoint,
     save_checkpoint,
@@ -2512,7 +2510,7 @@ def setup_model_and_optimizer(
         model_provider_func is None and cfg_container is not None and isinstance(cfg.model, ModelConfig)
     )
 
-    def _build_model_wrapper(wrap_with_ddp: bool, transformer_config=None):
+    def _build_model_wrapper(wrap_with_ddp: bool):
         if use_model_builder:
             from megatron.training.utils import start_memory_history_recording
 
@@ -2568,7 +2566,7 @@ def setup_model_and_optimizer(
                 model_type,
                 wrap_with_ddp=wrap_with_ddp,
                 pg_collection=pg_collection,
-                config=transformer_config if transformer_config is not None else cfg.model.transformer,
+                config=cfg.model.transformer,
                 ddp_config=cfg.ddp,
             )
 
@@ -2675,77 +2673,7 @@ def setup_model_and_optimizer(
     setup_dp_group = _get_memory_report_dp_group(_get_model_pg_collection(model[0]))
     report_memory("(after model and optimizer build)", process_group=setup_dp_group)
 
-    if args.moe_use_upcycling:
-        torch.distributed.barrier()
-        assert not checkpoint_exists(cfg.checkpoint.save), (
-            "The upcycling destination directory already exists. "
-            "Please check if --moe-use-upcycling is mistakenly enabled. "
-            "Upcycling should only be set for the first run when converting the dense model. "
-            "All subsequent runs should remove this flag. "
-        )
-        # before changing moe related global args, save them in local variables
-        num_experts = args.num_experts
-        expert_model_parallel_size = args.expert_model_parallel_size
-        moe_ffn_hidden_size = args.ffn_hidden_size
-
-        # set dense model related args in to global args before getting dense model
-        args.num_experts = None
-        args.expert_model_parallel_size = 1
-        args.ffn_hidden_size = moe_ffn_hidden_size * args.moe_upcycling_granularity
-
-        # get dense model
-        dense_transformer_config = None
-        if not use_model_builder:
-            # Preserve callback upcycling without mutating the live MoE config.
-            # Native-builder upcycling and its legacy policy remain a separate follow-up.
-            dense_transformer_config = copy.deepcopy(cfg.model.transformer)
-            dense_transformer_config.num_moe_experts = None
-            dense_transformer_config.expert_model_parallel_size = 1
-            dense_transformer_config.ffn_hidden_size *= args.moe_upcycling_granularity
-        dense_model_for_upcycling = _build_model_wrapper(
-            wrap_with_ddp=True, transformer_config=dense_transformer_config
-        )
-
-        # recover moe upcycling related args in global args before executing upcycling
-        args.num_experts = num_experts
-        args.expert_model_parallel_size = expert_model_parallel_size
-        args.ffn_hidden_size = moe_ffn_hidden_size
-
-        # execute upcycling
-        _, train_state.num_floating_point_operations_so_far = upcycling_utils.load_and_upcycle_model(
-            load_checkpoint,
-            unwrapped_model,
-            dense_model_for_upcycling,
-            load_kwargs={
-                'model': dense_model_for_upcycling,
-                'optimizer': None,
-                'opt_param_scheduler': None,
-                'restore_training_state': True,
-            },
-        )
-        train_state.iteration = 1
-        train_state.resume_iteration = 1
-        train_state.resume_num_floating_point_operations = (
-            train_state.num_floating_point_operations_so_far
-        )
-        update_num_microbatches(consumed_samples=train_state.consumed_train_samples, verbose=True)
-        save_checkpoint(
-            train_state.iteration, model, None, None, train_state.num_floating_point_operations_so_far
-        )
-        torch.distributed.barrier()
-        del dense_model_for_upcycling
-        # CPU offload keeps separate optimizer copies of FP32 parameters as well.
-        if optimizer is not None and (
-            cfg.model.transformer.fp16
-            or cfg.model.transformer.bf16
-            or cfg.optimizer.optimizer_cpu_offload
-        ):
-            optimizer.reload_model_params()
-        print_rank_0(f'Upcycled checkpoint saved to {cfg.checkpoint.save}')
-
-    if (
-        cfg.checkpoint.load is not None or cfg.checkpoint.pretrained_checkpoint is not None
-    ) and not args.moe_use_upcycling:
+    if cfg.checkpoint.load is not None or cfg.checkpoint.pretrained_checkpoint is not None:
         one_logger and one_logger.log_metrics(
             {'load_checkpoint_start_time': one_logger_utils.get_timestamp_in_ms()}
         )
