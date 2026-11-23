@@ -710,6 +710,11 @@ def _get_megatron_optimizer_based_on_param_groups(
         optimizer = None
         init_state_fn = None
 
+    # Only the Megatron wrapper reads the collection, so require it before building any wrapper:
+    # a DistributedOptimizer would otherwise be constructed over the model's buffers first.
+    if pg_collection is None:
+        raise ValueError("pg_collection must be resolved by get_megatron_optimizer")
+
     # Grad scaler:
     #    if loss-scale is provided, instantiate the constant scaler.
     #    if we are using fp16 and loss-scale is not present, use a
@@ -763,8 +768,6 @@ def _get_megatron_optimizer_based_on_param_groups(
         optimizer = FP32Optimizer(optimizer, config, init_state_fn)
         setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
 
-    if pg_collection is None or not hasattr(pg_collection, 'tp'):
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     tp_group = pg_collection.tp
     expert_tp_group = getattr(pg_collection, 'expt_tp', tp_group)
     # TODO(M4): plumb TP groups through optimizer constructors so these setattrs disappear.
@@ -859,7 +862,7 @@ def _get_megatron_emerging_optimizer(
         raise ValueError('emerging optimizer with fp16 is not supported.')
 
     if pg_collection is None:
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        raise ValueError("pg_collection must be resolved by get_megatron_optimizer")
 
     log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
 
@@ -1006,6 +1009,13 @@ def _get_megatron_emerging_optimizer(
                 if non_layer_wise_buffers:
                     distopt_per_model_buffers[is_expert][model_chunk_idx] = non_layer_wise_buffers
 
+    # Expert parameters reduce gradient statistics over the expert analog of ``mp``: tp_ep_pp
+    # merged across EGTP_remat peers, which hold distinct shards of each expert weight.
+    # tp_ep_pp is the same group when EGTP_remat is off.
+    expert_model_parallel_group = pg_collection.tp_ep_pp_with_egtp_remat
+    if expert_model_parallel_group is None:
+        expert_model_parallel_group = pg_collection.tp_ep_pp
+
     # Build an optimizer for each (optimizer_name, is_expert) bucket and combine.
     # In layer-wise mode, emerging-optimizer (Muon) groups feed into LayerWise,
     # while non-emerging (Adam) groups are managed by a separate DistributedOptimizer
@@ -1017,7 +1027,7 @@ def _get_megatron_emerging_optimizer(
         if not groups:
             continue
 
-        model_parallel_group = pg_collection.tp_ep_pp if is_expert else pg_collection.mp
+        model_parallel_group = expert_model_parallel_group if is_expert else pg_collection.mp
 
         # Only the primary emerging optimizer (stored in ``eopt_name``, e.g., Muon) is
         # constructed via ``_create_emerging_optimizer``. Scalar optimizers that also appear
@@ -1194,6 +1204,12 @@ def get_megatron_optimizer(
         config_overrides = get_standard_config_overrides(config)
 
     check_config_overrides_consistency(config, config_overrides)
+
+    # Compatibility boundary. get_megatron_optimizer is the edge of megatron/core for optimizer
+    # construction, so the global-state fallback lives here and nowhere deeper: every helper below
+    # receives an explicit collection. See docs/developer/parallel-state-deprecation.md.
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     is_mfsdp_v2 = isinstance(model_chunks[0], FullyShardedDataParallelV2)
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;

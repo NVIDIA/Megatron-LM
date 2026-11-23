@@ -13,6 +13,7 @@ import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from torch.distributed import _coalescing_manager
 
+import megatron.core.allocator.vmm_symm_allocator as vmm_symm_allocator
 import megatron.core.nccl_allocator as nccl_allocator
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -1352,6 +1353,13 @@ class _ParamAndGradBuffer:
             tmp_warmup_tensor = torch.zeros([1], device="cuda")
             torch.distributed.all_reduce(tmp_warmup_tensor, group=self.data_parallel_group)
             torch.distributed.barrier()
+        elif self.num_optimizer_shards is not None and any(
+            getattr(p, "needs_nccl_mem", False) for p in self.params
+        ):
+            # Params opted into symmetric-pool backing of param_data; they register the pool on
+            # their own groups (register_ub_pool below), so this branch only allocates.
+            self.param_nccl_mem_pool = vmm_symm_allocator.create_symm_mem_pool()
+            mem_alloc_context = functools.partial(torch.cuda.use_mem_pool, self.param_nccl_mem_pool)
         else:
             # If nccl_ub is False, the allocation context is nullcontext.
             mem_alloc_context = nullcontext
@@ -1424,6 +1432,11 @@ class _ParamAndGradBuffer:
                     if self.num_optimizer_shards is not None:
                         with param_alloc_context():
                             allocate_param_buffer()
+                    if self.nccl_ub:
+                        with grad_alloc_context():
+                            allocate_grad_buffer()
+                # Without nccl_ub the pool (if any) backs only param_data; grads stay plain.
+                if not self.nccl_ub:
                     with grad_alloc_context():
                         allocate_grad_buffer()
 
@@ -1595,6 +1608,9 @@ class _ParamAndGradBuffer:
                                     "Failed to remap high-precision TE GroupedTensor parameter "
                                     "storage into DDP param_data."
                                 )
+                    # Hook to register the symmetric pool backing this param's data.
+                    if getattr(param, "needs_nccl_mem", False):
+                        param.register_ub_pool(self.param_nccl_mem_pool or self.nccl_mem_pool)
 
             # Grad buffer always uses full-numel offsets from param_index_map.
             param.main_grad = self._get(
@@ -1879,6 +1895,10 @@ class _ParamAndGradBuffer:
 
     def deregister_nccl_mem_pools(self) -> None:
         """Deregister every live NCCL memory pool owned by this buffer."""
+        if not self.nccl_ub:
+            # Only nccl_ub buffers register their pools on the DP group; pools handed to
+            # params via register_ub_pool are deregistered by whoever registered them.
+            return
         for pool in self.get_nccl_mem_pools():
             nccl_allocator.deregister_mem_pool(pool, self.data_parallel_group)
 

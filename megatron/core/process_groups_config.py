@@ -2,13 +2,73 @@
 
 """Dataclasses for organizing model parallelism and gradient communication process groups."""
 
+import os
+import warnings
 from dataclasses import dataclass, field, fields
 from functools import partial
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Set, Union
 
 import torch
 
 from megatron.core import parallel_state
+
+# The fallbacks first warn in Megatron Core 0.21, so the N+2 policy in
+# docs/api-backwards-compatibility-check.md removes them in 0.23.
+_FALLBACK_DEPRECATED_IN = "0.21"
+_FALLBACK_REMOVED_IN = "0.23"
+
+# The fallback is reached through subclass constructors, build_module, nn.Module calls and
+# autograd functions, so no fixed stacklevel finds the caller. Skipping Megatron Core and torch
+# frames attributes the warning to the first frame outside them, i.e. the code that omitted the
+# argument.
+_FALLBACK_WARNING_SKIP_PREFIXES = (
+    os.path.dirname(__file__) + os.sep,
+    os.path.dirname(torch.__file__) + os.sep,
+)
+
+_warned_global_process_group_fallbacks: Set[str] = set()
+
+
+def warn_process_group_deprecation(message: str) -> None:
+    """Emit a ``FutureWarning`` about a deprecated process-group usage, attributed to the caller.
+
+    Skips Megatron Core and torch frames, so the warning points at the first frame outside them,
+    i.e. the code that has to change, however deep the call chain through ``build_module``,
+    ``nn.Module`` and autograd frames is. It is not deduplicated here: Python's warning filters
+    already show it once per location. Use ``warn_global_process_group_fallback`` for a
+    once-per-owner warning.
+
+    The warning is a ``FutureWarning`` because Python hides ``DeprecationWarning`` unless it is
+    attributed to ``__main__``, and the callers to reach are libraries and training scripts built
+    on Megatron Core.
+
+    Args:
+        message: Text of the warning.
+    """
+    warnings.warn(message, FutureWarning, skip_file_prefixes=_FALLBACK_WARNING_SKIP_PREFIXES)
+
+
+def warn_global_process_group_fallback(owner: str, argument: str = "pg_collection") -> None:
+    """Warn, once per ``owner``, that a missing process-group argument uses the global grid.
+
+    Callers that omit ``argument`` keep the previous behavior during the deprecation period: the
+    caller resolves the groups from ``megatron.core.parallel_state``. That global grid belongs to
+    a single model, so the fallback is deprecated and ``argument`` becomes required once the
+    fallback is removed (see the N+2 policy in docs/api-backwards-compatibility-check.md).
+
+    Args:
+        owner: Name of the class or function whose caller omitted ``argument``.
+        argument: Name of the omitted process-group argument.
+    """
+    if owner in _warned_global_process_group_fallbacks:
+        return
+    _warned_global_process_group_fallbacks.add(owner)
+    warn_process_group_deprecation(
+        f"{owner} was called without `{argument}` and falls back to the global process groups "
+        "in megatron.core.parallel_state. This fallback is deprecated since Megatron Core "
+        f"{_FALLBACK_DEPRECATED_IN} and will be removed in {_FALLBACK_REMOVED_IN}; pass the "
+        "owning model's process groups explicitly."
+    )
 
 
 class ProcessGroupHelperMeta(type):
@@ -181,8 +241,10 @@ class ProcessGroupCollection:
     # _INTRA_EXPERT_DATA_PARALLEL_GROUP
     intra_expt_dp: torch.distributed.ProcessGroup = field(init=False)
 
-    # Checkpoint I/O uses Gloo mirrors of the dense and expert optimizer sharding groups.
-    # Their ranks must match in order. Jobs without Gloo leave the mirrors unset.
+    # Gloo mirrors of the two groups the distributed optimizer shards over (dp_cp and expt_dp,
+    # or intra_dp_cp and intra_expt_dp with more than one distributed optimizer instance), used
+    # for checkpoint I/O. Each must hold the same ranks, in the same order, as the group it
+    # mirrors. May be None when the job was built without Gloo groups (including GTP remat jobs).
     # _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
     intra_dp_cp_gloo: Optional[torch.distributed.ProcessGroup] = field(init=False)
 
@@ -554,13 +616,16 @@ class ProcessGroupCollection:
                         )
                     intra_dist_opt_group = pg_collection.intra_dist_opt
                 else:
-                    intra_dist_opt_group = None
+                    # Megatron-FSDP leaves ddp_config.use_distributed_optimizer False but still
+                    # reduces gradient statistics over this group when OptimizerConfig enables
+                    # the distributed optimizer, so pass it through like the parallel_state path.
+                    intra_dist_opt_group = pg_set.get('intra_dist_opt')
             else:
                 # No ddp_config available - use simple fallback
                 intra_dp_cp_group = dp_cp_group
                 intra_expt_dp_group = expt_dp_group
                 inter_dist_opt_group = None
-                intra_dist_opt_group = None
+                intra_dist_opt_group = pg_set.get('intra_dist_opt')
 
             # 5. Model communication groups
             if 'mp' not in pg_set:
@@ -773,6 +838,41 @@ class ProcessGroupCollection:
             result['expt_gtp_remat_group'] = getattr(pg_collection, 'expt_gtp_remat', None)
 
             return result
+
+
+def _get_gloo_mirror_group(
+    pg_set: Dict,
+    gloo_group_name: str,
+    group: torch.distributed.ProcessGroup,
+    group_description: str,
+) -> torch.distributed.ProcessGroup:
+    """Return the collection's Gloo group ``gloo_group_name`` after checking it mirrors ``group``.
+
+    The distributed optimizer shards its state over ``group`` and gathers that state over the
+    Gloo group for checkpoint I/O, so both must hold the same ranks in the same order.
+    """
+    # torch resolves a None group to WORLD, which would let a WORLD Gloo group "mirror" a
+    # sharding group that was never supplied.
+    if group is None:
+        raise ValueError(
+            f"use_gloo_process_groups=True requires {group_description}, which the distributed "
+            f"optimizer shards over and pg_collection.{gloo_group_name} mirrors, but it is None."
+        )
+    gloo_group = pg_set.get(gloo_group_name)
+    if gloo_group is None:
+        raise ValueError(
+            f"use_gloo_process_groups=True requires pg_collection.{gloo_group_name}. Build the "
+            "job with Gloo process groups or pass use_gloo_process_groups=False."
+        )
+    gloo_group_ranks = torch.distributed.get_process_group_ranks(gloo_group)
+    group_ranks = torch.distributed.get_process_group_ranks(group)
+    if gloo_group_ranks != group_ranks:
+        raise ValueError(
+            f"pg_collection.{gloo_group_name} has ranks {gloo_group_ranks}, but "
+            f"{group_description}, which the distributed optimizer shards over, has ranks "
+            f"{group_ranks}. The Gloo group must hold the same ranks in the same order."
+        )
+    return gloo_group
 
 
 def resolve_gtp_remat_group(

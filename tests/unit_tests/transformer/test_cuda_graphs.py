@@ -17,6 +17,7 @@ import megatron.core.transformer.moe.paged_stash as paged_stash_module
 import megatron.core.transformer.transformer_config as transformer_config_module
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
+from megatron.core.extensions.te_cuda_graphs import set_te_cuda_graph_current_microbatch
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
@@ -33,7 +34,6 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.pipeline_parallel.schedules import set_current_microbatch
 from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
@@ -52,7 +52,7 @@ from megatron.core.transformer.cuda_graphs import (
     _CudagraphGlobalRecord,
     _CudagraphReplayNode,
     _CudaGraphRunner,
-    _layer_is_graphable,
+    _te_cuda_graph_layer_is_graphable,
     create_cudagraphs,
     delete_cuda_graphs,
     is_graph_warmup,
@@ -758,6 +758,20 @@ class TestCudaGraphConfigAndArguments:
             _te_whole_moe_paged_stash_config(
                 cuda_graph_modules=cuda_graph_modules, cuda_graph_warmup_steps=warmup_steps
             )
+
+    def test_full_iteration_paged_stash_requires_two_warmup_steps(self):
+        kwargs = dict(
+            cuda_graph_impl="full_iteration",
+            cuda_graph_modules=[],
+            moe_expert_capacity_factor=1.0,
+            moe_pad_expert_input_to_capacity=True,
+        )
+        for warmup_steps in (0, 1):
+            with pytest.raises(AssertionError, match="at least two eager warmup steps"):
+                _te_whole_moe_paged_stash_config(cuda_graph_warmup_steps=warmup_steps, **kwargs)
+
+        config = _te_whole_moe_paged_stash_config(cuda_graph_warmup_steps=2, **kwargs)
+        assert config.cuda_graph_warmup_steps == 2
 
     @pytest.mark.parametrize(
         "cuda_graph_modules", [[CudaGraphModule.moe], []], ids=["explicit-moe", "full-layer"]
@@ -1608,6 +1622,7 @@ class TestLLaVACudaGraph:
             post_process=True,
             add_encoder=True,
             add_decoder=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def teardown_method(self, method):
@@ -1628,8 +1643,8 @@ class TestLLaVACudaGraph:
         for param in self.llava_model.parameters():
             param.main_grad = torch.zeros_like(param)
 
-        set_current_microbatch(self.llava_model.vision_model, 1)
-        set_current_microbatch(self.llava_model.language_model, 1)
+        set_te_cuda_graph_current_microbatch(self.llava_model.vision_model, 1)
+        set_te_cuda_graph_current_microbatch(self.llava_model.language_model, 1)
 
         # Create test inputs
         batch_size = 2
@@ -1793,7 +1808,7 @@ class TestParallelHybridBlockCudagraphs:
 
         When ``enable_hyper_connections=True``, ``HybridStack`` wraps every layer in
         ``HyperConnectionHybridLayer``. That wrapper must subclass
-        ``GraphableMegatronModule`` and be recognized by ``_layer_is_graphable`` so TE
+        ``TECudaGraphMixin`` and be recognized by ``_te_cuda_graph_layer_is_graphable`` so TE
         cuda-graph discovery finds the wrapped layers. Before the fix the wrapper
         subclassed plain ``MegatronModule``, so discovery rejected every layer (0
         graphable) and CUDA graph capture was silently skipped for the whole hybrid
@@ -1826,7 +1841,9 @@ class TestParallelHybridBlockCudagraphs:
 
         # Every layer is wrapped, and the wrappers are discoverable as graphable.
         assert all(isinstance(layer, HyperConnectionHybridLayer) for layer in block.layers)
-        graphable = [layer for layer in block.layers if _layer_is_graphable(layer, config)]
+        graphable = [
+            layer for layer in block.layers if _te_cuda_graph_layer_is_graphable(layer, config)
+        ]
         assert len(graphable) > 0, (
             "mHC HybridStack produced 0 graphable layers -- TE cuda-graph capture would "
             "be silently skipped for the entire model (the pre-fix bug)."
@@ -2118,7 +2135,7 @@ class TestHybridTECudaGraphDiscovery:
         mtp_stack.layers = torch.nn.ModuleList([head, tail, eager])
 
         monkeypatch.setattr(
-            cuda_graphs, '_layer_is_graphable', lambda layer, config: layer.graphable
+            cuda_graphs, '_te_cuda_graph_layer_is_graphable', lambda layer, config: layer.graphable
         )
         callables = cuda_graphs._get_mtp_te_callables(mtp_stack, object())
 
@@ -2176,7 +2193,7 @@ class TestHybridTECudaGraphDiscovery:
         assert tuple(head.state_dict()) == state_dict_keys
         assert any(param is tail.capture_weight for param in head.parameters())
 
-        head.cuda_graphs = [object()]
+        head.te_cuda_graphs = [object()]
         head.train()
         assert head._get_active_te_cuda_graph_group_tail() is tail
         head.eval()
@@ -2229,19 +2246,13 @@ class TestHybridTECudaGraphDiscovery:
     def test_hybrid_offload_graph_replay_args_include_te_stream_and_event(
         self, monkeypatch, offload_in_graph
     ):
-        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            FineGrainedActivationOffloadingInterface,
-        )
-
         wrapper = self._bare_hybrid_wrapper(offload_in_graph=offload_in_graph)
         graph_stream = object()
         graph_event = object()
-        monkeypatch.setattr(
-            FineGrainedActivationOffloadingInterface, 'cuda_graph_stream', lambda: graph_stream
+        off_interface = SimpleNamespace(
+            cuda_graph_stream=lambda: graph_stream, cuda_graph_event=lambda: graph_event
         )
-        monkeypatch.setattr(
-            FineGrainedActivationOffloadingInterface, 'cuda_graph_event', lambda: graph_event
-        )
+        object.__setattr__(wrapper, 'get_offload_interface', lambda: off_interface)
 
         cudagraph_args, cudagraph_kwargs = wrapper._get_te_cuda_graph_replay_args(
             torch.ones(2, 1, 4)
@@ -2258,7 +2269,8 @@ class TestHybridTECudaGraphDiscovery:
     def test_hybrid_capture_records_offload_boundary_exactly_once(self):
         calls = []
         wrapper = self._bare_hybrid_wrapper(offload_in_graph=True)
-        object.__setattr__(wrapper, 'off_interface', self._recording_offload_interface(calls))
+        off_interface = self._recording_offload_interface(calls)
+        object.__setattr__(wrapper, 'get_offload_interface', lambda: off_interface)
         object.__setattr__(wrapper, '_get_te_cuda_graph_group_tail', lambda: None)
         object.__setattr__(wrapper, '_inner_is_partial_moe_capture', lambda: False)
 
@@ -2275,7 +2287,7 @@ class TestHybridTECudaGraphDiscovery:
 
     def test_hybrid_capture_requires_offload_interface_for_enabled_boundary(self):
         wrapper = self._bare_hybrid_wrapper(offload_in_graph=True)
-        object.__setattr__(wrapper, 'off_interface', None)
+        object.__setattr__(wrapper, 'get_offload_interface', lambda: None)
 
         with pytest.raises(AssertionError, match='offload[ _]interface'):
             wrapper._te_cuda_graph_capture(torch.ones(2, 1, 4))
@@ -2302,8 +2314,8 @@ class TestHybridTECudaGraphDiscovery:
         head = self._bare_hybrid_wrapper(offload_in_graph=True)
         tail = self._bare_hybrid_wrapper(offload_in_graph=True)
         off_interface = self._recording_offload_interface(calls)
-        object.__setattr__(head, 'off_interface', off_interface)
-        object.__setattr__(tail, 'off_interface', off_interface)
+        object.__setattr__(head, 'get_offload_interface', lambda: off_interface)
+        object.__setattr__(tail, 'get_offload_interface', lambda: off_interface)
         object.__setattr__(head, '_get_te_cuda_graph_group_tail', lambda: tail)
 
         def head_forward(hidden_states, **_kwargs):
@@ -2379,7 +2391,7 @@ class TestHybridTECudaGraphDiscovery:
 
         class Tail:
             @staticmethod
-            def _resume_partial_moe_cuda_graph(_outputs):
+            def _resume_partial_moe_cuda_graph(_outputs, padding_mask=None):
                 calls.append('eager_tail')
                 if tail_raises:
                     raise RuntimeError('eager tail failed')
@@ -2397,7 +2409,7 @@ class TestHybridTECudaGraphDiscovery:
             calls.append('graph_replay')
             return (torch.ones(2, 1, 4),)
 
-        monkeypatch.setattr(GraphableMegatronModule, '_te_cuda_graph_replay', graph_replay)
+        monkeypatch.setattr(HyperConnectionHybridLayer, '_te_cuda_graph_replay_graph', graph_replay)
 
         if tail_raises:
             with pytest.raises(RuntimeError, match='eager tail failed'):
@@ -2416,17 +2428,35 @@ _unique_buffer_counts = {}
 
 class TestTECudaGraphHelper:
     @pytest.mark.launch_on_gb200
-    @pytest.mark.parametrize("pp_size,cp_size,chunks", [(1, 1, 1), (2, 1, 1), (2, 2, 1), (2, 2, 2)])
+    @pytest.mark.parametrize(
+        "pp_size,cp_size,chunks",
+        [
+            (1, 1, 1),
+            (2, 1, 1),
+            (2, 2, 1),
+            pytest.param(
+                2,
+                2,
+                2,
+                marks=pytest.mark.skipif(
+                    'torch.cuda.is_available() and "GB200" in torch.cuda.get_device_name().upper()',
+                    reason="GB200 CUDA OOM followed by NCCL timeout",
+                ),
+            ),
+        ],
+    )
     def test_scheduler_thd_replay_preserves_pipeline_inputs(
         self, monkeypatch, pp_size, cp_size, chunks
     ):
         """Changing packed microbatch counts must preserve outputs and every gradient."""
+        from megatron.core.extensions.te_cuda_graphs import set_te_cuda_graph_current_microbatch
         from megatron.core.pipeline_parallel.schedules import (
             get_pp_rank_microbatches,
             get_schedule_table,
-            set_current_microbatch,
         )
-        from megatron.core.transformer.cuda_graphs import convert_schedule_table_to_order
+        from megatron.core.transformer.cuda_graphs import (
+            convert_te_cuda_graph_schedule_table_to_order,
+        )
 
         Utils.initialize_model_parallel(
             pipeline_model_parallel_size=pp_size,
@@ -2553,7 +2583,7 @@ class TestTECudaGraphHelper:
                     _, _, warmup, _ = get_pp_rank_microbatches(
                         count, chunks, 2, p2p_communicator=helper.p2p_communicator
                     )
-                    order = convert_schedule_table_to_order(
+                    order = convert_te_cuda_graph_schedule_table_to_order(
                         warmup, chunks, get_schedule_table(count, chunks, 2)
                     )
                     forwards, backwards, pending = [0] * chunks, [0] * chunks, {}
@@ -2563,7 +2593,7 @@ class TestTECudaGraphHelper:
                         if entry > 0:
                             mb = forwards[chunk]
                             forwards[chunk] += 1
-                            set_current_microbatch(models[chunk], mb)
+                            set_te_cuda_graph_current_microbatch(models[chunk], mb)
                             hidden = inputs[chunk, mb].clone().requires_grad_(True)
                             output, _ = layer(
                                 hidden,
@@ -2666,8 +2696,10 @@ class TestTECudaGraphHelper:
         monkeypatch.setattr(
             paged_stash_module, "paged_stash_te_graph_capture", record_capture_context
         )
+        # create_cudagraphs() imports make_graphed_callables from TE at call time,
+        # so patch the TE module attribute rather than a cuda_graphs global.
         monkeypatch.setattr(
-            cuda_graphs_module, "make_graphed_callables", lambda *args, **kwargs: ()
+            "transformer_engine.pytorch.graph.make_graphed_callables", lambda *args, **kwargs: ()
         )
 
         helper.create_cudagraphs()
@@ -3245,7 +3277,7 @@ class TestPartialCudaGraph:
                         expected_shape[1] //= args.tensor_model_parallel_size
                     for layer in get_attr_wrapped_model(gpt_model[0], "decoder").layers:
                         if layer._moe_router_in_cuda_graph():
-                            assert layer._cuda_graph_padding_mask_shape == tuple(
+                            assert layer._te_cuda_graph_padding_mask_shape == tuple(
                                 expected_shape
                             ), layer.layer_number
 

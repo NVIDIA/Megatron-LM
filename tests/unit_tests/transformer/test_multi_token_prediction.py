@@ -4,6 +4,7 @@ import itertools
 import os
 import sys
 import types
+import weakref
 
 import pytest
 import torch
@@ -726,7 +727,13 @@ class TestMultiTokenPredictionLayer:
         mtp_block_spec = get_gpt_mtp_block_spec(
             config=config, spec=transformer_layer_spec, use_transformer_engine=False
         )
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['cp', 'tp', 'pp']
+            ),
+        )
 
         assert isinstance(mtp, MultiTokenPredictionBlock)
         assert mtp.config.mtp_detach_heads is True
@@ -743,7 +750,13 @@ class TestMultiTokenPredictionLayer:
 
         torch.manual_seed(_SEED)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp, cp=1)
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['cp', 'tp', 'pp']
+            ),
+        )
 
         assert isinstance(mtp, MultiTokenPredictionBlock)
         assert len(mtp.layers) == config.mtp_num_layers
@@ -769,7 +782,13 @@ class TestMultiTokenPredictionLayer:
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp, cp, use_te=True)
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['cp', 'tp', 'pp']
+            ),
+        )
 
         assert isinstance(mtp, MultiTokenPredictionBlock)
         assert len(mtp.layers) == config.mtp_num_layers
@@ -796,7 +815,13 @@ class TestMultiTokenPredictionLayer:
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(
             tp=1, cp=1, use_te=True, use_repeated_layer=repeated
         )
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'pp']
+            ),
+        )
 
         # Quantization is what would otherwise make TE act on the flag, so ask under it.
         config.fp8 = "hybrid"
@@ -821,7 +846,13 @@ class TestMultiTokenPredictionLayer:
             pytest.skip(f"TP={tp}, CP={cp} requires at least {tp * cp} ranks")
         torch.manual_seed(_SEED)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=tp, cp=cp, use_te=cp > 1)
-        mtp_layer = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).layers[0]
+        mtp_layer = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['cp', 'tp', 'pp']
+            ),
+        ).layers[0]
         # Only the token-field preprocessing is exercised; no attention forward runs.
         mtp_layer.config.attention_cp_layout = cp_layout
         cp_group = get_context_parallel_group()
@@ -902,7 +933,13 @@ class TestMultiTokenPredictionLayer:
         """Conditioning validity shares the token-ID roll instead of adding an exchange."""
         torch.manual_seed(_SEED)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
-        mtp_layer = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).layers[0]
+        mtp_layer = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['cp', 'tp', 'pp']
+            ),
+        ).layers[0]
         input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64)
         position_ids = torch.arange(input_ids.size(1), dtype=torch.int64).unsqueeze(0)
         hidden_states = torch.randn(input_ids.size(1), 1, config.hidden_size)
@@ -939,7 +976,13 @@ class TestMultiTokenPredictionLayer:
         """Packed CP rolling keeps token IDs and their validity exactly aligned."""
         torch.manual_seed(_SEED)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=cp, use_te=cp > 1)
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['cp', 'tp', 'pp']
+            ),
+        )
         mtp_layer = mtp.layers[0]
         cp_group = get_context_parallel_group() if cp > 1 else None
         cp_rank = torch.distributed.get_rank(group=cp_group) if cp_group is not None else 0
@@ -1005,7 +1048,13 @@ class TestMultiTokenPredictionLayer:
         """
         torch.manual_seed(_SEED)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['cp', 'tp', 'pp']
+            ),
+        )
         mtp_layer = mtp.layers[0]
 
         seq_len = 4
@@ -1108,7 +1157,13 @@ class TestMultiTokenPredictionLayer:
         torch.manual_seed(_SEED)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
         config.mtp_detach_heads = True
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['cp', 'tp', 'pp']
+            ),
+        )
         mtp_layer = mtp.layers[0]
 
         seq_len = 4
@@ -1157,7 +1212,13 @@ class TestMultiTokenPredictionLayer:
         torch.manual_seed(_SEED)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
         config.sequence_parallel = True
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['cp', 'tp', 'pp']
+            ),
+        )
         mtp_layer = mtp.layers[0]
 
         seq_len = 4
@@ -1210,7 +1271,13 @@ class TestMultiTokenPredictionLayer:
         config.mtp_detach_heads = detach_heads
         # Runs on GPU because _concat_embeddings exercises the (fused) norm and
         # projection kernels; the rest of the MTP transformer layer is stubbed out.
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).cuda()
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['cp', 'tp', 'pp']
+            ),
+        ).cuda()
 
         # Replace each MTP transformer layer with an identity so the test isolates
         # gradient flow to the detach logic (not the attention kernels). Must be an
@@ -1304,7 +1371,13 @@ class TestMultiTokenPredictionLayer:
         mtp_block_spec = get_gpt_mtp_block_spec(
             config=config, spec=layer_spec, use_transformer_engine=False
         )
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).cuda()
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['cp', 'tp', 'pp']
+            ),
+        ).cuda()
 
         vocab_size = 16
         invalid_token_ids = (9, 10)
@@ -1822,6 +1895,43 @@ class TestMultiTokenPredictionLayer:
         result.sum().backward()
         # The injected head gradients reach the MTP head inputs through the main backward.
         assert torch.count_nonzero(hidden_states.grad[seq_len:]) > 0
+
+    def test_process_mtp_loss_early_backward_releases_logits_before_next_head(self):
+        """With early backward and unfused CE, no reference to an earlier head's logits may
+        survive into the next head's vocabulary projection."""
+        config = TransformerConfig(
+            mtp_num_layers=3,
+            num_layers=2,
+            hidden_size=8,
+            num_attention_heads=2,
+            use_cpu_initialization=True,
+            mtp_loss_early_backward=True,
+        )
+        seq_len = 4
+        hidden_states = torch.randn(4 * seq_len, 1, config.hidden_size, requires_grad=True)
+        output_weight = torch.nn.Parameter(torch.randn(16, config.hidden_size))
+        logits_refs = []
+        live_previous_logits = []
+
+        def output_layer(hidden, weight=None, runtime_gather_output=None):
+            live_previous_logits.append(sum(ref() is not None for ref in logits_refs))
+            logits = torch.matmul(hidden, weight.t())
+            logits_refs.append(weakref.ref(logits))
+            return logits, None
+
+        process_mtp_loss(
+            hidden_states=hidden_states,
+            labels=torch.arange(seq_len).unsqueeze(0),
+            loss_mask=torch.ones(1, seq_len),
+            output_layer=output_layer,
+            output_weight=output_weight,
+            is_training=False,
+            compute_language_model_loss=lambda labels, logits: logits.square()
+            .sum(dim=-1)
+            .transpose(0, 1),
+            config=config,
+        )
+        assert live_previous_logits == [0, 0, 0]
 
     def test_process_mtp_loss_early_backward_is_skipped_without_grad(self):
         """Under no_grad there is no graph to back-propagate; the plain path must be taken."""
@@ -5575,6 +5685,7 @@ class TestMultiTokenPredictionHybrid:
             pre_process=False,
             post_process=True,
             hybrid_layer_config_list=None,
+            _has_custom_layers=False,
             position_embedding_type='none',
             decoder=decoder,
             share_embeddings_and_output_weights=False,

@@ -29,9 +29,9 @@ it does not read global process-group state and is outside this deprecation.
 
 The helpers in `megatron/core/inference/communication_utils.py` accept an explicit pipeline
 group, but only check physical stages; they do not replace virtual-pipeline-aware predicates.
-Gloo groups are tier-1 group accessors. The collection carries the partial data-parallel Gloo
-groups in `intra_dp_cp_gloo` and `intra_expt_dp_gloo`. Pass other Gloo groups explicitly
-when migrating a caller. The dynamic (formerly hybrid)
+Gloo groups are still tier-1 group accessors. The collection holds only the partial
+data-parallel Gloo groups, as `intra_dp_cp_gloo` and `intra_expt_dp_gloo`; pass the other Gloo
+groups explicitly when migrating a caller. The dynamic (formerly hybrid)
 data/context groups map to the `dynamic_cp` and `dynamic_tp_cp` fields, which are keyed by the
 runtime context-parallel size.
 
