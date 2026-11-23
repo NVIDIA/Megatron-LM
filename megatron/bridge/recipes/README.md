@@ -12,8 +12,8 @@ legacy features must tolerate absent arguments.
 
 The wrapper supplies MLM's config-driven dataset provider and GPT/Hybrid model
 builder to the existing training loop. Framework startup finalizes the config;
-recipes should not call `finalize()` themselves. An optional `dataset_provider`
-uses MLM's existing dataset callback interface with a loader-only `cfg.data`.
+recipes should not call `finalize()` themselves. Recipes must specify their
+dataset and dataloader through `cfg.data`; there is no dataset-provider override.
 Custom model providers still use the lower-level training entrypoint.
 
 ## Llama 3 example
@@ -42,7 +42,7 @@ sections, dataset classes, and Python callables in the recipe itself.
 
 The runner selects the GPT/Hybrid forward step from the model config.
 Use `--forward-step module:function` for an explicit MLM-compatible step.
-VLM recipes require both an explicit `--forward-step` and `--dataset-provider`;
+VLM recipes require an explicit `--forward-step` and a dataset in `cfg.data`;
 the runner does not supply synthetic image inputs or a default VLM step.
 `--dry-run` validates and displays the unfinalized config without setting global
 config, initializing distributed services, building datasets, or training.

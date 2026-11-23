@@ -74,9 +74,6 @@ def main(argv: list[str] | None = None) -> None:
         "--forward-step", help="MLM forward step as module:function; defaults to GPT/Hybrid's step"
     )
     parser.add_argument(
-        "--dataset-provider", help="Optional MLM dataset callback as module:function"
-    )
-    parser.add_argument(
         "--dry-run", action="store_true", help="Validate and display config without runtime setup"
     )
     parser.add_argument("overrides", nargs="*", metavar="KEY=VALUE")
@@ -103,9 +100,8 @@ def main(argv: list[str] | None = None) -> None:
         raise TypeError("Recipe must return an MLM PretrainConfigContainer")
     _apply_overrides(config, options.overrides)
     is_vlm = isinstance(config.model, (Nemotron35SuperVLModelConfig, Qwen35VLModelConfig))
-    if is_vlm and (options.forward_step is None or options.dataset_provider is None):
-        raise ValueError("VLM recipes require explicit --forward-step and --dataset-provider")
-    provider = _load_callable(options.dataset_provider) if options.dataset_provider else None
+    if is_vlm and options.forward_step is None:
+        raise ValueError("VLM recipes require an explicit --forward-step")
     step = options.forward_step
     if step is None:
         if isinstance(config.model, HybridModelConfig):
@@ -120,7 +116,7 @@ def main(argv: list[str] | None = None) -> None:
         if safe_get_rank() == 0:
             logger.info("Recipe config (not finalized):\n%s", pformat(config.to_dict()))
         return
-    pretrain(config, forward_step, dataset_provider=provider)
+    pretrain(config, forward_step)
     # On failure, let torchrun report the exception and terminate peer ranks.
     # Collective teardown in a finally block can hang before the traceback is printed.
     if torch.distributed.is_initialized():
