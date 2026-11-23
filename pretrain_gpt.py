@@ -53,24 +53,26 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.argument_utils import (  # noqa: F401  (core_gpt_dataset_config_from_args: legacy shape, importable from here)
-    core_gpt_dataset_config_from_args,
+from megatron.training.argument_utils import (
     gpt_config_from_args,
     gpt_data_config_from_args,
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.datasets.providers import build_gpt_datasets, is_dataset_built_on_rank
+from megatron.training.datasets.utils import get_dataset_input_length
 from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import is_first_or_last_pipeline_stage
-from model_provider import model_provider
 
 try:
     from megatron.post_training.arguments import add_modelopt_args
     from megatron.post_training.loss_func import loss_func as loss_func_modelopt
-    from megatron.post_training.model_builder import ModelOptModelConfig
-    from megatron.post_training.utils import maybe_enable_modelopt
+    from megatron.post_training.model_config import (
+        apply_modelopt_model_config,
+        distillation_config_from_args,
+    )
+    from megatron.post_training.utils import is_distillation_model, should_use_modelopt_config
 
     has_nvidia_modelopt = True
 except ImportError:
@@ -101,7 +103,6 @@ def get_batch(
 ):
     """Generate a batch."""
 
-    args = get_args()
     cfg = get_run_config()
 
     if cfg.model.transformer.sequence_packing_scheduler is not None:
@@ -127,11 +128,11 @@ def get_batch(
             config=cfg.model.transformer,
         )
 
+    # The data section's predicates and the dataset's fields; the packing path above needs
+    # neither them nor the length.
     cp_size = cfg.model.transformer.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
-    is_sft = args.sft
-    has_cu_seqlens = is_sft or args.dataloader_inter_document_masking
-    create_attention_mask_in_dataloader = args.create_attention_mask_in_dataloader
+    has_cu_seqlens = cfg.data.has_cu_seqlens()
     # Use the caller's pipeline group when it is given, so a model on its own grid places MTP by
     # the same group the model uses (GPTModel/HybridModel read pg_collection.pp).
     pp_group = pg_collection.pp if pg_collection is not None else None
@@ -154,6 +155,8 @@ def get_batch(
     ):
         return [None for _ in BATCH_KEYS]
 
+    # The dataset's row width (the derived pack width for SFT).
+    seq_length = get_dataset_input_length(cfg.data.dataset)
     batch = {}
     if tp_rank == 0:
         batch = next(data_iterator)
@@ -164,6 +167,9 @@ def get_batch(
                 else None
             )
 
+    # Read after the early return above: an intermediate stage without cu_seqlens never looks at
+    # the dataset (a loader-only section has none).
+    create_attention_mask_in_dataloader = cfg.data.creates_attention_mask()
     batch = get_batch_on_this_tp_rank(
         batch,
         broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
@@ -173,8 +179,8 @@ def get_batch(
         create_attention_mask_in_dataloader=create_attention_mask_in_dataloader,
         cp_size=cp_size,
         tp_rank=tp_rank,
-        micro_batch_size=args.micro_batch_size,
-        seq_length=args.seq_length,
+        micro_batch_size=cfg.train.micro_batch_size,
+        seq_length=seq_length,
         mtp_on_this_rank=mtp_on_this_rank,
         pipeline_model_parallel_size=cfg.model.transformer.pipeline_model_parallel_size,
         is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
@@ -202,7 +208,7 @@ def get_batch(
         batch,
         dynamic_cp=False,
         cp_group=get_context_parallel_group(),
-        use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
+        use_per_sequence_balancing=cfg.data.use_per_sequence_balancing(),
     )
 
     # Return values in BATCH_KEYS order so callers can unpack into the fixed
@@ -212,10 +218,6 @@ def get_batch(
     # get_batch_on_this_tp_rank. BATCH_KEYS is already alphabetical, matching
     # the historical sorted(batch.keys()) order.
     return [batch[key] for key in BATCH_KEYS]
-
-
-# define spiky loss as a loss that's 10x the max loss observed
-SPIKY_LOSS_FACTOR = 10
 
 
 @lru_cache(maxsize=1)
@@ -273,7 +275,7 @@ def loss_func(
             ignore_hash=args.logits_load_ignore_hash,
         )
         loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
-    elif has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
+    elif has_nvidia_modelopt and is_distillation_model(model):  # [ModelOpt]
         loss, num_tokens, report = loss_func_modelopt(loss_mask, output_tensor, model=model)
     else:
         losses = output_tensor.view(-1).float()
@@ -307,7 +309,7 @@ def loss_func(
             result=loss,
             rejection_func=partial(
                 rerun_state_machine.is_unexpectedly_large,
-                threshold=SPIKY_LOSS_FACTOR,
+                threshold=cfg.rerun_state_machine.spiky_loss_factor,
                 context="loss",
             ),
             message="Spiky loss",
@@ -326,7 +328,6 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         model (GPTModel): The GPT Model
         return_schedule_plan (bool): Whether to return the schedule plan instead of the output tensor
     """
-    args = get_args()
     cfg = get_run_config()
     timers = get_timers()
 
@@ -394,7 +395,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                     max_seqlen_kv=int(max_seqlen.item()),
                     local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
                     cp_group=dynamic_cp_group,
-                    tokens_per_sample=args.seq_length,
+                    tokens_per_sample=get_dataset_input_length(cfg.data.dataset),
                 )
 
         # Offline logits KD: record this microbatch's global (un-CP-sharded)
@@ -488,17 +489,13 @@ if __name__ == "__main__":
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
-    if has_nvidia_modelopt:
-        maybe_enable_modelopt(args)
-    if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
-        model_cfg = gpt_config_from_args(
-            args, model_config_cls=ModelOptModelConfig, vocab_size_from_tokenizer=True
-        )
-    else:
-        model_cfg = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
+    model_cfg = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(
         args, model_cfg, data_cfg=gpt_data_config_from_args(args)
     )
+    if has_nvidia_modelopt and should_use_modelopt_config(args):
+        apply_modelopt_model_config(full_config.model, args)
+        full_config.distillation = distillation_config_from_args(args, full_config.model)
     set_run_config(full_config)
     pretrain(
         full_config,

@@ -531,6 +531,7 @@ if HAVE_TRANSFORMERS:
             supported = {
                 "add_special_tokens",
                 "split_special_tokens",
+                "sanitize_control_tokens",
                 "return_attention_mask",
                 "return_tensors",
                 "padding",
@@ -549,6 +550,7 @@ if HAVE_TRANSFORMERS:
                     )
                 )
                 or kwargs.keys() - supported
+                or kwargs.get("sanitize_control_tokens")
                 or kwargs.get("padding")
                 or kwargs.get("truncation")
                 or kwargs.get("max_length") is not None

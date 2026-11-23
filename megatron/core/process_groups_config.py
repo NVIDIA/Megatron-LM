@@ -122,6 +122,8 @@ class ProcessGroupCollection:
         intra_dp_cp: Intra partial data parallel group
         intra_expt_dp: Intra partial expert data parallel group
         inter_dist_opt: Inter distributed optimizer instance group
+        inter_expt_dist_opt: Inter distributed optimizer instance group for expert parameters;
+            same as inter_dist_opt unless the expert instance count differs
 
     Example:
         # Create instance and set needed process groups
@@ -249,8 +251,11 @@ class ProcessGroupCollection:
     # _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO
     intra_expt_dp_gloo: Optional[torch.distributed.ProcessGroup] = field(init=False)
 
-    # _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
+    # _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
     inter_dist_opt: torch.distributed.ProcessGroup = field(init=False)
+
+    # _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
+    inter_expt_dist_opt: torch.distributed.ProcessGroup = field(init=False)
 
     # _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
     intra_dist_opt: torch.distributed.ProcessGroup = field(init=False)
@@ -402,6 +407,11 @@ class ProcessGroupCollection:
             'inter_dist_opt': partial(
                 parallel_state.get_inter_distributed_optimizer_instance_group,
                 check_initialized=False,
+            ),
+            'inter_expt_dist_opt': partial(
+                parallel_state.get_inter_distributed_optimizer_instance_group,
+                check_initialized=False,
+                expert=True,
             ),
             'intra_dist_opt': partial(
                 parallel_state.get_intra_distributed_optimizer_instance_group,
@@ -584,10 +594,11 @@ class ProcessGroupCollection:
                 if ddp_config.num_distributed_optimizer_instances == 1:
                     # With a single optimizer instance:
                     # - intra_dp_cp is same as dp_cp
-                    # - intra_expt_dp is same as expt_dp
+                    # - intra_expt_dp is same as expt_dp, unless experts have more instances
+                    #   (MFSDP v2), so prefer the collection's
                     # - inter_dist_opt is not needed (set to None)
                     intra_dp_cp_group = dp_cp_group
-                    intra_expt_dp_group = expt_dp_group
+                    intra_expt_dp_group = pg_set.get('intra_expt_dp') or expt_dp_group
                     inter_dist_opt_group = None
                 else:
                     # With multiple optimizer instances, both groups must be provided
