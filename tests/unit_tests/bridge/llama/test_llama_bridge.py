@@ -283,6 +283,13 @@ class TestLlamaBridgeModelConfig:
         with pytest.raises(ValueError, match=expected):
             LlamaBridge().hf_config_to_model_config(config)
 
+    def test_rejects_rope_types_megatron_core_cannot_apply(self):
+        """Dynamic NTK scaling must not convert silently to unscaled RoPE."""
+        config = _small_llama_config(rope_scaling={"rope_type": "dynamic", "factor": 2.0})
+
+        with pytest.raises(ValueError, match=re.escape("Unsupported RoPE type 'dynamic'.")):
+            LlamaBridge().hf_config_to_model_config(config)
+
 
 class TestLlamaBridgeMegatronToHFConfig:
     """Test cases for Megatron -> HF config conversion."""

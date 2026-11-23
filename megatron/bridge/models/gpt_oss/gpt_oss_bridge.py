@@ -123,10 +123,11 @@ class GPTOSSBridge(MegatronModelBridge):
         the MXFP4 path is already aligned. Without this, BF16 imports silently store down_proj
         in the wrong orientation and inference is broken.
 
-        gate_up_proj is handled directly in GPTOSSMLPGateUpProjMapping.hf_to_megatron via
-        _align_expert_weight_to_shape, which auto-detects the orientation difference between
-        BF16 checkpoints ([num_experts, hidden, 2*intermediate]) and MXFP4-dequantized checkpoints
-        ([num_experts, 2*intermediate, hidden]).
+        ``gate_up_proj`` gets the same treatment: BF16 checkpoints store it as
+        ``[E, hidden, 2*intermediate]`` and MXFP4-dequantized weights come out as
+        ``[E, 2*intermediate, hidden]``, Megatron's layout. The BF16 transpose happens here
+        because the mapping can only tell the layouts apart by shape, which fails when
+        ``hidden == 2*intermediate``.
         """
         if isinstance(hf_param, str):
             if hf_param in hf_state_dict:
@@ -145,6 +146,13 @@ class GPTOSSBridge(MegatronModelBridge):
                     elif intermediate == hidden:
                         # Square: HF GptOssForCausalLM init produces (E, intermediate, hidden), so a plain BF16
                         # checkpoint is in that layout. Transpose to (E, hidden, intermediate) for Megatron.
+                        hf_weights = hf_weights.transpose(-1, -2).contiguous()
+                elif hf_param.endswith(".mlp.experts.gate_up_proj") and hf_weights.ndim == 3:
+                    cfg = self.hf_pretrained.config
+                    if tuple(hf_weights.shape[-2:]) == (cfg.hidden_size, 2 * cfg.intermediate_size):
+                        # BF16 layout (E, hidden, 2*intermediate); transpose to Megatron's
+                        # (E, 2*intermediate, hidden). When the two are equal the shape cannot tell
+                        # the layouts apart, and BF16 checkpoints use HF's.
                         hf_weights = hf_weights.transpose(-1, -2).contiguous()
                 return hf_weights
             blocks_key = hf_param + "_blocks"

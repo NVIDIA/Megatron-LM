@@ -343,12 +343,34 @@ class TestGPTOSSLoadedWeights:
 
         assert loaded is down_proj
 
-    def test_other_weights_are_returned_unchanged(self):
-        bridge = _bridge_with_hf_dims(hidden_size=8, intermediate_size=4)
-        gate_up_proj = torch.randn(3, 8, 8)
+    @pytest.mark.parametrize(
+        ("hidden_size", "intermediate_size"), [(8, 3), (8, 4)], ids=["rectangular", "square"]
+    )
+    def test_bf16_gate_up_proj_is_transposed_to_megatron_layout(
+        self, hidden_size, intermediate_size
+    ):
+        """With hidden == 2 * intermediate the shape cannot tell the layouts apart."""
+        bridge = _bridge_with_hf_dims(hidden_size=hidden_size, intermediate_size=intermediate_size)
+        gate_up_proj = torch.randn(3, hidden_size, 2 * intermediate_size)
+        name = "model.layers.0.mlp.experts.gate_up_proj"
+
+        loaded = bridge.maybe_modify_loaded_hf_weight(name, {name: gate_up_proj})
+
+        assert torch.equal(loaded, gate_up_proj.transpose(-1, -2))
+
+    def test_gate_up_proj_already_in_megatron_layout_is_kept(self):
+        bridge = _bridge_with_hf_dims(hidden_size=8, intermediate_size=3)
+        gate_up_proj = torch.randn(3, 6, 8)
         name = "model.layers.0.mlp.experts.gate_up_proj"
 
         assert bridge.maybe_modify_loaded_hf_weight(name, {name: gate_up_proj}) is gate_up_proj
+
+    def test_other_weights_are_returned_unchanged(self):
+        bridge = _bridge_with_hf_dims(hidden_size=8, intermediate_size=4)
+        router = torch.randn(4, 8)
+        name = "model.layers.0.mlp.router.weight"
+
+        assert bridge.maybe_modify_loaded_hf_weight(name, {name: router}) is router
 
     @pytest.mark.parametrize("name", ["down_proj", "gate_up_proj"])
     def test_mxfp4_experts_are_dequantized_without_transpose(self, name):
@@ -451,21 +473,34 @@ class TestGPTOSSExpertMappings:
         )
         assert torch.equal(bias_mapping.megatron_to_hf(bias, None)[bias_name], bias)
 
+    @pytest.mark.parametrize("hidden_size", [3, 8], ids=["rectangular", "square"])
     @pytest.mark.parametrize("bias", [False, True])
     @pytest.mark.parametrize("etp_size", [1, 2])
     @pytest.mark.parametrize("gtp_size", [1, 2])
     def test_gate_up_mapping_preserves_expert_rows_across_etp_and_gtp(
-        self, monkeypatch, bias, etp_size, gtp_size
+        self, monkeypatch, bias, etp_size, gtp_size, hidden_size
     ):
-        """Distinct gate/up rows detect a transpose or a split of the fused TP matrix."""
-        gate = torch.arange(4 if bias else 12).reshape((4,) if bias else (4, 3)).float() + 10
+        """Distinct gate/up rows detect a transpose or a split of the fused TP matrix.
+
+        The weights load through the bridge's import hook, as from a checkpoint. With hidden size 8
+        the BF16 weight (hidden, 2 * intermediate) is square, so its shape cannot reveal the layout.
+        """
+        gate = (
+            torch.arange(4 if bias else 4 * hidden_size)
+            .reshape((4,) if bias else (4, hidden_size))
+            .float()
+            + 10
+        )
         up = gate + 100
-        interleaved = torch.empty((8,) if bias else (8, 3))
+        interleaved = torch.empty((8,) if bias else (8, hidden_size))
         interleaved[::2], interleaved[1::2] = gate, up
         hf_expert = interleaved if bias else interleaved.t()
-        # Import expert 1, so extracting the wrong expert is also observable.
-        hf_weights = torch.stack((hf_expert + 1000, hf_expert))
         hf_name = "model.layers.0.mlp.experts.gate_up_proj" + ("_bias" if bias else "")
+        # Import expert 1, so extracting the wrong expert is also observable.
+        bridge = _bridge_with_hf_dims(hidden_size=hidden_size, intermediate_size=4)
+        hf_weights = bridge.maybe_modify_loaded_hf_weight(
+            hf_name, {hf_name: torch.stack((hf_expert + 1000, hf_expert))}
+        )
         param_name = "bias0" if bias else "weight0"
         megatron_name = "decoder.layers.0.mlp.experts.linear_fc1." + (
             "bias1" if bias else "weight1"
@@ -578,7 +613,9 @@ class TestGPTOSSWeightRoundTrip:
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize(
-        "intermediate_size", [64, 96], ids=["square_down_proj", "rectangular_down_proj"]
+        "intermediate_size",
+        [64, 96, 32],
+        ids=["square_down_proj", "rectangular_down_proj", "square_gate_up"],
     )
     def test_bf16_checkpoint_round_trips_exactly(self, tmp_path_dist_ckpt, intermediate_size):
         config = _gpt_oss_config(intermediate_size=intermediate_size)

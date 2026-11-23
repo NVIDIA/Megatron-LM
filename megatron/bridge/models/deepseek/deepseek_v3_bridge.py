@@ -22,7 +22,6 @@ from typing import Any
 import torch
 from transformers import PretrainedConfig
 
-from megatron.bridge.models.conversion import quantization_utils
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge, WeightConversionTask
 from megatron.bridge.models.deepseek.attention import get_deepseek_decoder_block_spec
@@ -52,9 +51,10 @@ class DeepSeekV3Bridge(MegatronModelBridge):
     """
 
     MODEL_CONFIG_CLASS = BridgeGPTMLAModelConfig
-    # FP8 checkpoints pair each weight with a ``*_scale_inv`` tensor. Import consumes it to
-    # dequantize the weight, and export writes plain weights, so strict saving must not wait
-    # for these keys: otherwise every shard holding one is left unwritten.
+    # FP8 checkpoints pair each weight with a ``*_scale_inv`` tensor. The base loader consumes it
+    # to dequantize the weight with the checkpoint's ``weight_block_size``, and export writes plain
+    # weights, so strict saving must not wait for these keys: otherwise every shard holding one is
+    # left unwritten.
     DEQUANTIZED_SOURCE_KEY_SUFFIXES = ("_scale_inv",)
 
     @staticmethod
@@ -147,6 +147,21 @@ class DeepSeekV3Bridge(MegatronModelBridge):
         """Convert a Megatron DeepSeek-V3 model config to a Hugging Face config dict."""
         hf_cfg = super(DeepSeekV3Bridge, cls).megatron_to_hf_config(model_config)
 
+        # MLA attention applies YaRN from the rotary fields of its transformer config, which the
+        # base export leaves out (it writes the yarn_* fields of other models). Write them, or state
+        # "no scaling", so a config export does not keep a reference model's scaling. Import gives
+        # a checkpoint without scaling a factor of 1.0, which YaRN applies as plain RoPE.
+        if model_config.rope_type == "yarn" and model_config.rotary_scaling_factor != 1.0:
+            hf_cfg["rope_scaling"] = {
+                "rope_type": "yarn",
+                **{
+                    hf_key: getattr(model_config, megatron_key)
+                    for hf_key, megatron_key in cls.MLA_ROPE_SCALING_MAPPING
+                },
+            }
+        else:
+            hf_cfg["rope_scaling"] = {"rope_type": "default"}
+
         # Megatron uses None="not set/disabled", but HF expects integers
         hf_cfg["num_nextn_predict_layers"] = hf_cfg.get("num_nextn_predict_layers") or 0
         hf_cfg["n_group"] = hf_cfg.get("n_group") or 1
@@ -174,39 +189,6 @@ class DeepSeekV3Bridge(MegatronModelBridge):
     def mapping_registry(self) -> MegatronMappingRegistry:
         mapping_list = get_common_mapping_list(hf_config=self.hf_config)
         return MegatronMappingRegistry(*mapping_list)
-
-    def maybe_modify_loaded_hf_weight(
-        self, hf_param: str | dict[str, str], hf_state_dict: Mapping[str, torch.Tensor]
-    ) -> torch.Tensor | dict[str, torch.Tensor]:
-        """Load HF weights and dequantize FP8 tensors on the fly.
-
-        DeepSeek-V3 ships linear weights as ``float8_e4m3fn`` with per-block scale
-        factors stored in ``<key>_scale_inv`` (128x128 blocks). The true bf16 weight is::
-
-            w_bf16 = fp8_weight.float() * scale_inv_block
-
-        Without this override the FP8 values would be cast to BF16 with the per-block
-        scales discarded, and the resulting model would produce random-looking logits.
-        """
-        hf_weights = super().maybe_modify_loaded_hf_weight(hf_param, hf_state_dict)
-
-        if isinstance(hf_weights, dict):
-            # Compound params (QKV / GatedMLP): dequantize each component individually.
-            return {
-                key: self._maybe_dequantize_fp8(tensor, hf_param[key], hf_state_dict)
-                for key, tensor in hf_weights.items()
-            }
-        return self._maybe_dequantize_fp8(hf_weights, hf_param, hf_state_dict)
-
-    @staticmethod
-    def _maybe_dequantize_fp8(
-        weight: torch.Tensor, param_name: str, hf_state_dict: Mapping[str, torch.Tensor]
-    ) -> torch.Tensor:
-        """Dequantize ``weight`` if it is stored as FP8 with a matching ``*_scale_inv``."""
-        scale_key = param_name + "_scale_inv"
-        return quantization_utils.maybe_dequantize_fp8_blockwise(
-            weight, hf_state_dict.get(scale_key)
-        )
 
     def maybe_modify_converted_hf_weight(
         self,
