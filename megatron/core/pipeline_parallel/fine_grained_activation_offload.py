@@ -365,17 +365,21 @@ class OffloadTensorPool:
             Dictionary containing status information
         """
         if self._fixed_buffer is not None:
+            if hasattr(self._fixed_buffer, "get_diagnostics"):
+                fixed_status = self._fixed_buffer.get_diagnostics()
+            else:
+                fixed_status = {
+                    "capacity_bytes": self._fixed_buffer.capacity_bytes,
+                    "live_bytes": self._fixed_buffer.live_bytes,
+                    "peak_live_bytes": self._fixed_buffer.peak_live_bytes,
+                    "graph_reserved_bytes": self._fixed_buffer.graph_reserved_bytes,
+                }
             if shape is not None or dtype is not None:
                 raise ValueError("Fixed offload storage has no per-shape pools")
             return {
                 "global_stats": self._stats.copy(),
                 "pools": {},
-                "fixed_buffer": {
-                    "capacity_bytes": self._fixed_buffer.capacity_bytes,
-                    "live_bytes": self._fixed_buffer.live_bytes,
-                    "peak_live_bytes": self._fixed_buffer.peak_live_bytes,
-                    "graph_reserved_bytes": self._fixed_buffer.graph_reserved_bytes,
-                },
+                "fixed_buffer": fixed_status,
             }
         if shape is not None:
             if dtype is None:
@@ -410,7 +414,7 @@ class OffloadTensorPool:
             return status
 
     def reset(self):
-        """Reset cached tensors; fixed storage reclaims only fully released epochs."""
+        """Reset cached tensors; fixed storage manages event-safe reuse itself."""
         if self._fixed_buffer is not None:
             # Manager resets must not discard outstanding backups or the events
             # protecting their H2D readers. The allocator advances epochs itself.

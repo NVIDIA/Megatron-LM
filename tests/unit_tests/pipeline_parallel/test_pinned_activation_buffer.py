@@ -40,10 +40,16 @@ def test_fixed_capacity_preserves_live_data_and_reuses_storage():
     arena.clear()
     assert arena.get_pool_status()["global_stats"]["current_in_use"] == 2
     arena.free(first)
-    # Individual releases do not permit overwriting outstanding backups.
+    # Reuse a released range while preserving the outstanding backup.
+    reused = arena.allocate((MIB,), torch.uint8)
+    assert reused.data_ptr() == ptr
+    # CUDA stream waits do not protect direct writes from the CPU thread.
+    torch.cuda.synchronize()
+    reused.fill_(43)
     with pytest.raises(RuntimeError, match="budget exceeded"):
         arena.allocate((1,), torch.uint8)
     assert torch.all(second == 29)
+    arena.free(reused)
     arena.free(second)
     # Reuse the same storage for a different shape and dtype after every backup retires.
     again = arena.allocate((MIB, 1), torch.float32)
@@ -165,6 +171,139 @@ def test_captured_read_reserves_an_eager_backup():
     eager_output = handler.reload(eager_state)
     assert torch.all(output == 17)
     assert torch.all(eager_output == 29)
+
+
+def test_graph_backup_released_eagerly_stays_reserved():
+    handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
+    pool = OffloadTensorPool(device="cpu", pin_memory=True, capacity_bytes=2 * MIB)
+    handler.cpu_tensor_pool = pool
+    source = torch.full((MIB,), 17, dtype=torch.uint8, device="cuda")
+    other = torch.full_like(source, 29)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        state = handler.offload(source)
+    graph.replay()
+    output = handler.reload(state)
+    eager_state = handler.offload(other)
+    graph.replay()
+    eager_output = handler.reload(eager_state)
+    assert torch.all(output == 17)
+    assert torch.all(eager_output == 29)
+    assert pool.get_pool_status()["fixed_buffer"]["graph_reserved_bytes"] == MIB
+
+
+def test_graph_prefix_reservation_survives_later_eager_release():
+    pool = OffloadTensorPool(device="cpu", pin_memory=True, capacity_bytes=3 * MIB)
+    first = pool.allocate((MIB,), torch.uint8)
+    captured = pool.allocate((MIB,), torch.uint8)
+    first.fill_(17)
+    captured.fill_(29)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        output = torch.empty(MIB, dtype=torch.uint8, device="cuda")
+        output.copy_(captured, non_blocking=True)
+        pool.free(captured)
+    # The captured read reserves the prefix, including the still-live first block.
+    pool.free(first)
+    tail = pool.allocate((MIB,), torch.uint8)
+    assert tail.data_ptr() == first.data_ptr() + 2 * MIB
+    torch.cuda.synchronize()
+    tail.fill_(43)
+    graph.replay()
+    assert torch.all(output == 29)
+    with pytest.raises(RuntimeError, match="budget exceeded"):
+        pool.allocate((1,), torch.uint8)
+    pool.free(tail)
+
+
+def test_capture_diagnostics_and_exhaustion_do_not_query_events(monkeypatch):
+    arena = PinnedActivationBuffer(MIB)
+    warmup = arena.allocate((MIB,), torch.uint8)
+    arena.release(warmup)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+
+    def forbidden_query(_event):
+        raise AssertionError("capture diagnostics must not query events")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.cuda.Event, "query", forbidden_query)
+        with torch.cuda.graph(graph, stream=stream):
+            diagnostics = arena.get_diagnostics()
+            host = arena.allocate((MIB,), torch.uint8)
+            with pytest.raises(RuntimeError, match="budget exceeded"):
+                arena.allocate((1,), torch.uint8)
+            arena.release(host)
+    assert diagnostics["pending_event_count"] > 0
+    graph.replay()
+    torch.cuda.synchronize()
+
+
+def test_capture_epoch_reuse_waits_for_multiple_readers_and_writers():
+    arena = PinnedActivationBuffer(2 * MIB)
+    sources = [torch.empty(MIB // 2, dtype=torch.uint8, device="cuda") for _ in range(8)]
+    outputs = [torch.empty_like(source) for source in sources]
+    capture = torch.cuda.Stream()
+    writers = [torch.cuda.Stream() for _ in range(2)]
+    readers = [torch.cuda.Stream() for _ in range(2)]
+    capture.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture):
+        for writer in writers:
+            writer.wait_stream(capture)
+        for epoch in range(2):
+            hosts = []
+            for index in range(4):
+                writer = writers[index % len(writers)]
+                with torch.cuda.stream(writer):
+                    host = arena.allocate((MIB // 2,), torch.uint8, stream=writer)
+                    host.copy_(sources[4 * epoch + index], non_blocking=True)
+                    hosts.append(host)
+            for index in range(4):
+                reader = readers[index % len(readers)]
+                reader.wait_stream(writers[index % len(writers)])
+                with torch.cuda.stream(reader):
+                    torch.cuda._sleep(1_000_000)
+                    outputs[4 * epoch + index].copy_(hosts[index], non_blocking=True)
+                    arena.release(hosts[index], stream=reader)
+        for reader in readers:
+            capture.wait_stream(reader)
+    for value in range(17, 22):
+        for index, source in enumerate(sources):
+            source.fill_(value + index)
+        graph.replay()
+        assert all(torch.all(output == value + index) for index, output in enumerate(outputs))
+    assert arena.graph_reserved_bytes == 2 * MIB
+
+
+def test_capture_start_ignores_historical_high_watermark():
+    arena = PinnedActivationBuffer(MIB)
+    previous = arena.allocate((MIB,), torch.uint8)
+    arena.release(previous)
+    live = arena.allocate((MIB // 4,), torch.uint8)
+    torch.cuda.synchronize()
+    live.fill_(17)
+    source = torch.full((MIB // 4,), 29, dtype=torch.uint8, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        host = arena.allocate(source.shape, source.dtype)
+        host.copy_(source, non_blocking=True)
+        output = torch.empty_like(source)
+        output.copy_(host, non_blocking=True)
+        arena.release(host)
+    assert host.data_ptr() == live.data_ptr() + MIB // 4
+    graph.replay()
+    assert torch.all(output == 29)
+    assert torch.all(live == 17)
+    assert arena.get_diagnostics()["high_watermark_bytes"] == MIB
+    arena.release(live)
 
 
 @pytest.mark.parametrize("explicit_stream", [False, True])
