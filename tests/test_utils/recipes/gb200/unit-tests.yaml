@@ -102,6 +102,7 @@ products:
         time_limit: [1800]
   # This file runs in isolated one-rank processes; other buckets exclude it.
   - test_case: [tests/unit_tests/inference/test_batch_invariant_fp8.py]
+    testmon: false
     products:
       - environment: [dev]
         tag: [latest]
