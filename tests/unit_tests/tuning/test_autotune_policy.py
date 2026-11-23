@@ -349,6 +349,21 @@ def test_packaged_entries_name_live_candidates():
                 assert table.lookup(kernel, key, tuner.configs) is not None, (arch, kernel, key)
 
 
+def test_packaged_tables_tune_csa_output_rope_reconstruction():
+    """Without an entry, a pinned run falls back to BLOCK_H=1, the slowest candidate here."""
+    autotuner = pytest.importorskip("triton.runtime.autotuner")
+    output_rope = importlib.import_module("megatron.core.ops.attention.csa.output_rope")
+    tuner = output_rope._autotuned_mla_rope_reconstruct_output_kernel
+    if not isinstance(tuner, autotuner.Autotuner):
+        pytest.skip("output RoPE reconstruction is not built with this triton install")
+    kernel = f"{selection.kernel_module(tuner)}.{selection.kernel_name(tuner)}"
+    for arch in ("sm100", "sm103"):
+        chosen = table_mod.load(arch).lookup(kernel, "an unrecorded shape", tuner.configs)
+        assert chosen is not None, arch
+        assert chosen.kwargs == {"BLOCK_H": 32}, arch
+        assert chosen is not selection.cheapest(tuner.configs), arch
+
+
 def test_verify_cadence_requires_the_interception():
     """Explicit verification cadence installs the adapter so choices are recorded."""
     set_deterministic_mode(False)

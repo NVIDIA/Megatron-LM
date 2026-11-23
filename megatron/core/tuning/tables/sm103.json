@@ -529,9 +529,18 @@
     "num_stages": 3,
     "num_warps": 4
    }
+  },
+  "megatron.core.ops.attention.csa.output_rope._mla_rope_reconstruct_output_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_H": 32
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   }
   }
  },
  "packages": {},
- "source": "mamba_ssm kernels: nemotron_3_ultra 96-GPU recording, majority vote over ranks; megatron.core MLA RoPE and mHC kernels: two sweeps timing every candidate at 2k, 8k and 32k tokens, smallest worst-case slowdown",
+ "source": "mamba_ssm kernels: nemotron_3_ultra 96-GPU recording, majority vote over ranks; megatron.core MLA RoPE and mHC kernels: two sweeps timing every candidate at 2k, 8k and 32k tokens, smallest worst-case slowdown; megatron.core CSA output-RoPE reconstruction kernel: copied from sm100, not yet measured on sm103",
  "triton": ""
 }
