@@ -274,6 +274,9 @@ class _ToyStack(MegatronModule):
         self.layers = _regions(
             codec, metadata, pp_layer_offset, end, self.cp, torch.cuda.current_device()
         )
+        for layer in self.layers:
+            # Schedules read each decoder layer's config, as HybridStack layers carry it.
+            layer.config = config
         self.input_tensor, self.state, self.graphs, self.iteration = None, None, None, 0
 
     def capture(self):
