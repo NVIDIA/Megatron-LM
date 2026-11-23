@@ -220,7 +220,7 @@ def _rng_contents():
     ],
 )
 def test_partial_cuda_graph_moe_matches_eager(
-    process_groups, hybrid, mla, strategy, scopes, separate_streams
+    process_groups, hybrid, mla, strategy, scopes, separate_streams, monkeypatch
 ):
     """Check MoE training parity, communication streams and retained weight lifetime."""
     config = replace(_moe_config(mla, hybrid), attention_dropout=0.1, hidden_dropout=0.1)
@@ -257,6 +257,12 @@ def test_partial_cuda_graph_moe_matches_eager(
                     helper = TECudaGraphHelper(
                         [model], model.config, 16, 1, [optimizer], process_groups
                     )
+                    if recapture and step == 3:
+                        with monkeypatch.context() as patch:
+                            patch.setattr(model.config, "context_parallel_size", 2)
+                            with pytest.raises(ValueError, match="TP=PP=CP=1"):
+                                helper.create_cudagraphs()
+                        assert not cuda_graphs.is_graph_capturing()
                     rng = _rng_contents()
                     helper.create_cudagraphs()
                     torch.testing.assert_close(_rng_contents(), rng, rtol=0, atol=0)
@@ -344,7 +350,7 @@ def test_partial_capture_rollback(process_groups, cleanup_fails, monkeypatch):
     original_calls = [type(layer).__call__ for layer in layers]
     original_start = helper._start_capturing
 
-    def fail(*args):
+    def fail(*args, **kwargs):
         raise RuntimeError("controlled capture failure")
 
     def fail_after_start():
@@ -359,13 +365,22 @@ def test_partial_capture_rollback(process_groups, cleanup_fails, monkeypatch):
     if not cleanup_fails:
         failures.insert(0, ("_start_capturing", fail_after_start))
     try:
-        if not cleanup_fails:
-            with monkeypatch.context() as patch:
-                patch.setattr(model.config, "context_parallel_size", 2)
-                with pytest.raises(ValueError, match="TP=PP=CP=1"):
-                    helper.create_cudagraphs()
-            assert not cuda_graphs.is_graph_capturing()
+        if cleanup_fails:
+            layer = layers[0]
+            reshard = layer.reshard
 
+            def fail_on_capture_exit():
+                # Allow the helper's subsequent buffer-release attempt to finish.
+                layer.reshard = reshard
+                raise RuntimeError("controlled reshard failure")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(te_graph, "make_graphed_callables", fail)
+                patch.setattr(layer, "reshard", fail_on_capture_exit)
+                with pytest.raises(RuntimeError, match="controlled capture failure") as error:
+                    helper.create_cudagraphs()
+            assert any("controlled reshard failure" in note for note in error.value.__notes__)
+        else:
             # TE rejects caller hooks. The capture context must leave them in place.
             layer = layers[0]
             handle = layer.register_forward_pre_hook(lambda *_: None)

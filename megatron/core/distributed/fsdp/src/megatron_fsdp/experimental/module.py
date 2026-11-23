@@ -251,6 +251,7 @@ class FsdpModule:
             if group.dtype != torch.bfloat16 or self.context.use_symmetric_memory:
                 raise ValueError("FSDP partial CUDA graphs require BF16 without symmetric memory.")
         saved_hooks = {}
+        capture_error = None
         self._fsdp_cuda_graph_capturing = True
         try:
             for group in self._parameter_groups:
@@ -263,12 +264,22 @@ class FsdpModule:
                     setattr(self, name, saved_hooks[name].copy())
                 getattr(self, name).pop(hook_id, None)
             yield
+        except BaseException as error:
+            capture_error = error
+            raise
         finally:
             for name, hooks in saved_hooks.items():
                 setattr(self, name, hooks)
             self._fsdp_cuda_graph_capturing = False
             # The graph owner releases retained storage after resetting failed graphs.
-            self.reshard()
+            try:
+                self.reshard()
+            except BaseException as error:
+                if capture_error is None:
+                    raise
+                capture_error.add_note(
+                    f"FSDP CUDA graph capture-exit reshard also failed: {error!r}"
+                )
 
     def release_cuda_graph_buffers(self) -> None:
         """Release captured compute-weight storage after the graphs have been deleted."""
