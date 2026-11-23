@@ -954,15 +954,6 @@ class TestMTPPairwise(_DynamicEngineTestBase):
                 )
             )
 
-    @torch.inference_mode()
-    def test_separate_depth_three_all_accept(self):
-        """Each distinct real MTP layer contributes a fully accepted proposal."""
-        case = _Case(name="separate-depth3-accept", depth=3, pattern="accept")
-        _, treatment = _run_mtp_pair(case)
-        assert set(treatment.witness.raw_depths) == {0, 1, 2}
-        assert set(treatment.witness.logical_depths) == {0, 1, 2}
-        assert all(value > 0 for value in treatment.accepted)
-
     @pytest.mark.parametrize("repeated", [False, True], ids=["separate", "cached-repeated"])
     @torch.inference_mode()
     def test_depth_three_request_local_acceptance_and_block_rewind(self, repeated):
@@ -1252,14 +1243,8 @@ class TestMTPPairwise(_DynamicEngineTestBase):
         assert treatment.runtime["mtp-full-attention-forwards"] > 0
 
 
+# tp2-pp2-sp-dp2 makes every pipeline assertion a pipeline-only case would.
 _PARALLEL_CASES = (
-    _Case(
-        name="pp2",
-        depth=2,
-        pattern="accept",
-        config={"pipeline_model_parallel_size": 2},
-        signals=("gpt",),
-    ),
     _Case(
         name="ep2-moe-optimized",
         depth=2,
@@ -1321,10 +1306,7 @@ class TestMTPPairwiseParallel(_DynamicEngineTestBase):
             assert parallel_state.get_expert_model_parallel_world_size() == ep
             ordinary, treatment = _run_mtp_pair(case)
             runtime = treatment.runtime
-            if case.name == "pp2":
-                assert runtime["pipeline-logits-broadcasts"] > 0
-                assert runtime["mtp-pipeline-logits-broadcasts"] > 0
-            elif case.name == "ep2-moe-optimized":
+            if case.name == "ep2-moe-optimized":
                 assert runtime["module-forward:inference-optimized"] > 0
                 assert runtime["module-forward:moe"] > 0
                 assert runtime["nccl-dispatchers-installed"] > 0

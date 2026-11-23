@@ -256,9 +256,10 @@ def test_mamba_dynamic_batch_invariance(case):
         )
 
 
-@pytest.mark.parametrize("depth", [1, 2])
 @pytest.mark.parametrize("graph_mode", ["eager", "decode", "mixed"])
-def test_mtp_dynamic_batch_invariance(depth, graph_mode):
+def test_mtp_dynamic_batch_invariance(graph_mode):
+    # Two speculative tokens run MTP depth 0 as well; nothing branches on a single depth.
+    depth = 2
     context = dict(num_speculative_tokens=depth)
     if graph_mode != "eager":
         context.update(num_cuda_graphs=-1, max_tokens=256)
