@@ -30,6 +30,7 @@ from torch.utils.data import Dataset
 # tensor_parallel.broadcast_data + the parallel-state helpers (mpu). If `mpu` is not exported
 # in your version, use: `from megatron.core import parallel_state as mpu`.
 from megatron.core import mpu, tensor_parallel
+from megatron.core.datasets.utils import Split
 
 # get_args / print_rank_0 live in megatron.training in current Megatron-LM.
 from megatron.training import get_args, print_rank_0
@@ -48,6 +49,16 @@ _INT_KEYS = ["inst_id", "patch_tod"]
 # target_mask is generated from finite return/volume targets in get_batch.
 ALL_KEYS = _FLOAT_KEYS + _INT_KEYS
 
+# Split-file stem -> Megatron Split. Megatron's loader builder reads ``dataset.index_split`` to pick
+# the eval micro-batch size and the full-validation sampler for valid/test (see
+# megatron/training/datasets/data_samplers.py), exactly as it does for GPTDataset.
+SPLIT_BY_NAME = {
+    "train": Split.train,
+    "val": Split.valid,
+    "valid": Split.valid,
+    "test": Split.test,
+}
+
 
 # --------------------------------------------------------------------------- #
 # Dataset                                                                      #
@@ -60,10 +71,19 @@ class FinancialMarketDataset(Dataset):
 
         Args:
             path: Path to ``train.pt``, ``val.pt`` or ``test.pt`` written by ``preprocessing.py``.
-            name: Split name used in log messages.
+            name: Split name (``train``, ``val``/``valid`` or ``test``). Sets ``index_split`` so
+                Megatron treats the dataset as that split, and is used in log messages.
             mmap: Memory-map the tensors on first access instead of loading them into RAM.
         """
         self.name = name
+        try:
+            # Same attribute GPTDataset exposes via MegatronDataset: Megatron's
+            # build_pretraining_data_loader uses it for eval batch sizing / full validation.
+            self.index_split: Split = SPLIT_BY_NAME[name]
+        except KeyError:
+            raise ValueError(
+                f"unknown split name {name!r}; expected one of {sorted(SPLIT_BY_NAME)}"
+            ) from None
         self.path = Path(path)
         self.mmap = mmap
         self._data: dict[str, torch.Tensor] | None = None  # mapped lazily, once per worker

@@ -938,6 +938,11 @@ def main() -> None:
             # No file for an empty split: the data loader skips a missing split (and only requires
             # train.pt when training), so a one-split dataset (e.g. --split-fracs 0,0,1) just works.
             shutil.rmtree(tmp, ignore_errors=True)
+            # A rerun into the same out_dir must not leave an earlier run's file behind: the
+            # loader would read it and silently mix datasets from different runs.
+            if out.exists():
+                out.unlink()
+                log.warning("  %-5s -> removed stale %s from a previous run", name, out)
             log.info(
                 "  %-5s -> no windows (split_fracs %s): %s not written",
                 name,

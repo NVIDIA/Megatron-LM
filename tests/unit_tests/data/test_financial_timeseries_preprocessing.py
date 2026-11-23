@@ -10,6 +10,8 @@ import numpy as np
 import pandas as pd
 import torch
 
+from megatron.core.datasets.utils import Split
+
 from examples.financial_timeseries.preprocessing import (
     PatchStore,
     PreprocConfig,
@@ -142,12 +144,19 @@ class SingleSplitTest(unittest.TestCase):
     _REPO = Path(__file__).resolve().parents[3]
     _SCRIPT = _REPO / "examples" / "financial_timeseries" / "preprocessing.py"
 
-    def _run(self, root: Path, split_fracs: str, days: int = 8, context_len: int = 2):
+    def _run(
+        self,
+        root: Path,
+        split_fracs: str,
+        days: int = 8,
+        context_len: int = 2,
+        out: Path | None = None,
+    ):
         import subprocess
         import sys
 
         parquet_dir = root / "bars"
-        parquet_dir.mkdir()
+        parquet_dir.mkdir(exist_ok=True)
         rows = []
         for d in range(days):
             date = pd.Timestamp("2026-01-05") + pd.Timedelta(days=d)
@@ -162,7 +171,7 @@ class SingleSplitTest(unittest.TestCase):
                     }
                 )
         pd.DataFrame(rows).to_parquet(parquet_dir / "bars.parquet", index=False)
-        out = root / "tensors"
+        out = out if out is not None else root / "tensors"
         cmd = [
             sys.executable,
             str(self._SCRIPT),
@@ -204,6 +213,20 @@ class SingleSplitTest(unittest.TestCase):
             self.assertEqual(meta["window_counts"]["train"], 0)
             self.assertGreater(meta["window_counts"]["test"], 0)
             self.assertIn("train split is empty", res.stderr)
+
+    def test_rerun_removes_stale_split_files(self):
+        """A split that is empty on a rerun must not leave the previous run's .pt in out_dir."""
+        with tempfile.TemporaryDirectory() as root:
+            out = Path(root) / "tensors"
+            res, _ = self._run(Path(root), "1,0,0", out=out)
+            self.assertEqual(res.returncode, 0, res.stderr[-2000:])
+            self.assertTrue((out / "train.pt").exists())
+            res, _ = self._run(Path(root), "0,0,1", out=out)
+            self.assertEqual(res.returncode, 0, res.stderr[-2000:])
+            self.assertFalse((out / "train.pt").exists(), "stale train.pt survived the rerun")
+            self.assertFalse((out / "val.pt").exists())
+            self.assertTrue((out / "test.pt").exists())
+            self.assertIn("removed stale", res.stderr)
 
     def test_train_only_dataset(self):
         with tempfile.TemporaryDirectory() as root:
@@ -433,6 +456,44 @@ class PerSymbolMatchesPerWindowTest(unittest.TestCase):
 
             tr, va, te = anchors(0), anchors(1), anchors(2)
             self.assertEqual(_leakage_check(store, cfg), (len(tr & va), len(tr & te), len(va & te)))
+
+
+class DatasetSplitTest(unittest.TestCase):
+    """``FinancialMarketDataset.index_split`` is the Megatron ``Split`` the loader builder expects."""
+
+    @staticmethod
+    def _write_split(path: Path, n: int = 3) -> None:
+        torch.save(
+            {
+                "patches": torch.zeros(n, 2, 1, 2),
+                "target_return": torch.zeros(n, 2, 1),
+                "target_volshare": torch.zeros(n, 2, 1),
+                "inst_id": torch.zeros(n, dtype=torch.int64),
+                "patch_tod": torch.zeros(n, 2, dtype=torch.int64),
+            },
+            path,
+        )
+
+    def test_index_split_follows_split_name(self):
+        from examples.financial_timeseries.ts_dataset import FinancialMarketDataset
+
+        expected = {"train": Split.train, "val": Split.valid, "valid": Split.valid, "test": Split.test}
+        with tempfile.TemporaryDirectory() as d:
+            for name, split in expected.items():
+                path = Path(d) / f"{name}.pt"
+                self._write_split(path)
+                ds = FinancialMarketDataset(path, name, mmap=False)
+                self.assertIs(ds.index_split, split)
+                self.assertEqual(len(ds), 3)
+
+    def test_unknown_split_name_is_rejected(self):
+        from examples.financial_timeseries.ts_dataset import FinancialMarketDataset
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "holdout.pt"
+            self._write_split(path)
+            with self.assertRaises(ValueError):
+                FinancialMarketDataset(path, "holdout", mmap=False)
 
 
 if __name__ == "__main__":

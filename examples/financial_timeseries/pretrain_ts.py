@@ -145,9 +145,14 @@ def loss_func(batch, output_tensor):
     loss_sum = se_ret.sum() + args.loss_lambda_volume * se_share.sum()  # SUM over supervised elems
     num = mask.sum().clamp_min(1.0).to(torch.int)  # supervised-element count
 
-    # Megatron's loss contract: (summed loss, number of supervised elements, report). The training
-    # loop divides the sum by the element count across micro-batches and data-parallel ranks, so do
-    # NOT pre-divide here. Each report entry is a [value_sum, count] pair for the same reason.
+    # Megatron's loss contract: (summed loss, number of supervised elements, report); do NOT
+    # pre-divide. With calculate_per_token_loss (set unconditionally in __main__) Megatron keeps
+    # the sum and scales the gradient by the GLOBAL element count over all micro-batches and
+    # data-parallel ranks, i.e. a mean over every supervised element in the global batch.
+    # Without it, each micro-batch would be divided by its own count and those local means
+    # averaged, which over-weights elements from micro-batches where intraday masking removed
+    # many targets. Each report entry is a [value_sum, count] pair; the logger reduces them as
+    # sum/count over the global batch, so the logged loss matches the optimised one.
     def pair(x):
         return torch.cat([x.detach().view(1), num.view(1)])
 
@@ -198,6 +203,12 @@ if __name__ == "__main__":
         extra_args_provider=add_ts_args,
         args_defaults={"tokenizer_type": "NullTokenizer", "vocab_size": 1},
     )
+    # Normalise the loss by the GLOBAL number of supervised elements (what Megatron requires for
+    # sequence packing, for the same reason): intraday masking makes that count differ between
+    # micro-batches and data-parallel ranks, and the default would average per-micro-batch
+    # means instead. Set here rather than via args_defaults, which only fills attributes that
+    # parsed as None; the store_true flag parses as False. See loss_func.
+    args.calculate_per_token_loss = True
     model_cfg = gpt_config_from_args(args)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(full_config)
