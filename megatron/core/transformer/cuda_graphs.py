@@ -986,11 +986,13 @@ class _CudagraphReplayNode(torch.autograd.Function):
 
         ctx.runner = runner
         if runner.fp8_enabled or runner.fp4_enabled:
-            if isinstance(FP8GlobalStateManager.get_fp8_recipe(), te.common.recipe.DelayedScaling):
+            if runner.fp8_enabled and isinstance(
+                runner.fp8_recipe, te.common.recipe.DelayedScaling
+            ):
                 for m in runner.base_module.modules():
                     if isinstance(m, TransformerEngineBaseModule):
                         m.fp8_meta["fp8_group"] = FP8GlobalStateManager.get_fp8_group()
-                        m.fp8_meta["recipe"] = FP8GlobalStateManager.get_fp8_recipe()
+                        m.fp8_meta["recipe"] = runner.fp8_recipe
 
                         if is_te_min_version("1.13.0"):
                             FP8GlobalStateManager.add_fp8_tensors_to_global_buffer(m.fp8_meta)
@@ -1058,9 +1060,7 @@ class _CudagraphReplayNode(torch.autograd.Function):
         runner.status = _GraphStatus.FWD_READY
 
         # Update FP8 scale factors if needed
-        if runner.fp8_enabled and isinstance(
-            FP8GlobalStateManager.get_fp8_recipe(), te.common.recipe.DelayedScaling
-        ):
+        if runner.fp8_enabled and isinstance(runner.fp8_recipe, te.common.recipe.DelayedScaling):
             FP8GlobalStateManager.reduce_and_update_fp8_tensors(forward=False)
 
         # DDP grad-ready hook is silenced at capture/replay, so fire it here (on each param's
@@ -1176,7 +1176,9 @@ class _CudaGraphRunner(torch.nn.Module):
                 _GTP_RUNNER_STREAMS.append(self.stream)
 
             if self.fp8_enabled:
-                self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
+                from megatron.core.fp8_utils import get_fp8_recipe  # to avoid circular import
+
+                self.fp8_recipe = get_fp8_recipe(self.base_module.config)
                 _set_skip_fp8_weight_update_tensor(False)
 
             if self.fp4_enabled:

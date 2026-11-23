@@ -1049,6 +1049,19 @@ _CUDA_GRAPH_VARIANT_SCENARIOS = (
         atol=0.0,
         parity="exact",
     ),
+    # Current and block scaling replay through the runner's own recipe.
+    *(
+        _variant(
+            "fp8-transformer-engine",
+            f"fp8-transformer-engine-{recipe}",
+            f"precision:fp8-{recipe}",
+            config={"fp8_recipe": recipe},
+            signals=("fixed-history-logits",),
+            atol=0.0,
+            parity="exact",
+        )
+        for recipe in ("tensorwise", "blockwise")
+    ),
 )
 
 
@@ -1137,6 +1150,11 @@ def _check_scenario_prerequisite(scenario):
         available, reason = check_fp8_support()
         if not available:
             pytest.skip(reason)
+        if (
+            scenario.config.get("fp8_recipe") == "blockwise"
+            and torch.cuda.get_device_capability()[0] != 9
+        ):
+            pytest.skip("FP8 blockwise scaling is supported only on Hopper")
     elif scenario.prerequisite == "torch-memory-saver":
         pytest.importorskip("torch_memory_saver")
     elif scenario.prerequisite == "mxfp8":
