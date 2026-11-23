@@ -44,7 +44,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 )
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import init_method_normal
+from megatron.core.utils import init_method_normal, is_te_min_version
 from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
     assert_replays_bit_exact,
@@ -1016,6 +1016,129 @@ class TestTEWrappers:
             raise
         assert len(scaled[1]) == 3  # Replay covers dQ, dK, and dV.
         assert not bytes_equal(default[0]["out"], scaled[0]["out"])
+
+
+# --- batch-invariant all-gather context parallelism -------------------------------------------
+
+
+# 8 query heads with 8, 2 and 1 K/V groups.
+@pytest.mark.parametrize("cp_size,num_query_groups", [(2, 8), (4, 8), (2, 1), (4, 2)])
+@pytest.mark.parametrize("qkv_format", ["sbhd", "thd"])
+def test_te_dot_product_attention_batch_invariant_all_gather_cp_replays(
+    cp_size, num_query_groups, qkv_format, monkeypatch
+):
+    """TE's all-gather CP attention on FA4 replays at a fixed CP size."""
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        te_supports_batch_invariant_attention,
+    )
+    from megatron.core.transformer.enums import AttnBackend
+    from megatron.core.transformer.utils import set_attention_backend
+
+    try:
+        from flash_attn.cute import flash_attn_varlen_func  # noqa: F401
+    except ImportError:
+        pytest.skip("requires FlashAttention-4")
+    if not te_supports_batch_invariant_attention():
+        pytest.skip("requires TE batch-invariant attention")
+    if not is_te_min_version("2.20.0"):
+        pytest.skip("all-gather CP with FlashAttention 4 requires Transformer-Engine >= 2.20.0")
+    if Utils.world_size < cp_size:
+        pytest.skip(f"requires {cp_size} ranks, got {Utils.world_size}")
+
+    clear_nvte_env_vars()
+    # set_attention_backend writes os.environ directly; registering the names here lets
+    # monkeypatch restore them after the test.
+    for name in (
+        "NVTE_FLASH_ATTN",
+        "NVTE_FUSED_ATTN",
+        "NVTE_UNFUSED_ATTN",
+        "NVTE_FLASH_ATTN_V2",
+        "NVTE_FLASH_ATTN_V3",
+        "NVTE_FLASH_ATTN_V4",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+    from transformer_engine.pytorch.attention.dot_product_attention import (
+        dot_product_attention as te_dpa,
+    )
+
+    monkeypatch.setattr(
+        te_dpa, "_attention_backends", dict(te_dpa._attention_backends, attention_params=None)
+    )
+    Utils.initialize_model_parallel(context_parallel_size=cp_size)
+    try:
+        seeded()
+        heads, head_dim = 8, 128
+        config = _config(
+            hidden_size=heads * head_dim,
+            num_attention_heads=heads,
+            num_query_groups=num_query_groups,
+            batch_invariant_mode=True,
+            flash_attention_version=4,
+            attention_backend=AttnBackend.flash,
+            context_parallel_size=cp_size,
+            cp_comm_type="all_gather",
+        )
+        # The FA version flags come from the config only through set_attention_backend; without
+        # it TE picks FA3 over FA4 when both are installed.
+        set_attention_backend(config)
+        module = TEDotProductAttention(
+            config,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type="self",
+            cp_comm_type="all_gather",
+        ).cuda()
+        assert module.cp_comm_type == "all_gather"
+        assert torch.distributed.get_world_size(module.cp_group) == cp_size
+
+        # Each rank holds its load-balanced share of the sequence for every head.
+        lengths = (768, 256, 512, 512)  # Each divisible by 2 * CP4.
+        tokens = sum(lengths) // cp_size
+        if qkv_format == "thd":
+            cu_seqlens = torch.tensor((0,) + lengths, device="cuda").cumsum(0).int()
+            # TE reads padded boundaries that are not the unpadded tensor itself as padding
+            # between sequences and then disables FA4, so all four share one tensor.
+            packed_seq_params = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                cu_seqlens_q_padded=cu_seqlens,
+                cu_seqlens_kv_padded=cu_seqlens,
+                max_seqlen_q=max(lengths),
+                max_seqlen_kv=max(lengths),
+            )
+            q_shape, kv_shape = (tokens, heads, head_dim), (tokens, num_query_groups, head_dim)
+        else:
+            packed_seq_params = None
+            q_shape, kv_shape = (tokens, 2, heads, head_dim), (
+                tokens,
+                2,
+                num_query_groups,
+                head_dim,
+            )
+        q, k, v = (
+            torch.randn(shape, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            for shape in (q_shape, kv_shape, kv_shape)
+        )
+
+        def fn(q, k, v):
+            return module(q, k, v, None, AttnMaskType.causal, packed_seq_params=packed_seq_params)
+
+        out, grads = assert_replays_bit_exact(
+            fn,
+            (q, k, v),
+            replays=3,
+            contention=True,
+            what=f"batch-invariant all-gather CP{cp_size}[groups={num_query_groups},{qkv_format}]",
+        )
+        assert len(grads) == 3  # Replay covers dQ, dK, and dV.
+        for tensor in list(out.values()) + list(grads.values()):
+            assert torch.isfinite(tensor).all()
+        assert te_dpa._attention_backends["use_flash_attention"]
+        assert te_dpa._attention_backends["flash_attention_backend"].major == 4
+    finally:
+        Utils.destroy_model_parallel()
 
 
 # --- fused RoPE --------------------------------------------------------------------------------
