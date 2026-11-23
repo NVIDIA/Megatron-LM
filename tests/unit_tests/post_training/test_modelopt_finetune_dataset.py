@@ -84,7 +84,9 @@ def test_streaming_finetune_loads_explicit_splits(tmp_path, monkeypatch):
     monkeypatch.setattr("finetune.get_args", lambda: args)
     monkeypatch.setattr("finetune.get_hf_tokenizer", lambda: tokenizer)
 
-    train, valid, test = finetune.train_valid_test_sft_datasets_provider([1, 1, 0], sequence_length=16)
+    train, valid, test = finetune.train_valid_test_sft_datasets_provider(
+        [1, 1, 0], sequence_length=16
+    )
 
     assert isinstance(train, streaming.MegatronEagleVllmStreamingDataset)
     assert isinstance(valid, streaming.MegatronEagleVllmStreamingDataset)
@@ -124,33 +126,89 @@ def test_eagle_streaming_args_accept_validation_with_a_corpus(streaming_args):
 
 
 @pytest.mark.parametrize(
-    ("flag", "value", "error"),
+    ("options", "error"),
     [
-        ("eagle_streaming_server_urls", None, "--eagle-streaming-server-urls"),
-        ("eagle_streaming_model", None, "--eagle-streaming-model and --eagle-streaming-train-data"),
-        (
-            "eagle_streaming_train_data",
-            None,
-            "--eagle-streaming-model and --eagle-streaming-train-data",
-        ),
-        ("export_offline_model", False, "offline EAGLE GPTModel checkpoint"),
-        ("load", None, "offline EAGLE GPTModel checkpoint"),
-        ("export_model_type", "HybridModel", "offline EAGLE GPTModel checkpoint"),
-        ("offline_distillation_data", "dump", "--offline-distillation-data"),
-        ("micro_batch_size", 2, "--micro-batch-size 1"),
-        ("bf16", False, "BF16 and CP=PP=1"),
-        ("context_parallel_size", 2, "BF16 and CP=PP=1"),
-        ("pipeline_model_parallel_size", 2, "BF16 and CP=PP=1"),
-        ("dynamic_context_parallel", True, "BF16 and CP=PP=1"),
-        ("dataloader_type", "external", "built-in sampler"),
-        ("full_validation", True, "built-in sampler"),
-        ("eval_iters", 1, "--eagle-streaming-valid-data"),
+        ({"eagle_streaming_server_urls": None}, "--eagle-streaming-server-urls"),
+        ({"eagle_streaming_train_data": None}, "--eagle-streaming-train-data"),
+        ({"export_model_type": "HybridModel"}, "offline EAGLE GPTModel checkpoint"),
+        ({"offline_distillation_data": "dump"}, "--offline-distillation-data"),
+        ({"micro_batch_size": 2}, "--micro-batch-size 1"),
+        ({"context_parallel_size": 2}, "BF16 and CP=PP=1"),
+        ({"dataloader_type": "external"}, "built-in sampler"),
+        ({"eval_iters": 1}, "--eagle-streaming-valid-data"),
     ],
 )
-def test_eagle_streaming_args_reject_unsupported_configuration(streaming_args, flag, value, error):
-    setattr(streaming_args, flag, value)
+def test_eagle_streaming_args_reject_unsupported_configuration(streaming_args, options, error):
+    vars(streaming_args).update(options)
     with pytest.raises(ValueError, match=error):
         validate_eagle_streaming_args(streaming_args)
+
+
+@pytest.mark.parametrize("source", ["streaming", "disk", "sft"])
+def test_eagle_finetune_forward_batch_alignment(monkeypatch, streaming_args, source):
+    offline = source != "sft"
+    if source != "streaming":
+        streaming_args.eagle_streaming_server_urls = None
+    streaming_args.reset_position_ids = False
+    streaming_args.reset_attention_mask = False
+    streaming_args.eod_mask_loss = False
+    monkeypatch.setattr(finetune, "get_args", lambda: streaming_args)
+    monkeypatch.setattr(finetune, "_is_offline_model", lambda: offline)
+    monkeypatch.setattr(
+        finetune,
+        "get_run_config",
+        lambda: SimpleNamespace(
+            model=SimpleNamespace(transformer=SimpleNamespace(max_seq_length_per_sample=3))
+        ),
+    )
+    monkeypatch.setattr(finetune, "get_eos_token_id", lambda: 99)
+    monkeypatch.setattr(finetune, "get_context_parallel_group", lambda: None)
+    monkeypatch.setattr(finetune.mpu, "is_pipeline_first_stage", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(
+        finetune,
+        "get_timers",
+        lambda: lambda *a, **kw: SimpleNamespace(start=lambda: None, stop=lambda: None),
+    )
+
+    sample = {
+        "input_ids": torch.tensor([[11, 23, 37, 41]]),
+        "loss_mask": torch.tensor([[0, 1, 0, 1]]),
+        "aux_hidden_states": torch.tensor([[[2, 3], [5, 7], [11, 13]]], dtype=torch.bfloat16),
+        "hidden_states": torch.tensor([[[17], [19], [29]]], dtype=torch.bfloat16),
+    }
+    broadcasts = []
+
+    def broadcast(keys, data, dtype):
+        broadcasts.append(keys)
+        result = {key: data[key] for key in keys}
+        assert all(value.dtype == dtype for value in result.values())
+        return result
+
+    monkeypatch.setattr(finetune.tensor_parallel, "broadcast_data", broadcast)
+
+    class Model:
+        eagle_offline = offline
+
+        def __call__(self, tokens, position_ids, attention_mask, *, labels, **features):
+            assert tokens.tolist() == [[11, 23, 37]]
+            assert labels.tolist() == [[23, 37, 41]]
+            assert position_ids.tolist() == [[0, 1, 2]]
+            if offline:
+                assert features.pop("aux_hidden_states").tolist() == [
+                    [[2, 3]],
+                    [[5, 7]],
+                    [[11, 13]],
+                ]
+                assert features.pop("hidden_states").tolist() == [[[17]], [[19]], [[29]]]
+            assert features == ({"base_hidden_prenorm": True} if source == "streaming" else {})
+            return labels
+
+    output, loss_callback = finetune.forward_step(iter((sample,)), Model())
+    assert output.tolist() == [[23, 37, 41]]
+    assert loss_callback.args[0].tolist() == ([[1, 1, 1]] if source == "disk" else [[1, 0, 1]])
+    assert broadcasts[0] == (["input_ids"] if source == "disk" else ["input_ids", "loss_mask"])
+    assert broadcasts[1:] == ([["aux_hidden_states", "hidden_states"]] if offline else [])
 
 
 def test_materialize_data_files_resolves_local_dataset_directory(tmp_path):

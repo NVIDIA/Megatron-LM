@@ -48,11 +48,13 @@ for more details. The final output is stored as `jsonlines` in an OpenAI chat co
 
 ### Stream teacher features to EAGLE3 (experimental)
 
-Use a [ModelOpt vLLM teacher server](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/speculative_decoding#megatron-eagle3-teacher-features)
+Use a [ModelOpt vLLM teacher server](https://github.com/WEIXILIN0307/Model-Optimizer/blob/0e6a792cfccf0bda1ebaecfec8f9b8d294858d62/examples/speculative_decoding/README.md#test-against-a-live-qwen3-server)
 and an offline EAGLE3 GPTModel checkpoint prepared with
 `convert_speculative.py --algorithm eagle3 --export-offline-model`. The checkpoint and server
-must use the same teacher weights and tokenizer. Install a ModelOpt build with
-`MegatronEagleVllmStreamingDataset` and NIXL in the trainer environment.
+must use the same teacher weights and tokenizer. Install ModelOpt at
+`0e6a792cfccf0bda1ebaecfec8f9b8d294858d62` from
+[#3473](https://github.com/NVIDIA/Model-Optimizer/pull/3473), and install NIXL
+for the CUDA version used by each process.
 
 The following one-step Qwen3-0.6B smoke test assumes the server is already running on a separate
 GPU at port 18876 under the name `qwen3-teacher`. Set `TEACHER_MODEL` to the local teacher
@@ -71,7 +73,7 @@ torchrun --standalone --nproc-per-node=1 examples/post_training/modelopt/finetun
     --seq-length 256 --max-position-embeddings 1024 --bf16 \
     --tokenizer-type HuggingFaceTokenizer --tokenizer-model "$TEACHER_MODEL" \
     --export-offline-model --export-model-type GPTModel --ckpt-format torch_dist \
-    --load "$OFFLINE_EAGLE_CKPT" --finetune --no-load-optim --no-load-rng \
+    --load "$OFFLINE_EAGLE_CKPT" --exit-on-missing-checkpoint --finetune --no-load-optim --no-load-rng \
     --save eagle-smoke --save-interval 1 --no-save-optim --no-save-rng \
     --micro-batch-size 1 --global-batch-size 1 --train-iters 1 --lr 1e-4 --lr-decay-style constant \
     --no-gradient-accumulation-fusion --no-masked-softmax-fusion --no-bias-swiglu-fusion \
@@ -92,6 +94,12 @@ JSONL through the streaming flags. Here `--mock-data` satisfies Megatron's gener
 validation. The capture slot must hold the full prompt and the server must allow one extra
 generation token. For same-host UCX, set `NIXL_BACKENDS=UCX` and `UCX_TLS=tcp,sm,self,cuda_copy`
 on both processes. Supply `--eagle-streaming-valid-data` when using nonzero `--eval-iters`.
+For TP2, select two trainer GPUs and set `--nproc-per-node=2` and
+`--tensor-model-parallel-size 2`. Keep the teacher on a separate GPU. Each TP
+group reads one sample at its source and broadcasts the IDs, mask and features.
+An exhausted or failing source makes the training job fail through the normal
+`torchrun` worker-failure path.
+
 Optional test data uses `--eagle-streaming-test-data`. To supervise only assistant tokens, use
 `--eagle-streaming-answer-only-loss` with a compatible chat template.
 

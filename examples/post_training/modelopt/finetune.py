@@ -553,11 +553,16 @@ def get_batch(data_iterator):
         data_b["loss_mask"][data_b["loss_mask"] == get_eos_token_id()] = 0
         data_b["loss_mask"] = torch.cat([data_b["loss_mask"], torch.zeros(1,1).to(torch.cuda.current_device())], dim=-1)
 
-    sample_loss_mask = data_b.get("loss_mask")
+    if offline:
+        feature_b = tensor_parallel.broadcast_data(
+            ["aux_hidden_states", "hidden_states"], data, torch.bfloat16
+        )
+
+    sequence_length = cfg.model.transformer.max_seq_length_per_sample
     batch = build_lm_batch(
         data_b["input_ids"],
-        cfg.model.transformer.max_seq_length_per_sample,
-        sample_loss_mask=sample_loss_mask,
+        sequence_length,
+        sample_loss_mask=data_b.get("loss_mask"),
         eos_token_id=get_eos_token_id(),
         reset_position_ids=args.reset_position_ids,
         reset_attention_mask=args.reset_attention_mask,
@@ -566,10 +571,6 @@ def get_batch(data_iterator):
     )
 
     if offline:
-        feature_b = tensor_parallel.broadcast_data(
-            ["aux_hidden_states", "hidden_states"], data, torch.bfloat16
-        )
-        sequence_length = cfg.model.transformer.max_seq_length_per_sample
         batch["aux_hidden_states"] = feature_b["aux_hidden_states"].transpose(0, 1)[:sequence_length]
         batch["hidden_states"] = feature_b["hidden_states"].transpose(0, 1)[:sequence_length]
 
