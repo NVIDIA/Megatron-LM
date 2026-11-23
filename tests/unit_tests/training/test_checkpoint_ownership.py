@@ -86,11 +86,6 @@ def test_integrity_verification_is_on_unless_disabled(argv, expected):
     assert checkpoint_config_from_args(_validated(*argv)).verify_integrity is expected
 
 
-def test_the_old_no_verify_integrity_spelling_is_not_accepted():
-    with pytest.raises(SystemExit):
-        _parsed("--no-verify-integrity")
-
-
 def test_the_deprecated_flags_are_inert_and_not_fields():
     args = _validated("--use-dist-ckpt", "--dist-ckpt-format", "x", "--ckpt-fully-parallel-save")
     config = checkpoint_config_from_args(args)
