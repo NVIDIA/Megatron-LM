@@ -252,9 +252,9 @@ def test_gtp_teardown_discards_pending_gradients_and_cache(recorded_teardown, mo
 
     ps.destroy_model_parallel()
 
-    # A later non-GTP model can reach this fence without constructing a GTP model
-    # (which would reset the cursors). It must not flush the previous model's gradient.
-    gtp._close_wgrad_accumulation_windows()
+    # The next model's gradient fence must not wait on or flush the old model's reductions.
+    gtp.wait_for_gtp_grad_reduction_on_current_stream()
+    param._wait_reduce_scatter.assert_not_called()
     param.flush_accumulated_wgrad.assert_not_called()
     assert param._wgrad_accum_buf is None
     assert not gtp._GTP_PENDING_WGRAD_ACCUM
