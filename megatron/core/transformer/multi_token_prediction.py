@@ -1293,7 +1293,9 @@ def process_mtp_loss(
         """Project one MTP depth to the vocabulary and compute its masked per-token loss.
 
         Returns the masked loss, acceptance counts, and detached CE/KL sums.
-        ``correct``/``total`` are None when not training. All [s, b, v] allocations for
+        ``correct``/``total`` are None when not training, and also under a train-mode
+        ``torch.no_grad()`` forward (e.g. RL log-probability passes), which must not
+        touch the logging-only acceptance metrics. All [s, b, v] allocations for
         one head lives here so ``mtp_loss_early_backward`` can run and release it as a unit.
         """
         mtp_logits, _ = output_layer(head_hidden, weight=output_weight, runtime_gather_output=False)
@@ -1339,7 +1341,7 @@ def process_mtp_loss(
         if kd_loss is not None:
             head_loss = head_loss + config.mtp_kl_loss_weight * kd_loss
         correct = total = None
-        if is_training:
+        if is_training and torch.is_grad_enabled():
             correct, total = _compute_mtp_acceptance_counts(
                 mtp_logits, head_labels, layer_loss_mask, tp_group=tp_group, preds=mtp_preds
             )
@@ -1448,7 +1450,11 @@ def process_mtp_loss(
             normalization_tokens = num_tokens
         safe_normalization_tokens = normalization_tokens.clamp(min=1)
 
-        if is_training:
+        # Train-mode no-grad forwards (e.g. RL log-probability computation) must not
+        # write logging-only MTP metrics: they would inflate the next training step's
+        # reported MTP loss. Every other train-only tracker in Megatron checks
+        # torch.is_grad_enabled(); this gate matches them.
+        if is_training and torch.is_grad_enabled():
             # Logging only: detach so nothing here keeps this head's graph alive.
             combined_sum = getattr(config, "mtp_ce_loss_weight", 1.0) * ce_sum if ce_enabled else 0
             if kd_enabled:

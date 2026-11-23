@@ -309,6 +309,60 @@ class TestMultiTokenPredictionLayer:
 
         assert captured["avg_group"] is metric_avg_group
 
+    def test_process_mtp_loss_does_not_track_under_no_grad(self, monkeypatch):
+        """A train-mode forward under no_grad (e.g. RL log probs) records no MTP metrics.
+
+        Repeated no-grad passes used to accumulate MTP loss into the tracker, inflating
+        the next training step's report. Training forwards must keep recording.
+        """
+        calls = {"metrics": 0, "acceptance": 0}
+
+        def capture_metrics(*args, **kwargs):
+            calls["metrics"] += 1
+
+        def capture_acceptance(*args, **kwargs):
+            calls["acceptance"] += 1
+            return torch.zeros(()), torch.zeros(())
+
+        monkeypatch.setattr(MTPLossLoggingHelper, "save_metrics_to_tracker", capture_metrics)
+        monkeypatch.setattr(mtp_module, "_compute_mtp_acceptance_counts", capture_acceptance)
+
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            mtp_loss_scaling_factor=1.0,
+            num_layers=2,
+            hidden_size=1,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+        )
+        seq_len = 4
+
+        def run_forward():
+            process_mtp_loss(
+                hidden_states=torch.ones(2 * seq_len, 1, 1),
+                labels=torch.zeros(1, seq_len, dtype=torch.long),
+                loss_mask=torch.ones(1, seq_len),
+                output_layer=lambda hidden, **kwargs: (hidden, None),
+                output_weight=None,
+                is_training=True,
+                compute_language_model_loss=lambda labels, logits: torch.ones_like(
+                    labels, dtype=logits.dtype
+                ),
+                config=config,
+                metric_avg_group=object(),
+            )
+
+        with torch.no_grad():
+            run_forward()
+        assert calls == {
+            "metrics": 0,
+            "acceptance": 0,
+        }, "train-mode no-grad forward must leave the MTP metrics tracker untouched"
+
+        run_forward()
+        assert calls["metrics"] == 1, "a grad-enabled training forward must record metrics"
+        assert calls["acceptance"] == 1, "a grad-enabled training forward must record acceptance"
+
     def test_hsm_mix_preserves_dtype_and_gradients(self, monkeypatch):
         """HSM selects per-element history entries without changing dtype or gradients."""
         first = torch.full((2, 1, 3), 1.0, dtype=torch.bfloat16, requires_grad=True)
