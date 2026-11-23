@@ -16,6 +16,8 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from tokenizers import Tokenizer, models
+from transformers import PreTrainedTokenizerFast
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
@@ -41,6 +43,7 @@ from megatron.core.tensor_parallel.random import (
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
+from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
@@ -1625,7 +1628,56 @@ class TestRLUtils:
         )
         assert get_num_microbatches() == expected_microbatches
 
-    def test_prepare_trajectories(self):
+    @pytest.mark.parametrize("initialize_model_parallel", [(1, 1)], indirect=True)
+    @pytest.mark.parametrize("packing", [False, True], ids=["unpacked", "packed"])
+    def test_generated_eod_sharing_pad_id(self, initialize_model_parallel, monkeypatch, packing):
+        """Only the generated EOD contributes, even when prompt EOD and right padding share its ID."""
+        _, dp, tp, pp = initialize_model_parallel
+        self.create_test_args(
+            micro_batch_size=1,
+            seq_length=8,
+            tensor_model_parallel_size=tp,
+            pipeline_model_parallel_size=pp,
+            global_batch_size=2 * dp,
+            grpo_prompts_per_step=dp,
+            grpo_group_size=2,
+            rl_use_sequence_packing=packing,
+            rl_sequence_packing_max_sequences_per_bin=2,
+        )
+        tokenizer = MockTokenizer()
+        tokenizer.pad = tokenizer.eod
+        monkeypatch.setattr("megatron.rl.sequence_packing_utils.get_tokenizer", lambda: tokenizer)
+        rollouts = [
+            [
+                make_token_rollout(
+                    [[5, tokenizer.eod, 7, tokenizer.eod]],
+                    [[-0.5]],
+                    [[False, False, False, True]],
+                    reward=reward,
+                )
+                for reward in (0.0, 1.0)
+            ]
+            for _ in range(dp)
+        ]
+        batches, _, _ = rl_utils.prepare_data_for_update(
+            [MockModel()],
+            {},
+            rollouts,
+            tokenizer,
+            packing,
+            False,
+            request_ledger=_ledger_for(*(r for group in rollouts for r in group)),
+        )
+        if packing:
+            (bin_idx,) = next(batches)
+            context = rl_utils.get_rl_runtime_state().packing_context
+            mask = rl_utils.load_packed_data_by_index(bin_idx.item(), context, False)[3]
+            assert mask.tolist() == [[0, 0, 1, 0, 0, 0, 1]]
+        else:
+            assert next(batches)[3][:, 1:].tolist() == [[0, 0, 1, 0, 0, 0, 0]]
+
+    @pytest.mark.parametrize("shared_zero", [False, True], ids=["distinct", "shared-zero"])
+    def test_prepare_trajectories(self, shared_zero, tmp_path):
         """Every row kind becomes one padded training row in a single batch: a single-turn
         rollout (one contiguous generated region), a multi-turn rollout collapsed to its final
         sequence (multi-region mask with a gap at the observation, per-turn logprobs
@@ -1634,6 +1686,15 @@ class TestRLUtils:
         seq_length = 8
         self.create_test_args(rl_skip_bos_token=False, micro_batch_size=1, seq_length=seq_length)
         tokenizer = MockTokenizer()
+        if shared_zero:
+            vocab = {"<eod>": 0, "<unk>": 1, **{str(i): i for i in range(2, 10)}}
+            backend = Tokenizer(models.WordLevel(vocab, unk_token="<unk>"))
+            PreTrainedTokenizerFast(
+                tokenizer_object=backend, eos_token="<eod>", pad_token="<eod>", unk_token="<unk>"
+            ).save_pretrained(tmp_path)
+            tokenizer = MegatronTokenizer.from_pretrained(
+                str(tmp_path), metadata_path={"library": "huggingface"}
+            )
         eod, pad = tokenizer.eod, tokenizer.pad
 
         # Single-turn rollout: one contiguous generated region.

@@ -2317,7 +2317,7 @@ def prepare_trajectories(
 
     if tokenizer.library == "huggingface":
         tokenizer : HuggingFaceTokenizer
-        if not tokenizer.pad:
+        if tokenizer.pad is None:
             for pad_token in DEFAULT_PAD_TOKENS:
                 if pad_token in tokenizer._tokenizer.tokenizer.get_vocab():
                     log_single_rank(
@@ -2431,14 +2431,10 @@ def prepare_trajectories(
     # A multi-turn row legitimately contains one eod per turn (each turn can end on eod),
     # so the "single eod" sanity check only applies to single-turn rows.
     single_turn = torch.tensor(single_turn_rows, dtype=torch.bool)
+    generated_eod = (trajs[single_turn] == tokenizer.eod) & generation_masks[single_turn]
     assert (
-        (trajs[single_turn] * generation_masks[single_turn].int() == tokenizer.eod).sum(axis=1)
-        <= 1
+        generated_eod.sum(axis=1) <= 1
     ).all(), "Only one eod per trajectory in single-turn generated tokens."
-    # TODO(rkirby):
-    # We should avoid the tokenizer pad token being the same as the eod token for proper loss masking,
-    # But now the deepseek tokenizer has the pad token set to eod, we need to handle this.
-    # assert (tokenizer.pad != tokenizer.eod), "Pad and eod should be different"
     return trajs, generation_masks, inference_logprobs
 
 
@@ -2672,7 +2668,8 @@ def prepare_data_for_update(
                     args.reset_position_ids,
                     reset_attention_mask=False,
                     eod_mask_loss=False,
-                    pad_mask_loss=True,
+                    # With a shared ID, the generation mask below distinguishes EOD from padding.
+                    pad_mask_loss=tokenizer.pad != tokenizer.eod,
                     create_attention_mask=False,
                 )
                 original_loss_mask[~generation_masks] = 0.0

@@ -690,7 +690,11 @@ class SequencePacker:
         self.seq_length_multiple = seq_length_multiple
 
     def pack_sequences(
-        self, trajs: torch.Tensor, generation_masks: Optional[torch.Tensor] = None
+        self,
+        trajs: torch.Tensor,
+        generation_masks: Optional[torch.Tensor] = None,
+        *,
+        eod_token: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, PackingInfo]:
         """Pack sequences into bins using a greedy first-fit algorithm."""
         # Convert trajectories to list for packing
@@ -698,7 +702,12 @@ class SequencePacker:
 
         sequences_tensor = torch.stack(sequences)
 
-        seq_lengths = get_actual_sequence_lengths(sequences_tensor, self.pad_token)
+        if self.pad_token == eod_token and generation_masks is not None:
+            # A sampled EOD occupies a slot even when it has the same ID as right padding.
+            occupied = (sequences_tensor != self.pad_token) | generation_masks.bool()
+            seq_lengths = get_actual_sequence_lengths(occupied, pad_token=False)
+        else:
+            seq_lengths = get_actual_sequence_lengths(sequences_tensor, self.pad_token)
 
         # Trim sequences to actual lengths
         sequences = [sequences_tensor[i, :length] for i, length in enumerate(seq_lengths)]
@@ -1038,12 +1047,9 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
         )
 
         # Pack sequences with generation masks
-        (
-            packed_trajs,
-            packed_position_ids,
-            packed_loss_mask,
-            packing_info,
-        ) = packer.pack_sequences(trajs, generation_masks)
+        packed_trajs, packed_position_ids, packed_loss_mask, packing_info = packer.pack_sequences(
+            trajs, generation_masks, eod_token=tokenizer.eod
+        )
         packing_info.packing_algo = packing_algo
 
         # Distribute packed bins across the data parallel ranks
