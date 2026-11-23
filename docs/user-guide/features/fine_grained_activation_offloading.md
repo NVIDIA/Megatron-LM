@@ -13,7 +13,7 @@ Contributed in collaboration with RedNote.
 
 Fine-grained activation offloading reduces GPU memory by asynchronously transferring activations to CPU at the granularity of individual submodules within a transformer layer. Unlike layer-level offloading, it allows precise control over which activations to offload, enabling a tradeoff between memory savings and PCIe bandwidth overhead.
 
-Supported offloading modules are `"attn_norm"`, `"qkv_linear"`, `"core_attn"`, `"attn_proj"`, `"mlp_norm"`, `"expert_fc1"`, `"moe_act"`, `"fused_group_mlp"`, and `"shortcut_post_norm"`. They can be combined with fine-grained recomputation to free almost all activations for a transformer layer on the device. `fused_group_mlp` requires `--use-transformer-engine-op-fuser` and offloads the whole fused grouped MLP, so it cannot be combined with `expert_fc1` or `moe_act`. `shortcut_post_norm` requires `--moe-shortcut-connection`.
+Supported offloading modules are `"attn_norm"`, `"qkv_linear"`, `"core_attn"`, `"attn_proj"`, `"mlp_norm"`, `"expert_fc1"`, `"moe_act"`, `"fused_group_mlp"`, `"shortcut_post_norm"`, and `"gdn_core_attn"`. They can be combined with fine-grained recomputation to free almost all activations for a transformer layer on the device. `fused_group_mlp` requires `--use-transformer-engine-op-fuser` and offloads the whole fused grouped MLP, so it cannot be combined with `expert_fc1` or `moe_act`. `shortcut_post_norm` requires `--moe-shortcut-connection`. `gdn_core_attn` requires BF16 GDN with the FLA recurrence.
 
 ## User Guide
 
@@ -24,13 +24,13 @@ Supported offloading modules are `"attn_norm"`, `"qkv_linear"`, `"core_attn"`, `
 --fine-grained-activation-offloading
 
 # Modules whose inputs are offloaded (refer to your training script for list or delimiter syntax).
-# Choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp", "shortcut_post_norm".
+# Choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp", "shortcut_post_norm", "gdn_core_attn".
 --offload-modules core_attn attn_proj expert_fc1
 ```
 
 ### Offloadable Modules
 
-Each module offloads its **input** activation to CPU during forward and reloads it before backward:
+Each scope offloads saved activations to CPU during forward and reloads them before backward:
 
 | Module | Description | Notes |
 |---|---|---|
@@ -43,10 +43,23 @@ Each module offloads its **input** activation to CPU during forward and reloads 
 | `moe_act` | Activation function in MoE experts | MoE models only |
 | `fused_group_mlp` | Whole fused grouped MLP | Requires `--use-transformer-engine-op-fuser`; cannot be combined with `expert_fc1` or `moe_act` |
 | `shortcut_post_norm` | Shortcut post-combine normalization | Requires `--moe-shortcut-connection` |
+| `gdn_core_attn` | Tensors saved inside the FLA GDN recurrence | BF16 GDN only; no full recomputation or CUDA graphs |
 
 When selective `residual_stream` replay is active, its shared checkpoint manager owns the
 connected ShortcutMoE post-norm. In that case `shortcut_post_norm` offloading is skipped for the
 replay-owned forward so that replay and offloading do not release the same activation.
+
+### GDN Recurrence Offloading
+
+`gdn_core_attn` selects tensors saved by the BF16 FLA GDN recurrence, independently
+of standard attention's `core_attn` scope. It commits before output normalization
+and anchors backward prefetch on a differentiable recurrence input. Shared inputs
+are not force-released; evaluation and no-grad execution bypass the scope.
+
+Selective `gdn_norm_out` recomputation and native pre-GDR fusion are supported.
+GDN2, FP8/NVFP4, other recurrence backends, full recomputation and CUDA graphs are
+rejected. See [GDN recurrence activation offloading](../../developer/gdn_activation_offloading.md)
+for configuration and the scope of validation.
 
 ### Tuning Parameters
 
@@ -176,6 +189,9 @@ Offloading and recomputation are complementary:
 
 
 ### Compatibility
+
+The table describes the existing transformer scopes. The initial `gdn_core_attn`
+scope has the restrictions and validation coverage described above.
 
 | Feature | Supported |
 |---|---|
