@@ -21,10 +21,8 @@ def validate_config(mixer) -> None:
     config = mixer.config
     if config.gdp_cutedsl_kernel or config.fp8 or config.fp4:
         raise ValueError('Canonical GDP requires BF16 and gdp_cutedsl_kernel=False in both modes')
-    if mixer.pg_collection.cp.size() != 1 or config.sequence_parallel:
-        raise NotImplementedError(
-            'Canonical GDP currently requires CP=1 and no sequence parallelism'
-        )
+    if mixer.pg_collection.cp.size() != 1:
+        raise NotImplementedError('Canonical GDP currently requires CP=1')
     if mixer.d_conv != 4:
         raise NotImplementedError('Canonical GDP currently supports convolution width four')
     if mixer.recompute_in_proj or mixer.recompute_qkv or mixer.offload_gdp_qkv:
@@ -130,6 +128,10 @@ def chunk_forward(
         raise NotImplementedError("Batch-invariant GDP requires runtime CP=1")
     # Native TE normalization requires a contiguous token matrix.
     projection, _ = mixer.in_proj(hidden_states.contiguous())
+    # Column-parallel projection gathers SP token shards before the recurrence;
+    # the output projection reduce-scatters them afterwards. Packed boundaries
+    # describe this complete sequence, not the rank-local hidden-state shard.
+    sequence_length = projection.shape[0]
     cu = None
     if packed_seq_params is not None:
         if hidden_states.shape[1] != 1 or ssm_state is not None:
@@ -137,7 +139,7 @@ def chunk_forward(
         cu = get_cu_seqlens(packed_seq_params).to(dtype=torch.int32).contiguous()
         # The trailing padded rows are a distinct sequence, including an empty
         # sentinel when the original offsets already cover the complete input.
-        cu = torch.cat([cu, cu.new_tensor([hidden_states.shape[0]])])
+        cu = torch.cat([cu, cu.new_tensor([sequence_length])])
     z, xs = _prepare(mixer, projection, conv_state=conv_state, cu=cu, runtime_cp=runtime_cp)
     if ssm_state is not None:
         core, _ = prefill(
@@ -148,9 +150,9 @@ def chunk_forward(
     elif cu is not None:
         max_length = packed_seq_params.max_seqlen_q
         if max_length is None:
-            max_length = hidden_states.shape[0]
+            max_length = sequence_length
         if packed_seq_params.cu_seqlens_q_padded is not None:
-            max_length = hidden_states.shape[0]
+            max_length = sequence_length
         core = _packed_train(xs, cu, max_length, mixer.config.gdp_batch_invariant_block_size)
     else:
         core, _ = train(*xs, block_size=mixer.config.gdp_batch_invariant_block_size)

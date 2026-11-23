@@ -39,8 +39,18 @@ def canonical_mixer(request, monkeypatch):
     Utils.initialize_model_parallel()
     model_parallel_cuda_manual_seed(123)
     enable_batch_invariant_mode(backend='te_native')
+    yield _make_canonical_mixer(*request.param)
+    disable_batch_invariant_mode()
+    Utils.destroy_model_parallel()
+
+
+def _make_canonical_mixer(
+    num_householder, block_size, *, tp_size=1, sequence_parallel=False, submodules=None
+):
     cfg = TransformerConfig(
         num_layers=1,
+        tensor_model_parallel_size=tp_size,
+        sequence_parallel=sequence_parallel,
         hidden_size=64,
         num_attention_heads=4,
         ffn_hidden_size=128,
@@ -51,8 +61,8 @@ def canonical_mixer(request, monkeypatch):
         mamba_num_groups=4,
         mamba_head_dim=16,
         mamba_state_dim=32,
-        gdp_num_householder=request.param[0],
-        gdp_batch_invariant_block_size=request.param[1],
+        gdp_num_householder=num_householder,
+        gdp_batch_invariant_block_size=block_size,
         is_hybrid_model=True,
         batch_invariant_mode=True,
         batch_invariant_backend='te_native',
@@ -68,7 +78,8 @@ def canonical_mixer(request, monkeypatch):
     mixer = (
         GatedDeltaProductMixer(
             cfg,
-            GatedDeltaProductMixerSubmodules(
+            submodules
+            or GatedDeltaProductMixerSubmodules(
                 in_proj=InferenceLayerNormColumnParallelLinear, out_proj=InferenceRowParallelLinear
             ),
             64,
@@ -78,9 +89,7 @@ def canonical_mixer(request, monkeypatch):
         .cuda()
         .bfloat16()
     )
-    yield mixer
-    disable_batch_invariant_mode()
-    Utils.destroy_model_parallel()
+    return mixer
 
 
 def test_training_static_decode(canonical_mixer):
@@ -338,3 +347,111 @@ def test_hybrid_dynamic_packed_prefill_and_graph(canonical_mixer):
             )
             exact(decoded, reference)
             exact(torch.log_softmax(decoded.float(), -1), torch.log_softmax(reference.float(), -1))
+
+
+@pytest.mark.parametrize(
+    "tp_size, num_householder, block_size, layout",
+    [(2, 1, 32, "dense"), (2, 3, 16, "packed"), (4, 3, 32, "padded")],
+)
+def test_sequence_parallel_training(monkeypatch, tp_size, num_householder, block_size, layout):
+    """SP preserves the complete recurrence and packed boundaries after its input all-gather."""
+    from megatron.core.extensions.transformer_engine import (
+        TELayerNormColumnParallelLinear,
+        TERowParallelLinear,
+    )
+    from megatron.core.packed_seq_params import PackedSeqParams
+
+    if Utils.world_size < tp_size:
+        pytest.skip(f"requires at least {tp_size} GPUs")
+    monkeypatch.setattr(tuning_policy, "_deterministic_override", True)
+    Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+    model_parallel_cuda_manual_seed(123)
+    enable_batch_invariant_mode(backend='te_native')
+    try:
+        submodules = GatedDeltaProductMixerSubmodules(
+            in_proj=TELayerNormColumnParallelLinear, out_proj=TERowParallelLinear
+        )
+        baseline = _make_canonical_mixer(
+            num_householder, block_size, tp_size=tp_size, submodules=submodules
+        )
+        sharded = _make_canonical_mixer(
+            num_householder,
+            block_size,
+            tp_size=tp_size,
+            sequence_parallel=True,
+            submodules=submodules,
+        )
+        sharded.load_state_dict(baseline.state_dict())
+        baseline.train()
+        sharded.train()
+        torch.manual_seed(456)
+        x = torch.randn(128, 2 if layout == "dense" else 1, 64, device='cuda', dtype=torch.bfloat16)
+        upstream = torch.randn_like(x)
+        rank = torch.distributed.get_rank(sharded.pg_collection.tp)
+        local = slice(rank * (128 // tp_size), (rank + 1) * (128 // tp_size))
+        reference_input = x.detach().requires_grad_()
+        local_input = x[local].clone().requires_grad_()
+        params = None
+        if layout != "dense":
+            cu = torch.tensor([0, 19, 73, 109], dtype=torch.int32, device='cuda')
+            padded = (
+                torch.tensor([0, 32, 96, 120], dtype=torch.int32, device='cuda')
+                if layout == "padded"
+                else None
+            )
+            params = PackedSeqParams(
+                qkv_format='thd',
+                cu_seqlens_q=cu,
+                cu_seqlens_kv=cu,
+                cu_seqlens_q_padded=padded,
+                cu_seqlens_kv_padded=padded,
+                max_seqlen_q=54,
+                max_seqlen_kv=54,
+            )
+        core_inputs = []
+
+        def record_core(_module, args):
+            core_inputs.append(args[0].detach().clone())
+
+        core_hook = baseline.out_proj.register_forward_pre_hook(record_core)
+        expected = baseline(reference_input, packed_seq_params=params)[0]
+        actual = sharded(local_input, packed_seq_params=params)[0]
+        exact(actual, expected[local])
+        expected.backward(upstream)
+        actual.backward(upstream[local].contiguous())
+        # Replicated normalization parameters have rank-local token gradients
+        # under SP. Training's gradient finalizer sums them over the TP group.
+        for parameter in sharded.parameters():
+            if getattr(parameter, "sequence_parallel", False) and parameter.grad is not None:
+                torch.distributed.all_reduce(parameter.grad, group=sharded.pg_collection.tp)
+        torch.testing.assert_close(
+            local_input.grad, reference_input.grad[local], rtol=0.03, atol=0.002
+        )
+        for (name, ref), (actual_name, parameter) in zip(
+            baseline.named_parameters(), sharded.named_parameters()
+        ):
+            assert name == actual_name
+            assert (ref.grad is None) == (parameter.grad is None), name
+            if ref.grad is not None:
+                torch.testing.assert_close(
+                    parameter.grad, ref.grad, rtol=0.03, atol=0.002, msg=name
+                )
+        # Serving uses the same TP shards without SP. Check the dense request
+        # (or first packed request) through prefill followed by one cached decode.
+        baseline.eval()
+        length = 128 if layout == "dense" else 19
+        context = StaticInferenceContext(max_batch_size=x.shape[1], max_sequence_length=128)
+        with torch.no_grad():
+            prefill = baseline(x[: length - 1], inference_context=context)[0]
+            context.sequence_len_offset = length - 1
+            decoded = baseline(x[length - 1 : length], inference_context=context)[0]
+            exact(torch.cat(core_inputs[1:]), core_inputs[0][:length])
+            # TP>=3 needs ordered output reductions for cross-batch bitwise
+            # parity: stock NCCL sums can change order with message size. The
+            # recurrence itself must remain exact at every tested TP size.
+            if tp_size == 2:
+                exact(torch.cat([prefill, decoded]), expected[:length])
+        core_hook.remove()
+    finally:
+        disable_batch_invariant_mode()
+        Utils.destroy_model_parallel()
