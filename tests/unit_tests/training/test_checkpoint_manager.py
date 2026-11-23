@@ -193,6 +193,24 @@ class TestDefaultCheckpointManager:
             **groups,
         )
 
+    def test_contexts_carry_full_train_state_and_config(self):
+        train_state, config = Mock(), Mock()
+        save_ctx = cm.CheckpointSaveContext(
+            iteration=1,
+            model=[],
+            optimizer=None,
+            opt_param_scheduler=None,
+            num_floating_point_operations_so_far=0,
+            train_state=train_state,
+            config=config,
+        )
+        load_ctx = cm.CheckpointLoadContext(
+            model=[], optimizer=None, opt_param_scheduler=None, train_state=train_state, config=config
+        )
+        for ctx in (save_ctx, load_ctx):
+            assert ctx.train_state is train_state
+            assert ctx.config is config
+
     @pytest.mark.parametrize("blocking, terminate", [(False, False), (True, True)])
     def test_finalize_forwards_blocking_and_terminate(self, blocking, terminate):
         with patch("megatron.training.async_utils.maybe_finalize_async_save") as finalize:

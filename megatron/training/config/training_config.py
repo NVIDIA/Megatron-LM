@@ -830,7 +830,7 @@ class CheckpointConfig:
     """Fully qualified class name for a custom CheckpointManager implementation.
     When set, checkpoint operations will instantiate and delegate to this class instead of the default
     checkpoint manager. The custom class must implement the `CheckpointManager` protocol
-    defined in `megatron.bridge.training.checkpointing`.
+    defined in `megatron.training.checkpointing`.
     Example: ``'mypackage.checkpoint.MyCheckpointManager'``
     """
 
@@ -857,9 +857,12 @@ class CheckpointConfig:
             f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx."
 
         if self.custom_manager_class is not None:
-            assert "." in self.custom_manager_class, (
-                f"--custom-manager-class {self.custom_manager_class!r} must be a fully qualified "
-                "class name like 'mypackage.module.ClassName'."
+            from megatron.training.config.instantiate_utils import target_allowlist
+
+            assert target_allowlist.is_allowed(self.custom_manager_class), (
+                f"checkpoint.custom_manager_class {self.custom_manager_class!r} is not permitted by "
+                "the _target_ allowlist. Register its package with "
+                "megatron.training.config.target_allowlist.add_prefix('<package>.') first."
             )
         assert self.async_write_results_mp_mode in ["fork", "spawn", "forkserver"], (
             f"async_write_results_mp_mode {self.async_write_results_mp_mode!r} is not supported. "

@@ -37,6 +37,8 @@ if TYPE_CHECKING:
     import torch
 
     from megatron.training.config import CheckpointConfig
+    from megatron.training.config.container import ConfigContainerBase
+    from megatron.training.state import TrainState
 
 
 @dataclass
@@ -58,6 +60,9 @@ class CheckpointSaveContext:
             Process groups of this rank's module (``None`` falls back to the mpu groups).
         rng_state_key_prefix: Per-grid RNG key namespace of a multi-grid model.
         on_saved: Called once the checkpoint is durable (after finalization for async saves).
+        train_state: The run's full ``TrainState``. Custom managers may use more than the default
+            save path needs (``None`` when no run state is initialized, e.g. direct test calls).
+        config: The run's full config container (``None`` when not available).
     """
 
     iteration: int
@@ -78,6 +83,8 @@ class CheckpointSaveContext:
     expt_dp_group: Optional["torch.distributed.ProcessGroup"] = None
     rng_state_key_prefix: str = ""
     on_saved: Optional[Callable[[], None]] = None
+    train_state: Optional["TrainState"] = None
+    config: Optional["ConfigContainerBase"] = None
 
 
 @dataclass
@@ -100,6 +107,8 @@ class CheckpointLoadContext:
         rng_state_key_prefix: Per-grid RNG key namespace of a multi-grid model.
         model_sharded_state_dict_modifier: Optional in-place edit of each model sharded state dict
             before loading (torch_dist only).
+        train_state: The run's full ``TrainState`` (``None`` when no run state is initialized).
+        config: The run's full config container (``None`` when not available).
     """
 
     model: list[Any]
@@ -118,6 +127,8 @@ class CheckpointLoadContext:
     checkpoint_group: Optional["torch.distributed.ProcessGroup"] = None
     rng_state_key_prefix: str = ""
     model_sharded_state_dict_modifier: Optional[Callable[[dict], None]] = None
+    train_state: Optional["TrainState"] = None
+    config: Optional["ConfigContainerBase"] = None
 
 
 @runtime_checkable
@@ -126,6 +137,10 @@ class CheckpointManager(Protocol):
 
     Implementations are constructed with the run's ``CheckpointConfig``.
     """
+
+    def __init__(self, checkpoint_config: "CheckpointConfig") -> None:
+        """Construct the manager; ``checkpoint_config`` is the only constructor argument."""
+        ...
 
     def save(self, ctx: CheckpointSaveContext) -> None:
         """Save a checkpoint."""
@@ -298,3 +313,6 @@ def set_checkpoint_manager(manager: Optional[CheckpointManager]) -> None:
         from megatron.training.global_vars import get_run_config
 
         _checkpoint_manager_config = get_run_config().checkpoint
+    else:
+        # Drop the stale config too; get_checkpoint_manager rebuilds from the run config.
+        _checkpoint_manager_config = None

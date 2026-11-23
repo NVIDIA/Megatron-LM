@@ -2778,6 +2778,8 @@ def setup_model_and_optimizer(
                         dp_group=ckpt_pgc.dp if ckpt_pgc is not None else None,
                         expt_dp_group=ckpt_pgc.expt_dp if ckpt_pgc is not None else None,
                         rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
+                        train_state=train_state,
+                        config=cfg,
                     )
                 )
             )
@@ -4205,6 +4207,8 @@ def save_checkpoint_and_time(
                     rng_state_key_prefix=rng_state_key_prefix,
                     cp_group=cp_group,
                     on_saved=on_saved,
+                    train_state=get_train_state(),
+                    config=get_run_config(),
                 )
             )
 
