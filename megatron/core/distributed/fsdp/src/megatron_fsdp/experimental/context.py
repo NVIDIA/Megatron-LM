@@ -347,7 +347,7 @@ class FsdpContext:
             callback(module)
 
     def register_post_backward_hook(self) -> None:
-        """Register one final callback for deferred cleanup and optional gradient sync.
+        """Retire previous gradient inputs and register the autograd completion callback.
 
         Multiple FSDP roots can share this context. Waiting for the
         reduce-scatter stream in each root's ``post_backward()`` would prevent
@@ -364,6 +364,9 @@ class FsdpContext:
         # requires a PyTorch version that includes it:
         # https://github.com/pytorch/pytorch/pull/193958
         torch.autograd.Variable._execution_engine.queue_callback(self.post_backward)
+
+        # Only the first root retires inputs from the preceding backward.
+        self._release_grad_buffers()
 
 
 def _collect_backward_order(
