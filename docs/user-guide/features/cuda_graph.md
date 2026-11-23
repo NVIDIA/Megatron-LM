@@ -270,9 +270,9 @@ fence only while the CUDA stream is being captured.
 The mHC functional regression recipes enable `--deterministic-mode` and set
 `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` to request exact golden verification, including
 the number of zero gradients. A passing repeat is still required to establish
-reproducibility. GDN uses its existing deterministic implementation under this
-setting and allocates its initial recurrent state directly on the input device
-so capture does not perform a CPU-to-CUDA copy. Fused mHC remains enabled in the
+reproducibility. The recipe with a GDN layer sets `--gdn-kernel-backend torch`
+to select the deterministic implementation. GDN allocates its initial recurrent
+state on the input device so capture avoids a CPU-to-CUDA copy. Fused mHC remains enabled in the
 recipes.
 
 ### Dense Model Training
