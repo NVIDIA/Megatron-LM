@@ -995,18 +995,21 @@ class TestMoEModules:
             (1, None, 256, False, True),
         ],
     )
-    def test_mok_moe_layer_replays(self, tp, latent, shared, mxfp8, gated, backend):
+    def test_mok_moe_layer_replays(self, tp, latent, shared, mxfp8, gated, backend, monkeypatch):
         """Replay real routed-only SiTU and legacy fused SwiGLU, including MXFP8 and dP."""
         if not HAVE_TE or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
             pytest.skip("MOK requires Transformer Engine and SM100/SM103 GPUs")
         if Utils.world_size < 4 or Utils.world_size % 4:
             pytest.skip("MOK EP4 requires a world size divisible by four")
+        from megatron.core.transformer.moe.megakernel.mok import package
         from megatron.core.transformer.moe.megakernel.mok.package import clear_mok_caches
 
         if backend == "cutemok":
             pytest.importorskip("cudnn.moe_ep.cutemok")
         else:
             functional = pytest.importorskip("mok.functional")
+            # Deprecated "mok" runs the standalone package only where CuTe MoK is not available.
+            monkeypatch.setattr(package, "cutemok_available", lambda: False)
             if "situ_beta" not in inspect.signature(functional.forward).parameters:
                 pytest.skip("MOK build with routed-only and SiTU support is required")
         if mxfp8 and te_post_all_gather_processing is None:
@@ -1058,6 +1061,7 @@ class TestMoEModules:
         with get_fp8_context(config, is_init=True):
             layer = MoELayer(config, get_submodules(spec)).cuda()
         megakernel = layer.megakernel_experts
+        assert (megakernel.cutemok is None) == (backend == "mok")
         assert layer.token_dispatcher is None and layer.megakernel_fuses_shared_expert == fused
         assert (megakernel.shared_fc1_weight is not None) == fused
         assert (megakernel.shared_output_gate_weight is not None) == gated
@@ -1115,7 +1119,7 @@ class TestMoEModules:
                 assert param.main_grad.dtype == torch.float32
         finally:
             handle.remove()
-            clear_mok_caches(backend)
+            clear_mok_caches()
 
     @pytest.mark.parametrize("dispatcher", ["allgather", "alltoall"])
     @pytest.mark.parametrize("balancing", ["aux_loss", "seq_aux_loss"])

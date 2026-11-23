@@ -18,7 +18,11 @@ from torch.distributed import ProcessGroup
 from megatron.core.activations import situlu
 from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
 from megatron.core.transformer.moe.megakernel.factory import split_megakernel_backend_config
-from megatron.core.transformer.moe.megakernel.mok.package import cutemok_api, mok_modules
+from megatron.core.transformer.moe.megakernel.mok.package import (
+    cutemok_api,
+    mok_modules,
+    resolve_mok_backend,
+)
 from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
 from megatron.core.transformer.moe.megakernel.mok.runtime import _MoKAutograd
 from megatron.core.transformer.moe.megakernel.mok.weights import (
@@ -55,11 +59,12 @@ class MoKMegakernel(MegakernelBackend):
         num_local_experts: int,
     ) -> None:
         super().__init__()
-        # "mok": our MCore-integration version of MOK:
-        # https://github.com/QiZhangNV/mixture-of-kittens/tree/qizhang/mcore-integration
-        # "cutemok": cuDNN frontend's CuTe MoK, an optimized version of MOK expected to outperform
-        # "mok", called through its public API: https://github.com/NVIDIA/cudnn-frontend/pull/2767
-        self._use_cutemok = getattr(config, "moe_megakernel_backend", "mok") == "cutemok"
+        # "cutemok": cuDNN frontend's CuTe MoK, an optimized version of MOK, called through its
+        # public API: https://github.com/NVIDIA/cudnn-frontend/pull/2767
+        # "mok" (deprecated; runs as "cutemok" when available): our MCore-integration version of
+        # MOK: https://github.com/QiZhangNV/mixture-of-kittens/tree/qizhang/mcore-integration
+        backend = getattr(config, "moe_megakernel_backend", None)
+        self._use_cutemok = resolve_mok_backend(backend) == "cutemok"
         try:
             if self._use_cutemok:
                 MoKConfig = cutemok_api().CuteMoKConfig
@@ -71,9 +76,9 @@ class MoKMegakernel(MegakernelBackend):
                 "(cudnn.moe_ep.cutemok, NVIDIA/cudnn-frontend#2767); see the CuTe MoK "
                 "installation instructions in megatron/core/transformer/moe/README.md"
                 if self._use_cutemok
-                else "moe_megakernel_backend='mok' requires the MCore integration fork of "
-                "mixture-of-kittens; see the MOK installation instructions in "
-                "megatron/core/transformer/moe/README.md"
+                else "moe_megakernel_backend='mok' requires cuDNN frontend with CuTe MoK or the "
+                "MCore integration fork of mixture-of-kittens; see the MOK installation "
+                "instructions in megatron/core/transformer/moe/README.md"
             ) from exc
 
         if not config.gradient_accumulation_fusion:

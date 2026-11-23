@@ -1181,10 +1181,11 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_megakernel_backend: Optional[str] = None
     """Optional backend that replaces MoE dispatch, expert computation, and combine.
-    Supported values: None, "mok" (MOK through the standalone mok package) and "cutemok" (cuDNN
-    frontend's CuTe MoK, an optimized version of MOK; NVIDIA/cudnn-frontend#2767). When set, the
-    megakernel owns dispatch/combine; moe_token_dispatcher_type and moe_flex_dispatcher_backend do
-    not select its transport.
+    Supported values: None, "cutemok" (cuDNN frontend's CuTe MoK, an optimized version of MOK;
+    NVIDIA/cudnn-frontend#2767) and the deprecated "mok", which runs as "cutemok" when CuTe MoK is
+    available and otherwise through the standalone mok package, with a FutureWarning either way.
+    When set, the megakernel owns dispatch/combine; moe_token_dispatcher_type and
+    moe_flex_dispatcher_backend do not select its transport.
     """
 
     moe_megakernel_backend_config: Optional[dict] = None

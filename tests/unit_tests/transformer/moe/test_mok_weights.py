@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import warnings
 from types import SimpleNamespace
 
 import pytest
@@ -97,6 +98,38 @@ def test_mok_accepts_key_supported_configurations(overrides, backend):
 def test_megakernel_backend_name_is_validated():
     with pytest.raises(ValueError, match="must be None, 'mok' or 'cutemok'"):
         _mok_transformer_config(moe_megakernel_backend="cute_mok")
+
+
+@pytest.mark.parametrize("available", [True, False])
+def test_deprecated_mok_runs_as_cutemok_when_available(monkeypatch, available):
+    from megatron.core.transformer.moe.megakernel.mok import package
+
+    monkeypatch.setattr(package, "cutemok_available", lambda: available)
+    with pytest.warns(FutureWarning, match='"mok" is deprecated'):
+        assert package.resolve_mok_backend("mok") == ("cutemok" if available else "mok")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert package.resolve_mok_backend("cutemok") == "cutemok"
+
+
+def test_cutemok_cannot_run_without_its_cute_dsl(monkeypatch):
+    gate = pytest.importorskip("cudnn.moe_ep._cutemok.cutedsl._version_gate")
+    from megatron.core.transformer.moe.megakernel.mok import package
+
+    def missing():
+        raise gate.CuteDslRequirementError("CuTe DSL is not installed")
+
+    monkeypatch.setattr(gate, "require_cutedsl", missing)
+    assert not package.cutemok_available.__wrapped__()
+
+
+@pytest.mark.parametrize("capability", [(9, 0), (10, 7)])
+def test_cutemok_cannot_run_on_other_gpus(monkeypatch, capability):
+    from megatron.core.transformer.moe.megakernel.mok import package
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: capability)
+    assert not package.cutemok_available.__wrapped__()
 
 
 @pytest.mark.parametrize("backend", ["mok", "cutemok"])

@@ -90,24 +90,30 @@ class _MoKExperts(torch.nn.Module):
 
 
 @pytest.mark.launch_on_gb200
-@pytest.mark.parametrize("backend", ["mok", "cutemok"])
+@pytest.mark.parametrize("backend", ["mok", "cutemok", "auto"])
 @pytest.mark.parametrize("gated", [False, True])
 @pytest.mark.parametrize("main_grad_dtype", [torch.float32, torch.bfloat16])
-def test_real_mok_ddp_numerics(gated, main_grad_dtype, backend):
+def test_real_mok_ddp_numerics(gated, main_grad_dtype, backend, monkeypatch):
     """Two microbatches, all weight buffers, no parameter mutation, and SGD refresh."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
         (10, 0),
         (10, 3),
     ):
         pytest.skip("MoK requires Blackwell SM100/SM103")
+    from megatron.core.transformer.moe.megakernel.mok import package
     from megatron.core.transformer.moe.megakernel.mok.package import clear_mok_caches
 
     # The backward entry point the adapter calls, which the mutation control below wraps.
-    if backend == "cutemok":
+    # "auto" is the deprecated "mok" where CuTe MoK can run, so it runs CuTe MoK.
+    if backend == "mok":
+        backward_owner, backward_name = pytest.importorskip("mok.functional"), "backward"
+        # Deprecated "mok" runs the standalone package only where CuTe MoK cannot run.
+        monkeypatch.setattr(package, "cutemok_available", lambda: False)
+    else:
         backward_owner = pytest.importorskip("cudnn.moe_ep.cutemok")
         backward_name = "cutemok_backward"
-    else:
-        backward_owner, backward_name = pytest.importorskip("mok.functional"), "backward"
+        if not package.cutemok_available():
+            pytest.skip("CuTe MoK cannot run here")
     pytest.importorskip("transformer_engine.pytorch")
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
     from megatron.core.models.gpt.gpt_layer_specs import (
@@ -140,7 +146,7 @@ def test_real_mok_ddp_numerics(gated, main_grad_dtype, backend):
             gated_linear_unit=True,
             activation_func=F.silu,
             gradient_accumulation_fusion=True,
-            moe_megakernel_backend=backend,
+            moe_megakernel_backend="mok" if backend == "auto" else backend,
             moe_shared_expert_gate=gated,
             add_bias_linear=False,
             bf16=True,
@@ -197,6 +203,7 @@ def test_real_mok_ddp_numerics(gated, main_grad_dtype, backend):
         assert all(not name.startswith("megakernel_experts.") for name in checkpoint)
         assert all(not name.startswith("megakernel_experts.") for name in parameters)
         megakernel = model.megakernel_experts
+        assert (megakernel.cutemok is None) == (backend == "mok")
         if gated:
             assert megakernel.shared_output_gate_weight is model.shared_experts.gate_weight
         buffers = {name: p.main_grad for name, p in parameters.items()}
@@ -280,7 +287,9 @@ def test_real_mok_ddp_numerics(gated, main_grad_dtype, backend):
                     ddp(x.requires_grad_(), probs.requires_grad_()).backward(upstream)
                 with pytest.raises(AssertionError, match=missing):
                     _assert_numerics(parameters[missing].main_grad, expected_dw[missing], missing)
+        clear_mok_caches()
+        assert not runtime._CUTEMOK_PLANS and not runtime._RETIRED_CUTEMOK_PLANS
     finally:
-        clear_mok_caches(backend)
+        clear_mok_caches()
         torch.backends.cuda.matmul.allow_tf32 = old_tf32
         Utils.destroy_model_parallel()
