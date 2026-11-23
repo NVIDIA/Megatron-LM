@@ -161,8 +161,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.select.outputs.matrix || inputs.buckets) }}
     runs-on: ${{ fromJSON(inputs.runner) }}
-    # Baselines get the scheduled producer's limit; recording the largest buckets nears 60 minutes.
-    timeout-minutes: ${{ inputs.unit_testmon_mode == 'baseline' && 90 || 60 }}
+    timeout-minutes: 60
     env:
       PIP_DISABLE_PIP_VERSION_CHECK: 1
       PIP_NO_PYTHON_VERSION_WARNING: 1
