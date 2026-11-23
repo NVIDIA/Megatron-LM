@@ -20,6 +20,7 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
 )
+from megatron.training.datasets.utils import get_training_data_sequence_length
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 from megatron.training.state import TrainState
 
@@ -43,7 +44,7 @@ def get_args():
 
 
 def get_run_config():
-    """Return the full pretrain config container."""
+    """Return the active training or inference run config container."""
     _ensure_var_is_initialized(_GLOBAL_RUN_CONFIG, 'run config')
     return _GLOBAL_RUN_CONFIG
 
@@ -235,7 +236,7 @@ def initialize_training_runtime_services(args: Namespace) -> None:
         data_parallel_size=cfg.get_batch_parallel_size(),
         decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
         step_batch_size_schedule=cfg.train.step_batch_size_schedule,
-        seq_length=args.seq_length,
+        seq_length=get_training_data_sequence_length(cfg),
     )
     _set_tensorboard_writer(args)
     _set_one_logger(args)
@@ -508,11 +509,10 @@ def _ensure_var_is_not_initialized(var, name):
 def _detect_gpu_identity(local_rank):
     """Best-effort physical GPU identity for this rank: index/name/UUID/serial/PCI.
 
-    Uses ``local_rank`` directly (not ``torch.cuda.current_device()``) because
-    this runs from ``set_global_variables`` during arg parsing, before
-    ``torch.cuda.set_device(cfg.dist.local_rank)`` happens in
-    ``_initialize_distributed`` -- ``current_device()`` would still read back
-    the default (always 0) at this point. ``local_rank`` is resolved against
+    The caller passes the selected CUDA index in ``local_rank``: normally the
+    local rank, or zero under external GPU mapping. This runs before device
+    selection in ``_initialize_distributed``, so ``torch.cuda.current_device()``
+    would still read the default device. The supplied index is resolved against
     ``CUDA_VISIBLE_DEVICES`` the same way ``set_device`` will later resolve it,
     so the reported index matches reality. Returns {} on any failure (no NVML,
     no visible GPU, MIG/UUID-style CUDA_VISIBLE_DEVICES entries we can't map
@@ -571,7 +571,6 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
     cfg = get_run_config()
     resource_attrs = {'dl.local_rank': cfg.dist.local_rank}
     fields = [
-        ('dl.sequence_length', 'seq_length'),
         ('megatron.ckpt_format', 'ckpt_format'),
     ]
     if include_training:
@@ -590,6 +589,13 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
         val = getattr(args, arg_name, None)
         if val is not None:
             resource_attrs[attr] = val
+    # Loader telemetry describes dataset rows, not VLM's expanded model input.
+    if include_training:
+        sequence_length = get_training_data_sequence_length(cfg)
+    else:
+        sequence_length = getattr(args, 'seq_length', None)
+    if sequence_length is not None:
+        resource_attrs['dl.sequence_length'] = sequence_length
 
     # Preserve inference's CLI boundary; training's existing model tags use its config owner.
     if include_training:
@@ -615,7 +621,8 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
     else:
         resource_attrs['megatron.precision'] = 'fp32'
 
-    resource_attrs.update(_detect_gpu_identity(cfg.dist.local_rank))
+    device_index = 0 if cfg.dist.external_gpu_device_mapping else cfg.dist.local_rank
+    resource_attrs.update(_detect_gpu_identity(device_index))
 
     # SLURM identity, so EVERY span can be correlated with the out-of-band reckoner (which keys
     # on SLUID). SLUID is not in the job env, so the launch script fetches it from sacct (it's
