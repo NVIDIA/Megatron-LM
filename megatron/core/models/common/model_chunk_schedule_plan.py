@@ -473,7 +473,7 @@ class TransformerLayerSchedulePlan:
         fsdp_context = None
         if b_layer is not None:
             model = getattr(b_layer.chunk_state, "model", None)
-            if isinstance(model, FsdpModule) and model.context.grad_staging_on_compute:
+            if isinstance(model, FsdpModule) and model.context.grad_staging_on_compute_stream:
                 fsdp_context = model.context
                 # Give the previous embedding reduction the paired forward to overlap.
                 fsdp_context._release_oldest_grad_buffer_if(_owns_input_embedding)

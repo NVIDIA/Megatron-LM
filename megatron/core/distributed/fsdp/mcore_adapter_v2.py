@@ -289,7 +289,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     runtime_policy=RuntimePolicy(
                         use_symmetric_memory=ddp_config.nccl_ub,
                         overlap_outer_communication=ddp_config.overlap_outer_communication,
-                        grad_staging_on_compute=ddp_config.fsdp_grad_staging_on_compute,
+                        grad_staging_on_compute_stream=ddp_config.fsdp_grad_staging_on_compute,
                     ),
                 )
             )

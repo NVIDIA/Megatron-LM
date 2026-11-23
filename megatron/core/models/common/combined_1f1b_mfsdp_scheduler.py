@@ -32,7 +32,7 @@ def _module_post_backward_hook(module: FsdpModule) -> None:
     module.reshard()
     # Delayed layer wgrads can stage another batch before the root packs its input.
     if (
-        module.context.grad_staging_on_compute
+        module.context.grad_staging_on_compute_stream
         and module.is_root()
         and any(
             group.requires_grad and group.requires_inner_reduction

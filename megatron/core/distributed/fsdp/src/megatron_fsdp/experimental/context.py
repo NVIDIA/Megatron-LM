@@ -118,7 +118,7 @@ class FsdpContext:
 
         self._gradient_finalization_mode = gradient_finalization_mode
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
-        self.grad_staging_on_compute = runtime_policy.grad_staging_on_compute
+        self.grad_staging_on_compute_stream = runtime_policy.grad_staging_on_compute_stream
         self.execution_order = ExecutionOrder()
         self.prefetch_order = runtime_policy.prefetch_order
         self._recording_execution_order = runtime_policy.prefetch_order is PrefetchOrder.RECORDED
@@ -292,18 +292,17 @@ class FsdpContext:
         self.current_stream().wait_stream(self.inner_reduction_stream)
         if self.outer_reduction_stream is not self.inner_reduction_stream:
             self.current_stream().wait_stream(self.outer_reduction_stream)
-        if self.grad_staging_on_compute:
+        if self.grad_staging_on_compute_stream:
             self._release_grad_buffers()
 
     def _retain_grad_buffers(
         self, buffers: list[torch.Tensor], allocation_stream: torch.cuda.Stream, producer: nn.Module
     ) -> None:
         """Keep packed inputs alive through inner reduction and local accumulation."""
-        if buffers:
-            done = self.inner_reduction_stream.record_event()
-            self._pending_grad_buffers.append(
-                _GradReductionInputs(tuple(buffers), done, allocation_stream, ref(producer))
-            )
+        done = self.inner_reduction_stream.record_event()
+        self._pending_grad_buffers.append(
+            _GradReductionInputs(tuple(buffers), done, allocation_stream, ref(producer))
+        )
 
     def _release_grad_buffers(self, *, keep: int = 0) -> None:
         """Order storage reuse on its allocation stream before dropping references."""

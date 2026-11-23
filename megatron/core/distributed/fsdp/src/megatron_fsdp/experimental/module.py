@@ -31,6 +31,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext, GradientFinalizationMode
 from .countdown import Countdown
+from .dbuffer import DBuffer
 from .execution_order import ExecutionEvent, ExecutionOrder
 from .module_utils import get_parameter_owner, is_in_backward
 from .parameter_group import (
@@ -435,7 +436,7 @@ class FsdpModule:
             is_first_root = not context._post_backward_hook_registered
             context.register_post_backward_hook()
             # Retire inputs from the previous backward before the first root unshards.
-            if is_first_root and context.grad_staging_on_compute:
+            if is_first_root and context.grad_staging_on_compute_stream:
                 context._release_grad_buffers()
             context.pre_backward()
 
@@ -464,15 +465,20 @@ class FsdpModule:
         with self._nvtx_range("reduce_gradients"):
             context = self.context
             inner_reduction_stream = context.inner_reduction_stream
-            buffers: list[torch.Tensor] | None = [] if context.grad_staging_on_compute else None
+            buffers = []
             for group in self._parameter_groups:
                 if not group.requires_grad:
                     continue
 
-                if group.requires_inner_reduction:
-                    self._reduce_inner_gradients(group, buffers)
-                else:
+                if not group.requires_inner_reduction:
                     self._accumulate_local_gradients(group)
+                elif context.grad_staging_on_compute_stream:
+                    if not buffers:
+                        # Leave room for this module within the two-batch limit.
+                        context._release_grad_buffers(keep=1)
+                    buffers.append(self._reduce_inner_gradients(group).local_buffer)
+                else:
+                    self._reduce_inner_gradients(group)
 
                 if context.gradient_finalization_mode is GradientFinalizationMode.SKIP_OUTER:
                     continue
@@ -501,27 +507,22 @@ class FsdpModule:
         # finish_grad_sync(), without making compute wait for earlier collectives.
         self.context.inner_reduction_stream.wait_stream(self.context.current_stream())
 
-    def _reduce_inner_gradients(
-        self, group: FsdpParameterGroup, buffers: list[torch.Tensor] | None
-    ) -> None:
-        """Pack on compute and enqueue reduction on the inner reduction stream."""
+    def _reduce_inner_gradients(self, group: FsdpParameterGroup) -> DBuffer:
+        """Pack gradients, enqueue inner reduction, and return the packed input."""
         context = self.context
         current_stream = context.current_stream()
         inner_reduction_stream = context.inner_reduction_stream
-        if buffers is None:
+        if context.grad_staging_on_compute_stream:
+            partial_grad = group.allocate_partial_grad_buffer()
+        else:
             with torch.cuda.stream(inner_reduction_stream):
                 partial_grad = group.allocate_partial_grad_buffer()
             current_stream.wait_stream(inner_reduction_stream)
-        else:
-            if not buffers:
-                # One retained module plus this module bounds staging to two batches.
-                context._release_grad_buffers(keep=1)
-            partial_grad = group.allocate_partial_grad_buffer()
-            buffers.append(partial_grad.local_buffer)
         group.copy_gradients_to_partial_buffer(partial_grad)
         inner_reduction_stream.wait_stream(current_stream)
         with torch.cuda.stream(inner_reduction_stream):
             group.reduce_inner_gradients(partial_grad)
+        return partial_grad
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
