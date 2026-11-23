@@ -81,6 +81,16 @@ def test_cli_and_native_settings_match_without_aliasing():
     assert config.save == "/ckpt/out" and config.save_optim is False
 
 
+@pytest.mark.parametrize("argv, expected", [((), True), (("--disable-verify-integrity",), False)])
+def test_integrity_verification_is_on_unless_disabled(argv, expected):
+    assert checkpoint_config_from_args(_validated(*argv)).verify_integrity is expected
+
+
+def test_the_old_no_verify_integrity_spelling_is_not_accepted():
+    with pytest.raises(SystemExit):
+        _parsed("--no-verify-integrity")
+
+
 def test_the_deprecated_flags_are_inert_and_not_fields():
     args = _validated("--use-dist-ckpt", "--dist-ckpt-format", "x", "--ckpt-fully-parallel-save")
     config = checkpoint_config_from_args(args)
@@ -202,7 +212,6 @@ def test_projection_round_trips_every_spelling_of_the_aliased_fields(name, alias
             ],
             "requires --ckpt-fully-parallel-save-process-group",
         ),
-        (["--verify-integrity", "--ckpt-format", "torch"], "only supported with torch_dist"),
     ],
 )
 def test_the_section_rejects_what_validate_args_rejected(argv, match):
