@@ -45,6 +45,7 @@ from .utils import (
     all_sharding_strategies_in,
     any_sharding_strategy_in,
     get_sharding_strategy,
+    is_torch_min_version,
     log_single_rank,
 )
 
@@ -599,7 +600,6 @@ class MegatronFSDP(torch.nn.Module):
         self.forward_hooks = {}
         self.backward_pre_hooks = {}
         self.grad_acc_hooks = {}
-        # Keep AccumulateGrad nodes alive for post hooks on fused None gradients.
         self.grad_acc_nodes = []
 
         """
@@ -1140,6 +1140,14 @@ class MegatronFSDP(torch.nn.Module):
         self.pre_backward = partial(_root_pre_backward, module=None, skip_backward_hook=True)
         self.post_backward = _root_post_backward
 
+        def _post_accumulate_hook(param):
+            if getattr(param, 'skip_backward_post_hook', False) or (
+                param.grad is None and not getattr(param, 'grad_added_to_main_grad', False)
+            ):
+                return
+            _process_post_backward_gradients([param])
+
+        use_tensor_post_hook = is_torch_min_version("2.8.0")
         fsdp_modules = []
         for name, module in root_module.named_modules():
             # Set post backward hook for TE grouped gemm if enabled comm overlap
@@ -1204,24 +1212,20 @@ class MegatronFSDP(torch.nn.Module):
                 if not param.requires_grad:
                     continue
 
-                # Megatron FSDP v1 registers a post hook on the parameter's AccumulateGrad node
-                # instead of a tensor post-accumulate hook: the tensor hook is skipped when fused wgrad
-                # returns None, while the node hook still runs and lets FSDP process the gradient already
-                # in main_grad. The delayed-wgrad callback remains on its existing path.
-                # FSDP may have released the parameter storage before hook registration.
-                param_tmp = param.as_strided((0,), (1,))
-                grad_acc = param_tmp.grad_fn.next_functions[0][0]
-                self.grad_acc_nodes.append(grad_acc)
-                self.grad_acc_hooks[f"grad_acc and reduce for {self.param_to_name[param]}"] = (
-                    grad_acc.register_hook(
-                        lambda *_, p=param: (
-                            None
-                            if getattr(p, 'skip_backward_post_hook', False)
-                            or (p.grad is None and not getattr(p, 'grad_added_to_main_grad', False))
-                            else _process_post_backward_gradients([p])
-                        )
+                hook_name = f"grad_acc and reduce for {self.param_to_name[param]}"
+                if use_tensor_post_hook:
+                    self.grad_acc_hooks[hook_name] = param.register_post_accumulate_grad_hook(
+                        _post_accumulate_hook
                     )
-                )
+                else:
+                    # Before PyTorch 2.8, tensor post-accumulate hooks skip None gradients.
+                    # FSDP may release parameter storage before hook registration.
+                    param_tmp = param.as_strided((0,), (1,))
+                    grad_acc = param_tmp.grad_fn.next_functions[0][0]
+                    self.grad_acc_nodes.append(grad_acc)
+                    self.grad_acc_hooks[hook_name] = grad_acc.register_hook(
+                        lambda *_, p=param: _post_accumulate_hook(p)
+                    )
 
         # Register root module pre- and post-backward hooks in cases where the
         # forward function of root module is not called, but rather the forward
