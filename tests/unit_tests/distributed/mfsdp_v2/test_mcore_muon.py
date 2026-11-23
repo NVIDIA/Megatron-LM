@@ -57,9 +57,10 @@ def _train(
         )
         success, norm, _ = optimizer.step()
         assert success
-        values.append(
-            torch.stack((losses[0], torch.as_tensor(norm, device=tokens.device).squeeze()))
-        )
+        # Distinct grad-stats groups can return an FP64 device norm. Preserve its
+        # precision when comparing the two numerical trajectories.
+        norm = torch.as_tensor(norm, dtype=torch.float64, device=tokens.device).reshape(())
+        values.append(torch.stack((losses[0], norm)))
     return torch.stack(values)
 
 

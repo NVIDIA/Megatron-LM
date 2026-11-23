@@ -623,7 +623,7 @@ def test_the_cli_gloo_check_sees_the_rewritten_distributed_optimizer(monkeypatch
         "--dist-ckpt-optim-fully-reshardable",
         "--distrib-optim-fully-reshardable-mem-efficient",
     ]
-    with pytest.raises(AssertionError, match="requires -enable-gloo-process-groups"):
+    with pytest.raises(AssertionError, match="fully-reshardable-mem-efficient requires Gloo"):
         _validated(*argv)
 
 
