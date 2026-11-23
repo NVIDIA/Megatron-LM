@@ -25,6 +25,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.multi_token_prediction import (
@@ -41,7 +42,6 @@ from megatron.elastification.arguments import add_flextron_args
 from megatron.training import (
     get_args,
     get_timers,
-    get_tokenizer,
     get_train_state,
     inprocess_restart,
     pretrain,
@@ -49,20 +49,27 @@ from megatron.training import (
 )
 from megatron.training.argument_utils import (
     gpt_data_config_from_args,
+    hybrid_config_from_args,
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.providers import build_gpt_datasets
+from megatron.training.datasets.utils import get_dataset_input_length
 from megatron.training.global_vars import get_run_config, set_run_config
+from megatron.training.models.base import compose_hooks
 from megatron.training.utils import is_first_or_last_pipeline_stage
 
 # modelopt distillation
 try:
+    import modelopt.torch.distill.plugins.megatron as _modelopt_megatron  # noqa: F401
+
     from megatron.elastification.loss_func import loss_func as loss_func_modelopt
     from megatron.post_training.arguments import add_modelopt_args
-    from megatron.post_training.model_builder import (
-        modelopt_gpt_mamba_builder as model_provider_modelopt,
+    from megatron.post_training.model_config import (
+        apply_modelopt_model_config,
+        distillation_config_from_args,
     )
+    from megatron.post_training.model_hooks import distillation_hooks, modelopt_setup_hooks
     has_nvidia_modelopt = True
 except ImportError:
     print_rank_0("ModelOpt is not installed. Please install it using `pip install nvidia-modelopt`")
@@ -84,6 +91,28 @@ def count_parameters_in_layer(model, layer_name):
     return num_params
 
 
+def _build_modelopt_stage(args, pre_process, post_process, vp_stage, pg_collection):
+    """Build one model stage with the stock builder for the ModelOpt config, running its pre-wrap hooks."""
+    run_config = get_run_config()
+    model_config = apply_modelopt_model_config(hybrid_config_from_args(args), args)
+    # This config is translated after tokenizer initialization bound the run's vocabulary.
+    if model_config.vocab_size is None:
+        model_config.vocab_size = run_config.tokenizer.padded_vocab_size
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    builder = model_config.get_builder_cls()(model_config)
+    models = [builder.build_model(pg_collection, pre_process, post_process, vp_stage)]
+    # Same order as setup_model_and_optimizer: ModelOpt setup, own hooks, KD conversion last.
+    pre_wrap_hook = compose_hooks(
+        [
+            *modelopt_setup_hooks(model_config, run_config.checkpoint),
+            *model_config.pre_wrap_hooks,
+            *distillation_hooks(model_config, run_config.distillation),
+        ]
+    )
+    return pre_wrap_hook(models)[0]
+
+
 def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] = None, config = None, pg_collection = None) -> HybridModel:
     """Builds the model.
 
@@ -99,7 +128,7 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
     cfg_container = get_run_config()
     if has_nvidia_modelopt:
 
-        model = model_provider_modelopt(args, pre_process, post_process, vp_stage=vp_stage, config=config, pg_collection=pg_collection)
+        model = _build_modelopt_stage(args, pre_process, post_process, vp_stage, pg_collection)
         from megatron.elastification.flextron_utils import (
             inject_flextron_forward_logic,
             setup_flextron_model,
@@ -177,14 +206,16 @@ BATCH_KEYS = [
 def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
 
-    args = get_args()
-    config = core_transformer_config_from_args(args)
+    cfg = get_run_config()
+    # The model section's transformer config (the container builder derives one from the
+    # arguments for this script) gives the parallel values; the sample predicates and the
+    # attention-mask field come from the data section, the sample length from the container.
+    config = cfg.model.transformer
 
-    cp_size = args.context_parallel_size
+    cp_size = config.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
-    is_sft = args.sft
-    has_cu_seqlens = is_sft or getattr(args, 'dataloader_inter_document_masking', False)
-    dynamic_cp = args.dynamic_context_parallel
+    has_cu_seqlens = cfg.data.has_cu_seqlens()
+    dynamic_cp = config.dynamic_context_parallel
     mtp_on_this_rank = mtp_on_this_rank_func(
         layout=config.pipeline_model_parallel_layout,
         mtp_num_layers=config.mtp_num_layers,
@@ -212,13 +243,13 @@ def get_batch(data_iterator, vp_stage=None):
         broadcast_group=mpu.get_tensor_model_parallel_group(),
         has_cu_seqlens=has_cu_seqlens,
         dynamic_cp=dynamic_cp,
-        create_attention_mask_in_dataloader=args.create_attention_mask_in_dataloader,
+        create_attention_mask_in_dataloader=cfg.data.creates_attention_mask(),
         cp_size=cp_size,
         tp_rank=tp_rank,
-        micro_batch_size=args.micro_batch_size,
-        seq_length=args.seq_length,
+        micro_batch_size=cfg.train.micro_batch_size,
+        seq_length=get_dataset_input_length(cfg.data.dataset),
         mtp_on_this_rank=mtp_on_this_rank,
-        pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+        pipeline_model_parallel_size=config.pipeline_model_parallel_size,
         is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
         is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
     )
@@ -236,9 +267,7 @@ def get_batch(data_iterator, vp_stage=None):
         dynamic_cp=dynamic_cp,
         cp_group=get_context_parallel_group(),
         dynamic_cp_group_func=get_dynamic_data_context_parallel_groups,
-        use_per_sequence_balancing=(
-            getattr(args, 'dataloader_inter_document_masking', False) and not is_sft
-        ),
+        use_per_sequence_balancing=cfg.data.use_per_sequence_balancing(),
     )
 
     cu_seqlens = batch.get('cu_seqlens')
@@ -255,10 +284,6 @@ def get_batch(data_iterator, vp_stage=None):
         cu_seqlens,
         max_seqlen,
     )
-
-
-# define spiky loss as a loss that's 10x the max loss observed
-SPIKY_LOSS_FACTOR = 10
 
 
 def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[HybridModel] = None, selected_budget=None):
@@ -317,7 +342,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
             result=loss,
             rejection_func=partial(
                 rerun_state_machine.is_unexpectedly_large,
-                threshold=SPIKY_LOSS_FACTOR,
+                threshold=cfg.rerun_state_machine.spiky_loss_factor,
                 context="loss",
             ),
             message="Spiky loss",
@@ -476,7 +501,7 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     ) and mpu.get_tensor_model_parallel_rank() == 0
 
 
-def flex_data_config_from_args(args, *, standalone=False):
+def flex_data_config_from_args(args):
     """``cfg.data`` for this entry point: the shared factory, less the varlen family.
 
     ``get_batch`` keys the packed-sequence metadata on ``--sft`` and the rank predicate above builds
@@ -487,17 +512,7 @@ def flex_data_config_from_args(args, *, standalone=False):
             "pretrain_hybrid_flex.py does not support --use-varlen-dataset (its batch path has no "
             "varlen packing support); use pretrain_hybrid.py for varlen data."
         )
-    return gpt_data_config_from_args(args, standalone=standalone)
-
-
-def core_gpt_dataset_config_from_args(args):
-    """The legacy call shape for this entry point: the standalone section of
-    ``flex_data_config_from_args`` (the varlen check included), validated and bound to the run's
-    tokenizer as before (the provider builds from ``cfg.data``)."""
-    data = flex_data_config_from_args(args, standalone=True)
-    data.validate()
-    data.bind_tokenizer(get_tokenizer())
-    return data.dataset
+    return gpt_data_config_from_args(args)
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
@@ -569,6 +584,10 @@ if __name__ == "__main__":
     full_config = pretrain_cfg_container_from_args(
         args, data_cfg=flex_data_config_from_args(args)
     )
+    if has_nvidia_modelopt and getattr(args, "export_kd_teacher_load", None):
+        full_config.distillation = distillation_config_from_args(
+            args, apply_modelopt_model_config(hybrid_config_from_args(args), args)
+        )
     set_run_config(full_config)
     pretrain(full_config,
              train_valid_test_datasets_provider,

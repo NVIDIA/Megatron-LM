@@ -256,6 +256,11 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         if self.training:
             return super().forward(x)
 
+        # Mirrors TELayerNormColumnParallelLinear's input cast: an fp32 residual stream reaches this
+        # fused norm + linear as fp32, and the norm and GEMM run in the parameter dtype.
+        if x.dtype != self.layer_norm_weight.dtype:
+            x = x.to(self.layer_norm_weight.dtype)
+
         if self.tp_size == 1:
             x = _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
             x = _apply_linear(x, self.weight, self.config)

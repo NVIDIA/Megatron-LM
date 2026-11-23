@@ -793,6 +793,15 @@ class InferenceConfig:
     kv_transport_backend: Literal["nixl", "nccl"] = "nixl"
     """Backend for disaggregated KV and recurrent-state transfers."""
 
+    disaggregation_role: Optional[Literal["prefill", "decode"]] = None
+    """This engine's side of a prefill/decode split, or None when not disaggregated.
+
+    Must be set before the context is built: a decode context drops
+    ``prefix_caching_mamba_gb``, so one config can serve both roles. Native disaggregation
+    sets it from ``disaggregation_shards``; callers that build their own context set it
+    directly.
+    """
+
     # =================================
     # Logging config
     # =================================
