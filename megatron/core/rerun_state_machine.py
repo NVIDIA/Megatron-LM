@@ -244,7 +244,89 @@ class RerunStateMachine:
 
         self.saved_results: dict[Call, Any] = {}
         self.stats: dict[Caller, QuickStats] = defaultdict(lambda: QuickStats())
+
+        # Device-side validate_result() verdicts, reduced in should_run_forward_backward().
+        self._bank_capacity: int = 0
+        self._banked_flags: Optional[torch.Tensor] = None
+        self._banked_calls: List[Tuple[Call, Any, str]] = []
+        self._banked_streams: Set[Any] = set()
+        self._bank_overflow_warned: bool = False
+
         log_single_rank(logger, logging.WARNING, f"RerunStateMachine initialized in mode {mode}")
+
+    def _record_initial_rejection(self, validation_call: Call, result: Any, message: str) -> None:
+        """Record the rejection that drives the rerun."""
+        self.failed_validation_call = validation_call
+        self.initial_result = result
+        self.rerun_requested = True
+        self._log_validation_error_to_file(
+            status=RerunValidationStatus.INITIAL_RUN, result=result, message=message
+        )
+        logger.error(
+            f"Unexpected result {result} "
+            f"on rank {safe_get_rank()} "
+            f"at iteration #{self.current_iteration + 1} "
+            f"invocation #{validation_call.sequence} "
+            f"(message='{message}')"
+        )
+
+    def _reset_banked_verdicts(self) -> None:
+        """Drop the previous iteration's verdicts and size the flag vector.
+
+        Call only where nothing is in flight, so the realloc cannot race a pending write.
+        """
+        needed: int = max(4096, 2 * len(self._banked_calls))
+        if self._banked_flags is None or self._bank_capacity < needed:
+            self._bank_capacity = needed
+            self._banked_flags = torch.zeros(
+                (needed,), dtype=torch.int8, device=torch.cuda.current_device()
+            )
+        self._banked_calls = []
+        self._banked_streams = set()
+
+    def _bank_verdict(
+        self, validation_call: Call, result: Any, message: str, rejected: torch.Tensor
+    ) -> bool:
+        """Bank one verdict on device. Return False if it must be validated synchronously."""
+        index: int = len(self._banked_calls)
+        if self._banked_flags is None or index >= self._bank_capacity:
+            # Fall back rather than realloc mid-iteration; resize at the next reset.
+            if not self._bank_overflow_warned:
+                self._bank_overflow_warned = True
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    f"banked verdict buffer ({self._bank_capacity}) exceeded; "
+                    "validating synchronously for the remainder",
+                )
+            return False
+        self._banked_calls.append((validation_call, result, message))
+        self._banked_flags[index] = rejected.reshape(()).to(torch.int8)
+        self._banked_streams.add(torch.cuda.current_stream())
+        return True
+
+    def _banked_rejection_flag(self) -> Optional[torch.Tensor]:
+        """Return the device-side OR of this iteration's verdicts, or None if empty."""
+        if not self._banked_calls:
+            return None
+        collector = torch.cuda.current_stream()
+        for stream in self._banked_streams:
+            if stream != collector:
+                # Order the read after the producing stream's writes. check_grads()
+                # runs on autograd's backward streams, not this one.
+                collector.wait_stream(stream)
+        return self._banked_flags[: len(self._banked_calls)].any()
+
+    def _identify_banked_rejection(self) -> None:
+        """Attribute a rejection to its call. Reached only when the reduction came back set."""
+        if not self._banked_calls:
+            return
+        flags = self._banked_flags[: len(self._banked_calls)].tolist()
+        for index, flag in enumerate(flags):
+            if flag:
+                # First rejection only, as on the synchronous path.
+                self._record_initial_rejection(*self._banked_calls[index])
+                break
 
     def set_mode(self, mode: RerunMode) -> None:
         """Method to set the operating mode"""
@@ -274,6 +356,20 @@ class RerunStateMachine:
             val_tensor: torch.Tensor = torch.tensor([value], dtype=torch.int32, device='cuda')
             torch.distributed.all_reduce(val_tensor)
             return val_tensor.item() > 0
+
+    def _reduce_any_flag(self, flag: torch.Tensor) -> bool:
+        """All-reduce a single-element device flag across the world group.
+
+        Reduces the same (1,) int32 buffer as _reduce_any(bool), so ranks taking
+        either path meet in one collective. Return True if any rank's flag is set.
+        """
+        if flag.numel() != 1:
+            raise ValueError(f"Expected a single-element flag, got shape {tuple(flag.shape)}")
+        # int32: the sum across ranks would wrap in a narrower dtype.
+        # copy=True: the in-place all-reduce must not write into the caller's tensor.
+        val_tensor = flag.reshape(1).to(torch.int32, copy=True)
+        torch.distributed.all_reduce(val_tensor)
+        return val_tensor.item() > 0
 
     def should_run_forward_backward(self, data_iterator: DataIteratorArgType) -> bool:
         """Method instructing whether to (re)run the forward-backward pass.
@@ -324,6 +420,7 @@ class RerunStateMachine:
             self.restart_again_requested = False
             self.continue_requested = False
             self.injected_result = None
+            self._reset_banked_verdicts()
             self.current_iteration += 1
             self.state = RerunState.INITIAL_RUN
             return True
@@ -332,7 +429,18 @@ class RerunStateMachine:
             if self.mode == RerunMode.DISABLED:
                 self.state = RerunState.NOT_RUNNING_YET
                 return False
-            will_rerun = self._reduce_any(self.rerun_requested)
+            # Ranks bank different numbers of verdicts, so reduce their OR as one
+            # scalar: both branches must meet in the same (1,) int32 collective.
+            banked_any = self._banked_rejection_flag()
+            if banked_any is not None:
+                if self.rerun_requested:
+                    banked_any.fill_(1)
+                will_rerun = self._reduce_any_flag(banked_any)
+            else:
+                will_rerun = self._reduce_any(self.rerun_requested)
+            if will_rerun:
+                self._identify_banked_rejection()
+            self._reset_banked_verdicts()
             if not will_rerun:
                 self.state = RerunState.NOT_RUNNING_YET
                 return False
@@ -644,21 +752,19 @@ class RerunStateMachine:
             if not self.first_iteration_complete:
                 return
 
-            result_rejected = self.error_injector.maybe_inject() or rejection_func(result)
-            if result_rejected:
-                self.failed_validation_call = validation_call
-                self.initial_result = result
-                self.rerun_requested = True
-                self._log_validation_error_to_file(
-                    status=RerunValidationStatus.INITIAL_RUN, result=result, message=message
-                )
-                logger.error(
-                    f"Unexpected result {result} "
-                    f"on rank {safe_get_rank()} "
-                    f"at iteration #{self.current_iteration + 1} "
-                    f"invocation #{validation_call.sequence} "
-                    f"(message='{message}')"
-                )
+            injected = self.error_injector.maybe_inject()
+            rejected = rejection_func(result)
+            # Read a device verdict in should_run_forward_backward(), not here.
+            if (
+                not injected
+                and torch.is_tensor(rejected)
+                and rejected.numel() == 1
+                and rejected.is_cuda
+                and self._bank_verdict(validation_call, result, message, rejected)
+            ):
+                return
+            if bool(injected) or bool(rejected):
+                self._record_initial_rejection(validation_call, result, message)
         # If this the first rerun (same GPU) or second 2nd rerun (different GPU), and have we
         # reached the validation call that failed during the initial run?
         elif (

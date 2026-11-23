@@ -65,9 +65,10 @@ def test_full_cuda_graph_validates_current_replay_before_optimizer(
                 return
 
             wrapper(**kwargs)
+            # The replayed verdict is banked on device and acted on at the loop exit.
+            assert machine.should_run_forward_backward(None)
             assert machine.rerun_requested
             assert rejection(machine.initial_result)
-            assert machine.should_run_forward_backward(None)
             assert machine.state == RerunState.RERUNNING_IN_PLACE
 
             source.fill_(bad_value if reproduced else 2.0)
