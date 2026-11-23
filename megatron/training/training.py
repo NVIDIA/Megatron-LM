@@ -2405,8 +2405,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         ]
 
         current_stream = torch.cuda.current_stream()
-        if config.cuda_graph_impl == "full_iteration":
-            # DDP initialization must use the full-iteration capture stream so its retained
+        if config.cuda_graph_impl in ("full_iteration", "local"):
+            # DDP initialization must use the CUDA graph capture stream so its retained
             # AccumulateGrad nodes do not reference a different, non-capturing stream.
             ddp_stream = get_shared_capture_stream()
         elif config.cuda_graph_impl == "none":
@@ -3374,10 +3374,12 @@ def train_step(
     is_last_stage = is_pp_last_stage(pg_collection.pp)
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
-    update_successful = logical_and_across_model_parallel_group(update_successful, group=mp_group)
+    if cfg.train.check_optimizer_step_success:
+        update_successful = logical_and_across_model_parallel_group(update_successful, group=mp_group)
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks
-    grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm, group=mp_group)
+    if not cfg.train.skip_sync_grad_norm_across_mp:
+        grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm, group=mp_group)
     if cfg.optimizer.log_num_zeros_in_grad:
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
             num_zeros_in_grad, group=mp_group
