@@ -2,35 +2,45 @@
 """The ``data`` section of ``PretrainConfigContainer``: Megatron Core's GPT dataset config, the loader
 settings and the dataset class.
 
-``DataConfig.dataset`` is ``megatron.core.datasets.gpt_dataset.GPTDatasetConfig`` itself (or its FIM
-subclass), the object ``BlendedMegatronDatasetBuilder`` consumes, constructed from the arguments or
+``DataConfig.dataset`` is Core's ``GPTDatasetConfig`` or its FIM subclass, or training's
+``SFTDatasetConfig`` subclass, the object ``BlendedMegatronDatasetBuilder`` consumes,
+constructed from the arguments or
 a YAML file before the tokenizer exists: nothing runs at construction, Core's checks that need no
 tokenizer (``validate_without_tokenizer()``) run at ``cfg.validate()``, and the complete
 ``validate()``, which needs the tokenizer, runs in ``DataConfig.bind_tokenizer`` once the runtime
 services bind the run's tokenizer (the builder runs it again before building).
 ``random_seed`` is Core's required constructor argument, filled from ``--seed`` by the factory and
-saved with the section. Six Core fields are owned by other container sections (the parallel
-layout and the validation flags): the container writes them at ``finalize()``
+saved with the section. Parallel layout, validation flags and SFT's physical pack width are owned
+by other container sections: the container writes them at ``finalize()``
 (``CONTAINER_WRITTEN_FIELDS``) and they are not serialized with the section.
 
 ``DataConfig`` groups the dataset config, the ``DataloaderConfig`` and ``dataset_type``, the dataset
 class the builder instantiates (``GPTDataset``, ``MockGPTDataset``, ``GPTFIMDataset``, ...). One rule
 serves every GPT entry point: the args-to-config factory forwards every data argument, the class
 follows the family flags, and the provider hands ``cfg.data.dataset`` to the builder unchanged.
+The loop reads the section through its predicates (``is_sft()``, ``has_cu_seqlens()``,
+``use_per_sequence_balancing()``, ``yields_unpacked_samples()``) and the dataset's fields, never
+through ``args``. GPT uses ``sequence_length`` for chunking. Real SFT keeps pack-level truncation:
+its ``packed_sequence_length`` is derived from the model's execution bound at finalization,
+without introducing a per-conversation truncation policy.
+Callback applications resolve their model input width before startup, including image expansion
+for VLMs. The model's positional capacity is independent of these dataset and execution lengths.
 Entry points with their own data pipeline carry a loader-only section (``dataset is None``) and
 nothing here runs for them.
 """
 
 from dataclasses import dataclass, field, fields
-from typing import Any
+from typing import Any, Literal, get_args
 
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.datasets.gpt_fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.config.utils import serialize_value
-from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
+from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset, SFTDatasetConfig
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 
-DATALOADER_TYPES = ("single", "cyclic", "external")
+DataloaderType = Literal["single", "cyclic", "external"]
+"""The loader kinds; the CLI choices of ``--dataloader-type`` come from this annotation."""
+DATALOADER_TYPES = get_args(DataloaderType)
 # Family -> (dataset class, mock dataset class or None): the legacy family flags select the class
 # and DataConfig.validate() checks the class against the config.
 DATASET_CLASSES: dict[str, tuple[type, type | None]] = {
@@ -41,11 +51,12 @@ DATASET_CLASSES: dict[str, tuple[type, type | None]] = {
 }
 DATASET_FAMILIES = tuple(DATASET_CLASSES)
 
-# Fields of the dataset config that other container sections own: the parallel layout (the model
-# config) and the validation flags (the validation config). PretrainConfigContainer writes them at
+# Fields of the dataset config that other container sections own: the physical pack width and
+# parallel layout (the model config), and validation flags. PretrainConfigContainer writes them at
 # finalize(), the container-oriented factory leaves them unset and the section serializes without
 # them: they are recorded once, in their owning sections.
 CONTAINER_WRITTEN_FIELDS = (
+    "packed_sequence_length",
     "data_parallel_size",
     "context_parallel_size",
     "sequence_parallel_size",
@@ -59,7 +70,7 @@ CONTAINER_WRITTEN_FIELDS = (
 class DataloaderConfig:
     """Settings for building torch DataLoaders on top of a dataset."""
 
-    dataloader_type: str | None = None
+    dataloader_type: DataloaderType | None = None
     """Single pass vs multiple pass data loader. 'external' passes the dataset through unchanged.
     Unset selects 'single'."""
 
@@ -70,16 +81,14 @@ class DataloaderConfig:
     """Shard the dataset per data-parallel rank before shuffling (cyclic sampler only)."""
 
     pin_memory: bool = True
-    """Pin host memory in the torch DataLoader. Declared only for now: the training loop keeps its
-    built-in value until the loader consumers read this config."""
+    """Pin host memory in the torch DataLoader."""
 
     persistent_workers: bool = True
-    """Keep DataLoader workers alive between epochs. Forced to False when num_workers == 0. Declared
-    only for now: the training loop keeps its built-in value until the loader consumers read it."""
+    """Keep DataLoader workers alive between epochs. Forced to False when num_workers == 0."""
 
     drop_last: bool = True
-    """Drop the last incomplete micro-batch. Declared only for now: the training loop keeps its
-    built-in value until the loader consumers read this config."""
+    """Drop the last incomplete micro-batch. Declared only for now: the training
+    loop keeps its built-in value until the loader consumers read this config."""
 
     def validate(self) -> None:
         """Check the loader settings without mutation."""
@@ -149,7 +158,8 @@ def resolve_dataset_class(
     Read-only: ``DataConfig.validate()`` calls it and ``DataConfig.finalize()`` commits its result.
     With no class given, a ``GPTFIMDatasetConfig`` with a source resolves to ``GPTFIMDataset``, a
     plain config with a source to ``GPTDataset`` and a plain config without one to
-    ``MockGPTDataset``; sft and varlen share the plain config class and are always explicit. An
+    ``MockGPTDataset``; SFTDatasetConfig selects SFT. Varlen uses the shared GPT config
+    and must be selected explicitly. An
     explicit class must match the config (mock without a source, real with one, the FIM class with
     the FIM config); nothing is silently rewritten.
     """
@@ -158,18 +168,22 @@ def resolve_dataset_class(
             raise ValueError("dataset_type needs a dataset: cfg.data.dataset is None.")
         return None
     source = has_data_source(dataset)
-    config_family = "fim" if isinstance(dataset, GPTFIMDatasetConfig) else None
+    if isinstance(dataset, GPTFIMDatasetConfig):
+        config_family = "fim"
+    elif isinstance(dataset, SFTDatasetConfig):
+        config_family = "sft"
+    elif isinstance(dataset, GPTDatasetConfig):
+        config_family = None
+    else:
+        raise TypeError(f"Unsupported dataset config: {type(dataset).__name__}")
     if dataset_type is None:
         family = config_family or "gpt"
-        if source:
-            return dataset_type_from_family(family, mock=False)
-        mock_class = dataset_type_from_family(family, mock=True)
-        if mock_class is None:
+        dataset_type = dataset_type_from_family(family, mock=not source)
+        if dataset_type is None:
             raise ValueError(
                 f"No data source is declared and there is no mock dataset for the {family} "
                 "family; declare blend or blend_per_split."
             )
-        return mock_class
     family, mock = dataset_family_from_type(dataset_type)
     real, mock_class = DATASET_CLASSES[family]
     if mock and source:
@@ -185,13 +199,16 @@ def resolve_dataset_class(
         raise ValueError(
             f"{dataset_type.__name__} needs a data source (blend or blend_per_split); {hint}."
         )
-    if (family == "fim") != (config_family == "fim"):
+    if family == "fim" and config_family != "fim":
         raise ValueError(
-            "GPTFIMDataset and GPTFIMDatasetConfig go together: the FIM fields live on that config "
-            f"class and only GPTFIMDataset reads them (got {dataset_type.__name__} with "
-            f"{type(dataset).__name__})."
+            f"{dataset_type.__name__} requires GPTFIMDatasetConfig, got {type(dataset).__name__}."
         )
-    if dataset.varlen_sbhd_validation and family == "varlen" and mock:
+    if config_family is not None and family != config_family:
+        raise ValueError(
+            f"{type(dataset).__name__} requires the {config_family} dataset family, "
+            f"got {dataset_type.__name__}."
+        )
+    if family == "varlen" and dataset.varlen_sbhd_validation and mock:
         raise ValueError("varlen_sbhd_validation requires real data (VarlenDataset, not its mock).")
     return dataset_type
 
@@ -205,7 +222,7 @@ class DataConfig:
     """
 
     dataset: GPTDatasetConfig | None = None
-    """Megatron Core's GPT dataset config (or ``GPTFIMDatasetConfig``), handed to
+    """GPT/FIM, SFT, or Varlen dataset config, handed to
     ``BlendedMegatronDatasetBuilder`` as is."""
 
     dataloader: DataloaderConfig = field(default_factory=DataloaderConfig)
@@ -216,18 +233,73 @@ class DataConfig:
     ``GPTFIMDataset``, ``SFTDataset``, ``MockSFTDataset``, ``VarlenDataset``, ``MockVarlenDataset``).
     Resolved at ``finalize()`` when unset. In YAML: ``{_target_: <module>.<class>, _call_: false}``."""
 
+    @staticmethod
+    def upgrade_cfg_dict(section: dict) -> dict:
+        """Upgrade a saved section before deserialization (``sanitize_dataclass_config`` hook).
+
+        Older SFT checkpoints saved a ``GPTDatasetConfig`` with an SFT ``dataset_type``; it is
+        restored as ``SFTDatasetConfig`` with every field, unknown keys included, for strict
+        deserialization to check.
+        """
+        dataset = section.get("dataset")
+        if not isinstance(dataset, dict) or dataset.get("_target_") != (
+            f"{GPTDatasetConfig.__module__}.{GPTDatasetConfig.__qualname__}"
+        ):
+            return section
+        selected = section.get("dataset_type")
+        if isinstance(selected, dict):
+            selected = selected.get("_target_")
+        if not any(
+            selected is cls or selected == f"{cls.__module__}.{cls.__qualname__}"
+            for cls in (SFTDataset, MockSFTDataset)
+        ):
+            return section
+        return {
+            **section,
+            "dataset": {
+                **dataset,
+                "_target_": f"{SFTDatasetConfig.__module__}.{SFTDatasetConfig.__qualname__}",
+            },
+        }
+
     def validate(self) -> None:
         """Check the loader settings and the class / config agreement; no mutation.
 
         Megatron Core's checks that need no tokenizer (``validate_without_tokenizer()``: the blend /
         split rules, the GPT booleans, the FIM rates and tokens) run here too, so a YAML or Python
         section fails at ``cfg.validate()``, before runtime initialization; the checks that need the
-        tokenizer run in ``bind_tokenizer()`` and in the builder.
+        tokenizer run in ``bind_tokenizer()`` and in the builder. Inter-document masking with the
+        dataloader attention mask is rejected here (the CLI normalizes the pair away), and so are
+        the GPT position / mask options for the real SFT and varlen datasets, which assert them per
+        sample.
         """
         self.dataloader.validate()
         if self.dataset is not None:
             self.dataset.validate_without_tokenizer()
-        resolve_dataset_class(self.dataset, self.dataset_type)
+            if (
+                isinstance(self.dataset, GPTDatasetConfig)
+                and self.dataset.inter_document_masking
+                and self.dataset.create_attention_mask
+            ):
+                raise ValueError(
+                    "data.dataset.inter_document_masking=True needs create_attention_mask=False: "
+                    "the dataset omits the attention mask under inter-document masking, and a "
+                    "batch path told to expect one waits for a broadcast that never comes "
+                    "(validate_args clears the flag for --dataloader-inter-document-masking; a "
+                    "Python or YAML section sets it explicitly)."
+                )
+        dataset_type = resolve_dataset_class(self.dataset, self.dataset_type)
+        if dataset_type in (SFTDataset, VarlenDataset) and (
+            self.dataset.reset_position_ids
+            or self.dataset.reset_attention_mask
+            or self.dataset.create_attention_mask
+        ):
+            raise ValueError(
+                f"{dataset_type.__name__} builds its own position ids and attention masks: "
+                "reset_position_ids, reset_attention_mask and create_attention_mask must be False "
+                "(--no-create-attention-mask-in-dataloader, without --reset-position-ids or "
+                "--reset-attention-mask)."
+            )
 
     def finalize(self) -> None:
         """Apply the loader defaults and commit the resolved dataset class (idempotent)."""
@@ -271,6 +343,48 @@ class DataConfig:
                 "cfg.data.bind_tokenizer(tokenizer)."
             )
         return self.dataset_type, self.dataset, is_packed_sequence(self.dataset_type, self.dataset)
+
+    def _family(self) -> str | None:
+        """The family of the dataset class the section entails (resolved read-only, nothing is
+        committed); None for a loader-only section."""
+        if self.dataset is None:
+            return None
+        family, _mock = dataset_family_from_type(
+            resolve_dataset_class(self.dataset, self.dataset_type)
+        )
+        return family
+
+    def is_sft(self) -> bool:
+        """The SFT family exactly (``SFTDataset`` / ``MockSFTDataset``); the loss reductions key on
+        it. Derived from the dataset class, so a mock dataset and its real counterpart agree; False
+        for a loader-only section."""
+        return self._family() == "sft"
+
+    def has_cu_seqlens(self) -> bool:
+        """``get_batch``'s formula: SFT samples and inter-document masking carry ``cu_seqlens``.
+        Read from the section on every rank before any sample is seen: tensor-parallel ranks other
+        than the source receive the batch by broadcast and the middle pipeline stages build only the
+        packed metadata, so neither can find out from a sample. False for a loader-only section."""
+        dataset = self.dataset
+        return dataset is not None and (self.is_sft() or bool(dataset.inter_document_masking))
+
+    def use_per_sequence_balancing(self) -> bool:
+        """``get_batch``'s formula: inter-document masking balances the context-parallel split per
+        sequence, SFT does not. False for a loader-only section."""
+        dataset = self.dataset
+        return dataset is not None and bool(dataset.inter_document_masking) and not self.is_sft()
+
+    def creates_attention_mask(self) -> bool:
+        """Whether this dataset emits the explicit attention-mask tensor for TP broadcast."""
+        return self._family() in ("gpt", "fim") and self.dataset.create_attention_mask
+
+    def yields_unpacked_samples(self) -> bool:
+        """The dataset emits one variable-length sample dict per item for an upstream packing
+        scheduler (the varlen family without SBHD validation), so the loader keeps the list as is
+        (the identity collate). ``False`` for every other family and for a loader-only section:
+        SFT samples are packed (``is_packed_sequence``) but fixed-width, and go through the
+        default collate."""
+        return self._family() == "varlen" and not bool(self.dataset.varlen_sbhd_validation)
 
     def to_cfg_dict(self) -> dict[str, Any]:
         """Serialize the section.

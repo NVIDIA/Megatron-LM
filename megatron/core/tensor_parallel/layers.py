@@ -1098,6 +1098,8 @@ def linear_with_grad_accumulation_and_async_allreduce(
                 )
                 linear_with_grad_accumulation_and_async_allreduce.warned = True
 
+    if gtp_remat_size > 1 and weight.requires_grad:
+        weight.record_wgrad_forward()
     return LinearWithGradAccumulationAndAsyncCommunication.apply(*args)
 
 
