@@ -14,7 +14,11 @@ from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.context_parallel import ContextParallelBatch, convert_cp_layout
-from megatron.core.context_parallel.sequence_roll import roll_contiguous, roll_contiguous_fields
+from megatron.core.context_parallel.sequence_roll import (
+    exchange_neighbor_tokens,
+    roll_contiguous,
+    roll_contiguous_fields,
+)
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
@@ -22,10 +26,14 @@ from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, get_backend
+from megatron.core.ops.mtp_kl_loss import vocab_parallel_kl_div, vocab_parallel_log_normalizer
 from megatron.core.ops.norm.torch_norm import LayerNormBuilder
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
@@ -138,10 +146,10 @@ def _mix_hidden_state_history(
     owner_start = sequence_owner_rank * sequence_length
     indices = all_indices[:, owner_start : owner_start + sequence_length]
 
-    # roll_tensor zeroes positions without a local continuation; use the newest state there.
+    # Rolls zero positions without a valid continuation; use the newest state there.
     selected_is_newest = indices.eq(num_older_states)
     older_indices = indices.clamp_max(num_older_states - 1)
-    invalid_locations = older_hidden_states.eq(0).all(dim=-1, keepdim=True)
+    invalid_locations = ~older_hidden_states.any(dim=-1, keepdim=True)
     selected_is_invalid = torch.gather(invalid_locations, dim=0, index=older_indices)
     use_newest = selected_is_newest | selected_is_invalid
     selected_older = torch.gather(
@@ -224,46 +232,13 @@ def tie_output_layer_state_dict(
 
 def _exchange_cp_roll_boundaries(first_boundary, second_boundary, cp_group):
     """Exchange both roll boundaries with the adjacent context-parallel ranks."""
-    first_boundary = first_boundary.contiguous()
-    second_boundary = second_boundary.contiguous()
-    global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
-    local_rank = torch.distributed.get_rank(group=cp_group)
-    first_received = (
-        torch.empty_like(first_boundary) if local_rank != len(global_ranks) - 1 else second_boundary
+    first_received, second_received = exchange_neighbor_tokens(
+        (first_boundary, second_boundary), cp_group, (-1, 1)
     )
-    second_received = (
-        torch.empty_like(second_boundary) if local_rank != 0 else torch.zeros_like(second_boundary)
-    )
-
-    # Keep boundary exchanges on the CP communicator so independent DP lanes
-    # can issue different packed P2P sequences without coupling through WORLD.
-    ops = []
-    if local_rank != 0:
-        previous_rank = global_ranks[local_rank - 1]
-        ops.append(
-            torch.distributed.P2POp(
-                torch.distributed.isend, first_boundary, previous_rank, group=cp_group
-            )
-        )
-        ops.append(
-            torch.distributed.P2POp(
-                torch.distributed.irecv, second_received, previous_rank, group=cp_group
-            )
-        )
-    if local_rank != len(global_ranks) - 1:
-        next_rank = global_ranks[local_rank + 1]
-        ops.append(
-            torch.distributed.P2POp(
-                torch.distributed.irecv, first_received, next_rank, group=cp_group
-            )
-        )
-        ops.append(
-            torch.distributed.P2POp(
-                torch.distributed.isend, second_boundary, next_rank, group=cp_group
-            )
-        )
-    for request in torch.distributed.batch_isend_irecv(ops):
-        request.wait()
+    if first_received is None:
+        first_received = second_boundary
+    if second_received is None:
+        second_received = torch.zeros_like(second_boundary)
     return first_received, second_received
 
 
@@ -286,7 +261,7 @@ def roll_tensor(
 
     Args:
         tensor (Tensor): The input tensor to roll. If None, returns (None, None).
-        shifts (int): The shift of the tensor (typically -1 for MTP).
+        shifts (int): The shift of the tensor; only -1 is supported.
         dims (int): The dimension to roll (typically -1 for sequence dimension).
         cp_group (ProcessGroup): The context parallelism process group. None or size 1
             uses a local roll.
@@ -304,27 +279,17 @@ def roll_tensor(
     if tensor is None:
         return None, None
 
-    if cp_layout == "contiguous":
-        if shifts != -1:
-            raise ValueError("Contiguous CP roll supports shifts=-1.")
-        result = roll_contiguous(tensor, dims, cp_group, packed_seq_params, fill_value)
-        return result, result.sum() if return_sum else None
-
-    if fill_value != 0:
+    if fill_value != 0 and cp_layout != "contiguous":
         raise ValueError("roll_tensor honors fill_value only with cp_layout='contiguous'.")
+    assert shifts == -1, "MTP roll only supports a single-token left shift."
+    if cp_layout == "contiguous" or get_pg_size(cp_group) == 1:
+        rolled = roll_contiguous(tensor, dims, cp_group, packed_seq_params, fill_value=fill_value)
+        return rolled, rolled.sum() if return_sum else None
 
     # Handle packed sequences cases
     if packed_seq_params is not None:
-        return _roll_tensor_packed_seq(
-            tensor, shifts, dims, packed_seq_params, cp_group, return_sum=return_sum
-        )
-
-    # Standard rolling behavior when CP is not enabled (cp_group is None or size=1)
-    if cp_group is None or cp_group.size() == 1:
-        rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
-        rolled_tensor.select(dims, shifts).fill_(0)
-        rolled_sum = rolled_tensor.sum() if return_sum else None
-        return rolled_tensor, rolled_sum
+        rolled = _roll_tensor_packed_seq(tensor, dims, packed_seq_params, cp_group)
+        return rolled, rolled.sum() if return_sum else None
 
     # CP-enabled rolling: Split tensor into chunks and handle boundary communication
     # This matches the batch splitting logic in get_batch_on_this_cp_rank() function
@@ -351,10 +316,8 @@ def roll_tensor(
     return rolled_tensor, rolled_sum
 
 
-def _roll_tensor_packed_seq(
-    tensor, shifts, dims, packed_seq_params, cp_group=None, return_sum=True
-):
-    """Roll packed documents one token left, exchanging CP boundary tokens when needed.
+def _roll_tensor_packed_seq(tensor, dims, packed_seq_params, cp_group):
+    """Roll zigzag-packed documents one token left, exchanging CP boundary tokens.
 
     With CP > 1, each physical document length must be divisible by ``2 * cp_size``.
     Slots after the final physical boundary roll as a separate segment and end in zero.
@@ -362,13 +325,6 @@ def _roll_tensor_packed_seq(
 
     ndim = tensor.dim()
     sequence_dim = dims if dims >= 0 else ndim + dims
-    assert sequence_dim in (
-        0,
-        ndim - 1,
-    ), f"Packed sequence roll only supports the first or last dimension, got dims={dims}."
-    mask_shape = [1] * ndim
-    mask_shape[sequence_dim] = -1
-    assert shifts == -1, "Packed sequence roll only supports a single-token left shift."
     cu_seqlens = packed_seq_params.cu_seqlens_q
     assert cu_seqlens is not None, "Packed sequence parameters must provide cu_seqlens_q."
     physical_cu_seqlens = packed_seq_params.cu_seqlens_q_padded
@@ -376,27 +332,9 @@ def _roll_tensor_packed_seq(
         physical_cu_seqlens = cu_seqlens
     physical_cu_seqlens = physical_cu_seqlens.to(device=tensor.device)
 
-    cp_size = cp_group.size() if cp_group is not None else 1
-    rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
-    rolled_tensor.select(dims, shifts).zero_()
-    if cp_size == 1:
-        cu_seqlens = cu_seqlens.to(device=tensor.device)
-        if cu_seqlens.numel() == 1:
-            return rolled_tensor, rolled_tensor.sum() if return_sum else None
-        # Mask each document's last valid position and physical padding; slots
-        # after the final document roll as a separate trailing segment.
-        positions = torch.arange(
-            tensor.size(sequence_dim), device=tensor.device, dtype=physical_cu_seqlens.dtype
-        )
-        document_ids = torch.searchsorted(physical_cu_seqlens[1:], positions, right=True)
-        # Clamp the lookup for positions beyond the final document.
-        trailing = positions >= physical_cu_seqlens[-1]
-        document_ids.clamp_max_(len(cu_seqlens) - 2)
-        valid_ends = physical_cu_seqlens[:-1] + torch.diff(cu_seqlens)
-        invalid = (positions >= valid_ends.index_select(0, document_ids) - 1) & ~trailing
-        rolled_tensor.masked_fill_(invalid.view(mask_shape), 0)
-        rolled_sum = rolled_tensor.sum() if return_sum else None
-        return rolled_tensor, rolled_sum
+    cp_size = cp_group.size()
+    rolled_tensor = torch.roll(tensor, shifts=-1, dims=dims)
+    rolled_tensor.select(dims, -1).zero_()
 
     # CP attention requires two equal chunks per rank for every physical document.
     aligned = (torch.diff(physical_cu_seqlens) % (2 * cp_size) == 0).all()
@@ -409,7 +347,7 @@ def _roll_tensor_packed_seq(
     if not bool(aligned):
         raise ValueError("Packed document lengths must be divisible by twice the CP size")
     if nonempty.numel() == 0:
-        return rolled_tensor, rolled_tensor.sum() if return_sum else None
+        return rolled_tensor
     local_starts = local_boundaries[:-1].index_select(0, nonempty)
     local_ends = local_boundaries[1:].index_select(0, nonempty)
     chunk_lengths = local_lengths.index_select(0, nonempty) // 2
@@ -424,41 +362,41 @@ def _roll_tensor_packed_seq(
 
     rolled_tensor.index_copy_(sequence_dim, first_ends, first_received)
     rolled_tensor.index_copy_(sequence_dim, second_ends, second_received)
-    rolled_sum = rolled_tensor.sum() if return_sum else None
-    return rolled_tensor, rolled_sum
+    return rolled_tensor
 
 
 def roll_tensor_precomputed_embeddings(
-    tensor, shifts=-1, dims=0, sp_group=None, cp_group=None, packed_seq_params=None, return_sum=True
-):
+    tensor,
+    shifts=-1,
+    dims=0,
+    sp_group=None,
+    cp_group=None,
+    packed_seq_params=None,
+    cp_layout="zigzag",
+) -> Tensor:
     """Roll precomputed embeddings while preserving SP and packed-sequence boundaries."""
+    assert shifts == -1, "MTP roll only supports a single-token left shift."
+    if cp_layout == "contiguous" or get_pg_size(cp_group) == 1:
+        return roll_contiguous(tensor, dims, cp_group, packed_seq_params, sp_group=sp_group)
     sp_size = get_pg_size(sp_group)
-    if sp_size == 1:
-        return roll_tensor(
-            tensor,
-            shifts=shifts,
-            dims=dims,
-            cp_group=cp_group,
-            packed_seq_params=packed_seq_params,
-            return_sum=return_sum,
-        )
-
-    sp_rank = get_pg_rank(sp_group)
-    gathered_shape = list(tensor.shape)
-    gathered_shape[dims] *= sp_size
-    full_tensor = torch.empty(gathered_shape, dtype=tensor.dtype, device=tensor.device)
-    dist_all_gather_func(full_tensor, tensor.contiguous(), group=sp_group)
-
-    rolled_full, rolled_sum = roll_tensor(
-        full_tensor,
+    if sp_size > 1:
+        gathered_shape = list(tensor.shape)
+        gathered_shape[dims] *= sp_size
+        full_tensor = torch.empty(gathered_shape, dtype=tensor.dtype, device=tensor.device)
+        dist_all_gather_func(full_tensor, tensor.contiguous(), group=sp_group)
+        tensor = full_tensor
+    rolled, _ = roll_tensor(
+        tensor,
         shifts=shifts,
         dims=dims,
         cp_group=cp_group,
         packed_seq_params=packed_seq_params,
-        return_sum=return_sum,
+        return_sum=False,
+        cp_layout=cp_layout,
     )
-    local_tensor = rolled_full.chunk(sp_size, dim=dims)[sp_rank].contiguous()
-    return local_tensor, rolled_sum
+    if sp_size > 1:
+        rolled = rolled.chunk(sp_size, dim=dims)[get_pg_rank(sp_group)].contiguous()
+    return rolled
 
 
 def _packed_seq_params_for_local_hsm_roll(
@@ -467,19 +405,12 @@ def _packed_seq_params_for_local_hsm_roll(
     cp_group: Optional[torch.distributed.ProcessGroup],
     tp_group: Optional[torch.distributed.ProcessGroup],
 ) -> Optional[PackedSeqParams]:
-    """Re-express packed document boundaries in this HSM roll's local frame.
+    """Re-express zigzag packed document boundaries in this HSM roll's local frame.
 
-    ``cu_seqlens`` is global, while a sequence-parallel rank holds a 1/tp slice of the
-    context-parallel-local sequence. ``_roll_tensor_packed_seq`` maps global to local by
-    dividing by ``cp_size`` alone -- a scale with no offset, so it is correct only for
-    the rank whose slice starts at zero. Dividing and then subtracting where this slice
-    starts fixes that: documents keep their order and stay contiguous in CP-local space,
-    so their intersections with a contiguous slice tile it exactly. Documents outside
-    the slice collapse to zero length, which the roll already skips.
-
-    The padded boundaries define physical CP ownership, while the unpadded boundaries
-    identify valid-token ends. Both become local roll boundaries; the padded variants
-    and ``total_tokens`` are then cleared because their global coordinates no longer match.
+    Map each document's owned chunks into local order, adding boundaries at gaps,
+    then intersect with this sequence-parallel rank's window.
+    Documents outside the slice collapse to repeated boundaries.
+    Global ``total_tokens`` and ``seq_idx`` are cleared.
 
     Returns:
         Translated params, or None when the boundaries cannot be translated, in which
@@ -554,6 +485,44 @@ def _packed_seq_params_for_local_hsm_roll(
     )
 
 
+def _roll_hidden_state_history(stacked, packed_seq_params, *, cp_layout, cp_group, sp_group):
+    """Align stacked HSM candidates with their next target across CP and SP shards."""
+    if cp_layout == "contiguous" or get_pg_size(cp_group) == 1:
+        return roll_contiguous(
+            stacked,
+            dims=1,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            sp_group=sp_group,
+        )
+
+    # Zigzag's CP-only exchange cannot fetch continuations from another SP rank.
+    use_local_roll = get_pg_size(sp_group) > 1
+    if packed_seq_params is not None:
+        padded = packed_seq_params.cu_seqlens_q_padded
+        # Zigzag CP rolls physical ends; local logical boundaries avoid pulling in padding.
+        use_local_roll = use_local_roll or (
+            padded is not None and padded is not packed_seq_params.cu_seqlens_q
+        )
+        if use_local_roll:
+            shard_params = _packed_seq_params_for_local_hsm_roll(
+                packed_seq_params,
+                local_seq_length=stacked.size(1),
+                cp_group=cp_group,
+                tp_group=sp_group,
+            )
+            if shard_params is not None:
+                packed_seq_params = shard_params
+    rolled, _ = roll_tensor(
+        stacked,
+        dims=1,
+        cp_group=None if use_local_roll else cp_group,
+        packed_seq_params=packed_seq_params,
+        return_sum=False,
+    )
+    return rolled
+
+
 class MTPLossLoggingHelper:
     """Helper class for logging MTP losses and acceptance rates."""
 
@@ -569,17 +538,19 @@ class MTPLossLoggingHelper:
         reduce_group: torch.distributed.ProcessGroup = None,
         avg_group: torch.distributed.ProcessGroup = None,
         num_tokens: Optional[torch.Tensor] = None,
+        ce_loss: Optional[torch.Tensor] = None,
     ):
         """Save the mtp metrics (loss, correct, total) for logging.
 
         Args:
-            loss (torch.Tensor): Normalized loss, or the loss sum when num_tokens is supplied.
+            loss (torch.Tensor): Weighted CE + KL mean, or sum when num_tokens is supplied.
             correct (torch.Tensor): Number of correct predictions.
             total (torch.Tensor): Total number of predictions.
             layer_number (int): Layer index of the loss.
             num_layers (int): The number of total layers.
             reduce_group (torch.distributed.ProcessGroup): The group for reducing the loss.
             avg_group (torch.distributed.ProcessGroup): The group for averaging the loss.
+            ce_loss (Optional[torch.Tensor]): Unweighted CE mean, or sum with num_tokens.
             num_tokens (torch.Tensor): Local valid-token count for per-token loss logging.
                 Sums and counts are accumulated across microbatches and reduced with SUM
                 over both groups before division. Omit to preserve legacy mean logging.
@@ -610,7 +581,7 @@ class MTPLossLoggingHelper:
                 )
         tracker["per_token"] = per_token
         if "loss_values" not in tracker:
-            tracker["loss_values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+            tracker["loss_values"] = loss.new_zeros(num_layers, dtype=torch.float32)
         if "correct_values" not in tracker:
             tracker["correct_values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
         if "total_values" not in tracker:
@@ -623,13 +594,34 @@ class MTPLossLoggingHelper:
                 tracker["loss_token_counts"] = torch.zeros_like(tracker["loss_values"])
             tracker["loss_sums"][layer_number] += loss.detach()
             tracker["loss_token_counts"][layer_number] += num_tokens.detach()
+            if ce_loss is not None:
+                if "ce_loss_sums" not in tracker:
+                    tracker["ce_loss_sums"] = torch.zeros_like(tracker["loss_values"])
+                tracker["ce_loss_sums"][layer_number] += ce_loss.detach()
+                ce_loss = ce_loss / num_tokens.clamp(min=1)
             # Keep local normalized diagnostics available until the global reduction.
             loss = loss / num_tokens.clamp(min=1)
         tracker["loss_values"][layer_number] += loss.detach()
+        if ce_loss is not None:
+            if "ce_loss_values" not in tracker:
+                tracker["ce_loss_values"] = ce_loss.new_zeros(num_layers, dtype=torch.float32)
+            tracker["ce_loss_values"][layer_number] += ce_loss.detach()
         tracker["correct_values"][layer_number] += correct.detach()
         tracker["total_values"][layer_number] += total.detach()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
+
+    @staticmethod
+    def save_kd_loss_to_tracker(loss_sum, count, layer_number, num_layers, avg_group):
+        """Accumulate unweighted KL sums/counts, independently of the combined objective tracker."""
+        tracker = MTPLossLoggingHelper.tracker
+        if "kd_loss_values" not in tracker:
+            tracker["kd_loss_values"] = loss_sum.new_zeros(num_layers, dtype=torch.float32)
+            tracker["kd_loss_counts"] = loss_sum.new_zeros(num_layers, dtype=torch.float32)
+        tracker["kd_loss_values"][layer_number] += loss_sum.detach()
+        # Match the source objective's empty-microbatch logging convention.
+        tracker["kd_loss_counts"][layer_number] += count.detach().float().clamp(min=1)
+        tracker["kd_avg_group"] = avg_group
 
     @staticmethod
     def reset_metrics_tracker():
@@ -643,13 +635,16 @@ class MTPLossLoggingHelper:
     def clean_metrics_in_tracker():
         """Clear the mtp metrics."""
         tracker = MTPLossLoggingHelper.tracker
+        for key in ("ce_loss_values", "kd_loss_values", "kd_loss_counts"):
+            if key in tracker:
+                tracker[key].zero_()
         if "loss_values" in tracker:
             tracker["loss_values"].zero_()
         if "correct_values" in tracker:
             tracker["correct_values"].zero_()
         if "total_values" in tracker:
             tracker["total_values"].zero_()
-        for key in ("loss_sums", "loss_token_counts"):
+        for key in ("loss_sums", "loss_token_counts", "ce_loss_sums"):
             if key in tracker:
                 tracker[key].zero_()
         # Keep per_token, reduce_group and avg_group across logging intervals: CUDA graph
@@ -665,7 +660,9 @@ class MTPLossLoggingHelper:
 
         loss_values = tracker["loss_values"]
         if tracker.get("per_token", False):
-            for key in ("loss_sums", "loss_token_counts"):
+            for key in ("loss_sums", "loss_token_counts", "ce_loss_sums"):
+                if key not in tracker:
+                    continue
                 for group_key in ("reduce_group", "avg_group"):
                     if tracker.get(group_key) is not None:
                         torch.distributed.all_reduce(
@@ -673,14 +670,21 @@ class MTPLossLoggingHelper:
                             group=tracker[group_key],
                             op=torch.distributed.ReduceOp.SUM,
                         )
-            loss_values.copy_(tracker["loss_sums"] / tracker["loss_token_counts"].clamp(min=1))
+            denominator = tracker["loss_token_counts"].clamp(min=1)
+            loss_values.copy_(tracker["loss_sums"] / denominator)
+            if "ce_loss_sums" in tracker:
+                tracker["ce_loss_values"].copy_(tracker["ce_loss_sums"] / denominator)
         else:
-            if tracker.get('reduce_group') is not None:
-                torch.distributed.all_reduce(loss_values, group=tracker.get('reduce_group'))
-            if tracker.get('avg_group') is not None:
-                torch.distributed.all_reduce(
-                    loss_values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
-                )
+            for key in ("loss_values", "ce_loss_values"):
+                if key not in tracker:
+                    continue
+                values = tracker[key]
+                if tracker.get("reduce_group") is not None:
+                    torch.distributed.all_reduce(values, group=tracker["reduce_group"])
+                if tracker.get("avg_group") is not None:
+                    torch.distributed.all_reduce(
+                        values, group=tracker["avg_group"], op=torch.distributed.ReduceOp.AVG
+                    )
 
         for key in ["correct_values", "total_values"]:
             if key not in tracker:
@@ -698,7 +702,21 @@ class MTPLossLoggingHelper:
         """Track the Multi-Token Prediction (MTP) metrics for logging."""
         MTPLossLoggingHelper.reduce_metrics_in_tracker()
         tracker = MTPLossLoggingHelper.tracker
+        if "kd_loss_values" in tracker:
+            metrics = torch.stack((tracker["kd_loss_values"], tracker["kd_loss_counts"]))
+            if tracker.get("kd_avg_group") is not None:
+                torch.distributed.all_reduce(metrics, group=tracker["kd_avg_group"])
+            # Sums/counts already account for microbatches; do not apply loss_scale again.
+            for i, loss in enumerate(metrics[0] / metrics[1].clamp(min=1)):
+                name = f"mtp_{i+1} kd_logit_loss"
+                if total_loss_dict is not None:
+                    total_loss_dict[name] = total_loss_dict.get(name, 0) + loss
+                if writer is not None:
+                    writer.add_scalar(name, loss, iteration)
+                if wandb_writer is not None:
+                    wandb_writer.log({name: loss}, iteration)
         if "loss_values" not in tracker:
+            MTPLossLoggingHelper.clean_metrics_in_tracker()
             return
 
         # Per-token losses are already normalized across all scheduled microbatches.
@@ -725,13 +743,24 @@ class MTPLossLoggingHelper:
         mtp_cumulative_corrects = tracker["cumulative_correct_values"]
         mtp_cumulative_totals = tracker["cumulative_total_values"]
 
-        mtp_num_layers = mtp_losses.shape[0]
+        mtp_num_layers = mtp_corrects.shape[0]
         for i in range(mtp_num_layers):
             loss_name = f"mtp_{i+1} loss"
             step_acc_name = f"mtp_{i+1}_acceptance_rate"
             cum_acc_name = f"mtp_{i+1}_cumulative_acceptance_rate"
 
             loss = mtp_losses[i]
+            if "ce_loss_values" in tracker:
+                ce_name = f"mtp_{i+1} ce_loss"
+                ce_loss = tracker["ce_loss_values"][i] * (
+                    1.0 if tracker.get("per_token", False) else loss_scale
+                )
+                if total_loss_dict is not None:
+                    total_loss_dict[ce_name] = total_loss_dict.get(ce_name, 0) + ce_loss
+                if writer is not None:
+                    writer.add_scalar(ce_name, ce_loss, iteration)
+                if wandb_writer is not None:
+                    wandb_writer.log({ce_name: ce_loss}, iteration)
             # Empty masks can leave no valid MTP positions, so clamp denominators to avoid NaNs.
             step_rate = (mtp_corrects[i] / torch.clamp(mtp_totals[i], min=1)) * 100.0
             cum_rate = (
@@ -903,14 +932,17 @@ def mtp_on_this_rank(
         - If no custom layout is provided, assumes all MTP layers (if any) are placed on the last
           pipeline stage. The function returns True only on the last pipeline stage.
     """
+    if layout is None and mtp_num_layers is None:
+        # No MTP layers anywhere, so the pipeline rank is not needed.
+        return False
     mtp_on_this_rank = False
-    if pp_group is not None:
-        pp_rank = get_pg_rank(pp_group)
-        pp_size = get_pg_size(pp_group)
-    else:
-        # Compatibility fallback for callers that have not migrated to an explicit PP group.
+    if pp_group is None:
+        warn_global_process_group_fallback("mtp_on_this_rank", "pp_group")
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         pp_size = None
+    else:
+        pp_rank = get_pg_rank(pp_group)
+        pp_size = get_pg_size(pp_group)
     if vp_size is None and layout is not None:
         vp_size = layout.virtual_pipeline_model_parallel_size
     elif vp_size is None and not ignore_virtual:
@@ -932,7 +964,6 @@ def mtp_on_this_rank(
         # without custom PP layout, we only support put all of MTP layers on the last pipeline stage
         if mtp_num_layers is not None:
             if pp_size is None:
-                # Compatibility fallback for callers without explicit pipeline metadata.
                 pp_size = parallel_state.get_pipeline_model_parallel_world_size()
             mtp_on_this_rank = pp_rank == pp_size - 1
             if mtp_on_this_rank and not ignore_virtual and vp_size not in (None, 1):
@@ -1100,6 +1131,18 @@ def _accepts_return_argmax(compute_language_model_loss: Callable) -> bool:
         return False
 
 
+def _roll_mtp_teacher(tensor, cp_group, packed_seq_params, cp_layout):
+    """Align projected teacher logits with the next MTP depth's target positions."""
+    shifted, _ = roll_tensor(
+        tensor.movedim(0, -1),
+        cp_group=cp_group,
+        packed_seq_params=packed_seq_params,
+        return_sum=False,
+        cp_layout=cp_layout,
+    )
+    return shifted.movedim(-1, 0).contiguous()
+
+
 def process_mtp_loss(
     hidden_states: Tensor,
     labels: Tensor,
@@ -1199,6 +1242,38 @@ def process_mtp_loss(
     # when calculate_per_token_loss is enabled. This ensures MTP gradients are
     # correctly scaled relative to the main loss gradients in finalize_model_grads.
     original_num_tokens = loss_mask.sum()
+    cp_size = cp_group.size() if cp_group is not None else 1
+    # Preserve CE-only behavior for config-like callers predating KD options.
+    ce_enabled = getattr(config, "mtp_ce_loss_weight", 1.0) > 0
+    kd_enabled = is_training and getattr(config, "mtp_kl_loss_weight", 0.0) > 0
+    if not ce_enabled and not kd_enabled:
+        if is_training:
+            # HybridModel can return separate main states. Keep all MTP gradient
+            # hooks active so overlapping DDP buckets receive zero gradients.
+            zero_mtp_loss = sum(state.float().sum() * 0.0 for state in hidden_states_list[1:])
+            hidden_states = hidden_states + zero_mtp_loss.to(hidden_states.dtype)
+        return hidden_states
+    if kd_enabled:
+        # Project before shifting: sequence-parallel projection gathers sequence rows.
+        # The first chunk uses the MTP CP layout, unlike an optional main_hidden_states.
+        with torch.no_grad():
+            activation_buffer = getattr(output_layer, "embedding_activation_buffer", None)
+            buffered = len(activation_buffer) if activation_buffer is not None else 0
+            try:
+                teacher_logits, _ = output_layer(
+                    hidden_states_list[0].detach(),
+                    weight=output_weight,
+                    runtime_gather_output=False,
+                )
+            finally:
+                # No teacher backward will consume deferred embedding wgrad activations.
+                if activation_buffer is not None:
+                    del activation_buffer[buffered:]
+            if scale_logits_fn is not None:
+                teacher_logits = scale_logits_fn(teacher_logits)
+            teacher_normalizer = vocab_parallel_log_normalizer(
+                teacher_logits, config.mtp_kd_logit_temperature, tp_group
+            )
 
     cumulative_mtp_input_mask = None
     rolled_num_tokens = original_num_tokens
@@ -1217,8 +1292,8 @@ def process_mtp_loss(
     ):
         """Project one MTP depth to the vocabulary and compute its masked per-token loss.
 
-        Returns ``(masked_loss, correct, total)``. ``correct``/``total`` are the acceptance
-        counts (``None`` when not training). Everything that allocates [s, b, v] tensors for
+        Returns the masked loss, acceptance counts, and detached CE/KL sums.
+        ``correct``/``total`` are None when not training. All [s, b, v] allocations for
         one head lives here so ``mtp_loss_early_backward`` can run and release it as a unit.
         """
         mtp_logits, _ = output_layer(head_hidden, weight=output_weight, runtime_gather_output=False)
@@ -1235,19 +1310,47 @@ def process_mtp_loss(
                 batch_dim=1,
             )
         mtp_preds = None
-        if loss_returns_argmax:
-            head_loss, mtp_preds = compute_language_model_loss(
-                head_labels, mtp_logits, return_argmax=True
+        ce_loss = kd_loss = None
+        if ce_enabled:
+            # Native CE may overwrite its input; KD backward needs the original logits.
+            ce_logits = mtp_logits.clone() if kd_enabled else mtp_logits
+            if loss_returns_argmax:
+                ce_loss, mtp_preds = compute_language_model_loss(
+                    head_labels, ce_logits, return_argmax=True
+                )
+            else:
+                ce_loss = compute_language_model_loss(head_labels, ce_logits)
+            ce_loss = layer_loss_mask * ce_loss
+        if kd_enabled:
+            kd_loss = (
+                vocab_parallel_kl_div(
+                    mtp_logits,
+                    teacher_logits,
+                    config.mtp_kd_logit_temperature,
+                    tp_group,
+                    teacher_normalizer,
+                    loss_scale=config.mtp_kd_loss_scale,
+                ).transpose(0, 1)
+                * layer_loss_mask
             )
-        else:
-            head_loss = compute_language_model_loss(head_labels, mtp_logits)
+        head_loss = (
+            getattr(config, "mtp_ce_loss_weight", 1.0) * ce_loss if ce_loss is not None else 0
+        )
+        if kd_loss is not None:
+            head_loss = head_loss + config.mtp_kl_loss_weight * kd_loss
         correct = total = None
         if is_training:
             correct, total = _compute_mtp_acceptance_counts(
                 mtp_logits, head_labels, layer_loss_mask, tp_group=tp_group, preds=mtp_preds
             )
-        head_loss = layer_loss_mask * head_loss
-        return head_loss, correct, total
+        # Only detached scalars escape with the loss, including during early backward.
+        return (
+            head_loss,
+            correct,
+            total,
+            ce_loss.detach().sum() if ce_loss is not None else None,
+            kd_loss.detach().sum() if kd_loss is not None else None,
+        )
 
     # Early backward: fwd(head) -> bwd(head) per depth so at most one head's logits/softmax is
     # resident at a time. Needs a live graph and cannot run inside CUDA-graph capture/warmup.
@@ -1315,21 +1418,51 @@ def process_mtp_loss(
                 # no-mask fast path for all non-multimodal MTP callers.
                 num_tokens = rolled_num_tokens
 
+        if kd_enabled:
+            teacher_logits = _roll_mtp_teacher(
+                teacher_logits, cp_group, packed_seq_params, config.attention_cp_layout
+            )
+            teacher_normalizer = _roll_mtp_teacher(
+                teacher_normalizer, cp_group, packed_seq_params, config.attention_cp_layout
+            )
+
         head_hidden = hidden_states_list[mtp_layer_number + 1]
         # In early-backward mode the head runs on a detached leaf so its backward stops at the
         # head input; the resulting gradient is re-injected into the main graph below.
         head_input = head_hidden.detach().requires_grad_(True) if early_backward else head_hidden
-        mtp_loss, correct, total = _mtp_head_loss(
+        mtp_loss, correct, total, ce_sum, kd_sum = _mtp_head_loss(
             mtp_layer_number, head_input, mtp_labels, layer_loss_mask
         )
 
+        # CP ranks own disjoint parts of the same examples. Use their combined
+        # counts so moving a target across a CP boundary cannot change its weight,
+        # including when a rank has no LM targets but receives a rolled MTP target.
+        if cp_size > 1:
+            token_counts = torch.stack((original_num_tokens, num_tokens))
+            torch.distributed.all_reduce(
+                token_counts, op=torch.distributed.ReduceOp.SUM, group=cp_group
+            )
+            normalization_original_tokens, normalization_tokens = token_counts.unbind()
+        else:
+            normalization_original_tokens = original_num_tokens
+            normalization_tokens = num_tokens
+        safe_normalization_tokens = normalization_tokens.clamp(min=1)
+
         if is_training:
             # Logging only: detach so nothing here keeps this head's graph alive.
-            mtp_loss_for_log = torch.sum(mtp_loss.detach())
+            combined_sum = getattr(config, "mtp_ce_loss_weight", 1.0) * ce_sum if ce_enabled else 0
+            if kd_enabled:
+                combined_sum = combined_sum + config.mtp_kl_loss_weight * kd_sum
+            mtp_loss_for_log = combined_sum
+            ce_loss_for_log = ce_sum if ce_enabled else None
             if not config.calculate_per_token_loss:
                 mtp_loss_for_log = (
-                    mtp_loss_for_log * (num_tokens > 0).to(mtp_loss.dtype)
-                ) / num_tokens.clamp(min=1)
+                    mtp_loss_for_log * (normalization_tokens > 0).to(mtp_loss.dtype) * cp_size
+                ) / safe_normalization_tokens
+                if ce_loss_for_log is not None:
+                    ce_loss_for_log = (
+                        ce_loss_for_log * (normalization_tokens > 0).to(mtp_loss.dtype) * cp_size
+                    ) / safe_normalization_tokens
 
             if metric_avg_group is None:
                 # Compatibility fallback for callers that have not migrated to explicit groups.
@@ -1343,8 +1476,13 @@ def process_mtp_loss(
                 mtp_layer_number,
                 config.mtp_num_layers,
                 avg_group=metric_avg_group,
+                ce_loss=ce_loss_for_log,
                 num_tokens=num_tokens if config.calculate_per_token_loss else None,
             )
+            if kd_enabled:
+                MTPLossLoggingHelper.save_kd_loss_to_tracker(
+                    kd_sum, num_tokens, mtp_layer_number, config.mtp_num_layers, metric_avg_group
+                )
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
         if config.calculate_per_token_loss and getattr(
             config, "mtp_normalize_loss_by_main_tokens", False
@@ -1355,25 +1493,19 @@ def process_mtp_loss(
             mtp_loss_normalized = mtp_loss_scale * mtp_loss
         elif config.calculate_per_token_loss:
             # finalize_model_grads divides by the global main-loss token count.
-            # Use one main/MTP token ratio for this logical microbatch, independent
-            # of its CP partition. Rolling and masking can leave different ratios
-            # (or no valid tokens) on individual ranks. Keep the local counts above
-            # unchanged for logging, which reduces them separately over DP+CP.
-            normalization_tokens = torch.stack((original_num_tokens, num_tokens))
-            if cp_group is not None and cp_group.size() > 1:
-                torch.distributed.all_reduce(
-                    normalization_tokens, op=torch.distributed.ReduceOp.SUM, group=cp_group
-                )
-            main_num_tokens, mtp_num_tokens = normalization_tokens.unbind()
-            # Clamp only after the collective; empty ranks must participate too.
+            # Use the CP-wide main/MTP ratio for this logical microbatch. Keep
+            # local counts unchanged for logging, which sums them over DP+CP.
             # This preserves CP partition invariance, not a global MTP-token mean
             # across different DP microbatches with different main/MTP ratios.
             mtp_loss_normalized = (
-                mtp_loss_scale * mtp_loss * (main_num_tokens / mtp_num_tokens.clamp(min=1))
+                mtp_loss_scale
+                * mtp_loss
+                * (normalization_original_tokens / safe_normalization_tokens)
             )
         else:
-            safe_num_tokens = num_tokens.clamp(min=1)
-            mtp_loss_normalized = mtp_loss_scale * mtp_loss / safe_num_tokens
+            # The legacy path averages parameter gradients over DP and CP.
+            # Compensate the CP average when using a CP-wide denominator.
+            mtp_loss_normalized = mtp_loss_scale * cp_size * mtp_loss / safe_normalization_tokens
 
         if early_backward:
             # Same upstream gradient MTPLossAutoScaler.backward would supply, applied now. This
@@ -2522,20 +2654,28 @@ class MultiTokenPredictionBlock(MegatronModule):
         # This enables MTP to work with CP > 1 by providing the CP process group
         # to the roll_tensor function for proper boundary communication
         if pg_collection is None:
-            # Use default MPU process groups if not provided
-            required_pgs = ['cp', 'tp', 'pp'] + (['dp', 'gtp_remat'] if self.config.mtp_hsm else [])
+            warn_global_process_group_fallback(type(self).__name__)
+            # hcp feeds TEDotProductAttention's a2a+p2p path in the MTP layers.
+            required_pgs = ['cp', 'hcp', 'tp', 'pp'] + (
+                ['dp', 'gtp_remat'] if self.config.mtp_hsm else []
+            )
+            if self.config.test_mode and self.config.qk_layernorm:
+                # SelfAttention.run_realtime_tests in the MTP layers compares the Q/K layernorm
+                # parameters across the data-parallel group.
+                required_pgs += [g for g in ('dp', 'dp_gtp_remat') if g not in required_pgs]
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)
-        else:
-            # Ensure the provided process groups include TP, CP, and PP.
-            for group_name in ('tp', 'cp', 'pp'):
-                assert (
-                    getattr(pg_collection, group_name, None) is not None
-                ), f"MultiTokenPredictionBlock pg_collection must have {group_name} process group"
-            if self.config.mtp_hsm:
-                for group_name in ('dp', 'gtp_remat'):
-                    assert (
-                        getattr(pg_collection, group_name, None) is not None
-                    ), f"MultiTokenPredictionBlock with HSM requires a {group_name} process group"
+        # Ensure the provided process groups include TP, CP, and PP.
+        for group_name in ('tp', 'cp', 'pp'):
+            if vars(pg_collection).get(group_name) is None:
+                raise ValueError(
+                    f"MultiTokenPredictionBlock pg_collection must have {group_name} process group"
+                )
+        if self.config.mtp_hsm:
+            for group_name in ('dp', 'gtp_remat'):
+                if vars(pg_collection).get(group_name) is None:
+                    raise ValueError(
+                        f"MultiTokenPredictionBlock with HSM requires a {group_name} process group"
+                    )
 
         self._build_layers(pg_collection)
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
@@ -2823,88 +2963,46 @@ class MultiTokenPredictionBlock(MegatronModule):
         if hidden_state_mixing_enabled:
             hidden_state_history = [hidden_states]
 
+        sp_group = self.tp_group if self.sequence_parallel else None
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
 
             if decoder_input is not None:
-                decoder_input, _ = roll_tensor_precomputed_embeddings(
+                decoder_input = roll_tensor_precomputed_embeddings(
                     decoder_input,
                     shifts=-1,
                     dims=0,
-                    sp_group=self.tp_group if self.sequence_parallel else None,
+                    sp_group=sp_group,
                     cp_group=cp_group,
                     packed_seq_params=packed_seq_params,
-                    return_sum=False,
+                    cp_layout=self.config.attention_cp_layout,
                 )
                 if padding_mask is not None:
                     # Precomputed embeddings bypass the layer's _get_embeddings,
                     # so shift validity here alongside those embeddings.
-                    valid_mask, _ = roll_tensor_precomputed_embeddings(
+                    valid_mask = roll_tensor_precomputed_embeddings(
                         (~padding_mask).transpose(0, 1).contiguous(),
                         shifts=-1,
                         dims=0,
-                        sp_group=self.tp_group if self.sequence_parallel else None,
+                        sp_group=sp_group,
                         cp_group=cp_group,
                         packed_seq_params=packed_seq_params,
-                        return_sum=False,
+                        cp_layout=self.config.attention_cp_layout,
                     )
                     padding_mask = ~valid_mask.transpose(0, 1).contiguous()
 
             # Older HSM entries predict earlier targets than the newest entry. Roll
             # them once per depth so all candidates correspond to the same target.
             if hidden_state_mixing_enabled and len(hidden_state_history) > 1:
-                entries_to_roll = hidden_state_history[:-1]
                 newest_entry = hidden_state_history[-1]
-                num_entries = len(entries_to_roll)
-                sequence_length, batch_size, hidden_size = entries_to_roll[0].shape
-                stacked = torch.stack(entries_to_roll, dim=0)
-                flattened = stacked.permute(0, 2, 3, 1).reshape(
-                    num_entries * batch_size, hidden_size, sequence_length
-                )
-                # Under sequence parallelism this rank holds a 1/tp slice of its CP
-                # chunks, not the chunk pair roll_tensor's CP branch assumes, so that
-                # branch's neighbour exchange fills the boundary slots with tokens from
-                # unrelated positions -- and a plausible-looking hidden state is one
-                # the mixing step cannot recognise as invalid. Withholding cp_group takes the
-                # contiguous path, which zeroes the slot that has no local continuation
-                # so the mix falls back to the newest entry there instead.
-                sequence_parallel_size = get_pg_size(self.tp_group) if self.sequence_parallel else 1
-                # Document boundaries are global too, so they need the same treatment:
-                # translated into this shard's frame, the withheld cp_group leaves the
-                # roll on its cp_size == 1 path, which then rolls each document's local
-                # piece within its own bounds and zeroes the seam.
-                roll_packed_seq_params = packed_seq_params
-                use_local_packed_roll = sequence_parallel_size > 1
-                if packed_seq_params is not None:
-                    padded_cu_seqlens = packed_seq_params.cu_seqlens_q_padded
-                    genuinely_padded = (
-                        padded_cu_seqlens is not None
-                        and padded_cu_seqlens is not packed_seq_params.cu_seqlens_q
-                    )
-                    use_local_packed_roll = use_local_packed_roll or (
-                        genuinely_padded and self.config.attention_cp_layout != "contiguous"
-                    )
-                if use_local_packed_roll and packed_seq_params is not None:
-                    shard_params = _packed_seq_params_for_local_hsm_roll(
-                        packed_seq_params,
-                        local_seq_length=sequence_length,
-                        cp_group=cp_group,
-                        tp_group=self.tp_group if self.sequence_parallel else None,
-                    )
-                    if shard_params is not None:
-                        roll_packed_seq_params = shard_params
-                rolled, _ = roll_tensor(
-                    flattened,
-                    shifts=-1,
-                    dims=-1,
-                    cp_group=None if use_local_packed_roll else cp_group,
-                    packed_seq_params=roll_packed_seq_params,
-                    return_sum=False,
+                stacked = torch.stack(hidden_state_history[:-1], dim=0)
+                rolled_older_hidden_states = _roll_hidden_state_history(
+                    stacked,
+                    packed_seq_params,
                     cp_layout=self.config.attention_cp_layout,
+                    cp_group=cp_group,
+                    sp_group=sp_group,
                 )
-                rolled_older_hidden_states = rolled.reshape(
-                    num_entries, batch_size, hidden_size, sequence_length
-                ).permute(0, 3, 1, 2)
                 hidden_states_input = _mix_hidden_state_history(
                     rolled_older_hidden_states,
                     newest_entry,

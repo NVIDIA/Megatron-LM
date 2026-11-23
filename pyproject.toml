@@ -13,6 +13,8 @@ include = [
     "megatron.core.*",
     "megatron.training",
     "megatron.training.*",
+    "megatron.bridge",
+    "megatron.bridge.*",
 ]
 
 [tool.setuptools.package-data]
@@ -71,6 +73,17 @@ Download = "https://github.com/NVIDIA/Megatron-LM/releases"
 Homepage = "https://github.com/NVIDIA/Megatron-LM"
 
 [project.optional-dependencies]
+bridge = [
+    "accelerate",
+    "einops",
+    "omegaconf>=2.3.0",
+    "pydantic>=2,<2.14",
+    "pyyaml>=6.0.2",
+    "rich",
+    "safetensors>=0.4.5",
+    "transformers>=5.21.1,<5.24",
+]
+
 training = [
     "flask-restful",
     "sentencepiece",
@@ -95,7 +108,7 @@ mlm = [
 ]
 
 dev = [
-    "nvidia-modelopt[torch]>=0.47; sys_platform != 'darwin'",
+    "nvidia-modelopt[torch]>=0.49.0rc0; sys_platform != 'darwin'",
     "nvidia-resiliency-ext==0.7.0",
     "tqdm",
     "einops~=0.8",
@@ -107,7 +120,8 @@ dev = [
     "av",
     "Pillow>=13.0.0",
     "flashinfer-python>=0.7.2,<0.8.0",
-    "nvidia-cudnn-frontend[cutedsl]==1.32.0",
+    "flash-attn-4[cu13]==4.0.0b27",
+    "nvidia-cudnn-frontend[cutedsl]==1.33.0",
     "wget",
     "onnxscript",
     "fastapi~=0.50",                                    # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
@@ -123,7 +137,32 @@ dev = [
 
 inference = [
     "torch-memory-saver",
+    "gigatoken==0.11.0",
+    # Dynamic text generation server and data-parallel inference coordinator.
+    # These are imported behind try/except, so a missing package only surfaces at runtime.
+    "hypercorn",
+    "msgpack",
+    "orjson",
+    "pyzmq",
+    "quart",
     "flashinfer-python>=0.7.2,<0.8.0",
+    # flashinfer-jit-cache ships pre-compiled CUTLASS MoE kernels and must match
+    # flashinfer-python exactly; bump both together. The wheels are CUDA-major
+    # specific and only published on flashinfer.ai (cu130 to match the dev image).
+    # The pin must also satisfy the dev group's flashinfer-python range.
+    "flashinfer-python==0.7.2.post1; sys_platform == 'linux'",
+    "flashinfer-jit-cache==0.7.2.post1; sys_platform == 'linux'",
+    # flashinfer-jit-cache is split into per-arch packages that also live only on
+    # flashinfer.ai. uv only applies [tool.uv.sources] to direct dependencies, so
+    # each one is listed here (same pin) and routed to the flashinfer index below.
+    "flashinfer-jit-cache-sm80==0.7.2.post1; sys_platform == 'linux'",
+    "flashinfer-jit-cache-sm89==0.7.2.post1; sys_platform == 'linux'",
+    "flashinfer-jit-cache-sm90a==0.7.2.post1; sys_platform == 'linux'",
+    "flashinfer-jit-cache-sm100a==0.7.2.post1; sys_platform == 'linux'",
+    "flashinfer-jit-cache-sm103a==0.7.2.post1; sys_platform == 'linux'",
+    "flashinfer-jit-cache-sm110a==0.7.2.post1; sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "flashinfer-jit-cache-sm120f==0.7.2.post1; sys_platform == 'linux'",
+    "flashinfer-jit-cache-sm121a==0.7.2.post1; sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
 
 otel = [
@@ -150,7 +189,7 @@ ssm = [
 [dependency-groups]
 test = [
     "coverage",
-    "nltk",
+    "nltk>=3.10.4",
     "wrapt",
     "pytest==9.1.1",
     "pytest-mock",
@@ -167,14 +206,7 @@ test = [
 # GitHub CI installs Testmon at runtime for baseline and selective test modes.
 # Testmon remains inactive unless pytest receives a --testmon option.
 testmon = ["pytest-testmon==2.2.0"]
-docs = [
-    "sphinx",
-    "sphinx-autobuild",    # For live doc serving while editing docs
-    "sphinx-autodoc2",     # For documenting Python API
-    "sphinx-copybutton",   # Adds a copy button for code blocks
-    "myst_parser",         # For our markdown docs
-    "nvidia-sphinx-theme", # Our NVIDIA theme
-]
+
 build = [
     "setuptools>=80",
     "packaging>=24.2",
@@ -182,19 +214,18 @@ build = [
     "pybind11",
     "Cython>=3.0.0",
     "torch",
-    "nvidia-cudnn-frontend>=1.29.0",  # for TE
+    "nvidia-cudnn-frontend>=1.31.0",  # for TE
     "nvidia-mathdx",                  # for TE
 ]
 linting = [
     "ruff~=0.9.0",
-    "black==26.3.0",
+    "black==26.10.1",
     "isort==5.13.2",
     "flake8==7.1.0",
     "pylint==3.2.6",
 ]
 ci = ["python-gitlab", "slack-sdk", "pandas"]
-batch_invariant = ["deep_gemm"]
-no_pypi_wheels = ["flash_mla", "emerging_optimizers", "deep_gemm"]
+no_pypi_wheels = ["flash_mla", "emerging_optimizers"]
 
 [tool.uv]
 managed = true
@@ -207,12 +238,11 @@ no-build-isolation-package = [
     "mamba-ssm",
     "transformer-engine",
     "transformer-engine-torch",
-    "deep_gemm",
     "fast-hadamard-transform",
 ]
 link-mode = "copy"
 # The Mamba revision retained from main pins an older TileLang/TVM FFI family.
-# Override those transitive constraints for cuDNN Frontend 1.29 compatibility.
+# Override those transitive constraints for cuDNN Frontend and FlashAttention-4 compatibility.
 # We don't define override-dependencies globally but rather locally where we need it.
 # For instance, when installing into a PyTorch base image, we don't want to install torch,
 # torchvision, and triton.
@@ -221,8 +251,8 @@ override-dependencies = [
     "torchvision; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
     "filelock>=4.2.1",  # CVE-2026-112940; multi-storage-client 0.51 caps filelock below 4
-    "tilelang==0.1.12",
-    "apache-tvm-ffi==0.1.11",
+    "tilelang==0.1.13",
+    "apache-tvm-ffi==0.1.12",
     # TorchX 0.7.0 caps urllib3 below 1.27; require the fix for GHSA-38jv-5279-wg99.
     "urllib3>=2.6.3",
 ]
@@ -234,7 +264,7 @@ requires-dist = []
 
 [[tool.uv.dependency-metadata]]
 name = "transformer-engine"
-version = "2.20.2+44f31bbe"
+version = "2.22.0+d05e4b83"
 requires-dist = [
     # Cap below 2.14: pydantic 2.14 breaks langchain_core's module-level
     # RunnablePassthrough() instantiation, which is imported transitively in
@@ -242,12 +272,12 @@ requires-dist = [
     "pydantic<2.14",
     "importlib-metadata>=1.0",
     "packaging",
-    "torch>=2.1",
+    "torch>=2.8",
     "einops",
     "onnxscript",
     "onnx",
     "nvdlfw-inspect",
-    "nvidia-cudnn-frontend>=1.29.0",
+    "nvidia-cudnn-frontend>=1.31.0",
 ]
 
 [[tool.uv.dependency-metadata]]
@@ -255,19 +285,49 @@ name = "fast-hadamard-transform"
 version = "1.0.4.post1"
 requires-dist = ["torch", "packaging", "ninja"]
 
+# The aarch64 flashinfer-jit-cache wheel also requires sm110a/sm121a (aarch64-only wheels),
+# but uv locks one wheel's metadata for every platform, which breaks x86_64 installs.
+# Keep this in sync with the flashinfer-jit-cache pin in the inference extra.
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-jit-cache"
+version = "0.7.2.post1+cu130"
+requires-dist = [
+    "flashinfer-jit-cache-sm80==0.7.2.post1",
+    "flashinfer-jit-cache-sm89==0.7.2.post1",
+    "flashinfer-jit-cache-sm90a==0.7.2.post1",
+    "flashinfer-jit-cache-sm100a==0.7.2.post1",
+    "flashinfer-jit-cache-sm103a==0.7.2.post1",
+    "flashinfer-jit-cache-sm110a==0.7.2.post1; platform_machine == 'aarch64'",
+    "flashinfer-jit-cache-sm120f==0.7.2.post1",
+    "flashinfer-jit-cache-sm121a==0.7.2.post1; platform_machine == 'aarch64'",
+]
+
 [tool.uv.sources]
 
 flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "nv_dev" },
 ]
-deep_gemm = { git = "https://github.com/deepseek-ai/DeepGEMM.git", rev = "ea2b7805b97956268bed1adf94591f428ded6cc1" }
-transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "44f31bbeaf99bd30a67b928000d4b980026debd2" }
+transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "d05e4b83f3da7035e0bfae2d635608be86829bed" }
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "e3935393a290aed1822af52139b4b8ee270fed1f" }
 emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.3.0" }
 fast-hadamard-transform = { git = "https://github.com/Dao-AILab/fast-hadamard-transform.git", rev = "f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" }
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "0048fbf2e7b2f214dcbe703ea3dec2b9647595e1" }
 nemo-lens = { git = "https://github.com/NVIDIA-NeMo/Lens.git", rev = "b85578fc2b736a1804705e537001b5f45e9c715d" }
 torch-memory-saver = { git = "https://github.com/fzyzcjy/torch_memory_saver.git", rev = "9bc9a442e6d108c7b7903def199896a005143aaf" }
+flashinfer-jit-cache = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm80 = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm89 = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm90a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm100a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm103a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm110a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm120f = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm121a = { index = "flashinfer-cu130" }
+
+[[tool.uv.index]]
+name = "flashinfer-cu130"
+url = "https://flashinfer.ai/whl/cu130"
+explicit = true
 
 [tool.isort]
 profile = "black"                                                          # black-compatible

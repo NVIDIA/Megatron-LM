@@ -16,11 +16,11 @@ from typing import Callable
 
 import torch
 
+from megatron.core.extensions.te_cuda_graphs import _TECudaGraphBackwardDWWrapperMixin
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
 from megatron.core.transformer.enums import CudaGraphModule
-from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
-from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
-from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
+from megatron.core.transformer.module import float16_to_fp32
+from megatron.core.utils import internal_api, make_viewless_tensor, nvtx_range_pop, nvtx_range_push
 
 
 def weak_method(method):
@@ -404,22 +404,18 @@ class _BackwardDWWrapper:
     """Backward weight-gradient wrapper for a transformer pre-dispatch slot.
 
     Runs the layer's ``self_attention.backward_dw`` plus, on MoE layers, the
-    shared-expert ``backward_dw``; coordinates with the cuda-graph wgrad
-    capture (``set_graphed_backward_dw_callable``) so that scopes covered by
-    the graph are not re-run eagerly. Used when
+    shared-expert ``backward_dw``. Used when
     ``overlap_moe_expert_parallel_comm`` and ``delay_wgrad_compute`` are both
     enabled.
     """
 
-    def __init__(self, layer):
-        assert isinstance(
-            layer, GraphableMegatronModule
-        ), "cuda graphed ep overlap only supports GraphableMegatronModule."
+    def __init__(self, layer) -> None:
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
         assert isinstance(
             layer, TransformerLayer
-        ), "cuda graphed ep overlap only supports TransformerLayer for now."
+        ), "Delayed-wgrad EP overlap only supports TransformerLayer for now."
         self.layer = layer
-        self.graphed_backward_dw_callable = None
         self.attn_dw_callable = layer.self_attention.backward_dw
         self.submodules = [layer.self_attention]
         if layer.is_moe_layer:
@@ -430,24 +426,13 @@ class _BackwardDWWrapper:
                 self.submodules.append(layer.mlp.shared_experts)
         else:
             self.shared_expert_dw_callable = None
-        self.cuda_graph_modules = layer.config.cuda_graph_modules
 
     def backward_dw(self):
-        """Run eager or graphed backward wgrad callables for the wrapped layer."""
-        is_replay = hasattr(self.layer, 'cuda_graphs') and self.layer.cuda_graphs
-        if self.shared_expert_dw_callable is not None and (
-            not is_replay or CudaGraphModule.moe_router not in self.cuda_graph_modules
-        ):
+        """Run eager backward wgrad callables for the wrapped layer."""
+        if self.shared_expert_dw_callable is not None:
             self.shared_expert_dw_callable()
-        if not is_replay or CudaGraphModule.attn not in self.cuda_graph_modules:
-            self.attn_dw_callable()
-        if is_replay and self.graphed_backward_dw_callable is not None:
-            self.graphed_backward_dw_callable()
+        self.attn_dw_callable()
         self.layer = None
-
-    def set_graphed_backward_dw_callable(self, graphed_backward_dw_callable):
-        """Plug the cuda-graph backward wgrad replay callable."""
-        self.graphed_backward_dw_callable = graphed_backward_dw_callable
 
     def parameters(self):
         """Yield parameters from the wrapped layer's wgrad submodules.
@@ -459,3 +444,7 @@ class _BackwardDWWrapper:
         for module in self.submodules:
             for param in module.parameters():
                 yield param
+
+
+class _TECudaGraphBackwardDWWrapper(_TECudaGraphBackwardDWWrapperMixin, _BackwardDWWrapper):
+    """Backward weight-gradient wrapper with TE CUDA graph replay."""
