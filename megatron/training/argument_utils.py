@@ -27,7 +27,6 @@ from megatron.core.distributed import (
     TorchFullyShardedDataParallelConfig,
 )
 from megatron.core.optimizer import OptimizerConfig
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.core.tuning import AutotunePolicy
@@ -54,6 +53,7 @@ from megatron.training.config import (
     ValidationConfig,
 )
 from megatron.training.config.dataset_config import dataset_type_from_family
+from megatron.training.datasets.sft_dataset import SFTDatasetConfig
 from megatron.training.models import (
     BertModelConfig,
     GPTModelConfig,
@@ -430,9 +430,10 @@ def core_transformer_config_from_args(args, config_class=None):
     for f in dataclasses.fields(config_class):
         if hasattr(args, f.name):
             kw_args[f.name] = getattr(args, f.name)
-    # The training sequence length, not max_position_embeddings (which GPTModelConfig.seq_length
-    # carries): core modules that size buffers per sample (NCCL EP) read it from the config.
-    kw_args['max_seq_length_per_sample'] = args.seq_length
+    # Keep the physical row/pack bound separate from the dataset's truncation limit.
+    # Existing scripts specifying only --seq-length retain their original execution width.
+    if kw_args.get('max_seq_length_per_sample') is None:
+        kw_args['max_seq_length_per_sample'] = args.seq_length
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
     kw_args['deallocate_pipeline_outputs'] = not _mfsdp_v2_disables_pipeline_output_dealloc(args)
     kw_args['pipeline_dtype'] = args.params_dtype
@@ -842,7 +843,40 @@ def model_config_from_args(
         return hybrid_config_from_args(args, model_config_cls=model_config_cls)
     if issubclass(model_config_cls, BertModelConfig):
         return bert_config_from_args(args, model_config_cls=model_config_cls)
+    if issubclass(model_config_cls, T5ModelConfig):
+        return t5_config_from_args(args, model_config_cls=model_config_cls)
+    if issubclass(model_config_cls, LLaVAModelConfig):
+        return llava_config_from_args(args, model_config_cls=model_config_cls)
     return model_config_cls(**_model_config_kwargs_from_args(args, model_config_cls))
+
+
+def t5_config_from_args(
+    args: Namespace, model_config_cls: type[T5ModelConfig] = T5ModelConfig
+) -> T5ModelConfig:
+    """Resolve the T5 execution width from the encoder and decoder widths at the CLI boundary."""
+    kwargs = _model_config_kwargs_from_args(args, model_config_cls)
+    if getattr(args, "max_seq_length_per_sample", None) is None:
+        lengths = [
+            length
+            for length in (args.encoder_seq_length, args.decoder_seq_length)
+            if length is not None
+        ]
+        if lengths:
+            kwargs["transformer"].max_seq_length_per_sample = max(lengths)
+    return model_config_cls(**kwargs)
+
+
+def llava_config_from_args(
+    args: Namespace, model_config_cls: type[LLaVAModelConfig] = LLaVAModelConfig
+) -> LLaVAModelConfig:
+    """Legacy VLM launchers name the language execution width --decoder-seq-length."""
+    kwargs = _model_config_kwargs_from_args(args, model_config_cls)
+    if (
+        getattr(args, "max_seq_length_per_sample", None) is None
+        and args.decoder_seq_length is not None
+    ):
+        kwargs["transformer"].max_seq_length_per_sample = args.decoder_seq_length
+    return model_config_cls(**kwargs)
 
 
 def bert_config_from_args(
@@ -855,6 +889,12 @@ def bert_config_from_args(
     if args.spec is not None:
         kwargs["transformer_layer_spec"] = (
             bert_layer_local_spec if args.spec[0] == "local" else import_module(args.spec)
+        )
+    bound = kwargs["transformer"].max_seq_length_per_sample
+    if args.seq_length is not None and bound != args.seq_length:
+        raise ValueError(
+            "The BERT callback emits fixed-width rows: --max-seq-length-per-sample "
+            "must equal --seq-length"
         )
     return model_config_cls(**kwargs)
 
@@ -1036,20 +1076,7 @@ def _resolve_data_sources(args: Namespace):
     return blend, blend_per_split, sequences_per_dataset
 
 
-def _container_written_fields_from_args(args: Namespace) -> dict[str, Any]:
-    """What a standalone (container-less) dataset config takes from ``args`` for the fields the
-    container writes otherwise (``CONTAINER_WRITTEN_FIELDS``: the layout, the validation flags)."""
-    return {
-        "data_parallel_size": args.data_parallel_size,
-        "context_parallel_size": args.context_parallel_size,
-        "sequence_parallel_size": args.tensor_model_parallel_size * int(bool(args.sequence_parallel)),
-        "dynamic_context_parallel": args.dynamic_context_parallel,
-        "full_validation": args.full_validation,
-        "multiple_validation_sets": args.multiple_validation_sets,
-    }
-
-
-def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> DataConfig:
+def gpt_data_config_from_args(args: Namespace) -> DataConfig:
     """Build ``cfg.data`` for a GPT entry point from the legacy arguments.
 
     One factory for ``pretrain_gpt.py``, ``pretrain_hybrid.py``, ``pretrain_hybrid_flex.py`` and
@@ -1065,9 +1092,8 @@ def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> D
     ``random_seed`` is the section's own setting, filled from ``--seed`` and saved with the section
     (independent of ``cfg.rng.seed`` after construction, as in Megatron-Bridge). The layout and
     validation fields the container writes at ``finalize()`` (``CONTAINER_WRITTEN_FIELDS``) are left
-    unset for a container; ``standalone=True`` fills them from ``args`` for callers without one
-    (``tools/prepare_cache.py``, the legacy ``core_gpt_dataset_config_from_args`` wrappers). The
-    returned config has no tokenizer: ``DataConfig.bind_tokenizer`` binds the run's and runs
+    unset. Offline cache preparation supplies its target layout locally in ``tools/prepare_cache.py``.
+    The returned config has no tokenizer: ``DataConfig.bind_tokenizer`` binds the run's and runs
     Megatron Core's ``validate()``.
     """
     family = requested_dataset_family(args)
@@ -1086,6 +1112,12 @@ def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> D
                 )
         # Otherwise (fim) the real class stays and DataConfig.validate() reports the missing source.
 
+    config_cls = {
+        "gpt": GPTDatasetConfig,
+        "fim": GPTFIMDatasetConfig,
+        "sft": SFTDatasetConfig,
+        "varlen": GPTDatasetConfig,
+    }[family]
     kwargs: dict[str, Any] = {
         field_name: deepcopy(getattr(args, source))
         for field_name, source in _DATASET_FIELD_SOURCES.items()
@@ -1093,8 +1125,8 @@ def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> D
     kwargs["blend"] = blend
     kwargs["blend_per_split"] = blend_per_split
     kwargs["sequences_per_dataset"] = sequences_per_dataset
-    if standalone:
-        kwargs.update(_container_written_fields_from_args(args))
+    if family == "sft":
+        kwargs["sft_loss_log_mode"] = args.sft_loss_log_mode
     if family == "fim":
         kwargs.update(
             fim_rate=args.fim_rate,
@@ -1112,39 +1144,10 @@ def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> D
         )
         dataset = GPTFIMDatasetConfig(**kwargs)
     else:
-        dataset = GPTDatasetConfig(**kwargs)
+        dataset = config_cls(**kwargs)
     return DataConfig(
         dataset=dataset, dataloader=dataloader_config_from_args(args), dataset_type=dataset_type
     )
-
-
-def core_gpt_dataset_config_from_args(
-    args: Namespace, *, tokenizer: Any = None, dataset_type: type | None = None
-) -> GPTDatasetConfig:
-    """A standalone dataset config from the legacy arguments, with its tokenizer bound.
-
-    The call shape the GPT entry points had before ``cfg.data`` existed, kept for scripts that build
-    the dataset config outside the container (the providers build from ``cfg.data``): the section of
-    ``gpt_data_config_from_args(args, standalone=True)`` (the layout and validation fields and the
-    seed from ``args``), the dataset class pinned to ``dataset_type`` when given
-    (``tools/prepare_cache.py`` builds ``GPTDataset`` whatever the flags name), validated, then bound
-    to ``tokenizer``, else to the run's registered tokenizer, else to one built from ``args``
-    (Megatron Core's ``validate()`` runs then).
-    """
-    data = gpt_data_config_from_args(args, standalone=True)
-    if dataset_type is not None:
-        data.dataset_type = dataset_type
-    data.validate()
-    if tokenizer is None:
-        from megatron.training import global_vars
-
-        # The run's tokenizer when one is registered, as the entry points' own factories did
-        # since #8391; tools/prepare_cache.py registers none and builds one from the arguments.
-        tokenizer = global_vars._GLOBAL_TOKENIZER
-        if tokenizer is None:
-            tokenizer = build_tokenizer(args)
-    data.bind_tokenizer(tokenizer)
-    return data.dataset
 
 
 def dataloader_config_from_args(args: Namespace) -> DataloaderConfig:
