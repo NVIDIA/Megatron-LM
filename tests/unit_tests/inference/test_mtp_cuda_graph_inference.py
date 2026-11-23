@@ -924,12 +924,12 @@ _STATE_DIMS = {
 def _reset_moe_layer_cache():
     """Drop the process-global MoE layer cache in `megatron.core.inference.utils`.
 
-    That cache is built once from the first model it is handed, which is correct in production
-    (one model per process) but wrong here, where every test builds a fresh model. With a stale
-    cache, `set_decode_expert_padding` flips `drop_and_pad` on the *previous* model's dispatchers
-    while writing `moe_expert_capacity_factor` onto the *current* model's config. The live
-    dispatchers then reach `preprocess` with `drop_and_pad=False` under a non-None capacity
-    factor, which lowers the sync point to "before_permutation_1" and trips the token
+    The production cache follows the current model, but each test still clears its strong
+    layer references so teardown can release the prior model promptly. Historically a stale
+    cache made `set_decode_expert_padding` flip `drop_and_pad` on the previous model's
+    dispatchers while writing `moe_expert_capacity_factor` onto the current model config.
+    Live dispatchers then reached `preprocess` with `drop_and_pad=False` under a non-None
+    capacity factor, lowering the sync point to "before_permutation_1" and tripping the
     dispatcher's "cuda_sync_point must be after cuda_dtoh_point" assertion.
     """
     from megatron.core.inference import utils as inference_utils

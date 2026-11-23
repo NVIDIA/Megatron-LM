@@ -84,6 +84,43 @@ class TestInferenceUtils:
         tokenizer = _tokenizer()
         assert detokenize_tokens(tokenizer, [5, 11, 2]) == "5 11"
 
+    def test_moe_cache_follows_the_current_model(self, monkeypatch):
+        """Metadata sync and decode padding act on a replacement model, not a stale cache."""
+        from megatron.core.inference import utils as inference_utils
+        from megatron.core.transformer.moe import moe_layer as moe_layer_module
+
+        class FakeMoELayer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self._inference_token_dispatcher = SimpleNamespace(_runs_metadata_sync=True)
+                self.token_dispatcher = SimpleNamespace(drop_and_pad=False)
+                self.router = SimpleNamespace()
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = SimpleNamespace()
+                self.layers = torch.nn.ModuleList([FakeMoELayer(), FakeMoELayer()])
+
+        monkeypatch.setattr(moe_layer_module, "MoELayer", FakeMoELayer)
+        monkeypatch.setattr(inference_utils, "moe_layer_cache", None)
+        monkeypatch.setattr(inference_utils, "_moe_layer_cache_owner", None)
+        monkeypatch.setattr(inference_utils, "_moe_metadata_sync_initialized", False)
+
+        first, replacement = FakeModel(), FakeModel()
+        for model in (first, replacement):
+            inference_utils.set_moe_metadata_sync(model)
+            flags = [
+                layer._inference_token_dispatcher._runs_metadata_sync for layer in model.layers
+            ]
+            assert flags == [True, False]
+        assert inference_utils._moe_layer_cache_owner() is replacement
+        assert inference_utils.moe_layer_cache == list(replacement.layers)
+
+        inference_utils.set_decode_expert_padding(replacement, set_to=True, capacity_factor=2)
+        assert all(layer.token_dispatcher.drop_and_pad for layer in replacement.layers)
+        assert not any(layer.token_dispatcher.drop_and_pad for layer in first.layers)
+
     @staticmethod
     def _head_capabilities(monkeypatch, general_gemm, batch_invariant=False):
         monkeypatch.setattr(

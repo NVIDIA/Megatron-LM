@@ -847,6 +847,7 @@ class TextGenerationController(MTPControllerMixin):
         # Remove Float16Module wrapper if it exists
         unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
         model_config = get_model_config(unwrapped_model)
+        set_moe_metadata_sync(unwrapped_model)
 
         # Initialize attention state and optionally publish CPU bookkeeping to GPU.
         range_push("initialize_attention_state")
@@ -857,8 +858,6 @@ class TextGenerationController(MTPControllerMixin):
             record_bookkeeping_done_event=record_bookkeeping_done_event,
         )
         range_pop()
-
-        set_moe_metadata_sync(unwrapped_model)
 
         # Derive the MTP padded batch size from the existing padded graph dimensions.
         # For MoE models this is post EP sync. In eager mode MTP uses locally SP-aligned
