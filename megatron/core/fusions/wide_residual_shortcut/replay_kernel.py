@@ -13,6 +13,7 @@ from triton.experimental import gluon as g
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language import BlockedLayout
 
+from .configs import _MX_SCHEDULES
 from .kernel_utils import (
     _e8m0_scale,
     _fma2,
@@ -23,12 +24,13 @@ from .kernel_utils import (
     _round_bf16,
     _store_bf16x4,
     allocate_operand,
+    cdiv,
     operand_buffers,
 )
 
 
 @g.jit
-def _bwd_wr_recompute(
+def bwd_wr_writeread_recompute_bf16(
     checkpoint,
     updates,
     coefficients,
@@ -90,7 +92,7 @@ def _emit_columns(y, data, scales, index, mask, EVEN: gl.constexpr):
 
 
 @g.jit
-def _bwd_wr_recompute_mxfp8quant(
+def bwd_wr_writeread_recompute_mxfp8(
     checkpoint,
     updates,
     cs,
@@ -223,7 +225,7 @@ def _bwd_wr_recompute_mxfp8quant(
 
 
 @triton.jit
-def _swizzle_scales(compact, scales, M, PADDED_H: tl.constexpr):
+def bwd_wr_writeread_swizzle_scales(compact, scales, M, PADDED_H: tl.constexpr):
     """Copy each operand's compact [row block, column] E8M0 scales (program axis 1) into TE's
     GEMM-ready layout: one program per 128 x 128 tile, whose 512 bytes it writes whole (byte
     t * 16 + g * 4 + i holds column g * 32 + t of row block i)."""
@@ -248,9 +250,10 @@ def _column_inputs(checkpoint, tapes, requested, columns):
     and scale buffers (None where not requested)."""
     m, h = tapes[0].update.shape
     if columns is None:
+        shape, device = (m, h), checkpoint.device
         columns = tuple(
             tuple(
-                allocate_operand((m, h), checkpoint.device, columnwise=True) if need else None
+                allocate_operand(shape, device, rowwise=False, columnwise=True) if need else None
                 for need in needs
             )
             for needs in requested
@@ -271,7 +274,7 @@ def _column_inputs(checkpoint, tapes, requested, columns):
                 d is None
                 or q is None
                 or d.shape != (m, h)
-                or q.numel() != triton.cdiv(m, 128) * triton.cdiv(h, 128) * 512
+                or q.numel() != cdiv(m, 128) * cdiv(h, 128) * 512
                 or any(
                     t.dtype != torch.uint8 or t.device != checkpoint.device or not t.is_contiguous()
                     for t in (d, q)
@@ -279,12 +282,6 @@ def _column_inputs(checkpoint, tapes, requested, columns):
             ):
                 raise ValueError("invalid MXFP8 column allocation")
     return columns, data, scales
-
-
-# Column replay schedules per residual dtype: (VEC columns per thread, THREADS lanes across a
-# 32-row tile, WARPS warps down it, MAXNREG registers, AHEAD transitions of update prefetch),
-# from an 8K-token Nano/Super/Ultra sweep.
-_MX_SCHEDULES = {torch.float32: (4, 8, 2, 128, 1), torch.bfloat16: (4, 8, 2, 128, 1)}
 
 
 def _launch_columns(checkpoint, tapes, outputs, data, scales, requested, terminal):
@@ -296,12 +293,12 @@ def _launch_columns(checkpoint, tapes, outputs, data, scales, requested, termina
         flat.extend((index, r) for r in emitted)
     vector, threads, warps, maxnreg, ahead = _MX_SCHEDULES[checkpoint.dtype]
     block = vector * threads
-    tiles = triton.cdiv(m, 128) * 4 * triton.cdiv(h, 128) * (128 // block)
-    padded_h = triton.cdiv(h, 128) * 128
+    tiles = cdiv(m, 128) * 4 * cdiv(h, 128) * (128 // block)
+    padded_h = cdiv(h, 128) * 128
     compact = torch.empty(
-        (len(flat), triton.cdiv(m, 128) * 4, padded_h), dtype=torch.uint8, device=checkpoint.device
+        (len(flat), cdiv(m, 128) * 4, padded_h), dtype=torch.uint8, device=checkpoint.device
     )
-    _bwd_wr_recompute_mxfp8quant[(tiles,)](
+    bwd_wr_writeread_recompute_mxfp8[(tiles,)](
         checkpoint,
         tuple(t.update for t in tapes),
         tuple(t.coefficients for t in tapes),
@@ -328,7 +325,7 @@ def _launch_columns(checkpoint, tapes, outputs, data, scales, requested, termina
         maxnreg=maxnreg,
         num_warps=warps,
     )
-    _swizzle_scales[(triton.cdiv(m, 128) * triton.cdiv(h, 128), len(flat))](
+    bwd_wr_writeread_swizzle_scales[(cdiv(m, 128) * cdiv(h, 128), len(flat))](
         compact, tuple(scales[t][r] for t, r in flat), m, padded_h, num_warps=1
     )
 
@@ -416,7 +413,7 @@ def replay_interval(
     if any(any(needs) for needs in requested):
         _launch_columns(checkpoint, tapes, outputs, data, scales, requested, terminal_output)
     elif transitions := (tapes if terminal_output is not None else tapes[:-1]):
-        _bwd_wr_recompute[(m * triton.cdiv(h, 512),)](
+        bwd_wr_writeread_recompute_bf16[(m * cdiv(h, 512),)](
             checkpoint,
             tuple(t.update for t in transitions),
             tuple(t.coefficients for t in transitions),

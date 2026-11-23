@@ -1170,6 +1170,58 @@ def test_mxfp8_training_absorbs_every_read_quantization(monkeypatch, recompute_s
 
 
 @pytest.mark.usefixtures("model_parallel")
+@pytest.mark.parametrize("fp32_residual,recompute", [(False, False), (True, False), (False, True)])
+@REQUIRES_FUSED_BACKWARD
+def test_mxfp8_update_gradients_match_te_quantization(monkeypatch, fp32_residual, recompute):
+    """MXFP8 training hands every seam's update gradient to its producer Linears already
+    quantized (a shortcut add's latent projection and shared expert fc2, also a recomputed one,
+    and each lone layer's output projection), and every gradient matches the model leaving those
+    Linears to quantize the BF16 gradient themselves, bit for bit."""
+    import transformer_engine.pytorch.module.base as te_base
+
+    options = dict(
+        fp8="e4m3", fp8_recipe="mxfp8", moe_latent_size=256, fp32_residual_connection=fp32_residual
+    )
+    if recompute:
+        options.update(recompute_granularity="selective", recompute_modules=["shared_experts"])
+    model = _hybrid_model("-*E*E-", hidden=2048, **options).train()
+    writes = [m for m in model.decoder.modules() if isinstance(m, wide_residual.DeferredWrite)]
+    shortcut_adds = [w for w in writes if len(w.producers) == 2]
+    assert len(shortcut_adds) == 2
+    assert all(w.update_formats == ("mxfp8", "mxfp8") for w in shortcut_adds)
+    lone = [w for w in writes if len(w.producers) == 1 and w.update_formats == ("mxfp8",)]
+    assert lone
+    twin = _hybrid_model("-*E*E-", hidden=2048, **options).train()
+    twin.load_state_dict(model.state_dict())
+    for write in twin.decoder.modules():  # the twin's producers quantize their BF16 gradients
+        if isinstance(write, wide_residual.DeferredWrite):
+            write.update_formats = None
+
+    seen = []
+    spy(
+        monkeypatch,
+        te_base.TransformerEngineBaseModule,
+        "grad_output_preprocess",
+        lambda ctx, grad, *a: seen.append(type(grad)),
+    )
+
+    def step(model):
+        torch.manual_seed(5)
+        model.zero_grad(set_to_none=True)
+        _train_step(model, 2048)
+        return {n: p.grad for n, p in model.named_parameters() if p.grad is not None}
+
+    fused = step(model)
+    quantized = seen.count(MXFP8Tensor)
+    seen.clear()
+    reference = step(twin)
+    assert quantized == 2 * len(shortcut_adds) + len(lone) and MXFP8Tensor not in seen
+    assert fused.keys() == reference.keys()
+    for name, grad in fused.items():
+        assert bytes_equal(grad, reference[name]), name
+
+
+@pytest.mark.usefixtures("model_parallel")
 @REQUIRES_FUSED_BACKWARD
 def test_mxfp8_training_with_standalone_moe_layers():
     """Without shortcut blocks, MXFP8 training (with checkpoint replay) hands each attention and

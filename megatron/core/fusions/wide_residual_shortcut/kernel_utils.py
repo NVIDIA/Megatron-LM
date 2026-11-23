@@ -12,14 +12,13 @@ from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language import BlockedLayout, NVMMASharedLayout
 from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
-# Training shapes (rows, hidden) admitted for the automatic MXFP8 handoff.
-WIDTHS = tuple(range(2048, 16385, 1024))
-SHAPES = tuple(
-    [(m, h) for m in range(2048, 16385, 1024) for h in WIDTHS]
-    + [(m, h) for m in range(17408, 65537, 1024) for h in WIDTHS[:3]]
-)
-# Nano/Super/Ultra (rows, hidden): the shapes the tuned tables and tests anchor on.
-FLAGSHIPS = ((16384, 3072), (8192, 4096), (8192, 10240))
+# An operand's formats (a reader's outputs, the update gradient): BF16, MXFP8, or both from the
+# same values; and each one's tag in kernel names.
+OUTPUT_FORMATS = ("bf16", "mxfp8", "both")
+KERNEL_FORMAT_TAGS = {"bf16": "bf16", "mxfp8": "mxfp8", "both": "bf16mxfp8"}
+
+# Host forms of Triton's integer helpers: their constexpr-function wrappers cost ~1 us a call.
+cdiv, next_power_of_2 = triton.cdiv.fn, triton.next_power_of_2.fn
 
 
 @dataclass(frozen=True)
@@ -47,16 +46,6 @@ def validate_num_streams(num_streams):
         raise ValueError("num_streams must be an integer from 1 through 6")
 
 
-def qualified_device(properties):
-    """The measured GB300 residency is not portable to every SM103 device."""
-    return (
-        "GB300" in properties.name
-        and properties.major == 10
-        and properties.minor == 3
-        and properties.multi_processor_count == 152
-    )
-
-
 def _tensor(t, shape, dtype, device, name):
     if (
         not isinstance(t, torch.Tensor)
@@ -68,16 +57,17 @@ def _tensor(t, shape, dtype, device, name):
         raise ValueError(f"{name} must be contiguous {dtype} {tuple(shape)} on {device}")
 
 
-def allocate_operand(shape, device, bf16=False, *, columnwise=False):
-    """Allocate a BF16 reader operand or an MXFP8 one of the requested TE orientation."""
+def allocate_operand(shape, device, bf16=False, *, rowwise=True, columnwise=False):
+    """Allocate a BF16 operand or an MXFP8 one with the requested TE orientations (its own
+    quantizer: TE may change a tensor's quantizer usage)."""
     if bf16:
         return torch.empty(shape, dtype=torch.bfloat16, device=device)
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
     from transformer_engine_torch import DType  # constants does not re-export it in every TE
 
-    q = MXFP8Quantizer(DType.kFloat8E4M3, rowwise=not columnwise, columnwise=columnwise)
-    q.optimize_for_gemm = True
-    return q.make_empty(shape, dtype=torch.bfloat16, device=device)
+    quantizer = MXFP8Quantizer(DType.kFloat8E4M3, rowwise=rowwise, columnwise=columnwise)
+    quantizer.optimize_for_gemm = True
+    return quantizer.make_empty(shape, dtype=torch.bfloat16, device=device)
 
 
 def operand_buffers(operands, *, columnwise=True):
@@ -310,8 +300,10 @@ def named_jit(fn, name):
 
 
 @triton.jit
-def _bwd_wr_reduce(JOBS):
-    """Reduce disjoint matrix tiles in one launch, preserving each axis's sum tree."""
+def bwd_wr_writeread_reduce(JOBS):
+    """Reduce disjoint matrix tiles in one launch, preserving each axis's sum tree. An
+    accumulating job adds its result, rounded to the parameter dtype first, into the output (a
+    parameter's main_grad): autograd's cast of the returned gradient, then the DDP hook's add."""
     for job in tl.static_range(len(JOBS)):
         if tl.program_id(0) >= JOBS[job][3][6] and tl.program_id(0) < JOBS[job][3][7]:
             source, output, factor = JOBS[job][:3]
@@ -322,6 +314,7 @@ def _bwd_wr_reduce(JOBS):
             chunk: tl.constexpr = spec[3]
             axis: tl.constexpr = spec[4]
             size: tl.constexpr = spec[5]
+            accumulate: tl.constexpr = spec[8]  # 0 store, 1 add, 2 round to BF16 then add
             chunks: tl.constexpr = (height + chunk - 1) // chunk
             tiles: tl.constexpr = (width + tile - 1) // tile
             bid = tl.program_id(0) - spec[6]
@@ -353,24 +346,28 @@ def _bwd_wr_reduce(JOBS):
                             total += tl.load(JOBS[job][4][2 * k + 1] + rows, rows < width, 0) * part
             if factor is not None:
                 total *= tl.load(factor + rows, rows < width, 0)
+            if accumulate:
+                if accumulate == 2:
+                    total = total.to(tl.bfloat16).to(tl.float32)
+                total += tl.load(output + rows, rows < width, 0).to(tl.float32)
             tl.store(output + rows * chunks + bid // tiles, total, rows < width)
-            if size > width and bid == 0:
+            if size > width and bid == 0 and not accumulate:
                 padding = tl.arange(0, triton.next_power_of_2(size))
                 tl.store(output + padding, 0, (padding >= width) & (padding < size))
 
 
 def reduce_jobs(jobs):
-    """Pack ``(source, output, axis, tile, chunk, factor[, combo])`` reductions into one launch."""
+    """Pack ``(source, output, axis, tile, chunk, factor, combo, accumulate)`` reductions into one
+    launch (``accumulate`` as in bwd_wr_writeread_reduce; a single chunk only)."""
     packed, grid = [], 0
     for job in jobs:
-        source, output, axis, tile, chunk, factor = job[:6]
-        combo = job[6] if len(job) == 7 else None
+        source, output, axis, tile, chunk, factor, combo, accumulate = job
         width, height = source.shape[1 - axis], source.shape[axis]
-        chunk = chunk or triton.next_power_of_2(height)
+        chunk = chunk or next_power_of_2(height)
         size = output.numel() if output.ndim == 1 else width
-        end = grid + triton.cdiv(width, tile) * triton.cdiv(height, chunk)
-        spec = (width, height, tile, chunk, axis, size, grid, end)
+        end = grid + cdiv(width, tile) * cdiv(height, chunk)
+        spec = (width, height, tile, chunk, axis, size, grid, end, accumulate)
         packed.append((source, output, factor, tl.constexpr(spec), combo))
         grid = end
     if packed:
-        _bwd_wr_reduce[(grid,)](tuple(packed), num_warps=4, enable_fp_fusion=False)
+        bwd_wr_writeread_reduce[(grid,)](tuple(packed), num_warps=4, enable_fp_fusion=False)

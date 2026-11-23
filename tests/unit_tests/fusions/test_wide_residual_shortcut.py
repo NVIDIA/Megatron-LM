@@ -20,9 +20,11 @@ import torch
 import triton
 from torch.multiprocessing.reductions import StorageWeakRef
 
+from megatron.core.enums import Fp8Recipe
 from megatron.core.fusions.wide_residual_shortcut import (
     PendingWideResidualWrites,
     backward_kernel,
+    configs,
     forward_kernel,
     fused_seam,
     kernel_utils,
@@ -56,9 +58,7 @@ except ImportError:  # BF16-only tests do not need Transformer Engine.
 # Host-only config tests run anywhere; every other test needs a GPU. Native schedules, the
 # MXFP8 handoff and the fused backward (so every training round trip) need a qualified GB300.
 GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA shortcut fusion")
-_GB300 = torch.cuda.is_available() and kernel_utils.qualified_device(
-    torch.cuda.get_device_properties(0)
-)
+_GB300 = torch.cuda.is_available() and configs.qualified_device(torch.cuda.get_device_properties(0))
 REQUIRES_FUSED_BACKWARD = pytest.mark.skipif(
     not _GB300, reason="the fused shortcut backward runs only on a qualified GB300"
 )
@@ -67,7 +67,7 @@ QUALIFIED = pytest.mark.skipif(
 )
 F, T = False, True
 BF16, F32 = torch.bfloat16, torch.float32
-FLAGSHIPS = kernel_utils.FLAGSHIPS
+FLAGSHIPS = configs.FLAGSHIPS
 # Rows x width of the Nano/Super/Ultra flagships and of expanded admitted shapes.
 MX_SHAPES = [*FLAGSHIPS, (2048, 2048), (2048, 16384), (16384, 2048), (6144, 12288)]
 # Seams as (readers, updates): one reader, a shortcut add read twice, a single write read twice,
@@ -581,7 +581,7 @@ def heuristic_cases(cluster):
     for hidden, streams, tokens, readers, quantized in itertools.product(*grid, (1, 2), (F, T)):
         if quantized and tokens % 32:
             continue
-        cfg = forward_kernel.choose_forward_config(
+        cfg = configs.choose_forward_config(
             tokens, hidden, streams, readers, outputs=formats(readers, quantized), inference=True
         )
         if (cfg.CLUSTER > 1) == cluster and cfg.LOADS_FIRST:
@@ -612,7 +612,7 @@ EXPLICIT_LAYOUTS = [  # (hidden, width, warps, parts, split): masked packets, sc
     [
         pytest.param(
             "loads",
-            forward_kernel._ForwardConfig(w, NUM_WARPS=k, PARTS=p if inf else 1, SPLIT=s and inf),
+            configs._ForwardConfig(w, NUM_WARPS=k, PARTS=p if inf else 1, SPLIT=s and inf),
             F, 3, n, h, 33, inf, id=f"explicit-{h}-{w}-{n}-{inf}",
         )
         for (h, w, k, p, s), n, inf in itertools.product(EXPLICIT_LAYOUTS, (1, 2), (F, T))
@@ -684,7 +684,7 @@ def test_rejects_invalid_inputs():
         with pytest.raises(ValueError, match=match):
             backward_kernel.backward(saved, None, (None,))
     _, args = backward_args(inputs(3, 1, 4096, 128))
-    single_reader = backward_kernel.BACKWARD_KERNELS[1]
+    single_reader = backward_kernel.BACKWARD_KERNELS[1, False, "bf16"]
     with patch.object(single_reader, "run", side_effect=AssertionError("launch")):
         for grid in (None, 0, -32, 31, True):
             with pytest.raises(ValueError, match="grid"):
@@ -731,7 +731,7 @@ def test_reader_formats_store_one_normalization(dtype, readers, updates, inferen
     format combination writes the bytes of the all-"both" launch, with the residual and tape
     unchanged, whatever the residual dtype."""
     raw = inputs(3, readers, 3072, 256, updates=updates, residual_dtype=dtype, logit_dtype=dtype)
-    cfg = forward_kernel.choose_forward_config(
+    cfg = configs.choose_forward_config(
         256, 3072, 3, readers, outputs=("both",) * readers, inference=inference, updates=updates
     )
     launch = lambda outputs: forced_forward(cfg, raw, 3, outputs=outputs, inference=inference)
@@ -749,18 +749,18 @@ def test_config_tables():
     """Training and prefill forwards follow their decision trees; the BF16-stream table serves
     512-1024-row inference; cached backward grids; every forward/backward config is valid;
     training and prefill own one CTA per row."""
-    choose = forward_kernel.choose_forward_config
+    choose = configs.choose_forward_config
     for (m, h), readers, mxfp8 in itertools.product(FLAGSHIPS, (1, 2), (F, T)):
-        knobs = backward_kernel.get_backward_knobs(m, h, 3, readers)
+        knobs = configs.get_backward_knobs(m, h, 3, readers)
         assert knobs.TARGET_CTAS == {3072: 456, 4096: 448, 10240: 440}[h]
         # Shared memory sets the CTAs per SM: four BF16 one-reader CTAs (128 registers), three
         # otherwise, two once an FP32 seam also stages a second gradient.
-        bf16 = backward_kernel.get_backward_knobs(m, h, 3, readers, bf16=True)
+        bf16 = configs.get_backward_knobs(m, h, 3, readers, bf16=True)
         four = {3072: 600, 4096: 608, 10240: 600}[h] if readers == 1 else knobs.TARGET_CTAS
         assert (bf16.TARGET_CTAS, bf16.MAXNREG) == (four, 128 if readers == 1 else 168)
-        second = backward_kernel.get_backward_knobs(m, h, 3, 2, second=True)
+        second = configs.get_backward_knobs(m, h, 3, 2, second=True)
         assert (second.TARGET_CTAS, second.MAXNREG) == ({3072: 300, 4096: 304, 10240: 280}[h], 255)
-    for (hidden, readers, updates, quantized), cfg in forward_kernel._FORWARD_CONFIGS_BF16.items():
+    for (hidden, readers, updates, quantized), cfg in configs._FORWARD_CONFIGS_BF16.items():
         assert cfg.LOADS_FIRST and cfg.WIDTH >= cfg.VECTOR * 32 * cfg.NUM_WARPS
         assert not cfg.PAIRED_REDUCE or readers == 2
         outputs = formats(readers, quantized)
@@ -774,10 +774,10 @@ def test_config_tables():
     for h, s, (n, u), bf16 in itertools.product(
         (2048, 3072, 4096, 6144, 10240, 16384), range(1, 7), SEAMS, (F, T)
     ):
-        tree = forward_kernel._training_config(h, s, n, bf16)
+        tree = configs._training_config(h, s, n, bf16)
         tree = tree._replace(PAIRED_REDUCE=tree.PAIRED_REDUCE and n == 2)
         for outputs in itertools.product(forward_kernel.OUTPUT_FORMATS, repeat=n):
-            prefill = forward_kernel._prefill_config(h, s, n, bf16, outputs)
+            prefill = configs._prefill_config(h, s, n, bf16, outputs)
             prefill = prefill._replace(PAIRED_REDUCE=prefill.PAIRED_REDUCE and n == 2)
             for rows in (2048, 8192, 65536):
                 options = dict(outputs=outputs, updates=u, bf16_residual=bf16)
@@ -819,9 +819,9 @@ def test_config_tables():
     for h, m, s, n in itertools.product(
         range(32, 16385, 32), (32, 1024, 65536), range(1, 7), (1, 2)
     ):
-        grid = backward_kernel.get_backward_knobs(m, h, s, n).TARGET_CTAS
+        grid = configs.get_backward_knobs(m, h, s, n).TARGET_CTAS
         assert grid > 0 and grid % ((h + 255) // 256) == 0
-        assert backward_kernel.get_backward_knobs(m, h, s, n, grid=7).TARGET_CTAS == 7
+        assert configs.get_backward_knobs(m, h, s, n, grid=7).TARGET_CTAS == 7
 
 
 # ---------------------------------------------------------------- checkpoint replay scopes
@@ -1133,13 +1133,13 @@ def test_saved_weight_keeps_identity_and_metadata(native_fp8_weight):
 
 
 @mxfp8_test
-@pytest.mark.parametrize("m,h", kernel_utils.FLAGSHIPS)
+@pytest.mark.parametrize("m,h", configs.FLAGSHIPS)
 @torch.no_grad()
 def test_native_update_rebinding_and_captured_descriptors(m, h):
     """Each captured graph must retain the descriptor for its own saved update."""
     _, (saved, r, dys, carry) = backward_args(mx_inputs(m, h, 1))
     changed = replace(saved, update=-saved.update)
-    grid = backward_kernel.get_backward_knobs(m, h, 3, 1).TARGET_CTAS
+    grid = configs.get_backward_knobs(m, h, 3, 1).TARGET_CTAS
     options = dict(config=grid, save_columns=(True,))
 
     def outputs(ws):
@@ -1303,7 +1303,7 @@ def test_generic_norm_matches_unfused_oracle(hidden):
         H=hidden,
         STREAMS=1,
         HAS_RETENTION=False,
-        CONFIG=forward_kernel._ForwardConfig(WIDTH=triton.next_power_of_2(hidden)),
+        CONFIG=configs._ForwardConfig(WIDTH=triton.next_power_of_2(hidden)),
         num_warps=4,
         enable_fp_fusion=False,
     )
@@ -1341,7 +1341,7 @@ def test_reads_feed_every_declared_linear_from_one_column_take(monkeypatch, form
         reference.append((dys, outputs, weight_grads))
 
     launches, intervals, seam_dys = [], [], []
-    kernel = replay_kernel._bwd_wr_recompute_mxfp8quant
+    kernel = replay_kernel.bwd_wr_writeread_recompute_mxfp8
     spy(monkeypatch, kernel, "run", lambda *a, **k: k.get("warmup") or launches.append(1))
     spy(monkeypatch, ReplayInterval, "record", lambda i, *a, **k: intervals.append(weakref.ref(i)))
     spy(monkeypatch, backward_kernel, "backward", lambda s, p, dys, *a, **k: seam_dys.append(dys))
@@ -1388,6 +1388,80 @@ def test_reads_feed_every_declared_linear_from_one_column_take(monkeypatch, form
     (interval,) = (ref() for ref in intervals)
     assert interval.checkpoint is None and not interval.tapes and not interval.slots
     assert interval.predecessors == [None]
+
+
+@mxfp8_test
+@pytest.mark.parametrize(
+    "streams,readers,hidden,rows,residual,formats",
+    [
+        (3, 1, 3072, 1024, BF16, ("mxfp8",)),
+        (3, 1, 1312, 1056, F32, ("bf16", "mxfp8")),  # padded scale rows and columns
+        (2, 2, 160, 96, BF16, ("bf16", "mxfp8")),
+        (3, 2, 4096, 2048, F32, ("bf16", "mxfp8")),
+        (1, 2, 2592, 2080, BF16, ("mxfp8",)),
+        (3, 2, 2048, 2048, BF16, ("mxfp8", "mxfp8")),  # dR alone through the TMA store ring
+    ],
+)
+def test_update_gradient_mxfp8_matches_te(streams, readers, hidden, rows, residual, formats):
+    """The backward's MXFP8 update gradient (rowwise and columnwise data and GEMM-swizzled
+    scales) is byte for byte TE's quantization of the BF16 update gradient, for every update
+    asking for it (a shortcut add may mix formats); the other gradients do not change."""
+    updates = len(formats)
+    raw = inputs(streams, readers, hidden, rows, updates=updates, residual_dtype=residual)
+    with torch.no_grad():
+        _, (saved, r, dys, carry) = backward_args(raw, streams)
+        plain, _ = backward_kernel.backward(saved, r, dys, carry)
+        mixed, _ = backward_kernel.backward(saved, r, dys, carry, update_formats=formats)
+    expected = mxfp8_quantizer()(plain[1])
+    for grad, fmt in zip(mixed[1 : 1 + updates], formats):
+        if fmt == "bf16":
+            assert bytes_equal(grad, plain[1])
+        else:
+            all_bytes_equal(buffers((grad,)), buffers((expected,)))
+            assert_columns_equal((grad,), (expected,))
+    all_bytes_equal((mixed[0], *mixed[1 + updates :]), (plain[0], *plain[1 + updates :]))
+
+
+@REQUIRES_FUSED_BACKWARD
+@pytest.mark.parametrize(
+    "readers,retention,logits,main,missing",
+    [
+        (1, True, BF16, BF16, False),
+        (1, False, F32, F32, False),
+        (2, True, BF16, F32, False),
+        (2, True, F32, BF16, True),
+        (2, False, BF16, BF16, True),
+    ],
+)
+def test_fused_wgrad_accumulation_matches_ddp(readers, retention, logits, main, missing):
+    """With fuse_wgrad_accumulation the backward adds each controller and norm weight gradient
+    into its parameter's DDP main_grad itself, bit for bit what autograd's cast to the parameter
+    dtype and DDP's main_grad.add_ would; a missing reader's parameters stay untouched."""
+
+    def step(fuse):
+        raw = inputs(3, readers, 1280, 2048, retention=retention, logit_dtype=logits)
+        params = [p for p in (*raw[2], *raw[3]) if p is not None]
+        g = torch.Generator(device="cuda").manual_seed(9)
+        for p in params:
+            p.main_grad = torch.randn(p.shape, device="cuda", generator=g).to(main)
+            p.grad_added_to_main_grad = False
+        out = run(raw, 3, fuse_wgrad_accumulation=fuse)
+        used = out[: readers if missing else readers + 1]
+        torch.autograd.backward(used, [torch.ones_like(t) for t in used])
+        for p in params:  # Megatron DDP's backward hook
+            if p.grad is not None and not p.grad_added_to_main_grad:
+                p.main_grad.add_(p.grad)
+        return [p.main_grad for p in params], [p.grad_added_to_main_grad for p in params], raw
+
+    plain, _, raw_plain = step(False)
+    fused, flags, raw_fused = step(True)
+    assert all(bytes_equal(a, b) for a, b in zip(plain, fused))
+    assert torch.equal(raw_plain[0].grad, raw_fused[0].grad)
+    # Every used parameter took the fused path; a missing reader's read and norm weight did not.
+    expected = [True] * len(flags)
+    if missing:  # the last reader's read logits (the last controller) and norm weight
+        expected[sum(c is not None for c in raw_fused[2]) - 1] = expected[-1] = False
+    assert flags == expected
 
 
 @REQUIRES_FUSED_BACKWARD
@@ -1467,6 +1541,7 @@ def test_direct_mxfp8_consumer_selection(monkeypatch, eligible):
         module = object.__new__(wide_residual.WriteReadNorm)
         torch.nn.Module.__init__(module)
         module.consumers, module.seam_layer = list(consumers), layers[seam_layer]
+        module.fuse_wgrad_accumulation = False
         module.resolve_formats(runs_mxfp8)
         return module
 
@@ -1500,3 +1575,91 @@ def test_direct_mxfp8_consumer_selection(monkeypatch, eligible):
     assert isinstance(options["interval"], ReplayInterval) and options["interval"] is only.interval
     assert (slot is not None) == eligible
     assert only.columns_slot is None if slot is None else only.columns_slot() is slot
+
+
+def _recipe(**overrides):
+    from megatron.core.extensions.transformer_engine import TEQuantizationRecipe
+
+    return TEQuantizationRecipe(**{"fp8_quantization_recipe": Fp8Recipe.mxfp8, **overrides})
+
+
+@pytest.mark.parametrize(
+    "override,quantized,fmt,takes,takes_gradients",
+    [
+        (None, True, "e4m3", True, True),  # no override: the layer's autocast
+        (None, True, "hybrid", True, False),  # hybrid gradients are E5M2
+        (None, False, "e4m3", False, False),
+        (dict(fp8_quantization_recipe=None), True, "e4m3", False, False),  # override to BF16
+        ({}, True, "hybrid", True, True),  # MXFP8 E4M3 override inside a hybrid layer
+        (dict(fp8_format="hybrid"), True, "e4m3", True, False),
+        (dict(fp8_quantization_recipe=Fp8Recipe.tensorwise), True, "e4m3", False, False),
+        (dict(recipe_attrs={"fp8_dpa": True}), True, "e4m3", False, False),
+        (dict(override_quantized_autocast=False), True, "e4m3", True, True),  # inherits
+        ({}, False, "e4m3", False, False),  # does not override a BF16 layer's autocast
+        (dict(override_nonquantized_autocast=True), False, "e4m3", True, True),
+        ("evaluation", True, "e4m3", False, False),  # another evaluation recipe
+    ],
+)
+def test_takes_mxfp8_follows_precision_overrides(
+    monkeypatch, override, quantized, fmt, takes, takes_gradients
+):
+    """A seam hands a Linear MXFP8 (its read; its update gradient, which also needs E4M3) exactly
+    where TE runs it MXFP8: under the layer's autocast, unless its --te-precision-config-file
+    override applying there selects another recipe or precision."""
+    monkeypatch.setattr(wide_residual, "mxfp8_linear_eligible", lambda linear: True)
+    linear = torch.nn.Linear(4, 4)
+    if override == "evaluation":
+        evaluation = _recipe(fp8_quantization_recipe=Fp8Recipe.tensorwise)
+        linear.te_quant_params = SimpleNamespace(
+            training_recipe=_recipe(), evaluation_recipe=evaluation
+        )
+    elif override is not None:
+        linear.te_quant_params = SimpleNamespace(
+            training_recipe=_recipe(**override), evaluation_recipe=None
+        )
+    assert wide_residual.takes_mxfp8(linear, quantized, fmt) == takes
+    assert wide_residual.takes_mxfp8(linear, quantized, fmt, gradients=True) == takes_gradients
+
+
+def test_deferred_write_checks_its_producer(monkeypatch):
+    """A write hands its update an MXFP8 gradient only after checking, in every training
+    forward, that the update is its linked producer's output (or that output passed on as is by
+    custom autograd Functions); an update has one producer."""
+    monkeypatch.setattr(wide_residual, "takes_mxfp8", lambda *a, **k: True)
+    monkeypatch.setattr(wide_residual, "runs_mxfp8", lambda config, layer: True)
+    write = object.__new__(wide_residual.DeferredWrite)
+    torch.nn.Module.__init__(write)
+    write.layer_number, write.retention = 3, None
+    write.write_map = lambda return_logits: None
+    handed = []
+    write.target = SimpleNamespace(hand=handed.append)
+    linear, layer = torch.nn.Linear(4, 4), SimpleNamespace(config=SimpleNamespace(fp8="e4m3"))
+    write.link_producer(linear, layer)
+    with pytest.raises(RuntimeError, match="one linked producer"):
+        write.link_producer(torch.nn.Linear(4, 4), layer)
+    write.resolve_formats(None)
+    assert write.update_formats == ("mxfp8",)
+    state = (torch.zeros(2, 4),)
+    step = dict(state=state, dropout_probability=0.0, training=True)
+    with torch.enable_grad():
+        out = linear(torch.randn(2, 4))
+        write((out, None), **step)
+        assert handed[-1].routed is out and handed[-1].update_formats == ("mxfp8",)
+        with pytest.raises(RuntimeError, match="not its linked producer's output"):
+            write((out * 1, None), **step)
+
+        class Identity(torch.autograd.Function):  # as a virtual-expert hook: input as is
+            forward = staticmethod(lambda ctx, x: x)
+            backward = staticmethod(lambda ctx, grad: grad)
+
+        class Copy(torch.autograd.Function):  # new values: rejected
+            forward = staticmethod(lambda ctx, x: x.clone())
+            backward = staticmethod(lambda ctx, grad: grad)
+
+        write((Identity.apply(Identity.apply(out)), None), **step)
+        with pytest.raises(RuntimeError, match="not its linked producer's output"):
+            write((Copy.apply(out), None), **step)
+        with pytest.raises(RuntimeError, match="not its linked producer's output"):
+            write((out.view(4, 2).view(2, 4), None), **step)  # a view chain, not a Function
+    with torch.no_grad():  # no gradient to hand on
+        write((torch.zeros(2, 4), None), **step)

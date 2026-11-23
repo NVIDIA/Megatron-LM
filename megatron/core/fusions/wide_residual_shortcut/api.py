@@ -48,7 +48,17 @@ class _Boundary(torch.autograd.Function):
     @staticmethod
     def forward(ctx, options, residual, *values):
         """Run the seam; ``ctx`` None is an inference call without autograd state."""
-        streams, replay, uses, slots, epsilon, update_count, batch_invariant = options
+        (
+            streams,
+            replay,
+            uses,
+            slots,
+            epsilon,
+            update_count,
+            batch_invariant,
+            fuse,
+            update_formats,
+        ) = options
         formats = tuple(_kernel_format(use) for use in uses)
         from .forward_kernel import forward
 
@@ -103,7 +113,9 @@ class _Boundary(torch.autograd.Function):
         ctx.replay, ctx.index = replay, replay.record(residual, current, saved, slots)
         ctx.save_for_backward(saved.update, saved.coefficients, *saved.gammas, *saved.rstd)
         ctx.spec = replace(saved, update=None, coefficients=None, gammas=(), rstd=())
-        ctx.leading, ctx.uses = leading, uses
+        ctx.leading, ctx.uses, ctx.update_formats = leading, uses, update_formats
+        # Controller and norm weight parameters whose gradients may accumulate in the kernel.
+        ctx.parameters = values[update_count:] if fuse else (None,) * (len(values) - update_count)
         for slot, operand in zip(slots, quantized):
             if slot is not None:
                 # Pinned on the rowwise data's base, which every view and detached alias keeps: a
@@ -146,19 +158,26 @@ class _Boundary(torch.autograd.Function):
             for t in dys
         )
         dc = None if carry is None else carry.contiguous().view_as(previous)
-        grads, _ = backward(saved, previous, dy, dc)
+        # A missing reader gets no read or norm weight gradient (its parameters' main_grad stays
+        # untouched), although the kernel materializes a zero dy for it.
+        missing = {j for i, grad in enumerate(dys) if grad is None for j in (2 + i, 2 + count + i)}
+        targets = tuple(
+            None if j in missing else _main_grad_target(p) for j, p in enumerate(ctx.parameters)
+        )
+        grads, _ = backward(
+            saved, previous, dy, dc, main_grads=targets, update_formats=ctx.update_formats
+        )
         if ctx.index == 0 and ctx.replay.previous is not None:
             # This seam applies the previous interval's last write: replay that interval now,
             # before any of its backward GEMMs (which need gradients this seam produces).
             ctx.replay.previous.replay()
             ctx.replay.previous = None
         grads = list(grads)
-        # A missing reader gets no controller or norm-weight gradient, although the kernel
-        # materializes a zero dy for it.
-        for index, grad in enumerate(dys):
-            if grad is None:
-                grads[update_count + 3 + index] = None
-                grads[update_count + 3 + count + index] = None
+        for j, (parameter, target) in enumerate(zip(ctx.parameters, targets)):
+            if j in missing:
+                grads[update_count + 1 + j] = None
+            elif target is not None:
+                grads[update_count + 1 + j] = _accumulated(parameter)
         # Memoize views so shared update gradients preserve Tensor identity.
         views = {}
         for i, grad in enumerate(grads[: update_count + 1]):
@@ -171,9 +190,36 @@ class _Boundary(torch.autograd.Function):
         )
 
 
+def _main_grad_target(parameter):
+    """``(main_grad, dtype)`` when the kernel may accumulate ``parameter``'s gradient itself: the
+    Megatron DDP contract Transformer Engine's fused weight-gradient accumulation follows (a
+    ``main_grad`` and the ``grad_added_to_main_grad`` flag, without overwrite or FSDP), else
+    None."""
+    if (
+        parameter is None
+        or not parameter.requires_grad
+        or getattr(parameter, "main_grad", None) is None
+        or not hasattr(parameter, "grad_added_to_main_grad")
+        or getattr(parameter, "overwrite_main_grad", False)
+        or hasattr(parameter, "__fsdp_param__")
+    ):
+        return None
+    return parameter.main_grad, parameter.dtype
+
+
+def _accumulated(parameter):
+    """Mark ``parameter``'s gradient as accumulated and return TE's placeholder, which DDP's hook
+    drops (zeros when it adds it anyway, ``zero_out_wgrad``)."""
+    from transformer_engine.pytorch.module.base import get_dummy_wgrad
+
+    parameter.grad_added_to_main_grad = True
+    zero = getattr(parameter, "zero_out_wgrad", False)
+    return get_dummy_wgrad(list(parameter.shape), parameter.dtype, zero=zero)
+
+
 @lru_cache
 def _trains_on(device_index: int) -> bool:
-    from .kernel_utils import qualified_device
+    from .configs import qualified_device
 
     return qualified_device(torch.cuda.get_device_properties(device_index))
 
@@ -185,7 +231,7 @@ def check_mxfp8_call(tensor) -> None:
     (Megatron's inference pads to 64)."""
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
 
-    from .kernel_utils import SHAPES
+    from .configs import SHAPES
 
     if not FP8GlobalStateManager.is_fp8_enabled():
         raise RuntimeError("an MXFP8 layer's fused seam ran outside its FP8 context")
@@ -214,6 +260,7 @@ def fused_seam(
     interval=None,
     epsilon=1.0e-5,
     batch_invariant=False,
+    fuse_wgrad_accumulation=False,
 ):
     """Write ``pending`` and emit one or two following read/RMSNorms in one kernel; returns
     ``(residual, *readers)``.
@@ -226,7 +273,8 @@ def fused_seam(
     ReplayInterval), and each MXFP8 reader's ``columns`` entry is a ColumnSlot that the interval's
     replay fills with its columnwise operand, for its consumers' weight-gradient GEMMs; the
     interval must replay before them. ``batch_invariant`` (inference) fixes the schedule across
-    batch sizes.
+    batch sizes. ``fuse_wgrad_accumulation`` lets the backward accumulate the controller and norm
+    weight gradients into their parameters' DDP ``main_grad`` (Transformer Engine's contract).
     """
     if not 1 <= len(reads) == len(gammas) <= 2:
         raise ValueError("a seam has one or two readers, each with read logits and a norm weight")
@@ -240,7 +288,18 @@ def fused_seam(
     slots = (None,) * len(reads) if columns is None else tuple(columns)
     if len(formats) != len(reads) or len(slots) != len(reads):
         raise ValueError("a seam takes one output format and column slot per reader")
-    options = (num_streams, interval, uses, slots, epsilon, len(updates), batch_invariant)
+    update_formats = p.update_formats
+    options = (
+        num_streams,
+        interval,
+        uses,
+        slots,
+        epsilon,
+        len(updates),
+        batch_invariant,
+        fuse_wgrad_accumulation,
+        update_formats,
+    )
     if not torch.is_grad_enabled():
         return _regroup(uses, _Boundary.forward(None, options, *inputs))
     if any((fmt == "bf16") != (slot is None) for fmt, slot in zip(formats, slots)):
@@ -295,7 +354,9 @@ class PendingWideResidualWrites:
     The next seam kernel writes it together with that layer's read/RMSNorm(s). A MoE output is
     a shortcut add of ``routed`` and ``shared``; a single branch update (a lone layer's output)
     leaves ``shared`` None. ``write``/``retain`` are the writing connection's logits
-    (``retain`` None is fixed identity retention).
+    (``retain`` None is fixed identity retention). ``update_formats`` may mark each update
+    (routed, then shared) "mxfp8" when its producer is an MXFP8 Linear taking its grad_output
+    directly, which the seam backward then emits quantized; else BF16 (default).
     """
 
     residual: torch.Tensor
@@ -303,3 +364,4 @@ class PendingWideResidualWrites:
     shared: torch.Tensor | None
     write: torch.Tensor
     retain: torch.Tensor | None
+    update_formats: tuple | None = None

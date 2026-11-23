@@ -17,6 +17,7 @@ import torch
 from megatron.core.fusions.wide_residual_shortcut import (
     api,
     backward_kernel,
+    configs,
     forward_kernel,
     kernel_utils,
 )
@@ -80,7 +81,7 @@ def graph_replay(execute, expected, fill=poison_bytes, stream=None):
 
 def taped_forward(forward, *args, **kwargs):
     """Materialize the tape with the inference schedule (one CTA per row), as an oracle."""
-    choose = forward_kernel.choose_forward_config
+    choose = configs.choose_forward_config
 
     def same_schedule(m, h, streams, readers=1, **options):
         cfg = choose(m, h, streams, readers, **(options | {"inference": True}))
@@ -148,7 +149,7 @@ FORWARD = [
 ] + [
     # Every BF16-stream inference table entry (512-1024 rows) with BF16 logits.
     pytest.param(1024, h, 3, n, u, T, q, T, BF16, 1e-5, F, T, marks=QUALIFIED if q else ())
-    for h, n, u, q in sorted(forward_kernel._FORWARD_CONFIGS_BF16)
+    for h, n, u, q in sorted(configs._FORWARD_CONFIGS_BF16)
 ] + [
     # Every leaf of the prefill tree (inference rows > 1024).
     pytest.param(m, h, s, len(o), u, T, o, T, d, 1e-5, F, T, marks=QUALIFIED)
@@ -208,7 +209,7 @@ INFERENCE = [
 ]
 # backward: (streams, readers, hidden, rows, retention, grid, routes, updates, BF16 residual[,
 # second gradient for the last reader (its two consumers' gradients summed in the kernel)]).
-# Column routes only prepend _bwd_wr_recompute_mxfp8quant launches (per reader index); explicit
+# Column routes only prepend bwd_wr_writeread_recompute_mxfp8 launches (per reader index); explicit
 # grids include idle groups that must skip their bootstrap transfers.
 EXPLICIT_GRIDS = [(32, 1), (96, 1), (128, 64), (288, 4), (4128, 34), (4096, 32)]
 EXPLICIT_GRIDS += [(4096, 960), (3072, 24), (10240, 80)]
@@ -360,8 +361,10 @@ def test_graph_replay_restores_poisoned_outputs(monkeypatch, kind, case):
         eager = execute()
         assert eager.kernel.metadata.launch_cooperative_grid is False
         assert [column is not None for column in eager.columns] == list(routes)
-        # The admission and row-tile counters must be poisoned and reset on replay.
-        assert any(t.dtype == torch.int32 and t.numel() == 2 for t in eager.allocations)
+        # The workspace (handoff words, then the admission and row-tile counters) must be
+        # poisoned and reset on replay.
+        words = -(-rows // 16) * (16 + readers * 16 * -(-hidden // 256)) + 1
+        assert any(t.dtype == torch.int64 and t.numel() == words for t in eager.allocations)
         expected = [t.clone() for t in workspace_tensors((eager.grads, eager.columns))]
         # Warm up and capture on a side stream, as production graph capture does.
         side = torch.cuda.Stream()
@@ -396,13 +399,15 @@ def test_graph_replay_restores_poisoned_outputs(monkeypatch, kind, case):
                 if output is not None:
                     start = planes[controller] * streams
                     factors = coefficients[(4 + controller) * streams : (5 + controller) * streams]
-                    jobs.append((partial[start : start + streams], output, 1, 1, 0, factors))
+                    jobs.append(
+                        (partial[start : start + streams], output, 1, 1, 0, factors, None, 0)
+                    )
                     reference_ = torch.zeros_like(output)
                     reference_[:streams] = partial[start : start + streams].sum(1) * factors
                     expected.append((output, reference_))
             if fused_gamma:
                 jobs = [
-                    (p, out, 0, 8, 0, None) for p, out in zip(gamma_partial, gamma_grads)
+                    (p, out, 0, 8, 0, None, None, 0) for p, out in zip(gamma_partial, gamma_grads)
                 ] + jobs
                 expected.extend((out, part.sum(0)) for out, part in zip(gamma_grads, gamma_partial))
             kernel_utils.reduce_jobs(jobs)

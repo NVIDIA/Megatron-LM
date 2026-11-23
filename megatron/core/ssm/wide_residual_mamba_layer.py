@@ -20,6 +20,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
     apply_combined_residual_keys,
+    link_branch_seam,
     load_residual_state,
 )
 from megatron.core.typed_torch import apply_module
@@ -113,6 +114,10 @@ class WideResidualMambaLayer(MambaLayer):
                 f"hidden_size={self.config.hidden_size}, got "
                 f"{self.residual_read.branch_hidden_size}."
             )
+        # Fused connections: the mixer's out_proj produces its update.
+        link_branch_seam(
+            self, self.residual_read, self.residual_write, getattr(self.mixer, "out_proj", None)
+        )
 
     def sharded_state_dict(
         self, prefix: str = "", sharded_offsets: tuple = (), metadata: dict | None = None

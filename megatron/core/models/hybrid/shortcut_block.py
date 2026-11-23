@@ -260,8 +260,17 @@ class ShortcutMoEBlock(MegatronModule):
             # compute read's write emits in the compute layer's quantization context.
             mlp = moe_layer.mlp
             shared = mlp.shared_experts
-            fc1 = shared.linear_fc1 if type(shared).forward is SharedExpertMLP.forward else shared
-            moe_layer.residual_read_mlp.link_consumer(fc1, moe_layer)
+            plain = type(shared).forward is SharedExpertMLP.forward
+            moe_layer.residual_read_mlp.link_consumer(
+                shared.linear_fc1 if plain else shared, moe_layer
+            )
+            if self.defers_shortcut_add:
+                # The shortcut add's producers: the latent projection's output is the routed
+                # update (else the combine's: no Linear's), a plain shared expert's linear_fc2
+                # output the shared one.
+                write = moe_layer.residual_write_mlp
+                write.link_producer(getattr(mlp, "fc2_latent_proj", None), moe_layer, update=0)
+                write.link_producer(shared.linear_fc2 if plain else None, moe_layer, update=1)
             if self.fused_shortcut_read:
                 read = self.shortcut_residual_read
                 object.__setattr__(read, "seam_layer", compute_layer)

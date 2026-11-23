@@ -15,14 +15,20 @@ from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language import BlockedLayout, SliceLayout, SwizzledSharedLayout
 from triton.experimental.gluon.language.nvidia.hopper import fence_async_shared, mbarrier, tma
 
+from .configs import choose_backward_layout, get_backward_knobs, qualified_device
 from .kernel_utils import (
+    KERNEL_FORMAT_TAGS,
+    OUTPUT_FORMATS,
     _coefficient,
     _descriptor,
+    _e8m0_scale,
     _fma2,
     _mul2,
+    _round_bf16,
     _widen_bf16,
+    allocate_operand,
+    cdiv,
     named_jit,
-    qualified_device,
     reduce_jobs,
     validate_num_streams,
 )
@@ -31,7 +37,6 @@ from .kernel_utils import (
 _tma_load = tma.async_load if hasattr(tma, "async_load") else tma.async_copy_global_to_shared
 
 _GRADIENT_LAYOUT = gl.constexpr(BlockedLayout([1, 4], [4, 8], [1, 4], [1, 0]))
-_SMS, _SM_SHARED_BYTES = 152, 232_000  # the qualified GB300
 _SLICE = (16, 128)  # rows x columns of one TMA copy: a column half of a row tile
 _ROWS = gl.constexpr(SliceLayout(1, _GRADIENT_LAYOUT))  # one value per slice row
 _COLUMNS = gl.constexpr(SliceLayout(0, _GRADIENT_LAYOUT))  # one value per slice column
@@ -49,7 +54,12 @@ class _BackwardInputs(NamedTuple):
 
 class _BackwardOutputs(NamedTuple):
     residual_grad: object
-    update_grad: object
+    update_grad: object  # BF16 du, or None when only MXFP8 du is emitted
+    # MXFP8 du for the producer Linears' dgrad/wgrad: (rowwise data, rowwise scales, columnwise
+    # data, columnwise scales), or None; and where an even row tile's BF16 du waits for its pair:
+    # None in shared memory, else one 4096-value global slot per CTA.
+    update_mxfp8: object
+    update_stash: object
     controller_partials: object
     projection: object  # tagged handoff words (see the protocol below)
     gamma_partials: tuple
@@ -63,32 +73,6 @@ class _Geometry(NamedTuple):
     HAS_RETENTION: bool
 
 
-class _BackwardConfig(NamedTuple):
-    """Launch grid (whole width-spanning CTA groups) and register cap."""
-
-    TARGET_CTAS: int
-    MAXNREG: int
-
-
-def get_backward_knobs(m, h, streams, readers=1, *, grid="auto", bf16=False, second=False, ring=0):
-    """Select the launch knobs for one shape; an explicit grid overrides the auto grid.
-
-    Each CTA stages one row tile in shared memory (the predecessor streams, the update and,
-    below six streams, every reader gradient), and the grid keeps as many CTAs per SM as that
-    allows, at most four. Four leave 128 registers each, enough only for one reader or one
-    stream; three take 168 and fewer take them all. From an 8K-row sweep of widths 2048-10240,
-    1-6 streams, both residual dtypes and all reader variants. ``ring`` adds per-CTA shared
-    bytes (the two-reader store ring or one reader's paired controller shares).
-    """
-    staged = 2 * (readers + second) if streams < 6 else 0
-    shared = 4096 * ((2 if bf16 else 4) * streams + staged + 2) + 3000 + ring
-    per_sm = min(_SM_SHARED_BYTES // shared, 4 if readers == 1 or streams == 1 else 3)
-    if grid == "auto":
-        participants = triton.cdiv(h, 256)
-        grid = min(triton.cdiv(m, 16), max(1, per_sm * _SMS // participants)) * participants
-    return _BackwardConfig(grid, {4: 128, 3: 168}.get(per_sm, 255))
-
-
 @torch.no_grad()
 def backward(
     saved,
@@ -100,16 +84,25 @@ def backward(
     save_columns=False,
     config="auto",
     on_columns_ready=None,
+    main_grads=None,
+    update_formats=None,
 ):
     """Gradients of one seam from its ``SavedWrite`` and predecessor residual.
 
     ``dys`` holds one gradient per reader, or a pair for a reader with two consumers (summed in
     FP32 in the kernel). Returns ``(grads, columns)``: the residual gradient, one update gradient
-    per branch update (a shortcut add's share one tensor), the controller gradients (write,
-    retain, one read per reader) and one RMSNorm weight gradient per reader. ``save_columns``
-    (a bool for reader zero, or one per reader) also returns columnwise MXFP8 reader operands,
-    reusing any given in ``columns``; ``on_columns_ready`` receives them before the fused kernel
-    launches, so dependent weight GEMMs overlap it. ``config`` may set an explicit grid (tests).
+    per branch update (a shortcut add's share one tensor per format), the controller gradients
+    (write, retain, one read per reader) and one RMSNorm weight gradient per reader.
+    ``save_columns`` (a bool for reader zero, or one per reader) also returns columnwise MXFP8
+    reader operands, reusing any given in ``columns``; ``on_columns_ready`` receives them before
+    the fused kernel launches, so dependent weight GEMMs overlap it. ``config`` may set an
+    explicit grid (tests).
+    ``main_grads`` (one entry per controller and RMSNorm weight gradient, in return order) may
+    give ``(main_grad, parameter dtype)``: that gradient is accumulated into ``main_grad`` as
+    autograd's cast to the parameter dtype and DDP's add would, and returned as None.
+    ``update_formats`` gives each update's gradient format: "bf16" (default) or "mxfp8", the
+    rowwise and columnwise MXFP8 operand its producer Linear's dgrad and wgrad take (E4M3, TE's
+    GEMM-swizzled scales), quantized from the BF16 gradient as TE would.
     """
     n, streams, updates = len(saved.gammas), saved.num_streams, saved.update_count
     m, h = saved.update.shape
@@ -140,7 +133,17 @@ def backward(
             raise ValueError("a reader's second gradient must match its first, contiguous")
     if not qualified_device(torch.cuda.get_device_properties(previous.device)):
         raise ValueError("shortcut backward requires a qualified GB300")
-    nt = triton.cdiv(h, 256)
+    formats = ("bf16",) * updates if update_formats is None else tuple(update_formats)
+    if len(formats) != updates or any(f not in ("bf16", "mxfp8") for f in formats):
+        raise ValueError("update_formats needs one 'bf16' or 'mxfp8' entry per update")
+    # Accumulated parameter gradients: round to the parameter dtype (2) or not (1), then add.
+    targets = (None,) * (2 + 2 * n) if main_grads is None else tuple(main_grads)
+    if len(targets) != 2 + 2 * n:
+        raise ValueError("main_grads needs one entry per controller and norm weight gradient")
+    if any(t is not None and t[1] not in (torch.bfloat16, torch.float32) for t in targets):
+        raise ValueError("accumulated gradients need a BF16 or FP32 parameter")
+    accumulate = tuple(0 if t is None else 2 if t[1] == torch.bfloat16 else 1 for t in targets)
+    nt = cdiv(h, 256)
     if config != "auto" and (type(config) is not int or config <= 0 or config % nt):
         raise ValueError("shortcut grid must contain positive whole participant groups")
     routes = (
@@ -161,51 +164,74 @@ def backward(
     if on_columns_ready is not None:
         on_columns_ready(columns)
     bf16 = previous.dtype == torch.bfloat16
-    knobs = lambda ring=0: get_backward_knobs(
-        m, h, streams, n, grid=config, bf16=bf16, second=seconds[-1] is not None, ring=ring
+    grid, maxnreg, spare = get_backward_knobs(
+        m, h, streams, n, grid=config, bf16=bf16, second=seconds[-1] is not None
     )
-    grid, maxnreg = knobs()
     planes = (1 + n + saved.has_retention) * streams
-    # BF16 residuals whose extra shared bytes keep residency: two readers send dR and du through
-    # a ring and TMA bulk stores (whole 256-column tiles); one reader pairs a tile's column
-    # halves, half zero leaving its controller shares for half one (FP32 measured ~1% slower).
-    ring = 8192 if n == 2 else triton.next_power_of_2(planes + n) * 512
-    resident = bf16 and knobs(ring) == (grid, maxnreg)
-    tma_store, paired = resident and n == 2 and h % 256 == 0, resident and n == 1
-    # Outputs and scratch belong to this invocation; a shortcut add's updates share one gradient.
+    shares = sum(_share_planes.fn(planes + n, k) for k in (0, 1)) * 512  # paired shares' bytes
+    stash_shared, tma_store, paired = choose_backward_layout(
+        spare, h, n, bf16=bf16, mxfp8="mxfp8" in formats, paired_shares=shares
+    )
+    # Outputs and scratch belong to this invocation; a shortcut add's updates share one gradient
+    # (per format).
     empty = saved.coefficients.new_empty
-    du = empty((m, h), dtype=torch.bfloat16)
+    du = empty((m, h), dtype=torch.bfloat16) if "bf16" in formats else None
+    du_mx, mx = None, None
+    if "mxfp8" in formats:
+        du_mx = allocate_operand((m, h), previous.device, columnwise=True)
+        mx = (
+            du_mx._rowwise_data,
+            du_mx._rowwise_scale_inv,
+            du_mx._columnwise_data,
+            du_mx._columnwise_scale_inv,
+        )
+        if m % 128 or h % 128:
+            for scale in mx[1::2]:  # padded scales stay zero, as the forward's
+                scale.zero_()
     grads = (
         empty((m, streams * h), dtype=previous.dtype),
-        *((du,) * updates),
-        *(empty((size,)) if size else None for size in saved.controller_sizes),
-        *(empty((h,)) for _ in range(n)),
+        *(du if f == "bf16" else du_mx for f in formats),
+        *(
+            (empty((size,)) if t is None else t[0]) if size else None
+            for size, t in zip(saved.controller_sizes, targets)
+        ),
+        *(empty((h,)) if t is None else t[0] for t in targets[2 + n :]),
     )
     # Eight partials per controller plane and (row tile, column tile or half).
-    p = triton.cdiv(m, 16) * triton.cdiv(h, 256 if paired else 128) * 8
-    gp = tuple(empty((triton.cdiv(m, 16), h)) for _ in range(n))
+    p = cdiv(m, 16) * cdiv(h, 256 if paired else 128) * 8
+    gp = tuple(empty((cdiv(m, 16), h)) for _ in range(n))
     controllers = empty((planes + n, p))
-    chunks = empty((planes + n, triton.cdiv(p, 1024)))
+    chunks = empty((planes + n, cdiv(p, 1024)))
 
     # Per row tile: a 16-word header (arrival hint, next row tile) and one projection word per
     # (reader, row, column tile); see the handoff protocol below. Its word count bounds every
     # 32-bit counter of the launch (tickets, claimed tiles, arrivals).
-    tiles, block = triton.cdiv(m, 16), 16 + n * 16 * nt
+    tiles, block = cdiv(m, 16), 16 + n * 16 * nt
     if max(grid, tiles) * block + 16 >= 2**31:
         raise ValueError("handoff workspace and counters exceed signed 32-bit capacity")
-    epochs = empty((2,), dtype=torch.int32)
-    pp = empty((tiles * block,), dtype=torch.int64)
+    # One zeroed workspace: the handoff words, then the admission and row-tile counters.
+    workspace = empty((tiles * block + 1,), dtype=torch.int64)
+    pp, epochs = workspace[: tiles * block], workspace[tiles * block :].view(torch.int32)
 
     staged = streams < 6  # six streams read dy from global memory
     # Reset on every invocation (also under graph replay) so every handoff word starts at tag 0.
-    epochs.zero_()
-    pp.zero_()
-    BACKWARD_KERNELS[n][(grid,)](
+    workspace.zero_()
+    du_formats = "both" if len(set(formats)) == 2 else formats[0]
+    BACKWARD_KERNELS[n, seconds[-1] is not None, du_formats][(grid,)](
         inputs=_BackwardInputs(saved.coefficients, saved.rstd, saved.gammas, carry, dys, seconds),
         GEOMETRY=_Geometry(m, h, streams, saved.has_retention),
         GRID=grid,
         PAIRED=paired,
-        outputs=_BackwardOutputs(grads[0], grads[1], controllers, pp, gp, epochs),
+        outputs=_BackwardOutputs(
+            grads[0],
+            du,
+            mx,
+            None if stash_shared or mx is None else empty((grid * 4096,), dtype=torch.bfloat16),
+            controllers,
+            pp,
+            gp,
+            epochs,
+        ),
         CARRY_DESC=_descriptor(carry, _SLICE),
         R_DESC=_descriptor(previous, _SLICE),
         DY0_DESC=_descriptor(dys[0] if staged else None, _SLICE),
@@ -233,21 +259,23 @@ def backward(
     beta0, beta1 = coefficients(2), coefficients(3) if two else None
     write, retain = coefficients(0), coefficients(1) if retention else None
     # Per controller (write, retention, then each reader's read): its partial plane and the
-    # raw rows/coefficients its final reduction combines (see _bwd_wr_reduce).
+    # raw rows/coefficients its final reduction combines (see bwd_wr_writeread_reduce).
     kinds = (
         (0, (chunks[raw_b], beta0, chunks[raw_b + 1] if two else None, beta1, True)),
         (1, (plane(2), beta0, plane(3) if two else None, beta1) if retention else None),
         *((1 + retention + r, (chunks[raw_b + r], write, retain)) for r in range(n)),
     )
-    final = [(p, g, 0, 8, 0, None) for p, g in zip(gp, grads[-n:])]
+    final = [(p, g, 0, 8, 0, None, None, a) for p, g, a in zip(gp, grads[-n:], accumulate[2 + n :])]
     for kind, (output, (index, combo)) in enumerate(
         zip(grads[1 + updates : 3 + updates + n], kinds)
     ):
         if output is not None:
-            final.append((plane(index), output, 1, 1, 0, coefficients(4 + kind), combo))
-    reduce_jobs([(controllers, chunks, 1, 1, 1024, None)])
+            args = (plane(index), output, 1, 1, 0, coefficients(4 + kind), combo, accumulate[kind])
+            final.append(args)
+    reduce_jobs([(controllers, chunks, 1, 1, 1024, None, None, 0)])
     reduce_jobs(final)
-    return grads, columns
+    parameters = (g if t is None else None for g, t in zip(grads[1 + updates :], targets))
+    return (*grads[: 1 + updates], *parameters), columns
 
 
 # Fence-free cross-CTA handoff (projection partials, next row tile): each value travels in one
@@ -418,6 +446,14 @@ def _store_partial(destination, partial, valid):
     gl.store(destination + gl.arange(0, 8, layout=total.type.layout), total, valid)
 
 
+@triton.constexpr_function
+def _share_planes(planes, buffer):
+    """Planes in buffer 0 or 1 of a pair's controller shares (512 B per plane): two power-of-two
+    buffers, the first the largest power of two below ``planes + 1``."""
+    first = 1 << (planes.bit_length() - 1)  # integer-only: cheap as a host call (``.fn``)
+    return first if buffer == 0 else 1 << max(planes - first - 1, 0).bit_length()
+
+
 @g.jit
 def _defer(queued, a, b, PLANE: gl.constexpr, at, PART: gl.constexpr):
     """Queue this thread's share of sum(a * b) for controller plane PLANE, stored at
@@ -430,7 +466,11 @@ def _defer(queued, a, b, PLANE: gl.constexpr, at, PART: gl.constexpr):
         queued += ((destination, share),)
     else:
         share = gl.where(at[2], share, 0)
-        slot = at[3].slice(PLANE * 128, 128)
+        FIRST: gl.constexpr = at[3][0].shape[0] // 128
+        if PLANE < FIRST:
+            slot = at[3][0].slice(PLANE * 128, 128)
+        else:
+            slot = at[3][1].slice((PLANE - FIRST) * 128, 128)
         if PART == 0:
             slot.store(share)
         else:
@@ -537,6 +577,82 @@ def _tma_store(DESC, slot, value, row, column):
 
 
 @g.jit
+def _emit_update_mxfp8(
+    mx,
+    stash,
+    du,
+    row_tile,
+    column,
+    PART: gl.constexpr,
+    SHARED: gl.constexpr,
+    M: gl.constexpr,
+    H: gl.constexpr,
+):
+    """Quantize a 16x128 du slice (its BF16 rounding, as TE quantizes the BF16 gradient; column
+    half PART, first column ``column``) to MXFP8 in TE's GEMM layouts. Rowwise 1x32 blocks now;
+    columnwise 32x1 blocks span a row-tile pair, so an even tile stashes its BF16 slice (shared
+    memory, or a per-CTA global slot each thread rereads itself) and the odd tile quantizes both.
+    Row tiles are 16 aligned rows and slices 128 aligned columns, so every scale index
+    (kernel_utils._swizzled_scale_index) splits into a per-tile scalar plus a per-thread constant.
+    """
+    row_data, row_scales, col_data, col_scales = mx
+    L: gl.constexpr = du.type.layout
+    EVEN: gl.constexpr = H % 256 == 0  # every slice column inside H (rows always are)
+    r = gl.arange(0, 16, layout=gl.constexpr(SliceLayout(1, L)))[:, None]
+    cc = gl.arange(0, 128, layout=gl.constexpr(SliceLayout(0, L)))
+    c = cc[None, :]
+    mask = (c + column < H) if not EVEN else None
+    local = r * H + c
+    base = row_tile * 16 * H + column
+    y = _widen_bf16(_round_bf16(du))
+    # Rowwise: a warp holds each 32-column block of four rows.
+    blocks = gl.reshape(y, (16, 4, 32))
+    exponent, bits = _e8m0_scale(gl.max(gl.abs(blocks), 2))
+    blocks, block_scale = gl.broadcast(blocks, gl.expand_dims(bits.to(gl.float32, bitcast=True), 2))
+    q = gl.reshape(
+        _mul2(blocks, block_scale).to(gl.float8e4nv).to(gl.uint8, bitcast=True), (16, 128)
+    )
+    gl.store(row_data + base + local, gl.convert_layout(q, L), mask)
+    SL: gl.constexpr = exponent.type.layout
+    br = gl.arange(0, 16, layout=gl.constexpr(SliceLayout(1, SL)))[:, None]
+    bb = gl.arange(0, 4, layout=gl.constexpr(SliceLayout(0, SL)))[None, :]
+    # Scale index of row row_tile * 16 + br, block column // 32 + bb.
+    row_scale = (row_tile // 8 * gl.cdiv(H, 128) + column // 128) * 512
+    row_scale += row_tile % 2 * 256 + row_tile % 8 // 2 * 4
+    gl.store(
+        row_scales + row_scale + (br * 16 + bb),
+        exponent.to(gl.uint8),
+        (column + bb * 32 < H) if not EVEN else None,
+    )
+    # Columnwise: the pair's 32 rows of each column share one scale.
+    if row_tile % 2 == 0:
+        if SHARED:
+            stash.slice(PART * 16, 16).store(y.to(gl.bfloat16))
+        else:
+            gl.store(stash + PART * 2048 + r * 128 + c, y.to(gl.bfloat16))
+    else:
+        if SHARED:
+            first = _widen_bf16(stash.slice(PART * 16, 16).load(L))
+        else:
+            first = _widen_bf16(gl.load(stash + PART * 2048 + r * 128 + c))
+        amax = gl.max(gl.maximum(gl.abs(first), gl.abs(y)), 0)  # one cross-lane reduction
+        column_exponent, column_bits = _e8m0_scale(amax)
+        first, column_scale = gl.broadcast(first, column_bits.to(gl.float32, bitcast=True)[None, :])
+        for k in gl.static_range(2):
+            value = first if k == 0 else y
+            quantized = _mul2(value, column_scale).to(gl.float8e4nv).to(gl.uint8, bitcast=True)
+            gl.store(col_data + base - (1 - k) * 16 * H + local, quantized, mask)
+        # Scale index of column column + cc, block row_tile // 2.
+        pair = row_tile // 2
+        col_scale = (column // 128 * gl.cdiv(M, 128) + pair // 4) * 512 + pair % 4
+        gl.store(
+            col_scales + col_scale + (cc % 32 * 16 + cc // 32 * 4),
+            column_exponent.to(gl.uint8),
+            (column + cc < H) if not EVEN else None,
+        )
+
+
+@g.jit
 def _sync():
     """Order every thread's shared-memory reads before the TMA copies issued next."""
     gl.barrier()
@@ -612,8 +728,10 @@ def _backward_body(
     if SECOND:
         ds2 = gl.allocate_shared_memory(DY2_DESC.dtype, [32, 128], DY2_DESC.layout)
     update_shared = gl.allocate_shared_memory(U_DESC.dtype, [32, 128], U_DESC.layout)
-    # Two readers' dR and du leave through a two-slot ring (every tile issues an even count).
+    # Two readers' dR and any BF16 du leave through a two-slot ring, RING stores per column half
+    # (every tile issues an even count, so consecutive stores alternate slots).
     TMA_STORE: gl.constexpr = DR_DESC is not None
+    RING: gl.constexpr = streams + 1 if DU_DESC is not None else streams
     out_shared = None
     if TMA_STORE:
         out_shared = gl.allocate_shared_memory(DR_DESC.dtype, [32, 128], DR_DESC.layout)
@@ -673,10 +791,14 @@ def _backward_body(
     gs = gl.allocate_shared_memory(gl.float32, [NREADERS * 256], LINEAR_SHARED)
     # Half zero's controller shares, one word per thread and plane (write, retention and read
     # per stream, then raw b); only the owning thread touches a word.
-    PLANES: gl.constexpr = triton.next_power_of_2((2 + retention) * streams + 1)
-    shares = (
-        gl.allocate_shared_memory(gl.float32, [PLANES * 128], LINEAR_SHARED) if PAIRED else None
-    )
+    # Two power-of-two buffers cover the planes (10 = 8 + 2 for three streams with retention).
+    shares = None
+    if PAIRED:
+        PLANES: gl.constexpr = (2 + retention) * streams + 1
+        shares = (
+            gl.allocate_shared_memory(gl.float32, [_share_planes(PLANES, 0) * 128], LINEAR_SHARED),
+            gl.allocate_shared_memory(gl.float32, [_share_planes(PLANES, 1) * 128], LINEAR_SHARED),
+        )
     gamma_cc = column_tile * 256 + gl.arange(0, 256, layout=_COLUMNS)
     for reader in gl.static_range(NREADERS):
         saved_gamma = gl.load(inputs.gammas[reader] + gamma_cc, gamma_cc < h, 0)
@@ -692,7 +814,14 @@ def _backward_body(
     else:
         for i in gl.static_range(4 * streams):
             coefficient += (gl.load(inputs.coefficients + i),)
-    row_tile = group
+    # MXFP8 du's 32-row column blocks: a group takes row tiles in pairs (even, then odd).
+    TILE_PAIRS: gl.constexpr = outputs.update_mxfp8 is not None
+    STASH_SHARED: gl.constexpr = TILE_PAIRS and outputs.update_stash is None
+    stash = None
+    if STASH_SHARED:
+        BF16_SHARED: gl.constexpr = gl.NVMMASharedLayout(64, 16, 2)
+        stash = gl.allocate_shared_memory(gl.bfloat16, [32, 128], BF16_SHARED)
+    row_tile = group * 2 if TILE_PAIRS else group
     iteration = 0
 
     # Bootstrap only active groups; gradient slices prefetch subsequent inputs.
@@ -715,7 +844,12 @@ def _backward_body(
         # The group leader claims the next row tile, publishes it in this tile's word and
         # warms the claimed tile's block in L2 (its zeroed lines are long evicted by now).
         if column_tile == 0:
-            claimed = GROUPS + gl.atomic_add(row_tile_counter, 1, sem="relaxed")
+            if TILE_PAIRS:
+                claimed = row_tile + 1
+                if row_tile % 2:
+                    claimed = (GROUPS + gl.atomic_add(row_tile_counter, 1, sem="relaxed")) * 2
+            else:
+                claimed = GROUPS + gl.atomic_add(row_tile_counter, 1, sem="relaxed")
             _publish_word(next_tile_word, claimed, tag, 127)
             block = outputs.projection + claimed * BLOCK
             _prefetch_warp_rows(block, (claimed < total_tiles).to(gl.int32), 0, 0, BLOCK * 8)
@@ -954,7 +1088,7 @@ def _backward_body(
                 d_previous = d_previous.to(outputs.residual_grad.dtype.element_ty)  # RN for BF16
                 if TMA_STORE:
                     store_column = s * h + column_tile * 256 + part * 128
-                    slot = out_shared.slice((part * (streams + 1) + s) % 2 * 16, 16)
+                    slot = out_shared.slice((part * RING + s) % 2 * 16, 16)
                     _tma_store(DR_DESC, slot, d_previous, row_tile * 16, store_column)
                 else:
                     pointer = residual_grad_rows + s * h
@@ -974,12 +1108,16 @@ def _backward_body(
             for reader in gl.static_range(NREADERS):
                 du = _fma2(update_mixes[reader], dxs[reader], du)
 
-            if TMA_STORE:
-                store_column = column_tile * 256 + part * 128
-                slot = out_shared.slice((part * (streams + 1) + streams) % 2 * 16, 16)
-                _tma_store(DU_DESC, slot, du.to(gl.bfloat16), row_tile * 16, store_column)
-            else:
+            du_column = column_tile * 256 + part * 128
+            if DU_DESC is not None:
+                slot = out_shared.slice((part * RING + streams) % 2 * 16, 16)
+                _tma_store(DU_DESC, slot, du.to(gl.bfloat16), row_tile * 16, du_column)
+            elif outputs.update_grad is not None:
                 gl.store(outputs.update_grad + offset, du, mask, cache_modifier=OUTPUT_CACHE)
+            if TILE_PAIRS:  # a global stash slot is rebuilt here: kept live, it costs registers
+                slot = stash if STASH_SHARED else outputs.update_stash + bid * 4096
+                mx = outputs.update_mxfp8
+                _emit_update_mxfp8(mx, slot, du, row_tile, du_column, part, STASH_SHARED, m, h)
 
         row_tile = next_rp
         iteration += 1
@@ -987,8 +1125,16 @@ def _backward_body(
         tma.store_wait(0)
 
 
-# One kernel body; its profiler name gives the variant (reader count).
+def _backward_kernel_name(readers, second, du):
+    """The profiler name of one variant: its readers, the gradients flowing into them (a reader
+    with two consumers takes two) and the update gradient's formats (``KERNEL_FORMAT_TAGS``)."""
+    return f"bwd_wr_writeread_{readers}reader_{readers + second}grad_{KERNEL_FORMAT_TAGS[du]}"
+
+
+# One kernel body; each variant compiles under its own name, keyed (readers, second, du).
 BACKWARD_KERNELS = {
-    1: named_jit(_backward_body, "_bwd_wr_read_norm_wr_write"),
-    2: named_jit(_backward_body, "_bwd_wr_read_norm_wr_write_2reader"),
+    key: named_jit(_backward_body, _backward_kernel_name(*key))
+    for key in [
+        (n, second, du) for n in (1, 2) for second in (False, True) for du in OUTPUT_FORMATS
+    ]
 }
