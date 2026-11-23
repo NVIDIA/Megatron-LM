@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Route the optimizer's multi-tensor Adam and L2 norm to persistent CuTe DSL kernels.
+"""Route multi-tensor Adam, L2 norm and zero count to persistent CuTe DSL kernels.
 
 Transformer Engine's ``multi_tensor_adam`` and ``multi_tensor_l2norm`` run
 ``multi_tensor_apply``, which caps one launch at 320 chunks of 65,536 elements: an
@@ -15,11 +15,13 @@ They use the kernels only after ``enable`` succeeded (``OptimizerConfig.
 use_cute_dsl_multi_tensor``); a call the kernels do not cover (a non-fp32 tensor,
 per-tensor norms, L2-mode Adam, another chunk size, or a call under CUDA graph capture, since
 the kernels upload their tensor table from a host buffer) falls through to TE unchanged.
+``count_zeros`` counts the zeros of the ``--log-num-zeros-in-grad`` statistic in one launch per
+dtype; it returns None where the caller keeps its ``torch.count_nonzero`` path.
 """
 
 import logging
 from types import ModuleType
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 import torch
 
@@ -126,3 +128,20 @@ def l2norm_impl(te_l2norm: Callable) -> Callable:
         return te_l2norm(chunk_size, noop_flag, tensor_lists, per_tensor)
 
     return multi_tensor_l2norm
+
+
+def count_zeros(base: int, tensors: List[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Count zeros with one persistent launch per dtype.
+
+    Args:
+        base: The number of counted elements; the result is ``base`` minus the nonzeros.
+        tensors: Contiguous bf16, fp16 or fp32 CUDA tensors to count.
+
+    Returns:
+        ``base`` minus the nonzero elements of ``tensors`` as a 0-d int64 tensor, or None
+        when the kernels are not enabled, under CUDA graph capture, or for tensors they do not
+        cover (the caller then counts with ``torch.count_nonzero``).
+    """
+    if _kernels is None or torch.cuda.is_current_stream_capturing():
+        return None
+    return _kernels.multi_tensor_count_zeros(tensors, base)

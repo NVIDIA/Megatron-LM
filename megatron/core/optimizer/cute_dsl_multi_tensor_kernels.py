@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Persistent-grid multi-tensor Adam and L2-norm kernels written in CuTe DSL.
+"""Persistent-grid multi-tensor Adam, L2-norm and zero-count kernels written in CuTe DSL.
 
 They replace Transformer Engine's ``multi_tensor_adam`` (``AdamFunctor<float, float,
 float, float>``) and ``multi_tensor_l2norm`` (``L2NormFunctor<float>`` + ``cleanup``) for
@@ -38,6 +38,16 @@ Registered as ``torch.ops.megatron_multi_tensor.adam_table`` and
 Launch configuration (512 threads, 2 CTAs/SM, 2 vectors in flight per thread) from a
 one-GPU sweep on GB300 over 20k chunks / 1.29 G fp32 elements: Adam 5.30 ms (6.8 TB/s)
 vs TE 6.52 ms; L2 norm 0.735 ms (7.0 TB/s) vs TE 1.60 ms.
+
+Zero count: ``base`` minus the nonzero elements of a list of contiguous bf16 / fp16 / fp32
+tensors (the grad-buffer regions and separate fp32 main grads the distributed optimizer's
+``--log-num-zeros-in-grad`` count covers), as an int64 tensor. One launch per dtype present;
+each element is read once (2 B for bf16) and tested ``!= 0`` after an exact cast to fp32, so
+NaN counts as nonzero and -0 as zero, as ``torch.count_nonzero``. Chunks of ``COUNT_CHUNK``
+elements give int32 per-chunk counts; the last CTA sums them in int64 (exact,
+deterministic). The table layout is the L2 norm's with ``COUNT_CHUNK``. Registered as
+``torch.ops.megatron_multi_tensor.count_zeros_table``; ``multi_tensor_count_zeros`` builds
+the tables and calls it.
 """
 
 import itertools
@@ -299,6 +309,147 @@ def _l2norm_host(
 
 
 # ---------------------------------------------------------------------------
+# Zero count
+# ---------------------------------------------------------------------------
+
+COUNT_CHUNK = 1 << 18
+"""Elements per chunk of the zero count (a chunk's count fits int32)."""
+_COUNT_KINDS = {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}
+_COUNT_TYPES = (cutlass.BFloat16, cutlass.Float16, cutlass.Float32)
+_COUNT_BYTES = (2, 2, 4)
+
+
+@cute.jit
+def _count_chunk(mp, num_tensors, c, KIND: cutlass.Constexpr, VEC: cutlass.Constexpr):
+    """Return (pointer to chunk ``c``, elements in the chunk) of a count table."""
+    packed = (mp + 2 * num_tensors + c).load()
+    t = cutlass.Int32(packed >> 32)
+    lc = packed & cutlass.Int64(0xFFFFFFFF)
+    off = lc * COUNT_CHUNK
+    n = (mp + num_tensors + t).load() - off
+    if n > COUNT_CHUNK:
+        n = cutlass.Int64(COUNT_CHUNK)
+    addr = (mp + t).load() + off * _COUNT_BYTES[KIND]
+    ptr = cute.make_ptr(
+        _COUNT_TYPES[KIND], addr, cute.AddressSpace.gmem, assumed_align=_COUNT_BYTES[KIND] * VEC
+    )
+    return ptr.raw_ptr(), cutlass.Int32(n)
+
+
+@cute.jit
+def _nonzeros(v, VEC: cutlass.Constexpr):
+    """Nonzero lanes of a loaded vector, tested ``!= 0`` after an exact fp32 cast."""
+    f = v.to(cutlass.Float32)
+    k = cutlass.Int32(0)
+    for i in cutlass.range_constexpr(VEC):
+        k = k + cutlass.Int32(f[i] != cutlass.Float32(0.0))
+    return k
+
+
+@cute.kernel
+def _count_kernel(
+    meta: cute.Tensor,  # int64 table: addresses, numels, chunk map
+    ws: cute.Tensor,  # int32 [2]
+    partial: cute.Tensor,  # int32 [num_chunks]
+    out: cute.Tensor,  # int64 [1]
+    num_tensors: cutlass.Int32,
+    num_chunks: cutlass.Int32,
+    base: cutlass.Int64,
+    first: cutlass.Int32,
+    KIND: cutlass.Constexpr,
+    VEC: cutlass.Constexpr,
+) -> None:
+    tid, _, _ = cute.arch.thread_idx()
+    nctas, _, _ = cute.arch.grid_dim()
+    slot = cutlass.Array(cutlass.Int32, 3, space=cutlass.AddressSpace.smem)
+    red = cutlass.Array(cutlass.Int32, 2 * _NW, space=cutlass.AddressSpace.smem)
+    wide = cutlass.Array(cutlass.Int64, THREADS, space=cutlass.AddressSpace.smem)
+    sp = slot.data_ptr()
+    rp = red.data_ptr()
+    wp = wide.data_ptr()
+    mp = meta.iterator.raw_ptr()
+    wsp = ws.iterator.raw_ptr()
+    pp = partial.iterator.raw_ptr()
+    esize = _COUNT_BYTES[KIND]
+
+    if tid == 0:
+        sp.store(cute.arch.atomic_add(wsp, cutlass.Int32(1), scope="gpu"))
+    prims.barrier_cta_sync(0)
+    parity = cutlass.Int32(0)
+    c = sp.load()
+    while c < num_chunks:
+        if tid == 0:
+            (sp + 1 - parity).store(cute.arch.atomic_add(wsp, cutlass.Int32(1), scope="gpu"))
+        xp, n = _count_chunk(mp, num_tensors, c, KIND, VEC)
+        nv = n // VEC
+        groups = nv // (UNROLL * THREADS)
+        k = cutlass.Int32(0)
+        for gi in range(groups):
+            xs = []
+            for u in cutlass.range_constexpr(UNROLL):
+                idx = ((gi * UNROLL + u) * THREADS + tid) * VEC
+                xs.append((xp + idx).load(count=VEC, alignment=esize * VEC))
+            for u in cutlass.range_constexpr(UNROLL):
+                k = k + _nonzeros(xs[u], VEC)
+        for i in range(groups * UNROLL * THREADS + tid, nv, THREADS):
+            k = k + _nonzeros((xp + i * VEC).load(count=VEC, alignment=esize * VEC), VEC)
+        if cutlass.const_expr(VEC > 1):
+            if tid < n - nv * VEC:
+                k = k + _nonzeros((xp + nv * VEC + tid).load(count=1, alignment=esize), 1)
+        _block_sum(k, rp + parity * _NW, tid)
+        prims.barrier_cta_sync(0)
+        if tid == 0:
+            tot = cutlass.Int32(0)
+            for w in cutlass.range_constexpr(_NW):
+                tot = tot + (rp + parity * _NW + w).load()
+            (pp + c).store(tot)
+        parity = 1 - parity
+        c = (sp + parity).load()
+
+    if tid == 0:
+        done = cute.arch.atomic_add(wsp + 1, cutlass.Int32(1), sem="acq_rel", scope="gpu")
+        (sp + 2).store(cutlass.Int32(done == nctas - 1))
+    prims.barrier_cta_sync(0)
+    if (sp + 2).load() != 0:
+        s = cutlass.Int64(0)
+        for i in range(tid, num_chunks, THREADS):
+            s = s + cutlass.Int64((pp + i).load())
+        (wp + tid).store(s)
+        prims.barrier_cta_sync(0)
+        if tid == 0:
+            nonzeros = cutlass.Int64(0)
+            for w in range(THREADS):
+                nonzeros = nonzeros + (wp + w).load()
+            op = out.iterator.raw_ptr()
+            res = base - nonzeros
+            if first == 0:
+                res = op.load() - nonzeros
+            op.store(res)
+            wsp.store(cutlass.Int32(0))
+            (wsp + 1).store(cutlass.Int32(0))
+
+
+@cute.jit
+def _count_host(
+    meta: cute.Tensor,
+    ws: cute.Tensor,
+    partial: cute.Tensor,
+    out: cute.Tensor,
+    num_tensors: cutlass.Int32,
+    num_chunks: cutlass.Int32,
+    base: cutlass.Int64,
+    first: cutlass.Int32,
+    nctas: cutlass.Int32,
+    stream,
+    KIND: cutlass.Constexpr,
+    VEC: cutlass.Constexpr,
+) -> None:
+    _count_kernel(meta, ws, partial, out, num_tensors, num_chunks, base, first, KIND, VEC).launch(
+        grid=(nctas, 1, 1), block=(THREADS, 1, 1), min_blocks_per_mp=CTAS_PER_SM, stream=stream
+    )
+
+
+# ---------------------------------------------------------------------------
 # Compile factories
 # ---------------------------------------------------------------------------
 
@@ -345,6 +496,27 @@ def compile_l2norm(VEC: int = 4) -> Callable:
         cutlass.Int32(1),
         cutlass.Int32(1),
         make_fake_stream(use_tvm_ffi_env_stream=True),
+        VEC,
+        options="--enable-tvm-ffi",
+    )
+
+
+@lru_cache(maxsize=None)
+def compile_count(KIND: int, VEC: int) -> Callable:
+    """Compile the persistent zero count (dtype ``_COUNT_TYPES[KIND]``, ``VEC`` per access)."""
+    return cute.compile(
+        _count_host,
+        _fake(cutlass.Int64),
+        _fake(cutlass.Int32, 4),
+        _fake(cutlass.Int32, 4),
+        _fake(cutlass.Int64, 8),
+        cutlass.Int32(1),
+        cutlass.Int32(1),
+        cutlass.Int64(0),
+        cutlass.Int32(1),
+        cutlass.Int32(1),
+        make_fake_stream(use_tvm_ffi_env_stream=True),
+        KIND,
         VEC,
         options="--enable-tvm-ffi",
     )
@@ -498,6 +670,41 @@ def table(tensor_lists: list[list[torch.Tensor]], fixed: int = 0):
     return e.meta, n, e.num_chunks, vec, stream
 
 
+def _count_table(kind: int, tensors: list[torch.Tensor], dev: torch.device, stream: int):
+    """Return ``(meta, num_tensors, num_chunks, vec)`` for a zero count of ``tensors``.
+
+    Keyed by the numels like the L2 norm's table; the addresses are uploaded on every
+    call from a fresh pinned block.
+    """
+    n = len(tensors)
+    numels = tuple(t.numel() for t in tensors)
+    key = (dev.index, stream, "count", kind, numels)
+    e = _TABLES.get(key)
+    if e is None:
+        numel = np.array(numels, dtype=np.int64)
+        chunks = (numel + COUNT_CHUNK - 1) // COUNT_CHUNK
+        num_chunks = int(chunks.sum())
+        h = np.zeros(2 * n + num_chunks, dtype=np.int64)
+        h[n : 2 * n] = numel
+        starts = np.cumsum(chunks) - chunks
+        tensor_of_chunk = np.repeat(np.arange(n, dtype=np.int64), chunks)
+        local = np.arange(num_chunks, dtype=np.int64) - np.repeat(starts, chunks)
+        h[2 * n :] = (tensor_of_chunk << 32) | local
+        e = _Table()
+        e.meta = torch.from_numpy(h).to(dev)
+        e.num_tensors = n
+        e.num_chunks = num_chunks
+        if len(_TABLES) >= _MAX_TABLES:
+            _TABLES.clear()
+        _TABLES[key] = e
+    host = torch.empty(n, dtype=torch.int64, pin_memory=True)
+    h = host.numpy()
+    h[:] = [t.data_ptr() for t in tensors]
+    vec = 16 // _COUNT_BYTES[kind] if not np.any(h % 16) else 1
+    e.meta[:n].copy_(host, non_blocking=True)
+    return e.meta, n, e.num_chunks, vec
+
+
 # ---------------------------------------------------------------------------
 # torch.library registration
 #
@@ -541,6 +748,21 @@ def _l2norm_table_meta(meta, ws, noop, num_tensors, num_chunks, vec):
     return meta.new_empty((1,), dtype=torch.float32)
 
 
+def _count_zeros_table_cuda(meta, ws, out, num_tensors, num_chunks, kind, vec, base, first):
+    partial = torch.empty(num_chunks, dtype=torch.int32, device=meta.device)
+    compile_count(kind, vec)(
+        meta,
+        ws,
+        partial,
+        out,
+        num_tensors,
+        num_chunks,
+        base,
+        int(first),
+        _nctas(num_chunks, meta.device),
+    )
+
+
 _LIB = torch.library.Library("megatron_multi_tensor", "DEF")
 _LIB.define(
     "adam_table(Tensor meta, Tensor(a!) ws, int num_tensors, int num_chunks, int vec, "
@@ -550,9 +772,14 @@ _LIB.define(
     "l2norm_table(Tensor meta, Tensor(a!) ws, Tensor(b!) noop, int num_tensors, "
     "int num_chunks, int vec) -> Tensor"
 )
+_LIB.define(
+    "count_zeros_table(Tensor meta, Tensor(a!) ws, Tensor(b!) out, int num_tensors, "
+    "int num_chunks, int kind, int vec, int base, bool first) -> ()"
+)
 _LIB.impl("adam_table", _adam_table_cuda, "CUDA")
 _LIB.impl("l2norm_table", _l2norm_table_cuda, "CUDA")
 _LIB.impl("l2norm_table", _l2norm_table_meta, "Meta")
+_LIB.impl("count_zeros_table", _count_zeros_table_cuda, "CUDA")
 
 
 def multi_tensor_adam(g, p, m, v, lr, beta1, beta2, eps, step, mode, bias_correction, weight_decay):
@@ -582,3 +809,35 @@ def multi_tensor_l2norm(x, noop):
     return torch.ops.megatron_multi_tensor.l2norm_table(
         meta, _workspace(meta.device, stream), noop, nt, nc, vec
     )
+
+
+def multi_tensor_count_zeros(tensors, base):
+    """``base`` minus the nonzero elements of ``tensors``, as a 0-d int64 tensor.
+
+    One launch per dtype present. None (the caller falls back) for an empty list, a
+    tensor that is not a contiguous bf16 / fp16 / fp32 CUDA tensor, or tensors on
+    more than one device.
+    """
+    if not tensors:
+        return None
+    dev = tensors[0].device
+    if dev.type != "cuda":
+        return None
+    groups: dict[int, list[torch.Tensor]] = {}
+    for t in tensors:
+        kind = _COUNT_KINDS.get(t.dtype)
+        if kind is None or t.device != dev or not t.is_contiguous():
+            return None
+        if t.numel():
+            groups.setdefault(kind, []).append(t)
+    out = torch.empty(1, dtype=torch.int64, device=dev)
+    if not groups:
+        return out.fill_(base)[0]
+    stream = torch.cuda.current_stream(dev).cuda_stream
+    ws = _workspace(dev, stream)
+    for i, kind in enumerate(sorted(groups)):
+        meta, nt, nc, vec = _count_table(kind, groups[kind], dev, stream)
+        torch.ops.megatron_multi_tensor.count_zeros_table(
+            meta, ws, out, nt, nc, kind, vec, base, i == 0
+        )
+    return out[0]

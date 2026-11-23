@@ -65,7 +65,11 @@ from ..fp8_utils import (
 from ..full_cuda_graph import FullIterationGradCopy
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
-from .clip_grads import _gtp_pad_zero_count, param_grad_counts_toward_num_zeros
+from .clip_grads import (
+    _gtp_pad_zero_count,
+    count_zeros_in_tensors,
+    param_grad_counts_toward_num_zeros,
+)
 from .grad_scaler import MegatronGradScaler
 from .optimizer import (
     MixedPrecisionOptimizer,
@@ -1190,57 +1194,31 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self._num_zeros_grad_buffer_plans[key] = plan
         return plan
 
-    @torch.no_grad()
-    def local_num_zeros_in_grads(
+    def num_zeros_count_inputs(
         self,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         expert_tp_group: Optional[torch.distributed.ProcessGroup] = None,
         gtp_group: Optional[torch.distributed.ProcessGroup] = None,
         expert_gtp_group: Optional[torch.distributed.ProcessGroup] = None,
-        max_chunk_numel: Optional[int] = None,
-    ) -> Optional[torch.Tensor]:
-        """This rank's ``count_zeros_fp32`` count, before its all-reduce, as an int64 tensor.
+    ) -> Optional[Tuple[int, int, List[torch.Tensor]]]:
+        """What this rank's ``count_zeros_fp32`` count, before its all-reduce, is counted from.
 
-        Takes one ``torch.count_nonzero`` per grad-buffer chunk of counted main grads (plus
-        one per main grad held outside the buffer) instead of one per main grad.
-        ``torch.count_nonzero`` materializes a bool mask and an int64 copy of it, so regions
-        are cut into chunks of at most ``max_chunk_numel`` elements (default: the largest
-        counted main grad): the count's temporaries never exceed those of the per-param loop.
-        Returns None where the main grads are not copies of grad-buffer slices
-        (Megatron-FSDP, precision-aware optimizer, stub).
+        Returns ``(num_counted, max_numel, tensors)``: the count is ``num_counted`` minus the
+        nonzero elements of ``tensors`` (the grad-buffer regions of counted main grads, then
+        the counted main grads held outside the buffer), and ``max_numel`` is the largest
+        counted main grad's numel. Returns None where the main grads are not copies of
+        grad-buffer slices (Megatron-FSDP, precision-aware optimizer, stub).
         """
         if not self._main_grads_are_grad_buffer_copies():
             return None
         num_counted, max_numel, regions, separate_main_params = self._num_zeros_grad_buffer_plan(
             (tp_group, expert_tp_group, gtp_group, expert_gtp_group)
         )
-        chunk_numel = max_chunk_numel or max_numel
-        nonzeros = [
-            torch.count_nonzero(
-                self.buffers[gbuf_index].grad_data[
-                    chunk_start : min(chunk_start + chunk_numel, end)
-                ]
-            )
-            for gbuf_index, start, end in regions
-            for chunk_start in range(start, end, chunk_numel)
+        tensors = [
+            self.buffers[gbuf_index].grad_data[start:end] for gbuf_index, start, end in regions
         ]
-        nonzeros += [torch.count_nonzero(param.grad) for param in separate_main_params]
-        num_zeros = torch.full((), num_counted, dtype=torch.int64, device='cuda')
-        if nonzeros:
-            num_zeros -= torch.stack(nonzeros).sum()
-        return num_zeros
-
-    def max_counted_main_grad_numel(
-        self, groups: Tuple[Optional[torch.distributed.ProcessGroup], ...]
-    ) -> Optional[int]:
-        """Numel of the largest main grad ``count_zeros_fp32`` counts on this rank (0 if none),
-        or None where ``local_num_zeros_in_grads`` returns None.
-
-        ``groups`` is ``(tp_group, expert_tp_group, gtp_group, expert_gtp_group)``.
-        """
-        if not self._main_grads_are_grad_buffer_copies():
-            return None
-        return self._num_zeros_grad_buffer_plan(groups)[1]
+        tensors += [param.grad for param in separate_main_params]
+        return num_counted, max_numel, tensors
 
     def _main_grads_are_grad_buffer_copies(self) -> bool:
         """Whether main grads are FP32 copies of grad-buffer slices (not Megatron-FSDP, not
@@ -1254,14 +1232,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     @torch.no_grad()
     def count_zeros(self) -> float:
         """Count number of zeros in model's gradients, from the grad buffers."""
-        num_zeros = self.local_num_zeros_in_grads(
+        inputs = self.num_zeros_count_inputs(
             tp_group=getattr(self, 'tp_group', None),
             expert_tp_group=getattr(self, 'expert_tp_group', None),
             gtp_group=getattr(self, 'gtp_group', None),
             expert_gtp_group=getattr(self, 'expert_gtp_group', None),
         )
-        if num_zeros is None:
+        if inputs is None:
             return super().count_zeros()
+        num_counted, max_numel, tensors = inputs
+        num_zeros = count_zeros_in_tensors(num_counted, tensors, max_numel)
         torch.distributed.all_reduce(
             num_zeros, op=torch.distributed.ReduceOp.SUM, group=self.get_grad_stats_parallel_group()
         )

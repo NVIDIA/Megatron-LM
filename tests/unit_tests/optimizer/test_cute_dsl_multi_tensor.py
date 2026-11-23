@@ -39,6 +39,10 @@ def disabled(monkeypatch):
     monkeypatch.setattr(cute_dsl_multi_tensor, "_kernels", None)
 
 
+def test_count_zeros_falls_through_when_disabled(disabled):
+    assert cute_dsl_multi_tensor.count_zeros(3, [torch.zeros(3)]) is None
+
+
 def test_wrappers_fall_through_when_disabled(disabled):
     te_adam, te_l2norm = _Recorder(), _Recorder(ret=("norm", "per_tensor"))
     adam = cute_dsl_multi_tensor.adam_impl(te_adam)
@@ -145,3 +149,37 @@ def test_l2norm_non_finite_sets_noop_and_bf16_falls_back(kernels):
     kernels.multi_tensor_l2norm(bad, noop)
     assert noop.item() == 1
     assert kernels.multi_tensor_l2norm([bad[0].bfloat16()], noop) is None
+
+
+@requires_kernels
+def test_count_zeros_matches_count_nonzero(kernels):
+    torch.manual_seed(0)
+    buf = torch.randn(20_000_000, device="cuda").bfloat16()
+    buf[torch.rand(buf.numel(), device="cuda") < 0.33] = 0
+    buf[5], buf[7], buf[11] = -0.0, float("nan"), float("inf")
+    cuts = [0, 64 * 1000, 64 * 70_001, 64 * 200_000, buf.numel()]
+    regions = [buf[a:b] for a, b in zip(cuts[:-1], cuts[1:])]
+    f32 = [torch.randn(n, device="cuda") for n in (1, 777, CHUNK * 3 + 5)]
+    for t in f32:
+        t[torch.rand(t.numel(), device="cuda") < 0.5] = 0
+    f16 = [torch.randn(100_003, device="cuda").half()]
+    f16[0][::3] = 0
+    cases = (regions, regions + f32, regions + f32 + f16, [buf[1:1_000_001], buf[3:4_000_003]])
+    for tensors in cases:
+        base = sum(t.numel() for t in tensors) + 7
+        ours = cute_dsl_multi_tensor.count_zeros(base, tensors)
+        assert ours.dtype is torch.int64 and ours.dim() == 0
+        assert ours.item() == base - sum(torch.count_nonzero(t).item() for t in tensors)
+    # Same numels, other storage: the cached table must re-read the addresses.
+    other = buf.clone()
+    other[: buf.numel() // 2] = 0
+    regions2 = [other[a:b] for a, b in zip(cuts[:-1], cuts[1:])]
+    base = buf.numel()
+    first = cute_dsl_multi_tensor.count_zeros(base, regions)
+    second = cute_dsl_multi_tensor.count_zeros(base, regions2)
+    assert first.item() == base - torch.count_nonzero(buf).item()
+    assert second.item() == base - torch.count_nonzero(other).item()
+    # Unsupported inputs fall back; empty tensors count nothing.
+    assert cute_dsl_multi_tensor.count_zeros(0, [buf[:10].to(torch.int32)]) is None
+    assert cute_dsl_multi_tensor.count_zeros(0, [buf[:20:2]]) is None
+    assert cute_dsl_multi_tensor.count_zeros(9, [buf[:0]]).item() == 9

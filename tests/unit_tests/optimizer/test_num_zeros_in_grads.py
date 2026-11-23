@@ -5,7 +5,7 @@ import torch
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
-from megatron.core.optimizer.clip_grads import count_zeros_fp32
+from megatron.core.optimizer.clip_grads import count_zeros_fp32, count_zeros_in_tensors
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -83,6 +83,7 @@ class TestNumZerosInGrads:
         assert optimizer.count_zeros() == expected
         # Tiny chunks exercise region splitting; the count must not change.
         dist_opt = getattr(optimizer, "chained_optimizers", [optimizer])[0]
-        local = dist_opt.local_num_zeros_in_grads(max_chunk_numel=7)
+        num_counted, _, tensors = dist_opt.num_zeros_count_inputs()
+        local = count_zeros_in_tensors(num_counted, tensors, max_chunk_numel=7)
         torch.distributed.all_reduce(local, group=optimizer.get_grad_stats_parallel_group())
         assert local.item() == expected

@@ -52,6 +52,7 @@ from ..utils import get_model_config, log_single_rank
 from .clip_grads import (
     clip_grad_by_total_norm_fp32,
     count_zeros_fp32,
+    count_zeros_in_tensors,
     get_grad_norm_fp32,
     scale_grads_fp32,
 )
@@ -2325,31 +2326,27 @@ class ChainedOptimizer(MegatronOptimizer):
             return num_zeros_in_grad
 
     def _local_num_zeros_in_grads(self) -> Optional[torch.Tensor]:
-        """Sum of the chained optimizers' local grad-buffer zero counts, filtered with the
-        first optimizer's groups as the shared-group ``count_zeros_fp32`` path does, and
-        chunked by the largest main grad that path counts; None unless every optimizer with
-        parameters provides one."""
+        """This rank's shared-group ``count_zeros_fp32`` count over every chained optimizer, as
+        one int64 tensor: duplicates filtered with the first optimizer's groups as that path
+        does, all optimizers' grads counted together; None unless every optimizer with
+        parameters provides its count inputs."""
         first = self.chained_optimizers[0]
         groups = tuple(
             getattr(first, name, None)
             for name in ('tp_group', 'expert_tp_group', 'gtp_group', 'expert_gtp_group')
         )
         optimizers = [opt for opt in self.chained_optimizers if opt.get_parameters()]
-        max_numels = [
-            (
-                opt.max_counted_main_grad_numel(groups)
-                if hasattr(opt, 'max_counted_main_grad_numel')
-                else None
-            )
+        inputs = [
+            opt.num_zeros_count_inputs(*groups) if hasattr(opt, 'num_zeros_count_inputs') else None
             for opt in optimizers
         ]
-        if not optimizers or None in max_numels:
+        if not optimizers or any(i is None for i in inputs):
             return None
-        counts = [
-            opt.local_num_zeros_in_grads(*groups, max_chunk_numel=max(max_numels))
-            for opt in optimizers
-        ]
-        return torch.stack(counts).sum()
+        return count_zeros_in_tensors(
+            sum(num_counted for num_counted, _, _ in inputs),
+            [tensor for _, _, tensors in inputs for tensor in tensors],
+            max(max_numel for _, max_numel, _ in inputs),
+        )
 
     def has_grad_norm_group(self, grad_norm_group: str) -> bool:
         """Whether any chained optimizer owns params for a gradient-norm group.

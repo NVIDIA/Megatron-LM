@@ -288,6 +288,30 @@ def param_grad_counts_toward_num_zeros(
     )
 
 
+def count_zeros_in_tensors(
+    num_counted: int, tensors: List[torch.Tensor], max_chunk_numel: int
+) -> torch.Tensor:
+    """``num_counted`` minus the nonzero elements of ``tensors``, as a 0-d int64 CUDA tensor.
+
+    One persistent CuTe DSL launch per dtype where ``cute_dsl_multi_tensor`` is enabled.
+    Otherwise one ``torch.count_nonzero`` per chunk of at most ``max_chunk_numel`` elements:
+    ``torch.count_nonzero`` materializes a bool mask and an int64 copy of its input, so the
+    chunk bound caps those temporaries.
+    """
+    num_zeros = cute_dsl_multi_tensor.count_zeros(num_counted, tensors)
+    if num_zeros is not None:
+        return num_zeros
+    nonzeros = [
+        torch.count_nonzero(tensor[start : start + max_chunk_numel])
+        for tensor in tensors
+        for start in range(0, tensor.numel(), max_chunk_numel)
+    ]
+    num_zeros = torch.full((), num_counted, dtype=torch.int64, device='cuda')
+    if nonzeros:
+        num_zeros -= torch.stack(nonzeros).sum()
+    return num_zeros
+
+
 def count_zeros_fp32(
     parameters: Union[List[torch.Tensor], torch.Tensor],
     grad_stats_parallel_group: torch.distributed.ProcessGroup,
