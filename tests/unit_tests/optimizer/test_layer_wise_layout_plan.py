@@ -2,9 +2,8 @@
 
 """CPU tests for how the layer-wise distributed optimizer plan is resolved.
 
-Covers the gradient collective (reduce-scatter -> padded layout, all-reduce -> compact
-layout), the optimizer intent, the DDP wrapping decision and the rank-independent
-whole-parameter owners of the compact layout.
+Covers padded and compact layouts, optimizer selection, DDP wrapping, and the
+rank-independent whole-parameter owners of the compact layout.
 """
 
 import random
@@ -50,29 +49,24 @@ def _model():
 
 
 @pytest.mark.parametrize(
-    ("optimizer", "use_distopt", "collective", "error"),
+    ("optimizer", "use_distopt", "layout", "error"),
     [
-        ("muon", True, "reduce-scatter", None),
-        ("muon", True, "all-reduce", None),
-        ("muon", True, "ragged", "must be"),
-        # all-reduce only changes the parameters a second-order optimizer owns whole; anywhere
-        # else it would silently do nothing, so it is rejected.
-        ("adam", True, "all-reduce", "applies to second-order optimizers"),
-        ("muon", False, "all-reduce", "applies to second-order optimizers"),
+        ("muon", True, "padded", None),
+        ("muon", True, "compact", None),
+        ("muon", True, "all-reduce", "must be"),
+        # Compact layout requires a LayerWise owner for the whole parameters.
+        ("adam", True, "compact", "requires the layer-wise distributed optimizer"),
+        ("muon", False, "compact", "requires the layer-wise distributed optimizer"),
     ],
 )
-def test_second_order_optimizer_grad_collective_validation(
-    optimizer, use_distopt, collective, error
-):
+def test_layer_wise_param_layout_validation(optimizer, use_distopt, layout, error):
     with nullcontext() if error is None else pytest.raises(ValueError, match=error):
         config = OptimizerConfig(
             optimizer=optimizer,
             use_distributed_optimizer=use_distopt,
-            second_order_optimizer_grad_collective=collective,
+            layer_wise_param_layout=layout,
         )
-        # Depending on the branch, OptimizerConfig checks at construction or in validate().
-        if hasattr(config, "validate"):
-            config.validate()
+        config.validate()
 
 
 @pytest.mark.parametrize(
@@ -107,19 +101,18 @@ def test_resolve_layer_wise_distributed_optimizer(optimizer, use_distopt, use_la
 
 
 @pytest.mark.parametrize(
-    ("collective", "layout"),
-    [(None, "padded"), ("reduce-scatter", "padded"), ("all-reduce", "compact")],
+    ("requested", "expected"), [(None, "padded"), ("padded", "padded"), ("compact", "compact")]
 )
-def test_configure_ddp_for_layer_wise_optimizer(collective, layout):
+def test_configure_ddp_for_layer_wise_optimizer(requested, expected):
     model = _model()
     # Direct LayerWise selection also works with a default DDP config.
     ddp_config = DistributedDataParallelConfig()
-    kwargs = {} if collective is None else {"second_order_optimizer_grad_collective": collective}
+    kwargs = {} if requested is None else {"layer_wise_param_layout": requested}
     fn = configure_ddp_for_layer_wise_optimizer(
         [model], ddp_config, use_layer_wise_distributed_optimizer=True, **kwargs
     )
     assert fn.func == LayerWiseDistributedOptimizer.compute_full_param_layout
-    assert fn.keywords == {"param_layout": layout}
+    assert fn.keywords == {"param_layout": expected}
     assert ddp_config.use_distributed_optimizer
     assert model.fc1.is_managed_by_layer_wise_optimizer
     assert model.fc2.is_managed_by_layer_wise_optimizer
@@ -131,7 +124,7 @@ def test_configure_ddp_for_layer_wise_optimizer(collective, layout):
             [model],
             ddp_config,
             use_layer_wise_distributed_optimizer=True,
-            second_order_optimizer_grad_collective="ragged",
+            layer_wise_param_layout="ragged",
         )
 
 
@@ -141,14 +134,14 @@ def _full_layout(sharded):
     return SimpleNamespace(layouts={key: SimpleNamespace(use_distributed_optimizer=sharded)})
 
 
-def test_resolve_param_layout_follows_the_grad_collective():
+def test_resolve_param_layout_matches_ddp_buffers():
     resolve = LayerWiseDistributedOptimizer._resolve_param_layout
     ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
-    padded = SimpleNamespace(second_order_optimizer_grad_collective="reduce-scatter")
-    compact = SimpleNamespace(second_order_optimizer_grad_collective="all-reduce")
+    padded = SimpleNamespace(layer_wise_param_layout="padded")
+    compact = SimpleNamespace(layer_wise_param_layout="compact")
     assert resolve(padded, ddp_config, [_full_layout(True)]) == "padded"
     assert resolve(compact, ddp_config, [_full_layout(False)]) == "compact"
-    # DDP buffers built for one collective cannot be driven with the other.
+    # The requested layout must agree with the layout of the DDP buffers.
     with pytest.raises(ValueError, match="does not match"):
         resolve(compact, ddp_config, [_full_layout(True)])
     # Chunks not wrapped for the layer-wise optimizer (e.g. the removed legacy layout).
@@ -163,9 +156,9 @@ def test_resolve_param_layout_follows_the_grad_collective():
     [
         ("bf16", False, None),
         ("mxfp8", True, None),
-        # Recipes the all-reduce collective can publish point there ...
-        ("mxfp8", False, "all-reduce"),
-        ("blockwise", True, "all-reduce"),
+        # The error names the compact layout for recipes it can publish ...
+        ("mxfp8", False, "compact"),
+        ("blockwise", True, "compact"),
         # ... and the others, which no LayerWise gather publishes, to another recipe.
         ("tensorwise", True, "mxfp8 or blockwise recipe"),
     ],

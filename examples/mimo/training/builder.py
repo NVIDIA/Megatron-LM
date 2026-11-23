@@ -124,7 +124,7 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
         ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
-        second_order_optimizer_grad_collective: str = "reduce-scatter",
+        layer_wise_param_layout: str = "padded",
         device: torch.device | str | None = None,
         checkpoint: Any | None = None,
         distillation: Any | None = None,
@@ -174,7 +174,7 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
             ddp_config=ddp_config,
             data_parallel_random_init=data_parallel_random_init,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
-            second_order_optimizer_grad_collective=second_order_optimizer_grad_collective,
+            layer_wise_param_layout=layer_wise_param_layout,
         )
         configure_grad_sync(args, mimo_model, topology)
         mimo_model.pg_collection = module_pg

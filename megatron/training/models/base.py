@@ -225,7 +225,7 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
         mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
-        second_order_optimizer_grad_collective: str = "reduce-scatter",
+        layer_wise_param_layout: str = "padded",
         device: Any | None = None,
     ) -> list[ModelT]:
         """Build model stages and wrap for distributed training.
@@ -241,8 +241,8 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
             model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
-            second_order_optimizer_grad_collective: See
-                ``OptimizerConfig.second_order_optimizer_grad_collective``.
+            layer_wise_param_layout: See
+                ``OptimizerConfig.layer_wise_param_layout``.
             device: Explicit model placement requested by the run configuration.
 
         Returns:

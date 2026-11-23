@@ -62,18 +62,18 @@ The following figures show the sharding scheme and the main steps of the paramet
 
 ## Layer-Wise Distributed Optimizer
 
-Second-order optimizers such as Muon need each weight matrix whole. With `--optimizer muon --use-distributed-optimizer`, Megatron uses the layer-wise distributed optimizer: one data-parallel rank updates each Muon-managed matrix and then all-gathers it to the other ranks. A regular distributed optimizer next to it shards the remaining parameters (embeddings, output layer, biases, norms) as described above.
+Muon updates each weight matrix as a whole. With `--optimizer muon --use-distributed-optimizer`, one data-parallel rank updates each Muon-managed matrix and the layer-wise distributed optimizer gathers it to the other ranks. A sibling distributed optimizer shards the remaining parameters (embeddings, output layer, biases, norms) as described above.
 
-`--second-order-optimizer-grad-collective` selects how the gradients of these matrices are reduced across data-parallel ranks, and with it how the matrices are laid out:
+`--layer-wise-param-layout` selects the memory layout of the Muon-managed matrices.
 
-| `--second-order-optimizer-grad-collective` | Parameter gather | Buffers |
-| ------ | ------ | ------ |
-| `reduce-scatter` (default) | fixed-size all-gather from the parameter buffer | Each matrix lies whole inside one rank's shard; shards are padded to equal size. |
-| `all-reduce` | all-gather of whole matrices with uneven sizes | No padding; every rank chooses the same owner rank for each matrix. Twice the gradient traffic. |
+| Layout | Buffers | Gradient communication | Parameter gather |
+| --- | --- | --- | --- |
+| `padded` (default) | Equal-size shards with padding so each matrix fits in one shard | Reduce-scatter | Fixed-size all-gather |
+| `compact` | Whole matrices assigned to owners without shard padding | All-reduce (twice the gradient traffic) | Variable-size all-gather of the owners' matrices |
 
-Both store the same optimizer state, so a `torch_dist` checkpoint saved with one collective loads with the other. The other parameters always use reduce-scatter. The layer-wise optimizer supports `--ckpt-format torch_dist` only.
+Both layouts store the same optimizer state, so a `torch_dist` checkpoint saved with one layout loads with the other. Parameters managed by the sibling distributed optimizer use reduce-scatter in both cases. The layer-wise optimizer supports `--ckpt-format torch_dist` only.
 
-For Muon-managed matrices, both layouts support plain MXFP8 parameter gather. The padded layout stages BF16 values from the FP32 masters through the gradient buffer for its fixed-size all-gather. The compact layout (`all-reduce`) also supports blockwise FP8. Every rank requantizes the gathered BF16 values. Both layouts reject per-tensor FP8 and NVFP4 parameter gather because the scaling metadata would otherwise be stale on non-owner ranks.
+For Muon-managed matrices, both layouts support plain MXFP8 parameter gather. The padded layout stages BF16 values from the FP32 masters through the gradient buffer for its fixed-size all-gather. The compact layout also supports blockwise FP8. Every rank requantizes the gathered BF16 values. Both layouts reject per-tensor FP8 and NVFP4 parameter gather because the scaling metadata would otherwise be stale on non-owner ranks.
 
 ### Checkpoints of the removed legacy layout
 

@@ -139,6 +139,17 @@ class ParamKey:
         return False
 
 
+LAYER_WISE_PARAM_LAYOUTS = ("padded", "compact")
+
+
+def validate_layer_wise_param_layout(layout: str) -> None:
+    """Check the layout selected for LayerWise-managed parameters."""
+    if layout not in LAYER_WISE_PARAM_LAYOUTS:
+        raise ValueError(
+            f"layer_wise_param_layout must be one of {LAYER_WISE_PARAM_LAYOUTS}, got {layout!r}."
+        )
+
+
 def resolve_layer_wise_distributed_optimizer(
     optimizer: str, use_distributed_optimizer: bool, use_layer_wise_distributed_optimizer: bool
 ) -> Tuple[str, bool]:
@@ -425,17 +436,14 @@ class OptimizerConfig:
     :func:`resolve_layer_wise_distributed_optimizer`). Finalization preserves the requested
     ``use_distributed_optimizer`` value; the factory selects the wrapper by optimizer name."""
 
-    second_order_optimizer_grad_collective: str = "reduce-scatter"
-    """Data-parallel gradient collective for the parameters that a second-order optimizer with
-    ``use_distributed_optimizer`` (e.g. Muon) updates whole on one rank.
+    layer_wise_param_layout: str = "padded"
+    """Buffer layout for the parameters the layer-wise optimizer updates whole on one rank.
 
-    - ``"reduce-scatter"``: each tensor stays whole inside one rank's shard of a padded buffer;
-      gradients are reduce-scattered and the equal-size shards all-gathered.
-    - ``"all-reduce"``: no padding; gradients are all-reduced and every owner all-gathers its
-      whole tensors (uneven sizes), which sends twice the gradient bytes.
-
-    Other parameters always use reduce-scatter. Both store the same optimizer state, so a
-    ``torch_dist`` checkpoint saved with one loads with the other."""
+    ``padded`` keeps each tensor in one rank's shard. Gradients are reduce-scattered and
+    parameters are gathered in equal-size shards. ``compact`` eliminates shard padding
+    by all-reducing gradients and gathering each owner's whole tensors in uneven sizes.
+    The sibling DistributedOptimizer uses reduce-scatter in both cases. Both layouts
+    support the same ``torch_dist`` optimizer checkpoints."""
 
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute. 
@@ -562,15 +570,11 @@ class OptimizerConfig:
         # value it will produce, not only the pre-finalize flag.
         will_be_layer_wise = self.uses_layer_wise_distributed_optimizer()
 
-        if self.second_order_optimizer_grad_collective not in ("reduce-scatter", "all-reduce"):
+        validate_layer_wise_param_layout(self.layer_wise_param_layout)
+        if self.layer_wise_param_layout == "compact" and not will_be_layer_wise:
             raise ValueError(
-                "second_order_optimizer_grad_collective must be 'reduce-scatter' or 'all-reduce', "
-                f"got {self.second_order_optimizer_grad_collective!r}."
-            )
-        if self.second_order_optimizer_grad_collective == "all-reduce" and not will_be_layer_wise:
-            raise ValueError(
-                "second_order_optimizer_grad_collective='all-reduce' applies to second-order "
-                "optimizers (e.g. Muon) with use_distributed_optimizer=True; got "
+                "layer_wise_param_layout='compact' requires the layer-wise distributed "
+                "optimizer (e.g. Muon with use_distributed_optimizer=True). Got "
                 f"optimizer={self.optimizer!r}, "
                 f"use_distributed_optimizer={self.use_distributed_optimizer}."
             )

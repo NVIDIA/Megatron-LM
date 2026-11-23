@@ -26,8 +26,7 @@ pytestmark = pytest.mark.skipif(
     reason="Skip layer-wise optimizer for LTS test",
 )
 
-# reduce-scatter selects the padded LayerWise layout, all-reduce the compact one.
-GRAD_COLLECTIVES = ['reduce-scatter', 'all-reduce']
+PARAM_LAYOUTS = ['padded', 'compact']
 
 multi_rank = pytest.mark.skipif(
     int(os.getenv('WORLD_SIZE', '1')) == 1, reason="Multi-rank test requires WORLD_SIZE > 1"
@@ -154,7 +153,7 @@ def _layer_wise(optimizer):
 def _create(
     model_class=SimpleModel,
     *,
-    grad_collective='reduce-scatter',
+    param_layout='padded',
     use_layer_wise=True,
     overlap_param_gather=False,
     optimizer_overlap_param_gather=None,
@@ -189,7 +188,7 @@ def _create(
             transformer_config,
             ddp_config,
             use_layer_wise_distributed_optimizer=True,
-            second_order_optimizer_grad_collective=grad_collective,
+            layer_wise_param_layout=param_layout,
         )[0]
     else:
         model = DistributedDataParallel(transformer_config, ddp_config, model)
@@ -212,9 +211,7 @@ def _create(
             overlap_param_gather=optimizer_overlap_param_gather,
             muon_tp_mode="duplicated",
             use_layer_wise_distributed_optimizer=use_layer_wise,
-            second_order_optimizer_grad_collective=(
-                grad_collective if use_layer_wise else 'reduce-scatter'
-            ),
+            layer_wise_param_layout=(param_layout if use_layer_wise else 'padded'),
         ),
         [model],
         pg_collection=pg_collection,
@@ -300,10 +297,10 @@ class TestLayerWiseOptimizer:
         yield
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize('grad_collective', GRAD_COLLECTIVES)
-    def test_basic(self, grad_collective):
+    @pytest.mark.parametrize('param_layout', PARAM_LAYOUTS)
+    def test_basic(self, param_layout):
         """Construction, bf16 wrapping and one training step; every rank ends equal."""
-        model, optimizer, pg_collection = _create(grad_collective=grad_collective)
+        model, optimizer, pg_collection = _create(param_layout=param_layout)
         layer_wise = _layer_wise(optimizer)
         assert isinstance(layer_wise.chained_optimizers[0], Float16OptimizerWithFloat16Params)
         assert layer_wise.grad_stats_parallel_group is pg_collection.intra_dist_opt
@@ -315,11 +312,11 @@ class TestLayerWiseOptimizer:
         assert any(not torch.equal(p, b) for p, b in zip(model.parameters(), before))
         _assert_replicas_equal(model)
 
-    @pytest.mark.parametrize('grad_collective', GRAD_COLLECTIVES)
-    def test_frozen_stage_builds_an_optimizer(self, grad_collective):
+    @pytest.mark.parametrize('param_layout', PARAM_LAYOUTS)
+    def test_frozen_stage_builds_an_optimizer(self, param_layout):
         """A pipeline stage whose params are all frozen has no routing tags; building the
         layer-wise optimizer must not mistake it for a model wrapped without a layout."""
-        _, optimizer, _ = _create(grad_collective=grad_collective, frozen=True)
+        _, optimizer, _ = _create(param_layout=param_layout, frozen=True)
         assert not any(group['params'] for group in _layer_wise(optimizer).param_groups)
 
     def test_explicit_muon_exclusion_updates_with_param_layout(self):
@@ -518,10 +515,10 @@ class TestLayerWiseOptimizer:
             LayerWiseDistributedOptimizer([wrapped_optimizer], config, pg_collection)
 
     @pytest.mark.parametrize('model_class', [SimpleModel, TinyModel])
-    @pytest.mark.parametrize('grad_collective', GRAD_COLLECTIVES)
-    def test_parameter_updates(self, grad_collective, model_class):
+    @pytest.mark.parametrize('param_layout', PARAM_LAYOUTS)
+    def test_parameter_updates(self, param_layout, model_class):
         """Updates match the non-distributed reference; TinyModel leaves ranks without params."""
-        model, optimizer, _ = _create(model_class, grad_collective=grad_collective)
+        model, optimizer, _ = _create(model_class, param_layout=param_layout)
         reference, reference_optimizer, _ = _create(
             model_class, use_layer_wise=False, copy_from=model
         )
@@ -535,8 +532,8 @@ class TestLayerWiseOptimizer:
 
     def test_broadcast_vs_allgather(self):
         """The whole-param all-gather matches the broadcast fallback bit for bit."""
-        model, optimizer, _ = _create(grad_collective='all-reduce')
-        reference, reference_optimizer, _ = _create(grad_collective='all-reduce', copy_from=model)
+        model, optimizer, _ = _create(param_layout='compact')
+        reference, reference_optimizer, _ = _create(param_layout='compact', copy_from=model)
         reference_layer_wise = _layer_wise(reference_optimizer)
         reference_layer_wise.allgather_params = reference_layer_wise.broadcast_params
         _set_same_main_grads(0, model, reference)
@@ -545,12 +542,12 @@ class TestLayerWiseOptimizer:
         _assert_params_equal(model, reference)
 
     @pytest.mark.parametrize('overlap', [False, True])
-    @pytest.mark.parametrize('grad_collective', GRAD_COLLECTIVES)
-    def test_training_matches_reference(self, grad_collective, overlap):
+    @pytest.mark.parametrize('param_layout', PARAM_LAYOUTS)
+    def test_training_matches_reference(self, param_layout, overlap):
         """Real gradient collectives: LayerWise buckets next to the sibling DistOpt buckets."""
         # FP32 gradient reduction keeps the collectives' rounding below the tolerance.
         model, optimizer, _ = _create(
-            grad_collective=grad_collective,
+            param_layout=param_layout,
             overlap_param_gather=overlap,
             grad_reduce_in_fp32=True,
             bucket_size=4096 if overlap else None,
@@ -558,7 +555,7 @@ class TestLayerWiseOptimizer:
         layer_wise = _layer_wise(optimizer)
         # The model-level config keeps DistOpt for the sibling optimizer.
         assert model.ddp_config.use_distributed_optimizer
-        if grad_collective == 'all-reduce':
+        if param_layout == 'compact':
             assert layer_wise.param_layout == 'compact'
             assert layer_wise.layerwise_param_sync_via_bucket_group == overlap
             for buffer in model.buffers + model.expert_parallel_buffers:
@@ -589,7 +586,7 @@ class TestLayerWiseOptimizer:
         runs = []
         for _ in range(2):
             model, optimizer, _ = _create(
-                grad_collective='all-reduce',
+                param_layout='compact',
                 overlap_param_gather=True,
                 grad_reduce_in_fp32=True,
                 bucket_size=4096,
@@ -606,13 +603,13 @@ class TestLayerWiseOptimizer:
         ('ddp_overlap_param_gather', 'optimizer_overlap_param_gather'),
         [(False, True), (True, False)],
     )
-    @pytest.mark.parametrize('grad_collective', GRAD_COLLECTIVES)
+    @pytest.mark.parametrize('param_layout', PARAM_LAYOUTS)
     def test_overlap_param_gather_follows_ddp_config(
-        self, grad_collective, ddp_overlap_param_gather, optimizer_overlap_param_gather
+        self, param_layout, ddp_overlap_param_gather, optimizer_overlap_param_gather
     ):
         """DDP's per-model overlap policy must override the global optimizer value."""
         model, optimizer, _ = _create(
-            grad_collective=grad_collective,
+            param_layout=param_layout,
             overlap_param_gather=ddp_overlap_param_gather,
             optimizer_overlap_param_gather=optimizer_overlap_param_gather,
         )
@@ -621,8 +618,8 @@ class TestLayerWiseOptimizer:
         assert layer_wise.overlap_param_gather == ddp_overlap_param_gather
 
     def test_overlap_param_gather_bucket_lw_params(self):
-        """Every all-reduce LayerWise bucket lists each rank's whole params and their sizes."""
-        model, _, pg_collection = _create(grad_collective='all-reduce', overlap_param_gather=True)
+        """Every compact LayerWise bucket lists each rank's whole params and their sizes."""
+        model, _, pg_collection = _create(param_layout='compact', overlap_param_gather=True)
         dp_size = get_pg_size(pg_collection.dp_cp)
         layer_wise_buckets = [
             bucket
@@ -643,9 +640,9 @@ class TestLayerWiseOptimizer:
         [(SimpleModel, False), (SimpleModel, True), (TinyModel, False)],
         ids=['simple', 'fp32-grad-reduce', 'tiny'],
     )
-    @pytest.mark.parametrize('grad_collective', GRAD_COLLECTIVES)
+    @pytest.mark.parametrize('param_layout', PARAM_LAYOUTS)
     def test_overlap_param_gather_matches_sync(
-        self, grad_collective, model_class, grad_reduce_in_fp32
+        self, param_layout, model_class, grad_reduce_in_fp32
     ):
         """Deferred gathers publish exactly what the synchronous gather does, however they
         complete, and leave the grad buffer they staged in zeroed.
@@ -653,7 +650,7 @@ class TestLayerWiseOptimizer:
         TinyModel leaves ranks without params; with grad_reduce_in_fp32 the grad buffer has a
         different dtype than the params staged in it.
         """
-        kwargs = dict(grad_collective=grad_collective, grad_reduce_in_fp32=grad_reduce_in_fp32)
+        kwargs = dict(param_layout=param_layout, grad_reduce_in_fp32=grad_reduce_in_fp32)
         model, optimizer, _ = _create(model_class, overlap_param_gather=True, **kwargs)
         reference, reference_optimizer, _ = _create(model_class, copy_from=model, **kwargs)
         in_features = next(model.module.parameters()).shape[1]
@@ -710,17 +707,17 @@ class TestLayerWiseOptimizer:
                     assert torch.count_nonzero(bucket.grad_data) == 0, complete.__name__
             _assert_params_equal(model, reference, msg=complete.__name__)
 
-    @pytest.mark.parametrize('grad_collective', GRAD_COLLECTIVES)
-    def test_overlap_param_gather_finish_chains_next_bucket(self, grad_collective):
+    @pytest.mark.parametrize('param_layout', PARAM_LAYOUTS)
+    def test_overlap_param_gather_finish_chains_next_bucket(self, param_layout):
         """finish_param_sync() dispatches next_param_gather_bucket_group."""
         model, optimizer, _ = _create(
-            grad_collective=grad_collective, overlap_param_gather=True, bucket_size=2000
+            param_layout=param_layout, overlap_param_gather=True, bucket_size=2000
         )
         bucket_groups = model.bucket_groups
         if len(bucket_groups) <= 1:
             pytest.skip("Need multiple bucket groups to test chaining")
         reference, reference_optimizer, _ = _create(
-            grad_collective=grad_collective, bucket_size=2000, copy_from=model
+            param_layout=param_layout, bucket_size=2000, copy_from=model
         )
         _set_same_main_grads(0, model, reference)
         optimizer.step()
@@ -753,10 +750,10 @@ class TestLayerWiseExperts:
         yield
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize('grad_collective', GRAD_COLLECTIVES)
-    def test_expert_params_shard_over_expert_dp(self, grad_collective):
+    @pytest.mark.parametrize('param_layout', PARAM_LAYOUTS)
+    def test_expert_params_shard_over_expert_dp(self, param_layout):
         model, optimizer, _ = _create(
-            ExpertModel, grad_collective=grad_collective, grad_reduce_in_fp32=True
+            ExpertModel, param_layout=param_layout, grad_reduce_in_fp32=True
         )
         expt_dp_size = get_pg_size(parallel_state.get_expert_data_parallel_group())
         if expt_dp_size > 1:
@@ -790,13 +787,13 @@ class TestSingleRankDenseGroup:
         yield
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize('grad_collective', GRAD_COLLECTIVES)
-    def test_experts_are_owned_once(self, grad_collective):
+    @pytest.mark.parametrize('param_layout', PARAM_LAYOUTS)
+    def test_experts_are_owned_once(self, param_layout):
         expt_dp = parallel_state.get_expert_data_parallel_group()
         assert get_pg_size(parallel_state.get_data_parallel_group(with_context_parallel=True)) == 1
         assert get_pg_size(expt_dp) > 1
         model, optimizer, _ = _create(
-            ExpertModel, grad_collective=grad_collective, grad_reduce_in_fp32=True
+            ExpertModel, param_layout=param_layout, grad_reduce_in_fp32=True
         )
         layer_wise = _layer_wise(optimizer)
         assert layer_wise.dp_cp_params_list is None

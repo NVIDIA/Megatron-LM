@@ -25,7 +25,7 @@ from tests.unit_tests.dist_checkpointing import (
 )
 from tests.unit_tests.test_utilities import Utils
 
-GRAD_COLLECTIVES = ['reduce-scatter', 'all-reduce']
+PARAM_LAYOUTS = ['padded', 'compact']
 
 
 def check_equal(input_1, input_2, path="state_dict"):
@@ -157,8 +157,8 @@ class TestLayerWiseOptimizer:
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize(('tp', 'pp'), [(1, 1), (2, 2), (1, 4)])
-    @pytest.mark.parametrize('grad_collective', GRAD_COLLECTIVES)
-    def test_layer_wise_optimizer_save_load(self, tmp_path_dist_ckpt, tp, pp, grad_collective):
+    @pytest.mark.parametrize('param_layout', PARAM_LAYOUTS)
+    def test_layer_wise_optimizer_save_load(self, tmp_path_dist_ckpt, tp, pp, param_layout):
         """Test save/load of LayerWiseDistributedOptimizer checkpoints."""
         bf16 = True
         Utils.initialize_model_parallel(tp, pp)
@@ -181,7 +181,7 @@ class TestLayerWiseOptimizer:
                     dist_opt=False,
                     initialize_fn=initialize_gpt_model,
                     optimizer='dist_muon',
-                    grad_collective=grad_collective,
+                    param_layout=param_layout,
                 )
 
                 # Save checkpoint A
@@ -199,7 +199,7 @@ class TestLayerWiseOptimizer:
                     dist_opt=False,
                     initialize_fn=initialize_gpt_model,
                     optimizer='dist_muon',
-                    grad_collective=grad_collective,
+                    param_layout=param_layout,
                 )
 
                 # Load checkpoint A into optimizer B
@@ -279,8 +279,8 @@ class TestLayerWiseOptimizer:
             optimizer_B.load_state_dict(state_dict)
 
     @pytest.mark.parametrize(('tp', 'pp', 'ep'), [(1, 1, 2), (2, 1, 4), (1, 2, 4)])
-    @pytest.mark.parametrize('grad_collective', GRAD_COLLECTIVES)
-    def test_layer_wise_optimizer_with_moe(self, tmp_path_dist_ckpt, tp, pp, ep, grad_collective):
+    @pytest.mark.parametrize('param_layout', PARAM_LAYOUTS)
+    def test_layer_wise_optimizer_with_moe(self, tmp_path_dist_ckpt, tp, pp, ep, param_layout):
         """Test LayerWiseDistributedOptimizer with MoE models."""
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp,
@@ -299,7 +299,7 @@ class TestLayerWiseOptimizer:
                 bf16=True,
                 dist_opt=False,
                 optimizer='dist_muon',
-                grad_collective=grad_collective,
+                param_layout=param_layout,
             )
 
             # Test that optimizer handles expert parallel parameters
@@ -321,7 +321,7 @@ class TestLayerWiseOptimizer:
                 bf16=True,
                 dist_opt=False,
                 optimizer='dist_muon',
-                grad_collective=grad_collective,
+                param_layout=param_layout,
             )
 
             model_sharded_sd = model_new[0].sharded_state_dict()

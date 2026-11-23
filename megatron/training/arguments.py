@@ -13,7 +13,10 @@ import torch
 
 from megatron.core.config import set_experimental_flag
 from megatron.core.model_parallel_config import normalize_gtp_nccl_ub
-from megatron.core.optimizer.optimizer_config import resolve_layer_wise_distributed_optimizer
+from megatron.core.optimizer.optimizer_config import (
+    LAYER_WISE_PARAM_LAYOUTS,
+    resolve_layer_wise_distributed_optimizer,
+)
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
@@ -3033,17 +3036,12 @@ def _add_distributed_args(parser):
     group.add_argument('--overlap-outer-communication', action='store_true',
                        help="Overlap outer-DP and inner-DP gradient reductions "
                             "with Megatron-FSDP v2.")
-    group.add_argument('--second-order-optimizer-grad-collective', type=str,
-                       default='reduce-scatter', choices=['reduce-scatter', 'all-reduce'],
-                       help='Data-parallel gradient collective for the parameters that a '
-                       'second-order optimizer with --use-distributed-optimizer (e.g. Muon) '
-                       'updates whole on one rank. reduce-scatter (default): those tensors '
-                       'stay whole inside padded, equal-size shards. all-reduce: no padding, '
-                       'twice the gradient traffic and an uneven all-gather of whole tensors; '
-                       'needed for blockwise FP8 params. Other parameters always use '
-                       'reduce-scatter, and torch_dist checkpoints load with either. The '
-                       'legacy layer-wise layout was removed; see '
-                       'docs/user-guide/features/dist_optimizer.md.')
+    group.add_argument('--layer-wise-param-layout', type=str,
+                       default='padded', choices=LAYER_WISE_PARAM_LAYOUTS,
+                       help='Layout of LayerWise-managed parameters. padded (default) uses '
+                       'equal-size shards and reduce-scatters gradients. compact removes shard '
+                       'padding, all-reduces gradients and gathers whole parameters from their '
+                       'owners. Both layouts load the same torch_dist optimizer checkpoints.')
     group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub',
                        help='Use the userbuffer registration for DP/FSDP communication buffers.'
                        'This option will reduce GPU SM usage for the DP/FSDP communication,'

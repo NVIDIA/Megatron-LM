@@ -1549,6 +1549,16 @@ def test_optimizer_model_constraints_use_the_model_owner(native_model, valid, co
         cfg.validate()
 
 
+@pytest.mark.parametrize("layout", [None, "padded", "compact"])
+def test_layer_wise_param_layout_cli(monkeypatch, layout):
+    argv = ["train", "--optimizer", "muon", "--use-distributed-optimizer"]
+    if layout is not None:
+        argv.extend(["--layer-wise-param-layout", layout])
+    monkeypatch.setattr(sys, "argv", argv)
+    config = _default_config_from_args(OptimizerConfig, parse_args())
+    assert config.layer_wise_param_layout == (layout or "padded")
+
+
 @pytest.mark.parametrize("optimizer", ["adam", "sgd", "muon", "dist_muon"])
 def test_legacy_checkpoint_gloo_requirement_uses_effective_optimizer(monkeypatch, optimizer):
     args = _minimal_training_args(monkeypatch)

@@ -34,7 +34,7 @@ from .optimizer import (
     _get_param_grad_norm_group,
     _validate_grad_norm_group,
 )
-from .optimizer_config import OptimizerConfig
+from .optimizer_config import OptimizerConfig, validate_layer_wise_param_layout
 from .param_layout import (
     FullParamLayout,
     PerBufferParamLayout,
@@ -93,25 +93,12 @@ def tag_params_for_buffer_routing(model_chunks) -> None:
             param.is_managed_by_layer_wise_optimizer = is_managed_by_layer_wise_optimizer(param)
 
 
-# LayerWise buffer layout behind each OptimizerConfig.second_order_optimizer_grad_collective.
-_PARAM_LAYOUTS = {"reduce-scatter": "padded", "all-reduce": "compact"}
-
-
-def _param_layout_for(grad_collective: str) -> str:
-    if grad_collective not in _PARAM_LAYOUTS:
-        raise ValueError(
-            "second_order_optimizer_grad_collective must be one of "
-            f"{list(_PARAM_LAYOUTS)}, got {grad_collective!r}."
-        )
-    return _PARAM_LAYOUTS[grad_collective]
-
-
 def configure_ddp_for_layer_wise_optimizer(
     model_chunks,
     ddp_config,
     *,
     use_layer_wise_distributed_optimizer: bool,
-    second_order_optimizer_grad_collective: str = "reduce-scatter",
+    layer_wise_param_layout: str = "padded",
 ) -> Optional[Callable]:
     """Prepare standard DDP wrapping for the selected optimizer; return its layout function.
 
@@ -121,8 +108,7 @@ def configure_ddp_for_layer_wise_optimizer(
 
     - Without the layer-wise distributed optimizer, a distributed-optimizer config gets
       :meth:`DistributedOptimizer.compute_full_param_layout` and other configs get no layout.
-    - With it, ``second_order_optimizer_grad_collective`` selects the LayerWise layout:
-      ``"reduce-scatter"`` the padded and ``"all-reduce"`` the compact one. Both enable
+    - With it, ``layer_wise_param_layout`` selects padded or compact LayerWise buffers. Both enable
       ``use_distributed_optimizer`` for the buffers of the sibling DistributedOptimizer, tag the
       params for buffer routing and get
       :meth:`LayerWiseDistributedOptimizer.compute_full_param_layout` for that layout.
@@ -132,8 +118,8 @@ def configure_ddp_for_layer_wise_optimizer(
         ddp_config: :class:`DistributedDataParallelConfig`, updated in place.
         use_layer_wise_distributed_optimizer: Whether the model is trained with
             :class:`LayerWiseDistributedOptimizer`.
-        second_order_optimizer_grad_collective: See
-            ``OptimizerConfig.second_order_optimizer_grad_collective``.
+        layer_wise_param_layout: See
+            ``OptimizerConfig.layer_wise_param_layout``.
 
     Returns:
         The ``compute_full_param_layout`` callable for DDP, or ``None``.
@@ -145,7 +131,7 @@ def configure_ddp_for_layer_wise_optimizer(
             return DistributedOptimizer.compute_full_param_layout
         return None
 
-    param_layout = _param_layout_for(second_order_optimizer_grad_collective)
+    validate_layer_wise_param_layout(layer_wise_param_layout)
     if ddp_config.num_distributed_optimizer_instances != 1:
         raise ValueError(
             "LayerWiseDistributedOptimizer requires num_distributed_optimizer_instances == 1: "
@@ -159,7 +145,8 @@ def configure_ddp_for_layer_wise_optimizer(
     # biases, layernorm) to DistOpt-style buffers.
     tag_params_for_buffer_routing(model_chunks)
     return partial(
-        LayerWiseDistributedOptimizer.compute_full_param_layout, param_layout=param_layout
+        LayerWiseDistributedOptimizer.compute_full_param_layout,
+        param_layout=layer_wise_param_layout,
     )
 
 
@@ -637,6 +624,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # Avoid a circular import: DistributedOptimizer imports LayerWise indirectly.
         from .distrib_optimizer import DistributedOptimizer
 
+        validate_layer_wise_param_layout(param_layout)
         buffer_groups = group_params_for_buffers(params, ddp_config.grad_reduce_in_fp32)
         layouts = {}
         for buffer_key, (group_params, param_indices) in buffer_groups.items():
@@ -931,7 +919,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         """Return the LayerWise layout (``"padded"`` or ``"compact"``) of the wrapped model
         chunks.
 
-        It follows ``config.second_order_optimizer_grad_collective``, which must match the layouts
+        It follows ``config.layer_wise_param_layout``, which must match the layouts
         DDP was built with: LayerWise buffers with optimizer shards are padded, those without
         are compact. Without DDP-wrapped model chunks (direct construction), whole params are
         owned and gathered as in the compact layout.
@@ -944,7 +932,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 "through configure_ddp_for_layer_wise_optimizer(), e.g. with "
                 "use_layer_wise_distributed_optimizer=True in wrap_model_chunks_with_ddp."
             )
-        declared = _param_layout_for(config.second_order_optimizer_grad_collective)
+        declared = config.layer_wise_param_layout
+        validate_layer_wise_param_layout(declared)
         sharded = {
             layout.use_distributed_optimizer
             for full_layout in full_param_layouts or []
@@ -959,8 +948,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         built = ('padded' if sharded.pop() else 'compact') if sharded else declared
         if built != declared:
             raise ValueError(
-                "second_order_optimizer_grad_collective="
-                f"{config.second_order_optimizer_grad_collective!r} does not match the {built} "
+                f"layer_wise_param_layout={declared!r} does not match the {built} "
                 "layout that DDP was built with. Pass the same value to "
                 "configure_ddp_for_layer_wise_optimizer() when wrapping the model."
             )
@@ -984,13 +972,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     if is_mxfp8tensor(param) and reuse_grad_buf:
                         continue
                     hint = (
-                        "Use --second-order-optimizer-grad-collective all-reduce, which gathers "
+                        "Use --layer-wise-param-layout compact, which gathers "
                         "BF16 values and requantizes them on every rank."
                         if is_mxfp8tensor(param) or is_blockwise_float8tensor(param)
                         else "Use the mxfp8 or blockwise recipe, or disable --fp8-param-gather."
                     )
                     raise ValueError(
-                        "The reduce-scatter grad collective all-gathers quantized params as raw "
+                        "The padded layout all-gathers quantized params as raw "
                         "bytes and keeps their scales consistent only for MXFP8 staged through "
                         "the grad buffer (reuse_grad_buf_for_mxfp8_param_ag); got "
                         f"{type(param.data).__name__}. {hint}"
