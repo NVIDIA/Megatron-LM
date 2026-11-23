@@ -49,6 +49,26 @@ def pytest_addoption(parser):
     )
 
 
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(config, items):
+    """Keep this shard's share of the selected tests when run_ci_test.sh packs shards.
+
+    UNIT_TEST_SHARD="<index>/<count>" keeps every count-th selected test, starting at
+    index. It runs after marker and keyword deselection, and every rank of a shard
+    collects the same items in the same order, so the shards split the selection
+    without overlap and each test still runs on all ranks of its shard.
+    """
+    shard = os.environ.get("UNIT_TEST_SHARD")
+    if not shard:
+        return
+    index, count = (int(part) for part in shard.split("/"))
+    kept = [item for position, item in enumerate(items) if position % count == index]
+    dropped = [item for position, item in enumerate(items) if position % count != index]
+    if dropped:
+        config.hook.pytest_deselected(items=dropped)
+        items[:] = kept
+
+
 def pytest_runtest_logreport(report):
     if report.failed:
         rank = os.environ.get("RANK", "?")
@@ -189,10 +209,13 @@ def tmp_path_dist_ckpt(tmp_path_factory) -> Path:
     """Common directory for saving the checkpoint.
 
     Can't use pytest `tmp_path_factory` directly because directory must be shared between processes.
+    The ranks of one launch share it; packed shards (UNIT_TEST_SHARD) run concurrently on the same
+    node, so each gets its own.
     """
 
     tmp_dir = tmp_path_factory.mktemp('ignored', numbered=False)
-    tmp_dir = tmp_dir.parent.parent / 'tmp_dist_ckpt'
+    shard = os.environ.get("UNIT_TEST_SHARD", "").split("/")[0]
+    tmp_dir = tmp_dir.parent.parent / (f'tmp_dist_ckpt_shard{shard}' if shard else 'tmp_dist_ckpt')
 
     if Utils.rank == 0:
         with TempNamedDir(tmp_dir, sync=False):

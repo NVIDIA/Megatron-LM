@@ -364,6 +364,7 @@ markers = [
     "flaky: mark flaky tests for LTS environment",
     "flaky_in_dev: mark flaky tests for DEV environment",
     "launch_on_gb200: mark a unit test to be launched on GB200 hardware (4 GPUs/node)",
+    "single_rank: the test needs one rank and no other rank's participation; full CI runs pack these tests as concurrent one-GPU shards (tests/unit_tests/run_ci_test.sh)",
 ]
 
 [tool.coverage.run]

@@ -9,7 +9,7 @@ import pytest
 
 from megatron.core.inference import unified_memory
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
-from tests.unit_tests.inference.engines import test_disagg_pairwise as core
+from tests.unit_tests.inference.isolated.two_rank import test_disagg_pairwise as core
 
 transport_world = core.transport_world
 
