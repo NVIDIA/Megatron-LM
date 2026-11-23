@@ -53,7 +53,7 @@ class GradientFinalizationMode(enum.Enum):
     """Launch outer reduction and wait for all gradient reductions at autograd completion."""
 
 
-class _GradBufferBatch(NamedTuple):
+class _GradReductionInputs(NamedTuple):
     """Inputs and their last-consumer event, owned by the allocation stream."""
 
     buffers: tuple[torch.Tensor, ...]
@@ -122,7 +122,7 @@ class FsdpContext:
         self.prefetch_order = runtime_policy.prefetch_order
         self._recording_execution_order = runtime_policy.prefetch_order is PrefetchOrder.RECORDED
         self._post_backward_hook_registered = False
-        self._pending_grad_buffers: deque[_GradBufferBatch] = deque()
+        self._pending_grad_buffers: deque[_GradReductionInputs] = deque()
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
         ] = []
@@ -300,7 +300,7 @@ class FsdpContext:
         if buffers:
             done = self.inner_reduction_stream.record_event()
             self._pending_grad_buffers.append(
-                _GradBufferBatch(tuple(buffers), done, allocation_stream, ref(producer))
+                _GradReductionInputs(tuple(buffers), done, allocation_stream, ref(producer))
             )
 
     def _release_grad_buffers(self, *, keep: int = 0) -> None:
