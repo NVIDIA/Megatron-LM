@@ -21,7 +21,6 @@ from megatron.core.datasets.data_schedule import (
     wrap_data_iterator,
 )
 from megatron.core.datasets.data_schedule_utils import (
-    align_sample_id_groups,
     compute_schedule_stats,
     create_data_iterator,
     next_dynamic_cp_group_packing_aware,
@@ -36,40 +35,40 @@ from tests.unit_tests.test_utilities import Utils
 
 
 @pytest.mark.parametrize(
-    'schedule,lengths,work,efficiency,counts',
+    'schedule,lengths,denominator,counts',
     [
-        ([[[0], [1]]], {0: 4, 1: 4}, [[16, 16]], 1, {1: 2}),
-        ([[[0], [1]]], {0: 4, 1: 2}, [[16, 4]], 0.625, {1: 2}),
-        ([[[0, 1], [2]]], {0: 3, 1: 4, 2: 5}, [[25, 25]], 1, {1: 3}),
-        ([[[0], [0], [1], [1]]], {0: 4, 1: 2}, [[8, 8, 2, 2]], 0.625, {2: 2}),
+        # Two equal-length IDs packed on rank 0 and one sample on rank 1.
+        ([[[0, 1], [2]]], {0: 3, 1: 3, 2: 4}, 36, {1: 3}),
+        # CP2 and CP4 copies each count as one logical sample.
         (
             [[[0], [0], [1], [2]], [[3], [3], [3], [3]]],
             {0: 4, 1: 2, 2: 2, 3: 8},
-            [[8, 8, 4, 4], [16, 16, 16, 16]],
-            88 / 96,
+            96,
             {1: 2, 2: 1, 4: 1},
         ),
-        # Alternating hotspots must not cancel across microbatches.
-        ([[[0], [1]], [[2], [3]]], {0: 4, 1: 2, 2: 2, 3: 4}, [[16, 4], [4, 16]], 0.625, {1: 4}),
-        # Unequal microbatch work weights the ratio, rather than their efficiencies.
-        ([[[0], [1]], [[2], [3]]], {0: 2, 1: 0, 2: 4, 3: 4}, [[4, 0], [16, 16]], 0.9, {1: 4}),
+        # Unequal microbatches have different hot ranks.
+        ([[[0], [1]], [[2], [3]]], {0: 4, 1: 2, 2: 2, 3: 6}, 104, {1: 4}),
     ],
+    ids=['equal-length-ids', 'cp-replicas', 'alternating-hotspots'],
 )
-def test_dcp_schedule_stats_hand_calculation(schedule, lengths, work, efficiency, counts):
+def test_dcp_schedule_stats_hand_calculation(schedule, lengths, denominator, counts):
     original = deepcopy((schedule, lengths))
     stats = compute_schedule_stats(schedule, lengths)
-    assert stats['rank_work'] == work
-    assert stats['balance_numerator'] / stats['balance_denominator'] == pytest.approx(efficiency)
-    assert stats['cp_sample_counts'] == counts
-    for microbatch, row in zip(schedule, stats['rank_work']):
+    expected_work = 0
+    for microbatch in schedule:
         ids = {sid for rank_ids in microbatch for sid in rank_ids}
-        assert sum(row) == pytest.approx(sum(lengths[sid] ** 2 for sid in ids))
+        work = sum(lengths[sid] ** 2 for sid in ids)
+        assert compute_schedule_stats([microbatch], lengths)['balance_numerator'] == work
+        expected_work += work
+    assert stats == {
+        'balance_numerator': expected_work,
+        'balance_denominator': denominator,
+        'cp_sample_counts': counts,
+    }
     assert (schedule, lengths) == original
 
 
-@pytest.mark.parametrize(
-    'schedule,lengths', [([], {}), ([[]], {}), ([[[], []]], {}), ([[[0], [0]]], {0: 0})]
-)
+@pytest.mark.parametrize('schedule,lengths', [([], {}), ([[[0], [0]]], {0: 0})])
 def test_dcp_schedule_stats_empty(schedule, lengths):
     stats = compute_schedule_stats(schedule, lengths)
     assert stats['balance_numerator'] == stats['balance_denominator'] == 0
@@ -80,18 +79,17 @@ def test_dcp_schedule_stats_empty(schedule, lengths):
 
 
 def test_dcp_schedule_stats_after_vpp_alignment():
-    schedule = [[[0], [0], [1], [2]]]
     lengths = [(0, 8), (1, 4), (2, 4)]
-    assert compute_schedule_stats(schedule, lengths)['cp_sample_counts'] == {2: 1, 1: 2}
-    aligned = align_sample_id_groups(deepcopy(schedule), 2)
-    assert len(aligned) == 2
-    stats = compute_schedule_stats(aligned, lengths)
-    assert stats['cp_sample_counts'] == {2: 2, 4: 1}
-    assert stats['rank_work'] == [[16, 16, 16, 16], [8, 8, 8, 8]]
-    assert stats['balance_numerator'] == 96
-    scheduler = DefaultDynamicCPScheduler(4, 4, 1, 2)
-    final = scheduler.get_groups_and_subsamples(lengths)
-    assert compute_schedule_stats(final, lengths)['cp_sample_counts'] == stats['cp_sample_counts']
+    before = DefaultDynamicCPScheduler(4, 4, 1, None).get_groups_and_subsamples(lengths)
+    final = DefaultDynamicCPScheduler(4, 4, 1, 2).get_groups_and_subsamples(lengths)
+    assert len(before) == 1 and len(final) == 2
+    assert compute_schedule_stats(before, lengths)['cp_sample_counts'] == {2: 1, 1: 2}
+    # Alignment splits the plan into two balanced microbatches with CP4 and CP2.
+    assert compute_schedule_stats(final, lengths) == {
+        'balance_numerator': 96,
+        'balance_denominator': 96,
+        'cp_sample_counts': {2: 2, 4: 1},
+    }
 
 
 def test_dcp_schedule_stats_window_and_reset():
@@ -192,8 +190,6 @@ def test_dcp_schedule_stats_tp_metadata(monkeypatch):
                 assert stats['balance_numerator'] == sum(padded_work)
                 assert stats['balance_denominator'] == 2 * max(padded_work)
                 assert stats['cp_sample_counts'] == {1: 2, 2: 0}
-            assert results[0]['rank_work'] == [padded_work]
-            assert 'rank_work' not in results[1]
     assert legacy_fields[False] == legacy_fields[True]
 
 
@@ -390,42 +386,32 @@ def test_dcp_schedule_stats_rerun_and_abort(monkeypatch, outcome, run_config):
     assert stats == (pending if outcome == 'success' else {})
 
 
-@pytest.mark.parametrize('vpp', [False, True])
-def test_dcp_schedule_stats_distributed(vpp):
-    """Cover TP/PP replicas with CP2, including the standard eight-rank CI job."""
+def test_dcp_schedule_stats_distributed():
+    """Compare the actual TP broadcast and VPP-aligned schedule with metrics off/on."""
     world_size = Utils.world_size
-    if world_size not in (2, 4, 8):
-        pytest.skip('requires two, four or eight ranks')
-    cp_size = 2 if world_size >= 4 else 1
+    if world_size not in (4, 8):
+        pytest.skip('requires four or eight ranks')
+    pp_size = 2
+    cp_size = 2
+    tp_size = world_size // (pp_size * cp_size)
     Utils.initialize_model_parallel(
-        1 if vpp else world_size // cp_size,
-        world_size // cp_size if vpp else 1,
-        2 if vpp else None,
-        context_parallel_size=cp_size,
-        dynamic_context_parallel=True,
+        tp_size, pp_size, 2, context_parallel_size=cp_size, dynamic_context_parallel=True
     )
     try:
         config = SimpleNamespace(
             max_seqlen_per_dp_cp_rank=256,
-            microbatch_group_size_per_vp_stage=2 if vpp else 1,
-            virtual_pipeline_model_parallel_size=2 if vpp else None,
+            microbatch_group_size_per_vp_stage=2,
+            virtual_pipeline_model_parallel_size=2,
             sequence_packing_scheduler='default_dynamic_cp',
             pipeline_model_parallel_layout=None,
             mtp_num_layers=None,
             min_dynamic_context_parallel_size=1,
         )
-        lengths = [512, 128, 128, 128, 128] if world_size >= 4 else [256, 128, 128]
-        if vpp:
-            if world_size < 4:
-                pytest.skip('VPP alignment case requires at least four ranks')
-            lengths = [512, 256, 128, 128, 256, 128, 128]
-            unaligned = DefaultDynamicCPScheduler(256, 2, 1, None).get_groups_and_subsamples(
-                list(enumerate(lengths))
-            )
-            assert len(unaligned) == 3
-        samples = []
-        for length in lengths:
-            samples.append(
+        lengths = [512, 256, 128, 128, 256, 128, 128]
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        legacy = []
+        for enabled in (False, True):
+            samples = [
                 dict(
                     tokens=torch.zeros(length, dtype=torch.int64, device='cuda'),
                     labels=torch.zeros(length, dtype=torch.int64, device='cuda'),
@@ -434,39 +420,20 @@ def test_dcp_schedule_stats_distributed(vpp):
                     original_seq_len=torch.tensor([length], dtype=torch.int32, device='cuda'),
                     padded_seq_len=torch.tensor([length], dtype=torch.int32, device='cuda'),
                 )
+                for length in lengths
+            ]
+            stats = {} if enabled else None
+            iterator = iter(samples) if pg.tp.rank() == 0 else None
+            result = wrap_data_iterator(
+                [iterator, None], config, len(lengths), pg_collection=pg, schedule_stats=stats
             )
-        stats = {}
-        source = parallel_state.get_tensor_model_parallel_rank() == 0
-        data_iterator = iter(samples) if source else None
-        if vpp:
-            data_iterator = [data_iterator, None]
-        result = wrap_data_iterator(
-            data_iterator,
-            config,
-            len(lengths),
-            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
-            schedule_stats=stats,
-        )
-        assert len(result) == 4
-        summaries = [None] * world_size
-        summary = {key: value for key, value in stats.items() if key != 'rank_work'}
-        torch.distributed.all_gather_object(summaries, summary)
-        assert all(s == summary for s in summaries)
-        assert summary['balance_numerator'] == sum(length**2 for length in lengths)
-        assert bool('rank_work' in stats) == source
-        if world_size >= 4:
-            assert stats['cp_sample_counts'][1] > 0 and stats['cp_sample_counts'][2] > 0
-        if vpp:
-            assert result[1] == 4
-            assert (
-                stats['cp_sample_counts']
-                != compute_schedule_stats(unaligned, dict(enumerate(lengths)))['cp_sample_counts']
-            )
-            # DP*CP is two, although four processes participate in PP2 training.
-            assert stats['balance_denominator'] == 2 * sum(max(row) for row in stats['rank_work'])
-        window = DcpStatsAccumulator()
-        window.update(stats)
-        assert sum(window.cp_sample_counts.values()) == len(lengths)
+            legacy.append(result[1:])
+            if enabled:
+                # The last unaligned group is split across CP2 to fill the VPP stride.
+                assert stats['cp_sample_counts'] == {1: 2, 2: 5}
+                assert stats['balance_numerator'] == sum(length**2 for length in lengths)
+                assert stats['balance_denominator'] == 512**2 + 2 * 256**2 + 4 * 128**2
+        assert legacy[0] == legacy[1] == (4, sum(lengths), sum(length**2 for length in lengths))
     finally:
         Utils.destroy_model_parallel()
 

@@ -41,8 +41,8 @@ def compute_schedule_stats(
             These lengths include dataset padding, not just valid tokens.
 
     Returns:
-        A dict containing ``rank_work`` (one row per microbatch), additive
-        ``balance_numerator`` and ``balance_denominator``, and
+        A dict containing additive ``balance_numerator`` and
+        ``balance_denominator``, and
         ``cp_sample_counts``. Each logical ID is counted once per microbatch.
         A zero denominator represents undefined efficiency, not perfect balance.
 
@@ -51,7 +51,7 @@ def compute_schedule_stats(
     padding. Inputs are not modified; no tensors or collectives are used.
     """
     lengths = dict(global_id_seqlens)
-    rank_work = []
+    total_work = critical_path_work = 0.0
     cp_sample_counts: Counter[int] = Counter()
     num_ranks = len(sample_id_groups[0]) if sample_id_groups else 0
     for microbatch in sample_id_groups:
@@ -59,16 +59,15 @@ def compute_schedule_stats(
             raise ValueError("All microbatches must have the same DP*CP rank count")
         cp_sizes = Counter(sid for rank_ids in microbatch for sid in set(rank_ids))
         cp_sample_counts.update(cp_sizes.values())
-        rank_work.append(
-            [
-                fsum(int(lengths[sid]) ** 2 / cp_sizes[sid] for sid in rank_ids)
-                for rank_ids in microbatch
-            ]
-        )
+        rank_work = [
+            fsum(int(lengths[sid]) ** 2 / cp_sizes[sid] for sid in rank_ids)
+            for rank_ids in microbatch
+        ]
+        total_work += fsum(rank_work)
+        critical_path_work += max(rank_work, default=0.0)
     return {
-        'rank_work': rank_work,
-        'balance_numerator': fsum(fsum(row) for row in rank_work),
-        'balance_denominator': num_ranks * fsum(max(row, default=0.0) for row in rank_work),
+        'balance_numerator': total_work,
+        'balance_denominator': num_ranks * critical_path_work,
         'cp_sample_counts': dict(cp_sample_counts),
     }
 

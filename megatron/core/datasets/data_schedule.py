@@ -272,8 +272,8 @@ class DpBalancedScheduler(BasePackingScheduler):
             seqlen_squared_sum_this_global_batch: Sum of squared real seqlens for FLOPs.
         """
 
-        total_dcp_gpus = dp_cp_group.size()
         if schedule_stats is not None:
+            total_dcp_gpus = dp_cp_group.size()
             schedule_stats.clear()
         is_first_pp = pp_group.rank() == 0
         is_last_pp = pp_group.rank() == pp_group.size() - 1
@@ -574,7 +574,6 @@ def wrap_data_iterator(
         config: The config object containing the max_seqlen_per_dp_cp_rank
         pg_collection: Caller-owned process groups; must define dp_cp, dp, tp, and pp.
         schedule_stats: Optional output dict for final schedule work estimates.
-            TP source ranks also retain the full rank-work matrix.
     """
 
     # GTP_remat peers consume distinct samples, so packing must span them like the rest of DP.
