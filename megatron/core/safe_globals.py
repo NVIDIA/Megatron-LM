@@ -141,6 +141,9 @@ class SafeDCPUnpickler(SafeUnpickler):
         {
             *SAFE_OBJECTS,
             ("pathlib", "PosixPath"),
+            # Multi-Storage Client writers record shard paths as ``MultiStoragePath``
+            # (a pathlib-style path) in the ``_StorageInfo`` entries of the metadata.
+            ("multistorageclient.pathlib", "MultiStoragePath"),
             ("torch.serialization", "_get_layout"),
             ("torch.distributed.checkpoint.filesystem", "_StorageInfo"),
             ("torch.distributed.checkpoint.metadata", "Metadata"),
