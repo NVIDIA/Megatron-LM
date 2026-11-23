@@ -63,6 +63,7 @@ class FsdpContext:
     use_symmetric_memory: bool
     # Prefetch uses construction order unless execution-order recording is enabled.
     execution_order: ExecutionOrder
+    prefetch_order: PrefetchOrder
     # Topology metadata must not keep modules alive after construction.
     _roots: WeakKeyDictionary[nn.Module, None]
     # Names are relative to each FSDP root and absent until finalization.
@@ -107,6 +108,7 @@ class FsdpContext:
         self._gradient_finalization_mode = gradient_finalization_mode
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
         self.execution_order = ExecutionOrder()
+        self.prefetch_order = runtime_policy.prefetch_order
         self._recording_execution_order = runtime_policy.prefetch_order is PrefetchOrder.RECORDED
         self._post_backward_hook_registered = False
         self._delayed_post_backward_callbacks: list[

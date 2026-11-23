@@ -826,7 +826,11 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
                     packed_seq_params=packed_seq_params,
                     replay_topk_idx=replay_topk_idx,
                 )
-                return apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
+                # Like dropless HybridEP, the megakernel gives padding tokens no routes and skips
+                # them.
+                return apply_module(self.megakernel_experts)(
+                    hidden_states, probs, routing_map, padding_mask
+                )
 
             if self.moe_layer_recompute and self.training:
                 output = precision_aware_checkpoint(
