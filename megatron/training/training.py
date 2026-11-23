@@ -2736,6 +2736,15 @@ def setup_model_and_optimizer(
         save_checkpoint(
             train_state.iteration, model, None, None, train_state.num_floating_point_operations_so_far
         )
+        # This save bypasses the checkpoint manager, so the manager's finalizer never sees the
+        # native async queue. Drain it here so the checkpoint metadata is published. With the
+        # default manager the queue is shared with later saves and closed by the manager at exit;
+        # with a custom manager nothing else will close it, so close it here.
+        from megatron.training.async_utils import maybe_finalize_async_save
+
+        maybe_finalize_async_save(
+            blocking=True, terminate=cfg.checkpoint.custom_manager_class is not None
+        )
         torch.distributed.barrier()
         del dense_model_for_upcycling
         # CPU offload keeps separate optimizer copies of FP32 parameters as well.
