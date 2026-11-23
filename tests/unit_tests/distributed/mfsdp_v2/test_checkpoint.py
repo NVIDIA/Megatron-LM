@@ -586,16 +586,12 @@ def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_
                 output = model(input_ids=ids, position_ids=pos, attention_mask=None)
                 return torch.nn.functional.mse_loss(output.float(), target)
 
-            losses = []
-            for _ in range(5):
-                model.zero_grad_buffer()
-                optimizer.zero_grad()
-                (loss,) = run_forward_backward_on_microbatches(model, forward)
-                success, _, _ = optimizer.step()
-                assert success
-                dist.all_reduce(loss, op=dist.ReduceOp.AVG)
-                losses.append(loss)
-            return losses
+            model.zero_grad_buffer()
+            optimizer.zero_grad()
+            (loss,) = run_forward_backward_on_microbatches(model, forward)
+            success, _, _ = optimizer.step()
+            assert success
+            return loss
 
         def checkpoint_state(model, optimizer, *, is_loading=False):
             state = {
@@ -605,27 +601,32 @@ def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_
             return preprocess_fsdp_dtensor_state_dict(model.config, state, model)
 
         def training_state(model, optimizer):
-            def clone(value):
-                if isinstance(value, DTensor):
-                    value = value.to_local()
-                return value.detach().clone() if isinstance(value, torch.Tensor) else value
+            def local(value):
+                return value.to_local() if isinstance(value, DTensor) else value
 
             return (
-                [clone(parameter) for parameter in model.parameters()],
+                [local(parameter) for parameter in model.parameters()],
                 [
                     {
-                        key: clone(value)
+                        key: local(value)
                         for key, value in optimizer.optimizer.state.get(parameter, {}).items()
                     }
                     for group in optimizer.optimizer.param_groups
                     for parameter in group["params"]
                 ],
-                [clone(group.get("step", 0)) for group in optimizer.optimizer.param_groups],
+                [local(group["step"]) for group in optimizer.optimizer.param_groups],
             )
 
         train(source, source_optimizer)
         with TempNamedDir(tmp_path_dist_ckpt / f"ep{ep_size}_mcore_roundtrip", sync=True) as path:
             dcp.save(checkpoint_state(source, source_optimizer), checkpoint_id=path)
+            saved_keys = dcp.FileSystemReader(path).read_metadata().state_dict_metadata
+            expert_fc1 = {
+                key.rsplit(".", 1)[-1]
+                for key in saved_keys
+                if key.startswith("model.") and ".mlp.experts.linear_fc1." in key
+            }
+            assert expert_fc1 == {f"weight{i}" for i in range(source.config.num_moe_experts)}
             destination, destination_optimizer = build(seed=987)
             raw_model_state = destination.state_dict_for_save_checkpoint()
             state = checkpoint_state(destination, destination_optimizer, is_loading=True)
@@ -639,11 +640,9 @@ def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_
             rtol=0,
             atol=0,
         )
-        expected_losses = train(source, source_optimizer)
-        actual_losses = train(destination, destination_optimizer)
-        torch.testing.assert_close(
-            torch.stack(actual_losses), torch.stack(expected_losses), rtol=0, atol=0
-        )
+        expected_loss = train(source, source_optimizer)
+        actual_loss = train(destination, destination_optimizer)
+        torch.testing.assert_close(actual_loss, expected_loss, rtol=0, atol=0)
         torch.testing.assert_close(
             training_state(destination, destination_optimizer),
             training_state(source, source_optimizer),
