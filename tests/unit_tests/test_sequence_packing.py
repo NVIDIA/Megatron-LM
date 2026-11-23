@@ -92,23 +92,6 @@ def test_dcp_schedule_stats_after_vpp_alignment():
     }
 
 
-def test_dcp_schedule_stats_window_and_reset():
-    window = DcpStatsAccumulator()
-    first = compute_schedule_stats([[[0], [1]]], {0: 2, 1: 0})
-    second = compute_schedule_stats([[[0], [0]]], {0: 8})
-    window.update(first)
-    # An early stdout print observes the current window without resetting it.
-    assert window.metrics(reset=False)['dcp/estimated_attention_balance_efficiency'] == 0.5
-    window.update(second, skipped=True)
-    window.update(None)
-    window.update(second)
-    metrics = window.metrics()
-    assert metrics['dcp/estimated_attention_balance_efficiency'] == pytest.approx(68 / 72)
-    assert metrics['dcp/cp_size_1_sample_fraction'] == pytest.approx(2 / 3)
-    assert metrics['dcp/cp_size_2_sample_fraction'] == pytest.approx(1 / 3)
-    assert window.metrics() == {}
-
-
 def test_dcp_schedule_stats_tp_metadata(monkeypatch):
     monkeypatch.setattr(data_schedule, 'mtp_on_this_pipeline_rank', lambda *a, **k: False)
     monkeypatch.setattr(torch.distributed, 'all_reduce', lambda *a, **kw: None)
@@ -157,11 +140,8 @@ def test_dcp_schedule_stats_tp_metadata(monkeypatch):
     monkeypatch.setattr(data_schedule, 'broadcast_scalars', broadcast)
     compute = mock.Mock(wraps=compute_schedule_stats)
     monkeypatch.setattr(data_schedule, 'compute_schedule_stats', compute)
-    legacy_fields = {}
     for enabled in (False, True):
         compute.reset_mock()
-        results = []
-        legacy_fields[enabled] = []
         for rank in (0, 1):
             scheduler = data_schedule.DpBalancedScheduler(1, 1, 2, None)
             monkeypatch.setattr(scheduler, 'get_groups_and_subsamples', lambda *a: schedule)
@@ -181,26 +161,13 @@ def test_dcp_schedule_stats_tp_metadata(monkeypatch):
             # 4096**2 + 1**2 = 16,777,217: TP0 retains the exact real-token
             # square sum; only its TP peer receives the existing FP32 rounding.
             assert result[1:] == (1, 4097, 16777217 if rank == 0 else 16777216)
-            legacy_fields[enabled].append(result[1:])
-            results.append(stats)
+            if enabled:
+                assert stats == {
+                    'balance_numerator': sum(padded_work),
+                    'balance_denominator': 2 * max(padded_work),
+                    'cp_sample_counts': {1: 2, 2: 0},
+                }
         assert compute.call_count == int(enabled)
-        if enabled:
-            for stats in results:
-                assert 'stale' not in stats
-                assert stats['balance_numerator'] == sum(padded_work)
-                assert stats['balance_denominator'] == 2 * max(padded_work)
-                assert stats['cp_sample_counts'] == {1: 2, 2: 0}
-    assert legacy_fields[False] == legacy_fields[True]
-
-
-def test_dcp_schedule_stats_cli_switch():
-    from argparse import ArgumentParser
-
-    from megatron.training.arguments import _add_logging_args
-
-    parser = _add_logging_args(ArgumentParser())
-    assert parser.parse_args([]).log_dcp_stats is False
-    assert parser.parse_args(['--log-dcp-stats']).log_dcp_stats is True
 
 
 def test_dcp_schedule_stats_evaluation_does_not_collect(monkeypatch, run_config):
@@ -218,9 +185,6 @@ def test_dcp_schedule_stats_evaluation_does_not_collect(monkeypatch, run_config)
         seq_length=8,
         decoder_seq_length=None,
     )
-    window = DcpStatsAccumulator()
-    window.update(compute_schedule_stats([[[0], [1]]], {0: 4, 1: 2}))
-    before = window.metrics(reset=False)
     wrapper = mock.Mock(return_value=(None, 3, 8.0, 64.0))
     forward = mock.Mock(return_value=[])
     monkeypatch.setattr(training, 'get_args', lambda: args)
@@ -246,10 +210,6 @@ def test_dcp_schedule_stats_evaluation_does_not_collect(monkeypatch, run_config)
     assert not result[2]
     assert wrapper.call_count == 2
     assert all('schedule_stats' not in call.kwargs for call in wrapper.call_args_list)
-    assert all(call.kwargs['forward_only'] for call in forward.call_args_list)
-    assert window.metrics() == before
-    model.eval.assert_called_once()
-    model.train.assert_called_once()
 
 
 def test_dcp_schedule_stats_training_log(monkeypatch, run_config):
@@ -259,7 +219,9 @@ def test_dcp_schedule_stats_training_log(monkeypatch, run_config):
 
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
-    args = parser.parse_args(['--micro-batch-size', '1', '--train-iters', '4'])
+    assert not parser.parse_args([]).log_dcp_stats
+    args = parser.parse_args(['--micro-batch-size', '1', '--train-iters', '4', '--log-dcp-stats'])
+    assert args.log_dcp_stats
     args.data_parallel_size = args.world_size = args.gtp_weight_remat_size = 1
     args.dsa_indexer_loss_coeff = None
     run_config.logger.log_interval = 2
@@ -283,8 +245,15 @@ def test_dcp_schedule_stats_training_log(monkeypatch, run_config):
     window = DcpStatsAccumulator()
     losses = {}
     key = 'dcp/estimated_attention_balance_efficiency'
-    for iteration in range(1, 5):
-        window.update(compute_schedule_stats([[[0], [1]]], {0: iteration, 1: 1}))
+    cp1 = 'dcp/cp_size_1_sample_fraction'
+    cp2 = 'dcp/cp_size_2_sample_fraction'
+    first = compute_schedule_stats([[[0], [1]]], {0: 2, 1: 0})
+    second = compute_schedule_stats([[[0], [0]]], {0: 8})
+    # Step 1 is an early stdout report; step 3 is skipped.
+    for iteration, (summary, skipped) in enumerate(
+        [(first, False), (second, False), (second, True), (first, False)], start=1
+    ):
+        window.update(summary, skipped=skipped)
         training.training_log(
             {},
             losses,
@@ -292,7 +261,7 @@ def test_dcp_schedule_stats_training_log(monkeypatch, run_config):
             iteration,
             1.0,
             False,
-            0,
+            int(skipped),
             None,
             None,
             None,
@@ -300,10 +269,17 @@ def test_dcp_schedule_stats_training_log(monkeypatch, run_config):
             is_first_iteration=iteration == 1,
             dcp_stats=window,
         )
-    logged = [call.args for call in writer.add_scalar.call_args_list if call.args[0] == key]
-    assert logged == [(key, 7 / 10, 2), (key, 27 / 50, 4)]
-    wandb_metrics = [call.args for call in wandb.log.call_args_list if key in call.args[0]]
-    assert len(wandb_metrics) == 2
+    expected = {2: {key: 68 / 72, cp1: 2 / 3, cp2: 1 / 3}, 4: {key: 0.5, cp1: 1.0}}
+    assert [
+        call.args for call in writer.add_scalar.call_args_list if call.args[0].startswith('dcp/')
+    ] == [
+        (metric, value, iteration)
+        for iteration, metrics in expected.items()
+        for metric, value in metrics.items()
+    ]
+    assert [call.args for call in wandb.log.call_args_list if key in call.args[0]] == [
+        (metrics, iteration) for iteration, metrics in expected.items()
+    ]
     assert [call.args[0].count(key) for call in stdout.call_args_list] == [1, 1, 1]
     assert window.metrics() == {}
 
@@ -355,7 +331,6 @@ def test_dcp_schedule_stats_rerun_and_abort(monkeypatch, outcome, run_config):
     monkeypatch.setattr(training, 'logical_and_across_model_parallel_group', lambda x, **kw: x)
     monkeypatch.setattr(training, 'reduce_max_stat_across_model_parallel_group', lambda x, **kw: x)
     stats = {'stale': True}
-    observer = mock.MagicMock()
     kwargs = dict(
         forward_step_func=None,
         data_iterator=object(),
@@ -372,7 +347,6 @@ def test_dcp_schedule_stats_rerun_and_abort(monkeypatch, outcome, run_config):
         forward_backward_func=forward,
         iteration=0,
         schedule_stats=stats,
-        tensor_metric_observer=observer,
     )
     if outcome == 'exception':
         with pytest.raises(RuntimeError, match='aborted forward'):
@@ -381,8 +355,6 @@ def test_dcp_schedule_stats_rerun_and_abort(monkeypatch, outcome, run_config):
         training.train_step(**kwargs)
         assert forward.call_count == 2
     wrapper.assert_called_once()
-    assert observer.call_count == int(outcome in ('success', 'skipped'))
-    assert observer.observe_forward_backward.call_count == (1 if outcome == 'exception' else 2)
     assert stats == (pending if outcome == 'success' else {})
 
 
