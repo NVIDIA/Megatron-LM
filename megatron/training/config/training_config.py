@@ -9,6 +9,16 @@ from typing import List, Literal, Optional
 class TrainingConfig:
     """Configuration settings related to the training loop."""
 
+    check_optimizer_step_success: bool = True
+    """Synchronize optimizer-step success across model-parallel ranks before advancing the scheduler.
+    Disabling this uses each rank's local result and requires consistent results across ranks.
+    """
+
+    skip_sync_grad_norm_across_mp: bool = False
+    """Skip the reporting-only MAX reduction of gradient norm across model-parallel ranks.
+    This does not change gradient clipping or the optimizer's own norm calculation.
+    """
+
     vision_pretraining_type: Literal["classify", "inpaint", "dino"] | None = None
     """Vision pretraining objective, or None when vision pretraining is disabled."""
 
@@ -177,6 +187,11 @@ class ValidationConfig:
 class SchedulerConfig:
     """Configuration settings for the learning rate scheduler and weight decay."""
 
+    max_steps: int | None = None
+    """Full iteration horizon for LR and weight decay when train_iters shortens a run.
+    Overrides lr_decay_iters without changing train_iters; unavailable with train_samples.
+    """
+
     # ---------------- Learning rate config. ----------------
     lr_decay_style: Literal["constant", "linear", "cosine", "inverse-square-root", "WSD"] = "linear"
     """Learning rate decay function."""
@@ -234,7 +249,7 @@ class SchedulerConfig:
     """number of samples to warmup learning rate over. Calculated at runtime from
     lr_warmup_fraction, lr_warmup_iters, or lr_warmup_samples.
     """
-    
+
     override_opt_param_scheduler: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--override-opt_param-scheduler", "--override-opt-param-scheduler"]}})
     """Reset the values of the scheduler (learning rate, warmup iterations, minimum learning rate,
     maximum number of iterations, and decay style) from input arguments and ignore values from
@@ -271,6 +286,13 @@ class SchedulerConfig:
         weight_decay: float | None,
     ) -> None:
         """Check this section against the rest of the run it belongs to."""
+        if self.max_steps is not None:
+            if self.max_steps <= 0:
+                raise ValueError("scheduler.max_steps must be positive")
+            if train_samples is not None:
+                raise ValueError("scheduler.max_steps requires iteration-based training")
+            if train_iters is not None and self.max_steps < train_iters:
+                raise ValueError("scheduler.max_steps must be at least train_iters")
         if train_iters and not skip_train:
             # If we use iteration-based training, make sure the
             # sample-based options are off.
@@ -646,6 +668,10 @@ class CheckpointConfig:
     thread/process that outlives each save. Required when ``async_save`` is set (an asynchronous
     distributed save is rejected without it)."""
 
+    async_write_results_mp_mode: Literal["fork", "spawn", "forkserver"] = "fork"
+    """Multiprocessing start method of the async checkpoint write-results queue. Only applies
+    when using the persistent ckpt worker (``use_persistent_ckpt_worker``)."""
+
     async_ckpt_cpu_priority: int = 10
     """CPU nice value target (0-19, higher = lower priority) for the async checkpoint writer process.
     If it exceeds 19, it will be set to 19. If the current nice value is greater than the target, it will be left unchanged.
@@ -782,8 +808,10 @@ class CheckpointConfig:
     exchange algorithm. Pass it explicitly on the inference command line."""
 
     dist_ckpt_workers: int = 1
-    """Number of workers for distributed checkpointing. Only used for async save.
-    If set to 1, the checkpointing is performed in a single process."""
+    """Number of workers for distributed checkpointing. Only used for async save; a synchronous
+    torch_dist save always uses 1. If set to 1, the checkpointing is performed in a single
+    process. For torch_dist the number of checkpoint files is
+    ``saving ranks * dist_ckpt_workers``."""
 
     override_ckpt_iteration: int | None = None
     """Override the iteration stored in the loaded checkpoint. Also resets
@@ -819,6 +847,11 @@ class CheckpointConfig:
 
         assert self.async_strategy in ["nvrx"], \
             f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx."
+
+        assert self.async_write_results_mp_mode in ["fork", "spawn", "forkserver"], (
+            f"async_write_results_mp_mode {self.async_write_results_mp_mode!r} is not supported. "
+            "Available modes: fork, spawn, forkserver."
+        )
 
         # An asynchronous distributed save needs the persistent checkpoint worker (a legacy torch
         # save cannot be asynchronous at all: save_checkpoint rejects it). Megatron-Bridge makes
