@@ -550,7 +550,7 @@ EP All-to-All can consume 30-40% of training time without optimization. These fe
 
 ##### Waiting for the Backward PP Receive on the Communication Stream
 
-With PP/VPP, `--ep-overlap-pp-bwd-recv-wait-on-comm-stream` waits for the backward pipeline receive on the EP communication stream instead of the computation stream, so the paired forward layer's pre-dispatch computation does not wait for a late gradient. Results are bitwise identical. See [Combined 1F1B: Expert-Parallel All-to-All Overlap](https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/moe_a2a_overlap.md#backward-pipeline-receive-wait) for the behavior, a diagram, configuration, limitations and tuning.
+With PP/VPP and `--overlap-moe-expert-parallel-comm`, the backward pipeline receive is waited for on the EP communication stream instead of the computation stream, so the paired forward layer's pre-dispatch computation does not wait for a late gradient. Results are bitwise identical to waiting on the computation stream. See [Combined 1F1B: Expert-Parallel All-to-All Overlap](https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/moe_a2a_overlap.md#backward-pipeline-receive-wait) for the behavior, a diagram, limitations and profiling.
 
 ### Compute Optimization
 
@@ -787,7 +787,6 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --moe-grouped-gemm | Use GroupedGEMM; disable with --no-moe-grouped-gemm | True |
 | --overlap-moe-expert-parallel-comm | Batch-level EP overlap | False |
 | --delay-wgrad-compute | Split dgrad/wgrad compute | False |
-| --ep-overlap-pp-bwd-recv-wait-on-comm-stream | Wait for the backward PP receive on the EP comm stream (needs --overlap-moe-expert-parallel-comm) | False |
 | --moe-shared-expert-intermediate-size | Shared expert FFN size | None |
 | --moe-shared-expert-overlap | Overlap shared expert | False |
 

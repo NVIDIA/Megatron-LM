@@ -84,9 +84,7 @@ def build_model(config, use_padding_mask=False, use_mtp_input_mask=False, post_p
     return gpt_model, f_schedule_plan, data
 
 
-def _make_b_grad(
-    f_output, late_pp_recv_streams, late_pp_recv_events=None, sleep_cycles=20_000_000
-):
+def _make_b_grad(f_output, late_pp_recv_streams, late_pp_recv_events=None, sleep_cycles=20_000_000):
     """Return ``(b_grad, pre_backward)`` for one backward chunk of the 1F1B pattern.
 
     Without ``late_pp_recv_streams`` the gradient is ready and there is no hook. Otherwise
@@ -593,21 +591,17 @@ class TestA2AOverlap:
         run_two_chunk_parity(layers, extra_kwargs)
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
-    @pytest.mark.parametrize("pp_bwd_recv_wait_on_comm_stream", [False, True])
     @pytest.mark.parametrize("mtp_layers", [0, 1])
     @pytest.mark.parametrize("layers", [[2, 1], [1, 2], [1, 1]])
-    def test_1f1b_schedule_model_chunk_late_pp_recv(
-        self, pp_bwd_recv_wait_on_comm_stream, mtp_layers, layers
-    ):
+    def test_1f1b_schedule_model_chunk_late_pp_recv(self, mtp_layers, layers):
         """A late backward pipeline receive is waited for before the gradient is read.
 
-        With ``ep_overlap_pp_bwd_recv_wait_on_comm_stream`` the wait is issued on the comm stream
-        only; the backward chunk must still be ordered after it on both streams.
+        The wait is issued on the comm stream only; the backward chunk must still be ordered
+        after it on both streams.
         """
         extra_kwargs = {
             "moe_token_dispatcher_type": "alltoall",
             "overlap_moe_expert_parallel_comm": True,
-            "ep_overlap_pp_bwd_recv_wait_on_comm_stream": pp_bwd_recv_wait_on_comm_stream,
         }
         if mtp_layers > 0:
             extra_kwargs["mtp_num_layers"] = mtp_layers
@@ -615,16 +609,12 @@ class TestA2AOverlap:
         streams = []
         run_two_chunk_parity(layers, extra_kwargs, late_pp_recv_streams=streams)
         assert len(streams) == 2, "pre_backward should run once per backward chunk"
-        expected = get_comm_stream() if pp_bwd_recv_wait_on_comm_stream else get_comp_stream()
-        assert all(stream == expected for stream in streams)
+        assert all(stream == get_comm_stream() for stream in streams)
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
-    @pytest.mark.parametrize("pp_bwd_recv_wait_on_comm_stream", [False, True])
-    def test_1f1b_schedule_late_pp_recv_overlap_intermediate_stage(
-        self, pp_bwd_recv_wait_on_comm_stream
-    ):
+    def test_1f1b_schedule_late_pp_recv_overlap_intermediate_stage(self):
         """On a stage without the output layer, the paired forward pre-dispatch computation
-        runs while a late backward pipeline receive is in flight only with the flag on.
+        runs while a late backward pipeline receive is in flight.
 
         Each chunk has one MoE layer, so the backward chunk starts with combine backward and
         nothing on the compute stream waits for the gradient before the paired forward
@@ -633,7 +623,6 @@ class TestA2AOverlap:
         extra_kwargs = {
             "moe_token_dispatcher_type": "alltoall",
             "overlap_moe_expert_parallel_comm": True,
-            "ep_overlap_pp_bwd_recv_wait_on_comm_stream": pp_bwd_recv_wait_on_comm_stream,
         }
         fwd_done = []
 
@@ -664,12 +653,9 @@ class TestA2AOverlap:
         )
         torch.cuda.synchronize()
         assert len(fwd_done) == 1 and len(recv_done) == 2
-        # Positive: the paired forward pre-dispatch finished after the gradient arrived.
+        # Negative: the paired forward pre-dispatch finished before the gradient arrived.
         fwd_after_recv_ms = recv_done[0].elapsed_time(fwd_done[0])
-        if pp_bwd_recv_wait_on_comm_stream:
-            assert fwd_after_recv_ms < 0, fwd_after_recv_ms
-        else:
-            assert fwd_after_recv_ms > 0, fwd_after_recv_ms
+        assert fwd_after_recv_ms < 0, fwd_after_recv_ms
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())

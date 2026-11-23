@@ -169,60 +169,47 @@ working overlap baseline before adding it.
 
 With PP>1, each steady-state 1F1B step pairs the forward pass of one model chunk
 with the backward pass of another. The backward chunk needs the output gradient
-received from the next pipeline stage; the paired forward layers do not. By
-default, the wait for this receive (`pre_backward`) is issued on the compute
-stream before any layer runs. If the gradient arrives late, for example because
-the next stage is slower (stage imbalance), the paired forward computation waits
-too.
+received from the next pipeline stage; the paired forward layers do not. If the
+gradient arrives late, for example because the next stage is slower (stage
+imbalance), any computation queued behind the receive wait is delayed.
 
-`--ep-overlap-pp-bwd-recv-wait-on-comm-stream` issues the receive wait on the
-communication stream instead. The communication stream waits for the backward
-chunk's CUDA event, waits for the receive, and records the event again. Every
-backward node of the chunk waits on this event on its own stream, so everything
-that reads the gradient stays ordered after the receive. The forward chunk has
-its own event, so its computation is no longer queued behind the receive.
+With `--overlap-moe-expert-parallel-comm`, the scheduler issues this receive wait
+(`pre_backward`) on the communication stream. The communication stream waits
+for the backward chunk's CUDA event, waits for the receive, and records the
+event again. Every backward node of the chunk waits on this event on its own
+stream, so everything that reads the gradient stays ordered after the receive.
+The forward chunk has its own event, so its computation is not queued behind
+the receive. Previously the wait was issued on the compute stream before any
+layer ran, so the paired forward computation waited for a late gradient too.
 
 For the first paired layer, with a late gradient:
 
 ```text
-Without the flag
+Previous behavior (wait on the compute stream)
   compute: [wait recv ..........] F.pre_dispatch  B.expert dgrad  F.expert ...
   comm:                            B.combine       F.dispatch      B.dispatch ...
 
-With the flag
+Current behavior (wait on the communication stream)
   compute: F.pre_dispatch [idle .........] B.expert dgrad  F.expert ...
   comm:    [wait recv ..........] B.combine  F.dispatch     B.dispatch ...
 ```
 
-What changes and what does not:
+What this does and does not change:
 
 - The paired forward layer's pre-dispatch computation (attention, router)
   runs while the gradient is in flight. This is the whole overlap window.
-- `F.dispatch` still waits for the receive, with or without the flag: it is
-  queued on the communication stream after `B.combine`, which needs the
-  gradient. The first backward compute node (normally the expert dgrad) also
-  waits, through the chunk event.
-- The flag only moves the receive wait. The kernels and their order on each
-  stream do not change, so results are bitwise identical with and without it.
-  It hides receive latency; it does not shorten the receive.
+- `F.dispatch` still waits for the receive: it is queued on the communication
+  stream after `B.combine`, which needs the gradient. The first backward
+  compute node (normally the expert dgrad) also waits, through the chunk event.
+- Only where the receive is waited for differs from the previous behavior. The
+  kernels and their order on each stream are the same, so results are bitwise
+  identical. It hides receive latency; it does not shorten the receive.
 
-Configuration:
-
-- Requires `--overlap-moe-expert-parallel-comm` (the config asserts this).
-- Takes effect only where the scheduler passes a backward receive wait to the
-  model chunk: the steady-state 1F1B phase of the interleaved (VPP) schedule
-  with P2P overlap. P2P overlap is on by default with VPP. With
-  `--no-overlap-p2p-communication`, without pipeline parallelism, or on the last
-  pipeline stage (which receives no gradient), the flag has no effect.
-
-```bash
---pipeline-model-parallel-size 4
---num-virtual-stages-per-pipeline-rank 2
---expert-model-parallel-size 32
---overlap-moe-expert-parallel-comm
---delay-wgrad-compute
---ep-overlap-pp-bwd-recv-wait-on-comm-stream
-```
+Where it applies: only where the scheduler passes a backward receive wait to the
+model chunk, that is the steady-state 1F1B phase of the interleaved (VPP)
+schedule with P2P overlap. P2P overlap is on by default with VPP. With
+`--no-overlap-p2p-communication`, without pipeline parallelism, or on the last
+pipeline stage (which receives no gradient), there is no receive to hide.
 
 Limitations. In these cases a compute-stream node waits for the chunk event
 before the paired forward pre-dispatch computation is issued, so most or all of
@@ -241,14 +228,13 @@ Dense layers are not excluded: their dispatch and combine are no-ops, and the
 paired forward pre-dispatch computation is still issued before the dense MLP
 backward, which then waits for the gradient on the compute stream.
 
-Tuning: A/B test the flag on the intended PP/VPP layout. The benefit depends on
-how often and how late the backward receive is, which depends on scale and
-stage balance. In a profile, check for exposed backward PP receive latency at
-the start of 1F1B chunks with the flag off, and whether forward computation runs
-during the receive with it on. Example: DeepSeek-V3 671B with NVFP4 on 64 VR200
-nodes (PP4, EP32, VPP) ran at 17.87 s/step without the flag and 17.57 s/step
-with it (-0.30 s/step). A 4-node proxy did not show the gain, because its
-backward pipeline receives are rarely late.
+Profiling: the benefit depends on how often and how late the backward receive
+is, which depends on scale and stage balance. In a profile, check whether
+forward computation runs during the backward PP receive at the start of 1F1B
+chunks. Example: DeepSeek-V3 671B with NVFP4 on 64 VR200 nodes (PP4, EP32, VPP)
+ran at 17.87 s/step with the wait on the compute stream and 17.57 s/step with
+it on the communication stream (-0.30 s/step). A 4-node proxy did not show the
+gain, because its backward pipeline receives are rarely late.
 
 ### Tensor lifetime management
 
@@ -361,7 +347,6 @@ the normal PP/VPP divisibility and warmup requirements.
 | `--delay-wgrad-compute` | Off | Splits TE linear dgrad and wgrad so wgrad can be scheduled separately. Requires the overlap flag. | Enable when A2A remains exposed because the available forward/dgrad compute is too short. |
 | `--high-priority-a2a-comm-stream` | Off | Creates the schedule's communication stream at high CUDA priority. | Test when A2A launch or progress is delayed by competing compute. It can also steal resources from compute, so retain only with measured benefit. |
 | `--ep-overlap-early-attn-memory-release` | Off | Runs attention backward earlier, before forward MLP, to release attention activations sooner. | Use to reduce an overlap-specific peak-memory regression. It can expose dispatch/combine communication and reduce throughput. |
-| `--ep-overlap-pp-bwd-recv-wait-on-comm-stream` | Off | With PP/VPP, waits for the backward pipeline receive on the communication stream instead of the compute stream, so the paired forward pre-dispatch computation does not wait for a late gradient. Results are bitwise identical. See [Backward pipeline receive wait](#backward-pipeline-receive-wait). | Enable when profiles show the backward PP receive exposed at the start of 1F1B chunks, typically with stage imbalance. |
 
 `--overlap-dispatch-backward-with-experts-wgrad` is a different optimization.
 It overlaps dispatch backward with expert wgrad and is mutually exclusive with
