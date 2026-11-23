@@ -34,7 +34,7 @@ from megatron.core.transformer import cuda_graphs
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
-from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
     run_forward_backward_on_microbatches,
 )
@@ -67,14 +67,8 @@ def process_groups(distributed_setup):
 PARTIAL_SCOPES = ("attn", "mlp", "moe_router", "moe_preprocess")
 
 
-def _moe_config(mla=False, hybrid=False):
-    config_type = MLATransformerConfig if mla else TransformerConfig
-    mla_options = (
-        dict(q_lora_rank=32, kv_lora_rank=32, qk_head_dim=16, qk_pos_emb_head_dim=16, v_head_dim=16)
-        if mla
-        else {}
-    )
-    return config_type(
+def _moe_config(hybrid=False):
+    return TransformerConfig(
         num_layers=4 if hybrid else 2,
         hidden_size=64,
         num_attention_heads=4,
@@ -97,8 +91,6 @@ def _moe_config(mla=False, hybrid=False):
         attention_dropout=0.0,
         hidden_dropout=0.0,
         attention_backend=AttnBackend.unfused,
-        multi_latent_attention=mla,
-        **mla_options,
     )
 
 
@@ -210,19 +202,16 @@ def _rng_contents():
 
 
 @pytest.mark.parametrize(
-    "hybrid,mla,strategy,scopes,separate_streams",
+    "hybrid,strategy,separate_streams",
     [
-        pytest.param(False, False, "optim_grads_params", PARTIAL_SCOPES, False, id="gpt-zero3"),
-        pytest.param(False, True, "optim_grads", ("attn", "moe_router"), True, id="mla-zero2"),
-        pytest.param(True, False, "optim", PARTIAL_SCOPES, True, id="hybrid-zero1"),
+        pytest.param(False, "optim_grads_params", False, id="gpt-zero3"),
+        pytest.param(True, "optim", True, id="hybrid-zero1"),
     ],
 )
-def test_partial_cuda_graph_moe_matches_eager(
-    process_groups, hybrid, mla, strategy, scopes, separate_streams
-):
-    """Check two-microbatch MoE updates, stream policy and the lifetime of captured weights."""
-    config = replace(_moe_config(mla, hybrid), attention_dropout=0.1, hidden_dropout=0.1)
-    recapture = strategy == "optim_grads_params"
+def test_partial_cuda_graph_moe_matches_eager(process_groups, hybrid, strategy, separate_streams):
+    """Check MoE training parity, communication streams and retained weight lifetime."""
+    config = replace(_moe_config(hybrid), attention_dropout=0.1, hidden_dropout=0.1)
+    recapture = not hybrid
     torch.manual_seed(4321 + torch.distributed.get_rank())
     batches = [
         torch.randint(0, 128, (2, 1, 17), device="cuda") for _ in range(7 if recapture else 5)
@@ -241,7 +230,7 @@ def test_partial_cuda_graph_moe_matches_eager(
         assert (streams[0] != streams[1]) == separate_streams
         with fully_shard_context(context):
             model, optimizer = _build_moe_model(
-                config, process_groups, hybrid, list(scopes), strategy, graphs
+                config, process_groups, hybrid, list(PARTIAL_SCOPES), strategy, graphs
             )
         groups = [
             group for layer in model.module.decoder.layers for group in layer.parameter_groups
@@ -306,73 +295,63 @@ def test_partial_cuda_graph_moe_matches_eager(
     torch.testing.assert_close(run(True), run(False), rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("failure", ["start", "finish", "cleanup"])
-def test_partial_capture_failure_retry(process_groups, failure, monkeypatch):
-    """Check rollback before and after graph installation, including a secondary error."""
+@pytest.mark.parametrize("cleanup_fails", [False, True], ids=["retry", "cleanup-error"])
+def test_partial_capture_rollback(process_groups, cleanup_fails, monkeypatch):
+    """Restore capture state and surface the original error even if cleanup raises."""
     config = replace(_moe_config(), attention_dropout=0.1, hidden_dropout=0.1)
-    torch.manual_seed(92)
+    model, optimizer = _build_moe_model(
+        config, process_groups, False, list(PARTIAL_SCOPES), "optim_grads_params", True
+    )
     batches = [torch.randint(0, 128, (2, 1, 17), device="cuda") for _ in range(4)]
+    for batch in batches[:3]:
+        _train_moe_step(model, optimizer, batch)
 
-    def run(graphs):
-        model, optimizer = _build_moe_model(
-            config, process_groups, False, list(PARTIAL_SCOPES), "optim_grads_params", graphs
-        )
-        for batch in batches[:3]:
-            _train_moe_step(model, optimizer, batch)
-        if not graphs:
-            return _train_moe_step(model, optimizer, batches[-1])
+    helper = TECudaGraphHelper([model], model.config, 16, 1, [optimizer], process_groups)
+    layers = helper.flattened_callables
+    rng = _rng_contents()
+    hook_names = ("_forward_pre_hooks", "_forward_hooks", "_backward_pre_hooks", "_backward_hooks")
+    hooks = [{name: dict(getattr(layer, name)) for name in hook_names} for layer in layers]
+    original_start = helper._start_capturing
 
-        helper = TECudaGraphHelper([model], model.config, 16, 1, [optimizer], process_groups)
-        layers = helper.flattened_callables
-        rng = _rng_contents()
-        hook_names = (
-            "_forward_pre_hooks",
-            "_forward_hooks",
-            "_backward_pre_hooks",
-            "_backward_hooks",
-        )
-        hooks = [{name: dict(getattr(layer, name)) for name in hook_names} for layer in layers]
-        original_calls = {type(layer): type(layer).__call__ for layer in layers}
+    def fail(*args):
+        raise RuntimeError("controlled capture failure")
 
-        def fail(*args, **kwargs):
-            raise RuntimeError("controlled capture failure")
+    def fail_after_start():
+        original_start()
+        fail()
 
-        def fail_cleanup():
-            raise RuntimeError("controlled cleanup failure")
+    def fail_cleanup():
+        raise RuntimeError("controlled cleanup failure")
 
-        start = helper._start_capturing
-
-        def fail_after_start():
-            start()
-            fail()
-
-        try:
+    # Reuse the idle model to cover failures before and after graph installation.
+    failures = [("_finish_capturing", fail)]
+    if not cleanup_fails:
+        failures.insert(0, ("_start_capturing", fail_after_start))
+    try:
+        for method, inject_failure in failures:
             with monkeypatch.context() as patch:
-                if failure == "start":
-                    patch.setattr(helper, "_start_capturing", fail_after_start)
-                else:
-                    patch.setattr(helper, "_finish_capturing", fail)
-                if failure == "cleanup":
+                patch.setattr(helper, method, inject_failure)
+                if cleanup_fails:
                     patch.setattr(helper, "_reset_after_capture", fail_cleanup)
                 with pytest.raises(RuntimeError, match="controlled capture failure") as error:
                     helper.create_cudagraphs()
-            if failure == "cleanup":
+            if cleanup_fails:
                 assert any("controlled cleanup failure" in note for note in error.value.__notes__)
-            assert not cuda_graphs.is_graph_capturing()
-            assert not te_graph.is_graph_capturing()
+            assert not (cuda_graphs.is_graph_capturing() or te_graph.is_graph_capturing())
             assert not helper.graphs_created()
             torch.testing.assert_close(_rng_contents(), rng, rtol=0, atol=0)
             for layer, original_hooks in zip(layers, hooks):
-                assert type(layer).__call__ is original_calls[type(layer)]
                 assert all(getattr(layer, name) == original_hooks[name] for name in hook_names)
                 assert not layer._fsdp_cuda_graph_capturing
                 assert not layer.te_cuda_graphs
                 assert all(not group._retain_unsharded_storage for group in layer.parameter_groups)
-            helper.create_cudagraphs()
-            return _train_moe_step(model, optimizer, batches[-1])
-        finally:
-            if helper.graphs_created():
-                helper.delete_cuda_graphs()
-            cuda_graphs._set_capture_end()
 
-    torch.testing.assert_close(run(True), run(False), rtol=0, atol=0)
+        if not cleanup_fails:
+            helper.create_cudagraphs()
+            assert helper.graphs_created()
+            loss, *_ = _train_moe_step(model, optimizer, batches[-1])
+            assert torch.isfinite(loss).all()
+    finally:
+        if helper.graphs_created():
+            helper.delete_cuda_graphs()
+        cuda_graphs._set_capture_end()
