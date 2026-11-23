@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 name: Publish Testmon caches
-run-name: Publish Testmon caches for ${{ github.sha }}
+run-name: ${{ inputs.run_id && format('Publish Testmon caches from run {0}', inputs.run_id) || format('Publish Testmon caches for {0}', github.sha) }}
 
 # Merge groups targeting main record Testmon baselines as artifacts. Their caches
 # would be scoped to the temporary merge-queue ref, so publish them from main once
@@ -10,9 +10,16 @@ on:
   push:
     branches:
       - main
+  # Republish a landed merge group's caches, e.g. to make an older commit the PR baseline.
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: cicd-main.yml merge-group run ID whose Testmon caches PRs should use
+        type: string
+        required: true
 
 concurrency:
-  group: publish-testmon-cache-${{ github.sha }}
+  group: publish-testmon-cache-${{ inputs.run_id || github.sha }}
   cancel-in-progress: false
 
 permissions:
@@ -26,19 +33,48 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       run_id: ${{ steps.find.outputs.run_id }}
+      source_sha: ${{ steps.find.outputs.source_sha }}
       matrix: ${{ steps.find.outputs.matrix }}
     steps:
-      - name: Find the first attempt of this commit's merge group
+      - name: Find the merge-group baselines to publish
         id: find
         shell: bash -e -u -o pipefail {0}
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
-          SOURCE_SHA: ${{ github.sha }}
+          REQUESTED_RUN_ID: ${{ inputs.run_id }}
         run: |
-          # A landed merge-group commit is the main commit, so match it exactly.
-          RUN_ID=$(gh api "repos/$REPOSITORY/actions/workflows/cicd-main.yml/runs?event=merge_group&head_sha=$SOURCE_SHA&per_page=100" \
-            --jq "[.workflow_runs[] | select(.head_repository.full_name == \"$REPOSITORY\")] | first | .id // empty")
+          if [[ -n "$REQUESTED_RUN_ID" ]]; then
+            # Caches saved from other refs are invisible to PRs.
+            if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+              echo "::error::Dispatch this workflow from main."
+              exit 1
+            fi
+            if [[ ! "$REQUESTED_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::run_id must be a numeric workflow run ID."
+              exit 1
+            fi
+            RUN=$(gh api "repos/$REPOSITORY/actions/runs/$REQUESTED_RUN_ID")
+            if ! jq -e --arg repository "$REPOSITORY" '.path == ".github/workflows/cicd-main.yml"
+                and .event == "merge_group" and .head_repository.full_name == $repository
+                and (.head_branch | startswith("gh-readonly-queue/main/"))' <<< "$RUN" > /dev/null; then
+              echo "::error::Run $REQUESTED_RUN_ID is not a cicd-main.yml merge group targeting main."
+              exit 1
+            fi
+            SOURCE_SHA=$(jq -r .head_sha <<< "$RUN")
+            # Only landed commits may become PR baselines.
+            STATUS=$(gh api "repos/$REPOSITORY/compare/$SOURCE_SHA...main" --jq .status)
+            if [[ "$STATUS" != "identical" && "$STATUS" != "ahead" ]]; then
+              echo "::error::Run $REQUESTED_RUN_ID tested $SOURCE_SHA, which is not on main."
+              exit 1
+            fi
+            RUN_ID=$REQUESTED_RUN_ID
+          else
+            SOURCE_SHA=$GITHUB_SHA
+            # A landed merge-group commit is the main commit, so match it exactly.
+            RUN_ID=$(gh api "repos/$REPOSITORY/actions/workflows/cicd-main.yml/runs?event=merge_group&head_sha=$SOURCE_SHA&per_page=100" \
+              --jq "[.workflow_runs[] | select(.head_repository.full_name == \"$REPOSITORY\")] | first | .id // empty")
+          fi
           MATRIX='[]'
           if [[ -n "$RUN_ID" ]]; then
             # Generations must come from the first attempt, as PR checkouts require.
@@ -47,13 +83,19 @@ jobs:
               | jq -R -s -c 'split("\n") | map(select(length > 0)) | map({artifact: .})')
           fi
           echo "run_id=$RUN_ID" | tee -a "$GITHUB_OUTPUT"
+          echo "source_sha=$SOURCE_SHA" | tee -a "$GITHUB_OUTPUT"
           echo "matrix=$MATRIX" | tee -a "$GITHUB_OUTPUT"
           if [[ "$MATRIX" == "[]" ]]; then
+            if [[ -n "$REQUESTED_RUN_ID" ]]; then
+              echo "::error::Run $REQUESTED_RUN_ID has no unexpired first-attempt Testmon baselines."
+              exit 1
+            fi
             echo "::notice::No merge-group Testmon baselines for $SOURCE_SHA; nothing to publish."
           fi
 
   publish:
-    name: Publish ${{ matrix.artifact }}
+    # PR checkouts read the baseline commit and generation from this name.
+    name: Publish ${{ matrix.artifact }} from run ${{ needs.find.outputs.run_id }} at ${{ needs.find.outputs.source_sha }}
     needs: find
     if: needs.find.outputs.matrix != '[]'
     runs-on: ubuntu-latest
@@ -65,7 +107,7 @@ jobs:
       - name: Checkout the landed commit
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.find.outputs.source_sha }}
 
       - name: Download the merge-group baseline
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
@@ -80,7 +122,7 @@ jobs:
         shell: bash -e -u -o pipefail {0}
         env:
           ARTIFACT: ${{ matrix.artifact }}
-          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_SHA: ${{ needs.find.outputs.source_sha }}
           GENERATION: ${{ needs.find.outputs.run_id }}-1
         run: |
           MANIFEST=assets_dir/testmon/manifest.json
