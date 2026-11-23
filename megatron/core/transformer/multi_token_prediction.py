@@ -55,7 +55,6 @@ from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
     get_pg_rank,
     get_pg_size,
-    is_torch_min_version,
     make_tp_sharded_tensor_for_checkpoint,
     make_viewless_tensor,
 )
@@ -65,10 +64,6 @@ if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
     from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
 
-if is_torch_min_version("1.13.0"):
-    dist_all_gather_func = torch.distributed.all_gather_into_tensor
-else:
-    dist_all_gather_func = torch.distributed._all_gather_base
 
 SUPPORTED_ATTN_MASK = [
     AttnMaskType.padding,
@@ -230,16 +225,42 @@ def tie_output_layer_state_dict(
     )
 
 
+class _ExchangeCPRollBoundaries(torch.autograd.Function):
+    """Zigzag CP boundary exchange whose backward returns each gradient to the token's owner."""
+
+    @staticmethod
+    def forward(ctx, first_boundary, second_boundary, cp_group):
+        """Receive the next rank's first token and the previous rank's second-chunk token."""
+        ctx.cp_group = cp_group
+        first_received, second_received = exchange_neighbor_tokens(
+            (first_boundary, second_boundary), cp_group, (-1, 1)
+        )
+        # On the last rank the first chunk is followed by this rank's own second chunk.
+        ctx.first_is_local = first_received is None
+        if first_received is None:
+            first_received = second_boundary.clone()
+        if second_received is None:
+            second_received = torch.zeros_like(second_boundary)
+        return first_received, second_received
+
+    @staticmethod
+    def backward(ctx, grad_first, grad_second):
+        """Send each boundary gradient back in the opposite direction of its token."""
+        grad_first_boundary, grad_second_boundary = exchange_neighbor_tokens(
+            (grad_first, grad_second), ctx.cp_group, (1, -1)
+        )
+        if grad_first_boundary is None:
+            grad_first_boundary = torch.zeros_like(grad_first)
+        if grad_second_boundary is None:
+            grad_second_boundary = torch.zeros_like(grad_second)
+        if ctx.first_is_local:
+            grad_second_boundary = grad_second_boundary + grad_first
+        return grad_first_boundary, grad_second_boundary, None
+
+
 def _exchange_cp_roll_boundaries(first_boundary, second_boundary, cp_group):
     """Exchange both roll boundaries with the adjacent context-parallel ranks."""
-    first_received, second_received = exchange_neighbor_tokens(
-        (first_boundary, second_boundary), cp_group, (-1, 1)
-    )
-    if first_received is None:
-        first_received = second_boundary
-    if second_received is None:
-        second_received = torch.zeros_like(second_boundary)
-    return first_received, second_received
+    return _ExchangeCPRollBoundaries.apply(first_boundary, second_boundary, cp_group)
 
 
 def roll_tensor(
@@ -380,11 +401,9 @@ def roll_tensor_precomputed_embeddings(
         return roll_contiguous(tensor, dims, cp_group, packed_seq_params, sp_group=sp_group)
     sp_size = get_pg_size(sp_group)
     if sp_size > 1:
-        gathered_shape = list(tensor.shape)
-        gathered_shape[dims] *= sp_size
-        full_tensor = torch.empty(gathered_shape, dtype=tensor.dtype, device=tensor.device)
-        dist_all_gather_func(full_tensor, tensor.contiguous(), group=sp_group)
-        tensor = full_tensor
+        assert dims == 0, f"Sequence-parallel roll only supports dims=0, got dims={dims}"
+        # Differentiable gather: its backward reduce-scatters the gradient back to each SP shard.
+        tensor = gather_from_sequence_parallel_region(tensor, group=sp_group)
     rolled, _ = roll_tensor(
         tensor,
         shifts=shifts,
