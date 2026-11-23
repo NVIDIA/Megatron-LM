@@ -72,7 +72,7 @@ def validate_lora_plus_warmup(
     """Reject unequal named A/B bounds with a shared nonzero initial warmup LR.
 
     Check the policy rather than local parameter presence so pipeline ranks agree.
-    This also covers hand-written LoRA+ mappings and custom callables.
+    This covers hand-written mappings and callables using standard adapter globs.
     """
     if initial_lr == 0:
         return

@@ -22,9 +22,10 @@ The callable contributes only B's differing bounds. Ratio one returns an empty
 mapping, and A stays in the base group. This avoids creating another group with
 the same checkpoint identity as other trainable base weights.
 
-MLM setup rejects unequal name-based A/B bounds with a nonzero initial warmup LR,
-including hand-written mappings. The check does not depend on rank-local adapter
-presence. The callable serializes through the existing recipe target mechanism
+MLM setup rejects unequal A/B bounds selected by the standard adapter name globs
+with a nonzero initial warmup LR, including hand-written mappings using those
+globs. Arbitrary layer-specific selectors require validation by their provider.
+The check does not depend on rank-local adapter presence. The callable serializes through the existing recipe target mechanism
 and can also be supplied to Bridge's shared mapping/callable interface.
 
 This configures optimizer groups only; adapter construction, freezing and adapter
