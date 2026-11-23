@@ -1147,13 +1147,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/experimental_attention_variant/dsa_gqa_inference.py",
             "megatron/core/transformer/experimental_attention_variant/dsa_gqa_inference_kernels.py",
         ),
+        tests=(K + "test_inference_kernels.py",),
         kind="triton",
         training_path=False,
-        exempt_reason="FlashInfer GVR2 top-k can vary tied indices and output ordering. "
-        "Native DSA decode does not support deterministic mode and rejects it before top-k "
-        "execution; this path has no bit-exact replay guarantee.",
-        notes="Paged Triton prefill and Gluon/Triton decode have exact top-k and training/decode "
-        "numerical parity coverage in "
+        notes="Deterministic mode routes decode rows, like prefill rows, through Triton scores "
+        "and FlashInfer's deterministic ragged top-k; the replay covers decode, prefill and mixed steps with tied scores, "
+        "windowed score buffers, eager and CUDA-graph replay. Native decode's FlashInfer GVR2 "
+        "top-k can vary tied indices, so it runs only outside deterministic mode and rejects "
+        "direct calls in it. Paged Triton prefill and Gluon/Triton decode have exact top-k and "
+        "training/decode numerical parity coverage in "
         "tests/unit_tests/transformer/experimental_attention_variant/test_dsa_gqa_inference.py, "
         "including empty/ragged requests, causal masks, and graph page-table refresh.",
     ),
