@@ -171,6 +171,14 @@ def test_real_mok_ddp_numerics(gated, main_grad_dtype, backend):
                 parameter.copy_(
                     torch.randn(parameter.shape, generator=generator, device="cuda") / 16
                 )
+        # No DDP yet, so no main_grad: forward only, as in --skip-train evaluation.
+        assert all(getattr(p, "main_grad", None) is None for p in model.parameters())
+        eval_generator = torch.Generator(device="cuda").manual_seed(4321)
+        x = torch.randn(512, 256, generator=eval_generator, device="cuda", dtype=torch.bfloat16)
+        probs = torch.randn(512, 2, generator=eval_generator, device="cuda").softmax(-1)
+        weights = {name: p.detach() for name, p in model.named_parameters()}
+        with torch.no_grad():
+            _assert_numerics(model(x, probs), _reference(x, probs, weights), "output without DDP")
         ddp = DistributedDataParallel(
             config,
             DistributedDataParallelConfig(
@@ -188,9 +196,9 @@ def test_real_mok_ddp_numerics(gated, main_grad_dtype, backend):
         assert set(parameters) <= set(checkpoint)
         assert all(not name.startswith("megakernel_experts.") for name in checkpoint)
         assert all(not name.startswith("megakernel_experts.") for name in parameters)
-        backend = model.megakernel_experts
+        megakernel = model.megakernel_experts
         if gated:
-            assert backend.shared_output_gate_weight is model.shared_experts.gate_weight
+            assert megakernel.shared_output_gate_weight is model.shared_experts.gate_weight
         buffers = {name: p.main_grad for name, p in parameters.items()}
         assert all(buf.dtype == main_grad_dtype for buf in buffers.values())
         original = {name: p.detach().clone() for name, p in parameters.items()}
@@ -237,7 +245,7 @@ def test_real_mok_ddp_numerics(gated, main_grad_dtype, backend):
         optimizer.zero_grad(set_to_none=True)
         reference_optimizer.step()
         reference_optimizer.zero_grad(set_to_none=True)
-        backend.is_first_microbatch = True
+        megakernel.is_first_microbatch = True
         x, probs, upstream = batches[0]
         with torch.no_grad():
             updated = ddp(x, probs)

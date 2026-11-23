@@ -1057,15 +1057,15 @@ class TestMoEModules:
         ).submodules.mlp
         with get_fp8_context(config, is_init=True):
             layer = MoELayer(config, get_submodules(spec)).cuda()
-        backend = layer.megakernel_experts
+        megakernel = layer.megakernel_experts
         assert layer.token_dispatcher is None and layer.megakernel_fuses_shared_expert == fused
-        assert (backend.shared_fc1_weight is not None) == fused
-        assert (backend.shared_output_gate_weight is not None) == gated
-        assert backend.situ_beta == (None if fused else (2.0, 8.0))
-        assert backend.use_mxfp8_weights == mxfp8
+        assert (megakernel.shared_fc1_weight is not None) == fused
+        assert (megakernel.shared_output_gate_weight is not None) == gated
+        assert megakernel.situ_beta == (None if fused else (2.0, 8.0))
+        assert megakernel.use_mxfp8_weights == mxfp8
         assert all(
             is_mxfp8tensor(p) == mxfp8
-            for p in backend.routed_fc1_parameters + backend.routed_fc2_parameters
+            for p in megakernel.routed_fc1_parameters + megakernel.routed_fc2_parameters
         )
         model = DistributedDataParallel(
             config,

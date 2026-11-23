@@ -73,6 +73,7 @@ def _cutemok_plan(module: "MoKMegakernel", api, x: torch.Tensor):
         has_shared=module.shared_fc1_weight is not None,
         split_routed_weights=not module.native_single_grouped_weights,
         shared_output_gate=module.shared_output_gate_weight is not None,
+        backward=main_grad is not None,
         main_grad_dtype=None if main_grad is None else main_grad.dtype,
         routed_precision="mxfp8" if module.use_mxfp8_weights else "bf16",
         native_columnwise=module.use_mxfp8_weights,

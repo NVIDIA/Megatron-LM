@@ -99,6 +99,57 @@ def test_megakernel_backend_name_is_validated():
         _mok_transformer_config(moe_megakernel_backend="cute_mok")
 
 
+@pytest.mark.parametrize("backend", ["mok", "cutemok"])
+def test_mok_rejects_megatron_fsdp_in_cli_arguments(monkeypatch, backend):
+    from megatron.training.arguments import parse_args, validate_args
+
+    argv = ["test_mok_weights.py", "--num-layers", "2", "--hidden-size", "128"]
+    argv += ["--num-attention-heads", "4", "--seq-length", "128", "--max-position-embeddings"]
+    argv += ["128", "--micro-batch-size", "1", "--num-experts", "8", "--moe-grouped-gemm"]
+    argv += ["--moe-megakernel-backend", backend, "--use-megatron-fsdp"]
+    monkeypatch.setattr("sys.argv", argv)
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.delenv("CUDA_DEVICE_MAX_CONNECTIONS", raising=False)
+    monkeypatch.setattr("megatron.training.arguments.get_device_arch_version", lambda: 10)
+    monkeypatch.setattr("megatron.training.arguments._print_args", lambda *_args: None)
+    with pytest.raises(ValueError, match="MOK has not been validated with Megatron-FSDP"):
+        validate_args(parse_args())
+
+
+@pytest.mark.parametrize("backend", ["mok", "cutemok"])
+def test_mok_rejects_megatron_fsdp_in_typed_config(monkeypatch, backend):
+    from megatron.core.distributed import DistributedDataParallelConfig
+    from megatron.core.optimizer import OptimizerConfig
+    from megatron.training.config import PretrainConfigContainer
+    from megatron.training.config.training_config import (
+        CheckpointConfig,
+        LoggerConfig,
+        SchedulerConfig,
+        TrainingConfig,
+    )
+    from megatron.training.models.gpt import GPTModelConfig
+
+    monkeypatch.delenv("CUDA_DEVICE_MAX_CONNECTIONS", raising=False)
+    container = PretrainConfigContainer(
+        train=TrainingConfig(micro_batch_size=1, global_batch_size=4, train_iters=2),
+        model=GPTModelConfig(
+            transformer=_mok_transformer_config(moe_megakernel_backend=backend),
+            vocab_size=1024,
+            seq_length=512,
+        ),
+        optimizer=OptimizerConfig(optimizer="adam", lr=1e-4, min_lr=0.0),
+        scheduler=SchedulerConfig(lr_decay_iters=2),
+        logger=LoggerConfig(),
+        checkpoint=CheckpointConfig(ckpt_format="fsdp_dtensor"),
+        ddp=DistributedDataParallelConfig(
+            use_megatron_fsdp=True, data_parallel_sharding_strategy="optim_grads_params"
+        ),
+    )
+    with pytest.raises(ValueError, match="MOK has not been validated with FSDP"):
+        container._validate_ddp_config()
+
+
 def test_native_moe_still_accepts_fp64_router():
     config = _mok_transformer_config(moe_megakernel_backend=None, moe_router_dtype="fp64")
     assert config.moe_router_dtype == "fp64"
