@@ -729,22 +729,23 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             if hasattr(meta, name)
         }
 
-        def write_token_maps(gpu_view, rows, positions, block_table, padded_token_count, **kw):
-            # `**kw` absorbs future arguments, for the same reason as above.
+        def write_token_maps(
+            gpu_view, rows, positions, block_table, padded_token_count, inherited_blocks=None
+        ):
             result = originals["write_token_maps"](
                 gpu_view=gpu_view,
                 rows=rows,
                 positions=positions,
                 block_table=block_table,
                 padded_token_count=padded_token_count,
-                **kw,
+                inherited_blocks=inherited_blocks,
             )
             record(gpu_view, positions.numel())
             return result
 
-        def write_draft_step_metadata(gpu_view, *args, **kw):
+        def write_draft_step_metadata(gpu_view):
             # One token per request slot; padding rows are sent to the dummy block.
-            result = originals["write_draft_step_metadata"](gpu_view, *args, **kw)
+            result = originals["write_draft_step_metadata"](gpu_view)
             record(gpu_view, meta.padded_count)
             return result
 
