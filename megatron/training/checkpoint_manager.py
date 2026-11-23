@@ -242,7 +242,11 @@ def create_checkpoint_manager(checkpoint_config: "CheckpointConfig") -> Checkpoi
     if target is None:
         return DefaultCheckpointManager(checkpoint_config)
 
-    from megatron.training.config.instantiate_utils import target_allowlist
+    from megatron.training.config.instantiate_utils import (
+        InstantiationException,
+        _reject_unsafe_target_name,
+        target_allowlist,
+    )
 
     if "." not in target:
         raise ValueError(
@@ -255,6 +259,11 @@ def create_checkpoint_manager(checkpoint_config: "CheckpointConfig") -> Checkpoi
             "allowlist. Register its package with "
             "megatron.training.config.target_allowlist.add_prefix('<package>.') first."
         )
+    # Same unsafe-name denylist as the checkpoint reader, applied before anything is imported.
+    try:
+        _reject_unsafe_target_name(target=target, full_key="checkpoint.custom_manager_class")
+    except InstantiationException as e:
+        raise ValueError(f"Invalid checkpoint.custom_manager_class '{target}': {e}") from e
 
     module_path, class_name = target.rsplit(".", 1)
     try:
@@ -268,21 +277,38 @@ def create_checkpoint_manager(checkpoint_config: "CheckpointConfig") -> Checkpoi
     except AttributeError as e:
         raise AttributeError(f"Module '{module_path}' has no class '{class_name}': {e}") from e
 
-    manager = manager_class(checkpoint_config)
-    if not isinstance(manager, CheckpointManager):
+    # Validate the class before calling it: the allowlist admits whole packages, so the target may
+    # be any callable in them (e.g. a function with side effects), and calling it is the risk.
+    if not inspect.isclass(manager_class):
+        raise TypeError(
+            f"Custom checkpoint manager '{target}' must be a class, got {type(manager_class).__name__}."
+        )
+    missing = [
+        name
+        for name in ("save", "load", "finalize_async_saves")
+        if not callable(getattr(manager_class, name, None))
+    ]
+    if missing:
         raise TypeError(
             f"Custom checkpoint manager '{target}' must implement save(ctx), load(ctx) and "
-            "finalize_async_saves(blocking, terminate)."
+            f"finalize_async_saves(blocking, terminate); missing: {', '.join(missing)}."
         )
     try:
-        inspect.signature(manager.save).bind(None)
-        inspect.signature(manager.load).bind(None)
+        inspect.signature(manager_class).bind(checkpoint_config)
+    except (TypeError, ValueError) as e:
+        raise TypeError(
+            f"Custom checkpoint manager '{target}' must be constructible with a single "
+            "CheckpointConfig argument."
+        ) from e
+    try:
+        inspect.signature(manager_class.save).bind(None, None)
+        inspect.signature(manager_class.load).bind(None, None)
     except (TypeError, ValueError) as e:
         raise TypeError(
             f"Custom checkpoint manager '{target}': save and load must each accept one context "
             "argument."
         ) from e
-    return manager
+    return manager_class(checkpoint_config)
 
 
 _checkpoint_manager: Optional[CheckpointManager] = None

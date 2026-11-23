@@ -101,6 +101,26 @@ class TestCreateCheckpointManager:
         with pytest.raises(ValueError, match="allowlist"):
             cm.create_checkpoint_manager(_config("not_an_allowed_pkg.module.Manager"))
 
+    def test_non_class_target_is_rejected_without_being_called(self, custom_module):
+        called = []
+        custom_module.side_effect_fn = lambda config: called.append(config)
+
+        with pytest.raises(TypeError, match="must be a class"):
+            cm.create_checkpoint_manager(_config(f"{_CUSTOM_MODULE}.side_effect_fn"))
+
+        assert called == []
+
+    def test_unsafe_target_is_rejected_before_import(self):
+        from megatron.training.config.instantiate_utils import target_allowlist
+
+        with patch.object(target_allowlist, "is_allowed", return_value=True), patch(
+            "importlib.import_module"
+        ) as import_module:
+            with pytest.raises(ValueError, match="not allowed"):
+                cm.create_checkpoint_manager(_config("torch.hub.load"))
+
+        import_module.assert_not_called()
+
     @pytest.mark.parametrize(
         "target, error",
         [
