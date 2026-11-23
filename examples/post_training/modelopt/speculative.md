@@ -54,7 +54,8 @@ and an offline EAGLE3 GPTModel checkpoint prepared with
 must use the same teacher weights and tokenizer. Install ModelOpt at
 `0e6a792cfccf0bda1ebaecfec8f9b8d294858d62` from
 [#3473](https://github.com/NVIDIA/Model-Optimizer/pull/3473), and install NIXL
-for the CUDA version used by each process.
+with the same backend version and CUDA major in the producer and trainer so
+they can deserialize the same transfer descriptors.
 
 The following one-step Qwen3-0.6B smoke test assumes the server is already running on a separate
 GPU at port 18876 under the name `qwen3-teacher`. Set `TEACHER_MODEL` to the local teacher
