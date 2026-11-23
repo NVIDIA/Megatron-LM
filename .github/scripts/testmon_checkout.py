@@ -13,6 +13,10 @@ import tempfile
 from pathlib import Path
 
 REPOSITORY = "NVIDIA/Megatron-LM"
+# publish-testmon-cache.yml names each successful publish job after its source.
+PUBLISH_JOB = re.compile(
+    r"Publish unit-testmon-v[0-9]+-main-.+-1 from run ([1-9][0-9]*) at ([0-9a-f]{40})"
+)
 
 
 def run(
@@ -45,48 +49,40 @@ def sha(value: object) -> str:
 
 
 def published_baseline() -> tuple[str, str] | None:
-    """Find the latest main commit whose merge-group baselines were published."""
+    """Find the latest merge-group baseline published on push or by manual dispatch."""
     try:
         publishers = json.loads(
             run(
                 "gh",
                 "api",
                 f"repos/{REPOSITORY}/actions/workflows/publish-testmon-cache.yml/"
-                "runs?branch=main&event=push&status=completed&per_page=100",
+                "runs?branch=main&status=completed&per_page=100",
             )
         )
     except subprocess.CalledProcessError:
         # The publisher workflow may not exist on main yet.
         return None
     for publisher in publishers["workflow_runs"]:
-        if publisher["head_repository"]["full_name"] != REPOSITORY:
+        if (
+            publisher["event"] not in {"push", "workflow_dispatch"}
+            or publisher["head_repository"]["full_name"] != REPOSITORY
+        ):
             continue
         # Commits without merge-group artifacts complete without publishing anything.
-        published = json.loads(
+        names = json.loads(
             run(
                 "gh",
                 "api",
                 f'repos/{REPOSITORY}/actions/runs/{publisher["id"]}/jobs?per_page=100',
                 "--jq",
-                '[.jobs[] | select((.name | startswith("Publish ")) and .conclusion == "success")]'
-                " | length",
+                '[.jobs[] | select(.conclusion == "success") | .name]',
             )
         )
-        if not published:
-            continue
-        source = sha(publisher["head_sha"])
-        producers = json.loads(
-            run(
-                "gh",
-                "api",
-                f"repos/{REPOSITORY}/actions/workflows/cicd-main.yml/"
-                f"runs?event=merge_group&head_sha={source}&per_page=100",
-            )
-        )
-        for producer in producers["workflow_runs"]:
-            if producer["head_repository"]["full_name"] == REPOSITORY:
-                # The publisher only accepts first-attempt merge-group artifacts.
-                return source, f'{producer["id"]}-1'
+        sources = {match.groups() for name in names if (match := PUBLISH_JOB.fullmatch(name))}
+        if len(sources) == 1:
+            # The publisher only accepts first-attempt merge-group artifacts.
+            producer, source = sources.pop()
+            return sha(source), f"{producer}-1"
     return None
 
 
