@@ -10,6 +10,7 @@ import random
 import re
 import shutil
 import sys
+import tempfile
 import threading
 import types
 from argparse import Namespace
@@ -534,6 +535,87 @@ def get_checkpoint_tracker_filename(checkpoints_path):
     return os.path.join(checkpoints_path, 'latest_checkpointed_iteration.txt')
 
 
+def _fsync_directory(path: str) -> None:
+    """Best-effort fsync of a directory, so a rename inside it is durable.
+
+    A failure to fsync the directory (for example, on filesystems that do
+    not support it) must not fail the save; the rename itself is still
+    atomic with respect to a process crash.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def write_text_file_atomically(filename: str, content: str) -> None:
+    """Write ``content`` to ``filename`` so a crash can never leave a torn file.
+
+    The content is written to a temporary file in the same directory, fsynced,
+    and then atomically renamed over ``filename``; a crash at any point before
+    the rename leaves the previous content in place, and the directory is
+    fsynced afterwards so the rename also survives a power loss. With the
+    multi-storage client enabled the write goes through a single PUT, which
+    object stores apply atomically, so the temporary-file dance is skipped
+    there.
+    """
+    if MultiStorageClientFeature.is_enabled():
+        with maybe_msc.open(filename, 'w') as f:
+            f.write(content)
+        return
+
+    directory = os.path.dirname(filename) or '.'
+    fd, tmp_filename = tempfile.mkstemp(
+        prefix=f'.{os.path.basename(filename)}.tmp-', dir=directory
+    )
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_filename, filename)
+    except BaseException:
+        try:
+            os.unlink(tmp_filename)
+        except OSError:
+            pass
+        raise
+    _fsync_directory(directory)
+
+
+def copy_file_atomically(src: str, dst: str) -> None:
+    """Copy ``src`` to ``dst`` so a crash can never leave a torn ``dst``.
+
+    Same atomicity contract as :func:`write_text_file_atomically`: the copy
+    lands in a temporary file in the destination directory first and is then
+    renamed over ``dst``. Local filesystems only; callers keep the
+    multi-storage-client path (a single PUT) separate.
+    """
+    directory = os.path.dirname(dst) or '.'
+    fd, tmp_filename = tempfile.mkstemp(prefix=f'.{os.path.basename(dst)}.tmp-', dir=directory)
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            with open(src, 'rb') as src_file:
+                shutil.copyfileobj(src_file, f)
+            f.flush()
+            os.fsync(f.fileno())
+        shutil.copymode(src, tmp_filename)
+        os.replace(tmp_filename, dst)
+    except BaseException:
+        try:
+            os.unlink(tmp_filename)
+        except OSError:
+            pass
+        raise
+    _fsync_directory(directory)
+
+
 def checkpoint_exists(checkpoints_path):
     """Return whether a persistent root has a train-state or legacy text tracker."""
     if checkpoints_path is None:
@@ -557,7 +639,10 @@ def read_metadata(tracker_filename):
             release = metastring == 'release'
             if not release:
                 print_rank_0('ERROR: Invalid metadata file {}. Exiting'.format(tracker_filename))
-                sys.exit()
+                # Exit non-zero: an unreadable tracker means the job cannot
+                # resume, and a scheduler must not mistake the exit for a
+                # successful run (see gh-9713: sys.exit() used to exit 0).
+                sys.exit(1)
             else:
                 # Set iteration to 0 for release checkpoints
                 iteration = 0
@@ -1313,7 +1398,20 @@ def save_checkpoint(
                 if save_retain_interval is not None:
                     if maybe_msc.os.path.exists(tracker_filename):
                         with maybe_msc.open(tracker_filename, 'r') as f:
-                            prev_iteration = int(f.read().strip())
+                            prev_content = f.read().strip()
+                        try:
+                            prev_iteration = int(prev_content)
+                        except ValueError:
+                            # Fail loudly instead of dying on a bare int()
+                            # parse: a torn tracker can only be left behind
+                            # by a crash from before atomic tracker writes
+                            # (gh-9713) or by hand, and guessing 0 here
+                            # could delete the wrong checkpoint.
+                            raise ValueError(
+                                f'Invalid iteration {prev_content!r} in checkpoint '
+                                f'tracker {tracker_filename}; repair or remove '
+                                'the file and retry.'
+                            ) from None
                 # Save run_config.yaml
                 checkpoint_name = get_checkpoint_name(
                     save_dir,
@@ -1366,10 +1464,16 @@ def save_checkpoint(
                         msc = MultiStorageClientFeature.import_package()
                         msc.torch.save(train_state_dict, train_state_global_filename)
                     else:
-                        shutil.copy(train_state_local_filename, train_state_global_filename)
+                        # Copy via a temp file + rename: a crash mid-copy
+                        # must not leave a torn latest_train_state.pt
+                        # (gh-9713), which every restart would fail to load.
+                        copy_file_atomically(
+                            train_state_local_filename, train_state_global_filename
+                        )
 
-                with maybe_msc.open(tracker_filename, 'w') as f:
-                    f.write('release' if release else str(iteration))
+                write_text_file_atomically(
+                    tracker_filename, 'release' if release else str(iteration)
+                )
 
                 print_rank_0(
                     f'  [{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] successfully saved '
@@ -1457,8 +1561,7 @@ def save_checkpoint(
 
                 def progress_finalize_fn():
                     tracker_filename = get_checkpoint_tracker_filename(save_root)
-                    with maybe_msc.open(tracker_filename, 'w') as f:
-                        f.write(str(iteration))
+                    write_text_file_atomically(tracker_filename, str(iteration))
                     print(f"  recorded logits-dump progress: iteration "
                           f"{iteration} to {tracker_filename}", flush=True)
 

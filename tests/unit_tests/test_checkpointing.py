@@ -34,6 +34,7 @@ from megatron.training.checkpointing import (
     _maybe_setup_gpt_to_hybrid_load,
     _read_checkpoint_run_config,
     check_checkpoint_args,
+    copy_file_atomically,
     get_checkpoint_tracker_filename,
     get_checkpoint_version,
     load_args_from_checkpoint,
@@ -42,6 +43,7 @@ from megatron.training.checkpointing import (
     read_metadata,
     save_checkpoint,
     set_checkpoint_version,
+    write_text_file_atomically,
 )
 from megatron.training.config import (
     CheckpointConfig,
@@ -1642,6 +1644,61 @@ def test_read_metadata_non_distributed(tmp_path, metadata_content, expected_iter
 
     assert max_iter == expected_iter, f"Expected iteration {expected_iter}, got {max_iter}"
     assert release == expected_release, f"Expected release={expected_release}, got {release}"
+
+
+@pytest.mark.parametrize("metadata_content", ["", "   ", "not-a-number", "12.5"])
+def test_read_metadata_invalid_exits_nonzero(tmp_path, metadata_content):
+    """An unreadable tracker must fail the job with a non-zero status (gh-9713).
+
+    read_metadata used to call bare sys.exit(), which exits 0, so a scheduler
+    treated the restart as a successful run and the job never trained again.
+    """
+    test_dir = tmp_path / "test_read_metadata_invalid"
+    test_dir.mkdir(parents=True, exist_ok=True)
+    tracker_file = test_dir / "latest_checkpointed_iteration.txt"
+    tracker_file.write_text(metadata_content)
+
+    with mock.patch('torch.distributed.is_initialized', return_value=False):
+        with pytest.raises(SystemExit) as exc_info:
+            read_metadata(str(tracker_file))
+
+    assert exc_info.value.code == 1
+
+
+def test_write_text_file_atomically(tmp_path):
+    """The tracker write must never leave a torn file behind (gh-9713)."""
+    tracker_file = tmp_path / "latest_checkpointed_iteration.txt"
+    tracker_file.write_text("1")
+
+    write_text_file_atomically(str(tracker_file), "2")
+    assert tracker_file.read_text() == "2"
+    # No temp files left behind.
+    assert list(tmp_path.iterdir()) == [tracker_file]
+
+    # An error (or crash) before the rename keeps the old content.
+    with mock.patch("os.replace", side_effect=RuntimeError("boom")):
+        with pytest.raises(RuntimeError, match="boom"):
+            write_text_file_atomically(str(tracker_file), "3")
+    assert tracker_file.read_text() == "2"
+    assert list(tmp_path.iterdir()) == [tracker_file]
+
+
+def test_copy_file_atomically(tmp_path):
+    """The train-state copy must never leave a torn file behind (gh-9713)."""
+    src = tmp_path / "train_state.pt"
+    src.write_bytes(b"state-bytes")
+    dst = tmp_path / "latest_train_state.pt"
+    dst.write_bytes(b"old-state")
+
+    copy_file_atomically(str(src), str(dst))
+    assert dst.read_bytes() == b"state-bytes"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["latest_train_state.pt", "train_state.pt"]
+
+    with mock.patch("os.replace", side_effect=RuntimeError("boom")):
+        with pytest.raises(RuntimeError, match="boom"):
+            copy_file_atomically(str(src), str(dst))
+    assert dst.read_bytes() == b"state-bytes"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["latest_train_state.pt", "train_state.pt"]
 
 
 def _describe_metadata_run(
