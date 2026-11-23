@@ -65,6 +65,62 @@ def test_flashinfer_mxfp8_active_row_policy(token_capacity, use_bounded_rows, ex
     )
 
 
+@pytest.mark.parametrize("local_expert_offset", [0, 2])
+def test_clamped_routed_mxfp8_preserves_probabilities_and_masks_padding(
+    monkeypatch, local_expert_offset
+):
+    adapter = flashinfer_mxfp8_module
+    weight = adapter.FlashInferRoutedMXFP8Weight(
+        data=torch.empty(2, 128, 128),
+        scale=torch.empty(2, 128, 4),
+        logical_rows=128,
+        logical_cols=128,
+        padded_rows=128,
+        padded_cols=128,
+    )
+    hidden = torch.zeros(3, 128, dtype=torch.bfloat16)
+    routing = torch.tensor([[0, 2], [1, 3], [-1, -1]])
+    probabilities = torch.tensor([[0.123456, 0.876544], [0.234567, 0.765433], [1.0, 1.0]])
+    limit = torch.full((2,), 0.5)
+    result = torch.ones_like(hidden)
+    out = torch.zeros_like(hidden)
+    monkeypatch.setattr(adapter, "require_flashinfer_routed_mxfp8", lambda: None)
+    monkeypatch.setattr(
+        adapter, "WeightLayout", SimpleNamespace(MajorK=SimpleNamespace(value=0)), raising=False
+    )
+    monkeypatch.setattr(
+        adapter, "Fp8QuantizationType", SimpleNamespace(MxFp8=object()), raising=False
+    )
+    monkeypatch.setattr(adapter, "quantize_routed_mxfp8_input", lambda x, cols: (x, weight.scale))
+
+    def launch(**kwargs):
+        ids, probs = kwargs["topk_ids"]
+        torch.testing.assert_close(ids[:2], routing[:2].to(torch.int32), rtol=0, atol=0)
+        torch.testing.assert_close(probs[:2], probabilities[:2], rtol=0, atol=0)
+        assert torch.all(ids[2] == (local_expert_offset + 2) % 4)
+        assert torch.count_nonzero(probs[2]) == 0
+        assert kwargs["gemm1_clamp_limit"] is limit
+        assert kwargs["local_expert_offset"] == local_expert_offset
+        assert kwargs["local_num_experts"] == 2
+        return result
+
+    monkeypatch.setattr(adapter, "trtllm_fp8_block_scale_routed_moe", launch, raising=False)
+    actual = adapter.flashinfer_routed_mxfp8_moe(
+        hidden,
+        routing,
+        probabilities,
+        weight,
+        weight,
+        num_experts=4,
+        local_expert_offset=local_expert_offset,
+        activation_type=12,
+        activation_clamp_limit=limit,
+        out=out,
+    )
+    assert actual is out
+    torch.testing.assert_close(actual, result, rtol=0, atol=0)
+
+
 def test_prepare_cutlass_mxfp8_weights_reuses_existing_swizzled_scale_bytes(monkeypatch):
     monkeypatch.setattr(flashinfer_mxfp8_module, "HAVE_FLASHINFER_CUTLASS_MXFP8", True)
     experts, rows, cols = 2, 128, 128
@@ -295,7 +351,8 @@ def test_flashinfer_clamped_relu2_rejects_unsupported_options(overrides, message
         _make_bounded_mxfp8_config(**kwargs)
 
 
-def test_flashinfer_clamp_limit_remains_fp32_after_module_conversion():
+@pytest.mark.parametrize("mxfp8", [False, True])
+def test_flashinfer_clamp_limit_remains_fp32_after_module_conversion(mxfp8):
     from megatron.core.inference.moe import InferenceGroupedGemmBackend
     from megatron.core.transformer.moe.experts import InferenceGroupedMLP
 
@@ -303,14 +360,16 @@ def test_flashinfer_clamp_limit_remains_fp32_after_module_conversion():
     module.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.FLASHINFER
     module._activation_clamp_scale = 16.0
     module._flashinfer_clamp_limit = None
+    module._uses_mxfp8_weights = mxfp8
+    module.num_local_experts = 2
     module.bfloat16()
     InferenceGroupedMLP._build_flashinfer_clamp_limit(module, torch.device("cpu"))
     limit = module._flashinfer_clamp_limit
     module.bfloat16()
     assert module._flashinfer_clamp_limit is limit
     assert limit.dtype == torch.float32
-    assert limit.shape == (1,)
-    assert limit.item() == 16.0
+    assert limit.shape == ((2,) if mxfp8 else (1,))
+    assert torch.all(limit == 16.0)
     assert "_flashinfer_clamp_limit" not in module.state_dict()
 
 

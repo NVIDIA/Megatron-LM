@@ -108,9 +108,7 @@ from megatron.core.inference.moe.flashinfer_mxfp8 import (
     attach_routed_mxfp8_writeback,
     flashinfer_cutlass_mxfp8_moe,
     flashinfer_routed_mxfp8_moe,
-    prepare_cutlass_mxfp8_weights,
     prepare_routed_mxfp8_weights,
-    require_flashinfer_cutlass_mxfp8,
     require_flashinfer_routed_mxfp8,
 )
 from megatron.core.inference.moe.flashinfer_nvfp4 import (
@@ -1478,7 +1476,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
             and self._activation_clamp_scale is not None
         ):
             self._flashinfer_clamp_limit = torch.full(
-                (1,), self._activation_clamp_scale, dtype=torch.float32, device=device
+                (self.num_local_experts if self._uses_mxfp8_weights else 1,),
+                self._activation_clamp_scale,
+                dtype=torch.float32,
+                device=device,
             )
 
     def _resolve_flashinfer_activation_type(self):
@@ -1595,33 +1596,21 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _build_concatenated_mxfp8_weights(self):
         """Build contiguous expert stacks after checkpoint loading.
 
-        Torch, vLLM and FlashInfer CUTLASS rebind each per-expert MXFP8Tensor to
-        its stacked view. FlashInfer routed derives a shuffled Major-K stack and makes
+        Torch and vLLM rebind each per-expert MXFP8Tensor to its stacked view.
+        FlashInfer routed derives a shuffled Major-K stack and makes
         the canonical tensors write through to it, releasing their storage.
         """
 
         use_flashinfer = (
             self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
         )
-        use_flashinfer_cutlass = use_flashinfer and self._activation_clamp_scale is not None
         backend = resolve_mxfp8_backend(self.inference_grouped_gemm_backend)
-        if use_flashinfer_cutlass:
-            require_flashinfer_cutlass_mxfp8()
-        elif use_flashinfer:
+        if use_flashinfer:
             require_flashinfer_routed_mxfp8()
         for linear_name, buf_name in InferenceGroupedMLP._EXPERT_WEIGHT_GROUPS:
             linear = getattr(self, linear_name)
             stacked_weight = self._stack_mxfp8_linear_weight(linear_name, backend)
-            if use_flashinfer_cutlass:
-                concatenated_weight = prepare_cutlass_mxfp8_weights(stacked_weight)
-                logger.info(
-                    "Prepared FlashInfer CUTLASS MXFP8 %s weights: experts=%d shape=(%d, %d)",
-                    linear_name,
-                    self.num_local_experts,
-                    concatenated_weight.logical_rows,
-                    concatenated_weight.logical_cols,
-                )
-            elif use_flashinfer:
+            if use_flashinfer:
                 concatenated_weight = prepare_routed_mxfp8_weights(stacked_weight)
                 logger.info(
                     "Prepared FlashInfer routed MXFP8 %s weights: experts=%d "
@@ -1641,8 +1630,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
             setattr(self, buf_name, concatenated_weight)
 
             # Preserve the wrappers referenced by refit plans; only redirect their
-            # storage. CUTLASS's packed-int32 scales view these same canonical bytes.
-            if not use_flashinfer or use_flashinfer_cutlass:
+            # storage; FlashInfer's writeback views were installed above.
+            if not use_flashinfer:
                 for i in range(self.num_local_experts):
                     w = getattr(linear, f'weight{i}')
                     if isinstance(w, MXFP8Tensor):
@@ -1810,6 +1799,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     out=out,
                     token_capacity=self._flashinfer_mxfp8_token_capacity,
                     use_bounded_rows=InferenceMode.use_bounded_mxfp8_rows(),
+                    activation_clamp_limit=self._flashinfer_clamp_limit,
                 )
             return output, None
         if self._nvfp4_weights is not None:
@@ -1934,13 +1924,13 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         # Lazily build concatenated weights on first forward (after checkpoint load)
         if not self._concatenated_weights_built:
-            self._build_flashinfer_clamp_limit(permuted_local_hidden_states.device)
             if InferenceGroupedMLP._expert_weights_use_mxfp8(self):
                 self._build_concatenated_mxfp8_weights()
             else:
                 self._build_concatenated_weights()
                 if self._nvfp4_recipe is not None:
                     self._build_flashinfer_nvfp4_weights()
+            self._build_flashinfer_clamp_limit(permuted_local_hidden_states.device)
             self._concatenated_weights_built = True
 
         if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:

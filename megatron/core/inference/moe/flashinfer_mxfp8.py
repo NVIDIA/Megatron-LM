@@ -473,7 +473,7 @@ def flashinfer_cutlass_mxfp8_moe(
 def flashinfer_routed_mxfp8_moe_prequantized(
     quantized_hidden: torch.Tensor,
     hidden_scale: torch.Tensor,
-    packed_routing: torch.Tensor,
+    packed_routing: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     fc1_weight: FlashInferRoutedMXFP8Weight,
     fc2_weight: FlashInferRoutedMXFP8Weight,
     *,
@@ -481,8 +481,9 @@ def flashinfer_routed_mxfp8_moe_prequantized(
     local_expert_offset: int,
     top_k: int,
     activation_type: int,
+    activation_clamp_limit: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Launch routed MXFP8 MoE with prequantized input and packed routing."""
+    """Launch routed MXFP8 MoE with prequantized input and precomputed routing."""
     require_flashinfer_routed_mxfp8()
     output = trtllm_fp8_block_scale_routed_moe(
         topk_ids=packed_routing,
@@ -501,7 +502,7 @@ def flashinfer_routed_mxfp8_moe_prequantized(
         local_expert_offset=local_expert_offset,
         local_num_experts=fc1_weight.data.shape[0],
         routed_scaling_factor=None,
-        # Packed precomputed routing consumes these weights as-is; no routing
+        # Precomputed routing consumes these weights as-is; no routing
         # softmax or top-k renormalization is applied.
         routing_method_type=0,
         use_shuffled_weight=True,
@@ -510,6 +511,7 @@ def flashinfer_routed_mxfp8_moe_prequantized(
         tune_max_num_tokens=max(quantized_hidden.shape[0], 128),
         fp8_quantization_type=Fp8QuantizationType.MxFp8,
         activation_type=activation_type,
+        gemm1_clamp_limit=activation_clamp_limit,
     )
     return _unwrap_output(output)[:, : fc2_weight.logical_rows]
 
@@ -527,6 +529,7 @@ def flashinfer_routed_mxfp8_moe(
     out: torch.Tensor | None = None,
     token_capacity: int | None = None,
     use_bounded_rows: bool = False,
+    activation_clamp_limit: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run the FlashInfer TRT-LLM routed MXFP8 MoE kernel.
 
@@ -575,7 +578,17 @@ def flashinfer_routed_mxfp8_moe(
     quantized_hidden, hidden_scale = quantize_routed_mxfp8_input(
         selected_hidden_states, fc1_weight.padded_cols
     )
-    packed_routing = pack_routed_mxfp8_routing(selected_routing_map, selected_probabilities)
+    if activation_clamp_limit is not None:
+        # Preserve the FP32 routing probabilities used by the previous CUTLASS
+        # path. Packed routing rounds them to BF16. Padding must contribute zero.
+        invalid = selected_routing_map < 0
+        outside_expert = (local_expert_offset + fc1_weight.data.shape[0]) % num_experts
+        packed_routing = (
+            selected_routing_map.to(torch.int32).masked_fill(invalid, outside_expert),
+            selected_probabilities.masked_fill(invalid, 0),
+        )
+    else:
+        packed_routing = pack_routed_mxfp8_routing(selected_routing_map, selected_probabilities)
     output = flashinfer_routed_mxfp8_moe_prequantized(
         quantized_hidden,
         hidden_scale,
@@ -586,6 +599,7 @@ def flashinfer_routed_mxfp8_moe(
         local_expert_offset=local_expert_offset,
         top_k=selected_routing_map.shape[1],
         activation_type=activation_type,
+        activation_clamp_limit=activation_clamp_limit,
     )
 
     if out is not None:
