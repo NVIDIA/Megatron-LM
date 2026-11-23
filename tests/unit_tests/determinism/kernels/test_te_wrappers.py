@@ -34,7 +34,7 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     set_batch_invariant_mode,
     te_supports_batch_invariant_grouped_gemm,
 )
-from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     _compute_index_scores,
     _dsa_index_share_carrier_scope,
@@ -850,6 +850,70 @@ class TestTEWrappers:
             module.load_state_dict(checkpoint)
             assert module.weight0 is parameter
             assert torch.equal(module.weight0, expected)
+
+    @pytest.mark.parametrize(
+        "backend,precision,rejected",
+        [("triton", "fp8", True), ("triton", "bf16", False), ("te_native", "fp8", False)],
+        ids=["triton-fp8", "triton-bf16", "te-native-fp8"],
+    )
+    @pytest.mark.parametrize("layer", ["linear", "layernorm-linear"])
+    def test_batch_invariant_triton_rejects_per_module_fp8(
+        self, backend, precision, rejected, layer
+    ):
+        """The triton batch-invariant backend replaces TE's dense GEMM with a BF16 kernel, so a
+        dense TE linear that quant_recipe makes FP8 fails when it is built, not at its first
+        GEMM."""
+        training_recipe = (
+            {"fp8_quantization_recipe": "mxfp8", "override_nonquantized_autocast": True}
+            if precision == "fp8"
+            else {}
+        )
+        recipe = RecipeConfig.from_config_dict(
+            {
+                "configs": {
+                    "fc1": {
+                        "transformer_engine_config_type": "TEQuantizationParams",
+                        "training_recipe": training_recipe,
+                    }
+                },
+                "matchers": {
+                    "fc1": {
+                        "config": "fc1",
+                        "type": "glob",
+                        "pattern": "*linear_fc1",
+                        "enabled": True,
+                    }
+                },
+            }
+        )
+        config = _config(
+            batch_invariant_mode=True,
+            batch_invariant_backend=backend,
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=3,
+            normalization="RMSNorm",
+            quant_recipe=recipe,
+        )
+        layer_cls = TEColumnParallelLinear if layer == "linear" else TELayerNormColumnParallelLinear
+
+        def build():
+            return layer_cls(
+                128,
+                256,
+                config=config,
+                init_method=init_method_normal(0.02),
+                gather_output=False,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                name="decoder.layers.0.mlp.linear_fc1",
+            )
+
+        if rejected:
+            with pytest.raises(ValueError, match="batch_invariant_backend='triton'"):
+                build()
+        else:
+            build()
 
     @pytest.mark.parametrize("return_argmax", [False, True])
     def test_te_fused_cross_entropy_replays(self, return_argmax):
