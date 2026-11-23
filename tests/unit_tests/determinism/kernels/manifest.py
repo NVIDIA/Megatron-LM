@@ -223,6 +223,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "under contention with explicit TP groups.",
     ),
     KernelEntry(
+        name="te_batched_linear_matrix_parameter",
+        sources=(
+            "megatron/core/extensions/te_batched_linear.py",
+            "megatron/core/transformer/experimental_attention_variant/deepseek_v4_hybrid_attention.py",
+        ),
+        tests=(K + "test_te_batched_linear.py",),
+        kind="external-lib",
+        notes="TE batched GEMM with a 2D optimizer owner; BF16/MXFP8 and fused main-grad replay.",
+    ),
+    KernelEntry(
         name="jit_fuser",
         sources=("megatron/core/jit.py",),
         kind="torch.compile",
