@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 name: Publish Testmon caches
-run-name: ${{ inputs.run_id && format('Publish Testmon caches from run {0}', inputs.run_id) || format('Publish Testmon caches for {0}', github.sha) }}
+run-name: Publish Testmon caches for ${{ inputs.head_sha || github.sha }}
 
 # Merge groups targeting main record Testmon baselines as artifacts. Their caches
 # would be scoped to the temporary merge-queue ref, so publish them from main once
@@ -13,13 +13,13 @@ on:
   # Republish a landed merge group's caches, e.g. to make an older commit the PR baseline.
   workflow_dispatch:
     inputs:
-      run_id:
-        description: cicd-main.yml merge-group run ID whose Testmon caches PRs should use
+      head_sha:
+        description: Commit on main whose merge-group Testmon caches PRs should use (full or short SHA)
         type: string
         required: true
 
 concurrency:
-  group: publish-testmon-cache-${{ inputs.run_id || github.sha }}
+  group: publish-testmon-cache-${{ inputs.head_sha || github.sha }}
   cancel-in-progress: false
 
 permissions:
@@ -42,39 +42,30 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
-          REQUESTED_RUN_ID: ${{ inputs.run_id }}
+          REQUESTED_SHA: ${{ inputs.head_sha }}
         run: |
-          if [[ -n "$REQUESTED_RUN_ID" ]]; then
+          SOURCE_SHA=$GITHUB_SHA
+          if [[ -n "$REQUESTED_SHA" ]]; then
             # Caches saved from other refs are invisible to PRs.
             if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
               echo "::error::Dispatch this workflow from main."
               exit 1
             fi
-            if [[ ! "$REQUESTED_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
-              echo "::error::run_id must be a numeric workflow run ID."
+            if [[ ! "$REQUESTED_SHA" =~ ^[0-9a-f]{7,40}$ ]]; then
+              echo "::error::head_sha must be a commit SHA (7 to 40 lowercase hex characters)."
               exit 1
             fi
-            RUN=$(gh api "repos/$REPOSITORY/actions/runs/$REQUESTED_RUN_ID")
-            if ! jq -e --arg repository "$REPOSITORY" '.path == ".github/workflows/cicd-main.yml"
-                and .event == "merge_group" and .head_repository.full_name == $repository
-                and (.head_branch | startswith("gh-readonly-queue/main/"))' <<< "$RUN" > /dev/null; then
-              echo "::error::Run $REQUESTED_RUN_ID is not a cicd-main.yml merge group targeting main."
-              exit 1
-            fi
-            SOURCE_SHA=$(jq -r .head_sha <<< "$RUN")
+            SOURCE_SHA=$(gh api "repos/$REPOSITORY/commits/$REQUESTED_SHA" --jq .sha)
             # Only landed commits may become PR baselines.
             STATUS=$(gh api "repos/$REPOSITORY/compare/$SOURCE_SHA...main" --jq .status)
             if [[ "$STATUS" != "identical" && "$STATUS" != "ahead" ]]; then
-              echo "::error::Run $REQUESTED_RUN_ID tested $SOURCE_SHA, which is not on main."
+              echo "::error::$SOURCE_SHA is not on main."
               exit 1
             fi
-            RUN_ID=$REQUESTED_RUN_ID
-          else
-            SOURCE_SHA=$GITHUB_SHA
-            # A landed merge-group commit is the main commit, so match it exactly.
-            RUN_ID=$(gh api "repos/$REPOSITORY/actions/workflows/cicd-main.yml/runs?event=merge_group&head_sha=$SOURCE_SHA&per_page=100" \
-              --jq "[.workflow_runs[] | select(.head_repository.full_name == \"$REPOSITORY\")] | first | .id // empty")
           fi
+          # A landed merge-group commit is the main commit, so match it exactly.
+          RUN_ID=$(gh api "repos/$REPOSITORY/actions/workflows/cicd-main.yml/runs?event=merge_group&head_sha=$SOURCE_SHA&per_page=100" \
+            --jq "[.workflow_runs[] | select(.head_repository.full_name == \"$REPOSITORY\" and (.head_branch | startswith(\"gh-readonly-queue/main/\")))] | first | .id // empty")
           MATRIX='[]'
           if [[ -n "$RUN_ID" ]]; then
             # Generations must come from the first attempt, as PR checkouts require.
@@ -86,8 +77,12 @@ jobs:
           echo "source_sha=$SOURCE_SHA" | tee -a "$GITHUB_OUTPUT"
           echo "matrix=$MATRIX" | tee -a "$GITHUB_OUTPUT"
           if [[ "$MATRIX" == "[]" ]]; then
-            if [[ -n "$REQUESTED_RUN_ID" ]]; then
-              echo "::error::Run $REQUESTED_RUN_ID has no unexpired first-attempt Testmon baselines."
+            # A requested commit must publish; pushes without baselines are routine.
+            if [[ -n "$REQUESTED_SHA" && -z "$RUN_ID" ]]; then
+              echo "::error::No merge group targeting main tested $SOURCE_SHA; it was merged outside the queue."
+              exit 1
+            elif [[ -n "$REQUESTED_SHA" ]]; then
+              echo "::error::Merge-group run $RUN_ID for $SOURCE_SHA has no unexpired first-attempt Testmon baselines."
               exit 1
             fi
             echo "::notice::No merge-group Testmon baselines for $SOURCE_SHA; nothing to publish."
