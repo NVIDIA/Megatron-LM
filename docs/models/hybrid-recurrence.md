@@ -102,7 +102,8 @@ does not enable cached decoding; inference contexts remain unsupported.
 
 The first region starts from the prefix output (or the embeddings when the prefix
 is empty). Each subsequent region starts from the preceding region's final output.
-Each iteration replaces the state with the current body's output:
+With the ordinary `hybrid_stack_spec`, each iteration replaces the state with the
+current body's output:
 
 ```text
 s = prefix(embeddings)
@@ -114,10 +115,50 @@ logits = head(final_norm(suffix(s)))
 
 Backpropagation traverses every iteration. Contributions to a shared parameter
 accumulate into that parameter's gradient. At one loop the computation is the
-ordinary hybrid decoder with the colons removed. There is no input re-injection,
-extra normalization, learned state adapter, gradient truncation, loop conditioning,
-or auxiliary loss imposed by this implementation. Layer behavior remains defined
-by the chosen static module specification.
+ordinary hybrid decoder with the colons removed when using the ordinary stack
+spec. It imposes no input re-injection or learned update rule. Layer behavior and
+optional gating remain defined by the chosen static module specification. Neither
+variant truncates gradients or introduces an auxiliary loss.
+
+## Adaptive-delta gate
+
+Choose a static gated stack spec to use the adaptive-delta rule of ELR/Koi §3.1:
+
+```bash
+--spec megatron.core.models.hybrid.hybrid_layer_specs adaptive_delta_hybrid_stack_spec
+--hybrid-layer-pattern 'G-:G-*G-:G-'
+--n-loops-distribution '1:1.0'
+```
+
+For a GDP backbone, select `adaptive_delta_gated_delta_product_stack_spec` instead;
+it places GDP in the `M` slot, so use an appropriate `M`-containing layer pattern.
+The `G` slot still denotes Gated DeltaNet. Custom specs can explicitly compose `HybridStackSubmodules.recurrence_gate` with
+`ModuleSpec(module=AdaptiveDeltaGate)`. The existing ordinary stack specs are
+unchanged. MTP uses ordinary, ungated submodules in the supplied gated specs.
+
+Each region has an independent gate and retains its own original entry tensor `h`:
+
+```text
+s = h
+repeat k times:
+    u = s + h
+    r = body(u)
+    beta = sigmoid(W_beta @ u + b_beta) * softplus(gamma)
+    s = s + beta * (r - s)
+```
+
+W_beta, b_beta, and gamma are shared across all passes of that region, but not
+across regions. All three start at zero, giving an initial rate of `log(2)/2`
+(approximately 0.35). The projection uses the model's parameter dtype; the nonlinear
+rate and delta update are computed in FP32, and gamma stays FP32 under the standard
+Float16Module wrapper. Gate parameters are replicated across TP ranks; with sequence
+parallelism they participate in the replicated-parameter TP gradient reduction.
+
+This gate is not bounded to `[0, 1]`, does not impose nGPT/unit-L2 normalization,
+and does not detach any earlier loop. Gated specs currently require ordinary
+residual width (no wide residuals or mHC). Even one gated pass differs from the
+ordinary decoder: its body receives `2*h`, and its output is mixed with `h`.
+One-loop adaptation training is therefore expected after conversion.
 
 ## Restarting with a different policy
 
@@ -125,7 +166,9 @@ Recurrence changes the execution schedule, not module registration. Each physica
 layer remains registered exactly once under `decoder.layers.<index>`. Ordinary
 and distributed state dictionaries have the same layer keys and tensor shapes as
 the corresponding pattern without colons. A non-recurrent checkpoint can therefore
-seed recurrent training without converting its weights or optimizer layout.
+seed ordinary, ungated recurrent training without converting its weights or optimizer
+layout. Adding the optional adaptive-delta gate introduces new parameters and uses
+the explicit import procedure below.
 
 Specify the desired distribution on **every restart**, including when using
 `--use-checkpoint-args`. The distribution is a runtime policy, not a model weight,
@@ -140,6 +183,54 @@ remains necessary for dropout and other stochastic model operations.
 `--inference-n-loops` is also a runtime override, not an architectural change. The
 legacy checkpoint-argument loader does not restore it. Supply the desired setting
 for each run, or omit it to use the largest training loop count.
+
+### Importing an ordinary checkpoint into a gated model
+
+For the first import, keep the same physical layers and add recurrence boundaries,
+choose the appropriate gated spec, and explicitly initialize the new parameters:
+
+```bash
+--load /path/to/ordinary/checkpoints
+--use-checkpoint-args
+--spec megatron.core.models.hybrid.hybrid_layer_specs adaptive_delta_hybrid_stack_spec
+--hybrid-layer-pattern 'G-:G-*G-:G-'
+--n-loops-distribution '1:1.0'
+--init-recurrence-gates
+--finetune
+--save /path/to/gated-warmup/checkpoints
+```
+
+This supports persistent `torch` and `torch_dist` checkpoints. Existing backbone
+keys/shapes remain unchanged, and only the new gate tensors are initialized to
+zero. Missing backbone weights, partial gate checkpoints, or incompatible shapes
+remain errors; the importer does not relax the model load to `strict=False`.
+With `--use-checkpoint-args`, the explicitly requested gated spec takes precedence
+over the source checkpoint's ordinary spec during this import.
+
+Adding gate parameters changes the optimizer layout. This first import therefore
+requires a fresh optimizer, explicitly selected with `--finetune` or
+`--no-load-optim`; it does not attempt to remap old optimizer slots. `--finetune`
+also resets iteration, scheduler, RNG, and data progress. `--no-load-optim` retains
+the standard non-finetune progress/RNG behavior, but the standard loader also skips
+the old LR scheduler in that mode: supply the intended warmup schedule. GPT-to-Hybrid
+optimizer restoration must be explicitly disabled with `--no-load-optim`.
+Remove `--ckpt-assume-constant-structure` for this first import so the new save plan
+cannot reuse the ungated checkpoint's layout. Old optimizer main-parameter imports
+(`--load-main-params-from-ckpt`) are not supported during this conversion.
+
+After saving the gated warmup checkpoint, **remove `--init-recurrence-gates`** and
+use a normal resume to retain learned gate weights and optimizer state. Leaving the
+flag enabled on a gated checkpoint raises an error rather than overwriting trained
+gates. Keep the trained recurrence-region boundaries and gated architecture on
+resume; changing boundaries requires an explicit migration.
+
+Direct Core callers importing ordinary state dictionaries can use
+`initialize_recurrence_gate_state(model, state_dict)` from
+`megatron.core.models.hybrid.recurrence_gate`, followed by
+`model.load_state_dict(state_dict, strict=True)` and a new optimizer. Distributed
+callers must first validate source keys with `validate_ungated_checkpoint_keys`,
+then supply load-only metadata `initialize_recurrence_gates=True` when constructing
+the target sharded model state. Never use that metadata when saving.
 
 ## Initial scope
 
@@ -173,6 +264,7 @@ estimates based on unique layer counts do not include recurrent execution work.
 ```bash
 uv run python -m torch.distributed.run --standalone --nproc-per-node 1 -m pytest -q \
   tests/unit_tests/models/hybrid/test_recurrence.py \
+  tests/unit_tests/models/hybrid/test_recurrence_gate.py \
   tests/unit_tests/ssm/test_hybrid_layer_allocation.py
 ```
 
@@ -192,3 +284,8 @@ and BF16, attention/MLP and GDN/MLP bodies, and multiple recurrent regions.
 
 Other single-/multi-region tests verify one shared count across accumulation
 microbatches and regions, with each body finishing its loops before the next starts.
+Gate tests independently check the formula/initialization, gradients against
+independent layer and gate copies, gated DDP accumulation, and FP32 parameter
+retention. They cover explicit ordinary/distributed ungated imports, strict failure
+cases, ordinary optimizer continuation after a gated save, and both training
+checkpoint-loader formats. The existing ungated unroll tests are retained unchanged.

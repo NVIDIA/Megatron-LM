@@ -93,6 +93,7 @@ class HybridStackSubmodules:
     moe_layer: ModuleSpec | type | None = None
     mtp_block_spec: ModuleSpec | None = None
     mtp_stack_submodules: "HybridStackSubmodules | None" = None
+    recurrence_gate: ModuleSpec | None = None
 
 
 class HybridStack(MegatronModule):
@@ -198,6 +199,14 @@ class HybridStack(MegatronModule):
                         raise ValueError("Routing replay is not supported for recurrent MoE layers")
         elif n_loops_distribution is not None:
             raise ValueError("n_loops_distribution requires recurrent_layer_ranges")
+
+        if submodules.recurrence_gate is not None:
+            if not self.recurrent_layer_ranges:
+                raise ValueError("An adaptive-delta gated spec requires ':' recurrence boundaries")
+            if config.wide_residual is not None or config.enable_mhc_connections:
+                raise ValueError(
+                    "Adaptive-delta recurrence currently requires ordinary residual width"
+                )
 
         super().__init__(config=config)
         self.pre_process = pre_process
@@ -468,6 +477,25 @@ class HybridStack(MegatronModule):
                     setattr(self.hc_head_fn, 'sequence_parallel', True)
                     setattr(self.hc_head_base, 'sequence_parallel', True)
                     setattr(self.hc_head_scale, 'sequence_parallel', True)
+
+        self.recurrence_gates = nn.ModuleList(
+            [
+                build_module(submodules.recurrence_gate, config=config, pg_collection=pg_collection)
+                for _ in self.recurrent_layer_ranges
+            ]
+            if submodules.recurrence_gate is not None
+            else []
+        )
+        self._gate_region_starts = (
+            {start: index for index, (start, _) in enumerate(self.recurrent_layer_ranges)}
+            if self.recurrence_gates
+            else {}
+        )
+        self._gate_region_ends = (
+            {end - 1: index for index, (_, end) in enumerate(self.recurrent_layer_ranges)}
+            if self.recurrence_gates
+            else {}
+        )
 
         self._execution_layer_indices = list(range(len(self.layers)))
         if self.config.moe_shortcut_connection:
@@ -805,6 +833,13 @@ class HybridStack(MegatronModule):
             else [None] * self.num_layers_per_pipeline_rank
         )
 
+        # Per-forward state only: each region retains its own entry activations
+        # across its loops, but never across microbatches or evaluation calls.
+        active_region = None
+        region_input = previous_state = loop_input = None
+        region_pass = 0
+        gate_starts = getattr(self, "_gate_region_starts", {})
+        gate_ends = getattr(self, "_gate_region_ends", {})
         with outer_fp8_context:
             if self.config.recompute_granularity == 'full' and self.training:
                 hidden_states = checkpointed_forward(
@@ -825,6 +860,17 @@ class HybridStack(MegatronModule):
                 )
             else:
                 for layer_idx in execution_indices:
+                    if layer_idx in gate_starts:
+                        index = gate_starts[layer_idx]
+                        if active_region is None:
+                            active_region = index
+                            region_input = hidden_states
+                        previous_state = hidden_states
+                        loop_input = previous_state + region_input
+                        # The gate must see the unmodified entry tensor even if a
+                        # custom body uses in-place activation operations.
+                        hidden_states = loop_input.clone()
+                        region_pass += 1
                     physical_layer_idx = self._execution_layer_indices[layer_idx]
                     layer_config = self._execution_layer_config_list[layer_idx]
                     layer = self.layers[layer_idx]
@@ -976,6 +1022,14 @@ class HybridStack(MegatronModule):
                         hidden_states=hidden_states,
                         is_block_end=mhc_block_ends[layer_idx],
                     )
+                    if layer_idx in gate_ends:
+                        hidden_states = self.recurrence_gates[active_region](
+                            previous_state, hidden_states, loop_input
+                        )
+                        previous_state = loop_input = None
+                        if region_pass == n_loops:
+                            active_region = region_input = None
+                            region_pass = 0
 
         if self.residual_stream_readout is not None:
             hidden_states = apply_module(self.residual_stream_readout)(hidden_states)
@@ -1073,9 +1127,19 @@ class HybridStack(MegatronModule):
 
             sharded_state_dict.update(layer_sharded_state_dict)
 
-        # Add modules other than self.layers
+        # ModuleList's default checkpoint path flattens its children and would
+        # bypass the gates' explicit ungated-import handling.
+        recurrence_gates = getattr(self, "recurrence_gates", ())
+        for index, gate in enumerate(recurrence_gates):
+            sharded_state_dict.update(
+                gate.sharded_state_dict(
+                    f"{prefix}recurrence_gates.{index}.", sharded_offsets, metadata
+                )
+            )
+
+        # Add modules other than the explicitly traversed module lists.
         for name, module in self.named_children():
-            if not module is self.layers:
+            if module is not self.layers and module is not recurrence_gates:
                 sharded_state_dict.update(
                     sharded_state_dict_default(
                         module,
