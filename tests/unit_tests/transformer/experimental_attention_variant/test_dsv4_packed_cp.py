@@ -11,6 +11,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from megatron.core.extensions.te_batched_linear import TEBatchedLinear
 from megatron.core.extensions.transformer_engine import HAVE_TE, TELinear
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -169,7 +170,12 @@ def _run_attention(model, hidden, grad, packed, *, documents=None, cp_group=None
     """Collect real TE FP32 wgrads, or ordinary grads when fusion is disabled."""
     fused_weights = set()
     for module in model.modules():
-        if isinstance(module, TELinear) and module.fuse_wgrad_accumulation:
+        fused = (isinstance(module, TELinear) and module.fuse_wgrad_accumulation) or (
+            TEBatchedLinear is not None
+            and isinstance(module, TEBatchedLinear)
+            and module._accumulate_into_main_grad
+        )
+        if fused:
             module.weight.main_grad = torch.zeros_like(module.weight, dtype=torch.float32)
             fused_weights.add(id(module.weight))
     hidden = hidden.detach().clone().requires_grad_()
@@ -187,6 +193,69 @@ def _run_attention(model, hidden, grad, packed, *, documents=None, cp_group=None
             dist.all_reduce(value, group=cp_group)
         result[f"param:{name}"] = value
     return result
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_attention_gradient_collection_includes_batched_linear(monkeypatch, fused):
+    """Collect and reset both TE linear owners' wgrads without requiring CUDA."""
+
+    class _Linear(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, inputs, weight):
+            ctx.save_for_backward(inputs, weight)
+            return inputs @ weight.t()
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            inputs, weight = ctx.saved_tensors
+            grad_weight = grad_output.flatten(0, -2).t() @ inputs.flatten(0, -2)
+            if fused:
+                weight.main_grad.add_(grad_weight)
+                grad_weight = None
+            return grad_output @ weight, grad_weight
+
+    class _Projection(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.arange(6, dtype=torch.float32).view(2, 3))
+
+        def forward(self, inputs):
+            return _Linear.apply(inputs, self.weight)
+
+    class _TELinear(_Projection):
+        fuse_wgrad_accumulation = fused
+
+    class _TEBatchedLinear(_Projection):
+        _accumulate_into_main_grad = fused
+
+    class _Attention(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = _TELinear()
+            self.batched = _TEBatchedLinear()
+
+        def forward(self, inputs, **_kwargs):
+            return self.linear(inputs) + self.batched(inputs), None
+
+    monkeypatch.setitem(_run_attention.__globals__, "TELinear", _TELinear)
+    monkeypatch.setitem(_run_attention.__globals__, "TEBatchedLinear", _TEBatchedLinear)
+    model = _Attention()
+    hidden = torch.arange(12, dtype=torch.float32).view(4, 1, 3)
+    grad = torch.arange(8, dtype=torch.float32).view(4, 1, 2)
+    expected_weight_grad = grad.flatten(0, -2).t() @ hidden.flatten(0, -2)
+    for _ in range(2):
+        model.zero_grad(set_to_none=True)
+        result = _run_attention(model, hidden, grad, None)
+        for name in ("linear", "batched"):
+            actual = result[f"param:{name}.weight"]
+            assert actual.dtype == torch.float32
+            torch.testing.assert_close(actual, expected_weight_grad, rtol=0, atol=0)
+        torch.testing.assert_close(
+            result["input_grad"],
+            grad @ (model.linear.weight + model.batched.weight),
+            rtol=0,
+            atol=0,
+        )
 
 
 def _compare_results(actual, expected, label, failures, rows=None):

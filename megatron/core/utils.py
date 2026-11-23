@@ -45,7 +45,7 @@ except ImportError:
     HAVE_DTENSOR = False
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing.mapping import ShardedTensor
+from megatron.core.dist_checkpointing.mapping import ShardedTensor, set_checkpoint_parameter_id
 
 try:
     from packaging.version import Version as PkgVersion
@@ -1158,9 +1158,8 @@ def make_tp_sharded_tensor_for_checkpoint(
             if is_float8tensor(tensor):
                 fp8_param = tensor
                 tensor = dequantize_gtp_native_fp8(tensor)
-                # Backlink to the live FP8 param: optimizer sharded_state_dict matches params
-                # to model entries by id(entry.data), which this dequantized copy would break
-                # (see _backfill_gtp_sharded_param_map in optimizer.py).
+                set_checkpoint_parameter_id(tensor, fp8_param)
+                # Keep the legacy backlink for existing GTP checkpoint consumers.
                 tensor._gtp_dequant_src = fp8_param
 
     if replica_id is None:
@@ -2913,12 +2912,12 @@ def _nvtx_range_get_func_path():
     Returns:
         str: Module path and function name joined by a dot
     """
-    # Get the caller's caller frame (go back 2 frames)
+    # Get the caller's caller frame (go back 2 frames). The frame itself holds both names:
+    # inspect.getframeinfo and inspect.getmodule would scan the code's line table and stat
+    # the source file on every call, which a forward pass makes hundreds of times.
     frame = inspect.currentframe().f_back.f_back
-    caller_func = inspect.getframeinfo(frame).function
-    module = inspect.getmodule(frame)
 
-    return f"{module.__name__}.{caller_func}"
+    return f"{frame.f_globals['__name__']}.{frame.f_code.co_name}"
 
 
 def nvtx_range_push(msg=None, suffix=None) -> None:

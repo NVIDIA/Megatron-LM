@@ -2,7 +2,7 @@ default_install_hook_types: [pre-commit, commit-msg]
 
 repos:
 - repo: https://github.com/psf/black
-  rev: 'refs/tags/26.3.0:refs/tags/26.3.0'
+  rev: 'refs/tags/26.10.1:refs/tags/26.10.1'
   hooks:
   - id: black
     files: ^megatron/core/.*|^tests/unit_tests/.*
