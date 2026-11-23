@@ -1428,19 +1428,24 @@ def test_fp4_model_fp8_buckets_follow_layer_order():
             )
     model.norm = torch.nn.LayerNorm(hidden, device="cuda", dtype=torch.bfloat16)
 
-    # A small bucket size gives every weight its own bucket.
+    # A small bucket size splits the weights over several buckets.
     ddp_model = _make_fp4_model_ddp(model, _fp4_model_ddp_config(bucket_size=1000))
-    fp8_weights = {
-        id(getattr(model, name).weight): name for name in ("qkv0", "expert0", "qkv1", "expert1")
-    }
-    order = []
+    names = ("qkv0", "expert0", "qkv1", "expert1")  # registration (= layer) order
+    fp8_weights = {id(getattr(model, name).weight): name for name in names}
+    groups = []
     for group in ddp_model.bucket_groups:
-        names = {
+        group_names = {
             fp8_weights[id(p)] for b in group.buckets for p in b.params if id(p) in fp8_weights
         }
-        assert len(names) <= 1
-        order.extend(names)
-    assert order == ["expert1", "qkv1", "expert0", "qkv0"]
+        if group_names:
+            groups.append(group_names)
+    assert set().union(*groups) == set(names)
+    # Each bucket group holds one fp8 bucket; they run from the last layer to the first across
+    # both buffers. The MXFP8 buffer comes first among the buffers, so without the merge
+    # qkv1 would lead.
+    last_index = [max(names.index(n) for n in group_names) for group_names in groups]
+    assert last_index == sorted(last_index, reverse=True)
+    assert "expert1" in groups[0]
     Utils.destroy_model_parallel()
 
 

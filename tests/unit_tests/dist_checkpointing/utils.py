@@ -378,6 +378,8 @@ def setup_model_and_optimizer(
         use_layer_wise_distributed_optimizer=use_layer_wise,
         optimizer=optimizer,
         muon_scalar_optimizer=muon_scalar_optimizer,
+        # Must match the DDP setting (the distributed optimizer checks it).
+        reuse_grad_buf_for_mxfp8_param_ag=ddp_config.reuse_grad_buf_for_mxfp8_param_ag,
     )
     if use_megatron_fsdp:
         # The FSDP DTensor sharded-state path may materialize missing optimizer
