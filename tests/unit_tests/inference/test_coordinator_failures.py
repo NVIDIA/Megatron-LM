@@ -17,6 +17,8 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest, S
 from megatron.core.inference.sampling_params import SamplingParams
 from tests.unit_tests.inference.coordinator_pairwise_utils import CoordinatorThread, until
 
+pytestmark = pytest.mark.single_rank
+
 REPLY_TIMEOUT = 30.0
 
 

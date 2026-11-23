@@ -18,6 +18,8 @@ from tests.unit_tests.inference.engines.test_dynamic_engine import (
 )
 from tests.unit_tests.test_utilities import Utils
 
+pytestmark = pytest.mark.single_rank
+
 _CHUNKED_REQUEST_ID = 17
 _PEER_REQUEST_ID = 3
 _OUTPUT_TOKEN = 5

@@ -11,6 +11,8 @@ from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.inference.engines import batch_invariant_test_utils as fixture
 
+pytestmark = pytest.mark.single_rank
+
 
 @pytest.mark.parametrize(
     "invalid,reason",

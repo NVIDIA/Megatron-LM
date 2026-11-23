@@ -13,7 +13,7 @@ from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngin
 from megatron.core.inference.inference_request import DynamicInferenceRequestRecord, Status
 from tests.unit_tests.inference.contexts.test_dynamic_prefix_caching import PrefixCachingTestBase
 
-pytestmark = pytest.mark.internal
+pytestmark = [pytest.mark.internal, pytest.mark.single_rank]
 
 
 class _NotificationLoop:

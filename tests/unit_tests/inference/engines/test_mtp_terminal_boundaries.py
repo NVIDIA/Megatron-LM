@@ -29,6 +29,8 @@ from tests.unit_tests.inference.engines.test_dynamic_engine import (
 )
 from tests.unit_tests.test_utilities import Utils
 
+pytestmark = pytest.mark.single_rank
+
 
 def _make_postprocess_engine(request, num_speculative_tokens=2, track_generated_token_events=False):
     """Build the smallest faithful owner of post-process state."""

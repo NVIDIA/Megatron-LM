@@ -1743,6 +1743,7 @@ def test_async_sched_step_wires_sampling_through_resolution(
     assert context.async_sched_compaction_step_count == expected_compaction_count
 
 
+@pytest.mark.single_rank
 @pytest.mark.internal
 def test_async_overlap_seed_uses_pending_logits_positions():
     """Preparing the next forward must not change the pending token's RNG draw."""

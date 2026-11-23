@@ -224,7 +224,15 @@ MAMBA_CASES = [
 ]
 
 
-@pytest.mark.parametrize("case", MAMBA_CASES, ids=lambda case: case.name)
+@pytest.mark.parametrize(
+    "case",
+    # A TP=PP=1 case builds one full model and needs no other rank.
+    [
+        pytest.param(case, marks=pytest.mark.single_rank) if case.tp == case.pp == 1 else case
+        for case in MAMBA_CASES
+    ],
+    ids=lambda case: case.name,
+)
 def test_mamba_dynamic_batch_invariance(case):
     engines = []
     with bi.invariant_runtime(case) as (backend, version), pytest.MonkeyPatch.context() as patch:
@@ -256,6 +264,7 @@ def test_mamba_dynamic_batch_invariance(case):
         )
 
 
+@pytest.mark.single_rank
 @pytest.mark.parametrize("graph_mode", ["eager", "decode", "mixed"])
 def test_mtp_dynamic_batch_invariance(graph_mode):
     # Two speculative tokens run MTP depth 0 as well; nothing branches on a single depth.
