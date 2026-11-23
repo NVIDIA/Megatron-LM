@@ -360,6 +360,10 @@ def assign_reviewer(pr_number):
         sys.exit(1)
 
     pr_data = pr_resp.json()
+    if pr_data["draft"] or pr_data["state"] != "open":
+        print(f"Skipping reviewer request: PR #{pr_number} is draft or closed")
+        return
+
     requested_reviewers = pr_data.get("requested_reviewers", [])
     requested_teams = pr_data.get("requested_teams", [])
     labels = {label.get("name") for label in pr_data.get("labels", [])}
