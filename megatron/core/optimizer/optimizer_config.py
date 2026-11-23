@@ -451,6 +451,14 @@ class OptimizerConfig:
     optimizer_cuda_graph: bool = False
     """If true, enables CUDA graph for optimizer step."""
 
+    fold_per_token_grad_scale: bool = False
+    """If true, with per-token loss normalization and only distributed optimizers, defer the
+    1/num_tokens gradient scaling from finalize_model_grads into the optimizer step: the grad
+    norm is multiplied by it and the clip pass (or one scale pass without clipping) applies it
+    to the fp32 main grads, which saves a full pass over the grad buffers. Model grads then stay
+    unscaled until the optimizer step, so anything that reads them in between sees unscaled
+    values. Not applied with DSA indexer gradient clipping or a full-iteration CUDA graph."""
+
     use_cute_dsl_multi_tensor: bool = False
     """If true, run the fp32 multi-tensor Adam and L2-norm calls as one persistent CuTe DSL
     launch per tensor list instead of Transformer Engine's chunked launches. Needs an SM100+

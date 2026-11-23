@@ -31,7 +31,7 @@ class _MixedDtypeNet(torch.nn.Module):
         return x
 
 
-def _model_and_optimizer(fp32_param: bool, bucket_size: int):
+def _model_and_optimizer(fp32_param: bool, bucket_size: int, **optimizer_kwargs):
     model = _MixedDtypeNet(fp32_param)
     model = DistributedDataParallel(
         TransformerConfig(num_attention_heads=1, num_layers=1),
@@ -44,7 +44,7 @@ def _model_and_optimizer(fp32_param: bool, bucket_size: int):
             lr=0.01,
             bf16=True,
             use_distributed_optimizer=True,
-            log_num_zeros_in_grad=True,
+            **{"log_num_zeros_in_grad": True, **optimizer_kwargs},
         ),
         [model],
     )

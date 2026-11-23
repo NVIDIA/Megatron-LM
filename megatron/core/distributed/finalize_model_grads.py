@@ -838,4 +838,9 @@ def finalize_model_grads(
         safe_num_tokens = torch.clamp(num_tokens, min=1)
         scaling = 1.0 / safe_num_tokens
         for model_chunk in model:
-            model_chunk.scale_gradients(scaling)
+            if getattr(model_chunk, 'fold_grad_scaling', False):
+                # The ChainedOptimizer folds the factor into its grad norm and clip scalar,
+                # whose pass delivers the scaled grads Adam loads: no pass over the buffers.
+                model_chunk.pending_grad_scaling = scaling
+            else:
+                model_chunk.scale_gradients(scaling)

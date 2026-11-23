@@ -147,11 +147,59 @@ def get_grad_norm_fp32(
     return total_norm
 
 
+def _fp32_grads(
+    parameters: Union[List[torch.Tensor], torch.Tensor], use_decoupled_grad: bool
+) -> List[torch.Tensor]:
+    """The fp32 (or decoupled) gradients of `parameters`, as local tensors."""
+    grads = []
+    for param in parameters:
+        if use_decoupled_grad:
+            if hasattr(param, "decoupled_grad") and param.decoupled_grad is not None:
+                assert param.decoupled_grad.dtype in [torch.float32, torch.bfloat16]
+                grads.append(to_local_if_dtensor(param.decoupled_grad).detach())
+        else:
+            if param.grad is not None:
+                assert param.grad.dtype in [torch.float32, torch.bfloat16]
+                grads.append(to_local_if_dtensor(param.grad).detach())
+    return grads
+
+
+def scale_grads_fp32(
+    parameters: Union[List[torch.Tensor], torch.Tensor],
+    scale: torch.Tensor,
+    use_decoupled_grad: bool = False,
+) -> None:
+    """Multiply the gradients of `parameters` in place by the fp32 device scalar `scale`.
+
+    Args:
+        parameters (Union[List[torch.Tensor], torch.Tensor]): Parameters whose gradients
+            are scaled.
+        scale (torch.Tensor): One-element fp32 CUDA tensor.
+        use_decoupled_grad (bool, optional): Whether to read from the
+            '.decoupled_grad' attribute instead of the standard '.grad'.
+            Defaults to False.
+    """
+    grads = _fp32_grads(parameters, use_decoupled_grad)
+    if not grads:
+        return
+    assert (
+        multi_tensor_scale_tensor_impl is not None
+    ), "A device-scalar grad scale needs multi_tensor_scale_tensor."
+    dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
+    multi_tensor_applier(
+        multi_tensor_scale_tensor_impl,
+        dummy_overflow_buf,
+        [grads, grads],
+        scale.to(torch.float32).reshape(1),
+    )
+
+
 def clip_grad_by_total_norm_fp32(
     parameters: Union[List[torch.Tensor], torch.Tensor],
     max_norm: Union[int, float],
     total_norm: float,
     use_decoupled_grad: bool = False,
+    grad_scaling: Optional[torch.Tensor] = None,
 ):
     """Clips the gradients of an iterable of parameters in FP32 by total norm.
 
@@ -166,21 +214,18 @@ def clip_grad_by_total_norm_fp32(
         use_decoupled_grad (bool, optional): Whether to read from the
             '.decoupled_grad' attribute instead of the standard '.grad'.
             Defaults to False.
+        grad_scaling (torch.Tensor, optional): A deferred fp32 factor the gradients
+            have not been multiplied by yet (``total_norm`` already includes it). It is
+            folded into the clip scalar, so the one pass applies both. Defaults to None.
     """
-    # Grads.
-    params = []
-    grads = []
-    for param in parameters:
-        if use_decoupled_grad:
-            if hasattr(param, "decoupled_grad") and param.decoupled_grad is not None:
-                assert param.decoupled_grad.dtype in [torch.float32, torch.bfloat16]
-                params.append(param)
-                grads.append(to_local_if_dtensor(param.decoupled_grad).detach())
-        else:
-            if param.grad is not None:
-                assert param.grad.dtype in [torch.float32, torch.bfloat16]
-                params.append(param)
-                grads.append(to_local_if_dtensor(param.grad).detach())
+    if grad_scaling is not None:
+        clip_coeff = torch.as_tensor(
+            max_norm / (total_norm + 1.0e-6), dtype=torch.float32, device='cuda'
+        ).clamp_max(1.0)
+        scale_grads_fp32(parameters, clip_coeff * grad_scaling, use_decoupled_grad)
+        return
+
+    grads = _fp32_grads(parameters, use_decoupled_grad)
 
     # Scale.
     clip_coeff = max_norm / (total_norm + 1.0e-6)
