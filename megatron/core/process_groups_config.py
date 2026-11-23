@@ -1047,38 +1047,3 @@ class MultiModuleProcessGroupCollection:
             else ""
         )
         return f"MultiModuleProcessGroupCollection(modules=[{modules_str}]{lm_str})"
-
-
-def _get_gloo_mirror_group(
-    pg_set: Dict,
-    gloo_group_name: str,
-    group: torch.distributed.ProcessGroup,
-    group_description: str,
-) -> torch.distributed.ProcessGroup:
-    """Return the collection's Gloo group ``gloo_group_name`` after checking it mirrors ``group``.
-
-    The distributed optimizer shards its state over ``group`` and gathers that state over the
-    Gloo group for checkpoint I/O, so both must hold the same ranks in the same order.
-    """
-    # torch resolves a None group to WORLD, which would let a WORLD Gloo group "mirror" a
-    # sharding group that was never supplied.
-    if group is None:
-        raise ValueError(
-            f"use_gloo_process_groups=True requires {group_description}, which the distributed "
-            f"optimizer shards over and pg_collection.{gloo_group_name} mirrors, but it is None."
-        )
-    gloo_group = pg_set.get(gloo_group_name)
-    if gloo_group is None:
-        raise ValueError(
-            f"use_gloo_process_groups=True requires pg_collection.{gloo_group_name}. Build the "
-            "job with Gloo process groups or pass use_gloo_process_groups=False."
-        )
-    gloo_group_ranks = torch.distributed.get_process_group_ranks(gloo_group)
-    group_ranks = torch.distributed.get_process_group_ranks(group)
-    if gloo_group_ranks != group_ranks:
-        raise ValueError(
-            f"pg_collection.{gloo_group_name} has ranks {gloo_group_ranks}, but "
-            f"{group_description}, which the distributed optimizer shards over, has ranks "
-            f"{group_ranks}. The Gloo group must hold the same ranks in the same order."
-        )
-    return gloo_group
