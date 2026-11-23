@@ -39,6 +39,7 @@ from megatron.bridge.models.gpt_oss.gpt_oss_bridge import (
     GPTOSSMLPGateUpProjMapping,
 )
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
+from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 _EXPECTED_YARN_ROPE_SCALING = {
@@ -579,19 +580,23 @@ class TestGPTOSSWeightRoundTrip:
     @pytest.mark.parametrize(
         "intermediate_size", [64, 96], ids=["square_down_proj", "rectangular_down_proj"]
     )
-    def test_bf16_checkpoint_round_trips_exactly(self, tmp_path, intermediate_size):
+    def test_bf16_checkpoint_round_trips_exactly(self, tmp_path_dist_ckpt, intermediate_size):
         config = _gpt_oss_config(intermediate_size=intermediate_size)
         torch.manual_seed(1234)
         hf_model = GptOssForCausalLM(config).to(torch.bfloat16)
-        hf_model.save_pretrained(tmp_path)
         expected = {name: tensor.detach().cpu() for name, tensor in hf_model.state_dict().items()}
 
-        bridge = AutoBridge.from_hf_pretrained(tmp_path)
-        models = bridge.get_model(wrap_with_ddp=False)
+        # Transformers saves only on rank 0 once torch.distributed is initialized, so every rank
+        # reads the checkpoint from one shared directory.
+        with TempNamedDir(tmp_path_dist_ckpt / "gpt_oss_round_trip") as hf_path:
+            if torch.distributed.get_rank() == 0:
+                hf_model.save_pretrained(hf_path)
+            torch.distributed.barrier()
+            bridge = AutoBridge.from_hf_pretrained(hf_path)
+            models = bridge.get_model(wrap_with_ddp=False)
+            exported = dict(bridge.export_hf_weights(models, cpu=True, show_progress=False))
+
         assert models[0].model_config.softmax_type == "learnable"
-
-        exported = dict(bridge.export_hf_weights(models, cpu=True, show_progress=False))
-
         assert set(exported) == set(expected)
         for name, tensor in exported.items():
             assert tensor.dtype == expected[name].dtype, name

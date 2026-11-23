@@ -38,6 +38,7 @@ from megatron.bridge.models.deepseek.common import get_common_mapping_list
 from megatron.bridge.models.deepseek.deepseek_v3_bridge import DeepSeekV3Bridge
 from megatron.bridge.models.gpt.model_config import BridgeGPTMLAModelConfig
 from megatron.bridge.models.transformer_config import MLATransformerConfig
+from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 _DS_V3_CONFIG = {
@@ -630,19 +631,21 @@ def _is_fp8_linear(name: str, tensor: torch.Tensor) -> bool:
     return tensor.ndim == 2 and name.endswith("proj.weight") and not name.endswith("eh_proj.weight")
 
 
-def _toy_checkpoint(tmp_path, *, q_lora_rank, mtp: bool, fp8: bool):
+def _toy_checkpoint(directory, *, q_lora_rank, mtp: bool, fp8: bool):
     """Save a toy DeepSeek-V3 checkpoint; return the BF16 tensors its export must reproduce.
 
     The MTP layer is the extra last decoder layer of a model built with one more layer, plus the
     MTP-only norms and projection. Router expert biases are FP32, as in released checkpoints.
+    Transformers saves only on rank 0 once torch.distributed is initialized, so call this on rank 0
+    in that case.
     """
     num_layers = 3
     hf_config = _toy_hf_config(q_lora_rank=q_lora_rank, num_hidden_layers=num_layers + int(mtp))
     torch.manual_seed(1234)
     # Transformers fuses the experts in memory and writes per-expert tensors, like released
     # checkpoints, only when saving.
-    DeepseekV3ForCausalLM(hf_config).to(torch.bfloat16).save_pretrained(tmp_path / "saved")
-    state = load_file(tmp_path / "saved" / "model.safetensors")
+    DeepseekV3ForCausalLM(hf_config).to(torch.bfloat16).save_pretrained(directory / "saved")
+    state = load_file(directory / "saved" / "model.safetensors")
     generator = torch.Generator().manual_seed(4321)
     for name in [name for name in state if name.endswith("e_score_correction_bias")]:
         state[name] = torch.randn(state[name].shape, generator=generator, dtype=torch.float32)
@@ -676,7 +679,7 @@ def _toy_checkpoint(tmp_path, *, q_lora_rank, mtp: bool, fp8: bool):
 
     hf_config.num_hidden_layers = num_layers
     hf_config.num_nextn_predict_layers = int(mtp)
-    checkpoint = tmp_path / "checkpoint"
+    checkpoint = directory / "checkpoint"
     hf_config.save_pretrained(checkpoint)
     save_file(state, checkpoint / "model.safetensors")
     return checkpoint, expected
@@ -687,6 +690,10 @@ class TestDeepSeekV3CheckpointCoverage:
 
     @pytest.mark.parametrize("q_lora_rank", [32, None], ids=["query_lora", "without_query_lora"])
     def test_every_source_tensor_has_a_mapping(self, tmp_path, q_lora_rank):
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            pytest.skip(
+                "Transformers saves the toy checkpoint only on rank 0, which runs this check."
+            )
         checkpoint, _ = _toy_checkpoint(tmp_path, q_lora_rank=q_lora_rank, mtp=True, fp8=True)
         bridge = DeepSeekV3Bridge()
         bridge.hf_config = DeepseekV3Config.from_pretrained(checkpoint)
@@ -728,13 +735,18 @@ class TestDeepSeekV3WeightRoundTrip:
         [(32, True, False), (None, False, False), (32, True, True)],
         ids=["bf16_mtp", "bf16_without_query_lora", "fp8_mtp"],
     )
-    def test_checkpoint_round_trips_exactly(self, tmp_path, q_lora_rank, mtp, fp8):
-        checkpoint, expected = _toy_checkpoint(tmp_path, q_lora_rank=q_lora_rank, mtp=mtp, fp8=fp8)
-
-        bridge = AutoBridge.from_hf_pretrained(checkpoint)
-        models = bridge.get_model(wrap_with_ddp=False, mixed_precision_wrapper=None)
-
-        exported = dict(bridge.export_hf_weights(models, cpu=True, show_progress=False))
+    def test_checkpoint_round_trips_exactly(self, tmp_path_dist_ckpt, q_lora_rank, mtp, fp8):
+        # Transformers saves only on rank 0 once torch.distributed is initialized, so rank 0 writes
+        # the checkpoint and the tensors its export must reproduce for every rank to read.
+        with TempNamedDir(tmp_path_dist_ckpt / "deepseek_v3_round_trip") as directory:
+            if torch.distributed.get_rank() == 0:
+                _, expected = _toy_checkpoint(directory, q_lora_rank=q_lora_rank, mtp=mtp, fp8=fp8)
+                save_file(expected, directory / "expected.safetensors")
+            torch.distributed.barrier()
+            expected = load_file(directory / "expected.safetensors")
+            bridge = AutoBridge.from_hf_pretrained(directory / "checkpoint")
+            models = bridge.get_model(wrap_with_ddp=False, mixed_precision_wrapper=None)
+            exported = dict(bridge.export_hf_weights(models, cpu=True, show_progress=False))
 
         assert set(exported) == set(expected)
         for name, tensor in exported.items():

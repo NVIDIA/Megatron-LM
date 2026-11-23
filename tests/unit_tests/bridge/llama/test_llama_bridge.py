@@ -32,6 +32,7 @@ from megatron.bridge.models.conversion.transformers_compat import rope_theta_fro
 from megatron.bridge.models.gpt.model_config import BridgeGPTModelConfig
 from megatron.bridge.models.llama.llama_bridge import LlamaBridge
 from megatron.bridge.models.transformer_config import TransformerConfig
+from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 _LLAMA3_ROPE_SCALING = {
@@ -539,7 +540,7 @@ class TestLlamaWeightRoundTrip:
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("tie_word_embeddings", [False, True], ids=["untied", "tied"])
-    def test_hf_weights_round_trip_exactly(self, tmp_path, tie_word_embeddings):
+    def test_hf_weights_round_trip_exactly(self, tmp_path_dist_ckpt, tie_word_embeddings):
         config = _small_llama_config(
             num_key_value_heads=2,
             max_position_embeddings=131072,
@@ -549,22 +550,26 @@ class TestLlamaWeightRoundTrip:
         )
         torch.manual_seed(1234)
         hf_model = LlamaForCausalLM(config).to(torch.bfloat16)
-        hf_model.save_pretrained(tmp_path)
         expected = {name: tensor.detach().cpu() for name, tensor in hf_model.state_dict().items()}
         if tie_word_embeddings:
             # The tied head is the embedding; the checkpoint stores it once.
             expected.pop("lm_head.weight")
 
-        bridge = AutoBridge.from_hf_pretrained(tmp_path)
-        models = bridge.get_model(wrap_with_ddp=False)
+        # Transformers saves only on rank 0 once torch.distributed is initialized, so every rank
+        # reads the checkpoint from one shared directory.
+        with TempNamedDir(tmp_path_dist_ckpt / "llama_round_trip") as hf_path:
+            if torch.distributed.get_rank() == 0:
+                hf_model.save_pretrained(hf_path)
+            torch.distributed.barrier()
+            bridge = AutoBridge.from_hf_pretrained(hf_path)
+            models = bridge.get_model(wrap_with_ddp=False)
+            exported = {
+                name: tensor
+                for name, tensor in bridge.export_hf_weights(models, cpu=True, show_progress=False)
+            }
+
         assert isinstance(models[0].model_config, BridgeGPTModelConfig)
         assert models[0].model_config.rope_scaling is True
-
-        exported = {
-            name: tensor
-            for name, tensor in bridge.export_hf_weights(models, cpu=True, show_progress=False)
-        }
-
         assert set(exported) == set(expected)
         for name, tensor in exported.items():
             assert tensor.dtype == expected[name].dtype, name
