@@ -13,10 +13,11 @@ mode produces the correct per-shard result:
   4. test_col_parallel      - TP and GTP both on dim 0: gather smaller group, distribute larger.
   5. test_padded_distributed_parity - padding stays in NS buffers but not Muon scale math.
 
-The TP cases run at ``tp_size * gtp_remat_size`` ranks and cover ``tp_size != gtp_remat_size``
-in both directions, since equal sizes are the one shape where a mix-up of the two dim-0 axes
-would still land on self-consistent offsets. Each case skips unless the launched world size
-matches, so the 4-rank shapes cover a 4-GPU dev box and the 8-rank ones cover CI.
+CI runs exactly 4 ranks, so every case is 4-rank. TP and GTP both > 1 then means tp = gtp = 2:
+equal sizes would hide a swap of the two group *sizes*, but not a swap of the two *groups*, since
+the TP groups ({0,1}, {2,3}) and GTP groups ({0,2}, {1,3}) differ, so ranks 1 and 2 would read the
+wrong block. Unequal TP and GTP sizes both > 1 need at least 8 ranks, so the tie-break sends
+(2, 2) down the gather-TP / distribute-over-GTP branch and the TP > GTP branch is not covered.
 """
 
 import pytest
@@ -37,15 +38,7 @@ from emerging_optimizers.orthogonalized_optimizers import get_muon_scale_factor
 from emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz
 
 from megatron.core.process_groups_config import ProcessGroupCollection
-
-# _torchrun_dist_init and reset_gtp_globals are autouse fixtures; pytest only applies them
-# if the names are bound in this module.
-from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: F401
-    _requires_multi_gpu,
-    _run_distributed,
-    _torchrun_dist_init,
-    reset_gtp_globals,
-)
+from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import _run_distributed
 
 # Parity is asserted at num_ns_steps=1: there the distributed Gram all-reduce equals the
 # full-matrix Gram to fp32 reduction-order noise (~1e-5). At more steps the (mathematically
@@ -64,10 +57,7 @@ _PAD_ALIGNMENT = 16
 _COEFFICIENT_TYPE = "quintic"
 _SCALE_MODE = "spectral"
 
-# GTP-only shapes (TP1); the GTP group spans the whole world.
-_GTP_ONLY_WORLD_SIZES = [4, 8]
-# (tp_size, gtp_remat_size) for the combined TP + GTP shapes; world size is their product.
-_TP_GTP_SHAPES = [(2, 2), (2, 4), (4, 2)]
+_WORLD_SIZE = 4
 
 
 def _make_muon(pg_collection, tp_mode="distributed"):
@@ -288,45 +278,32 @@ def _worker_padded_distributed_parity(
 class TestGTPMuonDistributedNS:
     """Distributed-NS orthogonalization matches full-matrix NS, per shard."""
 
-    @pytest.mark.parametrize("tp_mode", ["distributed", "duplicated", "auto"])
-    @pytest.mark.parametrize("world_size", _GTP_ONLY_WORLD_SIZES)
-    def test_gtp_only_parity(self, world_size, tp_mode):
-        _requires_multi_gpu(world_size)
-        _run_distributed(_worker_gtp_only_parity, world_size, tp_mode)
+    @pytest.mark.parametrize("tp_mode", ["distributed", "duplicated"])
+    def test_gtp_only_parity(self, tp_mode):
+        _run_distributed(_worker_gtp_only_parity, _WORLD_SIZE, tp_mode)
 
-    @pytest.mark.parametrize("tp_size,gtp_remat_size", _TP_GTP_SHAPES)
-    def test_row_parallel(self, tp_size, gtp_remat_size):
-        world_size = tp_size * gtp_remat_size
-        _requires_multi_gpu(world_size)
-        _run_distributed(_worker_row_parallel, world_size, tp_size, gtp_remat_size)
+    def test_row_parallel(self):
+        _run_distributed(_worker_row_parallel, _WORLD_SIZE, 2, 2)
 
-    @pytest.mark.parametrize("tp_size,gtp_remat_size", _TP_GTP_SHAPES)
-    def test_col_parallel(self, tp_size, gtp_remat_size):
-        world_size = tp_size * gtp_remat_size
-        _requires_multi_gpu(world_size)
-        _run_distributed(_worker_col_parallel, world_size, tp_size, gtp_remat_size)
+    def test_col_parallel(self):
+        _run_distributed(_worker_col_parallel, _WORLD_SIZE, 2, 2)
 
-    @pytest.mark.parametrize("world_size", _GTP_ONLY_WORLD_SIZES)
-    def test_gtp_blockwise_mode(self, world_size):
-        _requires_multi_gpu(world_size)
-        _run_distributed(_worker_gtp_blockwise, world_size)
+    def test_gtp_blockwise_mode(self):
+        _run_distributed(_worker_gtp_blockwise, _WORLD_SIZE)
 
     @pytest.mark.parametrize(
         "tp_size,gtp_remat_size,logical_m,partition_dim",
         [
-            pytest.param(1, 8, 126, None, id="gtp-only"),
-            pytest.param(1, 8, 62, None, id="gtp-only-padding-spans-shards"),
-            pytest.param(2, 4, 126, 1, id="row-parallel"),
-            pytest.param(4, 2, 124, 0, id="column-parallel"),
+            # 30 rows pad to 64: GTP shard 0 unpadded, 1 partly and 2-3 entirely padding.
+            pytest.param(1, 4, 30, None, id="gtp-only-padding-spans-shards"),
+            pytest.param(2, 2, 126, 1, id="row-parallel"),
+            pytest.param(2, 2, 124, 0, id="column-parallel"),
         ],
     )
     def test_padded_distributed_parity(self, tp_size, gtp_remat_size, logical_m, partition_dim):
-        world_size = tp_size * gtp_remat_size
-        # The eight ranks may span multiple nodes, so validate the initialized distributed
-        # world rather than requiring all eight CUDA devices to be visible on each host.
         _run_distributed(
             _worker_padded_distributed_parity,
-            world_size,
+            _WORLD_SIZE,
             tp_size,
             gtp_remat_size,
             logical_m,

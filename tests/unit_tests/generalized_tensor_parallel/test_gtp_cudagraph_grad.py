@@ -85,11 +85,15 @@ class TestGTPCaptureGradSnapshot:
         torch.testing.assert_close(shard1.main_grad, torch.full((8,), 0.04, device="cuda"))
 
     def test_non_gtp_backs_up_own_params_only(self):
-        """Non-GTP runner: own params are snapshotted, but the GTP cross-graph next_w walk is
+        """Non-GTP runner: own params are restored, but the GTP cross-graph next_w walk is
         skipped (the bwd capture doesn't touch main_grad on the non-GTP path)."""
         own = _gtp_param(0.0125)
         cross = _gtp_param(0.02)
         own.next_w = cross
         backup = _backup_grads_before_capture(_StubRunner(_Mod(own), gtp_remat=False))
-        assert id(own) in backup
-        assert id(cross) not in backup
+        own.main_grad.add_(410.0)
+        cross.main_grad.add_(99.0)
+        _restore_grads_after_capture(backup)
+
+        torch.testing.assert_close(own.main_grad, torch.full((8,), 0.0125, device="cuda"))
+        torch.testing.assert_close(cross.main_grad, torch.full((8,), 99.02, device="cuda"))

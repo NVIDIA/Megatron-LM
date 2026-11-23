@@ -910,6 +910,10 @@ def delete_cuda_graphs():
     torch.cuda.empty_cache()
 
     CudaGraphManager.global_mempool = None
+    if HAVE_GTP:
+        # GTP routes graph-owned allocations into the pool registered at manager init; the next
+        # model must not allocate into a pool whose graphs were deleted.
+        set_cuda_graph_mempool(None, None)
 
 
 class _GraphStatus(Enum):

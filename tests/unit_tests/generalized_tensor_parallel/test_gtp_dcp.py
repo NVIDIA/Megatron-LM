@@ -42,7 +42,6 @@ from megatron.core.process_groups_config import ProcessGroupCollection  # noqa: 
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules  # noqa: E402
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules  # noqa: E402
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import (  # noqa: E402
-    GTP_CONFIG,
     GTPShardedParam,
     make_sharded_tensors_for_checkpoint_with_gtp_remat,
     update_gtp_config,
@@ -63,23 +62,18 @@ from megatron.core.utils import (  # noqa: E402
     get_pg_size,
     make_tp_sharded_tensor_for_checkpoint,
 )
-from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: E402,F401
+from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
     _requires_mxfp8,
-    _torchrun_dist_init,
-    reset_gtp_globals,
+    cached_group,
 )
 
 
 @pytest.fixture(autouse=True)
 def _no_pad_alignment():
-    """Disable GTP_remat padding for the duration of each test so local shard sizes
-    are exactly ``per_tp_out / gtp_remat_size`` and the test math stays simple.
-    DCP semantics with padding are exercised by the integration tests.
+    """Disable GTP_remat padding (conftest restores it) so local shard sizes are exactly
+    ``per_tp_out / gtp_remat_size``; the padding tests opt back in explicitly.
     """
-    orig = GTP_CONFIG.pad_for_alignment
     update_gtp_config(pad_for_alignment=0)
-    yield
-    update_gtp_config(pad_for_alignment=orig)
 
 
 def _require_world_size(n):
@@ -90,30 +84,17 @@ def _require_world_size(n):
         )
 
 
-# Many workers need the same TP/GTP subgroups. Memoize by rank-set so the process holds a
-# handful of communicators instead of re-creating (and leaking) one per worker.
-_GROUP_CACHE = {}
-
-
-def _cached_new_group(ranks):
-    """Memoized ``dist.new_group`` keyed by rank-set (see note above)."""
-    key = tuple(ranks)
-    if key not in _GROUP_CACHE:
-        _GROUP_CACHE[key] = dist.new_group(list(ranks))
-    return _GROUP_CACHE[key]
-
-
 @pytest.fixture(scope="module", autouse=True)
 def _precreate_subgroups(_torchrun_dist_init):
     """Pre-create the shared TP/GTP subgroups once, on all ranks, in a fixed order.
 
     ``dist.new_group`` is a world-collective (all ranks must call it in the same order); the
     per-member ``new_group([0,1]) if rank in (0,1) else ...`` idiom collides disjoint groups on
-    the call-order tag and hangs NCCL. Pre-creating makes every later ``_cached_new_group`` a hit.
+    the call-order tag and hangs NCCL. Pre-creating makes every later ``cached_group`` a hit.
     """
     if dist.is_initialized() and dist.get_world_size() == 4:
         for ranks in ([0], [1], [2], [3], [0, 1], [2, 3], [0, 2], [1, 3], [0, 1, 2, 3]):
-            _cached_new_group(ranks)
+            cached_group(ranks)
     yield
 
 
@@ -160,8 +141,8 @@ def _worker_native_fp8_dcp_save(rank, world_size, port):
     _requires_mxfp8()
 
     # TP=2, GTP_remat=2 (4 ranks). MXFP8 needs dims % 32, so use fp8-valid sizes.
-    gtp_remat_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
-    tp_group = _cached_new_group([0, 2]) if rank in (0, 2) else _cached_new_group([1, 3])
+    gtp_remat_group = cached_group([0, 1]) if rank in (0, 1) else cached_group([2, 3])
+    tp_group = cached_group([0, 2]) if rank in (0, 2) else cached_group([1, 3])
     full_out, in_f = 128, 128
     tp_size, gtp_remat_size = 2, 2
     per_tp_out = full_out // tp_size  # 64
@@ -181,7 +162,7 @@ def _worker_native_fp8_dcp_save(rank, world_size, port):
         tensor_parallel_layers_axis_map={"weight": 0},
         sharded_offsets=(),
         tp_group=tp_group,
-        dp_cp_group=_cached_new_group(list(range(world_size))),
+        dp_cp_group=cached_group(list(range(world_size))),
     )
     st = sharded["weight"]
     assert isinstance(st, ShardedTensor), type(st)
@@ -269,8 +250,8 @@ def _worker_helper_offsets_tp_eq_gtp_axis(rank, world_size, port):
     gtp_remat_size. We mimic that by starting with a per-TP-rank tensor of size
     ``full // tp_size`` and letting wrap_module_params_gtp slice it.
     """
-    gtp_remat_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
-    tp_group = _cached_new_group([0, 2]) if rank in (0, 2) else _cached_new_group([1, 3])
+    gtp_remat_group = cached_group([0, 1]) if rank in (0, 1) else cached_group([2, 3])
+    tp_group = cached_group([0, 2]) if rank in (0, 2) else cached_group([1, 3])
 
     full_out_features = 8
     tp_size, gtp_remat_size = 2, 2
@@ -290,7 +271,7 @@ def _worker_helper_offsets_tp_eq_gtp_axis(rank, world_size, port):
         tensor_parallel_layers_axis_map={"weight": 0},
         sharded_offsets=(),
         tp_group=tp_group,
-        dp_cp_group=_cached_new_group(list(range(world_size))),
+        dp_cp_group=cached_group(list(range(world_size))),
     )
     st = sharded["weight"]
     assert isinstance(st, ShardedTensor), f"Expected ShardedTensor, got {type(st)}"
@@ -314,8 +295,8 @@ def _worker_helper_offsets_tp_neq_gtp_axis(rank, world_size, port):
     Per-TP-rank tensor: (full_out, full_in/tp_size). GTP_remat further shards
     axis 0 to (full_out/gtp_remat_size, full_in/tp_size).
     """
-    gtp_remat_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
-    tp_group = _cached_new_group([0, 2]) if rank in (0, 2) else _cached_new_group([1, 3])
+    gtp_remat_group = cached_group([0, 1]) if rank in (0, 1) else cached_group([2, 3])
+    tp_group = cached_group([0, 2]) if rank in (0, 2) else cached_group([1, 3])
 
     full_out, full_in = 8, 4
     tp_size, gtp_remat_size = 2, 2
@@ -331,7 +312,7 @@ def _worker_helper_offsets_tp_neq_gtp_axis(rank, world_size, port):
         tensor_parallel_layers_axis_map={"weight": 1},  # row-parallel
         sharded_offsets=(),
         tp_group=tp_group,
-        dp_cp_group=_cached_new_group(list(range(world_size))),
+        dp_cp_group=cached_group(list(range(world_size))),
     )
     st = sharded["weight"]
     tp_rank = rank // 2
@@ -353,7 +334,7 @@ def _worker_helper_no_op_no_gtp_remat(rank, world_size, port):
 
     Per-TP-rank shape under column-parallel TP=2: (full_out//tp_size, in).
     """
-    tp_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
+    tp_group = cached_group([0, 1]) if rank in (0, 1) else cached_group([2, 3])
 
     full_out, in_features, tp_size = 8, 4, 2
     per_tp_out = full_out // tp_size
@@ -369,7 +350,7 @@ def _worker_helper_no_op_no_gtp_remat(rank, world_size, port):
         tensor_parallel_layers_axis_map={"weight": 0, "bias": 0},
         sharded_offsets=(),
         tp_group=tp_group,
-        dp_cp_group=_cached_new_group(list(range(world_size))),
+        dp_cp_group=cached_group(list(range(world_size))),
     )
     # tp_group is [0,1] for ranks 0,1 and [2,3] for ranks 2,3 here — local tp_rank = rank % 2
     tp_rank = rank % 2
@@ -378,45 +359,6 @@ def _worker_helper_no_op_no_gtp_remat(rank, world_size, port):
         f"{sharded['weight'].global_offset[0]}"
     )
     assert sharded["weight"].global_shape == (full_out, in_features)
-
-
-def _worker_helper_padded_inproj_no_pad_case(rank, world_size, port):
-    """``in_proj.weight`` shape modeled after the production case (z|x|B|C|dt
-    concat along dim 0). With GTP_remat=4 and these dim-0 sizes the alignment
-    constraint ``dim0 % (gtp_remat_size * pad_for_alignment) == 0`` is satisfied —
-    *no* padding fires. Verify the helper emits the expected offsets.
-    """
-    update_gtp_config(pad_for_alignment=16)
-    # dim0 = 512+512+64+64+8 = 1160 → 1160 % (4*16=64) = 8 ⇒ NOT aligned.
-    # Pick sizes that ARE aligned to 64 to exercise the no-pad path:
-    dim0 = 1152  # = 18 * 64; alignment-clean for gtp_remat_size=4, pad=16
-    in_features = 4
-
-    # All 4 ranks form a single GTP_remat group.
-    gtp_remat_group = _cached_new_group(list(range(world_size)))
-    weight = _make_gtp_shard(dim0, in_features, gtp_remat_group)
-
-    # No padding ⇒ local shape is exactly dim0 / 4 = 288
-    expected_local = dim0 // 4
-    assert weight.shape == (expected_local, in_features), (
-        f"rank={rank}: padding should NOT have fired (dim0 aligned); "
-        f"got local shape {tuple(weight.shape)}, expected ({expected_local}, {in_features})"
-    )
-    assert getattr(weight, "pad_length", 0) == 0
-
-    sharded = make_sharded_tensors_for_checkpoint_with_gtp_remat(
-        {"weight": weight},
-        prefix="",
-        tensor_parallel_layers_axis_map={"weight": 0},
-        sharded_offsets=(),
-        tp_group=_cached_new_group([rank]),  # trivial 1-rank TP group
-        dp_cp_group=_cached_new_group(list(range(world_size))),
-    )
-    st = sharded["weight"]
-    assert (
-        st.global_shape[0] == dim0
-    ), f"rank={rank} no-pad case: global_shape[0] {st.global_shape[0]} != {dim0}"
-    assert st.global_offset[0] == rank * expected_local
 
 
 def _worker_helper_padded_inproj_pad_case(rank, world_size, port):
@@ -433,7 +375,7 @@ def _worker_helper_padded_inproj_pad_case(rank, world_size, port):
     dim0_padded = dim0_unpadded + pad
     per_shard = dim0_padded // gtp_remat_size
 
-    gtp_remat_group = _cached_new_group(list(range(world_size)))
+    gtp_remat_group = cached_group(list(range(world_size)))
     weight = _make_gtp_shard(dim0_unpadded, in_features, gtp_remat_group)
 
     assert weight.shape == (
@@ -451,8 +393,8 @@ def _worker_helper_padded_inproj_pad_case(rank, world_size, port):
         prefix="",
         tensor_parallel_layers_axis_map={"weight": 0},
         sharded_offsets=(),
-        tp_group=_cached_new_group([rank]),
-        dp_cp_group=_cached_new_group(list(range(world_size))),
+        tp_group=cached_group([rank]),
+        dp_cp_group=cached_group(list(range(world_size))),
     )
     st = sharded["weight"]
     # Helper saves the padded global. Cross-topology portability (allow_shape_mismatch) is
@@ -462,78 +404,6 @@ def _worker_helper_padded_inproj_pad_case(rank, world_size, port):
         st.global_shape[0] == dim0_padded
     ), f"rank={rank} pad case: global_shape[0] {st.global_shape[0]} != {dim0_padded}"
     assert st.global_offset[0] == rank * per_shard
-
-
-def _worker_helper_cross_topology_reshard_metadata(rank, world_size, port):
-    """Pin the cross-topology reshard contract via ShardedTensor metadata.
-
-    Can't run a real DCP save/load against itself in one torchrun (needs separate worlds), but we
-    can verify the saved global_shape covers any compatible load-side topology (>= unpadded
-    original). allow_shape_mismatch, the other half of the contract, is decided later at load
-    time by grant_shape_mismatch_for_gtp_padding, not baked in here.
-    """
-    update_gtp_config(pad_for_alignment=16)
-    dim0_unpadded = 1160
-    in_features = 4
-    gtp_remat_size = world_size
-    alignment_block = 16 * gtp_remat_size  # 64
-    dim0_padded = (
-        dim0_unpadded + (alignment_block - dim0_unpadded % alignment_block) % alignment_block
-    )
-    per_shard = dim0_padded // gtp_remat_size
-
-    gtp_remat_group = _cached_new_group(list(range(world_size)))
-    weight = _make_gtp_shard(dim0_unpadded, in_features, gtp_remat_group)
-
-    sharded = make_sharded_tensors_for_checkpoint_with_gtp_remat(
-        {"weight": weight},
-        prefix="",
-        tensor_parallel_layers_axis_map={"weight": 0},
-        sharded_offsets=(),
-        tp_group=_cached_new_group([rank]),
-        dp_cp_group=_cached_new_group(list(range(world_size))),
-    )
-    st = sharded["weight"]
-    # 1. The saved global covers >= unpadded original size.
-    assert st.global_shape[0] >= dim0_unpadded, (
-        f"rank={rank} saved global_shape ({st.global_shape[0]}) < unpadded ({dim0_unpadded}); "
-        f"would lose valid data on cross-topology reshard."
-    )
-    # 2. Each rank's offset+local_shape covers a contiguous slice of the
-    #    padded global; together the ranks cover [0, padded_global).
-    assert st.global_offset[0] + st.local_shape[0] <= st.global_shape[0]
-    assert st.global_offset[0] + st.local_shape[0] == (rank + 1) * per_shard
-
-
-def _worker_save_then_load_offsets_symmetric(rank, world_size, port):
-    """Save-side and load-side ShardedTensors must produce identical offsets
-    and global_shape so DCP can correctly resharded between them.
-
-    We don't run the real DCP save (avoids filesystem / async-writer issues
-    in CI); we just verify the symmetry property the load path relies on.
-    """
-    update_gtp_config(pad_for_alignment=0)
-    dim0 = 16
-    in_features = 4
-    gtp_remat_group = _cached_new_group(list(range(world_size)))
-
-    def _build(prefix):
-        weight = _make_gtp_shard(dim0, in_features, gtp_remat_group)
-        return make_sharded_tensors_for_checkpoint_with_gtp_remat(
-            {"weight": weight},
-            prefix=prefix,
-            tensor_parallel_layers_axis_map={"weight": 0},
-            sharded_offsets=(),
-            tp_group=_cached_new_group([rank]),
-            dp_cp_group=_cached_new_group(list(range(world_size))),
-        )["layer.weight"]
-
-    save_st = _build("layer.")
-    load_st = _build("layer.")
-    assert save_st.global_shape == load_st.global_shape
-    assert save_st.global_offset == load_st.global_offset
-    assert save_st.local_shape == load_st.local_shape
-    assert save_st.replica_id == load_st.replica_id
 
 
 def _worker_helper_offsets_ep_egtp(rank, world_size, port):
@@ -546,7 +416,7 @@ def _worker_helper_offsets_ep_egtp(rank, world_size, port):
 
     rank → (ep_rank, egtp_rank): 0→(0,0) 1→(0,1) 2→(1,0) 3→(1,1).
     """
-    egtp_remat_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
+    egtp_remat_group = cached_group([0, 1]) if rank in (0, 1) else cached_group([2, 3])
 
     ep_size, egtp_remat_size, num_gemms = 2, 2, 1
     ep_rank = rank // 2
@@ -560,7 +430,7 @@ def _worker_helper_offsets_ep_egtp(rank, world_size, port):
     # A routed-expert weight replicates over EXPERT DP, not dense dp_cp: with EP=2 the expert
     # replicas of rank 0's shard are its expt_dp peers ([0,2] here), so the writer election must
     # run over that group. Non-grouped expert linears stamp it from pg_collection.expt_dp.
-    expt_dp_group = _cached_new_group([0, 2]) if rank in (0, 2) else _cached_new_group([1, 3])
+    expt_dp_group = cached_group([0, 2]) if rank in (0, 2) else cached_group([1, 3])
     weight = _make_gtp_shard(
         per_expert_out, in_features, egtp_remat_group, replica_group=expt_dp_group
     )
@@ -576,8 +446,8 @@ def _worker_helper_offsets_ep_egtp(rank, world_size, port):
         tensor_parallel_layers_axis_map={"weight": 0},
         # EP prepends the global-expert axis; EGTP_remat shards out_features below it.
         sharded_offsets=((0, global_expert_idx, num_global_experts),),
-        tp_group=_cached_new_group([rank]),  # no TP in this case
-        dp_cp_group=_cached_new_group(list(range(world_size))),
+        tp_group=cached_group([rank]),  # no TP in this case
+        dp_cp_group=cached_group(list(range(world_size))),
     )
     st = sharded["weight"]
     assert isinstance(st, ShardedTensor), f"Expected ShardedTensor, got {type(st)}"
@@ -609,8 +479,8 @@ def _worker_helper_embedding_offsets(rank, world_size, port):
     GTP_remat axis-0 split. TP=2, GTP_remat=2, tp_axis=0 → composite axis-0 offset, same as the
     column-parallel case.
     """
-    gtp_remat_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
-    tp_group = _cached_new_group([0, 2]) if rank in (0, 2) else _cached_new_group([1, 3])
+    gtp_remat_group = cached_group([0, 1]) if rank in (0, 1) else cached_group([2, 3])
+    tp_group = cached_group([0, 2]) if rank in (0, 2) else cached_group([1, 3])
 
     full_vocab, hidden = 8, 4
     tp_size, gtp_remat_size = 2, 2
@@ -627,7 +497,7 @@ def _worker_helper_embedding_offsets(rank, world_size, port):
         allow_shape_mismatch=True,  # how VocabParallelEmbedding calls it
         prepend_offsets=(),
         tp_group=tp_group,
-        dp_cp_group=_cached_new_group(list(range(world_size))),
+        dp_cp_group=cached_group(list(range(world_size))),
     )
     assert isinstance(st, ShardedTensor), f"Expected ShardedTensor, got {type(st)}"
     tp_rank = rank // 2
@@ -647,8 +517,8 @@ def _worker_helper_public_wrapper_delegates(rank, world_size, port):
     GTP_remat-composite offset — i.e. it delegates to the GTP_remat-aware path not the vanilla
     TP-only one. TP=2, GTP_remat=2, column-parallel (tp_axis=0).
     """
-    gtp_remat_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
-    tp_group = _cached_new_group([0, 2]) if rank in (0, 2) else _cached_new_group([1, 3])
+    gtp_remat_group = cached_group([0, 1]) if rank in (0, 1) else cached_group([2, 3])
+    tp_group = cached_group([0, 2]) if rank in (0, 2) else cached_group([1, 3])
 
     full_out, in_features = 8, 4
     tp_size, gtp_remat_size = 2, 2
@@ -663,7 +533,7 @@ def _worker_helper_public_wrapper_delegates(rank, world_size, port):
         tensor_parallel_layers_axis_map={"weight": 0},
         sharded_offsets=(),
         tp_group=tp_group,
-        dp_cp_group=_cached_new_group(list(range(world_size))),
+        dp_cp_group=cached_group(list(range(world_size))),
     )
     st = sharded["layer.weight"]
     assert isinstance(st, ShardedTensor), f"Expected ShardedTensor, got {type(st)}"
@@ -692,9 +562,9 @@ def _worker_save_without_mpu_uses_stamped_replica_group(rank, world_size, port):
     world=4 -> tp1 * gtp_remat2 * dp2: gtp peers [0,1] / [2,3] hold DIFFERENT shards, replicas
     [0,2] / [1,3] hold the SAME shard, so a writer election over the wrong group is visible.
     """
-    gtp_remat_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
-    replica_group = _cached_new_group([0, 2]) if rank in (0, 2) else _cached_new_group([1, 3])
-    world_group = _cached_new_group(list(range(world_size)))
+    gtp_remat_group = cached_group([0, 1]) if rank in (0, 1) else cached_group([2, 3])
+    replica_group = cached_group([0, 2]) if rank in (0, 2) else cached_group([1, 3])
+    world_group = cached_group(list(range(world_size)))
     gtp_remat_size, per_tp_out, in_features = 2, 8, 4
     per_shard_out = per_tp_out // gtp_remat_size  # 4
     gtp_rank = rank % 2
@@ -707,89 +577,86 @@ def _worker_save_without_mpu_uses_stamped_replica_group(rank, world_size, port):
     assert not hasattr(unstamped, "gtp_replica_group")
 
     ps.destroy_model_parallel()
-    try:
-        assert not ps.is_initialized(), "MPU must be down for this regression to bite"
+    assert not ps.is_initialized(), "MPU must be down for this regression to bite"
 
-        def _check(st, what):
-            assert isinstance(st, ShardedTensor), f"{what}: got {type(st)}"
-            assert st.global_shape[0] == per_tp_out, f"{what}: global {st.global_shape}"
-            assert (
-                st.global_offset[0] == gtp_rank * per_shard_out
-            ), f"{what}: rank={rank} offset {st.global_offset} (gtp_rank={gtp_rank})"
-            # Writer election over the replica group: rank 0 of [0,2] / [1,3] -> ranks 0 and 1.
-            expected_replica = 0 if rank in (0, 1) else 1
-            assert st.replica_id == (0, 0, expected_replica), f"{what}: {st.replica_id}"
-
-        # Single-tensor helper (VocabParallelEmbedding / direct callers).
-        _check(
-            make_tp_sharded_tensor_for_checkpoint(
-                tensor=stamped,
-                key="single.weight",
-                tp_axis=0,
-                tp_group=None,  # TP=1
-                dp_cp_group=world_group,
-            ),
-            "make_tp_sharded_tensor_for_checkpoint",
-        )
-        # Multi-tensor helper (the path every module's sharded_state_dict takes).
-        _check(
-            make_sharded_tensors_for_checkpoint_with_gtp_remat(
-                {"weight": stamped},
-                prefix="multi.",
-                tensor_parallel_layers_axis_map={"weight": 0},
-                tp_group=None,
-                dp_cp_group=world_group,
-            )["multi.weight"],
-            "make_sharded_tensors_for_checkpoint_with_gtp_remat",
-        )
-
-        # Exactly one writer per GTP shard -- the property a wrong (gtp-inclusive) group breaks
-        # by leaving one of the two shards with no main replica at all.
-        st = make_tp_sharded_tensor_for_checkpoint(
-            tensor=stamped, key="elect.weight", tp_axis=0, tp_group=None, dp_cp_group=world_group
-        )
-        gathered = [None] * world_size
-        dist.all_gather_object(gathered, (gtp_rank, is_main_replica(st.replica_id)))
-        for shard in range(gtp_remat_size):
-            writers = [g for g, main in gathered if g == shard and main]
-            assert len(writers) == 1, f"shard {shard} has {len(writers)} writers: {gathered}"
-
-        # The GTP-REPLICATED entries alongside a GTP weight (bias here) take their replica
-        # coordinate from the same stamped group -- or from an explicit override when given.
-        bias = torch.zeros(per_shard_out, dtype=torch.bfloat16, device="cuda")
+    def _check(st, what):
+        assert isinstance(st, ShardedTensor), f"{what}: got {type(st)}"
+        assert st.global_shape[0] == per_tp_out, f"{what}: global {st.global_shape}"
+        assert (
+            st.global_offset[0] == gtp_rank * per_shard_out
+        ), f"{what}: rank={rank} offset {st.global_offset} (gtp_rank={gtp_rank})"
+        # Writer election over the replica group: rank 0 of [0,2] / [1,3] -> ranks 0 and 1.
         expected_replica = 0 if rank in (0, 1) else 1
-        sd = make_sharded_tensors_for_checkpoint_with_gtp_remat(
-            {"weight": stamped, "bias": bias},
-            prefix="",
+        assert st.replica_id == (0, 0, expected_replica), f"{what}: {st.replica_id}"
+
+    # Single-tensor helper (VocabParallelEmbedding / direct callers).
+    _check(
+        make_tp_sharded_tensor_for_checkpoint(
+            tensor=stamped,
+            key="single.weight",
+            tp_axis=0,
+            tp_group=None,  # TP=1
+            dp_cp_group=world_group,
+        ),
+        "make_tp_sharded_tensor_for_checkpoint",
+    )
+    # Multi-tensor helper (the path every module's sharded_state_dict takes).
+    _check(
+        make_sharded_tensors_for_checkpoint_with_gtp_remat(
+            {"weight": stamped},
+            prefix="multi.",
             tensor_parallel_layers_axis_map={"weight": 0},
             tp_group=None,
             dp_cp_group=world_group,
-        )
-        assert sd["bias"].replica_id == (0, gtp_rank, expected_replica), sd["bias"].replica_id
+        )["multi.weight"],
+        "make_sharded_tensors_for_checkpoint_with_gtp_remat",
+    )
 
-        override = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
-        sd = make_sharded_tensors_for_checkpoint_with_gtp_remat(
-            {"weight": stamped, "bias": bias},
-            prefix="",
-            tensor_parallel_layers_axis_map={"weight": 0},
+    # Exactly one writer per GTP shard -- the property a wrong (gtp-inclusive) group breaks
+    # by leaving one of the two shards with no main replica at all.
+    st = make_tp_sharded_tensor_for_checkpoint(
+        tensor=stamped, key="elect.weight", tp_axis=0, tp_group=None, dp_cp_group=world_group
+    )
+    gathered = [None] * world_size
+    dist.all_gather_object(gathered, (gtp_rank, is_main_replica(st.replica_id)))
+    for shard in range(gtp_remat_size):
+        writers = [g for g, main in gathered if g == shard and main]
+        assert len(writers) == 1, f"shard {shard} has {len(writers)} writers: {gathered}"
+
+    # The GTP-REPLICATED entries alongside a GTP weight (bias here) take their replica
+    # coordinate from the same stamped group -- or from an explicit override when given.
+    bias = torch.zeros(per_shard_out, dtype=torch.bfloat16, device="cuda")
+    expected_replica = 0 if rank in (0, 1) else 1
+    sd = make_sharded_tensors_for_checkpoint_with_gtp_remat(
+        {"weight": stamped, "bias": bias},
+        prefix="",
+        tensor_parallel_layers_axis_map={"weight": 0},
+        tp_group=None,
+        dp_cp_group=world_group,
+    )
+    assert sd["bias"].replica_id == (0, gtp_rank, expected_replica), sd["bias"].replica_id
+
+    override = cached_group([0, 1]) if rank in (0, 1) else cached_group([2, 3])
+    sd = make_sharded_tensors_for_checkpoint_with_gtp_remat(
+        {"weight": stamped, "bias": bias},
+        prefix="",
+        tensor_parallel_layers_axis_map={"weight": 0},
+        tp_group=None,
+        dp_cp_group=world_group,
+        intra_dp_cp_group=override,
+    )
+    assert sd["bias"].replica_id == (0, gtp_rank, gtp_rank), sd["bias"].replica_id
+
+    # No stamped group and no MPU: refuse with an actionable error instead of guessing a
+    # writer (which would silently drop or duplicate shards).
+    with pytest.raises(RuntimeError, match="gtp_replica_group"):
+        make_tp_sharded_tensor_for_checkpoint(
+            tensor=unstamped,
+            key="unstamped.weight",
+            tp_axis=0,
             tp_group=None,
             dp_cp_group=world_group,
-            intra_dp_cp_group=override,
         )
-        assert sd["bias"].replica_id == (0, gtp_rank, gtp_rank), sd["bias"].replica_id
-
-        # No stamped group and no MPU: refuse with an actionable error instead of guessing a
-        # writer (which would silently drop or duplicate shards).
-        with pytest.raises(RuntimeError, match="gtp_replica_group"):
-            make_tp_sharded_tensor_for_checkpoint(
-                tensor=unstamped,
-                key="unstamped.weight",
-                tp_axis=0,
-                tp_group=None,
-                dp_cp_group=world_group,
-            )
-    finally:
-        ps.initialize_model_parallel()
 
 
 def _worker_gtp_sharded_tp_replicated_roundtrip(rank, world_size, ckpt_base):
@@ -802,10 +669,10 @@ def _worker_gtp_sharded_tp_replicated_roundtrip(rank, world_size, ckpt_base):
     from megatron.core.dist_checkpointing import load, save
     from tests.unit_tests.dist_checkpointing import TempNamedDir
 
-    gtp_remat_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
-    tp_replica_group = _cached_new_group([0, 2]) if rank in (0, 2) else _cached_new_group([1, 3])
-    dp_replica_group = _cached_new_group([rank])
-    world_group = _cached_new_group(list(range(world_size)))
+    gtp_remat_group = cached_group([0, 1]) if rank in (0, 1) else cached_group([2, 3])
+    tp_replica_group = cached_group([0, 2]) if rank in (0, 2) else cached_group([1, 3])
+    dp_replica_group = cached_group([rank])
+    world_group = cached_group(list(range(world_size)))
     logical_out, in_features = 8, 4
     gtp_size = 2
     local_out = logical_out // gtp_size
@@ -813,46 +680,42 @@ def _worker_gtp_sharded_tp_replicated_roundtrip(rank, world_size, ckpt_base):
     gtp_rank = rank % gtp_size
 
     ps.destroy_model_parallel()
-    try:
-        weight = _make_gtp_shard(
-            logical_out, in_features, gtp_remat_group, replica_group=dp_replica_group
-        )
-        assert not ps.is_initialized(), "MPU must be down so all groups come from the caller"
+    weight = _make_gtp_shard(
+        logical_out, in_features, gtp_remat_group, replica_group=dp_replica_group
+    )
+    assert not ps.is_initialized(), "MPU must be down so all groups come from the caller"
 
-        sharded = make_sharded_tensors_for_checkpoint_with_gtp_remat(
-            {"weight": weight},
-            prefix="duplicated.",
-            tensor_parallel_layers_axis_map={},
-            tp_group=tp_replica_group,
-            dp_cp_group=world_group,
-        )
-        entry = sharded["duplicated.weight"]
-        assert isinstance(entry, ShardedTensor), type(entry)
-        assert entry.global_shape == (logical_out, in_features), entry.global_shape
-        assert entry.global_offset == (gtp_rank * local_out, 0), entry.global_offset
-        assert entry.axis_fragmentations == (gtp_size, 1), entry.axis_fragmentations
-        assert entry.replica_id == (0, tp_rank, 0), entry.replica_id
+    sharded = make_sharded_tensors_for_checkpoint_with_gtp_remat(
+        {"weight": weight},
+        prefix="duplicated.",
+        tensor_parallel_layers_axis_map={},
+        tp_group=tp_replica_group,
+        dp_cp_group=world_group,
+    )
+    entry = sharded["duplicated.weight"]
+    assert isinstance(entry, ShardedTensor), type(entry)
+    assert entry.global_shape == (logical_out, in_features), entry.global_shape
+    assert entry.global_offset == (gtp_rank * local_out, 0), entry.global_offset
+    assert entry.axis_fragmentations == (gtp_size, 1), entry.axis_fragmentations
+    assert entry.replica_id == (0, tp_rank, 0), entry.replica_id
 
-        gathered = [None] * world_size
-        dist.all_gather_object(
-            gathered,
-            (gtp_rank, entry.global_offset, entry.replica_id, is_main_replica(entry.replica_id)),
-        )
-        for shard_rank in range(gtp_size):
-            shard_records = [record for record in gathered if record[0] == shard_rank]
-            assert len(shard_records) == 2, shard_records
-            assert len({record[1] for record in shard_records}) == 1, shard_records
-            assert sum(record[3] for record in shard_records) == 1, shard_records
+    gathered = [None] * world_size
+    dist.all_gather_object(
+        gathered,
+        (gtp_rank, entry.global_offset, entry.replica_id, is_main_replica(entry.replica_id)),
+    )
+    for shard_rank in range(gtp_size):
+        shard_records = [record for record in gathered if record[0] == shard_rank]
+        assert len(shard_records) == 2, shard_records
+        assert len({record[1] for record in shard_records}) == 1, shard_records
+        assert sum(record[3] for record in shard_records) == 1, shard_records
 
-        with TempNamedDir(ckpt_base / 'gtp_tp_replicated_roundtrip', sync=True) as ckpt_dir:
-            save(sharded, ckpt_dir)
-            loaded = load(sharded, ckpt_dir)
-        torch.testing.assert_close(
-            loaded["duplicated.weight"].cpu(), weight.detach().cpu(), rtol=0, atol=0
-        )
-    finally:
-        ps.initialize_model_parallel()
-        GTPShardedParam._chain_state.clear()
+    with TempNamedDir(ckpt_base / 'gtp_tp_replicated_roundtrip', sync=True) as ckpt_dir:
+        save(sharded, ckpt_dir)
+        loaded = load(sharded, ckpt_dir)
+    torch.testing.assert_close(
+        loaded["duplicated.weight"].cpu(), weight.detach().cpu(), rtol=0, atol=0
+    )
 
 
 def _worker_helper_replicated_sink_rejects_gtp(rank, world_size, port):
@@ -862,14 +725,14 @@ def _worker_helper_replicated_sink_rejects_gtp(rank, world_size, port):
     """
     from megatron.core.utils import make_sharded_tensor_for_checkpoint
 
-    gtp_remat_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
+    gtp_remat_group = cached_group([0, 1]) if rank in (0, 1) else cached_group([2, 3])
     weight = _make_gtp_shard(4, 4, gtp_remat_group)
     with pytest.raises(AssertionError):
         make_sharded_tensor_for_checkpoint(
             weight,
             "weight",
-            tp_group=_cached_new_group([rank]),
-            dp_cp_group=_cached_new_group(list(range(world_size))),
+            tp_group=cached_group([rank]),
+            dp_cp_group=cached_group(list(range(world_size))),
         )
 
 
@@ -887,13 +750,13 @@ def _worker_mamba_replicated_param_replica_ids(rank, world_size, port):
     pg = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp_remat'])
 
     config = TransformerConfig(
-        num_attention_heads=32,
+        num_attention_heads=4,
         num_layers=1,
-        hidden_size=4096,
-        mamba_num_heads=128,
-        mamba_head_dim=64,
-        mamba_state_dim=128,
-        mamba_num_groups=8,
+        hidden_size=256,
+        mamba_num_heads=8,
+        mamba_head_dim=32,
+        mamba_state_dim=64,
+        mamba_num_groups=2,
         use_mamba_mem_eff_path=True,
         params_dtype=torch.bfloat16,
         hidden_dropout=0.0,
@@ -935,10 +798,6 @@ def _worker_mamba_replicated_param_replica_ids(rank, world_size, port):
     gathered = [None] * world_size
     dist.all_gather_object(gathered, local)
 
-    ps.destroy_model_parallel()
-    ps.initialize_model_parallel()
-    GTPShardedParam._chain_state.clear()
-
     if rank == 0:
         bases = set(gathered[0])
         assert bases, "no GTP_remat-replicated tiny params found in MambaMixer sharded_state_dict"
@@ -949,59 +808,6 @@ def _worker_mamba_replicated_param_replica_ids(rank, world_size, port):
             ), f"{base}: replica_id collision across ranks -> DCP write conflict: {rids}"
             n_writers = sum(is_main_replica(r) for r in rids)
             assert n_writers == 1, f"{base}: expected exactly 1 writer, got {n_writers}: {rids}"
-
-
-def _worker_replicated_param_needs_gtp_inclusive_dp_cp(rank, world_size, port):
-    """Regression for the checkpoint-save duplicate-writer bug in save_checkpoint_and_time.
-
-    A REPLICATED param's replica_id must use the gtp_remat-INCLUSIVE group (``pg.dp_cp_gtp_remat``);
-    the gtp-excluded ``pg.dp_cp`` collapses gtp_remat peers to one replica_id -> multiple writers
-    -> save validation failure. world=4 -> tp1*gtp2*dp2 (replicate=2 ranks, inclusive=4).
-    """
-    ps.destroy_model_parallel()
-    ps.initialize_model_parallel(
-        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
-    )
-    pg = ProcessGroupCollection.use_mpu_process_groups(
-        required_pgs=['tp', 'dp_cp', 'dp_cp_gtp_remat']
-    )
-
-    # The two attributes save_checkpoint_and_time may read must differ under GTP_remat, else the
-    # group choice would be moot: full = replicate x gtp_remat(2).
-    assert (
-        get_pg_size(pg.dp_cp_gtp_remat) == get_pg_size(pg.dp_cp) * 2
-    ), f"full={get_pg_size(pg.dp_cp_gtp_remat)} replicate={get_pg_size(pg.dp_cp)}"
-
-    replicated = torch.nn.Parameter(torch.zeros(8, 4, dtype=torch.bfloat16, device="cuda"))
-
-    def _gather_replica_ids(dp_cp_group):
-        sd = make_sharded_tensors_for_checkpoint(
-            {"w": replicated},
-            prefix="",
-            tensor_parallel_layers_axis_map={},
-            tp_group=pg.tp,
-            dp_cp_group=dp_cp_group,
-        )
-        out = [None] * world_size
-        dist.all_gather_object(out, tuple(sd["w"].replica_id))
-        return out
-
-    rids_replicate = _gather_replica_ids(pg.dp_cp)  # the bug
-    rids_full = _gather_replica_ids(pg.dp_cp_gtp_remat)  # the fix
-
-    ps.destroy_model_parallel()
-    ps.initialize_model_parallel()
-
-    if rank == 0:
-        # Replicate (gtp-excluded) group: gtp_remat peers collapse -> >1 writer (reproduces bug).
-        assert (
-            sum(is_main_replica(r) for r in rids_replicate) > 1
-        ), f"replicate dp_cp should collide across gtp_remat peers, got {rids_replicate}"
-        # gtp_remat-inclusive group: every holder distinct, exactly one writer.
-        assert len(set(rids_full)) == world_size, f"full-group replica_id collision: {rids_full}"
-        assert (
-            sum(is_main_replica(r) for r in rids_full) == 1
-        ), f"full group must elect exactly one writer, got {rids_full}"
 
 
 def _worker_embedding_writer_election_gtp_inclusive_default(rank, world_size, port):
@@ -1038,10 +844,6 @@ def _worker_embedding_writer_election_gtp_inclusive_default(rank, world_size, po
     gathered = [None] * world_size
     dist.all_gather_object(gathered, mine)
 
-    ps.destroy_model_parallel()
-    ps.initialize_model_parallel()
-    GTPShardedParam._chain_state.clear()
-
     if rank == 0:
         by_offset = defaultdict(list)
         for off, rid in gathered:
@@ -1054,87 +856,6 @@ def _worker_embedding_writer_election_gtp_inclusive_default(rank, world_size, po
                 f"(replica_ids {rids}); a gtp_remat-inclusive default DP group leaves a shard "
                 f"with no main-replica writer -> 'Invalid access pattern' at save"
             )
-
-
-def _worker_mamba_inproj_optim_param_map(rank, world_size, port):
-    """GTP_remat+Muon ckpt fix: in_proj's gathered+split model entry does NOT id-match the
-    per-shard optimizer param, so get_param_id_to_sharded_param_map misses it (the KeyError seen in
-    Float16OptimizerWithFloat16Params.sharded_state_dict). Verify the per-shard fallback used by the
-    fix restores a ShardedTensor with local_shape == the optimizer param shape, which
-    make_sharded_optimizer_tensor then accepts.
-    """
-    from megatron.core.dist_checkpointing.optimizer import (
-        get_param_id_to_sharded_param_map,
-        make_sharded_optimizer_tensor,
-    )
-    from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
-        tag_gtp_params_with_names,
-    )
-
-    ps.destroy_model_parallel()
-    ps.initialize_model_parallel(
-        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
-    )
-    model_parallel_cuda_manual_seed(42)
-    pg = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp_remat'])
-    config = TransformerConfig(
-        num_attention_heads=32,
-        num_layers=1,
-        hidden_size=4096,
-        mamba_num_heads=128,
-        mamba_head_dim=64,
-        mamba_state_dim=128,
-        mamba_num_groups=8,
-        use_mamba_mem_eff_path=True,
-        params_dtype=torch.bfloat16,
-        hidden_dropout=0.0,
-        bias_dropout_fusion=False,
-        tensor_model_parallel_size=1,
-        pipeline_model_parallel_size=1,
-    )
-    submodules = MambaLayerSubmodules(
-        mixer=ModuleSpec(
-            module=MambaMixer,
-            submodules=MambaMixerSubmodules(
-                in_proj=TELayerNormColumnParallelLinear, out_proj=TERowParallelLinear
-            ),
-        ),
-        mamba_bda=get_bias_dropout_add,
-    )
-    layer = MambaLayer(config, submodules, layer_number=1, pg_collection=pg).cuda()
-    tag_gtp_params_with_names(layer)  # set _debug_name (mirrors production setup)
-
-    in_proj_w = layer.mixer.in_proj.weight
-    assert isinstance(in_proj_w, GTPShardedParam), "in_proj.weight should be GTP_remat-sharded"
-
-    metadata = {'dp_cp_group': ps.get_data_parallel_group(with_context_parallel=True)}
-    model_sd = layer.mixer.sharded_state_dict(prefix='mixer.', metadata=metadata)
-
-    # Reproduce the gap: in_proj's per-shard optim param has no id-match in the model dict.
-    id_map = get_param_id_to_sharded_param_map(model_sd, [in_proj_w])
-    assert 0 not in id_map, "expected in_proj to be MISSING from id map (the KeyError gap)"
-
-    # The fix's per-shard fallback restores a matching entry.
-    key = in_proj_w._debug_name or '_gtp_optim_param_0'
-    entry = make_sharded_tensors_for_checkpoint_with_gtp_remat(
-        {key: in_proj_w},
-        prefix='',
-        tensor_parallel_layers_axis_map={key: 0},
-        tp_group=ps.get_tensor_model_parallel_group(),
-        dp_cp_group=ps.get_data_parallel_group(with_context_parallel=True),
-    )[key]
-    assert tuple(entry.local_shape) == tuple(in_proj_w.shape), (
-        f"per-shard entry local_shape {tuple(entry.local_shape)} != param shape "
-        f"{tuple(in_proj_w.shape)}"
-    )
-    # make_sharded_optimizer_tensor must accept it for a same-shape optimizer state tensor.
-    opt_state = torch.zeros_like(in_proj_w)
-    osh = make_sharded_optimizer_tensor(entry, opt_state, prefix='optimizer.state.exp_avg')
-    assert osh is not None
-
-    ps.destroy_model_parallel()
-    ps.initialize_model_parallel()
-    GTPShardedParam._chain_state.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -1208,11 +929,15 @@ def _gdp_valid_rows(in_proj_w, in_proj_dim):
     return max(0, min(local_rows, in_proj_dim - gtp_remat_rank * local_rows))
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+# One case per shard kind (no padding, partly padding, entirely padding); device and dtype vary
+# across them only to check the restored tensor keeps both.
 @pytest.mark.parametrize(
-    "gtp_rank, valid_rows",
-    [(61, 992), (62, 256), (63, 0)],
+    "device, dtype, gtp_rank, valid_rows",
+    [
+        ("cuda", torch.bfloat16, 61, 992),
+        ("cpu", torch.float32, 62, 256),
+        ("cuda", torch.float32, 63, 0),
+    ],
     ids=["full", "partial_padding", "all_padding"],
 )
 def test_gdp_gtp_padding_save_load_preprocessing(device, dtype, gtp_rank, valid_rows):
@@ -1229,9 +954,6 @@ def test_gdp_gtp_padding_save_load_preprocessing(device, dtype, gtp_rank, valid_
         _get_in_proj_checkpoint_split_layout,
         _gtp_split_tensor_factory,
     )
-
-    if device == "cuda" and not torch.cuda.is_available():
-        pytest.skip("CUDA unavailable")
 
     # A production-scale in_proj of 61,760 rows, GTP=64, alignment=32: 992 rows per rank.
     # Reduce only the input dimension so the regression does not require a full model or 64 GPUs.
@@ -1283,11 +1005,11 @@ def test_gdp_gtp_padding_save_load_preprocessing(device, dtype, gtp_rank, valid_
     assert rank_common == {}, "Padding must not leak into common checkpoint state"
 
 
-@pytest.mark.parametrize("algo", ["atomic", "fully_parallel"])
+# The full-shard case is covered by test_gdp_gtp_padding_save_load_preprocessing.
 @pytest.mark.parametrize(
-    "gtp_rank, valid_rows",
-    [(61, 992), (62, 256), (63, 0)],
-    ids=["full", "partial_padding", "all_padding"],
+    "algo, gtp_rank, valid_rows",
+    [("atomic", 62, 256), ("fully_parallel", 63, 0)],
+    ids=["atomic-partial_padding", "fully_parallel-all_padding"],
 )
 def test_gdp_gtp_padding_tensor_aware_state_dict_round_trip(algo, gtp_rank, valid_rows):
     """Restore real rows and zero padding through the local-checkpoint load path."""
@@ -1300,9 +1022,6 @@ def test_gdp_gtp_padding_tensor_aware_state_dict_round_trip(algo, gtp_rank, vali
         _gtp_split_tensor_factory,
         _split_tensor_factory,
     )
-
-    if not dist.is_initialized() or not torch.cuda.is_available():
-        pytest.skip("Requires torch.distributed and CUDA")
 
     # Same layout as test_gdp_gtp_padding_save_load_preprocessing: 992 rows per GTP rank.
     sections, names = _get_in_proj_checkpoint_split_layout(80 * 64, 80 * 128, 80, 3)
@@ -1374,74 +1093,69 @@ def _worker_gdp_inproj_shard_split(rank, world_size, port):
     ps.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
     )
-    try:
-        model_parallel_cuda_manual_seed(42)
-        update_gtp_config(pad_for_alignment=32)  # MXFP8 alignment
-        mixer, _, in_proj_dim = _build_gdp_mixer(['tp', 'cp', 'gtp_remat'])
-        in_proj_w = mixer.in_proj.weight
+    model_parallel_cuda_manual_seed(42)
+    update_gtp_config(pad_for_alignment=32)  # MXFP8 alignment
+    mixer, _, in_proj_dim = _build_gdp_mixer(['tp', 'cp', 'gtp_remat'])
+    in_proj_w = mixer.in_proj.weight
 
-        metadata = {'dp_cp_group': ps.get_data_parallel_group(with_context_parallel=True)}
-        sd = mixer.sharded_state_dict(prefix='mixer.', metadata=metadata)
+    metadata = {'dp_cp_group': ps.get_data_parallel_group(with_context_parallel=True)}
+    sd = mixer.sharded_state_dict(prefix='mixer.', metadata=metadata)
 
-        factory = sd['mixer.in_proj.weight']
-        assert isinstance(factory, ShardedTensorFactory), type(factory)
-        # Save side: this rank's shard as-is, not a gathered copy.
-        assert tuple(factory.data.shape) == tuple(in_proj_w.data.shape)
-        assert factory.data.data_ptr() == in_proj_w.data.data_ptr()
+    factory = sd['mixer.in_proj.weight']
+    assert isinstance(factory, ShardedTensorFactory), type(factory)
+    # Save side: this rank's shard as-is, not a gathered copy.
+    assert tuple(factory.data.shape) == tuple(in_proj_w.data.shape)
+    assert factory.data.data_ptr() == in_proj_w.data.data_ptr()
 
-        from megatron.core.ssm.gated_delta_product import _get_in_proj_checkpoint_split_layout
+    from megatron.core.ssm.gated_delta_product import _get_in_proj_checkpoint_split_layout
 
-        # The chunk names/sizes come from _get_in_proj_checkpoint_split_layout (householder-major:
-        # z, V0..V(M-1), K0..K(M-1), Q, b0..b(M-1), a). Derive the expectation from that helper so
-        # this pins "GTP splits exactly like a non-GTP_remat run" rather than a frozen key list.
-        expected_sizes, expected_names = _get_in_proj_checkpoint_split_layout(
-            mixer.d_inner_local_tp,
-            mixer.ngroups_local_tp * mixer.d_state,
-            mixer.nheads_local_tp,
-            mixer.num_householder,
+    # The chunk names/sizes come from _get_in_proj_checkpoint_split_layout (householder-major:
+    # z, V0..V(M-1), K0..K(M-1), Q, b0..b(M-1), a). Derive the expectation from that helper so
+    # this pins "GTP splits exactly like a non-GTP_remat run" rather than a frozen key list.
+    expected_sizes, expected_names = _get_in_proj_checkpoint_split_layout(
+        mixer.d_inner_local_tp,
+        mixer.ngroups_local_tp * mixer.d_state,
+        mixer.nheads_local_tp,
+        mixer.num_householder,
+    )
+    chunks = factory.build_fn(factory.key, factory.data, factory.replica_id, None)
+    n_valid = _gdp_valid_rows(in_proj_w, in_proj_dim)
+    assert sum(t.data.size(0) for t in chunks) == n_valid
+    shard_start = in_proj_w.data.data_ptr()
+    shard_end = shard_start + in_proj_w.data.numel() * in_proj_w.data.element_size()
+    for t in chunks:
+        # Views of the shard: no GPU copies at save time.
+        assert shard_start <= t.data.data_ptr() < shard_end, t
+        assert t.replica_id == factory.replica_id
+
+    # Across the GTP group the pieces of each chunk tile it exactly once.
+    pieces = [
+        (t.key.rsplit('.', 1)[-1], t.global_offset[0], t.data.size(0), t.global_shape[0])
+        for t in chunks
+    ]
+    all_pieces = [None] * in_proj_w.group.size()
+    dist.all_gather_object(all_pieces, pieces, group=in_proj_w.group)
+    for name, size in zip(expected_names, expected_sizes):
+        spans = sorted(
+            (offset, rows)
+            for rank_pieces in all_pieces
+            for piece_name, offset, rows, global_rows in rank_pieces
+            if piece_name == name and global_rows == size
         )
-        chunks = factory.build_fn(factory.key, factory.data, factory.replica_id, None)
-        n_valid = _gdp_valid_rows(in_proj_w, in_proj_dim)
-        assert sum(t.data.size(0) for t in chunks) == n_valid
-        shard_start = in_proj_w.data.data_ptr()
-        shard_end = shard_start + in_proj_w.data.numel() * in_proj_w.data.element_size()
-        for t in chunks:
-            # Views of the shard: no GPU copies at save time.
-            assert shard_start <= t.data.data_ptr() < shard_end, t
-            assert t.replica_id == factory.replica_id
+        covered = 0
+        for offset, rows in spans:
+            assert offset == covered, (name, spans)
+            covered += rows
+        assert covered == size, (name, spans, size)
 
-        # Across the GTP group the pieces of each chunk tile it exactly once.
-        pieces = [
-            (t.key.rsplit('.', 1)[-1], t.global_offset[0], t.data.size(0), t.global_shape[0])
-            for t in chunks
-        ]
-        all_pieces = [None] * in_proj_w.group.size()
-        dist.all_gather_object(all_pieces, pieces, group=in_proj_w.group)
-        for name, size in zip(expected_names, expected_sizes):
-            spans = sorted(
-                (offset, rows)
-                for rank_pieces in all_pieces
-                for piece_name, offset, rows, global_rows in rank_pieces
-                if piece_name == name and global_rows == size
-            )
-            covered = 0
-            for offset, rows in spans:
-                assert offset == covered, (name, spans)
-                covered += rows
-            assert covered == size, (name, spans, size)
-
-        # Load side: cat the pieces, then zeros for the pad rows -> this rank's live GTP shard.
-        merged = factory.merge_fn([t.data for t in chunks])
-        assert tuple(merged.shape) == tuple(in_proj_w.data.shape), (
-            tuple(merged.shape),
-            tuple(in_proj_w.data.shape),
-        )
-        torch.testing.assert_close(merged[:n_valid], in_proj_w.data[:n_valid], rtol=0, atol=0)
-        assert torch.equal(merged[n_valid:], torch.zeros_like(merged[n_valid:]))
-    finally:
-        ps.destroy_model_parallel()
-        ps.initialize_model_parallel()
-        GTPShardedParam._chain_state.clear()
+    # Load side: cat the pieces, then zeros for the pad rows -> this rank's live GTP shard.
+    merged = factory.merge_fn([t.data for t in chunks])
+    assert tuple(merged.shape) == tuple(in_proj_w.data.shape), (
+        tuple(merged.shape),
+        tuple(in_proj_w.data.shape),
+    )
+    torch.testing.assert_close(merged[:n_valid], in_proj_w.data[:n_valid], rtol=0, atol=0)
+    assert torch.equal(merged[n_valid:], torch.zeros_like(merged[n_valid:]))
 
 
 def _worker_gdp_save_load_roundtrip(rank, world_size, ckpt_base):
@@ -1459,58 +1173,51 @@ def _worker_gdp_save_load_roundtrip(rank, world_size, ckpt_base):
     ps.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
     )
-    try:
-        model_parallel_cuda_manual_seed(42)
-        update_gtp_config(pad_for_alignment=32)  # MXFP8 alignment
-        mixer, pg, in_proj_dim = _build_gdp_mixer(
-            ['tp', 'cp', 'gtp_remat', 'dp_cp', 'dp_cp_gtp_remat']
-        )
-        in_proj_w = mixer.in_proj.weight
+    model_parallel_cuda_manual_seed(42)
+    update_gtp_config(pad_for_alignment=32)  # MXFP8 alignment
+    mixer, pg, in_proj_dim = _build_gdp_mixer(['tp', 'cp', 'gtp_remat', 'dp_cp', 'dp_cp_gtp_remat'])
+    in_proj_w = mixer.in_proj.weight
 
-        # ``save_checkpoint_and_time`` threads the gtp_remat-INCLUSIVE group; using the
-        # gtp_remat-excluding pg.dp_cp here collides replica_ids across gtp_remat peers.
-        metadata = {'dp_cp_group': pg.dp_cp_gtp_remat}
-        golden = {k: v.detach().clone() for k, v in mixer.state_dict().items()}
+    # ``save_checkpoint_and_time`` threads the gtp_remat-INCLUSIVE group; using the
+    # gtp_remat-excluding pg.dp_cp here collides replica_ids across gtp_remat peers.
+    metadata = {'dp_cp_group': pg.dp_cp_gtp_remat}
+    golden = {k: v.detach().clone() for k, v in mixer.state_dict().items()}
 
-        with TempNamedDir(ckpt_base / 'gdp_gtp_dcp_roundtrip', sync=True) as ckpt_dir:
-            save(mixer.sharded_state_dict(prefix='mixer.', metadata=metadata), ckpt_dir)
+    with TempNamedDir(ckpt_base / 'gdp_gtp_dcp_roundtrip', sync=True) as ckpt_dir:
+        save(mixer.sharded_state_dict(prefix='mixer.', metadata=metadata), ckpt_dir)
 
-            # Scribble over every param so a no-op load cannot pass.
-            with torch.no_grad():
-                for p in mixer.parameters():
-                    p.data.fill_(float(rank + 1))
-            loaded = load(mixer.sharded_state_dict(prefix='mixer.', metadata=metadata), ckpt_dir)
+        # Scribble over every param so a no-op load cannot pass.
+        with torch.no_grad():
+            for p in mixer.parameters():
+                p.data.fill_(float(rank + 1))
+        loaded = load(mixer.sharded_state_dict(prefix='mixer.', metadata=metadata), ckpt_dir)
 
-        # in_proj comes back through the per-shard pieces + the GTP re-pad merge_fn.
-        merged = loaded['mixer.in_proj.weight']
-        assert tuple(merged.shape) == tuple(in_proj_w.data.shape), (
-            tuple(merged.shape),
-            tuple(in_proj_w.data.shape),
-        )
-        n_valid = _gdp_valid_rows(in_proj_w, in_proj_dim)
+    # in_proj comes back through the per-shard pieces + the GTP re-pad merge_fn.
+    merged = loaded['mixer.in_proj.weight']
+    assert tuple(merged.shape) == tuple(in_proj_w.data.shape), (
+        tuple(merged.shape),
+        tuple(in_proj_w.data.shape),
+    )
+    n_valid = _gdp_valid_rows(in_proj_w, in_proj_dim)
+    torch.testing.assert_close(
+        merged[:n_valid].cpu(), golden['in_proj.weight'][:n_valid].cpu(), rtol=0, atol=0
+    )
+
+    # The rest of the mixer must round-trip too -- a colliding replica_id across gtp_remat
+    # peers would either fail the load or return another rank's data.
+    for name in (
+        'A_log',
+        'dt_bias',
+        'conv1d.weight',
+        'norm.weight',
+        'out_proj.weight',
+        'in_proj.layer_norm_weight',
+    ):
+        key = f'mixer.{name}'
+        assert key in loaded, f"{key} missing from the loaded state dict: {sorted(loaded)}"
         torch.testing.assert_close(
-            merged[:n_valid].cpu(), golden['in_proj.weight'][:n_valid].cpu(), rtol=0, atol=0
+            loaded[key].cpu(), golden[name].cpu(), rtol=0, atol=0, msg=f"{name} drifted"
         )
-
-        # The rest of the mixer must round-trip too -- a colliding replica_id across gtp_remat
-        # peers would either fail the load or return another rank's data.
-        for name in (
-            'A_log',
-            'dt_bias',
-            'conv1d.weight',
-            'norm.weight',
-            'out_proj.weight',
-            'in_proj.layer_norm_weight',
-        ):
-            key = f'mixer.{name}'
-            assert key in loaded, f"{key} missing from the loaded state dict: {sorted(loaded)}"
-            torch.testing.assert_close(
-                loaded[key].cpu(), golden[name].cpu(), rtol=0, atol=0, msg=f"{name} drifted"
-            )
-    finally:
-        ps.destroy_model_parallel()
-        ps.initialize_model_parallel()
-        GTPShardedParam._chain_state.clear()
 
 
 def _worker_gdp_inproj_cross_gtp_load(rank, world_size, ckpt_base):
@@ -1547,57 +1254,51 @@ def _worker_gdp_inproj_cross_gtp_load(rank, world_size, ckpt_base):
         sd = mixer.sharded_state_dict(prefix="mixer.", metadata=metadata)
         return {key: sd[key]}
 
-    try:
-        update_gtp_config(pad_for_alignment=32)  # MXFP8 alignment
+    update_gtp_config(pad_for_alignment=32)  # MXFP8 alignment
 
-        # GTP save -> non-GTP load.
-        mixer, metadata, in_proj_dim = _init(gtp_remat_size=2)
+    # GTP save -> non-GTP load.
+    mixer, metadata, in_proj_dim = _init(gtp_remat_size=2)
+    in_proj_w = mixer.in_proj.weight
+    shards = [torch.empty_like(in_proj_w.data) for _ in range(in_proj_w.group.size())]
+    dist.all_gather(shards, in_proj_w.data.contiguous(), group=in_proj_w.group)
+    golden = torch.cat(shards)[:in_proj_dim].clone()
+    with TempNamedDir(ckpt_base / "gdp_gtp_to_non_gtp", sync=True) as ckpt_dir:
+        save(_in_proj_only(mixer, metadata), ckpt_dir)
+        mixer, metadata, _ = _init(gtp_remat_size=1)
+        with torch.no_grad():
+            mixer.in_proj.weight.fill_(-999.0)  # scribble so a no-op load cannot pass
+        loaded = load(_in_proj_only(mixer, metadata), ckpt_dir)
+    torch.testing.assert_close(loaded[key].cpu(), golden.cpu(), rtol=0, atol=0)
+
+    # Non-GTP save -> GTP load.
+    mixer, metadata, in_proj_dim = _init(gtp_remat_size=1)
+    golden = mixer.in_proj.weight.data.clone()
+    with TempNamedDir(ckpt_base / "gdp_non_gtp_to_gtp", sync=True) as ckpt_dir:
+        save(_in_proj_only(mixer, metadata), ckpt_dir)
+        mixer, metadata, _ = _init(gtp_remat_size=2)
         in_proj_w = mixer.in_proj.weight
-        shards = [torch.empty_like(in_proj_w.data) for _ in range(in_proj_w.group.size())]
-        dist.all_gather(shards, in_proj_w.data.contiguous(), group=in_proj_w.group)
-        golden = torch.cat(shards)[:in_proj_dim].clone()
-        with TempNamedDir(ckpt_base / "gdp_gtp_to_non_gtp", sync=True) as ckpt_dir:
-            save(_in_proj_only(mixer, metadata), ckpt_dir)
-            mixer, metadata, _ = _init(gtp_remat_size=1)
-            with torch.no_grad():
-                mixer.in_proj.weight.fill_(-999.0)  # scribble so a no-op load cannot pass
-            loaded = load(_in_proj_only(mixer, metadata), ckpt_dir)
-        torch.testing.assert_close(loaded[key].cpu(), golden.cpu(), rtol=0, atol=0)
-
-        # Non-GTP save -> GTP load.
-        mixer, metadata, in_proj_dim = _init(gtp_remat_size=1)
-        golden = mixer.in_proj.weight.data.clone()
-        with TempNamedDir(ckpt_base / "gdp_non_gtp_to_gtp", sync=True) as ckpt_dir:
-            save(_in_proj_only(mixer, metadata), ckpt_dir)
-            mixer, metadata, _ = _init(gtp_remat_size=2)
-            in_proj_w = mixer.in_proj.weight
-            with torch.no_grad():
-                in_proj_w.fill_(-999.0)
-            loaded = load(_in_proj_only(mixer, metadata), ckpt_dir)
-        local_rows = in_proj_w.data.size(0)
-        start = torch.distributed.get_rank(in_proj_w.group) * local_rows
-        n_valid = _gdp_valid_rows(in_proj_w, in_proj_dim)
-        merged = loaded[key]
-        assert tuple(merged.shape) == tuple(in_proj_w.data.shape)
-        torch.testing.assert_close(
-            merged[:n_valid].cpu(), golden[start : start + n_valid].cpu(), rtol=0, atol=0
-        )
-        assert torch.equal(merged[n_valid:], torch.zeros_like(merged[n_valid:]))
-    finally:
-        ps.destroy_model_parallel()
-        ps.initialize_model_parallel()
-        GTPShardedParam._chain_state.clear()
+        with torch.no_grad():
+            in_proj_w.fill_(-999.0)
+        loaded = load(_in_proj_only(mixer, metadata), ckpt_dir)
+    local_rows = in_proj_w.data.size(0)
+    start = torch.distributed.get_rank(in_proj_w.group) * local_rows
+    n_valid = _gdp_valid_rows(in_proj_w, in_proj_dim)
+    merged = loaded[key]
+    assert tuple(merged.shape) == tuple(in_proj_w.data.shape)
+    torch.testing.assert_close(
+        merged[:n_valid].cpu(), golden[start : start + n_valid].cpu(), rtol=0, atol=0
+    )
+    assert torch.equal(merged[n_valid:], torch.zeros_like(merged[n_valid:]))
 
 
 def _worker_gdp_inproj_optim_param_map(rank, world_size, port):
     """GDP ``in_proj`` must survive the optimizer id->ShardedTensor match (Muon path, §1.6).
 
-    Same gap as the Mamba case (``_worker_mamba_inproj_optim_param_map``): the model entry for
-    ``in_proj`` is a split factory, which deliberately does not id-match the per-shard GTP
-    optimizer param, so ``get_param_id_to_sharded_param_map`` drops it -> KeyError in
-    ``Float16OptimizerWithFloat16Params.sharded_state_dict``. Unlike that test, this one drives the
-    real production backfill (``_backfill_gtp_sharded_param_map``) rather than reproducing its
-    rebuild, so it also pins that GDP takes the per-shard rebuild branch, not the EP refusal.
+    The model entry for ``in_proj`` is a split factory, which deliberately does not id-match the
+    per-shard GTP optimizer param, so ``get_param_id_to_sharded_param_map`` drops it -> KeyError in
+    ``Float16OptimizerWithFloat16Params.sharded_state_dict``. This drives the real production
+    backfill (``_backfill_gtp_sharded_param_map``), so it also pins that GDP takes the per-shard
+    rebuild branch, not the EP refusal.
     """
     from megatron.core.dist_checkpointing.optimizer import (
         get_param_id_to_sharded_param_map,
@@ -1612,55 +1313,50 @@ def _worker_gdp_inproj_optim_param_map(rank, world_size, port):
     ps.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
     )
-    try:
-        model_parallel_cuda_manual_seed(42)
-        update_gtp_config(pad_for_alignment=32)  # MXFP8 alignment
-        mixer, pg, _ = _build_gdp_mixer(['tp', 'cp', 'gtp_remat', 'dp_cp', 'dp_cp_gtp_remat'])
-        tag_gtp_params_with_names(mixer)  # sets _debug_name, mirrors production setup
-        in_proj_w = mixer.in_proj.weight
+    model_parallel_cuda_manual_seed(42)
+    update_gtp_config(pad_for_alignment=32)  # MXFP8 alignment
+    mixer, pg, _ = _build_gdp_mixer(['tp', 'cp', 'gtp_remat', 'dp_cp', 'dp_cp_gtp_remat'])
+    tag_gtp_params_with_names(mixer)  # sets _debug_name, mirrors production setup
+    in_proj_w = mixer.in_proj.weight
 
-        metadata = {'dp_cp_group': pg.dp_cp_gtp_remat}
-        model_sd = mixer.sharded_state_dict(prefix='mixer.', metadata=metadata)
+    metadata = {'dp_cp_group': pg.dp_cp_gtp_remat}
+    model_sd = mixer.sharded_state_dict(prefix='mixer.', metadata=metadata)
 
-        # The gap: the split factory does not id-match the per-shard optimizer param.
-        id_map = get_param_id_to_sharded_param_map(model_sd, [in_proj_w])
-        assert 0 not in id_map, "expected in_proj to be MISSING from the id map (the KeyError gap)"
+    # The gap: the split factory does not id-match the per-shard optimizer param.
+    id_map = get_param_id_to_sharded_param_map(model_sd, [in_proj_w])
+    assert 0 not in id_map, "expected in_proj to be MISSING from the id map (the KeyError gap)"
 
-        # The production backfill must fill it via the per-shard rebuild. An expert-parallel param
-        # would raise instead; in_proj is dense, so it must rebuild cleanly.
-        _backfill_gtp_sharded_param_map(id_map, [[in_proj_w]], model_sd)
-        assert 0 in id_map, "backfill did not restore in_proj"
-        entry = id_map[0]
-        # A plain per-shard ShardedTensor keyed by the tagged name -- NOT the model's split
-        # factory (reusing that would change the optimizer-state checkpoint layout).
-        assert isinstance(entry, ShardedTensor), type(entry)
-        assert entry is not model_sd['mixer.in_proj.weight']
-        assert entry.key == in_proj_w._debug_name, (entry.key, in_proj_w._debug_name)
-        assert tuple(entry.local_shape) == tuple(in_proj_w.shape), (
-            f"rebuilt local_shape {tuple(entry.local_shape)} != param shape "
-            f"{tuple(in_proj_w.shape)}"
-        )
-        # The rebuilt entry must describe this rank's GTP slice of the PADDED global (what the
-        # optimizer shard actually is), not the pad-stripped split chunks the model entry uses.
-        gtp_remat_rank = torch.distributed.get_rank(in_proj_w.group)
-        assert entry.global_offset[0] == gtp_remat_rank * in_proj_w.shape[0], (
-            entry.global_offset,
-            gtp_remat_rank,
-        )
-        assert entry.global_shape[0] == in_proj_w.shape[0] * in_proj_w.gtp_remat_size, (
-            entry.global_shape,
-            in_proj_w.shape,
-        )
+    # The production backfill must fill it via the per-shard rebuild. An expert-parallel param
+    # would raise instead; in_proj is dense, so it must rebuild cleanly.
+    _backfill_gtp_sharded_param_map(id_map, [[in_proj_w]], model_sd)
+    assert 0 in id_map, "backfill did not restore in_proj"
+    entry = id_map[0]
+    # A plain per-shard ShardedTensor keyed by the tagged name -- NOT the model's split
+    # factory (reusing that would change the optimizer-state checkpoint layout).
+    assert isinstance(entry, ShardedTensor), type(entry)
+    assert entry is not model_sd['mixer.in_proj.weight']
+    assert entry.key == in_proj_w._debug_name, (entry.key, in_proj_w._debug_name)
+    assert tuple(entry.local_shape) == tuple(in_proj_w.shape), (
+        f"rebuilt local_shape {tuple(entry.local_shape)} != param shape "
+        f"{tuple(in_proj_w.shape)}"
+    )
+    # The rebuilt entry must describe this rank's GTP slice of the PADDED global (what the
+    # optimizer shard actually is), not the pad-stripped split chunks the model entry uses.
+    gtp_remat_rank = torch.distributed.get_rank(in_proj_w.group)
+    assert entry.global_offset[0] == gtp_remat_rank * in_proj_w.shape[0], (
+        entry.global_offset,
+        gtp_remat_rank,
+    )
+    assert entry.global_shape[0] == in_proj_w.shape[0] * in_proj_w.gtp_remat_size, (
+        entry.global_shape,
+        in_proj_w.shape,
+    )
 
-        # make_sharded_optimizer_tensor must accept it for a same-shape optimizer state tensor.
-        opt_state = torch.zeros_like(in_proj_w)
-        osh = make_sharded_optimizer_tensor(entry, opt_state, prefix='optimizer.state.exp_avg')
-        assert osh is not None
-        assert tuple(osh.local_shape) == tuple(in_proj_w.shape)
-    finally:
-        ps.destroy_model_parallel()
-        ps.initialize_model_parallel()
-        GTPShardedParam._chain_state.clear()
+    # make_sharded_optimizer_tensor must accept it for a same-shape optimizer state tensor.
+    opt_state = torch.zeros_like(in_proj_w)
+    osh = make_sharded_optimizer_tensor(entry, opt_state, prefix='optimizer.state.exp_avg')
+    assert osh is not None
+    assert tuple(osh.local_shape) == tuple(in_proj_w.shape)
 
 
 def _worker_save_load_roundtrip_needs_gtp_inclusive_group(rank, world_size, ckpt_base):
@@ -1676,56 +1372,52 @@ def _worker_save_load_roundtrip_needs_gtp_inclusive_group(rank, world_size, ckpt
     ps.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
     )
-    try:
-        pg = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=['tp', 'dp_cp', 'dp_cp_gtp_remat']
+    pg = ProcessGroupCollection.use_mpu_process_groups(
+        required_pgs=['tp', 'dp_cp', 'dp_cp_gtp_remat']
+    )
+    # The two group choices must differ under GTP_remat, else the test is moot.
+    assert (
+        get_pg_size(pg.dp_cp_gtp_remat) == get_pg_size(pg.dp_cp) * 2
+    ), f"full={get_pg_size(pg.dp_cp_gtp_remat)} replicate={get_pg_size(pg.dp_cp)}"
+
+    # A GTP-replicated param: byte-identical on every rank (like decoder.final_norm.weight).
+    replicated = torch.nn.Parameter(
+        torch.arange(32, dtype=torch.bfloat16, device="cuda").reshape(8, 4)
+    )
+
+    def _sd(dp_cp_group):
+        return make_sharded_tensors_for_checkpoint(
+            {"w": replicated},
+            prefix="",
+            tensor_parallel_layers_axis_map={},
+            tp_group=pg.tp,
+            dp_cp_group=dp_cp_group,
         )
-        # The two group choices must differ under GTP_remat, else the test is moot.
+
+    # Negative invariant (uniform, no failed collective): under the gtp_remat-EXCLUDING
+    # replicate group the gtp_remat peers collapse to the same replica_id -> >1 main writer
+    # for the identical element. That is exactly what makes DCP load-validation raise the
+    # a55b 'Invalid access pattern'. (validate_sharding_integrity raises on rank 0 only, so a
+    # real failed load() can't be asserted cleanly across ranks; we assert the root condition.)
+    rids_excl = [None] * world_size
+    dist.all_gather_object(rids_excl, tuple(_sd(pg.dp_cp)["w"].replica_id))
+    rids_incl = [None] * world_size
+    dist.all_gather_object(rids_incl, tuple(_sd(pg.dp_cp_gtp_remat)["w"].replica_id))
+    if rank == 0:
         assert (
-            get_pg_size(pg.dp_cp_gtp_remat) == get_pg_size(pg.dp_cp) * 2
-        ), f"full={get_pg_size(pg.dp_cp_gtp_remat)} replicate={get_pg_size(pg.dp_cp)}"
+            sum(is_main_replica(r) for r in rids_excl) > 1
+        ), f"gtp-excluding dp_cp must collide across gtp_remat peers (the bug): {rids_excl}"
+        assert (
+            sum(is_main_replica(r) for r in rids_incl) == 1
+        ), f"gtp-inclusive group must elect exactly one writer: {rids_incl}"
 
-        # A GTP-replicated param: byte-identical on every rank (like decoder.final_norm.weight).
-        replicated = torch.nn.Parameter(
-            torch.arange(32, dtype=torch.bfloat16, device="cuda").reshape(8, 4)
-        )
-
-        def _sd(dp_cp_group):
-            return make_sharded_tensors_for_checkpoint(
-                {"w": replicated},
-                prefix="",
-                tensor_parallel_layers_axis_map={},
-                tp_group=pg.tp,
-                dp_cp_group=dp_cp_group,
-            )
-
-        # Negative invariant (uniform, no failed collective): under the gtp_remat-EXCLUDING
-        # replicate group the gtp_remat peers collapse to the same replica_id -> >1 main writer
-        # for the identical element. That is exactly what makes DCP load-validation raise the
-        # a55b 'Invalid access pattern'. (validate_sharding_integrity raises on rank 0 only, so a
-        # real failed load() can't be asserted cleanly across ranks; we assert the root condition.)
-        rids_excl = [None] * world_size
-        dist.all_gather_object(rids_excl, tuple(_sd(pg.dp_cp)["w"].replica_id))
-        rids_incl = [None] * world_size
-        dist.all_gather_object(rids_incl, tuple(_sd(pg.dp_cp_gtp_remat)["w"].replica_id))
-        if rank == 0:
-            assert (
-                sum(is_main_replica(r) for r in rids_excl) > 1
-            ), f"gtp-excluding dp_cp must collide across gtp_remat peers (the bug): {rids_excl}"
-            assert (
-                sum(is_main_replica(r) for r in rids_incl) == 1
-            ), f"gtp-inclusive group must elect exactly one writer: {rids_incl}"
-
-        # Positive end-to-end roundtrip through the real DCP save/load with the gtp_remat-inclusive
-        # group (what save_checkpoint_and_time and the fixed load_checkpoint both thread): save and
-        # load must agree on this group, and the replicated data must round-trip intact.
-        with TempNamedDir(ckpt_base / 'gtp_dcp_roundtrip', sync=True) as ckpt_dir:
-            save(_sd(pg.dp_cp_gtp_remat), ckpt_dir)
-            loaded = load(_sd(pg.dp_cp_gtp_remat), ckpt_dir)
-            assert torch.equal(loaded["w"].cpu(), replicated.detach().cpu()), loaded["w"]
-    finally:
-        ps.destroy_model_parallel()
-        ps.initialize_model_parallel()
+    # Positive end-to-end roundtrip through the real DCP save/load with the gtp_remat-inclusive
+    # group (what save_checkpoint_and_time and the fixed load_checkpoint both thread): save and
+    # load must agree on this group, and the replicated data must round-trip intact.
+    with TempNamedDir(ckpt_base / 'gtp_dcp_roundtrip', sync=True) as ckpt_dir:
+        save(_sd(pg.dp_cp_gtp_remat), ckpt_dir)
+        loaded = load(_sd(pg.dp_cp_gtp_remat), ckpt_dir)
+        assert torch.equal(loaded["w"].cpu(), replicated.detach().cpu()), loaded["w"]
 
 
 def _worker_cross_gtp_degree_save_load_roundtrip(rank, world_size, ckpt_base):
@@ -1745,16 +1437,16 @@ def _worker_cross_gtp_degree_save_load_roundtrip(rank, world_size, ckpt_base):
     update_gtp_config(pad_for_alignment=32)  # mxfp8-like alignment
     dim0, in_features = 192, 4  # 192 % 128 (GTP4 align) != 0 -> pads; 192 % 64 (GTP2 align) == 0
 
-    world_group = _cached_new_group(list(range(world_size)))
+    world_group = cached_group(list(range(world_size)))
     save_gtp_group = world_group  # gtp_remat_size=4 -> pads (like the reported GTP64 save)
-    load_gtp_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
+    load_gtp_group = cached_group([0, 1]) if rank in (0, 1) else cached_group([2, 3])
     # tp_group also doubles as the (trivial) GTP replica_group: save_gtp_group is the whole
     # world, so no two ranks share a shard -- no real replication.
-    trivial_replica_group = _cached_new_group([rank])
+    trivial_replica_group = cached_group([rank])
     # ranks 0&2 and 1&3 land on the same GTP2 shard (two independent GTP2 groups over 4 ranks),
     # so they're REPLICAS and must share a replica_group -- else DCP sees two ranks claim the
     # same (offset, replica_id) and raises "Invalid access pattern".
-    load_replica_group = _cached_new_group([0, 2]) if rank % 2 == 0 else _cached_new_group([1, 3])
+    load_replica_group = cached_group([0, 2]) if rank % 2 == 0 else cached_group([1, 3])
 
     golden = torch.arange(dim0 * in_features, dtype=torch.bfloat16, device="cuda").reshape(
         dim0, in_features
@@ -1774,39 +1466,35 @@ def _worker_cross_gtp_degree_save_load_roundtrip(rank, world_size, ckpt_base):
         }
 
     ps.destroy_model_parallel()
-    try:
-        weight_save = _make_gtp_shard(
-            dim0, in_features, save_gtp_group, replica_group=trivial_replica_group
-        )  # save_gtp_group covers the whole world -- no replication, trivial replica group
-        assert getattr(weight_save, "pad_length", 0) == 64, weight_save.pad_length
-        sharded_save = _wrap(weight_save, "weight")
-        assert sharded_save["weight"].global_shape[0] == 256, sharded_save["weight"].global_shape
+    weight_save = _make_gtp_shard(
+        dim0, in_features, save_gtp_group, replica_group=trivial_replica_group
+    )  # save_gtp_group covers the whole world -- no replication, trivial replica group
+    assert getattr(weight_save, "pad_length", 0) == 64, weight_save.pad_length
+    sharded_save = _wrap(weight_save, "weight")
+    assert sharded_save["weight"].global_shape[0] == 256, sharded_save["weight"].global_shape
 
-        weight_load = _make_gtp_shard(
-            dim0, in_features, load_gtp_group, replica_group=load_replica_group
-        )
-        assert getattr(weight_load, "pad_length", 0) == 0, weight_load.pad_length
-        with torch.no_grad():
-            weight_load.fill_(-999.0)  # scribble so a no-op load cannot pass
-        sharded_load = _wrap(weight_load, "weight")
-        assert sharded_load["weight"].global_shape[0] == 192, sharded_load["weight"].global_shape
+    weight_load = _make_gtp_shard(
+        dim0, in_features, load_gtp_group, replica_group=load_replica_group
+    )
+    assert getattr(weight_load, "pad_length", 0) == 0, weight_load.pad_length
+    with torch.no_grad():
+        weight_load.fill_(-999.0)  # scribble so a no-op load cannot pass
+    sharded_load = _wrap(weight_load, "weight")
+    assert sharded_load["weight"].global_shape[0] == 192, sharded_load["weight"].global_shape
 
-        with TempNamedDir(ckpt_base / 'gtp_cross_degree_roundtrip', sync=True) as ckpt_dir:
-            save(sharded_save, ckpt_dir)
-            # THE FIX: without this, allow_shape_mismatch stays False (pad_length==0 here) and
-            # strict validation raises comparing the checkpoint's 256 against the expected 192.
-            grant_shape_mismatch_for_gtp_padding(sharded_load, ckpt_dir, pad_for_alignment=32)
-            assert sharded_load["weight"].allow_shape_mismatch is True
-            # Pre-fix: raises CheckpointingException("Global shape mismatch ... (256) vs (192)").
-            loaded = load(sharded_load, ckpt_dir)
+    with TempNamedDir(ckpt_base / 'gtp_cross_degree_roundtrip', sync=True) as ckpt_dir:
+        save(sharded_save, ckpt_dir)
+        # THE FIX: without this, allow_shape_mismatch stays False (pad_length==0 here) and
+        # strict validation raises comparing the checkpoint's 256 against the expected 192.
+        grant_shape_mismatch_for_gtp_padding(sharded_load, ckpt_dir, pad_for_alignment=32)
+        assert sharded_load["weight"].allow_shape_mismatch is True
+        # Pre-fix: raises CheckpointingException("Global shape mismatch ... (256) vs (192)").
+        loaded = load(sharded_load, ckpt_dir)
 
-        load_gtp_rank = torch.distributed.get_rank(load_gtp_group)
-        shard_dim0_load = dim0 // load_gtp_group.size()  # 96
-        expected = golden[load_gtp_rank * shard_dim0_load : (load_gtp_rank + 1) * shard_dim0_load]
-        torch.testing.assert_close(loaded["weight"].cpu(), expected.cpu(), rtol=0, atol=0)
-    finally:
-        ps.initialize_model_parallel()
-        GTPShardedParam._chain_state.clear()
+    load_gtp_rank = torch.distributed.get_rank(load_gtp_group)
+    shard_dim0_load = dim0 // load_gtp_group.size()  # 96
+    expected = golden[load_gtp_rank * shard_dim0_load : (load_gtp_rank + 1) * shard_dim0_load]
+    torch.testing.assert_close(loaded["weight"].cpu(), expected.cpu(), rtol=0, atol=0)
 
 
 def _worker_restrict_shape_mismatch_to_explainable_padding(rank, world_size, ckpt_base):
@@ -1824,8 +1512,8 @@ def _worker_restrict_shape_mismatch_to_explainable_padding(rank, world_size, ckp
     update_gtp_config(pad_for_alignment=pad_for_alignment)
     dim0, in_features = 192, 4  # same weight as the cross-degree roundtrip test above
 
-    world_group = _cached_new_group(list(range(world_size)))
-    trivial_replica_group = _cached_new_group([rank])
+    world_group = cached_group(list(range(world_size)))
+    trivial_replica_group = cached_group([rank])
 
     def _wrap(tensor, key, prepend_offsets=(), **extra):
         return {
@@ -1841,157 +1529,151 @@ def _worker_restrict_shape_mismatch_to_explainable_padding(rank, world_size, ckp
         }
 
     ps.destroy_model_parallel()
-    try:
-        # Save at GTP4 (pads 192 -> 256), exactly like the cross-degree roundtrip test.
-        weight_save = _make_gtp_shard(
-            dim0, in_features, world_group, replica_group=trivial_replica_group
-        )
-        sharded_save = _wrap(weight_save, "weight")
-        assert sharded_save["weight"].global_shape[0] == 256, sharded_save["weight"].global_shape
+    # Save at GTP4 (pads 192 -> 256), exactly like the cross-degree roundtrip test.
+    weight_save = _make_gtp_shard(
+        dim0, in_features, world_group, replica_group=trivial_replica_group
+    )
+    sharded_save = _wrap(weight_save, "weight")
+    assert sharded_save["weight"].global_shape[0] == 256, sharded_save["weight"].global_shape
 
-        with TempNamedDir(ckpt_base / 'gtp_restrict_bound', sync=True) as ckpt_dir:
-            save(sharded_save, ckpt_dir)
+    with TempNamedDir(ckpt_base / 'gtp_restrict_bound', sync=True) as ckpt_dir:
+        save(sharded_save, ckpt_dir)
 
-            # Legit: SAME logical weight (dim0=192), read at GTP2 -- expected global_shape=192,
-            # dim0_unpadded=192. declared=256 IS padding of 192 (256>=192, 256%32==0).
-            legit_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
-            weight_legit = _make_gtp_shard(
-                dim0, in_features, legit_group, replica_group=trivial_replica_group
-            )
-            sharded_legit = _wrap(weight_legit, "weight")
-            grant_shape_mismatch_for_gtp_padding(sharded_legit, ckpt_dir, pad_for_alignment)
-            assert (
-                sharded_legit["weight"].allow_shape_mismatch is True
-            ), "padding-caused shape difference (256 vs dim0_unpadded=192) must NOT be restricted"
-
-            # Bogus: a DIFFERENT weight (dim0=300) reusing the same key -- declared=256 <
-            # dim0_unpadded=300, not padding, flag must flip to False. Needs legit_group (size 2):
-            # a size-1 group makes wrap_module_params_gtp a no-op, so is_gtp_param never fires.
-            weight_bogus = _make_gtp_shard(
-                300, in_features, legit_group, replica_group=trivial_replica_group
-            )
-            sharded_bogus = _wrap(weight_bogus, "weight")
-            grant_shape_mismatch_for_gtp_padding(sharded_bogus, ckpt_dir, pad_for_alignment)
-            assert sharded_bogus["weight"].allow_shape_mismatch is False, (
-                "unexplainable shape discrepancy (declared=256 < dim0_unpadded=300) must stay "
-                "strictly validated, never granted a mismatch-tolerant bypass"
-            )
-
-            # Non-GTP: a PLAIN tensor (never wrapped by wrap_module_params_gtp) loading the same
-            # GTP4-saved key -- the GTP-saved -> non-GTP-loaded gap. allow_shape_mismatch starts
-            # False and must flip ON: declared=256 is still explainable padding of dim0_unpadded=192.
-            plain_weight = torch.nn.Parameter(
-                torch.zeros(dim0, in_features, dtype=torch.bfloat16, device="cuda")
-            )
-            assert not hasattr(plain_weight, "pad_length"), "must be a genuinely plain tensor"
-            sharded_plain = _wrap(plain_weight, "weight")
-            assert sharded_plain["weight"].global_shape[0] == 192, sharded_plain[
-                "weight"
-            ].global_shape
-            assert (
-                sharded_plain["weight"].allow_shape_mismatch is False
-            ), "a plain non-GTP tensor must never get allow_shape_mismatch from the GTP branch"
-            grant_shape_mismatch_for_gtp_padding(sharded_plain, ckpt_dir, pad_for_alignment)
-            assert sharded_plain["weight"].allow_shape_mismatch is True, (
-                "GTP-saved (256) -> non-GTP-loaded (192) is explainable padding and must be "
-                "reconciled to allow_shape_mismatch=True, closing the non-GTP load gap"
-            )
-
-        # Reverse: a PLAIN (non-GTP) save -- declared0 == dim0_unpadded == 100 exactly, which is NOT
-        # a multiple of pad_for_alignment=32 (100 % 32 == 4) since raw hidden dims have no reason
-        # to be tile-aligned. Loaded into a GTP4 config that DOES pad (100 -> 128). declared0
-        # equalling dim0_unpadded exactly must be unconditionally valid, regardless of alignment.
-        assert 100 % pad_for_alignment != 0, "must be unaligned to actually exercise the bound"
-        plain_unaligned = torch.nn.Parameter(
-            torch.zeros(100, in_features, dtype=torch.bfloat16, device="cuda")
-        )
-        sharded_plain_save = _wrap(plain_unaligned, "weight_unaligned")
-        assert sharded_plain_save["weight_unaligned"].global_shape[0] == 100
-
-        with TempNamedDir(ckpt_base / 'gtp_restrict_bound_reverse', sync=True) as ckpt_dir2:
-            save(sharded_plain_save, ckpt_dir2)
-
-            weight_gtp_load = _make_gtp_shard(
-                100, in_features, legit_group, replica_group=trivial_replica_group
-            )
-            assert getattr(weight_gtp_load, "pad_length", 0) == 28, weight_gtp_load.pad_length
-            sharded_gtp_load = _wrap(weight_gtp_load, "weight_unaligned")
-            assert sharded_gtp_load["weight_unaligned"].global_shape[0] == 128
-            grant_shape_mismatch_for_gtp_padding(sharded_gtp_load, ckpt_dir2, pad_for_alignment)
-            assert sharded_gtp_load["weight_unaligned"].allow_shape_mismatch is True, (
-                "declared0 (100) == dim0_unpadded (100) must always count as valid padding, even "
-                "though 100 is not itself a multiple of pad_for_alignment"
-            )
-
-        # Pre-set: a tensor whose allow_shape_mismatch=True was already granted for a reason
-        # unrelated to GTP (e.g. VocabParallelEmbedding's own vocab-padding logic) -- declared=50
-        # vs expected=80 is NOT explainable as GTP padding (50 < 80, and 50 % 32 != 0), so without
-        # the "already True -> skip" guard this function would incorrectly clobber it to False.
-        weight_vocab_like = torch.nn.Parameter(
-            torch.zeros(50, in_features, dtype=torch.bfloat16, device="cuda")
-        )
-        sharded_vocab_save = _wrap(weight_vocab_like, "weight_vocab_like")
-        with TempNamedDir(ckpt_base / 'gtp_restrict_bound_preset', sync=True) as ckpt_dir3:
-            save(sharded_vocab_save, ckpt_dir3)
-
-            weight_vocab_like_load = torch.nn.Parameter(
-                torch.zeros(80, in_features, dtype=torch.bfloat16, device="cuda")
-            )
-            sharded_vocab_load = _wrap(
-                weight_vocab_like_load,
-                "weight_vocab_like",
-                allow_shape_mismatch=True,  # e.g. what VocabParallelEmbedding sets
-            )
-            grant_shape_mismatch_for_gtp_padding(sharded_vocab_load, ckpt_dir3, pad_for_alignment)
-            assert sharded_vocab_load["weight_vocab_like"].allow_shape_mismatch is True, (
-                "a pre-set allow_shape_mismatch=True (non-GTP reason) must never be clobbered, "
-                "even when the shape difference (50 vs 80) doesn't look like GTP padding"
-            )
-
-        # Bf16 bound: pad_for_alignment=1 (bf16 -- no tile-size requirement) must not make the
-        # alignment check vacuous. declared0 % 1 == 0 for every integer, so without gating the
-        # alignment disjunct on pad_for_alignment > 1, any declared0 >= expected0 would be wrongly
-        # accepted as "padding" even for two genuinely incompatible plain tensors.
-        weight_incompatible = torch.nn.Parameter(
-            torch.zeros(200, in_features, dtype=torch.bfloat16, device="cuda")
-        )
-        sharded_incompatible_save = _wrap(weight_incompatible, "weight_incompatible")
-        with TempNamedDir(ckpt_base / 'gtp_restrict_bound_bf16', sync=True) as ckpt_dir4:
-            save(sharded_incompatible_save, ckpt_dir4)
-
-            weight_expected = torch.nn.Parameter(
-                torch.zeros(150, in_features, dtype=torch.bfloat16, device="cuda")
-            )
-            sharded_incompatible_load = _wrap(weight_expected, "weight_incompatible")
-            grant_shape_mismatch_for_gtp_padding(sharded_incompatible_load, ckpt_dir4, 1)
-            assert sharded_incompatible_load["weight_incompatible"].allow_shape_mismatch is False, (
-                "declared0=200 vs expected0=150 at pad_for_alignment=1 is a genuine shape "
-                "mismatch, not GTP padding -- must stay strictly validated"
-            )
-
-        # Prepended axis: a PP-layer axis ahead of dim0 (both sides' global_shape[0] is
-        # num_layers=3, always equal) -- would wrongly early-exit as "no difference" if the
-        # padded axis were read from index 0 instead of prepend_axis_num. Mocks the metadata
-        # read (no real save/load) -- only the axis-indexing math is under test here.
-        layer_axis = ((0, 1, 3),)  # (axis, layer_idx=1, num_layers=3)
-        weight_layer_load = _make_gtp_shard(
+        # Legit: SAME logical weight (dim0=192), read at GTP2 -- expected global_shape=192,
+        # dim0_unpadded=192. declared=256 IS padding of 192 (256>=192, 256%32==0).
+        legit_group = cached_group([0, 1]) if rank in (0, 1) else cached_group([2, 3])
+        weight_legit = _make_gtp_shard(
             dim0, in_features, legit_group, replica_group=trivial_replica_group
         )
-        sharded_layer_load = _wrap(weight_layer_load, "layer.weight", prepend_offsets=layer_axis)
-        assert sharded_layer_load["layer.weight"].global_shape == (3, 192, in_features)
-        fake_metadata = {"layer.weight": SimpleNamespace(global_shape=(3, 256, in_features))}
-        with mock.patch(
-            "megatron.core.dist_checkpointing.serialization.load_tensors_metadata",
-            return_value=fake_metadata,
-        ):
-            grant_shape_mismatch_for_gtp_padding(sharded_layer_load, "unused", pad_for_alignment)
-        assert sharded_layer_load["layer.weight"].allow_shape_mismatch is True, (
-            "prepended-axis padding (declared dim0=256 vs expected dim0=192) must be "
-            "recognized via prepend_axis_num, not silently no-op'd by comparing num_layers"
+        sharded_legit = _wrap(weight_legit, "weight")
+        grant_shape_mismatch_for_gtp_padding(sharded_legit, ckpt_dir, pad_for_alignment)
+        assert (
+            sharded_legit["weight"].allow_shape_mismatch is True
+        ), "padding-caused shape difference (256 vs dim0_unpadded=192) must NOT be restricted"
+
+        # Bogus: a DIFFERENT weight (dim0=300) reusing the same key -- declared=256 <
+        # dim0_unpadded=300, not padding, flag must flip to False. Needs legit_group (size 2):
+        # a size-1 group makes wrap_module_params_gtp a no-op, so is_gtp_param never fires.
+        weight_bogus = _make_gtp_shard(
+            300, in_features, legit_group, replica_group=trivial_replica_group
         )
-    finally:
-        ps.initialize_model_parallel()
-        GTPShardedParam._chain_state.clear()
+        sharded_bogus = _wrap(weight_bogus, "weight")
+        grant_shape_mismatch_for_gtp_padding(sharded_bogus, ckpt_dir, pad_for_alignment)
+        assert sharded_bogus["weight"].allow_shape_mismatch is False, (
+            "unexplainable shape discrepancy (declared=256 < dim0_unpadded=300) must stay "
+            "strictly validated, never granted a mismatch-tolerant bypass"
+        )
+
+        # Non-GTP: a PLAIN tensor (never wrapped by wrap_module_params_gtp) loading the same
+        # GTP4-saved key -- the GTP-saved -> non-GTP-loaded gap. allow_shape_mismatch starts
+        # False and must flip ON: declared=256 is still explainable padding of dim0_unpadded=192.
+        plain_weight = torch.nn.Parameter(
+            torch.zeros(dim0, in_features, dtype=torch.bfloat16, device="cuda")
+        )
+        assert not hasattr(plain_weight, "pad_length"), "must be a genuinely plain tensor"
+        sharded_plain = _wrap(plain_weight, "weight")
+        assert sharded_plain["weight"].global_shape[0] == 192, sharded_plain["weight"].global_shape
+        assert (
+            sharded_plain["weight"].allow_shape_mismatch is False
+        ), "a plain non-GTP tensor must never get allow_shape_mismatch from the GTP branch"
+        grant_shape_mismatch_for_gtp_padding(sharded_plain, ckpt_dir, pad_for_alignment)
+        assert sharded_plain["weight"].allow_shape_mismatch is True, (
+            "GTP-saved (256) -> non-GTP-loaded (192) is explainable padding and must be "
+            "reconciled to allow_shape_mismatch=True, closing the non-GTP load gap"
+        )
+
+    # Reverse: a PLAIN (non-GTP) save -- declared0 == dim0_unpadded == 100 exactly, which is NOT
+    # a multiple of pad_for_alignment=32 (100 % 32 == 4) since raw hidden dims have no reason
+    # to be tile-aligned. Loaded into a GTP4 config that DOES pad (100 -> 128). declared0
+    # equalling dim0_unpadded exactly must be unconditionally valid, regardless of alignment.
+    assert 100 % pad_for_alignment != 0, "must be unaligned to actually exercise the bound"
+    plain_unaligned = torch.nn.Parameter(
+        torch.zeros(100, in_features, dtype=torch.bfloat16, device="cuda")
+    )
+    sharded_plain_save = _wrap(plain_unaligned, "weight_unaligned")
+    assert sharded_plain_save["weight_unaligned"].global_shape[0] == 100
+
+    with TempNamedDir(ckpt_base / 'gtp_restrict_bound_reverse', sync=True) as ckpt_dir2:
+        save(sharded_plain_save, ckpt_dir2)
+
+        weight_gtp_load = _make_gtp_shard(
+            100, in_features, legit_group, replica_group=trivial_replica_group
+        )
+        assert getattr(weight_gtp_load, "pad_length", 0) == 28, weight_gtp_load.pad_length
+        sharded_gtp_load = _wrap(weight_gtp_load, "weight_unaligned")
+        assert sharded_gtp_load["weight_unaligned"].global_shape[0] == 128
+        grant_shape_mismatch_for_gtp_padding(sharded_gtp_load, ckpt_dir2, pad_for_alignment)
+        assert sharded_gtp_load["weight_unaligned"].allow_shape_mismatch is True, (
+            "declared0 (100) == dim0_unpadded (100) must always count as valid padding, even "
+            "though 100 is not itself a multiple of pad_for_alignment"
+        )
+
+    # Pre-set: a tensor whose allow_shape_mismatch=True was already granted for a reason
+    # unrelated to GTP (e.g. VocabParallelEmbedding's own vocab-padding logic) -- declared=50
+    # vs expected=80 is NOT explainable as GTP padding (50 < 80, and 50 % 32 != 0), so without
+    # the "already True -> skip" guard this function would incorrectly clobber it to False.
+    weight_vocab_like = torch.nn.Parameter(
+        torch.zeros(50, in_features, dtype=torch.bfloat16, device="cuda")
+    )
+    sharded_vocab_save = _wrap(weight_vocab_like, "weight_vocab_like")
+    with TempNamedDir(ckpt_base / 'gtp_restrict_bound_preset', sync=True) as ckpt_dir3:
+        save(sharded_vocab_save, ckpt_dir3)
+
+        weight_vocab_like_load = torch.nn.Parameter(
+            torch.zeros(80, in_features, dtype=torch.bfloat16, device="cuda")
+        )
+        sharded_vocab_load = _wrap(
+            weight_vocab_like_load,
+            "weight_vocab_like",
+            allow_shape_mismatch=True,  # e.g. what VocabParallelEmbedding sets
+        )
+        grant_shape_mismatch_for_gtp_padding(sharded_vocab_load, ckpt_dir3, pad_for_alignment)
+        assert sharded_vocab_load["weight_vocab_like"].allow_shape_mismatch is True, (
+            "a pre-set allow_shape_mismatch=True (non-GTP reason) must never be clobbered, "
+            "even when the shape difference (50 vs 80) doesn't look like GTP padding"
+        )
+
+    # Bf16 bound: pad_for_alignment=1 (bf16 -- no tile-size requirement) must not make the
+    # alignment check vacuous. declared0 % 1 == 0 for every integer, so without gating the
+    # alignment disjunct on pad_for_alignment > 1, any declared0 >= expected0 would be wrongly
+    # accepted as "padding" even for two genuinely incompatible plain tensors.
+    weight_incompatible = torch.nn.Parameter(
+        torch.zeros(200, in_features, dtype=torch.bfloat16, device="cuda")
+    )
+    sharded_incompatible_save = _wrap(weight_incompatible, "weight_incompatible")
+    with TempNamedDir(ckpt_base / 'gtp_restrict_bound_bf16', sync=True) as ckpt_dir4:
+        save(sharded_incompatible_save, ckpt_dir4)
+
+        weight_expected = torch.nn.Parameter(
+            torch.zeros(150, in_features, dtype=torch.bfloat16, device="cuda")
+        )
+        sharded_incompatible_load = _wrap(weight_expected, "weight_incompatible")
+        grant_shape_mismatch_for_gtp_padding(sharded_incompatible_load, ckpt_dir4, 1)
+        assert sharded_incompatible_load["weight_incompatible"].allow_shape_mismatch is False, (
+            "declared0=200 vs expected0=150 at pad_for_alignment=1 is a genuine shape "
+            "mismatch, not GTP padding -- must stay strictly validated"
+        )
+
+    # Prepended axis: a PP-layer axis ahead of dim0 (both sides' global_shape[0] is
+    # num_layers=3, always equal) -- would wrongly early-exit as "no difference" if the
+    # padded axis were read from index 0 instead of prepend_axis_num. Mocks the metadata
+    # read (no real save/load) -- only the axis-indexing math is under test here.
+    layer_axis = ((0, 1, 3),)  # (axis, layer_idx=1, num_layers=3)
+    weight_layer_load = _make_gtp_shard(
+        dim0, in_features, legit_group, replica_group=trivial_replica_group
+    )
+    sharded_layer_load = _wrap(weight_layer_load, "layer.weight", prepend_offsets=layer_axis)
+    assert sharded_layer_load["layer.weight"].global_shape == (3, 192, in_features)
+    fake_metadata = {"layer.weight": SimpleNamespace(global_shape=(3, 256, in_features))}
+    with mock.patch(
+        "megatron.core.dist_checkpointing.serialization.load_tensors_metadata",
+        return_value=fake_metadata,
+    ):
+        grant_shape_mismatch_for_gtp_padding(sharded_layer_load, "unused", pad_for_alignment)
+    assert sharded_layer_load["layer.weight"].allow_shape_mismatch is True, (
+        "prepended-axis padding (declared dim0=256 vs expected dim0=192) must be "
+        "recognized via prepend_axis_num, not silently no-op'd by comparing num_layers"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2017,7 +1699,7 @@ def _sharded_weight(weight, rank, world_group, *, gtp, expect_global_shape):
         {"weight": weight},
         prefix=_PREFIX,
         tensor_parallel_layers_axis_map={},
-        tp_group=_cached_new_group([rank]),
+        tp_group=cached_group([rank]),
         dp_cp_group=world_group,
     )
     entry = sharded[_PREFIX + "weight"]
@@ -2036,50 +1718,38 @@ def _worker_save_without_gtp_load_with_gtp_remat(rank, world_size, ckpt_base):
     from tests.unit_tests.dist_checkpointing import TempNamedDir
 
     ps.destroy_model_parallel()
-    world_group = _cached_new_group(list(range(world_size)))
+    world_group = cached_group(list(range(world_size)))
     out_features, in_features = 16, 8
     gtp_size = world_size
     local_out = out_features // gtp_size
 
-    try:
-        # ---- "save" side: GTP disabled, single full (unsharded) tensor ----
-        full_weight = torch.arange(
-            out_features * in_features, dtype=torch.bfloat16, device="cuda"
-        ).reshape(out_features, in_features)
+    # ---- "save" side: GTP disabled, single full (unsharded) tensor ----
+    full_weight = torch.arange(
+        out_features * in_features, dtype=torch.bfloat16, device="cuda"
+    ).reshape(out_features, in_features)
 
-        no_gtp_sharded = _sharded_weight(
-            full_weight,
-            rank,
-            world_group,
-            gtp=False,
-            expect_global_shape=(out_features, in_features),
+    no_gtp_sharded = _sharded_weight(
+        full_weight, rank, world_group, gtp=False, expect_global_shape=(out_features, in_features)
+    )
+
+    with TempNamedDir(ckpt_base / 'no_gtp_save', sync=True) as ckpt_dir:
+        save(no_gtp_sharded, ckpt_dir)
+
+        # ---- "load" side: gtp_remat_size=4, weight is now GTP-sharded ----
+        gtp_weight = _make_gtp_shard(
+            out_features, in_features, world_group, replica_group=cached_group([rank])
         )
+        assert tuple(gtp_weight.shape) == (local_out, in_features), gtp_weight.shape
 
-        with TempNamedDir(ckpt_base / 'no_gtp_save', sync=True) as ckpt_dir:
-            save(no_gtp_sharded, ckpt_dir)
-
-            # ---- "load" side: gtp_remat_size=4, weight is now GTP-sharded ----
-            gtp_weight = _make_gtp_shard(
-                out_features, in_features, world_group, replica_group=_cached_new_group([rank])
-            )
-            assert tuple(gtp_weight.shape) == (local_out, in_features), gtp_weight.shape
-
-            # Same global_shape as the non-GTP save recorded -> no shape mismatch on load.
-            gtp_sharded = _sharded_weight(
-                gtp_weight,
-                rank,
-                world_group,
-                gtp=True,
-                expect_global_shape=(out_features, in_features),
-            )
-            loaded = load(gtp_sharded, ckpt_dir)
-
-        torch.testing.assert_close(
-            loaded[_PREFIX + "weight"].cpu(), gtp_weight.detach().cpu(), rtol=0, atol=0
+        # Same global_shape as the non-GTP save recorded -> no shape mismatch on load.
+        gtp_sharded = _sharded_weight(
+            gtp_weight, rank, world_group, gtp=True, expect_global_shape=(out_features, in_features)
         )
-    finally:
-        ps.initialize_model_parallel()
-        GTPShardedParam._chain_state.clear()
+        loaded = load(gtp_sharded, ckpt_dir)
+
+    torch.testing.assert_close(
+        loaded[_PREFIX + "weight"].cpu(), gtp_weight.detach().cpu(), rtol=0, atol=0
+    )
 
 
 def _worker_save_with_gtp_load_without_gtp_aligned(rank, world_size, ckpt_base):
@@ -2092,236 +1762,171 @@ def _worker_save_with_gtp_load_without_gtp_aligned(rank, world_size, ckpt_base):
     from tests.unit_tests.dist_checkpointing import TempNamedDir
 
     ps.destroy_model_parallel()
-    world_group = _cached_new_group(list(range(world_size)))
+    world_group = cached_group(list(range(world_size)))
     out_features, in_features = 16, 8  # divisible by gtp_remat_size=4 -> no padding needed
 
-    try:
-        full_weight = torch.arange(
-            out_features * in_features, dtype=torch.bfloat16, device="cuda"
-        ).reshape(out_features, in_features)
+    full_weight = torch.arange(
+        out_features * in_features, dtype=torch.bfloat16, device="cuda"
+    ).reshape(out_features, in_features)
 
-        # ---- "save" side: gtp_remat_size=4 ----
-        gtp_weight = _make_gtp_shard(
-            out_features, in_features, world_group, replica_group=_cached_new_group([rank])
+    # ---- "save" side: gtp_remat_size=4 ----
+    gtp_weight = _make_gtp_shard(
+        out_features, in_features, world_group, replica_group=cached_group([rank])
+    )
+    assert gtp_weight.pad_length == 0, gtp_weight.pad_length
+
+    gtp_sharded = _sharded_weight(
+        gtp_weight, rank, world_group, gtp=True, expect_global_shape=(out_features, in_features)
+    )
+
+    with TempNamedDir(ckpt_base / 'gtp_save', sync=True) as ckpt_dir:
+        save(gtp_sharded, ckpt_dir)
+
+        # ---- "load" side: GTP disabled, plain full tensor ----
+        plain_weight = torch.zeros(out_features, in_features, dtype=torch.bfloat16, device="cuda")
+        no_gtp_sharded = _sharded_weight(
+            plain_weight,
+            rank,
+            world_group,
+            gtp=False,
+            expect_global_shape=(out_features, in_features),
         )
-        assert gtp_weight.pad_length == 0, gtp_weight.pad_length
+        loaded = load(no_gtp_sharded, ckpt_dir)
 
-        gtp_sharded = _sharded_weight(
-            gtp_weight, rank, world_group, gtp=True, expect_global_shape=(out_features, in_features)
-        )
-
-        with TempNamedDir(ckpt_base / 'gtp_save', sync=True) as ckpt_dir:
-            save(gtp_sharded, ckpt_dir)
-
-            # ---- "load" side: GTP disabled, plain full tensor ----
-            plain_weight = torch.zeros(
-                out_features, in_features, dtype=torch.bfloat16, device="cuda"
-            )
-            no_gtp_sharded = _sharded_weight(
-                plain_weight,
-                rank,
-                world_group,
-                gtp=False,
-                expect_global_shape=(out_features, in_features),
-            )
-            loaded = load(no_gtp_sharded, ckpt_dir)
-
-        torch.testing.assert_close(
-            loaded[_PREFIX + "weight"].cpu(), full_weight.cpu(), rtol=0, atol=0
-        )
-    finally:
-        ps.initialize_model_parallel()
-        GTPShardedParam._chain_state.clear()
+    torch.testing.assert_close(loaded[_PREFIX + "weight"].cpu(), full_weight.cpu(), rtol=0, atol=0)
 
 
-def _worker_save_with_gtp_padded_load_without_gtp_shape_mismatch(rank, world_size, ckpt_base):
+def _worker_save_with_gtp_padded_load_without_gtp(rank, world_size, ckpt_base):
     """Same reverse direction, but out_features needs alignment padding at save time
-    (pad_length > 0). The checkpoint then declares the PADDED global_shape; a load with GTP
-    disabled has no signal that padding is involved, so it requests the true (unpadded)
-    global_shape and must hard-fail with a global-shape-mismatch CheckpointingException rather
-    than silently truncating or corrupting data.
+    (pad_length > 0), so the checkpoint declares the PADDED global_shape. As in production
+    (load_checkpoint), the non-GTP load runs grant_shape_mismatch_for_gtp_padding first; it must
+    recognize the extra rows as GTP padding and the load must return exactly the unpadded weight.
     """
-    import traceback
-
     from megatron.core.dist_checkpointing import load, save
+    from megatron.core.utils import grant_shape_mismatch_for_gtp_padding
     from tests.unit_tests.dist_checkpointing import TempNamedDir
 
     ps.destroy_model_parallel()
-    world_group = _cached_new_group(list(range(world_size)))
+    world_group = cached_group(list(range(world_size)))
     out_features, in_features = 20, 8  # NOT divisible by gtp_remat_size=4 -> needs padding
-    orig_pad = GTP_CONFIG.pad_for_alignment
-    update_gtp_config(pad_for_alignment=2)  # alignment = pad_for_alignment * gtp_remat_size = 8
+    pad_for_alignment = 2  # alignment = pad_for_alignment * gtp_remat_size = 8
+    update_gtp_config(pad_for_alignment=pad_for_alignment)
 
-    try:
-        gtp_weight = _make_gtp_shard(
-            out_features, in_features, world_group, replica_group=_cached_new_group([rank])
+    full_weight = torch.arange(
+        out_features * in_features, dtype=torch.bfloat16, device="cuda"
+    ).reshape(out_features, in_features)
+    gtp_weight = _make_gtp_shard(
+        out_features, in_features, world_group, replica_group=cached_group([rank])
+    )
+    assert gtp_weight.pad_length == 4, gtp_weight.pad_length  # (8 - 20%8) % 8
+
+    # Checkpoint declares the padded shape (24, 8), not the true (20, 8).
+    gtp_sharded = _sharded_weight(
+        gtp_weight, rank, world_group, gtp=True, expect_global_shape=(out_features + 4, in_features)
+    )
+
+    with TempNamedDir(ckpt_base / 'gtp_padded_save', sync=True) as ckpt_dir:
+        save(gtp_sharded, ckpt_dir)
+
+        # ---- "load" side: GTP disabled, expects the TRUE (unpadded) shape ----
+        plain_weight = torch.full(
+            (out_features, in_features), -999.0, dtype=torch.bfloat16, device="cuda"
         )
-        assert gtp_weight.pad_length == 4, gtp_weight.pad_length  # (8 - 20%8) % 8
-
-        # Checkpoint declares the padded shape (24, 8), not the true (20, 8).
-        gtp_sharded = _sharded_weight(
-            gtp_weight,
+        no_gtp_sharded = _sharded_weight(
+            plain_weight,
             rank,
             world_group,
-            gtp=True,
-            expect_global_shape=(out_features + 4, in_features),
+            gtp=False,
+            expect_global_shape=(out_features, in_features),
         )
+        grant_shape_mismatch_for_gtp_padding(no_gtp_sharded, ckpt_dir, pad_for_alignment)
+        assert no_gtp_sharded[_PREFIX + "weight"].allow_shape_mismatch is True
+        loaded = load(no_gtp_sharded, ckpt_dir)
 
-        with TempNamedDir(ckpt_base / 'gtp_padded_save', sync=True) as ckpt_dir:
-            save(gtp_sharded, ckpt_dir)
+    torch.testing.assert_close(loaded[_PREFIX + "weight"].cpu(), full_weight.cpu(), rtol=0, atol=0)
 
-            # ---- "load" side: GTP disabled, expects the TRUE (unpadded) shape ----
-            plain_weight = torch.zeros(
-                out_features, in_features, dtype=torch.bfloat16, device="cuda"
-            )
-            no_gtp_sharded = _sharded_weight(
-                plain_weight,
-                rank,
-                world_group,
-                gtp=False,
-                expect_global_shape=(out_features, in_features),
-            )
 
-            # load()'s real failure surfaces as torch's own collective-wrapping
-            # CheckpointException, which subclasses BaseException directly (not Exception!), so
-            # match on the underlying message rather than the wrapper type -- and run this
-            # identically (no rank-asymmetric branching) on every rank to avoid desyncing NCCL.
-            raised = False
-            try:
-                load(no_gtp_sharded, ckpt_dir)
-            except BaseException as e:  # noqa: BLE001
-                raised = True
-                full_msg = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-                assert "Global shape mismatch" in full_msg, full_msg
-            assert (
-                raised
-            ), "load() unexpectedly succeeded despite the padded/unpadded global_shape mismatch"
+def _run(worker, ckpt_base=None):
+    """Run ``worker`` on every rank, then restore the default MPU it may have replaced."""
+    _require_world_size(4)
+    try:
+        worker(dist.get_rank(), 4, ckpt_base)
     finally:
-        update_gtp_config(pad_for_alignment=orig_pad)
+        ps.destroy_model_parallel()
         ps.initialize_model_parallel()
-        GTPShardedParam._chain_state.clear()
 
 
-@pytest.mark.run_only_on_devices_with_compute_capability(compute_capability=(10, 0))
 class TestGtpDcpHelper:
     def test_mamba_replicated_param_replica_ids(self):
-        _require_world_size(4)
-        _worker_mamba_replicated_param_replica_ids(dist.get_rank(), 4, None)
-
-    def test_mamba_inproj_optim_param_map(self):
-        _require_world_size(4)
-        _worker_mamba_inproj_optim_param_map(dist.get_rank(), 4, None)
+        _run(_worker_mamba_replicated_param_replica_ids)
 
     def test_gdp_inproj_shard_split(self):
-        _require_world_size(4)
-        _worker_gdp_inproj_shard_split(dist.get_rank(), 4, None)
+        _run(_worker_gdp_inproj_shard_split)
 
     def test_gdp_inproj_cross_gtp_load(self, tmp_path_dist_ckpt):
-        _require_world_size(4)
-        _worker_gdp_inproj_cross_gtp_load(dist.get_rank(), 4, tmp_path_dist_ckpt)
+        _run(_worker_gdp_inproj_cross_gtp_load, tmp_path_dist_ckpt)
 
     def test_gdp_save_load_roundtrip(self, tmp_path_dist_ckpt):
-        _require_world_size(4)
-        _worker_gdp_save_load_roundtrip(dist.get_rank(), 4, tmp_path_dist_ckpt)
+        _run(_worker_gdp_save_load_roundtrip, tmp_path_dist_ckpt)
 
     def test_gdp_inproj_optim_param_map(self):
-        _require_world_size(4)
-        _worker_gdp_inproj_optim_param_map(dist.get_rank(), 4, None)
-
-    def test_replicated_param_needs_gtp_inclusive_dp_cp(self):
-        _require_world_size(4)
-        _worker_replicated_param_needs_gtp_inclusive_dp_cp(dist.get_rank(), 4, None)
+        _run(_worker_gdp_inproj_optim_param_map)
 
     def test_save_load_roundtrip_needs_gtp_inclusive_group(self, tmp_path_dist_ckpt):
-        _require_world_size(4)
-        _worker_save_load_roundtrip_needs_gtp_inclusive_group(
-            dist.get_rank(), 4, tmp_path_dist_ckpt
-        )
+        _run(_worker_save_load_roundtrip_needs_gtp_inclusive_group, tmp_path_dist_ckpt)
 
     def test_composite_offset_same_axis(self):
-        _require_world_size(4)
-        _worker_helper_offsets_tp_eq_gtp_axis(dist.get_rank(), 4, None)
+        _run(_worker_helper_offsets_tp_eq_gtp_axis)
 
+    @pytest.mark.launch_on_gb200
     def test_native_fp8_dcp_save(self):
-        _require_world_size(4)
-        _worker_native_fp8_dcp_save(dist.get_rank(), 4, None)
+        _run(_worker_native_fp8_dcp_save)
 
+    @pytest.mark.launch_on_gb200
     def test_native_fp8_dcp_load_copy(self):
-        _require_world_size(4)
-        _worker_native_fp8_dcp_load_copy(dist.get_rank(), 4, None)
+        _run(_worker_native_fp8_dcp_load_copy)
 
     def test_dual_offsets_cross_axis(self):
-        _require_world_size(4)
-        _worker_helper_offsets_tp_neq_gtp_axis(dist.get_rank(), 4, None)
+        _run(_worker_helper_offsets_tp_neq_gtp_axis)
 
     def test_ep_egtp_offsets(self):
-        _require_world_size(4)
-        _worker_helper_offsets_ep_egtp(dist.get_rank(), 4, None)
+        _run(_worker_helper_offsets_ep_egtp)
 
     def test_embedding_offsets(self):
-        _require_world_size(4)
-        _worker_helper_embedding_offsets(dist.get_rank(), 4, None)
+        _run(_worker_helper_embedding_offsets)
 
     def test_embedding_writer_election(self):
-        _require_world_size(4)
-        _worker_embedding_writer_election_gtp_inclusive_default(dist.get_rank(), 4, None)
+        _run(_worker_embedding_writer_election_gtp_inclusive_default)
 
     def test_public_wrapper_delegates(self):
-        _require_world_size(4)
-        _worker_helper_public_wrapper_delegates(dist.get_rank(), 4, None)
+        _run(_worker_helper_public_wrapper_delegates)
 
     def test_save_without_mpu_uses_stamped_replica_group(self):
-        _require_world_size(4)
-        _worker_save_without_mpu_uses_stamped_replica_group(dist.get_rank(), 4, None)
+        _run(_worker_save_without_mpu_uses_stamped_replica_group)
 
     def test_gtp_sharded_tp_replicated_roundtrip(self, tmp_path_dist_ckpt):
-        _require_world_size(4)
-        _worker_gtp_sharded_tp_replicated_roundtrip(dist.get_rank(), 4, tmp_path_dist_ckpt)
+        _run(_worker_gtp_sharded_tp_replicated_roundtrip, tmp_path_dist_ckpt)
 
     def test_replicated_sink_rejects_gtp(self):
-        _require_world_size(4)
-        _worker_helper_replicated_sink_rejects_gtp(dist.get_rank(), 4, None)
+        _run(_worker_helper_replicated_sink_rejects_gtp)
 
     def test_no_op_no_gtp_remat(self):
-        _require_world_size(4)
-        _worker_helper_no_op_no_gtp_remat(dist.get_rank(), 4, None)
-
-    def test_inproj_no_pad(self):
-        _require_world_size(4)
-        _worker_helper_padded_inproj_no_pad_case(dist.get_rank(), 4, None)
+        _run(_worker_helper_no_op_no_gtp_remat)
 
     def test_inproj_with_pad(self):
-        _require_world_size(4)
-        _worker_helper_padded_inproj_pad_case(dist.get_rank(), 4, None)
-
-    def test_cross_topology_reshard_metadata(self):
-        _require_world_size(4)
-        _worker_helper_cross_topology_reshard_metadata(dist.get_rank(), 4, None)
-
-    def test_save_then_load_offsets_symmetric(self):
-        _require_world_size(4)
-        _worker_save_then_load_offsets_symmetric(dist.get_rank(), 4, None)
+        _run(_worker_helper_padded_inproj_pad_case)
 
     def test_cross_gtp_degree_save_load_roundtrip(self, tmp_path_dist_ckpt):
-        _require_world_size(4)
-        _worker_cross_gtp_degree_save_load_roundtrip(dist.get_rank(), 4, tmp_path_dist_ckpt)
+        _run(_worker_cross_gtp_degree_save_load_roundtrip, tmp_path_dist_ckpt)
 
     def test_restrict_shape_mismatch_to_explainable_padding(self, tmp_path_dist_ckpt):
-        _require_world_size(4)
-        _worker_restrict_shape_mismatch_to_explainable_padding(
-            dist.get_rank(), 4, tmp_path_dist_ckpt
-        )
+        _run(_worker_restrict_shape_mismatch_to_explainable_padding, tmp_path_dist_ckpt)
 
     def test_save_without_gtp_load_with_gtp_remat(self, tmp_path_dist_ckpt):
-        _require_world_size(4)
-        _worker_save_without_gtp_load_with_gtp_remat(dist.get_rank(), 4, tmp_path_dist_ckpt)
+        _run(_worker_save_without_gtp_load_with_gtp_remat, tmp_path_dist_ckpt)
 
     def test_save_with_gtp_load_without_gtp_aligned(self, tmp_path_dist_ckpt):
-        _require_world_size(4)
-        _worker_save_with_gtp_load_without_gtp_aligned(dist.get_rank(), 4, tmp_path_dist_ckpt)
+        _run(_worker_save_with_gtp_load_without_gtp_aligned, tmp_path_dist_ckpt)
 
-    def test_save_with_gtp_padded_load_without_gtp_shape_mismatch(self, tmp_path_dist_ckpt):
-        _require_world_size(4)
-        _worker_save_with_gtp_padded_load_without_gtp_shape_mismatch(
-            dist.get_rank(), 4, tmp_path_dist_ckpt
-        )
+    def test_save_with_gtp_padded_load_without_gtp(self, tmp_path_dist_ckpt):
+        _run(_worker_save_with_gtp_padded_load_without_gtp, tmp_path_dist_ckpt)

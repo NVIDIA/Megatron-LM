@@ -8,10 +8,17 @@ from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
 
 
-@pytest.mark.parametrize("tp_size", [1, 2, 4])
-@pytest.mark.parametrize("gtp_size", [1, 2, 3, 4])
-@pytest.mark.parametrize("singleton", [False, True])
-@pytest.mark.parametrize("dequantized", [False, True])
+# GTP3 shards straddle the w/v boundary of each TP-local [w|v] pair; GTP2 and GTP4 shards align
+# with it. ``dequantized`` reaches the GTP size through the ``_gtp_dequant_src`` backlink.
+@pytest.mark.parametrize(
+    ("tp_size", "gtp_size", "singleton", "dequantized"),
+    [
+        pytest.param(2, 3, False, False, id="tp2-gtp3-straddle"),
+        pytest.param(2, 3, True, True, id="tp2-gtp3-straddle-singleton-dequantized"),
+        pytest.param(2, 2, True, False, id="tp2-gtp2-singleton"),
+        pytest.param(1, 4, False, True, id="tp1-gtp4-dequantized"),
+    ],
+)
 def test_gtp_swiglu_checkpoint_layout(tp_size, gtp_size, singleton, dequantized):
     # Distinct values in every row expose permutations that constant weights hide.
     half_rows = 3 * gtp_size

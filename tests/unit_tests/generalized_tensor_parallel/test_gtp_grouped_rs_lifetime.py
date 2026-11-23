@@ -6,10 +6,6 @@ import pytest
 import torch
 
 from megatron.core.tensor_parallel import generalized_tensor_parallelism as gtp
-from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
-    _torchrun_dist_init,
-    reset_gtp_globals,
-)
 
 
 @pytest.mark.parametrize("async_op", [False, True])

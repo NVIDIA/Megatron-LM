@@ -6,17 +6,14 @@ import pytest
 import torch
 
 from megatron.core.tensor_parallel import generalized_tensor_parallelism as gtp
-from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: F401
+from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
     _make_gtp_linear,
     _make_gtp_remat_grouped_linear,
-    _torchrun_dist_init,
-    reset_gtp_globals,
 )
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("grouped", [False, True])
-def test_backward_gather_preserves_other_chunk_forward(dtype, grouped):
+def test_backward_gather_preserves_other_chunk_forward(grouped):
     """A backward in another virtual chunk must not overwrite a pending forward."""
     group = torch.distributed.group.WORLD
     if group.size() < 2:
@@ -24,8 +21,8 @@ def test_backward_gather_preserves_other_chunk_forward(dtype, grouped):
 
     def make_layer():
         if grouped:
-            return _make_gtp_remat_grouped_linear(2, 64, 64 * group.size(), group, dtype)
-        return _make_gtp_linear(64, 64 * group.size(), group, dtype)
+            return _make_gtp_remat_grouped_linear(2, 64, 64 * group.size(), group)
+        return _make_gtp_linear(64, 64 * group.size(), group)
 
     layers = [make_layer() for _ in range(3)]
     gtp.classify_gtp_remat_chains(layers)

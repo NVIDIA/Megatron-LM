@@ -38,14 +38,11 @@ from megatron.core.distributed.param_and_grad_buffer import shard_buffer
 from megatron.core.tensor_parallel import generalized_tensor_parallelism as gtp_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import PARAM_READY_CALLBACK_ATTR
-from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: F401
+from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
     _make_gtp_linear,
     _make_gtp_remat_grouped_linear,
     _requires_multi_gpu,
     _run_distributed,
-    _torchrun_dist_init,
-    reset_fp8_state,
-    reset_gtp_globals,
 )
 
 WORLD = 4
@@ -174,26 +171,22 @@ def _record_prefetches(ddp_model, targets):
 
 @contextlib.contextmanager
 def _gtp_env():
-    """MPU at ``gtp_remat_size=GTP`` with padding off; restores global GTP state on exit."""
+    """MPU at ``gtp_remat_size=GTP`` with padding off (GTP state is reset by the conftest)."""
     # Wait for all ranks to finish restoring the previous test's groups before teardown.
     torch.distributed.barrier()
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=GTP
     )
-    orig_pad = gtp_module.GTP_CONFIG.pad_for_alignment
     gtp_module.GTP_CONFIG.pad_for_alignment = 0
     try:
         yield
     finally:
-        gtp_module.GTP_CONFIG.pad_for_alignment = orig_pad
         # The grouped-expert test can leave a prefetch running on a separate CUDA stream.
         # The world barrier does not drain that stream; finish it before clearing groups/cache.
         torch.cuda.synchronize()
         torch.distributed.barrier()
         ps.destroy_model_parallel()
-        gtp_module.GTPShardedParam._chain_state.clear()
-        gtp_module.get_global_GTP_cache().clear()
         ps.initialize_model_parallel()
 
 

@@ -1,24 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Numeric repro: GTP_remat gradient correctness through the REAL
-DDP + distributed-optimizer + finalize path, with replicate (DP) > 1.
+"""GTP_remat gradient correctness through the real DDP + finalize path, with replicate (DP) > 1.
 
-The validated loss-trajectory test uses DP=1 (replicate=1) and manual
-SGD on main_grad, so it cannot catch a gradient-reduction error that only shows
-up when the dist-opt shards over a replicate group of size > 1 (the new-at-64-GPU
-condition: DP2 x GTP16). This test reproduces that condition at small scale
-(world=4 = GTP2 x DP2) and checks the gradient end-to-end against a trusted
-no-GTP_remat DP=4 baseline.
-
-Decisive choices:
-  * SGD lr=1.0 (NOT Adam): the step is scale-SENSITIVE, so a gtp_remat x gradient
-    under-scale shows up directly as a gtp_remat x smaller weight delta. Adam would
-    normalize a uniform scale error away and mask the bug.
-  * Distinct input per rank (seed=rank): each data-parallel position sees a
-    different batch (the HSDP guarantee), so the correct reduced grad is the
-    MEAN over all 4 positions. Baseline (DP4) and GTP_remat (GTP2xDP2) both
-    span the same 4 positions, so their reduced grads -- and thus post-step
-    weights and grad-norm -- must match.
+Each test builds the same model twice on 4 ranks -- an unsharded reference and a GTP/EGTP-sharded
+one -- loads identical weights, feeds each data-parallel position a distinct batch (seed=rank) and
+compares the reduced gradients per parameter. Both layouts span the same 4 positions, so the
+correctly reduced gradient is the same mean (or, under calculate_per_token_loss, the same sum).
+A gtp-axis scaling error shows up as a uniform factor on every sharded parameter.
 """
 
 import contextlib
@@ -32,474 +20,357 @@ from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 if not HAVE_GTP:
     pytest.skip("GTP requires TransformerEngine >= 2.19", allow_module_level=True)
 
-from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTPShardedParam
-from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: F401
-    _run_distributed,
-    _torchrun_dist_init,
-    reset_fp8_state,
-    reset_gtp_globals,
+import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp_module
+from megatron.core import parallel_state as ps
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.distributed.finalize_model_grads import (
+    _allreduce_replicated_grads_over_gtp_remat_group,
+)
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+    GTPShardedParam,
+    reset_gtp_state,
+    update_gtp_config,
+)
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
+    _make_gtp_linear,
+    cached_group,
 )
 
 HIDDEN = 256
 NUM_HEADS = 8
 FFN_HIDDEN = 512
-NUM_LAYERS = 1
 SEQ = 16
-BATCH = 1
-LR = 1.0  # scale-sensitive SGD step
 dtype = torch.bfloat16
 NUM_WIDE_STREAMS = 3
+NUM_EXPERTS = 4
+# BF16 reduction-order noise is ~5e-3 of max|grad| here; a dropped mean or a missing shard is ~1.
+GRAD_REL_TOL = 2e-2
 
 
-def _make_config(calculate_per_token_loss=False):
-    from megatron.core.transformer.transformer_config import TransformerConfig
-
-    return TransformerConfig(
-        num_attention_heads=NUM_HEADS,
-        num_layers=NUM_LAYERS,
-        hidden_size=HIDDEN,
-        ffn_hidden_size=FFN_HIDDEN,
-        add_bias_linear=False,
-        params_dtype=dtype,
-        hidden_dropout=0.0,
-        attention_dropout=0.0,
-        bias_dropout_fusion=False,
-        tensor_model_parallel_size=1,
-        pipeline_model_parallel_size=1,
-        calculate_per_token_loss=calculate_per_token_loss,
-    )
+@pytest.fixture(autouse=True)
+def _requires_four_ranks():
+    if dist.get_world_size() != 4:
+        pytest.skip("Requires 4 ranks")
 
 
-def _make_stack(config, pg_collection):
-    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-
-    spec = get_gpt_layer_with_transformer_engine_spec()
-    return torch.nn.ModuleList(
-        [
-            spec.module(config, spec.submodules, layer_number=i + 1, pg_collection=pg_collection)
-            for i in range(NUM_LAYERS)
-        ]
-    )
-
-
-def _make_wide_config(
-    gtp_remat_size=1, calculate_per_token_loss=False, residual_stream_recompute=False
-):
-    from megatron.core.transformer.transformer_config import TransformerConfig
-    from megatron.core.transformer.wide_residual_config import WideResidualConfig
-
-    return TransformerConfig(
-        num_attention_heads=NUM_HEADS,
-        num_layers=NUM_LAYERS,
-        hidden_size=HIDDEN,
-        ffn_hidden_size=FFN_HIDDEN,
-        add_bias_linear=False,
-        params_dtype=dtype,
-        hidden_dropout=0.0,
-        attention_dropout=0.0,
-        bias_dropout_fusion=False,
-        tensor_model_parallel_size=1,
-        tensor_parallel_num_weight_shards=gtp_remat_size,
-        pipeline_model_parallel_size=1,
-        fp32_residual_connection=True,
-        calculate_per_token_loss=calculate_per_token_loss,
-        recompute_granularity="selective" if residual_stream_recompute else None,
-        recompute_modules=["residual_stream"] if residual_stream_recompute else None,
-        residual_stream_recompute_num_layers=1 if residual_stream_recompute else None,
-        wide_residual=WideResidualConfig(
-            num_streams=NUM_WIDE_STREAMS,
-            streamwise_sigmoid_init_scale=0.01,
-            learned_retention=True,
-            retention_init=0.999,
-            retention_max_forget=0.10,
-        ),
-    )
-
-
-def _make_wide_stack(config, pg_collection):
-    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-    from megatron.core.transformer.wide_residual_transformer_layer import (
-        WideResidualTransformerLayer,
-    )
-
-    spec = get_gpt_layer_with_transformer_engine_spec()
-    return torch.nn.ModuleList(
-        [
-            WideResidualTransformerLayer(
-                config, spec.submodules, layer_number=i + 1, pg_collection=pg_collection
-            )
-            for i in range(NUM_LAYERS)
-        ]
-    )
-
-
-def _build_ddp(stack, calculate_per_token_loss=False):
-    """Wrap the stack in a NON-distributed-optimizer DDP so main_grad holds the
-    full all-reduced gradient (no optimizer needed; no Adam scale-invariance to
-    mask a scaling error)."""
-    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-
-    config = _make_config(calculate_per_token_loss=calculate_per_token_loss)
-    ddp_config = DistributedDataParallelConfig(
-        use_distributed_optimizer=False, overlap_grad_reduce=False
-    )
-    module = torch.nn.Sequential()
-    for i, layer in enumerate(stack):
-        module.add_module(str(i), layer)
-    return DistributedDataParallel(config, ddp_config, module)
-
-
-def _run_one_backward(ddp_model, rank, calculate_per_token_loss=False):
-    ddp_model.zero_grad_buffer()
-    # Distinct input per rank => the correct reduced grad is the MEAN over ranks.
-    torch.manual_seed(1000 + rank)
-    x = torch.randn(SEQ, BATCH, HIDDEN, dtype=dtype, device='cuda')
-    out = x
-    for layer in ddp_model.module.children():
-        out, _ = layer(out, attention_mask=None)
-    loss = out.float().mean()
-    loss.backward()
-    # Sync ONCE: finish_grad_sync() triggers the (single) grad reduction for
-    # overlap_grad_reduce=False. Do NOT also call start_grad_sync() — that double-
-    # reduces, which is idempotent at full-DP size but halves at replicate size.
-    ddp_model.finish_grad_sync()
-    from megatron.core import parallel_state as ps
-    from megatron.core.distributed.finalize_model_grads import (
-        _allreduce_replicated_grads_over_gtp_remat_group,
-    )
-
-    _allreduce_replicated_grads_over_gtp_remat_group(
-        [ddp_model],
-        ps.get_gtp_weight_remat_group(check_initialized=False),
-        ps.get_expert_gtp_weight_remat_group(check_initialized=False),
-        calculate_per_token_loss=calculate_per_token_loss,
-    )
-    return float(loss.item())
-
-
-def _build_wide_ddp(stack):
-    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-
-    module = torch.nn.Sequential()
-    for i, layer in enumerate(stack):
-        module.add_module(str(i), layer)
-    return DistributedDataParallel(
-        stack[0].config,
-        DistributedDataParallelConfig(use_distributed_optimizer=False, overlap_grad_reduce=False),
-        module,
-    )
-
-
-def _run_wide_backward(
-    ddp_model, rank, calculate_per_token_loss=False, residual_stream_recompute=False
-):
-    """Run one wide layer and complete both DP and replicated-GTP grad reductions."""
-
-    ddp_model.zero_grad_buffer()
-    torch.manual_seed(1000 + rank)
-    x = torch.randn(
-        SEQ,
-        BATCH,
-        NUM_WIDE_STREAMS * HIDDEN,
-        dtype=torch.float32,
-        device='cuda',
-        requires_grad=True,
-    )
-    layers = list(ddp_model.module.children())
-    if residual_stream_recompute:
-        from megatron.core.transformer.residual_recompute import (
-            build_residual_stream_recompute_plan,
+def _make_config(gtp=1, moe=False, egtp=1, ep=2, per_token=False):
+    """Dense or MoE single-layer config; the GTP/EGTP/EP sizes must match the MPU's."""
+    moe_kwargs = (
+        dict(
+            num_moe_experts=NUM_EXPERTS,
+            moe_router_topk=2,
+            moe_ffn_hidden_size=HIDDEN,
+            moe_grouped_gemm=True,
+            moe_token_dispatcher_type="alltoall",
+            moe_aux_loss_coeff=0.0,
+            expert_model_parallel_size=ep,
+            expert_tensor_parallel_num_weight_shards=egtp,
         )
-
-        replay_contexts = build_residual_stream_recompute_plan(len(layers), len(layers))
-    else:
-        replay_contexts = [None] * len(layers)
-
-    out = x
-    for layer, replay_context in zip(layers, replay_contexts):
-        out, _ = layer(out, attention_mask=None, residual_stream_recompute_context=replay_context)
-        if replay_context is not None:
-            replay_context.finalize(out)
-    out.float().square().mean().backward()
-    ddp_model.finish_grad_sync()
-
-    from megatron.core import parallel_state as ps
-    from megatron.core.distributed.finalize_model_grads import (
-        _allreduce_replicated_grads_over_gtp_remat_group,
+        if moe
+        else {}
+    )
+    return TransformerConfig(
+        num_attention_heads=NUM_HEADS,
+        num_layers=1,
+        hidden_size=HIDDEN,
+        ffn_hidden_size=FFN_HIDDEN,
+        add_bias_linear=False,
+        params_dtype=dtype,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        bias_dropout_fusion=False,
+        tensor_parallel_num_weight_shards=gtp,
+        calculate_per_token_loss=per_token,
+        **moe_kwargs,
     )
 
-    _allreduce_replicated_grads_over_gtp_remat_group(
-        [ddp_model],
-        ps.get_gtp_weight_remat_group(check_initialized=False),
-        ps.get_expert_gtp_weight_remat_group(check_initialized=False),
-        calculate_per_token_loss=calculate_per_token_loss,
-    )
-    return out.detach().float().cpu(), x.grad.detach().float().cpu()
+
+def _is_expert_param(name, p):
+    return ('experts' in name) or (not getattr(p, 'allreduce', True))
 
 
-def _full_main_grads(stack):
-    """Reconstruct full (unsharded) reduced gradients keyed by param name.
+def _reset_gtp_global_state():
+    """Drop GTP process-globals sized against the previous phase's layout.
 
-    GTPShardedParam.main_grad is the local shard -> all-gather over its own axis (expert params
-    shard over egtp_remat, dense over gtp_remat). Non-GTP_remat params are replicated -> take
-    the local (already gtp_remat-summed) copy.
+    The weight cache and wgrad pool are keyed by shape and outlive `destroy_model_parallel()`,
+    so a phase that changes the gtp_remat degree would be handed a stale-sized buffer.
     """
-    from megatron.core import parallel_state as ps
+    reset_gtp_state()
+    gtp_module.get_global_GTP_cache().clear()
+    gtp_module._wgrad_buf_pool.clear()
+    gtp_module._inflight_comm_params.clear()
 
-    out = {}
-    for layer in stack:
-        for name, p in layer.named_parameters():
-            g_attr = 'main_grad' if hasattr(p, 'main_grad') else 'grad'
-            mg = getattr(p, g_attr)
-            if isinstance(p, GTPShardedParam):
-                g = (
-                    ps.get_expert_gtp_weight_remat_group()
-                    if _is_expert_param(name, p)
-                    else ps.get_gtp_weight_remat_group()
-                )
-                shards = [torch.empty_like(mg) for _ in range(g.size())]
-                dist.all_gather(shards, mg.contiguous(), group=g)
-                out[name] = torch.cat(shards, dim=0).float().cpu()
-            else:
-                out[name] = mg.detach().float().cpu()
-    return out
+
+def _build_stack(gtp=1, moe=False, egtp=1, ep=2, per_token=False):
+    """Initialize the MPU for this phase and build one GPT layer on it."""
+    ps.destroy_model_parallel()
+    _reset_gtp_global_state()
+    kwargs = dict(gtp_remat_size=gtp)
+    if moe:
+        kwargs.update(expert_model_parallel_size=ep, expert_gtp_remat_size=egtp)
+    ps.initialize_model_parallel(**kwargs)
+    model_parallel_cuda_manual_seed(42)
+    config = _make_config(gtp, moe, egtp, ep, per_token)
+    spec = get_gpt_layer_with_transformer_engine_spec(
+        num_experts=NUM_EXPERTS if moe else None, moe_grouped_gemm=moe
+    )
+    # Every MPU group: the MoE token dispatcher reads pg_collection.tp_ep.
+    pgc = ProcessGroupCollection.use_mpu_process_groups()
+    layer = spec.module(config, spec.submodules, layer_number=1, pg_collection=pgc)
+    return torch.nn.ModuleList([layer]).cuda()
+
+
+def _unsharded_weights(stack, moe=False):
+    """Make every non-EP-local weight identical on all ranks and return a copy."""
+    for name, p in stack.named_parameters():
+        if not (
+            moe and _is_expert_param(name, p) and ps.get_expert_model_parallel_world_size() > 1
+        ):
+            dist.broadcast(p.data, src=0)
+    return {n: p.data.clone() for n, p in stack.named_parameters()}
 
 
 def _load_gtp_shards(stack, saved, moe=False):
     """Copy each param's own shard of the unsharded `saved` weights into `stack`."""
-    from megatron.core import parallel_state as ps
-
     gtp_rank = ps.get_gtp_weight_remat_group().rank()
     egtp_rank = ps.get_expert_gtp_weight_remat_group().rank() if moe else 0
+    n_sharded = 0
     for name, p in stack.named_parameters():
         full = saved[name]
         if isinstance(p, GTPShardedParam):
             r = egtp_rank if _is_expert_param(name, p) else gtp_rank
             ss = p.shape[0]
             p.data.copy_(full[r * ss : (r + 1) * ss])
+            n_sharded += 1
         else:
             p.data.copy_(full)
+    assert n_sharded > 0, "no GTP/EGTP-sharded param -- the comparison would be vacuous"
 
 
-def _worker(rank, world_size, port, calculate_per_token_loss=False):
-    from megatron.core import parallel_state as ps
-    from megatron.core.process_groups_config import ProcessGroupCollection
-    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-
-    # ---------- Phase A: baseline, GTP_remat=1 DP=4 (trusted standard path) ----------
-    ps.destroy_model_parallel()
-    ps.initialize_model_parallel(
-        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=1
-    )
-    model_parallel_cuda_manual_seed(42)
-    pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp_remat'])
-    base_stack = _make_stack(_make_config(calculate_per_token_loss=calculate_per_token_loss), pgc)
-    for layer in base_stack:
-        layer.cuda()
-    for p in base_stack.parameters():
-        dist.broadcast(p.data, src=0)
-    saved = {n: p.data.clone() for n, p in base_stack.named_parameters()}
-
-    base_ddp = _build_ddp(base_stack, calculate_per_token_loss=calculate_per_token_loss)
-    _run_one_backward(base_ddp, rank, calculate_per_token_loss=calculate_per_token_loss)
-    base_grads = _full_main_grads(base_stack)
-
-    ps.destroy_model_parallel()
-    GTPShardedParam._chain_state.clear()
-
-    # ---------- Phase B: GTP_remat=2 DP=2 (replicate>1!) ----------
-    ps.initialize_model_parallel(
-        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
-    )
-    model_parallel_cuda_manual_seed(42)
-    pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp_remat'])
-    gtp_stack = _make_stack(_make_config(calculate_per_token_loss=calculate_per_token_loss), pgc)
-    for layer in gtp_stack:
-        layer.cuda()
-
-    g = ps.get_gtp_weight_remat_group()
-    gtp_rank = g.rank()
-    assert g.size() == 2, f"expected gtp_remat shard group size 2, got {g.size()}"
-
-    # Load the SAME init weights as baseline: GTP_remat params get their gtp_remat shard.
-    for name, p in gtp_stack.named_parameters():
-        full = saved[name]
-        if isinstance(p, GTPShardedParam):
-            ss = p.shape[0]
-            p.data.copy_(full[gtp_rank * ss : (gtp_rank + 1) * ss])
-        else:
-            p.data.copy_(full)
-
-    gtp_ddp = _build_ddp(gtp_stack, calculate_per_token_loss=calculate_per_token_loss)
-    _run_one_backward(gtp_ddp, rank, calculate_per_token_loss=calculate_per_token_loss)
-    gtp_grads = _full_main_grads(gtp_stack)
-
-    ps.destroy_model_parallel()
-    GTPShardedParam._chain_state.clear()
-
-    # ---------- Compare reduced gradients on rank 0 ----------
-    if rank == 0:
-        max_err = 0.0
-        worst = None
-        for name in base_grads:
-            bg, gg = base_grads[name], gtp_grads[name]
-            assert bg.shape == gg.shape, f"{name}: {bg.shape} vs {gg.shape}"
-            err = (bg - gg).abs().max().item()
-            denom = bg.abs().max().item() + 1e-8
-            rel = err / denom
-            ratio = (gg.norm() / (bg.norm() + 1e-12)).item()
-            print(
-                f"[grad] {name:55s} rel_max_err={rel:.3e}  norm_ratio(orth/base)={ratio:.4f}",
-                flush=True,
-            )
-            if rel > max_err:
-                max_err, worst = rel, name
-        print(
-            f"[summary] max relative grad error GTP_remat-vs-DP4-baseline = {max_err:.3e} "
-            f"(worst: {worst})",
-            flush=True,
-        )
-        assert max_err < 2e-2, (
-            f"GTP_remat2xDP2 reduced gradient does not match the no-GTP_remat DP4 baseline "
-            f"(max rel err {max_err:.3e} on {worst}) -> gtp_remat-axis grad reduce/scaling error."
-        )
-
-
-def _worker_wide_residual(
-    rank, world_size, port, calculate_per_token_loss=False, residual_stream_recompute=False
-):
-    """Compare one wide layer under DP4 and GTP2 x DP2 with identical weights and data."""
-
-    from megatron.core import parallel_state as ps
-    from megatron.core.process_groups_config import ProcessGroupCollection
-    from megatron.core.tensor_parallel.generalized_tensor_parallelism import reset_gtp_state
-    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-
-    del world_size, port
-
-    # Phase A: trusted no-GTP baseline. Every rank owns the complete weights.
-    ps.destroy_model_parallel()
-    ps.initialize_model_parallel(
-        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=1
-    )
-    model_parallel_cuda_manual_seed(42)
-    pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp_remat'])
-    base_stack = _make_wide_stack(
-        _make_wide_config(gtp_remat_size=1, calculate_per_token_loss=calculate_per_token_loss), pgc
-    ).cuda()
-    for param in base_stack.parameters():
-        dist.broadcast(param.data, src=0)
-    saved = {name: param.data.clone() for name, param in base_stack.named_parameters()}
-
-    base_output, base_input_grad = _run_wide_backward(
-        _build_wide_ddp(base_stack), rank, calculate_per_token_loss
-    )
-    base_grads = _full_main_grads(base_stack)
-
-    ps.destroy_model_parallel()
-    reset_gtp_state()
-
-    # Phase B: GTP shards the branch GEMMs while wide-residual controllers stay replicated.
-    ps.initialize_model_parallel(
-        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
-    )
-    model_parallel_cuda_manual_seed(42)
-    pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp_remat'])
-    gtp_stack = _make_wide_stack(
-        _make_wide_config(
-            gtp_remat_size=2,
-            calculate_per_token_loss=calculate_per_token_loss,
-            residual_stream_recompute=residual_stream_recompute,
-        ),
-        pgc,
-    ).cuda()
-
-    gtp_group = ps.get_gtp_weight_remat_group()
-    assert gtp_group.size() == 2
-    gtp_rank = gtp_group.rank()
-    sharded_names = []
-    controller_names = []
-    for name, param in gtp_stack.named_parameters():
-        full = saved[name]
-        if isinstance(param, GTPShardedParam):
-            shard_size = param.shape[0]
-            param.data.copy_(full[gtp_rank * shard_size : (gtp_rank + 1) * shard_size])
-            sharded_names.append(name)
-        else:
-            param.data.copy_(full)
-        if 'residual_read_' in name or 'residual_write_' in name:
-            controller_names.append(name.removeprefix('0.'))
-            assert not isinstance(param, GTPShardedParam), f"controller was GTP-sharded: {name}"
-
-    assert sharded_names, "no branch parameter was GTP-sharded"
-    assert controller_names, "no wide-residual controller parameter was found"
-
-    gtp_output, gtp_input_grad = _run_wide_backward(
-        _build_wide_ddp(gtp_stack),
-        rank,
-        calculate_per_token_loss,
-        residual_stream_recompute=residual_stream_recompute,
-    )
-    gtp_grads = _full_main_grads(gtp_stack)
-
-    ps.destroy_model_parallel()
-    reset_gtp_state()
-
-    torch.testing.assert_close(gtp_output, base_output, atol=2e-3, rtol=2e-3)
-    torch.testing.assert_close(gtp_input_grad, base_input_grad, atol=2e-6, rtol=2e-2)
-
-    if rank == 0:
-        worst_rel, worst_name = _max_rel_grad_diff(base_grads, gtp_grads)
-        print(
-            f"[wide residual] max relative grad error GTP2xDP2-vs-DP4 = "
-            f"{worst_rel:.3e} ({worst_name})",
-            flush=True,
-        )
-        assert worst_rel < 2e-2, (
-            f"wide-residual GTP2xDP2 gradients differ from DP4 by {worst_rel:.3e} "
-            f"on {worst_name}"
-        )
-        for name in controller_names:
-            active_grad = base_grads[name][:NUM_WIDE_STREAMS]
-            assert torch.count_nonzero(active_grad) > 0, f"controller gradient is zero: {name}"
-            torch.testing.assert_close(
-                gtp_grads[name], base_grads[name], atol=2e-6, rtol=2e-2, msg=name
-            )
-
-
-# ---------------------------------------------------------------------------
-# Distributed-optimizer + grad-norm path (the production 64-GPU path)
-# ---------------------------------------------------------------------------
-
-
-def _build_ddp_distopt_and_optim(
-    stack,
-    overlap_grad_reduce=False,
-    bucket_size=None,
-    reduce_scatter_with_fp32_accumulation=False,
-    grad_reduce_in_fp32=True,
-):
-    """Real distributed-optimizer setup (Adam), matching the 64-GPU production path."""
-    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-    from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
-
-    # The stack's own layers already carry the config they were built with (including
-    # gtp_weight_remat_size/expert_gtp_weight_remat_size/expert_model_parallel_size, set
-    # correctly by _make_moe_config/_make_config for THIS phase) -- building a fresh, always-
-    # default _make_config() here instead would silently disconnect DDP's config from the
-    # model's actual GTP/EGTP/EP setup.
-    config = stack[0].config
-    ddp_config = DistributedDataParallelConfig(
-        use_distributed_optimizer=True,
-        overlap_grad_reduce=overlap_grad_reduce,
-        bucket_size=bucket_size,
-        grad_reduce_in_fp32=grad_reduce_in_fp32,
-        reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
-    )
+def _build_ddp(stack, use_distributed_optimizer=False, **ddp_kwargs):
+    """DDP over the stack with the stack's own config (it carries the GTP/EGTP/EP sizes that
+    DDP's expert gradient scaling reads). Without a distributed optimizer, main_grad holds the
+    full reduced gradient."""
     module = torch.nn.Sequential()
     for i, layer in enumerate(stack):
         module.add_module(str(i), layer)
-    ddp_model = DistributedDataParallel(config, ddp_config, module)
+    ddp_config = DistributedDataParallelConfig(
+        use_distributed_optimizer=use_distributed_optimizer, **ddp_kwargs
+    )
+    return DistributedDataParallel(stack[0].config, ddp_config, module)
+
+
+def _backward_and_reduce(ddp_model, rank, x_shape=(SEQ, 1, HIDDEN), x_dtype=dtype, replay=None):
+    """Run fwd+bwd on a per-rank batch, then the production grad reduction -> (output, input).
+
+    ``replay`` is a residual-stream recompute context (wide-residual layers only).
+    """
+    ddp_model.zero_grad_buffer()
+    torch.manual_seed(1000 + rank)
+    x = torch.randn(*x_shape, dtype=x_dtype, device='cuda', requires_grad=True)
+    out = x
+    for layer in ddp_model.module.children():
+        kw = {} if replay is None else dict(residual_stream_recompute_context=replay)
+        out, _ = layer(out, attention_mask=None, **kw)
+        if replay is not None:
+            replay.finalize(out)
+    out.float().square().mean().backward()
+    # Production order (finalize_model_grads): reduce across DP first, then the gtp_remat
+    # finalize. finish_grad_sync() alone issues the reduction when overlap_grad_reduce=False.
+    ddp_model.finish_grad_sync()
+    _allreduce_replicated_grads_over_gtp_remat_group(
+        [ddp_model],
+        ps.get_gtp_weight_remat_group(check_initialized=False),
+        ps.get_expert_gtp_weight_remat_group(check_initialized=False),
+        calculate_per_token_loss=ddp_model.module[0].config.calculate_per_token_loss,
+    )
+    return out.detach().float(), x
+
+
+def _full_main_grads(stack):
+    """Full (unsharded) reduced gradient per param name.
+
+    A GTPShardedParam's main_grad is the local shard -> all-gather over its own axis (expert
+    params shard over egtp_remat, dense over gtp_remat). Other params are already full.
+    """
+    out = {}
+    for name, p in stack.named_parameters():
+        mg = p.main_grad
+        if isinstance(p, GTPShardedParam):
+            g = (
+                ps.get_expert_gtp_weight_remat_group()
+                if _is_expert_param(name, p)
+                else ps.get_gtp_weight_remat_group()
+            )
+            shards = [torch.empty_like(mg) for _ in range(g.size())]
+            dist.all_gather(shards, mg.contiguous(), group=g)
+            out[name] = torch.cat(shards, dim=0).float()
+        else:
+            out[name] = mg.detach().float()
+    return out
+
+
+def _assert_grads_match(reference, other, label, rel_tol=GRAD_REL_TOL):
+    """Every gradient must be finite and within ``rel_tol`` of max|reference grad|.
+
+    Relative to the param's own scale: max|grad| is ~1e-4 on this micro-model, so an absolute
+    bound would read benign rounding as a huge error.
+    """
+    assert reference.keys() == other.keys(), f"{label}: param sets differ"
+    worst, worst_name = 0.0, None
+    for name, ref in reference.items():
+        got = other[name]
+        assert got.shape == ref.shape, f"{label} {name}: {got.shape} vs {ref.shape}"
+        assert torch.isfinite(ref).all() and torch.isfinite(got).all(), f"{label} {name}: NaN/inf"
+        scale = ref.abs().max().item()
+        err = (got - ref).abs().max().item()
+        rel = err / scale if scale > 0 else err
+        if rel >= worst:
+            worst, worst_name = rel, name
+    print(f"[{label}] max relative grad error {worst:.3e} ({worst_name})", flush=True)
+    assert worst < rel_tol, f"{label}: gradient differs by {worst:.3e} on {worst_name}"
+
+
+# ---------------------------------------------------------------------------
+# Per-parameter gradients, dense GTP and MoE EGTP
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "moe,gtp,egtp,per_token",
+    [
+        pytest.param(False, 2, 1, False, id="dense-gtp2"),
+        # Per-token loss: DDP does no 1/dp prescale, so the gtp axis must SUM, not average.
+        pytest.param(False, 2, 1, True, id="dense-gtp2-per_token"),
+        pytest.param(True, 2, 2, False, id="moe-gtp2-egtp2"),
+        # Mismatched sizes exercise DDP's egtp/gtp expert gradient correction both ways.
+        pytest.param(True, 4, 1, False, id="moe-gtp4-egtp1"),
+        pytest.param(True, 1, 2, False, id="moe-gtp1-egtp2"),
+        pytest.param(True, 2, 2, True, id="moe-gtp2-egtp2-per_token"),
+    ],
+)
+def test_gtp_grads_match_baseline(moe, gtp, egtp, per_token):
+    """GTP/EGTP-sharded reduced grads equal the unsharded (GTP1/EGTP1) reference per param.
+
+    MoE runs EP=2 in both phases: only EP>1 tags expert weights allreduce=False and builds DDP's
+    expert buffers, so the expert DP size (and hence its gradient scaling) differs from dense.
+    """
+    rank = dist.get_rank()
+    update_gtp_config(calculate_per_token_loss=per_token)
+
+    base_stack = _build_stack(moe=moe, per_token=per_token)
+    saved = _unsharded_weights(base_stack, moe)
+    _backward_and_reduce(_build_ddp(base_stack), rank)
+    base_grads = _full_main_grads(base_stack)
+
+    stack = _build_stack(gtp, moe, egtp, per_token=per_token)
+    _load_gtp_shards(stack, saved, moe)
+    ddp = _build_ddp(stack)
+    assert not moe or ddp.expert_parallel_buffers, "no expert buffer -- test setup bug"
+    _backward_and_reduce(ddp, rank)
+    # Every rank checks: expert grads are EP-local.
+    _assert_grads_match(base_grads, _full_main_grads(stack), f"gtp{gtp} egtp{egtp}")
+
+
+@pytest.mark.parametrize("residual_stream_recompute", [False, True], ids=["plain", "replay"])
+def test_wide_residual_gtp2_dp2_matches_dp4_baseline(residual_stream_recompute):
+    """Wide-residual outputs and grads match when branch GEMMs are GTP-sharded while the
+    wide-residual controllers stay replicated (and through selective residual replay)."""
+    from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
+    from megatron.core.transformer.wide_residual_config import WideResidualConfig
+    from megatron.core.transformer.wide_residual_transformer_layer import (
+        WideResidualTransformerLayer,
+    )
+
+    rank = dist.get_rank()
+
+    def build(gtp):
+        ps.destroy_model_parallel()
+        _reset_gtp_global_state()
+        ps.initialize_model_parallel(gtp_remat_size=gtp)
+        model_parallel_cuda_manual_seed(42)
+        recompute = residual_stream_recompute and gtp > 1
+        config = TransformerConfig(
+            num_attention_heads=NUM_HEADS,
+            num_layers=1,
+            hidden_size=HIDDEN,
+            ffn_hidden_size=FFN_HIDDEN,
+            add_bias_linear=False,
+            params_dtype=dtype,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            bias_dropout_fusion=False,
+            tensor_parallel_num_weight_shards=gtp,
+            fp32_residual_connection=True,
+            recompute_granularity="selective" if recompute else None,
+            recompute_modules=["residual_stream"] if recompute else None,
+            residual_stream_recompute_num_layers=1 if recompute else None,
+            wide_residual=WideResidualConfig(
+                num_streams=NUM_WIDE_STREAMS,
+                streamwise_sigmoid_init_scale=0.01,
+                learned_retention=True,
+                retention_init=0.999,
+                retention_max_forget=0.10,
+            ),
+        )
+        pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp_remat'])
+        spec = get_gpt_layer_with_transformer_engine_spec()
+        layer = WideResidualTransformerLayer(
+            config, spec.submodules, layer_number=1, pg_collection=pgc
+        )
+        return torch.nn.ModuleList([layer]).cuda()
+
+    def run(stack):
+        ddp = _build_ddp(stack)
+        replay = None
+        if "residual_stream" in (stack[0].config.recompute_modules or []):
+            (replay,) = build_residual_stream_recompute_plan(1, 1)
+        out, x = _backward_and_reduce(
+            ddp,
+            rank,
+            x_shape=(SEQ, 1, NUM_WIDE_STREAMS * HIDDEN),
+            x_dtype=torch.float32,
+            replay=replay,
+        )
+        return out, x.grad.float(), _full_main_grads(stack)
+
+    base_stack = build(1)
+    saved = _unsharded_weights(base_stack)
+    base_out, base_dx, base_grads = run(base_stack)
+
+    stack = build(2)
+    _load_gtp_shards(stack, saved)
+    controllers = [
+        n for n, _ in stack.named_parameters() if 'residual_read_' in n or 'residual_write_' in n
+    ]
+    assert controllers, "no wide-residual controller parameter was found"
+    for name, p in stack.named_parameters():
+        assert not (name in controllers and isinstance(p, GTPShardedParam)), name
+    out, dx, grads = run(stack)
+
+    torch.testing.assert_close(out, base_out, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(dx, base_dx, atol=2e-6, rtol=2e-2)
+    _assert_grads_match(base_grads, grads, "wide residual")
+    for name in controllers:
+        assert torch.count_nonzero(base_grads[name][:NUM_WIDE_STREAMS]) > 0, name
+        torch.testing.assert_close(grads[name], base_grads[name], atol=2e-6, rtol=2e-2, msg=name)
+
+
+# ---------------------------------------------------------------------------
+# Distributed optimizer: grad-norm over GTP/EGTP-sharded params (the production path)
+# ---------------------------------------------------------------------------
+
+
+def _build_ddp_distopt_and_optim(stack, **ddp_kwargs):
+    """Real distributed-optimizer setup (Adam), matching the production path."""
+    ddp_kwargs.setdefault("overlap_grad_reduce", False)
+    ddp_kwargs.setdefault("grad_reduce_in_fp32", True)
+    ddp_model = _build_ddp(stack, use_distributed_optimizer=True, **ddp_kwargs)
     opt_config = OptimizerConfig(
         optimizer='adam',
         lr=0.01,
@@ -510,363 +381,55 @@ def _build_ddp_distopt_and_optim(
         main_grads_dtype=torch.float32,
         exp_avg_dtype=torch.float32,
         exp_avg_sq_dtype=torch.float32,
-        clip_grad=1.0,  # reported grad-norm is computed pre-clip, so this is just for the step
+        clip_grad=1.0,  # the reported grad-norm is computed pre-clip
     )
-    optim = get_megatron_optimizer(opt_config, [ddp_model])
-    return ddp_model, optim
+    return ddp_model, get_megatron_optimizer(opt_config, [ddp_model])
 
 
-def _run_step_distopt(ddp_model, optim, rank):
-    """Mirror production finalize order: finish_grad_sync -> gtp_remat-finalize -> optim.step().
-    Returns the optimizer-reported grad-norm (computed pre-clip from the reduced grads)."""
+def _run_step_distopt(ddp_model, optim, seed):
+    """finish_grad_sync -> gtp_remat finalize -> optim.step(); returns the pre-clip grad-norm."""
     optim.zero_grad()
-    ddp_model.zero_grad_buffer()
-    torch.manual_seed(1000 + rank)
-    x = torch.randn(SEQ, BATCH, HIDDEN, dtype=dtype, device='cuda')
-    out = x
-    for layer in ddp_model.module.children():
-        out, _ = layer(out, attention_mask=None)
-    loss = out.float().mean()
-    loss.backward()
-    # Production order (finalize_model_grads): reduce across DP first, THEN the gtp_remat
-    # finalize. The GTP/EGTP expert-grad correction lives in DDP's own
-    # expert_gradient_scaling_factor (computed once at construction) -- no separate step here.
-    ddp_model.finish_grad_sync()
-    from megatron.core import parallel_state as ps
-    from megatron.core.distributed.finalize_model_grads import (
-        _allreduce_replicated_grads_over_gtp_remat_group,
-    )
-
-    gtp_remat_group = ps.get_gtp_weight_remat_group(check_initialized=False)
-    egtp_remat_group = ps.get_expert_gtp_weight_remat_group(check_initialized=False)
-    _allreduce_replicated_grads_over_gtp_remat_group([ddp_model], gtp_remat_group, egtp_remat_group)
+    _backward_and_reduce(ddp_model, seed)
     _, grad_norm, _ = optim.step()
     return float(grad_norm)
 
 
-def _worker_distopt(rank, world_size, port):
-    from megatron.core import parallel_state as ps
-    from megatron.core.process_groups_config import ProcessGroupCollection
-    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+@pytest.mark.parametrize("moe", [False, True], ids=["dense-gtp2", "moe-gtp2-egtp2"])
+def test_distopt_grad_norm_matches_baseline(moe):
+    """The dist-opt grad-norm over GTP/EGTP shards matches the unsharded reference.
 
-    # ---------- Phase A: baseline, GTP_remat=1 DP=4, dist-opt + Adam ----------
-    ps.destroy_model_parallel()
-    ps.initialize_model_parallel(
-        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=1
-    )
-    model_parallel_cuda_manual_seed(42)
-    pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp_remat'])
-    base_stack = _make_stack(_make_config(), pgc)
-    for layer in base_stack:
-        layer.cuda()
-    for p in base_stack.parameters():
-        dist.broadcast(p.data, src=0)
-    saved = {n: p.data.clone() for n, p in base_stack.named_parameters()}
-    base_ddp, base_optim = _build_ddp_distopt_and_optim(base_stack)
-    base_gn = _run_step_distopt(base_ddp, base_optim, rank)
-
-    ps.destroy_model_parallel()
-    GTPShardedParam._chain_state.clear()
-
-    # ---------- Phase B: GTP_remat=2 DP=2, dist-opt + Adam ----------
-    ps.initialize_model_parallel(
-        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
-    )
-    model_parallel_cuda_manual_seed(42)
-    pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp_remat'])
-    gtp_stack = _make_stack(_make_config(), pgc)
-    for layer in gtp_stack:
-        layer.cuda()
-    g = ps.get_gtp_weight_remat_group()
-    gtp_rank = g.rank()
-    for name, p in gtp_stack.named_parameters():
-        full = saved[name]
-        if isinstance(p, GTPShardedParam):
-            ss = p.shape[0]
-            p.data.copy_(full[gtp_rank * ss : (gtp_rank + 1) * ss])
-        else:
-            p.data.copy_(full)
-    gtp_ddp, gtp_optim = _build_ddp_distopt_and_optim(gtp_stack)
-    gtp_gn = _run_step_distopt(gtp_ddp, gtp_optim, rank)
-
-    ps.destroy_model_parallel()
-    GTPShardedParam._chain_state.clear()
-
-    if rank == 0:
-        ratio = gtp_gn / max(base_gn, 1e-12)
-        print(
-            f"\n[distopt grad-norm] baseline={base_gn:.6f}  GTP_remat={gtp_gn:.6f}  "
-            f"ratio={ratio:.6f}",
-            flush=True,
-        )
-        # Same model, same data, gradients proven equal -> grad-norm must match (bf16 Adam
-        # noise floor is ~4e-5 here).
-        torch.testing.assert_close(torch.tensor(gtp_gn), torch.tensor(base_gn), atol=0, rtol=1e-4)
-
-
-# ---------------------------------------------------------------------------
-# MoE + EGTP_remat dist-opt grad-norm path (EGTP_remat shards expert weights)
-# ---------------------------------------------------------------------------
-
-NUM_EXPERTS = 4
-MOE_FFN = 256
-
-
-def _make_moe_config(expert_model_parallel_size=1, gtp_remat_size=1, expert_gtp_remat_size=1):
-    """``expert_model_parallel_size``, ``gtp_remat_size``, and ``expert_gtp_remat_size`` must
-    all match the values passed to ``parallel_state.initialize_model_parallel`` for this phase.
-
-    Both TE's expert ``allreduce`` tagging and DDP's GTP scaling correction read these off
-    THIS TransformerConfig object, not off the global parallel_state -- leaving them at their
-    defaults while GTP/EGTP/EP are actually active silently produces the wrong config. Note
-    gtp_remat_size/expert_gtp_remat_size map to the DERIVED fields gtp_weight_remat_size /
-    expert_gtp_weight_remat_size via tensor_parallel_num_weight_shards (production sets these
-    the same way, from CLI args); with tensor_model_parallel_size=1 below they're equal.
+    The norm is reduced over the dist-opt grad-stats group, which must cover every gtp/egtp
+    shard exactly once (see test_distopt_gradstats_group_spans_world).
     """
-    from megatron.core.transformer.transformer_config import TransformerConfig
+    rank = dist.get_rank()
+    base_stack = _build_stack(moe=moe)
+    saved = _unsharded_weights(base_stack, moe)
+    base_gn = _run_step_distopt(*_build_ddp_distopt_and_optim(base_stack), rank)
 
-    return TransformerConfig(
-        num_attention_heads=NUM_HEADS,
-        num_layers=NUM_LAYERS,
-        hidden_size=HIDDEN,
-        ffn_hidden_size=FFN_HIDDEN,
-        num_moe_experts=NUM_EXPERTS,
-        moe_router_topk=2,
-        moe_ffn_hidden_size=MOE_FFN,
-        moe_grouped_gemm=True,
-        moe_token_dispatcher_type="alltoall",
-        moe_aux_loss_coeff=0.0,
-        add_bias_linear=False,
-        params_dtype=dtype,
-        hidden_dropout=0.0,
-        attention_dropout=0.0,
-        bias_dropout_fusion=False,
-        tensor_model_parallel_size=1,
-        pipeline_model_parallel_size=1,
-        expert_model_parallel_size=expert_model_parallel_size,
-        tensor_parallel_num_weight_shards=gtp_remat_size,
-        expert_tensor_parallel_num_weight_shards=expert_gtp_remat_size,
-    )
+    stack = _build_stack(2, moe, 2)
+    _load_gtp_shards(stack, saved, moe)
+    gtp_gn = _run_step_distopt(*_build_ddp_distopt_and_optim(stack), rank)
+    print(f"[distopt grad-norm moe={moe}] baseline={base_gn:.6f} gtp={gtp_gn:.6f}", flush=True)
+    # bf16 noise floor is ~6e-5 here; a missing or double-counted shard is O(1).
+    torch.testing.assert_close(torch.tensor(gtp_gn), torch.tensor(base_gn), atol=0, rtol=1e-4)
 
 
-def _make_moe_stack(config, pg_collection):
-    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+def test_distopt_gradstats_group_spans_world():
+    """The dist-opt grad-stats group (intra_dist_opt) spans the full world, dense and MoE.
 
-    spec = get_gpt_layer_with_transformer_engine_spec(
-        num_experts=NUM_EXPERTS, moe_grouped_gemm=True
-    )
-    return torch.nn.ModuleList(
-        [
-            spec.module(config, spec.submodules, layer_number=i + 1, pg_collection=pg_collection)
-            for i in range(NUM_LAYERS)
-        ]
-    )
-
-
-def _is_expert_param(name, p):
-    return ('experts' in name) or (not getattr(p, 'allreduce', True))
-
-
-def _worker_moe_distopt(rank, world_size, port):
-    from megatron.core import parallel_state as ps
-    from megatron.core.process_groups_config import ProcessGroupCollection
-    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-
-    # None => pull every group from the MPU globals. An explicit list is a trap here: the MoE
-    # token dispatcher reads pg_collection.tp_ep, and an omitted group comes back as None rather
-    # than raising, so the dispatcher silently gathers over a size-1 group and blows up in
-    # preprocess() with "shape '[ep,tp,num_experts]' is invalid".
-    pgs = None
-
-    # ---------- Phase A: baseline GTP1/EGTP1, EP2 (DP2 dense / expert_dp2) ----------
-    ps.destroy_model_parallel()
-    ps.initialize_model_parallel(
-        tensor_model_parallel_size=1,
-        pipeline_model_parallel_size=1,
-        expert_model_parallel_size=2,
-        gtp_remat_size=1,
-        expert_gtp_remat_size=1,
-    )
-    model_parallel_cuda_manual_seed(42)
-    pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=pgs)
-    base_stack = _make_moe_stack(
-        _make_moe_config(expert_model_parallel_size=2, gtp_remat_size=1, expert_gtp_remat_size=1),
-        pgc,
-    )
-    for layer in base_stack:
-        layer.cuda()
-    # Broadcast only NON-expert (dense) params; expert weights are EP-local and must
-    # stay rank-distinct. Save all params per-rank for the GTP_remat phase to mirror.
-    for name, p in base_stack.named_parameters():
-        if not _is_expert_param(name, p):
-            dist.broadcast(p.data, src=0)
-    saved = {n: p.data.clone() for n, p in base_stack.named_parameters()}
-    base_ddp, base_optim = _build_ddp_distopt_and_optim(base_stack)
-    base_gn = _run_step_distopt(base_ddp, base_optim, rank)
-
-    ps.destroy_model_parallel()
-    GTPShardedParam._chain_state.clear()
-
-    # ---------- Phase B: GTP2/EGTP2, EP2 (EGTP_remat actually shards experts) ----------
-    ps.initialize_model_parallel(
-        tensor_model_parallel_size=1,
-        pipeline_model_parallel_size=1,
-        expert_model_parallel_size=2,
-        gtp_remat_size=2,
-        expert_gtp_remat_size=2,
-    )
-    model_parallel_cuda_manual_seed(42)
-    pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=pgs)
-    moe_stack = _make_moe_stack(
-        _make_moe_config(expert_model_parallel_size=2, gtp_remat_size=2, expert_gtp_remat_size=2),
-        pgc,
-    )
-    for layer in moe_stack:
-        layer.cuda()
-    g = ps.get_gtp_weight_remat_group()
-    eg = ps.get_expert_gtp_weight_remat_group()
-    gtp_rank, egtp_rank = g.rank(), eg.rank()
-    n_egtp_sharded = 0
-    for name, p in moe_stack.named_parameters():
-        full = saved[name]  # EP2 layout identical to baseline -> rank-local match
-        if isinstance(p, GTPShardedParam):
-            # dense GTP_remat shards over gtp_remat group; expert (EGTP_remat) over egtp_remat.
-            is_expert = _is_expert_param(name, p)
-            r = egtp_rank if is_expert else gtp_rank
-            ss = p.shape[0]
-            p.data.copy_(full[r * ss : (r + 1) * ss])
-            if is_expert:
-                n_egtp_sharded += 1
-        else:
-            p.data.copy_(full)
-    if rank == 0:
-        print(
-            f"[moe-egtp] egtp-sharded expert params = {n_egtp_sharded} (must be >0 to be a "
-            f"faithful EGTP_remat test)",
-            flush=True,
-        )
-    moe_ddp, moe_optim = _build_ddp_distopt_and_optim(moe_stack)
-    moe_gn = _run_step_distopt(moe_ddp, moe_optim, rank)
-
-    ps.destroy_model_parallel()
-    GTPShardedParam._chain_state.clear()
-
-    if rank == 0:
-        ratio = moe_gn / max(base_gn, 1e-12)
-        print(
-            f"\n[moe distopt grad-norm] baseline={base_gn:.6f}  GTP_remat={moe_gn:.6f}  "
-            f"ratio={ratio:.6f}",
-            flush=True,
-        )
-        # bf16 Adam noise floor is ~6e-5 here.
-        torch.testing.assert_close(torch.tensor(moe_gn), torch.tensor(base_gn), atol=0, rtol=1e-4)
-
-
-def _worker_moe_gtp_egtp_mismatch(rank, world_size, port, gtp, egtp):
-    """EP=2 MoE dist-opt grad-norm for a mismatched (gtp, egtp) must match the GTP1/EGTP1
-    baseline: end-to-end regression for expert_gradient_scaling_factor's egtp/gtp correction
-    (folded into DistributedDataParallel's one-time prescale), through a real MoE model and a
-    real backward pass -- not mock groups or hand-set gradients.
-
-    The correction must apply for ANY gtp vs egtp relationship, not just gtp>egtp. Parametrized
-    over both directions by the caller.
-
-    EP=2 (not 1): the real grouped_gemm MoE model only tags expert weights allreduce=False
-    (building expert_parallel_buffers at all) when
-    TransformerConfig.expert_model_parallel_size > 1.
+    A naive build collapses the MoE case to a sub-world group (egtp factored out of
+    expert_data_parallel_size), under-counting the grad-norm.
     """
-    from megatron.core import parallel_state as ps
-    from megatron.core.process_groups_config import ProcessGroupCollection
-    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-
-    pgs = None
-
-    # ---------- Phase A: baseline GTP1/EGTP1, EP2 ----------
-    ps.destroy_model_parallel()
-    ps.initialize_model_parallel(
-        tensor_model_parallel_size=1,
-        pipeline_model_parallel_size=1,
-        expert_model_parallel_size=2,
-        gtp_remat_size=1,
-        expert_gtp_remat_size=1,
-    )
-    model_parallel_cuda_manual_seed(42)
-    pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=pgs)
-    base_stack = _make_moe_stack(
-        _make_moe_config(expert_model_parallel_size=2, gtp_remat_size=1, expert_gtp_remat_size=1),
-        pgc,
-    )
-    for layer in base_stack:
-        layer.cuda()
-    for name, p in base_stack.named_parameters():
-        if not _is_expert_param(name, p):
-            dist.broadcast(p.data, src=0)
-    saved = {n: p.data.clone() for n, p in base_stack.named_parameters()}
-    base_ddp, base_optim = _build_ddp_distopt_and_optim(base_stack)
-    assert (
-        len(base_ddp.expert_parallel_buffers) > 0
-    ), "no expert buffer built at EP=2 -- test setup bug (would make the comparison vacuous)"
-    base_gn = _run_step_distopt(base_ddp, base_optim, rank)
-
-    ps.destroy_model_parallel()
-    GTPShardedParam._chain_state.clear()
-
-    # ---------- Phase B: GTP={gtp}/EGTP={egtp}, EP2 (mismatched) ----------
-    ps.initialize_model_parallel(
-        tensor_model_parallel_size=1,
-        pipeline_model_parallel_size=1,
-        expert_model_parallel_size=2,
-        gtp_remat_size=gtp,
-        expert_gtp_remat_size=egtp,
-    )
-    model_parallel_cuda_manual_seed(42)
-    pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=pgs)
-    moe_stack = _make_moe_stack(
-        _make_moe_config(
-            expert_model_parallel_size=2, gtp_remat_size=gtp, expert_gtp_remat_size=egtp
-        ),
-        pgc,
-    )
-    for layer in moe_stack:
-        layer.cuda()
-    gtp_rank = ps.get_gtp_weight_remat_group().rank()
-    egtp_rank = ps.get_expert_gtp_weight_remat_group().rank()
-    n_sharded = 0
-    for name, p in moe_stack.named_parameters():
-        full = saved[name]  # EP2 layout identical to baseline -> rank-local match
-        if isinstance(p, GTPShardedParam):
-            is_expert = _is_expert_param(name, p)
-            r = egtp_rank if is_expert else gtp_rank
-            ss = p.shape[0]
-            p.data.copy_(full[r * ss : (r + 1) * ss])
-            n_sharded += 1
-        else:
-            p.data.copy_(full)
-    assert n_sharded > 0, "no GTP_remat/EGTP_remat-sharded param found -- test setup bug"
-    moe_ddp, moe_optim = _build_ddp_distopt_and_optim(moe_stack)
-    assert (
-        len(moe_ddp.expert_parallel_buffers) > 0
-    ), "no expert buffer built at EP=2 -- test setup bug (would make the comparison vacuous)"
-    moe_gn = _run_step_distopt(moe_ddp, moe_optim, rank)
-
-    ps.destroy_model_parallel()
-    GTPShardedParam._chain_state.clear()
-
-    if rank == 0:
-        ratio = moe_gn / max(base_gn, 1e-12)
-        print(
-            f"\n[moe gtp{gtp}-egtp{egtp}-mismatch grad-norm] baseline={base_gn:.6f}  "
-            f"moe={moe_gn:.6f}  ratio={ratio:.6f}",
-            flush=True,
-        )
-        # Without the egtp/gtp correction, expert grads come out gtp/egtp (or egtp/gtp) off,
-        # blowing the ratio far outside this tolerance (real MoE routing is noisier than the
-        # dense-only case, hence the same rtol as above rather than something tighter).
-        torch.testing.assert_close(torch.tensor(moe_gn), torch.tensor(base_gn), atol=0, rtol=1e-4)
+    world_size = dist.get_world_size()
+    for kwargs in (dict(expert_model_parallel_size=2, expert_gtp_remat_size=2), {}):
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel(gtp_remat_size=2, **kwargs)
+        size = ps.get_intra_distributed_optimizer_instance_group().size()
+        assert size == world_size, f"{kwargs}: grad-stats group {size}, expected {world_size}"
 
 
 # ---------------------------------------------------------------------------
-# GTP_remat + reduce_scatter_with_fp32_accumulation
+# DDP --ddp-reduce-scatter-with-fp32-accumulation under GTP_remat
 # ---------------------------------------------------------------------------
 
 # Small enough to split the stack into several bucket groups: with one big bucket every wgrad
@@ -886,165 +449,45 @@ def _reset_dist_reduce_scatter_func():
     pgb.dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
 
-def _run_gtp2_phase(rank, saved, fp32_accum):
-    """GTP_remat=2 dist-opt run with overlapped grad reduce; returns per-step grad-norms."""
-    from megatron.core import parallel_state as ps
-    from megatron.core.process_groups_config import ProcessGroupCollection
-    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-
-    ps.destroy_model_parallel()
-    ps.initialize_model_parallel(
-        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
-    )
-    model_parallel_cuda_manual_seed(42)
-    pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp_remat'])
-    stack = _make_stack(_make_config(), pgc)
-    for layer in stack:
-        layer.cuda()
-    gtp_rank = ps.get_gtp_weight_remat_group().rank()
-    for name, p in stack.named_parameters():
-        full = saved[name]
-        if isinstance(p, GTPShardedParam):
-            ss = p.shape[0]
-            p.data.copy_(full[gtp_rank * ss : (gtp_rank + 1) * ss])
-        else:
-            p.data.copy_(full)
-
-    _reset_dist_reduce_scatter_func()
-    ddp_model, optim = _build_ddp_distopt_and_optim(
-        stack,
-        overlap_grad_reduce=True,
-        bucket_size=FP32ACCUM_BUCKET_SIZE,
-        reduce_scatter_with_fp32_accumulation=fp32_accum,
-        grad_reduce_in_fp32=False,  # bf16 on the wire: the regime fp32-accum exists for
-    )
-    assert len(ddp_model.bucket_groups) > 1, (
-        f"expected >1 bucket group at bucket_size={FP32ACCUM_BUCKET_SIZE}, "
-        f"got {len(ddp_model.bucket_groups)} -- test would not cover the dispatch-ordering hazard"
-    )
-    grad_norms = [
-        _run_step_distopt(ddp_model, optim, rank + 17 * it) for it in range(FP32ACCUM_STEPS)
-    ]
-
-    ps.destroy_model_parallel()
-    GTPShardedParam._chain_state.clear()
-    return grad_norms
-
-
-def _worker_fp32accum(rank, world_size, port):
-    """GTP_remat=2 grad-norms must be identical with and without fp32-accumulation RS.
+def test_gtp2_fp32accum_rs_grad_norm_matches_plain_rs():
+    """GTP_remat + --ddp-reduce-scatter-with-fp32-accumulation must match plain RS.
 
     fp32-accum reads grad_data through an all-to-all at dispatch time, while GTP defers its
     wgrad ``main_grad.add_`` to a later backward node. If grad-ready fires from autograd instead
-    of GTP's manual hook, the all-to-all reads grad_data before the add lands. Both phases share
-    weights and data, so any difference is that staleness.
+    of GTP's manual post-add hook, the all-to-all reads grad_data before the add lands. Both
+    phases share weights and data, so any difference is that staleness. Needs >1 bucket group.
     """
-    from megatron.core import parallel_state as ps
-    from megatron.core.process_groups_config import ProcessGroupCollection
-    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-
-    # Common (unsharded) init weights from a GTP_remat=1 build.
-    ps.destroy_model_parallel()
-    ps.initialize_model_parallel(
-        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=1
-    )
-    model_parallel_cuda_manual_seed(42)
-    pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp_remat'])
-    ref_stack = _make_stack(_make_config(), pgc)
-    for layer in ref_stack:
-        layer.cuda()
-    for p in ref_stack.parameters():
-        dist.broadcast(p.data, src=0)
-    saved = {n: p.data.clone() for n, p in ref_stack.named_parameters()}
-    del ref_stack
-    ps.destroy_model_parallel()
-    GTPShardedParam._chain_state.clear()
-
-    plain_gns = _run_gtp2_phase(rank, saved, fp32_accum=False)
-    fp32_gns = _run_gtp2_phase(rank, saved, fp32_accum=True)
-    _reset_dist_reduce_scatter_func()  # don't leak fp32-accum into later tests
-
-    if rank == 0:
-        for step, (pg, fg) in enumerate(zip(plain_gns, fp32_gns)):
-            print(
-                f"[fp32accum] step {step}: grad_norm plainRS={pg:.6f} fp32accum={fg:.6f}",
-                flush=True,
+    rank = dist.get_rank()
+    saved = _unsharded_weights(_build_stack())
+    grad_norms = {}
+    try:
+        for fp32_accum in (False, True):
+            stack = _build_stack(2)
+            _load_gtp_shards(stack, saved)
+            _reset_dist_reduce_scatter_func()
+            ddp_model, optim = _build_ddp_distopt_and_optim(
+                stack,
+                overlap_grad_reduce=True,
+                bucket_size=FP32ACCUM_BUCKET_SIZE,
+                reduce_scatter_with_fp32_accumulation=fp32_accum,
+                grad_reduce_in_fp32=False,  # bf16 on the wire: the regime fp32-accum exists for
             )
-        torch.testing.assert_close(
-            torch.tensor(fp32_gns), torch.tensor(plain_gns), atol=0, rtol=1e-3
-        )
+            assert len(ddp_model.bucket_groups) > 1, "single bucket group hides the hazard"
+            grad_norms[fp32_accum] = [
+                _run_step_distopt(ddp_model, optim, rank + 17 * it) for it in range(FP32ACCUM_STEPS)
+            ]
+    finally:
+        _reset_dist_reduce_scatter_func()  # don't leak fp32-accum into later tests
+    print(f"[fp32accum] plain={grad_norms[False]} fp32accum={grad_norms[True]}", flush=True)
+    torch.testing.assert_close(
+        torch.tensor(grad_norms[True]), torch.tensor(grad_norms[False]), atol=0, rtol=1e-3
+    )
 
 
 # ---------------------------------------------------------------------------
 # GTP_remat wgrad reduce-scatter via FP32 accumulation
 # (--gtp-remat-reduce-scatter-with-fp32-accumulation)
 # ---------------------------------------------------------------------------
-
-
-def _reset_gtp_global_state():
-    """Drop GTP process-globals sized against the current layout.
-
-    The weight cache and wgrad pool are keyed by shape and outlive `destroy_model_parallel()`,
-    so a phase that changes the gtp_remat degree would be handed a stale-sized buffer.
-    """
-    import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp_module
-
-    GTPShardedParam._chain_state.clear()
-    gtp_module.get_global_GTP_cache().clear()
-    gtp_module._wgrad_buf_pool.clear()
-    gtp_module._inflight_comm_params.clear()
-
-
-def _gtp_rs_phase(rank, saved, fp32_accum, moe=False, gtp_size=4):
-    """One GTP_remat backward; returns the full (gathered) reduced gradients per param.
-
-    `saved` may be None when only the dispatch counts matter. gtp_size defaults to 4 because
-    size <= 2 is bypassed -- which the bypass test asserts and which would otherwise make the
-    gradient comparison vacuous.
-    """
-    import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp_module
-    from megatron.core import parallel_state as ps
-    from megatron.core.process_groups_config import ProcessGroupCollection
-    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-
-    ps.destroy_model_parallel()
-    init_kwargs = dict(
-        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=gtp_size
-    )
-    if moe:
-        # EP=1 (not 2) so all 4 ranks form ONE expert-GTP group: EP=2 would cap EGTP_remat at 2
-        # on a 4-GPU run, which the size-<=2 bypass turns back into a plain reduce-scatter.
-        init_kwargs.update(expert_model_parallel_size=1, expert_gtp_remat_size=gtp_size)
-    ps.initialize_model_parallel(**init_kwargs)
-    model_parallel_cuda_manual_seed(42)
-    # None => every group; the MoE dispatcher needs tp_ep (see _worker_moe_distopt).
-    pgc = ProcessGroupCollection.use_mpu_process_groups()
-    stack = (_make_moe_stack if moe else _make_stack)(
-        (
-            _make_moe_config(gtp_remat_size=gtp_size, expert_gtp_remat_size=gtp_size)
-            if moe
-            else _make_config()
-        ),
-        pgc,
-    )
-    for layer in stack:
-        layer.cuda()
-    assert ps.get_gtp_weight_remat_group().size() == gtp_size
-    if saved is not None:
-        _load_gtp_shards(stack, saved, moe)
-
-    gtp_module.update_gtp_config(reduce_scatter_with_fp32_accumulation=fp32_accum)
-    try:
-        # Non-dist-opt DDP so main_grad holds the full reduced gradient and can be compared
-        # directly (the dist-opt buffer only has this rank's reduce-scattered slice).
-        _run_one_backward(_build_ddp(stack), rank)
-        grads = _full_main_grads(stack)
-    finally:
-        gtp_module.update_gtp_config(reduce_scatter_with_fp32_accumulation=False)
-
-    ps.destroy_model_parallel()
-    _reset_gtp_global_state()
-    return grads
 
 
 @contextlib.contextmanager
@@ -1056,7 +499,6 @@ def _fp32accum_probe():
     because ``_reduce_scatter_fp32_accum`` imports the primitive at call time.
     """
     import megatron.core.distributed.reduce_scatter_with_fp32_accumulation as rs_fp32_module
-    import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp_module
 
     counts = {"dispatches": 0, "coalesced_composites": 0}
     orig_rs = rs_fp32_module.reduce_scatter_with_fp32_accumulation
@@ -1082,257 +524,51 @@ def _fp32accum_probe():
         gtp_module._GTPCompositeWorkHandle.__init__ = orig_init
 
 
-def _saved_unsharded_weights(moe=False):
-    """Unsharded init weights from a GTP_remat=1 build, so every phase starts identically.
+@pytest.mark.parametrize("moe", [False, True])
+def test_gtp_remat_rs_fp32_accumulation_preserves_grads(moe):
+    """FP32 accumulation alters only the summation precision of the gtp_remat reduce-scatter.
 
-    EP=1, so expert weights are DP replicas rather than EP-local and every param can be
-    broadcast.
+    moe=False covers the single-tensor RS; moe=True the batched grouped/expert RS, whose
+    coalesced all-to-alls and deferred FP32 sums are joined under one composite handle --
+    asserted, so a regression to per-weight launches fails. GTP=4 (EP=1, EGTP=4) because a
+    size <= 2 axis bypasses fp32-accum.
     """
-    from megatron.core import parallel_state as ps
-    from megatron.core.process_groups_config import ProcessGroupCollection
-    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-
-    ps.destroy_model_parallel()
-    init_kwargs = dict(
-        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=1
-    )
-    if moe:
-        init_kwargs.update(expert_model_parallel_size=1, expert_gtp_remat_size=1)
-    ps.initialize_model_parallel(**init_kwargs)
-    model_parallel_cuda_manual_seed(42)
-    pgc = ProcessGroupCollection.use_mpu_process_groups()
-    ref_stack = (_make_moe_stack if moe else _make_stack)(
-        _make_moe_config() if moe else _make_config(), pgc
-    )
-    for layer in ref_stack:
-        layer.cuda()
-    for _name, p in ref_stack.named_parameters():
-        dist.broadcast(p.data, src=0)
-    saved = {n: p.data.clone() for n, p in ref_stack.named_parameters()}
-    del ref_stack
-    ps.destroy_model_parallel()
-    _reset_gtp_global_state()
-    return saved
-
-
-def _max_rel_grad_diff(reference, other):
-    """Largest per-param relative gradient difference -> (value, param name).
-
-    Relative, not absolute: max|grad| is ~1e-4 on this micro-model, so an absolute bound would
-    read benign rounding as a huge error. All-zero params are skipped.
-    """
-    worst, worst_name = 0.0, None
-    for name, ref_grad in reference.items():
-        denom = ref_grad.abs().max().item()
-        if denom < 1e-30:
-            continue
-        rel = (ref_grad - other[name]).abs().max().item() / denom
-        if rel > worst:
-            worst, worst_name = rel, name
-    return worst, worst_name
-
-
-def _worker_gtp_rs_fp32accum(rank, world_size, port, moe):
-    """FP32 accumulation must not change the reduced gradients.
-
-    It alters only the summation precision of the gtp_remat reduce-scatter, never its math.
-    Guards the integration: the pooled all-to-all scratch, the deferred FP32 sums, and
-    (moe=True) the batched grouped path.
-    """
-    saved = _saved_unsharded_weights(moe)
-
+    rank = dist.get_rank()
+    saved = _unsharded_weights(_build_stack(moe=moe, ep=1), moe)
+    grads, dispatches = {}, {}
     with _fp32accum_probe() as counts:
-        plain = _gtp_rs_phase(rank, saved, fp32_accum=False, moe=moe)
-        n_plain = counts["dispatches"]
-        fp32 = _gtp_rs_phase(rank, saved, fp32_accum=True, moe=moe)
-        n_fp32 = counts["dispatches"] - n_plain
-        n_coalesced = counts["coalesced_composites"]
+        for fp32_accum in (False, True):
+            stack = _build_stack(4, moe, 4, ep=1)
+            _load_gtp_shards(stack, saved, moe)
+            update_gtp_config(reduce_scatter_with_fp32_accumulation=fp32_accum)
+            before = counts["dispatches"]
+            _backward_and_reduce(_build_ddp(stack), rank)
+            dispatches[fp32_accum] = counts["dispatches"] - before
+            grads[fp32_accum] = _full_main_grads(stack)
 
-    assert n_plain == 0, f"FP32-accum RS ran with the flag off ({n_plain} dispatches)"
-    assert n_fp32 > 0, "FP32-accum RS never ran with the flag on -- test would be vacuous"
+    assert dispatches[False] == 0, f"FP32-accum RS ran with the flag off: {dispatches}"
+    assert dispatches[True] > 0, "FP32-accum RS never ran with the flag on -- vacuous"
     if moe:
         # Only grouped expert chains carry several wgrads per RS, so only they build a composite.
-        assert n_coalesced > 0, (
-            "batched grouped RS did not coalesce its all-to-alls -- regressed to one "
-            "ncclGroupStart/End per weight"
-        )
-
-    if rank == 0:
-        worst, worst_name = _max_rel_grad_diff(plain, fp32)
-        print(
-            f"[gtp-rs-fp32accum moe={moe}] dispatches={n_fp32} "
-            f"max rel grad diff={worst:.3e} ({worst_name})",
-            flush=True,
-        )
-        # Tolerance, not equality: the paths legitimately differ by the rounding fp32-accum
-        # removes. Structural breakage (dropped mean, unwaited handle) lands near 1.0.
-        assert worst < 2e-2, (
-            f"GTP FP32-accumulation reduce-scatter changed the reduced gradient "
-            f"(max rel diff {worst:.3e} on {worst_name})"
-        )
+        assert counts["coalesced_composites"] > 0, "batched grouped RS did not coalesce"
+    # The paths legitimately differ by the rounding fp32-accum removes.
+    _assert_grads_match(grads[False], grads[True], f"gtp-rs-fp32accum moe={moe}")
 
 
-def _worker_gtp_rs_fp32accum_bypassed_at_size_2(rank, world_size, port):
-    """A gtp_remat axis of size 2 must fall back to the plain reduce-scatter, flag or not.
+def test_gtp_remat_rs_fp32_accumulation_bypassed_at_size_2():
+    """A size-2 gtp_remat axis reduce-scatters plainly even with the flag on.
 
     One addition rounds the same either way, so fp32-accum cannot change the result at size 2
-    while still costing the all-to-all scratch. Enabling the flag there must issue zero
-    fp32-accum collectives.
+    while still costing the all-to-all scratch.
     """
+    rank = dist.get_rank()
+    groups = [cached_group(ranks) for ranks in ((0, 1), (2, 3))]
+    layer = _make_gtp_linear(64, 128, groups[rank // 2])
+    update_gtp_config(reduce_scatter_with_fp32_accumulation=True)
+    wgrad = torch.full((128, 64), rank + 1.0, dtype=dtype, device='cuda')
     with _fp32accum_probe() as counts:
-        # saved=None: only the dispatch count matters here, not the gradient values.
-        _gtp_rs_phase(rank, saved=None, fp32_accum=True, gtp_size=2)
-
-    assert counts["dispatches"] == 0, (
-        f"gtp_remat=2 issued {counts['dispatches']} FP32-accumulation reduce-scatters; the "
-        "size-<=2 bypass is not firing, so the run pays the extra all-to-all buffer for no "
-        "precision gain"
-    )
-
-
-def _worker_idog_span(rank, world_size, port):
-    """Dist-opt grad-stats group (intra_dist_opt) must span the FULL world for both
-    dense-only and MoE(EP2/EGTP2) configs. A naive build collapses the MoE case to a sub-world
-    group (egtp factored out of expert_data_parallel_size), under-counting the grad-norm."""
-    from megatron.core import parallel_state as ps
-
-    # MoE EP2 EGTP2 GTP2 expert config.
-    ps.destroy_model_parallel()
-    ps.initialize_model_parallel(
-        tensor_model_parallel_size=1,
-        pipeline_model_parallel_size=1,
-        expert_model_parallel_size=2,
-        gtp_remat_size=2,
-        expert_gtp_remat_size=2,
-    )
-    moe_idog = ps.get_intra_distributed_optimizer_instance_group().size()
-    ps.destroy_model_parallel()
-    # Dense-only GTP2 (must remain world too).
-    ps.initialize_model_parallel(
-        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
-    )
-    dense_idog = ps.get_intra_distributed_optimizer_instance_group().size()
-    ps.destroy_model_parallel()
-    if rank == 0:
-        print(
-            f"[idog] MoE intra_dist_opt.size={moe_idog} dense.size={dense_idog} "
-            f"(world={world_size})",
-            flush=True,
-        )
-        assert moe_idog == world_size, (
-            f"MoE grad-stats group = {moe_idog}, expected world {world_size} "
-            f"-> grad-norm would under-count gtp_remat/egtp_remat-sharded params"
-        )
-        assert dense_idog == world_size, f"dense grad-stats group = {dense_idog}"
-
-
-class TestGTPGradCorrectness:
-    def test_distopt_gradstats_group_spans_world(self):
-        """intra_dist_opt_group (grad-stats) must span the full world."""
-        if torch.cuda.device_count() < 4:
-            pytest.skip("Requires 4 CUDA devices")
-        _run_distributed(_worker_idog_span, 4)
-
-    @pytest.mark.parametrize("per_token_loss", [False, True])
-    def test_gtp2_dp2_grad_matches_dp4_baseline(self, per_token_loss):
-        """GTP2xDP2 reduced grad must match no-GTP_remat DP4 (non-dist-opt main_grad).
-
-        per_token_loss=True disables DDP's 1/dp pre-scaling and normalizes by
-        1/total_global_tokens, so the gtp_remat axis must be SUM-reduced (plain reduce-scatter +
-        SUM finalize), NOT the 1/gtp MEAN used otherwise. A regression to an unconditional mean
-        shrinks every gtp grad by 1/gtp and the per_token_loss case catches it (GTP2xDP2 sum-grad
-        must still match the DP4 sum-grad). GTP_CONFIG is a process-global, so set it for the run
-        and always reset it.
-        """
-        if torch.cuda.device_count() < 4:
-            pytest.skip("Requires 4 CUDA devices")
-        from megatron.core.tensor_parallel.generalized_tensor_parallelism import update_gtp_config
-
-        update_gtp_config(calculate_per_token_loss=per_token_loss)
-        try:
-            _run_distributed(_worker, 4, per_token_loss)
-        finally:
-            update_gtp_config(calculate_per_token_loss=False)
-
-    @pytest.mark.parametrize("per_token_loss", [False, True])
-    def test_wide_residual_gtp2_dp2_matches_dp4_baseline(self, per_token_loss):
-        """Wide outputs and grads must match when branch weights are GTP-sharded."""
-
-        if torch.cuda.device_count() < 4:
-            pytest.skip("Requires 4 CUDA devices")
-        from megatron.core.tensor_parallel.generalized_tensor_parallelism import update_gtp_config
-
-        update_gtp_config(calculate_per_token_loss=per_token_loss)
-        try:
-            _run_distributed(_worker_wide_residual, 4, per_token_loss)
-        finally:
-            update_gtp_config(calculate_per_token_loss=False)
-
-    def test_wide_residual_replay_gtp2_dp2_matches_dp4_baseline(self):
-        """Selective residual replay must preserve GTP-sharded branch gradients."""
-
-        if torch.cuda.device_count() < 4:
-            pytest.skip("Requires 4 CUDA devices")
-        _run_distributed(_worker_wide_residual, 4, False, True)
-
-    @pytest.mark.parametrize("moe", [False, True])
-    def test_gtp_remat_rs_fp32_accumulation_preserves_grads(self, moe):
-        """--gtp-remat-reduce-scatter-with-fp32-accumulation must not change the gradients.
-
-        moe=False covers the single-tensor RS; moe=True covers the batched grouped/expert RS,
-        whose coalesced all-to-alls and deferred FP32 sums are joined under one composite
-        handle -- asserted, not just exercised, so a regression to per-weight launches fails.
-        """
-        if torch.cuda.device_count() < 4:
-            pytest.skip("Requires 4 CUDA devices")
-        _run_distributed(_worker_gtp_rs_fp32accum, 4, moe)
-
-    def test_gtp_remat_rs_fp32_accumulation_bypassed_at_size_2(self):
-        """A size-2 gtp_remat axis must ignore the flag (no gain, real memory cost)."""
-        if torch.cuda.device_count() < 4:
-            pytest.skip("Requires 4 CUDA devices")
-        _run_distributed(_worker_gtp_rs_fp32accum_bypassed_at_size_2, 4)
-
-    def test_gtp2_fp32accum_rs_grad_norm_matches_plain_rs(self):
-        """GTP_remat + --ddp-reduce-scatter-with-fp32-accumulation must match plain RS.
-
-        Regression guard for the dispatch-ordering hazard: the fp32-accum all-to-all reads
-        grad_data at dispatch, so DDP grad-ready has to fire from GTP's manual post-add hook,
-        not from autograd. Needs >1 bucket group (small bucket_size) to be sensitive.
-        """
-        if torch.cuda.device_count() < 4:
-            pytest.skip("Requires 4 CUDA devices")
-        _run_distributed(_worker_fp32accum, 4)
-
-    def test_gtp2_dp2_distopt_grad_norm_matches_dp4_baseline(self):
-        """GTP2xDP2 dist-opt grad-norm must match no-GTP_remat DP4 (the 64-GPU path)."""
-        if torch.cuda.device_count() < 4:
-            pytest.skip("Requires 4 CUDA devices")
-        _run_distributed(_worker_distopt, 4)
-
-    def test_moe_egtp_distopt_grad_norm_matches_baseline(self):
-        """GTP2/EGTP2 MoE dist-opt grad-norm must match GTP1/EGTP1 baseline (EP=2 both)."""
-        if torch.cuda.device_count() < 4:
-            pytest.skip("Requires 4 CUDA devices")
-        _run_distributed(_worker_moe_distopt, 4)
-
-    @pytest.mark.parametrize(
-        "gtp,egtp",
-        [
-            (4, 1),  # dense-only GTP_remat; experts stay EP-local, not EGTP-sharded
-            (1, 2),  # GTP_remat inactive; experts EGTP-sharded (the gtp<egtp direction)
-        ],
-    )
-    def test_moe_gtp_egtp_mismatch_distopt_grad_norm_matches_baseline(self, gtp, egtp):
-        """Mismatched (gtp, egtp), EP=2: MoE dist-opt grad-norm must match GTP1/EGTP1 baseline.
-
-        End-to-end regression for expert_gradient_scaling_factor's GTP/EGTP correction through
-        a real MoE model and real backward pass, covering both gtp>egtp and gtp<egtp -- unlike
-        TestExpertGradientScalingFactorGTPRemat (test_distributed_data_parallel.py; a synthetic
-        model checking the scaling factor value directly) or
-        test_moe_egtp_distopt_grad_norm_matches_baseline (GTP==EGTP, collapses the correction
-        to 1.0). See worker docstring for the full reasoning.
-        """
-        if torch.cuda.device_count() < 4:
-            pytest.skip("Requires 4 CUDA devices")
-        _run_distributed(_worker_moe_gtp_egtp_mismatch, 4, gtp, egtp)
+        (out,), _, _ = layer.weight._reduce_scatter([wgrad], async_op=False)
+    assert counts["dispatches"] == 0, f"{counts['dispatches']} fp32-accum RS at gtp_remat=2"
+    # The gtp mean of the pair's values (2r+1, 2r+2) for pair r.
+    expected = 2 * (rank // 2) + 1.5
+    torch.testing.assert_close(out, torch.full_like(out, expected), atol=0, rtol=0)

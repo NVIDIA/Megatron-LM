@@ -2,14 +2,13 @@
 
 """Integration test for GTP correctness with local partial CUDA graphs.
 
-This is the local-CUDA-graph counterpart of ``test_gtp_loss_correctness.py``. It compares eager
-execution with attention-only local CUDA graphs under the same GTP2 x DP2 topology, with and
-without cross-graph RS overlap. It verifies the complete loss trajectory and global gradient norm,
-including repeated replays of one backward.
+This is the local-CUDA-graph counterpart of ``test_gtp_loss_correctness.py``. Under the same
+GTP2 x DP2 topology it compares eager execution with local CUDA graphs over two scopes: dense
+attention layers, and an MoE router whose latent projections are GTP-sharded. The loss and global
+gradient norm must match at every step, starting with the first replay after capture.
 """
 
 import copy
-import gc
 
 import pytest
 import torch
@@ -28,18 +27,12 @@ from transformer_engine.pytorch import fp8_autocast
 
 import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp_module
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTPShardedParam
-from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: F401
-    _run_distributed,
-    _torchrun_dist_init,
-    reset_fp8_state,
-    reset_gtp_globals,
-)
+from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import _run_distributed
 
 
 def _worker_gtp_partial_cg_correctness(rank, world_size, port, partial_cg_modules, opt_in_modules):
     """Compare eager and local CUDA graphs with GTP2 x DP2."""
     del port
-    gtp_module._GTP_PARAMS.clear()
 
     from megatron.core import parallel_state as ps
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -60,15 +53,14 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, partial_cg_module
     from megatron.core.transformer.transformer_layer import MoETransformerLayer
 
     latent_projection_case = "moe_latent_proj" in opt_in_modules
-    hidden = 256 if latent_projection_case else 4096
-    num_heads = 8 if latent_projection_case else 32
-    ffn_hidden = 512 if latent_projection_case else 16384
-    # Use multiple layers to exercise repeated local CUDA-graph execution with GTP parameters.
-    num_layers = 1 if latent_projection_case else 4
+    hidden = 256
+    num_heads = 8
+    # Two attention layers make each graph prefetch into, and reduce from, a neighbouring graph.
+    num_layers = 1 if latent_projection_case else 2
     sequence_length = 16 if latent_projection_case else 32
     batch_size = 1
     learning_rate = 0.01
-    steps = 10
+    steps = 4
     dtype = torch.bfloat16
     gtp_degree = 2
     dp_degree = 2
@@ -81,7 +73,7 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, partial_cg_module
                 "num_moe_experts": 2,
                 "moe_router_topk": 1,
                 "moe_router_pre_softmax": True,
-                "moe_ffn_hidden_size": ffn_hidden,
+                "moe_ffn_hidden_size": 512,
                 "moe_grouped_gemm": True,
                 "moe_token_dispatcher_type": "allgather",
                 "moe_aux_loss_coeff": 0.0,
@@ -91,7 +83,6 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, partial_cg_module
             num_attention_heads=num_heads,
             num_layers=num_layers,
             hidden_size=hidden,
-            ffn_hidden_size=ffn_hidden,
             add_bias_linear=False,
             params_dtype=dtype,
             hidden_dropout=0.0,
@@ -274,7 +265,6 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, partial_cg_module
     gtp_group = ps.get_gtp_weight_remat_group()
     dp_group = ps.get_data_parallel_group(with_gtp_remat=False)
     gtp_size = gtp_group.size()
-    gtp_rank = gtp_group.rank()
     dp_rank = dp_group.rank()
     assert gtp_size == gtp_degree
     assert dp_group.size() == dp_degree
@@ -294,59 +284,16 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, partial_cg_module
     partial_cg_losses = []
     partial_cg_grad_norms = []
     try:
-        # Record one eager backward, then replay the same input and weights. This isolates the
-        # graph execution path: model state, GTP topology, and reduction order are unchanged.
+        # One eager step records the graph order; it does not update the weights. Every step of
+        # the trajectory below then replays, so its first step checks the first replay.
         reset_grad_state(partial_cg)
-        eager_probe_x = make_replica_input(1234, dp_rank)
-        eager_probe_x.requires_grad_()
-        eager_probe_loss = run_step(partial_cg, eager_probe_x)
-        eager_probe_loss.backward()
+        run_step(partial_cg, make_replica_input(0, dp_rank).requires_grad_()).backward()
         wait_for_gtp_grad_reduction_on_current_stream()
-        eager_grad_norm = global_grad_norm(partial_cg, gtp_group)
-        eager_probe_loss_value = eager_probe_loss.item()
-        del eager_probe_loss, eager_probe_x
-        reset_grad_state(partial_cg)
-
         create_cudagraphs()
         assert _CudagraphGlobalRecord.cudagraph_created
         managers = get_cudagraph_managers(partial_cg)
         assert all(len(manager.cudagraph_runners) == 1 for manager in managers)
-        runners = [manager.cudagraph_runners[0] for manager in managers]
-        assert any(runner.gtp_remat for runner in runners)
-
-        replay_grad_norms = []
-        replay_losses = []
-        for _ in range(3):
-            reset_grad_state(partial_cg)
-            replay_x = make_replica_input(1234, dp_rank).requires_grad_()
-            replay_loss = run_step(partial_cg, replay_x)
-            replay_loss.backward()
-            wait_for_gtp_grad_reduction_on_current_stream()
-            replay_losses.append(replay_loss.item())
-            replay_grad_norms.append(global_grad_norm(partial_cg, gtp_group))
-
-        replay_grad_norms_tensor = torch.tensor(replay_grad_norms)
-        assert torch.isfinite(replay_grad_norms_tensor).all()
-        torch.testing.assert_close(
-            replay_grad_norms_tensor,
-            torch.full_like(replay_grad_norms_tensor, eager_grad_norm),
-            atol=1e-6,
-            rtol=5e-3,
-        )
-        torch.testing.assert_close(
-            torch.tensor(replay_losses),
-            torch.full((len(replay_losses),), eager_probe_loss_value),
-            atol=1e-6,
-            rtol=5e-3,
-        )
-        if gtp_rank == 0:
-            print(
-                f"[partial-CG grad norm, DP replica {dp_rank}] "
-                f"eager={eager_grad_norm:.6f} replays={replay_grad_norms}",
-                flush=True,
-            )
-
-        del replay_loss, replay_x
+        assert any(manager.cudagraph_runners[0].gtp_remat for manager in managers)
 
         for step in range(steps):
             reset_grad_state(partial_cg)
@@ -360,22 +307,11 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, partial_cg_module
             apply_sgd_step(partial_cg, gtp_size)
         del loss, x
     finally:
-        torch.cuda.synchronize()
-        managers = get_cudagraph_managers(partial_cg)
-        for manager in managers:
-            for runner in manager.cudagraph_runners:
-                if runner.fwd_graph is not None:
-                    runner.fwd_graph.reset()
-                if runner.bwd_graph is not None:
-                    runner.bwd_graph.reset()
         delete_cuda_graphs()
-        for manager in managers:
+        for manager in get_cudagraph_managers(partial_cg):
             manager.cudagraph_runners.clear()
-        gc.collect()
         ps.destroy_model_parallel()
         ps.initialize_model_parallel()
-        gtp_module.reset_gtp_state()
-        gtp_module._GTP_PARAMS.clear()
 
     if rank == 0:
         for step, (eager_loss, partial_cg_loss) in enumerate(zip(eager_losses, partial_cg_losses)):
@@ -383,40 +319,33 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, partial_cg_module
                 f"Step {step:2d}: eager={eager_loss:.6f}  partial_cg={partial_cg_loss:.6f}",
                 flush=True,
             )
-    # latent-proj case uses gradient_accumulation_fusion; suspected (unconfirmed) GEMM
-    # algorithm-selection variance compounds over 10 SGD steps into eager/graph drift that
-    # a busy shared process exposes but isolation doesn't.
-    traj_rtol = 2e-2 if latent_projection_case else 5e-3
-    traj_atol = 1e-4 if latent_projection_case else 1e-6
     torch.testing.assert_close(
-        torch.tensor(partial_cg_losses), torch.tensor(eager_losses), atol=traj_atol, rtol=traj_rtol
+        torch.tensor(partial_cg_losses), torch.tensor(eager_losses), atol=1e-6, rtol=5e-3
     )
     torch.testing.assert_close(
-        torch.tensor(partial_cg_grad_norms),
-        torch.tensor(eager_grad_norms),
-        atol=traj_atol,
-        rtol=traj_rtol,
+        torch.tensor(partial_cg_grad_norms), torch.tensor(eager_grad_norms), atol=1e-6, rtol=5e-3
     )
 
 
 class TestGTPPartialCGCorrectness:
-    @pytest.mark.flaky_in_dev
     @pytest.mark.parametrize(
         "partial_cg_modules,opt_in_modules",
         [
             pytest.param(["attn"], [], id="attention"),
-            pytest.param(["moe_router"], ["moe_latent_proj"], id="moe-router-latent-projections"),
+            # In the full GTP bucket the eager reference and the graphed run both reach NaN at
+            # step 2; alone the case matches eager exactly. Not a CUDA-graph defect; cause open.
+            pytest.param(
+                ["moe_router"],
+                ["moe_latent_proj"],
+                id="moe-router-latent-projections",
+                marks=pytest.mark.flaky_in_dev,
+            ),
         ],
     )
     def test_gtp_partial_cg_loss_and_grad_norm_match_eager(
         self, partial_cg_modules, opt_in_modules
     ):
-        """Local-CG loss trajectory and global grad norm must match eager execution.
-
-        Flaky in the full H100 dev bucket: the attention case's first replay after capture can
-        differ from eager while later replays match. It does not reproduce alone or after the
-        preceding GTP files; cause unconfirmed.
-        """
+        """Local-CG loss trajectory and global grad norm must match eager execution."""
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires at least 4 CUDA devices")
         _run_distributed(_worker_gtp_partial_cg_correctness, 4, partial_cg_modules, opt_in_modules)

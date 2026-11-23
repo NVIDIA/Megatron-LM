@@ -34,9 +34,7 @@ from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
     _make_gtp_remat_grouped_linear,
     _requires_multi_gpu,
     _run_distributed,
-    _torchrun_dist_init,
-    reset_fp8_state,
-    reset_gtp_globals,
+    cached_group,
 )
 
 # Topology matters. Each block is one recomputed square GEMM followed by two NON-recomputed
@@ -74,7 +72,7 @@ def _recompute_buffer_addr(param):
 
 def _build_layers(world_size):
     """Return (recomputed square layers, non-recomputed differently-shaped spacer pairs)."""
-    gtp_remat_group = dist.new_group(list(range(world_size)))
+    gtp_remat_group = cached_group(range(world_size))
 
     def linear(in_f, out_f):
         return _make_gtp_linear(in_f, out_f, gtp_remat_group, DTYPE, fuse_wgrad_accumulation=True)
@@ -125,7 +123,6 @@ def _forward_backward(layers, x, recompute):
 def _worker_adjacent_nodes_use_distinct_buffers(rank, world_size, port):
     """Every adjacent pair of recompute-chain nodes must gather into different buffers."""
     torch.manual_seed(0)
-    gtp_module.reset_gtp_state()
     layers = _build_layers(world_size)
     recomputed = layers[0]
 
@@ -166,7 +163,6 @@ def _worker_recompute_matches_no_recompute(rank, world_size, port, registered=Fa
     what guards that.
     """
     torch.manual_seed(0)
-    gtp_module.reset_gtp_state()
     layers = _build_layers(world_size)
     recomputed, spacers = layers
     all_layers = recomputed + [m for pair in spacers for m in pair]
@@ -238,9 +234,8 @@ def _worker_grouped_adjacent_nodes_use_distinct_buffers(rank, world_size, port):
         the anchor.
     """
     torch.manual_seed(0)
-    gtp_module.reset_gtp_state()
 
-    gtp_remat_group = dist.new_group(list(range(world_size)))
+    gtp_remat_group = cached_group(range(world_size))
     blocks = [
         _make_gtp_remat_grouped_linear(
             NUM_GEMMS, HIDDEN, HIDDEN, gtp_remat_group, DTYPE, fuse_wgrad_accumulation=True

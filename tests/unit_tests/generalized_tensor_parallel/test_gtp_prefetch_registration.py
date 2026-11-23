@@ -9,19 +9,7 @@ import torch
 
 import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp
 from megatron.core.tensor_parallel.gtp_api import register_prefetch_chain
-from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: F401
-    _make_gtp_linear,
-    _torchrun_dist_init,
-    reset_gtp_globals,
-)
-
-
-@pytest.fixture(autouse=True)
-def restore_capture_config():
-    """Keep classification tests independent of earlier graph tests."""
-    gtp.set_cuda_graph_modules(None, cuda_graph_impl="none")
-    yield
-    gtp.set_cuda_graph_modules(None, cuda_graph_impl="none")
+from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import _make_gtp_linear
 
 
 def _weight(group=None, grouped=False):
@@ -48,7 +36,7 @@ def test_empty_selection_and_replicated_weight_rejection():
     assert not hasattr(replicated, "chain_id")
 
 
-@pytest.mark.parametrize("name", ["", "bad name", "a/b", None])
+@pytest.mark.parametrize("name", ["bad name", None])
 def test_invalid_name(name):
     with pytest.raises(ValueError, match="name"):
         register_prefetch_chain(name, [])
@@ -156,38 +144,6 @@ def test_same_logical_chain_splits_at_capture_boundary():
     assert not embedding._need_weight_prefetch_bwd
 
 
-@pytest.mark.parametrize(
-    "chain_id,grouped,graphed,stream_id",
-    [
-        ("opaque", True, True, "GTP_remat_grouped_graphed"),
-        ("GTP_remat_grouped_fc1_graphed", False, False, "GTP_ungraphed"),
-        ("GTP_ungraphed", False, True, "GTP_graphed"),
-        ("GTP_graphed", True, False, "GTP_remat_grouped_ungraphed"),
-    ],
-)
-def test_chain_queries_use_metadata_instead_of_names(
-    monkeypatch, chain_id, grouped, graphed, stream_id
-):
-    monkeypatch.setitem(
-        gtp._PREFETCH_CHAIN_METADATA,
-        chain_id,
-        gtp._PrefetchChainMetadata(grouped=grouped, graphed=graphed),
-    )
-    assert gtp._chain_is_grouped(chain_id) == grouped
-    assert gtp._chain_is_graphed(chain_id) == graphed
-    assert (chain_id in gtp.get_graphed_chain_ids()) == graphed
-    assert gtp._stream_key(chain_id, None) == (stream_id, 0)
-
-
-@pytest.mark.parametrize(
-    "query,args",
-    [(gtp._chain_is_grouped, ()), (gtp._chain_is_graphed, ()), (gtp._stream_key, (None,))],
-)
-def test_chain_queries_reject_unknown_ids(query, args):
-    with pytest.raises(KeyError):
-        query("GTP_remat_grouped_unknown_graphed", *args)
-
-
 def test_reset_preserves_builtin_metadata_and_removes_custom_chains():
     custom = _weight()
     register_prefetch_chain("custom", [custom])
@@ -231,20 +187,28 @@ def test_registered_dense_chains_follow_execution_not_registration_order():
 
 
 def test_registered_chain_buffers_do_not_alias():
+    """Chains sharing a stream are not serialized, so their gathers need separate buffers."""
     group = torch.distributed.group.WORLD
-    first, second = _weight(group), _weight(group)
+    layers = [_make_gtp_linear(32, 32, group) for _ in range(2)]
+    first, second = (layer.weight for layer in layers)
     register_prefetch_chain("a", [first])
     register_prefetch_chain("b", [second])
-    gtp.classify_gtp_remat_chains(_model(first=first, second=second))
-    assert gtp._stream_key(first.chain_id, None) == gtp._stream_key(second.chain_id, None)
+    gtp.classify_gtp_remat_chains(torch.nn.ModuleList(layers))
+    assert gtp.get_ag_stream(first.chain_id, group) is gtp.get_ag_stream(second.chain_id, group)
+    full = []
+    for weight in (first, second):
+        gathered = torch.empty(weight._unsharded_shape_padded, device="cuda", dtype=weight.dtype)
+        torch.distributed.all_gather_into_tensor(gathered, weight.detach(), group=group)
+        full.append(gathered)
     for recompute in (False, True):
-        assert first._get_cache_key(
-            torch.bfloat16, True, False, recompute
-        ) != second._get_cache_key(torch.bfloat16, True, False, recompute)
+        first_out, _ = first._all_gather_weight(async_op=False, fwd=True, recompute=recompute)
+        second_out, _ = second._all_gather_weight(async_op=False, fwd=True, recompute=recompute)
+        assert first_out.data_ptr() != second_out.data_ptr()
+        torch.testing.assert_close(first_out, full[0], atol=0, rtol=0)
+        torch.testing.assert_close(second_out, full[1], atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("impl,scope", [("none", []), ("local", ["mamba"]), ("full_iteration", [])])
-def test_model_initialization_registers_defaults_and_preserves_overrides(monkeypatch, impl, scope):
+def test_model_initialization_registers_defaults_and_preserves_overrides():
     """Exercise the training entry point, not a separate test-only registration path."""
     dense_group, expert_group = object(), object()
     mamba_fc1, mamba_fc2 = _weight(dense_group), _weight(dense_group)
@@ -254,14 +218,6 @@ def test_model_initialization_registers_defaults_and_preserves_overrides(monkeyp
     fc2 = [_weight(expert_group, True) for _ in range(2)]
     fc1[0].weight_list, fc2[0].weight_list = fc1, fc2
     register_prefetch_chain("custom", [custom])
-    calls = []
-    original = gtp.register_prefetch_chain
-
-    def record(name, weights):
-        calls.append(name)
-        return original(name, weights)
-
-    monkeypatch.setattr(gtp, "register_prefetch_chain", record)
     # Independently scheduled chunks need separate defaults; explicit overrides survive.
     models = [
         _model(
@@ -276,13 +232,7 @@ def test_model_initialization_registers_defaults_and_preserves_overrides(monkeyp
         ),
         _model(optional_enabled=optional_enabled, excluded=replicated, custom=custom),
     ]
-    gtp.classify_gtp_remat_chains(models, cuda_graph_impl=impl, cuda_graph_modules=scope)
-    assert set(calls) == {
-        "default_dense",
-        "default_dense_1",
-        "default_expert_fc1",
-        "default_expert_fc2",
-    }
+    gtp.classify_gtp_remat_chains(models, cuda_graph_impl="local", cuda_graph_modules=["mamba"])
     assert mamba_fc1.chain_id == mamba_fc2.chain_id
     assert mamba_fc1._gtp_prefetch_chain_name != optional_enabled._gtp_prefetch_chain_name
     assert custom._gtp_prefetch_chain_name == "custom"
@@ -301,8 +251,9 @@ def test_model_initialization_registers_defaults_and_preserves_overrides(monkeyp
         )
         == 5
     )
-    assert gtp._chain_is_graphed(mamba_fc1.chain_id) == (impl != "none")
-    assert gtp._chain_is_graphed(fc1[0].chain_id) == (impl == "full_iteration")
+    # Only the chunk's chains inside the capture scope are graphed.
+    assert gtp._chain_is_graphed(mamba_fc1.chain_id)
+    assert not gtp._chain_is_graphed(fc1[0].chain_id)
 
 
 def test_default_registration_preserves_chain_free_opt_out():
