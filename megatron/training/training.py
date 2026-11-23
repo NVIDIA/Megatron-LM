@@ -79,11 +79,7 @@ from megatron.core.num_microbatches_calculator import (
     get_num_microbatches,
     update_num_microbatches,
 )
-from megatron.core.optimizer import (
-    OptimizerConfig,
-    ParamKey,
-    get_megatron_optimizer,
-)
+from megatron.core.optimizer import OptimizerConfig, ParamKey, get_megatron_optimizer
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import (
     LayerWiseDistributedOptimizer,
@@ -154,12 +150,12 @@ from megatron.training.checkpointing import (
     save_checkpoint,
     save_grads,
 )
-from megatron.training.config import (
-    TrainingConfig,
-    ValidationConfig,
-)
+from megatron.training.config import TrainingConfig, ValidationConfig
 from megatron.training.config.container import PretrainConfigContainer
-from megatron.training.config.optimizer_config import build_optimizer_config_overrides
+from megatron.training.config.optimizer_config import (
+    build_optimizer_config_overrides,
+    validate_lora_plus_warmup,
+)
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.training.datasets.utils import get_training_data_sequence_length
 from megatron.training.initialize import (
@@ -2641,6 +2637,7 @@ def setup_model_and_optimizer(
             cfg.optimizer_config_overrides,
             mode=cfg.optimizer_config_overrides_mode,
         )
+        validate_lora_plus_warmup(optim_cfg_overrides, optim_cfg, cfg.scheduler.lr_warmup_init)
         optim_cfg.timers = timers
 
         # Legacy callers may supply a model/optimizer config without finalized scheduler
