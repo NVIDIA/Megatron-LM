@@ -2,6 +2,7 @@
 
 import contextlib
 import os
+import warnings
 from inspect import signature
 from unittest import mock
 
@@ -2193,6 +2194,46 @@ def _fused_kv_rope_quant_config(**overrides):
     )
     kwargs.update(overrides)
     return MLATransformerConfig(**kwargs)
+
+
+class TestFusedMLARoPEQuantMissingTEKernels:
+    """Without the TE query RoPE + MXFP8 kernels the options fall back with a warning."""
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_and_teardown(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        yield
+        Utils.destroy_model_parallel()
+
+    def test_warns_and_falls_back(self, monkeypatch):
+        monkeypatch.setattr(mla_module, "fused_mla_q_rope_mxfp8", None)
+        monkeypatch.setattr(mla_module, "fused_mla_q_rope_backward_mxfp8", None)
+        config = _fused_kv_rope_quant_config(
+            use_fused_mla_qkv_rope_quant=True, use_fused_mla_up_proj_grad_quant=True
+        )
+        with pytest.warns(UserWarning, match="use_fused_mla_up_proj_grad_quant requested"):
+            module = MLASelfAttention(
+                config,
+                get_mla_self_attn_submodules(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+            )
+        assert not module._use_fused_qkv_rope_quant
+        assert not module._use_fused_up_proj_grad_quant
+
+    def test_no_warning_when_options_off(self, monkeypatch):
+        monkeypatch.setattr(mla_module, "fused_mla_q_rope_mxfp8", None)
+        monkeypatch.setattr(mla_module, "fused_mla_q_rope_backward_mxfp8", None)
+        config = _fused_kv_rope_quant_config()
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", message=".*fused MLA query RoPE")
+            MLASelfAttention(
+                config,
+                get_mla_self_attn_submodules(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+            )
 
 
 def test_fused_up_proj_grad_quant_config_requires_qkv_rope_quant():

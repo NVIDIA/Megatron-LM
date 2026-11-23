@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import os
+import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NoReturn, Optional, Union
 
@@ -482,6 +483,23 @@ class MultiLatentAttention(Attention):
             and fused_mla_q_rope_backward_mxfp8 is not None
             and fused_mla_rope_kv_split_emb_grad is not None
         )
+        # These options need TE kernels that older TE releases lack; say so instead of silently
+        # running the unfused path.
+        missing_te_kernels = [
+            option
+            for option, kernel in (
+                ("use_fused_mla_qkv_rope_quant", fused_mla_q_rope_mxfp8),
+                ("use_fused_mla_up_proj_grad_quant", fused_mla_q_rope_backward_mxfp8),
+            )
+            if getattr(self.config, option, False) and kernel is None
+        ]
+        if missing_te_kernels:
+            warnings.warn(
+                f"{', '.join(missing_te_kernels)} requested, but the installed Transformer Engine "
+                "does not provide the fused MLA query RoPE + MXFP8 kernels "
+                "(fused_mla_q_rope_mxfp8, fused_mla_q_rope_backward_mxfp8); running the "
+                "unfused path."
+            )
 
         mscale = _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale_all_dim)
         self.softmax_scale = (
