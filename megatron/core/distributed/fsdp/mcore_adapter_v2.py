@@ -393,12 +393,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             )
 
         mtp_number_layers = 0 if config.mtp_num_layers is None else config.mtp_num_layers
-        if config.overlap_moe_expert_parallel_comm and mtp_number_layers not in (0, 1):
-            raise ValueError(
-                "overlap_moe_expert_parallel_comm requires mtp_num_layers <= 1 "
-                f"(got {mtp_number_layers})."
-            )
-
         model = unwrap_model(module)
         if config.overlap_moe_expert_parallel_comm and getattr(
             model, "share_embeddings_and_output_weights", False

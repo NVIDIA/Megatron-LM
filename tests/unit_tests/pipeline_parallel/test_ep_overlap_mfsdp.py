@@ -50,8 +50,6 @@ from tests.unit_tests.distributed.mfsdp_v2.conftest import distributed_setup as 
 from tests.unit_tests.distributed.mfsdp_v2.mcore_utils import destroy_model_parallel
 from tests.unit_tests.test_utilities import Utils
 
-pytestmark = pytest.mark.mfsdp
-
 
 @pytest.mark.parametrize("pipeline_size", [1, 2])
 @pytest.mark.parametrize("wrapped", [False, True])
@@ -92,7 +90,8 @@ def test_rejects_tied_weights_with_ep_overlap_before_sharding(pipeline_size, wra
 
 
 @pytest.mark.parametrize("delay_wgrad", [False, True])
-def test_ep_overlap_mtp(distributed_setup, monkeypatch, delay_wgrad):
+@pytest.mark.parametrize("mtp_num_layers", [1, 2])
+def test_ep_overlap_mtp(distributed_setup, monkeypatch, delay_wgrad, mtp_num_layers):
     """Reduce every trainable weight once per backward, including repeated MTP head uses."""
     setup = distributed_setup
     if setup.world_size < 2 or setup.world_size % 2:
@@ -114,7 +113,7 @@ def test_ep_overlap_mtp(distributed_setup, monkeypatch, delay_wgrad):
             moe_router_topk=2,
             moe_grouped_gemm=True,
             moe_ffn_hidden_size=128,
-            mtp_num_layers=1,
+            mtp_num_layers=mtp_num_layers,
             delay_wgrad_compute=delay_wgrad,
             mtp_loss_scaling_factor=0.1,
             overlap_moe_expert_parallel_comm=True,
