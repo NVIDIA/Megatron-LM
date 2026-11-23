@@ -3334,6 +3334,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def _copy_model_grads_to_main_grads_eager(self):
         """Convert model gradient shards without graph capture or replay."""
 
+        # Shard grads that need an fp32 copy, collected so the casts run as one
+        # multi-tensor copy instead of one copy kernel per parameter.
+        cast_params = []
+        cast_grads = []
+
         # Utility method for copying group grads.
         def copy_group_grads(model_groups, shard_main_groups):
             for model_group, shard_main_group in zip(model_groups, shard_main_groups):
@@ -3352,8 +3357,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # Note that this requires corresponding modifications in the optimizer (Let
                         # the optimizer read gradients from ".decoupled_grad" instead of ".grad").
                         shard_main_param.decoupled_grad = shard_model_grad
+                    elif shard_model_grad.dtype == torch.float32:
+                        # ".float()" of an fp32 grad is the grad itself; keep the alias.
+                        shard_main_param.grad = shard_model_grad
                     else:
-                        shard_main_param.grad = shard_model_grad.float()
+                        cast_params.append(shard_main_param)
+                        cast_grads.append(shard_model_grad)
 
         # Copy model groups to shard groups.
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
@@ -3362,6 +3371,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         else:
             copy_group_grads(self.model_float16_groups, self.shard_fp32_from_float16_groups)
             copy_group_grads(self.model_fp32_groups, self.shard_fp32_groups)
+
+        if cast_grads:
+            # One fp32 allocation holds every main grad (the same bytes the per-parameter
+            # ".float()" copies allocated); its views receive the casts in one
+            # multi-tensor copy.
+            numels = [grad.numel() for grad in cast_grads]
+            main_grads = torch.empty(
+                sum(numels), dtype=torch.float32, device=cast_grads[0].device
+            ).split(numels)
+            torch._foreach_copy_(main_grads, cast_grads)
+            for shard_main_param, main_grad in zip(cast_params, main_grads):
+                shard_main_param.grad = main_grad
 
     def _copy_main_params_to_model_params(self):
         """
@@ -3499,6 +3520,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             raise NotImplementedError(
                 "_copy_main_params_to_param_buffer not supported for Megatron-FSDP."
             )
+        shard_param_buffers = []
+        shard_main_params = []
         for shard_main_group, model_group in zip(
             self.shard_fp32_from_float16_groups, self.model_float16_groups
         ):
@@ -3512,9 +3535,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 param_buffer = self.buffers[gbuf_index].buckets[bucket_id].param_data
 
                 # Get the correct slice of param buffer
-                shard_param_buffer = param_buffer.view(-1)[world_range.start : world_range.end]
+                shard_param_buffers.append(
+                    param_buffer.view(-1)[world_range.start : world_range.end]
+                )
+                shard_main_params.append(shard_main_param)
 
-                shard_param_buffer.copy_(shard_main_param)
+        # One multi-tensor copy into the param buffer views instead of one copy per param.
+        if shard_param_buffers:
+            torch._foreach_copy_(shard_param_buffers, shard_main_params)
 
         # Staging params into the DDP param buffer invalidates any prior "already
         # dispatched" state. The next forward pre-hook must run post-sync cleanup,
