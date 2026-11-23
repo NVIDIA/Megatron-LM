@@ -415,6 +415,7 @@ class TextGenerationController(MTPControllerMixin):
             self._all_logits_cuda = torch.zeros(
                 (1, max_logits, self.vocab_size), dtype=logits_dtype, device=device
             )
+            context.logits_output_buffer = self._all_logits_cuda
         else:
             self._all_logits_cuda = None
         self._async_sched_forward = AsyncScheduleForwardState()
@@ -1004,14 +1005,16 @@ class TextGenerationController(MTPControllerMixin):
 
             if is_pipeline_last_stage(self.pp_group):
                 assert logits is not None and torch.Size(logits_shape) == logits.shape
+            elif self._enable_cuda_graph:
+                logits = self._all_logits_cuda[:, :logits_seq_len, :]
 
             logits = broadcast_from_last_pipeline_stage(
                 logits_shape, dtype=self._logits_dtype, tensor=logits, pp_group=self.pp_group
             )
 
-        # Copy logits to contiguous buffer.
         if self._enable_cuda_graph:
-            self._all_logits_cuda[:, :logits_seq_len, :].copy_(logits[:, :logits_seq_len, :])
+            # Ensure that the model wrote the logits into the correct buffer.
+            assert logits.data_ptr() == self._all_logits_cuda.data_ptr()
         else:
             self._all_logits_cuda = logits
 
@@ -1079,6 +1082,7 @@ class TextGenerationController(MTPControllerMixin):
             mamba_state_idx = context.mamba_metadata.request_to_mamba_state_idx[
                 active_request_slice
             ].to(cuda_device, non_blocking=True)
+            # Conv state rollback (full-window checkpoint copy).
             mamba_state_selective_copy(
                 intermediate_states=context.mamba_intermediate_conv_states,
                 current_states=context.mamba_conv_states,
@@ -1087,14 +1091,26 @@ class TextGenerationController(MTPControllerMixin):
                 accepted_counts=accepted_counts_gpu,
                 num_layers=context.num_mamba_layers,
             )
-            mamba_state_selective_copy(
-                intermediate_states=context.mamba_intermediate_ssm_states,
-                current_states=context.mamba_ssm_states,
-                prefill_status=prefill_status_gpu,
-                state_idx=mamba_state_idx,
-                accepted_counts=accepted_counts_gpu,
-                num_layers=context.num_mamba_layers,
-            )
+            # SSM state rollback: ReplaySSM ring-pointer commit, or the full
+            # intermediate-state copy.
+            if context.mamba_replay is not None:
+                # ReplaySSM: no state copy at all. Advance each slot's ring cursor by
+                # (accepted drafts + bonus token); rejected drafts are simply left
+                # behind the new write_pos and get overwritten next step.
+                context.mamba_replay.commit(
+                    accepted_draft_counts=accepted_counts_gpu,
+                    prefill_status=prefill_status_gpu,
+                    state_batch_indices=mamba_state_idx,
+                )
+            else:
+                mamba_state_selective_copy(
+                    intermediate_states=context.mamba_intermediate_ssm_states,
+                    current_states=context.mamba_ssm_states,
+                    prefill_status=prefill_status_gpu,
+                    state_idx=mamba_state_idx,
+                    accepted_counts=accepted_counts_gpu,
+                    num_layers=context.num_mamba_layers,
+                )
 
         return blocks_to_release, remove_mask
 
@@ -1745,6 +1761,8 @@ class TextGenerationController(MTPControllerMixin):
             input_ids (Tensor): Dummy input token IDs.
             position_ids (Tensor): Dummy input position IDs.
         """
+        # The forward overwrites `_all_logits_cuda`: nothing pending may still await sampling.
+        assert not self._async_sched_forward.is_valid
         self._dynamic_step_forward_logits(input_ids, position_ids)
 
     def _run_dummy_legacy_step(self, input_ids: Tensor, position_ids: Tensor) -> None:
@@ -2873,7 +2891,7 @@ class TextGenerationController(MTPControllerMixin):
             input_ids_gpu_view, position_ids_gpu_view, bookkeeping_done_event = (
                 self._dynamic_step_context_init(record_bookkeeping_done_event=True)
             )
-            if self.num_speculative_tokens > 0 and self.model_config.expert_model_parallel_size > 1:
+            if self.num_speculative_tokens > 0 and self._moe_dispatch_spans_ranks():
                 self._run_dummy_serial_mtp_forward()
             self._run_async_sched_forward(input_ids_gpu_view, position_ids_gpu_view)
 
@@ -3210,7 +3228,7 @@ class TextGenerationController(MTPControllerMixin):
                     assert primer_launched, "Initial no-overlap step must launch a forward primer."
                     launched_decode_only = context.is_decode_only()
                     self._synchronize_async_sched_event(bookkeeping_done_event)
-            elif had_pending_forward and self.model_config.expert_model_parallel_size > 1:
+            elif had_pending_forward and self._moe_dispatch_spans_ranks():
                 self._run_dummy_async_sched_base_step()
 
         decode_only = DecodeOnly(consumed=consumed_decode_only, launched=launched_decode_only)

@@ -16,6 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
+from megatron.core.fp8_utils import is_wrapped_for_fp8_inference
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
@@ -32,6 +33,7 @@ from megatron.core.ssm.ops.common.intermediate_extraction import (
 )
 from megatron.core.ssm.ops.mamba2.batch_invariant_decode import MambaBatchInvariantDecode
 from megatron.core.ssm.ops.mamba2.mamba_ssm import selective_state_update
+from megatron.core.ssm.ops.mamba2.mamba_ssm_replay import selective_state_update_replayssm_spec
 from megatron.core.ssm.packed_seq_helpers import build_packed_seq_idx
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.ssm.utils import _split_tensor_factory, _validate_dynamic_cp_head_geometry
@@ -193,6 +195,28 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         pg_collection: The required process groups to use for tensor model parallel and context
             parallel.
     """
+
+    @classmethod
+    def estimate_flops(
+        cls,
+        config: TransformerConfig,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+    ) -> float:
+        """Estimate forward projection and scan FLOPs using the existing SSD approximation."""
+        tokens = total_real_tokens_in_batch
+        hidden = config.hidden_size
+        inner = 2 * hidden
+        heads = config.mamba_num_heads or inner // config.mamba_head_dim
+        return (
+            2
+            * tokens
+            * hidden
+            * (2 * inner + 2 * config.mamba_num_groups * config.mamba_state_dim + heads)
+            + 7 * tokens * inner * config.mamba_state_dim  # Approximate scan cost.
+            + 2 * tokens * inner * hidden
+        )
 
     def __init__(
         self,
@@ -525,6 +549,13 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         runtime_cp_group = resolve_cp_group(self.cp.cp_group, packed_seq_params)
         runtime_cp = self.cp.for_context_parallel_group(runtime_cp_group)
 
+        batch_first = self._use_batch_first_ssm(inference_mode)
+        if batch_first:
+            # The gate keeps dynamic CP sequence-first, so no microbatch gets runtime CP here.
+            assert runtime_cp.cp_size == 1, "Batch-first Mamba layout requires CP size 1"
+            # l b h -> b l h on the d_model-wide input instead of the wider in_proj output.
+            hidden_states = hidden_states.transpose(0, 1).contiguous()
+
         zxBCdt, _ = self.in_proj(hidden_states)
         zxBCdt = runtime_cp.pre_conv_ssm(zxBCdt, packed_seq_params)
 
@@ -539,9 +570,55 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             )
         else:
             assert ssm_state is None
-            y = self._ssm_training(zxBCdt, packed_seq_params, runtime_cp=runtime_cp)
+            y = self._ssm_training(
+                zxBCdt, packed_seq_params, runtime_cp=runtime_cp, batch_first=batch_first
+            )
 
         return y
+
+    def _use_batch_first_ssm(self, inference_mode: bool) -> bool:
+        """Whether the training path keeps in_proj, the SSM and out_proj batch-first.
+
+        The SSM kernel is batch-first, so this moves the two l<->b transposes from the
+        in_proj/SSM outputs to the d_model-wide input and output. Sequence parallel and context
+        parallel (static, or dynamic CP that can pick CP > 1 per packed microbatch at runtime)
+        communicate along the sequence dim, and the FP8 inference padding wrapper pads
+        dim 0 as the sequence, so they keep the sequence-first layout. So does residual-stream or
+        mHC recompute, which discards the mixer input that in_proj would otherwise save, and any
+        config where batch-first could copy more (TP shards the in_proj/SSM outputs only).
+        """
+        # Copies per token, forward + backward. Sequence-first: the in_proj output and its grad,
+        # and the SSM output (the kernel reads its strided grad in place): 2 * in_proj + d_inner.
+        # Batch-first: the input, the output and the out_proj grad, plus the input grad, which its
+        # producer either copies (a separate norm, the wide-residual read) or adds into the
+        # residual grad with a strided, non-vectorized add that costs about as much: ~4 * d_model
+        # with TE linears. MCore-local linears copy each strided grad twice, on both sides.
+        in_proj_width = (
+            2 * self.d_inner_local_tp
+            + 2 * self.ngroups_local_tp * self.d_state
+            + self.nheads_local_tp
+        )
+        replays_mixer_input = self.config.recompute_granularity == "selective" and any(
+            module in ("residual_stream", "mhc") for module in self.config.recompute_modules or ()
+        )
+        return (
+            self.use_mem_eff_path
+            and not inference_mode
+            and self.cp.cp_size == 1
+            and not self.config.dynamic_context_parallel
+            and not self.config.sequence_parallel
+            and not replays_mixer_input
+            and 4 * self.d_model < 2 * in_proj_width + self.d_inner_local_tp
+            and not is_wrapped_for_fp8_inference(self.in_proj)
+            and not is_wrapped_for_fp8_inference(self.out_proj)
+        )
+
+    def _out_proj(self, y: torch.Tensor, batch_first: bool):
+        """Apply out_proj, returning the output in [sequence, batch, hidden] layout."""
+        out, out_bias = self.out_proj(y)
+        if batch_first:
+            out = out.transpose(0, 1).contiguous()
+        return out, out_bias
 
     def forward_pre_attn_and_core_attn(
         self,
@@ -561,7 +638,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
 
     def forward_post_core_attn(self, y):
         """Apply the Mamba output projection to an SSM output tensor."""
-        return self.out_proj(y)
+        return self._out_proj(y, self._use_batch_first_ssm(inference_mode=False))
 
     def forward(
         self,
@@ -599,7 +676,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             packed_seq_params=packed_seq_params,
             inference_mode=in_inference_mode,
         )
-        return self.out_proj(y)
+        return self._out_proj(y, self._use_batch_first_ssm(in_inference_mode))
 
     # ==================================================================
     # Static / eager inference
@@ -763,6 +840,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         zxBCdt: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams] = None,
         runtime_cp: Optional[MambaContextParallel] = None,
+        batch_first: bool = False,
     ) -> torch.Tensor:
         """
         Performs SSM computation for training step.
@@ -774,8 +852,9 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
 
         runtime_cp = self.cp if runtime_cp is None else runtime_cp
 
-        # transpose: l b pd --> b l pd
-        zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
+        if not batch_first:
+            # transpose: l b pd --> b l pd
+            zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
 
         # (nheads_local_tpcp)
         A = -torch.exp(runtime_cp.get_A_log().float())
@@ -813,7 +892,8 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             **state_dtype_kwarg,
         )
 
-        y = rearrange(y, "b l d -> l b d").contiguous()
+        if not batch_first:
+            y = rearrange(y, "b l d -> l b d").contiguous()
         y = runtime_cp.post_conv_ssm(y, packed_seq_params)
 
         if self.rmsnorm:
@@ -1219,6 +1299,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         batch_indices: Optional[torch.Tensor] = None,
         intermediate_conv_state: Optional[torch.Tensor] = None,
         intermediate_ssm_state: Optional[torch.Tensor] = None,
+        replay_context: Optional[DynamicInferenceContext] = None,
     ) -> torch.Tensor:
         """
         Performs SSM computation for inference decode step.
@@ -1234,6 +1315,10 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
                 sequence step (for speculative decoding rollback).
             intermediate_ssm_state: Optional buffer for storing SSM state at each
                 sequence step (for speculative decoding rollback).
+            replay_context: When ReplaySSM is enabled (`context.mamba_replay` is set),
+                the dynamic inference context; the SSM step then reads the ring buffers /
+                cursors from `context.mamba_replay` and runs the ReplaySSM kernels instead
+                of `selective_state_update`.
 
         Returns:
             The output tensor of shape (b, s, d).
@@ -1306,6 +1391,56 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
                 conv_state_indices=batch_indices,
                 intermediate_conv_states=intermediate_conv_state,
             ).to(xBC_dtype)
+
+        if replay_context is not None:
+            # ReplaySSM path: consume the packed post-conv output (x|B|C channel-last)
+            # and the raw per-head dt directly — no split, no dt broadcast, no
+            # intermediate SSM states. The live ssm_state is the checkpoint: it is
+            # only written on (early-)flush steps inside the kernel; rollback is the
+            # commit kernel's ring-pointer move in the controller.
+            replay = replay_context.mamba_replay
+            A = self._get_decode_A_neg_exp()
+            assert (
+                A.stride(-1) == 0 and A.stride(-2) == 0
+            ), "mamba_replay_ssm requires a per-head scalar A (Mamba-2 / TIE_HDIM)"
+            assert (
+                seq_len == replay.window
+            ), f"ReplaySSM decode window mismatch: seq_len={seq_len}, window={replay.window}"
+            conv_out = xBC.reshape(batch_size * seq_len, -1)
+            dt_raw = dt.reshape(batch_size * seq_len, self.nheads_local_tp)
+            z_replay = None
+            if not self.rmsnorm:
+                z_replay = z.reshape(batch_size * seq_len, self.nheads_local_tp, self.headdim)
+            post_conv_cache, dt_cache = replay.layer_caches(
+                replay_context.layer_map[self.layer_number - self.pp_layer_offset - 1]
+            )
+            out = selective_state_update_replayssm_spec(
+                state_checkpoint=ssm_state,
+                post_conv_cache=post_conv_cache,
+                dt_cache=dt_cache,
+                conv_out=conv_out,
+                dt_spec=dt_raw,
+                A=A,
+                write_pos=replay.write_pos,
+                post_conv_state_pos=replay.origin,
+                is_flush=replay.is_flush,
+                query_start_loc=replay.qsl[: batch_size + 1],
+                state_batch_indices=batch_indices,
+                max_cache_len=replay.flush_threshold,
+                max_spec_len=replay.window,
+                d_inner=self.d_inner_local_tp,
+                ngroups=self.ngroups_local_tp,
+                dstate=self.d_state,
+                D=self.D.unsqueeze(-1).expand(self.nheads_local_tp, self.headdim),
+                z=z_replay,
+                dt_bias=self.dt_bias,
+                dt_softplus=True,
+                bc_pre=replay.bc_pre,
+            )
+            y = out.view(batch_size, seq_len, -1).to(dtype)
+            if self.rmsnorm:
+                y = self.norm(y, None if self.config.batch_invariant_mode else z)
+            return y
 
         x, B, C = torch.split(
             xBC,

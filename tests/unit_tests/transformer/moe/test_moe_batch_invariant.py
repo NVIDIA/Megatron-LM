@@ -1,128 +1,51 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Tests for batch-invariant MoE grouped GEMM."""
+"""Batch-invariant MoE grouped GEMMs: training's TE grouped GEMM and inference's grouped_mm."""
+
 import pytest
 import torch
 import torch.nn.functional as F
 
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-    HAVE_DEEPGEMM_BF16,
-    _bf16_grouped_gemm_contiguous,
-    _m_splits_to_m_indices,
-    _offs_to_m_indices,
-    set_batch_invariant_mode,
-)
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
-def _hopper_or_newer() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 9
-
-
-pytestmark = [
-    pytest.mark.skipif(
-        not HAVE_DEEPGEMM_BF16,
-        reason="DeepGEMM with bf16 grouped bindings is required for MoE batch-invariant tests.",
-    ),
-    pytest.mark.skipif(
-        not _hopper_or_newer(), reason="DeepGEMM bf16 grouped kernels require Hopper (sm_90+)."
-    ),
-]
+BACKENDS = ["te_native", "triton"]
 
 
 # ---------------------------------------------------------------------------
-# Index-conversion helpers
+# Inference: torch grouped_mm (the torch backend's BF16 expert GEMM)
 # ---------------------------------------------------------------------------
 
 
-def test_m_splits_to_m_indices_basic():
-    m_splits = [3, 0, 5, 2]
-    m_total = sum(m_splits)
-    out = _m_splits_to_m_indices(m_splits, torch.device("cuda"), m_total)
-    expected = torch.tensor([0, 0, 0, 2, 2, 2, 2, 2, 3, 3], dtype=torch.int32, device="cuda")
-    assert torch.equal(out, expected)
-
-
-def test_offs_to_m_indices_basic():
-    # Three experts with 4/2/3 tokens, plus 1 row of post-padding (-1).
-    offs = torch.tensor([4, 6, 9], dtype=torch.int32, device="cuda")
-    m_total = 10  # one trailing pad row past offs[-1]=9
-    out = _offs_to_m_indices(offs, m_total)
-    expected = torch.tensor([0, 0, 0, 0, 1, 1, 2, 2, 2, -1], dtype=torch.int32, device="cuda")
-    assert torch.equal(out, expected)
-
-
-# ---------------------------------------------------------------------------
-# Kernel-level invariance
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("E", [2, 4, 8])
-def test_grouped_gemm_split_invariance(E):
-    """Splitting the M dimension at expert boundaries must give bitwise-identical
-    output to the full call."""
+@pytest.mark.skipif(not hasattr(torch, "_grouped_mm"), reason="needs torch._grouped_mm")
+@pytest.mark.parametrize("k,n", [(2688, 1856), (1856, 2688)])
+def test_grouped_mm_rows_do_not_depend_on_other_rows(k, n):
+    """A row's grouped_mm output does not depend on the other rows of its group nor on
+    the other groups: the batch-invariance the inference fused MoE relies on."""
     torch.manual_seed(0)
-    K, N = 128, 96
-    # Build expert-grouped tokens: 32 tokens per expert
-    per_expert = 32
-    M = per_expert * E
-    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(E, N, K, device="cuda", dtype=torch.bfloat16)
-    m_indices = torch.repeat_interleave(
-        torch.arange(E, device="cuda", dtype=torch.int32),
-        torch.tensor([per_expert] * E, device="cuda", dtype=torch.int32),
-    ).contiguous()
+    num_experts = 8
+    w = (torch.randn(num_experts, n, k, device="cuda") * 0.02).bfloat16().transpose(-2, -1)
+    probe = torch.randn(8, k, device="cuda").bfloat16()
 
-    counts = [per_expert] * E
-    y_full = _bf16_grouped_gemm_contiguous(x, w, m_indices, counts)
+    def probe_rows(counts, group):
+        """grouped_mm of the probe rows placed first in ``group``, which uses w[0]."""
+        x = torch.randn(sum(counts), k, device="cuda").bfloat16()
+        start = sum(counts[:group])
+        x[start : start + 8] = probe
+        weights = w.clone()
+        weights[group] = w[0]
+        offs = torch.tensor(counts, device="cuda").cumsum(0).int()
+        return torch._grouped_mm(x, weights, offs=offs)[start : start + 8]
 
-    # Split into halves at expert boundaries (mid-expert split is not legal for
-    # contiguous-layout DeepGEMM — must split on a boundary).
-    half = (E // 2) * per_expert
-    y0 = _bf16_grouped_gemm_contiguous(
-        x[:half].contiguous(), w, m_indices[:half].contiguous(), counts[: E // 2] + [0] * (E // 2)
-    )
-    y1 = _bf16_grouped_gemm_contiguous(
-        x[half:].contiguous(), w, m_indices[half:].contiguous(), [0] * (E // 2) + counts[E // 2 :]
-    )
-    y_cat = torch.cat([y0, y1], dim=0)
-    assert torch.equal(
-        y_full, y_cat
-    ), f"max abs diff: {(y_full.float() - y_cat.float()).abs().max().item()}"
-
-
-def test_grouped_gemm_per_expert_token_count_invariance():
-    """For a fixed expert id, the per-row output must be identical regardless of
-    how many *other* expert rows surround it in the batch."""
-    torch.manual_seed(1)
-    E, K, N = 4, 64, 48
-    w = torch.randn(E, N, K, device="cuda", dtype=torch.bfloat16)
-    x_target = torch.randn(8, K, device="cuda", dtype=torch.bfloat16)
-
-    # Layout A: just expert 1's tokens.
-    m_indices_A = torch.full((8,), 1, dtype=torch.int32, device="cuda")
-    y_A = _bf16_grouped_gemm_contiguous(x_target, w, m_indices_A, [0, 8, 0, 0])
-
-    # Layout B: expert 0 (16 rows), then expert 1 (8 rows, same x_target),
-    # then expert 3 (12 rows).
-    x_pad0 = torch.randn(16, K, device="cuda", dtype=torch.bfloat16)
-    x_pad3 = torch.randn(12, K, device="cuda", dtype=torch.bfloat16)
-    x_B = torch.cat([x_pad0, x_target, x_pad3], dim=0).contiguous()
-    m_indices_B = torch.cat(
-        [
-            torch.full((16,), 0, dtype=torch.int32, device="cuda"),
-            torch.full((8,), 1, dtype=torch.int32, device="cuda"),
-            torch.full((12,), 3, dtype=torch.int32, device="cuda"),
-        ],
-        dim=0,
-    ).contiguous()
-    y_B = _bf16_grouped_gemm_contiguous(x_B, w, m_indices_B, [16, 8, 0, 12])
-
-    # The 8 rows assigned to expert 1 inside y_B must match y_A bitwise.
-    y_B_target = y_B[16 : 16 + 8]
-    assert torch.equal(y_A, y_B_target)
+    ref = probe_rows([8] + [0] * (num_experts - 1), 0)
+    for counts, group in (
+        ([8] + [300] * 7, 0),
+        ([4096] + [16] * 7, 0),
+        ([8, 9, 33, 777, 1, 0, 64, 5000], 0),
+        ([128, 64, 500, 500, 500, 500, 500, 500], 1),
+    ):
+        assert torch.equal(probe_rows(counts, group), ref), (counts, group)
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +106,8 @@ def _build_moe_layer(hidden_size=64, ffn=128, num_experts=4, topk=1):
     return MoELayer(cfg, submodules).cuda().eval(), cfg
 
 
-def test_tegroupedmlp_batch_invariant_split(_moe_env):
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_tegroupedmlp_batch_invariant_split(_moe_env, backend):
     """Splitting the batch and concatenating outputs must give bitwise-identical
     results to the full batch — the basic batch-invariance contract."""
     from megatron.core.transformer.moe.experts import TEGroupedMLP
@@ -195,7 +119,7 @@ def test_tegroupedmlp_batch_invariant_split(_moe_env):
     M = 48
     x = torch.randn(M, 1, cfg.hidden_size, device="cuda", dtype=torch.bfloat16)
 
-    with torch.no_grad(), set_batch_invariant_mode(True):
+    with torch.no_grad(), set_batch_invariant_mode(True, backend=backend):
         y_full, _ = layer(x)
         y0, _ = layer(x[: M // 2])
         y1, _ = layer(x[M // 2 :])
@@ -206,7 +130,8 @@ def test_tegroupedmlp_batch_invariant_split(_moe_env):
     )
 
 
-def test_tegroupedmlp_per_token_invariance_across_batch_sizes(_moe_env):
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_tegroupedmlp_per_token_invariance_across_batch_sizes(_moe_env, backend):
     """The strongest batch-invariance check: a fixed set of "target" tokens must
     produce the *exact same output* regardless of what other tokens surround
     them in the batch. This is what RL log-prob parity needs."""
@@ -215,7 +140,7 @@ def test_tegroupedmlp_per_token_invariance_across_batch_sizes(_moe_env):
 
     # 8 target tokens whose outputs we lock in by running them alone.
     target = torch.randn(8, 1, cfg.hidden_size, device="cuda", dtype=torch.bfloat16)
-    with torch.no_grad(), set_batch_invariant_mode(True):
+    with torch.no_grad(), set_batch_invariant_mode(True, backend=backend):
         y_target_alone, _ = layer(target)
 
     # Now embed those same 8 tokens at different positions inside larger batches
@@ -224,7 +149,7 @@ def test_tegroupedmlp_per_token_invariance_across_batch_sizes(_moe_env):
         left = torch.randn(pad_left, 1, cfg.hidden_size, device="cuda", dtype=torch.bfloat16)
         right = torch.randn(pad_right, 1, cfg.hidden_size, device="cuda", dtype=torch.bfloat16)
         big = torch.cat([left, target, right], dim=0)
-        with torch.no_grad(), set_batch_invariant_mode(True):
+        with torch.no_grad(), set_batch_invariant_mode(True, backend=backend):
             y_big, _ = layer(big)
         y_target_in_big = y_big[pad_left : pad_left + 8]
         assert torch.equal(y_target_alone, y_target_in_big), (
@@ -235,7 +160,8 @@ def test_tegroupedmlp_per_token_invariance_across_batch_sizes(_moe_env):
         )
 
 
-def test_tegroupedmlp_invariance_under_permutation(_moe_env):
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_tegroupedmlp_invariance_under_permutation(_moe_env, backend):
     """Permuting the input batch and undoing the permutation in the output
     yields bitwise-identical results. Different routing distribution per
     micro-batch position, same kernel output."""
@@ -245,7 +171,7 @@ def test_tegroupedmlp_invariance_under_permutation(_moe_env):
     x = torch.randn(M, 1, cfg.hidden_size, device="cuda", dtype=torch.bfloat16)
 
     perm = torch.randperm(M, device="cuda")
-    with torch.no_grad(), set_batch_invariant_mode(True):
+    with torch.no_grad(), set_batch_invariant_mode(True, backend=backend):
         y_ref, _ = layer(x)
         y_perm, _ = layer(x[perm])
     y_unperm = y_perm[perm.argsort()]

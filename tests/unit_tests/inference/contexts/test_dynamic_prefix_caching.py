@@ -103,6 +103,8 @@ class PrefixCachingTestBase:
         enable_chunked_prefill=False,
         num_speculative_tokens=0,
         mtp_num_layers=None,
+        disaggregation_role=None,
+        disaggregation_shards=None,
     ):
         DynamicInferenceContext.ROUNDER = rounder
         DynamicInferenceContext.TOKEN_ROUNDER = rounder
@@ -142,6 +144,8 @@ class PrefixCachingTestBase:
             prefix_caching_eviction_policy=prefix_caching_eviction_policy,
             prefix_caching_mamba_gb=prefix_caching_mamba_gb,
             num_speculative_tokens=num_speculative_tokens,
+            disaggregation_role=disaggregation_role,
+            disaggregation_shards=disaggregation_shards,
         )
         return DynamicInferenceContext(
             model_config=transformer_config, inference_config=inference_config
@@ -1092,6 +1096,28 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert "memory-only" in caplog.text
 
     @pytest.mark.internal
+    def test_decode_engine_skips_the_mamba_prefix_cache(self, caplog):
+        # A decode engine imports each handoff straight into live SSM state, so it
+        # allocates no Mamba cache from a budget shared with prefill, and does not
+        # warn about memory-only mode: the budget was not forgotten.
+        import logging as _logging
+
+        with caplog.at_level(_logging.WARNING):
+            ctx = self._mctx(disaggregation_role="decode")
+        assert ctx.mamba_slot_allocator is None
+        assert ctx.prefix_caching_mamba_gb is None
+        assert ctx.config.prefix_caching_mamba_gb == 0.01  # the shared config is untouched
+        assert "memory-only" not in caplog.text
+        assert self._mctx(disaggregation_role="prefill").mamba_slot_allocator is not None
+
+    @pytest.mark.internal
+    def test_native_disaggregation_requires_a_role(self):
+        # Without the role a decode context would allocate the Mamba cache from the
+        # budget shared with prefill; native shards always have one to resolve.
+        with pytest.raises(AssertionError, match="disaggregation_role"):
+            self._mctx(disaggregation_shards="tp=1,role=prefill+tp=1,role=decode")
+
+    @pytest.mark.internal
     def test_mamba_cache_budget_too_small_raises(self, monkeypatch):
         # The CUDA-graph extraction scratch (sized to the per-step token-budget
         # cap, max_mamba_intermediate_states_per_step) is reserved from
@@ -1109,6 +1135,8 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
     @pytest.mark.internal
     def test_hybrid_admission_resumes_after_handoff_releases_live_slot(self):
         ctx = self._mctx(max_requests=1, rounder=1)
+        # setup_kv_transfer(role="prefill") enables transfer and handoff pinning.
+        ctx.kv_transfer_enabled = True
         ctx.kv_block_allocator.enable_handoff_pinning = True
         slot = ctx.mamba_metadata.allocate_slot()
         assert slot is not None
@@ -1130,6 +1158,50 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
 
         assert request_available
         assert ctx.mamba_metadata.mamba_state_free_slot_count == 1
+
+    @pytest.mark.internal
+    def test_hybrid_admission_counts_slots_reserved_outside_request_rows(self):
+        """A decode engine reserves live slots for incoming handoffs before they own a row.
+
+        Handoff pinning is off on decode, so the free request row must not be taken
+        as proof of a free recurrent-state slot; otherwise add_request raises.
+        """
+        ctx = self._mctx(max_requests=2, rounder=1, prefix_caching_mamba_gb=None)
+        # setup_kv_transfer(role="decode") enables transfer without handoff pinning.
+        ctx.kv_transfer_enabled = True
+        assert not ctx.kv_block_allocator.enable_handoff_pinning
+        reserved_slots = [ctx.mamba_metadata.allocate_slot() for _ in range(ctx.max_requests)]
+        assert None not in reserved_slots
+        assert ctx.total_request_count < ctx.max_requests
+        assert ctx.mamba_metadata.mamba_state_free_slot_count == 0
+        request = self._req(ctx, self._prompt(ctx.block_size_tokens))
+
+        request_available, _, _ = ctx.check_availability(request)
+
+        assert not request_available
+
+        ctx.mamba_metadata.free_slot(reserved_slots[0])
+
+        request_available, _, _ = ctx.check_availability(request)
+
+        assert request_available
+
+    @pytest.mark.internal
+    def test_hybrid_admission_asserts_slot_per_row_without_kv_transfer(self):
+        """Without KV transfer, a free request row must imply a free recurrent-state slot."""
+        ctx = self._mctx(max_requests=2, rounder=1, prefix_caching_mamba_gb=None)
+        assert not ctx.kv_transfer_enabled
+        request = self._req(ctx, self._prompt(ctx.block_size_tokens))
+
+        request_available, _, _ = ctx.check_availability(request)
+
+        assert request_available
+
+        for _ in range(ctx.max_requests):
+            assert ctx.mamba_metadata.allocate_slot() is not None
+
+        with pytest.raises(AssertionError, match="only KV transfer"):
+            ctx.check_availability(request)
 
     @pytest.mark.internal
     def test_mamba_prefill_skip_and_zero_prefill(self):

@@ -48,7 +48,7 @@ Both `GTP_remat` collectives are prefetched one step ahead, so they overlap the 
     - [2.4 Minimal end-to-end example](#24-minimal-end-to-end-example)
     - [2.5 Tuning knobs](#25-tuning-knobs)
     - [2.6 FP32-accumulation wgrad reduce-scatter (optional)](#26-fp32-accumulation-wgrad-reduce-scatter-optional)
-    - [2.7 NCCL symmetric-memory wgrad reduce-scatter (optional)](#27-nccl-symmetric-memory-wgrad-reduce-scatter-optional)
+    - [2.7 NCCL symmetric-memory GTP communication (optional)](#27-nccl-symmetric-memory-gtp-communication-optional)
     - [2.8 Batch and sequence partitioning within GTP_remat](#28-batch-and-sequence-partitioning-within-gtp_remat)
   - [3. Implementation details](#3-implementation-details)
     - [3.1 GTP\_remat architecture (Mcore ↔ TE integration)](#31-gtp_remat-architecture-mcore--te-integration)
@@ -244,8 +244,8 @@ The table below covers every GTP-related CLI flag and Python knob. "Required" me
 | `--expert-tensor-parallel-num-weight-shards` | **Required** | MoE models (to shard routed-expert weights) | — | Total ETP×EGTP_remat shards per expert weight; EGTP_remat degree = value ÷ ETP. Independent of dense axis. [§2.2](#22-required-flags) |
 | `--tensor-parallel-num-sequence-shards` | **Optional** | Split sequences within dense GTP groups | TP with SP, otherwise 1 | Includes TP/SP. Within each GTP_remat group, ranks are partitioned into batch-shard groups. Each group processes an independent microbatch, with its ranks handling different sequence partitions. [§2.8](#28-batch-and-sequence-partitioning-within-gtp_remat) |
 | `--gtp-remat-reduce-scatter-with-fp32-accumulation` | **Optional** | BF16 wgrads **and** GTP_remat axis ≥ 4 | off | Replaces the ring RS with an all-to-all + local FP32 sum to eliminate per-hop rounding error. Auto-bypassed at axis size ≤ 2. [§2.6](#26-fp32-accumulation-wgrad-reduce-scatter-optional) |
-| `--gtp-remat-nccl-ub` | **Optional** | For enabling symmetric-memory NCCL kernels on supported systems | off | Enables symmetric memory registration for the dense gtp_remat wgrad reduce-scatter path. Takes precedence over fp32-accum on its group; incompatible with `--disable-symmetric-registration`. [§2.7](#27-nccl-symmetric-memory-wgrad-reduce-scatter-optional) |
-| `--gtp-expert-remat-nccl-ub` | **Optional** | For enabling symmetric-memory NCCL kernels on supported systems | off | Enables symmetric memory registration for the routed-expert egtp_remat wgrad reduce-scatter path. [§2.7](#27-nccl-symmetric-memory-wgrad-reduce-scatter-optional) |
+| `--gtp-remat-nccl-ub [ag] [rs]` | **Optional** | For enabling symmetric-memory NCCL kernels on supported systems | off | Enables symmetric memory registration on the dense gtp_remat group. Takes a subset of `{ag, rs}`: `ag` covers the weight all-gather buffers (except the NVFP4 backward gather), `rs` the wgrad reduce-scatter send buffers; bare flag enables both. `rs` takes precedence over fp32-accum on its group; incompatible with `--disable-symmetric-registration`. [§2.7](#27-nccl-symmetric-memory-gtp-communication-optional) |
+| `--gtp-expert-remat-nccl-ub [ag] [rs]` | **Optional** | For enabling symmetric-memory NCCL kernels on supported systems | off | Like `--gtp-remat-nccl-ub` but for the routed-expert egtp_remat group. [§2.7](#27-nccl-symmetric-memory-gtp-communication-optional) |
 | `--gtp-remat-opt-in-modules` | **Optional** | MoE models with large `--moe-latent-size` | `[]` | Space-separated list of module tokens to opt in to GTP_remat sharding. Currently supported: `moe_latent_proj` (shards `fc1_latent_proj` / `fc2_latent_proj`; only beneficial when the latent size is large enough to amortize the all-gather). [§1.5](#15-opt-in-minimally-invasive-integration) |
 | `--fp8-param-gather` | **Required** | GTP + `--fp8-recipe mxfp8` | off | Gathers native MXFP8 shard directly; without it the grad-buffer reuse path is unavailable and `arguments.py` asserts. Always paired with `--reuse-grad-buf-for-mxfp8-param-ag`. [§1.3](#13-low-precision-gather-native-fp8--nvfp4-param) |
 | `--reuse-grad-buf-for-mxfp8-param-ag` | **Required** | GTP + `--fp8-recipe mxfp8` | off | Reuses the grad buffer for the MXFP8 all-gather (MXFP8 cannot map into the contiguous param buffer). Must accompany `--fp8-param-gather`. [§1.3](#13-low-precision-gather-native-fp8--nvfp4-param) |
@@ -396,14 +396,22 @@ it** — a different collective over a different process group, so enable either
   `async_op=True`: for this primitive that flag defers the sum, it does not merely return a
   handle. (DDP's own flag sidesteps all this by asserting a single bucket.)
 
-### 2.7 NCCL symmetric-memory wgrad reduce-scatter (optional)
+### 2.7 NCCL symmetric-memory GTP communication (optional)
 
 ```bash
---gtp-remat-nccl-ub         # dense gtp_remat group           default: off
---gtp-expert-remat-nccl-ub  # routed-expert egtp_remat group  default: off
+--gtp-remat-nccl-ub [ag] [rs]         # dense gtp_remat group           default: off
+--gtp-expert-remat-nccl-ub [ag] [rs]  # routed-expert egtp_remat group  default: off
 ```
 
-**Allocates the wgrad reduce-scatter send buffers from an NCCL-window-registered memory pool on the gtp_remat / egtp_remat group, so NCCL runs the reduce-scatter as a single symmetric device kernel — NVLS multimem within an NVLink domain, rail kernels when the group spans domains — instead of a ring.** Only the send side needs registration; the sharded output lands in the ordinary `main_grad`.
+**Allocates GTP communication buffers from an NCCL-window-registered memory pool on the gtp_remat / egtp_remat group, so NCCL runs the collectives as single symmetric device kernels — NVLS multimem within an NVLink domain, rail kernels when the group spans domains — instead of rings.** Each flag takes a subset of `{ag, rs}`; a bare flag enables both.
+
+- **`rs`** registers the wgrad reduce-scatter send buffers. Only the send side needs
+  registration; the sharded output lands in the ordinary `main_grad`.
+- **`ag`** registers the weight all-gather on both sides: the input (the pre-sharded weight
+  storage; under the distributed optimizer, the DDP param buffer the optimizer re-homes params
+  into) and the output (the gathered-weight cache buffers). Inputs DDP does not re-home, such
+  as frozen weights, are moved into the pool by `move_gtp_weights_to_symm_pool(model)`, which
+  `training.py` calls after the DDP wrap.
 
 | | |
 |---|---|
@@ -425,14 +433,20 @@ it** — a different collective over a different process group, so enable either
   out its own reduce-scatter and reuses the buffer, giving up one overlap to avoid a permanent
   allocation. The wait is skipped under CUDA-graph capture, where the branch would bake into the
   graph.
-- **FP32-accumulation interplay.** A registered pool takes precedence over §2.6 on its group:
+- **FP32-accumulation interplay.** A pool registered with `rs` takes precedence over §2.6 on its group:
   NVLS symmetric reduce-scatters accumulate in fp32 in-switch (NCCL's `multimem.ld_reduce` uses
   `.acc::f32` for bf16), so the group keeps the symmetric reduce-scatter and the fp32-accum
   all-to-all applies only to axes without a pool. E.g. `--gtp-remat-nccl-ub` + §2.6 gives a
   symmetric dense-GTP reduce-scatter and the fp32-accum all-to-all on the EGTP axis.
 - **Independent of `--use-nccl-ub`.** That flag registers DP-group (DDP bucket) buffers; these
   flags cover the gtp_remat axes only.
-- **Pool allocator.** The pools are backed by a VMM allocator implementing [NCCL's
+- **NVFP4 backward all-gather is not symmetric yet.** TE gathers NVFP4 columnwise (backward)
+  data into its own temporary buffers before reordering it, so that gather runs outside the
+  pool. The NVFP4 forward gather and the BF16/MXFP8 gathers use the pool.
+- **Pool allocator.** The GTP pools use a VMM allocator when available, falling back to
+  `ncclMemAlloc`. Under `ag`, the DDP param buffer uses the same allocator choice when
+  `--use-nccl-ub` is off; with `--use-nccl-ub` it keeps DDP's own NCCL pool, which is then
+  registered on both the DP and the GTP groups. The VMM allocator implements [NCCL's
   memory-allocator requirements](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#memory-allocator)
   minimally: unlike `ncclMemAlloc`, memory is mapped only on the allocation's device.
   `ncclMemAlloc` additionally maps every allocation on all P2P-visible peer GPUs, and those
@@ -771,8 +785,10 @@ A weight can be kept **out** of a chain by setting `weight.prefetch_initialized 
 
 **Production defaults require no user calls.** After DDP wrapping,
 `classify_gtp_remat_chains` registers dense, grouped-expert FC1, and grouped-expert FC2
-chains per process group, preserving explicit overrides and skipping replicated weights.
-Both Mamba projections stay in the dense chain.
+chains per process group and model chunk, preserving explicit overrides and skipping
+replicated weights. Both Mamba projections stay in their chunk's dense chain.
+Virtual pipeline chunks execute forward and backward independently; separate default
+chains prevent one chunk's gather from overwriting another chunk's live weight buffer.
 
 For a custom chain, register after parameter wrapping and before classification/warmup:
 
@@ -856,16 +872,29 @@ The chain stays a plain linear list — one slot per weight, no branching. MTP i
 
 - **Per-consume gradients accumulate.** Every consume produces its own wgrad and its own reduce-scatter, and the weight's `main_grad` ends up holding their sum — which is its true gradient. A weight keeps only one reduce-scatter in flight at a time, so an outstanding one is completed and accumulated before the next begins.
 
-  **`output_layer` is the exception**: its consumes sum into one buffer *before* the collective —
-  **one reduce-scatter per iteration**, not one per consume per microbatch. The count is learned
-  in iteration 1; the backward fence closes the window and fires DDP grad-ready once. **Off under
-  `--step-batch-size-schedule`**, where a rising count fires grad-ready twice and drops a
-  contribution. It is the only opt-in — TE-backed weights (`eh_proj`, the replayed layer) never
-  reach the hook.
+  **`output_layer` is the exception**: eligible linear uses accumulate before the collective,
+  producing **one reduce-scatter per accumulation window**. The non-pipeline schedule calls
+  `finalize_gtp_forward_counts(model)` after its last forward and before its last backward.
+  `WgradAccumulationWindow` tracks outstanding uses: each counted forward adds one,
+  and each backward removes one. Closing the forward window allows reduction when
+  that count reaches zero, including repeated MTP heads, with compute left to overlap.
+  Counts never depend on the global microbatch calculator or a previous iteration.
+  Grad-disabled or unexpected forwards select an explicit `FENCE_ONLY` state until
+  finalization resets the window; counters never double as fallback flags.
+
+  Custom loops can call the same API, or omit it and flush at the final GTP fence. Both
+  paths require `finalize_model_grads` (or the equivalent GTP fence before DDP finalization
+  and optimizer use). The fallback, also used by the combined MoE schedule, loses backward
+  overlap. Disconnected forwards, recomputation, and grad-disabled uses can select this
+  fallback. The early path requires at most one backward per counted forward; further
+  forwards or backwards after an early reduction raise an error.
+
+  Pipeline-parallel and CUDA-graphed weights retain per-consume reduction. TE-backed weights
+  never reach this accumulation hook.
 
 - **The deferred finalize is conditional.** Normally a weight finalizes its chain *successor's* reduce-scatter, hiding that latency behind the next backward. Once backward stops following chain order, the successor may not have started one yet, so the finalize runs only when something is actually in flight.
 
-The first rule always applies. The other two apply only under `async_reduction`; with it off, every wgrad reduce-scatters and accumulates inline.
+Output-layer accumulation is independent of `async_reduction`. Deferred finalization applies only when that option is on; with it off, each issued reduce-scatter completes inline.
 
 > Both hazards are **silent**. A stale gather keeps the loss finite and merely wrong, and a dropped reduce-scatter trains on an incomplete gradient — neither raises. The state guard that would catch the first (`check_param_states`) is off outside debug builds.
 

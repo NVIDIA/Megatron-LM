@@ -108,6 +108,26 @@ Detailed documentation for each feature is available in the [Feature Documentati
 ### Use the pre-defined config to train the popular MoE models
 We have provided some pre-defined config to train the popular MoE models in the [Megatron-MoE-Model-Zoo](https://github.com/yanring/Megatron-MoE-ModelZoo/tree/main) repository. You can use them as a reference to configure your training script. Currently we have added the config for Mixtral 8x7B, Mixtral 8x22B, DeepSeek-V3, Qwen3-30B-A3B, Qwen3-235B-A22B.
 
+### Default backends and SequentialMLP deprecation
+
+The default training token dispatcher is `alltoall`, and `moe_grouped_gemm=True` selects grouped
+experts on the Transformer Engine backend. Existing
+`--moe-grouped-gemm` launch arguments remain valid. To explicitly use the previous choices,
+pass `--moe-token-dispatcher-type allgather` and `--no-moe-grouped-gemm` (also spelled
+`--disable-moe-grouped-gemm`). Python callers can set `moe_grouped_gemm=False`.
+
+`SequentialMLP` is deprecated. Constructing it emits a `FutureWarning` once on the primary rank.
+It remains available for local-backend, checkpoint, and per-expert post-training workflows.
+The local backend still selects `SequentialMLP` even with `moe_grouped_gemm=True`; migrate to
+the Transformer Engine backend to use `TEGroupedMLP`. Grouped experts require `add_bias_linear=False` or
+`bias_dropout_fusion=False` when using linear biases.
+
+With `--use-checkpoint-args`, an explicitly saved `moe_grouped_gemm` setting is still restored;
+changing the default does not convert a SequentialMLP checkpoint's weight or optimizer layout.
+The dispatcher remains a runtime choice: pass `--moe-token-dispatcher-type allgather` explicitly
+to retain it when resuming. Inference-specific dispatchers and optional GroupedTensor, fused MLP,
+and single-grouped-weight settings retain their existing defaults.
+
 ### General Performance Tips
 #### Training arguments
 The following flags are general performance flags that can help to achieve higher performance on almost all workloads. Check if you have enabled all of them in your training script.
@@ -633,7 +653,7 @@ target is unsupported.
 | Parallelism | TP=1, expert TP=1, EP in {1, 4, 8, 16, 32, 64}; each EP group must fit within one NVLink domain supporting PyTorch symmetric memory and multicast |
 | Shapes | Hidden and expert intermediate sizes divisible by 256; at least 512 local tokens per rank, divisible by 256; identical token, hidden, and top-k shapes across EP ranks |
 | Recomputation | Whole-MoE activation recompute |
-| CUDA Graph | Full-iteration capture |
+| CUDA Graph | Full-iteration capture; per-layer Transformer Engine capture with the `moe` scope or whole-layer capture (empty `cuda_graph_modules`), whose graph contains the router and the megakernel (Transformer Engine 2.19 or later and `pipeline_model_parallel_size=1`; not with `moe` in `recompute_modules`). The capture requires a `padding_mask` model input in at least one eager warm-up step (`cuda_graph_warmup_steps` > 0; an all-False mask is enough) and raises an error without one, because the capture warm-up would route every token to the same experts and can exceed MOK's schedule capacity (a device-side trap). Runs whose batches carry no `padding_mask` must keep the MoE layer out of the graph (for example `cuda_graph_modules=[attn]`). Only `moe_router_force_load_balancing` (benchmark-only random routing) is exempt |
 | Checkpointing | Save/resume with unchanged backend, weight layout, and parallel configuration |
 
 Wgrad GEMMs accumulate in FP32. The destination `main_grad` dtype selects the reduction-store
@@ -650,15 +670,28 @@ require this mode in the current MCore buffer implementation. MOK aliases the na
 and refreshes its converted scale buffers once per optimizer iteration. The adapter requires
 both native weight layouts; TE's `post_all_gather_processing` is not an MXFP8 capability check.
 
-Per-layer whole-layer capture is distinct from `cuda_graph_impl=full_iteration`. Supporting
-per-layer MOK replay needs saved-state stashing or a recompute path for pending microbatches;
-static input token counts alone do not establish that lifecycle.
+Per-layer whole-layer capture (empty `cuda_graph_modules`) is distinct from
+`cuda_graph_impl=full_iteration`. Per-layer MOK replay goes through a Transformer Engine graph that
+contains the megakernel: the `moe` scope, or whole-layer capture, whose graph also contains the
+rest of the layer. The layer refreshes MOK's weight views eagerly before each replay. The `moe`
+scope was validated only without pipeline parallelism, where each microbatch's backward runs before
+the next microbatch replays the layer's graph, so both require `pipeline_model_parallel_size=1`.
+Pipeline schedules keep several microbatches in flight, and per-layer MOK replay has not been
+validated there. Transformer Engine's capture warm-up runs the layer on static inputs whose
+all-ones hidden states route every token to the same experts. The layer's static `padding_mask`
+input marks every token as padding, so the warm-up routes none, and each replay copies the batch's
+mask into it. The layer reserves that input only if a `padding_mask` reached it during the eager
+warm-up steps (`cuda_graph_warmup_steps` > 0). Otherwise the capture raises an error before the
+warm-up, unless `moe_router_force_load_balancing` (benchmark-only random routing) is set, so a run
+whose batches carry no `padding_mask` must keep the MoE layer out of the graph, for example with
+`cuda_graph_modules=[attn]`. Graphs that end between the router and MOK are not supported: capture
+the whole MoE layer, or leave it out of the graph.
 
 The current backend requires grouped experts and fused gradient accumulation. It does not support
 linear biases, applying router probabilities to expert inputs, MCore EP 1F1B overlap or delayed
 wgrad, native shared-expert overlap, shared-expert-only
 recompute, latent MoE, GTP weight rematerialization, shortcut MoE, inference-optimized layers,
-partial MoE CUDA Graph replay, MCore expert-input
+the `moe_router` and `moe_preprocess` CUDA Graph scopes, MCore expert-input
 capacity padding, FC1 GLU-interleaved weights, or checkpoint conversion between physical weight
 layouts.
 
@@ -750,7 +783,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 ### Token Dispatching
 | Argument | Description | Default |
 |----------|-------------|---------|
-| --moe-token-dispatcher-type | Dispatcher: allgather, alltoall, flex | allgather |
+| --moe-token-dispatcher-type | Dispatcher: allgather, alltoall, flex | alltoall |
 | --moe-enable-deepep | Enable DeepEP (with flex) | False |
 | --moe-expert-capacity-factor | Capacity factor | None |
 | --moe-pad-expert-input-to-capacity | Pad to capacity | False |
@@ -760,7 +793,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 ### Performance Optimization
 | Argument | Description | Default |
 |----------|-------------|---------|
-| --moe-grouped-gemm | Use GroupedGEMM | False |
+| --moe-grouped-gemm | Use GroupedGEMM; disable with --no-moe-grouped-gemm | True |
 | --overlap-moe-expert-parallel-comm | Batch-level EP overlap | False |
 | --delay-wgrad-compute | Split dgrad/wgrad compute | False |
 | --moe-shared-expert-intermediate-size | Shared expert FFN size | None |

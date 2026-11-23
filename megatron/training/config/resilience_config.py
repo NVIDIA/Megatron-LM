@@ -7,8 +7,42 @@ from megatron.core.rerun_state_machine import RerunDiagnostic, RerunMode
 
 
 @dataclass(kw_only=True)
+class FaultToleranceConfig:
+    """Fault monitoring and autoresume policy, separate from optional fault injection."""
+
+    adlr_autoresume: bool = False
+    """Enable autoresume on the ADLR cluster."""
+
+    adlr_autoresume_interval: int = 1000
+    """Interval in training iterations between autoresume termination checks."""
+
+    enable_ft_package: bool = False
+    """Enable NVIDIA Resiliency Extension (NVRx) fault-tolerance monitoring.
+
+    Requires nvidia-resiliency-ext and launching the workload with ft_launcher.
+    """
+
+    calc_ft_timeouts: bool = False
+    """Automatically compute FT timeouts from observed intervals."""
+
+    ft_num_warmup_iters: int = 5
+    """Warmup iterations excluded from step timeout monitoring."""
+
+    fault_injector: FaultInjectorConfig | None = None
+    """Optional fault injection settings, independent of enable_ft_package.
+
+    Injection is disabled unless ranks or a number of ranks is configured, as on the CLI.
+    """
+
+
+@dataclass(kw_only=True)
 class RerunStateMachineConfig:
     """Configuration for the rerun state machine used for result validation or stats."""
+
+    spiky_loss_factor: float = 10.0
+    """Reject GPT/hybrid loss above this multiple of the observed maximum when enabled.
+    Defaults to the existing 10x threshold; RL uses a separate percentage-based check.
+    """
 
     error_injection_rate: int = 0
     """Rate at which to inject unexpected results, e.g. 1000 means

@@ -70,6 +70,7 @@ def test_grouped_tensor_requires_grouped_gemm():
             hidden_size=128,
             num_attention_heads=4,
             num_moe_experts=2,
+            moe_grouped_gemm=False,
             moe_use_grouped_tensor=True,
         )
 

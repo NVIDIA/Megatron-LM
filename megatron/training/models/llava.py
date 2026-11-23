@@ -20,6 +20,24 @@ class LLaVAModelConfig:
     seq_length: int
     """Maximum position capacity, not the image or text data sequence length."""
 
+    img_h: int = 224
+    """Vision input height, also consumed by image preprocessing."""
+
+    img_w: int = 224
+    """Vision input width, also consumed by image preprocessing."""
+
+    patch_dim: int = 16
+    """Vision patch size."""
+
+    drop_vision_class_token: bool = False
+    """Drop vision class tokens before projecting image embeddings."""
+
+    freeze_language_model: bool = False
+    """Freeze language-model parameters."""
+
+    freeze_vision_model: bool = False
+    """Freeze vision-encoder parameters."""
+
     vocab_size: int | None = None
     """Language-model vocabulary, or None until tokenizer initialization."""
 
@@ -55,3 +73,19 @@ class LLaVAModelConfig:
 
     tp_comm_overlap_cfg: str | dict[str, Any] | None = None
     """Transformer Engine user-buffer overrides, as a YAML path or dictionary."""
+
+    def validate(self) -> None:
+        """The language execution width is an input of the application, never a data default."""
+        bound = self.transformer.max_seq_length_per_sample
+        if bound is None:
+            raise ValueError(
+                "LLaVA requires transformer.max_seq_length_per_sample, the resolved text + image + "
+                "padding width (--decoder-seq-length or --max-seq-length-per-sample); it is not "
+                "derived from the text-only dataset length"
+            )
+        if (
+            self.position_embedding_type == "learned_absolute"
+            and isinstance(self.seq_length, int)  # None until the CLI's required capacity is read
+            and self.seq_length < bound
+        ):
+            raise ValueError("LLaVA position capacity must cover max_seq_length_per_sample")
