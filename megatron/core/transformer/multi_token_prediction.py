@@ -51,6 +51,7 @@ from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
     get_pg_rank,
     get_pg_size,
+    is_te_min_version,
     is_torch_min_version,
     make_tp_sharded_tensor_for_checkpoint,
     make_viewless_tensor,
@@ -1601,6 +1602,9 @@ class MultiTokenPredictionLayer(MegatronModule):
         """
         if config.keep_mtp_in_bf16:
             config = deepcopy(config)
+            if config.fp8 is not None and not is_te_min_version("2.7.0"):
+                # Transformer Engine before 2.7 registers user buffers for one precision only.
+                config.tp_comm_overlap = False
             config.fp4 = None
             config.fp8 = None
         super().__init__(config=config)

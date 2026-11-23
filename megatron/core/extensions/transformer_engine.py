@@ -2043,6 +2043,8 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
         # Match ColumnParallelLinear.backward_dw's no-op so the LM head keeps
         # the same wgrad-timing behavior it had before this subclass existed.
         te_config.delay_wgrad_compute = False
+        # Transformer Engine has no user buffer for the vocabulary projection.
+        te_config.tp_comm_overlap = False
 
         super().__init__(
             input_size=input_size,

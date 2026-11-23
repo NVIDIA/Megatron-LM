@@ -320,11 +320,11 @@ def _initialize_tp_communicators(
         quantization_modes = [
             UserBufferQuantizationMode.FP8 if config.fp8 else UserBufferQuantizationMode.NONE
         ]
-        if (
-            config.fp8 is not None
-            and config.first_last_layers_bf16
-            and (config.num_layers_at_start_in_bf16 > 0 or config.num_layers_at_end_in_bf16 > 0)
-        ):
+        bf16_first_last_layers = config.first_last_layers_bf16 and (
+            config.num_layers_at_start_in_bf16 > 0 or config.num_layers_at_end_in_bf16 > 0
+        )
+        bf16_mtp = config.keep_mtp_in_bf16 and bool(config.mtp_num_layers)
+        if config.fp8 is not None and (bf16_first_last_layers or bf16_mtp):
             quantization_modes.append(UserBufferQuantizationMode.NONE)
         # The process group with the target bootstrap backend is created in Transformer Engine.
         te_module.base.initialize_ub(

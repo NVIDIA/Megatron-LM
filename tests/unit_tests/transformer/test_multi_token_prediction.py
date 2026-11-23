@@ -789,6 +789,44 @@ class TestMultiTokenPredictionLayer:
             assert num_weights == 15216 * config.mtp_num_layers
 
     @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
+    @pytest.mark.parametrize('te_registers_bf16_buffers', [True, False])
+    def test_bf16_mtp_in_fp8_model_overlaps_only_with_bf16_user_buffers(
+        self, monkeypatch, te_registers_bf16_buffers
+    ):
+        """Transformer Engine before 2.7 has FP8 user buffers only, so a BF16 MTP block skips overlap."""
+        tp = 2
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
+        monkeypatch.setattr(
+            mtp_module, "is_te_min_version", lambda version: te_registers_bf16_buffers
+        )
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=8,
+            tensor_model_parallel_size=tp,
+            tp_comm_overlap=True,
+            fp8="hybrid",
+            keep_mtp_in_bf16=True,
+        )
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=get_gpt_mtp_block_spec(
+                config=config,
+                spec=get_gpt_layer_with_transformer_engine_spec(),
+                use_transformer_engine=True,
+            ),
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['cp', 'tp', 'pp']
+            ),
+        )
+
+        linear_fc1 = mtp.layers[0].mtp_model_layer.mlp.linear_fc1
+        assert (config.fp8, config.tp_comm_overlap) == ("hybrid", True)
+        assert mtp.layers[0].config.fp8 is None
+        assert linear_fc1.ub_name == ("fc1" if te_registers_bf16_buffers else None)
+
+    @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
     @pytest.mark.parametrize('repeated', [False, True])
     def test_repeated_layer_opts_out_of_is_first_microbatch(self, repeated):
         """A shared MTP layer must hand TE None, because its first forward is its last backward."""

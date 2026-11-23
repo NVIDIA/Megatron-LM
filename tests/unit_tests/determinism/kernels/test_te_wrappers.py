@@ -632,6 +632,36 @@ class TestTEWrappers:
         assert unsupported.ub_name is None
         assert supported.ub_name == "fc1"
 
+    def test_lm_head_without_buffer_name_builds_while_tp_comm_overlap_is_on(self):
+        """The TE LM head has no userbuffer, so it runs without overlap and changes no other layer."""
+        config = _config(
+            tp_comm_overlap=True, fp8="hybrid", fp8_recipe="mxfp8", fp8_output_proj=True
+        )
+
+        def build(input_size: int, tp_comm_buffer_name: str) -> torch.nn.Module:
+            return te_ext.TEColumnParallelLinear(
+                input_size,
+                HIDDEN,
+                config=config,
+                init_method=init_method_normal(0.02),
+                gather_output=False,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name=tp_comm_buffer_name,
+            )
+
+        with pytest.warns(UserWarning, match="mtp_eh_proj"):
+            build(2 * HIDDEN, "mtp_eh_proj")
+        lm_head = te_ext.TELMHeadColumnParallelLinear(
+            HIDDEN, FFN, config=config, init_method=init_method_normal(0.02), bias=False
+        )
+        supported = build(HIDDEN, "fc1")
+
+        assert config.tp_comm_overlap is True
+        assert lm_head.ub_name is None
+        assert supported.ub_name == "fc1"
+
     @pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
     @pytest.mark.parametrize("zero_centered_gamma", [False, True])
     def test_te_layernorm_column_parallel_linear_replays(self, normalization, zero_centered_gamma):
