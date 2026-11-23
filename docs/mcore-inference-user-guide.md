@@ -155,8 +155,11 @@ workload rather than generalizing from any single comparison.
 > training-policy comparisons. Batch invariance needs no extra dependency: training
 > experts use TE's native grouped GEMM under the starved cuBLASLt workspace with
 > either backend, and the `torch` inference backend's BF16 experts use
-> `torch._grouped_mm`. Context parallelism and attention dropout are not supported
-> in either case. MXFP8 training uses
+> `torch._grouped_mm`. Attention dropout is not supported in either case. Training
+> supports context parallelism only with `cp_comm_type="all_gather"` for every layer
+> (no hierarchical CP), Transformer Engine >= 2.20 and FlashAttention 4; its forward
+> then matches the CP=1 forward bitwise. Inference does not support context
+> parallelism, so generation runs at CP=1. MXFP8 training uses
 > `batch_invariant_backend="te_native"`. Legacy TE GroupedLinear remains the
 > default. On SM100 with cuBLASLt 13.5.1, `moe_use_grouped_tensor=True` opts into
 > TE device-metadata grouped GEMM and its required 256-row expert padding.

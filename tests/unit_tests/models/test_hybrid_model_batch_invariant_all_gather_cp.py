@@ -23,7 +23,9 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.tuning import AutotunePolicy, install, set_deterministic_mode
+from megatron.core.tuning import AutotunePolicy, active_policy, install
+from megatron.core.tuning import policy as tuning_policy
+from megatron.core.tuning import set_deterministic_mode
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
@@ -274,6 +276,10 @@ class TestBatchInvariantAllGatherContextParallel:
         # Inputs are built on "cuda" before the parallel state sets each rank's device.
         torch.cuda.set_device(Utils.local_rank % torch.cuda.device_count())
         # Pinned kernel configs, so CP=1 and CP>1 shapes cannot autotune to different kernels.
+        # Teardown restores the incoming state: the determinism kernel package installs a
+        # pinned policy for the whole session.
+        self._incoming_deterministic_mode = tuning_policy._deterministic_override
+        self._incoming_policy = active_policy()
         set_deterministic_mode(True)
         install(AutotunePolicy(mode="pinned"))
         torch.backends.cuda.matmul.allow_tf32 = False
@@ -284,8 +290,8 @@ class TestBatchInvariantAllGatherContextParallel:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
-        set_deterministic_mode(None)
-        install(None)
+        set_deterministic_mode(self._incoming_deterministic_mode)
+        install(self._incoming_policy)
         if torch.distributed.is_initialized():
             # Model-parallel teardown drops MCore's references, but PyTorch keeps the NCCL
             # subgroups of both model setups in every case alive for the rest of the
