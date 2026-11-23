@@ -10,8 +10,6 @@ import numpy as np
 import pandas as pd
 import torch
 
-from megatron.core.datasets.utils import Split
-
 from examples.financial_timeseries.preprocessing import (
     PatchStore,
     PreprocConfig,
@@ -25,6 +23,7 @@ from examples.financial_timeseries.preprocessing import (
     build_split_tensors,
     build_store,
 )
+from megatron.core.datasets.utils import Split
 
 
 def _store() -> PatchStore:
@@ -477,7 +476,12 @@ class DatasetSplitTest(unittest.TestCase):
     def test_index_split_follows_split_name(self):
         from examples.financial_timeseries.ts_dataset import FinancialMarketDataset
 
-        expected = {"train": Split.train, "val": Split.valid, "valid": Split.valid, "test": Split.test}
+        expected = {
+            "train": Split.train,
+            "val": Split.valid,
+            "valid": Split.valid,
+            "test": Split.test,
+        }
         with tempfile.TemporaryDirectory() as d:
             for name, split in expected.items():
                 path = Path(d) / f"{name}.pt"
