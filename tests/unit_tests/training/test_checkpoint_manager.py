@@ -136,6 +136,19 @@ class TestCreateCheckpointManager:
             cm.create_checkpoint_manager(_config(target))
 
 
+class TestManagerReportsCheckpointing:
+    def test_default_manager_reports_itself(self):
+        assert cm.manager_reports_checkpointing(cm.DefaultCheckpointManager(_config()))
+
+    def test_custom_manager_is_reported_by_the_trainer_unless_it_opts_in(self):
+        assert not cm.manager_reports_checkpointing(_GoodManager(_config()))
+
+        class _SelfReporting(_GoodManager):
+            reports_checkpointing = True
+
+        assert cm.manager_reports_checkpointing(_SelfReporting(_config()))
+
+
 class TestDefaultCheckpointManager:
     def test_save_forwards_every_context_field(self):
         groups = {name: object() for name in _GROUP_NAMES}

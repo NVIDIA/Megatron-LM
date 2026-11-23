@@ -166,6 +166,11 @@ class CheckpointManager(Protocol):
 class DefaultCheckpointManager:
     """Delegates to the functional checkpoint code (``save_checkpoint`` and friends)."""
 
+    # ``save_checkpoint`` already starts and ends the fault-tolerance "checkpointing" section and
+    # counts the save. The trainer does this for any manager that does not (see
+    # ``manager_reports_checkpointing``), so each save is counted exactly once.
+    reports_checkpointing = True
+
     def __init__(self, checkpoint_config: "CheckpointConfig") -> None:
         self.checkpoint_config = checkpoint_config
 
@@ -343,6 +348,16 @@ def get_checkpoint_manager() -> CheckpointManager:
         _checkpoint_manager = create_checkpoint_manager(checkpoint_config)
         _checkpoint_manager_config = checkpoint_config
     return _checkpoint_manager
+
+
+def manager_reports_checkpointing(manager: CheckpointManager) -> bool:
+    """Whether ``manager.save`` already reports the save to the fault-tolerance monitor.
+
+    Custom managers default to ``False``, so the trainer brackets their ``save`` with the
+    checkpointing section and counts it. Set ``reports_checkpointing = True`` on a manager whose
+    ``save`` calls ``ft_integration.on_checkpointing_start/end`` itself (as the native one does).
+    """
+    return bool(getattr(manager, "reports_checkpointing", False))
 
 
 def set_checkpoint_manager(manager: Optional[CheckpointManager]) -> None:

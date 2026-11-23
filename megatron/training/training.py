@@ -155,6 +155,7 @@ from megatron.training.checkpoint_manager import (
     CheckpointLoadContext,
     CheckpointSaveContext,
     get_checkpoint_manager,
+    manager_reports_checkpointing,
 )
 from megatron.training.checkpointing import (
     checkpoint_exists,
@@ -4193,30 +4194,40 @@ def save_checkpoint_and_time(
 
         # Save checkpoint.
         with _otel_managed_span('checkpoint', 'megatron.checkpoint.save', is_goodput_span=True, **{'megatron.iteration': iteration}):
-            get_checkpoint_manager().save(
-                CheckpointSaveContext(
-                    iteration=iteration,
-                    model=model,
-                    optimizer=optimizer,
-                    opt_param_scheduler=opt_param_scheduler,
-                    num_floating_point_operations_so_far=num_floating_point_operations_so_far,
-                    checkpointing_context=checkpointing_context,
-                    non_persistent_ckpt=non_persistent_ckpt,
-                    train_data_iterator=train_data_iterator,
-                    preprocess_common_state_dict_fn=preprocess_common_state_dict,
-                    tp_group=tp_group,
-                    pp_group=pp_group,
-                    dp_cp_group=dp_cp_group,
-                    dp_group=dp_group,
-                    dp_gtp_remat_group=dp_gtp_remat_group,
-                    expt_dp_group=expt_dp_group,
-                    rng_state_key_prefix=rng_state_key_prefix,
-                    cp_group=cp_group,
-                    on_saved=on_saved,
-                    train_state=get_train_state(),
-                    config=get_run_config(),
+            # The native save reports itself to the fault-tolerance monitor; for any other manager
+            # the trainer starts/ends the checkpointing section and counts the save once.
+            checkpoint_manager = get_checkpoint_manager()
+            report_to_ft = not manager_reports_checkpointing(checkpoint_manager)
+            if report_to_ft:
+                ft_integration.on_checkpointing_start()
+            try:
+                checkpoint_manager.save(
+                    CheckpointSaveContext(
+                        iteration=iteration,
+                        model=model,
+                        optimizer=optimizer,
+                        opt_param_scheduler=opt_param_scheduler,
+                        num_floating_point_operations_so_far=num_floating_point_operations_so_far,
+                        checkpointing_context=checkpointing_context,
+                        non_persistent_ckpt=non_persistent_ckpt,
+                        train_data_iterator=train_data_iterator,
+                        preprocess_common_state_dict_fn=preprocess_common_state_dict,
+                        tp_group=tp_group,
+                        pp_group=pp_group,
+                        dp_cp_group=dp_cp_group,
+                        dp_group=dp_group,
+                        dp_gtp_remat_group=dp_gtp_remat_group,
+                        expt_dp_group=expt_dp_group,
+                        rng_state_key_prefix=rng_state_key_prefix,
+                        cp_group=cp_group,
+                        on_saved=on_saved,
+                        train_state=get_train_state(),
+                        config=get_run_config(),
+                    )
                 )
-            )
+            finally:
+                if report_to_ft:
+                    ft_integration.on_checkpointing_end(is_async_finalization=False)
 
             # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
             # Since timer.log() reports the min & max time, we do not need a barrier here.
