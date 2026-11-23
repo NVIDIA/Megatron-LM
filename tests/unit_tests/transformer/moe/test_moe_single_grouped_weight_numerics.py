@@ -35,6 +35,7 @@ from megatron.training.global_vars import (
 from megatron.training.training import force_param_sync, setup_model_and_optimizer
 from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
+from tests.unit_tests.process_group_test_utils import cleanup_process_groups
 from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 try:
