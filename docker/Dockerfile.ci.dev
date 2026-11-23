@@ -128,8 +128,8 @@ ARG NVTE_CUDA_ARCHS="80;90;100"
 # concurrently; the uv sync below then caps concurrent sources to keep the compiler budget.
 ARG NVTE_BUILD_THREADS_PER_JOB
 # Keep compiled wheels separate when the CPU or TE GPU targets change. The frontend
-# suffix forces TE to rebuild against the fixed 1.32 headers rather than reuse an old wheel.
-RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS}-cudnn-fe-1.32,target=/root/.cache/uv \
+# suffix forces TE to rebuild against the 1.33 headers rather than reuse an old wheel.
+RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS}-cudnn-fe-1.33,target=/root/.cache/uv \
     bash -ex <<"EOF"
     export TMS_CUDA_MAJOR="$("${CUDA_HOME:-/usr/local/cuda}"/bin/nvcc --version | sed -n 's/.*release \([0-9][0-9]*\).*/\1/p' | head -1)"
     test -n "$TMS_CUDA_MAJOR"
@@ -174,6 +174,24 @@ RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS}-cudnn-fe-1.32,targ
         --no-install-package nvidia-cusparselt-cu12 \
         --no-install-package nvidia-nccl-cu12
 
+    # FA2 owns the inherited flash_attn namespace and searches its directory first.
+    # Remove only the old FA4 distribution so its CuTe code cannot shadow the locked wheel.
+    FA4_BASE_PYTHON=$(python -c 'import sys; print(sys._base_executable)')
+    uv --no-config pip uninstall --python "${FA4_BASE_PYTHON}" --break-system-packages flash-attn-4
+    # Explicit FA4 configurations have no fallback if TE rejects the installed backend.
+    python - <<'PY'
+from importlib.metadata import distribution
+from pathlib import Path
+
+import flash_attn.cute
+from transformer_engine.pytorch.attention.dot_product_attention.utils import FlashAttentionUtils
+
+assert FlashAttentionUtils.v4_is_installed, f"TE could not load FA4 {FlashAttentionUtils.fa4_version}"
+loaded_fa4 = Path(flash_attn.cute.__file__).resolve()
+locked_fa4 = Path(distribution("flash-attn-4").locate_file("flash_attn/cute/__init__.py")).resolve()
+assert loaded_fa4 == locked_fa4, f"FA4 import {loaded_fa4} does not match locked wheel {locked_fa4}"
+PY
+
     # NCCL EP embeds its build-time JIT header path in Transformer Engine. Persist the headers
     # outside the BuildKit cache mount so zero-copy kernels can be compiled at runtime.
     TE_REV=$(sed -n 's/^transformer-engine = .*rev = "\([^"]*\)".*/\1/p' /workspace/pyproject.toml)
@@ -208,6 +226,17 @@ RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS}-cudnn-fe-1.32,targ
     cp /workspace/mamba-cxx20.patch /opt/mamba-build-info/
     rm -rf "${MAMBA_BUILD_DIR}"
     trap - EXIT
+EOF
+
+# TE 2.22 must preserve the quantizer usages of FSDP's already-quantized expert
+# weights: forward gathers rowwise planes, backward gathers columnwise planes.
+RUN --mount=type=bind,source=docker/patches/te-grouped-linear-fsdp.patch,target=/opt/te-grouped-linear-fsdp.patch \
+    bash -ex <<"EOF"
+    TE_SITE_PACKAGES=$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')
+    patch --batch --forward --fuzz=0 -d "${TE_SITE_PACKAGES}" -p1 < /opt/te-grouped-linear-fsdp.patch
+    python -m py_compile "${TE_SITE_PACKAGES}/transformer_engine/pytorch/module/grouped_linear.py"
+    mkdir -p /opt/transformer-engine-build-info
+    cp /opt/te-grouped-linear-fsdp.patch /opt/transformer-engine-build-info/
 EOF
 
 # FLA 0.5.1 lists a nonexistent autotune key that Triton 3.9 rejects at import.
@@ -382,15 +411,6 @@ RUN --mount=type=bind,source=docker/common/triton_block_ptr_compat.py,target=/op
     install -m 0644 /opt/triton_block_ptr_compat.py "${TRITON_LANGUAGE_DIR}/_megatron_block_ptr_compat.py"
     printf '\nfrom . import _megatron_block_ptr_compat\n' >> "${TRITON_LANGUAGE_DIR}/__init__.py"
     python -c 'import triton.language as tl; assert callable(tl.advance)'
-EOF
-
-# Backport FlashAttention#2787 for the image's CuTe code and pinned Quack0.6.5.
-# https://github.com/Dao-AILab/flash-attention/commit/145b1010051dbfd4bdc41a0ae55d495b08d7a458
-RUN --mount=type=bind,source=docker/patches/flash-attn-quack-api.patch,target=/opt/flash-attn-quack-api.patch \
-    bash -ex <<"EOF"
-    FLASH_ATTN_SITE_PACKAGES=$(python -c 'import importlib.util, pathlib; print(pathlib.Path(importlib.util.find_spec("flash_attn").origin).parent.parent)')
-    patch --batch --forward --fuzz=0 -d "${FLASH_ATTN_SITE_PACKAGES}" -p1 < /opt/flash-attn-quack-api.patch
-    python -c 'import cutlass.cute as cute; from flash_attn.cute.utils import ex2_emulation_2; assert callable(cute.arch.sub_packed_f32x2)'
 EOF
 
 ##### For NVIDIANS only #####

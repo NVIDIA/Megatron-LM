@@ -203,10 +203,42 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
         self._te_cuda_graph_padding_mask_shape = None
         if self._moe_router_in_cuda_graph():
             mask_shape = self._te_cuda_graph_padding_mask_shape_seen
+            # TE runs the graphed callable eagerly on these static inputs (warmup) before it
+            # captures it. The all-ones hidden states give every token the same router logits, so
+            # every token of every EP rank picks the same top-k experts. A megakernel inside the
+            # graph sizes its per-expert schedule for real routing (MOK's
+            # schedule_capacity_multiplier) and can trap on that skew, so its static mask marks
+            # every token as padding and the warmup routes none. Replay copies the real mask into
+            # this buffer. Native MoE layers keep the all-False mask.
+            megakernel_in_graph = self._cuda_graph_megakernel() is not None
+            if (
+                megakernel_in_graph
+                and mask_shape is None
+                and not self.config.moe_router_force_load_balancing
+            ):
+                # Without a mask input, nothing keeps the warmup's routes off that skew, except
+                # forced load balancing, a benchmark-only mode that replaces the router logits with
+                # random ones. TECudaGraphHelper builds the static inputs of every layer before it
+                # calls TE's make_graphed_callables, so this raises before any warmup forward.
+                raise RuntimeError(
+                    "This layer's TE CUDA graph contains the MoE megakernel, but no padding_mask "
+                    "reached the layer during the eager cuda_graph_warmup_steps. Without a "
+                    "padding_mask graph input, TE's capture warmup would route every token of its "
+                    "all-ones static input to the same experts, which can exceed the megakernel's "
+                    "static schedule capacity (MOK traps on the device). Pass a padding_mask model "
+                    "input (an all-False mask is enough) in at least one eager warmup step "
+                    "(cuda_graph_warmup_steps > 0), or leave the MoE layer out of the CUDA graph "
+                    "(for example cuda_graph_modules=['attn']). Benchmarks that set "
+                    "moe_router_force_load_balancing, which replaces the router logits with "
+                    "random ones, are exempt."
+                )
             if mask_shape is not None:
                 self._te_cuda_graph_padding_mask_shape = tuple(mask_shape)
-                static_inputs["padding_mask"] = torch.zeros(
-                    mask_shape, dtype=torch.bool, device=torch.cuda.current_device()
+                static_inputs["padding_mask"] = torch.full(
+                    mask_shape,
+                    megakernel_in_graph,
+                    dtype=torch.bool,
+                    device=torch.cuda.current_device(),
                 )
         return static_inputs
 
@@ -338,6 +370,42 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
             or CudaGraphModule.moe in self.config.cuda_graph_modules
             or CudaGraphModule.moe_router in self.config.cuda_graph_modules
         )
+
+    def _cuda_graph_megakernel(self):
+        """Return the MoE megakernel backend that this layer's TE CUDA graph runs, else None.
+
+        The graph contains the megakernel when its scope covers the whole MoE (``moe``, or every
+        module when ``cuda_graph_modules`` is empty). Otherwise the whole MoE layer runs eagerly:
+        TransformerConfig rejects the ``moe_router`` and ``moe_preprocess`` scopes for MOK, whose
+        graphs would end between the router and the megakernel.
+        """
+        if not self.is_moe_layer or (
+            self.config.cuda_graph_modules
+            and CudaGraphModule.moe not in self.config.cuda_graph_modules
+        ):
+            return None
+        return getattr(self.mlp, "megakernel_experts", None)
+
+    def _before_te_cuda_graph_replay(self):
+        """Refresh a megakernel's cached weight views before a graph that contains it replays.
+
+        The replay runs no Python, so a backend that converts weights once per optimizer step
+        (MOK's MXFP8 scale swizzle) does it here: after the manual parameter all-gather hooks and
+        before the graph on the same stream. MOK refreshes only at the first microbatch.
+        """
+        megakernel = self._cuda_graph_megakernel()
+        if megakernel is not None:
+            megakernel.refresh_weight_views()
+
+    def _after_te_cuda_graphs_deleted(self):
+        """Release a megakernel from the CUDA graphs of this layer, which were just deleted.
+
+        A backend may pin state while a graph references it (MOK's cached weight views must keep
+        their addresses); with the graphs gone, reloading or moving its parameters is safe again.
+        """
+        megakernel = self._cuda_graph_megakernel()
+        if megakernel is not None:
+            megakernel.cuda_graphs_deleted()
 
     def _te_cuda_graph_mlp_capture_output(self, mlp_output_with_bias, residual):
         """Return partial-capture outputs, or None to continue normal execution."""
