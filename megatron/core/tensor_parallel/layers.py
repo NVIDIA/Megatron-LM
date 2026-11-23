@@ -16,6 +16,7 @@ from typing_extensions import override
 
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.ops.collectives.ordered_reduce import use_ordered_tp_reduce
 from megatron.core.parallel_state import (
     get_expert_gtp_weight_remat_rank,
     get_global_memory_buffer,
@@ -517,12 +518,16 @@ class VocabParallelEmbedding(torch.nn.Module):
                 )
             else:
                 output = reduce_scatter_to_sequence_parallel_region(
-                    output_parallel.contiguous(), group=self.tp_group, ordered=True
+                    output_parallel.contiguous(),
+                    group=self.tp_group,
+                    ordered=use_ordered_tp_reduce(self.tp_group, output_parallel.dtype),
                 )
         elif self.tp_group.size() > 1:
             # Reduce across all the model parallel GPUs.
             output = reduce_from_tensor_model_parallel_region(
-                output_parallel, group=self.tp_group, ordered=True
+                output_parallel,
+                group=self.tp_group,
+                ordered=use_ordered_tp_reduce(self.tp_group, output_parallel.dtype),
             )
         else:
             output = output_parallel
@@ -1767,11 +1772,15 @@ class RowParallelLinear(torch.nn.Module):
             output_ = output_parallel
         elif self.sequence_parallel:
             output_ = reduce_scatter_to_sequence_parallel_region(
-                output_parallel, group=self.tp_group, ordered=True
+                output_parallel,
+                group=self.tp_group,
+                ordered=use_ordered_tp_reduce(self.tp_group, output_parallel.dtype),
             )
         else:
             output_ = reduce_from_tensor_model_parallel_region(
-                output_parallel, group=self.tp_group, ordered=True
+                output_parallel,
+                group=self.tp_group,
+                ordered=use_ordered_tp_reduce(self.tp_group, output_parallel.dtype),
             )
         if not self.skip_bias_add:
             output = (output_ + self.bias) if self.bias is not None else output_

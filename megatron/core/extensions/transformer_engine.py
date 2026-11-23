@@ -26,6 +26,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedState
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.ops.collectives.ordered_reduce import use_ordered_tp_reduce
 from megatron.core.ops.linear.ordered import tp_shard_row_linear
 from megatron.core.ops.norm.torch_norm import LayerNormInterface
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
@@ -1615,10 +1616,12 @@ class TELinear(te.pytorch.Linear):
             out, bias = out
         if self.config.sequence_parallel:
             out = reduce_scatter_to_sequence_parallel_region(
-                out, group=self._tp_group, ordered=True
+                out, group=self._tp_group, ordered=use_ordered_tp_reduce(self._tp_group, out.dtype)
             )
         else:
-            out = reduce_from_tensor_model_parallel_region(out, group=self._tp_group, ordered=True)
+            out = reduce_from_tensor_model_parallel_region(
+                out, group=self._tp_group, ordered=use_ordered_tp_reduce(self._tp_group, out.dtype)
+            )
         return self._bi_finish_bias(out, bias)
 
     def _bi_finish_bias(self, out, bias):

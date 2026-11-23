@@ -11,6 +11,7 @@ from typing import List, Optional, Union
 import torch
 
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
+from megatron.core.ops.collectives.ordered_reduce import use_ordered_tp_reduce
 from megatron.core.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -1042,7 +1043,9 @@ if HAVE_TE:
                 # Reduce-scatter after unpadding
                 if is_row_parallel_linear(module):
                     unpadded_output = reduce_scatter_to_sequence_parallel_region(
-                        unpadded_output, group=module.tp_group, ordered=True
+                        unpadded_output,
+                        group=module.tp_group,
+                        ordered=use_ordered_tp_reduce(module.tp_group, unpadded_output.dtype),
                     )
 
                 # Reset sequence parallelism flag on the module

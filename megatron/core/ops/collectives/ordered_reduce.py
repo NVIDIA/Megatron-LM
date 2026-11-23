@@ -51,7 +51,7 @@ def use_ordered_tp_reduce(group, dtype: torch.dtype) -> bool:
     single addition is commutative, so the stock collective already gives these bits.
     Integer sums are exact in any order.
 
-    Used by the forward reductions in ``tensor_parallel/mappings.py`` (training) and by
+    Used by training linear and embedding callers to select the explicit mapping flag, and by
     ``InferenceRowParallelLinear`` / the inference embedding reduce-scatter
     (``inference_layers.py``) to decide whether to leave the stock collective.
     """

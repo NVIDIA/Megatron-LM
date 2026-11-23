@@ -2,11 +2,7 @@
 
 import torch
 
-from megatron.core.ops.collectives.ordered_reduce import (
-    ordered_all_reduce,
-    ordered_reduce_scatter,
-    use_ordered_tp_reduce,
-)
+from megatron.core.ops.collectives.ordered_reduce import ordered_all_reduce, ordered_reduce_scatter
 from megatron.core.parallel_state import get_global_memory_buffer
 from megatron.core.utils import (
     get_pg_size,
@@ -175,9 +171,8 @@ def _reduce_scatter_along_first_dim(
         input_split_sizes (List[int], optional): A list specifying the sizes of
             the input splits along the first dimension for each rank. If None,
             equal splitting is assumed. Default: None.
-        ordered (bool): Use the batch-invariant rank-order sum when
-            `use_ordered_tp_reduce` selects it. Linear-layer callers opt in explicitly;
-            MoE combines and backward reductions keep their existing collectives.
+        ordered (bool): Use the fixed rank-order sum. Callers decide whether ordering
+            is needed; MoE combines and backward reductions keep their existing collectives.
     """
     assert group is not None, "group should not be None"
     world_size = group.size()
@@ -185,7 +180,7 @@ def _reduce_scatter_along_first_dim(
     if world_size == 1:
         return input_
 
-    if ordered and use_ordered_tp_reduce(group, input_.dtype):
+    if ordered:
         assert (
             input_split_sizes is None
         ), "uneven splits in the batch-invariant ordered reduce-scatter are not built yet"
@@ -249,15 +244,15 @@ class _ReduceFromModelParallelRegion(torch.autograd.Function):
     @staticmethod
     def symbolic(graph, input_, group, ordered=False):
         """Symbolic function for tracing."""
-        if ordered and use_ordered_tp_reduce(group, input_.dtype):
+        if ordered:
             return ordered_all_reduce(input_, group)
         return _reduce(input_, group)
 
     @staticmethod
     def forward(ctx, input_, group, ordered=False):
         """Forward function."""
-        if ordered and use_ordered_tp_reduce(group, input_.dtype):
-            # Batch-invariant mode at TP >= 3: fixed rank-order sum (backward is unchanged).
+        if ordered:
+            # The caller requested a fixed rank-order sum; backward is unchanged.
             return ordered_all_reduce(input_, group)
         return _reduce(input_, group)
 

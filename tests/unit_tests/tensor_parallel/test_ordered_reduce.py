@@ -115,13 +115,14 @@ class TestOrderedReduce:
         assert torch.equal(_bits(out), _bits(ref))
         assert torch.equal(x, x_before)
 
-    def test_mappings_forward_is_ordered_and_position_invariant(self):
+    @pytest.mark.parametrize("batch_invariant", [False, True])
+    def test_mappings_forward_is_ordered_and_position_invariant(self, batch_invariant):
         """A row gets the same bits wherever it sits and whatever the batch size."""
         hidden = 4096
         row = _partials((1, hidden), torch.bfloat16, seed=11)
         expected = _left_fold(_all_partials(row, self.group))[0]
-        with set_batch_invariant_mode(True):
-            assert orr.use_ordered_tp_reduce(self.group, torch.bfloat16)
+        with set_batch_invariant_mode(batch_invariant):
+            assert orr.use_ordered_tp_reduce(self.group, torch.bfloat16) == batch_invariant
             for rows in (4, 8, 64, 512):
                 for pos in (0, rows // 2 + 1, rows - 1):
                     x = _partials((rows, hidden), torch.bfloat16, seed=rows + pos)
@@ -232,9 +233,13 @@ class TestOrderedReduce:
 
     @pytest.mark.parametrize("sequence_parallel", [False, True])
     @pytest.mark.parametrize("caller_reduced", [False, True])
+    @pytest.mark.parametrize("batch_invariant", [False, True])
     def test_row_linear_call_sites_opt_into_ordered_reduction(
-        self, sequence_parallel, caller_reduced
+        self, sequence_parallel, caller_reduced, batch_invariant, monkeypatch
     ):
+        if not batch_invariant:
+            monkeypatch.setattr(mappings, "ordered_all_reduce", _unexpected_ordered_reduce)
+            monkeypatch.setattr(mappings, "ordered_reduce_scatter", _unexpected_ordered_reduce)
         model_parallel_cuda_manual_seed(123)
         config = TransformerConfig(
             num_layers=1,
@@ -243,7 +248,7 @@ class TestOrderedReduce:
             tensor_model_parallel_size=TP,
             sequence_parallel=sequence_parallel,
             params_dtype=torch.bfloat16,
-            batch_invariant_mode=True,
+            batch_invariant_mode=batch_invariant,
             batch_invariant_backend="te_native",
             attention_backend=AttnBackend.flash,
             flash_attention_version=4,
@@ -261,9 +266,13 @@ class TestOrderedReduce:
             tp_group=self.group,
         )
         x = _partials((8, 1, 128), torch.bfloat16, seed=83)
-        with set_batch_invariant_mode(True, backend="te_native"):
+        with set_batch_invariant_mode(batch_invariant, backend="te_native"):
             partial = torch.nn.functional.linear(x, layer.weight)
-            expected = _left_fold(_all_partials(partial, self.group))
+            if batch_invariant:
+                expected = _left_fold(_all_partials(partial, self.group))
+            else:
+                expected = partial.clone()
+                dist.all_reduce(expected, group=self.group)
             if caller_reduced:
                 # Shared-expert overlap defers its FC2 row reduction to this caller.
                 shared = SimpleNamespace(
@@ -362,18 +371,21 @@ class TestOrderedReduceTP2Unchanged:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def test_tp2_uses_stock_collectives(self):
+    def test_tp2_uses_stock_collectives(self, monkeypatch):
+        monkeypatch.setattr(mappings, "ordered_all_reduce", _unexpected_ordered_reduce)
+        monkeypatch.setattr(mappings, "ordered_reduce_scatter", _unexpected_ordered_reduce)
         x = _partials((64, 4096), torch.bfloat16, seed=17)
         stock_ar = x.clone()
         dist.all_reduce(stock_ar, group=self.group)
         stock_rs = torch.empty(32, 4096, dtype=torch.bfloat16, device="cuda")
         dist.reduce_scatter_tensor(stock_rs, x, group=self.group)
         with set_batch_invariant_mode(True):
-            assert not orr.use_ordered_tp_reduce(self.group, torch.bfloat16)
+            ordered = orr.use_ordered_tp_reduce(self.group, x.dtype)
+            assert not ordered
             ar = mappings.reduce_from_tensor_model_parallel_region(
-                x.clone(), self.group, ordered=True
+                x.clone(), self.group, ordered=ordered
             )
-            rs = mappings.reduce_scatter_to_sequence_parallel_region(x, self.group, ordered=True)
+            rs = mappings.reduce_scatter_to_sequence_parallel_region(x, self.group, ordered=ordered)
         assert torch.equal(_bits(ar), _bits(stock_ar))
         assert torch.equal(_bits(rs), _bits(stock_rs))
 

@@ -21,6 +21,7 @@ from megatron.core.fp8_utils import get_fp8_recipe
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
+from megatron.core.ops.collectives.ordered_reduce import use_ordered_tp_reduce
 from megatron.core.tensor_parallel.mappings import (
     copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
@@ -371,11 +372,15 @@ class SharedExpertMLP(MLP):
         with torch.cuda.stream(self.stream):
             if self.config.sequence_parallel:
                 self.cached_output = reduce_scatter_to_sequence_parallel_region(
-                    self.cached_fc2_output, group=self.tp_group, ordered=True
+                    self.cached_fc2_output,
+                    group=self.tp_group,
+                    ordered=use_ordered_tp_reduce(self.tp_group, self.cached_fc2_output.dtype),
                 )
             else:
                 self.cached_output = reduce_from_tensor_model_parallel_region(
-                    self.cached_fc2_output, group=self.tp_group, ordered=True
+                    self.cached_fc2_output,
+                    group=self.tp_group,
+                    ordered=use_ordered_tp_reduce(self.tp_group, self.cached_fc2_output.dtype),
                 )
             self.cached_fc2_output = None
             set_tensor_grad_fn_sequence_sr(self.cached_output, torch.iinfo(torch.int).max)
@@ -615,9 +620,17 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         fc2_output = self._fused_grouped_swiglu_no_comm(fc1_input)
 
         if self.config.sequence_parallel:
-            output = reduce_scatter_to_sequence_parallel_region(fc2_output, ordered=True)
+            output = reduce_scatter_to_sequence_parallel_region(
+                fc2_output,
+                group=self.tp_group,
+                ordered=use_ordered_tp_reduce(self.tp_group, fc2_output.dtype),
+            )
         else:
-            output = reduce_from_tensor_model_parallel_region(fc2_output, ordered=True)
+            output = reduce_from_tensor_model_parallel_region(
+                fc2_output,
+                group=self.tp_group,
+                ordered=use_ordered_tp_reduce(self.tp_group, fc2_output.dtype),
+            )
         return output
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
