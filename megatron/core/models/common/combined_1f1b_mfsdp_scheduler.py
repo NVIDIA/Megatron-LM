@@ -30,6 +30,11 @@ def _make_unshard_backward_hook(owner: FsdpModule):
 
 def _module_post_backward_hook(module: FsdpModule) -> None:
     module.reshard()
+    # Delayed layer wgrads can stage another batch before the root packs its input.
+    if module.is_root() and any(
+        group.requires_grad and group.requires_inner_reduction for group in module.parameter_groups
+    ):
+        module.context._release_grad_buffers()
     module.post_accumulate_grad()
 
 

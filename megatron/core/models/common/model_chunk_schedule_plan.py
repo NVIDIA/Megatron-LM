@@ -17,6 +17,13 @@ from megatron.core.pipeline_parallel.utils import (
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 
+def _owns_input_embedding(module: torch.nn.Module) -> bool:
+    if not isinstance(module, FsdpModule) or not module.is_root():
+        return False
+    model = getattr(module, "module", module)
+    return getattr(model, "pre_process", False) and getattr(model, "embedding", None) is not None
+
+
 class ModelChunkState:
     """State shared across a model chunk.
 
@@ -463,7 +470,13 @@ class TransformerLayerSchedulePlan:
             with f_layer.get_low_precision_context():
                 f_input = f_layer.pre_dispatch_computation.forward(f_input)
 
+        fsdp_context = None
         if b_layer is not None:
+            model = getattr(b_layer.chunk_state, "model", None)
+            if isinstance(model, FsdpModule):
+                fsdp_context = model.context
+                # Give the previous embedding reduction the paired forward to overlap.
+                fsdp_context._release_oldest_grad_buffer_if(_owns_input_embedding)
             b_grad = b_layer.mlp.backward(b_grad)
 
         if f_layer is not None:
@@ -475,6 +488,8 @@ class TransformerLayerSchedulePlan:
             b_grad = b_layer.moe_dispatch.backward(b_grad)
 
         if b_layer is not None and b_layer.config.ep_overlap_early_attn_memory_release:
+            if fsdp_context is not None:
+                fsdp_context._release_grad_buffers()
             b_grad = b_layer.pre_dispatch_computation.backward(b_grad)
 
         if f_layer is not None:
@@ -486,6 +501,8 @@ class TransformerLayerSchedulePlan:
                 f_input = f_layer.moe_combine.forward(f_input)
 
         if b_layer is not None and not b_layer.config.ep_overlap_early_attn_memory_release:
+            if fsdp_context is not None:
+                fsdp_context._release_grad_buffers()
             b_grad = b_layer.pre_dispatch_computation.backward(b_grad)
 
         if f_layer is not None:

@@ -482,7 +482,7 @@ class FsdpModule:
                     context.outer_reduction_stream.wait_stream(inner_reduction_stream)
                 with torch.cuda.stream(context.outer_reduction_stream):
                     group.reduce_outer_gradients()
-            context._retain_grad_buffers(buffers, current_stream)
+            context._retain_grad_buffers(buffers, current_stream, cast(nn.Module, self))
 
     def _accumulate_local_gradients(self, group: FsdpParameterGroup) -> None:
         """Accumulate on compute without waiting for other groups' inner reductions."""

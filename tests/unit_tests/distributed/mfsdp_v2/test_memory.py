@@ -93,12 +93,15 @@ def test_grad_buffer_release_orders_reuse_on_allocation_stream(distributed_setup
     with torch.cuda.stream(context.inner_reduction_stream):
         torch.cuda._sleep(10_000_000)
         result.copy_(source)
-    context._retain_grad_buffers([source], allocation_stream)
+    producer = nn.Module()
+    context._retain_grad_buffers([source], allocation_stream, producer)
     source_ref = ref(source)
     del source
     assert source_ref() is not None
 
-    context._release_grad_buffers()
+    context._release_oldest_grad_buffer_if(lambda _: False)
+    assert source_ref() is not None
+    context._release_oldest_grad_buffer_if(lambda owner: owner is producer)
     assert source_ref() is None
     with torch.cuda.stream(allocation_stream):
         replacement = torch.empty_like(result)
