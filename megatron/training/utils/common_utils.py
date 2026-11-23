@@ -5,10 +5,10 @@ import json
 import os
 import sys
 import warnings
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
@@ -39,14 +39,18 @@ from megatron.core import mpu
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.process_groups_config import (
+    IMPLICIT_PARAMETER_DOMAINS,
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
+    get_parameter_parallel_domain,
 )
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 from megatron.core.transformer.module import param_is_not_shared
 from megatron.core.utils import (
     get_data_parallel_group_if_dtensor,
+    get_extra_parameter_replica_groups,
     get_pg_rank,
+    get_pg_size,
     to_local_if_dtensor,
     unwrap_model,
 )
@@ -134,6 +138,9 @@ def calc_params_l2_norm(
     moe_sharded_params_data = []    # MoE, sharded → reduce over expert_dp
     moe_gtp_params_data = []        # MoE-GTP_remat, non-sharded
     moe_gtp_sharded_params_data = []  # MoE-GTP_remat sharded → expert_dp
+    # Extra parameter domains (e.g. sharded Engram tables), sharded or not → reduce over dp_cp.
+    domain_params_data = []
+    extra_replica_groups = get_extra_parameter_replica_groups(model, pg_collection)
 
     if pg_collection is None:
         gtp_rank = mpu.get_gtp_weight_remat_rank()
@@ -171,7 +178,25 @@ def calc_params_l2_norm(
                 param, tp_group=tp_group, expert_tp_group=expert_tp_group
             ):
                 continue
-            is_expert = not getattr(param, 'allreduce', True)
+            domain = get_parameter_parallel_domain(param)
+            if domain not in IMPLICIT_PARAMETER_DOMAINS:
+                if domain not in extra_replica_groups:
+                    raise ValueError(
+                        f"No replica process group is registered for parameter domain {domain!r}"
+                    )
+                # Replicas of an extra-domain param hold the same row shard: count it on
+                # replica rank 0, or count every distributed-optimizer fragment of it.
+                if param_is_not_shared(param):
+                    param = to_local_if_dtensor(param)
+                    data, is_sharded = _get_param_data(
+                        param, force_create_fp32_copy, cfg.model.transformer.bf16
+                    )
+                    if data is not None and (
+                        is_sharded or get_pg_rank(extra_replica_groups[domain]) == 0
+                    ):
+                        domain_params_data.append(data)
+                continue
+            is_expert = domain == 'expert'
 
             # Filter GTP_remat duplicates: non-GTP_remat params replicate across GTP_remat ranks.
             if is_expert:
@@ -238,6 +263,15 @@ def calc_params_l2_norm(
     # --- Combine dense + GTP_remat norms ---
     # model_parallel group = TP×GTP_remat×PP, so GTP_remat reduction is implicit.
     norm_2 = params_norm_2 + sharded_norm_2 + gtp_norm_2 + gtp_sharded_norm_2
+
+    # --- Extra parameter domains ---
+    # The row shards and replicas of a domain partition dp_cp, and each element was counted
+    # once within its replica group above, so dp_cp covers every row exactly once. The
+    # model-parallel reduce below then adds the pipeline stages, as for dense params.
+    if extra_replica_groups:
+        domain_norm_2 = _compute_norm_2(domain_params_data)
+        _sum_reduce(domain_norm_2, dp_cp_group)
+        norm_2 += domain_norm_2
 
     # --- Combine MoE + MoE-GTP_remat norms ---
     # expert_model_parallel = TP×EP×PP (does NOT include EGTP_remat), so we need
@@ -707,6 +741,199 @@ def get_blend_and_blend_per_split(args):
         blend, blend_per_split = None, None
 
     return blend, blend_per_split
+
+
+def _pipeline_tokens_from_batch(
+    batch, micro_batch_size: int, sequence_length: int, device
+) -> torch.Tensor:
+    """Return one microbatch's tokens on ``device``, right-padded to the sequence capacity.
+
+    Packed (THD) rows may be shorter than the capacity; they are zero-padded to it, the fixed
+    pipeline activation length (``max_seq_length_per_sample``).
+    """
+    if "tokens" not in batch:
+        raise RuntimeError("Engram data batches must contain token IDs.")
+    tokens = batch["tokens"].to(device=device, dtype=torch.int64, non_blocking=True)
+    if tokens.ndim != 2 or tokens.shape[0] != micro_batch_size or tokens.shape[1] > sequence_length:
+        raise ValueError(
+            f"Engram expected token shape [{micro_batch_size}, <= "
+            f"{sequence_length}], got {tuple(tokens.shape)}."
+        )
+    if tokens.shape[1] < sequence_length:
+        tokens = torch.nn.functional.pad(tokens, (0, sequence_length - tokens.shape[1]))
+    return tokens
+
+
+class PipelineTokenPrefetchIterator:
+    """Replay prefetched data while exposing PP-distributed tokens to ``get_batch``.
+
+    Only the first PP stage's TP source consumes its data iterator during prefetch. The
+    scheduler later receives those same batches from ``_prefetched_batches``; all other ranks
+    continue consuming their original iterator normally. The wrapper is scoped to one
+    forward/backward schedule and deliberately carries no model state.
+
+    When a single rank holds the whole schedule there is nothing to distribute, so
+    ``token_spec`` is set instead of ``pipeline_tokens`` and each microbatch's tokens are
+    derived on demand from the batch the scheduler just consumed.
+    """
+
+    def __init__(
+        self,
+        data_iterator,
+        prefetched_batches: list[Any],
+        pipeline_tokens: list[torch.Tensor],
+        token_spec: Optional[tuple] = None,
+    ) -> None:
+        self._data_iterator = data_iterator
+        self._prefetched_batches = deque(prefetched_batches)
+        self._pipeline_tokens = deque(pipeline_tokens)
+        self._token_spec = token_spec
+        self._last_batch = None
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._prefetched_batches:
+            batch = self._prefetched_batches.popleft()
+        elif self._data_iterator is None:
+            raise StopIteration
+        else:
+            batch = next(self._data_iterator)
+        self._last_batch = batch
+        return batch
+
+    def pop_pipeline_tokens(self) -> torch.Tensor:
+        """Return the tokens prepared for the next scheduled microbatch.
+
+        Packed (THD) rows shorter than the sequence capacity are returned zero-padded to the
+        capacity, the fixed pipeline activation length. Padding cannot leak into valid
+        positions: the Engram convolution is causal and the padded tail's hidden states are
+        dummy sequence anyway.
+        """
+        if self._token_spec is not None:
+            # Consume the batch so a second call without an intervening microbatch raises
+            # instead of silently handing out the previous microbatch's tokens.
+            batch, self._last_batch = self._last_batch, None
+            if batch is None:
+                raise RuntimeError("Engram pipeline token prefetch queue is exhausted.")
+            return _pipeline_tokens_from_batch(batch, *self._token_spec)
+        if not self._pipeline_tokens:
+            raise RuntimeError("Engram pipeline token prefetch queue is exhausted.")
+        return self._pipeline_tokens.popleft()
+
+
+def prepare_tokens_for_pipeline(
+    data_iterator,
+    num_microbatches: int,
+    micro_batch_size: int,
+    sequence_length: int,
+    pp_group,
+    tp_group,
+) -> PipelineTokenPrefetchIterator:
+    """Distribute every Engram microbatch's tokens before pipeline scheduling starts.
+
+    A blocking PP collective inside ``forward_step`` deadlocks a non-interleaved pipeline:
+    stage zero enters the collective before sending its activation while the next stage waits
+    for that activation. This helper performs all token collectives before the schedule. On the
+    first PP stage, the TP source prefetches all microbatches and broadcasts one stacked token
+    tensor to its TP peers; each TP coordinate then broadcasts to the matching PP group. Data
+    availability is broadcast first so an exhausted iterator fails on every rank instead of
+    hanging the peers inside the token broadcast.
+    """
+    # Under VPP the scheduler hands each model chunk its own iterator and indexes the list
+    # itself before calling forward_step, so every chunk ends up with its own wrapper and no
+    # virtual-stage index has to be threaded anywhere. Tokens depend only on the microbatch,
+    # never on the chunk, so one prefetch feeds them all.
+    chunk_iterators = data_iterator if isinstance(data_iterator, list) else [data_iterator]
+    is_virtual = isinstance(data_iterator, list)
+    token_source = chunk_iterators[0] if chunk_iterators else None
+
+    def _wrap(per_chunk_tokens, prefetched, token_spec=None):
+        wrappers = [
+            PipelineTokenPrefetchIterator(
+                data_iterator=chunk_iterator,
+                # Only the chunk that was drained has batches to replay; the others still own
+                # an unconsumed iterator that yields the same microbatches.
+                prefetched_batches=prefetched if index == 0 else [],
+                pipeline_tokens=list(per_chunk_tokens),
+                token_spec=token_spec,
+            )
+            for index, chunk_iterator in enumerate(chunk_iterators)
+        ]
+        return wrappers if is_virtual else wrappers[0]
+
+    padded_shape = (micro_batch_size, sequence_length)
+    pp_rank = get_pg_rank(pp_group)
+    tp_rank = get_pg_rank(tp_group)
+    pp_size = get_pg_size(pp_group)
+    tp_size = get_pg_size(tp_group)
+    device = torch.cuda.current_device() if torch.cuda.is_available() else torch.device("cpu")
+    prefetched_batches = []
+    source_failure = None
+    source_exception = None
+
+    if pp_size == 1 and tp_size == 1:
+        # Nothing to distribute: draining the schedule's whole global batch up front would
+        # only hold every microbatch resident for no benefit.
+        return _wrap([], [], token_spec=(micro_batch_size, sequence_length, device))
+
+    if pp_rank == 0 and tp_rank == 0:
+        microbatch_tokens = []
+        try:
+            if token_source is None:
+                raise RuntimeError("The first pipeline stage TP source must own Engram data.")
+            for _ in range(num_microbatches):
+                batch = next(token_source)
+                prefetched_batches.append(batch)
+                microbatch_tokens.append(
+                    _pipeline_tokens_from_batch(batch, micro_batch_size, sequence_length, device)
+                )
+            stacked_tokens = torch.stack(microbatch_tokens).contiguous()
+        except StopIteration:
+            source_failure = "the Engram data iterator was exhausted during token prefetch"
+        except Exception as error:  # pylint: disable=broad-except
+            # Any source-side prefetch failure must reach the peers through the availability
+            # flag, or they hang in the token broadcast until the NCCL watchdog fires.
+            source_failure = f"Engram token prefetch failed on the source rank: {error}"
+            source_exception = error
+    else:
+        stacked_tokens = torch.empty(
+            (num_microbatches, *padded_shape), dtype=torch.int64, device=device
+        )
+
+    def _broadcast_from_source(tensor, group):
+        return torch.distributed.broadcast(
+            tensor, src=torch.distributed.get_global_rank(group, 0), group=group
+        )
+
+    # Broadcast availability before the payload so every rank raises together.
+    data_available = torch.tensor([int(source_failure is None)], dtype=torch.int32, device=device)
+    if pp_rank == 0 and tp_size > 1:
+        _broadcast_from_source(data_available, tp_group)
+    if pp_size > 1:
+        _broadcast_from_source(data_available, pp_group)
+    if not bool(data_available.item()):
+        # The source rank re-raises the original error; peers only know the flag.
+        if source_exception is not None:
+            raise source_exception
+        raise RuntimeError(source_failure or "the Engram token prefetch source reported no data")
+
+    if pp_rank == 0 and tp_size > 1:
+        _broadcast_from_source(stacked_tokens, tp_group)
+    if pp_size > 1:
+        _broadcast_from_source(stacked_tokens, pp_group)
+
+    return _wrap(stacked_tokens.unbind(0), prefetched_batches)
+
+
+def get_pipeline_prefetched_tokens(data_iterator) -> torch.Tensor:
+    """Consume the token batch prepared before the current pipeline schedule."""
+    if not isinstance(data_iterator, PipelineTokenPrefetchIterator):
+        raise RuntimeError(
+            "Engram requires pipeline tokens to be prepared before forward/backward scheduling."
+        )
+    return data_iterator.pop_pipeline_tokens()
 
 
 def update_use_dist_ckpt(args):

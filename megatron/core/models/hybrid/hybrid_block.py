@@ -441,6 +441,17 @@ class HybridStack(MegatronModule):
             self.layers = group_layers_into_shortcut_blocks(
                 self.layers, self.layer_config_list, self.config, pp_layer_offset=pp_layer_offset
             )
+            for layer in self.layers:
+                # Both halves of a shortcut pair run outside TransformerLayer._forward_attention,
+                # where the Engram residual is added, so the memory would be silently skipped.
+                if isinstance(layer, ShortcutMoEBlock) and (
+                    self._uses_engram(layer.compute_layer) or self._uses_engram(layer.moe_layer)
+                ):
+                    raise ValueError(
+                        "Engram cannot run inside a shortcut MoE pair (layers "
+                        f"{layer.compute_layer.layer_number} and {layer.moe_layer.layer_number}): "
+                        "both halves bypass the layer entry point that applies the memory."
+                    )
             self._execution_layer_indices = [
                 (
                     layer.attn_local_idx
@@ -534,6 +545,12 @@ class HybridStack(MegatronModule):
             tp_group=self.tp_group,
             tp_cp_group=runtime_tp_cp_group,
         )
+
+    @staticmethod
+    def _uses_engram(layer: torch.nn.Module) -> bool:
+        """Return whether a (possibly mHC-wrapped) TransformerLayer owns an Engram memory."""
+        inner_layer = getattr(layer, "inner_layer", layer)
+        return getattr(inner_layer, "engram", None) is not None
 
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
@@ -630,8 +647,8 @@ class HybridStack(MegatronModule):
             inference_context (BaseInferenceContext): the inference parameters.
             rotary_pos_emb (Tensor, optional): the rotary positional embeddings.
                 Defaults to None.
-            input_ids (Tensor, optional): Token IDs forwarded to hash-routed
-                TransformerLayer instances and custom layers. Defaults to None.
+            input_ids (Tensor, optional): Token IDs forwarded to hash-routed and
+                Engram-owning TransformerLayer instances and custom layers. Defaults to None.
                 Custom layers must accept None; HybridModel does not forward IDs to MTP stacks.
         Returns:
             Tensor: the output tensor.
@@ -832,10 +849,16 @@ class HybridStack(MegatronModule):
                         is_custom_layer = (
                             layer_utils.get_custom_layer_type(layer_config) is not None
                         )
+                        # An Engram memory hashes the tokens of the positions its layer holds,
+                        # so it takes the IDs in the layer's CP layout too. Its IDs are full on
+                        # every tensor-parallel rank, not sequence-parallel shards.
+                        uses_engram = self._uses_engram(layer)
                         layer_input_ids = input_ids
-                        if is_custom_layer and cp_layout_state is not None:
+                        if (is_custom_layer or uses_engram) and cp_layout_state is not None:
                             layer_input_ids = cp_layout_state.get_layer_input_ids(
-                                physical_layer_idx, input_ids
+                                physical_layer_idx,
+                                input_ids,
+                                sequence_parallel_local=not uses_engram,
                             )
                         with inner_quant_context:
                             if is_custom_layer and not isinstance(
@@ -879,8 +902,11 @@ class HybridStack(MegatronModule):
                                     layer, HyperConnectionHybridLayer
                                 ):
                                     layer_kwargs["mhc_recompute_manager"] = mhc_manager
+                                # Only hash-routed MoE layers, Engram memories and custom layers
+                                # consume the token IDs; the other layers keep their exact kwarg
+                                # set, which TE CUDA graphs fix at capture.
                                 if input_ids is not None and (
-                                    is_custom_layer or self._uses_hash_routing(layer)
+                                    is_custom_layer or uses_engram or self._uses_hash_routing(layer)
                                 ):
                                     layer_kwargs["input_ids"] = layer_input_ids
                                 hidden_states, _ = layer(hidden_states, **layer_kwargs)

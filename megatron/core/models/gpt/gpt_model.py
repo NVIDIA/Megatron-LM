@@ -166,6 +166,11 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 "The decoder contracts the residual before the multi-stream MTP block."
             )
 
+        if self.config.engram_enabled:
+            raise ValueError(
+                "Engram is not supported by GPTModel, which would silently train without it. "
+                "Engram is integrated into HybridModel (pretrain_hybrid.py) only."
+            )
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 

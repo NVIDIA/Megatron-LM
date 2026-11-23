@@ -2,6 +2,7 @@
 import gc
 import os
 from argparse import Namespace
+from contextlib import contextmanager
 from datetime import timedelta
 from typing import Literal
 
@@ -188,6 +189,45 @@ def reset_transient_process_state():
     # Built from the first model (TestMTPCudaGraphExpertParallel resets it by hand).
     inference_utils.moe_layer_cache = None
     inference_utils._moe_metadata_sync_initialized = False
+
+
+@contextmanager
+def release_process_groups():
+    """Destroy the process groups created inside the block when it ends.
+
+    ``parallel_state.destroy_model_parallel`` drops its NCCL groups without destroying them, and
+    so do most tests that call ``torch.distributed.new_group``. Torch keeps such a group: its
+    threads and, once a collective ran on it, its communicator and the address space NCCL
+    reserved for it stay until the process exits. A file of many cases that communicate on
+    several groups wraps each case in this block, from an autouse fixture, so that what its
+    cases leave behind does not add up over the bucket it runs in.
+
+    The block ends like a teardown: on every rank at the same point, with a barrier, and with
+    the model-parallel state torn down, since that state refers to the groups.
+    """
+    created = []
+    new_group = torch.distributed.new_group
+
+    def tracking_new_group(*args, **kwargs):
+        group = new_group(*args, **kwargs)
+        created.append(group)
+        return group
+
+    torch.distributed.new_group = tracking_new_group
+    try:
+        yield
+    finally:
+        torch.distributed.new_group = new_group
+        if created and torch.distributed.is_initialized():
+            # Also when the case set its groups up without Utils, or tore them down already.
+            Utils.inited = True
+            Utils.destroy_model_parallel()
+            for group in created:
+                try:
+                    torch.distributed.destroy_process_group(group)
+                except ValueError:
+                    # Already destroyed: a Gloo group of parallel_state, or by the case itself.
+                    pass
 
 
 def is_nccl_ep_available():

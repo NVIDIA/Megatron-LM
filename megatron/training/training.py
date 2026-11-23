@@ -66,6 +66,7 @@ from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+from megatron.core.models.engram import close_engram_transports
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_gated_delta_net_variant,
     is_linear_attention_variant,
@@ -81,6 +82,7 @@ from megatron.core.num_microbatches_calculator import (
 from megatron.core.optimizer import (
     OptimizerConfig,
     ParamKey,
+    get_engram_config_overrides,
     get_megatron_optimizer,
     get_mup_config_overrides,
     get_standard_config_overrides,
@@ -140,6 +142,7 @@ from megatron.core.utils import (
     get_attr_wrapped_model,
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
+    get_extra_parameter_replica_groups,
     get_model_config,
     get_pg_rank,
     get_pg_size,
@@ -175,7 +178,11 @@ from megatron.training.logging.packed_sequence_stats import (
     update_packed_sequence_stats,
 )
 from megatron.training.models import ModelConfig, T5ModelConfig
-from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
+from megatron.training.utils import (
+    is_gtp_remat_active,
+    is_hybrid_model,
+    prepare_tokens_for_pipeline,
+)
 
 # Local.
 from . import ft_integration, one_logger_utils
@@ -1911,6 +1918,16 @@ def pretrain(
                 # (SystemExit from the exit-interval path is NOT caught here; it already
                 # flushed before sys.exit(). SIGKILL is unrecoverable regardless.)
                 _end_otel_job_spans()
+                # Abort the Engram symmetric transports, without a device barrier: the peers of
+                # this rank's row group may be spinning in a transport kernel that it will never
+                # join. An aborted communicator cannot hold this process at exit, so the launcher
+                # sees the failure and can stop them. A no-op when none is open.
+                try:
+                    close_engram_transports()
+                except Exception:  # pylint: disable=broad-except
+                    logging.getLogger(__name__).warning(
+                        "Cannot abort the Engram symmetric transports", exc_info=True
+                    )
                 raise
 
         print_datetime('after training is done')
@@ -1993,6 +2010,9 @@ def pretrain(
         # Deregister the GTP symmetric-memory pools: windows left registered when the
         # process groups are destroyed make NCCL abort.
         deregister_and_clear_gtp_symm_pools()
+    # Close the Engram symmetric transports collectively (device barrier, windows, communicator)
+    # while every rank of their row groups is here; a no-op when none is open.
+    close_engram_transports(clean=True)
 
     ft_integration.shutdown()
     one_logger_utils.finish()
@@ -2049,7 +2069,8 @@ def wrap_model_chunks_with_ddp(
             variant).
         pg_collection: Optional :class:`ProcessGroupCollection`. When provided,
             forwarded to both standard DDP and FSDP variants, and used to source
-            DP world sizes for layout computation.
+            DP world sizes for layout computation. Extra parameter domains registered
+            in its ``parameter_replica_groups`` require the standard DDP.
         bucket_sizes: Optional per-chunk bucket size override; defaults to
             ``[ddp_config.bucket_size] * len(model_chunks)``.
         disable_bucketing_per_chunk: Optional per-chunk disable_bucketing flag;
@@ -2058,6 +2079,12 @@ def wrap_model_chunks_with_ddp(
     Returns:
         List of DDP-wrapped chunks.
     """
+    extra_replica_groups = get_extra_parameter_replica_groups(pg_collection=pg_collection)
+    if extra_replica_groups and DP is not DDP:
+        raise ValueError(
+            f"Parameter replica domains {sorted(extra_replica_groups)} require the standard "
+            "DistributedDataParallel; Megatron FSDP and Torch FSDP2 do not support them."
+        )
     n = len(model_chunks)
     if bucket_sizes is None:
         bucket_sizes = [ddp_config.bucket_size] * n
@@ -2105,6 +2132,13 @@ def wrap_model_chunks_with_ddp(
                 if intra_expt_dp_group is not None
                 else getattr(layout_pgs, "expt_dp", None)
             )
+            # Buffers of an extra domain are sharded over the domain's whole replica group.
+            # The argument is passed only when such domains exist (the MPU groups have none).
+            layout_kwargs = {}
+            if extra_replica_groups:
+                layout_kwargs["parallel_group_sizes"] = {
+                    name: get_pg_size(group) for name, group in extra_replica_groups.items()
+                }
             for i, (chunk, bucket_size) in enumerate(zip(model_chunks, bucket_sizes)):
                 all_params = [p for p in chunk.parameters() if p.requires_grad]
                 per_chunk_layouts[i] = compute_layout(
@@ -2113,6 +2147,7 @@ def wrap_model_chunks_with_ddp(
                     data_parallel_world_size,
                     ddp_config,
                     expert_data_parallel_world_size=expert_data_parallel_world_size,
+                    **layout_kwargs,
                 )
 
     # Wrap each chunk.
@@ -2415,6 +2450,11 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         if ddp_stream is not current_stream:
             ddp_stream.wait_stream(current_stream)
 
+        # Standard DDP keeps the MPU groups unless extra parameter domains are registered:
+        # their replica groups exist only in pg_collection.
+        use_pg_collection = ddp_config.use_megatron_fsdp or bool(
+            get_extra_parameter_replica_groups(pg_collection=pg_collection)
+        )
         with torch.cuda.stream(ddp_stream):
             model = wrap_model_chunks_with_ddp(
                 model,
@@ -2423,7 +2463,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
                 use_layer_wise_param_layout=cfg.optimizer.use_layer_wise_param_layout,
                 DP=DP,
-                pg_collection=pg_collection if ddp_config.use_megatron_fsdp else None,
+                pg_collection=pg_collection if use_pg_collection else None,
                 bucket_sizes=per_chunk_bucket_sizes,
                 disable_bucketing_per_chunk=per_chunk_disable_bucketing,
             )
@@ -2658,6 +2698,14 @@ def setup_model_and_optimizer(
             )
             if mup_overrides:
                 optim_cfg_overrides = {**(optim_cfg_overrides or {}), **mup_overrides}
+        engram_config = getattr(cfg.model, "engram_config", None)
+        if engram_config is not None:
+            engram_overrides = get_engram_config_overrides(
+                optim_cfg,
+                lr_multiplier=engram_config.embedding_lr_multiplier,
+                weight_decay=engram_config.embedding_weight_decay,
+            )
+            optim_cfg_overrides = {**(optim_cfg_overrides or {}), **engram_overrides}
 
         optimizer = get_megatron_optimizer(
             optim_cfg,
@@ -3221,6 +3269,22 @@ def train_step(
         else:
             scheduled_num_microbatches = get_num_microbatches()
             forward_backward_data_iterator = data_iterator
+
+        if getattr(cfg.model.transformer, "engram_enabled", False):
+            # Every pipeline stage needs the raw token IDs, but only the first one reads the
+            # data iterator, so broadcast them down the pipeline before the schedule starts.
+            # Prefetching inside this loop repeats it for a rerun, and rerun_data_iterator stays
+            # the RerunDataIterator that the rerun state machine expects. (Engram rejects the
+            # sequence-packing scheduler, so data_iterator is the schedule's iterator here.)
+            engram_pg_collection = _get_model_pg_collection(model[0])
+            forward_backward_data_iterator = prepare_tokens_for_pipeline(
+                data_iterator,
+                scheduled_num_microbatches,
+                cfg.train.micro_batch_size,
+                sequence_length,
+                engram_pg_collection.pp,
+                engram_pg_collection.tp,
+            )
 
         # Forward pass.
         if save_activations_in_this_iteration:
@@ -5392,10 +5456,12 @@ def train(
             # Deregister the GTP symmetric-memory pools: windows left registered when the
             # process groups are destroyed make NCCL abort.
             deregister_and_clear_gtp_symm_pools()
+        # Every rank exits here together: close the Engram symmetric transports collectively.
+        close_engram_transports(clean=True)
 
         for model_module in model:
             if isinstance(model_module, DDP):
-                for buf in model_module.buffers + model_module.expert_parallel_buffers:
+                for buf in model_module.all_buffers:
                     buf.deregister_nccl_mem_pools()
         one_logger and one_logger.log_metrics(
             {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
@@ -5446,6 +5512,16 @@ def evaluate(
     sequence_length = cfg.model.transformer.max_seq_length_per_sample
     timers = get_timers()
     train_state = get_train_state()
+
+    if (
+        getattr(cfg.model.transformer, "engram_enabled", False)
+        and process_non_loss_data_func is not None
+        and non_loss_data_func is None
+    ):
+        # This extra pass runs a last-rank-only forward, so the collective Engram token
+        # prefetch cannot be prepared for it. Raise on every rank so the job fails cleanly
+        # instead of hanging the peers at their next collective.
+        raise RuntimeError("Engram does not support process_non_loss_data_func evaluation.")
 
     step_start_event = "on_test_step_start" if is_test else "on_eval_step_start"
     step_end_event = "on_test_step_end" if is_test else "on_eval_step_end"
@@ -5547,6 +5623,16 @@ def evaluate(
             else:
                 packed_data_iterator = data_iterator
                 scheduled_eval_num_microbatches = eval_num_microbatches
+
+            if getattr(cfg.model.transformer, "engram_enabled", False):
+                packed_data_iterator = prepare_tokens_for_pipeline(
+                    packed_data_iterator,
+                    scheduled_eval_num_microbatches,
+                    eval_micro_batch_size,
+                    sequence_length,
+                    eval_pgc.pp,
+                    eval_pgc.tp,
+                )
 
             ft_integration.on_eval_step_start()
 

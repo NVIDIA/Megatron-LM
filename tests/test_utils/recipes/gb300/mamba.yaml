@@ -84,3 +84,17 @@ products:
         platforms: [dgx_gb300]
         n_repeat: [2]
         time_limit: [1800]
+  - test_case: [hybrid_mr_mcore_te_tp1_pp2_vpp2_ep2_engram]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_gb300]
+        n_repeat: [2]
+        time_limit: [1800]
+  - test_case: [hybrid_mr_mcore_te_tp1_pp2_dp2_engram_shard]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_gb300]
+        n_repeat: [2]
+        time_limit: [1800]

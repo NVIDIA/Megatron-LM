@@ -1,0 +1,913 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2026 The Qwen Team and The HuggingFace Inc. team. All rights reserved.
+#
+# Parts of this file are adapted from:
+# - DeepSeek Engram (engram_demo_v1.py), https://github.com/deepseek-ai/Engram at revision
+#   fb7f84a21f91223715394a33a1dc24bbfb7f788e;
+# - Hugging Face Transformers (src/transformers/models/qwen4_exp/modeling_qwen4_exp.py),
+#   https://github.com/huggingface/transformers at revision
+#   fd3cf0140de03f7619ac95b5cfed05b711ff9e22.
+# Both are licensed under the Apache License, Version 2.0
+# (http://www.apache.org/licenses/LICENSE-2.0).
+
+"""Faithful standard-residual and native-mHC Engram module.
+
+The gated fusion of the ``deepseek_v41`` variant (:meth:`Engram._gated_fusion_residual`)
+follows the DeepSeek-V4.1 Engram module of NVIDIA/Megatron-LM#7224 by Deyu Fu and Hongxiao Bai,
+megatron/core/models/deepseek_v41/engram.py at commit 1bb21c69c.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+from typing import NamedTuple
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor, nn
+
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+from megatron.core.transformer.module import MegatronModule
+from megatron.core.utils import get_pg_rank, get_pg_size, nvtx_range_pop, nvtx_range_push
+
+from .config import EngramConfig
+from .cp_layout import (
+    CONTIGUOUS_CP_LAYOUT,
+    gather_sequence_thd,
+    resolve_layer_cp_layout,
+    restore_zigzag,
+    scatter_sequence_thd,
+    select_contiguous,
+    select_zigzag,
+    stack_mixes_cp_layouts,
+    thd_partition_index,
+)
+from .distributed_embedding import EPShardedMultiTableEmbedding
+from .hashing import (
+    build_ngram_hashes,
+    slice_hashes_for_sequence_parallel,
+    valid_positions_from_cu_seqlens,
+)
+from .symmetric_lookup import select_engram_lookup
+from .table_sharding import ENGRAM_PARAMETER_DOMAIN, resolve_engram_groups, tag_engram_tables
+from .variants import GATED_FUSION
+
+logger = logging.getLogger(__name__)
+
+
+class EngramLookupResult(NamedTuple):
+    """What :meth:`Engram.lookup` hands to :meth:`Engram.forward` for one microbatch.
+
+    ``memory`` holds the looked-up rows of this rank's positions, ``[S_local, B,
+    total_memory_dim]`` in the table dtype, and carries the gradient edge to the tables.
+    ``valid`` marks the positions that hold a token (``[1, S_local, 1]``), or is None for an
+    unpacked row and for a fusion that does not gate on it. ``cu_seqlens`` holds the positions
+    of the documents of a packed row, or None for an unpacked one; the short convolution splits
+    a context-parallel row by them. No field has a default, so a result that is rebuilt from
+    its tensors cannot drop one.
+    """
+
+    memory: Tensor
+    valid: Tensor | None
+    cu_seqlens: Tensor | None
+
+
+class _PreviousRankConvHalo(torch.autograd.Function):
+    """Differentiable fetch of the previous rank's trailing convolution context.
+
+    Serves a group whose ranks own consecutive slices of the sequence: the TP group under
+    sequence parallelism, and the CP group in the contiguous layout. The causal short
+    convolution needs the last ``history_length`` positions of the previous rank's slice. The
+    first rank keeps zeros, matching the true sequence start. Backward returns the received
+    context's gradient to the sending rank's trailing positions.
+    """
+
+    @staticmethod
+    def _exchange(send_tensor, recv_tensor, send_peer, recv_peer, group):
+        operations = []
+        if send_tensor is not None:
+            operations.append(
+                torch.distributed.P2POp(
+                    torch.distributed.isend,
+                    send_tensor.contiguous(),
+                    torch.distributed.get_global_rank(group, send_peer),
+                    group,
+                )
+            )
+        if recv_tensor is not None:
+            operations.append(
+                torch.distributed.P2POp(
+                    torch.distributed.irecv,
+                    recv_tensor,
+                    torch.distributed.get_global_rank(group, recv_peer),
+                    group,
+                )
+            )
+        for request in torch.distributed.batch_isend_irecv(operations):
+            request.wait()
+
+    @staticmethod
+    def forward(ctx, local_slice: Tensor, history_length: int, group) -> Tensor:
+        """Fetch the previous rank's trailing ``history_length`` rows."""
+        ctx.group = group
+        ctx.history_length = history_length
+        ctx.local_shape = local_slice.shape
+        rank = get_pg_rank(group)
+        size = get_pg_size(group)
+        ctx.rank, ctx.size = rank, size
+        send_tensor = local_slice[-history_length:] if rank < size - 1 else None
+        recv_tensor = local_slice.new_zeros((history_length, *local_slice.shape[1:]))
+        _PreviousRankConvHalo._exchange(
+            send_tensor, recv_tensor if rank > 0 else None, rank + 1, rank - 1, group
+        )
+        return recv_tensor
+
+    @staticmethod
+    def backward(ctx, grad_history: Tensor):
+        """Send the history gradient back to the previous rank."""
+        rank, size = ctx.rank, ctx.size
+        send_tensor = grad_history if rank > 0 else None
+        recv_tensor = (
+            grad_history.new_empty((ctx.history_length, *ctx.local_shape[1:]))
+            if rank < size - 1
+            else None
+        )
+        _PreviousRankConvHalo._exchange(send_tensor, recv_tensor, rank - 1, rank + 1, ctx.group)
+        grad_local = grad_history.new_zeros(ctx.local_shape)
+        if recv_tensor is not None:
+            grad_local[-ctx.history_length :] = recv_tensor
+        return grad_local, None, None
+
+
+class EngramGroupRMSNorm(torch.nn.Module):
+    """RMSNorm over groups of ``group_size`` channels with optional zero-centered gamma.
+
+    One weight of width ``num_groups * group_size`` normalized per group is mathematically
+    identical to independent per-group RMSNorms, and matches the official Qwen PLE layout
+    (one norm per role across all residual streams). Normalization and scaling run in fp32
+    for half-precision inputs, mirroring the reference implementation; wider dtypes (fp64
+    parity tests) keep their own precision.
+    """
+
+    def __init__(self, width: int, group_size: int, eps: float, zero_centered: bool, **factory):
+        super().__init__()
+        if width % group_size != 0:
+            raise ValueError(f"width ({width}) must be divisible by group_size ({group_size}).")
+        self.group_size = group_size
+        self.eps = eps
+        self.zero_centered = zero_centered
+        initial = torch.zeros(width, **factory) if zero_centered else torch.ones(width, **factory)
+        self.weight = nn.Parameter(initial)
+
+    def forward(self, hidden: Tensor) -> Tensor:
+        """Normalize each ``group_size`` channel group of ``hidden``."""
+        compute = hidden.float() if hidden.dtype in (torch.float16, torch.bfloat16) else hidden
+        grouped = compute.reshape(*compute.shape[:-1], -1, self.group_size)
+        normed = grouped * torch.rsqrt(grouped.pow(2).mean(-1, keepdim=True) + self.eps)
+        normed = normed.flatten(-2)
+        gamma = self.weight.to(normed.dtype)
+        if self.zero_centered:
+            gamma = 1.0 + gamma
+        return (normed * gamma).type_as(hidden)
+
+
+def _at_least_fp32(tensor: Tensor) -> Tensor:
+    """Return ``tensor`` in FP32 when it is half precision, and unchanged otherwise."""
+    return tensor.float() if tensor.dtype in (torch.float16, torch.bfloat16) else tensor
+
+
+def _gather_tokens_across_cp(
+    input_ids: Tensor, cp_group, cu_seqlens: Tensor | None, contiguous: bool = False
+) -> Tensor:
+    """Restore the globally ordered token row from this rank's context-parallel shard.
+
+    Token IDs are not differentiable, so this is a plain all-gather plus the inverse of the
+    partitioning the batch went through: a plain zigzag for an unpacked row, and the
+    per-document zigzag for a packed one. In the contiguous layout the rank-major gather is
+    the row already, packed or not.
+    """
+    cp_size = get_pg_size(cp_group)
+    parts = [torch.empty_like(input_ids) for _ in range(cp_size)]
+    torch.distributed.all_gather(parts, input_ids.contiguous(), group=cp_group)
+    gathered = torch.cat(parts, dim=1)
+    if contiguous:
+        return gathered
+    if cu_seqlens is None:
+        return restore_zigzag(gathered, cp_size, sequence_dim=1)
+    total_length = int(cu_seqlens[-1].item())
+    index = torch.cat([thd_partition_index(cu_seqlens, cp_size, rank) for rank in range(cp_size)])
+    restored = gathered.new_zeros((gathered.shape[0], total_length))
+    return restored.index_copy(1, index, gathered)
+
+
+def _row_cu_seqlens(packed_seq_params: PackedSeqParams | None) -> Tensor | None:
+    """Return the packed document boundaries for this microbatch, or None when unpacked.
+
+    ``get_batch`` keeps ``cu_seqlens`` as ``(1, N)`` for consistency and squeezes it to 1-D
+    before building PackedSeqParams, so accept either and hand back a 1-D tensor.
+    """
+    if packed_seq_params is None:
+        return None
+    cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q", None)
+    if cu_seqlens is None:
+        return None
+    return cu_seqlens.reshape(-1)
+
+
+def _row_document_bounds(
+    packed_seq_params: PackedSeqParams | None, contiguous_cp: bool
+) -> tuple[Tensor | None, Tensor | None]:
+    """Return the row positions of the packed documents and, if known, their token counts.
+
+    ``cu_seqlens_q`` holds the positions the documents occupy in the row. The exception is a
+    context-parallel row in the contiguous layout (``contiguous_cp``): its ``cu_seqlens_q``
+    counts the tokens of the documents, and ``cu_seqlens_q_padded``, which a row that pads
+    its documents carries, holds the positions. The token counts are returned for such a row
+    only, and are None otherwise.
+    """
+    cu_seqlens = _row_cu_seqlens(packed_seq_params)
+    if cu_seqlens is None or not contiguous_cp:
+        return cu_seqlens, None
+    cu_seqlens_padded = getattr(packed_seq_params, "cu_seqlens_q_padded", None)
+    if cu_seqlens_padded is None:
+        return cu_seqlens, None
+    return cu_seqlens_padded.reshape(-1), cu_seqlens.diff()
+
+
+class _ContextParallelConvHalo(torch.autograd.Function):
+    """Differentiable one-hop exchange of convolution context between zigzag CP neighbours.
+
+    Causal context parallelism cuts the sequence into ``2 * cp_size`` chunks and gives rank
+    ``r`` the pair ``(chunk[r], chunk[2 * cp_size - 1 - r])``. Each of those two chunks needs
+    the tail of the chunk that precedes it globally, and the ownership map makes both
+    predecessors land on an immediate neighbour:
+
+    * ``chunk[r]``'s predecessor ``chunk[r - 1]`` is rank ``r - 1``'s **first** chunk;
+      rank 0 has none, which is the true sequence start and stays zeros.
+    * ``chunk[2 * cp_size - 1 - r]``'s predecessor ``chunk[2 * cp_size - 2 - r]`` is rank
+      ``r + 1``'s **second** chunk -- except on the last rank, where it is that rank's own
+      first chunk and needs no communication at all (handled by the caller).
+
+    So the pattern is a fixed two-send/two-receive between ``r - 1`` and ``r + 1``, which is
+    why this is a generalization of the sequence-parallel halo rather than a new mechanism.
+    Backward is its transpose: the gradient of a received context returns to the trailing
+    positions of the chunk it came from.
+    """
+
+    @staticmethod
+    def _exchange(ops):
+        pending = [op for op in ops if op is not None]
+        if not pending:
+            return
+        for request in torch.distributed.batch_isend_irecv(pending):
+            request.wait()
+
+    @staticmethod
+    def _p2p(kind, tensor, peer, group):
+        return torch.distributed.P2POp(
+            kind, tensor, torch.distributed.get_global_rank(group, peer), group
+        )
+
+    @staticmethod
+    def forward(ctx, chunk_a: Tensor, chunk_b: Tensor, history_length: int, group):
+        """Exchange the convolution context of both zigzag chunks with the CP neighbours."""
+        rank, size = get_pg_rank(group), get_pg_size(group)
+        ctx.group, ctx.history_length = group, history_length
+        ctx.rank, ctx.size = rank, size
+        ctx.shape_a, ctx.shape_b = chunk_a.shape, chunk_b.shape
+
+        history_a = chunk_a.new_zeros((history_length, *chunk_a.shape[1:]))
+        history_b = chunk_b.new_zeros((history_length, *chunk_b.shape[1:]))
+        ops = [
+            # My first chunk's tail is the left context of rank r+1's first chunk.
+            (
+                _ContextParallelConvHalo._p2p(
+                    torch.distributed.isend, chunk_a[-history_length:].contiguous(), rank + 1, group
+                )
+                if rank + 1 <= size - 1
+                else None
+            ),
+            # My second chunk's tail is the left context of rank r-1's second chunk.
+            (
+                _ContextParallelConvHalo._p2p(
+                    torch.distributed.isend, chunk_b[-history_length:].contiguous(), rank - 1, group
+                )
+                if rank >= 1
+                else None
+            ),
+            (
+                _ContextParallelConvHalo._p2p(torch.distributed.irecv, history_a, rank - 1, group)
+                if rank >= 1
+                else None
+            ),
+            (
+                _ContextParallelConvHalo._p2p(torch.distributed.irecv, history_b, rank + 1, group)
+                if rank + 1 <= size - 1
+                else None
+            ),
+        ]
+        _ContextParallelConvHalo._exchange(ops)
+        return history_a, history_b
+
+    @staticmethod
+    def backward(ctx, grad_history_a: Tensor, grad_history_b: Tensor):
+        """Return the context gradients to the neighbours that sent the context."""
+        rank, size, group = ctx.rank, ctx.size, ctx.group
+        history_length = ctx.history_length
+        grad_a_tail = grad_history_a.new_zeros((history_length, *ctx.shape_a[1:]))
+        grad_b_tail = grad_history_b.new_zeros((history_length, *ctx.shape_b[1:]))
+        ops = [
+            # Transpose of forward: return each received context's gradient to its sender.
+            (
+                _ContextParallelConvHalo._p2p(
+                    torch.distributed.isend, grad_history_a.contiguous(), rank - 1, group
+                )
+                if rank >= 1
+                else None
+            ),
+            (
+                _ContextParallelConvHalo._p2p(
+                    torch.distributed.isend, grad_history_b.contiguous(), rank + 1, group
+                )
+                if rank + 1 <= size - 1
+                else None
+            ),
+            (
+                _ContextParallelConvHalo._p2p(torch.distributed.irecv, grad_a_tail, rank + 1, group)
+                if rank + 1 <= size - 1
+                else None
+            ),
+            (
+                _ContextParallelConvHalo._p2p(torch.distributed.irecv, grad_b_tail, rank - 1, group)
+                if rank >= 1
+                else None
+            ),
+        ]
+        _ContextParallelConvHalo._exchange(ops)
+
+        grad_chunk_a = grad_history_a.new_zeros(ctx.shape_a)
+        grad_chunk_b = grad_history_b.new_zeros(ctx.shape_b)
+        grad_chunk_a[-history_length:] = grad_a_tail
+        grad_chunk_b[-history_length:] = grad_b_tail
+        return grad_chunk_a, grad_chunk_b, None, None
+
+
+class Engram(MegatronModule):
+    """DeepSeek Engram injection for one selected global transformer layer."""
+
+    def __init__(
+        self,
+        config,
+        engram_config: EngramConfig,
+        layer_number: int,
+        pg_collection: ProcessGroupCollection,
+    ) -> None:
+        super().__init__(config=config)
+        self.engram_config = engram_config
+        self.layer_number = layer_number
+        self.pg_collection = pg_collection
+        self.tp_group = pg_collection.tp
+        self.cp_group = getattr(pg_collection, "cp", None)
+        # The layout this layer's hidden states and token IDs are in under context parallelism.
+        self.cp_layout = resolve_layer_cp_layout(config)
+        self._stack_mixes_cp_layouts = stack_mixes_cp_layouts(config)
+        self.num_streams = config.mhc_num_residual_streams if config.enable_mhc_connections else 1
+        self.hidden_size = config.hidden_size
+        device = (
+            torch.device("cpu") if config.use_cpu_initialization else torch.cuda.current_device()
+        )
+
+        if engram_config.tokenizer_remap is not None:
+            self.register_buffer(
+                "tokenizer_remap", engram_config.tokenizer_remap.to(device=device), persistent=False
+            )
+        else:
+            # The qwen variant hashes raw token IDs directly.
+            self.tokenizer_remap = None
+        self.register_buffer(
+            "hash_multipliers",
+            torch.tensor(engram_config.multipliers(layer_number), dtype=torch.int64, device=device),
+            persistent=False,
+        )
+        table_sizes = engram_config.table_sizes(layer_number)
+        self.register_buffer(
+            "table_sizes",
+            torch.tensor(table_sizes, dtype=torch.int64, device=device),
+            persistent=False,
+        )
+
+        # The rows are sharded over the expert-parallel group (EP layout) or over a slice of
+        # dp_cp (engram_config.parallel_size); the embedding takes either through its EP and
+        # expert-DP arguments.
+        row_group, replica_group, parameter_domain = resolve_engram_groups(
+            pg_collection, engram_config
+        )
+        # The lookup is chosen once, before any table is allocated: the symmetric backend
+        # checks its libraries here, so a missing one fails before a parameter exists.
+        make_lookup = select_engram_lookup(engram_config, row_group)
+        self.embedding = EPShardedMultiTableEmbedding(
+            config=config,
+            table_sizes=table_sizes,
+            embedding_dim=engram_config.head_dim,
+            init_method=config.init_method,
+            ep_group=row_group,
+            tp_group=pg_collection.tp,
+            expt_dp_group=replica_group,
+        )
+        if parameter_domain == ENGRAM_PARAMETER_DOMAIN:
+            tag_engram_tables(self.embedding)
+        if engram_config.freeze_embedding:
+            for table in self.embedding.tables:
+                table.weight.requires_grad_(False)
+        # The embedding's own call (NCCL all-to-alls) or a SymmetricEngramLookup bound to it:
+        # a bound method or a plain object, never a submodule, so the state dict keeps only the
+        # embedding's keys.
+        self._lookup = make_lookup(self.embedding)
+        factory_kwargs = {"device": device, "dtype": config.params_dtype}
+        self._gated_fusion = engram_config.variant_spec.fusion == GATED_FUSION
+        if self._gated_fusion:
+            self._build_gated_fusion(factory_kwargs)
+        else:
+            self._build_gated_conv_fusion(factory_kwargs)
+        self._initialize_dense_parameters()
+        self._log_allocation()
+
+    def _build_gated_conv_fusion(self, factory_kwargs: dict) -> None:
+        """Build the projections, group norms and short convolution of Engram and PLE."""
+        config, engram_config = self.config, self.engram_config
+        # Official Qwen PLE layout: one fused key projection over all residual streams, one
+        # shared value projection, and one group RMSNorm per role. This is mathematically
+        # identical to per-stream projections/norms and maps 1:1 onto the HF weights. The
+        # qwen variant uses bias-free projections and zero-centered gamma.
+        use_bias = engram_config.variant_spec.projection_bias
+        zero_centered = engram_config.variant_spec.zero_centered_gamma
+        stream_width = self.num_streams * config.hidden_size
+        self.value_projection = nn.Linear(
+            engram_config.total_memory_dim, config.hidden_size, bias=use_bias, **factory_kwargs
+        )
+        self.key_projection = nn.Linear(
+            engram_config.total_memory_dim, stream_width, bias=use_bias, **factory_kwargs
+        )
+        norm_kwargs = dict(
+            group_size=config.hidden_size,
+            eps=config.layernorm_epsilon,
+            zero_centered=zero_centered,
+            **factory_kwargs,
+        )
+        self.key_norm = EngramGroupRMSNorm(stream_width, **norm_kwargs)
+        self.query_norm = EngramGroupRMSNorm(stream_width, **norm_kwargs)
+        self.conv_norm = EngramGroupRMSNorm(stream_width, **norm_kwargs)
+        channels = self.num_streams * config.hidden_size
+        dilation = engram_config.max_ngram_order
+        # The causal left context is provided explicitly: zeros at the true sequence start and,
+        # under sequence parallelism, the previous TP rank's trailing positions (halo exchange).
+        self.conv_history_length = (engram_config.kernel_size - 1) * dilation
+        self.short_conv = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size=engram_config.kernel_size,
+            groups=channels,
+            bias=False,
+            padding=0,
+            dilation=dilation,
+            **factory_kwargs,
+        )
+
+    def _build_gated_fusion(self, factory_kwargs: dict) -> None:
+        """Build the DeepSeek-V4.1 fusion: one projection and two per-channel gate weights.
+
+        ``wkv`` maps the memory to one key per residual stream followed by the shared value,
+        without a bias. ``q_weight`` and ``k_weight`` scale the normalized streams and keys
+        in the gate. The names are those of the DeepSeek-V4.1 module.
+        """
+        stream_width = self.num_streams * self.hidden_size
+        self.wkv = nn.Linear(
+            self.engram_config.total_memory_dim,
+            stream_width + self.hidden_size,
+            bias=False,
+            **factory_kwargs,
+        )
+        self.q_weight = nn.Parameter(torch.ones(stream_width, **factory_kwargs))
+        self.k_weight = nn.Parameter(torch.ones(stream_width, **factory_kwargs))
+
+    @property
+    def local_sparse_parameter_count(self) -> int:
+        """Rank-local sparse-table parameter count."""
+        return self.embedding.local_parameter_count
+
+    @property
+    def global_sparse_parameter_count(self) -> int:
+        """Global logical sparse-table parameter count."""
+        return self.embedding.global_parameter_count
+
+    def _initialize_dense_parameters(self) -> None:
+        if self._gated_fusion:
+            if self.config.perform_initialization:
+                self.config.init_method(self.wkv.weight)
+        else:
+            if self.config.perform_initialization:
+                self.config.init_method(self.value_projection.weight)
+                self.config.init_method(self.key_projection.weight)
+            with torch.no_grad():
+                if self.value_projection.bias is not None:
+                    self.value_projection.bias.zero_()
+                if self.key_projection.bias is not None:
+                    self.key_projection.bias.zero_()
+                self.short_conv.weight.zero_()
+
+        if self.config.sequence_parallel:
+            # Under SP every TP rank sees a distinct sequence slice, so all Engram gradients
+            # need a TP sum. Sparse tables are already marked in EPShardedEmbeddingTable and are
+            # reduced on a dedicated unflattened path; mark only the dense parameters here.
+            for parameter in self.parameters():
+                if not getattr(parameter, "is_engram_embedding", False):
+                    parameter.sequence_parallel = True
+
+    def _log_allocation(self) -> None:
+        """Emit one machine-readable ownership record per instantiated module and rank."""
+        global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        # Rank in the group the rows are sharded over: EP, or the dp_cp row group.
+        row_rank = get_pg_rank(self.embedding.ep_group)
+        local_rows = [table.local_num_embeddings for table in self.embedding.tables]
+        row_ranges = [(table.row_start, table.row_end) for table in self.embedding.tables]
+        # DEBUG: one record per rank and layer is far too chatty for large jobs at INFO.
+        logger.debug(
+            "[Engram allocation] rank=%s layer=%s row_rank=%s local_rows=%s "
+            "row_ranges=%s global_rows=%s local_sparse_parameters=%s "
+            "global_sparse_parameters=%s",
+            global_rank,
+            self.layer_number,
+            row_rank,
+            local_rows,
+            row_ranges,
+            list(self.embedding.table_sizes),
+            self.local_sparse_parameter_count,
+            self.global_sparse_parameter_count,
+        )
+
+    def _convolution_history(self, normed: Tensor) -> Tensor:
+        """Return the causal left context: zeros at the sequence start, SP halo otherwise."""
+        history_shape = (self.conv_history_length, *normed.shape[1:])
+        if (
+            self.conv_history_length == 0
+            or not self.config.sequence_parallel
+            or get_pg_size(self.tp_group) <= 1
+        ):
+            return normed.new_zeros(history_shape)
+        if normed.shape[0] < self.conv_history_length:
+            raise RuntimeError(
+                "Engram sequence-parallel convolution requires each TP rank to own at least "
+                f"{self.conv_history_length} positions "
+                f"(kernel_size - 1 = {self.engram_config.kernel_size - 1} times dilation "
+                f"{self.engram_config.max_ngram_order}); got {normed.shape[0]}."
+            )
+        return _PreviousRankConvHalo.apply(normed, self.conv_history_length, self.tp_group)
+
+    def _short_convolution(self, value: Tensor, cu_seqlens: Tensor | None = None) -> Tensor:
+        if get_pg_size(self.cp_group) <= 1:
+            return self._short_convolution_local(value)
+        # The context-parallel paths need the CP-local sequence whole: the zigzag chunk
+        # boundaries sit inside the sequence-parallel split, and a contiguous slice takes its
+        # context from the whole previous CP rank. Every TP rank convolves all of it
+        # but keeps, and so backpropagates, only its own slice. The gather's backward then
+        # reduce-scatters the input gradient, and the TP sum of the sequence-parallel
+        # parameters adds each slice's parameter gradient exactly once.
+        sequence_parallel = self.config.sequence_parallel and get_pg_size(self.tp_group) > 1
+        local_length = value.shape[0]
+        if sequence_parallel:
+            value = gather_from_sequence_parallel_region(
+                value, tensor_parallel_output_grad=True, group=self.tp_group
+            )
+        if self.cp_layout == CONTIGUOUS_CP_LAYOUT:
+            # One slice per rank, packed or not, and the convolution does not stop at a
+            # document boundary: the previous CP rank's tail is the whole left context.
+            convolved = self._short_convolution_contiguous(value)
+        elif cu_seqlens is not None:
+            # Packed rows zigzag per document, so the chunk map changes with the batch and
+            # the halo's fixed neighbour pattern no longer describes it. Restore the row,
+            # convolve it from the sequence start (zero left context), and scatter it back.
+            total_length = int(cu_seqlens[-1].item())
+            restored = gather_sequence_thd(value, self.cp_group, cu_seqlens, total_length)
+            normed = self.conv_norm(restored.flatten(start_dim=-2)).view_as(restored)
+            history = normed.new_zeros((self.conv_history_length, *normed.shape[1:]))
+            convolved = scatter_sequence_thd(
+                self._convolve_with_history(normed, history), self.cp_group, cu_seqlens
+            )
+        else:
+            # Unpacked rows keep a fixed zigzag chunk map, so a halo exchange of
+            # conv_history_length positions per chunk boundary gives every chunk its context.
+            convolved = self._short_convolution_cp_halo(value)
+        if sequence_parallel:
+            tp_rank = get_pg_rank(self.tp_group)
+            convolved = convolved.narrow(0, tp_rank * local_length, local_length)
+        return convolved
+
+    def _convolve_with_history(self, normed: Tensor, history: Tensor) -> Tensor:
+        """Valid causal convolution of ``normed`` given its explicit left context."""
+        sequence_length, batch_size, num_streams, hidden_size = normed.shape
+        with_history = torch.cat((history, normed), dim=0)
+        channels_first = with_history.permute(1, 2, 3, 0).reshape(
+            batch_size, num_streams * hidden_size, sequence_length + self.conv_history_length
+        )
+        # Valid causal convolution over [history + local]: output length equals sequence_length.
+        convolved = self.short_conv(channels_first)
+        return (
+            F.silu(convolved)
+            .view(batch_size, num_streams, hidden_size, sequence_length)
+            .permute(3, 0, 1, 2)
+            .contiguous()
+        )
+
+    def _short_convolution_local(self, value: Tensor) -> Tensor:
+        """Convolve one contiguous slice, taking its left context from the SP halo or zeros."""
+        normed = self.conv_norm(value.flatten(start_dim=-2)).view_as(value)
+        return self._convolve_with_history(normed, self._convolution_history(normed))
+
+    def _short_convolution_contiguous(self, value: Tensor) -> Tensor:
+        """Convolve this rank's contiguous CP slice with the previous CP rank's tail as context."""
+        history_length = self.conv_history_length
+        normed = self.conv_norm(value.flatten(start_dim=-2)).view_as(value)
+        if history_length == 0:
+            return self._convolve_with_history(normed, normed[:0])
+        if normed.shape[0] < history_length:
+            raise RuntimeError(
+                "Engram context-parallel convolution requires each contiguous slice to own at "
+                f"least {history_length} positions; got {normed.shape[0]}."
+            )
+        history = _PreviousRankConvHalo.apply(normed, history_length, self.cp_group)
+        return self._convolve_with_history(normed, history)
+
+    def _short_convolution_cp_halo(self, value: Tensor) -> Tensor:
+        """Give each of this rank's two zigzag chunks its own one-hop left context (CP halo).
+
+        Cheaper than restoring the whole sequence -- only ``conv_history_length`` positions
+        cross the wire per boundary -- and the predecessor map is static, so this stays a
+        fixed two-send/two-receive between neighbouring CP ranks.
+        """
+        cp_size, cp_rank = get_pg_size(self.cp_group), get_pg_rank(self.cp_group)
+        history_length = self.conv_history_length
+        normed = self.conv_norm(value.flatten(start_dim=-2)).view_as(value)
+        if history_length == 0:
+            # A one-tap kernel needs no left context, so no chunk needs its neighbour.
+            return self._convolve_with_history(normed, normed[:0])
+        if normed.shape[0] % 2 != 0:
+            raise RuntimeError(
+                "Engram context-parallel convolution expects an even local sequence length "
+                f"(two zigzag chunks); got {normed.shape[0]}."
+            )
+        chunk_a, chunk_b = normed.chunk(2, dim=0)
+        if chunk_a.shape[0] < history_length:
+            raise RuntimeError(
+                "Engram context-parallel convolution requires each zigzag chunk to own at "
+                f"least {history_length} positions; got {chunk_a.shape[0]}."
+            )
+        history_a, history_b = _ContextParallelConvHalo.apply(
+            chunk_a, chunk_b, history_length, self.cp_group
+        )
+        if cp_rank == cp_size - 1:
+            # The last rank's second chunk follows its own first chunk, so its context is
+            # local and must stay inside autograd rather than come off the wire.
+            history_b = chunk_a[-history_length:]
+        return torch.cat(
+            (
+                self._convolve_with_history(chunk_a, history_a),
+                self._convolve_with_history(chunk_b, history_b),
+            ),
+            dim=0,
+        )
+
+    def lookup(
+        self,
+        input_ids: Tensor,
+        packed_seq_params: PackedSeqParams | None = None,
+        *,
+        local_sequence_length: int | None = None,
+    ) -> EngramLookupResult:
+        """Hash the token IDs and look up this rank's rows: the first step of :meth:`forward`.
+
+        :meth:`forward` runs this step itself unless it is handed the result, so a caller that
+        wants the lookup ahead of the fusion, for instance in front of a region it recomputes,
+        calls this method and passes the result on with ``forward(..., lookup=result)``.
+
+        ``input_ids`` is this rank's ``[B, S]`` token row in the layer's context-parallel
+        layout, not sliced over the tensor-parallel group, and ``packed_seq_params`` describes
+        the packed row as in :meth:`forward`. ``local_sequence_length`` is the length of the
+        hidden states the result is fused into; left out, it is the row length, divided by the
+        tensor-parallel size under sequence parallelism. The result holds everything the fusion
+        needs from the row, so ``forward`` takes it alone.
+
+        The result carries the gradient edge to the tables, and the lookup is a collective over
+        the ranks that share the tables. So every result must be made with gradients enabled
+        when the tables train, and be consumed by exactly one :meth:`forward`, the same one on
+        every rank, with the calls in the same order on every rank.
+        """
+        cp_size = get_pg_size(self.cp_group)
+        contiguous_cp = cp_size > 1 and self.cp_layout == CONTIGUOUS_CP_LAYOUT
+        row_cu_seqlens, document_lengths = _row_document_bounds(packed_seq_params, contiguous_cp)
+        if cp_size > 1 and row_cu_seqlens is not None:
+            self._check_packed_cp_partition(packed_seq_params)
+        if local_sequence_length is None:
+            # The hidden states are sliced over TP under sequence parallelism; the row is not.
+            local_sequence_length = input_ids.shape[1]
+            tp_size = get_pg_size(self.tp_group)
+            if self.config.sequence_parallel and tp_size > 1:
+                local_sequence_length //= tp_size
+
+        message = "engram.hash"
+        nvtx_range_push(message)
+        try:
+            # Hash windows and the causal convolution both read positions that CP may have
+            # placed on another rank, so the memory is computed on the restored global
+            # sequence and re-selected afterwards. input_ids is a small int64 tensor, so the
+            # gather costs far less than threading a second token channel through the model.
+            if cp_size > 1:
+                global_input_ids = _gather_tokens_across_cp(
+                    input_ids, self.cp_group, row_cu_seqlens, contiguous=contiguous_cp
+                )
+            else:
+                global_input_ids = input_ids
+            hash_ids = build_ngram_hashes(
+                input_ids=global_input_ids,
+                tokenizer_remap=self.tokenizer_remap,
+                multipliers=self.hash_multipliers,
+                table_sizes=self.table_sizes,
+                max_ngram_order=self.engram_config.max_ngram_order,
+                num_hash_heads=self.engram_config.num_hash_heads,
+                boundary_token_id=self.engram_config.hash_boundary_token_id,
+                reset_at_boundary=self.engram_config.variant_spec.resets_windows_at_boundary_token,
+                cu_seqlens=row_cu_seqlens,
+            )
+            hash_ids = self._select_local_positions(hash_ids, row_cu_seqlens, local_sequence_length)
+            valid = None
+            if self._gated_fusion and row_cu_seqlens is not None:
+                # A position after the last document boundary belongs to no document, and a
+                # position in the padding of a document holds no token.
+                valid = self._select_local_positions(
+                    valid_positions_from_cu_seqlens(
+                        row_cu_seqlens, global_input_ids.shape[1], document_lengths
+                    ).view(1, -1, 1),
+                    row_cu_seqlens,
+                    local_sequence_length,
+                )
+        finally:
+            nvtx_range_pop(message)
+
+        message = "engram.lookup"
+        nvtx_range_push(message)
+        try:
+            memory = self._lookup(hash_ids).flatten(start_dim=-2).transpose(0, 1).contiguous()
+        finally:
+            nvtx_range_pop(message)
+        return EngramLookupResult(memory, valid, row_cu_seqlens)
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        input_ids: Tensor | None = None,
+        packed_seq_params: PackedSeqParams | None = None,
+        add_to_hidden_states: bool = False,
+        *,
+        lookup: EngramLookupResult | None = None,
+    ) -> Tensor:
+        """Return an Engram residual with the same standard or mHC layout as input.
+
+        ``packed_seq_params`` carries the packed (THD) document boundaries, as positions of
+        the row. They stop an n-gram window from reaching back into the previous document of the
+        same row; the causal convolution deliberately still mixes across the boundary, matching
+        both published reference implementations. The ``gated`` fusion also closes its gate on
+        the positions after the last boundary. The ``--sft`` rows have none: their last document
+        ends at the end of the row and holds the padding. A context-parallel row in the
+        contiguous layout carries the token counts of its documents next to their positions,
+        and the ``gated`` fusion closes its gate on the padding of every document too.
+
+        With ``add_to_hidden_states`` the hidden states are returned with the residual added,
+        which is what the layers ask for. The ``gated`` fusion then adds half-precision hidden
+        states in FP32 and rounds once, as DeepSeek-V4.1 does; the ``gated_conv`` fusion adds in
+        the hidden dtype.
+
+        ``lookup`` takes the result of an earlier :meth:`lookup` call for the same microbatch;
+        ``input_ids`` and ``packed_seq_params`` are then unused. Without it the lookup runs
+        here, which is the same computation in one call.
+        """
+        if hidden_states.ndim != 3:
+            raise ValueError(f"Engram hidden_states must be [S,B,H], got {hidden_states.shape}.")
+        expected_hidden = self.num_streams * self.hidden_size
+        if hidden_states.shape[-1] != expected_hidden:
+            raise ValueError(
+                f"Engram expected hidden width {expected_hidden}, got {hidden_states.shape[-1]}."
+            )
+
+        if lookup is None:
+            if input_ids is None:
+                raise ValueError("Engram needs input_ids, or the result of an earlier lookup().")
+            lookup = self.lookup(
+                input_ids, packed_seq_params, local_sequence_length=hidden_states.shape[0]
+            )
+        memory, valid, row_cu_seqlens = lookup
+        if memory.shape[:2] != hidden_states.shape[:2]:
+            raise ValueError(
+                "Engram lookup result does not match the hidden states: looked up "
+                f"[S,B]={tuple(memory.shape[:2])}, hidden states {tuple(hidden_states.shape[:2])}."
+            )
+        if self._gated_fusion:
+            message = "engram.gate-projection"
+            nvtx_range_push(message)
+            try:
+                streams, residual = self._gated_fusion_residual(memory, hidden_states, valid)
+                output = streams + residual if add_to_hidden_states else residual
+                return output.flatten(start_dim=-2).to(hidden_states.dtype)
+            finally:
+                nvtx_range_pop(message)
+
+        streams = hidden_states.view(
+            hidden_states.shape[0], hidden_states.shape[1], self.num_streams, self.hidden_size
+        )
+
+        message = "engram.gate-projection"
+        nvtx_range_push(message)
+        try:
+            shared_value = self.value_projection(memory)
+            key = self.key_norm(self.key_projection(memory)).view_as(streams)
+            query = self.query_norm(hidden_states).view_as(streams)
+            score = (key * query).sum(dim=-1) / math.sqrt(self.hidden_size)
+            score = score.abs().clamp_min(1e-6).sqrt() * score.sign()
+            gate = score.sigmoid().unsqueeze(-1)
+            value = gate * shared_value.unsqueeze(2)
+        finally:
+            nvtx_range_pop(message)
+
+        message = "engram.short-conv"
+        nvtx_range_push(message)
+        try:
+            output = value + self._short_convolution(value, row_cu_seqlens)
+        finally:
+            nvtx_range_pop(message)
+        output = output.reshape(hidden_states.shape)
+        return hidden_states + output if add_to_hidden_states else output
+
+    def _check_packed_cp_partition(self, packed_seq_params: PackedSeqParams) -> None:
+        """Reject a packed context-parallel row whose partition this layer does not follow.
+
+        The partition of the row is cross-checked when the parameters record it
+        (``cp_partition_mode``); it is the layer's own layout otherwise.
+        """
+        partition = getattr(packed_seq_params, "cp_partition_mode", None)
+        if partition is not None and partition != self.cp_layout:
+            raise ValueError(
+                f"Engram layer {self.layer_number} runs in the {self.cp_layout} context-parallel "
+                f"layout, but its packed row is partitioned in the {partition} layout."
+            )
+        if self.cp_layout != CONTIGUOUS_CP_LAYOUT and self._stack_mixes_cp_layouts:
+            raise NotImplementedError(
+                f"Engram layer {self.layer_number} runs in the zigzag context-parallel layout of "
+                "a stack whose linear_cp_layout and attention_cp_layout differ. A packed row "
+                "reaches a zigzag layer of such a stack in the padded per-sequence zigzag, which "
+                "Engram does not follow; place the memory on a layer that runs in the contiguous "
+                "layout, or use one layout for the stack."
+            )
+
+    def _select_local_positions(
+        self, tensor: Tensor, cu_seqlens: Tensor | None, local_sequence_length: int
+    ) -> Tensor:
+        """Select this rank's positions of a ``[B, S_global, ...]`` tensor.
+
+        The context-parallel step inverts :func:`_gather_tokens_across_cp`; the
+        sequence-parallel slice follows it.
+        """
+        cp_size = get_pg_size(self.cp_group)
+        if cp_size > 1:
+            cp_rank = get_pg_rank(self.cp_group)
+            if self.cp_layout == CONTIGUOUS_CP_LAYOUT:
+                tensor = select_contiguous(tensor, cp_size, cp_rank, sequence_dim=1)
+            elif cu_seqlens is not None:
+                tensor = tensor.index_select(1, thd_partition_index(cu_seqlens, cp_size, cp_rank))
+            else:
+                tensor = select_zigzag(tensor, cp_size, cp_rank, sequence_dim=1)
+        return slice_hashes_for_sequence_parallel(tensor, local_sequence_length, self.tp_group)
+
+    def _gated_fusion_residual(
+        self, memory: Tensor, hidden_states: Tensor, valid: Tensor | None
+    ) -> tuple[Tensor, Tensor]:
+        """Return the residual streams and the gated value added to each of them.
+
+        ``wkv`` yields one key per residual stream and one shared value. The gate is the
+        sigmoid of the signed square root of the normalized stream-key product. Half-precision
+        inputs are widened first, so both RMS factors, the product, the gate and the returned
+        tensors are FP32. Positions outside ``valid`` (``[1, S, 1]``) keep a closed gate.
+        """
+        num_streams, hidden_size = self.num_streams, self.hidden_size
+        key, value = self.wkv(memory).split([num_streams * hidden_size, hidden_size], dim=-1)
+        key = _at_least_fp32(key).unflatten(-1, (num_streams, hidden_size))
+        streams = _at_least_fp32(hidden_states).unflatten(-1, (num_streams, hidden_size))
+        eps = self.config.layernorm_epsilon
+        scale = (streams.square().mean(-1) + eps).rsqrt() * (key.square().mean(-1) + eps).rsqrt()
+        gamma = _at_least_fp32(self.q_weight) * _at_least_fp32(self.k_weight)
+        score = (streams * gamma.view(num_streams, hidden_size) * key).sum(-1)
+        score = score * scale * hidden_size**-0.5
+        gate = torch.sigmoid(torch.copysign(score.abs().clamp_min(1e-6).sqrt(), score))
+        if valid is not None:
+            gate = gate.masked_fill(~valid.transpose(0, 1).to(gate.device), 0)
+        return streams, gate.unsqueeze(-1) * _at_least_fp32(value).unsqueeze(-2)

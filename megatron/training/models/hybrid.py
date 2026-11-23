@@ -8,6 +8,12 @@ import torch
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
+from megatron.core.models.engram import (
+    EngramConfig,
+    apply_engram_to_hybrid_stack_spec,
+    initialize_engram_parallel_state,
+    initialize_engram_transports,
+)
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec as default_hybrid_stack_spec,
@@ -52,6 +58,8 @@ class HybridModelConfig(ModelConfig):
 
     builder: ClassVar[str] = "megatron.training.models.hybrid.HybridModelBuilder"
     transformer: TransformerConfig
+    engram_config: EngramConfig | None = None
+    """Hashed n-gram memory (Engram / Qwen PLE) attached to the configured global layers."""
     fp16_lm_cross_entropy: bool = False
     logit_dtype: torch.dtype | None = None
     parallel_output: bool = True
@@ -207,6 +215,14 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         Note:
             Virtual pipeline model parallelism is not supported for Hybrid models.
         """
+        if (
+            self._model_config.engram_config is not None
+            and self._model_config.transformations is not None
+        ):
+            # Not validated: this builder would compose the memory into the ModelOpt stack spec
+            # and into a distillation teacher (a second copy of the tables), and the ModelOpt
+            # hooks (state restore, QAD freeze, KD conversion) have never run with it.
+            raise ValueError("Engram does not support ModelOpt model building.")
         hybrid_stack_spec = resolve_hybrid_stack_spec(self._model_config)
 
         assert (
@@ -220,6 +236,19 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             )
         else:
             padded_vocab_size = self._model_config.vocab_size
+
+        engram_config = self._model_config.engram_config
+        if engram_config is not None:
+            # The padded vocabulary is only known here; the stack spec carries the memory to
+            # every transformer layer type, and TransformerLayer builds it only for the
+            # configured global layer numbers.
+            engram_config.validate_vocabulary(padded_vocab_size)
+            hybrid_stack_spec = apply_engram_to_hybrid_stack_spec(
+                hybrid_stack_spec,
+                engram_config,
+                self._model_config.hybrid_layer_pattern,
+                self._model_config.transformer,
+            )
 
         pre_process = (
             pre_process if pre_process is not None else is_pp_first_stage(pg_collection.pp)
@@ -286,6 +315,9 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             List of model stages.
         """
         transformer_config = self._model_config.transformer
+        # Collective over every rank, so it runs here and not in build_model: it creates the
+        # sharded Engram table groups on the pg_collection that the model stages and DDP share.
+        initialize_engram_parallel_state(pg_collection, self._model_config.engram_config)
         composed_pre_wrap_hook = compose_hooks(self._model_config.pre_wrap_hooks)
         model_list = unimodal_build_distributed_models(
             self.build_model,
@@ -304,6 +336,10 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             use_layer_wise_param_layout=use_layer_wise_param_layout,
             device=device,
         )
+        # Collective over every rank as well, once DDP holds the tables in its buffers: creates
+        # the symmetric transport of each row group with Engram tables and registers their
+        # storage. Returns at once for NCCL lookups.
+        initialize_engram_transports(model_list, pg_collection, self._model_config.engram_config)
 
         composed_post_wrap_hook = compose_hooks(self._model_config.post_wrap_hooks)
         _model = composed_post_wrap_hook(model_list)

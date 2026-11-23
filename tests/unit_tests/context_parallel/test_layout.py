@@ -208,6 +208,77 @@ def test_layer_input_ids_are_cached_per_forward(monkeypatch, boundary_layout, se
     torch.testing.assert_close(calls[1], next_input_ids.T)
 
 
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+def test_layer_input_ids_held_in_full_on_every_tp_rank(monkeypatch, sequence_parallel):
+    """IDs that every TP rank holds in full are converted in the sequence-parallel frame.
+
+    Under sequence parallelism they are scattered to this rank's shard, converted and gathered
+    back, and cached apart from IDs that arrive as sequence-parallel shards.
+    """
+    cp_group = SimpleNamespace(size=lambda: 2)
+    tp_group, tp_cp_group, thd_plan = object(), object(), object()
+    manager = ContextParallelLayoutManager(
+        layer_layouts=("zigzag", "contiguous"),
+        boundary_layout="contiguous",
+        sequence_parallel=sequence_parallel,
+        cp_group=cp_group,
+        tp_group=tp_group,
+        tp_cp_group=tp_cp_group,
+    )
+    steps = []
+
+    def fake_scatter(value, group):
+        assert group is tp_group
+        steps.append("scatter")
+        # This rank's shard: the first half of the sequence.
+        return value[: value.shape[0] // 2]
+
+    def fake_convert(input_, source, target, *_):
+        assert (source, target) == ("contiguous", "zigzag")
+        steps.append("convert")
+        return input_.flip(0)
+
+    def fake_gather(value, group):
+        assert group is tp_group
+        steps.append("gather")
+        return torch.cat([value, value + 100])
+
+    monkeypatch.setattr(
+        context_parallel_layout_module, "scatter_to_sequence_parallel_region", fake_scatter
+    )
+    monkeypatch.setattr(
+        context_parallel_layout_module, "gather_from_sequence_parallel_region", fake_gather
+    )
+    monkeypatch.setattr(context_parallel_layout_module, "convert_cp_layout", fake_convert)
+
+    input_ids = torch.arange(8, dtype=torch.int64).reshape(2, 4)
+    state = manager.build_forward_state(None, thd_plan=thd_plan)
+    full_ids = state.get_layer_input_ids(0, input_ids, sequence_parallel_local=False)
+    if sequence_parallel:
+        assert steps == ["scatter", "convert", "gather"]
+        shard = input_ids.T[:2].flip(0)
+        torch.testing.assert_close(full_ids, torch.cat([shard, shard + 100]).T)
+    else:
+        assert steps == ["convert"]
+        torch.testing.assert_close(full_ids, input_ids.flip(1))
+    assert full_ids.is_contiguous()
+    # Cached for the forward; a layer in the boundary layout takes the IDs as they are.
+    assert (
+        state.get_layer_input_ids(0, input_ids.detach(), sequence_parallel_local=False) is full_ids
+    )
+    assert state.get_layer_input_ids(1, input_ids, sequence_parallel_local=False) is input_ids
+
+    # IDs that arrive as sequence-parallel shards are converted, and cached, on their own.
+    local_ids = state.get_layer_input_ids(0, input_ids)
+    torch.testing.assert_close(local_ids, input_ids.flip(1))
+    if sequence_parallel:
+        assert local_ids is not full_ids
+        assert steps == ["scatter", "convert", "gather", "convert"]
+    else:
+        assert local_ids is full_ids
+        assert steps == ["convert"]
+
+
 def test_prebuilt_packed_layout_state_is_reused():
     manager = ContextParallelLayoutManager(
         layer_layouts=("zigzag",),

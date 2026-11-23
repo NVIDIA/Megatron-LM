@@ -1,5 +1,6 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 
+from megatron.core.models.engram import EngramConfig, apply_engram_to_hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.transformer import TransformerConfig
@@ -15,6 +16,16 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
     if getattr(args, 'dynamic_context_parallel', False):
         raise NotImplementedError(
             "Dynamic context parallelism is not yet supported for HybridModel"
+        )
+    if getattr(args, 'engram_parallel_size', None) is not None:
+        # The sharded tables need their groups created by a collective over every rank before
+        # the model is built, on the process groups DDP then wraps it with. Only
+        # HybridModelBuilder.build_distributed_models does that; the callers of this provider
+        # (get_model, RL, tools) do not.
+        raise NotImplementedError(
+            "--engram-parallel-size is supported only by the HybridModelBuilder path "
+            "(pretrain_hybrid.py), which creates the Engram table groups on every rank before "
+            "building the model; the hybrid_builder model provider does not."
         )
     if config is None:
         config = core_transformer_config_from_args(args, TransformerConfig)
@@ -32,6 +43,14 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
         raise ValueError("You must provide a valid hybrid layer spec via --spec")
 
     cfg_container = get_run_config()
+    engram_config = EngramConfig.from_args(args, config)
+    if engram_config is not None:
+        # The padded vocabulary is resolved by the time this runs, and lives in the run config.
+        engram_config.validate_vocabulary(cfg_container.tokenizer.padded_vocab_size)
+        hybrid_stack_spec = apply_engram_to_hybrid_stack_spec(
+            hybrid_stack_spec, engram_config, args.hybrid_layer_pattern, config
+        )
+
     model = HybridModel(
         config=config,
         hybrid_stack_spec=hybrid_stack_spec,

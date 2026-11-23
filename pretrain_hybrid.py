@@ -59,7 +59,10 @@ from megatron.training.datasets.providers import build_gpt_datasets, is_dataset_
 from megatron.training.datasets.utils import get_dataset_input_length
 from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
-from megatron.training.utils import is_first_or_last_pipeline_stage
+from megatron.training.utils import (
+    get_pipeline_prefetched_tokens,
+    is_first_or_last_pipeline_stage,
+)
 
 try:
     from megatron.post_training.arguments import add_modelopt_args
@@ -90,6 +93,49 @@ BATCH_KEYS = [
     "position_ids",
     "tokens",
 ]
+
+
+def _engram_tokens(data_iterator, tokens):
+    """Return this microbatch's n-gram memory tokens, distributed before the schedule.
+
+    Every pipeline stage needs the token IDs, including middle stages that own no batch, so
+    the tokens come from the pre-schedule broadcast rather than this rank's data iterator.
+    """
+    prefetched_tokens = get_pipeline_prefetched_tokens(data_iterator)
+    if tokens is None:
+        # Stages that hold no tokens of their own take the full row, which the prefetch pads
+        # to the fixed pipeline activation length.
+        return prefetched_tokens
+    # Keep the batch's own length, so the row stays aligned with its labels and cu_seqlens.
+    return prefetched_tokens[..., : tokens.shape[-1]]
+
+
+def _split_batch_over_cp(batch, cfg, tokens_per_sample):
+    """Partition a batch that every TP rank holds over the context-parallel ranks.
+
+    ``tokens_per_sample`` is the dataset's row width, which only the packed-sequence
+    parameters of a batch with ``cu_seqlens`` read.
+    """
+    config = cfg.model.transformer
+    additional_layouts = set()
+    if config.context_parallel_size > 1 and config.linear_cp_layout != config.attention_cp_layout:
+        additional_layouts.add(config.attention_cp_layout)
+    return get_batches_on_this_cp_rank(
+        batch,
+        boundary_layout=config.linear_cp_layout,
+        dynamic_cp=False,
+        cp_group=get_context_parallel_group(),
+        additional_layouts=additional_layouts,
+        use_per_sequence_balancing=cfg.data.use_per_sequence_balancing(),
+        sequence_parallel=config.sequence_parallel,
+        tp_group=mpu.get_tensor_model_parallel_group(),
+        tp_cp_group=(
+            mpu.get_tensor_and_context_parallel_group()
+            if config.sequence_parallel and config.tensor_model_parallel_size > 1
+            else None
+        ),
+        tokens_per_sample=tokens_per_sample,
+    )
 
 
 def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroupCollection] = None):
@@ -140,17 +186,28 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
     )
     # Dynamic CP always uses the sequence-packing path above.
     assert not cfg.model.transformer.dynamic_context_parallel
+    engram_enabled = getattr(cfg.model.transformer, "engram_enabled", False)
 
     if (
         not is_first_or_last_pipeline_stage(vp_stage)
         and not mtp_on_this_rank
         and not has_cu_seqlens
     ):
-        return ContextParallelBatch(
-            boundary_layout=cfg.model.transformer.linear_cp_layout,
-            batches_by_layout={cfg.model.transformer.linear_cp_layout: dict.fromkeys(BATCH_KEYS)},
-            packed_seq_params_by_layout={cfg.model.transformer.linear_cp_layout: None},
-        )
+        if not engram_enabled:
+            return ContextParallelBatch(
+                boundary_layout=cfg.model.transformer.linear_cp_layout,
+                batches_by_layout={
+                    cfg.model.transformer.linear_cp_layout: dict.fromkeys(BATCH_KEYS)
+                },
+                packed_seq_params_by_layout={cfg.model.transformer.linear_cp_layout: None},
+            )
+        # Engram layers on this stage hash the token row broadcast before the schedule. The
+        # stage builds no dataset, and every TP rank already holds the full row, so there is
+        # nothing to read, broadcast or flatten: only split the row over CP. The batch has no
+        # cu_seqlens, so the split needs no row width, and the stage never looks at the dataset.
+        batch = dict.fromkeys(BATCH_KEYS)
+        batch["tokens"] = _engram_tokens(data_iterator, None)
+        return _split_batch_over_cp(batch, cfg, None)
 
     # The dataset's row width (the derived pack width for SFT).
     seq_length = get_dataset_input_length(cfg.data.dataset)
@@ -184,6 +241,12 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
     )
 
+    if engram_enabled:
+        # Before flattening: flatten_batch_for_packed_sequences reshapes tokens together with
+        # labels and merges cu_seqlens, so substituting afterwards would restore the unflattened
+        # shape and silently misalign tokens against labels.
+        batch['tokens'] = _engram_tokens(data_iterator, batch.get('tokens'))
+
     batch = flatten_batch_for_packed_sequences(batch)
 
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
@@ -193,33 +256,11 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
             'cu_seqlens': batch['cu_seqlens'],
             'cu_seqlens_padded': batch['cu_seqlens_padded'],
             'max_seqlen': batch['max_seqlen'],
+            # Engram layers on middle stages consume the pipeline-prefetched tokens.
+            'tokens': batch.get('tokens') if engram_enabled else None,
         }
 
-    additional_layouts = set()
-    if (
-        cp_size > 1
-        and cfg.model.transformer.linear_cp_layout != cfg.model.transformer.attention_cp_layout
-    ):
-        additional_layouts.add(cfg.model.transformer.attention_cp_layout)
-    return get_batches_on_this_cp_rank(
-        batch,
-        boundary_layout=cfg.model.transformer.linear_cp_layout,
-        dynamic_cp=False,
-        cp_group=get_context_parallel_group(),
-        additional_layouts=additional_layouts,
-        use_per_sequence_balancing=cfg.data.use_per_sequence_balancing(),
-        sequence_parallel=cfg.model.transformer.sequence_parallel,
-        tp_group=mpu.get_tensor_model_parallel_group(),
-        tp_cp_group=(
-            mpu.get_tensor_and_context_parallel_group()
-            if (
-                cfg.model.transformer.sequence_parallel
-                and cfg.model.transformer.tensor_model_parallel_size > 1
-            )
-            else None
-        ),
-        tokens_per_sample=seq_length,
-    )
+    return _split_batch_over_cp(batch, cfg, seq_length)
 
 
 @lru_cache(maxsize=1)
@@ -491,6 +532,10 @@ if __name__ == "__main__":
         args, model_cfg, data_cfg=gpt_data_config_from_args(args)
     )
     if has_nvidia_modelopt and should_use_modelopt_config(args):
+        # Engram is not validated with ModelOpt: the stock builder would compose the memory into
+        # the ModelOpt stack spec and into the distillation teacher (a second copy of the
+        # tables), and the ModelOpt hooks (state restore, QAD freeze, KD) are untested with it.
+        assert not args.engram_enabled, "Engram does not support ModelOpt model building."
         apply_modelopt_model_config(full_config.model, args)
         full_config.distillation = distillation_config_from_args(args, full_config.model)
     set_run_config(full_config)
