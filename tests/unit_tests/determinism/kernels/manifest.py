@@ -131,6 +131,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Elementwise; weighted variants reduce the per-token weight grad over ffn (Inductor tree reduction).",
     ),
     KernelEntry(
+        name="fused_swiglu_triton",
+        sources=("megatron/core/fusions/fused_swiglu_triton.py",),
+        tests=(K + "test_fused_activations.py",),
+        kind="triton",
+        notes="Bias-free plain, clamped and router-weighted SwiGLU behind bias_swiglu_impl and "
+        "weighted_bias_swiglu_impl; one row per program or several short rows per program. The "
+        "weighted d_w is a per-row tl.sum over a fixed tile order; no atomics.",
+    ),
+    KernelEntry(
         name="fused_bias_geglu",
         sources=("megatron/core/fusions/fused_bias_geglu.py",),
         tests=(K + "test_fused_activations.py", R + 'test_activation_replay.py'),
@@ -283,7 +292,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="streamwise_residual_ops",
         sources=("megatron/core/transformer/streamwise_residual_ops.py",),
-        tests=(K + "test_streamwise_residual_ops.py",),
+        tests=(K + "test_streamwise_residual_ops.py", K + "test_inference_triton_pdl.py"),
         kind="triton",
         notes="Fused streamwise read/write with fixed-order controller-gradient reductions; "
         "replay covers identity carry and learned retention.",
@@ -400,7 +409,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_mok_kernels.py",),
         kind="triton",
         notes="Dense routing-map compaction and router-gradient scatter use one CTA per token "
-        "and unique expert indices; replayed with missing routes and side-stream contention.",
+        "and unique expert indices; replayed with missing routes, a strided padding mask and "
+        "side-stream contention. test_moe_kernels.py also replays it with MoELayer's padding mask, "
+        "through a megakernel stand-in, in eager and CUDA-graph replay.",
     ),
     KernelEntry(
         name="mok_runtime",
@@ -442,7 +453,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available; "
         "virtual-expert routing metadata and probability gradients replay under stream contention; "
         "the FlashInfer per-token NVFP4 value pass (moe_training_matches_inference) with recompute "
-        "backward, and its MXFP8 training-stack quantization.",
+        "backward, and its MXFP8 training-stack quantization. The megakernel branch passes the "
+        "padding mask to a stand-in backend that runs MOK route compaction: replayed under stream "
+        "contention against the reference semantics, and in a CUDA graph whose static mask "
+        "changes between replays.",
     ),
     KernelEntry(
         name="moe_experts",
@@ -508,7 +522,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="inference_routing_mask_kernel",
         sources=("megatron/core/transformer/moe/inference_routing_mask_kernel.py",),
-        tests=(K + "test_inference_kernels.py",),
+        tests=(K + "test_inference_kernels.py", K + "test_inference_triton_pdl.py"),
         kind="triton",
         training_path=False,
     ),
@@ -589,7 +603,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ssm/ops/common/intermediate_extraction.py",
             "megatron/core/ssm/ops/common/determinism.py",
         ),
-        tests=(K + "test_ssm_kernels.py",),
+        tests=(K + "test_ssm_kernels.py", K + "test_inference_triton_pdl.py"),
         kind="triton",
         notes="determinism.py provides ordered workspaces and re-exports the shared tuning "
         "policy; SSM replay checks that runtime pinning covers the module-level autotuners, "
@@ -611,7 +625,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ssm/ops/gdp/wy_fast.py",
             "megatron/core/ssm/context_parallel/gdp.py",
         ),
-        tests=(K + "test_ssm_kernels.py",),
+        tests=(K + "test_ssm_kernels.py", K + "test_inference_triton_pdl.py"),
         kind="triton",
         notes="Gated Delta Product varlen chunk scan (drives cumsum/l2norm/kkt/solve_tril/wy_fast/chunk_h/chunk_o), "
         "fused recurrent decode, and the decode- and prefill-prepare kernels. The decode kernels are "
@@ -669,16 +683,19 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/optimizer/clip_grads.py",
             "megatron/core/optimizer/__init__.py",
             "megatron/core/optimizer/optimizer.py",
+            "megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py",
             "megatron/training/utils/common_utils.py",
         ),
         tests=(
             K + "test_optimizer_kernels.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
+            "tests/unit_tests/distributed/mfsdp_v2/test_mcore_muon.py",
         ),
         kind="external-lib",
         notes="multi_tensor l2norm / scale (TE, apex or local fallback) and fused Adam; "
         "optimizer.py (gradient unscaling) and training/utils/common_utils.py (param / grad norm "
-        "logging) launch the same multi_tensor kernels through multi_tensor_applier.",
+        "logging) launch the same multi_tensor kernels through multi_tensor_applier. "
+        "Hybrid CPU/GPU Adam replay also covers overlapped parameter and gradient copies.",
     ),
     KernelEntry(
         name="tensor_metric_l2",
@@ -728,22 +745,31 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/contexts/attention_context/triton/tensor_ops.py",
             "megatron/core/inference/contexts/fused_kv_append_kernel.py",
         ),
-        tests=(K + "test_inference_kernels.py",),
+        tests=(K + "test_inference_kernels.py", K + "test_inference_triton_pdl.py"),
         kind="triton",
         training_path=False,
     ),
     KernelEntry(
         name="inference_zero_padding_rows",
         sources=("megatron/core/inference/contexts/zero_padding_rows_kernel.py",),
-        tests=(K + "test_inference_kernels.py",),
+        tests=(K + "test_inference_kernels.py", K + "test_inference_triton_pdl.py"),
         kind="triton",
         training_path=False,
+    ),
+    KernelEntry(
+        name="inference_triton_pdl",
+        sources=("megatron/core/inference/triton_pdl.py",),
+        kind="triton",
+        training_path=False,
+        exempt_reason="Launch helper only (griddepcontrol.wait and the PDL launch option of the "
+        "registered inference Triton kernels); its no-op fallback is never compiled.",
     ),
     KernelEntry(
         name="sigmoid_topk_router",
         sources=("megatron/core/inference/moe/sigmoid_topk.py",),
         tests=(
             K + "test_inference_kernels.py",
+            K + "test_inference_triton_pdl.py",
             "tests/unit_tests/transformer/moe/test_moe_batch_invariant_router.py",
         ),
         kind="triton",
@@ -765,6 +791,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/inference/test_ep_invariant_ordered_rsv.py",
             "tests/unit_tests/inference/test_moe_dispatching_and_routing.py",
             K + "test_inference_kernels.py",
+            K + "test_inference_triton_pdl.py",
             "tests/unit_tests/transformer/moe/test_moe_batch_invariant.py",
         ),
         kind="triton",
@@ -834,6 +861,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="cuda-ext",
         training_path=False,
         exempt_reason="Byte copy for refit; needs NVSHMEM and a multi-GPU RL environment.",
+    ),
+    KernelEntry(
+        name="nccl_m2n_expert_refit",
+        sources=("megatron/core/resharding/copy_services/nccl_m2n_copy_service.py",),
+        tests=(
+            K + "test_refit_expert_staging.py",
+            "tests/unit_tests/resharding/test_nccl_m2n_copy_service.py",
+        ),
+        kind="external-lib",
+        training_path=False,
+        notes="Expert stack views, staging, and foreach writeback replay bit-exactly under "
+        "contention. Native M2N/MXFP8 parity runs in the dedicated GB200 integration bucket.",
     ),
     # ---------------------------------------------------------------- external-library dispatch sites
     # Modules that choose between / call external GPU kernels. Covered by the replay tests of

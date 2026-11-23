@@ -9,13 +9,22 @@ instance (begin_push_blocks). Both sides enumerate the same reshard plan in
 the same deterministic order, so the point-to-point operations match by post
 order per peer pair. Data moves straight out of the prefill's pinned blocks;
 there is no staging copy on the send side.
+
+All transfers run on one communicator, so each rank executes its batches in
+post order. That is deadlock-free because every rank posts in one global order:
+a decode posts its receives right after its KV_TRANSFER_READY, and a prefill
+posts its sends as the coordinator relays those notifications (SEND_KV), so
+both follow the coordinator's processing order. Posting a batch to a peer
+for the first time sets up the connection and blocks the CPU until that peer
+posts too; ``setup_transfer_group`` connects every pair at startup, so serving
+never blocks there.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -30,6 +39,43 @@ from megatron.core.inference.disaggregation.transfer_backends.base import (
 from megatron.core.inference.disaggregation.utils import transfer_peer_records
 
 logger = logging.getLogger(__name__)
+
+# The process group every transfer runs on, set by setup_transfer_group (None: the default group).
+_TRANSFER_GROUP: Optional[dist.ProcessGroup] = None
+
+
+def setup_transfer_group(pairs: Sequence[Tuple[int, int]], device: torch.device) -> None:
+    """Create the transfer group and connect every (prefill, decode) rank pair on it.
+
+    Collective over the whole world: every rank must call this with the same
+    ``pairs`` in the same order. One group spanning the transfer ranks keeps the
+    transfers off the default group, whose stream other collectives use. Every
+    pair is then connected by a one-element exchange, all posted as one batch per
+    rank so the connections are set up concurrently: the first batch between two
+    ranks blocks until both have posted, which must not happen while serving.
+
+    Args:
+        pairs: (prefill global rank, decode global rank) pairs that may transfer.
+        device: This rank's CUDA device.
+    """
+    global _TRANSFER_GROUP
+    rank = dist.get_rank()
+    group = dist.new_group(sorted({r for pair in pairs for r in pair}))
+    ops = []
+    for src, dst in pairs:
+        if rank == src:
+            ops.append(dist.P2POp(dist.isend, torch.zeros(1, device=device), dst, group=group))
+        elif rank == dst:
+            ops.append(dist.P2POp(dist.irecv, torch.zeros(1, device=device), src, group=group))
+    if ops:
+        for work in dist.batch_isend_irecv(ops):
+            work.wait()
+    torch.cuda.synchronize(device)
+    _TRANSFER_GROUP = group
+
+
+def _p2p(op, tensor: torch.Tensor, peer: int) -> Any:
+    return dist.P2POp(op, tensor, int(peer), group=_TRANSFER_GROUP)
 
 
 @dataclass
@@ -274,7 +320,7 @@ class NcclTransferBackend:
                     view = self._memory_buffer[layer, int(slot), lo:hi]
                     buf = torch.empty(view.shape, dtype=dtype, device=device)
                     buffers.append(buf)
-                    ops.append(dist.P2POp(dist.irecv, buf, int(meta["nccl_rank"])))
+                    ops.append(_p2p(dist.irecv, buf, meta["nccl_rank"]))
                     scatters.append(_make_copy(view, buf))
         else:
             geo = self._geometry
@@ -288,7 +334,7 @@ class NcclTransferBackend:
                         device=device,
                     )
                     buffers.append(buf)
-                    ops.append(dist.P2POp(dist.irecv, buf, int(meta["nccl_rank"])))
+                    ops.append(_p2p(dist.irecv, buf, meta["nccl_rank"]))
                     scatters.append(_make_copy(self._kv_block_view(int(block), layers, heads), buf))
 
         return NcclTransferPlan(ops, buffers, scatters)
@@ -316,13 +362,13 @@ class NcclTransferBackend:
                 for slot in src_block_ids:
                     sub = self._memory_buffer[layer, int(slot), lo:hi].contiguous()
                     keep.append(sub)
-                    ops.append(dist.P2POp(dist.isend, sub, int(meta["nccl_rank"])))
+                    ops.append(_p2p(dist.isend, sub, meta["nccl_rank"]))
         else:
             for meta, layers, heads in self._kv_transfers(records, mine_is_src=True):
                 for block in src_block_ids:
                     sub = self._kv_block_view(int(block), layers, heads).contiguous()
                     keep.append(sub)
-                    ops.append(dist.P2POp(dist.isend, sub, int(meta["nccl_rank"])))
+                    ops.append(_p2p(dist.isend, sub, meta["nccl_rank"]))
 
         return NcclTransferPlan(ops, keep, [])
 
@@ -334,7 +380,7 @@ class NcclTransferBackend:
         keepalive = [tensor for plan in plans for tensor in plan.keepalive]
         scatters = [scatter for plan in plans for scatter in plan.scatters]
         try:
-            works = dist.batch_isend_irecv(ops) if ops else []
+            works = list(dist.batch_isend_irecv(ops)) if ops else []
         except Exception as error:
             raise TransferStartError(str(error), storage_safe=False, resources=plans) from error
         return NcclTransferHandle(works, keepalive, scatters)

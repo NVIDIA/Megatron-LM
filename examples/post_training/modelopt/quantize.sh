@@ -9,7 +9,6 @@ source "${SCRIPT_DIR}/conf/arguments.sh"
 MLM_DEFAULT_ARGS="
     --distributed-timeout-minutes 30 \
     --finetune --auto-detect-ckpt-format \
-    --export-te-mcore-model \
     --sequence-parallel \
 "
 
