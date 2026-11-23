@@ -1,10 +1,14 @@
 # Native MLM recipe pretraining
 
-`llama3_pretrain.py` constructs an MLM `PretrainConfigContainer` and calls
+Recipes construct an MLM `PretrainConfigContainer`. `scripts/run_recipe.py` calls
 `megatron.training.api.pretrain(config, forward_step_func, callbacks=None)`.
-It does not import Megatron Bridge, adapt Bridge configs, parse training CLI
-arguments, or create a legacy argument namespace. The forward step and callbacks
-use MLM interfaces, not Bridge's `GlobalState` interface.
+There is no dependency on the separate Megatron-Bridge repository, no config
+adapter, and no fabricated CLI namespace. Forward steps and callbacks use MLM
+interfaces, not Bridge's `GlobalState` interface.
+
+**`get_args()` can return `None` after this change.** Config-only runs do not
+register arguments. Migrated consumers should read their config owner; optional
+legacy features must tolerate absent arguments.
 
 The wrapper supplies MLM's config-driven dataset provider and GPT/Hybrid model
 builder to the existing training loop. Framework startup finalizes the config;
@@ -17,8 +21,8 @@ Use the generic recipe runner from the repository root:
 
 ```bash
 CUDA_DEVICE_MAX_CONNECTIONS=1 uv run python -m torch.distributed.run \
-    --nproc-per-node=2 scripts/run_recipe.py \
-    --recipe examples.bridge.training.llama3_pretrain:llama3_pretrain_config \
+    --nproc-per-node=4 scripts/run_recipe.py \
+    --recipe megatron.bridge.recipes.llama:llama3_8b_pretrain_config \
     model.transformer.context_parallel_size=1 \
     model.transformer.tensor_model_parallel_size=2 \
     model.transformer.max_seq_length_per_sample=512 \
@@ -48,18 +52,19 @@ neither that wrapper nor the underlying training API is changed by the runner.
 
 The independently expressed settings follow the
 [Bridge Llama 3 8B BF16 recipe](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/eea53e431a8b0b4e9c4f47a76784c6f3200c9a1f/src/megatron/bridge/recipes/llama/h100/llama3.py).
-Like that scratch-training recipe, this uses mock data and a 32K NullTokenizer,
-not pretrained weights or the original Llama tokenizer. It is a training-path
-example, not a model-quality benchmark.
+It uses mock data and a NullTokenizer, not pretrained weights or the original
+Llama tokenizer. Unlike the reference's 32K mock vocabulary, this recipe retains
+Llama 3's 128256-token architecture vocabulary. This is scratch training, not a
+model-quality benchmark. Replace the dataset and tokenizer together for real data.
 
 Import the factory into a Python launch script and set explicit run overrides:
 
 ```python
-from examples.bridge.training.llama3_pretrain import llama3_pretrain_config
+from megatron.bridge.recipes.llama import llama3_8b_pretrain_config
 from megatron.training.api import pretrain
 from pretrain_gpt import forward_step
 
-cfg = llama3_pretrain_config()
+cfg = llama3_8b_pretrain_config()
 cfg.model.transformer.context_parallel_size = 1
 cfg.model.transformer.tensor_model_parallel_size = 2
 cfg.model.transformer.max_seq_length_per_sample = 512
@@ -79,13 +84,11 @@ Run that script from the repository root in an MLM training environment:
 
 ```bash
 CUDA_DEVICE_MAX_CONNECTIONS=1 uv run python -m torch.distributed.run \
-    --nproc-per-node=2 your_recipe.py
+    --nproc-per-node=4 your_recipe.py
 ```
 
-This short configuration fits two 80GB GPUs using TP=2. The factory's original
-CP=2 topology replicates model weights and may need more memory; select topology
-and batch size for your hardware. Reduce model dimensions explicitly for a small
-smoke test. Dataset length and model execution length remain separate config
+The command uses TP=2 and DP=2. Select topology and batch size for your hardware.
+Reduce model dimensions explicitly for a small smoke test. Dataset length and model execution length remain separate config
 owners; this fixed-length pretraining example sets both to the same value.
 
 For checkpointing, set `cfg.checkpoint.save` and `save_interval`. For resumption,
@@ -102,5 +105,7 @@ config or fabricate args to enable that feature. Ordinary pretraining needs no
 legacy argument namespace.
 
 This example uses the dataset/config implementation already on `main`. It does
-not introduce data-schema changes or migrate optional CLI-only features such as
-full-dataset training, dataset phase transitions, frozen-teacher mode, or upcycling.
+not introduce data-schema changes. Phase boundaries are owned by
+`cfg.train.phase_transition_iterations`, and optimizer mapping diagnostics by
+`cfg.optimizer.dump_param_to_param_group_map`. Other optional CLI-only features,
+including full-dataset training and upcycling, are not migrated here.

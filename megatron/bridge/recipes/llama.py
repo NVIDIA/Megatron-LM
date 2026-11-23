@@ -1,13 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Llama 3 pretraining using only MLM config types and MLM's training loop.
+"""Llama 3 pretraining using MLM config types and MLM's training loop.
 
 The architecture and training settings follow Bridge's Llama 3 8B BF16 recipe
 (eea53e431a8b0b4e9c4f47a76784c6f3200c9a1f). No Bridge package is required.
-Like that recipe, this example uses mock data and a 32K NullTokenizer for
-from-scratch training; it does not load pretrained Llama weights.
+This recipe keeps Llama 3's 128256-token architecture vocabulary. Mock data and
+a NullTokenizer support from-scratch training without downloading weights.
 
-Import ``llama3_pretrain_config`` to adjust run length, batch size, or topology.
+Replace cfg.data and cfg.tokenizer together to train on tokenized real data.
 """
 
 import torch
@@ -17,7 +17,6 @@ from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.transformer import TransformerConfig
-from megatron.training.api import pretrain
 from megatron.training.config import (
     CheckpointConfig,
     DataConfig,
@@ -30,10 +29,9 @@ from megatron.training.config import (
     ValidationConfig,
 )
 from megatron.training.models.gpt import GPTModelConfig
-from pretrain_gpt import forward_step
 
 
-def llama3_pretrain_config() -> PretrainConfigContainer:
+def llama3_8b_pretrain_config() -> PretrainConfigContainer:
     """Return the Llama 3 8B mock pretraining recipe as native MLM configuration."""
     transformer = TransformerConfig(
         num_layers=32,
@@ -50,7 +48,8 @@ def llama3_pretrain_config() -> PretrainConfigContainer:
         hidden_dropout=0.0,
         bf16=True,
         params_dtype=torch.bfloat16,
-        context_parallel_size=2,
+        tensor_model_parallel_size=2,
+        sequence_parallel=True,
         max_seq_length_per_sample=8192,
         cross_entropy_loss_fusion=True,
         cross_entropy_fusion_impl="te",
@@ -58,6 +57,7 @@ def llama3_pretrain_config() -> PretrainConfigContainer:
     return PretrainConfigContainer(
         model=GPTModelConfig(
             transformer=transformer,
+            vocab_size=128256,
             seq_length=8192,
             position_embedding_type="rope",
             rotary_base=500000,
@@ -106,11 +106,7 @@ def llama3_pretrain_config() -> PretrainConfigContainer:
             dataset_type=MockGPTDataset,
             dataloader=DataloaderConfig(num_workers=8),
         ),
-        tokenizer=TokenizerConfig(tokenizer_type="NullTokenizer", vocab_size=32000),
-        logger=LoggerConfig(log_interval=10),
+        tokenizer=TokenizerConfig(tokenizer_type="NullTokenizer", vocab_size=128256),
+        logger=LoggerConfig(log_interval=10, log_throughput=True),
         checkpoint=CheckpointConfig(save_interval=500, ckpt_format="torch_dist"),
     )
-
-
-if __name__ == "__main__":
-    pretrain(llama3_pretrain_config(), forward_step)

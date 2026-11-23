@@ -170,7 +170,6 @@ def build_dataset_caches(args: Any) -> Dict[str, Any]:
         train_valid_test_num_samples = calculate_train_valid_test_num_samples(
             train,
             validation,
-            phase_transition_iterations=args.phase_transition_iterations,
             iteration=0,
         )
         _print_effective_configuration(args, train_valid_test_num_samples, ignored_flags)

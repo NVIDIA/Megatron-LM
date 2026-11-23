@@ -201,7 +201,6 @@ from .global_vars import (
     get_timers,
     get_train_state,
     get_wandb_writer,
-    is_args_initialized,
 )
 from .theoretical_memory_usage import report_theoretical_memory
 from .utils import (
@@ -1467,7 +1466,7 @@ def pretrain(
 
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use cfg_container; remaining settings still use legacy args.
-    args = get_args() if is_args_initialized() else None
+    args = get_args()
     train_state = get_train_state()
     timers = get_timers()
 
@@ -2241,7 +2240,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     cfg = get_run_config()
     if ddp_config is None and isinstance(cfg, PretrainConfigContainer):
         ddp_config = cfg.ddp
-    args = get_args() if is_args_initialized() else None
+    args = get_args()
     if config is None:
         config = cfg.model.transformer
     if args is not None:
@@ -2500,7 +2499,7 @@ def setup_model_and_optimizer(
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use cfg_container; remaining settings still use legacy args.
     cfg = cfg_container if cfg_container is not None else get_run_config()
-    args = get_args() if is_args_initialized() else None
+    args = get_args()
     train_state = get_train_state()
     timers = get_timers()
     one_logger = get_one_logger()
@@ -2667,7 +2666,7 @@ def setup_model_and_optimizer(
             model,
             config_overrides=optim_cfg_overrides,
             use_gloo_process_groups=cfg.dist.use_gloo_process_groups,
-            dump_param_to_param_group_map=getattr(args, 'dump_param_to_param_group_map', None),
+            dump_param_to_param_group_map=cfg.optimizer.dump_param_to_param_group_map,
         )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
@@ -3119,7 +3118,7 @@ def train_step(
         Observers exposing `observe_forward_backward` also receive a context around the
         forward-backward execution for short-lived tensors.
     """
-    args = get_args() if is_args_initialized() else None
+    args = get_args()
     cfg = get_run_config()
     sequence_length = cfg.model.transformer.max_seq_length_per_sample
     timers = get_timers()
@@ -3490,7 +3489,7 @@ def training_log(
 ):
     """Log training information such as losses, timing, ...."""
     callback_manager = normalize_callbacks(callback_manager)
-    args = get_args() if is_args_initialized() else None
+    args = get_args()
     train_state = get_train_state()
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
@@ -4107,7 +4106,7 @@ def save_checkpoint_and_time(
 ):
     callback_manager = normalize_callbacks(callback_manager)
     cfg = get_run_config()
-    args = get_args() if is_args_initialized() else None
+    args = get_args()
     timers = get_timers()
     energy_monitor = get_energy_monitor()
 
@@ -4275,7 +4274,7 @@ def post_training_step_callbacks(
     nsys_nvtx_context = None,
 ):
     """Run all post-training-step functions (e.g., FT heartbeats, GC)."""
-    args = get_args() if is_args_initialized() else None
+    args = get_args()
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
     cfg = get_run_config()
@@ -4368,7 +4367,6 @@ def checkpoint_and_decide_exit(
     --exit-duration-in-mins is set). Actual exit happens in main training loop
     based on the return value of this function."""
     cfg = get_run_config()
-    args = get_args() if is_args_initialized() else None
     timers = get_timers()
 
     # Exit based on signal handler.
@@ -4460,8 +4458,8 @@ def checkpoint_and_decide_exit(
         cfg.train.exit_interval
         and iteration % cfg.train.exit_interval == 0
     ) or (
-        getattr(args, 'phase_transition_iterations', None)
-        and iteration in args.phase_transition_iterations
+        cfg.train.phase_transition_iterations
+        and iteration in cfg.train.phase_transition_iterations
     ):
         if cfg.checkpoint.save and not saved_checkpoint:
             save_checkpoint_and_time(
@@ -4532,7 +4530,7 @@ def train(
         changes (for data sources that reconfigure microbatches every iteration).
     """
     callback_manager = normalize_callbacks(callback_manager)
-    args = get_args() if is_args_initialized() else None
+    args = get_args()
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
     cfg = get_run_config()
@@ -5804,13 +5802,11 @@ def get_train_valid_test_num_samples():
     """Train/valid/test num samples."""
 
     cfg = get_run_config()
-    args = get_args() if is_args_initialized() else None
     train_state = get_train_state()
 
     return calculate_train_valid_test_num_samples(
         cfg.train,
         cfg.validation,
-        phase_transition_iterations=getattr(args, 'phase_transition_iterations', None),
         iteration=train_state.iteration if train_state is not None else 0,
     )
 
@@ -5819,7 +5815,6 @@ def calculate_train_valid_test_num_samples(
     train: TrainingConfig,
     validation: ValidationConfig,
     *,
-    phase_transition_iterations: list[int] | None,
     iteration: int,
 ) -> tuple[int, int | None, int]:
     """Calculate dataset sample counts without model or runtime initialization."""
@@ -5851,8 +5846,8 @@ def calculate_train_valid_test_num_samples(
     test_samples = validation.eval_iters * eval_global_batch_size
 
     # Get train_samples in current phase.
-    if phase_transition_iterations:
-        phase_transition_samples = [0] + [t * train.global_batch_size for t in phase_transition_iterations] + [train.train_samples]
+    if train.phase_transition_iterations:
+        phase_transition_samples = [0] + [t * train.global_batch_size for t in train.phase_transition_iterations] + [train.train_samples]
         current_sample = iteration * train.global_batch_size
         last_transition_sample = max(s for s in phase_transition_samples if s <= current_sample)
         next_transition_sample = min(s for s in phase_transition_samples if s > current_sample)
@@ -5879,7 +5874,6 @@ def build_train_valid_test_data_loaders(
 ):
     """Build pretraining data loaders."""
 
-    args = get_args() if is_args_initialized() else None
     train_state = get_train_state()
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
@@ -5892,8 +5886,8 @@ def build_train_valid_test_data_loaders(
     backfill_consumed_samples_from_iteration()
 
     # Get consumed train samples in this phase.
-    if getattr(args, 'phase_transition_iterations', None):
-        last_transition = max(iteration for iteration in (0, *args.phase_transition_iterations) if iteration <= train_state.iteration)
+    if cfg.train.phase_transition_iterations:
+        last_transition = max(iteration for iteration in (0, *cfg.train.phase_transition_iterations) if iteration <= train_state.iteration)
         consumed_train_samples_in_current_phase = (train_state.iteration - last_transition) * cfg.train.global_batch_size
     else:
         consumed_train_samples_in_current_phase = train_state.consumed_train_samples

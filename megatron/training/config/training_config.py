@@ -84,6 +84,13 @@ class TrainingConfig:
     """Total number of samples to train over all training runs.
     Note that either train_iters or train_samples should be provided."""
 
+    phase_transition_iterations: list[int] | None = field(
+        default=None, metadata={"argparse_meta": {"type": str, "nargs": None}}
+    )
+    """Iterations where training phases end. Requires fixed global batch size across phases.
+    The CLI accepts a comma-separated list and resolves it to sorted iteration numbers.
+    """
+
     exit_interval: int | None = None
     """Exit the program after the iteration is divisible by this value."""
 

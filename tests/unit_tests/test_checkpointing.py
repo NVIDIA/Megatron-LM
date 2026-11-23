@@ -703,12 +703,11 @@ def test_checkpoint_position_capacity(run_config, saved_config, position_embeddi
             check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
         run_config.model.seq_length = checkpoint_args.max_position_embeddings
         checkpoint_args.add_position_embedding = False
-        with mock.patch('megatron.training.checkpointing.is_args_initialized', return_value=True):
-            with pytest.raises(AssertionError, match="add_position_embedding"):
-                check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
-            # The deprecated False spelling remains valid for an identical CLI run.
-            args.add_position_embedding = False
+        with pytest.raises(AssertionError, match="add_position_embedding"):
             check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
+        # The deprecated False spelling remains valid for an identical CLI run.
+        args.add_position_embedding = False
+        check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
 
 
 @pytest.mark.parametrize("saved_config", [False, True])
@@ -836,6 +835,8 @@ def test_check_checkpoint_args_uses_config_owner(
         **{name: other},
     )
     owner = getattr(run_config, section)
+    if section == "train":
+        run_config.train.phase_transition_iterations = [100]
     if section == "tokenizer":
         run_config.tokenizer.vocab_file = "vocab.json"
         args.max_position_embeddings = run_config.model.seq_length
@@ -1395,10 +1396,7 @@ def test_strict_load_idle_rerun_checkpoint(
         sync_checkpoint_config(args)
         if native_config:
             monkeypatch.setattr('megatron.training.global_vars._GLOBAL_ARGS', None)
-            monkeypatch.setattr(
-                'megatron.training.checkpointing.get_args',
-                mock.Mock(side_effect=AssertionError('native checkpoint accessed CLI args')),
-            )
+            assert get_args() is None
         expected_cpu_rng = torch.get_rng_state().clone()
         expected_cuda_rng = torch.cuda.get_rng_state().clone()
         with mock.patch(

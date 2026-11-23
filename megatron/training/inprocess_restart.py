@@ -13,7 +13,6 @@ from megatron.training import get_args
 from megatron.training.async_utils import (
     reset_persistent_async_worker,
 )
-from megatron.training.global_vars import is_args_initialized
 
 from . import arguments
 
@@ -151,7 +150,7 @@ def maybe_wrap_for_inprocess_restart(pretrain):
 
 def maybe_force_nccl_backend_init(device_id):
 
-    args = get_args() if is_args_initialized() else None
+    args = get_args()
 
     # Inprocess uses destroy_process_group to terminate NCCL backend, which
     # does not terminate NCCL kernels if NCCL backend wasn't fully initialized

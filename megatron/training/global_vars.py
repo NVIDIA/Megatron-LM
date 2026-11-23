@@ -37,15 +37,9 @@ _GLOBAL_ENERGY_MONITOR = None
 _GLOBAL_SIGNAL_HANDLER = None
 _GLOBAL_TELEMETRY_HANDLE = None
 
-def get_args():
-    """Return CLI arguments."""
-    _ensure_var_is_initialized(_GLOBAL_ARGS, 'args')
+def get_args() -> Namespace | None:
+    """Return CLI arguments, or None for config-only runs without registered arguments."""
     return _GLOBAL_ARGS
-
-
-def is_args_initialized() -> bool:
-    """Whether CLI metadata is available; config-only runs do not register args."""
-    return _GLOBAL_ARGS is not None
 
 
 def get_run_config():

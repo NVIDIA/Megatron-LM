@@ -53,7 +53,6 @@ from megatron.training.global_vars import (
     get_run_config,
     get_train_state,
     initialize_runtime_services,
-    is_args_initialized,
 )
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 
@@ -95,7 +94,7 @@ def initialize_megatron(
         # Make sure cuda is available.
         assert torch.cuda.is_available(), "Megatron requires CUDA."
 
-    args = get_args() if is_args_initialized() else None
+    args = get_args()
 
     cfg = get_run_config()
     # Resolve runtime config before distributed initialization and RNG setup.
@@ -362,7 +361,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                             expert_num_distributed_optimizer_instances=None):
     """Initialize torch.distributed and core model parallel."""
     cfg = get_run_config()
-    args = get_args() if is_args_initialized() else None
+    args = get_args()
     if model_config is None:
         # Direct inference/bootstrap callers have not constructed a training model config.
         model_config = cfg.model.transformer if isinstance(cfg, PretrainConfigContainer) else args
@@ -589,7 +588,7 @@ def _set_random_seed(
 
 def write_args_to_tensorboard():
     """Write arguments to tensorboard."""
-    args = get_args() if is_args_initialized() else None
+    args = get_args()
     writer = get_tensorboard_writer()
     if writer and args is not None:
         for arg in vars(args):

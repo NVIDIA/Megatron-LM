@@ -81,7 +81,7 @@ from .ckpt.glu_checkpointing import (
     validate_glu_checkpoint_backend,
     validate_glu_optimizer_layout,
 )
-from .global_vars import get_args, is_args_initialized
+from .global_vars import get_args
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
 from .utils import append_to_progress_log, is_last_rank, print_rank_0, print_rank_last, warn_rank_0
 
@@ -307,7 +307,7 @@ def check_checkpoint_args(
     ``ckpt_format`` is the format of this load (default: the run's checkpoint section's).
     """
     cfg = get_run_config()
-    args = get_args() if is_args_initialized() else None
+    args = get_args()
     use_dist_ckpt = (cfg.checkpoint.ckpt_format if ckpt_format is None else ckpt_format) != 'torch'
     skip_args = skip_args or set()
 
@@ -385,7 +385,11 @@ def check_checkpoint_args(
         _compare('tokenizer_type', config_section='tokenizer')
     if cfg.rng.data_parallel_random_init:
         _compare('data_parallel_random_init', config_section='rng')
-    if check_training_state and getattr(args, 'phase_transition_iterations', None):
+    if (
+        check_training_state
+        and isinstance(cfg, PretrainConfigContainer)
+        and cfg.train.phase_transition_iterations
+    ):
         _compare('global_batch_size', config_section='train')
     if get_checkpoint_version() < 3.0:
         _compare('tensor_model_parallel_size', old_arg_name='model_parallel_size', config_section='model.transformer')
@@ -837,7 +841,7 @@ def save_checkpoint(
             follows the section, which is not written.
     """
     start_ckpt = time()
-    args = get_args() if is_args_initialized() else None
+    args = get_args()
     cfg = get_run_config()
     checkpoint = cfg.checkpoint
     # The values of this save; ``ckpt_format`` below is the format actually written. The run
@@ -2380,7 +2384,7 @@ def _load_base_checkpoint(
     ``finetune`` whether this load is weights-only (default: the section's).
     ``args`` is still read for the settings other sections own.
     """
-    if args is None and is_args_initialized():
+    if args is None:
         args = get_args()
     checkpoint = get_run_config().checkpoint if checkpoint is None else checkpoint
     if finetune is None:
@@ -2940,7 +2944,7 @@ def load_checkpoint(
         must not inherit the student's selected iteration, fallback or nonpersistent source).
     """
     cfg = get_run_config()
-    args = get_args() if is_args_initialized() else None
+    args = get_args()
     checkpoint = cfg.checkpoint
     selector_overrides = {
         key: value
