@@ -220,9 +220,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/extensions/te_batched_linear.py",
             "megatron/core/transformer/experimental_attention_variant/deepseek_v4_hybrid_attention.py",
         ),
-        tests=(K + "test_te_batched_linear.py",),
+        tests=(
+            K + "test_te_batched_linear.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_packed_cp.py",
+        ),
         kind="external-lib",
-        notes="TE batched GEMM with a 2D optimizer owner; BF16/MXFP8 and fused main-grad replay.",
+        notes="TE batched GEMM with a 2D optimizer owner; standalone BF16/MXFP8 and fused "
+        "main-grad replay. The packed CP2 full-width replay covers the DSv4 deterministic "
+        "attention-to-projection path and its nonzero matrix wgrad; its backend is reported "
+        "so an einsum fallback is not mistaken for native TE coverage.",
     ),
     KernelEntry(
         name="jit_fuser",

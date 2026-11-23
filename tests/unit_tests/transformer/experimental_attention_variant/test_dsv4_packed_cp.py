@@ -594,6 +594,12 @@ def test_packed_cp2_full_width_deterministic_replay(ratio, monkeypatch):
             recompute_modules=["mla_up_proj"],
         )
         model = _build_attention(cfg, 1, pg).cuda()
+        projection_weight = model._linear_o_group_proj_weight
+        projection_key = next(
+            f"param:{name}"
+            for name, parameter in model.named_parameters()
+            if parameter is projection_weight
+        )
         # One document spans both ranks: rank 1 must differentiate rank 0's keys.
         cu = torch.tensor([0, 256], dtype=torch.int32, device="cuda")
         packed = PackedSeqParams(
@@ -665,6 +671,13 @@ def test_packed_cp2_full_width_deterministic_replay(ratio, monkeypatch):
             model.zero_grad(set_to_none=True)
             results.append(_run_attention(model, whole[rows], grad[rows], packed, cp_group=pg.cp))
             coverage.append(observations)
+        # The grouped projection participates in the packed replay, not only the
+        # standalone TE test. Collect the same matrix owner on both backends.
+        assert model._linear_o_group_proj_weight is projection_weight
+        for result in results:
+            projection_grad = result[projection_key]
+            assert projection_grad.ndim == 2 and projection_grad.shape == projection_weight.shape
+            assert (projection_grad != 0).any(), projection_key
         assert results[0].keys() == results[1].keys()
         for name, first in results[0].items():
             second = results[1][name]
@@ -683,7 +696,14 @@ def test_packed_cp2_full_width_deterministic_replay(ratio, monkeypatch):
                 checked = {name: all(value.item() for value in observed[name]) for name in required}
                 print(
                     "DSV4_CP_REMOTE_BACKWARD "
-                    + json.dumps({"ratio": ratio, "replay": replay, "checks": checked}),
+                    + json.dumps(
+                        {
+                            "ratio": ratio,
+                            "replay": replay,
+                            "projection_backend": type(model.linear_o_group_proj).__name__,
+                            "checks": checked,
+                        }
+                    ),
                     flush=True,
                 )
                 assert all(checked.values()), (ratio, replay, checked)
