@@ -241,7 +241,7 @@ def test_train_step_invokes_tensor_metric_observer_before_optimizer(
     skip_norm_sync = False if skip_norm_sync is None else skip_norm_sync
     run_config.optimizer.log_num_zeros_in_grad = True
     success_reduction = mock.Mock(return_value=False)
-    stat_reduction = mock.Mock(side_effect=lambda value, group: value + 5.0)
+    stat_reduction = mock.Mock(side_effect=lambda value, group, return_tensor: value + 5.0)
     args = SimpleNamespace(
         save_params_interval=None,
         save_activations_interval=None,
@@ -323,8 +323,8 @@ def test_train_step_invokes_tensor_metric_observer_before_optimizer(
         assert result[1] == 0
     assert result[5] == (1.0 if skip_norm_sync else 6.0)
     assert result[6] == 5.0
-    calls = [] if skip_norm_sync else [mock.call(1.0, group=pg_collection.mp)]
-    calls.append(mock.call(0, group=pg_collection.mp))
+    calls = [] if skip_norm_sync else [mock.call(1.0, group=pg_collection.mp, return_tensor=True)]
+    calls.append(mock.call(0, group=pg_collection.mp, return_tensor=True))
     assert stat_reduction.call_args_list == calls
 
 
@@ -387,7 +387,7 @@ def test_train_step_scopes_forward_tensor_observation_around_schedule():
         mock.patch.object(
             training_mod,
             "reduce_max_stat_across_model_parallel_group",
-            side_effect=lambda value, group: value,
+            side_effect=lambda value, group, return_tensor: value,
         ),
     ):
         training_mod.train_step(
