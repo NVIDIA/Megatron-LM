@@ -2319,6 +2319,9 @@ def _load_global_dist_base_checkpoint(
         validate_access_integrity=checkpoint.ckpt_load_validate_sharding_integrity,
         strict=checkpoint.dist_ckpt_strictness,
         verify_integrity=checkpoint.verify_integrity and checkpoint.ckpt_format == "torch_dist",
+        # Verification is on by default, so checkpoints saved without hashes must still load;
+        # a manifest that is present is always checked.
+        require_integrity_manifest=False,
         process_group=checkpoint_group,
     )
     return state_dict, checkpoint_name, release, CheckpointType.GLOBAL

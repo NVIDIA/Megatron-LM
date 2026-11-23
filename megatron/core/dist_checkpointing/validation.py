@@ -533,20 +533,28 @@ def save_integrity_manifest(checkpoint_dir: str) -> None:
     logger.info("Saved integrity manifest with %d file(s) to %s", len(manifest), integrity_path)
 
 
-def _verify_integrity_manifest_impl(checkpoint_dir: str) -> None:
+def _verify_integrity_manifest_impl(checkpoint_dir: str, require_manifest: bool = True) -> None:
     """Single-process implementation of integrity verification.
     Reads ``integrity.json``, recomputes each file's hash, and raises
     `megatron.core.dist_checkpointing.core.CheckpointingException`
     on any mismatch or missing file.
     Args:
         checkpoint_dir: checkpoint directory to verify.
+        require_manifest: if False, a checkpoint without ``integrity.json`` (e.g. saved before
+            hashing was on by default) is accepted without verification; a present manifest is
+            always checked.
     Raises:
-        CheckpointingException: if the manifest is absent, uses an unsupported
+        CheckpointingException: if the manifest is absent (and required), uses an unsupported
             algorithm, or any file's hash does not match.
     """
     integrity_path = os.path.join(checkpoint_dir, INTEGRITY_FNAME)
 
     if not maybe_msc.os.path.exists(integrity_path):
+        if not require_manifest:
+            logger.info(
+                "No integrity manifest at %s; skipping integrity verification.", integrity_path
+            )
+            return
         raise CheckpointingException(
             f'Integrity manifest not found at {integrity_path}. '
             'The checkpoint must be saved with integrity verification enabled '
@@ -587,12 +595,14 @@ def _verify_integrity_manifest_impl(checkpoint_dir: str) -> None:
     logger.info("Checkpoint integrity verified: %d file(s) OK in %s", len(manifest), checkpoint_dir)
 
 
-def verify_integrity_manifest(checkpoint_dir: str) -> None:
+def verify_integrity_manifest(checkpoint_dir: str, require_manifest: bool = True) -> None:
     """Verify checkpoint files against their recorded SHA-256 hashes.
     Args:
         checkpoint_dir: checkpoint directory to verify.
+        require_manifest: if False, a missing ``integrity.json`` is accepted (nothing to verify);
+            a present manifest is still checked.
     Raises:
-        CheckpointingException: if ``integrity.json`` is absent or any file's
+        CheckpointingException: if ``integrity.json`` is absent (and required) or any file's
             hash no longer matches the stored value.
     """
     import torch
@@ -601,11 +611,11 @@ def verify_integrity_manifest(checkpoint_dir: str) -> None:
         error_payload = [None]
         if torch.distributed.get_rank() == 0:
             try:
-                _verify_integrity_manifest_impl(checkpoint_dir)
+                _verify_integrity_manifest_impl(checkpoint_dir, require_manifest)
             except CheckpointingException as exc:
                 error_payload = [str(exc)]
         torch.distributed.broadcast_object_list(error_payload, src=0)
         if error_payload[0] is not None:
             raise CheckpointingException(error_payload[0])
     else:
-        _verify_integrity_manifest_impl(checkpoint_dir)
+        _verify_integrity_manifest_impl(checkpoint_dir, require_manifest)

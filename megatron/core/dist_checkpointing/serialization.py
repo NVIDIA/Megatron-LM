@@ -83,6 +83,7 @@ def load(
     strict: Union[str, StrictHandling] = StrictHandling.ASSUME_OK_UNEXPECTED,
     verify_integrity: bool = False,
     process_group: Optional[torch.distributed.ProcessGroup] = None,
+    require_integrity_manifest: bool = True,
 ) -> Union[StateDict, Tuple[StateDict, Set[str], Set[str]]]:
     """Loading entrypoint.
 
@@ -120,6 +121,10 @@ def load(
             `verify_integrity=True`.
         process_group (ProcessGroup, optional): ranks that collectively describe
             one complete sharded state dict. Defaults to the global process group.
+        require_integrity_manifest (bool, optional): only used with `verify_integrity=True`.
+            If True (default), a checkpoint without an integrity manifest is rejected. If False,
+            such a checkpoint is loaded without verification, while a present manifest is still
+            checked.
 
     Returns:
         StateDict or Tuple[StateDict, Set[str], Set[str]]: in most cases only
@@ -128,7 +133,7 @@ def load(
 
     verify_checkpoint(checkpoint_dir)
     if verify_integrity:
-        verify_integrity_manifest(checkpoint_dir)
+        verify_integrity_manifest(checkpoint_dir, require_manifest=require_integrity_manifest)
     if sharded_strategy is None:
         sharded_strategy = TorchDistLoadShardedStrategy()
 
