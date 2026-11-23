@@ -40,8 +40,10 @@ public dataclass fields (numbers, booleans, `null`, lists, or strings); repeated
 keys use the last value. Unknown fields are rejected. Define optional config
 sections, dataset classes, and Python callables in the recipe itself.
 
-The runner selects the GPT/Hybrid or supported VLM forward step from the model config.
+The runner selects the GPT/Hybrid forward step from the model config.
 Use `--forward-step module:function` for an explicit MLM-compatible step.
+VLM recipes require both an explicit `--forward-step` and `--dataset-provider`;
+the runner does not supply synthetic image inputs or a default VLM step.
 `--dry-run` validates and displays the unfinalized config without setting global
 config, initializing distributed services, building datasets, or training.
 It is not a substitute for runtime validation against the actual GPU topology.
@@ -99,28 +101,6 @@ configuration and runtime topology replace optional CLI metadata; checkpoints
 from native runs do not contain fabricated `args`. Older tools that require
 checkpoint `args` are not yet supported. Config-only MoE upcycling is also deferred.
 
-## Vision-language inputs
-
-For Qwen3.5 VL and Nemotron3.5 Super VL model configs, the runner selects
-`megatron.bridge.training.vlm.mock_vlm_datasets_provider` and its forward step.
-Use a loader-only `cfg.data` for this callback. Each sample contains one synthetic
-image followed by random text, with shifted causal labels and no loss on image
-placeholders. Vision, projection, and
-language parameters are trainable. This tests image-conditioned training, not
-real-data quality, conversation processing, video, or SFT packing.
-
-The supplied VL path currently requires PP=CP=1 and unpacked inputs. TP/EP/DP are
-supported. For a real dataset, supply `--dataset-provider module:function` and
-an MLM-compatible `--forward-step` as needed. Both are callbacks to the same
-training loop. These restrictions apply to the supplied mock VLM path, not to
-custom pairs of callbacks. Dataset providers must honor MLM's distributed-rank
-and sampler interfaces and supply matching media metadata and shifted labels.
-
-Report steady-state throughput separately from compilation and startup;
-MLM's current Hybrid FLOPs estimate covers the
-language model, not the vision encoder/projector, so a VL TFLOPS result using
-that estimate is a language-only estimate over the whole VL iteration time.
-
 Offline cached-logit distillation remains on its CLI path until
 [#9635](https://github.com/NVIDIA/Megatron-LM/pull/9635) supplies
 `cfg.offline_distillation`. This entrypoint does not add a competing cached-logit
@@ -130,5 +110,5 @@ legacy argument namespace.
 This example uses the dataset/config implementation already on `main`. It does
 not introduce data-schema changes. Phase boundaries are owned by
 `cfg.train.phase_transition_iterations`, and optimizer mapping diagnostics by
-`cfg.optimizer.dump_param_to_param_group_map`. Other optional CLI-only features,
+`cfg.logger.dump_param_to_param_group_map`. Other optional CLI-only features,
 including full-dataset training and upcycling, are not migrated here.

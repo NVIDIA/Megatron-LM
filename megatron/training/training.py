@@ -2666,7 +2666,7 @@ def setup_model_and_optimizer(
             model,
             config_overrides=optim_cfg_overrides,
             use_gloo_process_groups=cfg.dist.use_gloo_process_groups,
-            dump_param_to_param_group_map=cfg.optimizer.dump_param_to_param_group_map,
+            dump_param_to_param_group_map=cfg.logger.dump_param_to_param_group_map,
         )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 

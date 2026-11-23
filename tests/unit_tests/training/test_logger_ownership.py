@@ -39,10 +39,13 @@ def test_cli_aliases_and_native_config_match(run_config):
             '--otel-span-groups',
             'checkpoint',
             '--no-barrier-with-level-1-timing',
+            '--dump-param-to-param-group-map',
+            'param-groups',
         ]
     )
     config = _default_config_from_args(LoggerConfig, args)
     expected = LoggerConfig(
+        dump_param_to_param_group_map='param-groups',
         enable_one_logger=False,
         one_logger_project='project',
         one_logger_run_name='run',

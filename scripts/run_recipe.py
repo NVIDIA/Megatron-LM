@@ -104,19 +104,11 @@ def main(argv: list[str] | None = None) -> None:
     _apply_overrides(config, options.overrides)
     is_vlm = isinstance(config.model, (Nemotron35SuperVLModelConfig, Qwen35VLModelConfig))
     if is_vlm and (options.forward_step is None or options.dataset_provider is None):
-        from megatron.bridge.training.vlm import validate_vlm_run
-
-        validate_vlm_run(config)
+        raise ValueError("VLM recipes require explicit --forward-step and --dataset-provider")
     provider = _load_callable(options.dataset_provider) if options.dataset_provider else None
-    if is_vlm and provider is None:
-        from megatron.bridge.training.vlm import mock_vlm_datasets_provider
-
-        provider = mock_vlm_datasets_provider
     step = options.forward_step
     if step is None:
-        if is_vlm:
-            step = "megatron.bridge.training.vlm:forward_step"
-        elif isinstance(config.model, HybridModelConfig):
+        if isinstance(config.model, HybridModelConfig):
             step = "pretrain_hybrid:forward_step"
         elif isinstance(config.model, GPTModelConfig):
             step = "pretrain_gpt:forward_step"

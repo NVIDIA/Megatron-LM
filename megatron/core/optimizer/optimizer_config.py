@@ -155,9 +155,6 @@ class OptimizerConfig:
     min_lr: Optional[float] = None
     """Minumum value for learning rate. The scheduler clip values below this threshold."""
 
-    dump_param_to_param_group_map: Optional[str] = None
-    """Optional checkpoint path for dumping the parameter-to-optimizer-group mapping."""
-
     decoupled_lr: Optional[float] = None
     """Separate learning rate for the input and output layer."""
 

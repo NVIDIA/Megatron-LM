@@ -346,6 +346,9 @@ class SchedulerConfig:
 class LoggerConfig:
     """Configuration settings for logging, including TensorBoard and WandB."""
 
+    dump_param_to_param_group_map: str | None = None
+    """Optional checkpoint path for dumping the parameter-to-optimizer-group mapping."""
+
     log_interval: int = 100
     """Report loss and timing interval."""
 
