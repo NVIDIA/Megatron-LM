@@ -44,6 +44,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import (
     MegatronModule,
     TwoStageAttentionLayer,
+    accepts_flops_config,
     mark_keep_in_fp32,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -231,6 +232,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         name: Module instance name passed top-down from its parent module.
     """
 
+    @accepts_flops_config
     def estimate_flops(
         self,
         *,

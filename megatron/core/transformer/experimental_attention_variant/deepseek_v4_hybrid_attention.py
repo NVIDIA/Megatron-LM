@@ -25,6 +25,7 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     CompressedSparseAttentionBuilder,
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
+from megatron.core.transformer.module import accepts_flops_config
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
@@ -549,6 +550,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
     and returns output of the same size.
     """
 
+    @accepts_flops_config
     def estimate_flops(
         self,
         *,

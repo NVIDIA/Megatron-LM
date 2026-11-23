@@ -26,7 +26,7 @@ from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import MegatronModule, accepts_flops_config
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     cat_with_oom_fallback,
@@ -171,6 +171,7 @@ class MLP(MegatronModule):
      s: sequence length
     """
 
+    @accepts_flops_config
     def estimate_flops(
         self,
         *,

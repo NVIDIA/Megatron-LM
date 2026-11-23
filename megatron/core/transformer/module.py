@@ -2,7 +2,8 @@
 
 """Megatron Module."""
 
-from functools import partial
+from functools import partial, wraps
+from types import SimpleNamespace
 from typing import Any, Optional, Tuple
 
 import torch
@@ -21,6 +22,21 @@ from megatron.core.transformer.utils import (
 _FLOAT_TYPES = (torch.FloatTensor, torch.cuda.FloatTensor)
 _HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
 _BF16_TYPES = (torch.BFloat16Tensor, torch.cuda.BFloat16Tensor)
+
+
+def accepts_flops_config(estimate):
+    """Keep the config-only call used by training reports for built-in layer types."""
+
+    @wraps(estimate)
+    def from_module_or_config(config, **batch_stats):
+        if isinstance(config, MegatronModule):
+            return estimate(config, **batch_stats)
+        # A config describes the attention arithmetic but cannot own an indexer.
+        # Config-only reports count indexer executions separately.
+        layer = SimpleNamespace(config=config, core_attention=None, indexer=None)
+        return estimate(layer, **batch_stats)
+
+    return from_module_or_config
 
 
 class TwoStageAttentionLayer:

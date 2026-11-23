@@ -35,7 +35,11 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
+from megatron.core.transformer.module import (
+    MegatronModule,
+    TwoStageAttentionLayer,
+    accepts_flops_config,
+)
 from megatron.core.transformer.utils import is_layer_window_attention
 from megatron.core.typed_torch import apply_module, copy_signature, not_none
 from megatron.core.utils import (
@@ -1839,6 +1843,7 @@ class SelfAttention(Attention):
     and returns output of the same size.
     """
 
+    @accepts_flops_config
     def estimate_flops(
         self,
         *,

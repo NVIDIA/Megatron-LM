@@ -23,6 +23,7 @@ from megatron.core.ssm.gated_delta_net.common import (
     get_parameter_local_cp,
     l2norm,
 )
+from megatron.core.transformer.module import accepts_flops_config
 from megatron.core.utils import (
     deprecate_inference_params,
     get_pg_size,
@@ -62,6 +63,7 @@ class GatedDeltaNet2(_GDNBase):
     The layer takes input with size [s, b, h] and returns output of the same size.
     """
 
+    @accepts_flops_config
     def estimate_flops(
         self,
         *,

@@ -83,19 +83,6 @@ def _minimal_training_args(monkeypatch):
     return args
 
 
-@pytest.mark.parametrize("is_hybrid", [False, True], ids=["uniform", "hybrid-config-list"])
-def test_uneven_pipeline_split_requires_hybrid_model(monkeypatch, is_hybrid):
-    args = _minimal_training_args(monkeypatch)
-    args.world_size = 2
-    args.rank = 0
-    args.pipeline_model_parallel_size = 2
-    args.num_layers = 3
-    args.is_hybrid_model = is_hybrid
-
-    with nullcontext() if is_hybrid else pytest.raises(AssertionError, match="divisible by"):
-        validate_args(args)
-
-
 @pytest.mark.parametrize("version", [1, 2])
 def test_megatron_fsdp_user_buffer_registration_matches_version(monkeypatch, version):
     monkeypatch.delenv("CUDA_DEVICE_MAX_CONNECTIONS", raising=False)

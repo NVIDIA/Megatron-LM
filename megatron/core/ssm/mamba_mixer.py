@@ -39,7 +39,11 @@ from megatron.core.ssm.utils import _split_tensor_factory, _validate_dynamic_cp_
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
+from megatron.core.transformer.module import (
+    MegatronModule,
+    TwoStageAttentionLayer,
+    accepts_flops_config,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -195,6 +199,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             parallel.
     """
 
+    @accepts_flops_config
     def estimate_flops(
         self,
         *,

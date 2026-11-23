@@ -38,6 +38,7 @@ from megatron.core.ssm.ops.gdp import (
     fused_recurrent_gated_delta_rule_update,
 )
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
+from megatron.core.transformer.module import accepts_flops_config
 from megatron.core.utils import (
     deprecate_inference_params,
     get_pg_size,
@@ -77,6 +78,7 @@ def get_parameter_local_cp_headwise(
 
 class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
     # pylint: disable=missing-class-docstring
+    @accepts_flops_config
     def estimate_flops(
         self,
         *,

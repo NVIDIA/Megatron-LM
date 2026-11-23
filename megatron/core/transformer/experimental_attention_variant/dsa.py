@@ -30,7 +30,7 @@ from megatron.core.transformer.experimental_attention_variant import (
     dsa_layout,
     dsa_masking,
 )
-from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
+from megatron.core.transformer.module import MegatronModule, accepts_flops_config, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import ensure_params_ready, get_pg_size
@@ -2203,6 +2203,7 @@ class DSAIndexer(MegatronModule):
         https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py#L431-L480
     """
 
+    @accepts_flops_config
     def estimate_flops(
         self,
         *,
@@ -2925,6 +2926,7 @@ class DSAttention(MegatronModule):
         https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py#L491-L597
     """
 
+    @accepts_flops_config
     def estimate_flops(
         self, *, include_backward: bool = False, absorbed_mla: bool = True, **batch_stats: float
     ) -> float:

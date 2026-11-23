@@ -20,7 +20,7 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.enums import CudaGraphModule
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import MegatronModule, accepts_flops_config
 from megatron.core.transformer.moe.megakernel import (
     build_megakernel_backend,
     megakernel_shared_expert_init_context,
@@ -258,6 +258,7 @@ class MoELayer(BaseMoELayer):
     strategies such as All-to-All and All-Gather.
     """
 
+    @accepts_flops_config
     def estimate_flops(
         self,
         *,
