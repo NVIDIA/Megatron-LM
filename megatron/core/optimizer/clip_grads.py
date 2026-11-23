@@ -223,6 +223,26 @@ def _gtp_pad_zero_count(param: torch.Tensor, grad: torch.Tensor) -> int:
     return pad_zeros or 0
 
 
+def param_grad_counts_toward_num_zeros(
+    param: torch.Tensor,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    expert_tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    gtp_group: Optional[torch.distributed.ProcessGroup] = None,
+    expert_gtp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> bool:
+    """Whether ``param``'s grad is counted once by ``count_zeros_fp32``: not shared, and not a
+    replica due to tensor or (expert) generalized tensor parallelism."""
+    return (
+        param_is_not_shared(param)
+        and param_is_not_tensor_parallel_duplicate(
+            param, tp_group=tp_group, expert_tp_group=expert_tp_group
+        )
+        and param_is_not_gtp_duplicate(
+            param, gtp_group=gtp_group, expert_gtp_group=expert_gtp_group
+        )
+    )
+
+
 def count_zeros_fp32(
     parameters: Union[List[torch.Tensor], torch.Tensor],
     grad_stats_parallel_group: torch.distributed.ProcessGroup,
@@ -275,14 +295,9 @@ def count_zeros_fp32(
             num_zeros = grad.numel() - torch.count_nonzero(grad)
             total_num_zeros += num_zeros
             continue
-        is_not_shared = param_is_not_shared(param)
-        is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(
-            param, tp_group=tp_group, expert_tp_group=expert_tp_group
-        )
-        is_not_gtp_duplicate = param_is_not_gtp_duplicate(
-            param, gtp_group=gtp_group, expert_gtp_group=expert_gtp_group
-        )
-        if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_gtp_duplicate:
+        if grad_not_none and param_grad_counts_toward_num_zeros(
+            param, tp_group, expert_tp_group, gtp_group, expert_gtp_group
+        ):
             grad_obj = getattr(param, grad_attr)
             data_parallel_group = get_data_parallel_group_if_dtensor(grad_obj, data_parallel_group)
             grad = to_local_if_dtensor(grad_obj).detach()

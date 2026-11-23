@@ -2232,6 +2232,14 @@ class ChainedOptimizer(MegatronOptimizer):
     @torch.no_grad()
     def count_zeros(self):
         if self.grads_states_parallel_group_is_shared():
+            num_zeros = self._local_num_zeros_in_grads()
+            if num_zeros is not None:
+                torch.distributed.all_reduce(
+                    num_zeros,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=self.get_grad_stats_parallel_group(),
+                )
+                return num_zeros.item()
             params = []
             for optimizer in self.chained_optimizers:
                 params += optimizer.get_parameters()
@@ -2256,6 +2264,33 @@ class ChainedOptimizer(MegatronOptimizer):
                     optimizer.count_zeros() if optimizer.config.log_num_zeros_in_grad else 0
                 )
             return num_zeros_in_grad
+
+    def _local_num_zeros_in_grads(self) -> Optional[torch.Tensor]:
+        """Sum of the chained optimizers' local grad-buffer zero counts, filtered with the
+        first optimizer's groups as the shared-group ``count_zeros_fp32`` path does, and
+        chunked by the largest main grad that path counts; None unless every optimizer with
+        parameters provides one."""
+        first = self.chained_optimizers[0]
+        groups = tuple(
+            getattr(first, name, None)
+            for name in ('tp_group', 'expert_tp_group', 'gtp_group', 'expert_gtp_group')
+        )
+        optimizers = [opt for opt in self.chained_optimizers if opt.get_parameters()]
+        max_numels = [
+            (
+                opt.max_counted_main_grad_numel(groups)
+                if hasattr(opt, 'max_counted_main_grad_numel')
+                else None
+            )
+            for opt in optimizers
+        ]
+        if not optimizers or None in max_numels:
+            return None
+        counts = [
+            opt.local_num_zeros_in_grads(*groups, max_chunk_numel=max(max_numels))
+            for opt in optimizers
+        ]
+        return torch.stack(counts).sum()
 
     def has_grad_norm_group(self, grad_norm_group: str) -> bool:
         """Whether any chained optimizer owns params for a gradient-norm group.

@@ -65,6 +65,7 @@ from ..fp8_utils import (
 from ..full_cuda_graph import FullIterationGradCopy
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
+from .clip_grads import _gtp_pad_zero_count, param_grad_counts_toward_num_zeros
 from .grad_scaler import MegatronGradScaler
 from .optimizer import (
     MixedPrecisionOptimizer,
@@ -927,6 +928,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             )
             self.gbuf_ranges.append(self._build_gbuf_range_map(buffer))
         self.model_param_gbuf_map = self._build_model_param_gbuf_map(self.gbuf_ranges)
+        # count_zeros() grad-buffer plans, keyed by the ids of the duplicate-filter groups.
+        self._num_zeros_grad_buffer_plans = {}
 
         self._word_embedding_params = []
         self._embedding_min_norm_stats = None
@@ -1115,6 +1118,154 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         with the non-distributed optimizer).
         """
         return getattr(self, 'grad_stats_parallel_group', None)
+
+    def _num_zeros_grad_buffer_plan(
+        self, groups: Tuple[Optional[torch.distributed.ProcessGroup], ...]
+    ) -> Tuple[int, int, List[Tuple[int, int, int]], List[torch.Tensor]]:
+        """Where the main grads ``count_zeros_fp32`` counts on this rank can be counted from.
+
+        A main grad whose model param's ``main_grad`` is a view into its DDP grad buffer is
+        ``.float()`` of a slice of this rank's shard of a bucket, and ``.float()`` maps zero to
+        zero and nonzero to nonzero. Such params that are adjacent in a bucket's shard, or
+        separated only by alignment padding, merge into one ``(buffer index, start, end)``
+        region. The padding is zeroed with the buffer and never written by backward, so it adds
+        no nonzeros. A param with a separate higher-precision ``main_grad`` (FP32 local
+        accumulation) is counted from its own main param, as ``count_zeros_fp32`` does, since
+        its grad-buffer slice need not hold the same values when the optimizer steps.
+
+        Returns the number of counted elements (net of structural GTP padding zeros), the
+        largest counted main grad's numel, the grad-buffer regions, and the main params
+        counted individually.
+        """
+        key = tuple(map(id, groups))
+        if key in self._num_zeros_grad_buffer_plans:
+            return self._num_zeros_grad_buffer_plans[key]
+        main_params = {}
+        for model_groups, main_groups in (
+            (self.model_float16_groups, self.shard_fp32_from_float16_groups),
+            (self.model_fp32_groups, self.shard_fp32_groups),
+        ):
+            for model_group, main_group in zip(model_groups, main_groups):
+                main_params.update(zip(model_group, main_group))
+        assert len(main_params) == len(self.get_parameters())
+
+        num_counted = 0
+        max_numel = 0
+        regions = []
+        separate_main_params = []
+        for gbuf_index, gbuf_range_map in enumerate(self.gbuf_ranges):
+            grad_storage = self.buffers[gbuf_index].grad_data.untyped_storage().data_ptr()
+            for bucket_range_maps in gbuf_range_map.values():
+                for bucket_range_map in bucket_range_maps:
+                    run = None
+                    for model_param, range_map in sorted(
+                        bucket_range_map["param_map"].items(),
+                        key=lambda item: item[1]["gbuf_world"].start,
+                    ):
+                        main_param = main_params.get(model_param)
+                        counted = main_param is not None and param_grad_counts_toward_num_zeros(
+                            main_param, *groups
+                        )
+                        in_buffer = (
+                            model_param.main_grad.untyped_storage().data_ptr() == grad_storage
+                        )
+                        if counted:
+                            num_counted += main_param.numel() - _gtp_pad_zero_count(
+                                main_param, main_param
+                            )
+                            max_numel = max(max_numel, main_param.numel())
+                        if counted and in_buffer:
+                            world_range = range_map["gbuf_world"]
+                            start = world_range.start if run is None else run[0]
+                            run = (start, world_range.end)
+                            continue
+                        if counted:
+                            separate_main_params.append(main_param)
+                        if run is not None:
+                            regions.append((gbuf_index, *run))
+                            run = None
+                    if run is not None:
+                        regions.append((gbuf_index, *run))
+        plan = (num_counted, max_numel, regions, separate_main_params)
+        self._num_zeros_grad_buffer_plans[key] = plan
+        return plan
+
+    @torch.no_grad()
+    def local_num_zeros_in_grads(
+        self,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        expert_tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        gtp_group: Optional[torch.distributed.ProcessGroup] = None,
+        expert_gtp_group: Optional[torch.distributed.ProcessGroup] = None,
+        max_chunk_numel: Optional[int] = None,
+    ) -> Optional[torch.Tensor]:
+        """This rank's ``count_zeros_fp32`` count, before its all-reduce, as an int64 tensor.
+
+        Takes one ``torch.count_nonzero`` per grad-buffer chunk of counted main grads (plus
+        one per main grad held outside the buffer) instead of one per main grad.
+        ``torch.count_nonzero`` materializes a bool mask and an int64 copy of it, so regions
+        are cut into chunks of at most ``max_chunk_numel`` elements (default: the largest
+        counted main grad): the count's temporaries never exceed those of the per-param loop.
+        Returns None where the main grads are not copies of grad-buffer slices
+        (Megatron-FSDP, precision-aware optimizer, stub).
+        """
+        if not self._main_grads_are_grad_buffer_copies():
+            return None
+        num_counted, max_numel, regions, separate_main_params = self._num_zeros_grad_buffer_plan(
+            (tp_group, expert_tp_group, gtp_group, expert_gtp_group)
+        )
+        chunk_numel = max_chunk_numel or max_numel
+        nonzeros = [
+            torch.count_nonzero(
+                self.buffers[gbuf_index].grad_data[
+                    chunk_start : min(chunk_start + chunk_numel, end)
+                ]
+            )
+            for gbuf_index, start, end in regions
+            for chunk_start in range(start, end, chunk_numel)
+        ]
+        nonzeros += [torch.count_nonzero(param.grad) for param in separate_main_params]
+        num_zeros = torch.full((), num_counted, dtype=torch.int64, device='cuda')
+        if nonzeros:
+            num_zeros -= torch.stack(nonzeros).sum()
+        return num_zeros
+
+    def max_counted_main_grad_numel(
+        self, groups: Tuple[Optional[torch.distributed.ProcessGroup], ...]
+    ) -> Optional[int]:
+        """Numel of the largest main grad ``count_zeros_fp32`` counts on this rank (0 if none),
+        or None where ``local_num_zeros_in_grads`` returns None.
+
+        ``groups`` is ``(tp_group, expert_tp_group, gtp_group, expert_gtp_group)``.
+        """
+        if not self._main_grads_are_grad_buffer_copies():
+            return None
+        return self._num_zeros_grad_buffer_plan(groups)[1]
+
+    def _main_grads_are_grad_buffer_copies(self) -> bool:
+        """Whether main grads are FP32 copies of grad-buffer slices (not Megatron-FSDP, not
+        the precision-aware optimizer, not a stub)."""
+        return not (
+            self.is_stub_optimizer
+            or self.ddp_config.use_megatron_fsdp
+            or self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+        )
+
+    @torch.no_grad()
+    def count_zeros(self) -> float:
+        """Count number of zeros in model's gradients, from the grad buffers."""
+        num_zeros = self.local_num_zeros_in_grads(
+            tp_group=getattr(self, 'tp_group', None),
+            expert_tp_group=getattr(self, 'expert_tp_group', None),
+            gtp_group=getattr(self, 'gtp_group', None),
+            expert_gtp_group=getattr(self, 'expert_gtp_group', None),
+        )
+        if num_zeros is None:
+            return super().count_zeros()
+        torch.distributed.all_reduce(
+            num_zeros, op=torch.distributed.ReduceOp.SUM, group=self.get_grad_stats_parallel_group()
+        )
+        return num_zeros.item()
 
     @property
     def optimizer_state_keys(self):
