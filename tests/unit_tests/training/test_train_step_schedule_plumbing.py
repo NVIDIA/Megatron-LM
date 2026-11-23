@@ -560,13 +560,18 @@ def test_train_step_wraps_sequence_packing_after_rerun_check():
     assert result[8:] == (3, 12.0, 34.0, None, 3)
 
 
+@pytest.mark.parametrize("layer_wise", [True, False])
 @pytest.mark.parametrize(
     ("dsa_indexer_loss_coeff", "expect_tracker_init"), [(0.1, True), (None, False)]
 )
 def test_config_container_forwards_layer_wise_optimizer_to_model_builder(
-    dsa_indexer_loss_coeff, expect_tracker_init
+    dsa_indexer_loss_coeff, expect_tracker_init, layer_wise
 ):
-    """The config-container path must preserve Muon's layer-wise DDP routing flag."""
+    """The config-container path must preserve Muon's layer-wise DDP routing flag.
+
+    The gradient collective is LayerWise-only: other optimizers must not receive it, so
+    builders written against the earlier ``build_distributed_models`` signature keep working.
+    """
     args = SimpleNamespace(
         skip_train=True,
         freeze_all_layers=False,
@@ -603,7 +608,7 @@ def test_config_container_forwards_layer_wise_optimizer_to_model_builder(
         ddp=SimpleNamespace(use_megatron_fsdp=False),
         optimizer=SimpleNamespace(
             overlap_param_gather_with_optimizer_step=False,
-            use_layer_wise_distributed_optimizer=True,
+            use_layer_wise_distributed_optimizer=layer_wise,
             second_order_optimizer_grad_collective="all-reduce",
         ),
         dist=SimpleNamespace(use_megatron_fsdp=False, use_torch_fsdp2=False),
@@ -653,8 +658,8 @@ def test_config_container_forwards_layer_wise_optimizer_to_model_builder(
         use_torch_fsdp2=False,
         wrap_with_ddp=False,
         data_parallel_random_init=False,
-        use_layer_wise_distributed_optimizer=True,
-        second_order_optimizer_grad_collective="all-reduce",
+        use_layer_wise_distributed_optimizer=layer_wise,
+        **({"second_order_optimizer_grad_collective": "all-reduce"} if layer_wise else {}),
     )
 
 

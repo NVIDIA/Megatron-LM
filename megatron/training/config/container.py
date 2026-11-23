@@ -352,13 +352,36 @@ class PretrainConfigContainer(ConfigContainerBase):
         """Return independent batch partitions, including GTP batch shards but not CP."""
         return self.get_parallel_layout(self.get_model_world_size()).batch_parallel_size
 
+    def _mxfp8_param_gather_reuses_grad_buffer(self) -> bool:
+        """Whether the MXFP8 parameter all-gather has to stage in gradient storage.
+
+        MXFP8 parameters cannot be mapped into DDP's parameter buffer, so outside FSDP their
+        all-gather always goes through the gradient buffer. This follows from the effective
+        model and wrapper configuration, whichever entry point built the container.
+        """
+        transformer = self.model.transformer
+        return (
+            transformer.fp8 is not None
+            and transformer.fp8_recipe == "mxfp8"
+            and self.ddp.fp8_param_gather
+            and not self.ddp.use_megatron_fsdp
+            and not isinstance(self.ddp, TorchFullyShardedDataParallelConfig)
+        )
+
     def _optimizer_with_model_precision(self) -> OptimizerConfig:
-        """Return an optimizer copy with authoritative model precision, without mutation."""
-        precision = {
+        """Return an optimizer copy with authoritative model precision, without mutation.
+
+        The copy also carries the derived MXFP8 grad-buffer reuse. Only ``validate_args``
+        sets that flag for CLI runs; YAML and native configs reach validation and
+        finalization through this copy.
+        """
+        effective = {
             name: getattr(self.model.transformer, name)
             for name in ("fp16", "bf16", "params_dtype", "fp8_recipe")
         }
-        return replace(self.optimizer, **precision)
+        if self._mxfp8_param_gather_reuses_grad_buffer():
+            effective["reuse_grad_buf_for_mxfp8_param_ag"] = True
+        return replace(self.optimizer, **effective)
 
     def _resolve_batch_sizes(
         self, batch_parallel_size: int | None = None
@@ -486,7 +509,7 @@ class PretrainConfigContainer(ConfigContainerBase):
         if self.fault_tolerance.enable_ft_package and not self.checkpoint.save:
             raise ValueError("checkpointing save dir must be set to enable fault tolerance")
         global_batch_size, _, _ = self._resolve_batch_sizes()
-        self._validate_ddp_config()
+        self._validate_ddp_config(optimizer)
         self._validate_rl_config(global_batch_size)
         optimizer.validate_run(
             ddp_config=self.ddp,
@@ -563,10 +586,13 @@ class PretrainConfigContainer(ConfigContainerBase):
             assert checkpoint.save_params_interval is None, \
                 '--save-params-interval is not supported with --overlap-param-gather'
 
-    def _validate_ddp_config(self) -> None:
-        """Check wrapper requirements without deriving or mutating other configs."""
+    def _validate_ddp_config(self, optimizer: OptimizerConfig) -> None:
+        """Check wrapper requirements without deriving or mutating other configs.
+
+        ``optimizer`` is the effective copy from ``_optimizer_with_model_precision``.
+        """
         # DDP's copy is derived during finalization; recipes only set optimizer policy.
-        if self.optimizer.reuse_grad_buf_for_mxfp8_param_ag and not self.ddp.use_megatron_fsdp:
+        if optimizer.reuse_grad_buf_for_mxfp8_param_ag and not self.ddp.use_megatron_fsdp:
             if self.ddp.grad_buffer_offload or self.rl.requires_grad_buffer_offload:
                 raise ValueError(
                     "Gradient-buffer offload is incompatible with "

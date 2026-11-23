@@ -4438,6 +4438,13 @@ def setup_model_and_optimizer(
                 freeze_base_model_for_mtp=cfg.model.transformer.freeze_base_model_for_mtp,
             )
 
+            layer_wise_kwargs = {}
+            if cfg.optimizer.use_layer_wise_distributed_optimizer:
+                # Only LayerWise wrapping reads the collective. Builders written against the
+                # earlier signature keep working for every other optimizer.
+                layer_wise_kwargs["second_order_optimizer_grad_collective"] = (
+                    cfg.optimizer.second_order_optimizer_grad_collective
+                )
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
                 ddp_config=cfg.ddp,
@@ -4447,9 +4454,7 @@ def setup_model_and_optimizer(
                 wrap_with_ddp=wrap_with_ddp,
                 data_parallel_random_init=cfg.rng.data_parallel_random_init,
                 use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
-                second_order_optimizer_grad_collective=(
-                    cfg.optimizer.second_order_optimizer_grad_collective
-                ),
+                **layer_wise_kwargs,
             )
         else:
             assert (

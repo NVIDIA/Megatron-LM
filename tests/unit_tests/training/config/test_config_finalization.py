@@ -185,6 +185,38 @@ def test_optimizer_validation_uses_model_precision(run_config, model_recipe, opt
         assert run_config.to_dict() == before
 
 
+@pytest.mark.parametrize("fp8_recipe, expect_reuse", [("mxfp8", True), (None, False)])
+def test_mxfp8_grad_buffer_reuse_is_derived_without_the_deprecated_flag(
+    monkeypatch, run_config, fp8_recipe, expect_reuse
+):
+    """YAML and native configs bypass ``validate_args``, so the container derives the reuse."""
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
+    transformer = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
+    transformer.fp8 = "hybrid"
+    if fp8_recipe is not None:
+        transformer.fp8_recipe = fp8_recipe
+    run_config.model = GPTModelConfig(transformer=transformer, vocab_size=128, seq_length=16)
+    run_config.train.micro_batch_size = 1
+    run_config.train.global_batch_size = 8
+    run_config.ddp.fp8_param_gather = True
+    assert not run_config.optimizer.reuse_grad_buf_for_mxfp8_param_ag
+
+    # Offload releases the storage the MXFP8 gather stages in. Without the explicit flag,
+    # only the derived reuse can reject the combination.
+    run_config.ddp.grad_buffer_offload = True
+    if expect_reuse:
+        with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
+            run_config.validate()
+    else:
+        run_config.validate()
+    assert not run_config.optimizer.reuse_grad_buf_for_mxfp8_param_ag
+
+    run_config.ddp.grad_buffer_offload = False
+    run_config.finalize()
+    assert run_config.optimizer.reuse_grad_buf_for_mxfp8_param_ag is expect_reuse
+    assert run_config.ddp.reuse_grad_buf_for_mxfp8_param_ag is expect_reuse
+
+
 @pytest.mark.parametrize("invalid_policy", ["ddp_offload", "model_pipeline"])
 def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_config, invalid_policy):
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
