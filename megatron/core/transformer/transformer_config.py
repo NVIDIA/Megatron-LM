@@ -1205,8 +1205,9 @@ class TransformerConfig(ModelParallelConfig):
     changes no forward activation, so the all-reduce overlaps dispatch, expert computation,
     combine and the remaining layers' forward. Backward adds the reduced counts to the running
     sum in the order the micro-batches were launched, with the same ops on the same buffers as
-    the synchronous path, so each micro-batch's loss value and gradients are bitwise unchanged
-    whatever order backward visits the micro-batches in. A synchronous call made within a step of
+    the synchronous path, so each micro-batch's loss reads the same running average, and its
+    value and gradients match the synchronous path (bitwise with deterministic kernels), whatever
+    order backward visits the micro-batches in. A synchronous call made within a step of
     deferred calls first waits for the deferred all-reduces launched before it and adds their
     counts, so the running sum stays as on the synchronous path (Megatron's training loop does
     not mix them: CUDA-graph warmup and capture run between steps). A training forward whose
