@@ -1435,6 +1435,8 @@ class DynamicEngineTestConfig:
     normalization: str = "LayerNorm"
     inference_moe_token_dispatcher_type: str = "nccl"
     moe_enable_routing_replay: bool = False
+    moe_router_topk: int = 2
+    moe_router_pre_softmax: bool = False
     # If False, do not build cuda graphs in the tests, even if
     # num_cuda_graphs is set.
     # For tests concerning cuda-graph warmups, we set this to False
@@ -1778,6 +1780,8 @@ class DynamicInferenceEngineTestBase:
                 expert_tensor_parallel_size=test_config.expert_tensor_parallel_size,
                 num_moe_experts=num_moe_experts,
                 moe_grouped_gemm=bool(test_config.moe_grouped_gemm),
+                moe_router_topk=test_config.moe_router_topk,
+                moe_router_pre_softmax=test_config.moe_router_pre_softmax,
                 sequence_parallel=test_config.sequence_parallel,
                 pipeline_dtype=torch.bfloat16,
                 add_bias_linear=test_config.expert_model_parallel_size == 1

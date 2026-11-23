@@ -803,6 +803,27 @@ _ASYNC_PAIR_SCENARIOS = (
         prerequisite="mxfp8",
         atol=0.0,
     ),
+    _pair_scenario(
+        "mxfp8-inference-topk1",
+        "precision:mxfp8",
+        "model:moe",
+        "routing:top-1",
+        "implementation:inference-optimized",
+        config={
+            "fp8": True,
+            "fp8_recipe": "mxfp8",
+            "hidden_size": 128,
+            "num_moe_experts": 2,
+            "moe_grouped_gemm": True,
+            "use_moe_layer_spec": True,
+            "transformer_impl": "inference_optimized",
+            "moe_router_topk": 1,
+            "moe_router_pre_softmax": True,
+        },
+        signals=("inference-optimized", "moe", "mxfp8"),
+        prerequisite="mxfp8",
+        atol=0.0,
+    ),
     # Four heads of width 64 exercise FlashInfer's supported fused-RoPE kernel.
     # Width 16 crosses half-head boundaries in its vectorized NeoX rotation.
     _pair_scenario(

@@ -1553,7 +1553,10 @@ class InferenceTopKRouter(TopKRouter):
             precomputed_indices=precomputed_indices,
             allow_batch_invariant_sigmoid_topk=self.routing_type != "quantile_balancing",
         )
-        return probs.squeeze(1), top_indices.squeeze(1)
+        # Keep the dense inference contract [num_tokens, topk] when topk == 1.
+        # Squeezing that singleton route dimension breaks inference dispatchers
+        # and fused-MoE kernels, all of which index the top-k axis explicitly.
+        return probs, top_indices
 
     def forward(
         self,
