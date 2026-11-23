@@ -45,3 +45,21 @@ def test_invalid_override_cannot_create_phantom_fields(run_config, override):
         _apply_overrides(run_config, [override])
     assert not hasattr(run_config.train, "typo")
     assert not run_config._finalized
+
+
+def test_rank_local_failure_reaches_launcher_without_collective_teardown(run_config, monkeypatch):
+    from megatron.training import api
+    from scripts import run_recipe
+
+    def fail_training(*args, **kwargs):
+        raise RuntimeError("rank-local dataset failure")
+
+    def fail_teardown():
+        pytest.fail("Collective teardown can hide the rank-local exception")
+
+    monkeypatch.setattr(run_recipe, "_load_callable", lambda path: lambda: run_config)
+    monkeypatch.setattr(api, "pretrain", fail_training)
+    monkeypatch.setattr("torch.distributed.is_initialized", lambda: True)
+    monkeypatch.setattr("torch.distributed.destroy_process_group", fail_teardown)
+    with pytest.raises(RuntimeError, match="rank-local dataset failure"):
+        run_recipe.main(["--recipe", "test:recipe", "--forward-step", "test:step"])

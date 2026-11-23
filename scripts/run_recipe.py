@@ -74,6 +74,9 @@ def main(argv: list[str] | None = None) -> None:
         "--forward-step", help="MLM forward step as module:function; defaults to GPT/Hybrid's step"
     )
     parser.add_argument(
+        "--dataset-provider", help="Optional MLM dataset callback as module:function"
+    )
+    parser.add_argument(
         "--dry-run", action="store_true", help="Validate and display config without runtime setup"
     )
     parser.add_argument("overrides", nargs="*", metavar="KEY=VALUE")
@@ -87,6 +90,8 @@ def main(argv: list[str] | None = None) -> None:
 
     import torch
 
+    from megatron.bridge.models.nemotron_3.super_vl_config import Nemotron35SuperVLModelConfig
+    from megatron.bridge.models.qwen_vl.qwen35_vl_config import Qwen35VLModelConfig
     from megatron.core._rank_utils import safe_get_rank
     from megatron.training.api import pretrain
     from megatron.training.config import PretrainConfigContainer
@@ -97,9 +102,21 @@ def main(argv: list[str] | None = None) -> None:
     if not isinstance(config, PretrainConfigContainer):
         raise TypeError("Recipe must return an MLM PretrainConfigContainer")
     _apply_overrides(config, options.overrides)
+    is_vlm = isinstance(config.model, (Nemotron35SuperVLModelConfig, Qwen35VLModelConfig))
+    if is_vlm and (options.forward_step is None or options.dataset_provider is None):
+        from megatron.bridge.training.vlm import validate_vlm_run
+
+        validate_vlm_run(config)
+    provider = _load_callable(options.dataset_provider) if options.dataset_provider else None
+    if is_vlm and provider is None:
+        from megatron.bridge.training.vlm import mock_vlm_datasets_provider
+
+        provider = mock_vlm_datasets_provider
     step = options.forward_step
     if step is None:
-        if isinstance(config.model, HybridModelConfig):
+        if is_vlm:
+            step = "megatron.bridge.training.vlm:forward_step"
+        elif isinstance(config.model, HybridModelConfig):
             step = "pretrain_hybrid:forward_step"
         elif isinstance(config.model, GPTModelConfig):
             step = "pretrain_gpt:forward_step"
@@ -111,11 +128,11 @@ def main(argv: list[str] | None = None) -> None:
         if safe_get_rank() == 0:
             logger.info("Recipe config (not finalized):\n%s", pformat(config.to_dict()))
         return
-    try:
-        pretrain(config, forward_step)
-    finally:
-        if torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
+    pretrain(config, forward_step, dataset_provider=provider)
+    # On failure, let torchrun report the exception and terminate peer ranks.
+    # Collective teardown in a finally block can hang before the traceback is printed.
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

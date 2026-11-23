@@ -12,8 +12,9 @@ legacy features must tolerate absent arguments.
 
 The wrapper supplies MLM's config-driven dataset provider and GPT/Hybrid model
 builder to the existing training loop. Framework startup finalizes the config;
-recipes should not call `finalize()` themselves. Custom callback-provided models
-and datasets can continue to use the lower-level training entrypoint.
+recipes should not call `finalize()` themselves. An optional `dataset_provider`
+uses MLM's existing dataset callback interface with a loader-only `cfg.data`.
+Custom model providers still use the lower-level training entrypoint.
 
 ## Llama 3 example
 
@@ -39,7 +40,7 @@ public dataclass fields (numbers, booleans, `null`, lists, or strings); repeated
 keys use the last value. Unknown fields are rejected. Define optional config
 sections, dataset classes, and Python callables in the recipe itself.
 
-The runner selects the standard GPT/Hybrid forward step from the model config.
+The runner selects the GPT/Hybrid or supported VLM forward step from the model config.
 Use `--forward-step module:function` for an explicit MLM-compatible step.
 `--dry-run` validates and displays the unfinalized config without setting global
 config, initializing distributed services, building datasets, or training.
@@ -47,8 +48,8 @@ It is not a substitute for runtime validation against the actual GPU topology.
 
 Dataset selection stays in `cfg.data`. The runner neither synchronizes sequence
 lengths nor finalizes the config: both remain under the existing framework
-ownership rules. It calls the current `megatron.training.api.pretrain` wrapper;
-neither that wrapper nor the underlying training API is changed by the runner.
+ownership rules. It calls `megatron.training.api.pretrain`, which delegates to
+the existing training loop.
 
 The independently expressed settings follow the
 [Bridge Llama 3 8B BF16 recipe](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/eea53e431a8b0b4e9c4f47a76784c6f3200c9a1f/src/megatron/bridge/recipes/llama/h100/llama3.py).
@@ -97,6 +98,28 @@ across launches. Config-only save/resume currently supports `torch_dist`. Saved
 configuration and runtime topology replace optional CLI metadata; checkpoints
 from native runs do not contain fabricated `args`. Older tools that require
 checkpoint `args` are not yet supported. Config-only MoE upcycling is also deferred.
+
+## Vision-language inputs
+
+For Qwen3.5 VL and Nemotron3.5 Super VL model configs, the runner selects
+`megatron.bridge.training.vlm.mock_vlm_datasets_provider` and its forward step.
+Use a loader-only `cfg.data` for this callback. Each sample contains one synthetic
+image followed by random text, with shifted causal labels and no loss on image
+placeholders. Vision, projection, and
+language parameters are trainable. This tests image-conditioned training, not
+real-data quality, conversation processing, video, or SFT packing.
+
+The supplied VL path currently requires PP=CP=1 and unpacked inputs. TP/EP/DP are
+supported. For a real dataset, supply `--dataset-provider module:function` and
+an MLM-compatible `--forward-step` as needed. Both are callbacks to the same
+training loop. These restrictions apply to the supplied mock VLM path, not to
+custom pairs of callbacks. Dataset providers must honor MLM's distributed-rank
+and sampler interfaces and supply matching media metadata and shifted labels.
+
+Report steady-state throughput separately from compilation and startup;
+MLM's current Hybrid FLOPs estimate covers the
+language model, not the vision encoder/projector, so a VL TFLOPS result using
+that estimate is a language-only estimate over the whole VL iteration time.
 
 Offline cached-logit distillation remains on its CLI path until
 [#9635](https://github.com/NVIDIA/Megatron-LM/pull/9635) supplies
