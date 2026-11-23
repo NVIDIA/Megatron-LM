@@ -172,7 +172,7 @@ def reinitialize_grpo_microbatch_calculator(args: Any, data_parallel_size: int) 
         data_parallel_size=data_parallel_size,
         decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
         step_batch_size_schedule=cfg.train.step_batch_size_schedule,
-        seq_length=args.seq_length,
+        seq_length=cfg.model.transformer.max_seq_length_per_sample,
     )
     print_rank_0(f"> GRPO training: num_microbatches set to {get_num_microbatches()}")
 
