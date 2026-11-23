@@ -5,7 +5,6 @@ import torch
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer, rounding
-from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -105,7 +104,7 @@ class TestMainParamsRoundingConfig:
 
 
 def _train(offload_fraction, rounding, steps):
-    """A small BF16 model under DDP + get_megatron_optimizer; returns (model params, initial)."""
+    """Train a small BF16 model with DDP and the distributed optimizer."""
     torch.manual_seed(0)
     module = torch.nn.Sequential(
         torch.nn.Linear(1024, 2048, bias=False),
@@ -150,21 +149,19 @@ def _train(offload_fraction, rounding, steps):
     return optimizer, params, initial
 
 
-def _main_params(optimizer, params):
-    """FP32 main param for each model param (world size 1, so each shard is the full param)."""
+def _model_and_main_param_shards(optimizer):
+    """Pair each locally owned BF16 model slice with its FP32 master shard."""
     inner = (
         optimizer.chained_optimizers[0] if hasattr(optimizer, "chained_optimizers") else optimizer
     )
-    if isinstance(inner.optimizer, HybridDeviceOptimizer):
-        shards = {
-            id(m): s
-            for mg, sg in zip(inner.model_float16_groups, inner.shard_float16_groups)
-            for m, s in zip(mg, sg)
-        }
-        main = {k: inner.optimizer.param_to_inner_param[s] for k, s in shards.items()}
-    else:
-        main = {id(m): m.main_param for g in inner.model_float16_groups for m in g}
-    return [main[id(p)].detach().float().cuda().view(p.shape) for p in params]
+    assert inner.model_param_group_index_map
+    for param in inner.model_param_group_index_map:
+        span = inner._get_model_param_range_map(param)["param"]
+        model_shard = param.detach().view(-1)[span.start : span.end]
+        main_shard = inner._get_main_param_and_optimizer_states(param)["param"].detach()
+        assert main_shard.dtype == torch.float32
+        assert main_shard.shape == model_shard.shape
+        yield model_shard, main_shard.to(model_shard.device)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -178,16 +175,17 @@ class TestMainParamsRoundingOptimizer:
 
     @pytest.mark.parametrize("offload_fraction", [None, 0.0, 0.5, 1.0])
     def test_nearest_matches_cast(self, offload_fraction):
-        optimizer, params, _ = _train(offload_fraction, "nearest", steps=3)
-        for param, main in zip(params, _main_params(optimizer, params)):
-            assert torch.equal(param, main.bfloat16())
+        optimizer, _, _ = _train(offload_fraction, "nearest", steps=3)
+        for model_shard, main_shard in _model_and_main_param_shards(optimizer):
+            assert torch.equal(model_shard, main_shard.bfloat16())
 
     @pytest.mark.parametrize("offload_fraction", [None, 0.0, 0.5, 1.0])
     def test_stochastic_rounds_to_neighbours_and_moves_weights(self, offload_fraction):
         optimizer, params, initial = _train(offload_fraction, "stochastic", steps=3)
-        for param, main in zip(params, _main_params(optimizer, params)):
-            lo, hi = _bf16_neighbours(main)
-            assert bool(((param.float() == lo) | (param.float() == hi)).all())
+        for model_shard, main_shard in _model_and_main_param_shards(optimizer):
+            lo, hi = _bf16_neighbours(main_shard)
+            value = model_shard.float()
+            assert bool(((value == lo) | (value == hi)).all())
         _, nearest_params, _ = _train(offload_fraction, "nearest", steps=3)
         moved = sum(int((p != i).sum()) for p, i in zip(params, initial))
         moved_nearest = sum(int((p != i).sum()) for p, i in zip(nearest_params, initial))
