@@ -143,7 +143,7 @@ and the one case for a custom digest: `references/tracing-setup.md` §3.
 
 Cheapest first — do not start on a cluster:
 
-- **Module level.** `tests/unit_tests/determinism/` runs a model or block twice
+- **Module level.** `tests/unit_tests/core/determinism/` runs a model or block twice
   under restored RNG state and asserts bit-identical outputs and gradients,
   parametrized over model presets × parallelism cells × FP8/FP4 recipes. If your
   break reproduces by adding a case to `configs.PARALLELISM_CONFIGS`, you never

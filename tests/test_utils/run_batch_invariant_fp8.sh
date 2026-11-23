@@ -36,7 +36,7 @@ for ((iteration = 1; iteration <= REPEAT; iteration++)); do
             --standalone --nnodes=1 --nproc-per-node=1 --max-restarts=0 \
             --log-dir "$LOG_DIR/$iteration-$profile" --redirects=3 --tee=3 \
             -m coverage run --parallel-mode --source=megatron/core \
-            -m pytest -vs tests/unit_tests/inference/test_batch_invariant_fp8.py \
+            -m pytest -vs tests/unit_tests/core/inference/test_batch_invariant_fp8.py \
             -k "$selection" -m "$MARKER" --junitxml="$result"
         # The suite normalizes empty collections to success; this dedicated job must run.
         uv run --no-sync python - "$result" <<'PY'

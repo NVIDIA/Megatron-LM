@@ -1,8 +1,33 @@
 # Megatron-LM Tests
 
+## Unit-test layout and CI buckets
+
+Place tests under the package they exercise: `megatron/core` tests belong in
+`unit_tests/core`, `megatron/training` tests in `unit_tests/training`, and
+`megatron/inference` tests in `unit_tests/inference`. Shared test infrastructure
+and tests for repository-root scripts, tools, and examples remain at the
+unit-test root.
+
+CI groups are independent of the directories. The recipe bucket IDs retain
+their historical names and launch settings; `unit_tests/ci_buckets.yaml` lists
+their current test files in collection order. A bucket can span several
+directories. Add a new test to the appropriate existing bucket on each target
+platform; otherwise it runs in the catch-all bucket, subject to the existing
+platform markers and exclusions. Do not create a new CI job merely because a
+test moves to another directory.
+
+Full runs and Testmon use the same bucket resolver. To inspect a bucket's
+actual files from the repository root, run:
+
+```bash
+python tests/unit_tests/find_test_cases.py 'tests/unit_tests/data/**/*.py' h100 --targets
+```
+
+Legacy suites use their historical checkout and directory selectors.
+
 ## A2A Overlap Test Isolation
 
-The two-chunk schedule tests in `unit_tests/a2a_overlap/test_schedule_chunk_1f1b.py`
+The two-chunk schedule tests in `unit_tests/core/pipeline_parallel/test_schedule_chunk_1f1b.py`
 reuse one parallel topology per class (and per TP size for padding-mask tests).
 This bounds communicator and HybridEP initialization across the parameter matrix.
 MCore's `destroy_model_parallel()` clears NCCL group references without unregistering those

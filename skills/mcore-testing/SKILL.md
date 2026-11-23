@@ -40,6 +40,15 @@ tests/
     └── python_scripts/  # helpers (recipe_parser, golden-value download, …)
 ```
 
+Directories under `tests/unit_tests/` mirror the corresponding relative paths
+under `megatron/`; for example, hybrid model tests belong in
+`tests/unit_tests/core/models/hybrid/`. Explicit exceptions are
+`core/distributed/mfsdp_v1/` and `core/distributed/mfsdp_v2/`, which keep the
+FSDP versions separate, and the `core/determinism/` subtree, which keeps its
+shared helpers, `correctness/` tests, and `kernels/` tests together. Keep other
+shared test infrastructure and tests for code outside `megatron/` as flat
+files at the unit-test root.
+
 ---
 
 ## How Tests Execute
@@ -126,11 +135,11 @@ uv run python -m torch.distributed.run --nproc-per-node 8 -m pytest -q \
 
 # Single file
 uv run python -m torch.distributed.run --nproc-per-node 8 -m pytest -q \
-  tests/unit_tests/models/test_gpt_model.py
+  tests/unit_tests/core/models/test_gpt_model.py
 
 # Single test
 uv run python -m torch.distributed.run --nproc-per-node 8 -m pytest -q \
-  tests/unit_tests/models/test_gpt_model.py::TestGPTModel::test_constructor
+  tests/unit_tests/core/models/test_gpt_model.py::TestGPTModel::test_constructor
 
 # Filter by name substring
 uv run python -m torch.distributed.run --nproc-per-node 8 -m pytest -q \
@@ -225,7 +234,8 @@ For ad-hoc runs, prefer the direct `torch.distributed.run` invocations above.
 
 ### Implementation steps
 
-1. Create `tests/unit_tests/<category>/test_<name>.py`.
+1. Create `tests/unit_tests/<megatron-relative-package>/test_<name>.py`,
+   following the directory rules in Test Layout above.
 2. Use fixtures from `tests/unit_tests/conftest.py`.
 3. Apply markers as needed:
    - `@pytest.mark.internal` — skipped on `legacy` tag
@@ -234,12 +244,18 @@ For ad-hoc runs, prefer the direct `torch.distributed.run` invocations above.
    - `@pytest.mark.experimental` — `latest` tag only
 4. Verify locally (see Running Unit Tests Locally above).
 5. If the test needs a dedicated CI bucket, add an entry to
-   `tests/test_utils/recipes/h100/unit-tests.yaml`.
+   `tests/test_utils/recipes/h100/unit-tests.yaml`. Normally, add the test to an
+   existing group in `tests/unit_tests/ci_buckets.yaml` instead. Bucket IDs retain
+   their historical recipe names; their ordered file lists can span multiple
+   directories. Full execution and Testmon resolve those same lists. Files not
+   assigned to a dedicated group run in the catch-all bucket with the usual
+   platform marker filtering. Directory moves alone must preserve bucket
+   membership and launch settings.
 6. If the change adds or modifies a GPU kernel (Triton, `jit_fuser` /
    `torch.compile`, CUDA extension, TE or external-library dispatch, or a
    scatter/index accumulation), add or update its bit-exact replay test under
-   `tests/unit_tests/determinism/kernels/` and register it in
-   `tests/unit_tests/determinism/kernels/manifest.py`. The `linting` CI job
+   `tests/unit_tests/core/determinism/kernels/` and register it in
+   `tests/unit_tests/core/determinism/kernels/manifest.py`. The `linting` CI job
    (`tools/check_kernel_determinism_coverage.py`) fails kernel PRs without
    this; the `determinism-exempt` label overrides it for non-numeric edits.
    See `docs/developer/determinism/testing.md`.

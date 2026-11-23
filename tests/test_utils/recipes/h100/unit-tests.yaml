@@ -95,6 +95,8 @@ spec:
         echo "No unit-test coverage data was produced; skipping coverage export."
     fi
 
+# Bucket IDs retain the main CI groups. Latest test paths are resolved through
+# tests/unit_tests/ci_buckets.yaml; legacy checkouts retain their original paths.
 products:
   # Runtime topology regressions run separately from the broad SSM/transformer buckets.
   - test_case: [tests/unit_tests/context_parallel/runtime/**/*.py]

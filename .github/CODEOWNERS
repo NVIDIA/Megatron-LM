@@ -86,17 +86,19 @@ tests/functional_tests/python_test_utils/ @NVIDIA/ci
 tests/functional_tests/shell_test_utils/ @NVIDIA/ci
 tests/test_utils/recipes/ @NVIDIA/ci
 tests/unit_tests/run_ci_test.sh @NVIDIA/ci
+tests/unit_tests/ci_buckets.yaml @NVIDIA/ci
 
 # API Backwards Compatibility Check
 scripts/check_api_backwards_compatibility.py @NVIDIA/ci
 scripts/README_API_COMPAT.md @NVIDIA/ci
 .github/workflows/check_api_backwards_compatibility_workflow.yml @NVIDIA/ci
 docs/api-backwards-compatibility-check.md @NVIDIA/ci
-tests/unit_tests/test_api_backwards_compat_setup.py @NVIDIA/ci
+tests/unit_tests/core/test_api_backwards_compat_setup.py @NVIDIA/ci
 
 megatron/rl/ @NVIDIA/reinforcement-learning
 examples/rl/ @NVIDIA/reinforcement-learning
 tests/unit_tests/rl/ @NVIDIA/reinforcement-learning
+tests/unit_tests/training/test_refit_arguments.py @NVIDIA/reinforcement-learning
 train_rl.py @NVIDIA/reinforcement-learning
 
 # Batch-invariant implementations.
