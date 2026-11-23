@@ -1360,6 +1360,7 @@ def test_load_checkpoint_override_opt_param_scheduler(
         optimizer.param_groups = [
             {"is_decoupled_lr": False, "max_lr": -1.0, "min_lr": -1.0},
             {"is_decoupled_lr": True, "max_lr": -1.0, "min_lr": -1.0},
+            {"default_config": False, "wd_mult": 0.5, "max_lr": 16.0, "min_lr": 1.6},
         ]
         opt_param_scheduler = MockOptParamScheduler(
             {"opt_param_scheduler": "scheduler_state", "num_steps": 3}
@@ -1377,6 +1378,7 @@ def test_load_checkpoint_override_opt_param_scheduler(
         new_optimizer.param_groups = [
             {"is_decoupled_lr": False, "max_lr": -2.0, "min_lr": -2.0},
             {"is_decoupled_lr": True, "max_lr": -2.0, "min_lr": -2.0},
+            {"default_config": False, "wd_mult": 0.5, "max_lr": 32.0, "min_lr": 3.2},
         ]
         new_opt_param_scheduler = MockOptParamScheduler(
             {"opt_param_scheduler": "dummy2", "num_steps": 0}
@@ -1399,6 +1401,9 @@ def test_load_checkpoint_override_opt_param_scheduler(
         assert new_optimizer.param_groups[0]["min_lr"] == run_config.optimizer.min_lr
         assert new_optimizer.param_groups[1]["max_lr"] == run_config.optimizer.decoupled_lr
         assert new_optimizer.param_groups[1]["min_lr"] == run_config.optimizer.decoupled_min_lr
+        assert new_optimizer.param_groups[2]["max_lr"] == 32.0
+        assert new_optimizer.param_groups[2]["min_lr"] == 3.2
+        assert new_optimizer.param_groups[2]["default_config"] is False
         assert new_opt_param_scheduler.num_steps == train_state.consumed_train_samples == 42
         assert new_opt_param_scheduler.step_calls[-1] == 0
 
