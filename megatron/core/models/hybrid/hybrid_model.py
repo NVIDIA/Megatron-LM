@@ -730,9 +730,18 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
     ):
-        """Build a combined-1F1B training plan with one entry per logical decoder layer."""
+        """Build a combined-1F1B training plan with one entry per logical decoder layer.
+
+        For compatibility with other schedule builders, ``extra_block_kwargs`` accepts
+        ``None`` or an empty mapping.
+        """
         from .fine_grained_callables import build_hybrid_schedule_plan
 
+        # TODO: Support block kwargs once the Hybrid layer callables can consume them.
+        if extra_block_kwargs:
+            raise ValueError(
+                "HybridModel.build_schedule_plan does not support nonempty extra_block_kwargs."
+            )
         return build_hybrid_schedule_plan(
             self,
             input_ids,
@@ -741,10 +750,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             decoder_input,
             labels,
             packed_seq_params,
-            extra_block_kwargs,
-            runtime_gather_output,
-            loss_mask,
-            padding_mask,
+            runtime_gather_output=runtime_gather_output,
+            loss_mask=loss_mask,
+            padding_mask=padding_mask,
             mtp_input_mask=mtp_input_mask,
             output_processor=output_processor,
             output_processor_context=output_processor_context,

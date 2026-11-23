@@ -315,6 +315,12 @@ def test_grouped_overlap_matches_eager_outputs_and_gradients(pattern, num_layers
         }
         model.zero_grad(set_to_none=True)
 
+        with pytest.raises(ValueError, match="extra_block_kwargs"):
+            model.build_schedule_plan(**microbatches[0], extra_block_kwargs={"attention_bias": 1})
+        # Exercise omitted, None, and empty kwargs against the same eager references.
+        microbatches[1]["extra_block_kwargs"] = None
+        microbatches[2]["extra_block_kwargs"] = {}
+
         # Planning each microbatch must not reconstruct the legacy full-stack symbol list.
         monkeypatch.delattr(HybridStack, "layer_type_list")
         set_streams()
