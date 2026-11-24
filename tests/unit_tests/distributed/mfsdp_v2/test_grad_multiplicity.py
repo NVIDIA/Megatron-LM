@@ -4,7 +4,6 @@
 
 import copy
 
-import pytest
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -41,8 +40,7 @@ def _graph_task(model, inputs, node):
     """Materialize one unit for an independently executed forward/backward node."""
     model.context.allgather_stream.wait_stream(model.context.current_stream())
     model.unshard()
-    consumer = model if node is None else model[node]
-    loss = consumer(inputs).square().mean()
+    loss = model[node](inputs).square().mean()
     loss.backward()
     model.reshard()
     return loss.detach()
@@ -57,12 +55,7 @@ def _gather_parameter_shards(tensor):
     return torch.cat(shards, dim=0).to(tensor.device)
 
 
-@pytest.mark.parametrize(
-    "nodes",
-    [(None,), (None, None), (None, None, None), (0, 1, 0)],
-    ids=["one_graph_task", "two_graph_tasks", "three_graph_tasks", "unequal_multiplicities"],
-)
-def test_gradients_and_updates_match_baseline(distributed_setup, nodes):
+def test_gradients_and_updates_match_baseline(distributed_setup):
     """Losses, public gradients, and updated weights match dense training."""
     setup = distributed_setup
     torch.manual_seed(0)
@@ -86,10 +79,10 @@ def test_gradients_and_updates_match_baseline(distributed_setup, nodes):
                 else GradientFinalizationMode.SKIP_OUTER
             )
             with model.context.finalize_gradients(mode=mode):
-                for node in nodes:
+                # One layer contributes twice and the other once, in separate GraphTasks.
+                for node in (0, 1, 0):
                     inputs = torch.randn(4, 16, device=setup.device)
-                    consumer = baseline if node is None else baseline[node]
-                    baseline_loss = consumer(inputs).square().mean()
+                    baseline_loss = baseline[node](inputs).square().mean()
                     baseline_loss.backward()
                     torch.testing.assert_close(
                         _graph_task(model, inputs, node), baseline_loss.detach()

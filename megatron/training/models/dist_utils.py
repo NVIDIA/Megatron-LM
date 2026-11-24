@@ -28,6 +28,7 @@ except ImportError:
     HAVE_FSDP2 = False
 
 from megatron.core.enums import ModelType
+from megatron.core.pipeline_parallel.combined_1f1b import setup_mfsdp_v2_ep_overlap
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.transformer.module import Float16Module
@@ -444,6 +445,7 @@ def _ddp_wrap(
                     **chunk_kwargs,
                 )
                 wrapped_model.append(wrapped_chunk)
+        setup_mfsdp_v2_ep_overlap(wrapped_model)
         model = wrapped_model
 
     # Ensure side-stream initialization completes before touching params on the current stream.

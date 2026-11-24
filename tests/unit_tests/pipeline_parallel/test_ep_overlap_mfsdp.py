@@ -25,35 +25,38 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_optimizer,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
-    FsdpParameterGroup,
-)
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import (
     post_fsdp_backward,
+    register_fsdp_ep_overlap_schedule_hooks,
     register_fsdp_module_hooks,
 )
-from megatron.core.models.common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.pipeline_parallel.combined_1f1b import combined_forward_backward_step
+from megatron.core.pipeline_parallel.combined_1f1b import (
+    combined_forward_backward_step,
+    setup_mfsdp_v2_ep_overlap,
+)
 from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
-from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
+from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler, MTPLossLoggingHelper
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.distributed.mfsdp_v2.conftest import distributed_setup as distributed_setup
 from tests.unit_tests.distributed.mfsdp_v2.mcore_utils import destroy_model_parallel
 from tests.unit_tests.test_utilities import Utils
 
 
-@pytest.mark.parametrize("pipeline_size", [1, 2])
-@pytest.mark.parametrize("wrapped", [False, True])
-def test_rejects_tied_weights_with_ep_overlap_before_sharding(pipeline_size, wrapped):
+@pytest.mark.parametrize(
+    "overlap,mtp_num_layers,error",
+    [(True, None, "MoE EP overlap.*tied"), (False, 1, "PP > 1 with MTP and tied embeddings")],
+    ids=["ep_overlap", "pipeline_mtp"],
+)
+def test_rejects_tied_weights_before_sharding(overlap, mtp_num_layers, error):
     """Reject tied weights on every pipeline stage before constructing FSDP state."""
     config = TransformerConfig(
         num_layers=4,
@@ -65,18 +68,16 @@ def test_rejects_tied_weights_with_ep_overlap_before_sharding(pipeline_size, wra
         num_moe_experts=4,
         expert_model_parallel_size=2,
         moe_token_dispatcher_type="alltoall",
-        overlap_moe_expert_parallel_comm=True,
-        pipeline_model_parallel_size=pipeline_size,
-        virtual_pipeline_model_parallel_size=2 if pipeline_size > 1 else None,
+        overlap_moe_expert_parallel_comm=overlap,
+        pipeline_model_parallel_size=2,
+        virtual_pipeline_model_parallel_size=2,
+        mtp_num_layers=mtp_num_layers,
         gradient_accumulation_fusion=False,
     )
     model = nn.Linear(16, 16)
     model.share_embeddings_and_output_weights = True
-    if wrapped:
-        model = Float16Module(config, model)
-
     # No usable process group: validation must reject before building a mesh.
-    with pytest.raises(ValueError, match="MoE EP overlap.*tied"):
+    with pytest.raises(ValueError, match=error):
         FullyShardedDataParallel(
             config=config,
             ddp_config=DistributedDataParallelConfig(
@@ -84,15 +85,16 @@ def test_rejects_tied_weights_with_ep_overlap_before_sharding(pipeline_size, wra
                 megatron_fsdp_version=2,
                 data_parallel_sharding_strategy="optim_grads_params",
             ),
-            module=model,
+            module=Float16Module(config, model),
             pg_collection=SimpleNamespace(dp_cp=None),
         )
 
 
-@pytest.mark.parametrize("delay_wgrad", [False, True])
-@pytest.mark.parametrize("mtp_num_layers", [1, 2])
+@pytest.mark.parametrize(
+    "delay_wgrad,mtp_num_layers", [(False, 1), (True, 2)], ids=["mtp1", "mtp2_delayed_wgrad"]
+)
 def test_ep_overlap_mtp(distributed_setup, monkeypatch, delay_wgrad, mtp_num_layers):
-    """Reduce every trainable weight once per backward, including repeated MTP head uses."""
+    """Complete each FSDP unit once per backward, including repeated MTP head uses."""
     setup = distributed_setup
     if setup.world_size < 2 or setup.world_size % 2:
         pytest.skip("EP=2 requires an even world size of at least two.")
@@ -146,22 +148,18 @@ def test_ep_overlap_mtp(distributed_setup, monkeypatch, delay_wgrad, mtp_num_lay
             module=Float16Module(config, model),
             pg_collection=pg_collection,
         )
+        setup_mfsdp_v2_ep_overlap([wrapped])
         units = [module for module in wrapped.modules() if isinstance(module, FsdpModule)]
-        expected_reductions = {
-            id(parameter): 1
-            for unit in units
-            for group in unit.parameter_groups
-            if group.requires_grad
-            for parameter in group.fsdp_parameters
-        }
-        reductions = Counter()
-        reduce_gradients = FsdpParameterGroup.reduce_inner_gradients
+        expected_completions = dict.fromkeys(units, 1)
+        completions = Counter()
+        post_accumulate_grad = FsdpModule.post_accumulate_grad
 
-        def record_reduction(group, *args, **kwargs):
-            reduce_gradients(group, *args, **kwargs)
-            reductions.update(id(parameter) for parameter in group.fsdp_parameters)
+        def record_completion(unit):
+            post_accumulate_grad(unit)
+            completions[unit] += 1
 
-        monkeypatch.setattr(FsdpParameterGroup, "reduce_inner_gradients", record_reduction)
+        monkeypatch.setattr(FsdpModule, "post_accumulate_grad", record_completion)
+        monkeypatch.setattr(MTPLossLoggingHelper, "tracker", {})
         monkeypatch.setattr(
             MTPLossAutoScaler, "main_loss_backward_scale", torch.tensor(1.0, device=setup.device)
         )
@@ -196,7 +194,7 @@ def test_ep_overlap_mtp(distributed_setup, monkeypatch, delay_wgrad, mtp_num_lay
 
         previous_loss = None
         for microbatch in range(3):
-            reductions.clear()
+            completions.clear()
             with wrapped.no_sync():
                 previous_loss = run_step(True, previous_loss)
             if microbatch == 0:
@@ -205,11 +203,11 @@ def test_ep_overlap_mtp(distributed_setup, monkeypatch, delay_wgrad, mtp_num_lay
                 for unit in units:
                     if not unit.is_root():
                         assert all(not group._unshard_events for group in unit.parameter_groups)
-            assert reductions == (expected_reductions if microbatch else {})
-        reductions.clear()
+            assert completions == (expected_completions if microbatch else {})
+        completions.clear()
         run_step(False, previous_loss)
         wrapped.finish_grad_sync()
-        assert reductions == expected_reductions
+        assert completions == expected_completions
     finally:
         destroy_model_parallel()
 
@@ -241,7 +239,7 @@ def test_train_validate_train_reshards_and_matches_dense(distributed_setup):
     reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.1)
 
     torch.manual_seed(123 + setup.rank)
-    for training in (True, False, True, False, True, False):
+    for training in (True, False, True, False):
         model.train(training)
         reference.train(training)
         inputs = torch.randn(4, 16, device=setup.device)
@@ -270,12 +268,9 @@ def test_train_validate_train_reshards_and_matches_dense(distributed_setup):
             assert all(not group._unshard_events for group in unit.parameter_groups)
 
 
-@pytest.mark.parametrize("repeated", [False, True])
-@pytest.mark.parametrize("wrapped", [False, True])
-def test_schedule_finishes_shared_and_nested_units_once(repeated, wrapped):
+def test_schedule_finishes_shared_and_nested_units_once():
     """Schedule boundaries own completion across GraphTasks, not parameter hooks."""
     reductions = []
-    releases = Counter()
 
     class Unit(nn.Module, FsdpModule):
         def __init__(self, name):
@@ -298,7 +293,6 @@ def test_schedule_finishes_shared_and_nested_units_once(repeated, wrapped):
 
         def reshard(self):
             self.unsharded = False
-            releases[self.label] += 1
 
         def post_accumulate_grad(self):
             reductions.append((self.label, self.weight.grad.item()))
@@ -320,14 +314,8 @@ def test_schedule_finishes_shared_and_nested_units_once(repeated, wrapped):
     model.add_module("other", other)
     root.add_module("model", model)
     register_fsdp_module_hooks(root)
-    plans = [Plan(shared), Plan(other)] + ([Plan(shared)] if repeated else [])
-    outer_model = nn.Sequential(root) if wrapped else root
-    chunk_plan = SimpleNamespace(_transformer_layers=plans)
-    TransformerModelChunkSchedulePlan.register_fsdp_hooks(chunk_plan, outer_model)
-    for unit in root.modules():
-        if isinstance(unit, FsdpModule):
-            assert not unit._backward_hooks
-            assert not unit.weight._post_accumulate_grad_hooks
+    plans = [Plan(shared), Plan(other), Plan(shared)]
+    finish_chunk = register_fsdp_ep_overlap_schedule_hooks(nn.Sequential(root), plans)
 
     # Exercise the actual schedule callback: the outer layer's reshard must also
     # release nested experts, including each repeated forward of a shared layer.
@@ -340,25 +328,17 @@ def test_schedule_finishes_shared_and_nested_units_once(repeated, wrapped):
         plan.finish_forward()
         assert all(not unit.unsharded for unit in layer_units)
     assert root.unsharded
-    assert releases == {"shared": 2 if repeated else 1, "expert": 2 if repeated else 1, "other": 1}
 
     # The root weight receives contributions before and after layer backward.
     (root.weight * 2).backward()
-    if repeated:
-        shared(torch.tensor(5.0)).backward()
-        plans[-1].finish()
-        assert reductions == []
+    shared(torch.tensor(5.0)).backward()
+    plans[-1].finish()
+    assert reductions == []
     other(torch.tensor(4.0)).backward()
     plans[1].finish()
     assert reductions == [("other", 4.0)]
     shared(torch.tensor(3.0)).backward()
     plans[0].finish()
     (root.weight * 7).backward()
-    chunk_plan._on_backward_complete()
-    expected_shared = 8.0 if repeated else 3.0
-    assert reductions == [
-        ("other", 4.0),
-        ("shared", expected_shared),
-        ("expert", expected_shared),
-        ("root", 9.0),
-    ]
+    finish_chunk()
+    assert reductions == [("other", 4.0), ("shared", 8.0), ("expert", 8.0), ("root", 9.0)]

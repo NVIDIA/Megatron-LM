@@ -30,7 +30,6 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.fsdp_unit_collector import FsdpUnitCollector
-from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_fsdp_module_hooks
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -328,9 +327,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 )
 
         super().__init__(config=config, module=module)
-
-        if config.overlap_moe_expert_parallel_comm:
-            register_fsdp_module_hooks(self.module)
 
     @staticmethod
     def prefetch_order_for(config: TransformerConfig) -> "PrefetchOrder":

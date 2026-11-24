@@ -1,12 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
+from collections.abc import Sequence
 from contextlib import nullcontext
 from typing import List, Union
 
 import torch
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.mcore_adapter_v2 import FullyShardedDataParallelV2
 from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
     any_sharding_strategy_in,
     find_megatron_fsdp,
@@ -34,6 +35,18 @@ def _release_tensor_storage(tensors):
         if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
             tensor.record_stream(torch.cuda.current_stream())
             tensor.untyped_storage().resize_(0)
+
+
+def setup_mfsdp_v2_ep_overlap(model_chunks: Sequence[torch.nn.Module]) -> None:
+    """Install persistent module hooks once after wrapping, before training or evaluation."""
+    from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_fsdp_module_hooks
+
+    for chunk in model_chunks:
+        if (
+            isinstance(chunk, FullyShardedDataParallelV2)
+            and chunk.config.overlap_moe_expert_parallel_comm
+        ):
+            register_fsdp_module_hooks(chunk.module)
 
 
 def combined_1f1b_schedule_for_no_pipelining(
@@ -392,7 +405,7 @@ def combined_forward_backward_step(
                 f_schedule_plan, AbstractSchedulePlan
             ), "first output of forward_step_func must be one instance of AbstractSchedulePlan"
 
-        if any(isinstance(module, FsdpModule) for module in f_model.modules()):
+        if isinstance(f_model, FullyShardedDataParallelV2):
             f_schedule_plan.register_fsdp_hooks(f_model)
 
         # Wire per-layer FSDP parameter release callbacks.  The EP overlap
