@@ -55,17 +55,17 @@ class _FsdpGroupAssignment:
         )
 
 
-def _schedule(pipelines: list["_GroupPipeline"]) -> list["_GroupPipeline"]:
-    """Spread the groups that need no communication evenly over the others, the last at the end.
+def _schedule(pipelines: list["_GroupPipeline"]) -> None:
+    """Reorder the groups in place: spread those that need no communication over the others.
 
-    Their Newton-Schulz hides the transfers in flight, which the other groups' own may be too
-    short for.
+    The last of them goes at the end. Their Newton-Schulz hides the transfers in flight, which the
+    other groups' own may be too short for.
     """
     free = [p for p in pipelines if not p.assignment.requires_communication]
     comm = [p for p in pipelines if p.assignment.requires_communication]
-    positions = [(k + 1) / len(free) for k in range(len(free))]
-    positions += [(i + 0.5) / len(comm) for i in range(len(comm))]
-    return [p for _, p in sorted(zip(positions, free + comm), key=lambda item: item[0])]
+    position = {p: (k + 1) / len(free) for k, p in enumerate(free)}
+    position |= {p: (i + 0.5) / len(comm) for i, p in enumerate(comm)}
+    pipelines.sort(key=lambda p: (position[p], p.assignment.requires_communication))
 
 
 class _PipelineStage(Enum):
@@ -322,7 +322,8 @@ class FsdpMuon(Muon):
         if closure is not None:
             raise ValueError("closure is not supported")
 
-        pipelines = _schedule([pipeline for pipeline in self._group_pipelines if pipeline.has_grad])
+        pipelines = [pipeline for pipeline in self._group_pipelines if pipeline.has_grad]
+        _schedule(pipelines)
 
         # n = num_groups_in_flight; N: Newton-Schulz, G: gather, S: scatter, A: apply.
         #
