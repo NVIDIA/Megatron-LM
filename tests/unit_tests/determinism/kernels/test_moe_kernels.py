@@ -1982,6 +1982,14 @@ class TestMoEModules:
                 1,
                 {"moe_expert_capacity_factor": 0.5, "moe_pad_expert_input_to_capacity": True},
             ),
+            # topk * capacity_factor > num_experts (2 * 5.0 > 8): the expert capacity exceeds
+            # the local token count, so the dispatcher caps it at routing_map.size(0).
+            pytest.param(
+                "alltoall",
+                1,
+                {"moe_expert_capacity_factor": 5.0, "moe_pad_expert_input_to_capacity": True},
+                id="alltoall-pad-capacity-above-tokens",
+            ),
             pytest.param("alltoall", 2, {"moe_permute_fusion": HAVE_TE_PERMUTE}, id="alltoall-ep2"),
             pytest.param(
                 "flex",
