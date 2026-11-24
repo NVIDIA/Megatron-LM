@@ -12,13 +12,17 @@ import torch
 from megatron.core.models.hybrid import MTPSplit, PipelineSplit
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.hybrid.layers.utils import create_layer_config
+from megatron.core.ssm.gated_delta_net.kda import KimiDeltaAttention
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.training import checkpointing
 from megatron.training.models.hybrid import HybridModelConfig
 from megatron.training.training import (
     _hybrid_config_list_moe_logging_metadata,
+    _hybrid_model_chunks_for_runtime_metrics,
     num_floating_point_operations,
 )
 from megatron.training.utils.checkpoint_utils import read_run_config
@@ -85,11 +89,67 @@ def test_training_forwards_packed_sequence_counts_to_external_estimator(monkeypa
     assert result == layer_flops + 21_504
 
 
+def test_pattern_model_counts_kda_and_mla_from_wrapped_chunk():
+    config = MLATransformerConfig(
+        num_layers=2,
+        hidden_size=16,
+        num_attention_heads=2,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        linear_conv_kernel_dim=3,
+        q_lora_rank=None,
+        kv_lora_rank=4,
+        qk_head_dim=2,
+        qk_pos_emb_head_dim=2,
+        v_head_dim=3,
+        apply_rope_fusion=False,
+    )
+    pattern = "K+"
+    kda_config, mla_config = (create_layer_config(config, symbol) for symbol in pattern)
+    model = _model(
+        config,
+        [
+            _bare(KimiDeltaAttention, kda_config),
+            _bare(MLASelfAttention, mla_config, core_attention=None),
+        ],
+        post_process=False,
+    )
+    model.hybrid_layer_pattern = pattern
+    model.hybrid_layer_config_list = None
+    wrapped = SimpleNamespace(module=model)
+    chunks = _hybrid_model_chunks_for_runtime_metrics([wrapped], model.pg_collection)
+    assert chunks == [model]
+    # Seven tokens and sum(length²)=25: KDA contributes 42,000 training FLOPs, MLA 16,338.
+    model_config = HybridModelConfig(
+        transformer=config, vocab_size=32, hybrid_layer_pattern=pattern
+    )
+    assert _flops(*chunks, model_config=model_config) == 58_338
+
+
 def _mock_pipeline(monkeypatch):
     pp_group = object()
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
     monkeypatch.setattr(torch.distributed, "get_backend", lambda group: "gloo")
     return pp_group
+
+
+@pytest.mark.parametrize("local_is_hybrid", [False, True])
+def test_mixed_pipeline_stages_agree_to_use_config_estimate(monkeypatch, local_is_hybrid):
+    pp_group = _mock_pipeline(monkeypatch)
+    chunk = _model(_config(), [], pp_group=pp_group) if local_is_hybrid else torch.nn.Identity()
+
+    def reduce_eligibility(value, op, group):
+        assert group is pp_group
+        assert op == torch.distributed.ReduceOp.MIN
+        assert value.item() == int(local_is_hybrid)
+        value.fill_(0)  # One stage in the pipeline has no HybridModel.
+
+    collective = Mock(side_effect=reduce_eligibility)
+    monkeypatch.setattr(torch.distributed, "all_reduce", collective)
+    assert _hybrid_model_chunks_for_runtime_metrics([chunk], SimpleNamespace(pp=pp_group)) is None
+    collective.assert_called_once()
 
 
 @pytest.mark.parametrize("with_layers,expected_local", [(False, 0), (True, 672)])
