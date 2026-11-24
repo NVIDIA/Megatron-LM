@@ -382,16 +382,18 @@ def test_speculative_decoding_needs_the_flashinfer_backend():
 
 
 @requires_flashinfer_dsa
-def test_mtp_forwards_stage_their_dsa_plan():
+@pytest.mark.parametrize("index_key_dtype", INDEX_KEY_DTYPES)
+def test_mtp_forwards_stage_their_dsa_plan(index_key_dtype):
     """MTP draft and graphed-commit forwards stage a decode-path plan on the GPU (one row per
-    request, then num_speculative_tokens causal rows per request), and their index keys go to
-    the MTP draft plane."""
+    request, then num_speculative_tokens causal rows per request), and their index keys, BF16 or
+    NVFP4, go to the MTP draft plane."""
     Utils.initialize_model_parallel(1, 1)
     try:
         context = DynamicInferenceContext(
             model_config=_config(mtp_num_layers=1, mtp_use_repeated_layer=True),
             inference_config=_inference_config(
                 dsa_backend="flashinfer",
+                dsa_indexer_key_dtype=index_key_dtype,
                 block_size_tokens=256,
                 num_speculative_tokens=2,
             ),
