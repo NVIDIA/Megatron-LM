@@ -39,6 +39,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory_tri
     triton_simplified_selected_index_scores,
     triton_simplified_selected_index_scores_backward,
     triton_simplified_selected_index_scores_backward_qk,
+    triton_sparse_attention_tile,
 )
 
 
@@ -563,6 +564,51 @@ def test_triton_simplified_score_block_matches_reference():
 
     assert torch.equal(torch.isneginf(actual), invalid)
     torch.testing.assert_close(actual[~invalid], expected[~invalid], rtol=5e-3, atol=5e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA Triton only")
+@pytest.mark.parametrize(
+    "dtype,rtol,atol",
+    [(torch.float32, 1e-5, 1e-6), (torch.float16, 2e-3, 5e-4), (torch.bfloat16, 2e-2, 2e-3)],
+)
+def test_triton_sparse_attention_tile_matches_fp64_reference(dtype, rtol, atol):
+    """GQA sparse attention over selected keys, with future keys masked, against fp64.
+
+    The value sum keeps the probabilities in fp32, so fp32 inputs keep fp32 accuracy.
+    """
+    torch.manual_seed(321)
+    device = torch.device("cuda")
+    query_len, key_len, batch_size = 48, 512, 2
+    num_heads, num_groups, head_dim, value_dim, topk = 8, 2, 128, 128, 256
+    q_start = key_len - query_len
+    softmax_scale = head_dim**-0.5
+    query = torch.randn(query_len, batch_size, num_heads, head_dim, device=device).to(dtype)
+    key = torch.randn(key_len, batch_size, num_groups, head_dim, device=device).to(dtype)
+    value = torch.randn(key_len, batch_size, num_groups, value_dim, device=device).to(dtype)
+    positions = q_start + torch.arange(query_len, device=device).view(1, query_len, 1)
+    topk_indices = (torch.rand(batch_size, query_len, topk, device=device) * (positions + 1)).long()
+    # Two keys past each query's position, which the kernel must ignore.
+    topk_indices[..., -2:] = (positions + 1 + torch.arange(2, device=device)).clamp(max=key_len - 1)
+
+    actual = triton_sparse_attention_tile(query, key, value, topk_indices, softmax_scale, q_start)
+    assert actual is not None
+
+    future = topk_indices > positions
+    expected = torch.empty(
+        query_len, batch_size, num_heads, value_dim, device=device, dtype=torch.float64
+    )
+    for head in range(num_heads):
+        group = head // (num_heads // num_groups)
+        q = query[:, :, head].double().transpose(0, 1)
+        k = key[:, :, group].double().transpose(0, 1).unsqueeze(1).expand(-1, query_len, -1, -1)
+        v = value[:, :, group].double().transpose(0, 1).unsqueeze(1).expand(-1, query_len, -1, -1)
+        selected_k = torch.gather(k, 2, topk_indices.unsqueeze(-1).expand(-1, -1, -1, head_dim))
+        selected_v = torch.gather(v, 2, topk_indices.unsqueeze(-1).expand(-1, -1, -1, value_dim))
+        scores = (q.unsqueeze(2) * selected_k).sum(-1) * softmax_scale
+        probs = torch.softmax(scores.masked_fill(future, float("-inf")), dim=-1)
+        expected[:, :, head] = (probs.unsqueeze(-1) * selected_v).sum(2).transpose(0, 1)
+
+    torch.testing.assert_close(actual.double(), expected, rtol=rtol, atol=atol)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA Triton only")
