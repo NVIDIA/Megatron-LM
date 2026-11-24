@@ -296,6 +296,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "through the single-pass chain with and without recompute.",
     ),
     KernelEntry(
+        name="single_pass_mhc_bda_backward_cute",
+        sources=("megatron/core/ops/mhc/bda_backward_cute.py",),
+        tests=("tests/unit_tests/fusions/test_fused_mhc_single_pass.py",),
+        kind="cutedsl",
+        notes="Compare all four gradients bitwise with Triton across launches and check the "
+        "fallback for a width outside the VR200 kernel contract.",
+    ),
+    KernelEntry(
         name="fused_mhc_kernels",
         sources=(
             "megatron/core/fusions/fused_mhc_kernels.py",

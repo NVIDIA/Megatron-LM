@@ -1,4 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# VR200 BDA backward adapted from Guihong Li, BSD-3-Clause (see LICENSE).
+# https://github.com/guihong-nv/Megatron-LM/commit/e2a7d6ef817bec1c74d096daa70129e5f7124fc6
 
 """Tests of the opt-in fast single-pass mHC path (MCORE_MHC_SP_FAST).
 
@@ -395,12 +397,45 @@ def test_bda_backward_tiled_matches_row_loop(data, monkeypatch, rows):
     x, y, go = data["x"][:rows], data["y"][:rows], data["go"][:rows]
     hr = torch.rand(rows, N, N, device="cuda")
     hp = torch.rand(rows, N, device="cuda")
+    monkeypatch.setattr(SP, "_select_cute_bda_backward", lambda device: None)
     monkeypatch.setattr(SP, "BDA_BWD4T_CFG", None)
     ref = SP.sp_bda_backward(go, hr, x, hp, y, N)
     monkeypatch.setattr(SP, "BDA_BWD4T_CFG", dict(block_s=8, num_warps=2))
     got = SP.sp_bda_backward(go, hr, x, hp, y, N)
     for a, b in zip(got, ref):
         assert _bits_equal(a, b)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="the CuTe DSL kernel uses packed FP32 instructions (compute capability 10.x)",
+)
+@pytest.mark.parametrize("width", [512, 1024])
+def test_bda_backward_cute_matches_triton(data, monkeypatch, width):
+    """Check all four gradients for the VR200 launch width and the narrower Triton fallback."""
+    pytest.importorskip("tvm_ffi")
+    impl = pytest.importorskip("megatron.core.ops.mhc.bda_backward_cute")
+    rows = 61
+    x, go = (data[key].reshape(-1, N * width)[:rows] for key in ("x", "go"))
+    y = data["y"].reshape(-1, width)[:rows]
+    hr = torch.rand(rows, N, N, device="cuda")
+    hp = torch.rand(rows, N, device="cuda")
+
+    monkeypatch.setattr(SP, "_select_cute_bda_backward", lambda device: None)
+    ref = SP.sp_bda_backward(go, hr, x, hp, y, N)
+    launched = []
+
+    def check_launch(*args):
+        used = impl.try_bda_backward4(*args)
+        launched.append(used)
+        return used
+
+    monkeypatch.setattr(SP, "_select_cute_bda_backward", lambda device: check_launch)
+    for _ in range(2):
+        got = SP.sp_bda_backward(go, hr, x, hp, y, N)
+        for actual, expected in zip(got, ref):
+            assert _bits_equal(actual, expected)
+    assert launched == [width == 1024] * 2
 
 
 @pytest.mark.parametrize("entry", [False, True])

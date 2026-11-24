@@ -1,4 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# VR200 BDA backward adapted from Guihong Li, BSD-3-Clause (see LICENSE).
+# https://github.com/guihong-nv/Megatron-LM/commit/e2a7d6ef817bec1c74d096daa70129e5f7124fc6
 
 """Fast single-pass (V4.1) mHC: fewer passes over the residual and cheap launches.
 
@@ -27,7 +29,9 @@ backward
                           the same sublayer's mapping backward instead of autograd. On VR200,
                           ``_sp_bda_bwd4t_kernel`` (one 128-column tile per program, all loads
                           first) + ``_sp_bda_bwd_rowsum_kernel`` (the tiles' row sums added in
-                          tile order) give the same bits faster.
+                          tile order) give the same bits faster, and where the CUTLASS DSL
+                          imports, ``try_bda_backward4`` (one CuTe DSL
+                          kernel, row sums kept on chip in the same order) faster still.
   ``_sp_pre_bwd_fin_kernel``  Sinkhorn and coefficient backward:
                           dL/dproj (as BF16 hi + lo), the RMS term and alpha / bias partials; extra
                           programs split W into BF16 hi + lo.
@@ -51,12 +55,15 @@ in the last bit (explicit fused multiply-adds). Checkpoint replays reproduce the
 All kernels take runtime arguments first and constexprs last and launch through ``_LeanLaunch``.
 """
 
+import logging
+from functools import cache
 from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
 
 from megatron.core.env_flags import env_flag
+from megatron.core.ops._backends import is_available
 
 # Optionally, each BDA also writes the next sublayer's aggregate and sum(x^2)
 # partials (``NextAggregate``), so that sublayer skips ``_sp_agg_sq_kernel``. On the 64K proxy
@@ -1311,6 +1318,19 @@ BDA_BWD4T_CFG: Optional[dict] = None
 _BDA_BWD_LAUNCHERS = None
 
 
+@cache
+def _select_cute_bda_backward(device: torch.device):
+    """Select the optional VR200 kernel once per device."""
+    if torch.cuda.get_device_capability(device) != (10, 7) or not is_available("tvm_ffi"):
+        return None
+    try:
+        from megatron.core.ops.mhc.bda_backward_cute import try_bda_backward4
+    except (ImportError, OSError) as exc:
+        logging.getLogger(__name__).warning("Using Triton for mHC BDA backward: %s", exc)
+        return None
+    return try_bda_backward4
+
+
 def _bda_bwd_launchers():
     """Lean launchers of fused_mhc_kernels' two Triton BDA backward kernels (imported lazily)."""
     global _BDA_BWD_LAUNCHERS
@@ -1386,6 +1406,7 @@ def single_pass_fast_supports(x: Tensor, n: int, weight: Tensor) -> bool:
     if not (_TRITON_AVAILABLE and x.is_cuda and x.dim() == 3 and x.numel() and x.is_contiguous()):
         return False
     _apply_device_configs(x.device)
+    _select_cute_bda_backward(x.device)
     # BF16 only: the BF16 hi + lo split of W makes the products exact for BF16 x.
     if x.dtype != torch.bfloat16 or n & (n - 1) or n * n + 2 * n > NPAD:
         return False
@@ -1593,6 +1614,12 @@ def sp_bda_backward(
     small = torch.empty(T * (n + n * n), dtype=h_res.dtype, device=dev)
     g_hp = small[: T * n].view(T, n)
     g_hr = small[T * n :].view(T, n, n)
+    if n == 4:
+        cute_backward = _select_cute_bda_backward(dev)
+        if cute_backward is not None and cute_backward(
+            grad_out, h_res, x2d, h_post, y2d, g_res, g_y, g_hp, g_hr
+        ):
+            return g_res, g_y, g_hp, g_hr
     if n == 4 and C % 128 == 0 and BDA_BWD4T_CFG is not None:
         cfg = BDA_BWD4T_CFG
         tiles = C // 128
