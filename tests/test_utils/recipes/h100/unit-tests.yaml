@@ -156,6 +156,7 @@ products:
         time_limit: [1800]
   # This file runs in isolated one-rank processes; other buckets exclude it.
   - test_case: [tests/unit_tests/inference/test_batch_invariant_fp8.py]
+    testmon: false
     products:
       - environment: [lts, dev]
         tag: [latest]
@@ -283,6 +284,7 @@ products:
         n_repeat: [1]
         time_limit: [1800]
   - test_case: [tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py]
+    testmon: false
     products:
       - environment: [lts, dev]
         tag: [latest]
@@ -290,6 +292,7 @@ products:
         n_repeat: [1]
         time_limit: [1800]
   - test_case: [tests/unit_tests/inference/test_disagg_transfer_pairwise.py]
+    testmon: false
     products:
       - environment: [lts, dev]
         tag: [latest]
@@ -370,6 +373,14 @@ products:
     products:
       - environment: [lts, dev]
         tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  # KDA's autotuning matrix takes about 19 minutes; keep it out of the broad SSM bucket.
+  - test_case: [tests/unit_tests/ssm/test_kda.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]

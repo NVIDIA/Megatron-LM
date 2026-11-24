@@ -49,24 +49,26 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.argument_utils import (  # noqa: F401  (core_gpt_dataset_config_from_args: legacy shape, importable from here)
-    core_gpt_dataset_config_from_args,
+from megatron.training.argument_utils import (
     gpt_data_config_from_args,
     hybrid_config_from_args,
     pretrain_cfg_container_from_args,
 )
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.datasets.providers import build_gpt_datasets, is_dataset_built_on_rank
+from megatron.training.datasets.utils import get_dataset_input_length
 from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import is_first_or_last_pipeline_stage
-from model_provider import model_provider
 
 try:
     from megatron.post_training.arguments import add_modelopt_args
     from megatron.post_training.loss_func import loss_func as loss_func_modelopt
-    from megatron.post_training.model_builder import ModelOptHybridModelConfig
-    from megatron.post_training.utils import maybe_enable_modelopt
+    from megatron.post_training.model_config import (
+        apply_modelopt_model_config,
+        distillation_config_from_args,
+    )
+    from megatron.post_training.utils import is_distillation_model, should_use_modelopt_config
 
     has_nvidia_modelopt = True
 except ImportError:
@@ -80,7 +82,7 @@ BATCH_KEYS = [
     "attention_mask",
     "cu_seqlens",
     "cu_seqlens_padded",
-    "hybrid_cp_group",
+    "dynamic_cp_group",
     "labels",
     "local_cp_size",
     "loss_mask",
@@ -90,30 +92,12 @@ BATCH_KEYS = [
 ]
 
 
-# The args object and the transformer config built from it, reused until the args object
-# is replaced.
-_transformer_config_cache = None
-
-
-def _get_transformer_config(args):
-    """Return the transformer config for args, building it only when args is a new object.
-
-    get_batch runs every microbatch, and rebuilding the config there re-runs
-    TransformerConfig.__post_init__, which repeats its validation warnings in the log.
-    """
-    global _transformer_config_cache
-    if _transformer_config_cache is None or _transformer_config_cache[0] is not args:
-        _transformer_config_cache = (args, core_transformer_config_from_args(args))
-    return _transformer_config_cache[1]
-
-
 def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroupCollection] = None):
     """Generate a batch."""
 
-    args = get_args()
-    config = _get_transformer_config(args)
+    cfg = get_run_config()
 
-    if args.sequence_packing_scheduler is not None:
+    if cfg.model.transformer.sequence_packing_scheduler is not None:
         if pg_collection is None:
             # Compatibility for direct entrypoint callers; Core receives explicit groups.
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(
@@ -121,35 +105,41 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
             )
         return get_batch_on_this_rank_for_sequence_packing(
             data_iterator,
-            vpp_size=config.virtual_pipeline_model_parallel_size,
+            vpp_size=cfg.model.transformer.virtual_pipeline_model_parallel_size,
             mtp_on_this_rank=mtp_on_this_rank_func(
-                layout=config.pipeline_model_parallel_layout,
-                mtp_num_layers=config.mtp_num_layers,
+                layout=cfg.model.transformer.pipeline_model_parallel_layout,
+                mtp_num_layers=cfg.model.transformer.mtp_num_layers,
                 ignore_virtual=False,
                 vp_stage=vp_stage,
                 pp_group=pg_collection.pp,
-                vp_size=config.virtual_pipeline_model_parallel_size or 1,
+                vp_size=cfg.model.transformer.virtual_pipeline_model_parallel_size or 1,
             ),
             vp_stage=vp_stage,
-            dynamic_cp=args.dynamic_context_parallel,
+            dynamic_cp=cfg.model.transformer.dynamic_context_parallel,
             pg_collection=pg_collection,
-            config=config,
+            config=cfg.model.transformer,
             return_context_parallel_batch=True,
         )
 
-    cp_size = args.context_parallel_size
+    # The data section's predicates and the dataset's fields; the packing path above needs
+    # neither them nor the length.
+    cp_size = cfg.model.transformer.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
-    is_sft = args.sft
-    has_cu_seqlens = is_sft or args.dataloader_inter_document_masking
-    create_attention_mask_in_dataloader = args.create_attention_mask_in_dataloader
+    has_cu_seqlens = cfg.data.has_cu_seqlens()
+    # Use the caller's pipeline group when it is given, so a model on its own grid places MTP by
+    # the same group the model uses (GPTModel/HybridModel read pg_collection.pp).
+    pp_group = pg_collection.pp if pg_collection is not None else None
+    if pp_group is None:
+        pp_group = mpu.get_pipeline_model_parallel_group()
     mtp_on_this_rank = mtp_on_this_rank_func(
-        layout=config.pipeline_model_parallel_layout,
-        mtp_num_layers=config.mtp_num_layers,
+        layout=cfg.model.transformer.pipeline_model_parallel_layout,
+        mtp_num_layers=cfg.model.transformer.mtp_num_layers,
         ignore_virtual=False,
         vp_stage=vp_stage,
+        pp_group=pp_group,
     )
     # Dynamic CP always uses the sequence-packing path above.
-    assert not args.dynamic_context_parallel
+    assert not cfg.model.transformer.dynamic_context_parallel
 
     if (
         not is_first_or_last_pipeline_stage(vp_stage)
@@ -157,11 +147,13 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         and not has_cu_seqlens
     ):
         return ContextParallelBatch(
-            boundary_layout=config.linear_cp_layout,
-            batches_by_layout={config.linear_cp_layout: dict.fromkeys(BATCH_KEYS)},
-            packed_seq_params_by_layout={config.linear_cp_layout: None},
+            boundary_layout=cfg.model.transformer.linear_cp_layout,
+            batches_by_layout={cfg.model.transformer.linear_cp_layout: dict.fromkeys(BATCH_KEYS)},
+            packed_seq_params_by_layout={cfg.model.transformer.linear_cp_layout: None},
         )
 
+    # The dataset's row width (the derived pack width for SFT).
+    seq_length = get_dataset_input_length(cfg.data.dataset)
     batch = {}
     if tp_rank == 0:
         batch = next(data_iterator)
@@ -172,6 +164,9 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
                 else None
             )
 
+    # Read after the early return above: an intermediate stage without cu_seqlens never looks at
+    # the dataset (a loader-only section has none).
+    create_attention_mask_in_dataloader = cfg.data.creates_attention_mask()
     batch = get_batch_on_this_tp_rank(
         batch,
         broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
@@ -181,10 +176,10 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         create_attention_mask_in_dataloader=create_attention_mask_in_dataloader,
         cp_size=cp_size,
         tp_rank=tp_rank,
-        micro_batch_size=args.micro_batch_size,
-        seq_length=args.seq_length,
+        micro_batch_size=cfg.train.micro_batch_size,
+        seq_length=seq_length,
         mtp_on_this_rank=mtp_on_this_rank,
-        pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+        pipeline_model_parallel_size=cfg.model.transformer.pipeline_model_parallel_size,
         is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
         is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
     )
@@ -201,28 +196,30 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         }
 
     additional_layouts = set()
-    if cp_size > 1 and config.linear_cp_layout != config.attention_cp_layout:
-        additional_layouts.add(config.attention_cp_layout)
+    if (
+        cp_size > 1
+        and cfg.model.transformer.linear_cp_layout != cfg.model.transformer.attention_cp_layout
+    ):
+        additional_layouts.add(cfg.model.transformer.attention_cp_layout)
     return get_batches_on_this_cp_rank(
         batch,
-        boundary_layout=config.linear_cp_layout,
+        boundary_layout=cfg.model.transformer.linear_cp_layout,
         dynamic_cp=False,
         cp_group=get_context_parallel_group(),
         additional_layouts=additional_layouts,
-        use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
-        sequence_parallel=config.sequence_parallel,
+        use_per_sequence_balancing=cfg.data.use_per_sequence_balancing(),
+        sequence_parallel=cfg.model.transformer.sequence_parallel,
         tp_group=mpu.get_tensor_model_parallel_group(),
         tp_cp_group=(
             mpu.get_tensor_and_context_parallel_group()
-            if config.sequence_parallel and config.tensor_model_parallel_size > 1
+            if (
+                cfg.model.transformer.sequence_parallel
+                and cfg.model.transformer.tensor_model_parallel_size > 1
+            )
             else None
         ),
-        tokens_per_sample=args.seq_length,
+        tokens_per_sample=seq_length,
     )
-
-
-# define spiky loss as a loss that's 10x the max loss observed
-SPIKY_LOSS_FACTOR = 10
 
 
 @lru_cache(maxsize=1)
@@ -278,7 +275,7 @@ def loss_func(
             ignore_hash=args.logits_load_ignore_hash,
         )
         loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
-    elif has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
+    elif has_nvidia_modelopt and is_distillation_model(model):  # [ModelOpt]
         loss, num_tokens, report = loss_func_modelopt(loss_mask, output_tensor, model=model)
     else:
         losses = output_tensor.view(-1).float()
@@ -312,7 +309,7 @@ def loss_func(
             result=loss,
             rejection_func=partial(
                 rerun_state_machine.is_unexpectedly_large,
-                threshold=SPIKY_LOSS_FACTOR,
+                threshold=cfg.rerun_state_machine.spiky_loss_factor,
                 context="loss",
             ),
             message="Spiky loss",
@@ -489,17 +486,13 @@ if __name__ == "__main__":
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
-    if has_nvidia_modelopt:
-        maybe_enable_modelopt(args)
-    if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
-        model_cfg = hybrid_config_from_args(
-            args, model_config_cls=ModelOptHybridModelConfig, vocab_size_from_tokenizer=True
-        )
-    else:
-        model_cfg = hybrid_config_from_args(args, vocab_size_from_tokenizer=True)
+    model_cfg = hybrid_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(
         args, model_cfg, data_cfg=gpt_data_config_from_args(args)
     )
+    if has_nvidia_modelopt and should_use_modelopt_config(args):
+        apply_modelopt_model_config(full_config.model, args)
+        full_config.distillation = distillation_config_from_args(args, full_config.model)
     set_run_config(full_config)
     pretrain(
         full_config,

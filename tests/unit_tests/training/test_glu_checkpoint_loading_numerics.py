@@ -18,7 +18,7 @@ from megatron.training import checkpointing
 from megatron.training.global_vars import get_args, get_train_state, set_args
 from megatron.training.training import force_param_sync, setup_model_and_optimizer
 from tests.unit_tests.dist_checkpointing import TempNamedDir
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 from tests.unit_tests.transformer.moe import test_moe_single_grouped_weight_numerics as numerics
 
 # The GB200 CI selector scans this file's text before pytest resolves inherited marks.
@@ -95,15 +95,17 @@ def _setup_model(
         single_weight=single_weight,
         gradient_accumulation_fusion=False,
         use_transformer_engine_op_fuser=use_op_fuser,
+        model_overrides=dict(
+            add_bias_linear=True,
+            add_qkv_bias=True,
+            swiglu=gated,
+            bias_gelu_fusion=False,
+            bias_swiglu_fusion=False,
+            bias_dropout_fusion=False,
+            moe_single_grouped_bias=single_bias,
+            moe_mlp_glu_interleave_size=interleave,
+        ),
     )
-    args.add_bias_linear = True
-    args.add_qkv_bias = True
-    args.swiglu = gated
-    args.bias_gelu_fusion = False
-    args.bias_swiglu_fusion = False
-    args.bias_dropout_fusion = False
-    args.moe_single_grouped_bias = single_bias
-    args.moe_mlp_glu_interleave_size = interleave
     args.save = directory
     args.load = directory if load else None
     args.ckpt_format = "torch_dist"
@@ -119,6 +121,9 @@ def _setup_model(
     args.no_load_rng = True
     args.load_main_params_from_ckpt = True
     set_args(args)
+    # The fixture built the run config before these save/load settings were chosen; the setup
+    # load below reads the registered checkpoint section, not the namespace.
+    sync_checkpoint_config(args)
     torch.manual_seed(1234)
     Utils.initialize_model_parallel()
     model, optimizer, scheduler = setup_model_and_optimizer(
@@ -312,6 +317,7 @@ def _save_canonical_checkpoint(case, directory, canonical, *, gated=True):
     optimizer.reload_model_params()
     force_param_sync(model, optimizer=optimizer)
     _assert_parameters(experts, canonical)
+    sync_checkpoint_config(get_args())
     checkpointing.save_checkpoint(1, model, optimizer, scheduler, 0)
     torch.distributed.barrier()
     _assert_checkpoint_parameters(directory, 1, canonical)
@@ -344,12 +350,13 @@ def _forward(case, model, experts):
         hook.remove()
 
 
-def _forward_with_fp32_intermediates(case, model, experts, monkeypatch):
-    """Keep the unfused MXFP8 reference's intermediates at the fused kernel's precision.
+def _forward_with_fp32_intermediates(case, model, experts, monkeypatch, *, precision):
+    """Keep the unfused reference's intermediates at the fused kernel's precision.
 
-    This is forward-only: parameters and MXFP8 quantizers are unchanged, while FC1,
-    SwiGLU and FC2 keep FP32 intermediates until the final BF16 output. Casting an
-    already rounded BF16 result to FP32 would not recover the lost precision.
+    This is forward-only: FC1 and SwiGLU keep FP32 intermediates. The BF16 kernel
+    rounds the activation before FC2; MXFP8 quantizes it directly from FP32. Both
+    paths add FC2's scaled bias before the final BF16 cast. Casting an already
+    rounded BF16 result to FP32 would not recover the lost precision.
     """
     from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU
 
@@ -367,8 +374,40 @@ def _forward_with_fp32_intermediates(case, model, experts, monkeypatch):
             return original_linear(op, **kwargs)
         assert not torch.is_grad_enabled() and not torch.is_autocast_enabled()
         assert kwargs["dtype"] == torch.bfloat16
-        assert kwargs["with_quantized_compute"] and kwargs["out_buffer"] is None
+        assert kwargs["out_buffer"] is None
         is_fc2 = op is ops[2]
+        if precision == "bf16":
+            assert not kwargs["with_quantized_compute"]
+            assert kwargs["input_"].dtype == torch.bfloat16 and op.has_bias
+            splits = kwargs["split_sizes"].tolist()
+            weights = (
+                op.weight.rowwise_data.reshape(op.num_groups, op.out_features, op.in_features)
+                if op.single_grouped_weight
+                else [getattr(op, f"weight{idx}") for idx in range(op.num_groups)]
+            )
+            biases = (
+                op.bias.rowwise_data.reshape(op.num_groups, op.out_features)
+                if op.single_grouped_bias
+                else [getattr(op, f"bias{idx}") for idx in range(op.num_groups)]
+            )
+            scales = kwargs["scales"]
+            scale_splits = (
+                torch.split(scales, splits) if scales is not None else [None] * len(splits)
+            )
+            outputs = []
+            for input_, weight, bias, scale in zip(
+                torch.split(kwargs["input_"], splits), weights, biases, scale_splits
+            ):
+                assert weight.dtype == torch.bfloat16
+                output = torch.mm(input_, weight.T, out_dtype=torch.float32)
+                bias = bias.float()
+                if scale is not None:
+                    bias = scale.float().unsqueeze(-1) * bias
+                outputs.append(output + bias)
+            output = torch.cat(outputs)
+            calls.append("fc2" if is_fc2 else "fc1")
+            return (output.bfloat16() if is_fc2 else output), ()
+        assert precision == "mxfp8" and kwargs["with_quantized_compute"]
         assert kwargs["input_"].dtype == (torch.float32 if is_fc2 else torch.bfloat16)
         # Override after TE checks grouped-path eligibility using the BF16 parameters.
         # FC2 must also keep FP32, or it would round the activation before quantizing it.
@@ -384,11 +423,13 @@ def _forward_with_fp32_intermediates(case, model, experts, monkeypatch):
             return original_activation(op, input_, scales)
         assert not torch.is_grad_enabled() and not torch.is_autocast_enabled()
         assert input_.dtype == torch.float32
-        # The fused MXFP8 activation rounds router probabilities to BF16 too.
-        output = original_activation(op, input_, scales.bfloat16().float())
+        # Only the fused MXFP8 activation rounds router probabilities to BF16.
+        if precision == "mxfp8":
+            scales = scales.bfloat16().float()
+        output = original_activation(op, input_, scales)
         assert output.dtype == torch.float32
         calls.append("activation")
-        return output
+        return output.bfloat16() if precision == "bf16" else output
 
     with monkeypatch.context() as reference:
         reference.setattr(GroupedLinear, "_fuser_forward_grouped_tensor", linear_fp32)
@@ -398,7 +439,7 @@ def _forward_with_fp32_intermediates(case, model, experts, monkeypatch):
     return output, losses
 
 
-def _assert_execution_plan(experts, *, fused):
+def _assert_execution_plan(experts, *, fused_op=None):
     """An op-fuser configuration flag alone does not prove the fused kernel ran."""
     (sequence,) = experts._fused_ops
     selected = [
@@ -407,12 +448,12 @@ def _assert_execution_plan(experts, *, fused):
         for op, indices in group._forward_ops
     ]
     expected = (
-        [("GroupedMLP_CuTeGEMMGLU", (0, 1, 2))]
-        if fused
+        [(fused_op, (0, 1, 2))]
+        if fused_op is not None
         else [("GroupedLinear", (0,)), ("ScaledSwiGLU", (1,)), ("GroupedLinear", (2,))]
     )
     assert selected == expected, (
-        f"Expected {expected}, got {selected}. Fused MXFP8 requires a GB200 container "
+        f"Expected {expected}, got {selected}. Fused grouped MLP requires a GB200 container "
         "with native TE/cuDNN grouped-MLP fusion support."
     )
 
@@ -428,13 +469,17 @@ def test_canonical_checkpoint_matches_interleaved_ddp(
 
     Both execution layouts load the same independently checked canonical checkpoint.
     Nonzero FC1/FC2 biases participate in all four weight/bias storage combinations.
-    MXFP8 op-fuser cases require actual joint fusion and an FP32-intermediate reference.
+    Jointly fused cases require an FP32-intermediate reference with matching cast boundaries.
     The negative control bypasses only the load conversion and must break expert output.
     Optimizer moments are deliberately not restored when changing the execution layout.
     """
     numerics._skip_if_unsupported(precision)
+    fused_op = None
     if precision == "mxfp8" and use_op_fuser:
         _enable_native_glu_fusion(monkeypatch)
+        fused_op = "GroupedMLP_CuTeGEMMGLU"
+    elif use_op_fuser and numerics._bf16_grouped_mlp_fusion_supported():
+        fused_op = "GroupedMLP_CuTeGEMMGLUBf16"
     canonical = _canonical_parameters()
     with TempNamedDir(tmp_path_dist_ckpt / "canonical_glu_checkpoint", sync=True) as directory:
         _save_canonical_checkpoint(moe_case, directory, canonical)
@@ -450,14 +495,14 @@ def test_canonical_checkpoint_matches_interleaved_ddp(
             load=True,
         )
         _assert_parameters(experts, canonical)
-        if precision == "mxfp8" and use_op_fuser:
+        if fused_op is not None:
             reference_output, reference_losses = _forward_with_fp32_intermediates(
-                moe_case, model, experts, monkeypatch
+                moe_case, model, experts, monkeypatch, precision=precision
             )
         else:
             reference_output, reference_losses = _forward(moe_case, model, experts)
         if use_op_fuser:
-            _assert_execution_plan(experts, fused=False)
+            _assert_execution_plan(experts)
         del experts, model, optimizer, scheduler
 
         model, optimizer, scheduler, experts = _setup_model(
@@ -474,7 +519,7 @@ def test_canonical_checkpoint_matches_interleaved_ddp(
         _assert_parameters(experts, expected_runtime)
         actual_output, actual_losses = _forward(moe_case, model, experts)
         if use_op_fuser:
-            _assert_execution_plan(experts, fused=precision == "mxfp8")
+            _assert_execution_plan(experts, fused_op=fused_op)
         tolerance = 5e-3 if precision == "bf16" else 5e-2
         torch.testing.assert_close(actual_output, reference_output, rtol=tolerance, atol=tolerance)
         torch.testing.assert_close(actual_losses, reference_losses, rtol=tolerance, atol=tolerance)
@@ -484,6 +529,7 @@ def test_canonical_checkpoint_matches_interleaved_ddp(
             missing_conversion.setattr(
                 checkpointing, "prepare_glu_checkpoint_for_load", lambda state, args: state
             )
+            sync_checkpoint_config(get_args())
             checkpointing.load_checkpoint(model, optimizer, scheduler, strict=True)
         optimizer.quantize_and_sync_model_params_from_main_params()
         _assert_parameters(experts, canonical)
@@ -541,6 +587,7 @@ def test_non_glu_checkpoint_ignores_interleave_size(
         torch.testing.assert_close(actual_output, reference_output, rtol=0, atol=0)
         torch.testing.assert_close(actual_losses, reference_losses, rtol=0, atol=0)
 
+        sync_checkpoint_config(get_args())
         checkpointing.save_checkpoint(2, model, optimizer, scheduler, 0)
         torch.distributed.barrier()
         _assert_checkpoint_parameters(directory, 2, canonical)
@@ -605,10 +652,11 @@ def test_bf16_full_optimizer_resume_matches_uninterrupted_training(
         args = get_args()
         assert args.no_save_optim is False and args.no_load_optim is False
         assert (
-            checkpointing._build_sharded_state_dict_metadata(args)["distrib_optim_sharding_type"]
+            checkpointing._build_sharded_state_dict_metadata()["distrib_optim_sharding_type"]
             == "dp_reshardable"
         )
         force_param_sync(model, optimizer=optimizer)
+        sync_checkpoint_config(get_args())
         checkpointing.save_checkpoint(2, model, optimizer, scheduler, 0)
         torch.distributed.barrier()
         _assert_state_equal(
