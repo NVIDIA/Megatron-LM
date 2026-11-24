@@ -92,8 +92,10 @@ def test_muon_matches_reference(
 ):
     """FSDP, HSDP, HFSDP, and unsharded Muon should produce identical loss curves.
 
-    Each linear layer is its own FSDP group, so several groups' communication is in flight at once;
-    with 8, all four Muon groups are.
+    block1's two matrices share one FSDP group and every other linear layer is a group of its own,
+    so several groups' communication is in flight at once; with 8, all three Muon groups are. The
+    Muon matrices are split into two optimizer groups with different settings, and block1's group
+    holds one matrix of each, so its momentum update handles several tensors and optimizer groups.
     """
     world_size = distributed_setup.world_size
     if dp_mode == "fsdp":
@@ -127,7 +129,8 @@ def test_muon_matches_reference(
     reference = copy.deepcopy(model).float()
     reference_params = dict(reference.named_parameters())
     with fully_shard_context(FsdpContext(device=device)):
-        for layer in model.modules():
+        fully_shard(model.block1, mesh=mesh, placements=placements)
+        for layer in model.block2:
             if isinstance(layer, nn.Linear):
                 fully_shard(layer, mesh=mesh, placements=placements)
     params = dict(model.named_parameters())
@@ -140,11 +143,23 @@ def test_muon_matches_reference(
     )
     excluded_names = ["block2.3.weight", "block2.3.bias"]
     muon_names = [name for name in params if name not in excluded_names]
+
+    def param_groups(named_params):
+        """block1.0 and block2.0 with the defaults, block1.2 and block2.2 with their own settings."""
+        return [
+            {"params": [named_params[name] for name in muon_names[0::2]]},
+            {
+                "params": [named_params[name] for name in muon_names[1::2]],
+                "lr": 0.02,
+                "weight_decay": 0.05,
+            },
+        ]
+
     optimizer = muon.FsdpMuon(
-        [params[name] for name in muon_names], num_groups_in_flight=num_groups_in_flight, **kwargs
+        param_groups(params), num_groups_in_flight=num_groups_in_flight, **kwargs
     )
     fully_shard_optimizer(optimizer, precision_aware=True)
-    reference_optimizer = Muon([reference_params[name] for name in muon_names], **kwargs)
+    reference_optimizer = Muon(param_groups(reference_params), **kwargs)
     other_optimizer = torch.optim.SGD([params[n] for n in excluded_names], lr=0.01, foreach=False)
     fully_shard_optimizer(other_optimizer)
     reference_other = torch.optim.SGD([reference_params[n] for n in excluded_names], lr=0.01)
