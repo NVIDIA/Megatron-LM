@@ -20,7 +20,7 @@ from tests.unit_tests.test_utilities import Utils
 
 @pytest.mark.parametrize("stack_spec", [hybrid_stack_spec, wide_residual_hybrid_stack_spec])
 def test_with_norm_backend_names_liger_in_every_norm_slot(stack_spec):
-    assert with_norm_backend(stack_spec, "native") is stack_spec
+    assert with_norm_backend(stack_spec, "te") is stack_spec
     liger = with_norm_backend(stack_spec, "liger")
     # Every TENorm slot at any depth (ModuleSpecs, submodule dataclasses, partials, MTP layer
     # lists) now names Liger; the shared default spec is left as it was.
@@ -46,7 +46,7 @@ def hybrid_models():
     precision = torch.get_float32_matmul_precision()
     torch.set_float32_matmul_precision("highest")  # keep TF32 from amplifying norm rounding
     models = {}
-    for impl in ("native", "liger"):
+    for impl in ("te", "liger"):
         # The Liger model takes HybridModel's default spec, which follows config.rmsnorm_impl.
         model_parallel_cuda_manual_seed(123)
         config = TransformerConfig(
@@ -63,7 +63,7 @@ def hybrid_models():
         )
         models[impl] = HybridModel(
             config=config,
-            hybrid_stack_spec=hybrid_stack_spec if impl == "native" else None,
+            hybrid_stack_spec=hybrid_stack_spec if impl == "te" else None,
             vocab_size=128,
             max_sequence_length=16,
             hybrid_layer_pattern="*E/*-",  # attention, MoE, and one MTP depth
@@ -74,7 +74,7 @@ def hybrid_models():
 
 
 def test_hybrid_norm_slots(hybrid_models):
-    native, liger = _rms_norms(hybrid_models["native"]), _rms_norms(hybrid_models["liger"])
+    native, liger = _rms_norms(hybrid_models["te"]), _rms_norms(hybrid_models["liger"])
     # Final, MoE pre-MLP and MTP norms; norms fused into TE linears are not RMSNorm modules.
     assert {"decoder.final_norm", "decoder.layers.1.pre_mlp_layernorm"} <= native.keys()
     assert any(name.startswith("mtp.") for name in native)
@@ -84,7 +84,7 @@ def test_hybrid_norm_slots(hybrid_models):
 
 
 def test_hybrid_forward_backward_parity(hybrid_models):
-    native, liger = hybrid_models["native"], hybrid_models["liger"]
+    native, liger = hybrid_models["te"], hybrid_models["liger"]
     skipped = liger.load_state_dict(native.state_dict(), strict=False)
     assert all(
         key.endswith("_extra_state") for key in skipped.missing_keys + skipped.unexpected_keys
@@ -100,7 +100,7 @@ def test_hybrid_forward_backward_parity(hybrid_models):
             input_ids=tokens, position_ids=positions, attention_mask=mask, labels=labels
         )
         losses[impl].sum().backward()
-    torch.testing.assert_close(losses["liger"], losses["native"], atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(losses["liger"], losses["te"], atol=2e-5, rtol=2e-5)
     native_params = dict(native.named_parameters())
     for name, parameter in liger.named_parameters():
         expected = native_params[name].grad

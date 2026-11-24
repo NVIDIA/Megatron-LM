@@ -32,7 +32,7 @@ def _config(**overrides):
 def test_unselected_paths_do_not_import_liger(monkeypatch):
     for module in ("liger_kernel", "liger_kernel.megatron"):
         monkeypatch.setitem(sys.modules, module, None)  # any import attempt now fails
-    assert get_norm_module_spec("native") is TENorm
+    assert get_norm_module_spec("te") is TENorm
     assert get_norm_module_spec("liger") is LigerRMSNorm  # naming it in a spec imports nothing
     with pytest.raises(ImportError, match="Liger RMSNorm requires liger_kernel.megatron"):
         LigerRMSNorm(config=_config(), hidden_size=8)
@@ -70,7 +70,7 @@ def test_config_rejects_unsupported_setups():
     ):
         with pytest.raises(ValueError, match=f"rmsnorm_impl='liger' requires {requirement}"):
             _config(**invalid)
-    with pytest.raises(ValueError, match="rmsnorm_impl must be 'native' or 'liger'"):
+    with pytest.raises(ValueError, match="rmsnorm_impl must be 'te' or 'liger'"):
         _config(rmsnorm_impl="apex")
     with pytest.raises(ValueError, match="supported only by HybridModel"):
         GPTModel(config=_config(), transformer_layer_spec=None, vocab_size=8, max_sequence_length=8)

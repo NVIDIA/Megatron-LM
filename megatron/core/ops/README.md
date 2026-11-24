@@ -274,7 +274,7 @@ Install `liger-kernel>=0.8.5` (the dev image has it) and select `--normalization
 stack spec with `with_norm_backend(spec, "liger")`, whose norm slots (layer, QK, MoE pre-MLP,
 MTP and final norms) name Liger's RMSNorm. Norms fused into a Transformer Engine linear, Mamba's
 gated norm and norms built outside the spec stay Transformer Engine. It is not a speedup: Liger
-is usually slower than the native norms.
+is usually slower than Transformer Engine's norms.
 
 ## Dependency checks
 

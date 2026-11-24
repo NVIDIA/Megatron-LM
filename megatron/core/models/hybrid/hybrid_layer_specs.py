@@ -715,14 +715,14 @@ def _replace_norm(spec, norm):
     return spec
 
 
-def with_norm_backend(stack_spec: ModuleSpec, norm_backend: str = "native") -> ModuleSpec:
+def with_norm_backend(stack_spec: ModuleSpec, norm_backend: str = "te") -> ModuleSpec:
     """Return ``stack_spec`` with its norms built by ``norm_backend`` (a ``rmsnorm_impl`` value).
 
     Every norm slot that names ``TENorm`` (layer, QK, MoE pre-MLP, MTP and final norms) names
-    ``get_norm_module_spec(norm_backend)`` instead; ``"native"`` returns ``stack_spec`` itself.
+    ``get_norm_module_spec(norm_backend)`` instead; ``"te"`` returns ``stack_spec`` itself.
     Norms fused into Transformer Engine linears are not separate slots and stay TE.
     """
-    if norm_backend == "native":
+    if norm_backend == "te":
         return stack_spec
     return _replace_norm(stack_spec, get_norm_module_spec(norm_backend))
 

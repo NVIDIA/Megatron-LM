@@ -152,7 +152,7 @@ def resolve_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:
     if model_config.hybrid_stack_spec is not None:
         return with_norm_backend(model_config.hybrid_stack_spec, norm_backend)
     modelopt = model_config.transformations is not None or model_config.restore_modelopt_state
-    if norm_backend != "native" and modelopt:
+    if norm_backend != "te" and modelopt:
         raise ValueError("rmsnorm_impl='liger' is not supported by ModelOpt Hybrid specs.")
     use_wide_residual = model_config.transformer.wide_residual is not None
     if model_config.transformations is not None:
