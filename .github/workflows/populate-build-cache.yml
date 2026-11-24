@@ -48,6 +48,10 @@ on:
         description: Query the captured GEMM geometry across K values without training
         type: boolean
         default: false
+      mfsdp_baseline_only:
+        description: Run one uninstrumented 50-step reproduction and record GPU identity
+        type: boolean
+        default: false
 
 concurrency:
   group: populate-ci-caches-${{ inputs.mfsdp_isolation && github.ref || 'main' }}
@@ -163,14 +167,14 @@ jobs:
       actions: read
     env:
       AWS_REGION: us-east-2
-      IMAGE: 766267172432.dkr.ecr.us-east-2.amazonaws.com/megatron-lm@sha256:b5a0587987dbbb500943cbdd2090707ef16912c3c3476d25b72d860d6858e1c2
+      IMAGE: 766267172432.dkr.ecr.us-east-2.amazonaws.com/megatron-lm@sha256:678b53e3ac9f655afe5b1b9df7b9980c12a32436e8598b08f7e728cb0583f66d
     steps:
       - name: Checkout diagnostic scripts
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Checkout unchanged training source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: 68f829281ffec0a158f2c875b0f3273a035292b4
+          ref: bad2f84cba7f675c914049031c1422e406ad0a70
           path: mfsdp-source
       - name: Reuse a prior captured GEMM
         if: inputs.mfsdp_snapshot_run != ''
@@ -180,12 +184,13 @@ jobs:
           run-id: ${{ inputs.mfsdp_snapshot_run }}
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/mfsdp-isolation-${{ github.run_id }}
-      - name: Trace the exact passing image
+      - name: Reproduce with the exact batch image
         shell: bash
         run: |
           set -euo pipefail
           stage="$RUNNER_TEMP/mfsdp-isolation-$GITHUB_RUN_ID"
           mkdir -p "$stage"
+          nvidia-smi --query-gpu=name,uuid,driver_version,pci.bus_id --format=csv > "$stage/gpu-identity.csv"
           cp .github/diagnostics/mfsdp/* "$stage/"
           case_dir=mfsdp-source/tests/functional_tests/test_cases/moe/deepseek_proxy_mfsdp_v2_ep2_mb4_per_token_loss_1node
           cp "$case_dir/model_config.yaml" "$stage/model_config.yaml"
@@ -195,6 +200,7 @@ jobs:
           docker image inspect --format '{{json .RepoDigests}}' "$IMAGE" > "$stage/image-digests.json"
           docker run --rm --gpus all --runtime nvidia --ipc host --shm-size 30g \
             -e MFSDP_HEURISTIC_SCAN=${{ inputs.mfsdp_heuristic_scan }} \
+            -e MFSDP_BASELINE_ONLY=${{ inputs.mfsdp_baseline_only }} \
             -v "$PWD/mfsdp-source:/opt/megatron-lm" \
             -v "$stage:/workspace" \
             -v /mnt/datadrive/TestData/megatron-lm/artifacts:/mnt/artifacts:ro \
@@ -209,4 +215,5 @@ jobs:
             ${{ runner.temp }}/mfsdp-isolation-${{ github.run_id }}/results
             ${{ runner.temp }}/mfsdp-isolation-${{ github.run_id }}/image-digests.json
             ${{ runner.temp }}/mfsdp-isolation-${{ github.run_id }}/source-commit.txt
+            ${{ runner.temp }}/mfsdp-isolation-${{ github.run_id }}/gpu-identity.csv
           retention-days: 3

@@ -16,6 +16,15 @@
 set -euo pipefail
 cd /opt/megatron-lm
 export UV_PROJECT_ENVIRONMENT=/opt/venv
+if [ "${MFSDP_BASELINE_ONLY:-false}" = "true" ]; then
+  result=/workspace/results/github-baseline-50
+  mkdir -p "$result"
+  echo '{"label":"github-baseline-50","steps":50,"trace":false}' > "$result/request.json"
+  uv run --no-sync python /workspace/payload.py "$result/request.json" > "$result/payload.log" 2>&1
+  cat "$result/runtime.json"
+  cat "$result/result.json"
+  exit
+fi
 if [ "${MFSDP_HEURISTIC_SCAN:-false}" = "true" ]; then
   mkdir -p /workspace/results/heuristic-scan
   g++ -std=c++17 -O2 /workspace/scan_heuristics.cpp -o /workspace/scan-heuristics \
