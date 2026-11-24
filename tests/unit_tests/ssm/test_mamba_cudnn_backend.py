@@ -4,6 +4,7 @@
 
 import sys
 import types
+from dataclasses import replace
 
 import pytest
 import torch
@@ -11,7 +12,11 @@ import torch
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.mamba_mixer import MambaMixer
+from megatron.core.ssm.mamba_mixer import (
+    CudnnMambaSplitConv1dScan,
+    MambaMixer,
+    TritonMambaSplitConv1dScan,
+)
 from megatron.core.ssm.ops.mamba2.cudnn_ssd import (
     _cudnn_mamba2_import_error,
     _ensure_stride,
@@ -22,6 +27,7 @@ from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 HIDDEN_SIZE = 256
+MIXER_SUBMODULES = hybrid_stack_spec.submodules.mamba_layer.submodules.mixer.submodules
 
 
 def _config(**kwargs):
@@ -31,11 +37,11 @@ def _config(**kwargs):
     return TransformerConfig(**(defaults | kwargs))
 
 
-def _mixer(config, **kwargs):
+def _mixer(config, submodules=MIXER_SUBMODULES, **kwargs):
     pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
     return MambaMixer(
         config,
-        hybrid_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
+        submodules,
         config.hidden_size,
         layer_number=1,
         pg_collection=pg_collection,
@@ -87,13 +93,21 @@ def test_rejects_old_cudnn_frontend(monkeypatch):
         _cudnn_mamba2_import_error.cache_clear()
 
 
-class TestMambaCudnnBackendErrorChecks:
+class TestMambaKernelSelection:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    def test_spec_kernel_overrides_config(self):
+        # mamba_head_dim=32 would make the cuDNN kernel module raise.
+        config = _config(mamba_kernel_backend="cudnn", mamba_head_dim=32)
+        submodules = replace(MIXER_SUBMODULES, split_conv1d_scan=TritonMambaSplitConv1dScan)
+        mixer = _mixer(config, submodules)
+        assert isinstance(mixer.split_conv1d_scan, TritonMambaSplitConv1dScan)
 
     @pytest.mark.parametrize("head_dim, state_dim", [(32, 128), (64, 64)])
     def test_rejects_unsupported_shape(self, head_dim, state_dim):
@@ -122,6 +136,7 @@ class TestMambaCudnnBackendParity:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.parametrize("batch_first", [True, False], ids=["batch_first", "sequence_first"])
     @pytest.mark.parametrize(
         "nheads, ngroups, D_has_hdim, packing",
         [
@@ -135,16 +150,23 @@ class TestMambaCudnnBackendParity:
             (20, 4, False, "seq_idx"),
         ],
     )
-    def test_matches_triton(self, nheads, ngroups, D_has_hdim, packing):
+    def test_matches_triton(self, monkeypatch, nheads, ngroups, D_has_hdim, packing, batch_first):
         hidden_size = 32 * nheads
-        mixer = _mixer(
-            _config(
-                mamba_kernel_backend="cudnn", hidden_size=hidden_size, mamba_num_groups=ngroups
-            ),
-            D_has_hdim=D_has_hdim,
-        )
-        mixer = mixer.cuda().bfloat16()
-        assert mixer.use_cudnn_kernels and mixer.nheads == nheads
+        mixers = {}
+        for backend in ("triton", "cudnn"):
+            config = _config(
+                mamba_kernel_backend=backend, hidden_size=hidden_size, mamba_num_groups=ngroups
+            )
+            mixer = _mixer(config, D_has_hdim=D_has_hdim).cuda().bfloat16()
+            # This config passes the batch-first gate, so only sequence-first needs pinning.
+            assert mixer._use_batch_first_ssm(inference_mode=False)
+            if not batch_first:
+                monkeypatch.setattr(mixer, "_use_batch_first_ssm", lambda inference_mode: False)
+            mixers[backend] = mixer
+        # The kernel modules hold no state, so the mixers swap state dicts.
+        mixers["cudnn"].load_state_dict(mixers["triton"].state_dict())
+        assert isinstance(mixers["cudnn"].split_conv1d_scan, CudnnMambaSplitConv1dScan)
+        assert mixers["cudnn"].nheads == nheads
 
         seqlen, batch = 512, 2
         packed_seq_params = None
@@ -163,10 +185,8 @@ class TestMambaCudnnBackendParity:
         hidden = torch.randn(seqlen, batch, hidden_size, device="cuda", dtype=torch.bfloat16)
         dout = torch.randn_like(hidden)
 
-        mixer.use_cudnn_kernels = False
-        expected, expected_grads = _fwd_bwd(mixer, hidden, dout, packed_seq_params)
-        mixer.use_cudnn_kernels = True
-        actual, grads = _fwd_bwd(mixer, hidden, dout, packed_seq_params)
+        expected, expected_grads = _fwd_bwd(mixers["triton"], hidden, dout, packed_seq_params)
+        actual, grads = _fwd_bwd(mixers["cudnn"], hidden, dout, packed_seq_params)
 
         assert _rel(actual, expected) < 2e-2
         assert grads.keys() == expected_grads.keys()

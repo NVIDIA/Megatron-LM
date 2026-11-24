@@ -15,7 +15,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm import causal_conv1d as causal_conv1d_module
 from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic
-from megatron.core.ssm.mamba_mixer import MambaMixer
+from megatron.core.ssm.mamba_mixer import CudnnMambaSplitConv1dScan, MambaMixer
 from megatron.core.ssm.ops.mamba2.cudnn_ssd import cudnn_mamba2_unsupported_reason
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -195,7 +195,9 @@ class TestMambaMixerDeterminism:
         monkeypatch.setenv("MAMBA_DETERMINISTIC", "1")
         monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
         mixer = _build_mixer(mamba_kernel_backend=backend)
-        assert mixer.use_cudnn_kernels == (backend == "cudnn")
+        assert isinstance(mixer.split_conv1d_scan, CudnnMambaSplitConv1dScan) == (
+            backend == "cudnn"
+        )
         # This config passes the batch-first gate, so only sequence-first needs pinning.
         assert mixer._use_batch_first_ssm(inference_mode=False)
         if not batch_first:

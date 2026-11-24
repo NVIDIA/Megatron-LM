@@ -1722,9 +1722,10 @@ class TransformerConfig(ModelParallelConfig):
     """Controls usage of the memory efficient path for Mamba layers."""
 
     mamba_kernel_backend: Literal["triton", "cudnn"] = "triton"
-    """Kernel backend for the Mamba layers' training conv + SSD. ``triton`` runs mamba_ssm's
+    """Kernel backend for the Mamba layers' training conv + SSD, the MambaMixer
+    ``split_conv1d_scan`` submodule when its spec leaves it unset. ``triton`` runs mamba_ssm's
     fused kernel. ``cudnn`` runs causal-conv1d plus the cuDNN frontend's CuTe DSL Mamba-2
-    kernels (nvidia-cudnn-frontend[cutedsl]>=1.32.0), which need SM100 / SM103 / SM107,
+    kernels (nvidia-cudnn-frontend[cutedsl]>=1.33.0), which need SM100 / SM103 / SM107,
     mamba_head_dim=64 and mamba_state_dim=128. The selected backend is required to be
     available; there is no automatic fallback. Inference and the non-memory-efficient path
     always use the Triton kernels."""

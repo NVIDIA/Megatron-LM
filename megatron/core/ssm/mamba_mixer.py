@@ -159,21 +159,162 @@ class MambaInferenceParamCache:
     stale: bool = True
 
 
+class TritonMambaSplitConv1dScan(nn.Module):
+    """The fused causal conv1d + SSD scan of the memory-efficient training path, on mamba_ssm's
+    Triton kernel `mamba_split_conv1d_scan_combined` (``mamba_kernel_backend='triton'``).
+
+    Takes the batch-first in_proj output ``zxBCdt``, [b, l, d], and the context-parallel-local
+    conv and SSM parameters, and returns the gated SSM output, [b, l, d_inner].
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        *,
+        headdim: int,
+        d_state: int,
+        D_has_hdim: bool,
+        chunk_size: int,
+        activation: str,
+        norm_before_gate: bool,
+    ):
+        super().__init__()
+        self.headdim = headdim
+        self.D_has_hdim = D_has_hdim
+        self.chunk_size = chunk_size
+        self.activation = activation
+        self.norm_before_gate = norm_before_gate
+        self.state_dtype_kwarg = (
+            {"state_dtype": config.mamba_training_ssm_states_dtype or config.params_dtype}
+            if MAMBA_HAS_STATE_DTYPE
+            else {}
+        )
+
+    def forward(
+        self,
+        zxBCdt: torch.Tensor,
+        conv1d_weight: torch.Tensor,
+        conv1d_bias: torch.Tensor,
+        dt_bias: torch.Tensor,
+        A: torch.Tensor,
+        D: torch.Tensor,
+        *,
+        ngroups: int,
+        seq_idx: Optional[torch.Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ) -> torch.Tensor:
+        """Runs the conv and scan; ``seq_idx`` alone delimits packed sequences."""
+        return mamba_split_conv1d_scan_combined(
+            zxBCdt,
+            conv1d_weight,
+            conv1d_bias,
+            dt_bias,
+            A,
+            D=D,
+            chunk_size=self.chunk_size,
+            activation=self.activation,
+            headdim=None if self.D_has_hdim else self.headdim,
+            ngroups=ngroups,
+            norm_before_gate=self.norm_before_gate,
+            seq_idx=seq_idx,
+            **self.state_dtype_kwarg,
+        )
+
+
+class CudnnMambaSplitConv1dScan(nn.Module):
+    """`TritonMambaSplitConv1dScan` on causal-conv1d plus the cuDNN frontend's CuTe DSL Mamba-2
+    kernels (``mamba_kernel_backend='cudnn'``), with the same inputs and output.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        *,
+        headdim: int,
+        d_state: int,
+        D_has_hdim: bool,
+        chunk_size: int,
+        activation: str,
+        norm_before_gate: bool,
+    ):
+        super().__init__()
+        if not config.use_mamba_mem_eff_path:
+            raise ValueError(
+                "mamba_kernel_backend='cudnn' replaces the memory-efficient training kernel "
+                "and cannot be combined with use_mamba_mem_eff_path=False."
+            )
+        if config.mamba_training_ssm_states_dtype is not None:
+            raise ValueError(
+                "mamba_kernel_backend='cudnn' does not support mamba_training_ssm_states_dtype."
+            )
+        reason = cudnn_mamba2_unsupported_reason(headdim, d_state)
+        if reason is not None:
+            raise ValueError(f"mamba_kernel_backend='cudnn' is unavailable: {reason}.")
+        self.config = config
+        self.headdim = headdim
+
+    def forward(
+        self,
+        zxBCdt: torch.Tensor,
+        conv1d_weight: torch.Tensor,
+        conv1d_bias: torch.Tensor,
+        dt_bias: torch.Tensor,
+        A: torch.Tensor,
+        D: torch.Tensor,
+        *,
+        ngroups: int,
+        seq_idx: Optional[torch.Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ) -> torch.Tensor:
+        """Runs the conv and scan; the kernels also take the sequence boundaries as cu_seqlens."""
+        batch, seqlen, _ = zxBCdt.shape
+        if packed_seq_params is not None:
+            assert batch == 1, "Packed sequences must be passed with a batch size of 1."
+            # Like build_packed_seq_idx, the tokens after cu_seqlens[-1] form one more
+            # (possibly empty) sequence. Padded boundaries can run past the packed length,
+            # which the kernel would read beyond.
+            cu_seqlens = get_cu_seqlens(packed_seq_params)
+            cu_seqlens = torch.cat([cu_seqlens, cu_seqlens.new_full((1,), seqlen)])
+            cu_seqlens = cu_seqlens.clamp(max=seqlen)
+        else:
+            cu_seqlens = torch.arange(
+                0, (batch + 1) * seqlen, seqlen, dtype=torch.int32, device=zxBCdt.device
+            )
+        return cudnn_mamba_split_conv1d_scan_combined(
+            zxBCdt,
+            conv1d_weight,
+            conv1d_bias,
+            dt_bias,
+            A,
+            D=D,
+            cu_seqlens=cu_seqlens,
+            headdim=self.headdim,
+            ngroups=ngroups,
+            seq_idx=seq_idx,
+            batch_invariant=self.config.batch_invariant_mode,
+        )
+
+
 @dataclass
 class MambaMixerSubmodules:
     """
-    Contains the module specs for the input and output linear layers.
+    Contains the module specs for the input and output linear layers, and for the training
+    path's fused conv1d + SSD scan.
     """
 
     in_proj: Union[ModuleSpec, type] = None
     out_proj: Union[ModuleSpec, type] = None
+    split_conv1d_scan: Union[ModuleSpec, type, None] = None
+    """`TritonMambaSplitConv1dScan`, `CudnnMambaSplitConv1dScan` or a module with their
+    interface; None picks the one for ``config.mamba_kernel_backend``."""
 
 
 class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLayer):
     """
     Args:
         config: The config of the model.
-        submodules: Contains the module specs for the input and output linear layers.
+        submodules: Contains the module specs for the input and output linear layers, and for
+            the training path's fused conv1d + SSD scan.
         d_model: The hidden size of the model.
         d_state: The state size of the SSM.
         d_conv: The number of channels in the causal convolution.
@@ -298,22 +439,6 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         assert self.d_state is not None and self.d_state > 0
         assert self.headdim is not None and self.headdim > 0
         assert self.ngroups is not None and self.ngroups > 0
-
-        self.use_cudnn_kernels = self.config.mamba_kernel_backend == "cudnn"
-        if self.use_cudnn_kernels:
-            if not self.use_mem_eff_path:
-                raise ValueError(
-                    "mamba_kernel_backend='cudnn' replaces the memory-efficient training kernel "
-                    "and cannot be combined with use_mamba_mem_eff_path=False."
-                )
-            if config.mamba_training_ssm_states_dtype is not None:
-                raise ValueError(
-                    "mamba_kernel_backend='cudnn' does not support "
-                    "mamba_training_ssm_states_dtype."
-                )
-            reason = cudnn_mamba2_unsupported_reason(self.headdim, self.d_state)
-            if reason is not None:
-                raise ValueError(f"mamba_kernel_backend='cudnn' is unavailable: {reason}.")
 
         if self.config.mamba_num_heads is not None:
             self.nheads = self.config.mamba_num_heads
@@ -454,6 +579,24 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         self.activation = "silu"
         self.act = nn.SiLU()
 
+        split_conv1d_scan = submodules.split_conv1d_scan
+        if split_conv1d_scan is None:
+            split_conv1d_scan = (
+                CudnnMambaSplitConv1dScan
+                if self.config.mamba_kernel_backend == "cudnn"
+                else TritonMambaSplitConv1dScan
+            )
+        self.split_conv1d_scan = build_module(
+            split_conv1d_scan,
+            config=self.config,
+            headdim=self.headdim,
+            d_state=self.d_state,
+            D_has_hdim=self.D_has_hdim,
+            chunk_size=self.chunk_size,
+            activation=self.activation,
+            norm_before_gate=self.norm_before_gate,
+        )
+
         with get_cuda_rng_tracker().fork():
             # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
             dt = torch.exp(
@@ -587,11 +730,6 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             )
             y = self._static_prefill(
                 zxBCdt, conv_state=conv_state, ssm_state=ssm_state, runtime_cp=runtime_cp
-            )
-        elif self.use_cudnn_kernels:
-            assert ssm_state is None
-            y = self._ssm_training_cudnn(
-                zxBCdt, packed_seq_params, runtime_cp=runtime_cp, batch_first=batch_first
             )
         else:
             assert ssm_state is None
@@ -870,9 +1008,9 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         """
         Performs SSM computation for training step.
 
-        Uses the memory-efficient kernel `mamba_split_conv1d_scan_combined` which reduces the size
-        of forward activations stored for backprop and therefore reduces memory pressure during
-        training.
+        Runs the conv and scan in `split_conv1d_scan`, by default the memory-efficient kernel
+        `mamba_split_conv1d_scan_combined` which reduces the size of forward activations stored
+        for backprop and therefore reduces memory pressure during training.
         """
 
         runtime_cp = self.cp if runtime_cp is None else runtime_cp
@@ -894,10 +1032,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             if seq_idx is None:
                 seq_idx = build_packed_seq_idx(packed_seq_params, zxBCdt.shape[1])
 
-        state_dtype_kwarg = (
-            {"state_dtype": self.mamba_training_ssm_states_dtype} if MAMBA_HAS_STATE_DTYPE else {}
-        )
-        y = mamba_split_conv1d_scan_combined(
+        y = self.split_conv1d_scan(
             zxBCdt,
             rearrange(runtime_cp.get_conv1d_weight(), "d 1 w -> d w"),
             runtime_cp.get_conv1d_bias(),
@@ -908,83 +1043,9 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
                 if self.D_has_hdim
                 else runtime_cp.get_D()
             ),
-            chunk_size=self.chunk_size,
-            activation=self.activation,
-            headdim=None if self.D_has_hdim else self.headdim,
-            ngroups=runtime_cp.ngroups_local_tpcp,
-            norm_before_gate=self.norm_before_gate,
-            seq_idx=seq_idx,
-            **state_dtype_kwarg,
-        )
-
-        if not batch_first:
-            y = rearrange(y, "b l d -> l b d").contiguous()
-        y = runtime_cp.post_conv_ssm(y, packed_seq_params)
-
-        if self.rmsnorm:
-            y = self.norm(y)
-
-        return y
-
-    def _ssm_training_cudnn(
-        self,
-        zxBCdt: torch.Tensor,
-        packed_seq_params: Optional[PackedSeqParams] = None,
-        runtime_cp: Optional[MambaContextParallel] = None,
-        batch_first: bool = False,
-    ) -> torch.Tensor:
-        """
-        Performs SSM computation for training step on the cuDNN frontend's Mamba-2 kernels
-        (`mamba_kernel_backend='cudnn'`), with the same inputs and outputs as `_ssm_training`.
-        """
-
-        runtime_cp = self.cp if runtime_cp is None else runtime_cp
-
-        if not batch_first:
-            # transpose: l b pd --> b l pd
-            zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
-        batch, seqlen, _ = zxBCdt.shape
-
-        # (nheads_local_tpcp)
-        A = -torch.exp(runtime_cp.get_A_log().float())
-
-        seq_idx = None
-        if packed_seq_params is not None:
-            sequence_packing_available, reason_for_no_sequence_packing = (
-                _check_mamba_sequence_packing_support(for_inference_not_training=False)
-            )
-            assert sequence_packing_available, reason_for_no_sequence_packing
-            assert batch == 1, "Packed sequences must be passed with a batch size of 1."
-            seq_idx = packed_seq_params.seq_idx
-            if seq_idx is None:
-                seq_idx = build_packed_seq_idx(packed_seq_params, seqlen)
-            # Like build_packed_seq_idx, the tokens after cu_seqlens[-1] form one more
-            # (possibly empty) sequence. Padded boundaries can run past the packed length,
-            # which the kernel would read beyond.
-            cu_seqlens = get_cu_seqlens(packed_seq_params)
-            cu_seqlens = torch.cat([cu_seqlens, cu_seqlens.new_full((1,), seqlen)])
-            cu_seqlens = cu_seqlens.clamp(max=seqlen)
-        else:
-            cu_seqlens = torch.arange(
-                0, (batch + 1) * seqlen, seqlen, dtype=torch.int32, device=zxBCdt.device
-            )
-
-        y = cudnn_mamba_split_conv1d_scan_combined(
-            zxBCdt,
-            rearrange(runtime_cp.get_conv1d_weight(), "d 1 w -> d w"),
-            runtime_cp.get_conv1d_bias(),
-            runtime_cp.get_dt_bias().float(),
-            A,
-            D=(
-                rearrange(runtime_cp.get_D().float(), "(h p) -> h p", p=self.headdim)
-                if self.D_has_hdim
-                else runtime_cp.get_D()
-            ),
-            cu_seqlens=cu_seqlens,
-            headdim=self.headdim,
             ngroups=runtime_cp.ngroups_local_tpcp,
             seq_idx=seq_idx,
-            batch_invariant=self.config.batch_invariant_mode,
+            packed_seq_params=packed_seq_params,
         )
 
         if not batch_first:
