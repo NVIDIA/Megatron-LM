@@ -3089,7 +3089,10 @@ def load_checkpoint(
             run_tp_pp, ckpt_tp_pp
         )
 
-        load_dp_rng_states = _checkpoint_has_per_dp_rng_states(cfg.checkpoint)
+        load_dp_rng_states = _checkpoint_has_per_dp_rng_states(
+            checkpoint_config,
+            default=cfg.checkpoint.save_rng_state_per_dp_rank or cfg.rng.data_parallel_random_init,
+        )
 
         # Determine if RNG state will be loaded
         # world_size must match too: the rng shard key includes dp_cp, so a DP rescale leaves this
@@ -3334,9 +3337,13 @@ def load_checkpoint(
         load_kwargs['sharded_state_dict'] = sharded_state_dict
     elif load_format == 'fsdp_dtensor':
         reader = FileSystemReader(_get_load_checkpoint_path(load_dir, checkpoint))
-        load_dp_rng_states = cfg.checkpoint.save_rng_state_per_dp_rank or cfg.rng.data_parallel_random_init
+        # Layout comes from the checkpoint's saved run config; checkpoints without one fall back
+        # to the active run's policy.
+        load_dp_rng_states = _checkpoint_has_per_dp_rng_states(
+            checkpoint_config,
+            default=cfg.checkpoint.save_rng_state_per_dp_rank or cfg.rng.data_parallel_random_init,
+        )
         try:
-            load_dp_rng_states = _checkpoint_has_per_dp_rng_states(cfg)
             state_dict_metadata = reader.read_metadata().state_dict_metadata
         except FileNotFoundError:
             state_dict_metadata = {}
@@ -3905,10 +3912,17 @@ def _checkpoint_dp_cp_group(
     return dp_cp_gtp_remat or dp_cp
 
 
-def _checkpoint_has_per_dp_rng_states(run_config: dict[str, Any]) -> bool:
-    """Return whether a checkpoint stores one RNG state per DP/CP rank."""
-    return run_config.get("checkpoint", {}).get("save_rng_state_per_dp_rank", False) or run_config.get("rng", {}).get(
-        "data_parallel_random_init", False
+def _checkpoint_has_per_dp_rng_states(run_config: Optional[dict[str, Any]], default: bool = False) -> bool:
+    """Return whether a checkpoint stores one RNG state per DP/CP rank.
+
+    ``run_config`` is the run config saved with the checkpoint (None for checkpoints written
+    before it was saved, in which case ``default`` is returned).
+    """
+    if run_config is None:
+        return bool(default)
+    return bool(
+        (run_config.get("checkpoint") or {}).get("save_rng_state_per_dp_rank", False)
+        or (run_config.get("rng") or {}).get("data_parallel_random_init", False)
     )
 
 
