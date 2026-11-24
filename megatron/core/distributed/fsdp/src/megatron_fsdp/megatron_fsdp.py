@@ -10,7 +10,7 @@
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
-# limitations under the License.import functools
+# limitations under the License.
 
 import functools
 import importlib
@@ -1219,9 +1219,7 @@ class MegatronFSDP(torch.nn.Module):
                     )
                 else:
                     # Before PyTorch 2.8, tensor post-accumulate hooks skip None gradients.
-                    # FSDP may release parameter storage before hook registration.
-                    param_tmp = param.as_strided((0,), (1,))
-                    grad_acc = param_tmp.grad_fn.next_functions[0][0]
+                    grad_acc = torch.autograd.graph.get_gradient_edge(param).node
                     self.grad_acc_nodes.append(grad_acc)
                     self.grad_acc_hooks[hook_name] = grad_acc.register_hook(
                         lambda *_, p=param: _post_accumulate_hook(p)

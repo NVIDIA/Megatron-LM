@@ -315,8 +315,8 @@ class TestTEWrappers:
 
     @pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 output projection requires Blackwell")
     def test_te_lm_head_two_uses_replays(self):
-        """The MXFP8 LM head used twice in one backward pass, as by the main and MTP heads, with
-        its weight gradient accumulated into main_grad without a tensor .grad."""
+        """The MXFP8 LM head used twice in one backward pass, as by the main and MTP heads,
+        with its weight gradient accumulated into main_grad."""
         seeded()
         config = _config(
             fp8="hybrid",
@@ -346,10 +346,11 @@ class TestTEWrappers:
             for _ in range(2)
         )
         module = TwoUses()
-        assert_module_replays_bit_exact(
+        _, grads = assert_module_replays_bit_exact(
             module, (x, y), replays=3, contention=True, what="TELMHeadColumnParallelLinear x2"
         )
-        assert head.weight.grad is None
+        assert "chunk0.head.weight" in grads
+        assert torch.count_nonzero(grads["chunk0.head.weight"]) > 0
 
     @pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 output projection requires Blackwell")
     def test_te_lm_head_fp4_replays(self):
