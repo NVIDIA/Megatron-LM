@@ -30,7 +30,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_gro
 )
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import (
     post_fsdp_backward,
-    register_combined_1f1b_hooks,
+    register_fsdp_module_hooks,
 )
 from megatron.core.models.common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -235,7 +235,7 @@ def test_train_validate_train_reshards_and_matches_dense(distributed_setup):
                 placements=placements,
                 schedule_policy=SchedulePolicy(register_hooks=False),
             )
-    register_combined_1f1b_hooks(model)
+    register_fsdp_module_hooks(model)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
     fully_shard_optimizer(optimizer)
     reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.1)
@@ -319,13 +319,11 @@ def test_schedule_finishes_shared_and_nested_units_once(repeated, wrapped):
     model.add_module("shared", shared)
     model.add_module("other", other)
     root.add_module("model", model)
-    register_combined_1f1b_hooks(root)
+    register_fsdp_module_hooks(root)
     plans = [Plan(shared), Plan(other)] + ([Plan(shared)] if repeated else [])
     outer_model = nn.Sequential(root) if wrapped else root
     chunk_plan = SimpleNamespace(_transformer_layers=plans)
     TransformerModelChunkSchedulePlan.register_fsdp_hooks(chunk_plan, outer_model)
-    remaining = chunk_plan._fsdp_remaining_modules
-    assert remaining == (root,)
     for unit in root.modules():
         if isinstance(unit, FsdpModule):
             assert not unit._backward_hooks
@@ -356,8 +354,7 @@ def test_schedule_finishes_shared_and_nested_units_once(repeated, wrapped):
     shared(torch.tensor(3.0)).backward()
     plans[0].finish()
     (root.weight * 7).backward()
-    for unit in remaining:
-        post_fsdp_backward(unit)
+    chunk_plan._on_backward_complete()
     expected_shared = 8.0 if repeated else 3.0
     assert reductions == [
         ("other", 4.0),

@@ -1,5 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from typing import Callable
+
 from torch import nn
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
@@ -48,8 +50,8 @@ def reshard_fsdp_modules(module: nn.Module) -> None:
         unit.reshard()
 
 
-def register_combined_1f1b_hooks(module: FsdpModule) -> None:
-    """Install demand-gather and evaluation-release hooks for the EP schedule."""
+def register_fsdp_module_hooks(module: FsdpModule) -> None:
+    """Register PyTorch hooks for on-demand unshard and eval-time reshard."""
 
     def register_hooks(submodule, owner):
         if isinstance(submodule, FsdpModule):
@@ -71,20 +73,17 @@ def register_combined_1f1b_hooks(module: FsdpModule) -> None:
             submodule.register_forward_hook(_module_post_forward_hook)
 
 
-def register_fsdp_schedule_hooks(model: nn.Module, layer_plans) -> tuple[FsdpModule, ...]:
-    """Reduce each unit after its last scheduled backward use, including delayed wgrad.
+def register_fsdp_ep_overlap_schedule_hooks(
+    model: nn.Module, layer_plans
+) -> Callable[[], None] | None:
+    """Register layer hooks and return a chunk-level backward completion hook.
 
-    Operations:
-        1. Collect FSDP units from the current chunk's outer model.
-        2. Visit layers in forward order and assign each unit once, so shared
-           units finish at their last backward use (after delayed wgrad).
-        3. Return the remaining units for completion after pre-process backward.
-           These are typically root units owning embeddings, output heads,
-           final normalization, and MTP projections/norms.
+    Assign shared units in forward order so they finish at their last backward use.
+    Units outside the layer plans, such as the root, finish after pre-process backward.
     """
     remaining = dict.fromkeys(unit for unit in model.modules() if isinstance(unit, FsdpModule))
     if not remaining:
-        return ()
+        return None
     for plan in layer_plans:
         units = tuple(unit for unit in plan.layer.modules() if unit in remaining)
         for unit in units:
@@ -95,4 +94,13 @@ def register_fsdp_schedule_hooks(model: nn.Module, layer_plans) -> tuple[FsdpMod
                 post_fsdp_backward(unit)
 
         plan.set_fsdp_reshard_hooks(reshard_fsdp_modules, finish_layer)
-    return tuple(remaining)
+
+    if not remaining:
+        return None
+    chunk_units = tuple(remaining)
+
+    def finish_chunk():
+        for unit in chunk_units:
+            post_fsdp_backward(unit)
+
+    return finish_chunk

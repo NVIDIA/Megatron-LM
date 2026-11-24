@@ -5,10 +5,8 @@ from typing import Any, Callable, List, Optional
 import torch
 from torch import Tensor
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import (
-    post_fsdp_backward,
-    register_fsdp_schedule_hooks,
+    register_fsdp_ep_overlap_schedule_hooks,
 )
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
@@ -662,7 +660,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 model, self._model_chunk_state, self._event, get_comp_stream
             )
 
-        self._fsdp_remaining_modules: tuple[FsdpModule, ...] = ()
+        self._on_backward_complete: Optional[Callable[[], None]] = None
 
         # Split into segments; pre_process and post_process keep their graphs.
         self._build_recompute_segments(model.config)
@@ -760,7 +758,9 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
     def register_fsdp_hooks(self, model: torch.nn.Module) -> None:
         """Configure FSDP completion using this chunk's outer model and wrappers."""
-        self._fsdp_remaining_modules = register_fsdp_schedule_hooks(model, self._transformer_layers)
+        self._on_backward_complete = register_fsdp_ep_overlap_schedule_hooks(
+            model, self._transformer_layers
+        )
 
     def get_layer(self, i):
         """Gets the transformer layer at the specified index."""
@@ -782,6 +782,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
     def release_state(self):
         """Release reference, this helps avoid memory leak."""
+        self._on_backward_complete = None
         self._recompute_segments = []
         self._model_chunk_state.model = None
         self.pre_process.model_chunk_state = None
@@ -926,8 +927,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             f_schedule_plan.wait_current_stream()
         if b_schedule_plan:
             b_schedule_plan.wait_current_stream()
-            for unit in b_schedule_plan._fsdp_remaining_modules:
-                post_fsdp_backward(unit)
+            if b_schedule_plan._on_backward_complete is not None:
+                b_schedule_plan._on_backward_complete()
             # Release reference as early as possible, this helps avoid memory leak.
             b_schedule_plan.release_state()
 
