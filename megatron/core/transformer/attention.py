@@ -1685,7 +1685,11 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     )
             else:
                 query, key, value = apply_fused_qkv_rotary_pos_emb(
-                    mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list
+                    mixed_qkv,
+                    q_pos_emb,
+                    k_pos_emb,
+                    qkv_split_arg_list,
+                    interleaved=self.config.rotary_interleaved,
                 )
 
             # TODO, can apply positional embedding to value_layer so it has
