@@ -49,7 +49,7 @@ def _config() -> TransformerConfig:
 
 
 def _build_model_and_optimizer(
-    config, outer_size, outer_strategy, inner_strategy="optim_grads_params"
+    config, outer_size, outer_strategy, inner_strategy="optim_grads_params", optimizer_name="sgd"
 ):
     """Build a model and optimizer over the already-initialized DP topology.
 
@@ -75,13 +75,14 @@ def _build_model_and_optimizer(
     )
     optimizer = get_megatron_optimizer(
         OptimizerConfig(
-            optimizer="sgd",
+            optimizer=optimizer_name,
             lr=1.0e-2,
             weight_decay=0.0,
             bf16=True,
             params_dtype=torch.bfloat16,
             use_distributed_optimizer=False,
             clip_grad=0.0,
+            muon_split_qkv=False,
         ),
         [model],
     )
@@ -170,11 +171,12 @@ def test_hybrid_placements(model_parallel_cleanup, outer_strategy, inner_strateg
         assert parameter.grad.placements == (expected_outer, Shard(0))
 
 
+@pytest.mark.parametrize("optimizer_name", ["sgd", "muon"])
 @pytest.mark.parametrize("microbatches", [1, 2])
 @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"])
 @pytest.mark.parametrize("inner_strategy", ["optim_grads", "optim_grads_params"])
 def test_hybrid_matches_zero3_reference(
-    model_parallel_cleanup, outer_strategy, inner_strategy, microbatches
+    model_parallel_cleanup, outer_strategy, inner_strategy, microbatches, optimizer_name
 ):
     """Compare losses against ZeRO-3 sharded across all DP ranks.
 
@@ -184,7 +186,9 @@ def test_hybrid_matches_zero3_reference(
     """
     config = _config()
     Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=1)
-    model, optimizer = _build_model_and_optimizer(config, 1, "no_shard")
+    model, optimizer = _build_model_and_optimizer(
+        config, 1, "no_shard", optimizer_name=optimizer_name
+    )
     reference = _train(model, optimizer, microbatches=microbatches)
     del model, optimizer
     destroy_model_parallel()
@@ -192,7 +196,7 @@ def test_hybrid_matches_zero3_reference(
     outer_size = 2
     Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=outer_size)
     model, optimizer = _build_model_and_optimizer(
-        config, outer_size, outer_strategy, inner_strategy
+        config, outer_size, outer_strategy, inner_strategy, optimizer_name
     )
     actual = _train(model, optimizer, microbatches=microbatches)
     assert torch.isfinite(reference).all()
@@ -200,6 +204,7 @@ def test_hybrid_matches_zero3_reference(
 
 
 @pytest.mark.flaky_in_dev
+@pytest.mark.parametrize("optimizer_name", ["sgd", "muon"])
 @pytest.mark.parametrize("ep_size", [1, 2])
 @pytest.mark.parametrize("dense_outer_strategy", ["optim", "no_shard"])
 @pytest.mark.parametrize("expert_outer_strategy", ["optim", "no_shard"])
@@ -211,6 +216,7 @@ def test_moe_with_independent_hybrid_placements(
     ep_size,
     dense_outer_size,
     expert_outer_size,
+    optimizer_name,
 ):
     """Check dense/expert placements and finite losses across accumulated optimizer steps."""
     outer_size = max(dense_outer_size, expert_outer_size)
@@ -276,11 +282,12 @@ def test_moe_with_independent_hybrid_placements(
     )
     optimizer = get_megatron_optimizer(
         OptimizerConfig(
-            optimizer="sgd",
+            optimizer=optimizer_name,
             lr=1.0e-3,
             weight_decay=0.0,
             use_distributed_optimizer=False,
             clip_grad=0.0,
+            muon_split_qkv=False,
         ),
         [model],
     )

@@ -64,6 +64,7 @@ def _check_projection_gradient(reference, candidate, values, cp_group):
         (1, 1, False, "*-*"),
         (1, 2, False, "*-*"),
         (2, 2, True, "*-*"),
+        (2, 2, True, "contiguous-attention"),
         (1, 2, False, "G-*"),
         (1, 2, False, "M-*"),
         (1, 2, False, "gpt"),
@@ -116,10 +117,13 @@ def test_model_residual_layout_forward_backward(tp, cp, packed, pattern):
             )
         elif pattern == "wide":
             config_kwargs.update(wide_residual=WideResidualConfig(num_streams=2))
+        if pattern == "contiguous-attention":
+            config_kwargs.update(cp_comm_type="all_gather")
         config = TransformerConfig(**config_kwargs, global_cp_layout="zigzag")
         fixed_config = TransformerConfig(
             **config_kwargs,
             global_cp_layout="contiguous",
+            attention_cp_layout="contiguous" if pattern == "contiguous-attention" else "auto",
             linear_cp_mode="chunkwise" if pattern == "chunkwise" else "headwise",
             linear_attention_cp_layout="contiguous" if pattern == "M-*" else "auto",
         )
@@ -143,12 +147,12 @@ def test_model_residual_layout_forward_backward(tp, cp, packed, pattern):
                     if pattern == "chunkwise"
                     else (
                         "*-*"
-                        if pattern in ("mhc", "wide")
+                        if pattern in ("mhc", "wide", "contiguous-attention")
                         else "*E*" if pattern == "hash" else pattern
                     )
                 ),
                 pg_collection=groups,
-                position_embedding_type="rope",
+                position_embedding_type="none" if pattern == "contiguous-attention" else "rope",
                 **(
                     {"hybrid_stack_spec": wide_residual_hybrid_stack_spec}
                     if pattern == "wide"
@@ -184,7 +188,11 @@ def test_model_residual_layout_forward_backward(tp, cp, packed, pattern):
             boundary_layout="contiguous",
             dynamic_cp=False,
             cp_group=groups.cp,
-            additional_layouts=("zigzag",) if pattern == "gpt" else fixed.cp_required_layouts,
+            additional_layouts=(
+                ("zigzag",)
+                if pattern == "gpt"
+                else reference.cp_required_layouts | fixed.cp_required_layouts
+            ),
             sequence_parallel=tp > 1,
             tp_group=groups.tp,
             tp_cp_group=groups.tp_cp,

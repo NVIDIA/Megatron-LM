@@ -285,12 +285,22 @@ def test_pretrain_entry_prebuilds_module_views(monkeypatch, script_name, mode):
         sft=True,
         dataloader_inter_document_masking=False,
         create_attention_mask_in_dataloader=False,
-        seq_length=8,
         micro_batch_size=1,
     )
     monkeypatch.setattr(script, "get_args", lambda: args)
     monkeypatch.setattr(
-        script, "get_run_config", lambda: SimpleNamespace(model=SimpleNamespace(transformer=config))
+        script,
+        "get_run_config",
+        lambda: SimpleNamespace(
+            model=SimpleNamespace(transformer=config),
+            train=SimpleNamespace(micro_batch_size=1),
+            data=SimpleNamespace(
+                dataset=SimpleNamespace(sequence_length=8),
+                has_cu_seqlens=lambda: True,
+                creates_attention_mask=lambda: False,
+                use_per_sequence_balancing=lambda: False,
+            ),
+        ),
     )
     monkeypatch.setattr(script, "is_first_or_last_pipeline_stage", lambda stage: True)
     monkeypatch.setattr(script, "mtp_on_this_rank_func", lambda **kwargs: False)
