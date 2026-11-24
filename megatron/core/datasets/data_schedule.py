@@ -8,7 +8,7 @@ import torch
 
 from megatron.core.context_parallel import get_batches_on_this_cp_rank
 from megatron.core.context_parallel.groups import get_valid_dynamic_context_parallel_group_sizes
-from megatron.core.context_parallel.module import get_cp_boundary_layout, uses_fixed_cp_layout
+from megatron.core.context_parallel.module import get_cp_boundary_layout
 from megatron.core.datasets.data_schedule_utils import (
     align_sample_id_groups,
     broadcast_scalars,
@@ -845,11 +845,11 @@ def get_batch_on_this_rank_for_sequence_packing(
         batch['cu_seqlens'] = batch['cu_seqlens'].unsqueeze(0)
         batch['cu_seqlens_padded'] = batch['cu_seqlens_padded'].unsqueeze(0)
         boundary_layout = get_cp_boundary_layout(config)
-        additional_layouts = {config.linear_cp_layout, config.attention_cp_layout} - {
-            boundary_layout
-        }
-        if required_cp_layouts is not None:
-            additional_layouts.update(required_cp_layouts)
+        additional_layouts = set(
+            required_cp_layouts
+            if required_cp_layouts is not None
+            else (config.linear_attention_cp_layout, config.attention_cp_layout)
+        ) - {boundary_layout}
         cp_batch = get_batches_on_this_cp_rank(
             batch,
             boundary_layout=boundary_layout,
@@ -881,8 +881,7 @@ def get_batch_on_this_rank_for_sequence_packing(
                 params.max_seqlen_q = params.max_seqlen_kv = int(bound.item())
                 params.pad_between_seqs = True
                 values["max_seqlen"] = bound
-        if uses_fixed_cp_layout(config):
-            cp_batch.prepare_module_layouts()
+        cp_batch.prepare_module_layouts()
         return cp_batch
 
     # Extract the data from batch after broadcasting.

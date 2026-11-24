@@ -10,7 +10,7 @@ from torch import Tensor, nn
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
-from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec,
     wide_residual_gated_delta_product_inference_stack_spec,
@@ -988,12 +988,12 @@ class TestResidualStreamRecomputeIntegration:
         assert reference_output.dtype == expected_dtype
         assert recomputed_output.dtype == expected_dtype
 
-    def test_hybrid_mamba_cp_layout_finalizes_before_residual_replay(self, monkeypatch):
+    def test_hybrid_mamba_preserves_boundary_before_residual_replay(self, monkeypatch):
         config = _wide_recompute_config(num_layers=1)
         stack = HybridStack(
             config,
             HybridStackSubmodules(mamba_layer=_recording_mamba_spec()),
-            layer_type_list=[Symbols.MAMBA],
+            layer_config_list=validate_segment_layers(Symbols.MAMBA, config),
             post_layer_norm=False,
             pg_collection=_process_groups(),
         ).cuda()
@@ -1001,44 +1001,6 @@ class TestResidualStreamRecomputeIntegration:
         events = []
         # HybridStack reads the runtime CP fields, so the boundary metadata must be real.
         boundary_packed_seq_params = PackedSeqParams()
-        layer_packed_seq_params = object()
-
-        class _RecordingCPLayoutState:
-            finalized_hidden_states = None
-
-            def prepare_layer(self, layer_index, hidden_states):
-                assert layer_index == 0
-                assert hidden_states.shape[-1] == 3 * config.hidden_size
-                events.append("cp_prepare")
-                return hidden_states, layer_packed_seq_params
-
-            def get_layer_padding_mask(self, layer_index, default, masks):
-                assert layer_index == 0
-                assert masks is None
-                return default
-
-            def finalize_layer(self, layer_index, hidden_states):
-                assert layer_index == 0
-                events.append("cp_finalize")
-                self.finalized_hidden_states = hidden_states + 1.0
-                return self.finalized_hidden_states
-
-            def get_layer_padding_mask(self, layer_index, default, padding_masks_by_layout):
-                return default
-
-        cp_layout_state = _RecordingCPLayoutState()
-
-        class _RecordingCPLayoutManager:
-            def build_forward_state(
-                self, packed_seq_params, packed_seq_params_by_layout=None, thd_plan=None
-            ):
-                assert packed_seq_params is boundary_packed_seq_params
-                assert packed_seq_params_by_layout is None
-                assert thd_plan is None
-                events.append("cp_build")
-                return cp_layout_state
-
-        stack._cp_layout_manager = _RecordingCPLayoutManager()
         stack.layers[0].event_log = events
 
         replay_inputs = []
@@ -1058,17 +1020,11 @@ class TestResidualStreamRecomputeIntegration:
             packed_seq_params=boundary_packed_seq_params,
         )
 
-        assert events == [
-            "cp_build",
-            "cp_prepare",
-            "mamba_forward",
-            "cp_finalize",
-            "replay_finalize",
-        ]
-        assert stack.layers[0].received_packed_seq_params is layer_packed_seq_params
+        assert events == ["mamba_forward", "replay_finalize"]
+        assert stack.layers[0].received_packed_seq_params is boundary_packed_seq_params
         assert stack.layers[0].received_residual_recompute_context is not None
         assert len(replay_inputs) == 1
-        assert replay_inputs[0] is cp_layout_state.finalized_hidden_states
+        assert replay_inputs[0].shape[-1] == 3 * config.hidden_size
         assert output.shape == hidden_states.shape
 
     def test_hybrid_mtp_stack_stays_ordinary_width_and_skips_residual_replay(self):

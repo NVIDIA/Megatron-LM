@@ -10,7 +10,7 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.context_parallel import ContextParallelBatch
-from megatron.core.context_parallel.module import get_cp_boundary_layout, uses_fixed_cp_layout
+from megatron.core.context_parallel.module import get_cp_boundary_layout
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
@@ -749,7 +749,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
 
-        if uses_fixed_cp_layout(self.config) and cp_batch is not None:
+        if cp_batch is not None:
             if cp_batch.boundary_layout != get_cp_boundary_layout(self.config):
                 raise ValueError("The producer CP boundary layout does not match the model policy")
             cp_batch.prepare_module_layouts()

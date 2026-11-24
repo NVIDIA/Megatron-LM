@@ -23,7 +23,7 @@ import torch
 from gpt_builders import gpt_builder
 from megatron.core import mpu
 from megatron.core.context_parallel import ContextParallelBatch, get_batches_on_this_cp_rank
-from megatron.core.context_parallel.module import get_cp_boundary_layout, uses_fixed_cp_layout
+from megatron.core.context_parallel.module import get_cp_boundary_layout
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
@@ -125,7 +125,7 @@ def get_batch(
             dynamic_cp=cfg.model.transformer.dynamic_context_parallel,
             pg_collection=pg_collection,
             config=cfg.model.transformer,
-            return_context_parallel_batch=uses_fixed_cp_layout(cfg.model.transformer),
+            return_context_parallel_batch=True,
         )
 
     cp_size = cfg.model.transformer.context_parallel_size
@@ -184,59 +184,28 @@ def get_batch(
 
     batch = flatten_batch_for_packed_sequences(batch)
 
-    if uses_fixed_cp_layout(cfg.model.transformer):
-        boundary = get_cp_boundary_layout(cfg.model.transformer)
-        cp_batch = get_batches_on_this_cp_rank(
-            batch,
-            boundary_layout=boundary,
-            dynamic_cp=False,
-            cp_group=get_context_parallel_group(),
-            additional_layouts={
-                cfg.model.transformer.attention_cp_layout,
-                cfg.model.transformer.linear_cp_layout,
-            }
-            - {boundary},
-            use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
-            sequence_parallel=cfg.model.transformer.sequence_parallel,
-            tp_group=mpu.get_tensor_model_parallel_group(),
-            tp_cp_group=(
-                mpu.get_tensor_and_context_parallel_group()
-                if cfg.model.transformer.sequence_parallel
-                else None
-            ),
-            tokens_per_sample=args.seq_length,
-        )
-        return cp_batch.prepare_module_layouts()
-
-    if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
-        assert has_cu_seqlens
-        return (
-            None,
-            batch['cu_seqlens'],
-            batch['cu_seqlens_padded'],
-            None,
-            None,
-            None,
-            None,
-            batch['max_seqlen'],
-            None,
-            None,
-        )
-
-    batch = get_batch_on_this_cp_rank(
+    boundary = get_cp_boundary_layout(cfg.model.transformer)
+    cp_batch = get_batches_on_this_cp_rank(
         batch,
+        boundary_layout=boundary,
         dynamic_cp=False,
         cp_group=get_context_parallel_group(),
+        additional_layouts={
+            cfg.model.transformer.attention_cp_layout,
+            cfg.model.transformer.linear_cp_layout,
+        }
+        - {boundary},
         use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
+        sequence_parallel=cfg.model.transformer.sequence_parallel,
+        tp_group=mpu.get_tensor_model_parallel_group(),
+        tp_cp_group=(
+            mpu.get_tensor_and_context_parallel_group()
+            if cfg.model.transformer.sequence_parallel
+            else None
+        ),
+        tokens_per_sample=args.seq_length,
     )
-
-    # Return values in BATCH_KEYS order so callers can unpack into the fixed
-    # names regardless of any provenance fields wrappers like BlendedDataset
-    # add (e.g. "dataset_id"). The for-loop above already populates every
-    # BATCH_KEYS entry on tp_rank 0; other tp_ranks receive a fresh dict from
-    # get_batch_on_this_tp_rank. BATCH_KEYS is already alphabetical, matching
-    # the historical sorted(batch.keys()) order.
-    return [batch[key] for key in BATCH_KEYS]
+    return cp_batch.prepare_module_layouts()
 
 
 # define spiky loss as a loss that's 10x the max loss observed

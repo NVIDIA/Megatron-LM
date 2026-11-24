@@ -19,6 +19,8 @@ workspace when the explicit deterministic policy (or ``torch.use_deterministic_a
 Each kernel is replayed in that mode, including with Triton's autotune cache enabled.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -49,6 +51,17 @@ except ImportError:
 pytestmark = pytest.mark.skipif(
     not (torch.cuda.is_available() and HAVE_TRITON), reason="needs a GPU and Triton"
 )
+
+
+@pytest.mark.parametrize("backend", ["torch", "transformer_engine"])
+def test_gdn_chunkwise_cp_requires_supported_backend(backend):
+    from megatron.core.ssm.gated_delta_net.gdn import GatedDeltaNet
+
+    module = SimpleNamespace(
+        cp_size=2, config=SimpleNamespace(linear_cp_mode="chunkwise", gdn_kernel_backend=backend)
+    )
+    with pytest.raises(ValueError, match="requires FLA"):
+        GatedDeltaNet._setup_variant_attrs(module)
 
 
 @pytest.fixture(autouse=True)

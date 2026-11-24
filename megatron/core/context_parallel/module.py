@@ -13,14 +13,11 @@ from .layout import CPLayout, THDCPLayoutPlan, convert_cp_partition_mode
 
 
 def get_cp_boundary_layout(config) -> CPLayout:
-    """Resolve a concrete residual-stream layout; None retains the existing auto policy."""
-    mode = getattr(config, "cp_partition_mode", None)
-    return config.linear_cp_layout if mode in (None, "auto") else mode
-
-
-def uses_fixed_cp_layout(config) -> bool:
-    """Whether module boundaries, rather than runs of layers, own conversion."""
-    return getattr(config, "cp_partition_mode", None) in ("zigzag", "contiguous")
+    """Read the residual layout already resolved during configuration."""
+    layout = config.residual_state_layout
+    if layout not in ("contiguous", "zigzag"):
+        raise ValueError("Resolve residual_state_layout before constructing the model")
+    return layout
 
 
 @dataclass(frozen=True)
@@ -124,17 +121,9 @@ def prepare_module_cp_input(
 
     if isinstance(getattr(module, "self_attention", None), IdentityOp):
         return hidden_states, packed_seq_params, None
-    if not (
-        uses_fixed_cp_layout(config)
-        or getattr(module, "_cp_layout_conversion_enabled", False)
-        or getattr(packed_seq_params, "cp_layout_views", None) is not None
-    ):
-        return hidden_states, packed_seq_params, None
     source = getattr(packed_seq_params, "cp_partition_mode", None)
     if source is None:
-        source = getattr(module, "_cp_input_partition_mode", None)
-    if source is None:
-        source = config.cp_partition_mode if uses_fixed_cp_layout(config) else target_layout
+        source = get_cp_boundary_layout(config)
     if source == target_layout:
         return hidden_states, packed_seq_params, None
     groups = module.pg_collection
@@ -204,15 +193,13 @@ def attention_cp_layout(module):
     consumer_layout = getattr(getattr(module, "self_attention", None), "cp_input_layout", None)
     if consumer_layout is not None:
         return consumer_layout
-    if hasattr(module, "_cp_compute_partition_mode"):
-        return module._cp_compute_partition_mode
     config = module.config
     if getattr(config, "experimental_attention_variant", None) in (
         "gdn",
         "gdn2",
         "gated_delta_net",
     ):
-        return config.linear_cp_layout
+        return config.linear_attention_cp_layout
     return getattr(config, "attention_cp_layout", "zigzag")
 
 

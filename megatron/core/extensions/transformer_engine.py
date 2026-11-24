@@ -2380,6 +2380,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 "Please install it with `pip install transformer-engine`."
             )
 
+        if (config.context_parallel_size > 1 or config.dynamic_context_parallel) and (
+            config.attention_cp_layout != "zigzag"
+        ):
+            raise ValueError("TEDotProductAttention CP requires zigzag compute layout")
         self.config = config
         self.te_forward_mask_type = False
         self.qkv_format: str = "sbhd"

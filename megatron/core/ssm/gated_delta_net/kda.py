@@ -282,11 +282,7 @@ class KimiDeltaAttention(_GDNBase):
         inference_params: Optional[BaseInferenceContext] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Run KDA on inputs already arranged in ``config.linear_cp_layout``.
-
-        HybridStack owns layout conversion through ContextParallelLayoutManager,
-        including the packed metadata and output conversion at stack boundaries.
-        """
+        """Run KDA on the compute-branch view selected by the shared CP adapter."""
 
         del attention_mask, sequence_len_offset, kwargs
         inference_context = deprecate_inference_params(inference_context, inference_params)

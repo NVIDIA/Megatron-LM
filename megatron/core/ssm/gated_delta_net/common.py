@@ -164,6 +164,9 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
 
     gated_delta_rule: GatedDeltaRuleInterface
 
+    # A new kernel may override this declaration without relaxing every GDN implementation.
+    supported_cp_layouts = {"headwise": ("zigzag",), "chunkwise": ("contiguous",)}
+
     @classmethod
     def _estimate_flops(
         cls, config: TransformerConfig, total_real_tokens_in_batch: float, *, use_gdn2: bool
@@ -247,6 +250,13 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
         self.cp_size = self.pg_collection.cp.size()
+        if self.cp_size > 1 or config.dynamic_context_parallel:
+            supported = self.supported_cp_layouts[config.linear_cp_mode]
+            if config.linear_attention_cp_layout not in supported:
+                raise ValueError(
+                    f"{type(self).__name__} {config.linear_cp_mode} CP supports {supported}; "
+                    "select a kernel that supports the requested layout instead of overriding it"
+                )
         self.tp_size = self.pg_collection.tp.size()
         self.sp_size = self.tp_size if config.sequence_parallel else 1
 
@@ -409,7 +419,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
     @property
     def cp_input_layout(self):
         """Headwise kernels consume dual chunks; chunkwise kernels consume causal rank order."""
-        return "contiguous" if self.config.linear_cp_mode == "chunkwise" else "zigzag"
+        return self.config.linear_attention_cp_layout
 
     def forward_post_core_attn(
         self, norm_out: torch.Tensor

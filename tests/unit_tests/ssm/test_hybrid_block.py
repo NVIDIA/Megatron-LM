@@ -138,7 +138,7 @@ def test_all_layer_configs_route_to_matching_specs(monkeypatch, layer_pattern, e
     assert [layer.layer_number for layer in block.layers] == expected_layer_numbers
 
 
-def test_cp_layouts_are_selected_by_layer_config_type(monkeypatch):
+def test_layers_keep_residual_layout_and_declare_compute_requirements(monkeypatch):
     """Each layer config type selects the corresponding context-parallel layout."""
 
     class BuiltLayer(torch.nn.Module):
@@ -147,15 +147,12 @@ def test_cp_layouts_are_selected_by_layer_config_type(monkeypatch):
             super().__init__()
             self.config = config
             self.layer_number = layer_number
+            self.cp_input_layout = (
+                config.attention_cp_layout
+                if type(config) in layer_utils.Symbols.ATTENTION_LAYER_CONFIGS
+                else config.linear_attention_cp_layout
+            )
 
-    layout_manager_kwargs = {}
-
-    class CapturingLayoutManager:
-
-        def __init__(self, **kwargs):
-            layout_manager_kwargs.update(kwargs)
-
-    monkeypatch.setattr(hybrid_block_module, "ContextParallelLayoutManager", CapturingLayoutManager)
     monkeypatch.setattr(
         hybrid_block_module,
         "build_module",
@@ -173,7 +170,7 @@ def test_cp_layouts_are_selected_by_layer_config_type(monkeypatch):
         "D+", config
     )
 
-    HybridStack(
+    stack = HybridStack(
         config=config,
         submodules=hybrid_stack_spec.submodules,
         layer_config_list=layer_config_list,
@@ -185,17 +182,8 @@ def test_cp_layouts_are_selected_by_layer_config_type(monkeypatch):
         ),
     )
 
-    assert layout_manager_kwargs["layer_layouts"] == (
-        "contiguous",
-        "contiguous",
-        "contiguous",
-        "zigzag",
-        "contiguous",
-        "contiguous",
-        "zigzag",
-        "zigzag",
-    )
-    assert layout_manager_kwargs["boundary_layout"] == "contiguous"
+    assert stack.required_cp_layouts == {"contiguous", "zigzag"}
+    assert all(layer.config.residual_state_layout == "contiguous" for layer in stack.layers)
 
 
 def test_hybrid_stack_rejects_layer_config_subclasses(monkeypatch):

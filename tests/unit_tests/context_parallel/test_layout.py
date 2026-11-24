@@ -6,10 +6,8 @@ import pytest
 import torch
 import torch.distributed as dist
 
-import megatron.core.context_parallel.layout as context_parallel_layout_module
 from megatron.core import parallel_state
 from megatron.core.context_parallel import (
-    ContextParallelLayoutManager,
     THDCPLayoutPlan,
     build_thd_cp_layout_plan,
     contiguous_to_zigzag,
@@ -22,7 +20,6 @@ from megatron.core.context_parallel.layout import (
     _build_thd_zigzag_metadata,
     _local_segment_ids,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -73,170 +70,6 @@ def _simulate_thd_plan(plans_by_group_rank, inputs_by_group_rank, *, reverse=Fal
             output = received.new_full((plan.zigzag_local_token_count,), -1)
             outputs.append(output.index_copy(0, plan.forward_receive_positions, received))
     return outputs
-
-
-def test_layout_conversion_coalesces_layout_runs(monkeypatch):
-    layer_layouts = ("zigzag", "zigzag", "contiguous", "contiguous", "zigzag")
-    cp_group = SimpleNamespace(size=lambda: 2)
-    tp_group = object()
-    tp_cp_group = object()
-    manager = ContextParallelLayoutManager(
-        layer_layouts=layer_layouts,
-        boundary_layout="contiguous",
-        sequence_parallel=True,
-        cp_group=cp_group,
-        tp_group=tp_group,
-        tp_cp_group=tp_cp_group,
-    )
-    calls = []
-
-    def fake_contiguous_to_zigzag(
-        hidden_states, cp_group, sequence_parallel, tp_group, tp_cp_group, thd_plan
-    ):
-        calls.append(("to_zigzag", cp_group, sequence_parallel, tp_group, tp_cp_group, thd_plan))
-        return hidden_states + 1
-
-    def fake_zigzag_to_contiguous(
-        hidden_states, cp_group, sequence_parallel, tp_group, tp_cp_group, thd_plan
-    ):
-        calls.append(
-            ("to_contiguous", cp_group, sequence_parallel, tp_group, tp_cp_group, thd_plan)
-        )
-        return hidden_states + 2
-
-    monkeypatch.setattr(
-        context_parallel_layout_module, "contiguous_to_zigzag", fake_contiguous_to_zigzag
-    )
-    monkeypatch.setattr(
-        context_parallel_layout_module, "zigzag_to_contiguous", fake_zigzag_to_contiguous
-    )
-
-    hidden_states = torch.zeros(2, 1, 1)
-    thd_plan = object()
-    layout_state = manager.build_forward_state(None)
-    assert layout_state is not None
-    layout_state.thd_plan = thd_plan
-    for layer_index in range(len(layer_layouts)):
-        hidden_states, layer_packed_seq_params = layout_state.prepare_layer(
-            layer_index, hidden_states
-        )
-        assert layer_packed_seq_params is None
-        hidden_states = layout_state.finalize_layer(layer_index, hidden_states)
-
-    assert calls == [
-        ("to_zigzag", cp_group, True, tp_group, tp_cp_group, thd_plan),
-        ("to_contiguous", cp_group, True, tp_group, tp_cp_group, thd_plan),
-        ("to_zigzag", cp_group, True, tp_group, tp_cp_group, thd_plan),
-        ("to_contiguous", cp_group, True, tp_group, tp_cp_group, thd_plan),
-    ]
-    torch.testing.assert_close(hidden_states, torch.full_like(hidden_states, 6))
-
-
-def test_matching_cp_layouts_do_not_convert(monkeypatch):
-    manager = ContextParallelLayoutManager(
-        layer_layouts=("zigzag",),
-        boundary_layout="zigzag",
-        sequence_parallel=False,
-        cp_group=SimpleNamespace(size=lambda: 2),
-        tp_group=object(),
-        tp_cp_group=object(),
-    )
-
-    def fail_conversion(*_args):
-        raise AssertionError("matching layouts must not convert")
-
-    monkeypatch.setattr(context_parallel_layout_module, "contiguous_to_zigzag", fail_conversion)
-    monkeypatch.setattr(context_parallel_layout_module, "zigzag_to_contiguous", fail_conversion)
-
-    hidden_states = torch.zeros(2, 1, 1)
-    assert manager.prepare_layer_input(0, hidden_states) is hidden_states
-    assert manager.finalize_layer_output(0, hidden_states) is hidden_states
-    assert manager.build_forward_state(None) is None
-
-
-@pytest.mark.parametrize("boundary_layout", ["contiguous", "zigzag"])
-@pytest.mark.parametrize("sequence_parallel", [False, True])
-def test_layer_input_ids_are_cached_per_forward(monkeypatch, boundary_layout, sequence_parallel):
-    target_layout = "zigzag" if boundary_layout == "contiguous" else "contiguous"
-    cp_group = SimpleNamespace(size=lambda: 2)
-    tp_group, tp_cp_group, thd_plan = object(), object(), object()
-    manager = ContextParallelLayoutManager(
-        layer_layouts=(target_layout, target_layout, boundary_layout, target_layout),
-        boundary_layout=boundary_layout,
-        sequence_parallel=sequence_parallel,
-        cp_group=cp_group,
-        tp_group=tp_group,
-        tp_cp_group=tp_cp_group,
-    )
-    calls = []
-
-    def fake_convert(input_, source, target, cp, sp, tp, tp_cp, plan):
-        assert (source, target, cp, sp, tp, tp_cp, plan) == (
-            boundary_layout,
-            target_layout,
-            cp_group,
-            sequence_parallel,
-            tp_group,
-            tp_cp_group,
-            thd_plan,
-        )
-        calls.append(input_.clone())
-        return input_.flip(0)
-
-    monkeypatch.setattr(context_parallel_layout_module, "convert_cp_layout", fake_convert)
-    input_ids = torch.arange(8, dtype=torch.int64).reshape(2, 4)
-    state = manager.build_forward_state(None, thd_plan=thd_plan)
-    assert state.get_layer_input_ids(0, None) is None
-    converted_ids = state.get_layer_input_ids(0, input_ids)
-    torch.testing.assert_close(converted_ids, input_ids.flip(1))
-    assert converted_ids.is_contiguous()
-    assert state.get_layer_input_ids(1, input_ids) is converted_ids
-    assert state.get_layer_input_ids(2, input_ids) is input_ids
-    assert state.get_layer_input_ids(3, input_ids) is converted_ids
-    # Checkpoint replay must reuse the conversion even if its inputs were detached.
-    assert state.get_layer_input_ids(0, input_ids.detach()) is converted_ids
-    assert state.get_layer_input_ids(0, None) is None
-    assert len(calls) == 1
-    torch.testing.assert_close(calls[0], input_ids.T)
-
-    next_input_ids = input_ids + 10
-    next_state = manager.build_forward_state(None, thd_plan=thd_plan)
-    torch.testing.assert_close(
-        next_state.get_layer_input_ids(0, next_input_ids), next_input_ids.flip(1)
-    )
-    assert len(calls) == 2
-    torch.testing.assert_close(calls[1], next_input_ids.T)
-
-
-def test_prebuilt_packed_layout_state_is_reused():
-    manager = ContextParallelLayoutManager(
-        layer_layouts=("zigzag",),
-        boundary_layout="contiguous",
-        sequence_parallel=False,
-        cp_group=SimpleNamespace(size=lambda: 2),
-        tp_group=None,
-        tp_cp_group=None,
-    )
-    contiguous_params = PackedSeqParams(qkv_format="thd")
-    zigzag_params = PackedSeqParams(qkv_format="thd")
-    plan = object()
-    packed_seq_params_by_layout = {"contiguous": contiguous_params, "zigzag": zigzag_params}
-
-    state = manager.build_forward_state(
-        contiguous_params, packed_seq_params_by_layout=packed_seq_params_by_layout, thd_plan=plan
-    )
-
-    assert state is not None
-    assert state.thd_plan is plan
-    assert state.contiguous_packed_seq_params is contiguous_params
-    assert state.zigzag_packed_seq_params is zigzag_params
-
-    contiguous_mask = torch.tensor([False, True])
-    zigzag_mask = torch.tensor([True, False])
-    masks_by_layout = {"contiguous": contiguous_mask, "zigzag": zigzag_mask}
-    assert state.get_layer_padding_mask(0, contiguous_mask, masks_by_layout) is zigzag_mask
-    # A middle pipeline stage without masks carries only the boundary layout's view.
-    assert state.get_layer_padding_mask(0, None, {"contiguous": None}) is None
 
 
 @pytest.mark.parametrize(

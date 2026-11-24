@@ -906,7 +906,13 @@ class TestTEWrappers:
 
         cp_group = parallel_state.get_context_parallel_group()
         assert cp_group.size() == 1
-        runtime_cp1 = PackedSeqParams(qkv_format="sbhd", cp_group=cp_group, local_cp_size=1)
+        runtime_cp1 = PackedSeqParams(
+            qkv_format="sbhd",
+            cp_group=cp_group,
+            local_cp_size=1,
+            cp_partition_mode="contiguous",
+            cp_layout_views=None,
+        )
         assert module.cp_group is None
         reference = None
 

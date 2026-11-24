@@ -1,58 +1,56 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Microbatch-local hybrid layout managers and TP x CP groups."""
+"""Microbatch-local CP groups at the computation-branch boundary."""
 
 from types import SimpleNamespace
 
 import pytest
+import torch
 
-from megatron.core.models.hybrid.hybrid_block import HybridStack
+import megatron.core.context_parallel.module as cp_module
 from megatron.core.packed_seq_params import PackedSeqParams
 
 pytestmark = pytest.mark.launch_on_gb200
 
 
-def test_runtime_cp_layout_uses_microbatch_groups_without_mutating_stack():
-    """CP1/2/4 microbatches get independent layout managers and TPxCP groups."""
-
-    class FakeGroup:
+def test_runtime_cp_layout_uses_microbatch_groups_without_mutating_module(monkeypatch):
+    class Group:
         def __init__(self, size):
             self._size = size
 
         def size(self):
             return self._size
 
-    static_cp_group = FakeGroup(1)
-    tp_group = FakeGroup(2)
-    runtime_groups = {size: FakeGroup(size) for size in (1, 2, 4)}
-    runtime_tp_cp_groups = {size: object() for size in (2, 4)}
-
-    stack = SimpleNamespace(
-        cp_group=static_cp_group,
-        tp_group=tp_group,
-        tp_cp_group=None,
-        _cp_layout_manager=None,
-        layer_cp_layouts=("contiguous", "zigzag"),
-        boundary_layout="contiguous",
-        config=SimpleNamespace(sequence_parallel=True),
+    static_cp = Group(1)
+    tp = Group(2)
+    groups = SimpleNamespace(cp=static_cp, tp=tp, tp_cp=None)
+    module = SimpleNamespace(
+        pg_collection=groups,
+        config=SimpleNamespace(
+            residual_state_layout="contiguous", sequence_parallel=True, cuda_graph_impl="none"
+        ),
     )
+    calls = []
 
-    for cp_size in (1, 2, 4, 1):
-        # The batch fetch attaches the runtime TP x CP group next to the runtime CP group.
-        packed_seq_params = PackedSeqParams(
-            local_cp_size=cp_size,
-            cp_group=runtime_groups[cp_size],
-            tp_cp_group=runtime_tp_cp_groups.get(cp_size),
+    def convert(value, **kwargs):
+        calls.append(kwargs)
+        return value
+
+    monkeypatch.setattr(cp_module, "convert_cp_partition_mode", convert)
+    hidden = torch.zeros(4, 1, 2)
+    for size in (1, 2, 4, 1):
+        cp, tp_cp = Group(size), Group(2 * size)
+        params = PackedSeqParams(
+            local_cp_size=size, cp_group=cp, tp_cp_group=tp_cp, cp_partition_mode="contiguous"
         )
-        runtime_group, manager = HybridStack._resolve_runtime_cp_layout(stack, packed_seq_params)
-
-        assert runtime_group is runtime_groups[cp_size]
-        if cp_size == 1:
-            assert manager is None
+        _, _, reverse = cp_module.prepare_module_cp_input(
+            module, hidden, params, target_layout="zigzag"
+        )
+        if size == 1:
+            assert reverse is None
         else:
-            assert manager.cp_group is runtime_groups[cp_size]
-            assert manager.tp_cp_group is runtime_tp_cp_groups[cp_size]
-            assert manager.layer_layouts == stack.layer_cp_layouts
-
-        assert stack.cp_group is static_cp_group
-        assert stack.tp_cp_group is None
+            assert calls[-1]["cp_group"] is cp
+            assert calls[-1]["tp_cp_group"] is tp_cp
+            assert reverse.cp_group is cp
+        assert groups.cp is static_cp and groups.tp_cp is None
+    assert len(calls) == 2

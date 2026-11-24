@@ -106,74 +106,97 @@ It validates conflicts with `use_contiguous_cp`; it does not merely annotate
 the returned tokens. `auto` is a conversion policy, not a physical ordering,
 and is rejected by these tensor and batch APIs.
 
-### Model policies and module boundaries
+### Configuration-time layout resolution
 
-`TransformerConfig.cp_partition_mode` (also `--cp-partition-mode`) selects the
-residual-stream policy. The default `None` retains the existing main behavior;
-`auto` explicitly selects that policy. Hybrid stacks coalesce runs of equal
-consumer layouts. `zigzag` and `contiguous` instead keep a fixed residual layout:
-only the self-attention or mixer branch converts to its consumer layout, then
-converts back **before** BDA, residual writes, and MLP/MoE execution. These policies
-share the same canonical conversion implementation.
+The user-facing controls are:
 
-`linear_cp_layout` and `attention_cp_layout` still describe consumer requirements,
-not the residual policy. For example, chunkwise linear attention still requires
-`linear_cp_layout="contiguous"`. The module adapter receives the actual consumer
-layout selected by the Hybrid layer config, rather than inferring every layer's
-requirements from one model-wide attention-variant flag. The lower-level manager's
-`boundary_mode="fixed"` remains a layer-boundary primitive and is not used to
-implement this attention-only policy.
+| Field / CLI flag | Values | Default resolution |
+| --- | --- | --- |
+| `linear_cp_mode` / `--linear-cp-mode` | `headwise`, `chunkwise` | `headwise`; no `auto` algorithm |
+| `linear_attention_cp_layout` / `--linear-attention-cp-layout` | `auto`, `contiguous`, `zigzag` | Headwise -> zigzag; chunkwise -> contiguous |
+| `attention_cp_layout` / `--attention-cp-layout` | `auto`, `contiguous`, `zigzag` | Zigzag, or contiguous for the configured DSv4 hybrid variant |
+| `residual_state_layout` / `--residual-state-layout` | `auto`, `contiguous`, `zigzag` | The resolved linear layout |
 
-Both pretraining entry points and the Hybrid packing scheduler prepare the
-required batch views. Fixed-layout producers call
-`ContextParallelBatch.prepare_module_layouts()` once after metadata finalization.
-This attaches an acyclic `CPLayoutViews` context: its leaf metadata has no back
-reference, tensors and the plan are reused, and module calls do not copy metadata
-or build routes. Legacy/auto metadata keeps `cp_layout_views=None`. RoPE preparation
-uses the largest physical sequence length among the prepared views.
+All three layout defaults are resolved in `TransformerConfig.__post_init__`,
+before module construction. An explicit concrete value is never overwritten.
+The resulting configuration, including its serialized representation, contains
+concrete layouts. Modules read these values; they do not resolve defaults during
+forward. The selected kernel checks its supported layouts during construction.
 
-Bridge callers that already have packed metadata can call
-`finalize_packed_seq_params` from `megatron.core.context_parallel.module` at batch
-preparation and use its returned metadata. Both physical padding and logical
-boundaries must describe the actual input. Already-sharded zigzag data requiring
-additional padding is rejected: prepare it from the raw batch instead. The old
-`megatron.core.context_parallel_layout` import path provides thin exports, not a
-second route builder. Its old equal-length `ThdCpRoute` constructor is not retained;
-callers migrate to `THDCPLayoutPlan` and the returned target metadata.
+This first-stage rule does not inspect the actual layer pattern or optimize a
+cost model. In particular, an unused linear-layout setting can still determine
+the residual layout of a full-attention-only model. Set `residual_state_layout`
+explicitly when that default is unsuitable. Architecture-aware default selection
+and finer optimization policies are separate work.
 
-Metadata-only Hybrid callers reuse the contiguous leaf when preparing packed
-chunkwise recurrence metadata, even if the residual input is zigzag with different
-physical padding. MTP resolves the source layout from the actual batch or tagged
-metadata, falling back to the model boundary policy. When MTP needs a different
-layout, callers must supply the full `ContextParallelBatch` with token, label and
-mask views; a metadata-only adapter does not provide these tensors.
+`linear_cp_layout` remains an input compatibility alias for
+`linear_attention_cp_layout`; concrete `cp_partition_mode` values alias
+`residual_state_layout`. Conflicting aliases are rejected. The former
+`cp_partition_mode=auto` layer-run policy is rejected rather than silently
+reinterpreted as the new configuration-time default.
 
-Two-stage execution carries its reverse converter with each intermediate result,
-so interleaved calls cannot overwrite one another's layout state. Runtime CP1
-does not convert and requires no route. TP×CP groups are resolved from the same
-runtime metadata as the CP group. Hybrid MTP keeps the existing explicit conversion
-to its rolling layout, including token/mask views and the matching plan. GPT MTP
-currently requires a fixed residual layout matching `attention_cp_layout`; use
-HybridModel for MTP across different layouts.
+### Computation branches own conversion
 
-GDN1's FLA backend supports chunkwise CP with contiguous compute inputs, retaining
-all TP-local heads and passing the same FLA CP context to convolution and recurrence.
-Static SBHD contexts are cached by runtime group and shape; THD recurrence contexts
-are shared through the producer-owned metadata within a microbatch. Chunkwise CP
-currently requires THD or SBHD micro-batch size one, unfused pre-GDR, no independent
-local convolution padding, and eager execution. Torch/TE backends retain headwise CP;
-GDN2 also retains headwise-only CP. This does not claim deterministic FLA replay.
+Residual state, masks and token IDs keep their boundary layout throughout a
+stack. Self-attention/mixer branches convert to their resolved compute layout
+after reading the residual, then restore the boundary before BDA/residual writes.
+The same boundary holds during checkpoint recomputation and Shortcut-MoE
+execution. The stack only composes modules and supplies runtime metadata; it
+does not transpose the entire residual state.
 
-### Explicit boundaries
+The removed `ContextParallelLayoutManager` / `ContextParallelLayoutState`
+layer-run orchestration is replaced by `prepare_module_cp_input` and its
+call-local reverse converter. Two-stage execution carries that converter with
+its intermediate result, so interleaved calls do not overwrite shared state.
 
-- A changed module layout currently requires implicit attention masking, no dense
-  attention bias, and no cross-attention. CP module conversion is training-only.
-- New explicit policies that change layout reject mHC/wide cross-layer residual
-  state and custom layers without a matching adapter. Existing unset-policy paths
-  are retained. Fixed layouts requiring no conversion are unaffected.
-- Module conversion with THD views is not CUDA-graph replayable. SBHD conversion
-  also rejects graphs containing attention/mixer or the full iteration; MLP-only
-  graph scopes leave the SBHD converter outside capture.
-- Auto layout conversion can remain outside layer-local graphs. A THD plan inside
-  a full-iteration graph is rejected because native all-to-all fixes split sizes
-  during capture. Accepting a metadata dataclass does not establish replay support.
+A module whose input and compute layouts already match performs no layout
+conversion. Runtime CP1 likewise requires no communication or route. A kernel
+supporting an alternate native layout can declare and validate that support,
+allowing an explicit compute-layout override without adding another conversion
+backend. Current GDN/KDA implementations require zigzag for headwise and
+contiguous for chunkwise; the existing headwise Mamba path supports either.
+A layout override alone does not add a kernel capability.
+
+### Producer metadata and MTP
+
+GPT/Hybrid pretraining and packing-scheduler producers prepare the requested
+batch views once. `ContextParallelBatch.prepare_module_layouts()` attaches
+acyclic `CPLayoutViews`: leaves have no back reference, tensors and the canonical
+plan are reused, and module calls neither copy metadata nor build routes.
+RoPE preparation covers the largest physical sequence length among the views.
+
+Metadata-only callers can use `finalize_packed_seq_params` at batch preparation
+and must use its return value. Existing stack callers supplying both the
+metadata dictionary and plan are adapted to the same views without rebuilding
+routes. Already-sharded zigzag input whose physical padding metadata is
+insufficient is rejected; prepare that batch from its unsliced input instead.
+
+Chunkwise recurrence metadata is built from the contiguous consumer view, not
+from differently padded residual metadata. CP and TP×CP groups are resolved
+from the same microbatch context; no shared module group is mutated.
+
+Hybrid MTP retains its configured rolling/attention boundary and token/mask
+views. MTP resolves its source from the actual batch or tagged metadata, falling
+back to the concrete residual policy. Cross-layout MTP requires the complete
+`ContextParallelBatch`, including token, label and mask views; metadata-only
+adapters cannot fabricate these tensors. GPT MTP requires matching residual and
+attention layouts when CP is active.
+
+### Kernel and capture boundaries
+
+GDN1 FLA chunkwise CP retains all TP-local heads and shares one CP context between
+convolution and recurrence. Static contexts are cached by runtime group/shape;
+THD contexts are reused within the microbatch. This path requires unfused FLA,
+THD or SBHD batch size one, no independent local convolution padding, and eager
+execution. GDN2 remains headwise-only; torch/TE do not silently replace FLA.
+
+Actual module layout conversion requires implicit attention masking, no dense
+attention bias, and no cross-attention, and is currently training-only.
+THD module views and conversion inside attention/mixer/full CUDA Graph capture
+are not supported. SBHD conversion may remain outside an MLP-only graph.
+No automatic full-iteration capture or bit-exact equivalence between distinct
+token partitions is implied.
+
+The old `megatron.core.context_parallel_layout` import path provides thin
+module/conversion exports. The equal-length `ThdCpRoute` constructor is not
+retained; callers use `THDCPLayoutPlan` and the matching target metadata.

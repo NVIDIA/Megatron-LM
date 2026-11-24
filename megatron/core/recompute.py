@@ -4,7 +4,6 @@ from typing import List, Optional, Set, Tuple, Union
 
 from torch import Tensor
 
-from megatron.core.context_parallel import ContextParallelLayoutState, CPLayout
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.hybrid.layers import utils as hybrid_layer_utils
@@ -28,10 +27,8 @@ def checkpointed_forward(
     packed_seq_params: PackedSeqParams,
     use_inner_quantization_context: bool,
     padding_mask: Optional[Tensor] = None,
-    padding_mask_by_layout: Optional[dict[CPLayout, Optional[Tensor]]] = None,
     extract_layer_indices: Optional[Set[int]] = None,
     layer_offset: int = 0,
-    cp_layout_state: Optional[ContextParallelLayoutState] = None,
     packed_sequence_cp_metadata: object | None = None,
     input_ids: Optional[Tensor] = None,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
@@ -44,7 +41,6 @@ def checkpointed_forward(
         layer_offset (int): The global layer offset for the current
             pipeline stage. Used to convert local layer indices to
             global indices when checking extract_layer_indices.
-        cp_layout_state (ContextParallelLayoutState, optional): CP layout state for this forward.
         packed_sequence_cp_metadata (optional): Packed-sequence CP metadata for Mamba layers.
         input_ids (Tensor, optional): Boundary-layout token IDs for hash-routed MoE
             and custom layers.
@@ -99,17 +95,9 @@ def checkpointed_forward(
                 # function works for both TransformerBlock and HybridStack.
                 layer = self.layers[index]
                 layer_packed_seq_params = packed_seq_params
-                if cp_layout_state is not None:
-                    hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
-                        index, hidden_states
-                    )
-                # Keep both residuals in the layer's layout, inside the CP conversions.
+                # Branch-local conversion leaves the residual and token metadata unchanged.
                 residual_accumulator = hidden_states
                 layer_padding_mask = padding_mask
-                if cp_layout_state is not None:
-                    layer_padding_mask = cp_layout_state.get_layer_padding_mask(
-                        index, padding_mask, padding_mask_by_layout
-                    )
 
                 # Get appropriate inner quantization context
                 if use_inner_quantization_context:
@@ -147,8 +135,6 @@ def checkpointed_forward(
                     is not None
                 )
                 layer_input_ids = input_ids
-                if is_custom_layer and cp_layout_state is not None:
-                    layer_input_ids = cp_layout_state.get_layer_input_ids(index, input_ids)
                 if input_ids is not None and (
                     is_custom_layer or getattr(router, "is_hash_layer", False)
                 ):
@@ -204,8 +190,6 @@ def checkpointed_forward(
                 if isinstance(hidden_states, tuple):
                     hidden_states = hidden_states[0]
                 observe_layer_residuals(layer, residual_accumulator, hidden_states)
-                if cp_layout_state is not None:
-                    hidden_states = cp_layout_state.finalize_layer(index, hidden_states)
             return hidden_states, context
 
         if dsa_index_share_carrier_scope is None:

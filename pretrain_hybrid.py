@@ -23,7 +23,7 @@ import torch
 from hybrid_builders import hybrid_builder
 from megatron.core import mpu
 from megatron.core.context_parallel import ContextParallelBatch, get_batches_on_this_cp_rank
-from megatron.core.context_parallel.module import get_cp_boundary_layout, uses_fixed_cp_layout
+from megatron.core.context_parallel.module import get_cp_boundary_layout
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.enums import ModelType
 from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -200,11 +200,11 @@ def get_batch(
     additional_layouts = set()
     if required_cp_layouts is not None:
         additional_layouts.update(required_cp_layouts)
-    if cp_size > 1:
+    elif cp_size > 1:
         additional_layouts.update(
             (cfg.model.transformer.linear_cp_layout, cfg.model.transformer.attention_cp_layout)
         )
-        additional_layouts.discard(boundary_layout)
+    additional_layouts.discard(boundary_layout)
     cp_batch = get_batches_on_this_cp_rank(
         batch,
         boundary_layout=boundary_layout,
@@ -224,8 +224,7 @@ def get_batch(
         ),
         tokens_per_sample=args.seq_length,
     )
-    if uses_fixed_cp_layout(cfg.model.transformer):
-        cp_batch.prepare_module_layouts()
+    cp_batch.prepare_module_layouts()
     return cp_batch
 
 

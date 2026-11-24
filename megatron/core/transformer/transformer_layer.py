@@ -732,6 +732,11 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
 
         return attention_output_with_bias, self.attn_norm_manager, residual
 
+    @property
+    def cp_input_layout(self):
+        """Compute-branch layout; an MLP-only layer has no attention requirement."""
+        return None if isinstance(self.self_attention, IdentityOp) else attention_cp_layout(self)
+
     def supports_two_stage_attention(self) -> bool:
         """Return whether this is an attention-only layer that supports two-stage execution."""
         return (

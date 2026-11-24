@@ -339,6 +339,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         )
         self.chunkwise_cp_backend = None
         if may_use_chunkwise_context_parallel:
+            if config.linear_attention_cp_layout != "contiguous":
+                raise ValueError("GDP chunkwise CP backends require contiguous compute layout")
             if self.config.gdp_cutedsl_kernel:
                 if not HAVE_CUTEDSL_GDP_CP:
                     raise ImportError(

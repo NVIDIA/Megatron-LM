@@ -2,8 +2,6 @@
 
 from .groups import get_valid_dynamic_context_parallel_group_sizes
 from .layout import (
-    ContextParallelLayoutManager,
-    ContextParallelLayoutState,
     CPLayout,
     CpPartitionMode,
     THDCPLayoutPlan,
@@ -29,8 +27,6 @@ __all__ = [
     "finalize_packed_seq_params",
     "prepare_module_cp_input",
     "ContextParallelBatch",
-    "ContextParallelLayoutManager",
-    "ContextParallelLayoutState",
     "THDCPLayoutPlan",
     "build_thd_cp_layout_plan",
     "contiguous_to_zigzag",

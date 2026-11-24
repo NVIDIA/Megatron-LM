@@ -7,14 +7,15 @@
 
 import warnings
 from contextlib import nullcontext
+from copy import copy
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import Tensor, nn
 
-from megatron.core.context_parallel import ContextParallelLayoutManager, CPLayout, THDCPLayoutPlan
-from megatron.core.context_parallel.module import get_cp_boundary_layout, uses_fixed_cp_layout
+from megatron.core.context_parallel import CPLayout, THDCPLayoutPlan
+from megatron.core.context_parallel.module import attach_cp_layout_views, get_cp_boundary_layout
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
@@ -33,7 +34,7 @@ from megatron.core.models.hybrid.shortcut_block import (
     ShortcutMoEBlock,
     group_layers_into_shortcut_blocks,
 )
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
@@ -163,6 +164,7 @@ class HybridStack(MegatronModule):
             )
             layer_config_list = validate_segment_layers(segment, config)
 
+        assert layer_config_list is not None
         for layer_config in layer_config_list:
             if layer_utils.get_custom_layer_type(layer_config) is None:
                 segment = layer_utils.get_layer_symbol_from_config(layer_config)
@@ -209,45 +211,12 @@ class HybridStack(MegatronModule):
             and layer_config.linear_cp_mode == "chunkwise"
             for layer_config in self.layer_config_list
         )
-        self.layer_cp_layouts = tuple(
-            (
-                layer_config.attention_cp_layout
-                if type(layer_config) in layer_utils.Symbols.ATTENTION_LAYER_CONFIGS
-                else layer_config.linear_cp_layout
-            )
-            for layer_config in self.layer_config_list
-        )
-        module_input_layouts = self.layer_cp_layouts
-        module_compute_layouts = list(self.layer_cp_layouts)
-        if uses_fixed_cp_layout(self.config):
-            if (
-                any(layout != self.boundary_layout for layout in self.layer_cp_layouts)
-                and (self.cp_group.size() > 1 or self.config.dynamic_context_parallel)
-                and (self.config.enable_mhc_connections or self.config.wide_residual is not None)
-            ):
-                raise ValueError(
-                    "Fixed CP conversion with cross-layer residual state is unsupported"
-                )
-            for layer_config, consumer_layout in zip(self.layer_config_list, self.layer_cp_layouts):
-                if (
-                    layer_utils.get_custom_layer_type(layer_config) is not None
-                    and consumer_layout != self.boundary_layout
-                    and (self.cp_group.size() > 1 or self.config.dynamic_context_parallel)
-                ):
-                    raise ValueError("Custom layers need an explicit module CP boundary adapter")
-            module_input_layouts = (self.boundary_layout,) * len(self.layer_cp_layouts)
-            self.layer_cp_layouts = module_input_layouts
-        self._cp_layout_manager = None
-        if self.cp_group.size() > 1:
-            self._cp_layout_manager = ContextParallelLayoutManager(
-                layer_layouts=self.layer_cp_layouts,
-                boundary_layout=self.boundary_layout,
-                sequence_parallel=self.config.sequence_parallel,
-                cp_group=self.cp_group,
-                tp_group=self.tp_group,
-                tp_cp_group=self.tp_cp_group,
-                cuda_graph_impl=self.config.cuda_graph_impl,
-            )
+        # The root residual layout is already resolved; pipeline stages do not infer it.
+        self.layer_config_list = [copy(layer_config) for layer_config in self.layer_config_list]
+        for layer_config in self.layer_config_list:
+            layer_config.residual_state_layout = self.boundary_layout
+            layer_config.cp_partition_mode = self.boundary_layout
+        required_cp_layouts = {self.boundary_layout}
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
         for i, layer_config in enumerate(self.layer_config_list):
@@ -421,30 +390,14 @@ class HybridStack(MegatronModule):
                     "wide-residual layer classes; "
                     f"layer {layer_number} constructed {type(layer).__name__}."
                 )
-            module_compute_layouts[i] = getattr(
-                getattr(layer, "self_attention", None), "cp_input_layout", module_compute_layouts[i]
-            )
-            layer._cp_input_partition_mode = (
-                module_input_layouts[i]
-                if uses_fixed_cp_layout(self.config)
-                else module_compute_layouts[i]
-            )
-            layer._cp_compute_partition_mode = module_compute_layouts[i]
-            layer._cp_layout_conversion_enabled = uses_fixed_cp_layout(self.config)
+            compute_layout = getattr(layer, "cp_input_layout", None)
+            if compute_layout is not None:
+                required_cp_layouts.add(compute_layout)
             if self.config.enable_mhc_connections:
                 layer = HyperConnectionHybridLayer(config=layer_config, layer=layer)
             self.layers.append(layer)
 
-        # Auto and fixed policies must agree on the actual kernel consumer contract.
-        self.required_cp_layouts = frozenset((self.boundary_layout, *module_compute_layouts))
-        if (
-            not uses_fixed_cp_layout(self.config)
-            and tuple(module_compute_layouts) != self.layer_cp_layouts
-        ):
-            self.layer_cp_layouts = tuple(module_compute_layouts)
-            if self._cp_layout_manager is not None:
-                self._cp_layout_manager.layer_layouts = self.layer_cp_layouts
-                self._cp_layout_manager.__post_init__()
+        self.required_cp_layouts = frozenset(required_cp_layouts)
 
         if self.config.cuda_graph_impl == "local":
             annotate_first_last_layer(self.layers)
@@ -548,36 +501,6 @@ class HybridStack(MegatronModule):
             return False
         router = getattr(getattr(inner_layer, "mlp", None), "router", None)
         return bool(getattr(router, "is_hash_layer", False))
-
-    def _resolve_runtime_cp_layout(
-        self, packed_seq_params: PackedSeqParams | None
-    ) -> tuple[torch.distributed.ProcessGroup, ContextParallelLayoutManager | None]:
-        """Resolve the CP group and layout manager for one microbatch."""
-        runtime_cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
-        assert runtime_cp_group is not None, "HybridStack requires a context-parallel group"
-
-        if packed_seq_params is None or packed_seq_params.local_cp_size is None:
-            return runtime_cp_group, self._cp_layout_manager
-
-        if runtime_cp_group.size() == 1:
-            return runtime_cp_group, None
-
-        runtime_tp_cp_group = resolve_tp_cp_group(
-            self.tp_cp_group,
-            packed_seq_params,
-            sequence_parallel=self.config.sequence_parallel,
-            tp_group=self.tp_group,
-        )
-
-        return runtime_cp_group, ContextParallelLayoutManager(
-            layer_layouts=self.layer_cp_layouts,
-            boundary_layout=self.boundary_layout,
-            sequence_parallel=self.config.sequence_parallel,
-            cp_group=runtime_cp_group,
-            tp_group=self.tp_group,
-            tp_cp_group=runtime_tp_cp_group,
-            cuda_graph_impl=self.config.cuda_graph_impl,
-        )
 
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
@@ -685,15 +608,20 @@ class HybridStack(MegatronModule):
         if self._has_custom_layers and (inference_context is not None or InferenceMode.is_active()):
             raise ValueError("Custom hybrid layers do not support inference contexts yet.")
 
-        runtime_cp_group, cp_layout_manager = self._resolve_runtime_cp_layout(packed_seq_params)
+        runtime_cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
+        assert runtime_cp_group is not None, "HybridStack requires a CP group"
 
-        cp_layout_state = None
-        if cp_layout_manager is not None:
-            cp_layout_state = cp_layout_manager.build_forward_state(
-                packed_seq_params,
-                packed_seq_params_by_layout=packed_seq_params_by_layout,
-                thd_plan=cp_layout_plan,
+        if (
+            packed_seq_params is not None
+            and packed_seq_params.cp_layout_views is None
+            and packed_seq_params_by_layout is not None
+            and cp_layout_plan is not None
+        ):
+            # Thin adapter for callers of the existing prebuilt stack-metadata API.
+            packed_seq_params_by_layout = attach_cp_layout_views(
+                packed_seq_params_by_layout, cp_layout_plan
             )
+            packed_seq_params = packed_seq_params_by_layout[self.boundary_layout]
 
         packed_sequence_cp_metadata = None
         if (
@@ -701,13 +629,13 @@ class HybridStack(MegatronModule):
             and runtime_cp_group.size() > 1
             and packed_seq_params is not None
         ):
-            linear_params = packed_seq_params
+            linear_params: PackedSeqParams | None = packed_seq_params
             if packed_seq_params_by_layout is not None:
                 linear_params = packed_seq_params_by_layout["contiguous"]
             elif packed_seq_params.cp_layout_views is not None:
                 # Metadata-only callers still provide the consumer's physical view.
                 linear_params = packed_seq_params.cp_layout_views.contiguous
-            if linear_params.seq_idx is None:
+            if linear_params is None or linear_params.seq_idx is None:
                 raise ValueError("Packed chunkwise CP requires packed_seq_params.seq_idx")
             packed_sequence_cp_metadata = build_packed_sequence_cp_metadata(
                 linear_params.seq_idx,
@@ -813,9 +741,7 @@ class HybridStack(MegatronModule):
                     packed_seq_params=packed_seq_params,
                     padding_mask=padding_mask,
                     input_ids=input_ids,
-                    padding_mask_by_layout=padding_mask_by_layout,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
-                    cp_layout_state=cp_layout_state,
                     packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                 )
             else:
@@ -856,25 +782,15 @@ class HybridStack(MegatronModule):
                             packed_seq_params=layer_packed_seq_params,
                             padding_mask=padding_mask,
                             quant_context_factory=get_inner_quant_context,
-                            cp_layout_state=cp_layout_state,
                             packed_sequence_cp_metadata=layer_cp_metadata,
                             attn_recompute_context=residual_stream_recompute_context,
                             moe_recompute_context=moe_recompute_context,
-                            padding_mask_by_layout=padding_mask_by_layout,
                         )
                         residual_stream_recompute_context = moe_recompute_context
                     else:
-                        if cp_layout_state is not None:
-                            hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
-                                physical_layer_idx, hidden_states
-                            )
-                        # Keep both residuals in the layer's layout, inside the CP conversions.
+                        # Computation branches restore the residual boundary before returning.
                         residual_accumulator = hidden_states
                         layer_padding_mask = padding_mask
-                        if cp_layout_state is not None:
-                            layer_padding_mask = cp_layout_state.get_layer_padding_mask(
-                                physical_layer_idx, padding_mask, padding_mask_by_layout
-                            )
                         # Layers have 1-indexed layer numbers attribute.
                         inner_quant_context = get_inner_quant_context(
                             layer_config, layer.layer_number - 1
@@ -883,10 +799,6 @@ class HybridStack(MegatronModule):
                             layer_utils.get_custom_layer_type(layer_config) is not None
                         )
                         layer_input_ids = input_ids
-                        if is_custom_layer and cp_layout_state is not None:
-                            layer_input_ids = cp_layout_state.get_layer_input_ids(
-                                physical_layer_idx, input_ids
-                            )
                         with inner_quant_context:
                             if is_custom_layer and not isinstance(
                                 layer, HyperConnectionHybridLayer
@@ -963,10 +875,6 @@ class HybridStack(MegatronModule):
                         if isinstance(hidden_states, tuple):
                             hidden_states = hidden_states[0]
                         observe_layer_residuals(layer, residual_accumulator, hidden_states)
-                        if cp_layout_state is not None:
-                            hidden_states = cp_layout_state.finalize_layer(
-                                physical_layer_idx, hidden_states
-                            )
 
                     if residual_stream_recompute_context is not None:
                         residual_stream_recompute_context.finalize(hidden_states)

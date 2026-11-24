@@ -19,6 +19,25 @@ pytestmark = [
 ]
 
 
+def test_dsa_rejects_unsupported_compute_layout_before_building_indexer():
+    from megatron.core.transformer.enums import AttnMaskType
+    from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    config = TransformerConfig(
+        num_layers=1, hidden_size=64, num_attention_heads=4, attention_cp_layout="contiguous"
+    )
+    with pytest.raises(ValueError, match="zigzag compute layout"):
+        DSAttention(
+            config,
+            SimpleNamespace(),
+            1,
+            AttnMaskType.causal,
+            "self",
+            pg_collection=SimpleNamespace(cp=_FakeCPGroup(2, 0)),
+        )
+
+
 class _FakeCPGroup:
     """Provide hashable process-group geometry without distributed communication."""
 

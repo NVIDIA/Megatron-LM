@@ -122,8 +122,7 @@ def _build_stack(
         .to(dtype=config.params_dtype)
     )
     assert model._residual_stream_atomic_layer_pairs == ((0, 1),)
-    if cp_size > 1:
-        assert model._cp_layout_manager is not None
+    assert model.boundary_layout == config.residual_state_layout
     return model
 
 

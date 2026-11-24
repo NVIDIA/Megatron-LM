@@ -6,7 +6,7 @@ import os
 import warnings
 from copy import deepcopy
 from dataclasses import MISSING, dataclass, field, fields
-from typing import Any, Callable, Dict, List, Literal, Optional, Self, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Self, Tuple, Union, cast
 
 import torch
 import torch.nn.functional as F
@@ -1325,17 +1325,20 @@ class TransformerConfig(ModelParallelConfig):
     linear_cp_mode: Literal["headwise", "chunkwise"] = "headwise"
     """Context-parallel algorithm for recurrent and linear-attention layers."""
 
-    linear_cp_layout: CPLayout = "zigzag"
-    """CP layout for linear-attention layers."""
+    linear_attention_cp_layout: Literal["auto", "contiguous", "zigzag"] = "auto"
+    """Linear/recurrent compute layout. Auto resolves from linear_cp_mode during config setup."""
 
-    attention_cp_layout: CPLayout = "zigzag"
-    """CP layout for softmax-attention layers."""
+    attention_cp_layout: Literal["auto", "contiguous", "zigzag"] = "auto"
+    """Attention compute layout. Auto uses the selected attention variant's default."""
 
-    cp_partition_mode: Literal["zigzag", "contiguous", "auto"] | None = None
-    """Residual-stream layout policy. Concrete modes convert only the attention/mixer branch;
-    auto coalesces equal-layout layers. None retains the existing main policy and defaults.
-    Consumer layouts linear_cp_layout and attention_cp_layout remain kernel requirements.
-    """
+    residual_state_layout: Literal["auto", "contiguous", "zigzag"] = "auto"
+    """Residual-stream layout. Auto follows the resolved linear layout, without scanning layers."""
+
+    linear_cp_layout: CPLayout | None = None
+    """Compatibility alias for linear_attention_cp_layout; not an independent setting."""
+
+    cp_partition_mode: CPLayout | None = None
+    """Compatibility alias for a concrete residual_state_layout. Layer-run auto is removed."""
 
     ##################
     # Cuda Graphs
@@ -1883,37 +1886,44 @@ class TransformerConfig(ModelParallelConfig):
         return new_config
 
     def _validate_cp_layouts(self) -> None:
-        """Validate context-parallel layout settings."""
-        if self.cp_partition_mode not in (None, "auto", "zigzag", "contiguous"):
-            raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode!r}")
-        boundary = (
-            self.linear_cp_layout
-            if self.cp_partition_mode in (None, "auto")
-            else self.cp_partition_mode
-        )
-        converts = any(x != boundary for x in (self.linear_cp_layout, self.attention_cp_layout))
-        if self.cp_partition_mode is not None and self.context_parallel_size > 1 and converts:
-            if self.enable_mhc_connections or self.wide_residual is not None:
-                raise ValueError(
-                    "Explicit CP layout conversion with cross-layer residual state is not "
-                    "supported; leave cp_partition_mode unset to retain the existing main path"
-                )
-            if self.sequence_parallel and self.tensor_model_parallel_size % 2:
-                if self.tensor_model_parallel_size > 1:
-                    raise ValueError("Sequence-parallel CP conversion requires even TP size")
-        if self.linear_cp_mode == "chunkwise" and self.linear_cp_layout != "contiguous":
-            raise ValueError("linear_cp_mode='chunkwise' requires linear_cp_layout='contiguous'.")
-        if (
-            self.context_parallel_size > 1
-            and self.attention_cp_layout == "contiguous"
-            and self.experimental_attention_variant != "dsv4_hybrid"
+        """Resolve defaults once, before model construction; preserve explicit compute layouts."""
+        if self.linear_cp_mode not in ("headwise", "chunkwise"):
+            raise ValueError(f"Unsupported linear_cp_mode: {self.linear_cp_mode!r}")
+        for alias, target in (
+            ("linear_cp_layout", "linear_attention_cp_layout"),
+            ("cp_partition_mode", "residual_state_layout"),
         ):
-            raise ValueError(
-                "attention_cp_layout='contiguous' is not yet supported with context parallelism."
-            )
+            value = getattr(self, alias)
+            if value is not None:
+                if value not in ("contiguous", "zigzag"):
+                    raise ValueError(f"{alias} only accepts a concrete layout; use {target}=auto")
+                if getattr(self, target) not in ("auto", value):
+                    raise ValueError(f"Conflicting {alias} and {target}")
+                setattr(self, target, value)
+        defaults = {
+            "linear_attention_cp_layout": (
+                "contiguous" if self.linear_cp_mode == "chunkwise" else "zigzag"
+            ),
+            "attention_cp_layout": (
+                "contiguous" if self.experimental_attention_variant == "dsv4_hybrid" else "zigzag"
+            ),
+        }
+        for name in (*defaults, "residual_state_layout"):
+            value = getattr(self, name)
+            if value == "auto":
+                value = defaults.get(name, self.linear_attention_cp_layout)
+                setattr(self, name, value)
+            elif value not in ("contiguous", "zigzag"):
+                raise ValueError(f"Unsupported {name}: {value!r}")
+        # Normalize aliases too, so serialization/reconstruction retains concrete values.
+        self.linear_cp_layout = cast(CPLayout, self.linear_attention_cp_layout)
+        self.cp_partition_mode = cast(CPLayout, self.residual_state_layout)
         if (
             self.context_parallel_size > 1
-            and self.linear_cp_layout != self.attention_cp_layout
+            and any(
+                layout != self.residual_state_layout
+                for layout in (self.linear_attention_cp_layout, self.attention_cp_layout)
+            )
             and self.sequence_parallel
             and self.tensor_model_parallel_size > 1
             and self.tensor_model_parallel_size % 2 != 0

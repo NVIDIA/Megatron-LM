@@ -596,11 +596,9 @@ class ShortcutMoEBlock(MegatronModule):
         packed_seq_params,
         padding_mask,
         quant_context_factory,
-        cp_layout_state=None,
         packed_sequence_cp_metadata=None,
         attn_recompute_context: ResidualStreamRecomputeContext | None = None,
         moe_recompute_context: ResidualStreamRecomputeContext | None = None,
-        padding_mask_by_layout=None,
     ):
         """Run the eager schedule with each physical layer's quantization context.
 
@@ -613,10 +611,7 @@ class ShortcutMoEBlock(MegatronModule):
         if select_token_dispatcher is not None:
             select_token_dispatcher()
         inference = InferenceMode.is_active()
-        if inference:
-            if cp_layout_state is not None:
-                raise RuntimeError("Shortcut-MoE inference does not support context parallelism.")
-        else:
+        if not inference:
             assert inference_context is None, (
                 "Shortcut-MoE received an inference context outside inference mode; the two-stage "
                 "schedule does not update KV-cache or recurrent inference state."
@@ -651,21 +646,9 @@ class ShortcutMoEBlock(MegatronModule):
 
         attn_config = self.compute_layer.config
         moe_config = self.moe_layer.config
-        if cp_layout_state is not None:
-            assert self.attn_local_idx is not None and self.moe_local_idx is not None
-            hidden_states, packed_seq_params = cp_layout_state.prepare_layer(
-                self.attn_local_idx, hidden_states
-            )
         moe_hidden_states = hidden_states
         moe_packed_seq_params = packed_seq_params
         moe_padding_mask = padding_mask
-        if cp_layout_state is not None:
-            moe_hidden_states, moe_packed_seq_params = cp_layout_state.prepare_layer(
-                self.moe_local_idx, moe_hidden_states
-            )
-            moe_padding_mask = cp_layout_state.get_layer_padding_mask(
-                self.moe_local_idx, padding_mask, padding_mask_by_layout
-            )
 
         # Launch the moe_router
         with quant_context_factory(moe_config, self.moe_layer_idx):
@@ -735,11 +718,6 @@ class ShortcutMoEBlock(MegatronModule):
                 if isinstance(attn_layer_output, tuple):
                     attn_layer_output = attn_layer_output[0]
 
-        if cp_layout_state is not None:
-            attn_layer_output, moe_packed_seq_params = cp_layout_state.prepare_layer(
-                self.moe_local_idx, attn_layer_output
-            )
-
         # launch the moe shared experts and combine attn and moe layer outputs
         with quant_context_factory(moe_config, self.moe_layer_idx):
             shared_expert_output, moe_unflatten_mbs, mlp_residual, mlp_state = (
@@ -764,6 +742,4 @@ class ShortcutMoEBlock(MegatronModule):
                 mlp_state=mlp_state,
                 recompute_context=moe_recompute_context,
             )
-        if cp_layout_state is not None:
-            output = cp_layout_state.finalize_layer(self.moe_local_idx, output)
         return output

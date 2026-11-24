@@ -96,6 +96,11 @@ class MambaLayer(TECudaGraphMambaLayerMixin, GraphableMegatronModule, TwoStageAt
     #: Whether this layer class owns a wide-residual connection around its mixer.
     supports_wide_residual_connections: bool = False
 
+    @property
+    def cp_input_layout(self):
+        """The mixer consumes the compute layout resolved in its configuration."""
+        return self.config.linear_attention_cp_layout
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -255,10 +260,7 @@ class MambaLayer(TECudaGraphMambaLayerMixin, GraphableMegatronModule, TwoStageAt
         )
 
         branch_input, packed_seq_params, cp_reverse = prepare_module_cp_input(
-            self,
-            prepared.branch_input,
-            packed_seq_params,
-            target_layout=self.config.linear_cp_layout,
+            self, prepared.branch_input, packed_seq_params, target_layout=self.cp_input_layout
         )
         ssm_output = self.mixer.forward_pre_attn_and_core_attn(
             branch_input,
@@ -351,7 +353,7 @@ class MambaLayer(TECudaGraphMambaLayerMixin, GraphableMegatronModule, TwoStageAt
                     self,
                     prepared.branch_input,
                     packed_seq_params,
-                    target_layout=self.config.linear_cp_layout,
+                    target_layout=self.cp_input_layout,
                     inference_context=inference_context,
                 )
                 if packed_sequence_cp_metadata is None:
