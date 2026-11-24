@@ -11,11 +11,12 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
-from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.te_recipe import get_quantization_disabled_context
+from megatron.core.quantization.utils import is_quantization_enabled
 from megatron.core.ssm.gated_delta_net.common import (
     HAVE_FLA,
     GatedDeltaNetSubmodules,
@@ -262,7 +263,7 @@ class KimiDeltaAttention(_GDNBase):
         BF16 with no FP8 scales), so the actor must match to keep actor<->rollout
         pearson sharp under FP8 hybrid training."""
         if self.config.kda_disable_fp8:
-            with get_fp8_disabled_context(self.config):
+            with get_quantization_disabled_context(self.config):
                 return proj(x)
         return proj(x)
 
@@ -407,7 +408,7 @@ class KimiDeltaAttention(_GDNBase):
                     chunkwise_cp_context,
                 )
 
-            if self.config.fp8 or self.config.fp4:
+            if is_quantization_enabled(self.config):
                 from megatron.core.extensions.transformer_engine import te_checkpoint
 
                 out, out_bias = te_checkpoint(

@@ -32,6 +32,21 @@ def is_custom_recipe_selected(config: Any) -> bool:
     return False
 
 
+def disable_quantization(config: Any) -> None:
+    """Turn off every global quantization mode on ``config`` in place.
+
+    Clears FP8, FP4 and the TE custom recipe, including the deprecated
+    ``--fp8-recipe custom`` / ``--fp4-recipe custom`` quantizer factories, so that
+    :func:`is_quantization_enabled` and :func:`is_custom_recipe_selected` both return False.
+    Callers that need the original config must pass a copy.
+    """
+    config.fp8 = None
+    config.fp4 = None
+    config.custom_recipe = None
+    config.fp8_quantizer_factory = None
+    config.fp4_quantizer_factory = None
+
+
 def get_quant_config_or_none(
     module_path: Optional[str], recipe: Optional[RecipeConfig] = None
 ) -> Union[QuantizationConfig, None]:

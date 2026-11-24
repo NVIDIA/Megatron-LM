@@ -166,14 +166,17 @@ class TestMultimodalProjector:
 
         projector = MultimodalProjector.__new__(MultimodalProjector)
         torch.nn.Module.__init__(projector)
-        projector.config = SimpleNamespace(fp8="e4m3", fp8_recipe="mxfp8", gtp_weight_remat_size=2)
+        projector.config = SimpleNamespace(
+            fp8="e4m3", fp8_recipe="mxfp8", custom_recipe=None, gtp_weight_remat_size=2
+        )
         projector.encoder = RecordingEncoder()
         monkeypatch.setattr(
-            "megatron.core.models.vision.multimodal_projector.get_fp8_context",
-            lambda config: nullcontext(),
+            "megatron.core.models.vision.multimodal_projector.get_quantization_context",
+            lambda config, layer_no=-1, is_init=False: nullcontext(),
         )
         monkeypatch.setattr(
-            "megatron.core.models.vision.multimodal_projector.get_fp8_align_size", lambda recipe: 32
+            "megatron.core.models.vision.multimodal_projector.get_quantization_alignment",
+            lambda config: 32,
         )
 
         output = projector(torch.empty(0, 16))

@@ -33,7 +33,7 @@ from megatron.core.process_groups_config import (
     warn_global_process_group_fallback,
 )
 from megatron.core.quantization.te_recipe import get_quantization_context
-from megatron.core.quantization.utils import is_quantization_enabled
+from megatron.core.quantization.utils import disable_quantization, is_quantization_enabled
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
@@ -1566,8 +1566,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         """
         if config.keep_mtp_in_bf16:
             config = deepcopy(config)
-            config.fp4 = None
-            config.fp8 = None
+            disable_quantization(config)
         super().__init__(config=config)
         if mamba_submodules is not None:
             if hybrid_submodules is not None:
@@ -1732,8 +1731,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 layer_config.mtp_num_layers = self.config.mtp_num_layers
                 layer_config.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
                 if self.config.keep_mtp_in_bf16:
-                    layer_config.fp4 = None
-                    layer_config.fp8 = None
+                    disable_quantization(layer_config)
             stack_config = self.config
             if self.config.moe_shortcut_disable_mtp:
                 # The stack groups its layers from its own config, and each layer reads its
@@ -2792,12 +2790,7 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         def build_layer_legacy(layer_spec, layer_number):
             """Build layer using legacy spec-based approach."""
-            if self.config.fp8:
-                quant_init_context = get_fp8_context(self.config, is_init=True)
-            elif self.config.fp4:
-                quant_init_context = get_fp4_context(self.config, is_init=True)
-            else:
-                quant_init_context = nullcontext()
+            quant_init_context = get_quantization_context(self.config, is_init=True)
             with quant_init_context:
                 module = build_module(
                     layer_spec,
@@ -2814,12 +2807,7 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         def build_hybrid_layer(layer_spec, layer_number):
             """Build a hybrid MTP layer from the canonical config list."""
-            if self.config.fp8:
-                quant_init_context = get_fp8_context(self.config, is_init=True)
-            elif self.config.fp4:
-                quant_init_context = get_fp4_context(self.config, is_init=True)
-            else:
-                quant_init_context = nullcontext()
+            quant_init_context = get_quantization_context(self.config, is_init=True)
             with quant_init_context:
                 module = build_module(
                     layer_spec,

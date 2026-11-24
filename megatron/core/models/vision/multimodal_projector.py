@@ -1,10 +1,14 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
 
-from megatron.core.fp8_utils import get_fp8_align_size, get_fp8_context
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.te_recipe import (
+    get_quantization_alignment,
+    get_quantization_context,
+)
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -43,8 +47,7 @@ class MultimodalProjector(MegatronModule):
 
         assert submodules is not None, "MLPSubmodules must be provided"
 
-        fp8_init_context = get_fp8_context(config, 0, is_init=True)
-        with fp8_init_context:
+        with self._quantization_context(layer_no=0, is_init=True):
             if self.projector_type == "mlp":
                 self.encoder = MLP(
                     config=config,
@@ -70,6 +73,16 @@ class MultimodalProjector(MegatronModule):
             else:
                 raise Exception(f"Unsupported multimodal projection type {self.projector_type}")
 
+    def _is_quantized(self) -> bool:
+        # The projector has always run in BF16 under --fp4; keep that, and quantize it under
+        # --fp8 or --custom-recipe so moving to --custom-recipe keeps the projector precision.
+        return bool(self.config.fp8) or self.config.custom_recipe is not None
+
+    def _quantization_context(self, layer_no: int = -1, is_init: bool = False):
+        if not self._is_quantized():
+            return nullcontext()
+        return get_quantization_context(self.config, layer_no, is_init=is_init)
+
     def forward(self, hidden_states):
         """Run multimodal projector.
 
@@ -81,8 +94,8 @@ class MultimodalProjector(MegatronModule):
         """
         original_shape = hidden_states.shape
         padding = 0
-        if self.config.fp8:
-            alignment = get_fp8_align_size(self.config.fp8_recipe)
+        if self._is_quantized():
+            alignment = get_quantization_alignment(self.config)
             num_tokens = hidden_states.numel() // hidden_states.shape[-1]
             padding = (
                 alignment
@@ -96,8 +109,7 @@ class MultimodalProjector(MegatronModule):
                     dim=0,
                 )
 
-        fp8_context = get_fp8_context(self.config)
-        with fp8_context:
+        with self._quantization_context():
             # Run encoder.
             encoder_output, encoder_output_bias = apply_module(self.encoder)(hidden_states)
 

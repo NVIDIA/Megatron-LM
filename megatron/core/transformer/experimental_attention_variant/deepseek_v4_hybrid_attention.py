@@ -22,6 +22,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.utils import is_quantization_enabled
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa import (
@@ -1109,7 +1110,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             return query, key, value, boundary_kv
 
         if self.recompute_up_proj:
-            quantization = self.config.fp8 or self.config.fp4
+            quantization = is_quantization_enabled(self.config)
             self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=quantization)
             if boundary_kv_compressed is None:
                 query, key, value = self.qkv_up_checkpoint.checkpoint(

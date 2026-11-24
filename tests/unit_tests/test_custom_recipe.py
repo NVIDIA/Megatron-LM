@@ -733,3 +733,141 @@ def test_disabled_quantization_init_restores_parameter_storage(precision, compat
         with disable(config, is_init=True):
             assert not FP8GlobalStateManager.with_fp8_parameters()
         assert FP8GlobalStateManager.with_fp8_parameters()
+
+
+@pytest.mark.parametrize(
+    "config_kwargs",
+    [
+        pytest.param({"fp8": "e4m3", "fp8_recipe": "tensorwise"}, id="fp8"),
+        pytest.param({"fp4": "e2m1", "fp4_recipe": "nvfp4"}, id="fp4"),
+        *CUSTOM_RECIPE_SPELLINGS,
+    ],
+)
+def test_disable_quantization_clears_every_mode(config_kwargs):
+    from megatron.core.quantization.utils import (
+        disable_quantization,
+        is_custom_recipe_selected,
+        is_quantization_enabled,
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        warnings.simplefilter("ignore", DeprecationWarning)
+        config = TransformerConfig(
+            num_layers=1, hidden_size=128, num_attention_heads=4, **config_kwargs
+        )
+    assert is_quantization_enabled(config)
+
+    disable_quantization(config)
+
+    assert not is_quantization_enabled(config)
+    assert not is_custom_recipe_selected(config)
+    assert config.fp8_quantizer_factory is None
+    assert config.fp4_quantizer_factory is None
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("keep_mtp_in_bf16", [False, True], ids=["quantized-mtp", "bf16-mtp"])
+@pytest.mark.parametrize(
+    "quant_kwargs",
+    [
+        pytest.param({"fp8": "e4m3", "fp8_recipe": "tensorwise"}, id="fp8"),
+        pytest.param({"custom_recipe": TEST_FACTORY_PATH}, id="custom"),
+    ],
+)
+def test_mtp_block_builds_under_quantization_and_honors_keep_mtp_in_bf16(
+    quant_kwargs, keep_mtp_in_bf16
+):
+    """MTP layers build under every quantization mode, and --keep-mtp-in-bf16 clears them all."""
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.quantization.utils import is_quantization_enabled
+    from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock
+
+    _skip_unless_fp8_available()
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            num_layers=2,
+            mtp_num_layers=1,
+            hidden_size=128,
+            ffn_hidden_size=256,
+            num_attention_heads=4,
+            params_dtype=torch.bfloat16,
+            keep_mtp_in_bf16=keep_mtp_in_bf16,
+            **quant_kwargs,
+        )
+        spec = get_gpt_mtp_block_spec(
+            config=config,
+            spec=get_gpt_layer_with_transformer_engine_spec(),
+            use_transformer_engine=True,
+        )
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            name="mtp",
+        )
+
+        # The block keeps the global config; every MTP layer below it owns the effective one.
+        assert is_quantization_enabled(mtp.config)
+        layer_configs = {
+            name: module.config
+            for name, module in mtp.named_modules()
+            if module is not mtp and getattr(module, "config", None) is not None
+        }
+        assert layer_configs
+        mismatched = sorted(
+            name
+            for name, layer_config in layer_configs.items()
+            if is_quantization_enabled(layer_config) is keep_mtp_in_bf16
+        )
+        assert not mismatched, mismatched
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_multimodal_projector_runs_under_custom_recipe():
+    """Moving from --fp8 to --custom-recipe must keep the projector quantized."""
+    from megatron.core.models.vision.multimodal_projector import MultimodalProjector
+    from megatron.core.transformer.mlp import MLPSubmodules
+
+    _skip_unless_fp8_available()
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            params_dtype=torch.bfloat16,
+            custom_recipe=TEST_FACTORY_PATH,
+        )
+        projector = MultimodalProjector(
+            config=config,
+            submodules=MLPSubmodules(
+                linear_fc1=te_extension.TEColumnParallelLinear,
+                linear_fc2=te_extension.TERowParallelLinear,
+            ),
+            projector_type="mlp",
+            input_size=64,
+        ).cuda()
+        # A token count that is not a multiple of the recipe alignment exercises padding.
+        hidden_states = torch.randn(
+            5, 3, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+
+        RECORDED_ROLES.clear()
+        output = projector(hidden_states)
+        output.float().square().mean().backward()
+
+        assert RECORDED_ROLES, "the projector linears did not run under the custom recipe"
+        assert output.shape == (5, 3, config.hidden_size)
+        assert torch.isfinite(output).all()
+        assert torch.isfinite(hidden_states.grad).all()
+    finally:
+        Utils.destroy_model_parallel()
