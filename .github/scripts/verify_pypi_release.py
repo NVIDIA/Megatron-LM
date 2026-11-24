@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Verify an uploaded release against its build artifacts and signed provenance."""
 
@@ -112,7 +112,9 @@ def main() -> None:
     index = INDEXES[args.index]
     check_release(fetch_json(f'{index}/pypi/{args.package}/{version}/json'), files)
     verify_attestations(index, args.package, version, args.dist_dir, files)
-    print(f'Verified {len(files)} distributions for {args.package}=={version} on {args.index}')
+    sys.stdout.write(
+        f'Verified {len(files)} distributions for {args.package}=={version} on {args.index}\n'
+    )
     if output := os.environ.get('GITHUB_OUTPUT'):
         with open(output, 'a', encoding='utf-8') as stream:
             stream.write(f'version={version}\n')
