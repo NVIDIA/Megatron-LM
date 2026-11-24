@@ -4146,8 +4146,19 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("MOK does not support moe_apply_probs_on_input")
             if self.glu_linear_offset != 0.0:
                 raise ValueError("MOK requires glu_linear_offset=0.0")
-            if self.activation_func_tanh_clamp_scale is not None:
-                raise ValueError("MOK does not support activation_func_tanh_clamp_scale")
+            # Gated silu with both tanh clamp scales is SiTU-GLU, the function situlu computes;
+            # MOK runs it with situ_beta=(scale, scale_linear). MOK always clamps the up half.
+            if self.activation_func_tanh_clamp_scale is not None and (
+                not self.gated_linear_unit
+                or self.activation_func is not F.silu
+                or self.activation_func_tanh_clamp_scale_linear is None
+                or self.activation_func_clamp_value is not None
+            ):
+                raise ValueError(
+                    "MOK supports activation_func_tanh_clamp_scale only as SiTU-GLU: gated silu "
+                    "with activation_func_tanh_clamp_scale_linear set and no "
+                    "activation_func_clamp_value"
+                )
             mok_bf16 = (
                 self.bf16
                 and not self.fp16
