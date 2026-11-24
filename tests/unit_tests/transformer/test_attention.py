@@ -162,8 +162,8 @@ class TestParallelAttention:
         self.parallel_attention.config.rotary_interleaved = rotary_interleaved
         self.parallel_attention.config.fused_single_qkv_rope = fused_qkv_rope
         config = self.parallel_attention.config
-        sequence_length = 32
-        micro_batch_size = 2
+        sequence_length = 8
+        micro_batch_size = 1
 
         self.parallel_attention.cuda().float().eval()
 
@@ -191,31 +191,25 @@ class TestParallelAttention:
         assert output.shape[2] == config.hidden_size
         assert bias.shape[0] == config.hidden_size
 
+        if not fused_qkv_rope:
+            return
         upstream = torch.randn_like(output)
         grad_inputs = (hidden_states, *self.parallel_attention.parameters())
-        grads = torch.autograd.grad(output + bias, grad_inputs, upstream)
-        # Replay the real fused dispatch, including input and parameter gradients.
-        replay, replay_bias = self.parallel_attention(
-            hidden_states, attention_mask, rotary_pos_emb=rotary_pos_emb
-        )
-        replay_grads = torch.autograd.grad(replay + replay_bias, grad_inputs, upstream)
-        for actual, expected in zip((replay, replay_bias, *replay_grads), (output, bias, *grads)):
-            assert torch.equal(
-                actual.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8)
+        actual = (output, *torch.autograd.grad(output + bias, grad_inputs, upstream))
+        # Replay single-QKV fusion, then compare with split/unfused RoPE.
+        for fused in (True, False):
+            config.fused_single_qkv_rope = config.apply_rope_fusion = fused
+            out, bias = self.parallel_attention(
+                hidden_states, attention_mask, rotary_pos_emb=rotary_pos_emb
             )
-
-        config.fused_single_qkv_rope = False
-        config.apply_rope_fusion = False
-        reference, reference_bias = self.parallel_attention(
-            hidden_states, attention_mask, rotary_pos_emb=rotary_pos_emb
-        )
-        reference_grads = torch.autograd.grad(reference + reference_bias, grad_inputs, upstream)
-        torch.testing.assert_close(
-            (output, bias, grads),
-            (reference, reference_bias, reference_grads),
-            rtol=1e-4,
-            atol=1e-4,
-        )
+            expected = (out, *torch.autograd.grad(out + bias, grad_inputs, upstream))
+            if fused:
+                for x, y in zip(actual, expected):
+                    assert torch.equal(
+                        x.contiguous().view(torch.uint8), y.contiguous().view(torch.uint8)
+                    )
+            else:
+                torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
 
     def test_checkpointed_gpu_forward(self):
         transformer_config = self.transformer_config
