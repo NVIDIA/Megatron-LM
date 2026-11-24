@@ -4676,5 +4676,4 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         match = ctx._compute_prefix_match(r, bs * 3)
         assert match.matched_block_ids == []
         assert match.backed_off_blocks == 1
-        assert match.mtp_backoff_reason == "carry"
         assert match.prefix_skip_tokens == 0

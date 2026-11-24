@@ -27,7 +27,6 @@ class TurnStats:
     kv_matched: List[int] = field(default_factory=list)  # per chunk, before the MTP trim
     inherited: List[int] = field(default_factory=list)  # per chunk, after the MTP trim
     backed_off: List[int] = field(default_factory=list)
-    reasons: List[str] = field(default_factory=list)
     skipped_tokens: int = 0
     registered_blocks: int = 0  # complete prompt blocks findable by hash after the turn
 
@@ -72,7 +71,6 @@ class TestMtpMultiTurnPrefixReuse(PrefixCachingTestBase):
             stats.kv_matched.append(len(kv_matched))
             stats.inherited.append(len(match.matched_block_ids))
             stats.backed_off.append(match.backed_off_blocks)
-            stats.reasons.append(match.mtp_backoff_reason)
             stats.skipped_tokens += match.prefix_skip_tokens
             if i < len(chunks) - 1:
                 req.finished_chunk_token_count += n
@@ -116,7 +114,7 @@ class TestMtpMultiTurnPrefixReuse(PrefixCachingTestBase):
         for t, (a, b) in enumerate(zip(on, off)):
             print(
                 f"turn {t}: mtp inherited {a.inherited} (kv {a.kv_matched}, backed off "
-                f"{a.backed_off} {a.reasons}, skipped {a.skipped_tokens}, registered "
+                f"{a.backed_off}, skipped {a.skipped_tokens}, registered "
                 f"{a.registered_blocks}) | no-mtp inherited {b.inherited} (skipped "
                 f"{b.skipped_tokens}, registered {b.registered_blocks})"
             )
@@ -138,10 +136,15 @@ class TestMtpMultiTurnPrefixReuse(PrefixCachingTestBase):
         never paired (-1). Turn 1 must decline that block, but turn 1's own later blocks must
         still be registered so turn 2 reuses them."""
         on, off = self._compare([5 * self.BS, 2 * self.BS + 11, 3 * self.BS + 5])
-        assert on[1].backed_off == [1] and on[1].reasons == ["unwritten"]
-        # Turn 2 must reuse everything turn 1 registered, apart from the one declined block.
+        # Turn 1 finds all of turn 0's blocks by hash but declines exactly the last one.
+        assert on[1].kv_matched == off[1].kv_matched == [5]
+        assert on[1].inherited == [4] and on[1].backed_off == [1]
+        # Turn 1 still registers its whole prompt, including its own copy of the declined block,
+        # so turn 2 reuses everything turn 1 registered, exactly as without MTP.
         assert on[1].registered_blocks == off[1].registered_blocks
-        assert sum(on[2].inherited) >= sum(off[2].inherited) - 1
+        assert on[2].kv_matched == off[2].kv_matched
+        assert sum(on[2].inherited) == sum(off[2].inherited)
+        assert sum(on[2].backed_off) == 0
 
     @pytest.mark.internal
     def test_continuation_chunk_does_not_privatize_the_rest_of_the_prompt(self):
@@ -263,18 +266,30 @@ class TestMtpDeclinedBlockReplacementInvariants(PrefixCachingTestBase):
         if stale_checks:
             # Both availability checks see the declined block cached before either is admitted.
             assert all(all(ctx.check_availability(r)) for r in reqs)
+        declined_index = len(base) // self.BS - 1
+        first_row = None
         for req in reqs:
             if not stale_checks:
                 assert all(ctx.check_availability(req))
             ctx.add_request(req)
+            if first_row is None:
+                first_row = ctx.total_request_count - 1
             self._check_forest(ctx, reqs)
+            # Only the first admission may replace the declined block: the hash must resolve to
+            # the first request's own copy after every admission, so the second never evicts it.
+            first_copy = alloc.registry.kv_hash_to_block_id.get(declined_hash)
+            assert (
+                first_copy is not None
+            ), "the first request's copy of the block was not registered"
+            assert int(ctx.request_to_kv_block_ids[first_row][declined_index]) == first_copy
+            assert int(alloc.pc_state.block_ref_counts[first_copy]) >= 1
 
-        # Only the first admission may replace the declined block; the second must never evict
-        # the copy the first request now holds.
-        assert ctx.mtp_prefix_replaced_blocks == 1
-        first_copy = alloc.registry.kv_hash_to_block_id.get(declined_hash)
-        assert first_copy is not None, "the first request's copy of the block was not registered"
-        assert int(alloc.pc_state.block_ref_counts[first_copy]) >= 1
+        # The replacement lets the first request register every complete prompt block it has,
+        # so a later turn extending it can reuse the whole prompt.
+        n = len(reqs[0].prompt_tokens) // self.BS
+        assert all(
+            h in alloc.registry.kv_hash_to_block_id for h in reqs[0].precomputed_block_hashes[:n]
+        )
 
         # Release both and peel the whole cached forest: `evict_lru_blocks` asserts the parent
         # graph is a forest, so a dangling or cyclic chain would fail here.
