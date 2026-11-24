@@ -554,11 +554,10 @@ class FsdpParameterGroup:
             buffers = unsharded_model_weight.planes_for(rowwise=rowwise, columnwise=columnwise)
         with self._symmetric_memory_context():
             for buffer in buffers:
-                # CUDA Storage.resize_ reallocates even at the same size. Keep an
-                # already allocated buffer's address stable for captured compute.
-                # Ordinary reshard frees this storage; graph retention clears only
-                # readiness. Both paths still refresh its contents below.
-                if not buffer.is_allocated:
+                # CUDA Storage.resize_ can move an allocation at the same size.
+                # Skip the resize only for retained graph buffers. Their contents
+                # still refresh below, and eager follows its usual allocation path.
+                if not self._retain_unsharded_storage or not buffer.is_allocated:
                     buffer.reallocate_storage()
 
         # This buffer backs unsharded Parameters whose views may be saved by autograd.
