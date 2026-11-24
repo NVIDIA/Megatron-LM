@@ -62,7 +62,7 @@ def process_group_collection(distributed_setup):
     destroy_model_parallel()
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] < 10,
     reason="MXFP8 requires Blackwell-or-newer CUDA hardware.",
@@ -109,7 +109,7 @@ def test_mxfp8_parameters(process_group_collection):
     assert any(isinstance(p, MXFP8Tensor) for p in parameters)
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] < 10,
     reason="MXFP8 requires Blackwell-or-newer CUDA hardware.",

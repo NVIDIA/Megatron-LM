@@ -32,7 +32,7 @@ permissions:
 
 env:
   container-registry: 766267172432.dkr.ecr.us-east-1.amazonaws.com
-  container-registry-gb200: 766267172432.dkr.ecr.us-east-2.amazonaws.com
+  container-registry-gb300: 766267172432.dkr.ecr.us-east-2.amazonaws.com
   # GAR path includes the repository; the reusable workflow appends the image name.
   container-registry-gcp-h100: asia-southeast1-docker.pkg.dev/nv-nemoautomati-20260505210812/megatron-lm
   # Repository variable: aws (default), gcp, or 50-50. Applied only to
@@ -56,7 +56,7 @@ jobs:
       is_external_contributor: ${{ github.event.pull_request.user.type == 'User' }}
       is_maintainer: ${{ steps.check-membership.outputs.is_maintainer }}
       selected_runner: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-aws-gpu-x8' || needs.ephemeral-runner-routing.outputs.runner_label_base }}
-      selected_runner_gb200: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-aws-use2-gpu-x4' || 'ubuntu-latest' }}
+      selected_runner_gb300: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-aws-use2-gpu-x4' || 'ubuntu-latest' }}
     permissions:
       issues: write
       pull-requests: write
@@ -311,7 +311,7 @@ jobs:
             FORCE_RUN_ALL=true
           fi
 
-          # Keep the existing functional-test selection for GB200 unchanged.
+          # Keep the existing functional-test selection for GB300 unchanged.
           RUN_FUNCTIONAL=false
           if [ "$HAS_RUN_TESTS" == "true" ] \
             || [ "$HAS_RUN_FUNCTIONAL" == "true" ] \
@@ -323,7 +323,7 @@ jobs:
           fi
 
           # H100 functional tests now run on PRs as well. Keep this separate
-          # from RUN_FUNCTIONAL so GB200 test selection remains unchanged.
+          # from RUN_FUNCTIONAL so GB300 test selection remains unchanged.
           RUN_H100_FUNCTIONAL=$RUN_FUNCTIONAL
           if [ "$IS_PR" == "true" ]; then
             RUN_H100_FUNCTIONAL=true
@@ -730,10 +730,10 @@ jobs:
         run: |
           BASE_REF="${BASE_REF#refs/heads/}"
           git fetch origin "$BASE_REF"
-          # Pure renames (-M100%) carry no new values and are skipped; a renamed and
-          # edited file shows up as an addition and is checked.
+          # Exact renames and copies carry no new values and are skipped.
+          # Renamed/copied files with edits are still checked as additions.
           mapfile -t GOLDEN_VALUES_FILES < <(
-            git diff --name-only --diff-filter=ACM -M100% \
+            git diff --name-only --diff-filter=AM -M100% -C100% --find-copies-harder \
               --merge-base "origin/$BASE_REF" -- \
               ':(glob)tests/functional_tests/test_cases/**/golden_values*.json'
           )
@@ -989,7 +989,7 @@ jobs:
     with:
       is-maintainer: ${{ needs.is-not-external-contributor.outputs.is_maintainer == 'true' }}
       selected-runner: ${{ needs.configure.outputs.h100_build_runner }}
-      selected-runner-gb200: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
+      selected-runner-gb300: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb300 }}
       registry-gcp-h100: asia-southeast1-docker.pkg.dev/nv-nemoautomati-20260505210812/megatron-lm
       use-gcp-h100: ${{ needs.configure.outputs.h100_use_gcp == 'true' }}
       source-sha: ${{ needs.configure.outputs.sha }}
@@ -1068,11 +1068,11 @@ jobs:
       unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
       unit_testmon_checkout_artifact_id: ${{ needs.configure.outputs.unit_testmon_checkout_artifact_id }}
 
-  cicd-parse-unit-tests-gb200:
+  cicd-parse-unit-tests-gb300:
     runs-on: ubuntu-latest
     outputs:
-      unit-tests-gb200: ${{ steps.parse-unit-tests.outputs.unit-tests-gb200 }}
-      container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
+      unit-tests-gb300: ${{ steps.parse-unit-tests.outputs.unit-tests-gb300 }}
+      container-image: ${{ env.container-registry-gb300 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
     needs:
       - is-not-external-contributor
       - pre-flight
@@ -1085,7 +1085,7 @@ jobs:
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
       && needs.is-not-external-contributor.outputs.is_maintainer == 'true'
-      && vars.ENABLE_GB200_TESTING == 'true'
+      && (vars.ENABLE_GB300_TESTING || vars.ENABLE_GB200_TESTING) == 'true'
       && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
@@ -1107,27 +1107,27 @@ jobs:
       - name: Parse unit tests
         id: parse-unit-tests
         run: |
-          cat tests/test_utils/recipes/gb200/unit-tests.yaml | yq -o json '[.products[] | select(.testmon != false) | .test_case[] | { "bucket": .}] + [.products[] | select(.testmon == false) | .test_case[] | { "bucket": ., "mode": "testmon-disabled"}] | sort_by(.model, .test_case)' | jq -c > unit-tests-gb200.json
-          echo "unit-tests-gb200=$(cat unit-tests-gb200.json)" | tee -a $GITHUB_OUTPUT
+          cat tests/test_utils/recipes/gb300/unit-tests.yaml | yq -o json '[.products[] | select(.testmon != false) | .test_case[] | { "bucket": .}] + [.products[] | select(.testmon == false) | .test_case[] | { "bucket": ., "mode": "testmon-disabled"}] | sort_by(.model, .test_case)' | jq -c > unit-tests-gb300.json
+          echo "unit-tests-gb300=$(cat unit-tests-gb300.json)" | tee -a $GITHUB_OUTPUT
 
-  cicd-unit-tests-latest-gb200:
+  cicd-unit-tests-latest-gb300:
     needs:
       - is-not-external-contributor
       - pre-flight
       - configure
       - cicd-wait-in-queue
       - cicd-container-build
-      - cicd-parse-unit-tests-gb200
-    name: Unit tests (GB200)
+      - cicd-parse-unit-tests-gb300
+    name: Unit tests (GB300)
     if: |
       needs.is-not-external-contributor.result != 'cancelled'
       && needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
-      && needs.cicd-parse-unit-tests-gb200.result == 'success'
+      && needs.cicd-parse-unit-tests-gb300.result == 'success'
       && needs.is-not-external-contributor.outputs.is_maintainer == 'true'
-      && vars.ENABLE_GB200_TESTING == 'true'
+      && (vars.ENABLE_GB300_TESTING || vars.ENABLE_GB200_TESTING) == 'true'
       && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
@@ -1137,10 +1137,10 @@ jobs:
       && !cancelled()
     uses: ./.github/workflows/_unit-tests.yml
     with:
-      buckets: ${{ needs.cicd-parse-unit-tests-gb200.outputs.unit-tests-gb200 }}
-      runner: ${{ toJSON(needs.is-not-external-contributor.outputs.selected_runner_gb200) }}
-      container-image: ${{ needs.cicd-parse-unit-tests-gb200.outputs.container-image }}
-      platform: dgx_gb200
+      buckets: ${{ needs.cicd-parse-unit-tests-gb300.outputs.unit-tests-gb300 }}
+      runner: ${{ toJSON(needs.is-not-external-contributor.outputs.selected_runner_gb300) }}
+      container-image: ${{ needs.cicd-parse-unit-tests-gb300.outputs.container-image }}
+      platform: dgx_gb300
       sha: ${{ needs.configure.outputs.sha }}
       # Merge groups targeting main record Testmon baselines for the post-merge publisher.
       unit_testmon_mode: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_ref == 'refs/heads/main' && 'baseline' || (needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full') }}
@@ -1158,7 +1158,7 @@ jobs:
   #       merge_group; scheduled / force-run workflows bypass this for
   #       full nightly coverage.
   # H100 applies its PR-specific functional-test selection after the original
-  # approval + unit gate. GB200 keeps the original approval + unit behavior.
+  # approval + unit gate. GB300 keeps the original approval + unit behavior.
   cicd-integration-gate:
     runs-on: ubuntu-latest
     needs:
@@ -1176,7 +1176,7 @@ jobs:
       && !cancelled()
     outputs:
       should_run: ${{ steps.gate.outputs.should_run }}
-      should_run_gb200: ${{ steps.gate.outputs.should_run_gb200 }}
+      should_run_gb300: ${{ steps.gate.outputs.should_run_gb300 }}
     steps:
       - id: gate
         env:
@@ -1210,15 +1210,15 @@ jobs:
             should_run=false
           fi
           echo "should_run=$should_run" >> "$GITHUB_OUTPUT"
-          # Preserve the pre-traffic-split GB200 gate: after approval and
-          # successful unit tests, GB200 functional tests run whenever enabled.
+          # Preserve the pre-traffic-split GB300 gate: after approval and
+          # successful unit tests, GB300 functional tests run whenever enabled.
           if [ "$approval" = "true" ] && [ "$unit" = "true" ]; then
-            should_run_gb200=true
+            should_run_gb300=true
           else
-            should_run_gb200=false
+            should_run_gb300=false
           fi
-          echo "should_run_gb200=$should_run_gb200" >> "$GITHUB_OUTPUT"
-          echo "approval=$approval unit=$unit run_h100_functional=$RUN_H100_FUNCTIONAL -> H100=$should_run GB200=$should_run_gb200"
+          echo "should_run_gb300=$should_run_gb300" >> "$GITHUB_OUTPUT"
+          echo "approval=$approval unit=$unit run_h100_functional=$RUN_H100_FUNCTIONAL -> H100=$should_run GB300=$should_run_gb300"
           echo "  (wait-in-queue=$WAIT_RESULT, unit-tests=$UNIT_RESULT,"
           echo "   is_merge_group=$IS_MERGE_GROUP, is_ci_workload=$IS_CI_WORKLOAD,"
           echo "   force_run_all=$FORCE_RUN_ALL)"
@@ -1318,7 +1318,7 @@ jobs:
           cadence: ${{ needs.configure.outputs.cadence }}
           sha: ${{ needs.configure.outputs.sha }}
 
-  cicd-parse-integration-tests-gb200:
+  cicd-parse-integration-tests-gb300:
     runs-on: ubuntu-latest
     needs:
       - is-not-external-contributor
@@ -1326,11 +1326,11 @@ jobs:
       - cicd-integration-gate
     if: |
       !cancelled()
-      && needs.cicd-integration-gate.outputs.should_run_gb200 == 'true'
+      && needs.cicd-integration-gate.outputs.should_run_gb300 == 'true'
       && needs.is-not-external-contributor.outputs.is_maintainer == 'true'
-      && vars.ENABLE_GB200_TESTING == 'true'
+      && (vars.ENABLE_GB300_TESTING || vars.ENABLE_GB200_TESTING) == 'true'
     outputs:
-      integration-tests-gb200: ${{ steps.main.outputs.integration-tests-gb200 }}
+      integration-tests-gb300: ${{ steps.main.outputs.integration-tests-gb300 }}
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -1363,28 +1363,28 @@ jobs:
             --slurm-account gh \
             --no-enable-warmup \
             --environment dev \
-            --platform dgx_gb200 \
-            --cluster dgxgb200_oci-hsg \
+            --platform dgx_gb300 \
+            --cluster dgxgb300_oci-hsg \
             ${ARGS[@]} \
-            --output-path integration-tests-gb200.yaml
+            --output-path integration-tests-gb300.yaml
 
-          cat integration-tests-gb200.yaml | \
-            yq -o json 'del(.default, .stages, .workflow) | to_entries | map({"model": .value.stage, "test_case": .key}) | sort_by(.model, .test_case)' | jq -c  > integration-tests-gb200.json
+          cat integration-tests-gb300.yaml | \
+            yq -o json 'del(.default, .stages, .workflow) | to_entries | map({"model": .value.stage, "test_case": .key}) | sort_by(.model, .test_case)' | jq -c  > integration-tests-gb300.json
 
-          echo "integration-tests-gb200=$(cat integration-tests-gb200.json)" | tee -a "$GITHUB_OUTPUT"
+          echo "integration-tests-gb300=$(cat integration-tests-gb300.json)" | tee -a "$GITHUB_OUTPUT"
 
-  cicd-integration-tests-latest-gb200:
+  cicd-integration-tests-latest-gb300:
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJson(needs.cicd-parse-integration-tests-gb200.outputs.integration-tests-gb200) }}
+        include: ${{ fromJson(needs.cicd-parse-integration-tests-gb300.outputs.integration-tests-gb300) }}
     needs:
       - is-not-external-contributor
       - configure
       - cicd-integration-gate
-      - cicd-parse-integration-tests-gb200
-    runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
+      - cicd-parse-integration-tests-gb300
+    runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb300 }}
     name: "${{ matrix.model }}/${{ matrix.test_case }} - latest"
     env:
       PIP_DISABLE_PIP_VERSION_CHECK: 1
@@ -1394,10 +1394,10 @@ jobs:
       PIP_RETRIES: 5
     if: |
       !cancelled()
-      && needs.cicd-integration-gate.outputs.should_run_gb200 == 'true'
-      && needs.cicd-parse-integration-tests-gb200.result == 'success'
+      && needs.cicd-integration-gate.outputs.should_run_gb300 == 'true'
+      && needs.cicd-parse-integration-tests-gb300.result == 'success'
       && needs.is-not-external-contributor.outputs.is_maintainer == 'true'
-      && vars.ENABLE_GB200_TESTING == 'true'
+      && (vars.ENABLE_GB300_TESTING || vars.ENABLE_GB200_TESTING) == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -1411,11 +1411,11 @@ jobs:
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "false"
-          container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
+          container-image: ${{ env.container-registry-gb300 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
           scope: ${{ needs.configure.outputs.scope }}
           n_repeat: ${{ needs.configure.outputs.n_repeat }}
           lightweight: ${{ needs.configure.outputs.lightweight }}
-          platform: dgx_gb200
+          platform: dgx_gb300
           cadence: ${{ needs.configure.outputs.cadence }}
           sha: ${{ needs.configure.outputs.sha }}
 
@@ -1425,10 +1425,10 @@ jobs:
       - configure
       - is-not-external-contributor
       - cicd-unit-tests-latest
-      - cicd-unit-tests-latest-gb200
+      - cicd-unit-tests-latest-gb300
       - cicd-integration-gate
       - cicd-integration-tests-latest-h100
-      - cicd-integration-tests-latest-gb200
+      - cicd-integration-tests-latest-gb300
     if: |
       (
         needs.pre-flight.outputs.docs_only == 'true'
@@ -1457,12 +1457,12 @@ jobs:
           IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
           FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
           RUN_H100_FUNCTIONAL: ${{ needs.configure.outputs.run_h100_functional }}
-          GB200_SHOULD_RUN: ${{ needs.cicd-integration-gate.outputs.should_run_gb200 }}
-          ENABLE_GB200_TESTING: ${{ vars.ENABLE_GB200_TESTING }}
+          GB300_SHOULD_RUN: ${{ needs.cicd-integration-gate.outputs.should_run_gb300 }}
+          ENABLE_GB300_TESTING: ${{ vars.ENABLE_GB300_TESTING || vars.ENABLE_GB200_TESTING }}
           UNIT_RESULT: ${{ needs.cicd-unit-tests-latest.result }}
-          UNIT_GB200_RESULT: ${{ needs.cicd-unit-tests-latest-gb200.result }}
+          UNIT_GB300_RESULT: ${{ needs.cicd-unit-tests-latest-gb300.result }}
           H100_RESULT: ${{ needs.cicd-integration-tests-latest-h100.result }}
-          GB200_RESULT: ${{ needs.cicd-integration-tests-latest-gb200.result }}
+          GB300_RESULT: ${{ needs.cicd-integration-tests-latest-gb300.result }}
         run: |
           # Docs-only and deployment workflows intentionally skip all tests
           if [ "$DOCS_ONLY" == "true" ] || [ "$IS_DEPLOYMENT" == "true" ]; then
@@ -1484,10 +1484,10 @@ jobs:
             echo "❌ cicd-unit-tests-latest: $UNIT_RESULT"
             FAILED=true
             # On PR-push / merge_group, integration was skipped by design —
-            # don't double-fail on H100/GB200 below.
+            # don't double-fail on H100/GB300 below.
             if [ "$FORCE_INTEGRATION" != "true" ]; then
               H100_RESULT=skipped-by-unit-failure
-              GB200_RESULT=skipped-by-unit-failure
+              GB300_RESULT=skipped-by-unit-failure
             fi
           fi
 
@@ -1498,21 +1498,21 @@ jobs:
             FAILED=true
           fi
 
-          # GB200 tests are required after the original approval + unit gate
-          # whenever the GB200 lane is enabled for maintainers.
-          if [ "$ENABLE_GB200_TESTING" == "true" ]; then
-            # GB200 tests may be skipped only for non-maintainer PRs
-            # (no GB200 runners available); maintainer runs must always succeed.
-            if [ "$GB200_RESULT" == "skipped" ] && [ "$IS_MAINTAINER" == "true" ] && [ "$GB200_SHOULD_RUN" == "true" ]; then
-              echo "❌ cicd-integration-tests-latest-gb200: skipped unexpectedly for a maintainer run"
+          # GB300 tests are required after the original approval + unit gate
+          # whenever the GB300 lane is enabled for maintainers.
+          if [ "$ENABLE_GB300_TESTING" == "true" ]; then
+            # GB300 tests may be skipped only for non-maintainer PRs
+            # (no GB300 runners available); maintainer runs must always succeed.
+            if [ "$GB300_RESULT" == "skipped" ] && [ "$IS_MAINTAINER" == "true" ] && [ "$GB300_SHOULD_RUN" == "true" ]; then
+              echo "❌ cicd-integration-tests-latest-gb300: skipped unexpectedly for a maintainer run"
               FAILED=true
             fi
-            if [ "$UNIT_GB200_RESULT" == "skipped" ] && [ "$IS_MAINTAINER" == "true" ]; then
-              echo "❌ cicd-unit-tests-latest-gb200: skipped unexpectedly for a maintainer run"
+            if [ "$UNIT_GB300_RESULT" == "skipped" ] && [ "$IS_MAINTAINER" == "true" ]; then
+              echo "❌ cicd-unit-tests-latest-gb300: skipped unexpectedly for a maintainer run"
               FAILED=true
             fi
           else
-            echo "✅ GB200 integration tests disabled by ENABLE_GB200_TESTING"
+            echo "✅ GB300 integration tests disabled by ENABLE_GB300_TESTING"
           fi
 
           # Broad scan: catch any individual job failures or cancellations
@@ -1583,7 +1583,7 @@ jobs:
 
   Coverage:
     runs-on: ubuntu-latest
-    needs: [Nemo_CICD_Test, pre-flight, configure, cicd-parse-unit-tests, cicd-parse-unit-tests-gb200]
+    needs: [Nemo_CICD_Test, pre-flight, configure, cicd-parse-unit-tests, cicd-parse-unit-tests-gb300]
     if: |
       !cancelled()
       && needs.Nemo_CICD_Test.result == 'success'
@@ -1627,7 +1627,7 @@ jobs:
         env:
           SELECTIVE: ${{ needs.configure.outputs.unit_testmon_eligible }}
           H100_BUCKETS: ${{ needs.cicd-parse-unit-tests.outputs.unit-tests || '[]' }}
-          GB200_BUCKETS: ${{ needs.cicd-parse-unit-tests-gb200.outputs.unit-tests-gb200 || '[]' }}
+          GB300_BUCKETS: ${{ needs.cicd-parse-unit-tests-gb300.outputs.unit-tests-gb300 || '[]' }}
           SOURCE_SHA: ${{ needs.configure.outputs.unit_testmon_sha || needs.configure.outputs.sha }}
         run: |
           python - <<'PY'
@@ -1642,7 +1642,7 @@ jobs:
               expected = {
                   (platform, entry["bucket"])
                   for platform, variable in (
-                      ("dgx_h100", "H100_BUCKETS"), ("dgx_gb200", "GB200_BUCKETS")
+                      ("dgx_h100", "H100_BUCKETS"), ("dgx_gb300", "GB300_BUCKETS")
                   )
                   for entry in json.loads(os.environ[variable])
               }

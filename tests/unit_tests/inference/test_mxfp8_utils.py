@@ -1240,7 +1240,7 @@ class TestPermuteAndQuantizeMxfp8:
         assert fused_calls == 1
         assert output.shape == hidden.shape
 
-    @pytest.mark.launch_on_gb200
+    @pytest.mark.launch_on_gb300
     @pytest.mark.parametrize("activation_type", ["squared_relu", "swiglu"])
     def test_batch_invariant_moe_fused_matches_unfused(self, activation_type):
         """Fused input preprocessing preserves the complete MXFP8 MoE output bitwise."""
@@ -1311,7 +1311,7 @@ def _make_te_mxfp8_expert_linear(quantizer, out_features, in_features):
     return linear
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
     reason="MXFP8 parameter storage requires Blackwell",
@@ -1344,7 +1344,7 @@ def test_model_conversion_preserves_bf16_parameters():
     assert isinstance(model.mlp.experts.linear_fc2.weight0, MXFP8Tensor)
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
     reason="MXFP8 parameter storage requires Blackwell",

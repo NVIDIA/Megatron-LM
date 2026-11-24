@@ -24,7 +24,7 @@ except ImportError:
     HAVE_TRITON = False
 
 pytestmark = [
-    pytest.mark.launch_on_gb200,
+    pytest.mark.launch_on_gb300,
     pytest.mark.skipif(
         not (torch.cuda.is_available() and HAVE_TRITON), reason="needs a GPU and Triton"
     ),

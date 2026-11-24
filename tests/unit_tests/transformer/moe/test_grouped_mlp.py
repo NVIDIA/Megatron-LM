@@ -1789,7 +1789,7 @@ class TestTEGroupedMLP:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
-    @pytest.mark.launch_on_gb200
+    @pytest.mark.launch_on_gb300
     def test_gpu_split_alignment_enables_fusion_without_env(self, monkeypatch):
         """Explicit split alignment enables the real fused kernels without the legacy env var."""
         import inspect
@@ -2009,7 +2009,7 @@ class TestTEGroupedMLP:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
-    @pytest.mark.launch_on_gb200
+    @pytest.mark.launch_on_gb300
     def test_gpu_quantized_precision_override_runs_fused_with_module_recipe(
         self, monkeypatch, request
     ):
@@ -2093,7 +2093,7 @@ class TestTEGroupedMLP:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
-    @pytest.mark.launch_on_gb200
+    @pytest.mark.launch_on_gb300
     def test_gpu_quantized_precision_override_must_cover_fc1_and_fc2(self):
         """The TE sequence rejects a quantized override matching only one of its linears."""
         import transformer_engine.pytorch as te
@@ -2701,7 +2701,7 @@ class TestTEGroupedMLP:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
-    @pytest.mark.launch_on_gb200
+    @pytest.mark.launch_on_gb300
     @pytest.mark.parametrize("tanh_clamp_scale", [None, 2.0])
     def test_gpu_fused_clamp_matches_unfused_reference(self, request, tanh_clamp_scale):
         """Fused cuDNN epilogue vs MCore's unfused path: forward and both gradients, MXFP8."""
@@ -2736,7 +2736,7 @@ class TestTEGroupedMLP:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
-    @pytest.mark.launch_on_gb200
+    @pytest.mark.launch_on_gb300
     def test_gpu_clamp_scale_reaches_the_kernel(self, request):
         """Saturated, the output scales as s^2: s=8 vs s=1 gives ~64x. An ignored scale gives
         ~1x and a scale applied without the square ~8x."""

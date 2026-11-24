@@ -29,7 +29,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.global_vars import destroy_global_vars
 from tests.unit_tests.test_utilities import Utils
 
-pytestmark = pytest.mark.launch_on_gb200
+pytestmark = pytest.mark.launch_on_gb300
 
 
 @pytest.fixture(autouse=True)

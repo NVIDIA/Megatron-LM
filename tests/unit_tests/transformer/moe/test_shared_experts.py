@@ -424,7 +424,7 @@ class TestSharedExperts:
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
-    @pytest.mark.launch_on_gb200
+    @pytest.mark.launch_on_gb300
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("overlap", [False, True])
     def test_gpu_split_alignment_enables_fusion_without_env(self, monkeypatch, overlap):

@@ -109,7 +109,7 @@ def _replay():
         print(f"Ring,NVLS replay: {world_size} ranks, every result {distinct.pop()}", flush=True)
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA GPUs")
 @pytest.mark.skipif(
     _IS_HOPPER, reason="--deterministic-mode rejects Ring,NVLS on Hopper (NVIDIA/nccl#2360)"

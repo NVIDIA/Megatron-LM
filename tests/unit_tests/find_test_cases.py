@@ -7,10 +7,11 @@ from pathlib import Path
 
 # Platforms whose unit-test selection is driven by a pytest marker rather than
 # by the full recipe bucket. Only files carrying the marker are launched.
-PLATFORM_MARKERS = {"gb200": "launch_on_gb200"}
+# GB200 retains the same four-GPU suite for internal CI.
+PLATFORM_MARKERS = {"gb200": "launch_on_gb300", "gb300": "launch_on_gb300"}
 
-# This bucket is scheduled exclusively on GB200. Keep it out of H100 catch-all
-# buckets without changing the additive behavior of launch_on_gb200 elsewhere.
+# This bucket is scheduled exclusively on the four-GPU Blackwell lane. Keep it out of H100 catch-all
+# buckets without changing the additive behavior of launch_on_gb300 elsewhere.
 PLATFORM_EXCLUSIONS = {"h100": {"tests/unit_tests/ssm/test_gated_delta_net.py"}}
 
 
@@ -19,7 +20,7 @@ def file_has_marker(filepath, marker):
 
     Args:
         filepath: Path to a Python test file.
-        marker: The pytest marker name to look for (e.g. ``launch_on_gb200``).
+        marker: The pytest marker name to look for (e.g. ``launch_on_gb300``).
 
     Returns:
         True if the marker name appears anywhere in the file, else False.

@@ -579,7 +579,7 @@ def test_swap_gpt_parametrized(
         (4, 2, 8, 1),
     ],
 )
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 def test_swap_dsa_parallelism(dsa_type: str, src_tp: int, src_pp: int, dst_tp: int, dst_pp: int):
     """Refit real MLA and single-group GQA DSA models across full-node TP/PP layouts."""
     if not has_mamba_deps:
@@ -1051,7 +1051,7 @@ def test_router_expert_bias_refit_non_collocated(refit_backend: str):
     ],
 )
 @pytest.mark.parametrize("dsa_type", ["mla", "gqa"])
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 def test_swap_dsa_non_collocated(
     refit_backend: str,
     src_world: int,

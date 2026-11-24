@@ -16,7 +16,7 @@ from megatron.training.ckpt.glu_checkpointing import (
     validate_glu_optimizer_layout,
 )
 
-pytestmark = pytest.mark.launch_on_gb200
+pytestmark = pytest.mark.launch_on_gb300
 
 ROUTED = "decoder.layers.0.mlp.experts.linear_fc1."
 SHARED = "decoder.layers.0.mlp.shared_experts.linear_fc1."

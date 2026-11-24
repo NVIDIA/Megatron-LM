@@ -10,7 +10,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
 case "$PLATFORM" in
     h100) PROFILES=(delayed blockwise) ;;
-    gb200) PROFILES=(mxfp8) ;;
+    gb200|gb300) PROFILES=(mxfp8) ;;
     *) echo "Unsupported FP8 test platform: $PLATFORM" >&2; exit 1 ;;
 esac
 case "$ENVIRONMENT" in

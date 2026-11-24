@@ -66,7 +66,7 @@ except (ImportError, AttributeError):
 
 pytestmark = [
     pytest.mark.internal,
-    pytest.mark.launch_on_gb200,
+    pytest.mark.launch_on_gb300,
     pytest.mark.skipif(
         not is_te_min_version("2.14.0"),
         reason="moe_single_grouped_weight requires Transformer Engine >= 2.14.0",

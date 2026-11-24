@@ -13,7 +13,7 @@ from megatron.core.ssm.gated_delta_net import HAVE_FLA, HAVE_FLA_GDN2
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.transformer.parallel_test_utils import _test_parallel_attention_correctness
 
-pytestmark = pytest.mark.launch_on_gb200
+pytestmark = pytest.mark.launch_on_gb300
 
 
 @pytest.mark.parametrize(

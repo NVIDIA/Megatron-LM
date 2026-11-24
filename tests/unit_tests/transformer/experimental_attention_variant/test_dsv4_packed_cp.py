@@ -25,7 +25,7 @@ from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybri
     _make_config,
 )
 
-pytestmark = pytest.mark.launch_on_gb200
+pytestmark = pytest.mark.launch_on_gb300
 
 
 @pytest.fixture(autouse=True)

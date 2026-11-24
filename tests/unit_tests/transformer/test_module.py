@@ -10,7 +10,7 @@ from tests.unit_tests.test_utilities import Utils
 
 # Seed for the GB200 unit-test lane: launch this module on GB200 hardware
 # (4 GPUs/node) in CI. Extend coverage by adding this marker to other tests.
-pytestmark = pytest.mark.launch_on_gb200
+pytestmark = pytest.mark.launch_on_gb300
 
 DEVICE_CAPABILITY = None
 if torch.cuda.is_available():

@@ -44,7 +44,7 @@ from tests.unit_tests.test_utilities import (
 # These tests configure mxfp8 + the TE op fuser, so they only run on Blackwell (sm100+). Mark the
 # whole module for the GB200 CI bucket (selection there is marker-driven; see
 # tests/unit_tests/find_test_cases.py and recipes/gb200/unit-tests.yaml).
-pytestmark = pytest.mark.launch_on_gb200
+pytestmark = pytest.mark.launch_on_gb300
 
 
 @pytest.fixture(autouse=True)

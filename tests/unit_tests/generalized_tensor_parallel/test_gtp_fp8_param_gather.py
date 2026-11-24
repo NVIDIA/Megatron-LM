@@ -446,7 +446,7 @@ class TestGTPFp8ParamGather:
 
             update_gtp_config(pad_for_alignment=16, calculate_per_token_loss=False)
 
-    @pytest.mark.launch_on_gb200
+    @pytest.mark.launch_on_gb300
     @pytest.mark.skipif(
         get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
     )
@@ -492,7 +492,7 @@ class TestGTPFp8ParamGather:
 
             update_gtp_config(pad_for_alignment=16, calculate_per_token_loss=False)
 
-    @pytest.mark.launch_on_gb200
+    @pytest.mark.launch_on_gb300
     @pytest.mark.skipif(
         get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
     )
@@ -576,7 +576,7 @@ class TestGTPFp8ParamGather:
 
             update_gtp_config(pad_for_alignment=16, calculate_per_token_loss=False)
 
-    @pytest.mark.launch_on_gb200
+    @pytest.mark.launch_on_gb300
     @pytest.mark.skipif(
         get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
     )
@@ -669,7 +669,7 @@ class TestGTPFp8ParamGather:
         finally:
             harness.teardown_method(None)
 
-    @pytest.mark.launch_on_gb200
+    @pytest.mark.launch_on_gb300
     @pytest.mark.skipif(
         get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
     )

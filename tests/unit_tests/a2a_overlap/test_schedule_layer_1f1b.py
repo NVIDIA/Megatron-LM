@@ -467,7 +467,7 @@ class TestA2AOverlap:
         "wire_dtype",
         [
             pytest.param("bf16", marks=pytest.mark.flaky_in_dev),
-            pytest.param("mxfp8", marks=pytest.mark.launch_on_gb200),
+            pytest.param("mxfp8", marks=pytest.mark.launch_on_gb300),
         ],
     )
     def test_transformer_layer_overlap_zero_copy(self, wire_dtype):

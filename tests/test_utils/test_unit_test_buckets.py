@@ -2,19 +2,24 @@
 
 """Dedicated runtime-CP tests must be scheduled once on both CI GPU platforms."""
 
+import importlib.util
 import sys
 from pathlib import Path
 
 import pytest
 import yaml
 
-from tests.unit_tests import find_test_cases
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
+# The bucket selector is CPU tooling; loading it directly avoids GPU suite initialization.
+_spec = importlib.util.spec_from_file_location(
+    "find_test_cases", REPO_ROOT / "tests/unit_tests/find_test_cases.py"
+)
+find_test_cases = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(find_test_cases)
 RUNTIME_BUCKET = "tests/unit_tests/context_parallel/runtime/**/*.py"
 
 
-@pytest.mark.parametrize("platform,gpus", [("h100", 8), ("gb200", 4)])
+@pytest.mark.parametrize("platform,gpus", [("h100", 8), ("gb200", 4), ("gb300", 4)])
 def test_runtime_cp_bucket_has_exclusive_ownership(monkeypatch, capsys, platform, gpus):
     """Exercise real bucket expansion, child exclusions, and GB200 marker filtering."""
     monkeypatch.chdir(REPO_ROOT)

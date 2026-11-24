@@ -704,7 +704,7 @@ class TestMXFP8RefitIntegration:
 
 
 @pytest.mark.internal
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 class TestTEGroupedParameterRefit:
     """Refit grouped BF16 and MXFP8 experts independent of TE's parameter format."""
 

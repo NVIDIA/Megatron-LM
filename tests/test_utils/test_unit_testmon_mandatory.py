@@ -33,7 +33,7 @@ MAPPINGS = [
         "source_dirs": ["megatron/core/foo", "megatron/core/bar/*.py"],
         "test_buckets": {
             "dgx_h100": ["tests/unit_tests/foo/**/*.py", "tests/unit_tests/test_bar.py"],
-            "dgx_gb200": ["tests/unit_tests/test_bar.py"],
+            "dgx_gb300": ["tests/unit_tests/test_bar.py"],
         },
     },
     {"source_dirs": ["megatron/core/baz"], "test_buckets": {"dgx_h100": ["tests/unit_tests/baz"]}},
@@ -74,22 +74,22 @@ def test_repository_config_is_valid():
                 assert (ROOT / base).exists(), pattern
 
 
-def test_repository_gb200_mapping_respects_recipe_and_marker_filtering(monkeypatch, capsys):
+def test_repository_gb300_mapping_respects_recipe_and_marker_filtering(monkeypatch, capsys):
     monkeypatch.chdir(ROOT)
-    recipe = yaml.safe_load((ROOT / "tests/test_utils/recipes/gb200/unit-tests.yaml").read_text())
+    recipe = yaml.safe_load((ROOT / "tests/test_utils/recipes/gb300/unit-tests.yaml").read_text())
     buckets = [case for product in recipe["products"] for case in product["test_case"]]
     bucket = "tests/unit_tests/**/*.py"
     assert bucket in buckets
     finder = sys.modules["find_test_cases"]
     monkeypatch.setattr(finder, "get_test_cases", lambda _: buckets)
-    monkeypatch.setattr(sys, "argv", ["find_test_cases.py", bucket, "gb200"])
+    monkeypatch.setattr(sys, "argv", ["find_test_cases.py", bucket, "gb300"])
     finder.main()
     ignored = {line.removeprefix("--ignore=") for line in capsys.readouterr().out.splitlines()}
 
     _, patterns = mandatory.triggered_patterns(
         mandatory.load_mappings(CONFIG_PATH),
         ["megatron/core/distributed/fsdp/src/megatron_fsdp/experimental/__init__.py"],
-        "dgx_gb200",
+        "dgx_gb300",
     )
     assert mandatory.mandatory_files(patterns, bucket, ignored) == [
         "tests/unit_tests/distributed/mfsdp_v2/test_gradient_accumulation.py",
@@ -138,18 +138,18 @@ def test_invalid_config_is_rejected(tmp_path, document):
         ),
         (
             ["megatron/core/bar/x.py"],
-            "dgx_gb200",
+            "dgx_gb300",
             ["megatron/core/bar/*.py"],
             ["tests/unit_tests/test_bar.py"],
         ),
         # Glob entries use fnmatch semantics, where `*` also spans directories.
         (
             ["megatron/core/bar/sub/x.py"],
-            "dgx_gb200",
+            "dgx_gb300",
             ["megatron/core/bar/*.py"],
             ["tests/unit_tests/test_bar.py"],
         ),
-        (["megatron/core/baz/x.py"], "dgx_gb200", [], []),
+        (["megatron/core/baz/x.py"], "dgx_gb300", [], []),
         (
             ["megatron/core/baz/x.py", "megatron/core/foo/y.py"],
             "dgx_h100",

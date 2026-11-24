@@ -9,7 +9,7 @@ import pytest
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.packed_seq_params import PackedSeqParams
 
-pytestmark = pytest.mark.launch_on_gb200
+pytestmark = pytest.mark.launch_on_gb300
 
 
 def test_runtime_cp_layout_uses_microbatch_groups_without_mutating_stack():

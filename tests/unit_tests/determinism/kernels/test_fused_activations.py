@@ -155,7 +155,7 @@ def test_triton_swiglu_dispatch_by_row_length(n_cols, multi_row):
 )
 @pytest.mark.parametrize(
     "bf16_override",
-    [False, pytest.param(True, marks=pytest.mark.launch_on_gb200)],
+    [False, pytest.param(True, marks=pytest.mark.launch_on_gb300)],
     ids=["bf16", "bf16_override_under_mxfp8"],
 )
 def test_paged_stash_marked_activation_fusions_replay_bit_exactly(name, activation, bf16_override):

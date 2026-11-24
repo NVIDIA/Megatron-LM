@@ -446,7 +446,7 @@ def _unpack_e2m1(packed):
     return torch.stack((lookup[packed & 0xF], lookup[packed >> 4]), dim=-1).flatten(-2)
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @requires_blackwell
 @requires_flashinfer_nvfp4
 @pytest.mark.parametrize("tokens", [1, 37, 256])
@@ -475,7 +475,7 @@ def test_per_token_nvfp4_quantize_matches_reference(monkeypatch, tokens, hidden_
     assert torch.equal(_unpack_e2m1(data).reshape(tokens, hidden_size), values)
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @requires_blackwell
 @requires_flashinfer_nvfp4
 @pytest.mark.parametrize("gated", [False, True], ids=["squared_relu", "swiglu"])
@@ -546,7 +546,7 @@ def test_flashinfer_routed_nvfp4_moe_matches_bf16_reference(hidden_size, interme
         )
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @requires_blackwell
 @requires_flashinfer_nvfp4
 @pytest.mark.parametrize("gated", [False, True], ids=["squared_relu", "swiglu"])
@@ -618,7 +618,7 @@ def test_flashinfer_routed_nvfp4_is_batch_invariant(local_expert_offset, mode, g
         assert torch.count_nonzero(output_alone).item() == 0
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @requires_blackwell
 @requires_flashinfer_nvfp4
 @pytest.mark.parametrize("gated", [False, True], ids=["squared_relu", "swiglu"])
@@ -715,7 +715,7 @@ def _make_nvfp4_layer_config(**overrides):
 
 
 @pytest.mark.internal
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @requires_blackwell
 @requires_flashinfer_nvfp4
 class TestNVFP4MoELayer:

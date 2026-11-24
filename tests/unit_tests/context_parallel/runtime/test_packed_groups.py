@@ -6,7 +6,7 @@ import pytest
 
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_tp_cp_group
 
-pytestmark = pytest.mark.launch_on_gb200
+pytestmark = pytest.mark.launch_on_gb300
 
 
 class _MockCPGroup:

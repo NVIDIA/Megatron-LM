@@ -67,7 +67,7 @@ except ImportError:
 _WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
 pytestmark = [
     pytest.mark.internal,
-    pytest.mark.launch_on_gb200,
+    pytest.mark.launch_on_gb300,
     pytest.mark.skipif(
         _WORLD_SIZE < 2,
         reason=(

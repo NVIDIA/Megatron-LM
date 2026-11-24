@@ -9,7 +9,7 @@ from tests.unit_tests.ssm.gdp_test_utils import (
     assert_in_proj_recompute_preserves_norm_gate_view,
 )
 
-pytestmark = pytest.mark.launch_on_gb200
+pytestmark = pytest.mark.launch_on_gb300
 
 
 @pytest.fixture(autouse=True)

@@ -1945,7 +1945,7 @@ class TestOptimizerResharding:
                 Utils.destroy_model_parallel()
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 class TestCheckpointParameterIdentity:
     @pytest.mark.parametrize("factory", [False, True])
     def test_optimizer_maps_original_parameter_and_keeps_moment_dtype(self, factory):

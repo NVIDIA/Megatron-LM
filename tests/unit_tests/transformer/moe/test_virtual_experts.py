@@ -8,7 +8,7 @@ Run on one node with four Blackwell GPUs::
         tests/unit_tests/transformer/moe/test_virtual_experts.py
 
 Eight-GPU H100 nodes run the non-MXFP8 cases; MXFP8 compute skips on pre-Blackwell
-hardware. The existing GB200 CI selection uses ``launch_on_gb200``. All inputs are
+hardware. The existing GB200 CI selection uses ``launch_on_gb300``. All inputs are
 synthetic; no dataset or custom launcher is required.
 """
 
@@ -298,7 +298,7 @@ def _assert_bitwise_parity(actual, expected, name):
 
 
 @requires_hybridep
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @pytest.mark.flaky_in_dev  # https://github.com/NVIDIA/Megatron-LM/issues/9647
 @pytest.mark.usefixtures("mxfp8_grouped_mlp")
 @pytest.mark.parametrize(
@@ -851,7 +851,7 @@ def test_bf16_virtual_expert_routing_parity(monkeypatch, use_op_fuser):
 
 
 @requires_hybridep
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @pytest.mark.usefixtures("mxfp8_grouped_mlp")
 def test_mxfp8_expert_recompute_parity():
     """Selective activation recomputation preserves outputs and every expert/input gradient."""
@@ -964,7 +964,7 @@ def _virtual_expert_hybridep_config(**overrides):
 
 @requires_hybridep
 @pytest.mark.parametrize(
-    "precision", ["bf16", pytest.param("mxfp8", marks=pytest.mark.launch_on_gb200)]
+    "precision", ["bf16", pytest.param("mxfp8", marks=pytest.mark.launch_on_gb300)]
 )
 @pytest.mark.parametrize(
     "recompute,offload_scope,use_op_fuser",

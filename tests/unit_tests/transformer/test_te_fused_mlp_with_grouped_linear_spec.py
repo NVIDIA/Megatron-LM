@@ -473,7 +473,7 @@ class TestTEFusedMLPWithGroupedLinearSpec:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
-    @pytest.mark.launch_on_gb200
+    @pytest.mark.launch_on_gb300
     def test_split_alignment_enables_fusion_without_env(self, monkeypatch):
         import transformer_engine.pytorch as te
 

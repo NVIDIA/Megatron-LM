@@ -89,7 +89,7 @@ class _MoKExperts(torch.nn.Module):
         return self.megakernel_experts(x, probs, torch.ones_like(probs, dtype=torch.bool))
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @pytest.mark.parametrize("gated", [False, True])
 @pytest.mark.parametrize("main_grad_dtype", [torch.float32, torch.bfloat16])
 def test_real_mok_ddp_numerics(gated, main_grad_dtype):

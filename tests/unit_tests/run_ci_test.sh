@@ -3,7 +3,7 @@ set -euxo pipefail
 
 # Parse command line arguments
 usage() {
-    echo "Usage: $0 --tag {latest|legacy} --environment {lts|dev} --bucket BUCKET [--platform {h100|gb200}] [--unit-test-repeat N] [--unit-test-timeout N] --log-dir LOG_DIR"
+    echo "Usage: $0 --tag {latest|legacy} --environment {lts|dev} --bucket BUCKET [--platform {h100|gb200|gb300}] [--unit-test-repeat N] [--unit-test-timeout N] --log-dir LOG_DIR"
     exit 1
 }
 
@@ -112,8 +112,8 @@ fi
 cd $TEST_PATH
 
 MARKER=()
-if [[ "$PLATFORM" == "gb200" ]]; then
-    MARKER+=("launch_on_gb200")
+if [[ ( "$PLATFORM" == "gb200" || "$PLATFORM" == "gb300" ) ]]; then
+    MARKER+=("launch_on_gb300")
 fi
 
 if [[ "$TAG" == "legacy" ]]; then
@@ -168,7 +168,7 @@ run_test_cmd() {
     eval "$cmd"
     rc=$?
     set -e
-    if [[ "$rc" -eq 5 && "$PLATFORM" == "gb200" ]]; then
+    if [[ "$rc" -eq 5 && ( "$PLATFORM" == "gb200" || "$PLATFORM" == "gb300" ) ]]; then
         echo "No tests collected for this bucket on $PLATFORM (pytest exit 5) — treating as pass."
         return 0
     fi

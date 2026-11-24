@@ -1608,7 +1608,7 @@ class TestMoEModules:
         finally:
             PipelineOffloadManager.reset_instance()
 
-    @pytest.mark.launch_on_gb200
+    @pytest.mark.launch_on_gb300
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
     def test_te_op_fuser_bf16_override_replays_under_mxfp8(self, monkeypatch):
         """Replay the real BF16 TE ops selected inside an outer MXFP8 context."""
@@ -1877,7 +1877,7 @@ class TestMoEModules:
             what=f"TEGroupedMLP[tanh clamp, {'op fuser' if op_fuser else 'unfused'}]",
         )
 
-    @pytest.mark.launch_on_gb200
+    @pytest.mark.launch_on_gb300
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
     def test_te_grouped_mlp_replays_under_quantized_precision_override(self, monkeypatch):
         """Fused ``TEGroupedMLP`` whose ``--te-precision-config-file`` override keeps the experts

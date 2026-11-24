@@ -44,7 +44,7 @@ from tests.unit_tests.test_utilities import Utils, is_nccl_ep_available
 
 pytestmark = [
     pytest.mark.internal,
-    pytest.mark.launch_on_gb200,
+    pytest.mark.launch_on_gb300,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available"),
 ]
 

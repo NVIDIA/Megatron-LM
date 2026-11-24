@@ -1978,7 +1978,7 @@ class TestFusedMLARequiresQLora:
             )
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @pytest.mark.skipif(
     get_device_arch_version() < 10,
     reason="Fused MLA Q up-projection requires Blackwell architecture",
@@ -2322,7 +2322,7 @@ def test_is_mxfp8_attention_active_ignores_runtime_dpa_env():
         assert _gate_with_recipe(recipe, dpa_recipe="", dpa_format="HYBRID") is False
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @pytest.mark.skipif(
     get_device_arch_version() < 10,
     reason="The fused MLA key/value RoPE + MXFP8 kernel requires Blackwell architecture",

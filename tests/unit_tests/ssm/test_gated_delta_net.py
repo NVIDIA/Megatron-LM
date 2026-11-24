@@ -37,7 +37,7 @@ from tests.unit_tests.ssm.gated_delta_net_test_utils import _unpack_sequence
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
 
-pytestmark = pytest.mark.launch_on_gb200
+pytestmark = pytest.mark.launch_on_gb300
 
 
 def _assert_relative_rms_close(

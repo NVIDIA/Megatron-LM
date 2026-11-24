@@ -40,7 +40,7 @@ from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noq
     reset_gtp_globals,
 )
 
-pytestmark = [pytest.mark.internal, pytest.mark.launch_on_gb200]
+pytestmark = [pytest.mark.internal, pytest.mark.launch_on_gb300]
 
 
 def _bf16_mtp_recipe():

@@ -547,7 +547,7 @@ def test_step_matches_duplicated_mode(case):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @pytest.mark.parametrize("ns_batch", [1, 32], ids=["ns_batch1", "ns_batch32"])
 def test_2d_domain_matches_full_matrix_reference(ns_batch):
     """Column-parallel, row-parallel, GTP-only and replicated params mixed in one group.
@@ -607,7 +607,7 @@ def test_2d_domain_matches_full_matrix_reference(ns_batch):
             ), f"replicated param {i} diverged on rank {other_rank}"
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @pytest.mark.parametrize("ns_batch", [1, 8], ids=["ns_batch1", "ns_batch8"])
 def test_dense_and_expert_groups_use_their_own_domains(ns_batch):
     """Dense params route over (gtp_remat, tp) and expert params over (egtp, None) in one
@@ -655,7 +655,7 @@ def test_dense_and_expert_groups_use_their_own_domains(ns_batch):
         )
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 def test_concurrent_groups_match_serial_bitwise():
     """Per-group CUDA streams only reorder work across groups, so any difference is a
     synchronization bug, not rounding."""
@@ -692,7 +692,7 @@ def test_concurrent_groups_match_serial_bitwise():
         )
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 def test_degenerate_domain_group_falls_back_to_local_ns():
     """A group whose (GTP_remat x TP) domain is a single rank runs plain local NS."""
     _require_four_ranks()
@@ -767,7 +767,7 @@ def _layer_wise_muon(ns_batch_size, nesterov):
     return model, [getattr(o, 'optimizer', o) for o in optimizer.chained_optimizers], optimizer
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @pytest.mark.parametrize("nesterov", [False, True], ids=["plain", "nesterov"])
 @pytest.mark.parametrize("ns_batch", [1, 4], ids=["ns_batch1", "ns_batch4"])
 def test_single_rank_domains_run_local_ns(monkeypatch, ns_batch, nesterov):
@@ -897,7 +897,7 @@ def test_batched_matches_unbatched(ns_batch_size, n_same, n_other, home):
         )
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 def test_tp_replicated_ns_chunking_is_column_invariant():
     """nsb > 1 must not diverge the TP replicas of a GTP_remat-only param.
 
@@ -941,7 +941,7 @@ def test_tp_replicated_ns_chunking_is_column_invariant():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @pytest.mark.parametrize("pd", [0, 1], ids=["col_parallel", "row_parallel"])
 def test_padded_param_2d_two_stage_matches_reference(pd):
     """Padded param on TP2 x GTP2: the pad must be stripped at the stage-1 seam (after TP
@@ -1031,7 +1031,7 @@ def test_param_shard_spec_reads_model_attributes_once():
         spec(_mark_tp(torch.nn.Parameter(torch.randn(6, 4)), 0), 2, 2)
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 def test_tp_sharded_without_gtp_marker_is_rejected():
     """A TP-sharded param without is_gtp_weight_remat is replicated across GTP_remat; the
     exchange would concatenate the copies as shards, so step() must raise before any
@@ -1084,7 +1084,7 @@ def test_weight_update_hooks_called_on_all_paths():
     assert calls2 == {"pre": 2, "post": 2}, f"hooks missed on the degenerate path: {calls2}"
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 def test_exchange_plan_cache_bitwise_and_reused():
     """Routing plans are reused across steps and reproduce cold-start steps bitwise."""
     _require_four_ranks()

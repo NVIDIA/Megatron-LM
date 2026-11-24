@@ -26,7 +26,7 @@ from transformer_engine.pytorch import is_mxfp8_available
 from transformer_engine.pytorch.cpp_extensions import general_gemm
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 
-pytestmark = pytest.mark.launch_on_gb200
+pytestmark = pytest.mark.launch_on_gb300
 
 requires_mxfp8 = pytest.mark.skipif(
     not is_mxfp8_available(), reason="MXFP8 quantization is not available."
