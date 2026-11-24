@@ -43,6 +43,8 @@ __all__ = ["HAVE_PDL", "gdc_wait", "pdl_kwargs"]
 
 # Process-wide (Triton, environment) conditions, resolved on first use.
 _enabled = None
+# Compute capability >= 9.0, per device index.
+_device_supports_pdl = {}
 
 
 def pdl_kwargs() -> dict:
@@ -58,7 +60,14 @@ def pdl_kwargs() -> dict:
             and torch.cuda.is_available()
             and torch.version.hip is None
         )
-    # The capability is checked per call: a process may drive GPUs of different generations.
-    if _enabled and torch.cuda.get_device_capability()[0] >= 9:
-        return {"USE_PDL": True, "launch_pdl": True}
-    return {}
+    if not _enabled:
+        return {}
+    # The capability is checked per device: a process may drive GPUs of different generations.
+    # It is cached because torch.cuda.get_device_capability() costs microseconds per call,
+    # which an eager launch pays on every kernel.
+    device = torch.cuda.current_device()
+    supported = _device_supports_pdl.get(device)
+    if supported is None:
+        supported = torch.cuda.get_device_capability(device)[0] >= 9
+        _device_supports_pdl[device] = supported
+    return {"USE_PDL": True, "launch_pdl": True} if supported else {}

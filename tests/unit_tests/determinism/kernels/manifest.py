@@ -857,6 +857,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         training_path=False,
         exempt_reason="Multi-rank NVLS multimem collectives over torch symmetric memory; the in-switch reduction "
         "order is hardware defined and needs an NVLink peer group. Batch-invariant mode routes around them.",
+        notes="test_inference_triton_pdl.py checks their PDL launches against the non-PDL launch on two or "
+        "more NVLink ranks.",
     ),
     KernelEntry(
         name="unified_memory_allocator",

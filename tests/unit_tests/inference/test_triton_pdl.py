@@ -10,7 +10,9 @@ PDL_KWARGS = {"USE_PDL": True, "launch_pdl": True}
 def test_pdl_kwargs_only_under_inference_mode(monkeypatch):
     """With PDL supported, kernels get the PDL launch arguments only under inference mode."""
     monkeypatch.setattr(triton_pdl, "_enabled", True)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (9, 0))
+    monkeypatch.setattr(triton_pdl, "_device_supports_pdl", {})
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
     assert triton_pdl.pdl_kwargs() == {}
     with torch.inference_mode():
         assert triton_pdl.pdl_kwargs() == PDL_KWARGS
@@ -30,7 +32,10 @@ def test_pdl_kwargs_empty_when_unsupported(monkeypatch):
 def test_pdl_kwargs_follow_the_current_device(monkeypatch):
     """In a process with an SM90 and an SM80 GPU, only launches on the SM90 GPU get PDL."""
     monkeypatch.setattr(triton_pdl, "_enabled", True)
-    for capability, expected in [((9, 0), PDL_KWARGS), ((8, 0), {}), ((9, 0), PDL_KWARGS)]:
-        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda c=capability: c)
+    monkeypatch.setattr(triton_pdl, "_device_supports_pdl", {})
+    capabilities = {0: (9, 0), 1: (8, 0)}
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: capabilities[device])
+    for device, expected in [(0, PDL_KWARGS), (1, {}), (0, PDL_KWARGS)]:
+        monkeypatch.setattr(torch.cuda, "current_device", lambda d=device: d)
         with torch.inference_mode():
-            assert triton_pdl.pdl_kwargs() == expected, capability
+            assert triton_pdl.pdl_kwargs() == expected, device
