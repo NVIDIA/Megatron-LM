@@ -63,6 +63,7 @@ from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
+from megatron.core.transformer.moe.moe_utils import MoEAuxLossAutoScaler
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -2384,6 +2385,10 @@ class TestHybridLayerPairCudaGraph:
         model_parallel_cuda_manual_seed(123)
         # The MoE metrics tracker sizes its per-layer buffers at first use.
         destroy_moe_metrics_tracker()
+        # The schedule copies its loss scale, of shape [1], into the MoE aux-loss scale once one
+        # exists, and an earlier test that ran an MoE backward outside the schedule leaves a
+        # scalar there. Start without one; monkeypatch puts the earlier scale back afterward.
+        monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", None)
         data_parallel_size = parallel_state.get_data_parallel_world_size()
         destroy_num_microbatches_calculator()
         init_num_microbatches_calculator(
