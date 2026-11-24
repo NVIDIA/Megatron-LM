@@ -9,7 +9,6 @@ import traceback
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
-from megatron.training.global_vars import get_run_config
 import numpy as np
 import torch
 from einops import rearrange
@@ -38,6 +37,8 @@ from megatron.energon import (
 )
 from megatron.energon.task_encoder.base import stateless
 from megatron.training import get_args, get_tokenizer
+from megatron.training.global_vars import get_run_config
+from megatron.training.models import LLaVAModelConfig
 
 
 @dataclass
@@ -195,22 +196,37 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             structured_conversation.append(turn)
         return structured_conversation
 
-    def __init__(self):
+    def __init__(self, *, sequence_length, packing_sequence_length, image_token_budget):
         super().__init__()
 
         self.args = get_args()
-        self.cfg = get_run_config()
+        cfg = get_run_config()
+        if not isinstance(cfg.model, LLaVAModelConfig):
+            raise TypeError(
+                "Expected cfg.model to be LLaVAModelConfig, "
+                f"got {type(cfg.model).__name__}"
+            )
+        if not image_token_budget:
+            raise ValueError(
+                "image_token_budget must be a positive token count (the entry points pass "
+                "--seq-length)"
+            )
+        # Workers retain serializable preprocessing inputs, not the runtime config.
+        self.img_h = cfg.model.img_h
+        self.img_w = cfg.model.img_w
+        self.patch_dim = cfg.model.patch_dim
+        self.drop_vision_class_token = cfg.model.drop_vision_class_token
+        self.freeze_language_model = cfg.model.freeze_language_model
+        self.max_seq_length_per_sample = cfg.model.transformer.max_seq_length_per_sample
 
         self.tokenizer = get_tokenizer()
         self.manual_prompts = {}
         if self.args.prompt_path:
             with open(self.args.prompt_path, "r") as f:
                 self.manual_prompts = json.load(f)
-        self.dataloader_seq_length = (
-            self.args.dataloader_seq_length
-        )  # Always return samples of this length.
+        self.dataloader_seq_length = sequence_length  # Always return samples of this length.
         self.packing_seq_length = (
-            self.args.packing_seq_length
+            packing_sequence_length
         )  # Packing sequence length, if packing is enabled.
         self.is_packing_enabled = (
             self.args.packing_buffer_size is not None and self.args.packing_buffer_size > 0
@@ -225,35 +241,34 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             assert self.packing_seq_length > 0, "packing sequence length must be set"
 
         self.num_image_embeddings_per_tile = get_num_image_embeddings(
-            img_h=self.args.img_h,
-            img_w=self.args.img_w,
-            patch_dim=self.args.patch_dim,
+            img_h=self.img_h,
+            img_w=self.img_w,
+            patch_dim=self.patch_dim,
             vision_model_type=self.args.vision_model_type,
-            disable_vision_class_token=self.args.disable_vision_class_token,
+            disable_vision_class_token=self.drop_vision_class_token,
             class_token_len=1,
             pixel_shuffle=self.args.pixel_shuffle,
             use_tile_tags=self.args.use_tile_tags,
             max_num_tiles=self.args.max_num_tiles,
-            tokenizer_type=self.cfg.tokenizer.tokenizer_prompt_format,
+            tokenizer_type=cfg.tokenizer.tokenizer_prompt_format,
         )
 
         # Create a partial function with all the self.args parameters pre-filled
         # Only img_h and img_w need to be specified when calling this function
         self._get_num_image_embeddings = functools.partial(
             get_num_image_embeddings,
-            patch_dim=self.args.patch_dim,
+            patch_dim=self.patch_dim,
             vision_model_type=self.args.vision_model_type,
-            disable_vision_class_token=self.args.disable_vision_class_token,
+            disable_vision_class_token=self.drop_vision_class_token,
             class_token_len=1,
             pixel_shuffle=self.args.pixel_shuffle,
             use_tile_tags=self.args.use_tile_tags,
             max_num_tiles=self.args.max_num_tiles,
-            tokenizer_type=self.cfg.tokenizer.tokenizer_prompt_format,
+            tokenizer_type=cfg.tokenizer.tokenizer_prompt_format,
         )
 
         self.txt_to_token_dict = {}
 
-        self.img_h, self.img_w = self.args.img_h, self.args.img_w
         self.img_token_id = self.tokenizer.image_token_index
         # This map is used to reduce the number of tiles used per image if the number of tokens is
         # larger than the decoder_seq_length.
@@ -269,11 +284,11 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             self.img_h,
             self.args.vision_model_type,
             dynamic_resolution=self.args.dynamic_resolution,
-            res_step=self.args.patch_dim,
+            res_step=self.patch_dim,
             min_num_patches=self.args.dynamic_resolution_min_patches,
-            max_num_patches=self.args.seq_length
+            max_num_patches=image_token_budget
             - (
-                1 if not self.args.disable_vision_class_token else 0
+                1 if not self.drop_vision_class_token else 0
             ),  # TODO: handle class toekn length correctly(not just use 1)
             pixel_shuffle=self.args.pixel_shuffle,
             min_side=self.args.dynamic_resolution_min_side,
@@ -285,11 +300,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         )
 
     def _verify_no_temporal_compression(self):
-        """
-        This TaskEncoder is not updated to support these features, but we still construct it during
-        training setup even when using MultiModalTaskEncoder, enen though we don't use it. So we
-        have to check this during runtime.
-        """
+        """Reject temporal compression when this legacy TaskEncoder is used."""
         # For tiling only, need a fixed number of embeddings for num_image_embeddings_per_tile
         # We don't pass in `is_video` to calculate `self.num_image_embeddings_per_tile`,
         # so we currently require no temporal compression because we can't verify the number of frames
@@ -457,8 +468,9 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             input_ids, target = self._truncate_for_packing(input_ids, target, num_tiles, imgs)
 
         assert (
-            self._get_total_seq_length(input_ids, num_tiles, imgs) < self.args.decoder_seq_length
-        ), f"total sequence length {self._get_total_seq_length(input_ids, num_tiles, imgs)} needs to be less than {self.args.decoder_seq_length}"
+            self._get_total_seq_length(input_ids, num_tiles, imgs)
+            < self.max_seq_length_per_sample
+        ), f"total sequence length {self._get_total_seq_length(input_ids, num_tiles, imgs)} needs to be less than {self.max_seq_length_per_sample}"
 
         return ImageTaskSample(
             __key__=sample.__key__,
@@ -533,8 +545,8 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         if hasattr(sample, "images") and not has_video:
             # If this is a text-only sample and we are freezing the LM,
             # then use a dummy input image.
-            if len(sample.images) == 0 and self.args.freeze_LM:
-                empty_img = Image.new('RGB', (self.args.img_w, self.args.img_h), (255, 255, 255))
+            if len(sample.images) == 0 and self.freeze_language_model:
+                empty_img = Image.new('RGB', (self.img_w, self.img_h), (255, 255, 255))
                 sample.images.append(empty_img)
             if len(sample.images) > 0:
                 has_image = True
@@ -612,7 +624,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             max_num_tiles = self.args.max_num_tiles
             # We keep a buffer of 4 tokens for the question,
             # the rest can be used for image tokens.
-            max_image_token_allowed = self.args.decoder_seq_length - len(input_ids) - 4
+            max_image_token_allowed = self.max_seq_length_per_sample - len(input_ids) - 4
             # We start by extracting as many tiles per image as possible, and decrease the max
             # number of tiles if there are too many image tokens.
             while True:
@@ -708,8 +720,9 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         ), "Sample has no trainable tokens."
 
         assert (
-            self._get_total_seq_length(input_ids, num_tiles, imgs) < self.args.decoder_seq_length
-        ), f"total sequence length {self._get_total_seq_length(input_ids, num_tiles, imgs)} needs to be less than {self.args.decoder_seq_length}"
+            self._get_total_seq_length(input_ids, num_tiles, imgs)
+            < self.max_seq_length_per_sample
+        ), f"total sequence length {self._get_total_seq_length(input_ids, num_tiles, imgs)} needs to be less than {self.max_seq_length_per_sample}"
 
         # Context parallel and FP8 require padding.
         # TODO: Total sample len and padded len are kept the same here.
@@ -726,7 +739,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                 self.args.tensor_model_parallel_size,
                 self.args.sequence_parallel,
                 self.args.tp_comm_overlap,
-                self.args.decoder_seq_length,
+                self.max_seq_length_per_sample,
                 fp8_enabled=False,
             )
             padding_input = np.ones(padding_needed) * self.tokenizer.pad
@@ -752,7 +765,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         self._verify_no_temporal_compression()
 
         # Compute the loss mask based on extending the image tags with the proper
-        # number of image tokens, extracting the first self.args.decoder_seq_length tokens, and
+        # number of image tokens, extracting the first self.max_seq_length_per_sample tokens, and
         # ensuring that some of these tokens have a loss mask > 0.
         # Note that this is a bit hacky because we reproduce here parts of the logics which are in
         # the model itself. Ideally, the data sampler would return the already processed inputs
@@ -783,7 +796,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         loss_mask[expanded_target == self.tokenizer.pad] = 0.0  # mask paddings
         loss_mask[expanded_target == IGNORE_INDEX] = 0.0  # mask prompts
         loss_mask = torch.cat((loss_mask[1:], torch.zeros((1,))))
-        loss_mask = loss_mask[: self.args.decoder_seq_length]
+        loss_mask = loss_mask[: self.max_seq_length_per_sample]
         return torch.sum(loss_mask) > 0
 
     def replace_value_with_repetition(self, arr, token_to_replace, num_repetition, new_token):
@@ -1098,8 +1111,8 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         if has_fp8 and self.args.dynamic_resolution and no_cp:
             img_seq_len = 0
             for img in imgs:
-                img_seq_len += (img.shape[1] // self.args.patch_dim) * (
-                    img.shape[2] // self.args.patch_dim
+                img_seq_len += (img.shape[1] // self.patch_dim) * (
+                    img.shape[2] // self.patch_dim
                 )
             padding_needed = get_padding(
                 img_seq_len,
@@ -1107,18 +1120,18 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                 self.args.tensor_model_parallel_size,
                 self.args.sequence_parallel,
                 self.args.tp_comm_overlap,
-                self.args.decoder_seq_length,
+                self.max_seq_length_per_sample,
                 fp8_enabled=has_fp8,
             )
             if padding_needed > 0:
                 pad_img = torch.zeros(
-                    [3, self.args.patch_dim, padding_needed * self.args.patch_dim]
+                    [3, self.patch_dim, padding_needed * self.patch_dim]
                 )
                 imgs.append(pad_img)
                 has_pad_img = torch.tensor(True)
 
         imgs, imgs_sizes, vision_cu_lengths, vision_max_lengths = process_images(
-            imgs, self.args.patch_dim, self.args.dynamic_resolution, batch_mode=True
+            imgs, self.patch_dim, self.args.dynamic_resolution, batch_mode=True
         )
 
         # Set default values if no vision metadata was returned (static resolution case)
@@ -1153,7 +1166,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                 self.args.tensor_model_parallel_size,
                 self.args.sequence_parallel,
                 self.args.tp_comm_overlap,
-                self.args.decoder_seq_length,
+                self.max_seq_length_per_sample,
                 fp8_enabled=has_fp8,
             )
             if padding_needed > 0:

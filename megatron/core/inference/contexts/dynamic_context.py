@@ -60,6 +60,7 @@ from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMet
 from .base_context import BaseInferenceContext
 from .gpu_view import ContextGPUView
 from .kv_block_allocator import MAX_CACHED_PROMPT_TOP_N_LOGPROBS, KVBlockAllocator
+from .mamba_replay_metadata import MambaReplayMetadata
 from .mamba_slot_allocator import MambaSlotAllocator
 from .mtp_context_mixin import MTPContextMixin
 from .prefix_cache_block_state import PrefixCacheBlockState
@@ -406,6 +407,22 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.enable_prefix_caching = inference_config.enable_prefix_caching
         self.prefix_caching_eviction_policy = inference_config.prefix_caching_eviction_policy
         self.prefix_caching_coordinator_policy = inference_config.prefix_caching_coordinator_policy
+        # An external router (Dynamo) splits work without shards, so only native
+        # disaggregation can be checked here; its factory sets the role first.
+        assert (
+            inference_config.disaggregation_shards is None
+            or inference_config.disaggregation_role is not None
+        ), (
+            "disaggregation_shards is set but disaggregation_role is not; build the engine "
+            "with build_dynamic_inference_engine or set the role before the context"
+        )
+        # Decode imports each handoff straight into live SSM state and never
+        # restores a cached one, so it holds no Mamba prefix cache.
+        self.prefix_caching_mamba_gb = (
+            None
+            if inference_config.disaggregation_role == "decode"
+            else inference_config.prefix_caching_mamba_gb
+        )
 
         # Hyperparameter for choosing to prioritize prefix hit matches vs minimizing idle load
         self.prefix_caching_routing_alpha = inference_config.prefix_caching_routing_alpha
@@ -480,6 +497,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         )
         self._async_sched_token_offsets = None
 
+        # Intermediate (rollback) buffers checkpoint the state after every verification
+        # window position (the guaranteed-accepted free token + the drafted tokens).
+        self.num_mamba_intermediate_states = self.num_speculative_tokens + 1
+
         # Cache the PP group we should use for PP collectives inside the context.
         # If the model provides a pg_collection with a pp group, prefer it.
         # Otherwise:
@@ -520,9 +541,21 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # CPU, avoiding a per-step NCCL AllReduce kernel on the compute stream.
         self._ep_zmq_communicator = None
 
+        # Persistent logits destination the controller installs under CUDA graphs.
+        # The controller owns it, so it is exempt from asserts and deallocation.
+        self.logits_output_buffer = None
+
         # Mamba states.
         mamba_inference_state_config = inference_config.mamba_inference_state_config
         self.is_hybrid_model = mamba_inference_state_config is not None
+        # ReplaySSM (Mamba-2 speculative decoding); None unless enabled. Only replaces the
+        # intermediate SSM states; the conv intermediate machinery is unchanged.
+        self.mamba_replay = MambaReplayMetadata.create(
+            enabled=inference_config.mamba_replay_ssm,
+            num_speculative_tokens=self.num_speculative_tokens,
+            buffer_len=inference_config.mamba_replay_buffer_len,
+            state_config=mamba_inference_state_config,
+        )
         self.gdp_num_householder = 0
         if self.is_hybrid_model:
             self.mamba_conv_states_shape = mamba_inference_state_config.conv_states_shape
@@ -590,6 +623,37 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.mamba_conv_states_shape, self.mamba_ssm_states_shape = (None, None)
             self.layer_map = {i: i for i in range(self.num_attention_layers)}
 
+        self.max_tokens = inference_config.max_tokens or self.DEFAULT_MAX_TOKENS
+
+        # Prefill token budget per step. Batch-invariant hybrid chunked prefill ends
+        # every non-final chunk on an SSM chunk boundary, so a step whose decode
+        # tokens leave less than `max_tokens` of room would round its prefill chunk
+        # down by up to a whole SSM chunk. Budget prefill against `max_tokens` alone
+        # and add one SSM chunk of step capacity for the decode tokens, so a mixed
+        # step admits at least as many prefill tokens as without batch invariance.
+        self.max_prefill_tokens = self.max_tokens
+        if (
+            self.batch_invariant_mode
+            and self.is_hybrid_model
+            and inference_config.enable_chunked_prefill
+        ):
+            self.max_tokens += self.ssm_chunk_alignment
+
+        if self.max_tokens % tp_size:
+            raise ValueError(
+                f"max_tokens ({self.max_tokens}) must be divisible by tensor parallel size "
+                f"({tp_size}) so eager prefill padding fits the input buffers."
+            )
+        if (
+            self.batch_invariant_mode
+            and self.round_up_tokens(self.max_tokens, tp_size=tp_size) != self.max_tokens
+        ):
+            raise ValueError(
+                f"max_tokens ({self.max_tokens}) must respect token rounding "
+                f"({self.TOKEN_ROUNDER}) and tensor parallel size ({tp_size}) "
+                "in batch-invariant mode."
+            )
+
         self._mtp_initialize_kv_cache(model_config, inference_config.mtp_layer_type_list)
 
         if self.num_attention_layers == 0:
@@ -629,21 +693,33 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         mamba_states_memory_per_request = 0
         if self.is_hybrid_model:
-            mamba_states_memory_per_request += (
+            conv_bytes_per_layer = (
                 math.prod(self.mamba_conv_states_shape) * self.mamba_conv_states_dtype.itemsize
             )
-            mamba_states_memory_per_request += (
+            ssm_bytes_per_layer = (
                 math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
             )
-            mamba_states_memory_per_request *= self.num_mamba_layers
+            mamba_states_memory_per_request += (
+                conv_bytes_per_layer + ssm_bytes_per_layer
+            ) * self.num_mamba_layers
             if self.num_speculative_tokens > 0:
-                # Add memory for intermediate conv and SSM states
+                # Conv intermediate (checkpointed full conv windows).
                 intermediate_memory_per_request = (
-                    math.prod(self.mamba_conv_states_shape) * self.mamba_conv_states_dtype.itemsize
-                    + math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
+                    conv_bytes_per_layer
+                    * self.num_mamba_layers
+                    * self.num_mamba_intermediate_states
                 )
-                intermediate_memory_per_request *= self.num_mamba_layers
-                intermediate_memory_per_request *= self.num_speculative_tokens + 1
+                if self.mamba_replay is not None:
+                    # ReplaySSM ring buffers instead of SSM intermediates.
+                    intermediate_memory_per_request += self.mamba_replay.ring_bytes_per_request(
+                        self.num_mamba_layers
+                    )
+                else:
+                    intermediate_memory_per_request += (
+                        ssm_bytes_per_layer
+                        * self.num_mamba_layers
+                        * self.num_mamba_intermediate_states
+                    )
                 mamba_states_memory_per_request += intermediate_memory_per_request
 
         # Unified memory and general tensor management.
@@ -674,6 +750,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         # When not using `torch_memory_saver`, we manually offload/restore tensors.
         # We use storage resize, similar to the logic in `core/distributed/param_and_grad_buffer.py`
+        # Attribute paths, resolved with `operator.attrgetter`; dotted paths reach tensors held
+        # by sub-objects (e.g. `mamba_replay.write_pos`).
         self._offloadable_tensor_names: set[str] = set()
         self._offloadable_cpu_backups: dict[str, torch.Tensor] = {}
         self._offloadable_storage_sizes: dict[str, int] = {}
@@ -689,14 +767,20 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         mamba_max_requests = float('inf')
         # Handoff may retain every request-owned recurrent-state slot after the requests leave
-        # the batch. An idle EP rank must still run a dummy forward to join its peers' expert
+        # the batch. An idle rank must still run a dummy forward to join its tp_ep peers'
         # collectives, so disaggregated callers can reserve one slot outside request capacity.
+        # The engine's work consensus runs over the tp_ep group (ETP x EP), so a dummy forward
+        # can happen whenever that group has more than one rank, including TP > 1 with EP = 1.
         self.reserve_recurrent_state_dummy_slot = bool(
             self.is_hybrid_model
             and inference_config.reserve_recurrent_state_dummy_slot
-            and model_config.expert_model_parallel_size > 1
+            and model_config.expert_tensor_parallel_size * model_config.expert_model_parallel_size
+            > 1
         )
         reserved_mamba_slots = int(self.reserve_recurrent_state_dummy_slot)
+        # Set by setup_kv_transfer. Disaggregated handoffs can hold recurrent-state
+        # slots outside request rows, so admission must not assume one slot per row.
+        self.kv_transfer_enabled = False
         reserved_mamba_bytes = reserved_mamba_slots * mamba_states_memory_per_request
 
         if (mamba_memory_ratio := inference_config.mamba_memory_ratio) is not None:
@@ -732,7 +816,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             )
             assert mamba_memory_needed < total_memory, (
                 f"Not enough memory for {inference_config.max_requests} mamba requests "
-                f"plus {reserved_mamba_slots} reserved EP dummy slot(s). "
+                f"plus {reserved_mamba_slots} reserved tp_ep dummy slot(s). "
                 f"Need {mamba_memory_needed / 1024**3:.2f} GB for recurrent states, "
                 f"but total buffer is {total_memory / 1024**3:.2f} GB."
             )
@@ -788,8 +872,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             # stage (see `_compute_prefix_match`), so it stays available.
             mamba_prefix_cache_requested = (
                 self.enable_prefix_caching
-                and inference_config.prefix_caching_mamba_gb is not None
-                and inference_config.prefix_caching_mamba_gb > 0
+                and self.prefix_caching_mamba_gb is not None
+                and self.prefix_caching_mamba_gb > 0
             )
             if (
                 mamba_prefix_cache_requested
@@ -849,7 +933,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 self._decode_kv_lookahead_tokens / self.block_size_tokens
             )
 
-        # Set max_requests, max_tokens.
+        # Set max_requests.
         if inference_config.max_requests is None:
             # Maximize compute utilization by defaulting to 1 block per request.
             self.max_requests = self.kv_block_allocator.pool_size - 1  # -1 for dummy block
@@ -867,22 +951,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         assert (
             self.max_requests % tp_size == 0
         ), f"max_requests must be divisible by tp_size ({tp_size}), but got {self.max_requests}"
-
-        self.max_tokens = inference_config.max_tokens or self.DEFAULT_MAX_TOKENS
-
-        # Prefill token budget per step. Batch-invariant hybrid chunked prefill ends
-        # every non-final chunk on an SSM chunk boundary, so a step whose decode
-        # tokens leave less than `max_tokens` of room would round its prefill chunk
-        # down by up to a whole SSM chunk. Budget prefill against `max_tokens` alone
-        # and add one SSM chunk of step capacity for the decode tokens, so a mixed
-        # step admits at least as many prefill tokens as without batch invariance.
-        self.max_prefill_tokens = self.max_tokens
-        if (
-            self.batch_invariant_mode
-            and self.is_hybrid_model
-            and inference_config.enable_chunked_prefill
-        ):
-            self.max_tokens += self.ssm_chunk_alignment
 
         # Per-step upper bound on Mamba intermediate-state extractions, shared with
         # MambaMetadata and MambaSlotAllocator so scratch/metadata buffers and the
@@ -1025,6 +1093,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 topk=model_config.moe_router_topk,
                 hidden_size=moe_hidden_size,
                 tp_ep_group=self.expert_tensor_and_model_parallel_group,
+                ep_invariant_combine=model_config.moe_ep_invariant_combine,
             )
 
         # Pre-allocate the vLLM fused-MoE intermediates so no allocation happens
@@ -1091,14 +1160,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self._bookkeeping_no_real_work = False
         self.initialize_all_tensors()
 
-        # Bind the GPU real-token-count tensor onto the NVLS dispatcher class
-        # so it can mask out CUDA-graph padding tokens during routing. The
-        # tensor lives inside gpu_view._buf (fixed address) and is refreshed
-        # each step by transfer_bookkeeping_to_gpu(). NVLS-only — the NCCL
-        # dispatcher requires equal token counts across ranks already.
-        if self._nvls_dispatcher:
-            NVLSAllGatherVDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
-
         # Print info.
         pool_size = self.kv_block_allocator.pool_size
         usable_blocks = pool_size - 1
@@ -1149,17 +1210,24 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             ]
 
             if self.num_speculative_tokens > 0:
-                spec_multiplier = self.num_speculative_tokens + 1
-                spec_bytes_per_req = mamba_bytes_per_req * spec_multiplier
+                conv_int_bytes = mamba_conv_bytes * self.num_mamba_intermediate_states
+                if self.mamba_replay is not None:
+                    ssm_int_bytes = self.mamba_replay.ring_bytes_per_request(self.num_mamba_layers)
+                    spec_label = f"ReplaySSM ring buffers, buf={self.mamba_replay.cache_buf_len}"
+                else:
+                    ssm_int_bytes = mamba_ssm_bytes * self.num_mamba_intermediate_states
+                    spec_label = "full intermediate states"
+                spec_bytes_per_req = conv_int_bytes + ssm_int_bytes
                 spec_total_bytes = spec_bytes_per_req * state_slot_count
                 log_lines += [
-                    f"  Mamba speculative buffers (num_speculative_tokens={self.num_speculative_tokens}):",
+                    f"  Mamba speculative buffers ({spec_label}, "
+                    f"num_speculative_tokens={self.num_speculative_tokens}):",
                     f"    per_request:           {get_mem_size_str(spec_bytes_per_req)}",
                     f"    total ({state_slot_count} state slots):  "
                     f"{get_mem_size_str(spec_total_bytes)}",
                 ]
 
-            prefix_caching_mamba_gb = inference_config.prefix_caching_mamba_gb
+            prefix_caching_mamba_gb = self.prefix_caching_mamba_gb
             if (
                 inference_config.enable_prefix_caching
                 and prefix_caching_mamba_gb is not None
@@ -1252,8 +1320,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             # The prefix-cached subclass carries the intermediate-state extraction machinery.
             use_prefix_cached = (
                 self.config.enable_prefix_caching
-                and self.config.prefix_caching_mamba_gb is not None
-                and self.config.prefix_caching_mamba_gb > 0
+                and self.prefix_caching_mamba_gb is not None
+                and self.prefix_caching_mamba_gb > 0
             )
             if use_prefix_cached:
                 self.mamba_metadata = PrefixCachedMambaMetadata(
@@ -1316,22 +1384,30 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     (
                         self.num_mamba_layers,
                         state_slot_count,
-                        self.num_speculative_tokens + 1,
+                        self.num_mamba_intermediate_states,
                         *self.mamba_conv_states_shape,
                     ),
                     dtype=self.mamba_conv_states_dtype,
                     device=torch.cuda.current_device(),
                 )
-                self.mamba_intermediate_ssm_states = torch.empty(
-                    (
-                        self.num_mamba_layers,
-                        state_slot_count,
-                        self.num_speculative_tokens + 1,
-                        *self.mamba_ssm_states_shape,
-                    ),
-                    dtype=self.mamba_ssm_states_dtype,
-                    device=torch.cuda.current_device(),
-                )
+                if self.mamba_replay is not None:
+                    # ReplaySSM ring buffers replace the intermediate SSM states entirely; the
+                    # live mamba_ssm_states become the checkpoint (stale between flush steps).
+                    # Sized like the states so the reserved EP dummy slot is covered too.
+                    self.mamba_replay.allocate(
+                        self.num_mamba_layers, state_slot_count, torch.cuda.current_device()
+                    )
+                else:
+                    self.mamba_intermediate_ssm_states = torch.empty(
+                        (
+                            self.num_mamba_layers,
+                            state_slot_count,
+                            self.num_mamba_intermediate_states,
+                            *self.mamba_ssm_states_shape,
+                        ),
+                        dtype=self.mamba_ssm_states_dtype,
+                        device=torch.cuda.current_device(),
+                    )
             if (
                 self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
                 and not self._uses_torch_memory_saver
@@ -1352,12 +1428,20 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                             self.mamba_intermediate_conv_states, device="cpu"
                         ).pin_memory()
                     )
-                    self._offloadable_tensor_names.add("mamba_intermediate_ssm_states")
-                    self._offloadable_cpu_backups["mamba_intermediate_ssm_states"] = (
-                        torch.empty_like(
-                            self.mamba_intermediate_ssm_states, device="cpu"
-                        ).pin_memory()
-                    )
+                    if self.mamba_replay is not None:
+                        for name in MambaReplayMetadata.PERSISTENT_TENSORS:
+                            name = f"mamba_replay.{name}"
+                            self._offloadable_tensor_names.add(name)
+                            self._offloadable_cpu_backups[name] = torch.empty_like(
+                                operator.attrgetter(name)(self), device="cpu"
+                            ).pin_memory()
+                    else:
+                        self._offloadable_tensor_names.add("mamba_intermediate_ssm_states")
+                        self._offloadable_cpu_backups["mamba_intermediate_ssm_states"] = (
+                            torch.empty_like(
+                                self.mamba_intermediate_ssm_states, device="cpu"
+                            ).pin_memory()
+                        )
         else:
             self.mamba_metadata = None
 
@@ -1370,6 +1454,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         # Validate no tensors allocated prior to this method.
         for key in vars(self).keys():
+            if key == "logits_output_buffer":
+                continue
             value = getattr(self, key)
             assert not isinstance(value, torch.Tensor), (
                 "All tensors should be allocated within `initialize_all_tensors()`. "
@@ -1766,6 +1852,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         )
         self._bookkeeping_h2d_done_event = torch.cuda.Event()
 
+        # Bind the GPU real-token-count tensor onto the NVLS dispatcher class
+        # so it can mask out CUDA-graph padding tokens during routing. The
+        # tensor lives inside gpu_view._buf (fixed address) and is refreshed
+        # each step by transfer_bookkeeping_to_gpu(). NVLS-only — the NCCL
+        # dispatcher requires equal token counts across ranks already.
+        # Bound here, not in __init__: a RECOMPUTE resume rebuilds gpu_view.
+        if self._nvls_dispatcher:
+            NVLSAllGatherVDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
+
         if self.cache_dsa_indexer_keys:
             self.dsa_metadata = DSAMetadata(
                 max_requests=self.max_requests, max_tokens=self.max_tokens
@@ -1811,12 +1906,17 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.mamba_slot_allocator: Optional[MambaSlotAllocator] = None
         if (
             self.is_hybrid_model
-            and self.config.prefix_caching_mamba_gb is not None
-            and self.config.prefix_caching_mamba_gb > 0
+            and self.prefix_caching_mamba_gb is not None
+            and self.prefix_caching_mamba_gb > 0
             and self.config.enable_prefix_caching
         ):
-            self._allocate_mamba_cache(self.config.prefix_caching_mamba_gb)
-        elif self.is_hybrid_model and self.config.enable_prefix_caching:
+            self._allocate_mamba_cache(self.prefix_caching_mamba_gb)
+        elif (
+            self.is_hybrid_model
+            and self.config.enable_prefix_caching
+            # Decode skips the cache by design; the warning is for a forgotten budget.
+            and self.config.disaggregation_role != "decode"
+        ):
             # Memory-only mode: prefix caching on a hybrid model without a Mamba
             # cache budget deduplicates identical KV prefixes for memory savings,
             # but does NOT cache Mamba recurrent state. Prefill skipping is
@@ -1831,7 +1931,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 "memory savings, but Mamba state caching and prefill skipping are "
                 "disabled (every token is recomputed). Set prefix_caching_mamba_gb "
                 "> 0 to enable full prefix caching.",
-                self.config.prefix_caching_mamba_gb,
+                self.prefix_caching_mamba_gb,
             )
 
         self._mtp_allocate_buffers()
@@ -1869,7 +1969,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             return
 
         if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
-            for name, tensor in ((n, getattr(self, n)) for n in self._offloadable_tensor_names):
+            for name, tensor in (
+                (n, operator.attrgetter(n)(self)) for n in self._offloadable_tensor_names
+            ):
                 tensor.storage().resize_(self._offloadable_storage_sizes[name])
                 tensor.copy_(self._offloadable_cpu_backups[name], non_blocking=True)
         elif self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
@@ -1909,18 +2011,25 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.dsa_metadata.topk_workspace = None
 
         if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
-            for name, tensor in ((n, getattr(self, n)) for n in self._offloadable_tensor_names):
+            for name, tensor in (
+                (n, operator.attrgetter(n)(self)) for n in self._offloadable_tensor_names
+            ):
                 self._offloadable_storage_sizes[name] = tensor.storage().size()
                 self._offloadable_cpu_backups[name].copy_(tensor, non_blocking=True)
                 tensor.storage().resize_(0)
         elif self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
             # TODO(@lmcafee): check that device == 'cuda'?
             for key in list(vars(self).keys()):
+                if key == "logits_output_buffer":
+                    continue
                 value = getattr(self, key)
                 if isinstance(value, torch.Tensor):
                     delattr(self, key)
             # The MTP scratch buffers hang off `self.mtp_metadata`, so the sweep above misses them.
             self.mtp_metadata.deallocate()
+            # Likewise the ReplaySSM ring buffers, which hang off `self.mamba_replay`.
+            if self.mamba_replay is not None:
+                self.mamba_replay.deallocate()
             self.dsa_metadata = None
 
     @classmethod
@@ -2225,7 +2334,12 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         mamba_layer_number = self.layer_map[layer_number - 1]
         if intermediate:
             conv_state = self.mamba_intermediate_conv_states[mamba_layer_number]
-            ssm_state = self.mamba_intermediate_ssm_states[mamba_layer_number]
+            # In ReplaySSM mode there is no full intermediate SSM buffer.
+            ssm_state = (
+                None
+                if self.mamba_replay is not None
+                else self.mamba_intermediate_ssm_states[mamba_layer_number]
+            )
         else:
             conv_state = self.mamba_conv_states[mamba_layer_number]
             ssm_state = self.mamba_ssm_states[mamba_layer_number]
@@ -2787,6 +2901,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     dummy_slots is not None
                 ), f"No free recurrent-state slots for {N} expert-parallel dummy request(s)"
                 self.mamba_metadata.request_to_mamba_state_idx[0:N] = dummy_slots
+                # Queue them for zeroing like every other allocation site so the deferred Mamba
+                # ops (state zeroing + ReplaySSM cursor reset) treat them uniformly.
+                self._pending_mamba_zeros.extend(dummy_slots.tolist())
 
     def initialize_attention_state(
         self,
@@ -2890,7 +3007,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     padded_decode_req_count = padded_token_count
                 padded_prefill_req_count = 0
             else:
-                padded_token_count = self.round_up_tokens(self.active_token_count)
+                padded_token_count = min(
+                    self.max_tokens, self.round_up_tokens(self.active_token_count)
+                )
                 target_padding_req_count = min(
                     self.max_requests,
                     self.round_up_requests(self.total_request_count - self.paused_request_count),
@@ -3123,6 +3242,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         """
         if not (self._pending_mamba_restores or self._pending_mamba_zeros):
             return
+
+        # ReplaySSM: any slot that is (re)initialized — zeroed for a new request or
+        # restored from the prefix cache — starts with an empty ring buffer. The
+        # restored/zeroed state is the checkpoint; cursors must reset with it.
+        if self.mamba_replay is not None:
+            self.mamba_replay.reset_slots(
+                [m for _, _, m in self._pending_mamba_restores] + list(self._pending_mamba_zeros)
+            )
 
         # Restore cached Mamba state to live buffers.  On failure, fall back to zeroing.
         for request_idx, block_id, mamba_idx in self._pending_mamba_restores:
@@ -3678,15 +3805,29 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             prefill_chunk_length (Optional[int]): Prompt tokens in the chunk to admit.
                 Defaults to the whole remaining prompt.
         """
-        # Note that for hybrid models checking the total request count is sufficient
-        # because we allocate a single set of Mamba state tensors for each request.
         request_can_be_added = (
             self.total_request_count < self.max_requests and self.paused_request_count == 0
         )
-        # A handoff is the exception: it keeps its live recurrent-state slot after
-        # its request row is removed, so both capacities must be checked independently.
-        if self.is_hybrid_model and self.kv_block_allocator.enable_handoff_pinning:
-            request_can_be_added &= self.mamba_metadata.mamba_state_free_slot_count > 0
+        # Hybrid models also need a free recurrent-state slot. The slot pool has one
+        # entry per request row, but with KV transfer slots can be held by state that
+        # owns no row: a prefill engine keeps a finished handoff's slot until the
+        # decode peer has read it, and a decode engine reserves a slot for each
+        # incoming handoff before that request is admitted. A free row therefore does
+        # not imply a free slot, and add_request would fail mid-allocation without
+        # this check. Without KV transfer, the only slot held outside the counted rows
+        # is a chunked prefill request's between chunks: update_requests hides its row
+        # past total_request_count until the next chunk re-adds it, but keeps its slot.
+        if self.is_hybrid_model:
+            has_free_mamba_slot = self.mamba_metadata.mamba_state_free_slot_count > 0
+            if not self.kv_transfer_enabled and request_can_be_added:
+                assert has_free_mamba_slot or (
+                    self.chunked_prefill_request_id != -1
+                    and self.get_index_of_chunked_prefill_request(safe=True) == -1
+                ), (
+                    "A free request row has no free Mamba state slot, but only KV transfer "
+                    "or a hidden chunked prefill request may hold slots outside request rows"
+                )
+            request_can_be_added &= has_free_mamba_slot
 
         if prefill_chunk_length is None:
             prefill_chunk_length = req.remaining_prompt_length

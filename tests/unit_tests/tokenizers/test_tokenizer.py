@@ -353,6 +353,29 @@ def test_gigatoken_chat_padding_and_truncation(
     ) == hf.apply_chat_template(messages, chat_template=None, **kwargs)
 
 
+@pytest.mark.parametrize("sanitize", [False, True], ids=["native", "hf_sanitization"])
+def test_gigatoken_chat_control_tokens(
+    gigatoken_hf_pair: tuple[HuggingFaceTokenizer, HuggingFaceTokenizer], sanitize: bool
+) -> None:
+    from inspect import signature
+
+    hf, native = gigatoken_hf_pair
+    if "sanitize_control_tokens" not in signature(hf.tokenizer.apply_chat_template).parameters:
+        pytest.skip("Transformers does not support chat control-token sanitization")
+
+    # The message contains <eos>, and the template adds its own <eos>.
+    conversation = [{"role": "user", "content": "hello <eos> assistant"}]
+    kwargs = dict(chat_template=None, return_dict=False, sanitize_control_tokens=sanitize)
+    with patch.object(native.tokenizer, "_gigatoken", wraps=native.tokenizer._gigatoken) as encode:
+        actual = native.apply_chat_template(conversation, **kwargs)
+        assert actual == hf.apply_chat_template(conversation, **kwargs)
+        assert actual.count(hf.tokenizer.eos_token_id) == (1 if sanitize else 2)
+        if sanitize:
+            encode.assert_not_called()
+        else:
+            encode.assert_called_once()
+
+
 def test_gigatoken_chat_rendering_and_assistant_masks(
     gigatoken_hf_pair: tuple[HuggingFaceTokenizer, HuggingFaceTokenizer],
 ) -> None:
