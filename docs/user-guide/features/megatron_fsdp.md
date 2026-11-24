@@ -225,6 +225,31 @@ def load_model_and_optimizer_state_dict(state_dict):
     optimizer.load_state_dict(state_dict["optimizer"])
 ```
 
+### Weight retention in MFSDP v2
+
+With `--use-megatron-fsdp --megatron-fsdp-version 2`, enable
+`--megatron-fsdp-weight-retention` to reuse gathered weights between module calls.
+The first eager iteration records the complete schedule. Before the next iteration
+or CUDA graph capture, M-LM builds a release mask from that trace.
+
+Compute, single-successor prefetch and retained weights share the standard
+window of two gathered FSDP owners. The planner keeps prefetch enabled and retains
+an owner only when its complete release-to-next-use interval fits that window.
+For nested root/layer/expert execution, it preserves the normal prefetch schedule's
+larger owner-slot envelope instead of adding retention buffers. Replicated weights
+that alias persistent storage use no gathered-buffer slot.
+
+All recorded FSDP modules can participate; no layer-type registry or byte budget
+is needed. This is a module-slot policy, not a bound on allocated bytes when owners
+have different sizes. Every iteration releases gathered weights before optimizer
+updates. Recording and planning happen once, before CUDA graph capture.
+
+Retention defaults to off and requires PP=1 without VPP, a fixed
+module/microbatch schedule, and ordinary hooks. Enabled M-LM wrappers use single-successor prefetch; standalone
+callers must use prefetch sizes of `None` (one successor) or `0` (disabled).
+MoE EP overlap and NCCL user buffers are currently unsupported. Gradient
+accumulation and reduction modes are unchanged.
+
 ### 🔁 Checkpoint Conversion
 
 Megatron-FSDP checkpointing supports [PyTorch Distributed Checkpoint (DCP)](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html). In Megatron-LM, this is the `--ckpt-format fsdp_dtensor` checkpointing format.

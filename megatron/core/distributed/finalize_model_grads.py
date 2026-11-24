@@ -735,7 +735,11 @@ def finalize_model_grads(
 
     # All local MFSDP chunks share one context and have finished backward.
     if isinstance(model[0], FullyShardedDataParallelV2):
-        model[0].module.context.post_backward()
+        context = model[0].module.context
+        was_recording = context.is_recording_execution_order
+        context.post_backward()
+        if was_recording and model[0].ddp_config.megatron_fsdp_weight_retention:
+            FullyShardedDataParallelV2.compile_weight_retention(model, dp_cp_group)
 
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:

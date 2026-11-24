@@ -2129,7 +2129,9 @@ def wrap_model_chunks_with_ddp(
             FsdpContext(
                 gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER,
                 runtime_policy=RuntimePolicy(
-                    prefetch_order=FullyShardedDataParallelV2.prefetch_order_for(config),
+                    prefetch_order=FullyShardedDataParallelV2.prefetch_order_for(
+                        config, ddp_config
+                    ),
                     autograd_completes_execution=False,
                     use_symmetric_memory=ddp_config.nccl_ub,
                     overlap_outer_communication=ddp_config.overlap_outer_communication,

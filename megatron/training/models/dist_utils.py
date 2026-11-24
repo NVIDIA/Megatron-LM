@@ -382,7 +382,7 @@ def _ddp_wrap(
                     gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER,
                     runtime_policy=RuntimePolicy(
                         prefetch_order=FullyShardedDataParallelV2.prefetch_order_for(
-                            get_model_config(model[0])
+                            get_model_config(model[0]), ddp_config
                         ),
                         autograd_completes_execution=False,
                         use_symmetric_memory=ddp_config.nccl_ub,
