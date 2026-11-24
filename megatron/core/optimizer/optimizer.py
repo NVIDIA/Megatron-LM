@@ -2163,18 +2163,21 @@ class ChainedOptimizer(MegatronOptimizer):
             return self._step_with_deferred_mxfp8_param_sync()
         return self._step()
 
-    def grads_states_parallel_group_is_shared(self):
-        """Whether all optimizers' gradient statistics can share one reduction."""
+    @staticmethod
+    def _grad_stats_can_share_reduction(optimizers: List[MegatronOptimizer]) -> bool:
+        """Whether gradient statistics of ``optimizers`` can share one reduction."""
         if any(
-            getattr(optimizer, 'requires_individual_grad_stats', False)
-            for optimizer in self.chained_optimizers
+            getattr(optimizer, 'requires_individual_grad_stats', False) for optimizer in optimizers
         ):
             return False
-        reference_group = self.chained_optimizers[0].get_grad_stats_parallel_group()
+        reference_group = optimizers[0].get_grad_stats_parallel_group()
         return all(
-            optimizer.get_grad_stats_parallel_group() == reference_group
-            for optimizer in self.chained_optimizers
+            optimizer.get_grad_stats_parallel_group() == reference_group for optimizer in optimizers
         )
+
+    def grads_states_parallel_group_is_shared(self):
+        """Whether all optimizers' gradient statistics can share one reduction."""
+        return self._grad_stats_can_share_reduction(self.chained_optimizers)
 
     def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
         assert self.grads_states_parallel_group_is_shared(), (
@@ -2200,15 +2203,12 @@ class ChainedOptimizer(MegatronOptimizer):
         if len(optimizers) == 1:
             return optimizers[0].get_grad_norm()
         try:
-            reference_group = optimizers[0].get_grad_stats_parallel_group()
-            shared = all(
-                optimizer.get_grad_stats_parallel_group() == reference_group
-                for optimizer in optimizers
-            )
+            shared = self._grad_stats_can_share_reduction(optimizers)
         except AssertionError:
             # A nested ChainedOptimizer member cannot report a single group.
             shared = False
         if shared:
+            reference_group = optimizers[0].get_grad_stats_parallel_group()
             grads_for_norm = []
             for optimizer in optimizers:
                 grads_for_norm += optimizer.get_grads_for_grad_norm()
@@ -2231,10 +2231,8 @@ class ChainedOptimizer(MegatronOptimizer):
             return 0.0, 0.0
         if len(optimizers) == 1:
             return optimizers[0].get_dsa_split_grad_norms()
-        reference_group = optimizers[0].get_grad_stats_parallel_group()
-        if all(
-            optimizer.get_grad_stats_parallel_group() == reference_group for optimizer in optimizers
-        ):
+        if self._grad_stats_can_share_reduction(optimizers):
+            reference_group = optimizers[0].get_grad_stats_parallel_group()
             indexer_grads = []
             non_indexer_grads = []
             for optimizer in optimizers:

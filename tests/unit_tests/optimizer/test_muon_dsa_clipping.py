@@ -96,3 +96,31 @@ def test_muon_exemption_preserves_dsa_clipping(monkeypatch, dsa_clip, exemptions
                     limit = dsa_clip if index == 0 else 1.0
                 expected = grad * min(1.0, limit / (denominator + 1e-6))
             torch.testing.assert_close(param.grad, expected)
+
+
+def test_subset_norms_respect_individual_grad_stats(monkeypatch):
+    """Members that require individual grad stats (MFSDP v2) are never reduced jointly."""
+    shared_calls = []
+    monkeypatch.setattr(
+        optimizer_module, 'get_grad_norm_fp32', lambda grads, **kwargs: shared_calls.append(1)
+    )
+
+    class Member:
+        requires_individual_grad_stats = True
+        config = SimpleNamespace()
+
+        def get_grad_stats_parallel_group(self):
+            return 0
+
+        def get_grad_norm(self):
+            return 3.0
+
+        def get_dsa_split_grad_norms(self):
+            return 3.0, 4.0
+
+    chain = ChainedOptimizer([Member(), Member(), Member()])
+    subset = chain.chained_optimizers[:2]
+    assert not chain.grads_states_parallel_group_is_shared()
+    assert chain._get_grad_norm_over(subset) == pytest.approx(18**0.5)
+    assert chain.get_dsa_split_grad_norms(subset) == pytest.approx((18**0.5, 32**0.5))
+    assert not shared_calls
