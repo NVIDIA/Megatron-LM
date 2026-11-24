@@ -464,15 +464,16 @@ class _ParamAndGradBucketGroup:
         async_op = self.ddp_config.overlap_param_gather and not force_sync
 
         if not self.ddp_config.use_distributed_optimizer:
-            # Legacy layer-wise optimizer path: use all_gather for variable-size
-            # param gather.  Once all layerwise call sites set
-            # ddp_config.use_distributed_optimizer=True, this branch can be removed.
+            # Legacy layer-wise optimizer path: gather variable-size param slots.  Once all
+            # layerwise call sites set ddp_config.use_distributed_optimizer=True, this branch
+            # can be removed.
             #
             # Each rank may own a different number of params per bucket, so
-            # layerwise_param_flat_sizes can vary across ranks.  PyTorch's NCCL
-            # backend handles uneven tensor sizes in torch.distributed.all_gather
-            # (falling back to grouped send/recv internally when sizes differ),
-            # so no manual padding is needed.
+            # layerwise_param_flat_sizes can vary across ranks and many slots can be empty.
+            # Each non-empty slot is broadcast from its owner instead of using an uneven
+            # torch.distributed.all_gather, which some NCCL process-group backends reject
+            # when only the last rank's slot is non-empty.  The broadcasts run in order on
+            # one communicator, so waiting on the last one is enough.
             dp_size = self.intra_distributed_optimizer_instance_size
             if dp_size == 1:
                 # Single-rank group (e.g., expt_dp_size == 1): no all-gather needed.
@@ -531,11 +532,17 @@ class _ParamAndGradBucketGroup:
                     local_slot_view.copy_(flat_local_params)
                 bucket.layerwise_gather_list = gather_list
 
-                work = torch.distributed.all_gather(
-                    gather_list, local_slot_view, group=group, async_op=async_op
-                )
-                if async_op and work is not None:
-                    layerwise_work_handles.append(work)
+                for owner, size in enumerate(bucket.layerwise_param_flat_sizes):
+                    if size == 0:
+                        continue
+                    work = torch.distributed.broadcast(
+                        gather_list[owner],
+                        src=torch.distributed.get_global_rank(group, owner),
+                        group=group,
+                        async_op=async_op,
+                    )
+                    if async_op and work is not None:
+                        layerwise_work_handles.append(work)
 
             if async_op:
                 self.param_gather_handle = _LayerwiseAllGatherHandle(layerwise_work_handles)
