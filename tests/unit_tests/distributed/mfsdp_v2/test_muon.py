@@ -25,17 +25,27 @@ from emerging_optimizers.orthogonalized_optimizers.muon import Muon
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import muon
 
 
+class LowRankLinear(nn.Linear):
+    """A linear layer plus a low-rank term, so its FSDP group holds three differently shaped
+    matrices."""
+
+    def __init__(self, in_features: int, out_features: int, rank: int):
+        super().__init__(in_features, out_features, bias=False)
+        self.down = nn.Parameter(torch.randn(rank, in_features) / in_features**0.5)
+        self.up = nn.Parameter(torch.randn(out_features, rank) / rank**0.5)
+
+    def forward(self, x):
+        """Add the low-rank term to the linear output."""
+        return super().forward(x) + x @ self.down.t() @ self.up.t()
+
+
 class TinyModel(nn.Module):
     """Hidden matrices optimized by Muon, with an output layer optimized by SGD."""
 
     def __init__(self):
         super().__init__()
         self.block1 = nn.Sequential(
-            nn.Linear(8, 16, bias=False),
-            nn.ReLU(),
-            nn.Linear(16, 16, bias=False),
-            nn.ReLU(),
-            nn.Linear(16, 4, bias=False),
+            LowRankLinear(8, 16, rank=4), nn.ReLU(), nn.Linear(16, 4, bias=False)
         )
         self.block2 = nn.Sequential(
             nn.Linear(4, 16, bias=False),
@@ -47,10 +57,6 @@ class TinyModel(nn.Module):
     def forward(self, x):
         """Run both blocks."""
         return self.block2(self.block1(x))
-
-    def fsdp_units(self):
-        """Modules to shard, one FSDP group each: block1 as a whole, each linear layer of block2."""
-        return [self.block1, *(layer for layer in self.block2 if isinstance(layer, nn.Linear))]
 
 
 def _train(
@@ -100,11 +106,10 @@ def test_muon_matches_reference(
 ):
     """FSDP, HSDP, HFSDP, and unsharded Muon should produce identical loss curves.
 
-    block1's three matrices share one FSDP group and every other linear layer is a group of its
-    own, so several groups' communication is in flight at once; with 8, all three Muon groups are.
-    The Muon matrices are split into two optimizer groups with different settings. block1's group
-    holds two differently shaped matrices of the first and one of the second, so its momentum update
-    batches several tensors per optimizer group and handles both groups at once.
+    Each linear layer is its own FSDP group, so several groups' communication is in flight at once;
+    with 8, all four Muon groups are. The Muon matrices are split into two optimizer groups with
+    different settings; block1.0's group holds two differently shaped matrices of the first and one
+    of the second, so its momentum update batches several tensors per optimizer group.
     """
     world_size = distributed_setup.world_size
     if dp_mode == "fsdp":
@@ -138,8 +143,9 @@ def test_muon_matches_reference(
     reference = copy.deepcopy(model).float()
     reference_params = dict(reference.named_parameters())
     with fully_shard_context(FsdpContext(device=device)):
-        for unit in model.fsdp_units():
-            fully_shard(unit, mesh=mesh, placements=placements)
+        for layer in model.modules():
+            if isinstance(layer, nn.Linear):
+                fully_shard(layer, mesh=mesh, placements=placements)
     params = dict(model.named_parameters())
     kwargs = dict(
         lr=0.05,
@@ -150,8 +156,7 @@ def test_muon_matches_reference(
     )
     excluded_names = ["block2.3.weight", "block2.3.bias"]
     muon_names = [name for name in params if name not in excluded_names]
-
-    second_group = ["block1.2.weight", "block2.0.weight"]
+    second_group = ["block1.0.up", "block2.0.weight"]
 
     def param_groups(named_params):
         """The Muon matrices with the defaults, except second_group with its own settings."""
