@@ -27,7 +27,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
-from megatron.core.tensor_observation import observe_tensor
+from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
@@ -1196,6 +1196,19 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 output_cross_entropy_loss=True,
                 labels=labels,
             )
+
+        head_loss = getattr(self.output_layer, "chunked_training_loss", None)
+        if (
+            head_loss is not None
+            and labels is not None
+            and self.training
+            and not self.config.use_mup
+            and not in_inference_mode
+            and not is_observing_tensor("output_logits")
+        ):
+            result = head_loss(hidden_states, labels, output_weight)
+            if result is not None:
+                return result[0]
 
         # Inference consumes logits in fp32: emit them so when the head can, upcast otherwise.
         emit_fp32 = in_inference_mode and self.lm_head_can_emit_fp32
