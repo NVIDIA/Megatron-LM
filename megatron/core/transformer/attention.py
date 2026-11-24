@@ -1275,9 +1275,8 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 tokens_per_request = q.shape[0] // num_requests
             q = q.reshape(num_requests, tokens_per_request, q.shape[2], q.shape[3])
 
-            # If using MLA we use the FlashMLA kernel
-            # The `softmax_scale` attribute check is to find out whether this is an MLA layer or
-            # standard Attention.
+            # If using MLA we use the FlashMLA kernel. Standard attention may also set
+            # `softmax_scale` (YaRN with RoPE fusion), so the config type identifies MLA.
             if isinstance(self.config, MLATransformerConfig) and hasattr(self, "softmax_scale"):
                 # FlashMLA does not currently support sliding window attention.
                 assert window_size == (-1, -1), (
@@ -1526,6 +1525,9 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
             rotary_pos_emb = (rotary_pos_emb,) * 2
 
+        # Whether RoPE from rotary_pos_emb runs in this forward (flash decode uses cos/sin instead).
+        rope_from_freqs = not self.config.flash_decode or inference_context is None
+
         # The softmax scale carries the YaRN factor squared, for RoPE on both q and k. For each
         # side that gets no RoPE in this call, take one factor back out of q.
         rope_mscale = self._rope_mscale
@@ -1544,9 +1546,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 yarn_q_rescale = self._yarn_concentration_factor**-2
             else:
                 num_rotated = 0
-                if rotary_pos_emb is not None and (
-                    not self.config.flash_decode or inference_context is None
-                ):
+                if rotary_pos_emb is not None and rope_from_freqs:
                     num_rotated = sum(emb is not None for emb in rotary_pos_emb)
                 yarn_q_rescale = self._yarn_concentration_factor ** (num_rotated - 2)
 
@@ -1682,9 +1682,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         # relative positional embedding (rotary embedding)
         # ================================================
         nvtx_range_push(suffix="rotary_pos_emb")
-        if rotary_pos_emb is not None and (
-            not self.config.flash_decode or inference_context is None
-        ):
+        if rotary_pos_emb is not None and rope_from_freqs:
             q_pos_emb, k_pos_emb = rotary_pos_emb
 
             if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
