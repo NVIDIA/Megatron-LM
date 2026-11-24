@@ -14,7 +14,7 @@ from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.layers.utils import create_layer_config
 from megatron.core.ssm.gated_delta_net.kda import KimiDeltaAttention
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
@@ -89,6 +89,37 @@ def test_training_forwards_packed_sequence_counts_to_external_estimator(monkeypa
     assert result == layer_flops + 21_504
 
 
+@pytest.mark.parametrize("pattern", ["-", None], ids=["pattern", "config-list"])
+def test_training_propagates_missing_layer_estimator(pattern):
+    config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=2)
+    layer_config = create_layer_config(config, "-")
+    model_config = HybridModelConfig(
+        transformer=config,
+        vocab_size=32,
+        hybrid_layer_pattern=pattern,
+        hybrid_layer_config_list=[layer_config] if pattern is None else None,
+    )
+    model = _model(config, [MegatronModule(layer_config)])
+    model.hybrid_layer_pattern = pattern
+    model.hybrid_layer_config_list = model_config.hybrid_layer_config_list
+    chunks = _hybrid_model_chunks_for_runtime_metrics([model], model_config)
+
+    with pytest.raises(NotImplementedError, match="MegatronModule must implement estimate_flops"):
+        _flops(*chunks, model_config=model_config)
+
+
+@pytest.mark.parametrize("chunks", [None, []], ids=["omitted", "empty"])
+def test_config_list_flops_requires_constructed_hybrid_model(chunks):
+    config = _config()
+    model_config = HybridModelConfig(
+        transformer=config, hybrid_layer_config_list=[config] * config.num_layers, vocab_size=32
+    )
+    with pytest.raises(ValueError, match="constructed HybridModel"):
+        num_floating_point_operations(
+            model_config, batch_size=2, sequence_length=128, hybrid_models=chunks
+        )
+
+
 def test_pattern_model_counts_kda_and_mla_from_wrapped_chunk():
     config = MLATransformerConfig(
         num_layers=2,
@@ -118,13 +149,13 @@ def test_pattern_model_counts_kda_and_mla_from_wrapped_chunk():
     )
     model.hybrid_layer_pattern = pattern
     model.hybrid_layer_config_list = None
-    wrapped = SimpleNamespace(module=model)
-    chunks = _hybrid_model_chunks_for_runtime_metrics([wrapped], model.pg_collection)
-    assert chunks == [model]
-    # Seven tokens and sum(length²)=25: KDA contributes 42,000 training FLOPs, MLA 16,338.
+    wrapped = _bare(Float16Module, config, module=model)
     model_config = HybridModelConfig(
         transformer=config, vocab_size=32, hybrid_layer_pattern=pattern
     )
+    chunks = _hybrid_model_chunks_for_runtime_metrics([wrapped], model_config)
+    assert chunks == [model]
+    # Seven tokens and sum(length²)=25: KDA contributes 42,000 training FLOPs, MLA 16,338.
     assert _flops(*chunks, model_config=model_config) == 58_338
 
 
@@ -135,21 +166,12 @@ def _mock_pipeline(monkeypatch):
     return pp_group
 
 
-@pytest.mark.parametrize("local_is_hybrid", [False, True])
-def test_mixed_pipeline_stages_agree_to_use_config_estimate(monkeypatch, local_is_hybrid):
-    pp_group = _mock_pipeline(monkeypatch)
-    chunk = _model(_config(), [], pp_group=pp_group) if local_is_hybrid else torch.nn.Identity()
-
-    def reduce_eligibility(value, op, group):
-        assert group is pp_group
-        assert op == torch.distributed.ReduceOp.MIN
-        assert value.item() == int(local_is_hybrid)
-        value.fill_(0)  # One stage in the pipeline has no HybridModel.
-
-    collective = Mock(side_effect=reduce_eligibility)
-    monkeypatch.setattr(torch.distributed, "all_reduce", collective)
-    assert _hybrid_model_chunks_for_runtime_metrics([chunk], SimpleNamespace(pp=pp_group)) is None
-    collective.assert_called_once()
+def test_missing_hybrid_chunk_requires_an_estimator_only_for_hybrid_runs():
+    chunks = [torch.nn.Identity()]
+    config = HybridModelConfig(transformer=_config(), vocab_size=32)
+    with pytest.raises(ValueError, match="constructed HybridModel"):
+        _hybrid_model_chunks_for_runtime_metrics(chunks, config)
+    assert _hybrid_model_chunks_for_runtime_metrics(chunks, SimpleNamespace()) is None
 
 
 @pytest.mark.parametrize("with_layers,expected_local", [(False, 0), (True, 672)])

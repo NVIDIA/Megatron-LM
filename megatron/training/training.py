@@ -174,7 +174,7 @@ from megatron.training.logging.packed_sequence_stats import (
     consume_packed_sequence_stats_in_iteration,
     update_packed_sequence_stats,
 )
-from megatron.training.models import ModelConfig, T5ModelConfig
+from megatron.training.models import HybridModelConfig, ModelConfig, T5ModelConfig
 from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
 
 # Local.
@@ -844,13 +844,6 @@ def _dsv4_attention_flops(transformer_cfg, layer_counts, total_tokens, seqlen_sq
     return 3 * forward
 
 
-def _pipeline_flops_device(pp_group):
-    """Use the device supported by the pipeline group's collective backend."""
-    if torch.distributed.get_backend(pp_group) == "nccl":
-        return torch.cuda.current_device()
-    return "cpu"
-
-
 def _hybrid_model_flops(hybrid_models, **kwargs):
     """Combine local chunk estimates across PP, without counting TP/DP replicas."""
     error = None
@@ -866,7 +859,12 @@ def _hybrid_model_flops(hybrid_models, **kwargs):
         flops = float("nan")
     pp_group = hybrid_models[0].pg_collection.pp
     if pp_group is not None and torch.distributed.get_world_size(pp_group) > 1:
-        total = torch.tensor(flops, dtype=torch.float64, device=_pipeline_flops_device(pp_group))
+        device = (
+            torch.cuda.current_device()
+            if torch.distributed.get_backend(pp_group) == "nccl"
+            else "cpu"
+        )
+        total = torch.tensor(flops, dtype=torch.float64, device=device)
         torch.distributed.all_reduce(total, group=pp_group)
         flops = total.item()
     if error is not None:
@@ -910,9 +908,9 @@ def num_floating_point_operations(
             than ``batch_size * llm_seq_length`` whenever the dataloader added
             CP-alignment padding or end-of-sequence padding, so neither kind of
             padding shows up in the reported FLOPs.
-        hybrid_models: All local, unwrapped HybridModel chunks, built from a pattern or
-            a config list. Their estimates are summed across pipeline stages. Callers
-            without a constructed model use the config-based estimate.
+        hybrid_models: All local, unwrapped HybridModel chunks. Hybrid training and
+            config-list estimates require the constructed chunks. Standalone callers
+            can estimate a legacy pattern from its config alone.
     """
     llm_seq_length = sequence_length
     if isinstance(model_config, T5ModelConfig) and model_config.decoder_seq_length is not None:
@@ -926,12 +924,17 @@ def num_floating_point_operations(
     if total_real_tokens_in_batch is None:
         total_real_tokens_in_batch = batch_size * llm_seq_length
 
-    if hybrid_models is not None:
+    if hybrid_models:
         return _hybrid_model_flops(
             hybrid_models,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
         )
+    if (
+        hybrid_models is not None
+        or getattr(model_config, "hybrid_layer_config_list", None) is not None
+    ):
+        raise ValueError("Hybrid layer FLOP accounting requires constructed HybridModel chunks.")
 
     from megatron.core.transformer.attention import SelfAttention
     from megatron.core.transformer.mlp import MLP
@@ -3538,49 +3541,17 @@ def _hybrid_config_list_moe_logging_metadata(
     return track_names, num_layers, num_moe_layers, True, num_hash_layers
 
 
-def _find_hybrid_model_for_runtime_metrics(model):
-    """Find a HybridModel through precision/DDP and language-model wrappers."""
+def _hybrid_model_chunks_for_runtime_metrics(model, model_config):
+    """Return the local chunks when training a HybridModel."""
     from megatron.core.models.hybrid.hybrid_model import HybridModel
 
-    pending = [model]
-    visited = set()
-    while pending:
-        candidate = pending.pop()
-        if candidate is None or id(candidate) in visited:
-            continue
-        visited.add(id(candidate))
-        if isinstance(candidate, HybridModel):
-            return candidate
-        pending.extend(
-            nested
-            for nested in (
-                getattr(candidate, 'module', None),
-                getattr(candidate, 'language_model', None),
-            )
-            if nested is not None
-        )
+    if model:
+        chunks = unwrap_model(model)
+        if isinstance(chunks[0], HybridModel):
+            return chunks
+    if isinstance(model_config, HybridModelConfig):
+        raise ValueError("Hybrid training requires constructed HybridModel chunks to estimate FLOPs.")
     return None
-
-
-def _hybrid_model_chunks_for_runtime_metrics(model, pg_collection):
-    """Use layer FLOPs when every stage in the language pipeline has HybridModel chunks."""
-    if not model:
-        return None
-    if pg_collection is None:
-        pg_collection = getattr(unwrap_model(model[0]), "pg_collection", None)
-    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
-        if not pg_collection.has_language_model():
-            return None
-        pg_collection = pg_collection.get_language_model_collection()
-    pp_group = pg_collection.pp if pg_collection is not None else None
-    chunks = [_find_hybrid_model_for_runtime_metrics(chunk) for chunk in model]
-    available = all(chunk is not None for chunk in chunks)
-    if pp_group is not None and torch.distributed.get_world_size(pp_group) > 1:
-        # An encoder-only stage can share a pipeline with a HybridModel decoder.
-        flag = torch.tensor(available, dtype=torch.int32, device=_pipeline_flops_device(pp_group))
-        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN, group=pp_group)
-        available = bool(flag.item())
-    return chunks if available else None
 
 
 def _get_indexer_logging_layer_counts(model_config) -> tuple[int, int | None]:
@@ -3638,7 +3609,7 @@ def training_log(
     ``moe_logging_metadata`` contains metric names, tracker size, MoE layer count,
     whether the model has MoE layers, and the main-stack hash-router count. If
     omitted, use the model config metadata. Compute batch FLOPs only if no count
-    is supplied, using the constructed HybridModel chunks when available.
+    is supplied. Hybrid training uses the constructed model chunks.
     """
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
@@ -3945,7 +3916,7 @@ def training_log(
                 sequence_length=sequence_length,
                 seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
                 total_real_tokens_in_batch=total_real_tokens_in_batch,
-                hybrid_models=_hybrid_model_chunks_for_runtime_metrics(model, pg_collection),
+                hybrid_models=_hybrid_model_chunks_for_runtime_metrics(model, cfg.model),
             )
         throughput = num_floating_point_operations_in_batch / (
             elapsed_time_per_iteration * 10**12 * llm_world_size
@@ -4702,8 +4673,7 @@ def train(
     sequence_length = cfg.model.transformer.max_seq_length_per_sample
     timers = get_timers()
     train_state = get_train_state()
-    model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
-    hybrid_models = _hybrid_model_chunks_for_runtime_metrics(model, model_pg_collection)
+    hybrid_models = _hybrid_model_chunks_for_runtime_metrics(model, cfg.model)
     hybrid_model = hybrid_models[0] if hybrid_models else None
     moe_logging_metadata = None
     has_moe_layers = cfg.model.transformer.num_moe_experts is not None
@@ -4776,6 +4746,8 @@ def train(
     # Turn on training mode which enables dropout.
     for model_module in model:
         model_module.train()
+
+    model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
 
     # Tracking loss.
     total_loss_dict = {}
