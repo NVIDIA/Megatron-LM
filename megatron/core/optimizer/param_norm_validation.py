@@ -10,10 +10,11 @@ import torch.distributed as dist
 class ParamNormAgreement:
     """Record the ordered tables seen by each group that holds their shards or replicas."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.tables = defaultdict(list)
 
     def add(self, constraint, owner, dp_group, *, num_rows, pg_collection):
+        """Append this table's metadata to the list each group compares at setup."""
         full_dp = getattr(pg_collection, "dp_cp", None) or getattr(pg_collection, "dp", None)
         tp = getattr(pg_collection, "tp", None)
         gtp = getattr(pg_collection, "gtp_remat", None)

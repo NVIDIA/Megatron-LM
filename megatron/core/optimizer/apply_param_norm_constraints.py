@@ -40,6 +40,7 @@ class _Rows:
     width: int
 
     def add_square_sums(self, sums: torch.Tensor, shard: torch.Tensor) -> None:
+        """Add each shard element's square to the sum for its matrix row."""
         row, offset = divmod(self.start, self.width)
         position = 0
         if offset:
@@ -59,6 +60,7 @@ class _Rows:
             sums[row] += shard[position:].square().sum()
 
     def scale_(self, shard: torch.Tensor, scales: torch.Tensor) -> None:
+        """Multiply each shard element in place by the scale for its row."""
         rows = torch.arange(self.start, self.end, dtype=torch.int64, device=shard.device).div_(
             self.width, rounding_mode="floor"
         )
@@ -184,7 +186,7 @@ class ParamNormSetup:
     until this check so peers can reach the same validation step.
     """
 
-    def __init__(self, model_chunks, recipe: ParamNormRecipe):
+    def __init__(self, model_chunks, recipe: ParamNormRecipe) -> None:
         self.constraints = []
         self.owners = {}
         self.agreement = ParamNormAgreement()
@@ -212,7 +214,10 @@ class ParamNormSetup:
         selected = [c for c in self.constraints if c.parameter in owned]
         for c in selected:
             if c.parameter in self.owners:
-                self.error = f"{c.name} has multiple optimizer owners: {self.owners[c.parameter]} and {owner}"
+                self.error = (
+                    f"{c.name} has multiple optimizer owners: "
+                    f"{self.owners[c.parameter]} and {owner}"
+                )
             elif not supported:
                 self.error = (
                     f"{c.name} requests embedding_min_norm but its owner {owner} cannot apply it"
