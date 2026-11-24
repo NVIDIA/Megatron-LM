@@ -14,6 +14,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
 )
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_fsdp_module_hooks
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     ScheduleNode,
@@ -39,8 +40,6 @@ def _release_tensor_storage(tensors):
 
 def setup_mfsdp_v2_ep_overlap(model_chunks: Sequence[torch.nn.Module]) -> None:
     """Install persistent module hooks once after wrapping, before training or evaluation."""
-    from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_fsdp_module_hooks
-
     for chunk in model_chunks:
         if (
             isinstance(chunk, FullyShardedDataParallelV2)
