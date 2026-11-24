@@ -59,6 +59,7 @@ class TestMimoModelTEQuantizationConfig:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.launch_on_gb200
     def test_vision_gemms_execute_bf16_under_mxfp8(self, monkeypatch):
         import transformer_engine.pytorch as te
         from transformer_engine.pytorch import is_mxfp8_available

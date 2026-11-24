@@ -346,6 +346,7 @@ class TestFP4Param:
         torch.testing.assert_close(loss_list, loss_list_ref, atol=1e-2, rtol=1e-2)
         torch.testing.assert_close(eval_loss_list, eval_loss_list_ref, atol=1e-2, rtol=1e-2)
 
+    @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(not is_nvfp4_available, reason=reason_for_no_nvfp4)
     @pytest.mark.skipif(not is_te_min_version("2.7.0.dev0"), reason="TE 2.7.0.dev0 is required")
     @pytest.mark.parametrize("tp_size", [2])
@@ -358,6 +359,7 @@ class TestFP4Param:
         kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
         self.run_test(tp_size=tp_size, inference=False, **kwargs)
 
+    @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(not is_nvfp4_available, reason=reason_for_no_nvfp4)
     @pytest.mark.skipif(not is_te_min_version("2.7.0.dev0"), reason="TE 2.7.0.dev0 is required")
     @pytest.mark.parametrize("tp_size", [2])
@@ -365,6 +367,7 @@ class TestFP4Param:
         kwargs = {"overlap_param_gather": True, "overlap_grad_reduce": True}
         self.run_test_with_eval_transition(tp_size=tp_size, **kwargs)
 
+    @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(not is_nvfp4_available, reason=reason_for_no_nvfp4)
     @pytest.mark.skipif(not is_te_min_version("2.7.0.dev0"), reason="TE 2.7.0.dev0 is required")
     @pytest.mark.parametrize("tp_size", [2])
@@ -372,6 +375,7 @@ class TestFP4Param:
         """Test NVFP4 primary weights in inference mode."""
         self.run_test(tp_size=tp_size, inference=True)
 
+    @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(
         get_device_arch_version() < 10, reason="NVFP4 is supported since Blackwell architecture"
     )

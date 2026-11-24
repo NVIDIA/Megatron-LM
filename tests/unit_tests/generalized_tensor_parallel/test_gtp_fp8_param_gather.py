@@ -333,6 +333,7 @@ class _GDPAdamWMuonHarness(_FP8ParamHarness):
 class TestGTPFp8ParamGather:
     """MXFP8 parameter-gather tests, including GTP and exact same-recipe parity."""
 
+    @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(
         get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
     )
@@ -391,6 +392,7 @@ class TestGTPFp8ParamGather:
 
             update_gtp_config(pad_for_alignment=16, calculate_per_token_loss=False)
 
+    @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(
         get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
     )
@@ -760,6 +762,7 @@ class TestGTPFp8ParamGather:
         finally:
             harness.teardown_method(None)
 
+    @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(
         get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
     )

@@ -25,9 +25,10 @@ from megatron.core.inference.moe.flashinfer_mxfp8 import (
     prepare_routed_mxfp8_weights,
 )
 
-pytestmark = pytest.mark.skipif(
-    not _IS_BLACKWELL, reason="MXFP8 tests require Blackwell GPU (SM >= 10)"
-)
+pytestmark = [
+    pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 tests require Blackwell GPU (SM >= 10)"),
+    pytest.mark.launch_on_gb200,
+]
 
 
 # ===========================================================================
@@ -704,7 +705,6 @@ class TestMXFP8RefitIntegration:
 
 
 @pytest.mark.internal
-@pytest.mark.launch_on_gb200
 class TestTEGroupedParameterRefit:
     """Refit grouped BF16 and MXFP8 experts independent of TE's parameter format."""
 

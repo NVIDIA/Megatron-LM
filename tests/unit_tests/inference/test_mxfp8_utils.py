@@ -600,6 +600,7 @@ class TestMXFP8Tensor:
 # ──────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.launch_on_gb200
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] < 10,
     reason="MXFP8 FlashInfer comparison requires Blackwell (SM 100+)",

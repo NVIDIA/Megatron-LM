@@ -202,6 +202,7 @@ class TestGTPMuonDCP:
 
                 check_equal(load_plain_tensors(ckpt_dir_A), load_plain_tensors(ckpt_dir_B))
 
+    @pytest.mark.launch_on_gb200
     def test_gtp_muon_moe_native_fp8_save_load(self, tmp_path_dist_ckpt):
         """GTP + Muon (LayerWise) + native-FP8 (fp8_model_init / mxfp8) checkpoint roundtrip.
 
@@ -222,12 +223,10 @@ class TestGTPMuonDCP:
         """
         import os
         from functools import partial
-        from unittest import mock
 
         import pytest
 
         from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
-        from tests.unit_tests.dist_checkpointing import utils as _dc_utils
         from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import _requires_mxfp8
 
         if not HAVE_GTP:
@@ -254,20 +253,11 @@ class TestGTPMuonDCP:
         # block (32) times gtp_remat_size, so GTP_remat padding is a no-op here.
         # MXFP8 params can't be aliased into the DDP param buffer (replace_raw_data unsupported);
         # the production native-FP8 path sets reuse_grad_buf_for_mxfp8_param_ag to skip that
-        # aliasing. The shared harness builds its own mock args, so wrap init_basic_mock_args to
-        # flip the flags before the DDP config is built from them.
-        _orig_init_args = _dc_utils.init_basic_mock_args
-
-        def _init_args_fp8(args, tp, pp, bf16=True):
-            _orig_init_args(args, tp, pp, bf16=bf16)
-            args.fp8_param_gather = True
-            args.reuse_grad_buf_for_mxfp8_param_ag = True
-            return args
-
+        # aliasing (validate_args requires it for GTP + mxfp8 + --fp8-param-gather).
+        native_fp8_ddp = dict(fp8_param_gather=True, reuse_grad_buf_for_mxfp8_param_ag=True)
         init_fn = partial(_initialize_native_fp8_moe_model, use_te=True, use_grouped_mlp=False)
         meta = {'distrib_optim_sharding_type': 'dp_reshardable'}
         with (
-            mock.patch.object(_dc_utils, 'init_basic_mock_args', _init_args_fp8),
             TempNamedDir(tmp_path_dist_ckpt / 'gtp_muon_fp8_A', sync=True) as ckpt_dir_A,
             TempNamedDir(tmp_path_dist_ckpt / 'gtp_muon_fp8_B', sync=True) as ckpt_dir_B,
         ):
@@ -280,6 +270,7 @@ class TestGTPMuonDCP:
                 use_param_layout=True,
                 initialize_fn=init_fn,
                 optimizer='dist_muon',
+                **native_fp8_ddp,
             )
             tag_gtp_params_with_names(model_A[0])
             assert any(
@@ -301,6 +292,7 @@ class TestGTPMuonDCP:
                 use_param_layout=True,
                 initialize_fn=init_fn,
                 optimizer='dist_muon',
+                **native_fp8_ddp,
             )
             tag_gtp_params_with_names(model_B[0])
             model_sd_B = model_B[0].sharded_state_dict()
