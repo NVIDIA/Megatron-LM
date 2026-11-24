@@ -2680,6 +2680,15 @@ class TestHybridLayerPairCudaGraph:
                 "G-*-", [CudaGraphModule.attn, CudaGraphModule.mlp], {}, False, None, id="dense-mlp"
             ),
             pytest.param(
+                "GE*E",
+                _PARTIAL_MOE_GRAPH_MODULES,
+                # The mixers return FP32 residuals; the MoE layers' own graphs take BF16 inputs.
+                {"fp32_residual_connection": True},
+                False,
+                None,
+                id="moe-router-fp32-residual",
+            ),
+            pytest.param(
                 "GE*E/*E",
                 _PARTIAL_MOE_GRAPH_MODULES,
                 # MXFP8 needs GDN projection widths that are multiples of 32.
@@ -2975,6 +2984,14 @@ class TestHybridLayerPairCudaGraph:
                 [True, True],
                 "mtp_use_repeated_layer",
                 id="repeated-mtp-layer",
+            ),
+            # The BF16 graph inputs would round the FP32 residual stream of the MTP layers.
+            pytest.param(
+                "GE*E/*E",
+                {"fp32_residual_connection": True},
+                [True, True],
+                "fp32_residual_connection",
+                id="fp32-residual-connection",
             ),
         ],
     )

@@ -140,7 +140,8 @@ follows it as one graph, which halves the graph launches per block:
 
 - The pair's graph runs the same operations as the two per-layer graphs. The mixer launches it,
   and the MoE or MLP layer then runs only its work outside the graph, such as the MoE token
-  dispatch, experts and combine.
+  dispatch, experts and combine. With `--fp32-residual-connection`, the pair rounds the mixer's
+  FP32 output to the BF16 graph input of the MoE or MLP layer, as the per-layer graphs do.
 - The pair is not part of the model, so parameter names and checkpoints do not change.
 - A layer keeps its own graph when it cannot be paired: Mamba layers, layers whose neighbor is not
   graphed, pairs split by a pipeline stage boundary, hash-routed MoE layers, and pairs whose two
@@ -149,8 +150,9 @@ follows it as one graph, which halves the graph launches per block:
   `transformer_engine` is not paired and runs as it does with per-layer graphs; its neighbor keeps
   its own graph.
 - The layers of Hybrid MTP blocks, which per-layer graphs leave eager, are graphed too, paired the
-  same way. They stay eager with `--mtp-use-repeated-layer` and several MTP depths, and with
-  `--keep-mtp-in-bf16` in FP8 or FP4 training.
+  same way. They stay eager with `--mtp-use-repeated-layer` and several MTP depths, with
+  `--keep-mtp-in-bf16` in FP8 or FP4 training, and with `--fp32-residual-connection`, because the
+  BF16 graph inputs would round the FP32 residual stream that the eager MTP layers keep.
 - Pairing is skipped, with a warning, with `--overlap-moe-expert-parallel-comm`,
   `--delay-wgrad-compute`, `--fine-grained-activation-offloading`, `--sequence-packing-scheduler`,
   `--enable-mhc-connections` or `--context-parallel-size` greater than 1.

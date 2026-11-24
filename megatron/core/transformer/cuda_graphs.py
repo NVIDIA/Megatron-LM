@@ -2376,6 +2376,10 @@ class _TECudaGraphLayerPair(torch.nn.Module):
     stay as they are. Its ``parameters()`` are the union of both layers' parameters, which TE uses
     as the graph's parameter inputs, so the one backward graph returns the gradients of both.
 
+    The partner takes the mixer's output in the dtype of its own graph's hidden_states input, as
+    with per-layer graphs: with fp32_residual_connection, the mixer returns an FP32 residual, and
+    the partner's graph input is BF16.
+
     Args:
         mixer (TransformerLayer): The attention-type layer, which launches the graph.
         partner (TransformerLayer): The feed-forward layer that follows it.
@@ -2387,8 +2391,12 @@ class _TECudaGraphLayerPair(torch.nn.Module):
         self.partner = partner
         # Static-input keys owned by the partner, such as its router's padding_mask.
         self._partner_input_keys: tuple = ()
+        # The dtype of the partner's own static hidden_states input. Set with the keys above, by
+        # get_layer_static_inputs.
+        self._partner_input_dtype: torch.dtype | None = None
         # Whether the mixer's output is appended to the graph outputs. Partial MoE scopes already
-        # return it as the partner's residual, the last output. Set at capture.
+        # return it as the partner's residual, the last output, when the partner takes it without
+        # a cast. Set at capture.
         self._appends_mixer_output: bool | None = None
         # (mixer output, partner graph outputs) from the mixer's replay, for the partner's call.
         self._stash = None
@@ -2438,7 +2446,8 @@ class _TECudaGraphLayerPair(torch.nn.Module):
         """Return the mixer's static inputs plus the partner's other inputs."""
         static_inputs = self.mixer.get_layer_static_inputs(seq_length, micro_batch_size)
         partner_inputs = self.partner.get_layer_static_inputs(seq_length, micro_batch_size)
-        del partner_inputs["hidden_states"]
+        # The partner takes the mixer's output instead, cast to this input's dtype; see forward.
+        self._partner_input_dtype = partner_inputs.pop("hidden_states").dtype
         collisions = static_inputs.keys() & partner_inputs.keys()
         if collisions:
             raise ValueError(f"Paired TE CUDA graph inputs collide: {sorted(collisions)}.")
@@ -2453,7 +2462,12 @@ class _TECudaGraphLayerPair(torch.nn.Module):
         if len(mixer_outputs) != 1:
             raise RuntimeError("A paired mixer's CUDA graph must return only its layer output.")
         mixer_output = mixer_outputs[0]
-        outputs = list(self.partner._te_cuda_graph_capture(mixer_output, **partner_kwargs))
+        # The partner's own graph would copy the mixer's output into its static input, rounding an
+        # FP32 residual to BF16, and autograd would upcast that input's BF16 gradient for the
+        # mixer. The cast does the same inside the pair, and returns mixer_output itself when the
+        # dtypes already match.
+        partner_input = mixer_output.to(self._partner_input_dtype)
+        outputs = list(self.partner._te_cuda_graph_capture(partner_input, **partner_kwargs))
         appends_mixer_output = outputs[-1] is not mixer_output
         if self._appends_mixer_output is None:
             self._appends_mixer_output = appends_mixer_output
@@ -2576,7 +2590,9 @@ def _hybrid_mtp_graphs_supported(config: TransformerConfig) -> bool:
 
     A graph keeps the activations of one call per microbatch, so a block that runs once per MTP
     depth (mtp_use_repeated_layer) stays eager. TE graphs capture MTP layers with the model's
-    FP8/FP4 setting, so a block kept out of it (keep_mtp_in_bf16) stays eager too.
+    FP8/FP4 setting, so a block kept out of it (keep_mtp_in_bf16) stays eager too. A graph's
+    hidden_states input is BF16, so with fp32_residual_connection graphed layers would round the
+    FP32 residual stream that the block's eager layers keep, and the block stays eager as well.
     """
     blocking_features = [
         name
@@ -2586,6 +2602,7 @@ def _hybrid_mtp_graphs_supported(config: TransformerConfig) -> bool:
                 config.mtp_use_repeated_layer and (config.mtp_num_layers or 0) > 1,
             ),
             ("keep_mtp_in_bf16", config.keep_mtp_in_bf16 and bool(config.fp8 or config.fp4)),
+            ("fp32_residual_connection", config.fp32_residual_connection),
         )
         if enabled
     ]

@@ -1372,8 +1372,9 @@ class TransformerConfig(ModelParallelConfig):
     graph launches per block. The pair runs the same operations as the two per-layer graphs, and
     parameter names and checkpoints do not change. Layers that cannot be paired keep their own
     graphs. The layers of Hybrid MTP blocks, which per-layer graphs leave eager, are graphed the
-    same way, unless mtp_use_repeated_layer runs a block for several MTP depths or
-    keep_mtp_in_bf16 keeps it out of FP8/FP4 training. Pairing is skipped with a warning when EP
+    same way, unless mtp_use_repeated_layer runs a block for several MTP depths,
+    keep_mtp_in_bf16 keeps it out of FP8/FP4 training, or the BF16 graph inputs would round its
+    FP32 residual stream (fp32_residual_connection). Pairing is skipped with a warning when EP
     communication overlap, delay_wgrad_compute, fine-grained activation offloading,
     sequence_packing_scheduler, mHC or context parallelism is enabled. Wide residual streams do
     not support Transformer Engine CUDA graphs; configuration validation rejects that combination.
