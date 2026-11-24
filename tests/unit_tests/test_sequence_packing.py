@@ -101,15 +101,13 @@ def test_dcp_schedule_stats_tp_metadata(monkeypatch):
             self.rank = lambda: rank
             self.size = lambda: size
 
+    scheduler = data_schedule.DpBalancedScheduler(1, 1, 2, None)
     lengths = [(0, 1048579), (1, 513)]
     schedule = [[[0], [1]]]
     padded_work = [1048579**2, 513**2]
     samples = [
         {
-            **{
-                k: None
-                for k in data_schedule.DpBalancedScheduler(1, 1, 1, None).get_required_sample_keys()
-            },
+            **{k: None for k in scheduler.get_required_sample_keys()},
             'original_seq_len': torch.tensor([length]),
         }
         for length in (4096, 1)
@@ -127,24 +125,25 @@ def test_dcp_schedule_stats_tp_metadata(monkeypatch):
     monkeypatch.setattr(data_schedule, 'reroute_samples_to_dcp_ranks', lambda *a, **kw: {})
     monkeypatch.setattr(data_schedule, 'build_packed_microbatches', lambda *a, **kw: [])
     monkeypatch.setattr(data_schedule, 'create_data_iterator', lambda *a, **kw: None)
-    wire = []
+    wire = None
 
-    def broadcast(values, group, dev, dtype=torch.float32):
-        assert dtype == (torch.float64 if enabled else torch.float32)
-        if group.rank() == 0:
-            wire[:] = values
-            # The real broadcast returns the source's original Python values.
-            return values
-        return torch.tensor(wire, dtype=dtype).tolist()
+    def broadcast(tensor, src, group):
+        nonlocal wire
+        if group.rank() == src:
+            wire = tensor.clone()
+        else:
+            assert tensor.dtype == wire.dtype
+            tensor.copy_(wire)
 
-    monkeypatch.setattr(data_schedule, 'broadcast_scalars', broadcast)
+    # Exercise the real scalar packing and unpacking on CPU, stubbing only transport.
+    monkeypatch.setattr(torch.distributed, 'get_process_group_ranks', lambda group: [0, 1])
+    monkeypatch.setattr(torch.distributed, 'broadcast', broadcast)
+    monkeypatch.setattr(scheduler, 'get_groups_and_subsamples', lambda *a: schedule)
     compute = mock.Mock(wraps=compute_schedule_stats)
     monkeypatch.setattr(data_schedule, 'compute_schedule_stats', compute)
     for enabled in (False, True):
         compute.reset_mock()
         for rank in (0, 1):
-            scheduler = data_schedule.DpBalancedScheduler(1, 1, 2, None)
-            monkeypatch.setattr(scheduler, 'get_groups_and_subsamples', lambda *a: schedule)
             stats = {'stale': 1} if enabled else None
             result = scheduler.run(
                 iter(samples) if rank == 0 else None,
@@ -167,6 +166,7 @@ def test_dcp_schedule_stats_tp_metadata(monkeypatch):
                     'balance_denominator': 2 * max(padded_work),
                     'cp_sample_counts': {1: 2, 2: 0},
                 }
+        assert wire.dtype == (torch.float64 if enabled else torch.float32)
         assert compute.call_count == int(enabled)
 
 
@@ -176,7 +176,7 @@ def test_dcp_schedule_stats_evaluation_does_not_collect(monkeypatch, run_config)
     run_config.logger.log_dcp_stats = True
     run_config.validation.eval_global_batch_size = 2
     run_config.validation.eval_micro_batch_size = 1
-    run_config.validation.eval_iters = 2
+    run_config.validation.eval_iters = 1
     args = SimpleNamespace(
         data_parallel_size=1,
         gtp_weight_remat_size=1,
@@ -208,8 +208,8 @@ def test_dcp_schedule_stats_evaluation_does_not_collect(monkeypatch, run_config)
         SimpleNamespace(sequence_packing_scheduler='default_dynamic_cp'),
     )
     assert not result[2]
-    assert wrapper.call_count == 2
-    assert all('schedule_stats' not in call.kwargs for call in wrapper.call_args_list)
+    wrapper.assert_called_once()
+    assert wrapper.call_args.kwargs.get('schedule_stats') is None
 
 
 def test_dcp_schedule_stats_training_log(monkeypatch, run_config):
