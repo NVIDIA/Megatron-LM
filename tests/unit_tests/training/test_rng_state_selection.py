@@ -46,3 +46,74 @@ def test_layouts_agree_without_cp():
     states = _states(2)
     dp = _group(1, 2)
     assert checkpointing._select_rng_state(states, True, dp, dp) == {"id": 1}
+
+
+@pytest.mark.parametrize(
+    ("run_config", "default", "expected"),
+    [
+        (None, True, True),  # no saved config: fall back to the active run's policy
+        (None, False, False),
+        ({}, True, False),  # saved config without the fields: single-state layout
+        ({"checkpoint": {"save_rng_state_per_dp_rank": True}}, False, True),
+        ({"rng": {"data_parallel_random_init": True}}, False, True),
+        ({"checkpoint": None, "rng": None}, True, False),
+    ],
+)
+def test_saved_layout_is_read_from_the_saved_run_config(run_config, default, expected):
+    assert checkpointing._checkpoint_has_per_dp_rng_states(run_config, default) is expected
+
+
+def _rng_object(shape, offset, replica_id=0):
+    from megatron.core.dist_checkpointing.mapping import ShardedObject
+
+    return ShardedObject("rng_state", None, shape, offset, replica_id=replica_id)
+
+
+def _metadata(*objects):
+    return {obj.unique_key: obj for obj in objects}
+
+
+def test_metadata_with_the_exact_key_is_kept():
+    current = _rng_object((2, 2, 4), (0, 0, 3))
+    assert checkpointing._match_rng_state_metadata(current, _metadata(current)) is current
+
+
+def test_legacy_2d_metadata_is_adopted_with_dp_rank_as_replica_id():
+    current = _rng_object((2, 2, 4), (0, 0, 3))
+    legacy = _rng_object((2, 2), (0, 0))
+    matched = checkpointing._match_rng_state_metadata(current, _metadata(legacy))
+    assert (matched.global_shape, matched.global_offset) == ((2, 2), (0, 0))
+    assert matched.replica_id == 3
+
+
+def test_shrinking_the_dp_cp_world_drops_the_rng_state():
+    current = _rng_object((2, 2, 2), (0, 0, 1))
+    stored = _metadata(*(_rng_object((2, 2, 4), (0, 0, k)) for k in range(4)))
+    assert checkpointing._match_rng_state_metadata(current, stored) is None
+
+
+@pytest.mark.parametrize(
+    ("dp_random", "per_dp_flag", "gathers"), [(False, False, False), (False, True, True), (True, False, True)]
+)
+def test_either_flag_makes_the_save_gather_per_rank_states(
+    monkeypatch, run_config, dp_random, per_dp_flag, gathers
+):
+    from unittest.mock import Mock
+
+    run_config.rng.data_parallel_random_init = dp_random
+    run_config.checkpoint.save_rng_state_per_dp_rank = per_dp_flag
+    monkeypatch.setattr(checkpointing.torch.cuda, "get_rng_state", lambda: "cuda")
+    monkeypatch.setattr(
+        checkpointing.tensor_parallel,
+        "get_cuda_rng_tracker",
+        lambda: SimpleNamespace(get_states=lambda: {}),
+    )
+    monkeypatch.setattr(checkpointing.torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(checkpointing, "get_pg_size", lambda group: 2)
+    monkeypatch.setattr(checkpointing, "get_pg_rank", lambda group: 0)
+    gather = Mock(side_effect=lambda output, state, *, group: output.__setitem__(slice(None), [state, state]))
+    monkeypatch.setattr(checkpointing.torch.distributed, "all_gather_object", gather)
+    group = object()
+    state = checkpointing.get_rng_state("torch", group, group, dp_cp_group=group)
+    assert gather.call_count == int(gathers)
+    assert len(state) == (2 if gathers else 1)
