@@ -3,11 +3,16 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.models.common.language_module import language_module as language_module_module
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.ops.loss import cross_entropy as cross_entropy_module
 from megatron.core.ops.loss.cross_entropy import vocab_parallel_cross_entropy
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -170,6 +175,83 @@ def test_language_module_loss_on_gathered_logits_returns_full_vocab_argmax():
 
     assert loss.shape == labels.shape
     torch.testing.assert_close(returned_argmax, argmax)
+
+
+@pytest.mark.skipif(
+    Utils.world_size < 2 or Utils.world_size % 2 != 0 or not torch.cuda.is_available(),
+    reason="requires CUDA and an even number of ranks for TP=2",
+)
+def test_gpt_tp_loss_with_gathered_logits_and_int32_labels():
+    """Compare GPT's output projection and loss with an unsharded reference."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+    try:
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=8,
+            num_attention_heads=2,
+            tensor_model_parallel_size=2,
+            use_cpu_initialization=True,
+            perform_initialization=False,
+            gradient_accumulation_fusion=False,
+        )
+        generator = torch.Generator().manual_seed(51)
+        inputs = torch.randn(3, 2, 8, generator=generator).cuda()
+        weights = torch.randn(12, 8, generator=generator).cuda()
+        labels = torch.tensor([[0, 6, 11], [7, 4, 1]], device="cuda", dtype=torch.int32)
+        loss_grad = torch.linspace(0.1, 0.6, 6, device="cuda").view_as(labels)
+        ref_inputs = inputs.detach().requires_grad_()
+        ref_weights = weights.detach().requires_grad_()
+        ref_logits = torch.nn.functional.linear(ref_inputs, ref_weights)
+        ref_loss = torch.nn.functional.cross_entropy(
+            ref_logits.transpose(0, 1).reshape(-1, 12), labels.long().flatten(), reduction="none"
+        ).view_as(labels)
+        ref_loss.backward(loss_grad)
+
+        for gather_output, runtime_gather_output in ((True, None), (False, True), (True, False)):
+            projection = ColumnParallelLinear(
+                8,
+                12,
+                config=config,
+                init_method=config.init_method,
+                bias=False,
+                gather_output=gather_output,
+                tp_group=tp_group,
+            ).cuda()
+            with torch.no_grad():
+                projection.weight.copy_(weights.chunk(2)[tp_group.rank()])
+            model = SimpleNamespace(
+                config=config,
+                share_embeddings_and_output_weights=False,
+                post_process=True,
+                output_layer=projection,
+                _scale_logits=lambda logits: logits,
+                tp_group=tp_group,
+                vocab_parallel_cross_entropy=cross_entropy_module.unfused_cross_entropy,
+            )
+            model.compute_language_model_loss = (
+                language_module_module.LanguageModule.compute_language_model_loss.__get__(model)
+            )
+            local_inputs = inputs.detach().requires_grad_()
+            loss = GPTModel._postprocess(
+                model,
+                hidden_states=local_inputs,
+                input_ids=None,
+                position_ids=None,
+                labels=labels,
+                rotary_pos_emb=None,
+                rotary_pos_cos=None,
+                rotary_pos_sin=None,
+                runtime_gather_output=runtime_gather_output,
+            )
+            torch.testing.assert_close(loss, ref_loss)
+            loss.backward(loss_grad)
+            torch.testing.assert_close(local_inputs.grad, ref_inputs.grad)
+            torch.testing.assert_close(
+                projection.weight.grad, ref_weights.grad.chunk(2)[tp_group.rank()]
+            )
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_vocab_parallel_cross_entropy():

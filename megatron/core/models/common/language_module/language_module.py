@@ -149,8 +149,12 @@ class LanguageModule(MegatronModule):
             # own slice. Upcast like the vocab-parallel path does (it starts with
             # `vocab_parallel_logits.float()`): with bf16/fp16 logits the loss would
             # otherwise be computed, and returned, at the low-precision dtype.
+            # Vocab-parallel CE accepts int32 indices; PyTorch CE requires int64.
+            targets = labels.reshape(-1)
+            if targets.dtype == torch.int32:
+                targets = targets.long()
             loss = F.cross_entropy(
-                logits.float().reshape(-1, logits.size(-1)), labels.reshape(-1), reduction="none"
+                logits.float().reshape(-1, logits.size(-1)), targets, reduction="none"
             ).view_as(labels)
             if return_argmax:
                 argmax = logits.argmax(dim=-1)
