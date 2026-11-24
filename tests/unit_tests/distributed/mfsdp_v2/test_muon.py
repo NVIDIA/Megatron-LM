@@ -31,7 +31,11 @@ class TinyModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.block1 = nn.Sequential(
-            nn.Linear(8, 16, bias=False), nn.ReLU(), nn.Linear(16, 4, bias=False)
+            nn.Linear(8, 16, bias=False),
+            nn.ReLU(),
+            nn.Linear(16, 16, bias=False),
+            nn.ReLU(),
+            nn.Linear(16, 4, bias=False),
         )
         self.block2 = nn.Sequential(
             nn.Linear(4, 16, bias=False),
@@ -92,10 +96,11 @@ def test_muon_matches_reference(
 ):
     """FSDP, HSDP, HFSDP, and unsharded Muon should produce identical loss curves.
 
-    block1's two matrices share one FSDP group and every other linear layer is a group of its own,
-    so several groups' communication is in flight at once; with 8, all three Muon groups are. The
-    Muon matrices are split into two optimizer groups with different settings, and block1's group
-    holds one matrix of each, so its momentum update handles several tensors and optimizer groups.
+    block1's three matrices share one FSDP group and every other linear layer is a group of its
+    own, so several groups' communication is in flight at once; with 8, all three Muon groups are.
+    The Muon matrices are split into two optimizer groups with different settings. block1's group
+    holds two differently shaped matrices of the first and one of the second, so its momentum update
+    batches several tensors per optimizer group and handles both groups at once.
     """
     world_size = distributed_setup.world_size
     if dp_mode == "fsdp":
@@ -144,15 +149,13 @@ def test_muon_matches_reference(
     excluded_names = ["block2.3.weight", "block2.3.bias"]
     muon_names = [name for name in params if name not in excluded_names]
 
+    second_group = ["block1.2.weight", "block2.0.weight"]
+
     def param_groups(named_params):
-        """block1.0 and block2.0 with the defaults, block1.2 and block2.2 with their own settings."""
+        """The Muon matrices with the defaults, except second_group with its own settings."""
         return [
-            {"params": [named_params[name] for name in muon_names[0::2]]},
-            {
-                "params": [named_params[name] for name in muon_names[1::2]],
-                "lr": 0.02,
-                "weight_decay": 0.05,
-            },
+            {"params": [named_params[n] for n in muon_names if n not in second_group]},
+            {"params": [named_params[n] for n in second_group], "lr": 0.02, "weight_decay": 0.05},
         ]
 
     optimizer = muon.FsdpMuon(
