@@ -653,15 +653,67 @@ def test_shortcut_overlap_model_validation():
                 fp8="hybrid" if mxfp8 else None,
                 fp8_recipe="mxfp8" if mxfp8 else "delayed",
                 fp8_param=mxfp8,
+                activation_func_tanh_clamp_scale=16.0,
             )
-            if mxfp8:
-                with pytest.raises(ValueError, match="requires further testing"):
+            if mxfp8 and backend != InferenceGroupedGemmBackend.FLASHINFER:
+                with pytest.raises(ValueError, match="fp8_recipe='mxfp8' and"):
                     config.validate_shortcut_moe_model(candidate)
             else:
                 config.validate_shortcut_moe_model(candidate)
-    model_config.fp8 = "e4m3"
-    with pytest.raises(ValueError, match="requires further testing"):
+                if mxfp8:
+                    candidate.activation_func_tanh_clamp_scale = None
+                    with pytest.raises(ValueError, match="routed path is not yet validated"):
+                        config.validate_shortcut_moe_model(candidate)
+    # Non-MXFP8 FP8 recipes stay rejected, even with FlashInfer experts.
+    for backend in ("vllm", "flashinfer"):
+        candidate = dataclasses.replace(model_config, inference_grouped_gemm_backend=backend)
+        candidate.fp8 = "e4m3"
+        with pytest.raises(ValueError, match="fp8_recipe='mxfp8' and"):
+            config.validate_shortcut_moe_model(candidate)
+    model_config.fp4 = "nvfp4"
+    with pytest.raises(ValueError, match="FP4 requires further testing"):
         config.validate_shortcut_moe_model(model_config)
+
+
+def test_shortcut_overlap_parallelism_validation():
+    """TP>1 is accepted with sequence parallelism; CP>1 and TP-stream hazards are not."""
+    model_config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_router_topk=1,
+        moe_router_pre_softmax=True,
+        moe_router_dtype="fp32",
+        moe_shortcut_connection=True,
+        transformer_impl="inference_optimized",
+        normalization="RMSNorm",
+        add_bias_linear=False,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        inference_moe_token_dispatcher_type="nvls",
+        tensor_model_parallel_size=2,
+        sequence_parallel=True,
+    )
+    config = InferenceConfig(inference_shortcut_moe_overlap=True, verbose=False)
+    config.validate_shortcut_moe_model(model_config)
+    config.validate_shortcut_moe_model(
+        dataclasses.replace(model_config, expert_tensor_parallel_size=2)
+    )
+    rejected = {
+        "requires CP=1": dict(context_parallel_size=2),
+        "requires sequence_parallel": dict(sequence_parallel=False),
+        # TransformerConfig already rejects these two for Shortcut MoE; the overlap
+        # validator repeats the check because either one would race the streams.
+        "moe_shared_expert_overlap": dict(moe_shared_expert_overlap=True),
+        "inference_fuse_tp_communication": dict(inference_fuse_tp_communication=True),
+    }
+    for message, overrides in rejected.items():
+        candidate = dataclasses.replace(model_config)
+        for name, value in overrides.items():
+            setattr(candidate, name, value)
+        with pytest.raises(ValueError, match=message):
+            config.validate_shortcut_moe_model(candidate)
 
 
 def test_shortcut_overlap_setup_validation():
