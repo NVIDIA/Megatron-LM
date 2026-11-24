@@ -124,7 +124,6 @@ def test_mimo_param_norm_skips_frozen_pp1_module(monkeypatch):
     ids=("expert-parallel", "expert-tensor-parallel", "tp-larger-than-etp", "etp-larger-than-tp"),
 )
 def test_moe_param_norm_counts_each_logical_parameter_once(
-    monkeypatch,
     run_config,
     tensor_parallel_size: int,
     expert_parallel_size: int,
@@ -133,10 +132,6 @@ def test_moe_param_norm_counts_each_logical_parameter_once(
     """Parameter norm should be invariant to expert and expert-tensor parallelism."""
     if Utils.world_size < 4 or Utils.world_size % 4 != 0:
         pytest.skip("test requires a world size divisible by four")
-
-    monkeypatch.setattr(
-        common_utils, "get_args", lambda: SimpleNamespace(use_megatron_fsdp=False, bf16=False)
-    )
 
     try:
         Utils.initialize_model_parallel(
@@ -176,9 +171,7 @@ def test_moe_param_norm_counts_each_logical_parameter_once(
 
 
 @pytest.mark.flaky_in_dev
-def test_moe_param_norm_uses_expert_gtp_topology_when_it_differs_from_dense_gtp(
-    monkeypatch, run_config
-):
+def test_moe_param_norm_uses_expert_gtp_topology_when_it_differs_from_dense_gtp(run_config):
     """Expert parameters must use EGTP even when EP, TP, and ETP alone do not distinguish them."""
     from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
         GTP_CONFIG,
@@ -193,9 +186,6 @@ def test_moe_param_norm_uses_expert_gtp_topology_when_it_differs_from_dense_gtp(
     if Utils.world_size < 2 or Utils.world_size % 2 != 0:
         pytest.skip("test requires an even world size")
 
-    monkeypatch.setattr(
-        common_utils, "get_args", lambda: SimpleNamespace(use_megatron_fsdp=False, bf16=False)
-    )
     # Keep the all-ones assertion focused on topology rather than physical GTP padding.
     original_pad_for_alignment = GTP_CONFIG.pad_for_alignment
     update_gtp_config(pad_for_alignment=0)
@@ -472,9 +462,7 @@ def test_layer_wise_muon_grad_norm_uses_expert_tp_group_for_row_parallel_bias():
 
 
 @pytest.mark.parametrize("expert_parallel_size", (1, 2))
-def test_layer_wise_param_norm_counts_owners_before_param_sync(
-    monkeypatch, run_config, expert_parallel_size
-):
+def test_layer_wise_param_norm_counts_owners_before_param_sync(run_config, expert_parallel_size):
     """Norms use updated owner weights while non-owner model copies remain stale."""
     from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
     from megatron.core.process_groups_config import ProcessGroupCollection
@@ -482,7 +470,6 @@ def test_layer_wise_param_norm_counts_owners_before_param_sync(
     if Utils.world_size < 4 or Utils.world_size % 2 != 0:
         pytest.skip("test requires an even world size of at least four")
 
-    monkeypatch.setattr(common_utils, "get_args", lambda: SimpleNamespace(use_megatron_fsdp=False))
     try:
         Utils.initialize_model_parallel(expert_model_parallel_size=expert_parallel_size)
         model = _build_tiny_moe_gpt(

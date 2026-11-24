@@ -92,7 +92,6 @@ class TestLocalCheckpointing:
         with (
             TempNamedDir(tmp_path_dist_ckpt / "owned_rng_local", sync=True) as checkpoint_dir,
             mock.patch("megatron.training.checkpointing.get_args", return_value=args),
-            mock.patch("megatron.training.async_utils.get_args", return_value=args),
         ):
             context = {"local_checkpoint_manager": LocalCheckpointManager(checkpoint_dir)}
             expected_rng = torch.get_rng_state().clone()
@@ -226,7 +225,6 @@ class TestLocalCheckpointing:
         with (
             TempNamedDir(tmp_path_dist_ckpt / "test_local", sync=True) as local_ckpt_dir,
             mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
-            mock.patch('megatron.training.async_utils.get_args', new=lambda: mock_args),
             mock.patch('torch.empty', new=deterministic_empty),
         ):
             local_ckpt_dir = local_ckpt_dir / "subdir"  # Test handling of non-existent directories
@@ -357,7 +355,6 @@ class TestLocalCheckpointing:
             with (
                 TempNamedDir(tmp_path_dist_ckpt / subdir, sync=True) as local_ckpt_dir,
                 mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
-                mock.patch('megatron.training.async_utils.get_args', new=lambda: mock_args),
                 mock.patch.object(LocalCheckpointManager, '_save', new=save_wrapper),
                 caplog.at_level(logging.INFO),
             ):
