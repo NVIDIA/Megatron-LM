@@ -163,10 +163,6 @@ inference = [
     "flashinfer-jit-cache-sm110a==0.7.2.post1; sys_platform == 'linux' and platform_machine == 'aarch64'",
     "flashinfer-jit-cache-sm120f==0.7.2.post1; sys_platform == 'linux'",
     "flashinfer-jit-cache-sm121a==0.7.2.post1; sys_platform == 'linux' and platform_machine == 'aarch64'",
-    # Retain the validated FA2 pin, excluding NGC's local build suffix.
-    "flash-attn==2.8.3.post1; sys_platform == 'linux'",
-    # Keep FA4 aligned with the dev extra and its validated CUTLASS stack.
-    "flash-attn-4[cu13]==4.0.0b27; sys_platform == 'linux'",
     "tilelang>=0.1.12; sys_platform == 'linux'",
 ]
 
@@ -243,7 +239,6 @@ default-groups = ["linting", "build", "test"]
 # CUTLASS 4.8 moved CuTe APIs used by older Quack releases.
 constraint-dependencies = ["quack-kernels>=0.6.5", "virtualenv>=21.14.9"]
 no-build-isolation-package = [
-    "flash-attn",
     "causal-conv1d",
     "flash_mla",
     "mamba-ssm",
