@@ -1,10 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Adapted from https://github.com/NVIDIA-NeMo/nv-mistralai-megatron/pull/797
+# Source revision: aeab73be76294f8930377aae1e853b4e930e8dd0
+# License: BSD-3-Clause; original NVIDIA notices retained (see LICENSE).
 
 import logging
 import math
 from collections import defaultdict, deque
 from contextlib import nullcontext
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, ClassVar, Dict, Optional, Tuple
 
 import torch
 from torch.autograd.graph import saved_tensors_hooks
@@ -468,6 +471,8 @@ class OffloadTensorGroup:
         # Margin groups stay resident to provide compute time for the first reloads.
         self.is_offload_margin = False
         self.total_offload_bytes = 0
+        # CPU transfer bytes are not a measure of GPU storage reclaimed.
+        self.retained_storage_bytes = 0
         self.total_tensor_count = 0
         self._offload_info_collected = False
         # Warmup-only bookkeeping for redundant copies within this group.
@@ -959,6 +964,8 @@ class ChunkOffloadHandler:
     Manages tensor groups, coordinates asynchronous GPU-CPU transfers, and handles synchronization.
     """
 
+    _warned_retained_storage: ClassVar[bool] = False
+
     # Minimum fraction of the underlying storage bytes a non-contiguous view must
     # cover before offloading the storage instead of gathering the view: the
     # storage path trades D2H/H2D bytes on the copy engines for skipping the
@@ -1220,6 +1227,22 @@ class ChunkOffloadHandler:
             self._offload_pending_by_name[gname].append(group_to_offload._offload_event)
             self._drain_offload_pending(gname)
 
+    @staticmethod
+    def _saved_storage_sizes(tensors):
+        """Return unique physical storage sizes, including TE wrapper data."""
+        sizes = {}
+        for tensor in tensors:
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            data_tensors = (
+                tensor.get_data_tensors() if hasattr(tensor, "get_data_tensors") else (tensor,)
+            )
+            for data in data_tensors:
+                if isinstance(data, torch.Tensor) and data.numel() > 0:
+                    storage = data.untyped_storage()
+                    sizes[(data.device, storage.data_ptr())] = storage.nbytes()
+        return sizes
+
     def _collect_offload_info(self, group):
         """Discover eligible bytes and duplicate storage even when warmup skips the copy."""
         if group._offload_info_collected:
@@ -1374,16 +1397,38 @@ class ChunkOffloadHandler:
         # those opportunities (e.g. attn_norm commits after core_attn).
         if not group_to_offload.is_offload_margin:
             self._groups_to_reload.append(group_to_offload)
+        group_to_offload.retained_storage_bytes = 0
         if self.should_bulk_offload(group_to_offload):
             self.bulk_offload_group(group_to_offload)
             # Manually release tensors not auto-freed by torch GC
             if len(forced_released_tensors) > 0:
                 cur_stream = torch.cuda.current_stream()
+                # A copied parent may still be referenced by an uncopied saved view.
+                resident_sizes = self._saved_storage_sizes(group_to_offload._tensors.values())
+                retained_sizes = {}
                 for release_tensor in forced_released_tensors:
                     if self.tensor_need_offloading_checker(release_tensor):
+                        storage = release_tensor.untyped_storage()
+                        key = (release_tensor.device, storage.data_ptr())
+                        if key in resident_sizes:
+                            retained_sizes[key] = resident_sizes[key]
+                            continue
                         # Ensure tensor is not in use before freeing
                         release_tensor.record_stream(cur_stream)
-                        release_tensor.untyped_storage().resize_(0)
+                        storage.resize_(0)
+                # Refresh after every invocation: routing can change storage sizes
+                # after warmup. This is not a leak; backward owns the saved views.
+                group_to_offload.retained_storage_bytes = sum(retained_sizes.values())
+                if retained_sizes and not ChunkOffloadHandler._warned_retained_storage:
+                    ChunkOffloadHandler._warned_retained_storage = True
+                    logger.warning(
+                        "Activation offload retained %.2f MiB of GPU storage in group %s "
+                        "because uncopied saved views still reference it. CPU transfer bytes "
+                        "do not imply this storage was reclaimed. This warning is shown "
+                        "once per process; retained_storage_bytes is updated per group.",
+                        group_to_offload.retained_storage_bytes / (1024 * 1024),
+                        group_to_offload._name,
+                    )
         # A group commit is consumed even when policy keeps its tensors on GPU.
         self._groups_to_offload.remove(group_to_offload)
 

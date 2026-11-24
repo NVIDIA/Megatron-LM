@@ -1,4 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Adapted from https://github.com/NVIDIA-NeMo/nv-mistralai-megatron/pull/797
+# Source revision: aeab73be76294f8930377aae1e853b4e930e8dd0
+# License: BSD-3-Clause; original NVIDIA notices retained (see LICENSE).
 
 import argparse
 import os
@@ -2119,15 +2122,18 @@ class TestTEGroupedMLP:
         [
             (False, ["expert_fc1", "moe_act"]),
             (False, ["moe_act"]),
+            (False, ["expert_fc1"]),
             (True, ["expert_fc1", "moe_act"]),
             (True, ["fused_group_mlp"]),
             (True, ["moe_act"]),
         ],
-        ids=("module_both", "module_partial", "ops_both", "ops_fused", "ops_partial"),
+        ids=("module_both", "module_partial", "module_fc1", "ops_both", "ops_fused", "ops_partial"),
     )
     @pytest.mark.parametrize("override_pattern", (None, "*experts*"), ids=("inherit", "bf16"))
+    @pytest.mark.parametrize("recompute_moe_act", (False, True))
+    @pytest.mark.parametrize("fp8", (None, "e4m3"), ids=("bf16", "mxfp8"))
     def test_gpu_offload_knobs_follow_the_experts_path(
-        self, override_pattern, offload_modules, use_op_fuser
+        self, override_pattern, offload_modules, use_op_fuser, recompute_moe_act, fp8
     ):
         """'fused_group_mlp' and 'expert_fc1' + 'moe_act' are equivalent spellings; each
         GroupedMLP maps whichever is given onto its own path. A fused instance offloads the
@@ -2176,6 +2182,10 @@ class TestTEGroupedMLP:
             bias_activation_fusion=False,
             bf16=True,
             params_dtype=torch.bfloat16,
+            fp8=fp8,
+            fp8_recipe="mxfp8",
+            recompute_granularity="selective" if recompute_moe_act else None,
+            recompute_modules=["moe_act"] if recompute_moe_act else [],
             moe_router_load_balancing_type="sinkhorn",
             moe_router_topk=1,
             moe_grouped_gemm=True,
@@ -2213,8 +2223,8 @@ class TestTEGroupedMLP:
         else:
             assert not experts._with_fused_impl
             assert not experts.offload_fused_group_mlp
-            assert experts.offload_expert_fc1 == (not partial)
-            assert experts.offload_moe_act
+            assert experts.offload_expert_fc1 == ("expert_fc1" in offload_modules)
+            assert experts.offload_moe_act == ("moe_act" in offload_modules)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
