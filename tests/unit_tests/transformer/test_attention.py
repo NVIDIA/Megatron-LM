@@ -189,28 +189,19 @@ class TestParallelAttention:
         assert bias.shape[0] == config.hidden_size
 
         if fused_qkv_rope:
-            # Nonuniform inputs/frequencies expose the rotary layout in outputs and gradients.
-            self.parallel_attention.float().eval()
+            attn = self.parallel_attention.float().eval()
             x = torch.randn_like(hidden_states, dtype=torch.float32).requires_grad_()
             rope = RotaryEmbedding(
-                config.kv_channels,
-                1.0,
-                rotary_interleaved,
-                cp_group=self.parallel_attention.pg_collection.cp,
+                config.kv_channels, 1.0, rotary_interleaved, cp_group=attn.pg_collection.cp
             )(sequence_length)
             upstream = torch.randn_like(x)
-            grad_inputs = (x, *self.parallel_attention.parameters())
             results = []
             for fused in (True, True, False):  # Fused replay, then split/unfused reference.
                 config.fused_single_qkv_rope = config.apply_rope_fusion = fused
-                out, bias = self.parallel_attention(
-                    x, torch.zeros_like(attention_mask), rotary_pos_emb=rope
-                )
-                results.append((out, *torch.autograd.grad(out + bias, grad_inputs, upstream)))
-            for actual, replay in zip(results[0], results[1]):
-                assert torch.equal(
-                    actual.contiguous().view(torch.uint8), replay.contiguous().view(torch.uint8)
-                )
+                out, bias = attn(x, torch.zeros_like(attention_mask), rotary_pos_emb=rope)
+                grads = torch.autograd.grad(out + bias, (x, *attn.parameters()), upstream)
+                results.append(torch.cat([t.flatten() for t in (out, *grads)]))
+            assert torch.equal(results[0].view(torch.uint8), results[1].view(torch.uint8))
             torch.testing.assert_close(results[0], results[2], rtol=1e-4, atol=1e-4)
 
         self.parallel_attention.config.apply_rope_fusion = False
