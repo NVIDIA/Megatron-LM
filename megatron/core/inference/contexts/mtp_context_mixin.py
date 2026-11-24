@@ -297,8 +297,11 @@ class MTPContextMixin:
             self.padded_active_token_count,
             self._using_cuda_graph_this_step,
         )
+        # MTP forwards stage their own DSA sparse-attention plan when indexer keys are cached.
+        dsa_metadata = self.dsa_metadata if getattr(self, "cache_dsa_indexer_keys", False) else None
         if preserve_step_bookkeeping:
             saved_bookkeeping = self.gpu_view._buf.clone()
+            saved_dsa_plan = dsa_metadata.snapshot() if dsa_metadata is not None else None
             saved_mha_state = [
                 (mha, mha.state_data, mha._max_seqlen_q, mha._max_seqlen_k)
                 for mha in (
@@ -327,6 +330,8 @@ class MTPContextMixin:
                     mha.state_data = state_data
                     mha._max_seqlen_q = max_seqlen_q
                     mha._max_seqlen_k = max_seqlen_k
+                if saved_dsa_plan is not None:
+                    dsa_metadata.restore(saved_dsa_plan)
 
     def _mtp_activate_attn_metadata(
         self,
@@ -393,29 +398,13 @@ class MTPContextMixin:
         n = mtp.active_request_count
         padded = mtp.padded_count
 
-        positions = mtp.active_offsets  # [n] int, MTP write position P_r for this depth
+        # Token write maps (one token per active request at its MTP write position P_r, padded
+        # rows sent to the dummy block) and MHA read metadata (query_length=1 per request,
+        # kv_length = P_r + 1, write-then-attend), in one sync-free launch.
+        kv_len = mtp.write_draft_step_metadata(self.gpu_view)
 
-        # Token write maps (one token per active request), padded rows sent to the dummy block.
-        mtp.write_token_maps(
-            gpu_view=self.gpu_view,
-            rows=mtp.row_ids[:n],
-            positions=positions,
-            block_table=mtp.active_block_table,
-            padded_token_count=padded,
-        )
-
-        # MHA read metadata: query_length=1 per request, kv_length = P_r + 1 (write-then-attend).
-        query_lengths, kv_len = mtp.stage_decode_lengths()
-        mtp.write_mha_metadata(
-            gpu_view=self.gpu_view,
-            query_lengths=query_lengths,
-            kv_lengths=kv_len,
-            block_table=mtp.active_block_table,
-            padded_request_count=padded,
-        )
-
-        # The staged buffers above are read only by these writes; the graph reads `gpu_view`
-        # alone, whose addresses are fixed, so replaying against them is graph-safe.
+        # Outside the eager max below, the graph reads `gpu_view` alone, whose addresses are
+        # fixed, so replaying against them is graph-safe.
         if mtp.graphed:
             # Graphed: route to the graph metadata and use the FIXED capture-time sequence-length
             # bound (baked into the flash-attn kernel launch at capture) rather than a per-step
@@ -425,7 +414,7 @@ class MTPContextMixin:
         else:
             # Eager: tight per-step max via a GPU->CPU sync, non-graph metadata, graphs disabled.
             max_seqlen_k = int(kv_len.max().item()) if n > 0 else 1
-        self._mtp_activate_attn_metadata(
+        mha = self._mtp_activate_attn_metadata(
             graphed=mtp.graphed,
             padded_request_count=padded,
             max_seqlen_q=1,
@@ -433,6 +422,75 @@ class MTPContextMixin:
             token_count=n,
             padded_token_count=padded,
         )
+        if getattr(self, "cache_dsa_indexer_keys", False):
+            # One query row per request, reading its first `position + 1` keys.
+            self.dsa_metadata.stage_decode_rows(
+                row_requests=mtp.row_ids[:n],
+                row_lengths=kv_len,
+                padded_rows=padded,
+                padded_requests=padded,
+                block_table=mha.state_data["block_table"],
+            )
+
+    def _mtp_setup_commit_graphed(
+        self,
+        active_request_count: int,
+        padded_count: int,
+        accepted_counts: Optional[Tensor] = None,
+        base_positions: Optional[Tensor] = None,
+        block_table_src: Optional[Tensor] = None,
+    ) -> None:
+        """Publish the metadata for a CUDA-graphed (fixed-shape) commit pass.
+
+        Every request contributes `num_speculative_tokens` rows, so the forward's shape depends
+        only on `padded_count` and one graph per request count serves every step. With no
+        `accepted_counts` (CUDA-graph capture and EP dummy forwards), every row writes the dummy
+        block and attends over the dummy block's first `num_speculative_tokens` positions.
+
+        Args:
+            active_request_count (int): Decode requests whose accepted drafts are refreshed.
+            padded_count (int): Request slots the forward launches over.
+            accepted_counts (Optional[Tensor]): [>=active_request_count] accepted drafts.
+            base_positions (Optional[Tensor]): [>=active_request_count] position of each
+                request's next draft, one past its last committed token.
+            block_table_src (Optional[Tensor]): [>=active_request_count, max_kv_block_count]
+                block ids per request.
+        """
+        assert self.enable_mtp_kv_cache
+        mtp = self.mtp_metadata
+        num_slots = self.num_speculative_tokens
+        if accepted_counts is None:
+            accepted_counts = mtp.capture_accepted_counts
+            base_positions = mtp.capture_base_positions
+            block_table_src = None
+            active_request_count = padded_count
+        mtp.begin_commit_graphed(active_request_count, padded_count, block_table_src)
+        mtp.write_commit_step_metadata(
+            self.gpu_view, accepted_counts, base_positions, num_slots=num_slots
+        )
+        # Fixed capture-time KV bound, as in the graphed draft loop: kv_length = start + slots
+        # never exceeds the draft loop's own last kv_length.
+        mha = self._mtp_activate_attn_metadata(
+            graphed=True,
+            padded_request_count=padded_count,
+            max_seqlen_q=num_slots,
+            max_seqlen_k=self.graph_attn_metadata["mha_metadata"].max_seqlen,
+            token_count=active_request_count * num_slots,
+            padded_token_count=padded_count * num_slots,
+        )
+        if getattr(self, "cache_dsa_indexer_keys", False):
+            # `num_slots` causal rows per real request: row j of a request with `kv` keys reads
+            # its first `kv - num_slots + j + 1`, as the MHA kernel's bottom-right causal mask
+            # does. Padding requests' rows read none.
+            kv_lengths = self.gpu_view.mha_kv_seq_lengths[:active_request_count]
+            slot = torch.arange(num_slots, device=kv_lengths.device, dtype=kv_lengths.dtype)
+            self.dsa_metadata.stage_decode_rows(
+                row_requests=mtp.row_ids[:active_request_count].repeat_interleave(num_slots),
+                row_lengths=(kv_lengths[:, None] - num_slots + 1 + slot).clamp_(min=0).flatten(),
+                padded_rows=padded_count * num_slots,
+                padded_requests=padded_count,
+                block_table=mha.state_data["block_table"],
+            )
 
     def _mtp_setup_prefill_step(
         self,
@@ -515,7 +573,7 @@ class MTPContextMixin:
         # Never publish max_seqlen_q == 1 for this varlen pass: FlashAttention-2 would read it as
         # one query token per sequence and, under GQA, reshape q assuming total_q == num_seqs,
         # which requests contributing zero rows break. Raising the bound is safe.
-        self._mtp_activate_attn_metadata(
+        mha = self._mtp_activate_attn_metadata(
             graphed=False,
             padded_request_count=padded_p,
             max_seqlen_q=max(2, max_seqlen),
@@ -523,6 +581,18 @@ class MTPContextMixin:
             token_count=total,
             padded_token_count=padded_total,
         )
+        if getattr(self, "cache_dsa_indexer_keys", False):
+            # Eager varlen pass whose lengths the host already waited for above: plan it on the
+            # CPU like a prefill step, over the same block-table rows as the MHA metadata.
+            lengths = seq_lengths.tolist()
+            self.dsa_metadata.update(
+                lengths,
+                lengths,
+                padded_tokens=padded_total,
+                padded_requests=padded_p,
+                decode_only=False,
+            )
+            self.dsa_metadata.transfer(mha.state_data["block_table"], non_blocking=False)
         # COMMIT rather than DRAFT: per-request query lengths differ here, so the attention must
         # take the varlen path. On a pure-decode step `num_prefill_requests == 0` would otherwise
         # make `is_decode_only()` True and route to the decode kernel, whose uniform

@@ -473,6 +473,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.dsa_backend = inference_config.dsa_backend
             if self.dsa_backend not in ("triton", "flashinfer"):
                 raise ValueError(f"Unknown DSA inference backend {self.dsa_backend!r}.")
+            if inference_config.num_speculative_tokens and self.dsa_backend != "flashinfer":
+                raise NotImplementedError(
+                    "Speculative decoding with DSA sparse attention needs "
+                    "dsa_backend='flashinfer'; the triton backend decodes one token per request."
+                )
         if self.cache_mla_latent:
             assert (
                 inference_config.block_size_tokens == 64
@@ -1885,6 +1890,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     max_sequence_length=self.max_sequence_length,
                     query_heads=self.dsa_query_heads,
                     index_topk=self.dsa_index_topk,
+                    # A speculative-decoding verify step adds 1 + k rows per decode request.
+                    decode_tokens=1 + self.num_speculative_tokens,
                 )
             else:
                 self.dsa_metadata = DSAMetadata(
@@ -2107,6 +2114,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # rather than being inferred from the request counts.
         if self.mtp_metadata.is_varlen_forward:
             return False
+        # The graphed commit pass is uniform (num_speculative_tokens rows per request) and is
+        # captured once per request count, so it takes the decode kernel even on a mixed step.
+        if self.mtp_metadata.is_graphed_commit_forward:
+            return True
         if self._using_cuda_graph_this_step:
             return self.padded_batch_dimensions.prefill_req_count == 0
         return self.num_prefill_requests == 0
@@ -2320,10 +2331,17 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 self.active_attn_metadata["mha_metadata"].state_data["block_table"],
             )
 
+    def _dsa_layer_slot(self, layer_number: int) -> int:
+        """The index-key cache plane of a layer: the MTP draft plane during MTP forwards, as for
+        the KV cache (see `append_key_value_cache`)."""
+        if self.mtp_metadata.forward_active:
+            return self.mtp_kv_layer_slot
+        return self.layer_map[layer_number - 1]
+
     def append_dsa_key_cache(self, layer_number: int, key: Tensor) -> None:
         """Append learned simplified-indexer keys to their paged cache."""
         assert self.cache_dsa_indexer_keys, "DSA indexer key cache is not enabled."
-        attention_layer_number = self.layer_map[layer_number - 1]
+        attention_layer_number = self._dsa_layer_slot(layer_number)
         block_idx = self.gpu_view.token_to_block_idx[: self.padded_active_token_count]
         local_kv_seq_idx = self.gpu_view.token_to_local_position_within_kv_block[
             : self.padded_active_token_count
@@ -2343,7 +2361,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
     def dsa_key_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
         """Return a layer's learned indexer-key cache and active block table."""
         assert self.cache_dsa_indexer_keys, "DSA indexer key cache is not enabled."
-        attention_layer_number = self.layer_map[layer_number - 1]
+        attention_layer_number = self._dsa_layer_slot(layer_number)
         assert self.active_attn_metadata is not None
         return (
             self.dsa_memory_buffer[attention_layer_number],

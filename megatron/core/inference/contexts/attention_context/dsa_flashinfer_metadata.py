@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence, Tuple
 
 import torch
 
@@ -19,6 +19,10 @@ class FlashInferDSAMetadata(MetadataBase):
     table (once per step, outside CUDA graphs); ``plan`` returns the views a DSA layer reads. A
     step's view sizes depend only on its padded batch, so captured graphs replay on any batch that
     fits them.
+
+    With speculative decoding a decode request adds up to ``decode_tokens = 1 + k`` rows. The MTP
+    draft head's forwards, whose lengths exist only on the GPU, stage an all-decode-path plan
+    directly on the GPU instead (``stage_decode_rows``).
     """
 
     def __init__(
@@ -31,18 +35,24 @@ class FlashInferDSAMetadata(MetadataBase):
         max_sequence_length: int,
         query_heads: int,
         index_topk: int,
+        decode_tokens: int = 1,
     ):
         super().__init__()
         plan_lib.check_plan_rows(max_tokens)
         self.block_size_tokens = block_size_tokens
         self.max_sequence_length = max_sequence_length
         self.query_heads = query_heads
+        # Most rows a decode-path request adds: 1 + the speculative tokens it verifies.
+        self.decode_tokens = decode_tokens
         device = torch.cuda.current_device()
         tiles = plan_lib.plan_sizes(max_tokens, max_requests, False)["tiles"]
         tiled = tiles * plan_lib.TILE_ROWS
+        # A decode-only step puts every row on the decode path: up to `decode_tokens` rows per
+        # request (the MTP commit forward stages `decode_tokens - 1`).
+        decode_capacity = max_requests * decode_tokens
         self._capacity = {
-            "decode_requests": max_requests,
-            "decode_lengths": max_requests,
+            "decode_requests": decode_capacity,
+            "decode_lengths": decode_capacity,
             "tile_requests": tiles,
             "tile_ordinals": tiles,
             "row_ends": tiled,
@@ -94,13 +104,14 @@ class FlashInferDSAMetadata(MetadataBase):
             decode_only=decode_only,
             heads=self.query_heads,
             padded_prefill_requests=padded_prefill_requests,
+            decode_tokens=self.decode_tokens,
         )
         for name, values in arrays.items():
             assert values.size <= self._capacity[name], name
             self._cpu_views[name][: values.size] = torch.from_numpy(values)
             self._lengths[name] = values.size
         self._sizes = plan_lib.plan_sizes(
-            padded_tokens, padded_requests, decode_only, padded_prefill_requests
+            padded_tokens, padded_requests, decode_only, padded_prefill_requests, self.decode_tokens
         )
         self._page_rows = padded_requests
 
@@ -108,6 +119,66 @@ class FlashInferDSAMetadata(MetadataBase):
         """Copy the plan to the GPU and fill the page table from the step's GPU block table."""
         self._gpu_buf.copy_(self._cpu_buf, non_blocking=non_blocking)
         plan_lib.fill_page_table(block_table, self.block_size_tokens, self.page_table)
+
+    def stage_decode_rows(
+        self,
+        row_requests: torch.Tensor,
+        row_lengths: torch.Tensor,
+        padded_rows: int,
+        padded_requests: int,
+        block_table: torch.Tensor,
+    ) -> None:
+        """Stage an all-decode-path plan directly on the GPU, for the MTP draft and CUDA-graphed
+        commit forwards, whose lengths exist only on the GPU.
+
+        Row ``r`` reads the first ``row_lengths[r]`` keys of block-table row
+        ``row_requests[r]``; rows past ``row_requests.numel()`` (padding) read none. The plan's
+        sizes depend only on ``padded_rows`` and ``padded_requests``, so captured graphs replay.
+        No host synchronization.
+
+        Args:
+            row_requests (Tensor): [n] block-table row of each real row.
+            row_lengths (Tensor): [n] causal key count of each real row.
+            padded_rows (int): Rows the forward runs, including padding.
+            padded_requests (int): Block-table rows the forward reads.
+            block_table (Tensor): [>=padded_requests, max_kv_blocks] block ids; the MTP forwards
+                mark padding requests' blocks with -1.
+        """
+        n = row_requests.numel()
+        assert n <= padded_rows <= self._capacity["decode_requests"]
+        requests = self._gpu_views["decode_requests"]
+        lengths = self._gpu_views["decode_lengths"]
+        requests[:n].copy_(row_requests, non_blocking=True)
+        requests[n:padded_rows].zero_()
+        lengths[:n].copy_(row_lengths, non_blocking=True)
+        lengths[n:padded_rows].zero_()
+        pages = self.page_table[:padded_requests]
+        plan_lib.fill_page_table(block_table[:padded_requests], self.block_size_tokens, pages)
+        # -1 blocks give negative pages. No row reads them, but keep every page in range.
+        pages.clamp_(min=0)
+        self._lengths = {name: 0 for name in self._capacity}
+        self._lengths["decode_requests"] = padded_rows
+        self._lengths["decode_lengths"] = padded_rows
+        self._sizes = plan_lib.plan_sizes(padded_rows, padded_requests, decode_only=True)
+        self._page_rows = padded_requests
+
+    def snapshot(self) -> Tuple[Any, ...]:
+        """Opaque copy of the staged plan, for MTP forwards that run before the step's main
+        forward and must leave its plan in place (``restore`` puts it back)."""
+        return (
+            self._gpu_buf.clone(),
+            self.page_table[: self._page_rows].clone(),
+            dict(self._lengths),
+            dict(self._sizes),
+            self._page_rows,
+        )
+
+    def restore(self, state: Tuple[Any, ...]) -> None:
+        """Put back a plan saved by ``snapshot``."""
+        gpu_buf, page_table, lengths, sizes, page_rows = state
+        self._gpu_buf.copy_(gpu_buf)
+        self.page_table[:page_rows].copy_(page_table)
+        self._lengths, self._sizes, self._page_rows = lengths, sizes, page_rows
 
     def plan(self):
         """The step's ``dsa_flashinfer_plan.StepPlan``; kernel shapes use the configured bound."""

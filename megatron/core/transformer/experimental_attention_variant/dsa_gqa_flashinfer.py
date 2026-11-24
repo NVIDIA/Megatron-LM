@@ -535,11 +535,6 @@ def dynamic_sparse_attention(
     Returns:
         Attention output ``[T,1,Hq*Dv]``; rows of padding tokens are zero.
     """
-    if inference_context.num_speculative_tokens:
-        raise NotImplementedError(
-            "DSA inference decodes one token per request; MTP speculative decoding is not "
-            "supported."
-        )
     num_tokens, _, num_query_heads, _ = query.shape
     if key_cache.size(2) != 1:
         raise NotImplementedError(
