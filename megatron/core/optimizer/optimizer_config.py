@@ -427,9 +427,9 @@ class OptimizerConfig:
     Stochastic rounding keeps the BF16 weights equal to the main params in expectation, so
     updates smaller than half a BF16 ULP are not lost (useful at the small learning rates of
     RL post-training, see arXiv:2611.13545). It changes training numerics and adds zero-mean
-    noise of up to one BF16 ULP to the model weights. Supported with the distributed
-    optimizer, with or without optimizer CPU offload; not with FP8/FP4 parameters, Megatron
-    FSDP, or the precision-aware optimizer without CPU offload."""
+    noise of up to one BF16 ULP to the model weights. Requires BF16 training with the
+    distributed optimizer, with or without optimizer CPU offload; not supported with FP8/FP4
+    parameters, Megatron FSDP, or the precision-aware optimizer without CPU offload."""
 
     main_params_rounding_seed: int = 0
     """Seed for stochastic main params rounding. Rounding is a deterministic function of
@@ -499,6 +499,8 @@ class OptimizerConfig:
                 raise ValueError(
                     "main_params_rounding='stochastic' requires the distributed optimizer"
                 )
+            if not self.bf16 or self.fp16:
+                raise ValueError("main_params_rounding='stochastic' requires BF16 training")
             if self.use_precision_aware_optimizer and not self.optimizer_cpu_offload:
                 # TE FusedAdam keeps the main params and writes the model params itself.
                 raise ValueError(

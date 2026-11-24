@@ -73,6 +73,35 @@ class TestStochasticRounding:
         assert torch.equal(dst, x.bfloat16())
 
 
+@pytest.mark.parametrize(
+    "src_dtype,dst_dtype", [(torch.float32, torch.float16), (torch.float64, torch.bfloat16)]
+)
+def test_stochastic_rejects_unsupported_casts(src_dtype, dst_dtype):
+    src = torch.tensor([1.03127, -0.0113], dtype=src_dtype)
+    dst = torch.zeros_like(src, dtype=dst_dtype)
+    with pytest.raises(ValueError, match="Stochastic rounding only supports FP32 -> BF16 casts"):
+        rounding.round(dst, src, "stochastic")
+    assert torch.equal(dst, torch.zeros_like(dst))
+    rounding.round(dst, src, "nearest")
+    assert torch.equal(dst, src.to(dst_dtype))
+
+
+def test_stochastic_allows_exact_fp32_copy():
+    src = torch.tensor([-0.0, 1.03127, -0.0113], dtype=torch.float32)
+    dst = torch.zeros_like(src)
+    rounding.round(dst, src, "stochastic")
+    assert torch.equal(dst.view(torch.int32), src.view(torch.int32))
+
+
+def test_fmix32_scalar_and_tensor_match_in_place():
+    words = [0, 1, 0x80000000, 0xFFFFFFFF]
+    expected = [0, 0x514E28B7, 0x6D3C65A0, 0x81F16F39]
+    tensor = torch.tensor(words, dtype=torch.int64)
+    assert rounding._fmix32_(tensor) is tensor
+    assert tensor.tolist() == expected
+    assert [rounding._fmix32_(word) for word in words] == expected
+
+
 class TestMainParamsRoundingConfig:
 
     def test_rejects_unknown_mode(self):
@@ -83,20 +112,29 @@ class TestMainParamsRoundingConfig:
         with pytest.raises(ValueError, match="requires the distributed optimizer"):
             OptimizerConfig(main_params_rounding="stochastic").validate()
 
+    @pytest.mark.parametrize("fp16", [False, True], ids=["fp32", "fp16"])
+    def test_rejects_non_bf16_training(self, fp16):
+        with pytest.raises(ValueError, match="requires BF16 training"):
+            OptimizerConfig(
+                main_params_rounding="stochastic", use_distributed_optimizer=True, fp16=fp16
+            ).validate()
+
     def test_rejects_precision_aware_without_offload(self):
         with pytest.raises(ValueError, match="precision-aware"):
             OptimizerConfig(
                 main_params_rounding="stochastic",
+                bf16=True,
                 use_distributed_optimizer=True,
                 use_precision_aware_optimizer=True,
             ).validate()
 
     def test_accepts_supported_modes(self):
         OptimizerConfig(
-            main_params_rounding="stochastic", use_distributed_optimizer=True
+            main_params_rounding="stochastic", bf16=True, use_distributed_optimizer=True
         ).validate()
         OptimizerConfig(
             main_params_rounding="stochastic",
+            bf16=True,
             use_distributed_optimizer=True,
             use_precision_aware_optimizer=True,
             optimizer_cpu_offload=True,

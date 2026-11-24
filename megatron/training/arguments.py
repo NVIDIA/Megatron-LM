@@ -2815,7 +2815,8 @@ def _add_training_args(parser):
                        help='Rounding used when copying FP32 main params back to BF16 model '
                        'params after each optimizer step. "stochastic" keeps BF16 weights equal '
                        'to the main params in expectation so small updates are not lost; it '
-                       'changes training numerics. Requires the distributed optimizer.')
+                       'changes training numerics and requires --bf16 and '
+                       '--use-distributed-optimizer.')
     group.add_argument('--main-params-rounding-seed', type=int, default=0,
                        help='Seed for --main-params-rounding stochastic.')
     group.add_argument('--no-persist-layer-norm', action='store_true',

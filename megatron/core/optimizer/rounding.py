@@ -22,7 +22,7 @@ reproducible. When the input changes (e.g. main params after each step), so do t
 inputs.
 """
 
-from typing import Literal
+from typing import Literal, TypeVar
 
 import torch
 
@@ -33,23 +33,19 @@ _CHUNK = 1 << 22
 _MASK32 = 0xFFFFFFFF
 
 
-def _fmix32_(h: torch.Tensor) -> torch.Tensor:
-    """MurmurHash3 32-bit finalizer, in place on an int64 tensor holding values in [0, 2**32)."""
+_HashWord = TypeVar("_HashWord", int, torch.Tensor)
+
+
+def _fmix32_(h: _HashWord) -> _HashWord:
+    """Mix unsigned 32-bit words; mutate int64 tensor inputs in place."""
     h ^= h >> 16
-    h.mul_(0x85EBCA6B).bitwise_and_(_MASK32)
+    h *= 0x85EBCA6B
+    h &= _MASK32
     h ^= h >> 13
-    h.mul_(0xC2B2AE35).bitwise_and_(_MASK32)
+    h *= 0xC2B2AE35
+    h &= _MASK32
     h ^= h >> 16
     return h
-
-
-def _hash_seed(seed: int) -> int:
-    h = seed & _MASK32
-    h ^= h >> 16
-    h = h * 0x85EBCA6B & _MASK32
-    h ^= h >> 13
-    h = h * 0xC2B2AE35 & _MASK32
-    return h ^ h >> 16
 
 
 def stochastic_round_to_bf16_(dst: torch.Tensor, src: torch.Tensor, offset: int, seed: int) -> None:
@@ -67,7 +63,7 @@ def stochastic_round_to_bf16_(dst: torch.Tensor, src: torch.Tensor, offset: int,
     nan = src.isnan()
     bits = src.view(torch.int32)
     h = torch.arange(offset, offset + src.numel(), dtype=torch.int64, device=src.device)
-    h.mul_(0x9E3779B1).add_(_hash_seed(seed)).bitwise_xor_(bits.to(torch.int64))
+    h.mul_(0x9E3779B1).add_(_fmix32_(seed & _MASK32)).bitwise_xor_(bits.to(torch.int64))
     h.bitwise_and_(_MASK32)
     bits += (_fmix32_(h) >> 16).to(torch.int32)
     # With the low 16 bits cleared, the FP32 -> BF16 cast below is exact.
@@ -82,13 +78,18 @@ def round(
     """Copy ``src`` into ``dst`` with the given rounding mode.
 
     ``src`` may live on another device (e.g. CPU); rounding is done on ``dst``'s device.
-    ``rounding="nearest"`` is a plain non-blocking ``copy_``. ``"stochastic"`` applies only to
-    FP32 -> BF16 copies; other dtype pairs fall back to ``copy_``.
+    ``rounding="nearest"`` is a plain non-blocking ``copy_``. With ``"stochastic"``,
+    same-dtype copies are exact and only FP32 -> BF16 casts are supported.
     """
-    if rounding == "nearest" or dst.dtype != torch.bfloat16 or src.dtype != torch.float32:
+    if rounding not in ("nearest", "stochastic"):
+        raise ValueError(f"Unknown rounding mode: {rounding}")
+    if rounding == "nearest" or src.dtype == dst.dtype:
         dst.copy_(src, non_blocking=True)
         return
-    assert rounding == "stochastic", f"Unknown rounding mode: {rounding}"
+    if src.dtype != torch.float32 or dst.dtype != torch.bfloat16:
+        raise ValueError(
+            f"Stochastic rounding only supports FP32 -> BF16 casts, got {src.dtype} -> {dst.dtype}"
+        )
     flat_dst, flat_src = dst.view(-1), src.view(-1)
     for start in range(0, flat_dst.numel(), _CHUNK):
         chunk = slice(start, start + _CHUNK)
