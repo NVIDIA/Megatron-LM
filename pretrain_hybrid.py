@@ -346,7 +346,13 @@ def forward_step(data_iterator, model: HybridModel):
         tokens = batch.get("tokens")
         packed_seq_params = cp_batch.get_packed_seq_params()
         padding_mask = batch.get("padding_mask")
-        if cu_seqlens is not None:
+        # The packing scheduler already counted the global batch. For ordinary packed
+        # data, count each microbatch on one virtual stage per physical pipeline rank.
+        if (
+            cu_seqlens is not None
+            and vp_stage in (None, 0)
+            and get_run_config().model.transformer.sequence_packing_scheduler is None
+        ):
             update_seqlen_stats_from_cu_seqlens(cu_seqlens.squeeze(0))
 
         # Offline logits KD: record this microbatch's global (un-CP-sharded)
