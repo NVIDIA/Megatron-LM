@@ -6,7 +6,7 @@ import sys
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -174,26 +174,18 @@ def test_eagle_finetune_forward_batch_alignment(monkeypatch, streaming_args, sou
 
     monkeypatch.setattr(finetune.tensor_parallel, "broadcast_data", broadcast)
 
-    model_inputs = {}
-
-    class Model:
-        eagle_offline = offline
-
-        def __call__(self, tokens, position_ids, attention_mask, *, labels, **features):
-            model_inputs.update(tokens=tokens, labels=labels, positions=position_ids)
-            if offline:
-                assert features.pop("aux_hidden_states").tolist() == [
-                    [[2, 3]],
-                    [[5, 7]],
-                    [[11, 13]],
-                ]
-                assert features.pop("hidden_states").tolist() == [[[17]], [[19]], [[29]]]
-            assert features == ({"base_hidden_prenorm": True} if source == "streaming" else {})
-
-    _, loss_callback = finetune.forward_step(iter((sample,)), Model())
-    assert model_inputs["tokens"].tolist() == [[11, 23, 37]]
-    assert model_inputs["labels"].tolist() == [[23, 37, 41]]
-    assert model_inputs["positions"].tolist() == [[0, 1, 2]]
+    model = Mock(eagle_offline=offline)
+    _, loss_callback = finetune.forward_step(iter((sample,)), model)
+    model.assert_called_once()
+    tokens, positions, _ = model.call_args.args
+    features = model.call_args.kwargs.copy()
+    assert tokens.tolist() == [[11, 23, 37]]
+    assert positions.tolist() == [[0, 1, 2]]
+    assert features.pop("labels").tolist() == [[23, 37, 41]]
+    if offline:
+        assert features.pop("aux_hidden_states").tolist() == [[[2, 3]], [[5, 7]], [[11, 13]]]
+        assert features.pop("hidden_states").tolist() == [[[17]], [[19]], [[29]]]
+    assert features == ({"base_hidden_prenorm": True} if source == "streaming" else {})
     assert loss_callback.args[0].tolist() == ([[1, 1, 1]] if source == "disk" else [[1, 0, 1]])
 
 
