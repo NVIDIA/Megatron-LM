@@ -1021,23 +1021,12 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
-      # Plain steps, not a local action: switching the workspace inside an action
-      # replaces that action's own files while it runs.
-      - name: Download prepared unit-test checkout
-        if: needs.configure.outputs.unit_testmon_checkout_artifact_id != ''
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          artifact-ids: ${{ needs.configure.outputs.unit_testmon_checkout_artifact_id }}
-          path: ${{ runner.temp }}/testmon-pr-files
-          merge-multiple: true
       - name: Restore prepared unit-test checkout
         if: needs.configure.outputs.unit_testmon_checkout_artifact_id != ''
-        shell: bash -e -u -o pipefail {0}
-        env:
-          ORIGINAL_SHA: ${{ needs.configure.outputs.sha }}
-        run: |
-          python3 .github/scripts/testmon_checkout.py restore \
-            --directory "$RUNNER_TEMP/testmon-pr-files/testmon-checkout" --expected-sha "$ORIGINAL_SHA"
+        uses: ./.github/actions/testmon-checkout
+        with:
+          artifact-id: ${{ needs.configure.outputs.unit_testmon_checkout_artifact_id }}
+          original-sha: ${{ needs.configure.outputs.sha }}
       - name: Parse unit tests
         id: parse-unit-tests
         run: |
@@ -1109,23 +1098,12 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
-      # Plain steps, not a local action: switching the workspace inside an action
-      # replaces that action's own files while it runs.
-      - name: Download prepared unit-test checkout
-        if: needs.configure.outputs.unit_testmon_checkout_artifact_id != ''
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          artifact-ids: ${{ needs.configure.outputs.unit_testmon_checkout_artifact_id }}
-          path: ${{ runner.temp }}/testmon-pr-files
-          merge-multiple: true
       - name: Restore prepared unit-test checkout
         if: needs.configure.outputs.unit_testmon_checkout_artifact_id != ''
-        shell: bash -e -u -o pipefail {0}
-        env:
-          ORIGINAL_SHA: ${{ needs.configure.outputs.sha }}
-        run: |
-          python3 .github/scripts/testmon_checkout.py restore \
-            --directory "$RUNNER_TEMP/testmon-pr-files/testmon-checkout" --expected-sha "$ORIGINAL_SHA"
+        uses: ./.github/actions/testmon-checkout
+        with:
+          artifact-id: ${{ needs.configure.outputs.unit_testmon_checkout_artifact_id }}
+          original-sha: ${{ needs.configure.outputs.sha }}
       - name: Parse unit tests
         id: parse-unit-tests
         run: |
@@ -1626,23 +1604,12 @@ jobs:
         with:
           ref: ${{ needs.configure.outputs.sha }}
 
-      # Plain steps, not a local action: switching the workspace inside an action
-      # replaces that action's own files while it runs.
-      - name: Download prepared unit-test checkout
-        if: needs.configure.outputs.unit_testmon_checkout_artifact_id != ''
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          artifact-ids: ${{ needs.configure.outputs.unit_testmon_checkout_artifact_id }}
-          path: ${{ runner.temp }}/testmon-pr-files
-          merge-multiple: true
       - name: Restore prepared unit-test checkout
         if: needs.configure.outputs.unit_testmon_checkout_artifact_id != ''
-        shell: bash -e -u -o pipefail {0}
-        env:
-          ORIGINAL_SHA: ${{ needs.configure.outputs.sha }}
-        run: |
-          python3 .github/scripts/testmon_checkout.py restore \
-            --directory "$RUNNER_TEMP/testmon-pr-files/testmon-checkout" --expected-sha "$ORIGINAL_SHA"
+        uses: ./.github/actions/testmon-checkout
+        with:
+          artifact-id: ${{ needs.configure.outputs.unit_testmon_checkout_artifact_id }}
+          original-sha: ${{ needs.configure.outputs.sha }}
 
       - name: Download coverage reports of current branch
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7

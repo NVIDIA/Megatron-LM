@@ -67,25 +67,13 @@ jobs:
           cp .github/scripts/select_unit_tests.py "$RUNNER_TEMP/"
           cp "tests/test_utils/recipes/${RECIPE_PLATFORM#dgx_}/unit-tests.yaml" "$RUNNER_TEMP/unit-tests.yaml"
 
-      # Plain steps, not a local action: switching the workspace inside an action
-      # replaces that action's own files while it runs.
-      - name: Download prepared unit-test checkout
-        if: inputs.unit_testmon_checkout_artifact_id != ''
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          artifact-ids: ${{ inputs.unit_testmon_checkout_artifact_id }}
-          path: ${{ runner.temp }}/testmon-pr-files
-          merge-multiple: true
-
       - name: Restore prepared unit-test checkout
         id: testmon-checkout
         if: inputs.unit_testmon_checkout_artifact_id != ''
-        shell: bash -e -u -o pipefail {0}
-        env:
-          ORIGINAL_SHA: ${{ inputs.sha }}
-        run: |
-          python3 .github/scripts/testmon_checkout.py restore \
-            --directory "$RUNNER_TEMP/testmon-pr-files/testmon-checkout" --expected-sha "$ORIGINAL_SHA"
+        uses: ./.github/actions/testmon-checkout
+        with:
+          artifact-id: ${{ inputs.unit_testmon_checkout_artifact_id }}
+          original-sha: ${{ inputs.sha }}
 
       - name: Setup Python
         id: python
@@ -185,24 +173,13 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ inputs.sha }}
-      # Switch to the prepared checkout before loading the local action below, so
-      # the action file the runner reads stays unchanged for the whole job.
-      - name: Download prepared unit-test checkout
-        if: inputs.unit_testmon_checkout_artifact_id != ''
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          artifact-ids: ${{ inputs.unit_testmon_checkout_artifact_id }}
-          path: ${{ runner.temp }}/testmon-pr-files
-          merge-multiple: true
       - name: Restore prepared unit-test checkout
         id: testmon-checkout
         if: inputs.unit_testmon_checkout_artifact_id != ''
-        shell: bash -e -u -o pipefail {0}
-        env:
-          ORIGINAL_SHA: ${{ inputs.sha }}
-        run: |
-          python3 .github/scripts/testmon_checkout.py restore \
-            --directory "$RUNNER_TEMP/testmon-pr-files/testmon-checkout" --expected-sha "$ORIGINAL_SHA"
+        uses: ./.github/actions/testmon-checkout
+        with:
+          artifact-id: ${{ inputs.unit_testmon_checkout_artifact_id }}
+          original-sha: ${{ inputs.sha }}
       - name: Run unit-test bucket
         uses: ./.github/actions
         with:
