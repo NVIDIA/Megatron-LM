@@ -566,10 +566,19 @@ def _get_extra_te_kwargs(config: TransformerConfig):
 def _use_tp_comm_overlap(config: TransformerConfig, tp_comm_buffer_name: Optional[str]) -> bool:
     """Return whether a TE linear layer overlaps its TP communication with its GEMM.
 
-    Transformer Engine registers user buffers for a fixed set of names only. A layer with
-    another name runs without overlap. All layers share ``config``, so it is not modified.
+    Transformer Engine registers user buffers for a fixed set of names only, and they do not
+    support FP4 or blockwise FP8. A layer with another name or one of these precisions runs
+    without overlap. All layers share ``config``, so it is not modified.
     """
     if not config.tp_comm_overlap:
+        return False
+    if config.fp4 is not None or (
+        config.fp8 is not None and config.fp8_recipe == Fp8Recipe.blockwise
+    ):
+        warnings.warn(
+            "Transformer Engine user buffers do not support FP4 or blockwise FP8. "
+            "Disabling TP communication overlap for this layer."
+        )
         return False
     if tp_comm_buffer_name and tp_comm_buffer_name not in ["qkv", "proj", "fc1", "fc2"]:
         warnings.warn(

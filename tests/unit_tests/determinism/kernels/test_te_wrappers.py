@@ -632,6 +632,36 @@ class TestTEWrappers:
         assert unsupported.ub_name is None
         assert supported.ub_name == "fc1"
 
+    @pytest.mark.parametrize(
+        "layer_name", ["TEColumnParallelLinear", "TELayerNormColumnParallelLinear"]
+    )
+    @pytest.mark.parametrize(
+        "precision",
+        [dict(fp4="e2m1"), dict(fp8="hybrid", fp8_recipe="blockwise")],
+        ids=["fp4", "blockwise_fp8"],
+    )
+    def test_precision_without_userbuffers_builds_without_tp_comm_overlap(
+        self, layer_name, precision
+    ):
+        """TE userbuffers do not support FP4 or blockwise FP8, so the layer runs without overlap."""
+        config = _config(tp_comm_overlap=True, **precision)
+
+        with pytest.warns(UserWarning, match="FP4 or blockwise FP8"):
+            layer = getattr(te_ext, layer_name)(
+                HIDDEN,
+                FFN,
+                config=config,
+                init_method=init_method_normal(0.02),
+                gather_output=False,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name="fc1",
+            )
+
+        assert config.tp_comm_overlap is True
+        assert layer.ub_name is None
+
     def test_lm_head_without_buffer_name_builds_while_tp_comm_overlap_is_on(self):
         """The TE LM head has no userbuffer, so it runs without overlap and changes no other layer."""
         config = _config(
