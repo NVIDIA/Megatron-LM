@@ -2,7 +2,6 @@
 
 import contextlib
 import functools
-import math
 import os
 import subprocess
 import sys
@@ -176,7 +175,7 @@ class TestParallelMLAAttention:
         missing_params = attn_params - mla_params
         assert not missing_params, f"Missing parameters in MultiLatentAttention: {missing_params}"
 
-    @pytest.mark.parametrize("absorbed_decode_kernel", ["flash_mla", "flashinfer", None])
+    @pytest.mark.parametrize("absorbed_decode_kernel", ["flash_mla", None])
     @pytest.mark.parametrize("batch_invariant_mode", [False, True])
     @pytest.mark.parametrize("is_decode_only", [False, True])
     def test_dynamic_inference_forwards_decode_only_to_flash_attention(
@@ -195,7 +194,7 @@ class TestParallelMLAAttention:
         )
         assert flash_call.arguments["is_decode_only"] is absorbed
 
-    @pytest.mark.parametrize("absorbed_decode_kernel", ["flash_mla", "flashinfer", None])
+    @pytest.mark.parametrize("absorbed_decode_kernel", ["flash_mla", None])
     @pytest.mark.parametrize("batch_invariant_mode", [False, True])
     @pytest.mark.parametrize("is_decode_only", [False, True])
     def test_dynamic_inference_up_projects_cached_latents_unless_absorbed(
@@ -2517,431 +2516,51 @@ class TestMLALatentCacheDecode:
         assert relative_error(absorbed) < 0.05
         assert relative_error(absorbed_without_sink) > 0.2
 
+    @pytest.mark.launch_on_gb200
+    def test_decode_step_runs_on_this_device(self):
+        """A decode-only step, co-batched with three other requests, matches the prefill of the
+        same token on any device: with FlashMLA on SM90, and unabsorbed elsewhere. On Blackwell
+        FlashMLA's dense decode raises, so the layer must not pick it there."""
+        on_sm90 = torch.cuda.get_device_capability() == (9, 0) and attention_module.HAVE_FMLA
+        if on_sm90 and not _flash_mla_decode_runs():
+            pytest.skip("flash_mla was built without its SM90 decode kernels")
+        attention = self._attention()
+        inputs = self._inputs(attention.config.hidden_size)
+
+        decoded = self._decode(attention, inputs, num_cobatched=3)
+        prefilled = self._prefill(attention, inputs)
+
+        assert attention.absorbed_decode_kernel == ("flash_mla" if on_sm90 else None)
+        error = ((decoded.float() - prefilled.float()).norm() / prefilled.float().norm()).item()
+        assert error < 0.05, f"relative error {error:.3g}"
+
 
 @pytest.mark.parametrize(
-    (
-        "capability",
-        "have_flash_mla",
-        "have_flashinfer",
-        "missing_prebuilt",
-        "latent_shape",
-        "num_heads",
-        "params_dtype",
-        "expected",
-    ),
+    ("capability", "have_flash_mla", "latent_shape", "expected"),
     [
-        pytest.param(
-            (9, 0), True, True, None, (512, 64), 16, torch.bfloat16, "flash_mla", id="sm90"
-        ),
-        pytest.param(
-            (9, 0), False, True, None, (512, 64), 16, torch.bfloat16, None, id="sm90-no-fmla"
-        ),
-        pytest.param(
-            (9, 0), True, True, None, (256, 64), 16, torch.bfloat16, None, id="sm90-rank256"
-        ),
-        pytest.param(
-            (10, 0), True, True, None, (512, 64), 16, torch.bfloat16, "flashinfer", id="sm100"
-        ),
-        pytest.param(
-            (10, 0), True, True, None, (512, 64), 24, torch.bfloat16, "flashinfer", id="sm100-24h"
-        ),
-        pytest.param(
-            (10, 0), True, True, None, (512, 64), 48, torch.bfloat16, "flashinfer", id="sm100-48h"
-        ),
-        pytest.param(
-            (10, 0), True, True, None, (512, 64), 64, torch.bfloat16, "flashinfer", id="sm100-64h"
-        ),
-        pytest.param(
-            (10, 3), True, True, None, (512, 64), 128, torch.bfloat16, "flashinfer", id="sm103-128h"
-        ),
-        pytest.param(
-            (10, 0), True, True, None, (512, 64), 192, torch.bfloat16, "flashinfer", id="sm100-192h"
-        ),
-        pytest.param(
-            (10, 0), True, True, None, (512, 64), 96, torch.bfloat16, None, id="sm100-96h"
-        ),
-        pytest.param(
-            (10, 0), True, True, None, (512, 64), 160, torch.bfloat16, None, id="sm100-160h"
-        ),
-        pytest.param(
-            (10, 0), True, True, None, (512, 64), 16, torch.float16, None, id="sm100-fp16"
-        ),
-        pytest.param(
-            (10, 0), True, False, None, (512, 64), 16, torch.bfloat16, None, id="sm100-no-fi"
-        ),
-        pytest.param(
-            (10, 0),
-            True,
-            True,
-            "flashinfer-cubin==0.7.2.post1",
-            (512, 64),
-            16,
-            torch.bfloat16,
-            None,
-            id="sm100-no-prebuilt-kernels",
-        ),
-        pytest.param((12, 0), True, True, None, (512, 64), 16, torch.bfloat16, None, id="sm120"),
+        pytest.param((9, 0), True, (512, 64), "flash_mla", id="sm90"),
+        pytest.param((9, 0), False, (512, 64), None, id="sm90-no-fmla"),
+        pytest.param((9, 0), True, (256, 64), None, id="sm90-rank256"),
+        pytest.param((10, 0), True, (512, 64), None, id="sm100"),
+        pytest.param((10, 3), True, (512, 64), None, id="sm103"),
+        pytest.param((12, 0), True, (512, 64), None, id="sm120"),
+        pytest.param((8, 0), True, (512, 64), None, id="sm80"),
     ],
 )
 def test_absorbed_mla_decode_kernel_follows_device(
-    capability,
-    have_flash_mla,
-    have_flashinfer,
-    missing_prebuilt,
-    latent_shape,
-    num_heads,
-    params_dtype,
-    expected,
+    capability, have_flash_mla, latent_shape, expected
 ):
-    """FlashMLA runs absorbed MLA decode on SM90 and FlashInfer on SM100 and SM103, for the head
-    counts its kernels tile and only from its prebuilt kernels; a layer that neither covers gets
-    no absorbed decode kernel, and a reason."""
-    config = SimpleNamespace(
-        kv_lora_rank=latent_shape[0], qk_pos_emb_head_dim=latent_shape[1], params_dtype=params_dtype
-    )
+    """FlashMLA runs absorbed MLA decode only on SM90, for DeepSeek's latent shape; a layer it
+    does not cover, on Blackwell for example, gets no absorbed decode kernel, and a reason."""
+    config = SimpleNamespace(kv_lora_rank=latent_shape[0], qk_pos_emb_head_dim=latent_shape[1])
     with (
         mock.patch.object(torch.cuda, "is_available", return_value=True),
         mock.patch.object(torch.cuda, "get_device_capability", return_value=capability),
         mock.patch.object(attention_module, "HAVE_FMLA", have_flash_mla),
-        mock.patch.object(attention_module, "HAVE_FLASHINFER_MLA", have_flashinfer),
-        mock.patch.object(
-            attention_module, "_missing_flashinfer_mla_kernels", return_value=missing_prebuilt
-        ),
     ):
-        kernel, reason = attention_module.resolve_absorbed_mla_decode_kernel(config, num_heads)
-        assert attention_module.get_absorbed_mla_decode_kernel(config, num_heads) == kernel
+        kernel, reason = attention_module.resolve_absorbed_mla_decode_kernel(config)
     assert kernel == expected
     assert bool(reason) is (expected is None)
-    if missing_prebuilt is not None:
-        assert missing_prebuilt in reason
-
-
-def _absorbed_decode_reference(q, latents, block_table, seqlens_k, scale, softmax_offset=None):
-    """Absorbed MLA decode in fp32. q is [B, S, H, 576] and latents [pages, 64, 576]. Query s of a
-    request with L cached latents attends latents j <= L - S + s, whose first 512 channels are the
-    values; a sink adds exp(softmax_offset[h]) to head h's softmax denominator. Returns
-    [B, S, H, 512], with zeros for zero-length (padding) requests."""
-    batch, tokens, heads, _ = q.shape
-    out = torch.zeros(batch, tokens, heads, 512, device=q.device)
-    for request, length in enumerate(seqlens_k.tolist()):
-        if length == 0:
-            continue
-        pages = block_table[request, : math.ceil(length / latents.shape[1])].long()
-        cached = latents[pages].reshape(-1, latents.shape[-1])[:length].float()
-        scores = torch.einsum("shd,kd->shk", q[request].float(), cached) * scale
-        query_pos = torch.arange(tokens, device=q.device)[:, None, None]
-        key_pos = torch.arange(length, device=q.device)[None, None, :]
-        scores = scores.masked_fill(key_pos > length - tokens + query_pos, float("-inf"))
-        if softmax_offset is not None:
-            sink = softmax_offset.float().view(1, heads, 1).expand(tokens, heads, 1)
-            scores = torch.cat([scores, sink], dim=-1)
-        probs = torch.softmax(scores, dim=-1)[..., :length]
-        out[request] = torch.einsum("shk,kc->shc", probs, cached[:, :512])
-    return out
-
-
-def _latent_decode_inputs(lengths, tokens_per_request, num_heads, unwritten=None, spare_pages=0):
-    """Decode-only flash_decode_and_prefill arguments over a bf16 latent pool. Each request owns
-    consecutive pages; the block-table entries past them, and all entries of a zero-length
-    (padding) request, point at a last, dummy page, as in the dynamic context. The table is two
-    entries wider than the longest request needs, which makes it odd here. ``spare_pages`` free
-    pages sit before the dummy one. With ``unwritten``, the rows past each request's length and
-    the dummy page hold that value."""
-    block, dim = 64, 576
-    request_pages = [math.ceil(length / block) for length in lengths]
-    num_pages = sum(request_pages) + spare_pages + 1
-    generator = torch.Generator(device="cuda").manual_seed(7)
-    latents = torch.randn(num_pages, block, dim, generator=generator, device="cuda")
-    latents = latents.to(torch.bfloat16)
-    dummy = num_pages - 1
-    block_table = torch.full(
-        (len(lengths), max(request_pages) + 2), dummy, dtype=torch.int32, device="cuda"
-    )
-    first = 0
-    for request, (length, pages) in enumerate(zip(lengths, request_pages)):
-        block_table[request, :pages] = torch.arange(first, first + pages, dtype=torch.int32)
-        if unwritten is not None and pages:
-            latents[first + pages - 1, length - (pages - 1) * block :] = unwritten
-        first += pages
-    if unwritten is not None:
-        latents[dummy] = unwritten
-    batch = len(lengths)
-    q = torch.randn(
-        batch * tokens_per_request, 1, num_heads, dim, generator=generator, device="cuda"
-    ).to(torch.bfloat16)
-    seqlens_k = torch.tensor(lengths, dtype=torch.int32, device="cuda")
-    cu_seqlens_k = torch.zeros(batch + 1, dtype=torch.int32, device="cuda")
-    cu_seqlens_k[1:] = torch.cumsum(seqlens_k, 0)
-    # As in the dynamic context, padding requests have no query rows.
-    query_lengths = (seqlens_k > 0).to(torch.int32) * tokens_per_request
-    cu_seqlens_q = torch.zeros(batch + 1, dtype=torch.int32, device="cuda")
-    cu_seqlens_q[1:] = torch.cumsum(query_lengths, 0)
-    return dict(
-        q=q,
-        k=latents,
-        v=None,
-        max_seqlen_q=tokens_per_request,
-        max_seqlen_k=max(lengths),
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        seqlens_k=seqlens_k,
-        block_table=block_table,
-        is_decode_only=True,
-    )
-
-
-# FlashInfer's TRTLLM-GEN MLA decode picks its kernel family by head count: up to 32 heads per
-# rank a SwapsMmaAb kernel that reduces split-KV partials in-kernel, at 64 SwapsMmaAb or KeepsMmaAb
-# depending on the load, at 128 a 2-CTA KeepsMmaAb kernel with a separate reduction kernel. Head
-# counts that are not a power of two up to 64 run a padded tile (24 in Q32 SwapsMmaAb, 48 in Q64
-# KeepsMmaAb), and counts above 128 tile into 16- or 64-head CTAs without the 2-CTA kernel (192).
-_ABSORBED_DECODE_HEADS = [16, 24, 48, 64, 128, 192]
-
-
-@pytest.mark.launch_on_gb200
-class TestMLAAbsorbedDecode:
-    """Absorbed MLA decode with the kernel chosen for this device (FlashMLA on SM90, FlashInfer on
-    SM100 and SM103) against a plain PyTorch reference."""
-
-    # Prompts across one to five pages, a page-aligned one, and a padding slot (length 0), as
-    # CUDA-graph-padded steps have. Most have an odd page count, so FlashInfer's last 128-token KV
-    # tile of the request also spans the block-table entry past its last page.
-    lengths = [70, 300, 129, 64, 3, 0]
-
-    @pytest.fixture(autouse=True)
-    def setup_and_teardown(self):
-        Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
-        yield
-        Utils.destroy_model_parallel()
-
-    @staticmethod
-    def _attention(num_heads, **overrides):
-        """TestMLALatentCacheDecode's layer with ``num_heads`` heads (MLA's head dimensions do not
-        depend on hidden_size). It must pick this device's decode kernel: FlashMLA on SM90 and
-        FlashInfer on SM100 and SM103. Only other devices, which have none, skip."""
-        major, minor = torch.cuda.get_device_capability()
-        if major == 10:
-            expected = "flashinfer"
-        elif (major, minor) == (9, 0):
-            expected = "flash_mla"
-        else:
-            pytest.skip("no absorbed MLA decode kernel exists for this device")
-        attention = TestMLALatentCacheDecode._attention(
-            flash_attention_version=None, num_attention_heads=num_heads, **overrides
-        )
-        _, reason = attention_module.resolve_absorbed_mla_decode_kernel(
-            attention.config, attention.num_attention_heads_per_partition
-        )
-        assert attention.absorbed_decode_kernel == expected, reason
-        if expected == "flash_mla":
-            assert _flash_mla_decode_runs(), "flash_mla was built without its SM90 decode kernels"
-        return attention
-
-    @staticmethod
-    def _assert_matches(out, reference, lengths):
-        """Each request's output is within 2% (relative L2) of the reference, and a padding slot's
-        (length 0) output is zero: its rows flow on through the layer."""
-        out = out.view(reference.shape)
-        for request, length in enumerate(lengths):
-            if length == 0:
-                assert torch.count_nonzero(out[request]) == 0, f"padding slot {request} is not zero"
-                continue
-            expected = reference[request]
-            error = ((out[request].float() - expected).norm() / expected.norm()).item()
-            assert error < 0.02, f"request {request} (length {length}): relative error {error:.3g}"
-
-    @pytest.mark.parametrize(
-        "lengths",
-        [
-            pytest.param(lengths, id="batch"),
-            # FlashInfer runs DeepSeek's min-latency kernels for a single request.
-            pytest.param([300], id="single"),
-        ],
-    )
-    @pytest.mark.parametrize("tokens_per_request", [1, 2])
-    @pytest.mark.parametrize("softmax_type", ["vanilla", "learnable"])
-    @pytest.mark.parametrize("num_heads", _ABSORBED_DECODE_HEADS)
-    def test_decode_matches_reference(self, num_heads, softmax_type, tokens_per_request, lengths):
-        """Every request's output matches the reference, with one or two (MTP) query tokens per
-        request and with a learnable sink."""
-        if softmax_type != "vanilla" and not is_te_min_version("2.8.0"):
-            pytest.skip("softmax_type requires TE >= 2.8.0")
-        attention = self._attention(num_heads, softmax_type=softmax_type)
-        if softmax_type == "learnable":
-            with torch.no_grad():
-                attention.core_attention.softmax_offset.copy_(torch.linspace(0.0, 8.0, num_heads))
-        softmax_offset = attention._get_inference_softmax_offset()
-        inputs = _latent_decode_inputs(lengths, tokens_per_request, num_heads)
-
-        with torch.no_grad():
-            out = attention.flash_decode_and_prefill(**inputs, softmax_offset=softmax_offset)
-
-        q = inputs["q"].view(len(lengths), tokens_per_request, num_heads, -1)
-        reference = _absorbed_decode_reference(
-            q,
-            inputs["k"],
-            inputs["block_table"],
-            inputs["seqlens_k"],
-            attention.softmax_scale,
-            softmax_offset,
-        )
-        self._assert_matches(out, reference, lengths)
-
-    @pytest.mark.parametrize("num_heads", _ABSORBED_DECODE_HEADS)
-    def test_decode_masks_rows_past_each_request(self, num_heads):
-        """Large values in the rows past each request's length, and in the page that unused
-        block-table entries point at, which the 128-token tile past an odd page count spans, do
-        not reach any request's output. In the dynamic context those rows are finite: acquired
-        pages are zeroed (the KV page initialization PR) and the dummy page stays zero."""
-        attention = self._attention(num_heads)
-        inputs = _latent_decode_inputs(self.lengths, 1, num_heads, unwritten=1e4)
-
-        with torch.no_grad():
-            out = attention.flash_decode_and_prefill(**inputs)
-
-        q = inputs["q"].view(len(self.lengths), 1, num_heads, -1)
-        reference = _absorbed_decode_reference(
-            q, inputs["k"], inputs["block_table"], inputs["seqlens_k"], attention.softmax_scale
-        )
-        self._assert_matches(out, reference, self.lengths)
-
-    @pytest.mark.parametrize("num_heads", _ABSORBED_DECODE_HEADS)
-    def test_decode_replays_in_cuda_graph(self, num_heads):
-        """A decode call captured in a CUDA graph serves the next step: each request's next latent
-        is written in place, the request at a page boundary gets a new page, and the replayed
-        output matches the reference."""
-        attention = self._attention(num_heads)
-        inputs = _latent_decode_inputs(self.lengths, 1, num_heads, spare_pages=1)
-
-        with torch.no_grad():
-            stream = torch.cuda.Stream()
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                attention.flash_decode_and_prefill(**inputs)
-            torch.cuda.current_stream().wait_stream(stream)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                out = attention.flash_decode_and_prefill(**inputs)
-
-        latents, block_table = inputs["k"], inputs["block_table"]
-        spare_page = latents.shape[0] - 2
-        generator = torch.Generator(device="cuda").manual_seed(11)
-        next_lengths = [length + 1 if length else 0 for length in self.lengths]
-        for request, length in enumerate(self.lengths):
-            if length == 0:
-                continue
-            if length % 64 == 0:
-                block_table[request, length // 64] = spare_page
-            page = int(block_table[request, length // 64])
-            latents[page, length % 64] = torch.randn(576, generator=generator, device="cuda")
-        inputs["seqlens_k"].copy_(torch.tensor(next_lengths, dtype=torch.int32))
-        inputs["q"].copy_(torch.randn(inputs["q"].shape, generator=generator, device="cuda"))
-        graph.replay()
-
-        q = inputs["q"].view(len(self.lengths), 1, num_heads, -1)
-        reference = _absorbed_decode_reference(
-            q, latents, block_table, inputs["seqlens_k"], attention.softmax_scale
-        )
-        self._assert_matches(out, reference, next_lengths)
-
-    @pytest.mark.parametrize("num_heads", _ABSORBED_DECODE_HEADS)
-    def test_layer_decode_step_matches_reference(self, num_heads):
-        """A decode-only step of the layer under a real dynamic context runs the device's decode
-        kernel and matches the same step with the reference in place of the kernel."""
-        attention = self._attention(num_heads)
-        context = TestMLALatentCacheDecode._context(attention.config)
-        context.memory_buffer.zero_()
-        TestMLALatentCacheDecode._add_request(context, 0, 70)
-
-        def prefill_kernel(q, k, v, *args, **kwargs):
-            # The prefill only has to write the prompt's latents into the cache.
-            return torch.zeros(*q.shape[:-1], v.shape[-1], dtype=q.dtype, device=q.device)
-
-        def reference_kernel(q, k, v, *args, softmax_offset=None):
-            seqlens_k, block_table, is_decode_only = args[-3:]
-            assert is_decode_only and v is None
-            batch = seqlens_k.shape[0]
-            out = _absorbed_decode_reference(
-                q.view(batch, q.shape[0] // batch, *q.shape[2:]),
-                k,
-                block_table,
-                seqlens_k,
-                attention.softmax_scale,
-                softmax_offset,
-            )
-            return out.view(q.shape[0], 1, *out.shape[2:]).to(q.dtype)
-
-        def step(kernel):
-            generator = torch.Generator(device="cuda").manual_seed(2)
-            hidden_states = torch.randn(
-                context.padded_active_token_count,
-                1,
-                attention.config.hidden_size,
-                generator=generator,
-                device="cuda",
-            ).to(torch.bfloat16)
-            with (
-                mock.patch.object(attention, "flash_decode_and_prefill", side_effect=kernel),
-                torch.no_grad(),
-                InferenceMode.active(),
-            ):
-                output, _ = attention(hidden_states, attention_mask=None, inference_context=context)
-            return output[:1]
-
-        context.initialize_attention_state()
-        step(prefill_kernel)
-        context.update_requests(
-            active_requests_mask=torch.ones(1, dtype=torch.int32),
-            new_tokens=torch.zeros(1, dtype=torch.int64),
-        )
-        context.initialize_attention_state()
-        assert context.is_decode_only()
-        reference = step(reference_kernel)
-        decoded = step(attention.flash_decode_and_prefill)
-
-        error = ((decoded.float() - reference.float()).norm() / reference.float().norm()).item()
-        assert error < 0.02, f"relative error {error:.3g}"
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_latent_cache_dummy_block_stays_zero():
-    """Padding tokens append their latents to the dummy block, which block tables use for unused
-    entries and which a decode kernel's 128-token KV tile reads past a request's last page.
-    However non-finite the padding latents, the dummy block is zero after the append, and the
-    request's latents are in place."""
-    Utils.initialize_model_parallel(1, 1)
-    try:
-        config = MLATransformerConfig(
-            num_layers=1,
-            hidden_size=512,
-            num_attention_heads=16,
-            q_lora_rank=128,
-            kv_lora_rank=512,
-            qk_head_dim=64,
-            qk_pos_emb_head_dim=64,
-            v_head_dim=128,
-            bf16=True,
-            params_dtype=torch.bfloat16,
-            cache_mla_latents=True,
-        )
-        context = TestMLALatentCacheDecode._context(config)
-        TestMLALatentCacheDecode._add_request(context, 0, 70)
-        context.initialize_attention_state()
-        real, padded = context.active_token_count, context.padded_active_token_count
-        assert padded > real, "the step must have padding tokens"
-        latents = torch.randn(padded, 1, 576, device="cuda").to(torch.bfloat16)
-        latents[real:] = float("nan")
-
-        context.append_key_value_cache(1, latents, None)
-
-        pool = context.memory_buffer[0]
-        dummy = pool[context.kv_block_allocator.dummy_block_idx]
-        assert torch.equal(dummy, torch.zeros_like(dummy))
-        pages = context.request_to_kv_block_ids[0, : math.ceil(real / 64)].long()
-        assert torch.equal(pool[pages].reshape(-1, 576)[:real], latents[:real, 0])
-    finally:
-        Utils.destroy_model_parallel()
 
 
 def _fused_kv_rope_quant_config(**overrides):

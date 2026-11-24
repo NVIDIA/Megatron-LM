@@ -874,8 +874,7 @@ class TestFlashDecodeAndPrefillSoftcap:
 
 
 class TestFlashMLASoftcapRejected:
-    """MLA decode kernels (FlashMLA, FlashInfer) have no softcap support, so the combination
-    must fail rather than half-apply.
+    """FlashMLA has no softcap support, so the combination must fail rather than half-apply.
 
     Without this the cap would be applied in prefill, which shares the non-MLA path, and
     silently dropped in decode, inside a single forward.
@@ -894,7 +893,7 @@ class TestFlashMLASoftcapRejected:
         attn.training = False
         attn._resolve_flash_version.return_value = (False, False)
 
-        with pytest.raises(AssertionError, match="do not support attention logit softcapping"):
+        with pytest.raises(AssertionError, match="does not support attention logit softcapping"):
             Attention.flash_decode_and_prefill(
                 attn,
                 q=torch.zeros(2, 1, 4, 8),

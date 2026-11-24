@@ -546,100 +546,119 @@ def test_mla_flash_prefill_dispatch_sink_offset_replays(softmax_type):
 
 
 @pytest.mark.launch_on_gb200
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-# FlashInfer picks the kernel family, its head tile and how split-KV partials are reduced by head
-# count, padding counts that are not a power of two.
-@pytest.mark.parametrize("heads", [16, 24, 48, 64, 128, 192])
-def test_mla_flashinfer_decode_dispatch_sink_offset_replays(heads):
-    """The FlashInfer MLA decode that dynamic-inference MLA runs on SM100/SM103 replays
-    bit-exactly, with the sink offset applied by the kernel."""
-    from megatron.core.models.gpt.gpt_layer_specs import (
-        get_gpt_layer_with_transformer_engine_submodules,
-    )
-    from megatron.core.transformer.attention import resolve_absorbed_mla_decode_kernel
-    from megatron.core.transformer.enums import AttnMaskType
-    from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and flash-attn")
+def test_mla_decode_step_without_absorbed_kernel_replays():
+    """A decode-only step of an MLA layer that caches latents but has no absorbed decode kernel
+    (FlashMLA's covers only SM90, so Blackwell has none) up-projects the cached latents, runs the
+    varlen kernel over them and replays bit-exactly, co-batched with three other requests."""
+    from megatron.core.inference.config import InferenceConfig
+    from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+    from megatron.core.inference.inference_request import DynamicInferenceRequest
+    from megatron.core.inference.sampling_params import SamplingParams
+    from megatron.core.inference.utils import InferenceMode
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer import attention as attention_module
+    from megatron.core.transformer.spec_utils import build_module
     from megatron.core.transformer.transformer_config import MLATransformerConfig
-    from megatron.core.utils import is_te_min_version
     from tests.unit_tests.test_utilities import Utils
 
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("FlashInfer's MLA decode runs on SM100 and SM103")
-    if not is_te_min_version("2.8.0"):
-        pytest.skip("softmax_type requires Transformer Engine >= 2.8.0")
+    # The latent cache pages 64-token blocks, which FlashAttention 2 cannot read.
+    flash_attention_version = (
+        4 if attention_module.HAVE_FA4 else 3 if attention_module.HAVE_FA3 else None
+    )
+    if flash_attention_version is None:
+        pytest.skip("requires FlashAttention 3 or 4")
 
     Utils.initialize_model_parallel()
     try:
         seeded()
-        latent_dim = 512 + 64
+        model_parallel_cuda_manual_seed(123)
         config = MLATransformerConfig(
             num_layers=1,
             hidden_size=512,
-            num_attention_heads=heads,
+            num_attention_heads=16,
             q_lora_rank=128,
             kv_lora_rank=512,
             qk_head_dim=64,
-            qk_pos_emb_head_dim=64,  # FlashInfer's DeepSeek latent shape: 512 + 64.
+            qk_pos_emb_head_dim=64,
             v_head_dim=128,
+            qk_layernorm=True,
+            normalization="RMSNorm",
+            add_bias_linear=False,
+            transformer_impl="inference_optimized",
             rope_type="rope",
             bf16=True,
             params_dtype=torch.bfloat16,
-            attention_dropout=0.0,
+            use_cpu_initialization=False,
             hidden_dropout=0.0,
-            add_bias_linear=False,
-            softmax_type="learnable",
+            attention_dropout=0.0,
             cache_mla_latents=True,
+            flash_attention_version=flash_attention_version,
         )
-        submodules = get_gpt_layer_with_transformer_engine_submodules(
-            multi_latent_attention=True
-        ).self_attention.submodules
-        module = MLASelfAttention(
-            config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal
-        ).cuda()
-        module.eval()
-        assert module.absorbed_decode_kernel == "flashinfer", resolve_absorbed_mla_decode_kernel(
-            config, heads
-        )[1]
-        with torch.no_grad():
-            module.core_attention.softmax_offset.copy_(torch.linspace(0.0, 8.0, heads))
+        spec = hybrid_inference_stack_spec.submodules.mla_layer.submodules.self_attention
+        module = build_module(spec, config=config, layer_number=1, pp_layer_offset=0)
+        module = module.cuda().eval()
+        # As on a device without FlashMLA's dense decode, such as Blackwell.
+        module.absorbed_decode_kernel = None
 
-        # Absorbed decode of 64 requests, one token each, over 1 to 32 pages of 64 latents, long
-        # enough for the kernel to split a request's KV across CTAs and reduce the partials.
-        page_size, max_pages = 64, 32
-        lengths_k = [(37 * request) % (max_pages * page_size) + 1 for request in range(64)]
-        seqlens_k = torch.tensor(lengths_k, device="cuda", dtype=torch.int32)
-        num_pages = len(lengths_k) * max_pages
-        inputs = dict(
-            q=torch.randn(len(lengths_k), 1, heads, latent_dim, device="cuda").bfloat16(),
-            k=torch.randn(num_pages, page_size, latent_dim, device="cuda").bfloat16(),
-            v=None,
-            max_seqlen_q=1,
-            max_seqlen_k=max(lengths_k),
-            cu_seqlens_q=torch.arange(len(lengths_k) + 1, device="cuda", dtype=torch.int32),
-            cu_seqlens_k=torch.nn.functional.pad(seqlens_k.cumsum(0, dtype=torch.int32), (1, 0)),
-            seqlens_k=seqlens_k,
-            block_table=torch.arange(num_pages, device="cuda", dtype=torch.int32).view(
-                len(lengths_k), max_pages
+        context = DynamicInferenceContext(
+            model_config=config,
+            inference_config=InferenceConfig(
+                max_sequence_length=256,
+                buffer_size_gb=0.02,
+                paused_buffer_size_gb=0.002,
+                block_size_tokens=64,  # required with cache_mla_latents
+                max_tokens=1024,
+                max_requests=40,
+                num_cuda_graphs=None,
+                use_flashinfer_fused_rope=False,
+                unified_memory_level=0,
             ),
         )
-
-        def fn(**call):
-            return module.flash_decode_and_prefill(
-                **call, is_decode_only=True, softmax_offset=module._get_inference_softmax_offset()
+        prompt_lengths = (100, 9, 10, 11)
+        for request_id, prompt_length in enumerate(prompt_lengths):
+            context.add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=torch.arange(1, prompt_length + 1, device="cpu"),
+                    sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
+                )
             )
 
-        sink = assert_replays_bit_exact(
+        def fn(hidden_states):
+            with torch.no_grad(), InferenceMode.active():
+                output, _ = module(hidden_states, attention_mask=None, inference_context=context)
+            return output
+
+        def hidden_states():
+            return torch.randn(
+                context.padded_active_token_count,
+                1,
+                config.hidden_size,
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+
+        # Prefill the four prompts into the latent cache, then decode one token each.
+        context.initialize_attention_state()
+        fn(hidden_states())
+        context.update_requests(
+            active_requests_mask=torch.ones(len(prompt_lengths), dtype=torch.int32),
+            new_tokens=torch.zeros(len(prompt_lengths), dtype=torch.int64),
+        )
+        context.initialize_attention_state()
+        assert context.is_decode_only()
+        assert not module._absorbs_cached_latents(context)
+
+        out = assert_replays_bit_exact(
             fn,
-            inputs,
+            {"hidden_states": hidden_states()},
             replays=3,
             backward=False,
             contention=True,
-            what="MLA flash_decode_and_prefill[FlashInfer decode, learnable sink]",
+            what="MLA decode-only step without an absorbed decode kernel",
         )
-        assert torch.isfinite(sink[0]["out"]).all()
-
-        # Without the offset the output must change, proving the kernel applied the sink.
-        vanilla = module.flash_decode_and_prefill(**inputs, is_decode_only=True)
-        assert not bytes_equal(sink[0]["out"], vanilla)
+        assert torch.isfinite(out[0]["out"][: len(prompt_lengths)]).all()
     finally:
         Utils.destroy_model_parallel()

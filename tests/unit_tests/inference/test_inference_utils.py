@@ -139,12 +139,13 @@ class TestInferenceUtils:
         mode["enabled"] = False
         assert model.lm_head_can_emit_fp32 is True
 
-    def test_flashinfer_jit_cache_missing_hint(self, monkeypatch):
-        missing = (
-            "no flashinfer-jit-cache provider for sm100 at FlashInfer 0.7.2.post1 is installed"
-        )
-        monkeypatch.setattr(inference_utils, "missing_flashinfer_prebuilt_kernels", lambda: missing)
+    @pytest.mark.parametrize(
+        "cuda_version, expected",
+        [("13.0", "uv sync --extra inference"), ("12.9", "whl/cu129"), (None, "is not installed")],
+    )
+    def test_flashinfer_jit_cache_missing_hint(self, monkeypatch, cuda_version, expected):
+        monkeypatch.setattr(inference_utils, "FLASHINFER_JIT_CACHE_VERSION", None)
+        monkeypatch.setattr(torch.version, "cuda", cuda_version)
         with pytest.raises(RuntimeError, match="flashinfer-jit-cache") as excinfo:
             check_flashinfer_jit_cache_installed()
-        assert missing in str(excinfo.value)
-        assert "uv sync --extra inference" in str(excinfo.value)
+        assert expected in str(excinfo.value)

@@ -2,18 +2,20 @@
 
 import asyncio
 import contextlib
-import functools
-import hashlib
 import logging
 import multiprocessing
-import pathlib
 import sys
 from importlib.metadata import PackageNotFoundError, version
-from typing import Any, Optional, Sequence, Tuple
+from typing import Any
 
 import torch
 
 from megatron.core.utils import accepts_parameter, get_model_config
+
+try:
+    FLASHINFER_JIT_CACHE_VERSION = version("flashinfer-jit-cache")
+except PackageNotFoundError:
+    FLASHINFER_JIT_CACHE_VERSION = None
 
 
 def detokenize_tokens(
@@ -312,117 +314,43 @@ def set_decode_expert_padding(model, set_to: bool = False, capacity_factor: int 
             router.config.moe_pad_expert_input_to_capacity = bool(set_to)
 
 
-def missing_flashinfer_prebuilt_kernels(
-    aot_modules: Sequence[str] = (), cubin_dirs: Sequence[str] = ()
-) -> Optional[str]:
-    """What FlashInfer lacks to run its kernels on the current device without downloading or
-    compiling anything at its first call, or None if it lacks nothing.
-
-    This follows FlashInfer's own loader (``flashinfer.jit.env``), so its version rule and its
-    overrides (``FLASHINFER_CUBIN_DIR``, ``FLASHINFER_DISABLE_VERSION_CHECK``) apply. It needs:
-
-    - a flashinfer-jit-cache provider whose architectures cover this device, at FlashInfer's
-      version (FlashInfer ignores other versions); without one, FlashInfer compiles each module
-      with nvcc at its first call;
-    - a prebuilt copy of each of ``aot_modules`` (FlashInfer JIT module names) for this device;
-    - for each of ``cubin_dirs`` (FlashInfer artifact paths), its checksum manifest and every
-      file it lists, in the cubin directory FlashInfer reads: flashinfer-cubin at FlashInfer's
-      version, ``FLASHINFER_CUBIN_DIR``, or the cache that ``flashinfer download-cubin`` fills.
-      Each must have the SHA-256 FlashInfer checks: for the manifest, the one
-      ``flashinfer.artifacts`` pins; for each file, the one the manifest lists. Without them,
-      FlashInfer downloads cubins at its first call. The check runs once per process for each
-      set of arguments, so it hashes the files once.
-
-    Args:
-        aot_modules: FlashInfer modules the caller runs.
-        cubin_dirs: FlashInfer artifact directories whose cubins the caller runs.
-    """
-    major, minor = torch.cuda.get_device_capability()
-    return _missing_flashinfer_prebuilt_kernels(
-        f"sm{major}{minor}", tuple(aot_modules), tuple(cubin_dirs)
-    )
-
-
-@functools.lru_cache(maxsize=None)
-def _missing_flashinfer_prebuilt_kernels(
-    device: str, aot_modules: Tuple[str, ...], cubin_dirs: Tuple[str, ...]
-) -> Optional[str]:
-    try:
-        import flashinfer
-        from flashinfer.jit import env as jit_env
-    except ImportError:
-        return "FlashInfer is not installed"
-
-    providers = getattr(jit_env, "FLASHINFER_AOT_PROVIDERS", None)
-    if providers is None:
-        # FlashInfer before per-architecture providers ships one flashinfer-jit-cache wheel.
-        try:
-            jit_cache_version = version("flashinfer-jit-cache").split("+")[0]
-        except PackageNotFoundError:
-            jit_cache_version = None
-        if jit_cache_version != flashinfer.__version__:
-            return f"flashinfer-jit-cache=={flashinfer.__version__} is not installed"
-    elif not any(
-        jit_env.cuda_binary_target_compatibility_score(architecture, device) is not None
-        for provider in providers
-        for architecture in provider.cuda_architectures
-    ):
-        return (
-            f"no flashinfer-jit-cache provider for {device} at FlashInfer "
-            f"{flashinfer.__version__} is installed"
-        )
-    for module in aot_modules:
-        if not jit_env.get_aot_artifacts(module):
-            return f"flashinfer-jit-cache has no prebuilt {module} module for {device}"
-
-    for cubin_dir in cubin_dirs:
-        from flashinfer.artifacts import CheckSumHash
-
-        # FlashInfer's loader (flashinfer.jit.cubin_loader.get_artifact) takes a file from the
-        # cubin directory only if its SHA-256 matches, and otherwise downloads a replacement:
-        # the manifest must match the hash CheckSumHash pins, each file the hash the manifest lists.
-        directory = pathlib.Path(jit_env.FLASHINFER_CUBIN_DIR) / cubin_dir
-        try:
-            manifest = (directory / "checksums.txt").read_bytes()
-        except OSError:
-            return f"FlashInfer's cubins are not in {directory}"
-        pinned = CheckSumHash.map_checksums.get(f"{cubin_dir.rstrip('/')}/checksums.txt")
-        if hashlib.sha256(manifest).hexdigest() != pinned:
-            return (
-                f"{directory / 'checksums.txt'} is not the manifest FlashInfer "
-                f"{flashinfer.__version__} pins"
-            )
-        # The pinned manifest is FlashInfer's own: one "<sha256> <path>" line per file.
-        for line in manifest.decode().splitlines():
-            sha256, name = line.split()
-            try:
-                data = (directory / name).read_bytes()
-            except OSError:
-                return f"FlashInfer's cubins in {directory} are incomplete"
-            if hashlib.sha256(data).hexdigest() != sha256:
-                return f"{directory / name} does not match its SHA-256 in FlashInfer's manifest"
-    return None
-
-
 def check_flashinfer_jit_cache_installed(log_version: bool = False):
-    """Verify that FlashInfer's prebuilt kernels for this device are installed.
+    """Verify that the flashinfer-jit-cache package is installed.
 
-    flashinfer-jit-cache provides pre-compiled CUTLASS fused MoE kernels so that they are not
-    JIT-compiled at runtime, which would add a multi-minute compilation step to CUDA graph
-    warmup. See `missing_flashinfer_prebuilt_kernels`.
+    The flashinfer-jit-cache package provides pre-compiled CUTLASS fused MoE kernels
+    so they don't need to be JIT-compiled at runtime. This avoids a multi-minute
+    compilation step during CUDA graph warmup.
 
     Raises:
-        RuntimeError: If they are not installed for this device at FlashInfer's version.
+        RuntimeError: If flashinfer-jit-cache is not installed and CUDA version is 12 or 13.
     """
-    missing = missing_flashinfer_prebuilt_kernels()
-    if missing is None:
+    if FLASHINFER_JIT_CACHE_VERSION is not None:
         if log_version:
-            logging.info("Found FlashInfer's pre-compiled kernels for this device.")
+            logging.info(
+                f"Found flashinfer-jit-cache {FLASHINFER_JIT_CACHE_VERSION} with "
+                "pre-compiled CUTLASS kernels."
+            )
         return
+
+    cuda_major = torch.version.cuda.split(".")[0] if torch.version.cuda else None
+
+    if cuda_major == "12":
+        install_cmd = (
+            "Install it with:\n\npip install flashinfer-jit-cache "
+            "--index-url https://flashinfer.ai/whl/cu129\n"
+        )
+    elif cuda_major == "13":
+        install_cmd = (
+            "Install the 'inference' extra (e.g. `uv sync --extra inference`), or install "
+            "it with:\n\npip install flashinfer-jit-cache "
+            "--index-url https://flashinfer.ai/whl/cu130\n"
+        )
+    else:
+        install_cmd = ""
+
     raise RuntimeError(
-        "Expert parallel inference with the FlashInfer backend requires FlashInfer's "
-        f"pre-compiled kernels (flashinfer-jit-cache), but {missing}. Install them with "
-        "`flashinfer download-kernels`, or `uv sync --extra inference` in this repo."
+        "The 'flashinfer-jit-cache' package is required for expert parallel inference "
+        f"but is not installed. {install_cmd}"
     )
 
 
