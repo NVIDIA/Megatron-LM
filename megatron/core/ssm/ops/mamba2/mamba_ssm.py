@@ -283,8 +283,9 @@ def _selective_scan_update_kernel(
         # the state rounded to the cache dtype, so fold the same rounding into
         # the accumulator after each token: snapshots, the final state, and
         # every later token's output then match one-token-at-a-time decode bit
-        # for bit.
-        state = state.to(state_ptrs.dtype.element_ty).to(tl.float32)
+        # for bit. The final store below rounds the last token already.
+        if s + 1 < seq_len:
+            state = state.to(state_ptrs.dtype.element_ty).to(tl.float32)
 
     # After processing all sequence steps, persist the final state back to HBM
     tl.store(state_ptrs, state, mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate))

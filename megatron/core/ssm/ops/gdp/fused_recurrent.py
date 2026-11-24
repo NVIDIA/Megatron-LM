@@ -226,7 +226,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
                 # rounding into the accumulator at each token boundary: snapshots,
                 # the final state, and every later token's output then match
                 # one-token-at-a-time decode bit for bit.
-                if STORE_FINAL_STATE:
+                if STORE_FINAL_STATE and i_t + 1 < T:
                     b_h = b_h.to(ht.dtype.element_ty).to(tl.float32)
 
             p_q += H * K
@@ -295,7 +295,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
                 # rounding into the accumulator at each token boundary: snapshots,
                 # the final state, and every later token's output then match
                 # one-token-at-a-time decode bit for bit.
-                if STORE_FINAL_STATE:
+                if STORE_FINAL_STATE and i_t + 1 < T:
                     b_h = b_h.to(ht.dtype.element_ty).to(tl.float32)
 
             p_q += H * K
