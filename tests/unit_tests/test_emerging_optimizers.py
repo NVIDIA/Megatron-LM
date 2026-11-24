@@ -1902,6 +1902,81 @@ def test_muon_optimizer_nonuniform_per_head_splits_use_unbatched_ns():
     torch.testing.assert_close(actual, expected)
 
 
+def test_muon_optimizer_repeating_per_head_pattern_batches_each_position():
+    """MLA-style (K, V) per-head splits batch the slices at each pattern position."""
+    grad = torch.arange(36, dtype=torch.float32, device='cuda').view(9, 4)
+    param = torch.nn.Parameter(torch.zeros_like(grad))
+    param.is_qkv = True
+    param.qkv_split_shapes = [2, 1] * 3
+    optimizer = TensorParallelMuon(
+        params=[param],
+        split_qkv=True,
+        split_qkv_per_head=True,
+        is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
+        qkv_split_shapes=[2, 1] * 3,
+        pg_collection=None,
+    )
+    call_shapes = []
+
+    def center_rows(x, tp_group=None, partition_dim=None, tp_mode_this_group=None):
+        del tp_group, partition_dim, tp_mode_this_group
+        call_shapes.append(tuple(x.shape))
+        return x - x.mean(dim=-2, keepdim=True)
+
+    optimizer.scaled_orthogonalize_fn = center_rows
+    actual = optimizer.orthogonalize(param, grad)
+    assert call_shapes == [(3, 2, 4), (3, 1, 4)]
+    expected = torch.cat([center_rows(head) for head in torch.split(grad, [2, 1] * 3)])
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.skipif(
+    not _batched_newton_schulz_supported(),
+    reason="installed emerging-optimizers lacks batched Newton-Schulz",
+)
+def test_muon_optimizer_batched_mla_pattern_ns_matches_individual_slices():
+    """Batched NS over an MLA (nope, rope) pattern matches one NS call per slice, scale included."""
+    from emerging_optimizers import utils as eopt_utils
+
+    torch.manual_seed(42)
+    split_shapes = [6, 2] * 4
+    grad = torch.randn(sum(split_shapes), 16, dtype=torch.float32, device='cuda')
+    param = torch.nn.Parameter(torch.zeros_like(grad))
+    param.is_qkv = True
+    param.qkv_split_shapes = split_shapes
+    optimizer = TensorParallelMuon(
+        params=[param],
+        split_qkv=True,
+        split_qkv_per_head=True,
+        is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
+        qkv_split_shapes=split_shapes,
+        fp32_matmul_prec="highest",
+        num_ns_steps=2,
+        pg_collection=None,
+    )
+
+    with eopt_utils.fp32_matmul_precision(optimizer.fp32_matmul_prec):
+        actual = optimizer.orthogonalize(param, grad)
+        expected = torch.cat(
+            [
+                optimizer.scaled_orthogonalize_fn(head, tp_group=None, partition_dim=None)
+                for head in torch.split(grad, split_shapes)
+            ]
+        )
+    torch.testing.assert_close(actual, expected)
+
+
+def test_repeating_split_pattern():
+    """Only patterns that repeat at least twice are batched."""
+    from megatron.core.optimizer.emerging_optimizers import _repeating_split_pattern
+
+    assert _repeating_split_pattern([192, 64] * 64) == (192, 64)
+    assert _repeating_split_pattern([2, 2, 1] * 2) == (2, 2, 1)
+    assert _repeating_split_pattern([2, 1]) is None
+    assert _repeating_split_pattern([2, 1, 2]) is None
+    assert _repeating_split_pattern([3]) is None
+
+
 @pytest.mark.parametrize(
     ("layout", "expects_fallback"),
     (("local_projection", False), ("per_head", True), ("fragmented", True)),

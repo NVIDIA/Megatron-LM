@@ -278,10 +278,9 @@ class TestNativeHAggregate:
     def test_torch_fallback_grad_h_upcasts_before_the_product(self):
         """The torch fallback must compute grad_h exactly like its fp32 siblings.
 
-        ``FusedHAggregateInto.backward`` routes here whenever cuTile is absent,
-        which includes ordinary Triton-only builds, so a precision difference
-        here would make the numerics of a run depend on whether cuTile happens to
-        be installed.
+        ``FusedHAggregateInto.backward`` routes here under ``auto`` when Triton is
+        absent, so a precision difference here would make the numerics of a run
+        depend on whether Triton happens to be installed.
         """
         from megatron.core.fusions.fused_mhc_kernels import _torch_h_aggregate_bwd
 
@@ -392,6 +391,88 @@ class TestTritonHAggregate:
         out_r = _ref_h_aggregate(x_data, h_data)
 
         torch.testing.assert_close(out_t, out_r, atol=FWD_ATOL, rtol=FWD_RTOL)
+
+
+class TestTritonHAggregateBackward:
+    """Triton h_aggregate backward, which ``auto`` selects instead of the cuTile kernel.
+
+    grad_x is one product rounded once, so it must equal the torch path bit for bit;
+    grad_h is an fp32 reduction over the hidden dimension in a fixed order.
+    """
+
+    @staticmethod
+    def _inputs(s, b, n, C, h_dtype):
+        # Seeded: the grad_h checks compare error magnitudes.
+        torch.manual_seed(1234)
+        x = torch.randn(s, b, n, C, device=DEVICE, dtype=torch.float32).to(DTYPE)
+        h_pre = (torch.rand(s, b, n, device=DEVICE, dtype=torch.float32) + 0.5).to(h_dtype)
+        go = torch.randn(s, b, C, device=DEVICE, dtype=torch.float32).to(DTYPE)
+        return go, x, h_pre
+
+    @staticmethod
+    def _rel(a: Tensor, r: Tensor) -> float:
+        a, r = a.double().flatten(), r.double().flatten()
+        return ((a - r).pow(2).mean().sqrt() / r.pow(2).mean().sqrt()).item()
+
+    @_require_triton
+    @pytest.mark.parametrize("h_dtype", [torch.bfloat16, torch.float32])
+    @pytest.mark.parametrize(
+        "s,b,n,C", [(128, 2, 4, 128), (2, 4, 4, 1024), (1, 1, 2, 256), (5, 3, 3, 1536)]
+    )
+    def test_matches_torch_path(self, s, b, n, C, h_dtype):
+        from megatron.core.fusions.fused_mhc_kernels import (
+            _torch_h_aggregate_bwd,
+            _triton_h_aggregate_bwd,
+        )
+
+        _info()
+        go, x, h_pre = self._inputs(s, b, n, C, h_dtype)
+        t_gx, t_gh = _torch_h_aggregate_bwd(go, x, h_pre)
+        k_gx, k_gh = _triton_h_aggregate_bwd(go, x, h_pre)
+
+        assert k_gx.dtype == t_gx.dtype and k_gh.dtype == t_gh.dtype
+        # grad_x is a pure elementwise product — it must stay bit-identical.
+        assert torch.equal(k_gx, t_gx)
+
+        # The fp32 accumulation does not involve h_pre, so an fp32 h_pre exposes it before
+        # the final cast, and any other h_pre dtype must be that value rounded once.
+        _, k_gh_fp32 = _triton_h_aggregate_bwd(go, x, h_pre.float())
+        assert torch.equal(k_gh, k_gh_fp32.to(h_dtype))
+        products = go.double().unsqueeze(2) * x.double()
+        ref_gh = products.sum(-1)
+        # Per row and against the condition scale sum_c |go*x|, so a cancelling sum cannot
+        # inflate it: summing the exact products in fp32 stays within one fp32 epsilon,
+        # while rounding each product to bf16 first misses by orders of magnitude.
+        fp32_eps = torch.finfo(torch.float32).eps
+        assert ((k_gh_fp32.double() - ref_gh).abs() <= fp32_eps * products.abs().sum(-1)).all()
+        if h_dtype == torch.bfloat16:
+            # As in TestCutileHAggregateBackwardReduction: not noisier than torch.
+            assert self._rel(k_gh, ref_gh) <= self._rel(t_gh, ref_gh) * 1.1
+
+    @_require_triton
+    @pytest.mark.parametrize("s,b,n,C", [(128, 2, 4, 128), (1024, 4, 4, 4096)])
+    def test_repeated_calls_are_bitwise_identical(self, s, b, n, C):
+        """The cuTile kernel's wrong operand hit only some calls, so check many of them.
+
+        The first result is checked against the torch path, because replays that only
+        compare with each other miss a defect present in every call.
+        """
+        from megatron.core.fusions.fused_mhc_kernels import (
+            _torch_h_aggregate_bwd,
+            _triton_h_aggregate_bwd,
+        )
+
+        _info()
+        go, x, h_pre = self._inputs(s, b, n, C, DTYPE)
+        t_gx, _ = _torch_h_aggregate_bwd(go, x, h_pre)
+        first_gx, first_gh = _triton_h_aggregate_bwd(go, x, h_pre)
+        assert torch.equal(first_gx, t_gx)
+        assert torch.isfinite(first_gx).all() and torch.isfinite(first_gh).all()
+        for call in range(200):
+            gx, gh = _triton_h_aggregate_bwd(go, x, h_pre)
+            # torch.equal is False for NaN, so a NaN fails here as well.
+            assert torch.equal(gx, first_gx), f"grad_x differs on call {call}"
+            assert torch.equal(gh, first_gh), f"grad_h differs on call {call}"
 
 
 # ============================================================================
@@ -1796,13 +1877,13 @@ class TestExplicitBackendDispatch:
             seen.append(("forward", backend))
             return fused_mod.native_h_aggregate
 
-        def use_cutile(backend):
+        def get_triton_backward(backend):
             seen.append(("backward", backend))
-            return False
+            return fused_mod._torch_h_aggregate_bwd
 
         monkeypatch.setattr(fused_mod, "is_triton_available", lambda: True)
         monkeypatch.setattr(fused_mod, "_get_triton_h_aggregate_fwd", get_triton_forward)
-        monkeypatch.setattr(fused_mod, "_backend_uses_cutile", use_cutile)
+        monkeypatch.setattr(fused_mod, "_get_triton_h_aggregate_bwd", get_triton_backward)
 
         x = _rand(2, 2, 2, 8).requires_grad_(True)
         h_pre = _rand(2, 2, 2).requires_grad_(True)
@@ -1813,7 +1894,8 @@ class TestExplicitBackendDispatch:
         assert x.grad is not None
         assert h_pre.grad is not None
 
-    def test_h_aggregate_auto_mixes_triton_forward_and_cutile_backward(self, monkeypatch):
+    def test_h_aggregate_auto_uses_triton_forward_and_backward(self, monkeypatch):
+        """auto selects the Triton kernels in both directions, even where cuTile is usable."""
         from megatron.core.fusions import fused_mhc_kernels as fused_mod
 
         seen = []
@@ -1822,22 +1904,108 @@ class TestExplicitBackendDispatch:
             seen.append(("forward", backend, "triton"))
             return fused_mod.native_h_aggregate
 
-        def cutile_backward(grad_output, x, h_pre):
-            seen.append(("backward", "auto", "cutile"))
-            return fused_mod._torch_h_aggregate_bwd(grad_output, x, h_pre)
+        def get_triton_backward(backend):
+            seen.append(("backward", backend, "triton"))
+            return fused_mod._torch_h_aggregate_bwd
+
+        def cutile(*args, **kwargs):
+            raise AssertionError("auto must not select a cuTile h_aggregate kernel")
 
         monkeypatch.setattr(fused_mod, "is_triton_available", lambda: True)
         monkeypatch.setattr(fused_mod, "is_cutile_available", lambda: True)
         monkeypatch.setattr(fused_mod, "_get_triton_h_aggregate_fwd", get_triton_forward)
-        monkeypatch.setattr(fused_mod, "_cutile_h_aggregate_bwd", cutile_backward, raising=False)
+        monkeypatch.setattr(fused_mod, "_get_triton_h_aggregate_bwd", get_triton_backward)
+        monkeypatch.setattr(fused_mod, "_cutile_h_aggregate_fwd", cutile, raising=False)
+        monkeypatch.setattr(fused_mod, "_cutile_h_aggregate_bwd", cutile, raising=False)
 
         x = _rand(2, 2, 2, 8).requires_grad_(True)
         h_pre = _rand(2, 2, 2).requires_grad_(True)
         fused_mod.fused_h_aggregate(x, h_pre, backend="auto").sum().backward()
 
-        assert seen == [("forward", "auto", "triton"), ("backward", "auto", "cutile")]
+        assert seen == [("forward", "auto", "triton"), ("backward", "auto", "triton")]
         assert x.grad is not None
         assert h_pre.grad is not None
+
+    @_require_triton
+    @pytest.mark.parametrize("into", [False, True], ids=["allocating", "caller_owned"])
+    def test_h_aggregate_auto_never_reaches_cutile(self, monkeypatch, into):
+        """Both h_aggregate Functions run Triton under auto and match the torch path."""
+        from megatron.core.fusions import fused_mhc_kernels as fused_mod
+
+        def cutile(*args, **kwargs):
+            raise AssertionError("auto must not select a cuTile h_aggregate kernel")
+
+        monkeypatch.setattr(fused_mod, "is_cutile_available", lambda: True)
+        monkeypatch.setattr(fused_mod, "_cutile_h_aggregate_fwd", cutile, raising=False)
+        monkeypatch.setattr(fused_mod, "_cutile_h_aggregate_bwd", cutile, raising=False)
+        message, _ = fused_mod._mhc_backend_status("auto")
+        assert "h_aggregate=fwd:triton,bwd:triton" in message
+
+        torch.manual_seed(1234)
+        s, b, n, C = 128, 2, 4, 128
+        x_data = _rand(s, b, n, C)
+        h_data = (torch.rand(s, b, n, device=DEVICE, dtype=torch.float32) + 0.5).to(DTYPE)
+        grad_out = _rand(s, b, C)
+
+        x = x_data.clone().requires_grad_(True)
+        h_pre = h_data.clone().requires_grad_(True)
+        if into:
+            out = torch.empty(s, b, C, dtype=DTYPE, device=DEVICE)
+            output = fused_mod.fused_h_aggregate_into(x, h_pre, out, backend="auto")
+        else:
+            output = fused_mod.fused_h_aggregate(x, h_pre, backend="auto")
+        output.backward(grad_out)
+
+        t_gx, t_gh = fused_mod._torch_h_aggregate_bwd(grad_out, x_data, h_data)
+        expected = _ref_h_aggregate(x_data, h_data)
+        torch.testing.assert_close(output, expected, atol=FWD_ATOL, rtol=FWD_RTOL)
+        assert torch.equal(x.grad, t_gx)
+        torch.testing.assert_close(h_pre.grad, t_gh)
+
+    @pytest.mark.parametrize("into", [False, True], ids=["allocating", "caller_owned"])
+    def test_h_aggregate_auto_without_triton_runs_native(self, monkeypatch, into):
+        """auto with cuTile but no Triton runs native h_aggregate, never the cuTile kernels.
+
+        This is the only configuration where the cuTile quarantine changes the forward
+        (MHC_DISABLE_TRITON=1, or MHC_FORCE_BACKEND=cutile under the default policy).
+        """
+        from megatron.core.fusions import fused_mhc_kernels as fused_mod
+
+        def cutile(*args, **kwargs):
+            raise AssertionError("auto must not select a cuTile h_aggregate kernel")
+
+        monkeypatch.setattr(fused_mod, "is_triton_available", lambda: False)
+        monkeypatch.setattr(fused_mod, "is_cutile_available", lambda: True)
+        monkeypatch.setattr(fused_mod, "_cutile_h_aggregate_fwd", cutile, raising=False)
+        monkeypatch.setattr(fused_mod, "_cutile_h_aggregate_bwd", cutile, raising=False)
+        message, _ = fused_mod._mhc_backend_status("auto")
+        assert "h_aggregate=fwd:native,bwd:native" in message
+
+        torch.manual_seed(1234)
+        s, b, n, C = 16, 2, 4, 256
+        x_data = _rand(s, b, n, C)
+        h_data = _rand(s, b, n)
+        grad_out = _rand(s, b, C)
+
+        x = x_data.clone().requires_grad_(True)
+        h_pre = h_data.clone().requires_grad_(True)
+        if into:
+            out = torch.empty(s, b, C, dtype=DTYPE, device=DEVICE)
+            output = fused_mod.fused_h_aggregate_into(x, h_pre, out, backend="auto")
+            expected = native_h_aggregate_into(x_data, h_data, torch.empty_like(out))
+        else:
+            output = fused_mod.fused_h_aggregate(x, h_pre, backend="auto")
+            # The Function's forward runs without grad; compare against that compiled entry.
+            with torch.no_grad():
+                expected = native_h_aggregate(x_data, h_data)
+        output.backward(grad_out)
+
+        # Bitwise: the native forward rounds once, where rounding each product first
+        # (an eager sum into the bf16 output) differs in a large share of elements.
+        assert torch.equal(output, expected)
+        t_gx, t_gh = fused_mod._torch_h_aggregate_bwd(grad_out, x_data, h_data)
+        assert torch.equal(x.grad, t_gx)
+        assert torch.equal(h_pre.grad, t_gh)
 
     def test_h_post_bda_forward_backward_share_backend_policy(self, monkeypatch):
         from megatron.core.fusions import fused_mhc_kernels as fused_mod

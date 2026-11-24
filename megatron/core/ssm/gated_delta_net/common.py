@@ -19,6 +19,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.ssm.mamba_context_parallel import (
     _all_to_all_cp2hp,
@@ -114,7 +115,12 @@ def torch_l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 def _kda_fp8_disabled(config: TransformerConfig) -> bool:
     # Copied GDN layer configs can carry KDA settings from the stack config too.
-    return isinstance(config, KDALayerConfig) and config.kda_disable_fp8
+    # Dev's GPT KDA spec builds KDA from the plain decoder config, whose GDN-family
+    # variant is "kda"; per-layer copies are still told apart by their type.
+    is_kda_config = isinstance(config, KDALayerConfig) or (
+        not isinstance(config, GDNLayerConfig) and config.experimental_attention_variant == "kda"
+    )
+    return is_kda_config and config.kda_disable_fp8
 
 
 def _build_with_kda_fp8_disabled(fp8_config, module_spec, *args, **kwargs):
@@ -376,7 +382,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             groups=self.conv_dim_local_tp,
             padding=self.conv_kernel_dim - 1,
             device=torch.cuda.current_device(),
-            dtype=config.params_dtype,
+            dtype=(torch.float32 if getattr(self, "conv_in_fp32", False) else config.params_dtype),
         )
         setattr(self.conv1d.weight, "tensor_model_parallel", True)
         setattr(self.conv1d.weight, "partition_dim", 0)
@@ -708,7 +714,13 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         raise NotImplementedError
 
     def _resolve_cu_seqlens(
-        self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1
+        self,
+        cu_seqlens_padded,
+        cu_seqlens_actual,
+        total_seq_len,
+        name,
+        cp_size: int = 1,
+        cu_seqlens_cpu=None,
     ) -> torch.Tensor:
         """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
         if cu_seqlens_padded is not None:
@@ -716,7 +728,8 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         else:
             cu_seqlens = cu_seqlens_actual
 
-        total_cu = cu_seqlens[-1].cpu().item()
+        validation_offsets = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens
+        total_cu = validation_offsets[-1].cpu().item()
         if total_cu != total_seq_len:
             raise ValueError(
                 f"GDN: {name}[-1]={total_cu} does not match "
@@ -724,7 +737,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
                 f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
             )
 
-        seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        seq_lengths = validation_offsets[1:] - validation_offsets[:-1]
         if (seq_lengths % cp_size != 0).any():
             raise ValueError(
                 f"All per-sequence lengths in cu_seqlens must be divisible by cp_size={cp_size}, "

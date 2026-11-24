@@ -1,11 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 import math
+import os
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import partial
-from typing import TYPE_CHECKING, Optional, Tuple
+from functools import lru_cache, partial
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -13,7 +15,15 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 
+from megatron.core._rank_utils import log_single_rank, safe_get_rank
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
+from megatron.core.transformer.mhc_fused_ops import (
+    MHC_FUSED_OPS,
+    MHC_PRECISION_FLAGS,
+    mhc_fused_ops_errors,
+    mhc_fused_ops_field_errors,
+    triton_only_ops,
+)
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.residual_connection import (
     ResidualBranchOutput,
@@ -35,8 +45,15 @@ if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import MHCCheckpointManager
     from megatron.core.transformer.mhc_recompute import MHCRecomputeArenaSlot
 
+logger = logging.getLogger(__name__)
+
 _MHC_SINKHORN_EPS = 1e-6
 _MHC_COMPUTE_H_EPS = 1e-6
+
+# What this process has already logged: each distinct fused-ops line, and each per-op fallback
+# warning (by operations and reason).
+_FUSED_OPS_LINES_LOGGED: set[str] = set()
+_PER_OP_FALLBACK_WARNED: set[Tuple[Tuple[str, ...], str]] = set()
 
 
 def _resolve_mhc_checkpoint(
@@ -164,7 +181,9 @@ def native_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
 @torch.compile
 def _native_h_aggregate_into_forward(x: Tensor, h_pre: Tensor, out: Tensor) -> Tensor:
     """Fuse the same multiply/reduction as native_h_aggregate into caller-owned storage."""
-    return torch.sum(x * h_pre.unsqueeze(-1), dim=2, out=out)
+    # Reduce in the promoted dtype and round once into ``out``, as native_h_aggregate does.
+    # sum(..., out=out) would round FP32 mapping products to a BF16 buffer before reducing.
+    return out.copy_((x * h_pre.unsqueeze(-1)).sum(dim=2))
 
 
 class NativeHAggregateInto(torch.autograd.Function):
@@ -199,7 +218,10 @@ class NativeHAggregateInto(torch.autograd.Function):
         # An eager multiply materializes a rounded intermediate;
         # the allocating path fuses it with the reduction. Keep both paths fused
         # without allocating an aggregate and copying it into the graph's slot.
-        _native_h_aggregate_into_forward(x, h_pre, out)
+        # The forward is always no-grad. Canonicalize the inputs' requires_grad flags, as
+        # SinkhornKnopp.forward does, so a checkpoint's no-grad forward and its replay reuse
+        # one compiled specialization even when Dynamo's cache is full.
+        _native_h_aggregate_into_forward(x.detach(), h_pre.detach(), out)
         ctx.save_for_backward(x, h_pre)
         return out
 
@@ -226,17 +248,33 @@ def native_h_aggregate_into(x: Tensor, h_pre: Tensor, out: Tensor) -> Tensor:
     return NativeHAggregateInto.apply(x, h_pre, out)
 
 
-# dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
-@torch.compile
-def native_h_post_bda(
+def _h_res_mix(h_res: Tensor, residual: Tensor) -> Tensor:
+    """H_res.T @ residual as multiply-adds over the streams, rounded once to h_res.dtype.
+
+    mixed[..., i, :] = sum_j h_res[..., j, i] * residual[..., j, :] for h_res [..., n, n] and
+    residual [..., n, C], accumulated in FP32 (FP64 for FP64 inputs) in ascending j, as the
+    fused forward kernel does. With n <= 4 streams a GEMM buys nothing, and its precision
+    depends on the TF32 policy and on how Inductor pads and lowers each compiled
+    specialization: such a split made full-recompute forwards differ from the reference.
+    """
+    with torch.autocast(device_type=h_res.device.type, enabled=False):
+        acc_dtype = torch.promote_types(h_res.dtype, torch.float32)
+        h_res_acc = h_res.to(acc_dtype)
+        # Upcast one residual row per product and accumulate in place: an uncompiled call
+        # (Dynamo disabled or out of recompiles) then holds two FP32 copies of the residual,
+        # not four.
+        mixed = h_res_acc[..., 0, :, None] * residual[..., 0:1, :].to(acc_dtype)
+        for j in range(1, h_res.shape[-1]):
+            mixed += h_res_acc[..., j, :, None] * residual[..., j : j + 1, :].to(acc_dtype)
+    return mixed.to(h_res.dtype)
+
+
+def _native_h_post_bda_impl(
     h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
 ) -> Tensor:
     """Native H_res.T @ residual + H_post * (x [+ bias])."""
-    s, b, n, C = original_residual.shape
-    h_res_batched = h_res.view(s * b, n, n)
-    residual_batched = original_residual.view(s * b, n, C).to(h_res.dtype)
-    with torch.autocast(device_type=h_res_batched.device.type, enabled=False):
-        mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched).view(s, b, n, C)
+    C = original_residual.shape[-1]
+    mixed = _h_res_mix(h_res, original_residual.to(h_res.dtype))
     x_expanded = h_post.unsqueeze(-1) * x.unsqueeze(2)
     if bias is not None:
         bias_expanded = h_post.unsqueeze(-1) * bias.view(1, 1, 1, C)
@@ -244,21 +282,197 @@ def native_h_post_bda(
     return (x_expanded + mixed).to(original_residual.dtype)
 
 
+def _native_h_post_bda_bwd_impl(
+    grad_output: Tensor,
+    h_res: Tensor,
+    original_residual: Tensor,
+    h_post: Tensor,
+    x: Tensor,
+    bias: Optional[Tensor],
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
+    """Gradients of _native_h_post_bda_impl, in the dtypes autograd gives them.
+
+    Each term receives the output gradient in its own dtype and each input gradient is
+    rounded to its input's dtype, as autograd through the forward does. The mixing gradients
+    are FP32 multiply-adds like the forward, not GEMMs.
+    """
+    C = original_residual.shape[-1]
+    h_post_expanded = h_post.unsqueeze(-1)
+    x_dtype = torch.promote_types(h_post.dtype, x.dtype)
+    sum_dtype = torch.promote_types(x_dtype, h_res.dtype)
+    if bias is not None:
+        bias_dtype = torch.promote_types(h_post.dtype, bias.dtype)
+        sum_dtype = torch.promote_types(sum_dtype, bias_dtype)
+    with torch.autocast(device_type=h_res.device.type, enabled=False):
+        grad_sum = grad_output.to(sum_dtype)
+        grad_mixed = grad_sum.to(h_res.dtype)
+        # grad_h_res[j, i] = sum_c residual[j, c] * grad_mixed[i, c]: FP32 products (the residual
+        # promotes to the upcast gradient row) reduced over C. One gradient row at a time, so an
+        # uncompiled call (Dynamo disabled or out of recompiles) never holds an n x n x C product.
+        acc_dtype = torch.promote_types(h_res.dtype, torch.float32)
+        residual = original_residual.to(h_res.dtype)
+        grad_h_res = torch.stack(
+            [
+                (residual * grad_mixed[..., i : i + 1, :].to(acc_dtype)).sum(dim=-1)
+                for i in range(h_res.shape[-1])
+            ],
+            dim=-1,
+        )
+        # grad_residual[j, :] = sum_i h_res[j, i] * grad_mixed[i, :]
+        grad_residual = _h_res_mix(h_res.transpose(-1, -2), grad_mixed)
+        grad_x_expanded = grad_sum.to(x_dtype)
+        grad_h_post = (grad_x_expanded * x.unsqueeze(2)).sum(dim=-1).to(h_post.dtype)
+        grad_x = (grad_x_expanded * h_post_expanded).sum(dim=2).to(x.dtype)
+        grad_bias = None
+        if bias is not None:
+            grad_bias_expanded = grad_sum.to(bias_dtype)
+            grad_h_post_bias = (grad_bias_expanded * bias.view(1, 1, 1, C)).sum(dim=-1)
+            grad_h_post = grad_h_post + grad_h_post_bias.to(h_post.dtype)
+            grad_bias = (grad_bias_expanded * h_post_expanded).sum(dim=(0, 1, 2)).to(bias.dtype)
+    return (
+        grad_h_res.to(h_res.dtype),
+        grad_residual.to(original_residual.dtype),
+        grad_h_post,
+        grad_x,
+        grad_bias,
+    )
+
+
+class NativeHPostBDA(torch.autograd.Function):
+    """Native mHC residual update whose compiled forward serves every pass.
+
+    Full recompute runs the forward under no_grad and replays it with gradients. As one
+    compiled function, each grad mode and set of requires_grad flags was a separate Dynamo
+    specialization that Inductor could lower differently, so a recomputed output could differ
+    from the reference, and the specializations exhausted the recompile limit, after which
+    calls mixed compiled and eager arithmetic. The compiled forward runs on detached inputs, as
+    in SinkhornKnopp; unlike SinkhornKnopp, a compiled backward computes the gradients from the
+    saved inputs without recomputing the output.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        forward_impl: Callable,
+        backward_impl: Callable,
+        h_res: Tensor,
+        original_residual: Tensor,
+        h_post: Tensor,
+        x: Tensor,
+        bias: Optional[Tensor],
+    ) -> Tensor:
+        """Run ``forward_impl`` on detached inputs and save them for ``backward_impl``."""
+        output = forward_impl(
+            h_res.detach(),
+            original_residual.detach(),
+            h_post.detach(),
+            x.detach(),
+            None if bias is None else bias.detach(),
+        )
+        ctx.save_for_backward(h_res, original_residual, h_post, x, bias)
+        ctx.backward_impl = backward_impl
+        return output
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad_output: Tensor):
+        """Return every input's gradient from one compiled call on detached tensors."""
+        saved = [None if t is None else t.detach() for t in ctx.saved_tensors]
+        return (None, None, *ctx.backward_impl(grad_output.detach(), *saved))
+
+
+@torch.compile
+def _native_h_post_bda_forward(
+    h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
+) -> Tensor:
+    """native_h_post_bda's compiled forward, with the default compiler options."""
+    return _native_h_post_bda_impl(h_res, original_residual, h_post, x, bias)
+
+
+@torch.compile
+def _native_h_post_bda_backward(
+    grad_output: Tensor,
+    h_res: Tensor,
+    original_residual: Tensor,
+    h_post: Tensor,
+    x: Tensor,
+    bias: Optional[Tensor],
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
+    """native_h_post_bda's compiled backward, with the default compiler options."""
+    return _native_h_post_bda_bwd_impl(grad_output, h_res, original_residual, h_post, x, bias)
+
+
+def native_h_post_bda(
+    h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
+) -> Tensor:
+    """Compiled mHC residual update (NativeHPostBDA with the default compiler options)."""
+    return NativeHPostBDA.apply(
+        _native_h_post_bda_forward,
+        _native_h_post_bda_backward,
+        h_res,
+        original_residual,
+        h_post,
+        x,
+        bias,
+    )
+
+
+@lru_cache(maxsize=1)
+def _get_precision_preserving_h_post_bda():
+    """Lazily compile HF's activation-dtype rounding, without changing global settings.
+
+    The backward is compiled with the same option, so the gradients round the
+    activation-dtype products as eager autograd does.
+    """
+    message = (
+        "mhc_preserve_activation_dtype_rounding requires torch.compile support for "
+        "emulate_precision_casts; no eager or reduced-precision fallback is supported."
+    )
+    try:
+        from torch._inductor import list_options
+    except ImportError as error:
+        raise RuntimeError(message) from error
+    if "emulate_precision_casts" not in list_options():
+        raise RuntimeError(message)
+    options = {"emulate_precision_casts": True}
+    try:
+        forward = torch.compile(_native_h_post_bda_impl, options=options)
+        backward = torch.compile(_native_h_post_bda_bwd_impl, options=options)
+    except (RuntimeError, TypeError) as error:
+        raise RuntimeError(message) from error
+    return partial(NativeHPostBDA.apply, forward, backward)
+
+
 def _proj_rms_impl(
-    x: Tensor, weight: Tensor, eps: float = 1e-6, eps_inside_sqrt: bool = False
+    x: Tensor,
+    weight: Tensor,
+    eps: float = 1e-6,
+    eps_inside_sqrt: bool = False,
+    normalize_before_projection: bool = False,
 ) -> Tuple[Tensor, Tensor]:
-    """FP32 projection + RMS normalization from an activation-dtype input."""
+    """FP32 projection + RMS normalization from an activation-dtype input.
+
+    With normalize_before_projection, the projection consumes the RMS-normalized input,
+    as GLM does, and the caller must not scale it by the returned norm again. Otherwise
+    the caller scales the projection afterwards. Preserve this distinction rather than
+    commuting the FP32 GEMM.
+    """
     x = x.to(torch.float32)
     weight = weight.to(torch.float32)
     # Casting the operands is not sufficient under CUDA/CPU autocast: matmul and
     # reductions are still eligible to downcast float32 inputs.  Keep the whole
     # projection/RMS recipe in FP32; the caller controls the output cast.
     with torch.autocast(device_type=x.device.type, enabled=False):
-        proj = torch.matmul(x, weight.t())
         if eps_inside_sqrt:
             norm = torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + eps)
         else:
             norm = 1.0 / (x.norm(dim=-1, keepdim=True) / math.sqrt(x.shape[-1]) + eps)
+        if normalize_before_projection:
+            # HF 93c8b7b Glm5NextTextHyperConnection normalizes the FP32 residual
+            # before F.linear. This intentionally differs from PR 7521's ordering.
+            proj = F.linear(x * norm, weight)
+        else:
+            proj = torch.matmul(x, weight.t())
     return proj, norm
 
 
@@ -327,6 +541,102 @@ def learned_output_contract(
 
 
 # ============================================================================
+# Fused-operation selection: labels and logging
+# ============================================================================
+
+# The entry of fused_mhc_kernels' backend status message that describes each operation.
+_FMK_STATUS_KEYS = {"proj_rms": "proj_rms_compute_h"}
+
+
+def _read_or_error(read: Callable[[], object]) -> str:
+    """Return ``str(read())``, or the name of the exception it raises."""
+    try:
+        return str(read())
+    except Exception as error:  # torch raises when the legacy and new TF32 APIs were mixed
+        return f"<{type(error).__name__}>"
+
+
+def _precision_fields() -> Tuple[Tuple[str, str], ...]:
+    """Return the FP32 matmul precision state that decides whether TF32 runs."""
+    # One accessor per try, so that one raising accessor does not hide the others. Never read
+    # allow_tf32: it raises in the same mixed states and does not decide TF32 by itself.
+    return (
+        ("fp32_matmul_precision", _read_or_error(torch.get_float32_matmul_precision)),
+        (
+            "cuda.matmul.fp32_precision",
+            _read_or_error(lambda: torch.backends.cuda.matmul.fp32_precision),
+        ),
+        (
+            "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE",
+            os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "unset"),
+        ),
+        ("NVIDIA_TF32_OVERRIDE", os.environ.get("NVIDIA_TF32_OVERRIDE", "unset")),
+    )
+
+
+def _unfused_op_labels(config: TransformerConfig) -> Dict[str, str]:
+    """Return the labels of the unfused operations a module binds for ``config``."""
+    # From the flag: the default module must never call _get_precision_preserving_h_post_bda.
+    post = (
+        "native(emulate-casts)"
+        if config.mhc_preserve_activation_dtype_rounding
+        else "native(compiled)"
+    )
+    return {"proj_rms": "native", "sinkhorn": "native", "h_aggregate": "native", "h_post_bda": post}
+
+
+def _fmk_op_labels(policy: str, ops: Iterable[str]) -> Dict[str, str]:
+    """Label operations with the fused kernels' own backend resolution.
+
+    For example ``fmk(auto:fwd:triton,bwd:native)``; an entry the status message lacks prints
+    as ``?``.
+    """
+    from megatron.core.fusions import fused_mhc_kernels as fmk  # lazy: it imports this module
+
+    # The resolution that log_fused_mhc_backend_once prints. It validates the policy first.
+    message, _ = fmk._mhc_backend_status(policy)
+    resolved = dict(part.split("=", 1) for part in message.split("; ") if "=" in part)
+    return {op: f"fmk({policy}:{resolved.get(_FMK_STATUS_KEYS.get(op, op), '?')})" for op in ops}
+
+
+def _log_mhc_fused_ops_once(config: TransformerConfig, mode: str, labels: Dict[str, str]) -> None:
+    """Log which mHC operations run fused, on every rank, once per process per distinct line.
+
+    Logged when ``use_fused_mhc`` or an mHC precision flag is set. Every rank logs, because
+    the TF32 state and the backend availability are properties of each rank's process.
+    """
+    if not (config.use_fused_mhc or any(getattr(config, flag) for flag in MHC_PRECISION_FLAGS)):
+        return
+    # As log_single_rank does: without INFO, do not look up the rank, which warns in processes
+    # without torch.distributed, RANK or SLURM_PROCID.
+    if not logger.isEnabledFor(logging.INFO):
+        return
+    fields = [
+        f"mode={mode}",
+        f"policy={config.mhc_fused_backend}",
+        f"MHC_FORCE_BACKEND={os.environ.get('MHC_FORCE_BACKEND', 'unset')}",
+    ]
+    fields += [f"{op}={labels[op]}" for op in MHC_FUSED_OPS]
+    fields += [f"{name}={value}" for name, value in _precision_fields()]
+    line = f"[rank {safe_get_rank()}] [mHC] fused ops: " + " ".join(fields)
+    if line not in _FUSED_OPS_LINES_LOGGED:
+        _FUSED_OPS_LINES_LOGGED.add(line)
+        logger.info(line)
+
+
+def _warn_per_op_fallback_once(ops: List[str], reason: str) -> None:
+    """Warn once per process that listed operations keep their unfused implementation."""
+    key = (tuple(ops), reason)
+    if key not in _PER_OP_FALLBACK_WARNED:
+        _PER_OP_FALLBACK_WARNED.add(key)
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            f"[mHC] Falling back to the unfused path for mhc_fused_ops {list(ops)}: {reason}.",
+        )
+
+
+# ============================================================================
 # HyperConnectionModule
 # ============================================================================
 
@@ -392,16 +702,33 @@ class HyperConnectionModule(MegatronModule):
         # a trivial a+b+c) is not worth it for a pure memory-bound elementwise op.
         self._fused_add_3_op = native_fused_add_3
 
-        # The fused path computes the projection and compute_h in one op, so
-        # _projection_and_get_norm — and therefore _proj_rms_op — is only ever
-        # reached on the unfused path.
+        # The all-operations fused mode computes the projection and compute_h in one op,
+        # so there _projection_and_get_norm — and therefore _proj_rms_op — is never
+        # reached. In per-op mode _projection_and_get_norm runs unless proj_rms binds
+        # that projection-first fused op.
         # Full recompute forwards run under no_grad and replay with gradients. Use the
         # same FP32 arithmetic in both passes; compiling only one changes norm reductions.
-        self._proj_rms_op = partial(_proj_rms_impl, eps_inside_sqrt=config.mhc_norm_eps_inside_sqrt)
+        self._proj_rms_op = partial(
+            _proj_rms_impl,
+            eps_inside_sqrt=config.mhc_norm_eps_inside_sqrt,
+            normalize_before_projection=config.mhc_normalize_before_projection,
+        )
+        # The Triton GLM projection pair (fused_mhc_glm_projection), which per-op proj_rms binds
+        # with mhc_norm_eps_inside_sqrt and mhc_normalize_before_projection; None everywhere else.
+        self._glm_proj_rms_op = None
 
-        if config.use_fused_mhc:
-            if config.mhc_norm_eps_inside_sqrt or config.mhc_keep_mappings_in_fp32:
-                raise ValueError("Fused mHC does not support FP32 mixing or epsilon inside sqrt.")
+        if config.use_fused_mhc and config.mhc_fused_ops is None:
+            if (
+                config.mhc_norm_eps_inside_sqrt
+                or config.mhc_normalize_before_projection
+                or config.mhc_keep_mappings_in_fp32
+                or config.mhc_keep_pre_in_fp32
+                or config.mhc_preserve_activation_dtype_rounding
+            ):
+                raise ValueError(
+                    "Fused mHC does not support FP32 mixing, epsilon inside sqrt, "
+                    "normalize-before-projection or activation-dtype rounding preservation."
+                )
             from megatron.core.fusions.fused_mhc_kernels import (
                 fused_h_aggregate,
                 fused_h_aggregate_into,
@@ -418,14 +745,113 @@ class HyperConnectionModule(MegatronModule):
             self._h_aggregate_into_op = partial(fused_h_aggregate_into, backend=backend)
             self._h_post_bda_op = partial(fused_h_post_bda, backend=backend)
             self._proj_rms_compute_h_op = partial(fused_proj_rms_compute_h, backend=backend)
+            fused_mode, fused_labels = "all-ops", _fmk_op_labels(backend, MHC_FUSED_OPS)
         else:
             self._sinkhorn_op = native_sinkhorn
             self._h_aggregate_op = native_h_aggregate
             self._h_aggregate_into_op = native_h_aggregate_into
-            self._h_post_bda_op = native_h_post_bda
+            self._h_post_bda_op = (
+                _get_precision_preserving_h_post_bda()
+                if config.mhc_preserve_activation_dtype_rounding
+                else native_h_post_bda
+            )
             self._proj_rms_compute_h_op = None
+            fused_mode, fused_labels = "unfused", _unfused_op_labels(config)
+            if config.use_fused_mhc:
+                # Per-op mode: rebind only the operations listed in mhc_fused_ops.
+                fused_mode = "per-op"
+                fused_labels.update(self._bind_per_op_fused_ops(config))
+        self._fused_op_labels = fused_labels
+        _log_mhc_fused_ops_once(config, fused_mode, fused_labels)
 
         self._init_weights()
+
+    def _bind_per_op_fused_ops(self, config: TransformerConfig) -> Dict[str, str]:
+        """Rebind only the operations listed in ``mhc_fused_ops``; return their log labels.
+
+        Every other operation keeps the unfused object bound before this call. Under
+        ``MHC_FORCE_BACKEND=native`` or ``mhc_fused_backend="native"`` the listed operations
+        keep them too, so in per-op mode the native policy means the unfused path. The
+        all-operations mode binds the fused kernels' projection-first native op instead; the
+        difference is intended.
+
+        ``sinkhorn`` binds the fixed-launch Triton Sinkhorn of fused_mhc_glm_projection when
+        Triton is available; under ``auto`` without Triton it keeps the unfused object, with a
+        warning. Triton counts as unavailable also under ``MHC_DISABLE_TRITON=1`` and
+        ``MHC_FORCE_BACKEND=cutile``. proj_rms with ``mhc_norm_eps_inside_sqrt`` and
+        ``mhc_normalize_before_projection`` binds the Triton GLM projection pair of
+        fused_mhc_glm_projection when Triton is available, with the TF32 rounding of
+        ``mhc_fused_tf32_rounding``; under ``auto`` without Triton it keeps the unfused object,
+        with a warning. At call time the pair runs only on inputs it supports; on any other input
+        the module warns once and runs the unfused projection under ``auto``, and raises under
+        ``triton``.
+        """
+        # Configs edited after TransformerConfig validation. The table needs a well-formed
+        # list, so it runs only when the field checks pass.
+        errors = mhc_fused_ops_field_errors(config) or mhc_fused_ops_errors(config)
+        if errors:
+            raise ValueError(
+                "Fused mHC does not support this mhc_fused_ops selection: "
+                + "; ".join(errors)
+                + "."
+            )
+        from megatron.core.fusions import fused_mhc_kernels as fmk  # lazy: it imports this module
+
+        policy = config.mhc_fused_backend
+        # log_fused_mhc_backend_once would describe the fused kernels' choice for operations
+        # this module does not bind, so only validate: a deferred MHC_FORCE_BACKEND error, an
+        # unknown policy or an explicit policy whose backend is unavailable still raises here.
+        # Read the fused kernels' state through the module, so that tests can patch it.
+        fmk._validate_mhc_backend(policy)
+        if fmk._MHC_FORCED_BACKEND == "native":
+            return {op: "native(MHC_FORCE_BACKEND=native)" for op in config.mhc_fused_ops}
+        if policy == "native":
+            return {op: "native(mhc_fused_backend=native)" for op in config.mhc_fused_ops}
+
+        labels, unavailable = {}, []
+        fmk_labels = _fmk_op_labels(policy, MHC_FUSED_OPS)
+        for op in MHC_FUSED_OPS:
+            if op not in config.mhc_fused_ops:
+                continue
+            if op == "sinkhorn":
+                # Triton-only. The policy is auto or triton here: native returned above, the
+                # table rejects cutile, and triton without Triton raised in _validate_mhc_backend.
+                if fmk.is_triton_available():
+                    # Lazy: the file imports fused_mhc_kernels, which imports this module.
+                    from megatron.core.fusions import fused_mhc_glm_projection as glm
+
+                    self._sinkhorn_op = glm.fixed_launch_sinkhorn
+                    labels[op] = f"triton(num_warps={glm.SINKHORN_NUM_WARPS})"
+                else:
+                    labels[op] = "native(triton unavailable)"
+                    unavailable.append(op)
+                continue
+            if op in triton_only_ops(config):
+                # proj_rms with mhc_norm_eps_inside_sqrt and mhc_normalize_before_projection
+                # (sinkhorn continued above): the Triton GLM projection pair, Triton-only like the
+                # Sinkhorn. The policy is auto or triton here.
+                if fmk.is_triton_available():
+                    # Lazy: the file imports fused_mhc_kernels, which imports this module.
+                    from megatron.core.fusions import fused_mhc_glm_projection as glm
+
+                    self._glm_proj_rms_op = glm.glm_proj_rms_op(config.mhc_fused_tf32_rounding)
+                    labels[op] = self._glm_proj_rms_op.label
+                else:
+                    labels[op] = "native(triton unavailable)"
+                    unavailable.append(op)
+                continue
+            if op == "proj_rms":
+                self._proj_rms_compute_h_op = partial(fmk.fused_proj_rms_compute_h, backend=policy)
+            elif op == "h_aggregate":
+                self._h_aggregate_op = partial(fmk.fused_h_aggregate, backend=policy)
+                self._h_aggregate_into_op = partial(fmk.fused_h_aggregate_into, backend=policy)
+            else:  # h_post_bda
+                self._h_post_bda_op = partial(fmk.fused_h_post_bda, backend=policy)
+            labels[op] = fmk_labels[op]
+
+        if unavailable:
+            _warn_per_op_fallback_once(unavailable, "Triton is unavailable")
+        return labels
 
     def _init_weights(self) -> None:
         """Initialize weights for stable training."""
@@ -459,6 +885,14 @@ class HyperConnectionModule(MegatronModule):
         # mapping_proj is read here, not called, so its forward pre-hook never publishes it.
         ensure_params_ready([self.mapping_proj.weight])
         weight = self.mapping_proj.weight
+        glm_op = self._glm_proj_rms_op
+        if glm_op is not None:
+            # Before the checkpoint below, so that a full-recompute forward under no_grad and its
+            # replay run the same op; asked through the attribute, so that the spy counts refusals.
+            if glm_op.supported(x_2d, weight):
+                proj, r = glm_op(x_2d, weight, self.norm_eps)
+                return proj.view(s, b, proj.shape[-1]), r.view(s, b, 1)
+            self._refuse_glm_proj_rms(glm_op.refusal(x_2d, weight))
         if torch.is_grad_enabled() and (x_2d.requires_grad or weight.requires_grad):
             proj, r = checkpoint(
                 self._proj_rms_op,
@@ -472,8 +906,18 @@ class HyperConnectionModule(MegatronModule):
             proj, r = self._proj_rms_op(x_2d, weight, self.norm_eps)
         return proj.view(s, b, proj.shape[-1]), r.view(s, b, 1)
 
-    # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
-    @torch.compile
+    def _refuse_glm_proj_rms(self, reason: str) -> None:
+        """An explicit triton policy fails; auto warns once per reason and runs the unfused
+        projection."""
+        message = f"the Triton GLM projection pair does not support this input: {reason}"
+        if self.config.mhc_fused_backend == "triton":
+            raise RuntimeError(
+                f"mHC fused backend 'triton' was requested for ['proj_rms'], but {message}."
+            )
+        _warn_per_op_fallback_once(["proj_rms"], message)
+
+    # Static shapes: see _compute_h_one_specialization.
+    @torch.compile(dynamic=False)
     def _compute_h(self, proj: Tensor, r: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Compute h from projected hidden states and scaling factors.
@@ -496,7 +940,11 @@ class HyperConnectionModule(MegatronModule):
             dim=-1,
         )
 
-        h = r * proj * alpha_ + self.bias
+        # A normalize-before-projection GEMM already consumed the RMS scaling.
+        if self.config.mhc_normalize_before_projection:
+            h = proj * alpha_ + self.bias
+        else:
+            h = r * proj * alpha_ + self.bias
         # H_pre = σ(α_pre * (θ_pre @ x̃) + b_pre)
         h_pre = h[..., : self.n].sigmoid() + self.compute_h_eps  # [s, b, n]
 
@@ -504,6 +952,43 @@ class HyperConnectionModule(MegatronModule):
         h_post = h[..., self.n : 2 * self.n].sigmoid() * 2
         h_res = h[..., 2 * self.n :]
         return h_pre, h_post, h_res
+
+    def _compute_h_one_specialization(
+        self, proj: Tensor, r: Tensor
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Run the compiled ``_compute_h`` in its grad-mode specialization only.
+
+        Dynamo specializes ``_compute_h`` on grad mode and on whether its inputs
+        require grad. Full activation recompute runs the forward under no_grad and
+        replays it with gradients enabled; with two specializations, a full Dynamo
+        cache makes the missing one run eagerly, and the replay no longer reproduces
+        the forward's mappings bit for bit. Both halves therefore run the grad-mode
+        specialization on inputs that require grad. A grad-mode call that needs a
+        gradient runs it directly, so autograd uses its compiled backward; an input
+        that does not require grad is replaced by a detached one that does. Every
+        other call, under no_grad or with nothing to differentiate, runs it under
+        enable_grad on detached inputs and returns detached outputs.
+
+        ``_compute_h`` is compiled with static shapes because a dynamic-shape entry
+        compiled from the view inputs of a grad-mode call guards on their view base,
+        which detached inputs lack: the two halves of one recompute would then use
+        different entries. With static shapes they share the entry for their shape,
+        or, once Dynamo's cache is full, both run eagerly.
+        """
+        params = (self.alpha_pre, self.alpha_post, self.alpha_res, self.bias)
+        if torch.is_grad_enabled() and (
+            proj.requires_grad or r.requires_grad or any(p.requires_grad for p in params)
+        ):
+            if not proj.requires_grad:
+                proj = proj.detach().requires_grad_(True)
+            if not r.requires_grad:
+                r = r.detach().requires_grad_(True)
+            return self._compute_h(proj, r)
+        with torch.enable_grad():
+            outputs = self._compute_h(
+                proj.detach().requires_grad_(True), r.detach().requires_grad_(True)
+            )
+        return tuple(output.detach() for output in outputs)
 
     @nvtx_decorator(message="HyperConnection::compute_mappings")
     def compute_mappings(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
@@ -547,7 +1032,7 @@ class HyperConnectionModule(MegatronModule):
             with torch.cuda.nvtx.range("HyperConnection::projection_and_get_norm"):
                 proj, r = self._projection_and_get_norm(x)
             with torch.cuda.nvtx.range("HyperConnection::compute_h"):
-                h_pre, h_post, h_res = self._compute_h(proj, r)
+                h_pre, h_post, h_res = self._compute_h_one_specialization(proj, r)
             h_res = h_res.view(s, b, self.n, self.n)
 
         h_res = self._sinkhorn_op(
@@ -555,7 +1040,8 @@ class HyperConnectionModule(MegatronModule):
         )  # [s, b, n, n]
 
         dtype = torch.float32 if self.config.mhc_keep_mappings_in_fp32 else x.dtype
-        return h_pre.to(dtype), h_post.to(dtype), h_res.to(dtype)
+        pre_dtype = torch.float32 if getattr(self.config, "mhc_keep_pre_in_fp32", False) else dtype
+        return h_pre.to(pre_dtype), h_post.to(dtype), h_res.to(dtype)
 
     # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
     @torch.compile
@@ -675,14 +1161,11 @@ class HyperConnectionModule(MegatronModule):
         n = self.n
         C = self.hidden_size
 
-        # Reshape for bmm: [s, b, n, n] -> [s*b, n, n]
-        h_res_batched = h_res.view(s * b, n, n)
-        # [s, b, n*C] -> [s, b, n, C] -> [s*b, n, C]
-        residual_batched = residual.view(s * b, n, C).to(h_res.dtype)
+        # [s, b, n*C] -> [s, b, n, C]
+        residual_streams = residual.view(s, b, n, C).to(h_res.dtype)
 
-        # Batch matrix multiply: [s*b, n, n].T @ [s*b, n, C] -> [s*b, n, C]
-        with torch.autocast(device_type=h_res_batched.device.type, enabled=False):
-            mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched)
+        # FP32 multiply-adds, not a GEMM: [s, b, n, n].T @ [s, b, n, C] -> [s, b, n, C]
+        mixed = _h_res_mix(h_res.view(s, b, n, n), residual_streams)
 
         return mixed.view(s, b, n * C)
 

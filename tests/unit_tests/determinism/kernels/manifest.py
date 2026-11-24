@@ -219,15 +219,52 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="kda_recurrence",
-        sources=("megatron/core/ssm/gated_delta_net/kda.py",),
-        tests=(K + "test_dev_sync_kernels.py",),
+        sources=(
+            "megatron/core/ssm/gated_delta_net/kda.py",
+            "megatron/core/ssm/gated_delta_net/packed_cp_metadata.py",
+        ),
+        tests=(
+            K + "test_dev_sync_kernels.py",
+            "tests/unit_tests/ssm/gated_delta_net/test_packed_cp_metadata.py",
+        ),
         kind="dispatch",
         notes="KDA gate preparation and the selected FLA chunk_kda forward/backward at CP1, alone "
         "and feeding the fused sigmoid output norm that gdn_gated_output_norm_fusion selects in "
         "_apply_gated_norm, plus a module-level replay of the Kimi-K3 bias-free low-rank "
         "F-decay / output-gate projections (kda_f_lora_rank / kda_gate_lora_rank) with the "
         "TP-replicated beta projection under deterministic_mode. Multi-rank convolution and "
-        "chunkwise CP remain in the existing parity suite.",
+        "chunkwise CP remain in the existing parity suite. "
+        "Packed CP metadata tests compare cached partition boundaries with fresh construction "
+        "and exercise mutation invalidation and forward routing; they do not qualify kernel numerics.",
+    ),
+    KernelEntry(
+        name="kda_cp_state_exchange",
+        sources=(
+            "megatron/core/ssm/context_parallel/state_exchange.py",
+            "megatron/core/ssm/gated_delta_net/kda_cp_state_exchange.py",
+        ),
+        tests=(
+            K + "test_dev_sync_kernels.py",
+            "tests/unit_tests/ssm/test_kda_cp_state_exchange.py",
+        ),
+        kind="dispatch",
+        notes="Two-level CP boundary-state exchange for KDA chunkwise CP: FLA's CP summary kernels "
+        "(the forward pre-process and backward dhu pre-process stages) and FLA's "
+        "merge_fwd_bwd_kernel, with batched matmul composition in between. The replay drives "
+        "exchange_boundary_state for one rank of a 64-rank group (blocks of 8) on CUDA FP32 "
+        "summaries, forward and backward, through the composition and the FLA merge kernel; the "
+        "NCCL exchange and chunk_kda end to end against FLA's all-gather are in "
+        "tests/unit_tests/ssm/test_kda_cp_state_exchange.py.",
+    ),
+    KernelEntry(
+        name="kda_short_conv",
+        sources=("megatron/core/ssm/gated_delta_net/kda_conv.py",),
+        tests=(K + "test_dev_sync_kernels.py", "tests/unit_tests/ssm/test_kda_conv.py"),
+        kind="triton",
+        notes="Row-walking width-4 causal convolution forward and backward that replace FLA's "
+        "Triton conv ops for KDA (SiLU, bias, packed sequences, CP initial state); the per-chunk "
+        "weight and bias gradients are summed with torch. The replay covers forward and backward "
+        "with all of them; tests/unit_tests/ssm/test_kda_conv.py compares them with FLA's kernels.",
     ),
     KernelEntry(
         name="balanced_cp_route_metadata",
@@ -425,6 +462,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Sinkhorn / h_aggregate / h_post_bda / proj_rms_compute_h on the triton, native (torch.compile) and cuTile backends.",
     ),
     KernelEntry(
+        name="fused_mhc_glm_projection",
+        sources=("megatron/core/fusions/fused_mhc_glm_projection.py",),
+        tests=(K + "test_fused_triton_kernels.py",),
+        kind="triton",
+        notes="Fixed-launch Triton Sinkhorn (num_warps=1) over fused_mhc_kernels' JIT kernels, "
+        "and the GLM projection pair (GP-1..GP-4 with GP-4p and GP-4r: fixed-config Triton "
+        "kernels, index-order chain reductions from zero, no atomics); forward and backward "
+        "replay, eager and under CUDA-graph capture.",
+    ),
+    KernelEntry(
         name="streamwise_residual_ops",
         sources=("megatron/core/transformer/streamwise_residual_ops.py",),
         tests=(K + "test_streamwise_residual_ops.py",),
@@ -439,6 +486,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_tensor_parallel_kernels.py",),
         kind="cuda-ext",
         notes="apex FastLayerNormFN / FusedLayerNormAffineFunction; dgamma/dbeta cross-row reduction.",
+    ),
+    KernelEntry(
+        name="glm5_next_rms_norm",
+        sources=("megatron/core/transformer/glm5_next_norm.py",),
+        tests=(K + "test_glm5_next_norm.py",),
+        kind="torch.compile",
+        notes="GLM5Next RMSNorm (rmsnorm_cast_before_weight): eager passes and, with "
+        "rmsnorm_cast_before_weight_compiled, Inductor kernels with emulate_precision_casts; "
+        "mean-square and gamma-gradient reductions.",
     ),
     KernelEntry(
         name="fused_scale_mask_softmax",
@@ -764,12 +820,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ssm/gated_delta_net/gdn.py",
             "megatron/core/ssm/gated_delta_net/gdn2.py",
             "megatron/core/ssm/gated_delta_net/kda.py",
+            "megatron/core/ssm/gated_delta_net/packed_cp_metadata.py",
         ),
         tests=(
             K + "test_ssm_kernels.py",
             K + "test_gated_norm.py",
             C + "test_hybrid_model.py",
-            R + 'test_ssm_replay.py',
+            R + "test_ssm_replay.py",
+            "tests/unit_tests/ssm/gated_delta_net/test_packed_cp_metadata.py",
         ),
         kind="torch.compile",
         notes="deterministic_mode selects torch_chunk_gated_delta_rule over FLA (recorded non-deterministic). "
@@ -781,7 +839,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "activation; test_ssm_kernels.py replays a whole GatedDeltaNet built with a GELU "
         "activation_func under deterministic_mode (torch conv1d / L2 norm / chunk rule). The "
         "opt-in fused output norm (gdn_gated_output_norm_fusion; SiLU for GDN, sigmoid for KDA) "
-        "is replayed through both _apply_gated_norm dispatchers in test_gated_norm.py.",
+        "is replayed through both _apply_gated_norm dispatchers in test_gated_norm.py. "
+        "Packed CP metadata tests separately cover exact cached/fresh boundaries, invalidation, "
+        "and cross-layer forward reuse without claiming numerical CP kernel parity.",
     ),
     KernelEntry(
         name="gdn_pre_gated_delta_rule_fusion",
@@ -1192,6 +1252,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/optimizer/test_layer_sharded_muon.py",
             "tests/unit_tests/optimizer/test_layer_sharded_e2e_parity.py",
             "tests/unit_tests/optimizer/test_muon_grouped_projection.py",
+            K + "test_optimizer_kernels.py",
         ),
         kind="dispatch",
         notes="LayerShardedMuon._run_ns calls emerging-optimizers newton_schulz on the assembled "
@@ -1202,7 +1263,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "test_batched_matches_unbatched, test_concurrent_groups_match_serial_bitwise, "
         "test_exchange_plan_cache_bitwise_and_reused) and the e2e parity module against "
         "TensorParallelMuon duplicated mode. test_grouped_muon_replays also checks grouped "
-        "weights and momentum under stream contention for both optimizer implementations. "
+        "weights and momentum under stream contention for both optimizer implementations, and "
+        "test_mla_per_head_muon_replays the TensorParallelMuon per-head split whose MLA slice "
+        "pattern is batched per pattern position. "
         "The CI container's emerging-optimizers runs the "
         "GEMM path; the SYRK paths are exercised only where the stack supports them.",
     ),
@@ -1346,6 +1409,34 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "replayed bit-exactly for BF16 / FP16 / FP32 under serial and contended streams, and "
         "compared bitwise with the eager composition; the full eager-parity grid lives in "
         "tests/unit_tests/fusions/test_fused_attention_output_gate.py.",
+    ),
+    KernelEntry(
+        name="dsa_topk_zero_ties",
+        sources=("megatron/core/transformer/experimental_attention_variant/dsa_topk_zero_ties.py",),
+        tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/test_dsa_topk_zero_ties.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/"
+            "test_dsa_cudnn_topk_deterministic_gpu.py",
+        ),
+        kind="triton",
+        notes="Lowest-index exact-zero tie selection of the deterministic DSA top-k: integer "
+        "compares and per-row index writes only. The tests compare it exactly with a reference "
+        "(Triton interpreter on CPU, CUDA on GPU) and repeat the deterministic top-k bitwise, "
+        "eager and under CUDA graph replay.",
+    ),
+    KernelEntry(
+        name="dsa_deepselect_topk",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/dsa_deepselect_topk.py",
+        ),
+        tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/"
+            "test_dsa_deepselect_topk_gpu.py",
+        ),
+        kind="triton",
+        notes="Optional DeepSelect top-k backend (external DeepSelect build) and its NaN-row "
+        "repair kernel; deterministic mode never selects it. The GPU tests repeat the "
+        "selection bitwise, check batch independence and replay it under a CUDA graph.",
     ),
 )
 

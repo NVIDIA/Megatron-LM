@@ -256,6 +256,13 @@ def _backend_uses_cutile(backend: MHCBackend) -> bool:
     return backend in ("auto", "cutile") and is_cutile_available()
 
 
+def _h_aggregate_uses_cutile(backend: MHCBackend) -> bool:
+    # The cuTile h_aggregate kernels run only when 'cutile' is explicit: their h-tile load
+    # intermittently read wrong values on GB300 (see the cuTile H_aggregate kernels). Under
+    # 'auto' and 'triton' h_aggregate uses Triton, or native torch without Triton.
+    return backend == "cutile" and _backend_uses_cutile(backend)
+
+
 # ============================================================================
 # Triton implementations (only defined when triton is available)
 # ============================================================================
@@ -519,6 +526,95 @@ if _TRITON_AVAILABLE:
             x_flat, h_flat, out_flat, sb, C, n, x_flat.stride(0), x_flat.stride(1), x_flat.stride(2)
         )
         return out
+
+    # ============================================================================
+    # H_aggregate backward
+    # ============================================================================
+
+    @triton.jit
+    def _triton_h_agg_bwd_kernel(
+        go_ptr,
+        x_ptr,
+        h_ptr,
+        gx_ptr,
+        gh_ptr,
+        sb,
+        C: tl.constexpr,
+        N: tl.constexpr,
+        stride_go_s,
+        stride_x_s,
+        stride_x_n,
+        BLOCK_C: tl.constexpr,
+        BLOCK_S: tl.constexpr,
+    ):
+        """gx[s, i, c] = go[s, c] * h[s, i], gh[s, i] = sum_c go[s, c] * x[s, i, c].
+
+        Grid: (cdiv(sb, BLOCK_S),). Each program owns BLOCK_S whole rows and walks the
+        C tiles in order, so grad_h needs no atomics and its summation order is fixed.
+        """
+        pid_s = tl.program_id(0)
+        offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+        mask_s = offs_s < sb
+
+        for i in tl.static_range(N):
+            # One scalar per (row, stream), loaded as the forward kernel loads it.
+            h_i = tl.load(h_ptr + offs_s * N + i, mask=mask_s, other=0.0).to(tl.float32)
+            gh_acc = tl.zeros((BLOCK_S,), dtype=tl.float32)
+            for c_start in range(0, C, BLOCK_C):
+                offs_c = c_start + tl.arange(0, BLOCK_C)
+                mask_2d = mask_s[:, None] & (offs_c < C)[None, :]
+                go = tl.load(
+                    go_ptr + offs_s[:, None] * stride_go_s + offs_c[None, :],
+                    mask=mask_2d,
+                    other=0.0,
+                ).to(tl.float32)
+                x_i = tl.load(
+                    x_ptr + offs_s[:, None] * stride_x_s + i * stride_x_n + offs_c[None, :],
+                    mask=mask_2d,
+                    other=0.0,
+                ).to(tl.float32)
+                # One fp32 multiply and one cast, as _torch_h_aggregate_bwd computes grad_x.
+                tl.store(
+                    gx_ptr + (offs_s[:, None] * N + i) * C + offs_c[None, :],
+                    (go * h_i[:, None]).to(gx_ptr.dtype.element_ty),
+                    mask=mask_2d,
+                )
+                gh_acc += tl.sum(go * x_i, axis=1)
+            tl.store(gh_ptr + offs_s * N + i, gh_acc.to(gh_ptr.dtype.element_ty), mask=mask_s)
+
+    def _triton_h_aggregate_bwd(
+        grad_output: Tensor, x: Tensor, h_pre: Tensor
+    ) -> Tuple[Tensor, Tensor]:
+        s, b, n, C = x.shape
+        sb = s * b
+        gx = torch.empty(sb, n, C, dtype=x.dtype, device=x.device)
+        gh = torch.empty(sb, n, dtype=h_pre.dtype, device=x.device)
+        go_flat = grad_output.contiguous().view(sb, C)
+        x_flat = x.contiguous().view(sb, n, C)
+        h_flat = h_pre.contiguous().view(sb, n)
+
+        # A fixed launch configuration rather than autotuning: grad_h's summation order then
+        # depends on C alone, so it repeats bitwise across processes, and the first call
+        # neither benchmarks nor synchronizes, which CUDA graph capture would reject.
+        block_c = min(triton.next_power_of_2(C), 1024)
+        block_s = 1024 // block_c
+        _triton_h_agg_bwd_kernel[(triton.cdiv(sb, block_s),)](
+            go_flat,
+            x_flat,
+            h_flat,
+            gx,
+            gh,
+            sb,
+            C,
+            n,
+            go_flat.stride(0),
+            x_flat.stride(0),
+            x_flat.stride(1),
+            BLOCK_C=block_c,
+            BLOCK_S=block_s,
+            num_warps=4,
+        )
+        return gx.view(s, b, n, C), gh.view(s, b, n)
 
     # ============================================================================
     # H_post BDA
@@ -891,11 +987,18 @@ _TRITON_IMPLS = (
     {
         "sinkhorn": triton_fused_sinkhorn,
         "h_aggregate_fwd": _triton_h_aggregate_fwd,
+        "h_aggregate_bwd": _triton_h_aggregate_bwd,
         "h_post_bda_fwd": _triton_h_post_bda_fwd,
         "h_post_bda_bwd": _triton_h_post_bda_bwd,
     }
     if _TRITON_AVAILABLE
-    else {"sinkhorn": None, "h_aggregate_fwd": None, "h_post_bda_fwd": None, "h_post_bda_bwd": None}
+    else {
+        "sinkhorn": None,
+        "h_aggregate_fwd": None,
+        "h_aggregate_bwd": None,
+        "h_post_bda_fwd": None,
+        "h_post_bda_bwd": None,
+    }
 )
 
 
@@ -1109,6 +1212,11 @@ if _CUTILE_AVAILABLE:
         return grad_input.view(original_shape)
 
     # -- H_aggregate kernels -------------------------------------------------
+    # Only the explicit 'cutile' policy runs these (_h_aggregate_uses_cutile). On GB300
+    # (sm_103) test_mhc_module_bound_ops_replay_fwd_bwd caught _ct_h_agg_bwd_kernel
+    # intermittently using a fixed non-data value for streams 0-1 of its (TILE_M, N) bf16
+    # h tile, which made grad_x NaN or about -2^113 * grad_output for whole TILE_M-row
+    # tiles. The forward kernel loads h the same way, so 'auto' selects neither.
 
     @ct.kernel
     def _ct_h_agg_fwd_kernel(x, h_pre, out, N: ConstInt, TILE_M: ConstInt, TILE_C: ConstInt):
@@ -2688,8 +2796,8 @@ if _CUTILE_AVAILABLE:
 #
 #   sinkhorn fwd/bwd:       Triton -> cuTile -> torch
 #   h_post_bda fwd/bwd:     Triton -> cuTile -> torch
-#   h_aggregate fwd:        Triton -> cuTile -> torch
-#   h_aggregate bwd:        cuTile -> torch
+#   h_aggregate fwd/bwd:    Triton -> torch (cuTile only under the explicit 'cutile'
+#                           policy; see _h_aggregate_uses_cutile)
 #   proj_rms/proj_rms_compute_h: cuTile -> torch
 #
 # Runtime CUDA launch failures are intentionally not swallowed; after such an
@@ -2714,12 +2822,20 @@ def _select_triton_cutile_native(triton_impl, backend: MHCBackend) -> str:
     return "native"
 
 
+def _select_h_aggregate_backend(triton_impl, backend: MHCBackend) -> str:
+    if triton_impl is not None:
+        return "triton"
+    if _h_aggregate_uses_cutile(backend):
+        return "cutile"
+    return "native"
+
+
 def _mhc_backend_status(backend: MHCBackend = "auto") -> Tuple[str, bool]:
     """Return backend description and whether every backend is native."""
     _validate_mhc_backend(backend)
     sinkhorn = _select_triton_cutile_native(_get_triton_sinkhorn(backend), backend)
-    h_aggregate_fwd = _select_triton_cutile_native(_get_triton_h_aggregate_fwd(backend), backend)
-    h_aggregate_bwd = "cutile" if _backend_uses_cutile(backend) else "native"
+    h_aggregate_fwd = _select_h_aggregate_backend(_get_triton_h_aggregate_fwd(backend), backend)
+    h_aggregate_bwd = _select_h_aggregate_backend(_get_triton_h_aggregate_bwd(backend), backend)
     h_post_bda_fwd = _select_triton_cutile_native(_get_triton_h_post_bda_fwd(backend), backend)
     h_post_bda_bwd = _select_triton_cutile_native(_get_triton_h_post_bda_bwd(backend), backend)
     proj_rms_compute_h = "cutile" if _backend_uses_cutile(backend) else "native"
@@ -2785,6 +2901,12 @@ def _get_triton_h_aggregate_fwd(backend: MHCBackend = "auto"):
     return _TRITON_IMPLS["h_aggregate_fwd"]
 
 
+def _get_triton_h_aggregate_bwd(backend: MHCBackend = "auto"):
+    if not _backend_uses_triton(backend):
+        return None
+    return _TRITON_IMPLS["h_aggregate_bwd"]
+
+
 def _get_triton_h_post_bda_fwd(backend: MHCBackend = "auto"):
     if not _backend_uses_triton(backend):
         return None
@@ -2804,17 +2926,17 @@ def _torch_h_aggregate_bwd(grad_output: Tensor, x: Tensor, h_pre: Tensor) -> Tup
     # bf16 input in fp32, so `dtype=torch.float32` alone would change nothing --
     # what costs accuracy is rounding each go*x product to bf16 before a reduction
     # spanning the whole hidden dimension (the cuTile kernel's comment puts the
-    # result at ~3x noisier). _ct_h_agg_bwd_kernel and
-    # NativeHAggregateInto.backward upcast for the same reason, and this fallback
-    # is reachable whenever cuTile is absent -- including Triton-present builds --
-    # so it has to agree with them.
+    # result at ~3x noisier). _ct_h_agg_bwd_kernel, _triton_h_agg_bwd_kernel and
+    # NativeHAggregateInto.backward upcast for the same reason, and
+    # FusedHAggregate(Into).backward falls back to this under 'auto' when Triton is
+    # absent, so it has to agree with them.
     #
-    # Compatibility note: this function is also FusedHAggregate.backward, which
-    # use_fused_mhc has selected since before this change, so --use-fused-mhc runs
-    # on a cuTile-less stack get a different (less noisy) grad_h than prior
-    # releases and will not reproduce their loss curves. No functional case sets
-    # --use-fused-mhc, so no golden value flags it; a mismatch on such a run is
-    # expected and attributable here.
+    # Compatibility note: when this upcast landed, this function was also
+    # FusedHAggregate.backward on every cuTile-less stack (Triton stacks now use
+    # _triton_h_agg_bwd_kernel), so --use-fused-mhc runs there got a different (less
+    # noisy) grad_h than prior releases and will not reproduce their loss curves.
+    # No functional case sets --use-fused-mhc, so no golden value flags it; a
+    # mismatch on such a run is expected and attributable here.
     #
     # This does allocate fp32 temporaries, and a batched matmul would avoid them
     # by accumulating bf16 products in fp32 registers. Not taken: the precision of
@@ -2842,8 +2964,20 @@ def _torch_h_post_bda_bwd(
     hp = h_post.reshape(sb, n)
     x_flat = x.reshape(sb, C)
 
-    g_hr = torch.bmm(orig, go.transpose(1, 2)).view(s, b, n, n)
-    g_res = torch.bmm(hr, go).view(s, b, n, C)
+    # FP32 (FP64 for FP64 inputs) multiply-adds instead of GEMMs, as in the native backward:
+    # no TF32 policy or Inductor GEMM lowering decides their precision. One gradient row at a
+    # time, so an uncompiled call (Dynamo disabled or out of recompiles) never holds an
+    # n x n x C product.
+    acc_dtype = torch.promote_types(go.dtype, torch.float32)
+    go_rows = [go[:, i : i + 1].to(acc_dtype) for i in range(n)]
+    # g_hr[j, i] = sum_c orig[j, c] * go[i, c]
+    g_hr = torch.stack([(orig * go_i).sum(dim=-1) for go_i in go_rows], dim=-1).view(s, b, n, n)
+    # g_res[j, c] = sum_i hr[j, i] * go[i, c], in ascending i
+    hr_acc = hr.to(acc_dtype)
+    g_res = hr_acc[:, :, 0:1] * go_rows[0]
+    for i in range(1, n):
+        g_res += hr_acc[:, :, i : i + 1] * go_rows[i]
+    g_res = g_res.view(s, b, n, C)
     g_x = torch.sum(go * hp.unsqueeze(-1), dim=1).view(s, b, C)
     xb = x_flat if bias is None else x_flat + bias.view(1, C)
     g_hp = torch.sum(go * xb.unsqueeze(1), dim=2).view(s, b, n)
@@ -3014,10 +3148,12 @@ class FusedHAggregate(torch.autograd.Function):
         triton_fwd = _get_triton_h_aggregate_fwd(backend)
         if triton_fwd is not None:
             output = triton_fwd(x, h_pre)
-        elif _backend_uses_cutile(backend):
+        elif _h_aggregate_uses_cutile(backend):
             output = _cutile_h_aggregate_fwd(x, h_pre)
         else:
-            output = native_h_aggregate(x, h_pre)
+            # Reached under 'auto' without Triton. Detached inputs keep a checkpoint's
+            # no-grad forward and its replay on one compiled entry (NativeHAggregateInto).
+            output = native_h_aggregate(x.detach(), h_pre.detach())
         ctx.save_for_backward(x, h_pre)
         ctx.backend = backend
         return output
@@ -3026,7 +3162,10 @@ class FusedHAggregate(torch.autograd.Function):
     def backward(ctx, grad_output):
         """Run h_aggregate backward using the best available backend."""
         x, h_pre = ctx.saved_tensors
-        if _backend_uses_cutile(ctx.backend):
+        triton_bwd = _get_triton_h_aggregate_bwd(ctx.backend)
+        if triton_bwd is not None:
+            grad_x, grad_h_pre = triton_bwd(grad_output, x, h_pre)
+        elif _h_aggregate_uses_cutile(ctx.backend):
             grad_x, grad_h_pre = _cutile_h_aggregate_bwd(grad_output, x, h_pre)
         else:
             grad_x, grad_h_pre = _torch_h_aggregate_bwd(grad_output, x, h_pre)
@@ -3055,10 +3194,14 @@ class FusedHAggregateInto(torch.autograd.Function):
         triton_fwd = _get_triton_h_aggregate_fwd(backend)
         if triton_fwd is not None:
             output = triton_fwd(x, h_pre, out)
-        elif _backend_uses_cutile(backend):
+        elif _h_aggregate_uses_cutile(backend):
             output = _cutile_h_aggregate_fwd(x, h_pre, out)
         else:
-            torch.sum(x * h_pre.unsqueeze(-1), dim=2, out=out)
+            # Reached under 'auto' without Triton: the same compiled forward as
+            # NativeHAggregateInto, so both paths round once, not once per product.
+            from megatron.core.transformer.hyper_connection import _native_h_aggregate_into_forward
+
+            _native_h_aggregate_into_forward(x.detach(), h_pre.detach(), out)
             output = out
         ctx.save_for_backward(x, h_pre)
         ctx.backend = backend
@@ -3068,7 +3211,10 @@ class FusedHAggregateInto(torch.autograd.Function):
     def backward(ctx, grad_output):
         """Run h_aggregate backward; the caller-owned output needs no grad slot."""
         x, h_pre = ctx.saved_tensors
-        if _backend_uses_cutile(ctx.backend):
+        triton_bwd = _get_triton_h_aggregate_bwd(ctx.backend)
+        if triton_bwd is not None:
+            grad_x, grad_h = triton_bwd(grad_output, x, h_pre)
+        elif _h_aggregate_uses_cutile(ctx.backend):
             grad_x, grad_h = _cutile_h_aggregate_bwd(grad_output, x, h_pre)
         else:
             grad_x, grad_h = _torch_h_aggregate_bwd(grad_output, x, h_pre)

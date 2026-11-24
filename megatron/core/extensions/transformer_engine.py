@@ -12,7 +12,7 @@ import pickle
 import re
 import warnings
 from contextlib import contextmanager, nullcontext
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, cast
 
 import torch
@@ -1305,7 +1305,17 @@ class TENorm:
             assert hasattr(
                 te.pytorch, "RMSNorm"
             ), "Transformer-Engine >= v0.11 required to use this feature"
-            if use_fused_residual:
+            if config.rmsnorm_cast_before_weight:
+                if use_fused_residual:
+                    raise ValueError(
+                        "rmsnorm_cast_before_weight does not support fused residual RMSNorm."
+                    )
+                from megatron.core.transformer.glm5_next_norm import GLM5NextRMSNorm
+
+                norm_module = partial(
+                    GLM5NextRMSNorm, compiled=config.rmsnorm_cast_before_weight_compiled
+                )
+            elif use_fused_residual:
                 assert (
                     TEFusedResidualRMSNorm is not None
                 ), "TEFusedResidualRMSNorm requires Transformer-Engine >= v1.13.0"
@@ -2707,13 +2717,15 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
         # These fields are MCore-only and should not be forwarded to TE attention.
         # total_tokens and seq_idx are only for Mamba; tokens_per_sample is only for
-        # MoE sequence-level aux loss reshaping; cp_partition_mode and cp_partition_route
-        # are MCore CP metadata.
+        # MoE sequence-level aux loss reshaping; cp_partition_mode, cp_partition_route,
+        # tp_cp_partition_route, cp_scatter_cache and cp_singleton_group are MCore CP
+        # metadata.
         self.kept_packed_seq_params.discard("total_tokens")
         self.kept_packed_seq_params.discard("seq_idx")
         self.kept_packed_seq_params.discard("tokens_per_sample")
         self.kept_packed_seq_params.discard("cp_partition_mode")
         self.kept_packed_seq_params.discard("cp_partition_route")
+        self.kept_packed_seq_params.discard("tp_cp_partition_route")
         self.kept_packed_seq_params.discard("cp_scatter_cache")
         self.kept_packed_seq_params.discard("cp_singleton_group")
         # Runtime groups belong to MCore layout conversion and CP binding, not TE's forward API.
@@ -3629,6 +3641,13 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         @copy_signature(MLP.__init__)
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
+            if self.config.activation_func_clamp_value is not None:
+                # The TE activation ops built by _make_fused_impl do not clamp.
+                raise ValueError(
+                    f"{self.__class__.__name__} does not support activation_func_clamp_value: "
+                    "its Transformer Engine activation op does not clamp. Build the MLP "
+                    "without use_transformer_engine_op_fuser."
+                )
 
         def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
             """Construct fused module matching MLP."""

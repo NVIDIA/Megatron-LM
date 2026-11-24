@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from megatron.core.activations import squared_relu
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 
@@ -262,6 +263,152 @@ def test_dsa_kpool_cudnn_accepts_unquantized_fp32_weights_projection():
     assert config.dsa_indexer_kpool == 4
 
 
+@pytest.fixture
+def no_dsa_kernel_dependency_check(monkeypatch):
+    """Skip the CUDA/library probe of ``dsa_kernel_backend`` so the config rules run on CPU."""
+    import megatron.core.transformer.transformer_config as config_module
+
+    monkeypatch.setattr(config_module, "_validate_dsa_kernel_backend_dependencies", lambda _: None)
+
+
+@pytest.mark.usefixtures("no_dsa_kernel_dependency_check")
+def test_dsa_scorer_backend_is_unset_by_default_and_kpool_accepts_torch_and_cudnn():
+    unset = _make_dsa_kpool_config(dsa_indexer_kpool=4, dsa_indexer_topk=8)
+    assert unset.dsa_indexer_scorer_backend is None
+    for backend in ("torch", "cudnn"):
+        config = _make_dsa_kpool_config(
+            dsa_indexer_kpool=4,
+            dsa_indexer_topk=8,
+            dsa_kernel_backend="cudnn",
+            dsa_indexer_scorer_backend=backend,
+        )
+        assert config.dsa_indexer_scorer_backend == backend
+    # Without KPool, 'cudnn' is the per-token cuDNN scorer.
+    per_token = _make_dsa_kpool_config(
+        dsa_indexer_kpool=1,
+        dsa_indexer_topk=8,
+        dsa_kernel_backend="cudnn",
+        dsa_indexer_scorer_backend="cudnn",
+    )
+    assert per_token.dsa_indexer_scorer_backend == "cudnn"
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        (dict(dsa_indexer_scorer_backend="triton"), "'torch', 'cudnn' or 'deepgemm'"),
+        (dict(dsa_indexer_scorer_backend="deepgemm"), "does not apply to KPool selection"),
+        (
+            dict(dsa_indexer_kpool=1, dsa_indexer_scorer_backend="torch"),
+            "applies only to KPool selection",
+        ),
+        (dict(dsa_kernel_backend="tilelang"), "needs dsa_kernel_backend='cudnn'"),
+        (dict(dsa_indexer_scoring_relu=False), "needs ReLU scoring"),
+        (dict(attention_backend=AttnBackend.unfused), "needs the fused DSA kernels"),
+        (dict(dsa_indexer_kpool_use_quantization=True), "does not support FP8 KPool"),
+        (
+            dict(
+                dsa_indexer_weights_proj_output_dtype="fp32",
+                dsa_indexer_weights_proj_use_quantization=False,
+            ),
+            "needs BF16 indexer head",
+        ),
+    ],
+)
+@pytest.mark.usefixtures("no_dsa_kernel_dependency_check")
+def test_dsa_scorer_backend_rejects_unsupported_kpool_configs(overrides, message):
+    settings = dict(
+        dsa_indexer_kpool=4,
+        dsa_indexer_topk=8,
+        dsa_kernel_backend="cudnn",
+        dsa_indexer_scorer_backend="cudnn",
+    )
+    settings.update(overrides)
+    with pytest.raises(ValueError, match=message):
+        _make_dsa_kpool_config(**settings)
+
+
+@pytest.mark.parametrize("loss_coeff", [None, 0.0, -1.0])
+def test_dsa_kpool_frozen_selector_accepts_any_loss_flavor(loss_coeff):
+    config = _make_dsa_kpool_config(
+        dsa_indexer_kpool=4, dsa_indexer_topk=8, dsa_indexer_loss_coeff=loss_coeff
+    )
+    assert config.dsa_indexer_kpool == 4
+
+
+@pytest.mark.parametrize(
+    "recompute",
+    [
+        dict(),
+        dict(recompute_granularity="selective", recompute_modules=["layernorm"]),
+        dict(recompute_granularity="selective", recompute_modules=["mlp"]),
+    ],
+)
+def test_dsa_kpool_trainable_selector_accepts_sparse_loss(recompute):
+    config = _make_dsa_kpool_config(
+        dsa_indexer_kpool=4,
+        dsa_indexer_topk=8,
+        dsa_indexer_loss_coeff=0.01,
+        dsa_indexer_use_sparse_loss=True,
+        **recompute,
+    )
+    assert config.dsa_indexer_loss_coeff == 0.01
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        # The dense KPool loss stays rejected; the message keeps its historical wording.
+        (dict(dsa_indexer_use_sparse_loss=False), "indexer loss is not supported"),
+        (dict(dsa_indexer_kpool_use_quantization=True), "does not support FP8 KPool scoring"),
+        (
+            dict(recompute_granularity="full", recompute_method="uniform", recompute_num_layers=1),
+            "does not support recompute_granularity='full'",
+        ),
+        (
+            dict(recompute_granularity="selective", recompute_modules=["core_attn"]),
+            "does not support selective recompute of 'core_attn'",
+        ),
+        (dict(recompute_granularity="selective"), "selective recompute of 'core_attn'"),
+    ],
+)
+def test_dsa_kpool_trainable_selector_rejects_unsupported_configs(overrides, message):
+    settings = dict(
+        dsa_indexer_kpool=4,
+        dsa_indexer_topk=8,
+        dsa_indexer_loss_coeff=0.01,
+        dsa_indexer_use_sparse_loss=True,
+    )
+    settings.update(overrides)
+    with pytest.raises(ValueError, match=message):
+        _make_dsa_kpool_config(**settings)
+
+
+def test_dsa_kpool_trainable_selector_rejects_full_iteration_graphs():
+    with pytest.raises(ValueError, match="does not support cuda_graph_impl='full_iteration'"):
+        _make_dsa_kpool_config(
+            dsa_indexer_kpool=4,
+            dsa_indexer_topk=8,
+            dsa_indexer_loss_coeff=0.01,
+            dsa_indexer_use_sparse_loss=True,
+            cuda_graph_impl="full_iteration",
+        )
+
+
+@pytest.mark.parametrize("loss", [dict(), dict(dsa_indexer_loss_coeff=0.01)])
+def test_dsa_kpool_rejects_simplified_indexer(loss):
+    """The simplified indexer has no pools; KPool was silently ignored before this rule."""
+    with pytest.raises(ValueError, match="dsa_indexer_mode='simplified' does not support KPool"):
+        _make_dsa_kpool_config(
+            dsa_indexer_kpool=4,
+            dsa_indexer_topk=8,
+            dsa_indexer_mode="simplified",
+            dsa_indexer_use_sparse_loss=True,
+            num_query_groups=1,
+            **loss,
+        )
+
+
 def test_per_token_cudnn_still_rejects_fp32_weights_projection():
     with pytest.raises(ValueError, match="for per-token DSA"):
         _make_dsa_kpool_config(
@@ -282,6 +429,25 @@ def test_hybrid_gdn_does_not_require_gpt_layer_frequency():
         experimental_attention_variant="gated_delta_net",
     )
     assert config.linear_attention_freq is None
+
+
+def test_mla_default_kv_channels_follows_the_mla_query_head_dim():
+    """MLA heads need not divide hidden_size, so the default cannot be that quotient."""
+    from megatron.core.transformer.transformer_config import MLATransformerConfig
+
+    config = MLATransformerConfig(
+        num_layers=1,
+        hidden_size=7168,
+        num_attention_heads=96,
+        qk_head_dim=128,
+        qk_pos_emb_head_dim=64,
+    )
+    assert config.kv_channels == 192
+
+
+def test_non_mla_default_kv_channels_is_hidden_size_per_head():
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+    assert config.kv_channels == 32
 
 
 @pytest.mark.parametrize(
@@ -423,7 +589,15 @@ def test_mhc_fused_backend_defaults_to_auto():
     assert config.mhc_fused_backend == "auto"
 
 
-@pytest.mark.parametrize("flag", ["mhc_norm_eps_inside_sqrt", "mhc_keep_mappings_in_fp32"])
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "mhc_norm_eps_inside_sqrt",
+        "mhc_normalize_before_projection",
+        "mhc_keep_mappings_in_fp32",
+        "mhc_keep_pre_in_fp32",
+    ],
+)
 def test_mhc_fused_rejects_unsupported_precision_at_construction(flag):
     with pytest.raises(ValueError, match="use_fused_mhc does not support"):
         TransformerConfig(

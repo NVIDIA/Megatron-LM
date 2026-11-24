@@ -1039,10 +1039,12 @@ def _dsa_indexer_flops(
     Multiply ``token_linear`` by the real token count and ``core`` by
     ``sum_i(L_i ** 2)``.
 
-    With KPool (``dsa_indexer_kpool > 1``) the indexer is forward only and
-    scores complete key pools plus a per-token gate; that case delegates to the
-    shared counter in ``megatron.training.logging.dsa_flops``, which needs the
-    batch statistics ``total_tokens`` and ``seqlen_squared_sum``.
+    With KPool (``dsa_indexer_kpool > 1``) the indexer scores complete key pools
+    plus a per-token gate: forward only when frozen, and with the backward of
+    the sparse pool-level loss when trained (KPool rejects the dense loss);
+    that case delegates to the shared counter in
+    ``megatron.training.logging.dsa_flops``, which needs the batch statistics
+    ``total_tokens`` and ``seqlen_squared_sum``.
     """
     if dsa_indexer_kpool > 1:
         return _dsa_kpool_indexer_flops(
@@ -1111,24 +1113,26 @@ def _num_dsa_indexer_layers(
     *,
     mtp_num_layers=0,
     mtp_use_repeated_layer=False,
+    mtp_shares_sparse_attention_index=False,
 ):
     """Count DSA indexer executions on the standard-model path.
 
     Cross-layer top-k sharing is tied to the physical layer number, so repeated
-    MTP either executes its one indexer ``D`` times or reuses top-k ``D`` times.
+    MTP normally executes its one indexer ``D`` times. When repeated MTP shares
+    its sparse-attention index, only depth 0 executes the indexer.
     """
 
     def computes_index(layer_number):
         return not is_dsa_skip_topk_layer(layer_number, skip_topk_offset or 0, topk_freq or 1)
 
-    return sum(
-        computes_index(layer_number)
-        for layer_number in _standard_layer_numbers_for_execution(
-            num_decoder_layers,
-            mtp_num_layers=mtp_num_layers,
-            mtp_use_repeated_layer=mtp_use_repeated_layer,
-        )
+    layer_numbers = _standard_layer_numbers_for_execution(
+        num_decoder_layers,
+        mtp_num_layers=mtp_num_layers,
+        mtp_use_repeated_layer=mtp_use_repeated_layer,
     )
+    if mtp_use_repeated_layer and mtp_num_layers > 0 and mtp_shares_sparse_attention_index:
+        layer_numbers = layer_numbers[: num_decoder_layers + 1]
+    return sum(computes_index(layer_number) for layer_number in layer_numbers)
 
 
 def _vision_flops_stats_tensor(reference: torch.Tensor | None = None) -> torch.Tensor:
@@ -1940,6 +1944,7 @@ def num_floating_point_operations(
         conv_kernel_dim=4,
         f_lora_rank=None,
         gate_lora_rank=None,
+        two_stage_gates=False,
     ):
         """Calculate projection FLOPs for a Kimi Delta Attention layer."""
         if num_qk_heads != num_v_heads or qk_head_dim != v_head_dim:
@@ -1948,6 +1953,15 @@ def num_floating_point_operations(
             )
         qk_dim = qk_head_dim * num_qk_heads
         v_dim = v_head_dim * num_v_heads
+        if two_stage_gates:
+            # GLM two-stage gates are low-rank F-decay and output gates whose latent width is
+            # the head dimension, behind a Q/K/V-only input projection.
+            if f_lora_rank is not None or gate_lora_rank is not None:
+                raise ValueError(
+                    "KDA two-stage gates cannot be combined with kda_f_lora_rank / "
+                    "kda_gate_lora_rank."
+                )
+            f_lora_rank, gate_lora_rank = qk_head_dim, v_head_dim
         f_projection_flops = hidden_size * qk_dim
         if f_lora_rank is not None:
             if f_lora_rank <= 0:
@@ -2074,6 +2088,7 @@ def num_floating_point_operations(
         kda_conv_kernel_dim=4,
         kda_f_lora_rank=None,
         kda_gate_lora_rank=None,
+        kda_two_stage_gates=False,
         vocab_size=256000,
         mtp_num_layers=0,
         mtp_loss_type="cross_entropy",
@@ -2210,9 +2225,9 @@ def num_floating_point_operations(
                 dsa_indexer_kpool=dsa_indexer_kpool,
             )
             # The indexer carries its own forward/backward factor (forward only
-            # unless its KL loss is on; KPool requires the loss off, so it is
-            # forward only there), so it is added after the global factor 3
-            # below rather than inside it.
+            # unless its KL loss is on; with KPool only the sparse KL is
+            # allowed), so it is added after the global factor 3 below rather
+            # than inside it.
             dsa_indexer_flops_total = (
                 indexer_token_linear * total_tokens + indexer_core * seqlen_squared_sum
             )
@@ -2229,6 +2244,7 @@ def num_floating_point_operations(
                 kda_conv_kernel_dim,
                 kda_f_lora_rank,
                 kda_gate_lora_rank,
+                kda_two_stage_gates,
             )
 
         attn_res_flops_total = 0
@@ -2356,6 +2372,11 @@ def num_floating_point_operations(
         else:
             mtp_num_layers = 0
             num_layers = transformer_cfg.num_layers
+
+        mtp_use_repeated_layer = getattr(transformer_cfg, "mtp_use_repeated_layer", False)
+        mtp_shared_components = frozenset(
+            getattr(transformer_cfg, "mtp_repeated_layer_shared_components", None) or ()
+        )
 
         moe_ffn_hidden_size = (
             transformer_cfg.moe_ffn_hidden_size
@@ -2504,6 +2525,7 @@ def num_floating_point_operations(
         dsv4_hybrid_extra_core_term = 0
         dsa_extra_term = 0
         dsa_extra_core_term = 0
+        dsa_repeated_mtp_saved_term = 0
         if is_linear_attention_variant(transformer_cfg.experimental_attention_variant):
             # The attention pattern describes only the main decoder layers.
             if isinstance(transformer_cfg.linear_attention_freq, int):
@@ -2548,6 +2570,7 @@ def num_floating_point_operations(
                     num_qk_heads=transformer_cfg.linear_num_key_heads,
                     num_v_heads=transformer_cfg.linear_num_value_heads,
                     conv_kernel_dim=transformer_cfg.linear_conv_kernel_dim,
+                    two_stage_gates=getattr(transformer_cfg, "kda_two_stage_gates", False),
                 )
             elif is_gated_delta_net_variant(transformer_cfg.experimental_attention_variant):
                 # Calculate the FLOPs for the gated delta net attention.
@@ -2687,7 +2710,10 @@ def num_floating_point_operations(
                     transformer_cfg.dsa_indexer_skip_topk_offset,
                     transformer_cfg.dsa_indexer_topk_freq,
                     mtp_num_layers=mtp_num_layers,
-                    mtp_use_repeated_layer=getattr(transformer_cfg, "mtp_use_repeated_layer", False),
+                    mtp_use_repeated_layer=mtp_use_repeated_layer,
+                    mtp_shares_sparse_attention_index=(
+                        "sparse_attention_index" in mtp_shared_components
+                    ),
                 ),
                 dsa_indexer_loss_enabled=(transformer_cfg.dsa_indexer_loss_coeff or 0.0) > 0,
                 dsa_indexer_use_sparse_loss=getattr(transformer_cfg, "dsa_indexer_use_sparse_loss", False),
@@ -2697,6 +2723,22 @@ def num_floating_point_operations(
                 dsa_indexer_topk=transformer_cfg.dsa_indexer_topk,
                 dsa_indexer_kpool=dsa_indexer_kpool,
             )
+            if mtp_use_repeated_layer and "latent_kv" in mtp_shared_components:
+                # Later depths reuse the normalized, post-RoPE latent KV from depth 0.
+                # They still execute the absorbed K/V up-projection work on their query
+                # and attention output. Runtime also skips key RoPE and communication,
+                # which this FLOPs model does not count; only the KV down projection and
+                # norm disappear from the modeled standard MLA token-linear term.
+                dsa_repeated_mtp_saved_term = (
+                    forward_backward_expansion_factor
+                    * fma_expansion_factor
+                    * max(mtp_num_layers - 1, 0)
+                    * (
+                        transformer_cfg.hidden_size
+                        * (transformer_cfg.kv_lora_rank + transformer_cfg.qk_pos_emb_head_dim)
+                        + transformer_cfg.kv_lora_rank
+                    )
+                )
         else:
             num_linear_attention_layers = 0
             linear_self_attn_term = 0
@@ -2709,6 +2751,7 @@ def num_floating_point_operations(
             + standard_self_attn_term * num_standard_attention_layers
             + dsv4_hybrid_extra_term
             + dsa_extra_term
+            - dsa_repeated_mtp_saved_term
         )
         # Core attention (L^2) FLOPs. Standard attention has a uniform per-layer
         # coefficient; DSv4 sparse attention varies by layer type and is pre-summed.
@@ -2954,6 +2997,7 @@ def num_floating_point_operations(
             gdn_use_gdn2=(transformer_cfg.experimental_attention_variant == "gdn2"),
             kda_f_lora_rank=getattr(transformer_cfg, "kda_f_lora_rank", None),
             kda_gate_lora_rank=getattr(transformer_cfg, "kda_gate_lora_rank", None),
+            kda_two_stage_gates=getattr(transformer_cfg, "kda_two_stage_gates", False),
             vocab_size=vocab_size,
             mtp_num_layers=mtp_num_layers,
             mtp_loss_type=getattr(transformer_cfg, "mtp_loss_type", "cross_entropy"),
@@ -5824,6 +5868,13 @@ def training_log(
                 dsa_transformer_cfg.dsa_indexer_topk_freq,
                 mtp_num_layers=dsa_transformer_cfg.mtp_num_layers,
                 mtp_use_repeated_layer=dsa_transformer_cfg.mtp_use_repeated_layer,
+                mtp_shares_sparse_attention_index=(
+                    "sparse_attention_index"
+                    in (
+                        getattr(dsa_transformer_cfg, "mtp_repeated_layer_shared_components", None)
+                        or ()
+                    )
+                ),
             )
         if dsa_transformer_cfg.csa_compress_ratios is not None and is_hybrid_model(cfg.model):
             tracked_layers, num_indexer_layers = _get_indexer_logging_layer_counts(cfg.model)

@@ -35,14 +35,16 @@ def test_mla_config_accepts_implemented_fused_rope_variants(rope_type):
 def test_forward_binds_dynamic_cp_singleton_before_projection(attention_cls, monkeypatch):
     static_group = SimpleNamespace(size=lambda: 4, rank=lambda: 0)
     singleton = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
+    tp_group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
     packed = PackedSeqParams(local_cp_size=1, cp_singleton_group=singleton)
     layer = SimpleNamespace(
         training=True,
         cache_mla_latents=False,
-        config=SimpleNamespace(cache_mla_latents=False),
-        pg_collection=SimpleNamespace(cp=static_group),
+        config=SimpleNamespace(cache_mla_latents=False, sequence_parallel=False),
+        pg_collection=SimpleNamespace(cp=static_group, tp=tp_group),
         _build_time_cp_group=static_group,
         offload_qkv_linear=False,
+        core_attention=SimpleNamespace(),
     )
 
     class ProjectionReached(Exception):
