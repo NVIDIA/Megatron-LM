@@ -158,6 +158,8 @@ wrong graph:
 - Activation recomputation, activation offloading, and paged stashing.
 - CUDA graphs, FP8/FP4 quantization, weight rematerialization, and delayed weight gradients.
 - Shortcut MoE, expert communication overlap, and FSDP wrappers.
+- MoE routing replay inside a recurrent region. MoE layers in the prefix or suffix
+  still execute once and can use routing replay.
 - Cached inference: attention KV caches and state-space caches need distinct state
   per logical loop, which is not implemented. Full-sequence evaluation without an
   inference context is supported.

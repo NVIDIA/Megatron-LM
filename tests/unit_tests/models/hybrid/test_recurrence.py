@@ -337,7 +337,12 @@ def model_factory():
     torch.manual_seed(123)
 
     def build(
-        pattern="-:*-:-", distribution="3:1", dtype=torch.float32, grad_fusion=False, **kwargs
+        pattern="-:*-:-",
+        distribution="3:1",
+        dtype=torch.float32,
+        grad_fusion=False,
+        config_overrides=None,
+        **kwargs,
     ):
         config = TransformerConfig(
             num_layers=get_hybrid_total_layer_count(pattern),
@@ -355,6 +360,7 @@ def model_factory():
             linear_value_head_dim=16,
             linear_num_key_heads=2,
             linear_num_value_heads=4,
+            **(config_overrides or {}),
         )
         return HybridModel(
             config=config,
@@ -368,6 +374,25 @@ def model_factory():
 
     yield build
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("pattern", ["-:*:E-:-", "-:E*:-"])
+def test_routing_replay_rejects_recurrent_moe(model_factory, pattern):
+    with pytest.raises(ValueError, match="Routing replay is not supported for recurrent MoE"):
+        model_factory(
+            pattern=pattern,
+            config_overrides={"num_moe_experts": 2, "moe_enable_routing_replay": True},
+        )
+
+
+def test_routing_replay_allows_moe_outside_recurrent_regions(model_factory, monkeypatch):
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    monkeypatch.setattr(RouterReplay, "global_router_replay_instances", [])
+    model_factory(
+        pattern="E:*-:E", config_overrides={"num_moe_experts": 2, "moe_enable_routing_replay": True}
+    )
+    assert len(RouterReplay.global_router_replay_instances) == 2
 
 
 def _inputs():

@@ -189,6 +189,13 @@ class HybridStack(MegatronModule):
                 raise ValueError("Hybrid recurrence requires a non-pipelined decoder stack")
             for layer_config in layer_config_list:
                 validate_recurrence_config(layer_config)
+            for start, end in self.recurrent_layer_ranges:
+                for layer_config in layer_config_list[start:end]:
+                    if (
+                        type(layer_config) is layer_utils.MoELayerConfig
+                        and layer_config.moe_enable_routing_replay
+                    ):
+                        raise ValueError("Routing replay is not supported for recurrent MoE layers")
         elif n_loops_distribution is not None:
             raise ValueError("n_loops_distribution requires recurrent_layer_ranges")
 
