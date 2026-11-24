@@ -203,6 +203,7 @@ def _snapshot_leaf(value: Any) -> Any:
         pytest.param(1, False, 1, 1, None, 1.0, False, False, "gdn", True, id="hybrid-gdn"),
         pytest.param(1, False, 1, 1, None, 1.0, True, False, "gdn2", False, id="gdn2-decoder"),
         pytest.param(1, False, 1, 1, None, 1.0, True, False, "gdn2", True, id="hybrid-gdn2"),
+        pytest.param(1, False, 1, 1, None, 0.0, False, False, "gdn2", False, id="gdn2-resident"),
         pytest.param(1, False, 1, 1, None, 0.0, False, False, "gdn", False, id="resident"),
         pytest.param(1, False, 1, 1, None, 0.5, True, True, "gdn", False, id="fused-norm"),
         pytest.param(2, True, 1, 1, None, 1.0, False, False, "gdn", False, id="tp-sp"),
