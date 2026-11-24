@@ -53,6 +53,20 @@ class _NoFinalizeManager:
         return 0, 0
 
 
+class _RequiredStateFinalizeManager(_GoodManager):
+    """finalize_async_saves keeps a required extra argument the trainer never passes."""
+
+    def finalize_async_saves(self, state, blocking=False, terminate=False):
+        pass
+
+
+class _BlockingOnlyFinalizeManager(_GoodManager):
+    """finalize_async_saves lacks terminate, which the trainer passes at shutdown."""
+
+    def finalize_async_saves(self, blocking=False):
+        pass
+
+
 class _TwoArgSaveManager(_GoodManager):
     """save needs two arguments, but the loop passes one context."""
 
@@ -74,6 +88,8 @@ def custom_module(monkeypatch):
     module.GoodManager = _GoodManager
     module.NoFinalizeManager = _NoFinalizeManager
     module.TwoArgSaveManager = _TwoArgSaveManager
+    module.RequiredStateFinalizeManager = _RequiredStateFinalizeManager
+    module.BlockingOnlyFinalizeManager = _BlockingOnlyFinalizeManager
     monkeypatch.setitem(sys.modules, _CUSTOM_MODULE, module)
     return module
 
@@ -129,6 +145,8 @@ class TestCreateCheckpointManager:
             ("megatron.training._missing_module_for_test.Manager", ImportError),
             (f"{_CUSTOM_MODULE}.NoFinalizeManager", TypeError),
             (f"{_CUSTOM_MODULE}.TwoArgSaveManager", TypeError),
+            (f"{_CUSTOM_MODULE}.RequiredStateFinalizeManager", TypeError),
+            (f"{_CUSTOM_MODULE}.BlockingOnlyFinalizeManager", TypeError),
         ],
     )
     def test_invalid_custom_class_is_rejected(self, custom_module, target, error):

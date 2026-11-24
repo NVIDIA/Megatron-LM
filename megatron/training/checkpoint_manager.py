@@ -327,6 +327,17 @@ def create_checkpoint_manager(checkpoint_config: "CheckpointConfig") -> Checkpoi
             f"Custom checkpoint manager '{target}': save and load must each accept one context "
             "argument."
         ) from e
+    try:
+        # Both shapes the trainer uses: per-iteration polling and shutdown.
+        finalize_signature = inspect.signature(manager_class.finalize_async_saves)
+        finalize_signature.bind(None, blocking=False)
+        finalize_signature.bind(None, blocking=True, terminate=True)
+    except (TypeError, ValueError) as e:
+        raise TypeError(
+            f"Custom checkpoint manager '{target}': finalize_async_saves must accept the "
+            "keyword arguments blocking and terminate (called as finalize_async_saves(blocking=False) "
+            "and finalize_async_saves(blocking=True, terminate=True))."
+        ) from e
     return manager_class(checkpoint_config)
 
 
