@@ -18,6 +18,7 @@ from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import Yar
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.hybrid import HybridLayerEntry
 from megatron.core.models.hybrid.layers import utils as layer_utils
+from megatron.core.models.hybrid.loop_conditioning import LoopConditioningConfig
 from megatron.core.models.hybrid.recurrence import (
     LoopDistribution,
     validate_loop_count,
@@ -179,6 +180,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         inference_n_loops (int, optional): Fixed loop count used in both evaluation and
             inference (model.eval()). None uses the largest training-distribution count.
             Does not affect training. Forward's n_loops takes precedence.
+        loop_conditioning_config (LoopConditioningConfig, optional): Dimensions and fixed
+            reference budget for a loop-conditioned stack spec. Defaults to that spec's
+            standard configuration. Ordinary specs do not accept conditioning settings.
     """
 
     def __init__(
@@ -208,6 +212,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         hybrid_layer_config_list: Optional[Sequence[HybridLayerEntry]] = None,
         n_loops_distribution: str | None = None,
         inference_n_loops: int | None = None,
+        loop_conditioning_config: LoopConditioningConfig | None = None,
     ) -> None:
         if vocab_size is None or max_sequence_length is None:
             raise ValueError("vocab_size and max_sequence_length must be provided.")
@@ -600,6 +605,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             hash_moe_layer_threshold=hash_moe_layer_threshold or None,
             name="decoder",
             **(
+                {"loop_conditioning_config": loop_conditioning_config}
+                if loop_conditioning_config is not None
+                else {}
+            ),
+            **(
                 dict(
                     recurrent_layer_ranges=self.recurrent_layer_ranges,
                     n_loops_distribution=n_loops_distribution,
@@ -608,6 +618,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 else {}
             ),
         )
+
+        self.loop_conditioning_config = getattr(self.decoder, "loop_conditioning_config", None)
 
         # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
         if self.mtp_process:

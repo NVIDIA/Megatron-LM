@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Adaptive-delta region updates from ELR, without loop-conditioned modulation."""
+"""Adaptive-delta region updates from ELR."""
 
 from collections.abc import Iterable, MutableMapping
 
@@ -47,14 +47,22 @@ class AdaptiveDeltaGate(MegatronModule):
         for parameter in self.parameters():
             parameter.sequence_parallel = config.sequence_parallel
 
-    def forward(self, previous_state: Tensor, candidate: Tensor, loop_input: Tensor) -> Tensor:
-        """Apply the adaptive update without detaching any recurrent gradient path."""
-        beta = torch.sigmoid(self.beta_proj(loop_input).float()) * F.softplus(
-            self.base_alpha_raw.float()
-        )
-        return (previous_state.float() + beta * (candidate.float() - previous_state.float())).to(
-            previous_state.dtype
-        )
+    def forward(
+        self,
+        previous_state: Tensor,
+        candidate: Tensor,
+        loop_input: Tensor,
+        *,
+        update_scale: Tensor | float = 1.0,
+    ) -> Tensor:
+        """Apply the update with an optional explicit loop-dependent exit factor."""
+        beta = torch.sigmoid(
+            self.beta_proj(loop_input.to(self.beta_proj.weight.dtype)).float()
+        ) * F.softplus(self.base_alpha_raw.float())
+        return (
+            previous_state.float()
+            + update_scale * beta * (candidate.float() - previous_state.float())
+        ).to(previous_state.dtype)
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Save replicated parameters; explicitly initialize them on ungated imports."""

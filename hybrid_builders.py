@@ -5,6 +5,10 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.training import print_rank_0
+from megatron.training.argument_utils import (
+    _hybrid_inference_stack_spec,
+    _loop_conditioning_config_from_args,
+)
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.global_vars import get_run_config
 from model_provider import count_parameters_in_layer
@@ -20,7 +24,11 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
         config = core_transformer_config_from_args(args, TransformerConfig)
 
     if config.transformer_impl == "inference_optimized":
-        hybrid_stack_spec = hybrid_inference_stack_spec
+        hybrid_stack_spec = (
+            _hybrid_inference_stack_spec(args.spec, wide_residual=config.wide_residual is not None)
+            if args.spec is not None
+            else None
+        ) or hybrid_inference_stack_spec
         assert (
             not config.inference_fuse_tp_communication
         ), "inference_fuse_tp_communication is not supported for HybridModel"
@@ -40,6 +48,7 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
         hybrid_layer_pattern=args.hybrid_layer_pattern,
         n_loops_distribution=getattr(args, "n_loops_distribution", None),
         inference_n_loops=getattr(args, "inference_n_loops", None),
+        loop_conditioning_config=_loop_conditioning_config_from_args(args, hybrid_stack_spec),
         pre_process=pre_process,
         post_process=post_process,
         fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,

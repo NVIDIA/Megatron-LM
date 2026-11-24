@@ -817,13 +817,22 @@ def validate_args(args, defaults={}):
         if args.use_torch_fsdp2 or args.use_megatron_fsdp:
             raise ValueError("Hybrid recurrence does not yet support FSDP; use Megatron DDP")
 
-    if getattr(args, "init_recurrence_gates", False):
-        if not (args.load or args.pretrained_checkpoint):
-            raise ValueError("--init-recurrence-gates requires --load or --pretrained-checkpoint")
-        if not (args.finetune or args.no_load_optim):
-            raise ValueError("--init-recurrence-gates requires --finetune or --no-load-optim")
-        if not parse_hybrid_pattern(args.hybrid_layer_pattern).recurrent_layer_ranges:
-            raise ValueError("--init-recurrence-gates requires ':' recurrence boundaries")
+    from megatron.core.models.hybrid.loop_conditioning import LoopConditioningConfig
+
+    LoopConditioningConfig(
+        getattr(args, "loop_conditioning_dim", 256),
+        getattr(args, "loop_conditioning_rank", 256),
+        getattr(args, "loop_conditioning_max_loops", 4),
+    )
+    for flag in ("init_recurrence_gates", "init_loop_conditioning"):
+        if getattr(args, flag, False):
+            option = "--" + flag.replace("_", "-")
+            if not (args.load or args.pretrained_checkpoint):
+                raise ValueError(f"{option} requires --load or --pretrained-checkpoint")
+            if not (args.finetune or args.no_load_optim):
+                raise ValueError(f"{option} requires --finetune or --no-load-optim")
+            if not parse_hybrid_pattern(args.hybrid_layer_pattern).recurrent_layer_ranges:
+                raise ValueError(f"{option} requires ':' recurrence boundaries")
 
     # === End of hybrid layer pattern: deprecation handling and validation ===
 
@@ -3558,6 +3567,16 @@ def _add_experimental_args(parser):
                        help="Loop count for whenever the model is in eval mode (e.g., inference "
                        "and evaluation). Defaults to the largest training-distribution count from "
                        "`--n-loops-distribution` when omitted.")
+    group.add_argument("--loop-conditioning-dim", type=int, default=256,
+                       help="Even conditioning/embedding width for a loop-conditioned spec.")
+    group.add_argument("--loop-conditioning-rank", type=int, default=256,
+                       help="Low-rank input-correction dimension for a loop-conditioned spec.")
+    group.add_argument("--loop-conditioning-max-loops", type=int, default=4,
+                       help="Fixed reference budget K in k/K. Does not change with the loop "
+                       "distribution and is not a hard inference-depth limit.")
+    group.add_argument("--init-loop-conditioning", action="store_true",
+                       help="Import a checkpoint without loop-conditioning parameters into a "
+                       "conditioned spec; requires --finetune or --no-load-optim.")
     group.add_argument("--init-recurrence-gates", action="store_true",
                        help="Import an ungated checkpoint into an adaptive-delta gated spec. "
                        "Initializes only the new gate parameters; requires --finetune or "

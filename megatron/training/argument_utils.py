@@ -718,6 +718,19 @@ def _hybrid_inference_stack_spec(spec: list[str], wide_residual: bool) -> Module
     return None
 
 
+def _loop_conditioning_config_from_args(args, stack_spec):
+    """Bind scalar conditioning settings only to an explicitly conditioned recipe."""
+    from megatron.core.models.hybrid.loop_conditioning import LoopConditioningConfig
+
+    values = (
+        getattr(args, "loop_conditioning_dim", 256),
+        getattr(args, "loop_conditioning_rank", 256),
+        getattr(args, "loop_conditioning_max_loops", 4),
+    )
+    enabled = getattr(getattr(stack_spec, "submodules", None), "loop_conditioning", None) is not None
+    return LoopConditioningConfig(*values) if enabled or values != (256, 256, 4) else None
+
+
 def hybrid_config_from_args(
     args: Namespace,
     config: TransformerConfig | None = None,
@@ -772,6 +785,9 @@ def hybrid_config_from_args(
     kwargs["hybrid_layer_pattern"] = args.hybrid_layer_pattern
     kwargs["n_loops_distribution"] = getattr(args, "n_loops_distribution", None)
     kwargs["inference_n_loops"] = getattr(args, "inference_n_loops", None)
+    kwargs["loop_conditioning_config"] = _loop_conditioning_config_from_args(
+        args, kwargs.get("hybrid_stack_spec")
+    )
     kwargs["position_embedding_type"] = args.position_embedding_type
     kwargs["rotary_percent"] = args.rotary_percent
     kwargs["rotary_base"] = args.rotary_base

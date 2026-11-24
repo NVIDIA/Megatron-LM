@@ -28,9 +28,11 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
 )
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
+from megatron.core.models.hybrid.loop_conditioning import LoopConditioningConfig
 from megatron.core.models.hybrid.recurrence import (
     LoopDistribution,
     recurrent_layer_indices,
+    validate_loop_count,
     validate_recurrence_config,
 )
 from megatron.core.models.hybrid.shortcut_block import (
@@ -94,6 +96,8 @@ class HybridStackSubmodules:
     mtp_block_spec: ModuleSpec | None = None
     mtp_stack_submodules: "HybridStackSubmodules | None" = None
     recurrence_gate: ModuleSpec | None = None
+    loop_conditioning: ModuleSpec | None = None
+    unconditioned_submodules: Optional["HybridStackSubmodules"] = None
 
 
 class HybridStack(MegatronModule):
@@ -151,6 +155,7 @@ class HybridStack(MegatronModule):
         boundary_layout: CPLayout | None = None,
         recurrent_layer_ranges: tuple[tuple[int, int], ...] = (),
         n_loops_distribution: str | None = None,
+        loop_conditioning_config: LoopConditioningConfig | None = None,
     ) -> None:
         """
         Args:
@@ -268,9 +273,38 @@ class HybridStack(MegatronModule):
                 tp_group=self.tp_group,
                 tp_cp_group=self.tp_cp_group,
             )
-        # Build layers from the pre-selected segment
+        self.loop_conditioning = None
+        self.loop_conditioning_config = None
+        if submodules.loop_conditioning is not None:
+            if submodules.recurrence_gate is None or submodules.unconditioned_submodules is None:
+                raise ValueError("Loop conditioning requires an adaptive gate and prefix recipes")
+            self.loop_conditioning_config = loop_conditioning_config or LoopConditioningConfig()
+            self.loop_conditioning = build_module(
+                submodules.loop_conditioning,
+                config=config,
+                pg_collection=pg_collection,
+                conditioning_config=self.loop_conditioning_config,
+                num_regions=len(self.recurrent_layer_ranges),
+            )
+        elif loop_conditioning_config is not None:
+            raise ValueError("loop_conditioning_config requires a loop-conditioned stack spec")
+
+        def build_layer(spec, **kwargs):
+            if self.loop_conditioning is not None and i >= self.recurrent_layer_ranges[0][0]:
+                if not getattr(getattr(spec, "module", spec), "supports_loop_conditioning", False):
+                    raise ValueError("The selected layer recipe does not support loop conditioning")
+                kwargs["loop_conditioning_config"] = self.loop_conditioning_config
+            return build_module(spec, **kwargs)
+
+        # Build layers from the pre-selected segment, leaving the prefix ordinary.
         self.layers = nn.ModuleList()
+        stack_submodules = submodules
         for i, layer_config in enumerate(self.layer_config_list):
+            submodules = (
+                stack_submodules.unconditioned_submodules
+                if self.loop_conditioning is not None and i < self.recurrent_layer_ranges[0][0]
+                else stack_submodules
+            )
             layer_number = i + 1 + pp_layer_offset
             if layer_config.fp8:
                 quant_init_context = get_fp8_context(
@@ -305,7 +339,7 @@ class HybridStack(MegatronModule):
                         raise ValueError("Custom layers must retain the supplied tp_group.")
                 elif type(layer_config) is layer_utils.MambaLayerConfig:
                     self._assert_submodule_configured(submodules, "mamba_layer")
-                    layer = build_module(
+                    layer = build_layer(
                         submodules.mamba_layer,
                         config=layer_config,
                         layer_number=layer_number,
@@ -316,7 +350,7 @@ class HybridStack(MegatronModule):
                     )
                 elif type(layer_config) is layer_utils.AttentionLayerConfig:
                     self._assert_submodule_configured(submodules, "attention_layer")
-                    layer = build_module(
+                    layer = build_layer(
                         submodules.attention_layer,
                         config=layer_config,
                         layer_number=layer_number,
@@ -328,7 +362,7 @@ class HybridStack(MegatronModule):
                     )
                 elif type(layer_config) is layer_utils.DSALayerConfig:
                     self._assert_submodule_configured(submodules, "dsa_layer")
-                    layer = build_module(
+                    layer = build_layer(
                         submodules.dsa_layer,
                         config=layer_config,
                         layer_number=layer_number,
@@ -344,7 +378,7 @@ class HybridStack(MegatronModule):
                     )
                     self._assert_submodule_configured(submodules, csa_layer_spec_name)
                     csa_layer_spec = getattr(submodules, csa_layer_spec_name)
-                    layer = build_module(
+                    layer = build_layer(
                         csa_layer_spec,
                         config=layer_config,
                         layer_number=layer_number,
@@ -362,7 +396,7 @@ class HybridStack(MegatronModule):
                     )
                     self._assert_submodule_configured(submodules, mla_layer_spec_name)
                     mla_layer_spec = getattr(submodules, mla_layer_spec_name)
-                    layer = build_module(
+                    layer = build_layer(
                         mla_layer_spec,
                         config=layer_config,
                         layer_number=layer_number,
@@ -373,7 +407,7 @@ class HybridStack(MegatronModule):
                     )
                 elif type(layer_config) is layer_utils.MLPLayerConfig:
                     self._assert_submodule_configured(submodules, "mlp_layer")
-                    layer = build_module(
+                    layer = build_layer(
                         submodules.mlp_layer,
                         config=layer_config,
                         layer_number=layer_number,
@@ -384,7 +418,7 @@ class HybridStack(MegatronModule):
                     )
                 elif type(layer_config) is layer_utils.MoELayerConfig:
                     self._assert_submodule_configured(submodules, "moe_layer")
-                    layer = build_module(
+                    layer = build_layer(
                         submodules.moe_layer,
                         config=layer_config,
                         layer_number=layer_number,
@@ -402,7 +436,7 @@ class HybridStack(MegatronModule):
                     )
                     self._assert_submodule_configured(submodules, gdn_layer_spec_name)
                     gdn_layer_spec = getattr(submodules, gdn_layer_spec_name)
-                    layer = build_module(
+                    layer = build_layer(
                         gdn_layer_spec,
                         config=layer_config,
                         layer_number=layer_number,
@@ -415,7 +449,7 @@ class HybridStack(MegatronModule):
                     )
                 elif type(layer_config) is layer_utils.KDALayerConfig:
                     self._assert_submodule_configured(submodules, "kda_layer")
-                    layer = build_module(
+                    layer = build_layer(
                         submodules.kda_layer,
                         config=layer_config,
                         layer_number=layer_number,
@@ -445,6 +479,7 @@ class HybridStack(MegatronModule):
                 layer = HyperConnectionHybridLayer(config=layer_config, layer=layer)
             self.layers.append(layer)
 
+        submodules = stack_submodules
         if self.config.cuda_graph_impl == "local":
             annotate_first_last_layer(self.layers)
 
@@ -840,6 +875,11 @@ class HybridStack(MegatronModule):
         region_pass = 0
         gate_starts = getattr(self, "_gate_region_starts", {})
         gate_ends = getattr(self, "_gate_region_ends", {})
+        conditioner = getattr(self, "loop_conditioning", None)
+        conditions = None
+        if conditioner is not None:
+            validate_loop_count(n_loops)
+            conditions = [conditioner(index, n_loops) for index in range(n_loops)]
         with outer_fp8_context:
             if self.config.recompute_granularity == 'full' and self.training:
                 hidden_states = checkpointed_forward(
@@ -869,8 +909,21 @@ class HybridStack(MegatronModule):
                         loop_input = previous_state + region_input
                         # The gate must see the unmodified entry tensor even if a
                         # custom body uses in-place activation operations.
-                        hidden_states = loop_input.clone()
+                        prepared = (
+                            conditioner.regions[active_region].entry(
+                                loop_input, region_input, conditions[region_pass], region_pass
+                            )
+                            if conditioner is not None
+                            else loop_input
+                        )
+                        hidden_states = prepared.clone()
                         region_pass += 1
+                    layer_condition = None
+                    if conditions is not None:
+                        if active_region is not None:
+                            layer_condition = conditions[region_pass - 1]
+                        elif layer_idx >= recurrent_ranges[-1][1]:
+                            layer_condition = conditions[-1]
                     physical_layer_idx = self._execution_layer_indices[layer_idx]
                     layer_config = self._execution_layer_config_list[layer_idx]
                     layer = self.layers[layer_idx]
@@ -980,6 +1033,8 @@ class HybridStack(MegatronModule):
                                     is_custom_layer or self._uses_hash_routing(layer)
                                 ):
                                     layer_kwargs["input_ids"] = layer_input_ids
+                                if getattr(layer, "supports_loop_conditioning", False):
+                                    layer_kwargs["loop_condition"] = layer_condition
                                 hidden_states, _ = layer(hidden_states, **layer_kwargs)
                             elif isinstance(layer, MambaLayer):
                                 layer_kwargs = dict(
@@ -993,6 +1048,8 @@ class HybridStack(MegatronModule):
                                     layer_kwargs["residual_stream_recompute_context"] = (
                                         residual_stream_recompute_context
                                     )
+                                if getattr(layer, "supports_loop_conditioning", False):
+                                    layer_kwargs["loop_condition"] = layer_condition
                                 hidden_states = layer(hidden_states, **layer_kwargs)
                             else:  # Expert or MLP
                                 if residual_stream_recompute_context is not None:
@@ -1023,8 +1080,13 @@ class HybridStack(MegatronModule):
                         is_block_end=mhc_block_ends[layer_idx],
                     )
                     if layer_idx in gate_ends:
+                        gate_kwargs = {}
+                        if conditioner is not None:
+                            gate_kwargs["update_scale"] = conditioner.regions[active_region].exit(
+                                conditions[region_pass - 1], region_pass - 1
+                            )
                         hidden_states = self.recurrence_gates[active_region](
-                            previous_state, hidden_states, loop_input
+                            previous_state, hidden_states, loop_input, **gate_kwargs
                         )
                         previous_state = loop_input = None
                         if region_pass == n_loops:

@@ -17,6 +17,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
     wide_residual_hybrid_stack_spec,
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.hybrid.loop_conditioning import LoopConditioningConfig
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_stack_modelopt_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -64,6 +65,8 @@ class HybridModelConfig(ModelConfig):
     """Shared loop-count policy for all colon-delimited recurrent decoder regions."""
     inference_n_loops: int | None = None
     """Loop count for inference and evaluation. None uses the largest training loop count."""
+    loop_conditioning_config: LoopConditioningConfig | None = None
+    """Dimensions and reference budget for a static loop-conditioned stack spec."""
     seq_length: int = 8192
     """Learned position-table capacity and model metadata, passed as max_sequence_length;
     the launcher fills it from --max-position-embeddings. It does not limit RoPE inputs.
@@ -239,6 +242,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             hybrid_layer_pattern=self._model_config.hybrid_layer_pattern,
             n_loops_distribution=self._model_config.n_loops_distribution,
             inference_n_loops=self._model_config.inference_n_loops,
+            loop_conditioning_config=self._model_config.loop_conditioning_config,
             fp16_lm_cross_entropy=self._model_config.fp16_lm_cross_entropy,
             logit_dtype=self._model_config.logit_dtype,
             parallel_output=self._model_config.parallel_output,

@@ -2680,8 +2680,14 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('mtp_num_layers', force=True)
     _set_arg('mtp_use_repeated_layer', force=True)
 
-    # An explicit gated spec must win when importing a checkpoint with no gate parameters.
-    _set_arg('spec', force=not getattr(args, 'init_recurrence_gates', False))
+    # Explicit architecture choices win when initializing additional parameters.
+    _set_arg('spec', force=not (
+        getattr(args, 'init_recurrence_gates', False)
+        or getattr(args, 'init_loop_conditioning', False)
+    ))
+    if not getattr(args, 'init_loop_conditioning', False):
+        for name in ('loop_conditioning_dim', 'loop_conditioning_rank', 'loop_conditioning_max_loops'):
+            _set_arg(name, force=True)
 
     _set_arg('num_experts', force=True)
     _set_arg('mtp_num_layers', force=True)
@@ -2865,6 +2871,22 @@ def _maybe_setup_gpt_to_hybrid_load(
         + ('; optimizer state will be loaded.' if load_optim else '; optimizer state starts fresh.')
     )
     return layer_maps, load_optim
+
+
+def _validate_loop_conditioning_import(model, args, ckpt_format, loading_optimizer):
+    """Validate explicit imports that add conditioning parameters and split fused norms."""
+    if not getattr(args, "init_loop_conditioning", False):
+        return
+    from megatron.core.models.hybrid.loop_conditioning import LoopConditioner
+
+    if ckpt_format not in ("torch", "torch_dist"):
+        raise ValueError("--init-loop-conditioning supports only persistent torch/torch_dist checkpoints")
+    if getattr(args, "ckpt_assume_constant_structure", False):
+        raise ValueError("Remove --ckpt-assume-constant-structure: conditioning changes checkpoint structure")
+    if getattr(args, "load_main_params_from_ckpt", False) or loading_optimizer:
+        raise ValueError("Adding loop conditioning changes the optimizer parameter layout; use --no-load-optim")
+    if not any(isinstance(module, LoopConditioner) for root in model for module in root.modules()):
+        raise ValueError("--init-loop-conditioning requires a loop-conditioned model spec")
 
 
 def _validate_recurrence_gate_import(
@@ -3151,6 +3173,14 @@ def load_checkpoint(
         validate_glu_layout(state_dict, release)
 
     init_recurrence_gates = getattr(args, "init_recurrence_gates", False)
+    init_loop_conditioning = getattr(args, "init_loop_conditioning", False)
+    _validate_loop_conditioning_import(
+        model, args, ckpt_format,
+        loading_optimizer=(
+            restore_training_state and optimizer is not None and not release
+            and (not args.finetune or gpt_compat_load_optim) and not args.no_load_optim
+        ),
+    )
     _validate_recurrence_gate_import(
         model,
         args,
@@ -3164,7 +3194,7 @@ def load_checkpoint(
         ),
     )
     if ckpt_format == "torch_dist" and (
-        init_recurrence_gates
+        init_recurrence_gates or init_loop_conditioning
         or any(hasattr(module, "recurrence_gates") for root in model for module in root.modules())
     ):
         from megatron.core.models.hybrid.recurrence_gate import (
@@ -3172,16 +3202,23 @@ def load_checkpoint(
             validate_ungated_checkpoint_keys,
         )
 
-        if init_recurrence_gates and ckpt_type == CheckpointType.LOCAL:
-            raise ValueError("--init-recurrence-gates requires a persistent checkpoint")
+        if (init_recurrence_gates or init_loop_conditioning) and ckpt_type == CheckpointType.LOCAL:
+            raise ValueError("Initializing recurrence parameters requires a persistent checkpoint")
         if ckpt_type != CheckpointType.LOCAL:
+            from megatron.core.models.hybrid.loop_conditioning import (
+                validate_loop_conditioning_checkpoint,
+                validate_unconditioned_checkpoint_keys,
+            )
             checkpoint_keys = dist_checkpointing.load_tensors_metadata(checkpoint_name)
             for root in model:
+                validate_loop_conditioning_checkpoint(root, checkpoint_keys)
                 validate_recurrence_gate_checkpoint(
                     root, checkpoint_keys, getattr(ckpt_args, "hybrid_layer_pattern", None)
                 )
             if init_recurrence_gates:
                 validate_ungated_checkpoint_keys(checkpoint_keys)
+            if init_loop_conditioning:
+                validate_unconditioned_checkpoint_keys(checkpoint_keys)
 
     if ckpt_format == 'torch_dist':
         if not hasattr(ckpt_args, 'tensor_model_parallel_size'):
@@ -3355,6 +3392,8 @@ def load_checkpoint(
         if init_recurrence_gates:
             # Load-only metadata: never localize the gate tensors when saving.
             model_sd_metadata["initialize_recurrence_gates"] = True
+        if init_loop_conditioning:
+            model_sd_metadata["initialize_loop_conditioning"] = True
         model_sd_kwargs = dict(metadata=model_sd_metadata)
 
         # Determine if rerun state will be loaded
@@ -3686,20 +3725,26 @@ def load_checkpoint(
             from contextlib import nullcontext
 
             load_ctx = nullcontext
+        from megatron.core.models.hybrid.loop_conditioning import (
+            initialize_loop_conditioning_state,
+            validate_loop_conditioning_checkpoint,
+        )
         from megatron.core.models.hybrid.recurrence_gate import (
             AdaptiveDeltaGate,
             initialize_recurrence_gate_state,
             validate_recurrence_gate_checkpoint,
         )
-
         unwrapped_module = unwrap_model(module)
+        validate_loop_conditioning_checkpoint(unwrapped_module, state_dict)
         if not init_recurrence_gates:
             validate_recurrence_gate_checkpoint(unwrapped_module, state_dict, gate_source_pattern)
-        if init_recurrence_gates or any(
+        if init_recurrence_gates or init_loop_conditioning or any(
             isinstance(child, AdaptiveDeltaGate) for child in unwrapped_module.modules()
         ):
             if init_recurrence_gates and ckpt_format == "torch":
                 initialize_recurrence_gate_state(unwrapped_module, state_dict)
+            if init_loop_conditioning and ckpt_format == "torch":
+                initialize_loop_conditioning_state(unwrapped_module, state_dict)
             # Only the explicitly initialized gate keys may be absent. Do not
             # fall back to a non-strict load for corrupt backbone or gate weights.
             with load_ctx():

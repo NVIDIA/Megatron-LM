@@ -160,15 +160,94 @@ residual width (no wide residuals or mHC). Even one gated pass differs from the
 ordinary decoder: its body receives `2*h`, and its output is mixed with `h`.
 One-loop adaptation training is therefore expected after conversion.
 
+## Loop-conditioned modulation
+
+Choose `loop_conditioned_adaptive_delta_hybrid_stack_spec` for the adaptive-delta
+gate together with ELR §3.3 conditioning. The GDP variant is
+`loop_conditioned_adaptive_delta_gated_delta_product_stack_spec`, with GDP in the
+`M` slot. Matching `_inference_stack_spec` variants support full-sequence,
+uncached evaluation with the inference-optimized implementation.
+
+```bash
+--spec megatron.core.models.hybrid.hybrid_layer_specs loop_conditioned_adaptive_delta_hybrid_stack_spec
+--hybrid-layer-pattern 'G-:G-*G-:G-'
+--n-loops-distribution '1:1,2:1,4:1'
+--loop-conditioning-dim 256
+--loop-conditioning-rank 256
+--loop-conditioning-max-loops 4
+```
+
+For pass `i` of `k`, using one-based indices, a shared two-layer SiLU MLP embeds
+progress `i/k` and budget `k/K`. Each scalar has a sinusoidal embedding of
+`loop_conditioning_dim` channels. `K` is `loop_conditioning_max_loops`, a fixed
+reference scale rather than an execution limit. Counts greater than `K` are
+allowed. Keep this reference fixed when changing the training distribution or
+evaluation depth; it is stored and validated in checkpoints. The embedding uses
+exponentially spaced frequencies from 1 to approximately 1/10,000 cycles per unit;
+the paper does not prescribe a frequency convention.
+
+The prefix is unconditioned. Every recurrent and suffix layer has its own linear
+modulation heads and low-rank projections, shared across that layer's passes. For
+a pre-normalized residual branch, the update is:
+
+```text
+c_i = MLP(concat(sinusoidal(i/k), sinusoidal(k/K)))
+z = (1 + lambda(c_i)) * Norm(x) + mu(c_i)
+y = z + A @ (g(c_i) * (B @ z))
+x_out = x + (1 + omega(c_i)) * f(y)
+```
+
+`Norm` retains the backbone's normalization and learned weights. `B` projects from
+hidden width to `loop_conditioning_rank`; `A` projects back. Scaling applies to
+the complete branch output, including any projection bias, before residual
+addition. Attention, MLP, MoE, and Mamba/GDP branches use the same rule. The supplied
+recipes separate fused normalization/projection modules to expose the normalized
+input. The final stack norm and vocabulary projection are unchanged.
+
+Each region also has independent entry and exit heads. With `h` denoting that
+region's original input and `u_i = s_(i-1) + h`:
+
+```text
+z_1 = u_1
+z_i = (1 + lambda_entry(c_i)) * RMSNorm(u_i)
+      + mu_entry(c_i) + eta(c_i) * h                 # i > 1
+r_i = body(z_i, c_i)
+beta_i = sigmoid(W_beta @ u_i + b_beta) * softplus(gamma)
+s_i = s_(i-1) + (pi_i + g_exit(c_i)) * beta_i * (r_i - s_(i-1))
+pi_1 = 1; pi_i = 0 for i > 1
+```
+
+The adaptive gate still sees the unmodulated `u_i`. Progress resets to `1/k` at
+each region, all regions share the same encoder and budget, and each body finishes
+all its passes before the next starts. The suffix uses `c_k`, corresponding to
+progress 1. MTP remains unconditioned and executes once.
+
+All modulation heads start at zero; the encoder and low-rank bases start with
+random weights. Consequently, the first pass reproduces the gate-only update,
+and later passes have zero exit factors. With dropout disabled, this initially
+reproduces the adapted one-loop function at every requested depth in exact
+arithmetic. Floating-point kernel changes can introduce rounding differences.
+Backpropagation includes every pass; later exit heads can learn immediately, and
+zero-gradient paths keep all conditioning parameters participating even at one
+loop. Conditioning tensors are call-local, not cached module state.
+
+Conditioning parameters are replicated across tensor-parallel ranks. Like
+Megatron's duplicated linear layers, CUDA initialization uses a shared RNG stream;
+CPU initialization uses the standard shared CPU seed. No parameter broadcast is
+needed. With sequence parallelism, the existing replicated-parameter gradient
+reduction applies. Frequencies remain FP32 under the standard Float16Module wrapper.
+At hidden width 3072, conditioning dimension/rank 256, one recurrent region, and
+24 recurrent plus 14 output layers, conditioning adds 155,627,520 parameters,
+matching the paper's rounded 155.6M figure.
+
 ## Restarting with a different policy
 
 Recurrence changes the execution schedule, not module registration. Each physical
-layer remains registered exactly once under `decoder.layers.<index>`. Ordinary
-and distributed state dictionaries have the same layer keys and tensor shapes as
-the corresponding pattern without colons. A non-recurrent checkpoint can therefore
-seed ordinary, ungated recurrent training without converting its weights or optimizer
-layout. Adding the optional adaptive-delta gate introduces new parameters and uses
-the explicit import procedure below.
+layer remains registered exactly once under `decoder.layers.<index>`. Without
+conditioning, backbone layer keys and tensor shapes match the corresponding
+pattern without colons. A non-recurrent checkpoint can therefore seed ordinary,
+ungated recurrent training without converting weights or optimizer layout. Adding
+gates or conditioning introduces new parameters and requires an explicit import.
 
 Specify the desired distribution on **every restart**, including when using
 `--use-checkpoint-args`. The distribution is a runtime policy, not a model weight,
@@ -232,6 +311,52 @@ callers must first validate source keys with `validate_ungated_checkpoint_keys`,
 then supply load-only metadata `initialize_recurrence_gates=True` when constructing
 the target sharded model state. Never use that metadata when saving.
 
+### Importing a gate-only checkpoint into a conditioned model
+
+Select the matching conditioned recipe and initialize only the new conditioning
+modules:
+
+```bash
+--load /path/to/gated-warmup/checkpoints
+--use-checkpoint-args
+--spec megatron.core.models.hybrid.hybrid_layer_specs loop_conditioned_adaptive_delta_hybrid_stack_spec
+--hybrid-layer-pattern 'G-:G-*G-:G-'
+--n-loops-distribution '1:1,2:1,4:1'
+--loop-conditioning-dim 256
+--loop-conditioning-rank 256
+--loop-conditioning-max-loops 4
+--init-loop-conditioning
+--finetune
+--save /path/to/conditioned/checkpoints
+```
+
+Persistent `torch` and `torch_dist` imports load the backbone and learned gates
+strictly. The ordinary importer remaps fused normalization weights into their
+separate modules; distributed tensor storage keys stay compatible. New norm
+auxiliary state is initialized, not backbone weights. Missing or incompatible
+backbone/gate tensors remain errors. With `--use-checkpoint-args`, the explicitly
+selected conditioned spec and conditioning dimensions take precedence for this
+import.
+
+Adding conditioning changes parameter registration and optimizer layout. The
+same fresh-optimizer requirements, scheduler/progress caveats, and restrictions
+on constant-structure/main-parameter imports as the gate import apply. Use
+`--finetune` or `--no-load-optim`. Add `--init-recurrence-gates` only if the source
+also lacks gates. A checkpoint that already contains conditioning rejects
+`--init-loop-conditioning`, protecting learned parameters from reinitialization.
+
+After saving, remove initialization flags and resume normally, preserving both
+gates and conditioning optimizer state. With `--use-checkpoint-args`, normal resume
+restores conditioning dimension, rank, and reference budget. A conditioned
+checkpoint cannot be silently loaded into an unconditioned recipe.
+
+Direct Core callers can apply `initialize_loop_conditioning_state(model, state)`
+from `megatron.core.models.hybrid.loop_conditioning` before a strict ordinary load
+and construct a fresh optimizer. Distributed callers first validate source keys
+with `validate_unconditioned_checkpoint_keys`, then construct the target state with
+load-only metadata `initialize_loop_conditioning=True`. Never use this metadata
+when saving.
+
 ## Initial scope
 
 The implementation supports multiple recurrent regions of different lengths with
@@ -255,6 +380,7 @@ wrong graph:
   per logical loop, which is not implemented. Full-sequence evaluation without an
   inference context is supported.
 
+Conditioned recipes additionally reject fused residual updates and cross-attention.
 MTP patterns after `/` retain their existing semantics and are not repeated.
 Unmarked HybridModel configurations retain their existing behavior. Throughput
 estimates based on unique layer counts do not include recurrent execution work.
@@ -265,8 +391,12 @@ estimates based on unique layer counts do not include recurrent execution work.
 uv run python -m torch.distributed.run --standalone --nproc-per-node 1 -m pytest -q \
   tests/unit_tests/models/hybrid/test_recurrence.py \
   tests/unit_tests/models/hybrid/test_recurrence_gate.py \
+  tests/unit_tests/models/hybrid/test_loop_conditioning.py \
   tests/unit_tests/ssm/test_hybrid_layer_allocation.py
 ```
+
+GDP backward kernels may require executable temporary storage for JIT compilation.
+If `/tmp` is mounted `noexec`, set `TMPDIR` to an executable scratch directory.
 
 Tests cover parsing, distribution validation, stateless step replay without changing
 global RNG state or using collectives, CLI-to-builder and training-step propagation,
@@ -289,3 +419,8 @@ independent layer and gate copies, gated DDP accumulation, and FP32 parameter
 retention. They cover explicit ordinary/distributed ungated imports, strict failure
 cases, ordinary optimizer continuation after a gated save, and both training
 checkpoint-loader formats. The existing ungated unroll tests are retained unchanged.
+Conditioning tests check the embedding/entry/exit/branch equations and gradients,
+zero-head imports at multiple depths, independent per-pass model copies, interleaved
+forward graphs, scope cleanup after exceptions, DDP accumulation, GDP and MoE
+backward participation, ordinary/distributed imports and resumes, optimizer
+continuation, reference-budget validation, and the Koi parameter count.
