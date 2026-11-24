@@ -114,8 +114,7 @@ current path avoids that redundant computation.
 
 **Communication-free groups.** Groups whose tensors all sit on one rank need no
 gather or scatter. They are spread evenly over the pipeline, the last one at the
-end, so their Newton–Schulz hides the transfers of the other groups, and each is
-applied right after its Newton–Schulz.
+end, so their Newton–Schulz hides the transfers of the other groups.
 
 ### TensorAtomic placement
 

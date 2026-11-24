@@ -55,6 +55,19 @@ class _FsdpGroupAssignment:
         )
 
 
+def _schedule(pipelines: list["_GroupPipeline"]) -> list["_GroupPipeline"]:
+    """Spread the groups that need no communication evenly over the others, the last at the end.
+
+    Their Newton-Schulz hides the transfers in flight, which the other groups' own may be too
+    short for.
+    """
+    free = [p for p in pipelines if not p.assignment.requires_communication]
+    comm = [p for p in pipelines if p.assignment.requires_communication]
+    positions = [(k + 1) / len(free) for k in range(len(free))]
+    positions += [(i + 0.5) / len(comm) for i in range(len(comm))]
+    return [p for _, p in sorted(zip(positions, free + comm), key=lambda item: item[0])]
+
+
 class _PipelineStage(Enum):
     """Host-side progress; a posted stage may still be executing on the GPU."""
 
@@ -312,28 +325,14 @@ class FsdpMuon(Muon):
         if closure is not None:
             raise ValueError("closure is not supported")
 
-        pipelines = [pipeline for pipeline in self._group_pipelines if pipeline.has_grad]
-
-        # Spread the "free" groups, which need no communication, evenly over the "comm" groups,
-        # the last one at the end: their Newton-Schulz hides the transfers in flight, which the
-        # comm groups' own may be too short for.
-        free = [
-            pipeline for pipeline in pipelines if not pipeline.assignment.requires_communication
-        ]
-        comm = [pipeline for pipeline in pipelines if pipeline.assignment.requires_communication]
-        positions = [(k + 1) / len(free) for k in range(len(free))]
-        positions += [(i + 0.5) / len(comm) for i in range(len(comm))]
-        pipelines = [
-            pipeline for _, pipeline in sorted(zip(positions, free + comm), key=lambda p: p[0])
-        ]
+        pipelines = _schedule([pipeline for pipeline in self._group_pipelines if pipeline.has_grad])
 
         # n = num_groups_in_flight; N: Newton-Schulz, G: gather, S: scatter, A: apply.
         #
         #   G(pipelines[:n]) | for each group i: G(i + n), N(i), S(i), A(i - n)
         #
-        # A free group has nothing to scatter and is applied at once. Each reusable pipeline owns
-        # its scratch until the corresponding stage has consumed it. Every rank posts transfers in
-        # the same order.
+        # Each reusable pipeline owns its scratch until the corresponding stage has consumed it.
+        # Every rank posts transfers in the same order.
         for pipeline in pipelines[: self.num_groups_in_flight]:
             pipeline.gather(self)
         for i, pipeline in enumerate(pipelines):
@@ -341,15 +340,10 @@ class FsdpMuon(Muon):
                 pipelines[i + self.num_groups_in_flight].gather(self)
             pipeline.orthogonalize(self)
             pipeline.scatter()
-            if not pipeline.assignment.requires_communication:
-                pipeline.apply_updates(self)
             if i >= self.num_groups_in_flight:
-                previous = pipelines[i - self.num_groups_in_flight]
-                if previous.assignment.requires_communication:
-                    previous.apply_updates(self)
+                pipelines[i - self.num_groups_in_flight].apply_updates(self)
         for pipeline in pipelines[max(0, len(pipelines) - self.num_groups_in_flight) :]:
-            if pipeline.assignment.requires_communication:
-                pipeline.apply_updates(self)
+            pipeline.apply_updates(self)
 
     def _compute_momentum_inputs(
         self, fsdp_group: FsdpParameterGroup, tensor_to_optimizer_group_index: dict[int, int]
