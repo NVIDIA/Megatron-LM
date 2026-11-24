@@ -12,7 +12,7 @@ sys.path.append(
 )
 
 from dataloader_provider import is_first_or_last_stage, train_valid_test_dataloaders_provider
-from model import model_provider
+from model import model_provider, resolve_multimodal_sequence_lengths
 from multimodal_args import add_multimodal_extra_args
 
 from megatron.core import parallel_state, tensor_parallel
@@ -33,6 +33,7 @@ from megatron.training.argument_utils import (
 )
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.global_vars import set_run_config
+from megatron.training.models import LLaVAModelConfig
 from megatron.training.training import (
     update_packed_sequence_stats,
     update_seqlen_stats_from_cu_seqlens,
@@ -55,6 +56,10 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
     Note: attn_mask_type in layer_specs.py sets the attention mask. Attention mask is None here.
     """
     cfg = get_run_config()
+    if not isinstance(cfg.model, LLaVAModelConfig):
+        raise TypeError(
+            f"Expected cfg.model to be LLaVAModelConfig, got {type(cfg.model).__name__}"
+        )
     imgs = None
     tokens = None
     labels = None
@@ -166,7 +171,7 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
         # FSDP can hang with text-only samples. A workaround is to run a valid dummy image through the vision
         # model and then add image embeddings with a zero multiplier.
         if isinstance(cfg.ddp, TorchFullyShardedDataParallelConfig):
-            imgs = torch.zeros((1, 3, args.img_h, args.img_w), dtype=torch.float32, device=data_text.device)
+            imgs = torch.zeros((1, 3, cfg.model.img_h, cfg.model.img_w), dtype=torch.float32, device=data_text.device)
         else:
             # Similar workaround is not needed without FSDP and we can use an empty image.
             # FIXME: text-only data can cause still cause a hang in the special case where
@@ -191,9 +196,9 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
             (cu_lengths_padded if cu_lengths_padded is not None else cu_lengths)[-1].item()
         )
 
-        # The shared throughput accumulator otherwise uses args.seq_length,
-        # which is the vision length in multimodal training rather than the
-        # packed decoder work. PP>1 does not yet have all-rank participation.
+        # Feed real packed lengths to the shared throughput accumulator; otherwise it
+        # estimates from the configured execution width. PP>1 does not yet have
+        # all-rank participation.
         if pp_size == 1:
             update_seqlen_stats_from_cu_seqlens(cu_lengths)
 
@@ -566,17 +571,22 @@ def write_online_eval_to_tensorboard(data, iteration, writer, walltime=None):
 
 if __name__ == "__main__":
 
-    train_valid_test_dataloaders_provider.is_distributed = True
-    train_valid_test_dataloaders_provider.supports_train_full_dataset = True
-
     args = parse_and_validate_args(
         extra_args_provider=add_multimodal_extra_args,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
     from megatron.training.argument_utils import model_config_from_args
-    from megatron.training.models import LLaVAModelConfig
 
+    resolve_multimodal_sequence_lengths(args)
     model_cfg = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
+    train_valid_test_dataloaders_provider = partial(
+        train_valid_test_dataloaders_provider,
+        sequence_length=args.dataloader_seq_length,
+        packing_sequence_length=args.packing_seq_length,
+        image_token_budget=args.seq_length,
+    )
+    train_valid_test_dataloaders_provider.is_distributed = True
+    train_valid_test_dataloaders_provider.supports_train_full_dataset = True
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(full_config)
     pretrain(

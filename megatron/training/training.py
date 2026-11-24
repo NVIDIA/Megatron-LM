@@ -58,6 +58,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    GradientFinalizationMode,
     RuntimePolicy,
     fully_shard_context,
 )
@@ -160,20 +161,20 @@ from megatron.training.checkpointing import (
 from megatron.training.config import TrainingConfig, ValidationConfig
 from megatron.training.config.container import PretrainConfigContainer
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
+from megatron.training.datasets.utils import get_training_data_sequence_length
 from megatron.training.initialize import (
     initialize_megatron,
     set_jit_fusion_options,
     write_args_to_tensorboard,
 )
 from megatron.training.kernel_warmup import warmup_training_kernels
-from megatron.training.logging.dsa_flops import dsa_indexer_flops, dsa_layer_flops
 
 # Retain the training.py import path used by existing multimodal callers.
 from megatron.training.logging.packed_sequence_stats import (
     consume_packed_sequence_stats_in_iteration,
     update_packed_sequence_stats,
 )
-from megatron.training.models import ModelConfig
+from megatron.training.models import ModelConfig, T5ModelConfig
 from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
 
 # Local.
@@ -222,7 +223,7 @@ _TensorMetricObserverCallback = Callable[..., None]
 try:
     from modelopt.torch.distill.plugins.megatron import get_tensor_shapes_adjust_fn_for_distillation
 
-    from megatron.post_training.utils import maybe_enable_modelopt
+    from megatron.post_training.utils import is_distillation_model
 
     has_nvidia_modelopt = True
 except ImportError:
@@ -824,62 +825,23 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
 
 
 def _dsv4_attention_flops(transformer_cfg, layer_counts, total_tokens, seqlen_squared_sum):
-    """Estimate DSv4 W/C/H attention FLOPs, including projections and compressors.
-
-    Uses the model-FLOPs convention: multiply/add counts as two
-    operations and forward plus backward as three passes. Window and capped
-    Top-K work are token-linear; HCA and indexer scoring use the real sequence
-    length squared sum. Packed Top-K saturation uses the token-weighted mean
-    length, since these batch statistics do not retain individual document lengths.
-    """
+    """Aggregate the layer-owned DSv4 estimates with the training multiplier."""
     from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+    from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+        DSv4HybridSelfAttention,
+    )
 
-    if total_tokens == 0:
-        return 0
-    window_layers = layer_counts[Symbols.WINDOW]
-    csa_layers = layer_counts[Symbols.CSA]
-    hca_layers = layer_counts[Symbols.HCA]
-    attention_layers = window_layers + csa_layers + hca_layers
-    hidden = transformer_cfg.hidden_size
-    heads = transformer_cfg.num_attention_heads
-    head_dim = transformer_cfg.v_head_dim
-    q_rank = transformer_cfg.q_lora_rank
-    output_rank = transformer_cfg.output_projection_lora_rank
-    output_groups = transformer_cfg.output_projection_groups
-    window = transformer_cfg.csa_window_size
-    sequence_length = seqlen_squared_sum / total_tokens
-
-    # Read v_head_dim directly: DSv4 derives qk_head_dim on the layer config,
-    # so the stack config may still carry the ordinary MLA default.
-    query_projection = q_rank * (hidden + heads * head_dim + 1)
-    kv_projection = hidden * head_dim + head_dim
-    output_projection = heads * head_dim * output_rank + output_groups * output_rank * hidden
-    token_term = attention_layers * (query_projection + kv_projection + output_projection)
-    token_term += attention_layers * heads * window * head_dim * 2
-
-    # Ratio-4 compression overlaps two windows; ratio-128 uses one.
-    token_term += csa_layers * hidden * (2 * head_dim) * 2
-    token_term += hca_layers * hidden * head_dim * 2
-    core_term = hca_layers * heads * head_dim / 128
-
-    if csa_layers:
-        if transformer_cfg.csa_dense_mode:
-            # Dense CSA attends to all compressed keys and has no indexer.
-            core_term += csa_layers * heads * head_dim / 4
-        else:
-            indexer_heads = transformer_cfg.dsa_indexer_n_heads
-            indexer_dim = transformer_cfg.dsa_indexer_head_dim
-            topk = min(transformer_cfg.dsa_indexer_topk, sequence_length // 4)
-            average_compressed_keys = topk * (1 - topk * 4 / (2 * sequence_length))
-            token_term += csa_layers * heads * average_compressed_keys * head_dim * 2
-            token_term += csa_layers * (
-                hidden * (2 * indexer_dim) * 2
-                + q_rank * indexer_heads * indexer_dim
-                + hidden * indexer_heads
+    forward = 0
+    for symbol, ratio in Symbols.DSV4_COMPRESS_RATIO_MAP.items():
+        if layer_counts[symbol]:
+            config = copy.copy(transformer_cfg)
+            config.compress_ratio = ratio
+            forward += layer_counts[symbol] * DSv4HybridSelfAttention.estimate_flops(
+                config,
+                total_real_tokens_in_batch=total_tokens,
+                seqlen_squared_sum_in_batch=seqlen_squared_sum,
             )
-            core_term += csa_layers * indexer_heads * indexer_dim / 4
-
-    return 6 * (token_term * total_tokens + core_term * seqlen_squared_sum)
+    return 3 * forward
 
 
 def num_floating_point_operations(
@@ -894,7 +856,8 @@ def num_floating_point_operations(
 
     Args:
         model_config: Model configuration containing the resolved TransformerConfig.
-        sequence_length: Actual data/decoder length, distinct from position capacity.
+        sequence_length: Actual input length, distinct from position capacity. T5 uses its
+            configured decoder length when present, preserving the existing FLOPs estimate.
         batch_size: Global batch size (samples per iteration). Only used to
             compute the default token counts for the BSHD path -- with THD
             both ``total_real_tokens_in_batch`` and ``seqlen_squared_sum_in_batch``
@@ -915,12 +878,22 @@ def num_floating_point_operations(
             CP-alignment padding or end-of-sequence padding, so neither kind of
             padding shows up in the reported FLOPs.
     """
+    from megatron.core.transformer.attention import SelfAttention
+    from megatron.core.transformer.mlp import MLP
+    from megatron.core.transformer.moe.moe_layer import MoELayer
+    from megatron.core.transformer.multi_latent_attention import MLASelfAttention
     from megatron.training.vocab_utils import model_vocab_size
 
     transformer_cfg = model_config.transformer
     llm_seq_length = sequence_length
+    if isinstance(model_config, T5ModelConfig) and model_config.decoder_seq_length is not None:
+        # Preserve T5's decoder-based estimate without exposing it to pipeline sizing.
+        llm_seq_length = model_config.decoder_seq_length
     group_query_attention = transformer_cfg.num_query_groups != transformer_cfg.num_attention_heads
-    swiglu = transformer_cfg.gated_linear_unit and transformer_cfg.activation_func is torch.nn.functional.silu
+    swiglu = (
+        transformer_cfg.gated_linear_unit
+        and transformer_cfg.activation_func is torch.nn.functional.silu
+    )
     vocab_size = model_vocab_size(
         model_config.vocab_size,
         should_pad_vocab=model_config.should_pad_vocab,
@@ -936,228 +909,155 @@ def num_floating_point_operations(
     if total_real_tokens_in_batch is None:
         total_real_tokens_in_batch = batch_size * llm_seq_length
 
-    def mlp_layer_flops(total_tokens, hidden_size, expansion=4.0, swiglu=False):
-        """Calculate FLOPs for an MLP layer."""
-        scale_factor = 3.0 / 2.0 if swiglu else 1.0
-        return 4 * expansion * scale_factor * total_tokens * hidden_size**2
+    def estimate(layer_type, config=None):
+        return layer_type.estimate_flops(
+            legacy_config if config is None else config,
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+        )
 
-    def moe_layer_flops(total_tokens, hidden_size, moe_ffn_hidden_size,
-                        shared_expert_ffn_hidden_size, num_experts_routed_to,
-                        moe_latent_size=None, swiglu=False):
-        """Calculate FLOPs for an MoE layer."""
-        scale_factor = 3.0 / 2.0 if swiglu else 1.0
-        if moe_latent_size is None:
-            routed_flops = (4 * total_tokens * hidden_size *
-                            moe_ffn_hidden_size * num_experts_routed_to * scale_factor)
-        else:
-            # Routed experts run on moe_latent_size.
-            routed_flops = (4 * total_tokens * moe_latent_size *
-                            moe_ffn_hidden_size * num_experts_routed_to * scale_factor)
-            # Up proj and down proj.
-            routed_flops += (4 * total_tokens * hidden_size * moe_latent_size)
-        shared_flops = 4 * total_tokens * hidden_size * shared_expert_ffn_hidden_size * scale_factor
-        return routed_flops + shared_flops
-
-    def attn_layer_flops(
-        total_tokens, seqlen_squared_sum, hidden_size, num_heads, gqa=True,
-        gqa_groups=8, kv_channels=None,
+    def indexer_flops(
+        num_layers, *, hybrid_layer_pattern=None, mtp_num_layers=0, mtp_use_repeated_layer=False
     ):
-        """Calculate FLOPs for an attention layer.
-
-        Two parts:
-          - Token-linear (QKV + output projections): scales with ``total_tokens``
-            (= ``sum_i(L_i)``). Padding tokens are excluded by passing the real
-            (unpadded) token count.
-          - Core attention (``QK^T`` and ``softmax(QK^T) V``): scales with
-            ``seqlen_squared_sum`` (= ``sum_i(L_i ** 2)``).
-        """
-        p = (kv_channels * num_heads / hidden_size) if kv_channels else 1
-        g = gqa_groups if gqa else num_heads
-        # 4 * total_tokens * h * p * (h + h*(g/n)): QKV + output projections (fwd*3, with FMA*2).
-        # 2 * sum(L^2) * h * p: core attention (causal mask -> /2 cancels with FMA *2).
-        return (
-            4 * total_tokens * hidden_size * p
-            * (hidden_size + hidden_size * (g / num_heads))
-            + 2 * seqlen_squared_sum * hidden_size * p
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexer,
+            is_dsa_skip_topk_layer,
         )
 
-    def mamba_layer_flops(total_tokens, hidden_size, state_dim=16,
-                          head_dim=64, num_groups=1, num_heads=128):
-        """Calculate FLOPs for a Mamba layer."""
-        # Note (rwaleffe): flops estimate for scan should be updated based on new SSD kernels,
-        # but small percent of overall layer flops
-        d_in = 2 * hidden_size
-        if num_heads:
-            nheads = num_heads
-        else:
-            nheads = d_in // head_dim
-        return (
-            (
-                2
-                * total_tokens
-                * hidden_size
-                * (2 * d_in + 2 * num_groups * state_dim + nheads)
-            )  # in_proj
-            + (7 * total_tokens * d_in * state_dim)  # scan
-            + (2 * total_tokens * d_in * hidden_size)  # out_proj
-        )
+        if num_layers == 0:
+            return 0.0
 
-    def gated_delta_product_layer_flops(
-        total_tokens,
-        hidden_size,
-        num_householder,
-        state_dim=128,
-        head_dim=64,
-        num_groups=8,
-        num_heads=None,
-        conv_kernel_dim=4,
-    ):
-        """Calculate FLOPs for a Gated Delta Product (GDP) layer."""
-        if num_heads is None:
-            d_inner = 2 * hidden_size
-            num_heads = d_inner // head_dim
-        else:
-            d_inner = num_heads * head_dim
-        in_proj_dim = (
-            d_inner * (1 + num_householder)
-            + num_groups * state_dim * (1 + num_householder)
-            + num_heads * (1 + num_householder)
-        )
-        conv_dim = d_inner * num_householder + num_groups * state_dim * (1 + num_householder)
-        non_core_flops = 2 * total_tokens * (
-            hidden_size * in_proj_dim
-            + conv_kernel_dim * conv_dim
-            + d_inner * hidden_size
-        )
-        # Best-case recurrent GDP core estimate. The FLA chunk kernel may do additional
-        # score/solve/WY work, but this keeps the implementation-agnostic lower bound explicit.
-        core_flops = (4 * num_householder + 3) * total_tokens * d_inner * state_dim
-        return non_core_flops + core_flops
-
-    def gdn_layer_flops(total_tokens, hidden_size,
-                        qk_head_dim=128, v_head_dim=128,
-                        num_qk_heads=16, num_v_heads=32,
-                        conv_kernel_dim=4, use_gdn2=False):
-        """Calculate FLOPs for a Gated Delta Net (GDN) layer."""
-        qk_dim = qk_head_dim * num_qk_heads
-        v_dim = v_head_dim * num_v_heads
-        if use_gdn2:
-            # GDN2 in_proj: hidden_size -> (4*qk_dim + 3*v_dim) for q, k, v, z, f, b, w
-            in_proj_dim = 4 * qk_dim + 3 * v_dim
-        else:
-            # GDN in_proj: hidden_size -> (2*qk_dim + 2*v_dim + 2*num_v_heads)
-            in_proj_dim = 2 * qk_dim + 2 * v_dim + 2 * num_v_heads
-        return (
-            2 * total_tokens * (
-                # in_proj
-                hidden_size * in_proj_dim
-                # conv1d
-                + conv_kernel_dim * (2 * qk_dim + v_dim)
-                # gated delta rule: KK^T, VK^T, S(a(I-bKK^T)), and SQ
-                + num_v_heads * (v_head_dim ** 2) * 4
-                # out_proj: v_dim -> hidden_size
-                + hidden_size * v_dim
+        def count_indexers(layer_numbers):
+            return sum(
+                not is_dsa_skip_topk_layer(
+                    layer_number,
+                    transformer_cfg.dsa_indexer_skip_topk_offset or 0,
+                    transformer_cfg.dsa_indexer_topk_freq or 1,
+                )
+                for layer_number in layer_numbers
             )
+
+        if hybrid_layer_pattern is None:
+            mtp_num_layers = mtp_num_layers or 0
+            num_indexers = count_indexers(range(1, num_layers - mtp_num_layers + 1))
+            # MTP starts numbering at 1; repeated MTP executes layer 1 at every depth.
+            num_indexers += (
+                mtp_num_layers
+                if mtp_use_repeated_layer
+                else count_indexers(range(1, mtp_num_layers + 1))
+            )
+        else:
+            from megatron.core.models.hybrid.hybrid_layer_allocation import (
+                Symbols,
+                parse_hybrid_pattern,
+            )
+
+            parsed = parse_hybrid_pattern(hybrid_layer_pattern)
+
+            def count_pattern(pattern):
+                # All positions advance numbering; pipeline separators do not.
+                return count_indexers(
+                    i
+                    for i, symbol in enumerate(pattern.replace(Symbols.PIPE, ""), start=1)
+                    if symbol == Symbols.DS_ATTENTION
+                )
+
+            num_indexers = count_pattern(parsed.main_pattern or "")
+            if parsed.mtp_pattern:
+                # Each hybrid MTP depth restarts its template's numbering at 1.
+                num_indexers += parsed.mtp_num_depths * count_pattern(parsed.mtp_pattern)
+
+        # The detached indexer has loss-dependent backward costs, unlike the layer's x3.
+        return num_indexers * DSAIndexer.estimate_flops(
+            transformer_cfg,
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+            include_backward=True,
         )
 
-    def hybrid_flops(total_tokens, seqlen_squared_sum, hidden_size,
-                     num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers,
-                     num_dsa_layers, gdp_num_householder,
-                     num_gdn_layers=0,
-                     mamba_state_dim=128, mamba_head_dim=64,
-                     mamba_num_groups=8, mamba_num_heads=128,
-                     num_attn_heads=32, gqa=True,
-                     gqa_groups=8, kv_channels=None,
-                     mlp_expansion=4.0, swiglu=False,
-                     moe_latent_size=None,
-                     moe_ffn_hidden_size=2048, shared_expert_ffn_hidden_size=2048, num_experts_routed_to=1,
-                     use_gated_delta_product=False,
-                     gdn_qk_head_dim=128, gdn_v_head_dim=128,
-                     gdn_num_qk_heads=16, gdn_num_v_heads=32,
-                     gdn_conv_kernel_dim=4, gdn_use_gdn2=False,
-                     vocab_size=256000, mtp_num_layers=0):
-        """Calculate total training FLOPs for the hybrid model, including DSA."""
-        mamba_flops = (
-            gated_delta_product_layer_flops(total_tokens, hidden_size,
-                                            gdp_num_householder,
-                                            mamba_state_dim, mamba_head_dim,
-                                            mamba_num_groups, mamba_num_heads)
-            if use_gated_delta_product
-            else mamba_layer_flops(total_tokens, hidden_size,
-                                   mamba_state_dim, mamba_head_dim,
-                                   mamba_num_groups, mamba_num_heads)
+    def hybrid_flops():
+        from megatron.core.models.hybrid.hybrid_layer_allocation import (
+            Symbols,
+            get_hybrid_layer_counts,
+            parse_hybrid_pattern,
         )
-        dsa_attention_flops = (
-            dsa_layer_flops(
-                total_tokens=total_tokens,
-                seqlen_squared_sum=seqlen_squared_sum,
-                hidden_size=hidden_size,
-                num_attention_heads=num_attn_heads,
-                q_lora_rank=transformer_cfg.q_lora_rank,
-                kv_lora_rank=transformer_cfg.kv_lora_rank,
-                qk_head_dim=transformer_cfg.qk_head_dim,
-                qk_pos_emb_head_dim=transformer_cfg.qk_pos_emb_head_dim,
-                v_head_dim=transformer_cfg.v_head_dim,
-                dsa_indexer_topk=transformer_cfg.dsa_indexer_topk,
-                dsa_indexer_kpool=getattr(transformer_cfg, "dsa_indexer_kpool", 1),
-                dsa_indexer_kpool_always_select_tail=getattr(
-                    transformer_cfg, "dsa_indexer_kpool_always_select_tail", True
-                ),
-            ) if num_dsa_layers else 0
+
+        counts = get_hybrid_layer_counts(model_config.hybrid_layer_pattern)
+        # Preserve the legacy pattern estimator's gating convention during the move.
+        attention_config = copy.copy(legacy_config)
+        attention_config.attention_output_gate = False
+        forward = 0
+        if counts[Symbols.ATTENTION]:
+            forward += counts[Symbols.ATTENTION] * estimate(SelfAttention, attention_config)
+        if counts[Symbols.MLP]:
+            forward += counts[Symbols.MLP] * estimate(MLP)
+        if counts[Symbols.MOE]:
+            forward += counts[Symbols.MOE] * estimate(MoELayer)
+        if counts[Symbols.MAMBA]:
+            from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
+            from megatron.core.ssm.mamba_mixer import MambaMixer
+
+            spec = getattr(model_config, "hybrid_stack_spec", None)
+            layer = getattr(getattr(spec, "submodules", None), "mamba_layer", None)
+            mixer = getattr(getattr(layer, "submodules", None), "mixer", None)
+            mixer_type = (
+                GatedDeltaProductMixer
+                if getattr(mixer, "module", None) is GatedDeltaProductMixer
+                else MambaMixer
+            )
+            forward += counts[Symbols.MAMBA] * estimate(mixer_type)
+        if counts[Symbols.GDN]:
+            from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNet2
+
+            gdn_type = (
+                GatedDeltaNet2
+                if transformer_cfg.experimental_attention_variant == "gdn2"
+                else GatedDeltaNet
+            )
+            forward += counts[Symbols.GDN] * estimate(gdn_type)
+        expanded = 0
+        if counts[Symbols.DS_ATTENTION]:
+            from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+
+            forward += counts[Symbols.DS_ATTENTION] * estimate(DSAttention)
+            expanded += indexer_flops(
+                counts[Symbols.DS_ATTENTION], hybrid_layer_pattern=model_config.hybrid_layer_pattern
+            )
+        mtp_depths = transformer_cfg.mtp_num_layers or 0
+        if any(counts[symbol] for symbol in Symbols.DSV4_COMPRESS_RATIO_MAP):
+            mtp_depths = parse_hybrid_pattern(model_config.hybrid_layer_pattern).mtp_num_depths
+            expanded += _dsv4_attention_flops(
+                transformer_cfg, counts, total_real_tokens_in_batch, seqlen_squared_sum_in_batch
+            )
+            forward += (
+                2
+                * total_real_tokens_in_batch
+                * mtp_depths
+                * (3 * transformer_cfg.hidden_size + 2 * transformer_cfg.hidden_size**2)
+            )
+        forward += (
+            2
+            * total_real_tokens_in_batch
+            * transformer_cfg.hidden_size
+            * vocab_size
+            * (1 + mtp_depths)
         )
-        flops_fwd = (
-                num_dsa_layers * dsa_attention_flops +
-                num_attn_layers * attn_layer_flops(total_tokens, seqlen_squared_sum,
-                                                   hidden_size, num_attn_heads, gqa,
-                                                   gqa_groups, kv_channels) +
-                num_mlp_layers * mlp_layer_flops(total_tokens, hidden_size,
-                                                 mlp_expansion, swiglu) +
-                num_mamba_layers * mamba_flops +
-                num_moe_layers * moe_layer_flops(total_tokens, hidden_size, moe_ffn_hidden_size,
-                                                 shared_expert_ffn_hidden_size, num_experts_routed_to,
-                                                 moe_latent_size, swiglu) +
-                num_gdn_layers * gdn_layer_flops(total_tokens, hidden_size,
-                                                  gdn_qk_head_dim, gdn_v_head_dim,
-                                                  gdn_num_qk_heads, gdn_num_v_heads,
-                                                  gdn_conv_kernel_dim, gdn_use_gdn2) +
-                (2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
-        )
-        # The indexer has its own loss-dependent backward cost.
-        indexer_flops = (
-            dsa_indexer_flops(
-                total_tokens=total_tokens,
-                seqlen_squared_sum=seqlen_squared_sum,
-                hidden_size=hidden_size,
-                q_lora_rank=transformer_cfg.q_lora_rank,
-                dsa_indexer_n_heads=transformer_cfg.dsa_indexer_n_heads,
-                dsa_indexer_head_dim=transformer_cfg.dsa_indexer_head_dim,
-                dsa_indexer_topk=transformer_cfg.dsa_indexer_topk,
-                num_dsa_layers=num_dsa_layers,
-                dsa_indexer_loss_coeff=transformer_cfg.dsa_indexer_loss_coeff,
-                dsa_indexer_use_sparse_loss=getattr(transformer_cfg, "dsa_indexer_use_sparse_loss", False),
-                dsa_indexer_skip_topk_offset=transformer_cfg.dsa_indexer_skip_topk_offset,
-                dsa_indexer_topk_freq=transformer_cfg.dsa_indexer_topk_freq,
-                hybrid_layer_pattern=model_config.hybrid_layer_pattern,
-                dsa_indexer_kpool=getattr(transformer_cfg, "dsa_indexer_kpool", 1),
-            ) if num_dsa_layers else 0
-        )
-        return flops_fwd * 3 + indexer_flops
+        return 3 * forward + expanded
 
     def transformer_flops():
-        """Calculate FLOPs for a standard Transformer model."""
-        # TODO(helenn/dnarayanan): Refactor this to reuse the helper methods.
+        """Count layer executions and model-level work using Core's forward estimates."""
         # MoE.
         if transformer_cfg.num_moe_experts is None:
             # Every Transformer MLP is dense.
             num_dense_layers = transformer_cfg.num_layers
             num_moe_layers = 0
-            num_experts_routed_to = 0
             last_layer_is_moe = 0
         else:
             # Calculate number of dense and MoE Transformer MLPs.
             if isinstance(transformer_cfg.moe_layer_freq, int):
                 moe_layer_pattern = [
-                    1 if (i % transformer_cfg.moe_layer_freq == 0) else 0 for i in range(transformer_cfg.num_layers)
+                    1 if (i % transformer_cfg.moe_layer_freq == 0) else 0
+                    for i in range(transformer_cfg.num_layers)
                 ]
             elif isinstance(transformer_cfg.moe_layer_freq, list):
                 moe_layer_pattern = transformer_cfg.moe_layer_freq
@@ -1170,7 +1070,6 @@ def num_floating_point_operations(
             )
             num_moe_layers = sum(moe_layer_pattern)  # Number of 1s in `moe_layer_pattern`.
             num_dense_layers = transformer_cfg.num_layers - num_moe_layers
-            num_experts_routed_to = transformer_cfg.moe_router_topk
             last_layer_is_moe = moe_layer_pattern[-1]
 
         if transformer_cfg.mtp_num_layers is not None:
@@ -1182,139 +1081,13 @@ def num_floating_point_operations(
             mtp_num_layers = 0
             num_layers = transformer_cfg.num_layers
 
-        moe_ffn_hidden_size = (
-            transformer_cfg.moe_ffn_hidden_size
-            if transformer_cfg.moe_ffn_hidden_size is not None
-            else transformer_cfg.ffn_hidden_size
-        )
-        moe_latent_size = transformer_cfg.moe_latent_size
-        shared_expert_ffn_hidden_size = (
-            0
-            if transformer_cfg.moe_shared_expert_intermediate_size is None
-            else transformer_cfg.moe_shared_expert_intermediate_size
-        )
-
-        # - 3x: Each GEMM in the model needs to be performed 3 times (forward pass,
-        #       backward wgrad [weight gradient], backward dgrad [data gradient]).
-        forward_backward_expansion_factor = 3
-        # - 2x: A GEMM of a m*n tensor with a n*k tensor requires 2mnk floating-point operations.
-        fma_expansion_factor = 2
-        # - 3x (SwiGLU enabled): h->2*ffn_h GEMM and ffn_h->h GEMM are stacked.
-        # - 2x (SwiGLU disabled): h->ffn_h GEMM and ffn_h->h GEMM are stacked.
-        ffn_expansion_factor = 3 if swiglu else 2
-
-        # self_attn is split into a token-linear part (projections, multiplied by
-        # ``batch_size * llm_seq_length`` like all other token-linear work) and a
-        # core-attention part (``QK^T`` and ``softmax(QK^T) V``) whose compute scales
-        # with ``sum_i(L_i ** 2)`` instead of ``batch * seq^2``. With unpacked BSHD the
-        # two are equal, so the BSHD result is unchanged. With THD/packed sequences
-        # ``seqlen_squared_sum_in_batch`` is strictly smaller, reflecting the per-chunk
-        # causal mask of packed attention.
-        if transformer_cfg.multi_latent_attention:
-            assert not group_query_attention
-        if transformer_cfg.experimental_attention_variant == "dsa":
-            # DSA attention and its indexer are counted separately below.
-            standard_self_attn_term = 0
-            standard_self_attn_core_term = 0
-        elif transformer_cfg.multi_latent_attention:
-            '''
-            Basic arithmetic
-            let B is batch size, s is seq_len, h is embedding dim,
-            for one self_attnetion block (prenorm is not included)
-            qkv projection:  6Bsh^2
-            attn:            2Bs^2h
-            attn over value: 2Bs^2h
-            oproj:           2Bsh^2
-
-            references
-            https://arxiv.org/abs/2305.10403
-            https://arxiv.org/abs/2205.05198
-            '''
-            ## MLA
-            if transformer_cfg.q_lora_rank is None:
-                q_term = (
-                    transformer_cfg.hidden_size
-                    * transformer_cfg.num_attention_heads
-                    * (transformer_cfg.qk_head_dim + transformer_cfg.qk_pos_emb_head_dim)
-                )
-            else:
-                q_term = transformer_cfg.q_lora_rank * (
-                    transformer_cfg.hidden_size
-                    + transformer_cfg.num_attention_heads * (transformer_cfg.qk_head_dim + transformer_cfg.qk_pos_emb_head_dim)
-                    + 1
-                )
-            # Token-linear part of MLA self-attention (lora projs, kv proj, RoPE, output proj).
-            standard_self_attn_term = (
-                forward_backward_expansion_factor
-                * fma_expansion_factor
-                * (
-                    ## q lora + rope + q norm
-                    q_term
-                    ## kv lora + rope + kv norm
-                    + transformer_cfg.kv_lora_rank
-                    * (
-                        transformer_cfg.hidden_size
-                        + transformer_cfg.num_attention_heads * (transformer_cfg.qk_head_dim + transformer_cfg.v_head_dim)
-                        + 1
-                    )
-                    + transformer_cfg.hidden_size * transformer_cfg.qk_pos_emb_head_dim
-                    ## o proj
-                    + (transformer_cfg.num_attention_heads * transformer_cfg.v_head_dim) * transformer_cfg.hidden_size
-                )
-            )
-            # Core-attention (L^2) part: ``QK^T`` and ``(softmax(QK^T)) V``. The
-            # ``/2`` accounts for the causal mask and the ``*2`` cancels it via FMA.
-            standard_self_attn_core_term = (
-                forward_backward_expansion_factor
-                * fma_expansion_factor
-                * (
-                    transformer_cfg.num_attention_heads
-                    * (transformer_cfg.qk_head_dim + transformer_cfg.qk_pos_emb_head_dim)
-                    / 2
-                    + transformer_cfg.num_attention_heads * transformer_cfg.v_head_dim / 2
-                )
-            )
-
-        else:
-            ## MHA or GQA
-            query_projection_size = transformer_cfg.kv_channels * transformer_cfg.num_attention_heads
-            key_projection_size = transformer_cfg.kv_channels * transformer_cfg.num_query_groups
-            value_projection_size = transformer_cfg.kv_channels * transformer_cfg.num_query_groups
-            gate_projection_size = query_projection_size if transformer_cfg.attention_output_gate else 0
-            # Token-linear part of self-attention (QKV projection + output projection).
-            standard_self_attn_term = (
-                forward_backward_expansion_factor
-                * fma_expansion_factor
-                * (
-                    ## qkv proj
-                    transformer_cfg.hidden_size
-                    * (
-                        query_projection_size
-                        + key_projection_size
-                        + value_projection_size
-                        + gate_projection_size
-                    )
-                    ## out proj
-                    + query_projection_size
-                    * transformer_cfg.hidden_size
-                )
-            )
-            # Core-attention (L^2) part: ``QK^T`` and ``(softmax(QK^T)) V``.
-            standard_self_attn_core_term = (
-                forward_backward_expansion_factor
-                * fma_expansion_factor
-                * query_projection_size
-                / 2  # causal mask (only half of the mask is non-zero)
-                * 2  # QK^T and (QK^T)V
-            )
-
         if is_linear_attention_variant(transformer_cfg.experimental_attention_variant):
             # The attention pattern describes only the main decoder layers.
             if isinstance(transformer_cfg.linear_attention_freq, int):
                 linear_attention_pattern = [
                     # [1,1,...,1,0,1,1,...,1,0,...]
-                    0 if ((i + 1) % transformer_cfg.linear_attention_freq == 0)
-                    else 1 for i in range(transformer_cfg.num_layers)
+                    0 if ((i + 1) % transformer_cfg.linear_attention_freq == 0) else 1
+                    for i in range(transformer_cfg.num_layers)
                 ]
             elif isinstance(transformer_cfg.linear_attention_freq, list):
                 linear_attention_pattern = transformer_cfg.linear_attention_freq
@@ -1341,246 +1114,62 @@ def num_floating_point_operations(
             )
             num_standard_attention_layers = num_layers - num_linear_attention_layers
 
-            if is_gated_delta_net_variant(transformer_cfg.experimental_attention_variant):
-                # Calculate the FLOPs for the gated delta net attention.
-                qk_head_dim = transformer_cfg.linear_key_head_dim
-                v_head_dim = transformer_cfg.linear_value_head_dim
-                num_qk_heads = transformer_cfg.linear_num_key_heads
-                num_v_heads = transformer_cfg.linear_num_value_heads
-                qk_dim = qk_head_dim * num_qk_heads
-                v_dim = v_head_dim * num_v_heads
-                if transformer_cfg.experimental_attention_variant == "gdn2":
-                    # GDN2 in_proj: q, k, v, z, f, b, w
-                    in_proj_dim = 4 * qk_dim + 3 * v_dim
-                else:
-                    in_proj_dim = 2 * qk_dim + 2 * v_dim + 2 * num_v_heads
-                linear_self_attn_term = (
-                    forward_backward_expansion_factor
-                    * fma_expansion_factor
-                    * (
-                        ## in proj
-                        transformer_cfg.hidden_size
-                        * in_proj_dim
-                        ## conv1d
-                        + transformer_cfg.linear_conv_kernel_dim
-                        * (2 * qk_dim + v_dim)
-                        ## gated delta rule
-                        + num_v_heads
-                        * (v_head_dim ** 2)
-                        * 4  # KK^T, VK^T, S(a(I-bKK^T)), and SQ
-                        ## out proj
-                        + transformer_cfg.hidden_size
-                        * v_dim
-                    )
-                )
-            else:
+            if not is_gated_delta_net_variant(transformer_cfg.experimental_attention_variant):
                 raise ValueError(
                     "Invalid experimental_attention_variant: "
                     f"{transformer_cfg.experimental_attention_variant}"
                 )
+            from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNet2
+
+            linear_type = (
+                GatedDeltaNet2
+                if transformer_cfg.experimental_attention_variant == "gdn2"
+                else GatedDeltaNet
+            )
+            linear_flops = num_linear_attention_layers * estimate(linear_type)
         else:
-            num_linear_attention_layers = 0
-            linear_self_attn_term = 0
+            linear_flops = 0
             num_standard_attention_layers = num_layers
 
-        # Token-linear self-attention work (projections + linear-attention variants).
-        # Linear attention has no L^2 term, so it stays entirely token-linear.
-        self_attn_term = (
-            linear_self_attn_term * num_linear_attention_layers
-            + standard_self_attn_term * num_standard_attention_layers
-        )
-        # Core attention (L^2) FLOPs per standard-attention layer.
-        self_attn_core_term = standard_self_attn_core_term * num_standard_attention_layers
-
-        # Token-linear FLOPs scale with the real (unpadded) token count.
-        # For BSHD this falls back to ``batch_size * seq_length`` (no padding).
-        total_floating_point_operations = (
-            total_real_tokens_in_batch
-            * (
-                # MLP
-                forward_backward_expansion_factor
-                * fma_expansion_factor
-                * transformer_cfg.hidden_size
-                * (
-                    # dense layer (deepseek v2, v3 style)
-                    (transformer_cfg.ffn_hidden_size * ffn_expansion_factor)
-                    * num_dense_layers
-                    # routed experts
-                    + (
-                        (moe_ffn_hidden_size * num_experts_routed_to * ffn_expansion_factor)
-                        if moe_latent_size is None
-                        else (
-                            (
-                                moe_ffn_hidden_size
-                                * num_experts_routed_to
-                                * ffn_expansion_factor
-                                * moe_latent_size
-                                / transformer_cfg.hidden_size
-                            )  # Routed experts run on moe_latent_size.
-                            + 2 * moe_latent_size  # Up proj and down proj.
-                        )
-                    )
-                    * num_moe_layers
-                    # Shared Experts.
-                    + (shared_expert_ffn_hidden_size * ffn_expansion_factor)
-                    * num_moe_layers
-                )
-                # Self Attention (token-linear part).
-                + self_attn_term
-                # MTP norms and proj
-                + forward_backward_expansion_factor
-                * fma_expansion_factor
-                * mtp_num_layers
-                * (
-                    # MTP eh norm + final nrom
-                    3 * transformer_cfg.hidden_size
-                    # MTH eh proj
-                    + 2 * transformer_cfg.hidden_size * transformer_cfg.hidden_size
-                )
-                # Logit.
-                + forward_backward_expansion_factor
-                * fma_expansion_factor
-                * transformer_cfg.hidden_size
-                * vocab_size
-                * (mtp_num_layers + 1)  # MTP + final logit
-            )
-            # Self Attention (core L^2 part). For BSHD the default
-            # ``seqlen_squared_sum_in_batch = batch_size * seq_length^2`` recovers the
-            # original ``batch * seq^2 * Q_proj`` term; for THD this uses the actual
-            # ragged ``sum(L_i^2)`` and so undercounts the BSHD figure correctly.
-            + seqlen_squared_sum_in_batch * self_attn_core_term
-        )
+        if transformer_cfg.multi_latent_attention:
+            assert not group_query_attention
+        expanded = 0
         if transformer_cfg.experimental_attention_variant == "dsa":
-            total_floating_point_operations += (
-                num_layers
-                * dsa_layer_flops(
-                    total_tokens=total_real_tokens_in_batch,
-                    seqlen_squared_sum=seqlen_squared_sum_in_batch,
-                    hidden_size=transformer_cfg.hidden_size,
-                    num_attention_heads=transformer_cfg.num_attention_heads,
-                    q_lora_rank=transformer_cfg.q_lora_rank,
-                    kv_lora_rank=transformer_cfg.kv_lora_rank,
-                    qk_head_dim=transformer_cfg.qk_head_dim,
-                    qk_pos_emb_head_dim=transformer_cfg.qk_pos_emb_head_dim,
-                    v_head_dim=transformer_cfg.v_head_dim,
-                    dsa_indexer_topk=transformer_cfg.dsa_indexer_topk,
-                    dsa_indexer_kpool=getattr(transformer_cfg, "dsa_indexer_kpool", 1),
-                    dsa_indexer_kpool_always_select_tail=getattr(
-                        transformer_cfg, "dsa_indexer_kpool_always_select_tail", True
-                    ),
-                )
-                * forward_backward_expansion_factor
-            )
-            # Pass all DSA layers; the helper counts only layers that compute an index.
-            total_floating_point_operations += dsa_indexer_flops(
-                total_tokens=total_real_tokens_in_batch,
-                seqlen_squared_sum=seqlen_squared_sum_in_batch,
-                hidden_size=transformer_cfg.hidden_size,
-                q_lora_rank=transformer_cfg.q_lora_rank,
-                dsa_indexer_n_heads=transformer_cfg.dsa_indexer_n_heads,
-                dsa_indexer_head_dim=transformer_cfg.dsa_indexer_head_dim,
-                dsa_indexer_topk=transformer_cfg.dsa_indexer_topk,
-                num_dsa_layers=num_layers,
-                dsa_indexer_loss_coeff=transformer_cfg.dsa_indexer_loss_coeff,
-                dsa_indexer_use_sparse_loss=getattr(transformer_cfg, "dsa_indexer_use_sparse_loss", False),
-                dsa_indexer_skip_topk_offset=transformer_cfg.dsa_indexer_skip_topk_offset,
-                dsa_indexer_topk_freq=transformer_cfg.dsa_indexer_topk_freq,
+            from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+
+            attention_type = DSAttention
+            expanded = indexer_flops(
+                num_layers,
                 mtp_num_layers=mtp_num_layers,
-                mtp_use_repeated_layer=getattr(transformer_cfg, "mtp_use_repeated_layer", False),
-                dsa_indexer_kpool=getattr(transformer_cfg, "dsa_indexer_kpool", 1),
+                mtp_use_repeated_layer=transformer_cfg.mtp_use_repeated_layer,
             )
-        return total_floating_point_operations
-
-    def _uses_gated_delta_product_spec():
-        """Return whether the hybrid stack uses GatedDeltaProductMixer.
-
-        Used to select the gated-delta-product FLOPs calculation.
-        """
-        from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
-
-        spec = getattr(model_config, "hybrid_stack_spec", None)
-        layer = getattr(getattr(spec, "submodules", None), "mamba_layer", None)
-        mixer = getattr(getattr(layer, "submodules", None), "mixer", None)
-        return getattr(mixer, "module", None) is GatedDeltaProductMixer
-
-    # Main entrypoint for FLOPs calculation.
-    if is_hybrid_model(model_config):
-        # Calculate the number of each type of layer.
-        from operator import itemgetter
-
-        from megatron.core.models.hybrid.hybrid_layer_allocation import (
-            Symbols,
-            get_hybrid_layer_counts,
-            parse_hybrid_pattern,
-        )
-        layer_counts = get_hybrid_layer_counts(model_config.hybrid_layer_pattern)
-        num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers, num_dsa_layers = (
-            itemgetter(
-                Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE,
-                Symbols.DS_ATTENTION,
-            )(
-                layer_counts
+        else:
+            attention_type = (
+                MLASelfAttention if transformer_cfg.multi_latent_attention else SelfAttention
+            )
+        forward = linear_flops
+        if num_dense_layers:
+            forward += num_dense_layers * estimate(MLP)
+        if num_moe_layers:
+            forward += num_moe_layers * estimate(MoELayer)
+        if num_standard_attention_layers:
+            forward += num_standard_attention_layers * estimate(attention_type)
+        # MTP norms/projections and output heads belong to the model, not individual layers.
+        hidden_size = transformer_cfg.hidden_size
+        forward += (
+            2
+            * total_real_tokens_in_batch
+            * (
+                mtp_num_layers * (3 * hidden_size + 2 * hidden_size**2)
+                + hidden_size * vocab_size * (1 + mtp_num_layers)
             )
         )
+        return 3 * forward + expanded
 
-        mtp_num_layers = transformer_cfg.mtp_num_layers
-        if mtp_num_layers is None:
-            mtp_num_layers = 0
-        has_dsv4_attention = any(layer_counts[symbol] for symbol in Symbols.DSV4_COMPRESS_RATIO_MAP)
-        if has_dsv4_attention:
-            # The static C/H/W specs select DSv4 even when the CLI variant is
-            # inferred only on TransformerConfig. The pattern also owns MTP depth.
-            mtp_num_layers = parse_hybrid_pattern(model_config.hybrid_layer_pattern).mtp_num_depths
-        # Compute hybrid model FLOPs.
-        flops = hybrid_flops(
-            total_tokens=total_real_tokens_in_batch,
-            seqlen_squared_sum=seqlen_squared_sum_in_batch,
-            hidden_size=transformer_cfg.hidden_size,
-            num_attn_layers=num_attn_layers,
-            num_mamba_layers=num_mamba_layers,
-            num_mlp_layers=num_mlp_layers,
-            num_moe_layers=num_moe_layers,
-            num_dsa_layers=num_dsa_layers,
-            num_gdn_layers=num_gdn_layers,
-            mamba_state_dim=transformer_cfg.mamba_state_dim,
-            mamba_head_dim=transformer_cfg.mamba_head_dim,
-            mamba_num_groups=transformer_cfg.mamba_num_groups,
-            mamba_num_heads=transformer_cfg.mamba_num_heads,
-            gdp_num_householder=transformer_cfg.gdp_num_householder,
-            num_attn_heads=transformer_cfg.num_attention_heads,
-            gqa=group_query_attention,
-            gqa_groups=transformer_cfg.num_query_groups,
-            kv_channels=transformer_cfg.kv_channels,
-            mlp_expansion=transformer_cfg.ffn_hidden_size / transformer_cfg.hidden_size,
-            swiglu=swiglu,
-            use_gated_delta_product=_uses_gated_delta_product_spec(),
-            moe_latent_size=transformer_cfg.moe_latent_size,
-            moe_ffn_hidden_size=(transformer_cfg.moe_ffn_hidden_size if transformer_cfg.moe_ffn_hidden_size is not None
-                                 else transformer_cfg.ffn_hidden_size),
-            shared_expert_ffn_hidden_size=(0 if transformer_cfg.moe_shared_expert_intermediate_size is None
-                                           else transformer_cfg.moe_shared_expert_intermediate_size),
-            num_experts_routed_to=transformer_cfg.moe_router_topk,
-            gdn_qk_head_dim=transformer_cfg.linear_key_head_dim or 128,
-            gdn_v_head_dim=transformer_cfg.linear_value_head_dim or 128,
-            gdn_num_qk_heads=transformer_cfg.linear_num_key_heads or 16,
-            gdn_num_v_heads=transformer_cfg.linear_num_value_heads or 32,
-            gdn_conv_kernel_dim=transformer_cfg.linear_conv_kernel_dim or 4,
-            gdn_use_gdn2=(transformer_cfg.experimental_attention_variant == "gdn2"),
-            vocab_size=vocab_size,
-            mtp_num_layers=mtp_num_layers,
-        )
-        if has_dsv4_attention:
-            flops += _dsv4_attention_flops(
-                transformer_cfg, layer_counts, total_real_tokens_in_batch, seqlen_squared_sum_in_batch
-            )
-            # MTP normalization and the concatenated embedding/hidden projection.
-            flops += 6 * mtp_num_layers * (
-                3 * transformer_cfg.hidden_size + 2 * transformer_cfg.hidden_size ** 2
-            ) * total_real_tokens_in_batch
-        return int(flops)
-    else:
-        # Compute standard Transformer model FLOPs.
-        return int(transformer_flops())
+    # Keep legacy non-SiLU GLU accounting unchanged.
+    legacy_config = copy.copy(transformer_cfg)
+    legacy_config.gated_linear_unit = swiglu
+    return int(hybrid_flops() if is_hybrid_model(model_config) else transformer_flops())
 
 
 def get_start_time_from_progress_log():
@@ -1898,9 +1487,10 @@ def pretrain(
     if cfg_container.logger.log_progress:
         append_to_progress_log(cfg_container.checkpoint.save, "Starting job")
 
+    sequence_length = cfg_container.model.transformer.max_seq_length_per_sample
     set_jit_fusion_options(
         cfg_container.model.transformer,
-        sequence_length=args.seq_length,
+        sequence_length=sequence_length,
         micro_batch_size=cfg_container.train.micro_batch_size,
         tp_size=cfg_container.model.transformer.tensor_model_parallel_size,
     )
@@ -1923,7 +1513,7 @@ def pretrain(
     warmup_training_kernels(
         cfg_container.model,
         warmup_tp_group,
-        seq_length=args.seq_length,
+        seq_length=sequence_length,
         micro_batch_size=cfg_container.train.micro_batch_size,
     )
     print_rank_0("Finished training-kernel warmup.")
@@ -2254,7 +1844,7 @@ def pretrain(
         train_state.do_train,
         train_state.do_valid,
         train_state.do_test,
-        args.dataloader_type,
+        cfg_container.data.dataloader.dataloader_type or 'single',
     )
 
     # Print setup timing.
@@ -2543,9 +2133,9 @@ def wrap_model_chunks_with_ddp(
     construction_context = (
         fully_shard_context(
             FsdpContext(
+                gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER,
                 runtime_policy=RuntimePolicy(
                     use_symmetric_memory=ddp_config.nccl_ub,
-                    caller_managed_grad_sync=True,
                     overlap_outer_communication=ddp_config.overlap_outer_communication,
                 )
             )
@@ -2667,9 +2257,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             print_rank_0("> created all-gather process groups for AG/RS overlap")
             if expt_dp_ag is not None:
                 print_rank_0(">   including expert parallelism AG group")
-
-    if has_nvidia_modelopt:
-        maybe_enable_modelopt(args, checkpoint=cfg.checkpoint)
 
     # Build model.
     def build_model():
@@ -2814,8 +2401,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         ]
 
         current_stream = torch.cuda.current_stream()
-        if config.cuda_graph_impl == "full_iteration":
-            # DDP initialization must use the full-iteration capture stream so its retained
+        if config.cuda_graph_impl in ("full_iteration", "local"):
+            # DDP initialization must use the CUDA graph capture stream so its retained
             # AccumulateGrad nodes do not reference a different, non-capturing stream.
             ddp_stream = get_shared_capture_stream()
         elif config.cuda_graph_impl == "none":
@@ -2920,9 +2507,6 @@ def setup_model_and_optimizer(
     )
     wrap_with_ddp = build_optimizer
 
-    if has_nvidia_modelopt:
-        maybe_enable_modelopt(args, checkpoint=cfg.checkpoint)
-
     # A typed model config owns inputs without replacing an explicit application callback.
     use_model_builder = (
         model_provider_func is None and cfg_container is not None and isinstance(cfg.model, ModelConfig)
@@ -2936,7 +2520,6 @@ def setup_model_and_optimizer(
 
             model_config = cfg.model
             builder_cls = model_config.get_builder_cls()
-            builder = builder_cls(model_config)
 
             # Inject selective/all-layer freezing before wrapping so DDP/FSDP only allocates
             # gradient storage for parameters that remain trainable (matching get_model behavior).
@@ -2946,6 +2529,27 @@ def setup_model_and_optimizer(
                 freeze_base_model_for_mtp=cfg.model.transformer.freeze_base_model_for_mtp,
             )
 
+            # ModelOpt hooks surround the config's own hooks (including the freezes above):
+            # setup (state restore, QAD freeze, LSQ, TE-load) runs first, KD conversion last.
+            # They go on a copy, so cfg.model keeps only its own hooks across repeated builds.
+            # Only GPT/Hybrid configs have ModelOpt transformations.
+            transformations = getattr(model_config, "transformations", None)
+            if transformations is not None or cfg.distillation is not None:
+                from megatron.post_training.model_hooks import (
+                    distillation_hooks,
+                    modelopt_setup_hooks,
+                )
+
+                model_config = dataclasses.replace(
+                    model_config,
+                    pre_wrap_hooks=[
+                        *modelopt_setup_hooks(model_config, cfg.checkpoint),
+                        *model_config.pre_wrap_hooks,
+                        *distillation_hooks(model_config, cfg.distillation),
+                    ],
+                )
+
+            builder = builder_cls(model_config)
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
                 ddp_config=cfg.ddp,
@@ -2987,9 +2591,15 @@ def setup_model_and_optimizer(
         )
 
         if cfg.model.transformer.gtp_remat_nccl_ub:
-            register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=False))
+            register_gtp_symm_pool(
+                resolve_gtp_remat_group(pg_collection, is_expert=False),
+                collectives=cfg.model.transformer.gtp_remat_nccl_ub,
+            )
         if cfg.model.transformer.gtp_expert_remat_nccl_ub:
-            register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=True))
+            register_gtp_symm_pool(
+                resolve_gtp_remat_group(pg_collection, is_expert=True),
+                collectives=cfg.model.transformer.gtp_expert_remat_nccl_ub,
+            )
 
     model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
@@ -2998,8 +2608,12 @@ def setup_model_and_optimizer(
     # first forward. Placed here (not in get_model) so it also covers the config-container
     # builder path.
     if is_gtp_remat_active(cfg.model.transformer):
-        from megatron.core.tensor_parallel.gtp_api import classify_gtp_remat_chains
+        from megatron.core.tensor_parallel.gtp_api import (
+            classify_gtp_remat_chains,
+            move_gtp_weights_to_symm_pool,
+        )
 
+        move_gtp_weights_to_symm_pool(model)
         classify_gtp_remat_chains(
             model,
             cuda_graph_modules=cfg.model.transformer.cuda_graph_modules,
@@ -3120,7 +2734,12 @@ def setup_model_and_optimizer(
         )
         torch.distributed.barrier()
         del dense_model_for_upcycling
-        if (cfg.model.transformer.fp16 or cfg.model.transformer.bf16) and optimizer is not None:
+        # CPU offload keeps separate optimizer copies of FP32 parameters as well.
+        if optimizer is not None and (
+            cfg.model.transformer.fp16
+            or cfg.model.transformer.bf16
+            or cfg.optimizer.optimizer_cpu_offload
+        ):
             optimizer.reload_model_params()
         print_rank_0(f'Upcycled checkpoint saved to {cfg.checkpoint.save}')
 
@@ -3190,13 +2809,17 @@ def setup_model_and_optimizer(
         process_group=setup_dp_group,
     )
 
-    # [ModelOpt]: Load the teacher checkpoint for ModelOpt distillation if applicable.
+    # [ModelOpt]: Load the teacher checkpoint for distillation if applicable.
     # Import locally to prevent circular import: megatron.post_training.checkpointing
     # imports `get_args` from megatron.training at module scope.
     if has_nvidia_modelopt:
         from megatron.post_training.checkpointing import load_kd_teacher_checkpoint
 
-        load_kd_teacher_checkpoint(model)
+        load_kd_teacher_checkpoint(
+            model,
+            getattr(cfg_container, "distillation", None),
+            student_checkpoint=getattr(cfg_container, "checkpoint", None),
+        )
 
     # Validate that the world size can accommodate the current batch size.
     # This catches the case where GPUs were scaled up mid-training but the
@@ -3256,9 +2879,12 @@ def setup_model_and_optimizer(
 def dummy_train_step(data_iterator):
     """Single dummy training step."""
     cfg = get_run_config()
-    args = get_args()
+    sequence_length = cfg.model.transformer.max_seq_length_per_sample
     tp_rank = mpu.get_tensor_model_parallel_rank()
-    has_cu_seqlens = getattr(args, 'sft', False) or getattr(args, 'dataloader_inter_document_masking', False)
+    # Data predicates and model parallelism describe the batch transfer.
+    has_cu_seqlens = cfg.data.has_cu_seqlens()
+    dataset = cfg.data.dataset
+    create_attention_mask = cfg.data.creates_attention_mask() if dataset is not None else None
     dynamic_cp = cfg.model.transformer.dynamic_context_parallel
 
     BATCH_KEYS = [
@@ -3277,17 +2903,32 @@ def dummy_train_step(data_iterator):
                 batch = next(data_iterator)
                 for key in BATCH_KEYS:
                     batch[key] = batch[key].cuda(non_blocking=True) if key in batch and batch[key] is not None else None
+            if dataset is None:
+                # Callback datasets have no mask config. Agree on the source batch's
+                # mask presence before entering optional TP collectives. This metadata
+                # exchange is only needed on the skipped-iteration path.
+                mask_present = torch.tensor(
+                    batch.get("attention_mask") is not None,
+                    dtype=torch.bool,
+                    device=torch.cuda.current_device(),
+                )
+                torch.distributed.broadcast(
+                    mask_present,
+                    src=mpu.get_tensor_model_parallel_src_rank(),
+                    group=mpu.get_tensor_model_parallel_group(),
+                )
+                create_attention_mask = mask_present.item()
             batch = get_batch_on_this_tp_rank(
                 batch,
                 broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
                 broadcast_group=mpu.get_tensor_model_parallel_group(),
                 has_cu_seqlens=has_cu_seqlens,
                 dynamic_cp=dynamic_cp,
-                create_attention_mask_in_dataloader=args.create_attention_mask_in_dataloader,
+                create_attention_mask_in_dataloader=create_attention_mask,
                 cp_size=cfg.model.transformer.context_parallel_size,
                 tp_rank=tp_rank,
                 micro_batch_size=cfg.train.micro_batch_size,
-                seq_length=args.seq_length,
+                seq_length=sequence_length,
                 mtp_on_this_rank=False,
                 pipeline_model_parallel_size=cfg.model.transformer.pipeline_model_parallel_size,
                 is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
@@ -3389,6 +3030,66 @@ def _get_model_pg_collection(
     return pg_collection
 
 
+def _reduce_microbatch_losses(losses_reduced, *, is_sft, sft_loss_log_mode, group):
+    """Average the per-microbatch losses of a step for reporting.
+
+    ``is_sft`` is the data section's SFT family (``cfg.data.is_sft()``). For the
+    two-element (numerator, token count) values: SFT runs average over the trainable tokens of
+    the global batch (or, with ``--sft-loss-log-mode microbatch``, over the valid per-microbatch
+    means), the others take the ratio of the global sums; one-element values keep the legacy
+    per-microbatch mean. Reporting only; gradient normalization is elsewhere.
+    """
+    loss_reduced = {}
+    for key in losses_reduced[0].keys():
+        val = [x[key].view(-1) for x in losses_reduced]
+        if val[0].numel() == 2:
+            if is_sft and sft_loss_log_mode == 'microbatch':
+                # Some CP shards can legitimately contain no trainable tokens.
+                # Average only the valid per-microbatch losses.
+                val = torch.vstack(val)
+                numerators = val[:, 0]
+                denominators = val[:, 1]
+                valid = denominators > 0
+                if valid.any():
+                    local_sum = (numerators[valid] / denominators[valid]).sum()
+                    local_count = torch.tensor(
+                        float(valid.sum().item()),
+                        dtype=local_sum.dtype,
+                        device=local_sum.device,
+                    )
+                else:
+                    local_sum = torch.zeros_like(numerators[0])
+                    local_count = torch.zeros_like(denominators[0])
+
+                torch.distributed.all_reduce(local_sum, group=group)
+                torch.distributed.all_reduce(local_count, group=group)
+                loss_reduced[key] = torch.where(
+                    local_count > 0,
+                    local_sum / local_count.clamp(min=1),
+                    torch.zeros_like(local_sum),
+                )
+            elif is_sft:
+                # Average over the total number of tokens across the global batch.
+                val = torch.vstack(val).sum(dim=0)
+                torch.distributed.all_reduce(val, group=group)
+                loss_reduced[key] = torch.where(
+                    val[1] > 0,
+                    val[0] / val[1].clamp(min=1),
+                    torch.zeros_like(val[0]),
+                )
+            else:
+                val = torch.vstack(val).sum(dim=0)
+                torch.distributed.all_reduce(val, group=group)
+                loss_reduced[key] = val[0] / val[1]
+        elif val[0].numel() == 1:
+            # legacy behavior, we average over the number of microbatches
+            val = torch.cat(val).mean()
+            loss_reduced[key] = val
+        else:
+            raise ValueError(f"Invalid value shape: {val[0].shape} for key {key}")
+    return loss_reduced
+
+
 def train_step(
     forward_step_func,
     data_iterator,
@@ -3417,6 +3118,7 @@ def train_step(
     """
     args = get_args()
     cfg = get_run_config()
+    sequence_length = cfg.model.transformer.max_seq_length_per_sample
     timers = get_timers()
 
     # OTel: set up per-step sub-span support.
@@ -3450,13 +3152,13 @@ def train_step(
             model_chunk.force_all_reduce = save_wgrads_in_this_iteration
         optimizer.zero_grad()
 
-        if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
-            # Distillation shape-adjust reads parallel_state; only for modelopt-enabled runs.
+        if has_nvidia_modelopt and is_distillation_model(model):
+            # Pipeline-parallel distillation stacks student and teacher tensors.
             adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
                 model,
-                seq_length=args.seq_length,
+                seq_length=sequence_length,
                 micro_batch_size=cfg.train.micro_batch_size,
-                decoder_seq_length=args.decoder_seq_length,
+                decoder_seq_length=None,
             )
         else:
             adjust_tensor_shapes_fn = None
@@ -3543,15 +3245,21 @@ def train_step(
                 iteration=iteration,
                 pg_collection=metric_pg_collection,
             )
-        with grad_context, tensor_metric_context, _fb_cm:
+        # MFSDP v2 chunks share one context. Keep reductions asynchronous until the
+        # schedule's final wait, after all backward work including delayed wgrad.
+        gradient_finalization_context = (
+            model[0].module.context.finalize_gradients(mode=GradientFinalizationMode.REDUCE_OUTER)
+            if isinstance(model[0], FullyShardedDataParallelV2)
+            else nullcontext()
+        )
+        with grad_context, tensor_metric_context, _fb_cm, gradient_finalization_context:
             losses_reduced = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=forward_backward_data_iterator,
                 model=model,
                 num_microbatches=scheduled_num_microbatches,
-                seq_length=args.seq_length,
+                seq_length=sequence_length,
                 micro_batch_size=cfg.train.micro_batch_size,
-                decoder_seq_length=args.decoder_seq_length,
                 forward_only=forward_only,
                 adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
                 force_all_reduce=save_wgrads_in_this_iteration,
@@ -3604,7 +3312,7 @@ def train_step(
         torch.cuda.empty_cache()
 
     # Vision gradients.
-    if args.vision_pretraining and args.vision_pretraining_type == "dino":
+    if cfg.train.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.cancel_gradients_last_layer(get_train_state().iteration)
 
@@ -3663,17 +3371,19 @@ def train_step(
     is_last_stage = is_pp_last_stage(pg_collection.pp)
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
-    update_successful = logical_and_across_model_parallel_group(update_successful, group=mp_group)
+    if cfg.train.check_optimizer_step_success:
+        update_successful = logical_and_across_model_parallel_group(update_successful, group=mp_group)
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks
-    grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm, group=mp_group)
+    if not cfg.train.skip_sync_grad_norm_across_mp:
+        grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm, group=mp_group)
     if cfg.optimizer.log_num_zeros_in_grad:
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
             num_zeros_in_grad, group=mp_group
         )
 
     # Vision momentum.
-    if args.vision_pretraining and args.vision_pretraining_type == "dino":
+    if cfg.train.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.update_momentum(get_train_state().iteration)
 
@@ -3694,54 +3404,13 @@ def train_step(
     if is_last_stage and losses_reduced:
         # Average loss across microbatches.
         # Last stage may have no loss (e.g. MIMO encoder-grid ranks).
-        loss_reduced = {}
-        for key in losses_reduced[0].keys():
-            val = [x[key].view(-1) for x in losses_reduced]
-            if val[0].numel() == 2:
-                if args.sft and args.sft_loss_log_mode == 'microbatch':
-                    # Some CP shards can legitimately contain no trainable tokens.
-                    # Average only the valid per-microbatch losses.
-                    val = torch.vstack(val)
-                    numerators = val[:, 0]
-                    denominators = val[:, 1]
-                    valid = denominators > 0
-                    if valid.any():
-                        local_sum = (numerators[valid] / denominators[valid]).sum()
-                        local_count = torch.tensor(
-                            float(valid.sum().item()),
-                            dtype=local_sum.dtype,
-                            device=local_sum.device,
-                        )
-                    else:
-                        local_sum = torch.zeros_like(numerators[0])
-                        local_count = torch.zeros_like(denominators[0])
-
-                    torch.distributed.all_reduce(local_sum, group=dp_cp_group)
-                    torch.distributed.all_reduce(local_count, group=dp_cp_group)
-                    loss_reduced[key] = torch.where(
-                        local_count > 0,
-                        local_sum / local_count.clamp(min=1),
-                        torch.zeros_like(local_sum),
-                    )
-                elif args.sft:
-                    # Average over the total number of tokens across the global batch.
-                    val = torch.vstack(val).sum(dim=0)
-                    torch.distributed.all_reduce(val, group=dp_cp_group)
-                    loss_reduced[key] = torch.where(
-                        val[1] > 0,
-                        val[0] / val[1].clamp(min=1),
-                        torch.zeros_like(val[0]),
-                    )
-                else:
-                    val = torch.vstack(val).sum(dim=0)
-                    torch.distributed.all_reduce(val, group=dp_cp_group)
-                    loss_reduced[key] = val[0] / val[1]
-            elif val[0].numel() == 1:
-                # legacy behavior, we average over the number of microbatches
-                val = torch.cat(val).mean()
-                loss_reduced[key] = val
-            else:
-                raise ValueError(f"Invalid value shape: {val[0].shape} for key {key}")
+        loss_reduced = _reduce_microbatch_losses(
+            losses_reduced,
+            is_sft=cfg.data.is_sft(),
+            # Plain/legacy GPT dataset configs have no SFT reporting override.
+            sft_loss_log_mode=getattr(cfg.data.dataset, "sft_loss_log_mode", "token-weighted"),
+            group=dp_cp_group,
+        )
         return (
             loss_reduced,
             skipped_iter,
@@ -3823,6 +3492,7 @@ def training_log(
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
     cfg = get_run_config()
+    sequence_length = cfg.model.transformer.max_seq_length_per_sample
     timers = get_timers()
     writer = get_tensorboard_writer()
     wandb_writer = get_wandb_writer()
@@ -3903,7 +3573,7 @@ def training_log(
     )
 
     # Track app tag & app tag ID
-    one_logger_utils.track_app_tag(batch_size, safe_get_world_size(), args.seq_length)
+    one_logger_utils.track_app_tag(batch_size, safe_get_world_size(), sequence_length)
 
     total_iterations = total_loss_dict[advanced_iters_key] + total_loss_dict[skipped_iters_key]
     if packed_sequence_stats and wandb_writer:
@@ -4115,7 +3785,7 @@ def training_log(
         throughput = num_floating_point_operations(
             cfg.model,
             batch_size,
-            sequence_length=args.decoder_seq_length if args.decoder_seq_length is not None else args.seq_length,
+            sequence_length=sequence_length,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
         ) / (elapsed_time_per_iteration * 10**12 * llm_world_size)
@@ -4245,7 +3915,7 @@ def training_log(
             from megatron.core.telemetry.training_metrics import record_training_metrics
             _avg_loss = _otel_loss_snapshot
             _tokens_per_sec = (
-                batch_size * args.seq_length / elapsed_time_per_iteration
+                batch_size * get_training_data_sequence_length(cfg) / elapsed_time_per_iteration
                 if elapsed_time_per_iteration > 0 else None
             )
             _mem_gb = torch.cuda.max_memory_allocated() / (1024 ** 3) if torch.cuda.is_available() else None
@@ -4267,7 +3937,7 @@ def training_log(
             if torch.distributed.get_rank() == 0:
                 num_microbatches = get_num_microbatches()
                 report_theoretical_memory(
-                    cfg, sequence_length=args.seq_length, micro_batch_size=cfg.train.micro_batch_size,
+                    cfg, sequence_length=sequence_length, micro_batch_size=cfg.train.micro_batch_size,
                     data_parallel_size=cfg.get_data_parallel_size(), world_size=safe_get_world_size(),
                     num_microbatches=num_microbatches, verbose=True,
                 )
@@ -4341,8 +4011,8 @@ def _consume_embedding_min_norm_metrics(optimizer) -> Dict[str, float]:
 
 
 def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point_operations_so_far):
-    args = get_args()
     cfg = get_run_config()
+    sequence_length = get_training_data_sequence_length(cfg)
     checkpoint = cfg.checkpoint
     train_state = get_train_state()
     if checkpoint.save is None:
@@ -4366,7 +4036,7 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
         num_floating_point_operations_so_far - start_num_floating_point_operations
     ) / (elapsed_time * 10**12 * llm_world_size)
 
-    tokens_so_far = train_state.consumed_train_samples * args.seq_length
+    tokens_so_far = train_state.consumed_train_samples * sequence_length
     saved_ckpt_prefix = 'Saving async checkpoint' if checkpoint.async_save else 'Saved checkpoint'
     append_to_progress_log(
         checkpoint.save,
@@ -4868,6 +4538,7 @@ def train(
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
     cfg = get_run_config()
+    sequence_length = cfg.model.transformer.max_seq_length_per_sample
     timers = get_timers()
     train_state = get_train_state()
 
@@ -4952,7 +4623,7 @@ def train(
         iteration=iteration,
         consumed_train_samples=train_state.consumed_train_samples,
         train_samples=cfg.train.train_samples,
-        seq_length=args.seq_length,
+        seq_length=get_training_data_sequence_length(cfg),
         train_iters=cfg.train.train_iters,
         save=cfg.checkpoint.save,
         async_save=cfg.checkpoint.async_save,
@@ -5095,7 +4766,7 @@ def train(
             'num_floating_point_operations_so_far': train_state.num_floating_point_operations_so_far,
             'consumed_train_samples': train_state.consumed_train_samples,
             'world_size': cfg.get_model_world_size(),
-            'seq_length': args.seq_length,
+            'seq_length': get_training_data_sequence_length(cfg),
         }
 
     # Cache into one-logger for callback.
@@ -5162,7 +4833,7 @@ def train(
         cuda_graph_helper = TECudaGraphHelper(
             model=model,
             config=config,
-            seq_length=args.seq_length,
+            seq_length=sequence_length,
             micro_batch_size=cfg.train.micro_batch_size,
             optimizers=[optimizer],
         )
@@ -5508,7 +5179,7 @@ def train(
         num_floating_point_operations_in_batch = num_floating_point_operations(
             cfg.model,
             batch_size,
-            sequence_length=args.decoder_seq_length if args.decoder_seq_length is not None else args.seq_length,
+            sequence_length=sequence_length,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
         )
@@ -5777,6 +5448,7 @@ def evaluate(
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     cfg = get_run_config()
+    sequence_length = cfg.model.transformer.max_seq_length_per_sample
     timers = get_timers()
     train_state = get_train_state()
 
@@ -5836,13 +5508,13 @@ def evaluate(
             forward_backward_func,
         )
 
-    if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
+    if has_nvidia_modelopt and is_distillation_model(model):
         # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
         adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
             model,
-            seq_length=args.seq_length,
+            seq_length=sequence_length,
             micro_batch_size=eval_micro_batch_size,
-            decoder_seq_length=args.decoder_seq_length,
+            decoder_seq_length=None,
         )
     else:
         adjust_tensor_shapes_fn = None
@@ -5892,9 +5564,8 @@ def evaluate(
                     data_iterator=packed_data_iterator,
                     model=model,
                     num_microbatches=scheduled_eval_num_microbatches,
-                    seq_length=args.seq_length,
+                    seq_length=sequence_length,
                     micro_batch_size=eval_micro_batch_size,
-                    decoder_seq_length=args.decoder_seq_length,
                     forward_only=True,
                     adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
                     pg_collection=pg_collection,
@@ -5953,9 +5624,8 @@ def evaluate(
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=eval_num_microbatches,
-                seq_length=args.seq_length,
+                seq_length=sequence_length,
                 micro_batch_size=eval_micro_batch_size,
-                decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
                 collect_non_loss_data=True,
                 pg_collection=pg_collection,
@@ -6322,7 +5992,7 @@ def build_train_valid_test_data_iterators(
     )
 
     # Build iterators.
-    dl_type = args.dataloader_type
+    dl_type = cfg.data.dataloader.dataloader_type or 'single'  # unset selects single
     assert dl_type in ['single', 'cyclic', 'external']
 
     def _get_iterator(dataloader_type, dataloader):
