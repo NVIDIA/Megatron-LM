@@ -70,6 +70,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     is_gated_delta_net_variant,
     is_linear_attention_variant,
 )
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.msc_utils import maybe_msc
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
@@ -2596,7 +2597,7 @@ def setup_model_and_optimizer(
                 )
 
             builder = builder_cls(model_config)
-            models = builder.build_distributed_models(
+            return builder.build_distributed_models(
                 pg_collection=pg_collection,
                 ddp_config=cfg.ddp,
                 overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
@@ -2607,10 +2608,6 @@ def setup_model_and_optimizer(
                 use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
                 use_layer_wise_param_layout=cfg.optimizer.use_layer_wise_param_layout,
             )
-            if model_config is not cfg.model:
-                # Keep the resolved transformer config when hooks needed a temporary builder config.
-                cfg.model.transformer = model_config.transformer
-            return models
         else:
             assert model_provider_func is not None, "Must provide a model config via config_container or a model_provider_func."
             return get_model(
@@ -2653,6 +2650,10 @@ def setup_model_and_optimizer(
 
     model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
+    primary_chunk = unwrapped_model[0]
+    if isinstance(primary_chunk, HybridModel) and primary_chunk.hybrid_layer_config_list is not None:
+        # Core can detach a shared root config before resolving MTP depth.
+        cfg.model.transformer = primary_chunk.config
 
     # Register default GTP prefetch chains and finalize capture scopes after DDP wrap, before the
     # first forward. Placed here (not in get_model) so it also covers the config-container
@@ -3509,43 +3510,30 @@ def _moe_loss_metric_names(*moe_configs) -> list[str]:
     return track_names
 
 
-def _hybrid_config_list_moe_logging_metadata(
-    hybrid_layer_config_list, mtp_use_repeated_layer: bool, moe_num_hash_layers: int
-):
-    """Derive config-list MoE metadata using the existing pattern logging conventions."""
-    from megatron.core.models.hybrid.hybrid_layer_allocation import (
-        PipelineSplit,
-        parse_hybrid_layer_config_list,
-    )
+def _hybrid_config_list_moe_logging_metadata(model):
+    """Count built-in routers across the full config-list architecture on every PP rank."""
+    if not isinstance(model, HybridModel) or model.hybrid_layer_config_list is None:
+        return None
+
     from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 
-    parsed_config_list = parse_hybrid_layer_config_list(hybrid_layer_config_list)
-    main_configs = [
-        entry
-        for entry in parsed_config_list.main_layer_config_list
-        if entry is not PipelineSplit
+    moe_configs = [
+        entry for entry in model.hybrid_layer_config_list if type(entry) is MoELayerConfig
     ]
-    mtp_configs = parsed_config_list.mtp_layer_config_list or ()
-
-    # Routers reserve one logging slot per MTP depth, as on the pattern path.
-    num_layers = len(main_configs) + parsed_config_list.mtp_num_depths
-    main_moe_configs = [config for config in main_configs if type(config) is MoELayerConfig]
-    mtp_moe_configs = [config for config in mtp_configs if type(config) is MoELayerConfig]
-    mtp_repeats = (
-        1
-        if mtp_use_repeated_layer and parsed_config_list.mtp_num_depths > 0
-        else parsed_config_list.mtp_num_depths
-    )
-    num_moe_layers = len(main_moe_configs) + len(mtp_moe_configs) * mtp_repeats
-    num_hash_layers = min(len(main_moe_configs), max(moe_num_hash_layers, 0))
-    track_names = _moe_loss_metric_names(*main_moe_configs, *mtp_moe_configs)
-    return track_names, num_layers, num_moe_layers, num_hash_layers
+    num_moe_layers = len(moe_configs)
+    if model.config.mtp_use_repeated_layer and model.mtp_num_depths > 1:
+        # The source list includes every depth, but shared routers contribute only once.
+        routers_per_depth = sum(
+            type(entry) is MoELayerConfig for entry in model.mtp_layer_config_list
+        )
+        num_moe_layers -= (model.mtp_num_depths - 1) * routers_per_depth
+    layers = model.config.num_layers + model.mtp_num_depths
+    num_hash_layers = max(model.config.moe_num_hash_layers, 0)
+    return _moe_loss_metric_names(*moe_configs), layers, num_moe_layers, num_hash_layers
 
 
 def _hybrid_model_chunks_for_runtime_metrics(model, model_config):
     """Return the local chunks when training a HybridModel."""
-    from megatron.core.models.hybrid.hybrid_model import HybridModel
-
     if model:
         chunks = unwrap_model(model)
         if isinstance(chunks[0], HybridModel):
@@ -3783,6 +3771,8 @@ def training_log(
     # Log MoE metrics.
     moe_log_string = ""
     num_moe_layers = 0
+    if moe_logging_metadata is None and model:
+        moe_logging_metadata = _hybrid_config_list_moe_logging_metadata(unwrap_model(model[0]))
     if moe_logging_metadata is not None:
         track_names, layers, num_moe_layers, num_hash_layers = moe_logging_metadata
     elif cfg.model.transformer.num_moe_experts is not None:
@@ -3843,7 +3833,6 @@ def training_log(
             track_names=track_names,
             num_layers=layers,
             num_moe_layers=num_moe_layers,
-            moe_layer_freq=cfg.model.transformer.moe_layer_freq,
             num_hash_layers=num_hash_layers,
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
@@ -4663,17 +4652,9 @@ def train(
     timers = get_timers()
     train_state = get_train_state()
     hybrid_models = _hybrid_model_chunks_for_runtime_metrics(model, cfg.model)
-    hybrid_model = hybrid_models[0] if hybrid_models else None
-    moe_logging_metadata = None
-    has_moe_layers = cfg.model.transformer.num_moe_experts is not None
-    if hybrid_model is not None and hybrid_model.hybrid_layer_config_list is not None:
-        moe_logging_metadata = _hybrid_config_list_moe_logging_metadata(
-            hybrid_model.hybrid_layer_config_list,
-            hybrid_model.config.mtp_use_repeated_layer,
-            hybrid_model.config.moe_num_hash_layers,
-        )
-        _, _, num_moe_layers, _ = moe_logging_metadata
-        has_moe_layers = num_moe_layers > 0
+    moe_logging_metadata = _hybrid_config_list_moe_logging_metadata(
+        hybrid_models[0] if hybrid_models else None
+    )
 
     fault_injector_config = cfg.fault_tolerance.fault_injector
 
@@ -5389,8 +5370,6 @@ def train(
                     max_attention_logit,
                     pg_collection=model_pg_collection,
                     is_first_iteration=is_first_iteration,
-                    seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
-                    total_real_tokens_in_batch=total_real_tokens_in_batch,
                     model=model,
                     callback_manager=callback_manager,
                     packed_sequence_stats=packed_sequence_stats,
@@ -5438,8 +5417,7 @@ def train(
             timers('interval-time', log_level=0).start(barrier=True)
             if cfg.logger.log_energy:
                 energy_monitor.resume()
-            if has_moe_layers:
-                get_moe_metrics_tracker().clear()
+            get_moe_metrics_tracker().clear()
 
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).
         # Some of these only happen at specific iterations. Capture updated FLOPs accumulator

@@ -216,16 +216,15 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         matching preconfigured virtual-pipeline topology.
         """
         hybrid_layer_config_list = self._model_config.hybrid_layer_config_list
-        if hybrid_layer_config_list is not None:
-            has_deprecated_ratio = self._model_config.hybrid_attention_ratio != 0.0 or (
-                self._model_config.hybrid_mlp_ratio != 0.0
+        if hybrid_layer_config_list is not None and (
+            self._model_config.hybrid_override_pattern is not None
+            or self._model_config.hybrid_attention_ratio != 0.0
+            or self._model_config.hybrid_mlp_ratio != 0.0
+        ):
+            raise ValueError(
+                "hybrid_layer_config_list is mutually exclusive with hybrid_override_pattern, "
+                "hybrid_attention_ratio, and hybrid_mlp_ratio"
             )
-            if self._model_config.hybrid_override_pattern is not None or has_deprecated_ratio:
-                raise ValueError(
-                    "hybrid_layer_config_list is mutually exclusive with "
-                    "hybrid_override_pattern, "
-                    "hybrid_attention_ratio, and hybrid_mlp_ratio"
-                )
 
         hybrid_stack_spec = resolve_hybrid_stack_spec(self._model_config)
 

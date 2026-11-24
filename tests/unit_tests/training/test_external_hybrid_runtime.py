@@ -69,6 +69,35 @@ def _flops(*models, model_config=None):
     )
 
 
+def test_explicit_provider_uses_resolved_hybrid_config_for_training(run_config, monkeypatch):
+    from megatron.training import training
+
+    source = _config()
+    run_config.model.transformer = source
+    chunk = _model(_config(mtp_num_layers=1), [])
+    chunk.hybrid_layer_config_list = (source, source, source, MTPSplit, source)
+    wrapped = _bare(Float16Module, chunk.config, module=chunk)
+    monkeypatch.setattr(training, "get_model", lambda provider, *args, **kwargs: [provider()])
+    args = Namespace(logits_save_dir=None, logits_load_dir=None)
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "get_timers", Mock())
+    monkeypatch.setattr(training, "get_one_logger", lambda: None)
+
+    class ReachedOptimizerSetup(Exception):
+        pass
+
+    monkeypatch.setattr(
+        training, "get_standard_config_overrides", Mock(side_effect=ReachedOptimizerSetup)
+    )
+    with pytest.raises(ReachedOptimizerSetup):
+        training.setup_model_and_optimizer(
+            training.ModelType.encoder_or_decoder, lambda: wrapped, cfg_container=run_config
+        )
+
+    assert run_config.model.transformer is chunk.config
+    assert source.mtp_num_layers is None
+
+
 @pytest.mark.parametrize("layer_flops", [0, 123, 123.5])
 def test_training_forwards_packed_sequence_counts_to_external_estimator(monkeypatch, layer_flops):
     config = _config()
@@ -226,9 +255,20 @@ def test_estimation_failures_propagate_across_pipeline_ranks(monkeypatch, local_
     assert len(reductions) == 1  # A local error must still reach the shared collective.
 
 
+def _moe_metadata(root, entries, *, mtp_template=None, mtp_depths=0):
+    model = _bare(
+        HybridModel,
+        root,
+        hybrid_layer_config_list=tuple(entries),
+        mtp_layer_config_list=mtp_template,
+        mtp_num_depths=mtp_depths,
+    )
+    return _hybrid_config_list_moe_logging_metadata(model)
+
+
 @pytest.mark.parametrize("repeated_mtp", [False, True])
 def test_builtin_moe_metadata_with_external_layers_uses_standard_tracker_conventions(repeated_mtp):
-    dense = _config()
+    dense = _config(mtp_num_layers=2, mtp_use_repeated_layer=repeated_mtp)
     moe = MoELayerConfig.from_config(_config(num_moe_experts=4))
     mtp_moe = MoELayerConfig.from_config(
         _config(
@@ -240,9 +280,7 @@ def test_builtin_moe_metadata_with_external_layers_uses_standard_tracker_convent
     )
     configs = [dense, moe, PipelineSplit, moe, MTPSplit, mtp_moe, MTPSplit, mtp_moe]
 
-    metadata = _hybrid_config_list_moe_logging_metadata(
-        configs, mtp_use_repeated_layer=repeated_mtp, moe_num_hash_layers=0
-    )
+    metadata = _moe_metadata(dense, configs, mtp_template=(mtp_moe,), mtp_depths=2)
 
     assert metadata == (
         ["load_balancing_loss", "seq_load_balancing_loss", "global_load_balancing_loss", "z_loss"],
@@ -253,26 +291,22 @@ def test_builtin_moe_metadata_with_external_layers_uses_standard_tracker_convent
 
 
 def test_builtin_hash_metadata_with_external_non_moe_layer():
-    dense = _config()
+    dense = _config(num_moe_experts=4, hash_moe_vocab_size=32, moe_num_hash_layers=2)
     moe = MoELayerConfig.from_config(
         _config(num_moe_experts=4, moe_router_load_balancing_type="seq_aux_loss")
     )
-    assert _hybrid_config_list_moe_logging_metadata([dense, moe, moe], False, 9) == (
-        ["seq_load_balancing_loss"],
-        3,
-        2,
-        2,
-    )
+    assert _moe_metadata(dense, [dense, moe, moe]) == (["seq_load_balancing_loss"], 3, 2, 2)
 
 
 def test_external_non_moe_config_does_not_enable_moe_metrics():
     config = _config()
-    assert _hybrid_config_list_moe_logging_metadata([config], False, 0) == ([], 1, 0, 0)
+    assert _moe_metadata(config, [config] * config.num_layers) == ([], 3, 0, 0)
 
 
 def test_saved_hybrid_family_preserves_checkpoint_policy_and_runtime_args(run_config):
     config = _config(mtp_num_layers=2)
     model = Mock(spec=HybridModel)
+    model.config = config
     model.hybrid_layer_config_list = [config, config, config, MTPSplit, config, MTPSplit, config]
     model.state_dict_for_save_checkpoint.return_value = {"weight": 1}
     args = Namespace(
@@ -287,16 +321,13 @@ def test_saved_hybrid_family_preserves_checkpoint_policy_and_runtime_args(run_co
     run_config.checkpoint.save = "/configured"
     run_config.checkpoint.save_optim = False
     run_config.tokenizer.padded_vocab_size = 32
-    run_config.model = HybridModelConfig(
-        transformer=config, vocab_size=32, hybrid_layer_config_list=model.hybrid_layer_config_list
-    )
 
     state = checkpointing.generate_state_dict(
         args, [model], None, None, None, iteration=3, ckpt_format="torch", save="/actual"
     )
 
     saved_args = state["args"]
-    assert saved_args.is_hybrid_model is True
+    assert saved_args.uses_hybrid_layer_config_list is True
     assert saved_args.mtp_num_layers == 2
     assert saved_args.ckpt_format == "torch"
     assert saved_args.save == "/actual"
@@ -304,17 +335,53 @@ def test_saved_hybrid_family_preserves_checkpoint_policy_and_runtime_args(run_co
     assert saved_args.padded_vocab_size == 32
     assert vars(args) == original_args
     assert state["model"] == {"weight": 1}
-    assert checkpointing._validate_checkpoint_model_family(
-        Namespace(is_hybrid_model=False), [model], checkpoint_model=run_config.model.as_dict()
-    ) == (True, True, None)
+    # A Python provider can supply the model even when the saved launcher config describes GPT.
+    assert checkpointing._maybe_setup_gpt_to_hybrid_load(
+        args,
+        saved_args,
+        [model],
+        load_optim=True,
+        saved_save_optim=False,
+        checkpoint_model=run_config.model.as_dict(),
+    ) == (None, False)
 
 
-def test_external_layer_keeps_config_list_gpt_conversion_restriction():
+def test_checkpoint_layer_list_selects_native_load_without_saved_args():
+    config = _config()
+    saved = HybridModelConfig(transformer=config, hybrid_layer_config_list=[config] * 3).as_dict()
+    options = dict(load_optim=False, saved_save_optim=False, checkpoint_model=saved)
+    assert checkpointing._maybe_setup_gpt_to_hybrid_load(
+        Namespace(), None, [Mock(spec=HybridModel)], **options
+    ) == (None, False)
+    with pytest.raises(RuntimeError, match="non-hybrid model"):
+        checkpointing._maybe_setup_gpt_to_hybrid_load(Namespace(), None, [object()], **options)
+
+
+def test_pattern_checkpoint_can_be_loaded_after_conversion_to_gpt(run_config):
     model = Mock(spec=HybridModel)
-    model.hybrid_layer_config_list = [_config()]
-    with pytest.raises(RuntimeError, match="config-list-defined hybrid model"):
-        checkpointing._validate_checkpoint_model_family(
-            Namespace(hybrid_layer_pattern=None), [model]
+    model.hybrid_layer_config_list = None
+    args = Namespace(hybrid_layer_pattern="*-", is_hybrid_model=True)
+    state = checkpointing.generate_state_dict(args, [model], None, None, None, ckpt_format="torch")
+    # The offline converter clears the pattern when it writes the target GPT checkpoint.
+    state["args"].hybrid_layer_pattern = None
+    assert checkpointing._maybe_setup_gpt_to_hybrid_load(
+        args, state["args"], [object()], load_optim=False, saved_save_optim=False
+    ) == (None, False)
+
+
+def test_external_layer_keeps_config_list_gpt_conversion_restriction(run_config):
+    config = _config()
+    run_config.model = HybridModelConfig(transformer=config, hybrid_layer_pattern="*-")
+    model = Mock(spec=HybridModel)
+    model.hybrid_layer_pattern = None
+    model.hybrid_layer_config_list = [config] * config.num_layers
+    with pytest.raises(RuntimeError, match="requires --hybrid-layer-pattern"):
+        checkpointing._maybe_setup_gpt_to_hybrid_load(
+            Namespace(),
+            Namespace(hybrid_layer_pattern=None),
+            [model],
+            load_optim=False,
+            saved_save_optim=False,
         )
 
 
