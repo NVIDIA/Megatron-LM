@@ -114,6 +114,24 @@ def test_te_gemm_batched_operands_match_flattened_replay(layout):
         )
 
 
+def test_te_wgrad_preserves_fp32_main_grad_accumulation():
+    """Two NT backward GEMMs must preserve TE's FP32 accumulator semantics."""
+    from transformer_engine.pytorch import cpp_extensions as te_cpp
+
+    seeded()
+    native_gemm = te_cpp.general_gemm
+    actual = torch.full((64, 96), 0.75, device="cuda", dtype=torch.float32)
+    expected = actual.clone()
+    with set_batch_invariant_mode(True, backend="triton"):
+        for _ in range(2):
+            x = torch.randn(4, 3, 96, device="cuda", dtype=torch.bfloat16)
+            dy = torch.randn(4, 3, 64, device="cuda", dtype=torch.bfloat16)
+            options = dict(layout="NT", out_dtype=torch.float32, grad=True, accumulate=True)
+            native_gemm(x, dy, out=expected, **options)
+            te_cpp.general_gemm(x, dy, out=actual, **options)
+            assert bytes_equal(actual, expected)
+
+
 @pytest.fixture
 def aux_loss_capability_cache():
     """Keep mocked TE APIs from changing subsequent integration-test dispatch."""

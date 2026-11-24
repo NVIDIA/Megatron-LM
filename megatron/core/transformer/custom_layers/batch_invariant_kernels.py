@@ -1036,6 +1036,13 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
             "(extra_output/ub/ub_type/bulk_overlap)."
         )
 
+    if grad and layout.upper() == "NT":
+        # Weight gradients reduce over tokens rather than the forward's K axis.
+        # Keep TE's native backward, including FP32 main_grad and accumulation;
+        # the replacement below rounds to the input dtype and overwrites out.
+        # Native GEMMs retain the workspace pin installed by this mode.
+        return _TE_GENERAL_GEMM_ORIG(*args, **kwargs)
+
     # Compute via autograd-aware function matching TE's layout semantics
     result = BatchInvariantTEGemmFn.apply(A, B, bias if not grad else None, out_dtype, layout)
 
