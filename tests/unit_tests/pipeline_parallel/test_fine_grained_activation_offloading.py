@@ -1898,11 +1898,11 @@ def test_offload_resident_groups_preserve_forward_chunks(monkeypatch, fraction):
             optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
 
             def forward_step(batches, model):
-                tokens, positions, mask = next(batches)
-                output = model(tokens, positions, mask)
+                tokens, labels, positions = next(batches)
+                output = model(tokens, positions, None, labels=labels)
 
-                def loss_func(logits):
-                    loss = logits.float().square().mean()
+                def loss_func(token_losses):
+                    loss = token_losses.float().mean()
                     return loss, {"loss": loss.detach().clone()}
 
                 return output, loss_func
@@ -1910,13 +1910,16 @@ def test_offload_resident_groups_preserve_forward_chunks(monkeypatch, fraction):
             results = []
             for _ in range(3):
                 optimizer.zero_grad(set_to_none=True)
-                inputs = _make_gpt_inputs(
-                    seq_length=128, micro_batch_size=1, device=torch.device("cuda")
-                )
-                inputs[2].copy_(torch.triu(torch.ones_like(inputs[2]), diagonal=1))
+                positions = torch.arange(128, device="cuda").unsqueeze(0)
+                batches = []
+                for _ in range(2):
+                    tokens = torch.randint(0, 256, (1, 129), device="cuda")
+                    batches.append(
+                        (tokens[:, :-1].contiguous(), tokens[:, 1:].contiguous(), positions)
+                    )
                 losses = get_forward_backward_func()(
                     forward_step_func=forward_step,
-                    data_iterator=iter([inputs] * 2),
+                    data_iterator=iter(batches),
                     model=model,
                     num_microbatches=2,
                     seq_length=128,
