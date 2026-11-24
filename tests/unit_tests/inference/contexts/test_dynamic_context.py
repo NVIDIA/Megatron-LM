@@ -27,10 +27,14 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling.flashinfer_sampling import FlashInferSampling
 from megatron.core.inference.sampling.torch_sampling import TorchSampling
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
-from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
+from megatron.core.transformer.moe.token_dispatcher_inference import (
+    InferenceAllGatherDispatcherBase,
+    NVLSAllGatherVDispatcher,
+)
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.inference.paged_attention_test_utils import reference_paged_attention
@@ -3123,6 +3127,55 @@ class TestDynamicContext:
         assert dynamic_context.num_attention_heads_per_partition == 1
 
         self._restore_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("num_moe_experts", [None, 4])
+    def test_nvls_dispatcher_buffers_only_for_moe_models(self, num_moe_experts):
+        """At TP > 1 only a model with MoE layers sets up the NVLS dispatcher.
+
+        For a dense model the tp_ep group is the TP group, and the dispatcher buffers would
+        need a symmetric-memory rendezvous over it that no layer ever uses.
+        """
+        tp_size = 2
+        if Utils.world_size < tp_size:
+            pytest.skip(f"requires {tp_size} ranks, got {Utils.world_size}")
+        self._setup_model_parallel_group(tensor_parallel_size=tp_size, pipeline_parallel_size=1)
+        try:
+            model_config = TransformerConfig(
+                params_dtype=torch.bfloat16,
+                num_layers=2,
+                kv_channels=64,
+                num_attention_heads=8,
+                tensor_model_parallel_size=tp_size,
+                num_moe_experts=num_moe_experts,
+                # Expert TP defaults to TP, which MoE supports only without linear biases.
+                add_bias_linear=False,
+            )
+            assert model_config.inference_moe_token_dispatcher_type == "nvls"
+            inference_config = InferenceConfig(
+                max_sequence_length=512, buffer_size_gb=0.1, block_size_tokens=128, max_requests=8
+            )
+            with (
+                mock.patch.object(NVLSAllGatherVDispatcher, "allocate_buffers") as allocate,
+                mock.patch.object(SymmetricMemoryManager, "get_buffer") as get_symm_buffer,
+                mock.patch.object(InferenceAllGatherDispatcherBase, "_valid_tokens_tensor", None),
+            ):
+                context = DynamicInferenceContext(
+                    model_config=model_config, inference_config=inference_config
+                )
+                # The fused MoE kernels read this scalar even without dispatcher buffers.
+                assert InferenceAllGatherDispatcherBase._valid_tokens() is not None
+
+            if num_moe_experts is None:
+                assert not context._nvls_dispatcher
+                allocate.assert_not_called()
+                get_symm_buffer.assert_not_called()
+            else:
+                assert context._nvls_dispatcher
+                allocate.assert_called_once()
+                assert allocate.call_args.kwargs["tp_ep_group"].size() == tp_size
+        finally:
+            self._restore_model_parallel()
 
     @pytest.mark.internal
     @rounder_override(64)
