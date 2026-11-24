@@ -137,6 +137,8 @@ dev = [
 
 inference = [
     "torch-memory-saver",
+    # Match the prebuilt FA2 public version without NGC's local build suffix.
+    "flash-attn==2.8.3.post1; sys_platform == 'linux'",
     "gigatoken==0.11.0",
     # Dynamic text generation server and data-parallel inference coordinator.
     # These are imported behind try/except, so a missing package only surfaces at runtime.
@@ -233,6 +235,7 @@ default-groups = ["linting", "build", "test"]
 # CUTLASS 4.8 moved CuTe APIs used by older Quack releases.
 constraint-dependencies = ["quack-kernels>=0.6.5", "virtualenv>=21.14.9"]
 no-build-isolation-package = [
+    "flash-attn",
     "causal-conv1d",
     "flash_mla",
     "mamba-ssm",
