@@ -1233,8 +1233,14 @@ class _HybridEPManager(_DispatchManager):
             # In drop_and_pad mode, the number of tokens after the permute op
             # can be computed on the CPU
             self.num_permuted_tokens = self.capacity * self.group.size() * self.num_local_experts
+            # GroupedTensor needs device split counts during CUDA Graph capture.
+            # The list-based expert path consumes the counts on the host.
+            splits_device = routing_map.device if self.config.moe_use_grouped_tensor else "cpu"
             self.tokens_per_expert = torch.full(
-                (self.num_local_experts,), self.capacity * self.group.size(), dtype=torch.long
+                (self.num_local_experts,),
+                self.capacity * self.group.size(),
+                dtype=torch.long,
+                device=splits_device,
             )
 
     def dispatch(

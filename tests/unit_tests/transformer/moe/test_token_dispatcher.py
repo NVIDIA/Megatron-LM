@@ -1124,10 +1124,13 @@ def test_hybridep_dropless_excludes_padding_rows(monkeypatch):
     torch.testing.assert_close(manager.token_probs[:3], probs[:3])
 
 
-def test_hybridep_indices_mode_keeps_bool_map_with_pad_to_capacity(monkeypatch):
+@pytest.mark.parametrize("use_grouped_tensor", [False, True])
+def test_hybridep_indices_mode_keeps_bool_map_with_pad_to_capacity(monkeypatch, use_grouped_tensor):
     """With pad-to-capacity the routing map is the capacity mask (a token can carry more than
     topk assignments); the indices-mode topk reconstruction would drop the padded assignments
     while tokens_per_expert still declares the full capacity, so the bool map must be kept."""
+    if use_grouped_tensor and not torch.cuda.is_available():
+        pytest.skip("requires CUDA Graph")
     monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
     num_tokens, num_experts, topk, capacity_factor = 64, 2, 1, 2.0
     manager = object.__new__(_HybridEPManager)
@@ -1135,6 +1138,7 @@ def test_hybridep_indices_mode_keeps_bool_map_with_pad_to_capacity(monkeypatch):
         moe_hybridep_pad_uneven_dispatch_inputs=False,
         moe_hybridep_routing_map_mode="indices",
         moe_router_topk=topk,
+        moe_use_grouped_tensor=use_grouped_tensor,
     )
     manager.group = SimpleNamespace(size=lambda: 1)
     manager.num_experts = num_experts
@@ -1150,15 +1154,29 @@ def test_hybridep_indices_mode_keeps_bool_map_with_pad_to_capacity(monkeypatch):
     # Every token picked expert 0; pad-to-capacity fills expert 1 with the same tokens.
     capacity = get_capacity(num_tokens * topk, num_experts, capacity_factor)
     assert capacity == num_tokens
-    routing_map = torch.ones(num_tokens, num_experts, dtype=torch.bool)
-    probs = torch.zeros(num_tokens, num_experts)
+    device = "cuda" if use_grouped_tensor else "cpu"
+    routing_map = torch.ones(num_tokens, num_experts, dtype=torch.bool, device=device)
+    probs = torch.zeros(num_tokens, num_experts, device=device)
     probs[:, 0] = 1.0
 
     manager.setup_metadata(routing_map, probs)
 
     assert manager.topk_idx is None
-    assert torch.equal(manager.routing_map.sum(dim=0), torch.tensor([capacity, capacity]))
-    assert torch.equal(manager.tokens_per_expert, torch.tensor([capacity, capacity]))
+    expected = torch.full((num_experts,), capacity, dtype=torch.long, device=device)
+    torch.testing.assert_close(manager.routing_map.sum(dim=0), expected)
+
+    if use_grouped_tensor:
+        # Mirror the conversion at the GroupedLinear expert boundary.
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            manager.setup_metadata(routing_map, probs)
+            splits = manager.tokens_per_expert.to(
+                device=probs.device, dtype=torch.int64, non_blocking=True
+            )
+        graph.replay()
+        torch.testing.assert_close(splits, expected)
+
+    torch.testing.assert_close(manager.tokens_per_expert, expected)
 
 
 def test_hybridep_dense_input_requires_backend_support(monkeypatch):
