@@ -104,17 +104,12 @@ def _write_v2_shard(
 
 
 def _load_args(monkeypatch, *, sft: bool, num_samples: int):
-    args = SimpleNamespace(
-        micro_batch_size=1,
-        global_batch_size=num_samples,
-        sft=sft,
-        dataloader_inter_document_masking=False,
+    cfg = SimpleNamespace(
+        train=SimpleNamespace(micro_batch_size=1, global_batch_size=num_samples),
+        data=_run_config_for(sft).data,
     )
-    monkeypatch.setattr(cached_logits_loss, "get_args", lambda: args)
-    # is_packed_sequence_run() reads the data section of the registered run config, the same
-    # source as get_batch; give it a section whose family matches the run.
-    monkeypatch.setattr(distillation_utils, "get_args", lambda: args)
-    monkeypatch.setattr(distillation_utils, "get_run_config", lambda: _run_config_for(sft))
+    monkeypatch.setattr(cached_logits_loss, "get_run_config", lambda: cfg)
+    monkeypatch.setattr(distillation_utils, "get_run_config", lambda: cfg)
 
 
 # ---------------------------------------------------------------------------
