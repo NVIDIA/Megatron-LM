@@ -245,8 +245,8 @@ Say DSA gains a third fused backend, `flashinfer`, next to `tilelang` and `cudnn
 ## Liger vocab-parallel cross entropy
 
 Install `liger-kernel>=0.8.5` (the dev image has it) and select
-`--cross-entropy-loss-fusion --cross-entropy-fusion-impl liger`. It is rejected with
-full-iteration CUDA graphs, which have not been verified with it.
+`--cross-entropy-loss-fusion --cross-entropy-fusion-impl liger`. Full-iteration CUDA
+graphs can capture it: it makes no host syncs.
 
 ## Adding a cross-entropy or normalization backend
 

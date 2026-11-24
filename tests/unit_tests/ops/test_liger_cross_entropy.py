@@ -25,12 +25,12 @@ def test_liger_is_imported_only_when_selected(monkeypatch):
         backends.select_cross_entropy(True, "liger")
 
 
-def test_liger_rejects_unverified_setups(monkeypatch):
+def test_liger_rejects_missing_group_and_old_versions(monkeypatch):
     pytest.importorskip(_LIBRARY)
     from megatron.core.ops.loss.liger_cross_entropy import liger_cross_entropy
 
-    with pytest.raises(ValueError, match="full-iteration CUDA graphs"):
-        backends.select_cross_entropy(True, "liger", cuda_graph_impl="full_iteration")
+    selected = backends.select_cross_entropy(True, "liger", cuda_graph_impl="full_iteration")
+    assert selected is liger_cross_entropy
     with pytest.raises(ValueError, match="needs the tensor-parallel group"):
         liger_cross_entropy(torch.zeros(2, 1, 4), torch.zeros(2, 1, dtype=torch.long), None)
     monkeypatch.setattr(sys.modules["liger_kernel"], "__version__", "0.8.4", raising=False)
@@ -132,3 +132,45 @@ def test_loss_and_gradients_match_references(
     tolerance = dict(atol=2e-7, rtol=2e-5) if dtype == torch.float32 else dict(atol=2e-5, rtol=1e-2)
     torch.testing.assert_close(gradient, reference_grad.to(dtype), **tolerance)
     torch.testing.assert_close(gradient, native_grad, **tolerance)
+
+
+def test_cuda_graph_replay_matches_eager(ce_group):
+    """Full-iteration CUDA graphs capture the loss; replays must match eager on new data."""
+    pytest.importorskip(_LIBRARY)
+    target = backends.select_cross_entropy(True, "liger", cuda_graph_impl="full_iteration")
+    group, _, data_id = ce_group
+    size, rank = group.size(), group.rank()
+    generator = torch.Generator().manual_seed(4321 + data_id)
+
+    def sample():
+        full = torch.randn(11, 3, 37 * size, generator=generator)
+        labels = torch.randint(37 * size, (11, 3), generator=generator)
+        labels[1::2] = -100
+        return full[..., rank * 37 : (rank + 1) * 37].cuda(), labels.cuda()
+
+    upstream = torch.randn(11, 3, generator=generator).cuda()
+
+    def step(logits, labels):
+        loss = target(logits, labels, group)
+        return loss, torch.autograd.grad(loss, logits, upstream)[0]
+
+    logits, labels = sample()
+    static_logits, static_labels = logits.requires_grad_(True), labels
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):  # compile the Triton kernels and set up NCCL first
+        for _ in range(2):
+            step(static_logits, static_labels)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+        static_loss, static_grad = step(static_logits, static_labels)
+    for _ in range(2):
+        logits, labels = sample()
+        with torch.no_grad():
+            static_logits.copy_(logits)
+            static_labels.copy_(labels)
+        graph.replay()
+        expected_loss, expected_grad = step(logits.requires_grad_(True), labels)
+        torch.testing.assert_close(static_loss, expected_loss)
+        torch.testing.assert_close(static_grad, expected_grad)

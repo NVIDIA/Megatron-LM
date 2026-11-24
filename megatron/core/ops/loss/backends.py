@@ -47,11 +47,7 @@ def select_cross_entropy(
     if cross_entropy_fusion_impl == "native":
         return _fused_ce
     if cross_entropy_fusion_impl == "liger":
-        if cuda_graph_impl == "full_iteration":
-            raise ValueError(
-                "Liger cross entropy is not verified under full-iteration CUDA graphs; use "
-                "cross_entropy_fusion_impl 'te' or 'native'."
-            )
+        # Capturable like native: no host syncs, caching-allocator buffers, NCCL reductions.
         require(
             "liger_kernel.megatron",
             "LigerMegatronCrossEntropy",
