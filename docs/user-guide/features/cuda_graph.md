@@ -153,6 +153,14 @@ follows it as one graph, which halves the graph launches per block:
   same way. They stay eager with `--mtp-use-repeated-layer` and several MTP depths, with
   `--keep-mtp-in-bf16` in FP8 or FP4 training, and with `--fp32-residual-connection`, because the
   BF16 graph inputs would round the FP32 residual stream that the eager MTP layers keep.
+- The MoE layers of Hybrid MTP blocks also stay eager, with a warning, and the mixers before them
+  keep their own graphs, when an MoE layer's own config sets up a graph scope that pairing does
+  not capture:
+  - `--mlp-chunks-for-training` greater than 1 with `moe_router`;
+  - `moe` or whole-layer capture with `--moe-token-dispatcher-type allgather`;
+  - `moe` or whole-layer capture with neither drop-and-pad MoE (`--moe-expert-capacity-factor`
+    with `--moe-pad-expert-input-to-capacity`) nor `--moe-virtual-expert-load-balance`, which the
+    `moe` scope requires for decoder layers too.
 - Pairing is skipped, with a warning, with `--overlap-moe-expert-parallel-comm`,
   `--delay-wgrad-compute`, `--fine-grained-activation-offloading`, `--sequence-packing-scheduler`,
   `--enable-mhc-connections` or `--context-parallel-size` greater than 1.

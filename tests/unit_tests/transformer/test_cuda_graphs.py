@@ -2337,6 +2337,18 @@ class TestHybridLayerPairCudaGraph:
         )
         return logged
 
+    @staticmethod
+    def _record_stage_warnings(monkeypatch):
+        """Record the warnings that TECudaGraphHelper logs once per pipeline stage."""
+        warnings = []
+
+        def record(*args, level, msg, **kwargs):
+            if level == logging.WARNING:
+                warnings.append(msg)
+
+        monkeypatch.setattr(cuda_graphs_module, "log_on_each_pipeline_stage", record)
+        return warnings
+
     @pytest.mark.parametrize(
         "cuda_graph_impl,pair", [("transformer_engine", False), ("local", True), ("none", True)]
     )
@@ -2375,6 +2387,78 @@ class TestHybridLayerPairCudaGraph:
         assert len(logged) == 1
         level, msg = logged[0]
         assert level == logging.WARNING and feature in msg
+
+    @pytest.mark.parametrize(
+        "cuda_graph_modules,features,blocking_feature",
+        [
+            # Partial MoE graphs end before the token dispatch, whatever the dispatcher.
+            pytest.param(_PARTIAL_MOE_GRAPH_MODULES, {}, None, id="moe-router"),
+            pytest.param(
+                _PARTIAL_MOE_GRAPH_MODULES,
+                {"moe_token_dispatcher_type": "flex", "moe_flex_dispatcher_backend": "hybridep"},
+                None,
+                id="moe-router-hybridep",
+            ),
+            # Each chunk's partial graph returns intermediate MoE tensors, which the chunk loop
+            # cannot join.
+            pytest.param(
+                _PARTIAL_MOE_GRAPH_MODULES,
+                {"mlp_chunks_for_training": 2},
+                "mlp_chunks_for_training",
+                id="moe-router-mlp-chunks",
+            ),
+            # A graph that runs the token dispatch needs static dispatch shapes, such as those of
+            # drop-and-pad MoE; the chunk loop then runs inside the graph.
+            pytest.param(
+                [CudaGraphModule.attn, CudaGraphModule.moe],
+                {
+                    "moe_expert_capacity_factor": 1.0,
+                    "moe_pad_expert_input_to_capacity": True,
+                    "mlp_chunks_for_training": 2,
+                },
+                None,
+                id="moe-drop-and-pad-mlp-chunks",
+            ),
+            pytest.param([], {}, "drop-and-pad", id="whole-layer-dropless"),
+            # Virtual-expert load balancing, with which TransformerConfig also allows the moe scope.
+            pytest.param(
+                [CudaGraphModule.attn, CudaGraphModule.moe],
+                {
+                    "moe_token_dispatcher_type": "flex",
+                    "moe_flex_dispatcher_backend": "hybridep",
+                    "moe_virtual_expert_load_balance": True,
+                },
+                None,
+                id="moe-virtual-experts",
+            ),
+            # The allgather dispatcher copies token counts to the host even with drop-and-pad.
+            pytest.param(
+                [],
+                {
+                    "moe_token_dispatcher_type": "allgather",
+                    "moe_expert_capacity_factor": 1.0,
+                    "moe_pad_expert_input_to_capacity": True,
+                },
+                "allgather",
+                id="whole-layer-allgather-drop-and-pad",
+            ),
+        ],
+    )
+    def test_hybrid_mtp_moe_layers_need_a_capturable_graph_scope(
+        self, cuda_graph_modules, features, blocking_feature
+    ):
+        config = _base_cuda_graph_config(cuda_graph_impl="transformer_engine")
+        # Set after construction: these settings need more setup to validate, and the rule only
+        # reads the fields.
+        config.num_moe_experts = 4
+        config.cuda_graph_modules = list(cuda_graph_modules)
+        for name, value in features.items():
+            setattr(config, name, value)
+        blocking_features = cuda_graphs_module._hybrid_mtp_moe_blocking_features(config)
+        if blocking_feature is None:
+            assert blocking_features == []
+        else:
+            assert len(blocking_features) == 1 and blocking_feature in blocking_features[0]
 
     def _setup_parallel_state(self, monkeypatch, num_microbatches, **parallel_sizes):
         """Initialize parallelism and return a counter of CUDA graph replays."""
@@ -3024,6 +3108,101 @@ class TestHybridLayerPairCudaGraph:
             assert not logged
         else:
             assert len(logged) == 1 and blocking_feature in logged[0][1]
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("2.10.0")),
+        reason="Partial CUDA graph UT support requires TransformerEngine version >= 2.10.0",
+    )
+    @pytest.mark.parametrize(
+        "cuda_graph_modules,overrides,mtp_moe_overrides,expected_pairs,blocking_feature",
+        [
+            # The partial MoE graph of each MLP chunk would return intermediate MoE tensors, which
+            # the chunk loop cannot join. The decoder's MLP layer is not in these graph scopes.
+            pytest.param(
+                _PARTIAL_MOE_GRAPH_MODULES,
+                {"mlp_chunks_for_training": 2},
+                {},
+                [False, False],
+                "mlp_chunks_for_training",
+                id="moe-router-mlp-chunks",
+            ),
+            # Only the MTP MoE layer's own config, from a hybrid_layer_config_list, sets the MLP
+            # chunks, and the layer's capture reads that config.
+            pytest.param(
+                _PARTIAL_MOE_GRAPH_MODULES,
+                {},
+                {"mlp_chunks_for_training": 2},
+                [False, False],
+                "mlp_chunks_for_training",
+                id="mtp-moe-layer-config-mlp-chunks",
+            ),
+            # A whole-layer graph would run the token dispatch, and the allgather dispatcher
+            # copies token counts to the host, which a capture cannot do.
+            pytest.param(
+                [],
+                {"moe_token_dispatcher_type": "allgather"},
+                {},
+                [True, False],
+                "allgather",
+                id="whole-layer-allgather",
+            ),
+        ],
+    )
+    def test_uncapturable_hybrid_mtp_moe_layer_stays_eager(
+        self,
+        monkeypatch,
+        cuda_graph_modules,
+        overrides,
+        mtp_moe_overrides,
+        expected_pairs,
+        blocking_feature,
+    ):
+        """In "*-/*E" only the MTP block has an MoE layer, which per-layer graphs leave eager.
+
+        Pairing keeps that layer eager when the graph scope of its own config cannot be captured,
+        graphs the MTP mixer on its own, and trains bit for bit like per-layer graphs.
+        """
+        pattern = "*-/*E"
+        replays = self._setup_parallel_state(monkeypatch, num_microbatches=1)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            config = self._config(pattern, cuda_graph_modules, **overrides)
+            hybrid_layer_config_list = None
+            if mtp_moe_overrides:
+                decoder_pattern, mtp_pattern = pattern.split("/")
+                mtp_configs = validate_segment_layers(mtp_pattern, config)
+                for name, value in mtp_moe_overrides.items():
+                    setattr(mtp_configs[-1], name, value)
+                hybrid_layer_config_list = [
+                    *validate_segment_layers(decoder_pattern, config),
+                    MTPSplit,
+                    *mtp_configs,
+                ]
+            models = self._build_models(
+                config, pattern, hybrid_layer_config_list=hybrid_layer_config_list
+            )
+            batches = self._batches(num_microbatches=1, padding=False)
+            initial_params = {
+                name: param.detach().clone() for name, param in self._named_parameters(models)
+            }
+            unpaired_helper, unpaired = self._train(models, config, batches, replays, pair=False)
+            unpaired_helper.delete_cuda_graphs()
+            self._restore(models, initial_params)
+            stage_warnings = self._record_stage_warnings(monkeypatch)
+            paired_helper, paired = self._train(models, config, batches, replays, pair=True)
+
+            mtp_mixer, mtp_moe_layer = models[0].module.mtp.layers[0].mtp_model_layer.layers
+            callables = paired_helper.flattened_callables
+            assert [isinstance(c, _TECudaGraphLayerPair) for c in callables] == expected_pairs
+            assert callables[-1] is mtp_mixer
+            assert paired_helper.flattened_callables_is_mtp == [False, True]
+            assert mtp_moe_layer.is_moe_layer and not mtp_moe_layer.te_cuda_graphs
+            assert paired["replays"] == [0, 2 * len(callables), 2 * len(callables)]
+            assert len(stage_warnings) == 1 and blocking_feature in stage_warnings[0]
+            self._assert_bitwise_equal(paired, unpaired)
+            paired_helper.delete_cuda_graphs()
+        torch.cuda.current_stream().wait_stream(stream)
 
     def test_set_current_microbatch_reaches_hybrid_mtp_layers_of_a_vlm(self):
         """Graph replay selects the graph of each layer by its te_cuda_graph_current_microbatch.

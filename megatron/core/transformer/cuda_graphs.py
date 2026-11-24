@@ -2617,24 +2617,76 @@ def _hybrid_mtp_graphs_supported(config: TransformerConfig) -> bool:
     return True
 
 
-def _te_graph_callables(layers, config: TransformerConfig, pair_hybrid_layers: bool) -> tuple:
+def _hybrid_mtp_moe_blocking_features(config: TransformerConfig) -> list:
+    """Return the settings with which pairing keeps an MoE layer of a Hybrid MTP block eager.
+
+    Per-layer graphs leave Hybrid MTP blocks eager, so their MoE layers never had to be capturable.
+    A graph that ends inside the MoE layer (moe_router, moe_preprocess) returns its intermediate
+    tensors, which the chunk loop of mlp_chunks_for_training cannot join. A graph that runs the
+    token dispatch (moe, or empty cuda_graph_modules for the whole layer) needs static dispatch
+    shapes. Pairing captures it only with drop-and-pad MoE or virtual-expert load balancing, the
+    settings with which TransformerConfig allows the moe scope, and never with the allgather
+    dispatcher, which copies token counts to the host in every mode. Such MoE layers stay eager,
+    and the mixers before them keep their own graphs.
+
+    Args:
+        config (TransformerConfig): The MoE layer's own config, whose graph scope, MLP chunks and
+            token dispatcher its capture uses.
+
+    Returns:
+        list: The names of the blocking settings. Empty when pairing can graph the layer.
+    """
+    modules = config.cuda_graph_modules
+    partial_moe_graph = (
+        CudaGraphModule.moe_router in modules or CudaGraphModule.moe_preprocess in modules
+    )
+    whole_moe_graph = not modules or CudaGraphModule.moe in modules
+    drop_and_pad = (
+        config.moe_expert_capacity_factor is not None and config.moe_pad_expert_input_to_capacity
+    )
+    return [
+        name
+        for name, enabled in (
+            (
+                "mlp_chunks_for_training > 1 and the moe_router scope",
+                partial_moe_graph and config.mlp_chunks_for_training > 1,
+            ),
+            (
+                "the moe or whole-layer scope with neither drop-and-pad MoE nor virtual-expert "
+                "load balancing",
+                whole_moe_graph and not (drop_and_pad or config.moe_virtual_expert_load_balance),
+            ),
+            (
+                "the moe or whole-layer scope and the allgather dispatcher",
+                whole_moe_graph and config.moe_token_dispatcher_type == "allgather",
+            ),
+        )
+        if enabled
+    ]
+
+
+def _te_graph_callables(
+    layers, config: TransformerConfig, pair_hybrid_layers: bool, eager_layers=()
+) -> tuple:
     """Return the TE graphed callables of consecutive layers and how many of them are pairs.
 
     With pair_hybrid_layers, each mixer is captured with the layer after it where
     _te_cuda_graph_pair_supported allows it. Every other graphable layer keeps its own callable;
     as with per-layer graphs, a layer whose own config selects another cuda_graph_impl is not
-    graphable and stays eager.
+    graphable and stays eager. The eager_layers are neither graphed nor paired.
     """
     callables, num_pairs, index = [], 0, 0
     while index < len(layers):
         layer = layers[index]
         partner = layers[index + 1] if pair_hybrid_layers and index + 1 < len(layers) else None
+        if partner in eager_layers:
+            partner = None
         if partner is not None and _te_cuda_graph_pair_supported(layer, partner, config):
             callables.append(_TECudaGraphLayerPair(layer, partner))
             num_pairs += 1
             index += 2
             continue
-        if _te_cuda_graph_layer_is_graphable(layer, config):
+        if _te_cuda_graph_layer_is_graphable(layer, config) and layer not in eager_layers:
             callables.append(layer)
         index += 1
     return callables, num_pairs
@@ -2726,6 +2778,8 @@ class TECudaGraphHelper:
             and _hybrid_mtp_graphs_supported(self.config)
         )
         num_pairs, num_hybrid_mtp_callables = 0, 0
+        # The settings that keep MoE layers of Hybrid MTP blocks eager, for one warning.
+        mtp_moe_blocking_features = set()
         for chunk_number, model_chunk in enumerate(self.model):
             try:
                 chunk_with_decoder = get_attr_wrapped_model(
@@ -2770,8 +2824,24 @@ class TECudaGraphHelper:
                     if _te_cuda_graph_layer_is_graphable(mtp_layer.mtp_model_layer, self.config):
                         mtp_callables = [mtp_layer.mtp_model_layer]
                     elif graph_hybrid_mtp and getattr(mtp_layer, "is_hybrid_mtp", False):
+                        mtp_block_layers = mtp_layer.mtp_model_layer.layers
+                        # An MoE layer is captured with its own config, which a
+                        # hybrid_layer_config_list can set apart from the model config.
+                        eager_moe_layers = []
+                        for layer in mtp_block_layers:
+                            blocking_features = (
+                                _hybrid_mtp_moe_blocking_features(layer.config)
+                                if getattr(layer, "is_moe_layer", False)
+                                else []
+                            )
+                            if blocking_features:
+                                eager_moe_layers.append(layer)
+                                mtp_moe_blocking_features.update(blocking_features)
                         mtp_callables, mtp_pairs = _te_graph_callables(
-                            mtp_layer.mtp_model_layer.layers, self.config, pair_hybrid_layers
+                            mtp_block_layers,
+                            self.config,
+                            pair_hybrid_layers,
+                            eager_layers=eager_moe_layers,
                         )
                         chunk_pairs += mtp_pairs
                         num_hybrid_mtp_callables += len(mtp_callables)
@@ -2804,6 +2874,16 @@ class TECudaGraphHelper:
                     self.callables_per_chunk.append([])
                     self.callables_per_chunk_is_mtp.append([])
 
+        # Logged per pipeline stage: only the stage that holds the MTP blocks has their layers.
+        if mtp_moe_blocking_features:
+            log_on_each_pipeline_stage(
+                logger=logger,
+                tp_group=self.tp_group,
+                dp_cp_group=self.dp_cp_group,
+                level=logging.WARNING,
+                msg='MoE layers of Hybrid MTP blocks are not CUDA-graphed with '
+                f'{", ".join(sorted(mtp_moe_blocking_features))}; they run eagerly.',
+            )
         log_on_each_pipeline_stage(
             logger=logger,
             tp_group=self.tp_group,
