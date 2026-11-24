@@ -1325,7 +1325,7 @@ class Compressor(MegatronModule):
         # request a single overwrite of main_grad. Preserve their single-call
         # contract instead of splitting a projection into two invocations.
         projected_kv_score = None
-        zigzag = layout.boundary_segments == 2
+        zigzag = layout.boundary_segments > 1
         if zigzag and (pre_compacted_hidden is not None or self._cp_requires_single_projection()):
             raise NotImplementedError(
                 "The zigzag CP compressor layout supports only the split projection path; "
@@ -1345,7 +1345,7 @@ class Compressor(MegatronModule):
         else:
             if boundary_hidden.shape[0] < layout.boundary_rows:
                 raise ValueError("CP boundary is shorter than the compressor halo.")
-            if zigzag:
+            if layout.boundary_segments == 2:
                 # boundary_hidden is [halo_A | halo_B]; the layout's source buffer
                 # starts with the last d_comp rows of each halo.
                 d_window = boundary_hidden.shape[0] // 2
@@ -1360,7 +1360,7 @@ class Compressor(MegatronModule):
                         )
                     )
             else:
-                boundary = boundary_hidden[-layout.boundary_rows :]
+                boundary = boundary_hidden[boundary_hidden.shape[0] - layout.boundary_rows :]
             projections = []
             with get_fp8_disabled_context(self.config):
                 for linear in linears:
@@ -3519,11 +3519,18 @@ class CompressedSparseAttention(MegatronModule):
                 self.window_size,
                 self.config,
             )
-            global_start = zigzag_layout.segment_starts[0]
-            zigzag_index_kwargs = dict(
-                segment_rows=zigzag_layout.segment_rows,
-                second_global_start=zigzag_layout.segment_starts[1],
-            )
+            if isinstance(zigzag_layout, cp_utils.PackedZigzagLayout):
+                global_start = 0  # Each query supplies its own global row.
+                zigzag_index_kwargs = dict(
+                    packed_row_geometry=zigzag_layout.row_geometry,
+                    packed_halo_rows=zigzag_layout.recv_order.numel(),
+                )
+            else:
+                global_start = zigzag_layout.segment_starts[0]
+                zigzag_index_kwargs = dict(
+                    segment_rows=zigzag_layout.segment_rows,
+                    second_global_start=zigzag_layout.segment_starts[1],
+                )
             out_rope = _OutputInverseRope(
                 self,
                 x.dtype,
@@ -3556,9 +3563,14 @@ class CompressedSparseAttention(MegatronModule):
             d_window = boundary_hidden.shape[0]
         else:
             d_window = zigzag_layout.d_window
-            if boundary_hidden.shape[0] != 2 * d_window or boundary_kv.shape[0] != 2 * d_window:
+            halo_rows = (
+                zigzag_layout.recv_order.numel()
+                if isinstance(zigzag_layout, cp_utils.PackedZigzagLayout)
+                else 2 * d_window
+            )
+            if boundary_hidden.shape[0] != halo_rows or boundary_kv.shape[0] != halo_rows:
                 raise RuntimeError(
-                    "DSv4 zigzag CP expects two D_window halos: D_window="
+                    f"DSv4 zigzag CP expects {halo_rows} halo rows: D_window="
                     f"{d_window}, boundary_hidden rows={boundary_hidden.shape[0]}, "
                     f"boundary_kv rows={boundary_kv.shape[0]}."
                 )

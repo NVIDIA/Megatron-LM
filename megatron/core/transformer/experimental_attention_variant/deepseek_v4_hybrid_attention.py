@@ -549,12 +549,15 @@ class DSv4HybridAttention(Attention):
                 self.config.csa_window_size,
                 self.config,
             )
-            boundary_hidden = cp_utils.exchange_cp_zigzag_boundary_hidden(
-                hidden_states,
-                self._dsv4_compress_ratio,
-                self.config.csa_window_size,
-                self.pg_collection.cp,
-            )
+            if isinstance(zigzag_cp_layout, cp_utils.PackedZigzagLayout):
+                boundary_hidden = zigzag_cp_layout.exchange(hidden_states, cp_group)
+            else:
+                boundary_hidden = cp_utils.exchange_cp_zigzag_boundary_hidden(
+                    hidden_states,
+                    self._dsv4_compress_ratio,
+                    self.config.csa_window_size,
+                    self.pg_collection.cp,
+                )
         elif use_thd_cp:
             boundary_hidden = cp_utils.exchange_cp_boundary_hidden(
                 hidden_states,

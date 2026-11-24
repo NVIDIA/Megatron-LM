@@ -813,17 +813,14 @@ def _dsv4_config(**overrides):
             dict(cp_partition_mode="zigzag", dsv4_cp_zigzag=True, delay_wgrad_compute=True),
             "delay_wgrad_compute",
         ),
-        (
-            dict(cp_partition_mode="zigzag", dsv4_cp_zigzag=True, thd_max_packed_sequences=2),
-            "thd_max_packed_sequences",
-        ),
+        (dict(cp_partition_mode="zigzag", dsv4_cp_zigzag=True, thd_max_packed_sequences=2), None),
         (
             dict(
                 cp_partition_mode="zigzag",
                 dsv4_cp_zigzag=True,
                 sequence_packing_scheduler="dp_balanced",
             ),
-            "sequence_packing_scheduler",
+            None,
         ),
         (
             dict(cp_partition_mode="zigzag", dsv4_cp_zigzag=True, cuda_graph_impl="local"),
@@ -1277,3 +1274,215 @@ class TestDSv4ZigzagCPDistributed:
             assert (
                 rel_l2 <= max_rel_l2 and cosine >= min_cosine
             ), f"{label}: zigzag vs contiguous {what}: rel L2 {rel_l2:.3e}, cosine {cosine:.9f}"
+
+
+def _packed_document_zigzag_rows(padded_lengths, cp_rank, cp_size):
+    """Independent oracle for TE's per-document two-chunk THD partition."""
+    parts = []
+    start = 0
+    for length in padded_lengths:
+        chunk, remainder = divmod(length, 2 * cp_size)
+        assert remainder == 0
+        for index in (cp_rank, 2 * cp_size - 1 - cp_rank):
+            parts.append(torch.arange(start + index * chunk, start + (index + 1) * chunk))
+        start += length
+    return torch.cat(parts).cuda()
+
+
+def _packed_h_error(actual, reference, label, limit, group, sharded):
+    """Measure the entire CP group, including the worst single element, under one tolerance."""
+    a, b = actual.detach().double(), reference.detach().double()
+    assert a.shape == b.shape, label
+    delta = a - b
+    sums = torch.stack((delta.square().sum(), b.square().sum()))
+    absolute = delta.abs().amax()
+    if sharded:
+        dist.all_reduce(sums, group=group)
+        dist.all_reduce(absolute, op=dist.ReduceOp.MAX, group=group)
+    relative = (sums[0] / sums[1].clamp_min(1e-30)).sqrt().item()
+    if group.rank() == 0:
+        print(
+            f"[packed-H] group={dist.get_rank()} {label} "
+            f"rel_l2={relative:.8g} max_abs={absolute.item():.8g} limit={limit}",
+            flush=True,
+        )
+    assert relative <= limit, f"{label}: relative L2 {relative}, max absolute {absolute.item()}"
+
+
+@pytest.mark.skipif(_distributed_cp_size() < 2, reason="needs torchrun with >= 2 CUDA ranks")
+class TestPackedDSv4ZigzagCPDistributed:
+    """Real H attention against independent one-document CP1 forwards and backwards."""
+
+    @pytest.fixture(scope="class", autouse=True)
+    def packed_cp(self):
+        from tests.unit_tests.test_utilities import Utils
+
+        cp_size = min(16, Utils.world_size)
+        if cp_size not in (2, 4, 8, 16) or Utils.world_size % cp_size:
+            pytest.skip("requires complete CP2/4/8/16 groups")
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=cp_size,
+        )
+        yield cp_size
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("layer_number", [1, 2], ids=["window_only", "ratio_128"])
+    def test_multi_document_forward_backward_and_isolation(self, packed_cp, layer_number):
+        from megatron.core.extensions.transformer_engine import HAVE_TE
+        from megatron.core.process_groups_config import ProcessGroupCollection
+        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+        from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybrid_attention import (
+            _build_attention,
+        )
+        from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybrid_attention_cp import (
+            _copy_module_parameters,
+            _dsv4_cp_fused_kernels_available,
+            _make_dsv4_cp_config,
+            _make_thd_packed_seq_params,
+            _ReferenceCPGroup,
+        )
+
+        if not HAVE_TE:
+            pytest.skip("requires Transformer Engine")
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        ref_pg = ProcessGroupCollection.use_mpu_process_groups()
+        ref_pg.cp = _ReferenceCPGroup()
+        group, cp_size = pg.cp, packed_cp
+        leader = dist.get_global_rank(group, 0)
+        fused = _dsv4_cp_fused_kernels_available()
+        # With CP16 the per-document chunks are 1, 3, 5, 11, 26, and 82 rows.
+        # Every 128-row compressor block spans multiple chunks, and two docs are shorter
+        # than one sliding window. CP groups get different document order and contents.
+        lengths = [31, 95, 129, 337, 811, 2603]
+        padded = [32, 96, 160, 352, 832, 2624]
+        if leader:
+            lengths.reverse()
+            padded.reverse()
+        total = sum(padded)
+        local = total // cp_size
+        packed_args = dict(
+            dsa_indexer_loss_coeff=0.0,
+            use_fused_kernels=fused,
+            csa_compress_ratios=[0, 128, 0, 128],
+            csa_dense_mode=True,
+            cuda_graph_impl="none",
+        )
+        configs = {
+            "zigzag": _make_dsv4_cp_config(
+                context_parallel_size=cp_size,
+                max_seqlen_per_dp_cp_rank=local,
+                cp_partition_mode="zigzag",
+                dsv4_cp_zigzag=True,
+                sequence_packing_scheduler="dp_balanced",
+                **packed_args,
+            ),
+            "contiguous": _make_dsv4_cp_config(
+                context_parallel_size=cp_size, max_seqlen_per_dp_cp_rank=local, **packed_args
+            ),
+            "cp1": _make_dsv4_cp_config(context_parallel_size=1, **packed_args),
+        }
+        seed = 1234 + layer_number + leader
+        torch.manual_seed(seed)
+        model_parallel_cuda_manual_seed(seed)
+        modules = {
+            name: _build_attention(
+                config, layer_number=layer_number, pg_collection=ref_pg if name == "cp1" else pg
+            ).cuda()
+            for name, config in configs.items()
+        }
+        for parameter in modules["zigzag"].parameters():
+            dist.broadcast(parameter.data, src=leader, group=group)
+        for name in ("contiguous", "cp1"):
+            _copy_module_parameters(modules["zigzag"], modules[name])
+        generator = torch.Generator(device="cuda").manual_seed(seed + 53)
+        shape = (total, 1, configs["cp1"].hidden_size)
+        x = torch.randn(shape, device="cuda", dtype=torch.bfloat16, generator=generator)
+        dy = torch.randn(shape, device="cuda", dtype=torch.bfloat16, generator=generator)
+        valid = torch.cat([torch.arange(n, device="cuda") < v for n, v in zip(padded, lengths)])
+        dy[~valid] = 0
+        oracle_y, oracle_dx, oracle_grads = [], [], {}
+        start = 0
+        for length, span in zip(lengths, padded):
+            model = modules["cp1"]
+            model.zero_grad(set_to_none=True)
+            sample = x[start : start + span].detach().requires_grad_(True)
+            packed = _make_thd_packed_seq_params([length], [span])
+            out = model(hidden_states=sample, attention_mask=None, packed_seq_params=packed)[0]
+            out.backward(dy[start : start + span])
+            oracle_y.append(out.detach())
+            oracle_dx.append(sample.grad.detach())
+            for name, parameter in model.named_parameters():
+                assert parameter.grad is not None, name
+                if name not in oracle_grads:
+                    oracle_grads[name] = parameter.grad.detach().float().clone()
+                else:
+                    oracle_grads[name].add_(parameter.grad.detach().float())
+            start += span
+        oracle_y = torch.cat(oracle_y)
+        oracle_dx = torch.cat(oracle_dx)
+        rows = {
+            "contiguous": torch.arange(
+                group.rank() * local, (group.rank() + 1) * local, device="cuda"
+            ),
+            "zigzag": _packed_document_zigzag_rows(padded, group.rank(), cp_size),
+        }
+        for name in ("contiguous", "zigzag"):
+            packed = _make_thd_packed_seq_params(lengths, padded)
+            packed.cp_partition_mode = name
+            indices = rows[name]
+            is_valid = valid[indices]
+            model = modules[name]
+            sample = x[indices].detach().requires_grad_(True)
+            out = model(hidden_states=sample, attention_mask=None, packed_seq_params=packed)[0]
+            out.backward(dy[indices])
+            label = f"cp={cp_size} layer={layer_number} fused={fused} {name}"
+            _packed_h_error(
+                out[is_valid], oracle_y[indices][is_valid], label + "/y", 0.01, group, True
+            )
+            _packed_h_error(
+                sample.grad[is_valid],
+                oracle_dx[indices][is_valid],
+                label + "/dX",
+                0.02,
+                group,
+                True,
+            )
+            for key, parameter in model.named_parameters():
+                assert parameter.grad is not None, key
+                grad = parameter.grad.detach().float()
+                dist.all_reduce(grad, group=group)
+                _packed_h_error(grad, oracle_grads[key], label + "/grad/" + key, 0.05, group, False)
+            if name == "zigzag":
+                # Change exactly one document. Independently seed only its outputs for the VJP.
+                # Every other document's forward must remain identical, and dX must be exactly zero.
+                target = padded.index(352)
+                first = sum(padded[:target])
+                here = (indices >= first) & (indices < first + lengths[target])
+                other = is_valid & ~here
+                perturbed = sample.detach().clone()
+                perturbed[here] *= -2
+                perturbed.requires_grad_(True)
+                changed = model(
+                    hidden_states=perturbed, attention_mask=None, packed_seq_params=packed
+                )[0]
+                upstream = torch.zeros_like(changed)
+                upstream[here] = dy[indices][here]
+                delta_x = torch.autograd.grad(changed, perturbed, upstream)[0]
+                leaks = torch.stack(
+                    ((changed[other] != out.detach()[other]).sum(), delta_x[other].count_nonzero())
+                )
+                changed_rows = (changed[here] != out.detach()[here]).sum()
+                dist.all_reduce(leaks, group=group)
+                dist.all_reduce(changed_rows, group=group)
+                assert not leaks.any() and changed_rows > 0, (
+                    label,
+                    leaks.tolist(),
+                    changed_rows.item(),
+                )
+                if group.rank() == 0:
+                    print(
+                        f"[packed-H-isolation] group={leader} layer={layer_number} output_leaks=0 dx_leaks=0",
+                        flush=True,
+                    )

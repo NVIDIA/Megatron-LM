@@ -635,7 +635,7 @@ class TransformerConfig(ModelParallelConfig):
     """Run DSv4 hybrid THD context parallelism on MCore's per-sequence zigzag partition
     (cp_partition_mode='zigzag'): CP rank r holds chunks r and 2*CP-1-r of the sequence, which
     balances causal attention work across ranks. Off (default) keeps the contiguous partition.
-    Supported for one sequence per pack, sliding-window and ratio-128 compressed layers without
+    Supports THD packs with each document padded to a multiple of 2*CP, sliding-window and ratio-128 compressed layers without
     a CSA indexer (no ratio-4 layers), static CP, delay_wgrad_compute=False and
     cuda_graph_impl='none'; unsupported cases raise."""
 
@@ -2250,13 +2250,6 @@ class TransformerConfig(ModelParallelConfig):
         unsupported = []
         if self.dynamic_context_parallel:
             unsupported.append("dynamic_context_parallel")
-        if self.sequence_packing_scheduler is not None:
-            unsupported.append(
-                f"sequence_packing_scheduler={self.sequence_packing_scheduler!r} "
-                "(packs several sequences)"
-            )
-        if self.thd_max_packed_sequences is not None and self.thd_max_packed_sequences > 1:
-            unsupported.append(f"thd_max_packed_sequences={self.thd_max_packed_sequences} (> 1)")
         if 4 in (self.csa_compress_ratios or []):
             unsupported.append("compress ratio 4 (CSA indexer layers)")
         if self.dsa_cp_balance_indexer:
@@ -2268,7 +2261,7 @@ class TransformerConfig(ModelParallelConfig):
         if unsupported:
             raise ValueError(
                 "dsv4_cp_zigzag does not support " + ", ".join(unsupported) + " yet. It supports "
-                "one sequence per pack, ratio 0/128 layers without a CSA indexer, static CP, "
+                "ratio 0/128 layers without a CSA indexer, static CP, "
                 "no delayed weight gradients and no CUDA graphs."
             )
 

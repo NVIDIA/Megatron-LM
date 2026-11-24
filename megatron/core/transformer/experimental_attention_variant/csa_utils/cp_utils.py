@@ -7,7 +7,7 @@ retained compaction kernel; ``csa.py`` calls final-index lowering directly.
 """
 
 import math
-from typing import NamedTuple, Optional, Tuple
+from typing import NamedTuple, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -23,6 +23,7 @@ from .fused_sparse_attention import (
     indexer_topk,
     pack_thd_compact_k,
 )
+from .packed_zigzag import PackedZigzagLayout, build_packed_zigzag_layout
 
 CPIndexerLayout = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
@@ -454,9 +455,8 @@ def check_dsv4_zigzag_cp_pack(
     """
     if cu_seqlens.ndim != 1 or cu_seqlens.numel() != 2:
         raise NotImplementedError(
-            "DSv4 zigzag CP (dsv4_cp_zigzag) supports one sequence per pack; got cumulative "
-            f"lengths of shape {tuple(cu_seqlens.shape)}. Pack one sequence per microbatch "
-            "(thd_max_packed_sequences=1) or use cp_partition_mode='contiguous'."
+            "The two-segment zigzag layout expects one sequence per pack; got cumulative "
+            f"lengths of shape {tuple(cu_seqlens.shape)}. Packed inputs use the per-document layout."
         )
     if int(compress_ratio) == 4:
         raise NotImplementedError(
@@ -522,7 +522,7 @@ def get_dsv4_zigzag_cp_layout(
     compress_ratio: int,
     csa_window_size: int,
     config,
-) -> DSv4ZigzagCpLayout:
+) -> Union[DSv4ZigzagCpLayout, PackedZigzagLayout]:
     """Return this microbatch's zigzag CP layout, built once and shared by its layers.
 
     The layout is memoized on ``packed_seq_params``, which is built per microbatch. It is
@@ -547,9 +547,29 @@ def get_dsv4_zigzag_cp_layout(
     cache = getattr(packed_seq_params, _ZIGZAG_LAYOUT_CACHE_ATTR, None) if use_cache else None
     if cache is not None and key in cache:
         return cache[key]
-    layout = build_dsv4_zigzag_cp_layout(
-        cu_seqlens, cp_rank, cp_size, local_rows, compress_ratio, csa_window_size
-    )
+    if cu_seqlens.ndim == 1 and cu_seqlens.numel() > 2:
+        if capturing:
+            raise ValueError(
+                "Packed DSv4 zigzag needs eager mode to select its halo exchange splits."
+            )
+        bounds = getattr(packed_seq_params, "thd_cp_host_cu_seqlens_q", None)
+        # A scheduler may pad the metadata with repeated prefix values. The prebuilt route
+        # compacts those away; the compressor and attention must use the original sequence IDs.
+        if bounds is None or len(bounds) != cu_seqlens.numel():
+            bounds = cu_seqlens.detach().cpu().tolist()
+        layout = build_packed_zigzag_layout(
+            bounds,
+            cp_rank,
+            cp_size,
+            local_rows,
+            int(compress_ratio),
+            dsv4_cp_window_rows(compress_ratio, csa_window_size),
+            cu_seqlens.device,
+        )
+    else:
+        layout = build_dsv4_zigzag_cp_layout(
+            cu_seqlens, cp_rank, cp_size, local_rows, compress_ratio, csa_window_size
+        )
     if use_cache:
         if cache is None:
             cache = {}

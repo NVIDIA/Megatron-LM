@@ -763,6 +763,7 @@ if _CUTE_AVAILABLE:
         topk_length: cute.Tensor,
         indexer_physical_rows: cute.Tensor,
         q_padding_mask: cute.Tensor,
+        packed_row_geometry: cute.Tensor,
         n_seq: cutlass.Int32,
         global_start: cutlass.Int32,
         l_local: cutlass.Int32,
@@ -780,6 +781,7 @@ if _CUTE_AVAILABLE:
         segment_rows: cutlass.Int32,
         second_global_start: cutlass.Int32,
         halo_rows: cutlass.Int32,
+        has_packed_geometry: cutlass.Constexpr,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -792,18 +794,22 @@ if _CUTE_AVAILABLE:
             row = bidx
 
         if row < l_local:
-            # Local rows are one or two consecutive global segments. Contiguous CP passes
-            # segment_rows=l_local and halo_rows=d_window (one segment). Zigzag CP passes two
-            # segments whose left windows are stored as [halo_0 | halo_1] ahead of the
-            # local rows [segment_0 | segment_1].
-            segment = cutlass.Int32(0)
-            row_start = global_start
-            if row >= segment_rows:
-                segment = cutlass.Int32(1)
-                row_start = second_global_start
-            global_q = row_start + row - segment * segment_rows
-            halo_base = segment * d_window - (row_start - d_window)
-            local_base = halo_rows + segment * segment_rows - row_start
+            if cutlass.const_expr(has_packed_geometry):
+                global_q = packed_row_geometry[row, 0]
+                row_start = packed_row_geometry[row, 1]
+                halo_base = packed_row_geometry[row, 2]
+                local_base = packed_row_geometry[row, 3]
+            else:
+                # Contiguous CP has one segment. Single-document zigzag has two
+                # half-segments with their halos stored ahead of the local rows.
+                segment = cutlass.Int32(0)
+                row_start = global_start
+                if row >= segment_rows:
+                    segment = cutlass.Int32(1)
+                    row_start = second_global_start
+                global_q = row_start + row - segment * segment_rows
+                halo_base = segment * d_window - (row_start - d_window)
+                local_base = halo_rows + segment * segment_rows - row_start
             seq_start_found = cutlass.Int32(-1)
             seq_comp_start = cutlass.Int32(0)
             seq_comp_len = cutlass.Int32(0)
@@ -976,6 +982,7 @@ if _CUTE_AVAILABLE:
         topk_length: cute.Tensor,
         indexer_physical_rows: cute.Tensor,
         q_padding_mask: cute.Tensor,
+        packed_row_geometry: cute.Tensor,
         n_seq: cutlass.Int32,
         global_start: cutlass.Int32,
         l_local: cutlass.Int32,
@@ -994,6 +1001,7 @@ if _CUTE_AVAILABLE:
         segment_rows: cutlass.Int32,
         second_global_start: cutlass.Int32,
         halo_rows: cutlass.Int32,
+        has_packed_geometry: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
         _launch_named(
@@ -1009,6 +1017,7 @@ if _CUTE_AVAILABLE:
                 topk_length,
                 indexer_physical_rows,
                 q_padding_mask,
+                packed_row_geometry,
                 n_seq,
                 global_start,
                 l_local,
@@ -1026,6 +1035,7 @@ if _CUTE_AVAILABLE:
                 segment_rows,
                 second_global_start,
                 halo_rows,
+                has_packed_geometry,
             ),
             grid=(cute.ceil_div(launch_work, 128), 1, 1),
             block=(128, 1, 1),
@@ -1639,6 +1649,8 @@ def build_attention_indices(
     output_alignment: int = 1,
     segment_rows: Optional[int] = None,
     second_global_start: Optional[int] = None,
+    packed_row_geometry: Optional[torch.Tensor] = None,
+    packed_halo_rows: Optional[int] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Build final sparse-attention and optional indexer-loss indices.
 
@@ -1668,6 +1680,11 @@ def build_attention_indices(
             and ``second_global_start``, and the raw KV buffer is
             ``[halo_0 | halo_1 | segment_0 | segment_1]`` with ``d_window``-row halos.
             Omit both for one consecutive segment (``[halo | local]``).
+        packed_row_geometry/packed_halo_rows: multi-document zigzag CP. Each
+            contiguous int32 row contains ``[global_q, segment_global_start,
+            halo_base, local_base]``. Adding a global raw key index to its
+            halo or local base yields a row in ``[packed halos | local]``.
+            ``packed_halo_rows`` is the physical length of the halo prefix.
 
     Outputs:
         ``topk_idxs`` int32, shape ``(l_local, padded_width)`` where
@@ -1688,6 +1705,7 @@ def build_attention_indices(
         cu_seqlens_compressed,
         seq_to_rank_row,
         cu_seqlens_unpadded,
+        packed_row_geometry,
     )
     if cu_seqlens_unpadded is not None and cu_seqlens_unpadded.shape != cu_seqlens.shape:
         raise ValueError("padded and unpadded cumulative lengths must have the same shape")
@@ -1714,7 +1732,26 @@ def build_attention_indices(
 
     if (segment_rows is None) != (second_global_start is None):
         raise ValueError("segment_rows and second_global_start must be passed together.")
-    if segment_rows is None:
+    has_packed_geometry = packed_row_geometry is not None
+    if has_packed_geometry != (packed_halo_rows is not None):
+        raise ValueError("packed_row_geometry and packed_halo_rows must be passed together.")
+    if has_packed_geometry:
+        if segment_rows is not None:
+            raise ValueError("Packed zigzag geometry and two-segment geometry are exclusive.")
+        if (
+            packed_row_geometry.shape != (l_local, 4)
+            or packed_row_geometry.dtype != torch.int32
+            or packed_row_geometry.device != cu_seqlens.device
+            or not packed_row_geometry.is_contiguous()
+        ):
+            raise ValueError(
+                "packed_row_geometry must be contiguous int32 [l_local, 4] on the query device."
+            )
+        halo_rows = int(packed_halo_rows)
+        if halo_rows < 0:
+            raise ValueError("packed_halo_rows must be nonnegative.")
+        segment_rows, second_global_start = l_local, global_start
+    elif segment_rows is None:
         segment_rows, second_global_start, halo_rows = l_local, global_start, int(d_window)
     else:
         segment_rows, second_global_start = int(segment_rows), int(second_global_start)
@@ -1741,6 +1778,9 @@ def build_attention_indices(
     index_mode = 2 if for_indexer_loss else int(compressed_topk is None)
     if compressed_topk is None:
         compressed_topk = torch.empty((1, 1), dtype=torch.int32, device=cu_seqlens.device)
+    if not has_packed_geometry:
+        # The legacy specialization accepts the same signature and ignores this argument.
+        packed_row_geometry = compressed_topk
     if for_indexer_loss:
         topk_length_kernel = torch.empty((1,), dtype=torch.int32, device=cu_seqlens.device)
         indexer_physical_rows = torch.empty_like(compressed_topk)
@@ -1768,6 +1808,7 @@ def build_attention_indices(
             topk_length_kernel,
             indexer_physical_rows,
             q_padding_mask_kernel,
+            packed_row_geometry,
         ),
         (
             cu_seqlens.shape[0] - 1,
@@ -1788,8 +1829,9 @@ def build_attention_indices(
             segment_rows,
             second_global_start,
             halo_rows,
+            has_packed_geometry,
         ),
-        static_arg_indices=(11, 12, 13),
+        static_arg_indices=(11, 12, 13, 18),
     )
     q_padding_mask = q_padding_mask_kernel.view(torch.bool) if has_unpadded_seqlens else None
     if for_indexer_loss:
