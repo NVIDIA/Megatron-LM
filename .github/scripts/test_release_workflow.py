@@ -4,6 +4,7 @@
 
 import hashlib
 import importlib.util
+import json
 import os
 import re
 import subprocess
@@ -117,6 +118,35 @@ def test_builder_has_no_upload_credentials():
     assert not any(
         step.get('uses', '').startswith('actions/checkout@') for step in publisher['steps']
     )
+
+
+@pytest.mark.parametrize('state', ['success', 'failure', 'cancelled', 'skipped'])
+def test_verification_requires_successful_publish(state):
+    """Run verification after publishing even when optional ancestors were skipped."""
+    context = {'needs.publish-wheels.result': state}
+    guard = WORKFLOW['jobs']['verify-published-wheels']['if']
+    assert bool(evaluate(guard, context)) == (state == 'success')
+    assert not evaluate(guard, context, failed=True)
+    assert not evaluate(guard, context, cancelled=True)
+
+
+@pytest.mark.parametrize('required', [True, False])
+@pytest.mark.parametrize('state', ['success', 'failure', 'cancelled', 'skipped'])
+def test_summary_rejects_missing_required_verification(tmp_path, required, state):
+    """Execute the summary guard and reject false success after a skipped verifier."""
+    jobs = {
+        name: {'result': 'success'}
+        for name in ('publish-wheels', 'verify-published-wheels', 'finalize')
+    }
+    jobs['verify-published-wheels']['result'] = state
+    script = tmp_path / 'summary.sh'
+    script.write_text(WORKFLOW['jobs']['release-summary']['steps'][0]['run'])
+    env = dict(os.environ, NEEDS_JSON=json.dumps(jobs), REQUIRE_UPLOAD=str(required).lower())
+    result = subprocess.run(
+        ['bash', '-euo', 'pipefail', str(script)], env=env, capture_output=True, check=False
+    )
+    expected_success = state == 'success' or (state == 'skipped' and not required)
+    assert (result.returncode == 0) == expected_success
 
 
 @pytest.mark.parametrize(
