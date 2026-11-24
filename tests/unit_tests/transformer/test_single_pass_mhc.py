@@ -628,11 +628,10 @@ def test_cutile_proj_rms_is_opt_in_and_falls_back(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "cuda_graph_impl,supported", [("none", True), ("full_iteration", True), ("local", False)]
+    "cuda_graph_impl,supported", [("none", True), ("full_iteration", False), ("local", False)]
 )
 def test_single_pass_graph_validation(cuda_graph_impl, supported):
-    """A full-iteration graph captures the whole step, so single-pass mHC state needs no
-    tensor-state adapter there; per-layer local graphs still require one."""
+    """The standalone layer needs the model's tensor-state adapter for graph capture."""
     kwargs = dict(
         num_layers=2,
         hidden_size=16,

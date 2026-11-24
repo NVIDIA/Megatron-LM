@@ -22,6 +22,7 @@ from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
     CheckpointWithoutOutputManager,
     _get_share_storage,
+    _mark_checkpoint_without_output_tensor,
 )
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.residual_connection import (
@@ -478,14 +479,27 @@ class _SinglePassAggregateReplay(CheckpointWithoutOutput):
     """
 
     def __init__(self, manager, aggregated, hidden_states, pre_mix, n):
-        super().__init__(ckpt_manager=manager)
-        self.outputs = (aggregated,)
-        # The base class treats ctx None as "already recomputed".
-        self.ctx = True
-        self._replay = (hidden_states, pre_mix, n)
+        super().__init__()
+        _mark_checkpoint_without_output_tensor(aggregated)
+        # Replay restores values only. Detached aliases share storage without owning the
+        # forward graph, including when an earlier region rebuilds these inputs.
+        self.outputs = (aggregated.detach(),)
+        self._replay = (
+            hidden_states.detach(),
+            pre_mix.detach() if pre_mix is not None else None,
+            n,
+        )
         manager.add_checkpoint(self)
 
-    def _recompute(self, _):
+    def _release_outputs(self):
+        """Join the manager's ordered rebuild after dropping the aggregate storage."""
+        if self.outputs is None:
+            return None
+        self.outputs[0].untyped_storage().resize_(0)
+        return self
+
+    def rebuild(self):
+        """Restore the released aggregate before its consumer runs backward."""
         if self._replay is None:
             return
         from megatron.core.fusions.fused_mhc_single_pass import sp_aggregate
@@ -503,7 +517,6 @@ class _SinglePassAggregateReplay(CheckpointWithoutOutput):
         output = self.outputs[0]
         _get_share_storage()(output, fresh)
         self.outputs = None
-        self.ctx = None
 
 
 # ============================================================================
@@ -1105,7 +1118,7 @@ class HyperConnectionModule(MegatronModule):
             stash,
             precomputed,
         )
-        if manager is not None:
+        if manager is not None and aggregated.requires_grad:
             from megatron.core.transformer.cuda_graphs import is_graph_warmup
 
             if not is_graph_warmup():
