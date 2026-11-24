@@ -588,8 +588,10 @@ def get_rng_state(
 ) -> Union[List[Dict[str, Any]], ShardedObject]:
     """Collect rng state across data parallel ranks.
 
-    dp_group threads the data-parallel group used for RNG gather/indexing.
-    dp_cp_group threads the data-parallel (with context-parallel) group used for the rng shard key.
+    dp_cp_group is the data-parallel (with context-parallel) group, gtp_remat-inclusive when GTP is
+    active. It is used for the per-rank RNG gather, the rng shard key and (on load) the index into
+    the gathered list, so all three stay in the same rank order.
+    dp_group is accepted for backward compatibility and no longer used.
     key_prefix namespaces the rng ShardedObject key so disjoint grids avoid a key collision (default '').
     """
     cfg = get_run_config()
@@ -601,9 +603,13 @@ def get_rng_state(
         'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states(),
     }
 
-    dp_world_size = (
-        get_pg_size(dp_group) if dp_group is not None else mpu.get_data_parallel_world_size()
+    dp_cp_group = (
+        dp_cp_group
+        if dp_cp_group is not None
+        else mpu.get_data_parallel_group(with_context_parallel=True)
     )
+    dp_cp_rank = get_pg_rank(dp_cp_group)
+    dp_world_size = get_pg_size(dp_cp_group)
     rng_state_list = None
     # One RNG state per DP rank is stored when ranks are seeded differently
     # (data_parallel_random_init) or when the checkpoint layout asks for it explicitly.
@@ -615,17 +621,11 @@ def get_rng_state(
         torch.distributed.all_gather_object(
             rng_state_list,
             rng_state,
-            group=dp_group if dp_group is not None else mpu.get_data_parallel_group(),
+            group=dp_cp_group,
         )
     else:
         rng_state_list = [rng_state]
 
-    dp_cp_group = (
-        dp_cp_group
-        if dp_cp_group is not None
-        else mpu.get_data_parallel_group(with_context_parallel=True)
-    )
-    dp_cp_rank = get_pg_rank(dp_cp_group)
     if ckpt_format == 'torch_dist':
         pp_rank = get_pg_rank(pp_group)
         pp_size = get_pg_size(pp_group)
@@ -2840,7 +2840,6 @@ def load_checkpoint(
     dp_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
     checkpoint_group: Optional[torch.distributed.ProcessGroup] = None,
-    dp_cp_gtp_remat: Optional[torch.distributed.ProcessGroup] = None,
     rng_state_key_prefix: str = '',
     model_sharded_state_dict_modifier: Optional[Callable[[Dict], None]] = None,
     *,
@@ -3776,10 +3775,10 @@ def load_checkpoint(
                     else:
                         print_rank_0('WARNING: RNG state not found for current TP/PP rank')
                         rng_state_list = next(iter(state_dict['rng_state'].values()))
-                    rng_state = _select_rng_state(rng_state_list, load_dp_rng_states, dp_cp_gtp_remat, dp_cp_group)
+                    rng_state = _select_rng_state(rng_state_list, load_dp_rng_states, dp_cp_group)
                 else:
                     rng_state_list = state_dict['rng_state']
-                    rng_state = _select_rng_state(rng_state_list, load_dp_rng_states, dp_cp_gtp_remat, dp_cp_group)
+                    rng_state = _select_rng_state(rng_state_list, load_dp_rng_states, dp_cp_group)
                 random.setstate(rng_state['random_rng_state'])
                 np.random.set_state(rng_state['np_rng_state'])
                 torch.set_rng_state(rng_state['torch_rng_state'])
@@ -3883,38 +3882,18 @@ def _to_dtensor(wrapped_model, model_state_dict):
 def _select_rng_state(
     rng_state_list: list[dict[str, Any]],
     per_dp_rank: bool,
-    dp_cp_gtp_remat: Optional[torch.distributed.ProcessGroup],
-    dp_cp: Optional[torch.distributed.ProcessGroup],
+    dp_cp_group: Optional[torch.distributed.ProcessGroup],
 ) -> dict[str, Any]:
-    """Select the RNG state matching the saved checkpoint layout."""
-    return rng_state_list[_checkpoint_dp_cp_group(dp_cp_gtp_remat, dp_cp).rank() if per_dp_rank else 0]
+    """Select the RNG state matching the saved checkpoint layout.
 
-
-def _checkpoint_dp_cp_group(
-    dp_cp_gtp_remat: Optional[torch.distributed.ProcessGroup],
-    dp_cp: Optional[torch.distributed.ProcessGroup],
-) -> torch.distributed.ProcessGroup:
-    """Return the DP x CP group that sharded-checkpoint ``replica_id`` must be derived from.
-
-    ``pg_collection.dp_cp`` deliberately EXCLUDES the GTP weight-rematerialization axis -- it is
-    the *replicate* group, used for gradient all-reduce and optimizer-state sharding. Checkpoint
-    ``replica_id`` needs the opposite: the gtp_remat-INCLUSIVE ``dp_cp_gtp_remat`` group. A tensor
-    that is not GTP-sharded (a norm weight, a bias, an ``_extra_state`` blob) is held identically
-    by every gtp_remat peer, and with the excluded group those peers all report the same DP rank,
-    so each of them claims to be the main replica of the same shard. Distributed checkpointing then
-    rejects the save/load with::
-
-        CheckpointingException: Invalid sharding pattern validation. Errors: Invalid access
-          pattern for ShardedTensor(key='decoder.final_layernorm.weight', ...)
-
-    Megatron-LM's own training loop applies exactly this override before building the sharded
-    state dict (see ``megatron/training/training.py``); Megatron-Bridge has its own checkpoint
-    entrypoints and needs it too.
-
-    ``dp_cp_gtp_remat`` is absent on older Megatron-Core revisions and is the same group as
-    ``dp_cp`` whenever GTP is inactive, so the fallback is a no-op in both cases.
+    ``dp_cp_group`` must be the same group ``get_rng_state`` gathered over (the DP x CP group,
+    gtp_remat-inclusive when GTP is active), so the index follows the gather order.
     """
-    return dp_cp_gtp_remat or dp_cp
+    if not per_dp_rank:
+        return rng_state_list[0]
+    if dp_cp_group is None:
+        dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+    return rng_state_list[get_pg_rank(dp_cp_group)]
 
 
 def _checkpoint_has_per_dp_rng_states(run_config: Optional[dict[str, Any]], default: bool = False) -> bool:
