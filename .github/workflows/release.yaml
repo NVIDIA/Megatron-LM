@@ -269,7 +269,7 @@ jobs:
       pypi-name: megatron-core
       validate-only: ${{ github.event_name != 'workflow_dispatch' || inputs.publish-target == 'testpypi' }}
       dry-run: ${{ inputs.dry-run || inputs.publish-target == 'testpypi' }}
-      create-gh-release: ${{ inputs.create-gh-release }}
+      create-gh-release: ${{ github.event_name != 'workflow_dispatch' || inputs.create-gh-release == true }}
       gh-release-tag-prefix: core_
       gh-release-use-changelog-builder: ${{ inputs.generate-changelog || false }}
       gh-release-from-tag: ${{ inputs.gh-release-from-tag || '' }}

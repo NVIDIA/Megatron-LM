@@ -31,6 +31,7 @@ def evaluate(expression: str, context: dict, failed=False, cancelled=False):
         r'\b(?:github|inputs|needs)\.[\w.-]+', lambda match: repr(context[match[0]]), expression
     )
     expression = expression.replace('&&', ' and ').replace('||', ' or ')
+    expression = expression.replace('== true', '== True')
     expression = re.sub(r'!(?!=)', 'not ', expression)
     return eval(' '.join(expression.split()), {'__builtins__': {}}, {})
 
@@ -89,6 +90,18 @@ def test_testpypi_has_no_release_side_effects():
             assert evaluate(WORKFLOW['jobs'][name]['with'][key], context)
     context['inputs.publish-docs'] = True
     assert not evaluate(WORKFLOW['jobs']['finalize']['with']['publish-docs'], context)
+
+
+@pytest.mark.parametrize(
+    'event,requested,expected',
+    [('push', '', True), ('workflow_dispatch', False, False), ('workflow_dispatch', True, True)],
+)
+def test_finalize_receives_boolean_for_release_creation(event, requested, expected):
+    """Keep implicit push inputs boolean while respecting a manual false value."""
+    context = release_context(event=event)
+    context['inputs.create-gh-release'] = requested
+    actual = evaluate(WORKFLOW['jobs']['finalize']['with']['create-gh-release'], context)
+    assert actual is expected
 
 
 def test_builder_has_no_upload_credentials():
