@@ -78,3 +78,34 @@ def test_batched_linear_gradient_owner_replays(mode, fused):
         return outputs, value.grad, gradient
 
     assert_replays_bit_exact(run, (inputs,), backward=False, contention=True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fallback_grouped_projection_replays():
+    """Replay the batched-GEMM fallback used without TE BatchedLinear: outputs, dgrad and wgrad."""
+    torch.manual_seed(9058)
+    groups, in_features, rank = 2, 64, 64
+    weight = torch.nn.Parameter(
+        torch.randn(groups * rank, in_features, device="cuda", dtype=torch.bfloat16)
+        * in_features**-0.5
+    )
+    attention = SimpleNamespace(
+        _uses_te_batched_linear=False,
+        _linear_o_group_proj_weight=weight,
+        output_projection_local_groups=groups,
+    )
+    inputs = torch.randn(16, 2, groups, in_features, device="cuda", dtype=torch.bfloat16)
+    inputs.requires_grad_(True)
+
+    def run(value):
+        weight.grad = None
+        outputs = []
+        for offset in (0.0, 0.125):
+            output = DSv4HybridAttention._apply_linear_o_group_proj(attention, value + offset)
+            output.float().square().mean().backward()
+            outputs.append(output.detach())
+        assert outputs[0].shape == (16, 2, groups, rank)
+        assert torch.isfinite(weight.grad).all()
+        return outputs, value.grad, weight.grad
+
+    assert_replays_bit_exact(run, (inputs,), backward=False, contention=True)
