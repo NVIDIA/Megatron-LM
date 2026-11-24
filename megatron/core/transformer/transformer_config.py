@@ -3333,13 +3333,6 @@ class TransformerConfig(ModelParallelConfig):
                     "mhc_recompute_layer_num must be a positive integer when "
                     "'mhc' is in recompute_modules."
                 )
-            if self.fine_grained_activation_offloading:
-                raise NotImplementedError(
-                    "'mhc' in recompute_modules + fine_grained_activation_offloading is "
-                    "not yet supported. The mHC recompute hook currently fires before "
-                    "the offloading backward chunk is initialized, causing tensor_pop "
-                    "on a None chunk. Disable one of them."
-                )
 
         use_residual_stream_recompute = (
             self.recompute_granularity == "selective"

@@ -432,7 +432,7 @@ class TestTransformerBlockMHCRecompute:
         Utils.destroy_model_parallel()
 
     @staticmethod
-    def _make_mhc_block(num_layers, num_streams=4, mhc_recompute_layer_num=None):
+    def _make_mhc_block(num_layers, num_streams=4, mhc_recompute_layer_num=None, **config_kwargs):
         from megatron.core.models.gpt.gpt_layer_specs import (
             get_gpt_layer_with_transformer_engine_spec,
         )
@@ -457,6 +457,7 @@ class TestTransformerBlockMHCRecompute:
             recompute_modules=['mhc'],
             hidden_dropout=0.0,
             attention_dropout=0.0,
+            **config_kwargs,
         )
         spec = get_gpt_layer_with_transformer_engine_spec()
         spec.module = HyperConnectionTransformerLayer
@@ -528,6 +529,45 @@ class TestTransformerBlockMHCRecompute:
 
         with pytest.raises(ValueError, match="HyperConnectionTransformerLayer"):
             TransformerBlock(config, get_gpt_layer_with_transformer_engine_spec())
+
+    def test_block_with_activation_offloading_matches(self):
+        """mHC recompute with fine-grained activation offloading matches the same block without it."""
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            PipelineOffloadManager,
+        )
+
+        ref_block, config = self._make_mhc_block(num_layers=4, mhc_recompute_layer_num=2)
+        block, _ = self._make_mhc_block(
+            num_layers=4,
+            mhc_recompute_layer_num=2,
+            fine_grained_activation_offloading=True,
+            offload_modules=["attn_norm", "qkv_linear", "mlp_norm"],
+            min_offloaded_tensor_size=0,
+        )
+        block.load_state_dict(ref_block.state_dict())
+        seq_len, batch_size = 8, 2
+        hidden_states = torch.randn(seq_len, batch_size, config.hidden_size, device="cuda")
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=torch.bool, device="cuda")
+
+        results = []
+        for current in (ref_block, block):
+            PipelineOffloadManager.reset_instance()
+            if current is block:
+                PipelineOffloadManager.get_instance().init_model_chunk_offload_handler(
+                    pp_rank=0, vp_size=1, vp_stage=0, min_offloaded_tensor_size=0
+                )
+            current.train()
+            inputs = hidden_states.clone().requires_grad_(True)
+            output = current(hidden_states=inputs, attention_mask=attention_mask)
+            output.sum().backward()
+            results.append((output.detach(), inputs.grad, [p.grad for p in current.parameters()]))
+        PipelineOffloadManager.reset_instance()
+
+        (ref_output, ref_input_grad, ref_grads), (output, input_grad, grads) = results
+        torch.testing.assert_close(output, ref_output, rtol=0, atol=0)
+        torch.testing.assert_close(input_grad, ref_input_grad, rtol=0, atol=0)
+        for grad, ref_grad in zip(grads, ref_grads):
+            torch.testing.assert_close(grad, ref_grad, rtol=0, atol=0)
 
     def test_block_forward_input_expand_output_contract(self):
         """Forward exercises ``input_expand`` (pre) and ``output_contract`` (post)."""
