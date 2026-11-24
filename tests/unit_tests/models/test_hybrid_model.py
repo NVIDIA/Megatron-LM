@@ -44,7 +44,7 @@ from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, defer_parameter_gathers
 
 try:
     from fast_hadamard_transform import hadamard_transform as _hadamard_transform
@@ -657,15 +657,32 @@ class TestHybridModel:
             (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
         ).cuda()
 
+        check_readiness = recompute_method is None and not convert_cp_layout
+        if check_readiness:
+            model_parallel_cuda_manual_seed(123)
+            reference = self.model(
+                input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+            ).detach()
+            model_parallel_cuda_manual_seed(123)
+
         observed = []
-        with capture_tensor_observations(
-            lambda *args: observed.append(args),
-            frozenset({"residual_accumulator", "residual_contribution", "output_logits"}),
+        with (
+            defer_parameter_gathers(self.model, enabled=check_readiness),
+            capture_tensor_observations(
+                lambda *args: observed.append(args),
+                frozenset({"residual_accumulator", "residual_contribution", "output_logits"}),
+            ),
         ):
-            logits = self.model.forward(
+            logits = self.model(
                 input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
             )
             logits.sum().backward()
+
+        if check_readiness:
+            torch.testing.assert_close(logits, reference, atol=0, rtol=0)
+            for parameter in self.model.parameters():
+                if parameter.grad is not None:
+                    assert torch.isfinite(parameter.grad).all()
 
         for hook in hooks + backward_hooks:
             hook.remove()

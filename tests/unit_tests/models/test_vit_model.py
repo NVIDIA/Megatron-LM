@@ -45,10 +45,10 @@ def test_dynamic_patches_wait_for_projection(model_cls):
         ).cuda()
         patches = torch.randn(1, 4, 12, device="cuda", requires_grad=True)
         reference = model(patches, imgs_sizes=[(4, 4)])
-        with defer_parameter_gathers(model, model.patch_embed.proj.parameters()):
+        with defer_parameter_gathers(model):
             actual = model(patches, imgs_sizes=[(4, 4)])
-        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
-        actual.square().mean().backward()
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+            actual.square().mean().backward()
         assert torch.isfinite(patches.grad).all()
     finally:
         Utils.destroy_model_parallel()

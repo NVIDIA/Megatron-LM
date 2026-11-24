@@ -476,13 +476,12 @@ def test_functionality(tp_cp: List[int], qkv_format: str, down_proj_use_column_p
             param.grad.zero_()
     with defer_parameter_gathers(
         absorbed_mla,
-        absorbed_mla.linear_kv_up_proj.parameters(),
         enabled=tp_cp == [1, 1] and qkv_format == 'sbhd' and not down_proj_use_column_parallel,
     ):
         absorbed_outputs, _ = absorbed_mla(
             hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
         )
-    absorbed_outputs.backward(grads)
+        absorbed_outputs.backward(grads)
 
     for name, param in standard_mla.named_parameters():
         if param.grad is not None:

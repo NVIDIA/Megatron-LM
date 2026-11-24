@@ -259,7 +259,7 @@ def test_rope_packed_block_waits_for_qkv():
     block.attn.rope.extend_pe(4, hidden.device, hidden.dtype)
     with torch.no_grad():
         expected = block.forward_packed(hidden, cu_seqlens, max_seqlen=4, is_causal=False)
-        with defer_parameter_gathers(block, block.attn.w_qkv.parameters()):
+        with defer_parameter_gathers(block):
             actual = block.forward_packed(hidden, cu_seqlens, max_seqlen=4, is_causal=False)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 

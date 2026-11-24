@@ -1953,29 +1953,52 @@ class TestFusedMLARequiresQLora:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def test_raises_without_q_lora_rank(self):
+    @pytest.mark.parametrize("fused_down_projection", [False, True])
+    def test_without_q_lora_rank(self, fused_down_projection):
         config = MLATransformerConfig(
             num_layers=2,
             hidden_size=12,
             num_attention_heads=4,
+            attention_dropout=0.0,
             use_cpu_initialization=True,
+            qk_layernorm=True,
+            fp8="hybrid",
+            fp8_recipe="mxfp8",
+            fp8_dot_product_attention=True,
             q_lora_rank=None,
             kv_lora_rank=32,
             qk_head_dim=128,
             v_head_dim=128,
             qk_pos_emb_head_dim=64,
-            rope_type="rope",
+            rope_type="yarn",
             rotary_base=10000,
             original_max_position_embeddings=32,
+            apply_rope_fusion=True,
+            use_fused_mla_q_uproj=True,
         )
-        with pytest.raises(AssertionError, match="q_lora_rank"):
-            FusedMLASelfAttention(
+        attention_cls = FusedMLASelfAttention if fused_down_projection else MLASelfAttention
+        submodules = (
+            get_fused_mla_submodules() if fused_down_projection else get_mla_self_attn_submodules()
+        )
+        expected = (
+            pytest.raises(AssertionError, match="q_lora_rank")
+            if fused_down_projection
+            else contextlib.nullcontext()
+        )
+        # Hook installation must work even when the optional fused backend is available.
+        with mock.patch.object(mla_module, "FusedMLAQUpProjRopeQuant") as fused_q_uproj, expected:
+            fused_q_uproj.is_supported.return_value = True
+            attention = attention_cls(
                 config,
-                get_fused_mla_submodules(),
+                submodules,
                 layer_number=1,
                 attn_mask_type=AttnMaskType.causal,
                 pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
+            assert attention._use_fused_q_uproj
+            assert not hasattr(attention, "linear_q_up_proj")
+            with defer_parameter_gathers(attention, ()):
+                pass
 
 
 @pytest.mark.launch_on_gb200
@@ -2197,12 +2220,9 @@ class TestFusedMLAQUpProjIntegration:
             hidden_states = torch.randn(
                 256, 1, config.hidden_size, dtype=torch.bfloat16, device="cuda", requires_grad=True
             )
-            with (
-                defer_parameter_gathers(attention, attention.linear_q_up_proj.parameters()),
-                get_fp8_context(config),
-            ):
+            with defer_parameter_gathers(attention), get_fp8_context(config):
                 output, _ = attention(hidden_states, None)
-            output.float().square().mean().backward()
+                output.float().square().mean().backward()
 
             for grad in (
                 hidden_states.grad,

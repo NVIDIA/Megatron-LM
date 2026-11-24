@@ -39,8 +39,15 @@ _NVTE_ATTN_ENV_VARS = (
 
 
 @contextmanager
-def defer_parameter_gathers(model, parameters, *, enabled=True):
-    """Poison independent parameter buffers until DDP's real forward hooks publish them."""
+def defer_parameter_gathers(model, parameters=None, *, enabled=True):
+    """Poison parameters until DDP's real forward hooks publish them.
+
+    By default, cover every trainable parameter independently, so another parameter's
+    hook cannot hide a missing wait through a shared bucket. Compare the forward and
+    backward results with an unpoisoned reference inside the context. Unused parameters
+    may remain pending; an explicit parameter list instead requires every entry to be
+    published. Use fresh quantization caches so reads use the poisoned storage.
+    """
     if not enabled:
         yield
         return
@@ -48,6 +55,9 @@ def defer_parameter_gathers(model, parameters, *, enabled=True):
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
     from megatron.core.utils import PARAM_READY_CALLBACK_ATTR
 
+    require_all = parameters is not None
+    if parameters is None:
+        parameters = (p for p in model.parameters() if p.requires_grad)
     pending = {p: p.detach().clone() for p in parameters}
     original_callbacks = {p: getattr(p, PARAM_READY_CALLBACK_ATTR, None) for p in pending}
 
@@ -73,9 +83,12 @@ def defer_parameter_gathers(model, parameters, *, enabled=True):
     try:
         ddp.enable_forward_pre_hook()
         yield
-        assert not pending, "A direct parameter read never reached its readiness boundary"
+        if require_all:
+            assert not pending, "A direct parameter read never reached its readiness boundary"
     finally:
-        ddp.disable_forward_pre_hook(param_sync=False)
+        # Hook installation itself can fail; preserve that error and still restore parameters.
+        for handle in ddp.remove_forward_pre_hook_handles.values():
+            handle.remove()
         for param, callback in original_callbacks.items():
             publish(param)
             if callback is None:

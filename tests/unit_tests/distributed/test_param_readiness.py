@@ -9,6 +9,7 @@ CUDA-graph capture deferral, and out-of-order bucket dedup -- which would be con
 on real GPUs.
 """
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -25,6 +26,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataPa
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import PARAM_READY_CALLBACK_ATTR, ensure_params_ready
+from tests.unit_tests.test_utilities import defer_parameter_gathers
 
 
 class _FakeBucketGroup:
@@ -48,6 +50,35 @@ def _fake_ddp(align_param_gather=False, hooks_enabled=True):
 
 
 class TestParamReadinessProtocol:
+    @pytest.mark.parametrize("bypass_owner", [False, True])
+    def test_deferred_gathers_detect_unregistered_reads(self, bypass_owner):
+        model = torch.nn.Module()
+        model.projection = torch.nn.Linear(2, 2)
+        model.tied_projection = model.projection
+        model.unused = torch.nn.Linear(2, 2)
+        model.frozen = torch.nn.Parameter(torch.ones(2), requires_grad=False)
+        original = {name: value.clone() for name, value in model.state_dict().items()}
+        previous_callback = lambda: None  # noqa: E731
+        setattr(model.projection.weight, PARAM_READY_CALLBACK_ATTR, previous_callback)
+        x = torch.ones(1, 2)
+        expected = model.projection(x) + model.frozen
+
+        # This is an ordinary Linear with no entry in the dependency map. A new direct
+        # read must be detected by numerical comparison, even with unused/tied parameters.
+        with pytest.raises(AssertionError) if bypass_owner else nullcontext():
+            with defer_parameter_gathers(model):
+                if bypass_owner:
+                    actual = torch.nn.functional.linear(
+                        x, model.projection.weight, model.projection.bias
+                    )
+                else:
+                    actual = model.tied_projection(x)
+                torch.testing.assert_close(actual + model.frozen, expected)
+
+        torch.testing.assert_close(model.state_dict(), original)
+        assert getattr(model.projection.weight, PARAM_READY_CALLBACK_ATTR) is previous_callback
+        assert all(not module._forward_pre_hooks for module in model.modules())
+
     def test_no_marker_is_a_noop(self):
         """A parameter no backend owns must be readable without any callback."""
         param = torch.nn.Parameter(torch.zeros(2))

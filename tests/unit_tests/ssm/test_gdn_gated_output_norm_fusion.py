@@ -182,13 +182,8 @@ def test_split_forward_matches_monolithic(model_parallel, packed, pre_fusion, po
     model.config.gdn_gated_output_norm_fusion = post_fusion
     hidden, dy, metadata = _inputs(packed)
     expected, reference_grads = _run(model, hidden, dy, metadata)
-    params = [
-        *model.parameters(recurse=False),
-        *model.conv1d.parameters(),
-        *model.out_norm.parameters(),
-    ]
     # Cover the unfused and fully fused boundaries on one input layout each.
-    with defer_parameter_gathers(model, params, enabled=not packed and pre_fusion == post_fusion):
+    with defer_parameter_gathers(model, enabled=not packed and pre_fusion == post_fusion):
         actual, grads = _run(model, hidden, dy, metadata, staged=True)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     _assert_close(actual, expected, grads, reference_grads)

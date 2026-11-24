@@ -42,7 +42,11 @@ def collect_param_readiness_dependencies(
                 add(module.in_proj, module.out_norm.parameters())
         elif isinstance(module, HyperConnectionModule):
             add(module, module.mapping_proj.parameters())
-        elif isinstance(module, MLASelfAttention) and module._use_fused_q_uproj:
+        elif (
+            isinstance(module, MLASelfAttention)
+            and module._use_fused_q_uproj
+            and module.config.q_lora_rank is not None
+        ):
             boundary = (
                 module.linear_qkv_down_proj
                 if isinstance(module, FusedMLASelfAttention)

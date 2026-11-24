@@ -35,7 +35,7 @@ from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, defer_parameter_gathers
 
 
 class TestGPTModel:
@@ -237,14 +237,15 @@ class TestGPTModel:
             expected = F.log_softmax(logits, dim=-1).gather(dim=-1, index=labels.unsqueeze(-1))
             expected = expected.squeeze(-1).index_select(1, context["selected_token_positions"])
 
-            output = self.gpt_model.forward(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                output_processor=output_processor,
-                output_processor_context=context,
-            )
+            with defer_parameter_gathers(self.gpt_model):
+                output = self.gpt_model.forward(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    output_processor=output_processor,
+                    output_processor_context=context,
+                )
 
         assert output is created["result"]
         assert isinstance(output, dict)

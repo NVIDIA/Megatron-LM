@@ -163,13 +163,11 @@ class TestMambaLayer:
 
         layer.zero_grad(set_to_none=True)
         split_input = hidden_states.detach().clone().requires_grad_(True)
-        with defer_parameter_gathers(
-            layer, layer.mixer.parameters(recurse=False), enabled=not fp32_residual
-        ):
+        with defer_parameter_gathers(layer, enabled=not fp32_residual):
             stage_state = layer.forward_pre_attn_and_core_attn(split_input)
-        assert len(stage_state) == 3
-        split_output = layer.forward_post_core_attn(*stage_state)
-        split_output.float().square().mean().backward()
+            assert len(stage_state) == 3
+            split_output = layer.forward_post_core_attn(*stage_state)
+            split_output.float().square().mean().backward()
         split_grads = {
             name: param.grad for name, param in layer.named_parameters() if param.grad is not None
         }

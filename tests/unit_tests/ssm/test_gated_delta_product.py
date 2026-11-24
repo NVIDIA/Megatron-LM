@@ -30,7 +30,7 @@ from tests.unit_tests.ssm.gdp_test_utils import (
     _run,
     assert_in_proj_recompute_preserves_norm_gate_view,
 )
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, defer_parameter_gathers
 
 try:
     from transformer_engine.pytorch.fp8 import check_fp8_support
@@ -101,9 +101,10 @@ def test_in_proj_recompute_parity(recompute_qkv):
         )
         grads = torch.randn_like(hidden_states)
 
-        _assert_replay_matches(
-            _run(baseline, hidden_states, grads), _run(recomputed, hidden_states, grads)
-        )
+        reference = _run(baseline, hidden_states, grads)
+        with defer_parameter_gathers(recomputed, enabled=recompute_qkv):
+            actual = _run(recomputed, hidden_states, grads)
+        _assert_replay_matches(reference, actual)
     finally:
         Utils.destroy_model_parallel()
 

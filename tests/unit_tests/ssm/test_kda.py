@@ -169,10 +169,7 @@ def test_kda_forward_backward(two_stage_gates):
             dtype=torch.bfloat16,
             requires_grad=True,
         )
-        with defer_parameter_gathers(
-            kda, [*kda.conv1d.parameters(), *norm_params], enabled=not two_stage_gates
-        ):
-            output, bias = kda(hidden_states, None)
+        output, bias = kda(hidden_states, None)
         assert bias is None
         assert output.shape == hidden_states.shape
         assert output.dtype == hidden_states.dtype
@@ -336,9 +333,10 @@ def test_kda_selective_recompute(recompute_module, two_stage_gates):
         recompute_input = hidden_states.detach().clone().requires_grad_(True)
 
         base_output, base_input_grad, base_grads = run(base_kda, base_input)
-        recompute_output, recompute_input_grad, recompute_grads = run(
-            recompute_kda, recompute_input
-        )
+        with defer_parameter_gathers(recompute_kda, enabled=not two_stage_gates):
+            recompute_output, recompute_input_grad, recompute_grads = run(
+                recompute_kda, recompute_input
+            )
 
         assert base_kda.recompute_norm_out is False
         assert base_kda.recompute_gdn is False

@@ -112,19 +112,19 @@ class TestHyperConnectionModuleCheckpoint:
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
         manager = CheckpointWithoutOutputManager()
-        with defer_parameter_gathers(module, module.mapping_proj.parameters()):
+        with defer_parameter_gathers(module):
             aggregated_ckpt, h_res_ckpt, h_post_ckpt, residual_ckpt_out = module(
                 hidden_states_ckpt, mhc_recompute_manager=manager, return_residual=True
             )
-        mixed_ckpt = module.apply_h_res(h_res_ckpt, residual_ckpt)
-        # Calculate loss before discarding outputs
-        loss_ckpt = aggregated_ckpt.sum() + mixed_ckpt.sum() + h_post_ckpt.sum()
+            mixed_ckpt = module.apply_h_res(h_res_ckpt, residual_ckpt)
+            # Calculate loss before discarding outputs
+            loss_ckpt = aggregated_ckpt.sum() + mixed_ckpt.sum() + h_post_ckpt.sum()
 
-        # Register unified recompute hook
-        manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
+            # Register unified recompute hook
+            manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
 
-        # Backward pass
-        loss_ckpt.backward()
+            # Backward pass
+            loss_ckpt.backward()
         grad_hidden_ckpt = hidden_states_ckpt.grad.clone()
         grad_residual_ckpt = residual_ckpt.grad.clone()
 
