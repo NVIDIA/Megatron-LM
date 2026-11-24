@@ -55,7 +55,9 @@ class TinyModel(nn.Module):
         """The hidden matrices, with block1's middle one in a group with its own learning rate."""
         middle = self.block1[2].weight
         hidden = [
-            p for block in (self.block1, self.block2, self.block3[:3]) for p in block.parameters()
+            p
+            for module in (self.block1, self.block2, self.block3[0], self.block3[2])
+            for p in module.parameters()
         ]
         return [
             {"params": [p for p in hidden if p is not middle]},
