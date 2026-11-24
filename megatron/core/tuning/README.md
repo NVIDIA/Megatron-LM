@@ -101,8 +101,8 @@ decides whether values are computed packed or promoted and whether multiplies
 and adds are fused. A GPU test forces every candidate of each default entry and
 checks for bit-identical outputs. A pinned kernel without a table entry falls
 back to the cheapest candidate, which can be several times slower than the
-fastest one. The packaged `sm100` and `sm103` tables carry entries for the
-in-tree MLA RoPE and mHC kernels; on other architectures, record a table to
+fastest one. The packaged `sm90`, `sm100` and `sm103` tables carry entries for
+the in-tree MLA RoPE and mHC kernels; on other architectures, record a table to
 recover their throughput.
 
 In-tree SSM kernels also use `autotune_configs()` at decoration time. That helper
@@ -182,6 +182,11 @@ these kernels' tuning keys, keeping the config with the smallest worst-case
 slowdown: one `*` entry per kernel, plus an entry for each swept shape whose own
 best config beats `*` there by more than 5%. They were measured on `sm103`; the
 `sm100` entries are copies that have not been measured on that architecture.
+
+The `sm90` entries come from one such sweep on GH200 that also covered the
+Mamba2 SSD kernels. Each SSD tuning key gets its own entry: the config with the
+smallest worst-case slowdown over that key's shapes. The table applies to every
+`sm90` device, H100 included.
 
 ## Diagnostics and configuration reference
 
