@@ -43,7 +43,7 @@ Each scope offloads saved activations to CPU during forward and reloads them bef
 | `moe_act` | Activation function in MoE experts | MoE models only |
 | `fused_group_mlp` | Whole fused grouped MLP | Requires `--use-transformer-engine-op-fuser`; cannot be combined with `expert_fc1` or `moe_act` |
 | `shortcut_post_norm` | Shortcut post-combine normalization | Requires `--moe-shortcut-connection` |
-| `gdn_core_attn` | Tensors saved inside the FLA GDN recurrence | BF16 GDN/GDN2 only. See the recomputation and CUDA graph restrictions below. |
+| `gdn_core_attn` | Tensors saved inside the FLA GDN recurrence | BF16 FLA recurrence; TE FP8/NVFP4 projections allowed |
 
 When selective `residual_stream` replay is active, its shared checkpoint manager owns the
 connected ShortcutMoE post-norm. In that case `shortcut_post_norm` offloading is skipped for the
@@ -62,9 +62,13 @@ Set `--experimental-attention-variant gdn2` to use the GDN2 variant.
 With an explicit layer-config list, enable the scope on the model config and at least one GDN layer.
 Both variants support selective `gdn_norm_out` recomputation. Pre-GDR fusion is GDN-only.
 Whole-GDN selective recomputation (`--recompute-modules gdn`), full recomputation,
-FP8/NVFP4, other recurrence backends, and non-TE CUDA graphs are rejected.
+non-BF16 activations, other recurrence backends, and non-TE CUDA graphs are rejected.
 Set `NVTE_CPU_OFFLOAD_V1=1` with Transformer Engine 2.10 or newer.
 For TE graphs, use PyTorch 2.9+, TE 2.14+, positive warmup and attention or whole-layer capture.
+NVFP4 graph offload requires `disable_parameter_transpose_cache=True`.
+When training NVFP4 with DDP and without the distributed optimizer, use
+`--no-gradient-accumulation-fusion` unless the gradient-buffer layout guarantees
+16-byte alignment for fused weight-gradient outputs.
 
 ### Tuning Parameters
 

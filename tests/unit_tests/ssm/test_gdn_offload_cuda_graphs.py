@@ -29,6 +29,7 @@ from megatron.core.transformer.transformer_layer_mixins import TECudaGraphTransf
 from megatron.core.utils import is_te_min_version, is_torch_min_version, unwrap_model
 from tests.unit_tests.ssm.test_gdn_offload_training import (
     _build_training_model,
+    _require_precision,
     _run_microbatches,
     _step_snapshot,
     _training_batches,
@@ -43,15 +44,24 @@ from tests.unit_tests.test_utilities import Utils
     reason="CUDA graph offloading requires PyTorch >= 2.9 and TE >= 2.14.",
 )
 @pytest.mark.parametrize(
-    "variant,fused,recompute_norm,whole_layer,delay,fraction,tp,pp,mixed",
+    "variant,fused,recompute_norm,whole_layer,delay,fraction,tp,pp,mixed,precision",
     [
-        pytest.param("gdn", False, False, False, False, 1.0, 1, 1, True, id="mixed-attn"),
-        pytest.param("gdn", True, True, False, True, 1.0, 1, 1, False, id="fused-norm-delay"),
-        pytest.param("gdn", False, False, True, False, 1.0, 1, 1, False, id="gdn-layer"),
-        pytest.param("gdn2", False, True, True, True, 1.0, 1, 1, False, id="gdn2-layer"),
-        pytest.param("gdn2", False, False, True, False, 0.0, 1, 1, False, id="resident"),
-        pytest.param("gdn2", False, False, False, False, 1.0, 2, 1, False, id="tp-sp"),
-        pytest.param("gdn2", False, False, True, True, 1.0, 1, 2, False, id="pp"),
+        pytest.param("gdn", False, False, False, False, 1.0, 1, 1, True, "bf16", id="mixed-attn"),
+        pytest.param(
+            "gdn", True, True, False, True, 1.0, 1, 1, False, "bf16", id="fused-norm-delay"
+        ),
+        pytest.param("gdn", False, False, True, False, 1.0, 1, 1, False, "bf16", id="gdn-layer"),
+        pytest.param("gdn2", False, True, True, True, 1.0, 1, 1, False, "bf16", id="gdn2-layer"),
+        pytest.param("gdn2", False, False, True, False, 0.0, 1, 1, False, "bf16", id="resident"),
+        pytest.param("gdn2", False, False, False, False, 1.0, 2, 1, False, "bf16", id="tp-sp"),
+        pytest.param("gdn2", False, False, True, True, 1.0, 1, 2, False, "bf16", id="pp"),
+        pytest.param(
+            "gdn", False, False, False, False, 1.0, 1, 1, False, "fp8-delayed", id="fp8-gdn"
+        ),
+        pytest.param(
+            "gdn2", False, True, True, False, 1.0, 1, 1, False, "fp8-tensorwise", id="fp8-gdn2"
+        ),
+        pytest.param("gdn2", False, True, True, False, 1.0, 1, 1, False, "fp4", id="fp4-three-arm"),
     ],
 )
 def test_gdn_offload_with_te_graphs(
@@ -64,9 +74,11 @@ def test_gdn_offload_with_te_graphs(
     tp: int,
     pp: int,
     mixed: bool,
+    precision: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Compare complete optimizer states after captured backward on changing inputs."""
+    _require_precision(precision)
     if Utils.world_size % (tp * pp):
         pytest.skip("This topology requires two GPUs.")
     if variant == "gdn2":
@@ -74,6 +86,8 @@ def test_gdn_offload_with_te_graphs(
     if fused:
         pytest.importorskip("causal_conv1d", minversion="1.6.1")
         monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
     monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
     Utils.initialize_model_parallel(tp, pp)
     initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
@@ -111,7 +125,13 @@ def test_gdn_offload_with_te_graphs(
     try:
         groups = ProcessGroupCollection.use_mpu_process_groups()
         references = []
-        for enabled in (False, True):
+        arms = (
+            [(False, False), (True, False), (True, True)]
+            if precision == "fp4"
+            else [(True, False), (True, True)]
+        )
+        for capture_graphs, enabled in arms:
+            FP8GlobalStateManager.reset()
             off_interface.reset_instance()
             replayed_layers.clear()
             config = replace(
@@ -125,6 +145,7 @@ def test_gdn_offload_with_te_graphs(
                     recompute_norm,
                     fused_pre_gdr=fused,
                     variant=variant,
+                    precision=precision,
                 ),
                 fine_grained_activation_offloading=enabled,
                 offload_modules=(
@@ -137,6 +158,7 @@ def test_gdn_offload_with_te_graphs(
                 cuda_graph_warmup_steps=3,
                 use_te_rng_tracker=True,
                 delay_offload_until_cuda_graph=delay,
+                disable_parameter_transpose_cache=precision == "fp4",
             )
             # Match native training: DDP's retained AccumulateGrad nodes must use a side stream.
             current_stream = torch.cuda.current_stream()
@@ -159,7 +181,7 @@ def test_gdn_offload_with_te_graphs(
             generator = torch.Generator().manual_seed(19 + groups.dp.rank())
             states = []
             for step in range(6):
-                if step == 3:
+                if step == 3 and capture_graphs:
                     helper = TECudaGraphHelper(
                         models, config, 128, 1, optimizers=[optimizer], pg_collection=groups
                     )
@@ -172,19 +194,23 @@ def test_gdn_offload_with_te_graphs(
                 batches = _training_batches(generator, groups, 4)
                 losses = _run_microbatches(schedule, models, optimizer, groups, batches)
                 states.append(_step_snapshot(models, optimizer, losses))
-            assert len(replayed_layers) == len(unwrap_model(models[0]).decoder.layers)
+            assert len(replayed_layers) == (
+                len(unwrap_model(models[0]).decoder.layers) if capture_graphs else 0
+            )
             if enabled and mixed:
                 assert mixed_scopes == {"recurrence", "attention"}
             assert len(pool_checks) == 6
             if enabled:
                 assert (manager.offload_summary_total_bytes > 0) == (fraction > 0)
+            if references:
                 if fused:
                     torch.testing.assert_close(states, references, rtol=1e-5, atol=1e-8)
                 else:
                     assert not any(diff(references, states))
             else:
                 references = states
-            helper.delete_cuda_graphs()
+            if helper is not None:
+                helper.delete_cuda_graphs()
             helper = None
             del models, optimizer, states
             torch.cuda.synchronize()

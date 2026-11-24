@@ -1552,6 +1552,46 @@ class TestTECudaGraphHelper:
         # Note: _unique_buffer_counts is intentionally NOT cleared here so we can
         # compare values across parametrized test runs
 
+    @pytest.mark.parametrize("precision", ["bf16", "fp8", "fp4"])
+    @pytest.mark.parametrize("disable_cache", [False, True])
+    def test_te_graph_weight_caching_kwargs(self, precision, disable_cache):
+        """Forward the explicit cache setting for both low-precision graph modes."""
+        Utils.initialize_model_parallel()
+        init_num_microbatches_calculator(
+            rank=0,
+            global_batch_size=1,
+            micro_batch_size=1,
+            data_parallel_size=1,
+            decrease_batch_size_if_needed=False,
+        )
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            fp8="e4m3" if precision == "fp8" else None,
+            fp4="e2m1" if precision == "fp4" else None,
+            cuda_graph_impl="transformer_engine",
+            use_te_rng_tracker=True,
+            disable_parameter_transpose_cache=disable_cache,
+        )
+        torch.manual_seed(123)
+        model_parallel_cuda_manual_seed(123)
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=128,
+            max_sequence_length=128,
+        ).cuda()
+        helper = TECudaGraphHelper([model], config, 128, 1, optimizers=[])
+        _, kwargs = helper._get_cuda_graph_input_data()
+        if precision == "bf16":
+            assert kwargs["fp8_enabled"] is False
+            assert "fp8_weight_caching" not in kwargs
+        else:
+            assert kwargs["fp8_weight_caching"] is (not disable_cache)
+
     @pytest.mark.parametrize("num_microbatches", [16, 64, 256])
     @pytest.mark.parametrize("pp_size", [1, 2, 4])
     @pytest.mark.parametrize("vpp_size", [None, 2])
