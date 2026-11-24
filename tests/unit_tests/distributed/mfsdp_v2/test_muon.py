@@ -26,12 +26,16 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import muon
 
 
 class TinyModel(nn.Module):
-    """Three blocks of two hidden matrices optimized by Muon, with an output layer optimized by SGD."""
+    """Three blocks of hidden matrices optimized by Muon, with an output layer optimized by SGD."""
 
     def __init__(self):
         super().__init__()
         self.block1 = nn.Sequential(
-            nn.Linear(8, 16, bias=False), nn.ReLU(), nn.Linear(16, 16, bias=False)
+            nn.Linear(8, 16, bias=False),
+            nn.ReLU(),
+            nn.Linear(16, 16, bias=False),
+            nn.ReLU(),
+            nn.Linear(16, 16, bias=False),
         )
         self.block2 = nn.Sequential(
             nn.Linear(16, 16, bias=False), nn.ReLU(), nn.Linear(16, 4, bias=False)
@@ -46,6 +50,17 @@ class TinyModel(nn.Module):
     def forward(self, x):
         """Run the blocks."""
         return self.block3(self.block2(self.block1(x)))
+
+    def muon_param_groups(self):
+        """The hidden matrices, with block1's middle one in a group with its own learning rate."""
+        middle = self.block1[2].weight
+        hidden = [
+            p for block in (self.block1, self.block2, self.block3[:3]) for p in block.parameters()
+        ]
+        return [
+            {"params": [p for p in hidden if p is not middle]},
+            {"params": [middle], "lr": 0.02},
+        ]
 
 
 def _train(
@@ -96,8 +111,8 @@ def test_muon_matches_reference(
     """FSDP, HSDP, HFSDP, and unsharded Muon should produce identical loss curves.
 
     Each block is its own FSDP group, so several groups' communication is in flight at once; with
-    8, all three are. Each group holds two differently shaped Muon matrices, so the momentum
-    update batches them.
+    8, all three are. Each group holds several differently shaped Muon matrices, so the momentum
+    update batches them; block1's also spans two optimizer groups with different learning rates.
     """
     world_size = distributed_setup.world_size
     if dp_mode == "fsdp":
@@ -142,12 +157,11 @@ def test_muon_matches_reference(
         **kernel_options,
     )
     excluded_names = ["block3.3.weight", "block3.3.bias"]
-    muon_names = [name for name in params if name not in excluded_names]
     optimizer = muon.FsdpMuon(
-        [params[name] for name in muon_names], num_groups_in_flight=num_groups_in_flight, **kwargs
+        model.muon_param_groups(), num_groups_in_flight=num_groups_in_flight, **kwargs
     )
     fully_shard_optimizer(optimizer, precision_aware=True)
-    reference_optimizer = Muon([reference_params[name] for name in muon_names], **kwargs)
+    reference_optimizer = Muon(reference.muon_param_groups(), **kwargs)
     other_optimizer = torch.optim.SGD([params[n] for n in excluded_names], lr=0.01, foreach=False)
     fully_shard_optimizer(other_optimizer)
     reference_other = torch.optim.SGD([reference_params[n] for n in excluded_names], lr=0.01)
