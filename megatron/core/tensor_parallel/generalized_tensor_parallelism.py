@@ -3024,16 +3024,19 @@ class GTPWeightCache:
     def release(self, ticket: int):
         """Release a reusable buffer to the pool while keeping its ticket valid.
 
-        Captured reduce-scatter tickets keep exclusive ownership. ``slot.buf`` is never cleared,
-        so every CUDA-graph ticket retains a stable address across replays. Other tickets keep
-        ``slot.buf`` too, except eager reduce-scatter outputs (see below).
+        Reduce-scatter tickets captured in per-layer graphs keep exclusive ownership. ``slot.buf``
+        is never cleared, so every such ticket retains a stable address across replays. Other
+        tickets keep ``slot.buf`` too, except reduce-scatter outputs that are pooled: eager ones
+        and those of a full-iteration graph (see below).
         """
         slot = self._slots[ticket]
         if slot.buf is None:
             return
         # Independently replayed graphs may overlap, so a captured RS output must not be recycled
-        # into another fixed-address ticket.
-        if _chain_is_graphed(slot.chain_id) and slot.reduce_scatter:
+        # into another fixed-address ticket. A full-iteration graph is a single graph with a
+        # fixed order, so its RS outputs are pooled as eager ones are; keeping one buffer per
+        # weight there costs memory that grows with the number of layers.
+        if _chain_is_graphed(slot.chain_id) and slot.reduce_scatter and not _FULL_ITERATION:
             return
         # Use identity check — tensor == tensor returns a multi-element bool tensor
         # which crashes in a boolean context ("Boolean value of Tensor is ambiguous").
