@@ -394,6 +394,7 @@ def inject_flextron_forward_logic(model):
         runtime_gather_output=None,
         *,
         inference_params=None,
+        recurrence_step=None,
         **flextron_kwargs,
     ):
 
@@ -448,6 +449,7 @@ def inject_flextron_forward_logic(model):
             inference_context=inference_context,
             runtime_gather_output=runtime_gather_output,
             inference_params=inference_params,
+            **({"recurrence_step": recurrence_step} if recurrence_step is not None else {}),
         )
 
         # Handle return values based on training mode and flextron settings

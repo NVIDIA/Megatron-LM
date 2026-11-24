@@ -170,3 +170,29 @@ def test_offline_mode_follows_the_model_config(original_num_layers, expected):
     )
     with patch.object(finetune, "get_run_config", return_value=cfg):
         assert finetune._is_offline_model() is expected
+
+
+@pytest.mark.parametrize("pattern", [None, "*-", ":*-:"])
+def test_finetune_passes_one_recurrence_step_per_minibatch(monkeypatch, pattern):
+    from unittest.mock import Mock
+
+    from megatron.training.state import TrainState
+
+    config = Namespace(model=Namespace(transformations=None, hybrid_layer_pattern=pattern))
+    batch = dict.fromkeys(("tokens", "labels", "loss_mask", "attention_mask", "position_ids"))
+    train_state = TrainState(iteration=11)
+    monkeypatch.setattr(finetune, "get_run_config", lambda: config)
+    monkeypatch.setattr(finetune, "get_batch", lambda _: batch)
+    monkeypatch.setattr(finetune, "get_timers", Mock)
+    monkeypatch.setattr(finetune, "get_train_state", lambda: train_state)
+    model = Mock()
+
+    finetune.forward_step(None, model)
+    finetune.forward_step(None, model)
+    train_state.iteration += 1
+    finetune.forward_step(None, model)
+
+    if pattern == ":*-:":
+        assert [call.kwargs["recurrence_step"] for call in model.call_args_list] == [11, 11, 12]
+    else:
+        assert all("recurrence_step" not in call.kwargs for call in model.call_args_list)

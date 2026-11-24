@@ -81,6 +81,32 @@ class TestDistillationConfigFromArgs:
         )
         assert student.transformer.num_layers == 2  # the student config is untouched
 
+    @pytest.mark.parametrize(
+        "teacher_yaml, expected_policy",
+        [
+            ({"hybrid_layer_pattern": "*-"}, (None, None)),
+            ({}, ("1:1,4:1", 2)),
+            ({"n_loops_distribution": "3:1", "inference_n_loops": 3}, ("3:1", 3)),
+        ],
+    )
+    def test_hybrid_teacher_inherits_loop_policy_only_with_boundaries(
+        self, tmp_path, teacher_yaml, expected_policy
+    ):
+        config_path = tmp_path / "teacher.yaml"
+        config_path.write_text(yaml.safe_dump(teacher_yaml))
+        args = make_modelopt_test_args(
+            hybrid_layer_pattern=":*-:",
+            n_loops_distribution="1:1,4:1",
+            inference_n_loops=2,
+            export_kd_teacher_load=str(tmp_path),
+            export_kd_teacher_model_config=str(config_path),
+        )
+        student = mc.modelopt_model_config_from_args(args)
+        teacher = mc.distillation_config_from_args(args, student).teacher_model
+
+        assert (teacher.n_loops_distribution, teacher.inference_n_loops) == expected_policy
+        assert (student.n_loops_distribution, student.inference_n_loops) == ("1:1,4:1", 2)
+
     def test_loss_yaml_is_passed_through_unchanged(self, tmp_path):
         # Fields follow the installed ModelOpt version, so unknown keys are not rejected here.
         kd_yaml = tmp_path / "kd.yaml"

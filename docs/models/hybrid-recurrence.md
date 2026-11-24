@@ -51,7 +51,8 @@ The step alone determines the draw; no separate seed or persistent sampler state
 is needed. Restarting or retrying a step with the same policy reproduces its count.
 Changing the distribution changes how that step's draw maps to a count.
 
-`pretrain_hybrid.py` supplies the checkpointed `TrainState.iteration` automatically.
+`pretrain_hybrid.py`, ModelOpt's `finetune.py`, and `pretrain_hybrid_flex.py` supply
+`recurrence_step` from the checkpointed `TrainState.iteration`.
 Direct Core callers must pass a non-negative integer `recurrence_step` when training
 with a stochastic distribution, unless they explicitly override `n_loops`. Keep the
 step constant across all microbatches making up one minibatch, and advance it only

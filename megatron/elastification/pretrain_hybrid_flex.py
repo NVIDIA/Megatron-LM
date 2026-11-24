@@ -165,6 +165,8 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
         max_sequence_length=args.max_position_embeddings,
         pre_process=pre_process,
         hybrid_layer_pattern=args.hybrid_layer_pattern,
+        n_loops_distribution=getattr(args, "n_loops_distribution", None),
+        inference_n_loops=getattr(args, "inference_n_loops", None),
         post_process=post_process,
         fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
         logit_dtype=getattr(args, 'logit_dtype', None),
@@ -479,9 +481,16 @@ def forward_step(data_iterator, model: HybridModel):
         )
         flextron_kwargs = {'budget': selected_budget}
 
+    recurrence_kwargs = {}
+    if ":" in (getattr(args, "hybrid_layer_pattern", None) or ""):
+        train_state = get_train_state()
+        if train_state is not None:
+            recurrence_kwargs["recurrence_step"] = train_state.iteration
+
     with stimer:
-        output_tensor = model(tokens, position_ids, attention_mask,
-                              labels=labels, **flextron_kwargs)
+        output_tensor = model(
+            tokens, position_ids, attention_mask, labels=labels, **recurrence_kwargs, **flextron_kwargs
+        )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model, selected_budget=selected_budget)
