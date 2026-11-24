@@ -1554,6 +1554,8 @@ class TestTECudaGraphHelper:
 
     def test_mrope_replay_uses_current_positions(self):
         """Graph replay must preserve position-dependent mRoPE forward and gradients."""
+        from megatron.training.utils import get_ltor_masks_and_position_ids
+
         Utils.initialize_model_parallel()
         init_num_microbatches_calculator(
             rank=0,
@@ -1591,29 +1593,48 @@ class TestTECudaGraphHelper:
                 config, DistributedDataParallelConfig(grad_reduce_in_fp32=True), raw_model
             )
         current_stream.wait_stream(init_stream)
-        tokens = torch.arange(128, device="cuda").unsqueeze(0)
-        positions = tokens.unsqueeze(0).expand(3, -1, -1).contiguous()
-        shifted = positions * torch.tensor([1, 2, 3], device="cuda").view(3, 1, 1)
 
-        def train_step(position_ids):
+        def text_batch(document_break):
+            sequence = torch.arange(129, device="cuda").remainder(127).unsqueeze(0)
+            if document_break:
+                sequence[:, 63] = 127
+            tokens = sequence[:, :-1].contiguous()
+            labels = sequence[:, 1:].contiguous()
+            _, _, positions = get_ltor_masks_and_position_ids(
+                tokens,
+                eod_token=127,
+                pad_token=127,
+                reset_position_ids=True,
+                reset_attention_mask=False,
+                eod_mask_loss=False,
+                pad_mask_loss=False,
+                create_attention_mask=False,
+            )
+            return tokens, labels, positions.unsqueeze(0).expand(3, -1, -1).contiguous()
+
+        first, second = text_batch(False), text_batch(True)
+        assert not torch.equal(first[2], second[2])
+        batches = (first, second, first)
+
+        def train_step(batch):
+            tokens, labels, position_ids = batch
             model.zero_grad_buffer()
             model.set_is_first_microbatch()
-            losses = model(tokens, position_ids, None, labels=tokens)
+            losses = model(tokens, position_ids, None, labels=labels)
             losses.mean().backward()
             model.finish_grad_sync()
             return losses.detach().clone(), {
                 name: p.main_grad.detach().clone() for name, p in model.named_parameters()
             }
 
-        eager = [train_step(position_ids) for position_ids in (positions, shifted, positions)]
-        assert not torch.equal(eager[0][0], eager[1][0])
+        eager = [train_step(batch) for batch in batches]
         helper = TECudaGraphHelper(
             model=[model], config=config, seq_length=128, micro_batch_size=1, optimizers=[]
         )
         try:
             helper.create_cudagraphs()
             assert helper.graphs_created()
-            replay = [train_step(position_ids) for position_ids in (positions, shifted, positions)]
+            replay = [train_step(batch) for batch in batches]
             for expected, actual in zip(eager, replay, strict=True):
                 torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
         finally:
