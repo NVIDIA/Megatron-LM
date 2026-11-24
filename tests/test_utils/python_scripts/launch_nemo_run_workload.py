@@ -188,11 +188,17 @@ def main(
 ):
     cadence_arg = cadence or None
 
+    # Bridge belongs to the catch-all bucket in regular CI. Reuse its launch
+    # settings for Bridge-only PRs while collecting just the requested directory.
+    recipe_test_case = test_case
+    if scope == "unit-tests" and test_case == "tests/unit_tests/bridge":
+        recipe_test_case = "tests/unit_tests/**/*.py"
+
     workloads = recipe_parser.load_workloads(
         container_image="none",
         scope=scope,
         model=model,
-        test_case=test_case,
+        test_case=recipe_test_case,
         environment=environment,
         container_tag="none",
         platform=platform,
@@ -210,7 +216,7 @@ def main(
     magic_values["artifacts_dir"] = "/opt/megatron-lm/artifacts_dir"
     magic_values["environment"] = environment
     magic_values["n_repeat"] = n_repeat
-    magic_values["test_case"] = workload.spec["test_case"]
+    magic_values["test_case"] = test_case
     magic_values["name"] = workload.spec["name"].format(**magic_values)
     workload.spec["script"] = workload.spec["script"].format(**magic_values)
 

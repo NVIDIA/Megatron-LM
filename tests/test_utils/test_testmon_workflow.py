@@ -377,6 +377,7 @@ def test_pr_files_producer_requires_complete_data_for_the_tested_commit(
         _assert_pr_files_artifact(tmp_path, outputs, len(paths), paths)
     else:
         assert "ready" not in outputs
+        assert "bridge_only" not in outputs
         assert "::notice::" in result.stdout
         assert not (tmp_path / "runner/unit-test-pr-files/metadata.json").exists()
     no_api = {
@@ -391,6 +392,29 @@ def test_pr_files_producer_requires_complete_data_for_the_tested_commit(
         expected_calls.append("sha")
     calls = Path(environment["GH_LOG"])
     assert (calls.read_text().splitlines() if calls.exists() else []) == expected_calls
+
+
+@pytest.mark.parametrize(
+    ("paths", "previous_path", "bridge_only"),
+    [
+        (["megatron/bridge/model.py"], None, True),
+        (["examples/bridge/convert.sh"], "megatron/bridge/convert.sh", True),
+        (["megatron/bridge/model.py", "tests/unit_tests/bridge/test_model.py"], None, False),
+        (["examples/bridge/convert.sh"], "examples/bridge_tools/convert.sh", False),
+        (["megatron/core/model.py"], "megatron/bridge/model.py", False),
+    ],
+)
+def test_bridge_only_pr_paths(tmp_path, pr_files_environment, paths, previous_path, bridge_only):
+    records = [{"status": "modified", "filename": path} for path in paths]
+    if previous_path:
+        records[0].update(status="renamed", previous_filename=previous_path)
+    Path(pr_files_environment["TEST_PR_RESPONSE"]).write_text(json.dumps(records))
+    pr_files_environment["PR_CHANGED_FILES"] = str(len(records))
+    step = _step("cicd-main.yml", "configure", "unit-test-pr-files")
+    result, outputs = _run(step["run"], tmp_path, pr_files_environment)
+    assert result.returncode == 0, result.stderr
+    assert outputs["ready"] == "true"
+    assert (outputs.get("bridge_only") == "true") == bridge_only
 
 
 @pytest.mark.parametrize("direction", ["into", "out", "within"])
@@ -490,6 +514,7 @@ def configure_environment(
         "REF": "refs/heads/pull-request/6934",
         "FORCE_RUN_ALL": "false",
         "TEST_PR_LABEL_LOOKUP_EXIT": "0",
+        "BRIDGE_PATHS_ONLY": "false",
         "H100_TRAFFIC_MODE": "aws",
         "PREFLIGHT_IS_MEMBER": "true",
         "IS_MAINTAINER": "true",
@@ -808,11 +833,18 @@ def test_nemo_cicd_validator_declares_every_needs_reference_directly() -> None:
 
 
 @pytest.mark.parametrize(
-    ("run_h100_functional", "h100_result", "expected_success"),
-    [("true", "skipped", False), ("false", "skipped", True), ("true", "success", True)],
+    ("overrides", "expected_success"),
+    [
+        ({"H100_RESULT": "skipped"}, False),
+        ({"RUN_H100_FUNCTIONAL": "false", "H100_RESULT": "skipped"}, True),
+        ({}, True),
+        ({"ENABLE_GB200_TESTING": "true"}, False),
+        ({"ENABLE_GB200_TESTING": "true", "BRIDGE_ONLY": "true"}, True),
+        ({"BRIDGE_ONLY": "true", "UNIT_RESULT": "failure"}, False),
+    ],
 )
-def test_nemo_cicd_validator_checks_h100_functional_result(
-    tmp_path: Path, run_h100_functional: str, h100_result: str, expected_success: bool
+def test_nemo_cicd_validator_checks_required_tests(
+    tmp_path: Path, overrides: dict[str, str], expected_success: bool
 ) -> None:
     gh = tmp_path / "bin/gh"
     gh.parent.mkdir(parents=True)
@@ -831,16 +863,46 @@ def test_nemo_cicd_validator_checks_h100_functional_result(
             "IS_MAINTAINER": "true",
             "IS_CI_WORKLOAD": "false",
             "FORCE_RUN_ALL": "false",
-            "RUN_H100_FUNCTIONAL": run_h100_functional,
+            "RUN_H100_FUNCTIONAL": "true",
             "GB200_SHOULD_RUN": "false",
             "ENABLE_GB200_TESTING": "false",
             "UNIT_RESULT": "success",
+            "BRIDGE_ONLY": "false",
             "UNIT_GB200_RESULT": "skipped",
-            "H100_RESULT": h100_result,
+            "H100_RESULT": "success",
             "GB200_RESULT": "skipped",
+            **overrides,
         },
     )
     assert (result.returncode == 0) == expected_success, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("paths_only", "labels", "expected_bridge", "expected_testmon"),
+    [
+        ("true", [], True, False),
+        ("true", ["Run selective unit tests"], True, False),
+        ("true", ["Disable selective unit tests"], False, False),
+        ("false", ["Run selective unit tests"], False, True),
+    ],
+)
+def test_configure_bridge_unit_matrix(
+    tmp_path, configure_environment, paths_only, labels, expected_bridge, expected_testmon
+):
+    configure_environment["BRIDGE_PATHS_ONLY"] = paths_only
+    result, configured = _run_configure(tmp_path, configure_environment, labels)
+    assert result.returncode == 0, result.stderr
+    assert (configured["unit_testmon_eligible"] == "true") == expected_testmon
+    parser = _step("cicd-main.yml", "cicd-parse-unit-tests", "parse-unit-tests")
+    result, matrix = _run(
+        parser["run"], tmp_path, {**configure_environment, "BRIDGE_ONLY": configured["bridge_only"]}
+    )
+    assert result.returncode == 0, result.stderr
+    buckets = [entry["bucket"] for entry in json.loads(matrix["unit-tests"])]
+    if expected_bridge:
+        assert buckets == ["tests/unit_tests/bridge"]
+    else:
+        assert "tests/unit_tests/**/*.py" in buckets
 
 
 def test_selective_default_uses_the_repository_variable() -> None:
@@ -941,12 +1003,14 @@ def test_full_test_guards_override_selective_requests(
     labels: list[str],
     environment: dict[str, str],
 ) -> None:
+    configure_environment["BRIDGE_PATHS_ONLY"] = "true"
     if request_source == "default":
         configure_environment["ENABLE_SELECTIVE_UNIT_TESTS"] = "true"
     else:
         labels = [*labels, "Run selective unit tests"]
     result, outputs = _run_configure(tmp_path, {**configure_environment, **environment}, labels)
     assert result.returncode == 0, result.stderr
+    assert outputs["bridge_only"] == "false"
     assert outputs["unit_testmon_eligible"] == "false"
     # Eligibility guards must not obscure a requested selection in the summary.
     # If label lookup failed, only the repository default can establish a request.
@@ -1005,7 +1069,9 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
         ("gb200", "cicd-parse-unit-tests-gb200", "unit-tests-gb200"),
     ):
         parser = _step("cicd-main.yml", parser_job, "parse-unit-tests")
-        result, parsed = _run(parser["run"], tmp_path, shell_environment)
+        result, parsed = _run(
+            parser["run"], tmp_path, {**shell_environment, "BRIDGE_ONLY": "false"}
+        )
         assert result.returncode == 0, result.stderr
         recipe = yaml.safe_load(
             (ROOT / "tests/test_utils/recipes" / platform / "unit-tests.yaml").read_text()
