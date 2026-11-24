@@ -480,6 +480,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         kind="te-wrapper",
         notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert. "
+        "BF16 sReLU and tanh-sReLU: saved/acc input, activation recomputation, deterministic "
+        "dProb and empty EP ranks (SM100/103). "
         "FlashInfer MXFP8/BF16 experts: top-k=1 side-stream graph replay matches serial.",
     ),
     KernelEntry(

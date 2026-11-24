@@ -1879,6 +1879,68 @@ class TestMoEModules:
 
     @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
+    @pytest.mark.parametrize("clamp", [None, 2.0])
+    @pytest.mark.parametrize("recompute", [False, True])
+    @pytest.mark.parametrize("act_input,tanh_mode", [("acc", "approx"), ("saved", "accurate")])
+    @pytest.mark.parametrize("ep", [1, 2])
+    def test_te_grouped_mlp_bf16_srelu_replays(
+        self, monkeypatch, clamp, recompute, act_input, tanh_mode, ep
+    ):
+        """BF16 unary fusion replays with uneven experts and an empty EP rank."""
+        from transformer_engine.pytorch.ops.fused import grouped_mlp as te_mlp
+
+        fused_cls = getattr(te_mlp, "GroupedMLP_CuTeGEMMUnaryBf16", None)
+        if fused_cls is None or not fused_cls.is_supported():
+            pytest.skip("BF16 sReLU needs SM100/103 and the TE/cuDNN BF16 sReLU APIs")
+        if Utils.world_size % ep:
+            pytest.skip(f"needs a world size divisible by EP{ep}")
+        self._init(ep=ep)
+        seeded()
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+        config = _moe_config(
+            hidden_size=128,
+            ffn_hidden_size=320,
+            expert_model_parallel_size=ep,
+            gated_linear_unit=False,
+            activation_func=squared_relu,
+            bias_activation_fusion=False,
+            use_fused_weighted_squared_relu=True,
+            activation_func_tanh_clamp_scale=clamp,
+            use_transformer_engine_op_fuser=True,
+            moe_bf16_srelu_act_input=act_input,
+            moe_bf16_srelu_tanh_mode=tanh_mode,
+            recompute_granularity="selective" if recompute else None,
+            recompute_modules=["moe_act"] if recompute else None,
+        )
+        spec = get_gpt_layer_with_transformer_engine_spec(num_experts=8, moe_grouped_gemm=True)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        experts = (
+            get_submodules(spec.submodules.mlp)
+            .experts(num_local_experts=8 // ep, config=config, pg_collection=pg_collection)
+            .cuda()
+        )
+        counts = [17, 0, 257, 1] * (2 // ep)
+        if ep > 1 and pg_collection.ep.rank() == 1:
+            counts = [0] * len(counts)
+        sizes = torch.tensor(counts, dtype=torch.int64)
+        x = torch.randn(sum(counts), 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        p = torch.rand(sum(counts), device="cuda", requires_grad=True)
+        assert_module_replays_bit_exact(
+            experts,
+            (x, sizes, p),
+            replays=3,
+            contention=True,
+            what=f"TEGroupedMLP[BF16 sReLU, EP{ep}, clamp={clamp}, recompute={recompute}]",
+        )
+        (sequential,) = experts._fused_ops
+        assert any(
+            isinstance(entry[0], fused_cls)
+            for group in sequential._module_groups
+            for entry in group._forward_ops
+        )
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
     def test_te_grouped_mlp_replays_under_quantized_precision_override(self, monkeypatch):
         """Fused ``TEGroupedMLP`` whose ``--te-precision-config-file`` override keeps the experts
         quantized but with a different recipe than the ambient autocast (MXFP8 experts under a

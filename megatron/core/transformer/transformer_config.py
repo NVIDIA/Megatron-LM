@@ -683,6 +683,16 @@ class TransformerConfig(ModelParallelConfig):
     weighted variant; for the dense MLP, the tanh soft-clamped variant when
     activation_func_tanh_clamp_scale is set."""
 
+    moe_bf16_srelu_act_input: Literal["acc", "saved"] = "acc"
+    """Activation input for TE's BF16 fused grouped sReLU MLP: the FP32 GEMM accumulator
+    (acc) or its saved BF16 pre-activation (saved). Backward always reloads the saved value.
+    With selective moe_act recomputation, acc may therefore change the FC2 input used for
+    wgrad. This option does not select precision or alter other activation backends."""
+
+    moe_bf16_srelu_tanh_mode: Literal["approx", "accurate"] = "approx"
+    """Tanh implementation in TE's BF16 fused grouped sReLU MLP. Only affects tanh-clamped
+    squared ReLU; plain squared ReLU accepts either value with identical behavior."""
+
     fused_single_qkv_rope: bool = False
     """If set, avoid splitting QKV before ROPE forward and avoid concatenating ROPE dgrads."""
 
@@ -3878,6 +3888,13 @@ class TransformerConfig(ModelParallelConfig):
                     "If you don't want to use TransformerEngine activation function, set "
                     "use_te_activation_func to False"
                 )
+
+        for name, allowed in (
+            ("moe_bf16_srelu_act_input", ("acc", "saved")),
+            ("moe_bf16_srelu_tanh_mode", ("approx", "accurate")),
+        ):
+            if getattr(self, name) not in allowed:
+                raise ValueError(f"{name} must be one of {allowed}, got {getattr(self, name)!r}.")
 
         if self.activation_func_tanh_clamp_scale is not None:
             if self.activation_func_tanh_clamp_scale <= 0.0:

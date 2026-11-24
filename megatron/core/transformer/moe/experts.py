@@ -800,7 +800,20 @@ class TEGroupedMLP(MegatronModule):
             else:
                 srelu_cls = te.pytorch.ops.ScaledSReLU
                 kwargs = {}
-            if "activation_recompute_in_mlp" in inspect.signature(srelu_cls).parameters:
+            srelu_parameters = inspect.signature(srelu_cls).parameters
+            for config_name, te_name, default in (
+                ("moe_bf16_srelu_act_input", "bf16_act_input", "acc"),
+                ("moe_bf16_srelu_tanh_mode", "bf16_tanh_mode", "approx"),
+            ):
+                value = getattr(self.config, config_name, default)
+                if te_name in srelu_parameters:
+                    kwargs[te_name] = value
+                elif value != default:
+                    raise RuntimeError(
+                        f"{config_name}={value!r} requires Transformer Engine's "
+                        f"{srelu_cls.__name__} to accept {te_name}. Upgrade Transformer Engine."
+                    )
+            if "activation_recompute_in_mlp" in srelu_parameters:
                 kwargs["activation_recompute_in_mlp"] = activation_recompute_in_mlp
             op = srelu_cls(**kwargs)
         else:
