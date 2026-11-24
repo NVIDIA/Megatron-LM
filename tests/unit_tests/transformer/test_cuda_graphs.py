@@ -25,7 +25,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_block import HybridStack
-from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
+from megatron.core.models.hybrid.hybrid_layer_allocation import MTPSplit, validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.num_microbatches_calculator import (
@@ -2460,8 +2460,11 @@ class TestHybridLayerPairCudaGraph:
         config_kwargs.update(overrides)
         return TransformerConfig(**config_kwargs)
 
-    def _build_models(self, config, pattern):
-        """Build one DDP-wrapped HybridModel per virtual pipeline stage of this rank."""
+    def _build_models(self, config, pattern, hybrid_layer_config_list=None):
+        """Build one DDP-wrapped HybridModel per virtual pipeline stage of this rank.
+
+        The model takes its layers from hybrid_layer_config_list if given, else from pattern.
+        """
         vpp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
         models = []
         for vp_stage in range(vpp_size) if vpp_size else [None]:
@@ -2470,7 +2473,7 @@ class TestHybridLayerPairCudaGraph:
                 hybrid_stack_spec=hybrid_stack_spec,
                 vocab_size=self.vocab_size,
                 max_sequence_length=self.seq_length,
-                hybrid_layer_pattern=pattern,
+                hybrid_layer_pattern=pattern if hybrid_layer_config_list is None else None,
                 pre_process=parallel_state.is_pipeline_first_stage(
                     ignore_virtual=False, vp_stage=vp_stage
                 ),
@@ -2479,6 +2482,7 @@ class TestHybridLayerPairCudaGraph:
                 ),
                 position_embedding_type="rope",
                 vp_stage=vp_stage,
+                hybrid_layer_config_list=hybrid_layer_config_list,
             ).cuda()
             ddp_config = DistributedDataParallelConfig(grad_reduce_in_fp32=True)
             models.append(DistributedDataParallel(config, ddp_config, model))
@@ -2846,6 +2850,87 @@ class TestHybridLayerPairCudaGraph:
                 assert [len(callables) for callables in helper.callables_per_chunk] == counts
                 # One graph per callable and microbatch, each replayed in forward and backward.
                 assert record["replays"] == [0] + [2 * sum(counts) * num_microbatches] * 2
+            self._assert_bitwise_equal(paired, unpaired)
+            paired_helper.delete_cuda_graphs()
+        torch.cuda.current_stream().wait_stream(stream)
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("2.10.0")),
+        reason="Partial CUDA graph UT support requires TransformerEngine version >= 2.10.0",
+    )
+    @pytest.mark.parametrize(
+        # The layers of "*E*E/*E" are numbered over the decoder, then the MTP block. Each layer in
+        # eager_layers turns TE graphs off in its own layer config. expected_callables lists the
+        # layers that each graphed callable of the paired run captures.
+        "eager_layers,expected_callables",
+        [
+            # The MoE layers after the eager mixers keep their own graphs. As with per-layer
+            # graphs, the eager layers are not graphed.
+            pytest.param((0, 4), [(1,), (2, 3), (5,)], id="mixers"),
+            # The mixer before the eager MTP MoE layer keeps its own graph.
+            pytest.param((5,), [(0, 1), (2, 3), (4,)], id="mtp-moe-layer"),
+        ],
+    )
+    def test_layers_without_te_graphs_are_not_paired(
+        self, monkeypatch, eager_layers, expected_callables
+    ):
+        pattern = "*E*E/*E"
+        replays = self._setup_parallel_state(monkeypatch, num_microbatches=1)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            config = self._config(pattern, _PARTIAL_MOE_GRAPH_MODULES)
+            decoder_pattern, mtp_pattern = pattern.split("/")
+            decoder_configs = validate_segment_layers(decoder_pattern, config)
+            mtp_configs = validate_segment_layers(mtp_pattern, config)
+            layer_configs = [*decoder_configs, *mtp_configs]
+            for index in eager_layers:
+                layer_configs[index].cuda_graph_impl = "none"
+            models = self._build_models(
+                config, pattern, hybrid_layer_config_list=[*decoder_configs, MTPSplit, *mtp_configs]
+            )
+            layers = [
+                *get_attr_wrapped_model(models[0], "decoder").layers,
+                *models[0].module.mtp.layers[0].mtp_model_layer.layers,
+            ]
+            batches = self._batches(num_microbatches=1, padding=False)
+            initial_params = {
+                name: param.detach().clone() for name, param in self._named_parameters(models)
+            }
+            unpaired_helper, unpaired = self._train(models, config, batches, replays, pair=False)
+            unpaired_helper.delete_cuda_graphs()
+            self._restore(models, initial_params)
+            paired_helper, paired = self._train(models, config, batches, replays, pair=True)
+
+            def captured_layers(helper):
+                """The indices into layers of the layers that each graphed callable captures."""
+                return [
+                    (
+                        (layers.index(c.mixer), layers.index(c.partner))
+                        if isinstance(c, _TECudaGraphLayerPair)
+                        else (layers.index(c),)
+                    )
+                    for c in helper.flattened_callables
+                ]
+
+            # Per-layer graphs capture every decoder layer that keeps TE graphs and leave the MTP
+            # block eager.
+            assert captured_layers(unpaired_helper) == [
+                (index,) for index in range(len(decoder_configs)) if index not in eager_layers
+            ]
+            assert captured_layers(paired_helper) == expected_callables
+            assert paired_helper.flattened_callables_is_mtp == [
+                c[0] >= len(decoder_configs) for c in expected_callables
+            ]
+            # Layers without TE graphs do not even set up the TE graph state.
+            assert all(
+                getattr(layers[index], "_te_cuda_graph_pair_link", None) is None
+                for index in eager_layers
+            )
+            # One forward and one backward replay per graphed callable.
+            for helper, record in ((unpaired_helper, unpaired), (paired_helper, paired)):
+                num_replayed = len(helper.flattened_callables)
+                assert record["replays"] == [0, 2 * num_replayed, 2 * num_replayed]
             self._assert_bitwise_equal(paired, unpaired)
             paired_helper.delete_cuda_graphs()
         torch.cuda.current_stream().wait_stream(stream)

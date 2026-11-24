@@ -2485,13 +2485,18 @@ def _te_cuda_graph_pair_supported(mixer, partner, config) -> bool:
 
     The mixer must be an attention-type layer whose feed-forward branch is an identity, so that its
     graph output is its layer output, and the partner a feed-forward layer whose attention branch
-    is an identity, so that its graph starts at its layer input.
+    is an identity, so that its graph starts at its layer input. Both layers must replay TE graphs
+    under their own configs: the mixer launches the pair's graph, and the partner takes its outputs.
     """
     from megatron.core.transformer.identity_op import IdentityOp
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
     if not (isinstance(mixer, TransformerLayer) and isinstance(partner, TransformerLayer)):
         return False
+    # _te_cuda_graph_layer_is_graphable also reads each layer's own cuda_graph_impl, which a
+    # hybrid_layer_config_list can set per layer. A mixer that runs eagerly never launches the
+    # graph, so its partner finds no outputs to take; a partner that runs eagerly repeats the part
+    # of its layer that the graph already ran.
     if not (
         _te_cuda_graph_layer_is_graphable(mixer, config)
         and _te_cuda_graph_layer_is_graphable(partner, config)
@@ -2599,7 +2604,9 @@ def _te_graph_callables(layers, config: TransformerConfig, pair_hybrid_layers: b
     """Return the TE graphed callables of consecutive layers and how many of them are pairs.
 
     With pair_hybrid_layers, each mixer is captured with the layer after it where
-    _te_cuda_graph_pair_supported allows it. Every other graphable layer keeps its own callable.
+    _te_cuda_graph_pair_supported allows it. Every other graphable layer keeps its own callable;
+    as with per-layer graphs, a layer whose own config selects another cuda_graph_impl is not
+    graphable and stays eager.
     """
     callables, num_pairs, index = [], 0, 0
     while index < len(layers):

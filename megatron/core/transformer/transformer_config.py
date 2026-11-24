@@ -1377,7 +1377,8 @@ class TransformerConfig(ModelParallelConfig):
     communication overlap, delay_wgrad_compute, fine-grained activation offloading,
     sequence_packing_scheduler, mHC or context parallelism is enabled. Wide residual streams do
     not support Transformer Engine CUDA graphs; configuration validation rejects that combination.
-    Has no effect with other cuda_graph_impl values."""
+    A layer whose own layer config (hybrid_layer_config_list) sets another cuda_graph_impl is not
+    paired and runs as with per-layer graphs. Has no effect with other cuda_graph_impl values."""
 
     external_cuda_graph: bool = False
     """DEPRECATED and replaced by cuda_graph_impl.

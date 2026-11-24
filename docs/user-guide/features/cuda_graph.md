@@ -145,6 +145,9 @@ follows it as one graph, which halves the graph launches per block:
 - A layer keeps its own graph when it cannot be paired: Mamba layers, layers whose neighbor is not
   graphed, pairs split by a pipeline stage boundary, hash-routed MoE layers, and pairs whose two
   layers differ in their FP8/FP4 first/last-layer BF16 setting.
+- A layer whose own config in a `hybrid_layer_config_list` sets a `cuda_graph_impl` other than
+  `transformer_engine` is not paired and runs as it does with per-layer graphs; its neighbor keeps
+  its own graph.
 - The layers of Hybrid MTP blocks, which per-layer graphs leave eager, are graphed too, paired the
   same way. They stay eager with `--mtp-use-repeated-layer` and several MTP depths, and with
   `--keep-mtp-in-bf16` in FP8 or FP4 training.
