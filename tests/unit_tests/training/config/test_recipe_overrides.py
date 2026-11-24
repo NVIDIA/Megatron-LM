@@ -4,12 +4,15 @@
 
 import pytest
 
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from scripts.run_recipe import _apply_overrides
 
 
 def test_overrides_preserve_native_objects_and_leave_finalization_to_startup(run_config):
     transformer = run_config.model.transformer
     activation = transformer.activation_func
+    layout = PipelineParallelLayerLayout.from_str("Et*2L", pipeline_model_parallel_size=1)
+    transformer.pipeline_model_parallel_layout = layout
     _apply_overrides(
         run_config,
         [
@@ -28,6 +31,17 @@ def test_overrides_preserve_native_objects_and_leave_finalization_to_startup(run
     assert run_config.profiling.profile_ranks == [2, 4]
     assert run_config.model.transformer is transformer
     assert transformer.activation_func is activation
+    assert transformer.pipeline_model_parallel_layout is layout
+    assert not run_config._finalized
+
+
+@pytest.mark.parametrize("layout", ["Et*2|t*2L", "invalid", "[[E,t,t],[t,t,L]]", "null"])
+def test_pipeline_layout_override_requires_recipe_construction(run_config, layout):
+    transformer = run_config.model.transformer
+    original = transformer.pipeline_model_parallel_layout
+    with pytest.raises(ValueError, match="recipe factory"):
+        _apply_overrides(run_config, [f"model.transformer.pipeline_model_parallel_layout={layout}"])
+    assert transformer.pipeline_model_parallel_layout is original
     assert not run_config._finalized
 
 

@@ -55,6 +55,10 @@ def _apply_overrides(config: "PretrainConfigContainer", overrides: list[str]) ->
                 raise ValueError(f"Not an editable config field: {path!r}")
             if index < len(names) - 1:
                 owner = getattr(owner, name)
+        if names[-1] == "pipeline_model_parallel_layout":
+            # TransformerConfig normalizes the layout and derives VPP settings
+            # during construction; a leaf assignment cannot safely repeat that.
+            raise ValueError(f"Define {path!r} in the recipe factory, not as an override")
         current = getattr(owner, names[-1])
         if is_dataclass(current):
             raise ValueError(f"Override a field within {path!r}, not the entire config section")

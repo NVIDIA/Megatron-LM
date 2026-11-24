@@ -79,6 +79,47 @@ def test_batch_matches_existing_mlm_partitioning(run_config, tp, pp, cp, packed)
         Utils.destroy_model_parallel()
 
 
+def test_unpacked_mrope_keeps_full_positions_with_context_parallelism(run_config):
+    Utils.initialize_model_parallel(1, 1, context_parallel_size=2)
+    try:
+        transformer = run_config.model.transformer
+        transformer.context_parallel_size = 2
+        transformer.max_seq_length_per_sample = 16
+        run_config.model.position_embedding_type = "mrope"
+        run_config.train.micro_batch_size = 1
+        run_config.data = DataConfig(
+            dataset=GPTDatasetConfig(
+                random_seed=1234,
+                sequence_length=16,
+                reset_position_ids=False,
+                reset_attention_mask=False,
+                eod_mask_loss=False,
+                create_attention_mask=False,
+            ),
+            dataset_type=MockGPTDataset,
+        )
+        groups = ProcessGroupCollection.use_mpu_process_groups()
+        positions = torch.arange(48, device="cuda").reshape(3, 1, 16)
+        tokens = torch.arange(16, device="cuda").reshape(1, 16)
+        labels = tokens + 1
+        loss_mask = (tokens % 3 != 0).float()
+        batch = llm_step.get_batch(
+            iter([dict(tokens=tokens, labels=labels, position_ids=positions, loss_mask=loss_mask)]),
+            vp_stage=None,
+            pg_collection=groups,
+        )
+        rank = groups.cp.rank()
+        indices = torch.cat(
+            [torch.arange(rank * 4, (rank + 1) * 4), torch.arange((3 - rank) * 4, (4 - rank) * 4)]
+        ).cuda()
+        for view in batch.batches_by_layout.values():
+            torch.testing.assert_close(view["position_ids"], positions, rtol=0, atol=0)
+            for name, full in (("tokens", tokens), ("labels", labels), ("loss_mask", loss_mask)):
+                torch.testing.assert_close(view[name], full[:, indices], rtol=0, atol=0)
+    finally:
+        Utils.destroy_model_parallel()
+
+
 def test_masked_loss_preserves_token_count_and_gradients(run_config):
     run_config.rerun_state_machine.check_for_nan_in_loss = False
     run_config.rerun_state_machine.check_for_spiky_loss = False

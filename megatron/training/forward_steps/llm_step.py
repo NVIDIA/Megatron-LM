@@ -134,7 +134,9 @@ def get_batch(
         is_pipeline_last_stage=is_last,
     )
     batch = flatten_batch_for_packed_sequences(batch)
-    full_positions = batch.get("position_ids") if keep_full_positions else None
+    # mRoPE positions are [3, batch, sequence], not [batch, sequence]. The model
+    # needs the full positions; omit them from the generic sequence-dimension sharder.
+    full_positions = batch.pop("position_ids", None) if keep_full_positions else None
     additional_layouts = set()
     if cp_size > 1 and config.linear_cp_layout != config.attention_cp_layout:
         additional_layouts.add(config.attention_cp_layout)
