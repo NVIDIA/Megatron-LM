@@ -212,7 +212,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/extensions/transformer_engine.py",),
         tests=(K + "test_te_wrappers.py",),
         kind="external-lib",
-        notes="Replays TE's overwrite_input path when supported.",
+        notes="Replays TE's overwrite_input path when supported, and the MXFP8 gradient "
+        "output (cross_entropy_mxfp8_grad) when TE supports grad_quantizer.",
     ),
     KernelEntry(
         name="te_batched_linear_matrix_parameter",
@@ -356,7 +357,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="tensor_parallel_random_share_storage",
-        sources=("megatron/core/tensor_parallel/random.py",),
+        sources=("megatron/core/activation_policy/recompute/checkpointing.py",),
         kind="cuda-ext",
         exempt_reason="load_inline extension aliases tensor storage on the host; no GPU compute.",
     ),
@@ -445,6 +446,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         kind="torch.compile",
         notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing. "
+        "Global-batch QB also compares histograms and the compact-output compatibility fallback. "
         "Fused aux_loss, seq_aux_loss and global_aux_loss replay their logged scalar, "
         "input and router-weight gradients with fused TopK routing, and compare to the unfused reference.",
     ),
@@ -1053,6 +1055,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         exempt_reason="TE gather_along_first_dim / reduce_scatter_along_first_dim of weights and "
         "wgrads in generalized tensor parallelism; multi-rank NCCL collectives pinned by "
         "NCCL_ALGO=Ring under --deterministic-mode, not exercised by the determinism model tests.",
+    ),
+    KernelEntry(
+        name="gtp_fp8_checkpoint_casts",
+        sources=("megatron/core/tensor_parallel/generalized_tensor_parallelism.py",),
+        tests=("tests/unit_tests/generalized_tensor_parallel/test_gtp_dcp.py",),
+        kind="dispatch",
+        notes="Native-FP8 checkpoint copy/dequantization, with legacy TE class compatibility.",
     ),
     KernelEntry(
         name="te_thd_partitioned_indices",
