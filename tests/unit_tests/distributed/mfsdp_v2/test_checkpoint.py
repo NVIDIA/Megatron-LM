@@ -609,7 +609,12 @@ def test_ep_fsdp_checkpoint_roundtrip(
                 "model": model.state_dict_for_save_checkpoint(),
                 "optimizer": optimizer.sharded_state_dict({}, is_loading=is_loading),
             }
-            return preprocess_fsdp_dtensor_state_dict(model.config, state, unwrap_model(model))
+            return preprocess_fsdp_dtensor_state_dict(
+                model.config,
+                state,
+                unwrap_model(model),
+                megatron_fsdp_version=model.ddp_config.megatron_fsdp_version,
+            )
 
         train(source, source_optimizer)
         with TempNamedDir(tmp_path_dist_ckpt / f"ep{ep_size}_mcore_roundtrip", sync=True) as path:
