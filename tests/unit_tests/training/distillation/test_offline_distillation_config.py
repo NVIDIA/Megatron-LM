@@ -10,7 +10,6 @@ import pytest
 from megatron.training.argument_utils import offline_distillation_config_from_args
 from megatron.training.arguments import _add_logits_distillation_args
 from megatron.training.config import (
-    CheckpointConfig,
     LogitsLoadConfig,
     LogitsSaveConfig,
     OfflineDistillationConfig,
@@ -108,46 +107,6 @@ def test_cli_rejects_both_phases_and_disables_kd_without_either():
 def test_invalid_cache_settings_fail_before_runtime(config, message):
     with pytest.raises(ValueError, match=message):
         config.validate()
-
-
-@pytest.mark.parametrize("phase", ["teacher_save", "student_load"])
-@pytest.mark.parametrize("schedule", ["rampup_batch_size", "step_batch_size_schedule"])
-def test_batch_schedules_are_rejected(phase, schedule):
-    cfg = OfflineDistillationConfig(
-        **{
-            phase: (
-                LogitsSaveConfig(directory="/cache")
-                if phase == "teacher_save"
-                else LogitsLoadConfig(directory="/cache")
-            )
-        }
-    )
-    train = TrainingConfig(
-        **{schedule: [8, 8, 1000] if schedule == "rampup_batch_size" else "0:8 1K:16"}
-    )
-    with pytest.raises(ValueError, match="fixed global batch"):
-        cfg.validate_run(train=train, checkpoint=CheckpointConfig(), distillation=None)
-
-
-@pytest.mark.parametrize("async_save,persistent", [(False, False), (True, False)])
-def test_saving_requires_the_async_checkpoint_worker(async_save, persistent):
-    cfg = OfflineDistillationConfig(teacher_save=LogitsSaveConfig(directory="/cache"))
-    with pytest.raises(ValueError, match="persistent_ckpt_worker"):
-        cfg.validate_run(
-            train=TrainingConfig(),
-            checkpoint=CheckpointConfig(
-                async_save=async_save, use_persistent_ckpt_worker=persistent
-            ),
-            distillation=None,
-        )
-
-
-def test_cached_and_online_student_losses_are_exclusive():
-    cfg = OfflineDistillationConfig(student_load=LogitsLoadConfig(directory="/cache"))
-    with pytest.raises(ValueError, match="online ModelOpt"):
-        cfg.validate_run(
-            train=TrainingConfig(), checkpoint=CheckpointConfig(), distillation=object()
-        )
 
 
 def test_dataset_identity_preserves_the_existing_cache_schema():

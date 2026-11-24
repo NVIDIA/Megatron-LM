@@ -3,11 +3,7 @@
 """Configuration for producing or consuming an offline teacher-logits cache."""
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
-
-if TYPE_CHECKING:
-    from megatron.training.config.training_config import CheckpointConfig, TrainingConfig
-    from megatron.training.models.distillation import DistillationConfig
+from typing import Literal
 
 
 @dataclass(kw_only=True)
@@ -95,21 +91,3 @@ class OfflineDistillationConfig:
             )
         config = self.teacher_save if self.teacher_save is not None else self.student_load
         config.validate()
-
-    def validate_run(
-        self,
-        *,
-        train: "TrainingConfig",
-        checkpoint: "CheckpointConfig",
-        distillation: "DistillationConfig | None",
-    ) -> None:
-        """Check dependencies owned by the other run configuration sections."""
-        if train.rampup_batch_size is not None or train.step_batch_size_schedule is not None:
-            raise ValueError("Offline distillation requires a fixed global batch size.")
-        if self.teacher_save is not None:
-            if not checkpoint.async_save or not checkpoint.use_persistent_ckpt_worker:
-                raise ValueError(
-                    "teacher_save requires checkpoint.async_save and use_persistent_ckpt_worker."
-                )
-        elif distillation is not None:
-            raise ValueError("student_load cannot be combined with online ModelOpt distillation.")

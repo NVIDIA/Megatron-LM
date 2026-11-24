@@ -262,17 +262,17 @@ def loss_func(
     """
     cfg = get_run_config()
 
-    offline_kd = cfg.offline_distillation
-    if offline_kd is not None and offline_kd.student_load is not None:
-        load = offline_kd.student_load
+    offline_kd_cfg = cfg.offline_distillation
+    if offline_kd_cfg is not None and offline_kd_cfg.student_load is not None:
+        student_load_cfg = offline_kd_cfg.student_load
         # Offline knowledge distillation loss using cached teacher log-probabilities.
         loss_func_cached_logits = _build_cached_logits_loss_func(
-            logprobs_dir=load.directory,
-            decode_threads=load.decode_threads,
-            msc_prefetch_depth=load.msc_prefetch_depth,
-            kd_loss_alpha=load.loss_alpha,
-            ignore_errors=load.ignore_errors,
-            ignore_hash=load.ignore_hash,
+            logprobs_dir=student_load_cfg.directory,
+            decode_threads=student_load_cfg.decode_threads,
+            msc_prefetch_depth=student_load_cfg.msc_prefetch_depth,
+            kd_loss_alpha=student_load_cfg.loss_alpha,
+            ignore_errors=student_load_cfg.ignore_errors,
+            ignore_hash=student_load_cfg.ignore_hash,
         )
         loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
     elif has_nvidia_modelopt and is_distillation_model(model):  # [ModelOpt]

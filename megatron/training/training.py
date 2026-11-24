@@ -2616,27 +2616,27 @@ def setup_model_and_optimizer(
             cuda_graph_impl=cfg.model.transformer.cuda_graph_impl,
         )
 
-    offline_kd = cfg.offline_distillation
+    offline_kd_cfg = cfg.offline_distillation
     if (
-        offline_kd is not None
-        and offline_kd.teacher_save is not None
+        offline_kd_cfg is not None
+        and offline_kd_cfg.teacher_save is not None
         and mpu.is_pipeline_last_stage()
     ):
         from megatron.training.distillation import LogitsSaverHooks
 
-        save = offline_kd.teacher_save
+        teacher_save_cfg = offline_kd_cfg.teacher_save
         logits_saver = LogitsSaverHooks(
-            save_dir=save.directory,
-            k=save.top_k,
-            p=save.top_p,
-            min_k=save.min_k,
-            save_dtype=save.dtype,
+            save_dir=teacher_save_cfg.directory,
+            k=teacher_save_cfg.top_k,
+            p=teacher_save_cfg.top_p,
+            min_k=teacher_save_cfg.min_k,
+            save_dtype=teacher_save_cfg.dtype,
         )
         logits_saver.attach_hooks(unwrapped_model[-1])
 
     if (
-        offline_kd is not None
-        and offline_kd.student_load is not None
+        offline_kd_cfg is not None
+        and offline_kd_cfg.student_load is not None
         and mpu.is_pipeline_last_stage()
     ):
         from megatron.training.distillation import StudentLogitsCapture

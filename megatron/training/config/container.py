@@ -503,14 +503,7 @@ class PretrainConfigContainer(ConfigContainerBase):
         if self.fault_tolerance.enable_ft_package and not self.checkpoint.save:
             raise ValueError("checkpointing save dir must be set to enable fault tolerance")
         self._validate_distillation()
-        if self.offline_distillation is not None:
-            self.offline_distillation.validate_run(
-                train=self.train, checkpoint=self.checkpoint, distillation=self.distillation
-            )
-            if self.data.dataset is None:
-                raise ValueError(
-                    "Offline distillation requires cfg.data.dataset for cache identity."
-                )
+        self._validate_offline_distillation()
         if self.train.freeze_all_layers and transformer.freeze_base_model_for_mtp:
             raise ValueError("freeze_all_layers cannot be combined with freeze_base_model_for_mtp.")
         global_batch_size, _, _ = self._resolve_batch_sizes()
@@ -544,6 +537,26 @@ class PretrainConfigContainer(ConfigContainerBase):
             validate_distillation_student(self.distillation, self.model)
         if self.train.manual_gc:
             raise ValueError("ModelOpt distillation is incompatible with manual_gc.")
+
+    def _validate_offline_distillation(self) -> None:
+        """Check offline KD against the training, checkpoint, distillation and data sections."""
+        offline_kd_cfg = self.offline_distillation
+        if offline_kd_cfg is None:
+            return
+        if (
+            self.train.rampup_batch_size is not None
+            or self.train.step_batch_size_schedule is not None
+        ):
+            raise ValueError("Offline distillation requires a fixed global batch size.")
+        if offline_kd_cfg.teacher_save is not None:
+            if not self.checkpoint.async_save or not self.checkpoint.use_persistent_ckpt_worker:
+                raise ValueError(
+                    "teacher_save requires checkpoint.async_save and use_persistent_ckpt_worker."
+                )
+        elif self.distillation is not None:
+            raise ValueError("student_load cannot be combined with online ModelOpt distillation.")
+        if self.data.dataset is None:
+            raise ValueError("Offline distillation requires cfg.data.dataset for cache identity.")
 
     def _validate_checkpoint(self) -> None:
         """Check the checkpoint format and optimizer policy against the sections that own the
