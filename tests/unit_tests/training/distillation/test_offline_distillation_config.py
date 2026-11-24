@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.training.argument_utils import offline_distillation_config_from_args
 from megatron.training.arguments import _add_logits_distillation_args
 from megatron.training.config import (
@@ -132,8 +133,16 @@ def test_dataset_identity_preserves_the_existing_cache_schema():
 @pytest.mark.parametrize("sft,inter_document", [(True, False), (False, True), (False, False)])
 def test_packing_comes_from_the_dataset_config(sft, inter_document):
     data = DataConfig(
-        dataset=SimpleNamespace(inter_document_masking=inter_document),
-        dataset_type=dataset_type_from_family("sft" if sft else "gpt", mock=False),
+        dataset=GPTDatasetConfig(
+            sequence_length=16,
+            random_seed=1234,
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
+            inter_document_masking=inter_document,
+            create_attention_mask=not inter_document,
+        ),
+        dataset_type=dataset_type_from_family("sft" if sft else "gpt", mock=True),
     )
     assert utils.is_packed_sequence_run(data) is (sft or inter_document)
 

@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import TransformerConfig
 from megatron.training import global_vars
@@ -16,6 +17,8 @@ from megatron.training.config import (
     InferenceSetupConfig,
     RLConfig,
 )
+from megatron.training.config.dataset_config import DataConfig
+from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDatasetConfig
 from megatron.training.models import (
     BertModelConfig,
     GPTModelConfig,
@@ -27,115 +30,142 @@ from megatron.training.models import (
 from megatron.training.models.base import ModelConfig
 
 
-@pytest.mark.parametrize("overlap_grad_reduce", [False, True])
-@pytest.mark.parametrize("overlap_optimizer_step", [False, True])
-def test_frozen_training_config_disables_optimizer_gather_without_cli_args(
-    monkeypatch, run_config, caplog, overlap_grad_reduce, overlap_optimizer_step
-):
-    run_config.train.micro_batch_size = 1
-    run_config.train.global_batch_size = 8
-    run_config.train.freeze_all_layers = True
-    run_config.optimizer.use_distributed_optimizer = True
-    run_config.optimizer.overlap_param_gather = True
-    run_config.optimizer.overlap_param_gather_with_optimizer_step = overlap_optimizer_step
-    run_config.ddp.use_distributed_optimizer = True
-    run_config.ddp.overlap_param_gather = True
-    run_config.ddp.overlap_grad_reduce = overlap_grad_reduce
-    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
-
-    before = copy.deepcopy(run_config.to_dict())
-    for _ in range(2):
-        run_config.validate()
-        assert run_config.to_dict() == before
-        assert not run_config._finalized
-
-    with caplog.at_level("WARNING", logger="megatron.training.config.container"):
-        run_config.finalize()
-
-    assert "freeze_all_layers" in caplog.text
-    assert "use_distributed_optimizer" in caplog.text and "overlap_param_gather" in caplog.text
-    assert not run_config.optimizer.use_distributed_optimizer
-    assert not run_config.optimizer.overlap_param_gather
-    assert not run_config.optimizer.overlap_param_gather_with_optimizer_step
-    assert not run_config.ddp.use_distributed_optimizer
-    assert not run_config.ddp.overlap_param_gather
-    if overlap_optimizer_step:
-        assert "overlap_param_gather_with_optimizer_step" in caplog.text
-
-
-def test_frozen_validation_ignores_optimizer_local_overlap_prerequisites(run_config):
-    run_config.train.freeze_all_layers = True
-    # Neither prerequisite of this flag is enabled; freezing makes all three irrelevant.
-    run_config.optimizer.overlap_param_gather_with_optimizer_step = True
-    before = copy.deepcopy(run_config.to_dict())
-    run_config.validate()
-    assert run_config.to_dict() == before
-
-
-@pytest.mark.parametrize("checkpoint_case", ["legacy_without_gloo", "parameter_only_save"])
-def test_frozen_checkpoint_validation_uses_the_effective_optimizer(run_config, checkpoint_case):
-    run_config.train.freeze_all_layers = True
-    run_config.optimizer.use_distributed_optimizer = True
-    run_config.optimizer.overlap_param_gather = True
-    if checkpoint_case == "legacy_without_gloo":
-        run_config.checkpoint.ckpt_format = "torch"
-        run_config.dist.use_gloo_process_groups = False
+@pytest.mark.parametrize("packed", [False, True])
+def test_dataset_content_limit_and_execution_bound_are_distinct(run_config, packed):
+    cfg = run_config
+    cfg.train.micro_batch_size = 1
+    cfg.model.seq_length = 64
+    cfg.model.transformer.max_seq_length_per_sample = 32 if packed else None
+    cfg.data = DataConfig(
+        dataset=(SFTDatasetConfig if packed else GPTDatasetConfig)(
+            random_seed=1234,
+            sequence_length=8,
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
+        ),
+        dataset_type=MockSFTDataset if packed else MockGPTDataset,
+    )
+    before = copy.deepcopy(cfg.to_dict())
+    cfg.validate()
+    assert cfg.to_dict() == before
+    if packed:
+        assert cfg.data.dataset.packed_sequence_length is None
     else:
-        run_config.checkpoint.save = "/save"
-        run_config.checkpoint.save_params_interval = 2
+        assert not hasattr(cfg.data.dataset, "packed_sequence_length")
+    cfg.finalize()
+    assert cfg.data.dataset.sequence_length == 8
+    assert cfg.model.transformer.max_seq_length_per_sample == (32 if packed else 8)
+    saved = cfg.to_dict()
+    restored = type(cfg).from_dict(saved)
+    restored.finalize()
+    assert type(restored.data.dataset) is (SFTDatasetConfig if packed else GPTDatasetConfig)
+    assert restored.model.transformer.max_seq_length_per_sample == (32 if packed else 8)
+    assert restored.to_dict() == saved
+
+
+@pytest.mark.parametrize("position_embedding_type", ["learned_absolute", "rope", "relative"])
+def test_t5_input_widths_do_not_follow_position_capacity(position_embedding_type):
+    model = T5ModelConfig(
+        transformer=TransformerConfig(
+            num_layers=2, hidden_size=32, num_attention_heads=4, max_seq_length_per_sample=32
+        ),
+        seq_length=128,
+        encoder_num_layers=2,
+        encoder_seq_length=16,
+        decoder_seq_length=32,
+        position_embedding_type=position_embedding_type,
+    )
+    model.validate()
+    model.finalize()
+    assert model.encoder_seq_length == 16
+    assert model.transformer.max_seq_length_per_sample == 32
+    model.seq_length = 16
+    if position_embedding_type == "learned_absolute":
+        with pytest.raises(ValueError, match="position capacity.*decoder_seq_length"):
+            model.validate()
+        model.encoder_seq_length = None
+        with pytest.raises(ValueError, match="position capacity.*encoder_seq_length"):
+            model.validate()
+        model.encoder_seq_length = 16
+    else:
+        model.validate()
+    model.seq_length = 128
+    model.transformer.max_seq_length_per_sample = 16
+    with pytest.raises(ValueError, match="decoder_seq_length"):
+        model.validate()
+
+
+def test_bert_callback_validates_learned_position_capacity(run_config):
+    run_config.model = BertModelConfig(transformer=run_config.model.transformer, seq_length=32)
+    run_config.model.transformer.max_seq_length_per_sample = 64
+    assert run_config.data.dataset is None
+    with pytest.raises(ValueError, match="BERT position capacity"):
+        run_config.validate()
+    run_config.model.seq_length = 128
     before = copy.deepcopy(run_config.to_dict())
     run_config.validate()
     assert run_config.to_dict() == before
 
 
-@pytest.mark.parametrize("optimizer", ["muon", "dist_muon"])
-def test_frozen_validation_preserves_layer_wise_optimizer_selection(run_config, optimizer):
-    run_config.train.micro_batch_size = 1
-    run_config.train.freeze_all_layers = True
-    run_config.optimizer.optimizer = optimizer
-    run_config.optimizer.use_distributed_optimizer = True
-    run_config.optimizer.muon_tp_mode = "layer_sharded"
-    run_config.optimizer.muon_split_qkv = False
-    before = copy.deepcopy(run_config.to_dict())
-    run_config.validate()
-    assert run_config.to_dict() == before
-    run_config.finalize()
-    assert run_config.optimizer.optimizer == "muon"
-    assert run_config.optimizer.use_layer_wise_distributed_optimizer
-    assert not run_config.optimizer.use_distributed_optimizer
+def test_llava_requires_the_language_execution_width():
+    """The resolved text + image + padding width is an input; the container never derives it
+    from the text-only dataset length."""
+    transformer = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
+    model = LLaVAModelConfig(transformer=transformer, seq_length=32)
+    with pytest.raises(ValueError, match="requires transformer.max_seq_length_per_sample"):
+        model.validate()
+    transformer.max_seq_length_per_sample = 64
+    with pytest.raises(ValueError, match="LLaVA position capacity"):
+        model.validate()
+    model.position_embedding_type = "rope"
+    model.validate()
 
 
 @pytest.mark.parametrize(
-    "overlap_grad_reduce,overlap_optimizer_step,checkpoint_format,error",
-    [
-        (False, False, "torch_dist", "overlap-grad-reduce"),
-        (True, True, "torch_dist", "distributed checkpointing"),
-        (True, True, "torch", "interleaved pipeline parallelism"),
-        (True, False, "torch_dist", None),
-        (True, True, "torch", None),
-    ],
+    "bound,capacity,error", [(33, 64, "alignment"), (64, 32, "position capacity"), (32, 64, None)]
 )
-def test_unfrozen_training_retains_optimizer_overlap_validation(
-    run_config, overlap_grad_reduce, overlap_optimizer_step, checkpoint_format, error
-):
-    run_config.train.micro_batch_size = 1
-    run_config.optimizer.use_distributed_optimizer = True
-    run_config.optimizer.overlap_param_gather = True
-    run_config.optimizer.overlap_param_gather_with_optimizer_step = overlap_optimizer_step
-    run_config.ddp.overlap_grad_reduce = overlap_grad_reduce
-    run_config.checkpoint.ckpt_format = checkpoint_format
-    if overlap_optimizer_step and error is None:
-        transformer = run_config.model.transformer
-        transformer.num_layers = 4
-        transformer.pipeline_model_parallel_size = 2
-        transformer.virtual_pipeline_model_parallel_size = 2
-    before = copy.deepcopy(run_config.to_dict())
+def test_sft_pack_validates_physical_shape(run_config, bound, capacity, error):
+    cfg = run_config
+    cfg.model.seq_length = capacity
+    cfg.model.position_embedding_type = "learned_absolute"
+    cfg.model.transformer.max_seq_length_per_sample = bound
+    cfg.model.transformer.context_parallel_size = 2
+    cfg.data = DataConfig(
+        dataset=SFTDatasetConfig(
+            random_seed=1234,
+            sequence_length=9,
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
+        ),
+        dataset_type=MockSFTDataset,
+    )
     if error is None:
-        run_config.validate()
+        # Conversation truncation need not align; the emitted pack must.
+        cfg.validate()
     else:
-        with pytest.raises(AssertionError, match=error):
-            run_config.validate()
-    assert run_config.to_dict() == before
+        with pytest.raises(ValueError, match=error):
+            cfg.validate()
+
+
+def test_legacy_sft_config_requires_matching_execution_width(run_config):
+    cfg = run_config
+    cfg.model.transformer.max_seq_length_per_sample = 32
+    cfg.data = DataConfig(
+        dataset=GPTDatasetConfig(
+            random_seed=1234,
+            sequence_length=16,
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
+        ),
+        dataset_type=MockSFTDataset,
+    )
+    with pytest.raises(ValueError, match="Use SFTDatasetConfig"):
+        cfg.validate()
+    cfg.model.transformer.max_seq_length_per_sample = 16
+    cfg.validate()
 
 
 @pytest.mark.parametrize("inference", [False, True])
@@ -482,6 +512,9 @@ def test_serialization_starts_a_new_lifecycle(
     if isinstance(run_config.model, ModelConfig):
         # Preserve builder metadata without treating it as a constructor keyword.
         run_config.model.builder = "megatron.training.models.gpt.GPTModelBuilder"
+    if model_cls is LLaVAModelConfig:
+        # The application resolves the language execution width before building the container.
+        run_config.model.transformer.max_seq_length_per_sample = 16
     run_config.train.micro_batch_size = 1
     run_config.finalize()
     # Training attaches live objects to the transformer; checkpoint metadata must omit them.
@@ -636,3 +669,114 @@ def test_ddp_bucket_resolution_is_idempotent_and_round_trips(
         restored.ddp.num_buckets = 4
         restored.ddp.resolve_bucket_size(num_parameters=8192, data_parallel_size=2)
         assert restored.ddp.bucket_size == (2048 if overlap else None)
+
+
+@pytest.mark.parametrize("overlap_grad_reduce", [False, True])
+@pytest.mark.parametrize("overlap_optimizer_step", [False, True])
+def test_frozen_training_config_disables_optimizer_gather_without_cli_args(
+    monkeypatch, run_config, caplog, overlap_grad_reduce, overlap_optimizer_step
+):
+    run_config.train.micro_batch_size = 1
+    run_config.train.global_batch_size = 8
+    run_config.train.freeze_all_layers = True
+    run_config.optimizer.use_distributed_optimizer = True
+    run_config.optimizer.overlap_param_gather = True
+    run_config.optimizer.overlap_param_gather_with_optimizer_step = overlap_optimizer_step
+    run_config.ddp.use_distributed_optimizer = True
+    run_config.ddp.overlap_param_gather = True
+    run_config.ddp.overlap_grad_reduce = overlap_grad_reduce
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
+
+    before = copy.deepcopy(run_config.to_dict())
+    for _ in range(2):
+        run_config.validate()
+        assert run_config.to_dict() == before
+        assert not run_config._finalized
+
+    with caplog.at_level("WARNING", logger="megatron.training.config.container"):
+        run_config.finalize()
+
+    assert "freeze_all_layers" in caplog.text
+    assert "use_distributed_optimizer" in caplog.text and "overlap_param_gather" in caplog.text
+    assert not run_config.optimizer.use_distributed_optimizer
+    assert not run_config.optimizer.overlap_param_gather
+    assert not run_config.optimizer.overlap_param_gather_with_optimizer_step
+    assert not run_config.ddp.use_distributed_optimizer
+    assert not run_config.ddp.overlap_param_gather
+    if overlap_optimizer_step:
+        assert "overlap_param_gather_with_optimizer_step" in caplog.text
+
+
+def test_frozen_validation_ignores_optimizer_local_overlap_prerequisites(run_config):
+    run_config.train.freeze_all_layers = True
+    # Neither prerequisite of this flag is enabled; freezing makes all three irrelevant.
+    run_config.optimizer.overlap_param_gather_with_optimizer_step = True
+    before = copy.deepcopy(run_config.to_dict())
+    run_config.validate()
+    assert run_config.to_dict() == before
+
+
+@pytest.mark.parametrize("checkpoint_case", ["legacy_without_gloo", "parameter_only_save"])
+def test_frozen_checkpoint_validation_uses_the_effective_optimizer(run_config, checkpoint_case):
+    run_config.train.freeze_all_layers = True
+    run_config.optimizer.use_distributed_optimizer = True
+    run_config.optimizer.overlap_param_gather = True
+    if checkpoint_case == "legacy_without_gloo":
+        run_config.checkpoint.ckpt_format = "torch"
+        run_config.dist.use_gloo_process_groups = False
+    else:
+        run_config.checkpoint.save = "/save"
+        run_config.checkpoint.save_params_interval = 2
+    before = copy.deepcopy(run_config.to_dict())
+    run_config.validate()
+    assert run_config.to_dict() == before
+
+
+@pytest.mark.parametrize("optimizer", ["muon", "dist_muon"])
+def test_frozen_validation_preserves_layer_wise_optimizer_selection(run_config, optimizer):
+    run_config.train.micro_batch_size = 1
+    run_config.train.freeze_all_layers = True
+    run_config.optimizer.optimizer = optimizer
+    run_config.optimizer.use_distributed_optimizer = True
+    run_config.optimizer.muon_tp_mode = "layer_sharded"
+    run_config.optimizer.muon_split_qkv = False
+    before = copy.deepcopy(run_config.to_dict())
+    run_config.validate()
+    assert run_config.to_dict() == before
+    run_config.finalize()
+    assert run_config.optimizer.optimizer == "muon"
+    assert run_config.optimizer.use_layer_wise_distributed_optimizer
+    assert not run_config.optimizer.use_distributed_optimizer
+
+
+@pytest.mark.parametrize(
+    "overlap_grad_reduce,overlap_optimizer_step,checkpoint_format,error",
+    [
+        (False, False, "torch_dist", "overlap-grad-reduce"),
+        (True, True, "torch_dist", "distributed checkpointing"),
+        (True, True, "torch", "interleaved pipeline parallelism"),
+        (True, False, "torch_dist", None),
+        (True, True, "torch", None),
+    ],
+)
+def test_unfrozen_training_retains_optimizer_overlap_validation(
+    run_config, overlap_grad_reduce, overlap_optimizer_step, checkpoint_format, error
+):
+    run_config.train.micro_batch_size = 1
+    run_config.optimizer.use_distributed_optimizer = True
+    run_config.optimizer.overlap_param_gather = True
+    run_config.optimizer.overlap_param_gather_with_optimizer_step = overlap_optimizer_step
+    run_config.ddp.overlap_grad_reduce = overlap_grad_reduce
+    run_config.checkpoint.ckpt_format = checkpoint_format
+    if overlap_optimizer_step and error is None:
+        transformer = run_config.model.transformer
+        transformer.num_layers = 4
+        transformer.pipeline_model_parallel_size = 2
+        transformer.virtual_pipeline_model_parallel_size = 2
+    before = copy.deepcopy(run_config.to_dict())
+    if error is None:
+        run_config.validate()
+    else:
+        with pytest.raises(AssertionError, match=error):
+            run_config.validate()
+    assert run_config.to_dict() == before

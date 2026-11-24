@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Tests for LogitsSaverHooks' cu_seqlens capture/persist plumbing (CP+packing fix).
 
@@ -16,10 +16,27 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
+from megatron.training.config import DataConfig
+from megatron.training.datasets.sft_dataset import MockSFTDataset
 from megatron.training.distillation import logits_saver
 from megatron.training.distillation.logits_saver import LogitsSaverHooks
 
 zstandard = pytest.importorskip("zstandard")
+
+
+def _run_config_for(sft: bool):
+    """A run config whose data section has the family of the run (what is_packed_sequence_run
+    reads: the SFT family packs documents, plain GPT does not)."""
+    dataset = GPTDatasetConfig(
+        sequence_length=16,
+        random_seed=1,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+    )
+    dataset_type = MockSFTDataset if sft else MockGPTDataset
+    return SimpleNamespace(data=DataConfig(dataset=dataset, dataset_type=dataset_type))
 
 
 def _bare_saver(cp_size=1, tp_rank=0, tp_size=1, dp_rank=0, dp_size=1):
@@ -187,9 +204,7 @@ def _patch_init_deps(monkeypatch, *, cp_size, sft):
     cfg = SimpleNamespace(
         train=args,
         model=SimpleNamespace(transformer=SimpleNamespace(mtp_num_layers=0)),
-        data=SimpleNamespace(
-            dataset_type=None, dataset=SimpleNamespace(inter_document_masking=sft)
-        ),
+        data=_run_config_for(sft).data,
     )
     monkeypatch.setattr(logits_saver, "get_run_config", lambda: cfg)
     monkeypatch.setattr(logits_saver, "compute_dataset_hash", lambda cfg: ("hash", {}))

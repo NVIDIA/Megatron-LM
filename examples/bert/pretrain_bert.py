@@ -139,7 +139,9 @@ def forward_step(data_iterator, model):
     return output_tensor, partial(loss_func, loss_mask, sentence_order)
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
+def train_valid_test_datasets_provider(
+    train_val_test_num_samples, vp_stage=None, *, sequence_length
+):
     """Build train, valid, and test datasets."""
     cfg = get_run_config()
     args = get_args()
@@ -147,7 +149,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
 
     config = BERTMaskedWordPieceDatasetConfig(
         random_seed=cfg.rng.seed,
-        sequence_length=args.seq_length,
+        sequence_length=sequence_length,
         blend=get_blend_from_list(args.data_path),
         blend_per_split=[
             get_blend_from_list(args.train_data_path),
@@ -186,11 +188,13 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
 
 if __name__ == "__main__":
 
-    # Temporary for transition to core datasets
-    train_valid_test_datasets_provider.is_distributed = True
-
     args = parse_and_validate_args(args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
     model_cfg = model_config_from_args(args, model_config_cls=BertModelConfig)
+    train_valid_test_datasets_provider = partial(
+        train_valid_test_datasets_provider, sequence_length=args.seq_length
+    )
+    # Temporary for transition to core datasets
+    train_valid_test_datasets_provider.is_distributed = True
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(full_config)
     pretrain(full_config, train_valid_test_datasets_provider,

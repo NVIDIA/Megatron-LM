@@ -663,25 +663,44 @@ def test_checkpoint_model_checks_use_config_not_stale_args(run_config, model_cls
 
 
 @pytest.mark.parametrize("saved_config", [False, True])
-def test_checkpoint_allows_rope_to_yarn(run_config, saved_config):
+@pytest.mark.parametrize("position_embedding_type", ["learned_absolute", "rope", "yarn"])
+def test_checkpoint_position_capacity(run_config, saved_config, position_embedding_type):
     args = SimpleNamespace(
         num_layers=2,
         hidden_size=32,
         num_attention_heads=4,
         add_position_embedding=True,
-        vocab_file=None,
+        vocab_file="vocab",
         use_dist_ckpt=True,
         phase_transition_iterations=None,
     )
-    checkpoint_args = SimpleNamespace(**vars(args), position_embedding_type="rope")
-    run_config.model.position_embedding_type = "rope"
+    checkpoint_args = SimpleNamespace(
+        **vars(args),
+        max_position_embeddings=run_config.model.seq_length,
+        make_vocab_size_divisible_by=run_config.model.make_vocab_size_divisible_by,
+        tokenizer_type=run_config.tokenizer.tokenizer_type,
+    )
+    run_config.tokenizer.vocab_file = "vocab"
+    run_config.model.position_embedding_type = (
+        "rope" if position_embedding_type == "yarn" else position_embedding_type
+    )
     saved = run_config.to_dict() if saved_config else None
-    run_config.model.position_embedding_type = "yarn"
+    run_config.model.position_embedding_type = position_embedding_type
     with (
         mock.patch('megatron.training.checkpointing.get_args', return_value=args),
         mock.patch('megatron.training.checkpointing.get_checkpoint_version', return_value=3.0),
     ):
         check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
+        # Changing this metadata does not change RoPE/YaRN weight shapes.
+        run_config.model.seq_length *= 2
+        if position_embedding_type == "learned_absolute":
+            with pytest.raises(AssertionError, match="max_position_embeddings"):
+                check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
+            check_checkpoint_args(
+                checkpoint_args, skip_args={"max_position_embeddings"}, checkpoint_config=saved
+            )
+        else:
+            check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
         checkpoint_args.add_position_embedding = False
         with pytest.raises(AssertionError, match="add_position_embedding"):
             check_checkpoint_args(checkpoint_args, checkpoint_config=saved)

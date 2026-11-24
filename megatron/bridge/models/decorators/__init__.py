@@ -12,24 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from docutils import nodes
-from myst_parser.parsers.sphinx_ import MystParser
-from sphinx.ext.napoleon.docstring import GoogleDocstring
+# Adapted from https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/53c20f81cb575f19af34ff0ae1749fb13b07999b/src/megatron/bridge/models/decorators/__init__.py
+# Source license: Apache-2.0.
 
+from megatron.bridge.models.decorators.dispatch import dispatch
+from megatron.bridge.models.decorators.torchrun import torchrun_main
 
-class NapoleonParser(MystParser):
-    """Add support for Google style docstrings."""
-
-    def parse(self, input_string: str, document: nodes.document) -> None:
-        """Parse Google style docstrings."""
-
-        # Get the Sphinx configuration
-        config = document.settings.env.config
-
-        # Process with Google style
-        google_parsed = str(GoogleDocstring(input_string, config))
-
-        return super().parse(google_parsed, document)
-
-
-Parser = NapoleonParser
+__all__ = ["dispatch", "torchrun_main"]
