@@ -39,6 +39,17 @@ requires_tp4 = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def release_test_process_groups():
+    # c10d retains each NCCL subgroup and its watchdog after Megatron drops its handle.
+    registered = dist.distributed_c10d._world.pg_map
+    existing = set(registered)
+    yield
+    for group in reversed(list(registered)):
+        if group is not dist.group.WORLD and group not in existing:
+            dist.destroy_process_group(group)
+
+
 def _bits(t):
     return t.contiguous().view(torch.uint8)
 
