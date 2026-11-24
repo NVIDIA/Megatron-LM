@@ -22,7 +22,6 @@ from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.tensor_parallel.gtp_api import (
-    GTP_CONFIG,
     classify_gtp_remat_chains,
     configure_gtp_remat_from_recipe,
     is_gtp_param,
@@ -31,13 +30,9 @@ from megatron.core.tensor_parallel.gtp_api import (
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
 from megatron.core.transformer.transformer_config import TransformerConfig
-from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: F401
-    _requires_multi_gpu,
+from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
     _requires_mxfp8,
     _run_distributed,
-    _torchrun_dist_init,
-    reset_fp8_state,
-    reset_gtp_globals,
 )
 
 pytestmark = [pytest.mark.internal, pytest.mark.launch_on_gb200]
@@ -105,12 +100,15 @@ def _assert_bf16_close(actual, expected, label):
     assert relative_max < 0.12, f"{label}: max error / reference RMS {relative_max:.6f} >= 0.12"
 
 
-def _worker_mtp_bf16_numerics(rank, world_size, port, egtp_size):
+# The non-GTP BF16 override is covered in tests/unit_tests/transformer/moe/test_grouped_mlp.py.
+_EGTP_SIZE = 2
+
+
+def _worker_mtp_bf16_numerics(rank, world_size, port):
     hidden, ffn, num_experts = 256, 256, 2
     # Unequal, pre-padded expert segments exercise the device split contract without a
     # dispatcher or an independent host-padding implementation in the reference.
     splits = (256, 512)
-    saved_gtp_config = vars(GTP_CONFIG).copy()
     saved_tf32 = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
     parallel_state.destroy_model_parallel()
@@ -118,7 +116,7 @@ def _worker_mtp_bf16_numerics(rank, world_size, port, egtp_size):
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
         expert_model_parallel_size=1,
-        expert_gtp_remat_size=egtp_size,
+        expert_gtp_remat_size=_EGTP_SIZE,
     )
     try:
         configure_gtp_remat_from_recipe(fp8=True, fp8_recipe="mxfp8")
@@ -177,10 +175,10 @@ def _worker_mtp_bf16_numerics(rank, world_size, port, egtp_size):
             full = (
                 torch.randn(rows, cols, device="cuda", generator=generator) / math.sqrt(cols)
             ).to(torch.bfloat16)
-            assert is_gtp_param(param) == (egtp_size > 1), name
+            assert is_gtp_param(param), name
             assert not getattr(param, "_gtp_native_fp8", False), name
             assert param.dtype == torch.bfloat16
-            local = full.chunk(egtp_size, dim=0)[group.rank()] if egtp_size > 1 else full
+            local = full.chunk(_EGTP_SIZE, dim=0)[group.rank()]
             with torch.no_grad():
                 param.copy_(local)
             param.main_grad = torch.zeros(param.shape, device="cuda", dtype=torch.float32)
@@ -218,23 +216,18 @@ def _worker_mtp_bf16_numerics(rank, world_size, port, egtp_size):
             for name, param in experts.named_parameters():
                 expected_grad = reference_weights[name].grad.detach().clone()
                 # GTP's default contract is the MEAN over distinct-token peers, before
-                # any separate replica-DP reduction. EGTP=1 remains a local reference.
-                if egtp_size > 1:
-                    dist.all_reduce(expected_grad, group=group)
-                    expected_grad.div_(egtp_size)
-                    expected_grad = expected_grad.chunk(egtp_size, dim=0)[group.rank()]
+                # any separate replica-DP reduction.
+                dist.all_reduce(expected_grad, group=group)
+                expected_grad.div_(_EGTP_SIZE)
+                expected_grad = expected_grad.chunk(_EGTP_SIZE, dim=0)[group.rank()]
                 _assert_bf16_close(param.main_grad, expected_grad, f"{name} accumulated wgrad")
     finally:
-        for key, value in saved_gtp_config.items():
-            setattr(GTP_CONFIG, key, value)
         torch.backends.cuda.matmul.allow_tf32 = saved_tf32
         parallel_state.destroy_model_parallel()
         parallel_state.initialize_model_parallel()
 
 
-@pytest.mark.parametrize("egtp_size", [1, 2])
-def test_mtp_bf16_override_matches_reference(monkeypatch, egtp_size: int) -> None:
-    _requires_multi_gpu(4)
+def test_mtp_bf16_override_matches_reference(monkeypatch) -> None:
     _requires_mxfp8()
     monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
-    _run_distributed(_worker_mtp_bf16_numerics, 4, egtp_size)
+    _run_distributed(_worker_mtp_bf16_numerics, 4)

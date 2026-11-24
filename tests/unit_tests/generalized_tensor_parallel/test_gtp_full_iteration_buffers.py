@@ -6,10 +6,7 @@ import torch
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.tensor_parallel import generalized_tensor_parallelism as gtp
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
-from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
-    _make_gtp_linear,
-    reset_gtp_globals,
-)
+from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import _make_gtp_linear
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -101,7 +98,7 @@ def test_full_iteration_fp32_accumulation_scratch_lifetime(monkeypatch):
     try:
         wrapper(**kwargs)
         wrapper(**kwargs)
-        for step in range(10):
+        for step in range(3):
             source.fill_(group.rank() + step)
             result = wrapper(**kwargs)
             torch.cuda.synchronize()

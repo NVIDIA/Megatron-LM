@@ -1,15 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Integration test for GTP correctness.
+"""GTP training trajectory: GTP_remat=4 must train exactly like the unsharded model.
 
-Validates that GTP run as a first-class parallelism axis
-(world_size = TP * GTP * CP * DP) produces the same per-step loss as a no-GTP
-baseline. This is the end-to-end proof that the standalone-GTP rank grid built
-in parallel_state trains correctly.
-
-Mirrors TestAttentionGTPCorrectness. With world=4 and gtp_remat_size=4, GTP
-yields dp_replicate=1 and a single shard group [0,1,2,3], so the loss must match
-the GTP_remat_size=1 baseline.
+Every rank sees the same batch, so the GTP reduce-scatter (a gtp mean) hands each rank the shard
+of the full gradient. Both runs therefore take the same plain SGD step on the same weights; only
+BF16 reduction order differs. A step that is off by any factor (e.g. 1/gtp) moves the loss well
+outside the tolerance after the first step.
 """
 
 import pytest
@@ -21,163 +17,98 @@ from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 if not HAVE_GTP:
     pytest.skip("GTP requires TransformerEngine >= 2.19", allow_module_level=True)
 
-from transformer_engine.pytorch import fp8_autocast
-
-from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTPShardedParam
-from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: F401  (autouse, module-scoped: initializes the dist PG); noqa: F401  (autouse)
-    _assert_loss_trajectories_match,
-    _restore_gtp_shards_and_init_main_grad,
-    _run_distributed,
-    _torchrun_dist_init,
-    reset_fp8_state,
-    reset_gtp_globals,
+from megatron.core import parallel_state as ps
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+    GTPShardedParam,
+    reset_gtp_state,
+    wait_for_gtp_grad_reduction_on_current_stream,
 )
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.transformer_config import TransformerConfig
+
+HIDDEN = 256
+NUM_LAYERS = 2
+SEQ = 32
+STEPS = 4
+LR = 2.0
 
 
-def _worker_gtp_loss_correctness(rank, world_size, port):
-    """Baseline (GTP_remat_size=1, DP=4) vs GTP_remat_size=4 (world=TP1*GTP4*CP1*DP1)."""
-    from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+def _train(gtp_remat_size, initial=None):
+    """Build the stack at ``gtp_remat_size``, load ``initial`` and take STEPS SGD steps.
 
-    from megatron.core import parallel_state as ps
-    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-    from megatron.core.process_groups_config import ProcessGroupCollection
-    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-    from megatron.core.transformer.transformer_config import TransformerConfig
-
-    HIDDEN = 4096
-    NUM_HEADS = 32
-    FFN_HIDDEN = 16384
-    NUM_LAYERS = 2
-    SEQ = 32
-    BATCH = 1
-    LR = 0.01
-    STEPS = 10
-    dtype = torch.bfloat16
-
-    def make_config():
-        return TransformerConfig(
-            num_attention_heads=NUM_HEADS,
-            num_layers=NUM_LAYERS,
-            hidden_size=HIDDEN,
-            ffn_hidden_size=FFN_HIDDEN,
-            add_bias_linear=False,
-            params_dtype=dtype,
-            hidden_dropout=0.0,
-            attention_dropout=0.0,
-            bias_dropout_fusion=False,
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-        )
-
-    def make_transformer_stack(config, pg_collection):
-        spec = get_gpt_layer_with_transformer_engine_spec()
-        return torch.nn.ModuleList(
-            [
-                spec.module(
-                    config, spec.submodules, layer_number=i + 1, pg_collection=pg_collection
-                )
-                for i in range(NUM_LAYERS)
-            ]
-        )
-
-    def run_step(layers, x):
-        with fp8_autocast(enabled=False):
-            for layer in layers:
-                x, _ = layer(x, attention_mask=None)
-        return x.mean()
-
-    # ---- Phase 1: Baseline — GTP_remat=1 (DP=4) ----
+    Returns (per-step losses, unsharded initial weights).
+    """
     ps.destroy_model_parallel()
-    ps.initialize_model_parallel(
-        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=1
-    )
+    reset_gtp_state()
+    ps.initialize_model_parallel(gtp_remat_size=gtp_remat_size)
     model_parallel_cuda_manual_seed(42)
-    pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-        required_pgs=['tp', 'cp', 'gtp_remat']
+    pg = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp_remat'])
+    config = TransformerConfig(
+        num_layers=NUM_LAYERS,
+        hidden_size=HIDDEN,
+        num_attention_heads=8,
+        ffn_hidden_size=4 * HIDDEN,
+        add_bias_linear=False,
+        params_dtype=torch.bfloat16,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        bias_dropout_fusion=False,
     )
-    config = make_config()
-    layers = make_transformer_stack(config, pg_collection)
-    for layer in layers:
-        layer.cuda()
-    for p in layers.parameters():
-        dist.broadcast(p.data, src=0)
-    saved_weights = {n: p.data.clone() for n, p in layers.named_parameters()}
+    spec = get_gpt_layer_with_transformer_engine_spec()
+    layers = torch.nn.ModuleList(
+        spec.module(config, spec.submodules, layer_number=i + 1, pg_collection=pg)
+        for i in range(NUM_LAYERS)
+    ).cuda()
+    gtp_rank = pg.gtp_remat.rank()
+    with torch.no_grad():
+        for name, p in layers.named_parameters():
+            if initial is None:
+                dist.broadcast(p, src=0)
+            elif isinstance(p, GTPShardedParam):
+                p.copy_(initial[name].chunk(gtp_remat_size)[gtp_rank])
+                p.main_grad = torch.zeros_like(p)
+            else:
+                p.copy_(initial[name])
+    assert any(isinstance(p, GTPShardedParam) for p in layers.parameters()) == (gtp_remat_size > 1)
+    weights = {n: p.detach().clone() for n, p in layers.named_parameters()}
 
-    baseline_losses = []
-    for step in range(STEPS):
-        torch.manual_seed(step)
-        x = torch.randn(SEQ, BATCH, HIDDEN, dtype=dtype, device='cuda')
-        dist.broadcast(x, src=0)
-        loss = run_step(layers, x)
-        if rank == 0:
-            baseline_losses.append(loss.item())
+    # One fixed batch: the loss then falls step over step, at a rate set by the step size.
+    batch = torch.randn(
+        SEQ,
+        1,
+        HIDDEN,
+        dtype=torch.bfloat16,
+        device='cuda',
+        generator=torch.Generator('cuda').manual_seed(0),
+    )
+    losses = []
+    for _ in range(STEPS):
+        x = batch
+        for layer in layers:
+            x, _ = layer(x, attention_mask=None)
+        loss = x.float().square().mean()
         loss.backward()
+        wait_for_gtp_grad_reduction_on_current_stream()
+        losses.append(loss.item())
         with torch.no_grad():
             for p in layers.parameters():
-                if p.grad is not None:
-                    p.data.sub_(LR * p.grad)
-                    p.grad.zero_()
-
-    ps.destroy_model_parallel()
-    GTPShardedParam._chain_state.clear()
-    FP8GlobalStateManager.reset()
-
-    # ---- Phase 2: GTP_remat=4 (world = TP1 * GTP4 * CP1 * DP1) ----
-    ps.initialize_model_parallel(
-        tensor_model_parallel_size=1,
-        pipeline_model_parallel_size=1,
-        gtp_remat_size=4,  # standalone-axis GTP_remat under test
-    )
-    model_parallel_cuda_manual_seed(42)
-    pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-        required_pgs=['tp', 'cp', 'gtp_remat']
-    )
-    config = make_config()
-    layers_gtp = make_transformer_stack(config, pg_collection)
-    for layer in layers_gtp:
-        layer.cuda()
-
-    gtp_remat_group = ps.get_gtp_weight_remat_group()
-    gtp_remat_size = gtp_remat_group.size()
-    gtp_rank = gtp_remat_group.rank()
-    assert gtp_remat_size == 4, f"GTP shard group size should be 4, got {gtp_remat_size}"
-
-    gtp_params = [p for p in layers_gtp.parameters() if isinstance(p, GTPShardedParam)]
-    assert len(gtp_params) > 0, "GTP not active: no GTPShardedParam found"
-
-    _restore_gtp_shards_and_init_main_grad(layers_gtp, saved_weights, gtp_rank, dtype)
-
-    gtp_losses = []
-    for step in range(STEPS):
-        for p in layers_gtp.parameters():
-            if isinstance(p, GTPShardedParam):
-                p.main_grad.zero_()
-        torch.manual_seed(step)
-        x = torch.randn(SEQ, BATCH, HIDDEN, dtype=dtype, device='cuda')
-        dist.broadcast(x, src=0)
-        loss = run_step(layers_gtp, x)
-        if rank == 0:
-            gtp_losses.append(loss.item())
-        loss.backward()
-        with torch.no_grad():
-            for p in layers_gtp.parameters():
-                if isinstance(p, GTPShardedParam):
-                    p.data.sub_((LR / gtp_remat_size) * p.main_grad)
-                elif p.grad is not None:
-                    p.data.sub_(LR * p.grad)
-                    p.grad.zero_()
-
-    ps.destroy_model_parallel()
-    ps.initialize_model_parallel()
-    GTPShardedParam._chain_state.clear()
-
-    if rank == 0:
-        _assert_loss_trajectories_match(baseline_losses, gtp_losses, STEPS)
+                grad = p.main_grad if isinstance(p, GTPShardedParam) else p.grad
+                p.sub_(LR * grad)
+                grad.zero_()
+    return losses, weights
 
 
-class TestGTPLossCorrectness:
-    def test_gtp_loss_trajectory_matches_baseline(self):
-        """GTP_remat_size=4 per-step losses must match no-GTP baseline (atol=1e-5, rtol=1e-5)."""
-        if torch.cuda.device_count() < 4:
-            pytest.skip("Requires at least 4 CUDA devices")
-        _run_distributed(_worker_gtp_loss_correctness, 4)
+def test_gtp_loss_trajectory_matches_baseline():
+    """GTP_remat=4 per-step losses match the unsharded run to BF16 reduction-order noise."""
+    if dist.get_world_size() != 4:
+        pytest.skip("Requires 4 ranks")
+    baseline, initial = _train(1)
+    gtp, _ = _train(4, initial)
+    print(f"baseline={baseline}\ngtp_remat4={gtp}", flush=True)
+    # The loss must actually move, or a wrong step size would go unnoticed.
+    assert baseline[-1] < 0.99 * baseline[0], baseline
+    # Same GEMMs on the same weights, and an exact gtp mean of identical wgrads: observed
+    # bit-exact, so 1e-4 is all margin. A 1/gtp step ends ~20% off the baseline loss.
+    torch.testing.assert_close(torch.tensor(gtp), torch.tensor(baseline), rtol=1e-4, atol=0)

@@ -1,53 +1,29 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Shared fixtures and helpers for all GTP unit tests."""
+"""Shared helpers for the GTP unit tests (fixtures live in conftest.py)."""
 
 import pytest
 import torch
 import transformer_engine.pytorch as te
 from transformer_engine.pytorch import is_mxfp8_available, is_nvfp4_available
-from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
-from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
-    _GTP_PARAMS,
-    GTPShardedParam,
-    reset_gtp_state,
-)
-from tests.unit_tests.test_utilities import Utils
-
-# ---------------------------------------------------------------------------
-# Fixtures (import into each test module so pytest discovers them)
-# ---------------------------------------------------------------------------
+_GROUP_CACHE = {}
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _torchrun_dist_init():
-    """Initialize the torchrun-managed dist group once per module."""
-    Utils.initialize_model_parallel()
-    yield
-    Utils.destroy_model_parallel()
+def cached_group(ranks):
+    """Process group over ``ranks``, created once per process.
 
-
-@pytest.fixture(autouse=True)
-def reset_fp8_state():
-    yield
-    FP8GlobalStateManager.reset()
-
-
-@pytest.fixture(autouse=True)
-def reset_gtp_globals():
-    """Reset GTP mutable class-level state between tests.
-
-    Defers to the production reset so this cannot drift as new class-level state is added.
-    Note it only clears the process-global cursors: the chain links themselves live on the
-    params (``prev_w`` / ``_recompute_prev`` / ``_ag_ticket_*``, set once in
-    ``_init_gtp_runtime_attrs``), so a test that reuses modules across cases would inherit
-    stale links. Every GTP test builds fresh modules for this reason.
+    ``dist.new_group`` is a world collective whose NCCL communicator lives until the process
+    exits, and the GTP bucket runs every module in one process: a group per test exhausts NCCL
+    on large-memory systems. The whole world returns ``group.WORLD``. Every rank must call this
+    for every rank set, in the same order, as for ``dist.new_group``.
     """
-    yield
-    reset_gtp_state()
-    # Not part of the production reset: every GTP param ever built stays in it (and allocated).
-    _GTP_PARAMS.clear()
+    ranks = tuple(ranks)
+    if ranks == tuple(range(torch.distributed.get_world_size())):
+        return torch.distributed.group.WORLD
+    if ranks not in _GROUP_CACHE:
+        _GROUP_CACHE[ranks] = torch.distributed.new_group(list(ranks))
+    return _GROUP_CACHE[ranks]
 
 
 # ---------------------------------------------------------------------------
@@ -130,41 +106,3 @@ def _make_gtp_remat_grouped_linear(
     weight_names = [f"weight{idx}" for idx in range(num_gemms)]
     wrap_module_params_gtp(layer, weight_names, gtp_remat_group, is_grouped=True)
     return layer
-
-
-def _restore_gtp_shards_and_init_main_grad(module, saved_weights, gtp_rank, dtype=torch.bfloat16):
-    """Load saved full weights into a GTP_remat_size>1 module and prep it for backward.
-
-    GTPShardedParams receive their ``gtp_rank`` axis-0 shard; replicated params get the full
-    tensor. Then pre-allocate ``main_grad`` on every GTPShardedParam (required before the first
-    backward). Used by the dense two-phase baseline-vs-GTP tests.
-    """
-    for name, p in module.named_parameters():
-        full = saved_weights[name]
-        if isinstance(p, GTPShardedParam):
-            shard_size = p.shape[0]
-            p.data.copy_(full[gtp_rank * shard_size : (gtp_rank + 1) * shard_size])
-        else:
-            p.data.copy_(full)
-    for p in module.parameters():
-        if isinstance(p, GTPShardedParam):
-            p.main_grad = torch.zeros(p.shape, dtype=dtype, device='cuda')
-
-
-def _assert_loss_trajectories_match(baseline_losses, test_losses, steps, label="gtp_remat"):
-    """On rank 0: print and assert two per-step loss trajectories match.
-
-    GTP (ZeRO-3-like) reduces grads with a reduce-scatter-sum while the no-GTP baseline
-    all-reduces; in BF16 these differ only in reduction order, so the trajectories track to
-    BF16 precision (observed max |diff| ~1e-2 over 10 steps) rather than bitwise. The tolerance
-    is set for that BF16 noise floor and still trips on any real GTP sharding bug, which diverges
-    by O(loss). (The sibling grad-correctness test likewise checks ~1e-2-scale grad error.)
-    """
-    assert (
-        len(baseline_losses) == len(test_losses) == steps
-    ), f"loss counts: baseline={len(baseline_losses)} {label}={len(test_losses)} want {steps}"
-    for step, (lb, lt) in enumerate(zip(baseline_losses, test_losses)):
-        print(f"Step {step:2d}: baseline={lb:.6f}  {label}={lt:.6f}", flush=True)
-    torch.testing.assert_close(
-        torch.tensor(test_losses), torch.tensor(baseline_losses), atol=5e-2, rtol=5e-2
-    )

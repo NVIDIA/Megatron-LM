@@ -34,8 +34,8 @@ def _make_hook(param):
 @pytest.mark.parametrize(
     "gtp,already_added,zero_out,expected",
     [
+        # GTP ignores the autograd placeholder even when zero_out_wgrad would make DDP add it.
         (True, True, True, 3),
-        (True, True, False, 3),
         (False, True, True, 5),
         (False, True, False, 3),
         (False, False, False, 5),

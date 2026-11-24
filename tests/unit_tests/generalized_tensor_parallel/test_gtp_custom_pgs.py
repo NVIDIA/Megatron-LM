@@ -23,11 +23,8 @@ if not HAVE_GTP:
 
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTPShardedParam
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
-    _requires_multi_gpu,
     _run_distributed,
-    _torchrun_dist_init,
-    reset_fp8_state,
-    reset_gtp_globals,
+    cached_group,
 )
 
 WORLD = 4
@@ -41,9 +38,8 @@ BATCH = 1
 dtype = torch.bfloat16
 
 # The two ways to split a 4-rank world into gtp_remat pairs. Whichever one the MPU picks,
-# the test uses the other. Every rank creates every group in this fixed order so the NCCL
-# group tags agree across ranks -- a per-rank "create only the group I belong to" idiom
-# assigns mismatched tags and hangs.
+# the test uses the other. Every rank creates every group in this fixed order, as
+# dist.new_group requires.
 _PAIRINGS = {"adjacent": [[0, 1], [2, 3]], "strided": [[0, 2], [1, 3]]}
 
 # Forward is exact: all-gather is pure data movement, so both blocks feed bit-identical
@@ -94,7 +90,7 @@ def _pick_permuted_gtp_group(rank, mpu_ranks):
     my_groups = {}  # sorted pair -> this rank's group in that pairing
     for pairs in _PAIRINGS.values():
         for pair in pairs:
-            group = dist.new_group(ranks=pair)
+            group = cached_group(pair)
             if rank in pair:
                 my_groups[tuple(sorted(pair))] = group
 
@@ -219,9 +215,6 @@ def _worker_custom_pgs_match_mpu(rank, world_size, port):
     out_custom, grad_in_custom = _fwd_bwd(block_custom, x.clone().requires_grad_(True))
     grads_custom = _full_grads(block_custom, custom_gtp_group)
 
-    ps.destroy_model_parallel()
-    ps.initialize_model_parallel()
-
     # ---------------- The two topologies must agree ----------------
     torch.testing.assert_close(
         out_custom,
@@ -275,9 +268,6 @@ def _worker_partial_pgs_fall_back_to_mpu(rank, world_size, port):
             f"want {gtp_group.size()} (the MPU gtp_remat group)"
         )
 
-    ps.destroy_model_parallel()
-    ps.initialize_model_parallel()
-
 
 def _worker_gdp_uses_custom_gtp_group(rank, world_size, port):
     """GDP projections must use the caller-owned GTP group when MPU owns another topology."""
@@ -324,9 +314,6 @@ def _worker_gdp_uses_custom_gtp_group(rank, world_size, port):
         assert (
             param.group is custom_gtp_group
         ), f"GDP {name} used the MPU-global GTP group instead of the caller-owned group"
-
-    ps.destroy_model_parallel()
-    ps.initialize_model_parallel()
 
 
 def _worker_mtp_eh_proj_uses_custom_gtp_group(rank, world_size, port):
@@ -375,12 +362,15 @@ def _worker_mtp_eh_proj_uses_custom_gtp_group(rank, world_size, port):
         weight.group is custom_gtp_group
     ), "MTP eh_proj used the MPU-global GTP group instead of the caller-owned group"
 
-    ps.destroy_model_parallel()
-    ps.initialize_model_parallel()
-
 
 def _worker_seed_custom_gtp_groups_without_mpu(rank, world_size, port):
-    """Explicit GTP groups must seed their trackers without MPU groups."""
+    """Explicit GTP groups seed the GTP RNG trackers with no MPU state.
+
+    GTP peers init their shards from the GTP tracker, so it must differ across peers in a GTP
+    group and match across GTP groups (same GTP rank). The dense GTP group is the adjacent
+    pairing and the expert one the strided pairing, so a seed taken from the wrong group, or
+    from MPU state, gives the wrong equality pattern.
+    """
     from megatron.core import parallel_state as ps
     from megatron.core.tensor_parallel.random import (
         get_cuda_rng_tracker,
@@ -388,60 +378,71 @@ def _worker_seed_custom_gtp_groups_without_mpu(rank, world_size, port):
     )
     from megatron.training.initialize import _set_random_seed
 
-    singleton_group = None
-    for group_rank in range(world_size):
-        group = dist.new_group([group_rank])
-        if rank == group_rank:
-            singleton_group = group
-
+    singleton_group = [cached_group([r]) for r in range(world_size)][rank]
     pairing_groups = {}
     for name, pairs in _PAIRINGS.items():
         for pair in pairs:
-            group = dist.new_group(pair)
+            group = cached_group(pair)
             if rank in pair:
                 pairing_groups[name] = group
 
     ps.destroy_model_parallel()
+    _set_random_seed(
+        42,
+        pp_group=singleton_group,
+        dp_group=singleton_group,
+        tp_group=singleton_group,
+        ep_group=singleton_group,
+        etp_group=singleton_group,
+        gtp_remat_group=pairing_groups["adjacent"],
+        egtp_remat_group=pairing_groups["strided"],
+    )
+    for is_expert, pairing in ((False, "adjacent"), (True, "strided")):
+        with get_cuda_rng_tracker().fork(get_gtp_remat_rng_tracker_name(is_expert=is_expert)):
+            draw = torch.rand(8, device='cuda')
+        draws = [torch.empty_like(draw) for _ in range(world_size)]
+        dist.all_gather(draws, draw)
+        for pair in _PAIRINGS[pairing]:
+            assert not torch.equal(
+                draws[pair[0]], draws[pair[1]]
+            ), f"is_expert={is_expert}: GTP peers {pair} drew the same values"
+        gtp_rank = {r: pair.index(r) for pair in _PAIRINGS[pairing] for r in pair}
+        for r in range(world_size):
+            same = [q for q in range(world_size) if gtp_rank[q] == gtp_rank[r]]
+            for q in same:
+                assert torch.equal(
+                    draws[r], draws[q]
+                ), f"is_expert={is_expert}: ranks {r} and {q} share a GTP rank but drew differently"
+
+
+def _run_restoring_mpu(worker):
+    """Run ``worker`` (which re-initializes or destroys the MPU) and restore the default MPU."""
+    from megatron.core import parallel_state as ps
+
     try:
-        _set_random_seed(
-            42,
-            pp_group=singleton_group,
-            dp_group=singleton_group,
-            tp_group=singleton_group,
-            ep_group=singleton_group,
-            etp_group=singleton_group,
-            gtp_remat_group=pairing_groups["adjacent"],
-            egtp_remat_group=pairing_groups["strided"],
-        )
-        states = get_cuda_rng_tracker().get_states()
-        assert get_gtp_remat_rng_tracker_name() in states
-        assert get_gtp_remat_rng_tracker_name(is_expert=True) in states
+        _run_distributed(worker, WORLD)
     finally:
+        ps.destroy_model_parallel()
         ps.initialize_model_parallel()
 
 
 class TestGTPCustomProcessGroups:
     def test_custom_gtp_pg_collection_matches_mpu(self):
         """A permuted-but-equivalent gtp_remat group must give identical fwd/bwd results."""
-        _requires_multi_gpu(WORLD)
-        _run_distributed(_worker_custom_pgs_match_mpu, WORLD)
+        _run_restoring_mpu(_worker_custom_pgs_match_mpu)
 
     def test_pg_collection_without_gtp_remat_falls_back_to_mpu(self):
         """Omitting gtp_remat must fall back to the MPU group, not silently disable sharding."""
-        _requires_multi_gpu(WORLD)
-        _run_distributed(_worker_partial_pgs_fall_back_to_mpu, WORLD)
+        _run_restoring_mpu(_worker_partial_pgs_fall_back_to_mpu)
 
     def test_gdp_projections_use_custom_gtp_group(self):
         """GDP leaf linears must honor a MIMO-owned GTP group instead of MPU globals."""
-        _requires_multi_gpu(WORLD)
-        _run_distributed(_worker_gdp_uses_custom_gtp_group, WORLD)
+        _run_restoring_mpu(_worker_gdp_uses_custom_gtp_group)
 
     def test_mtp_eh_proj_uses_custom_gtp_group(self):
         """MTP's eh_proj must honor a MIMO-owned GTP group instead of MPU globals."""
-        _requires_multi_gpu(WORLD)
-        _run_distributed(_worker_mtp_eh_proj_uses_custom_gtp_group, WORLD)
+        _run_restoring_mpu(_worker_mtp_eh_proj_uses_custom_gtp_group)
 
     def test_custom_gtp_groups_seed_without_mpu(self):
         """Explicit GTP groups must not depend on MPU rank or world-size state."""
-        _requires_multi_gpu(WORLD)
-        _run_distributed(_worker_seed_custom_gtp_groups_without_mpu, WORLD)
+        _run_restoring_mpu(_worker_seed_custom_gtp_groups_without_mpu)

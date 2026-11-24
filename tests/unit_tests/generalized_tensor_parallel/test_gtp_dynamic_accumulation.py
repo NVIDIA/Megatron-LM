@@ -23,11 +23,6 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 if not gtp.HAVE_TE:
     pytest.skip("GTP requires TransformerEngine >= 2.19", allow_module_level=True)
 
-from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: F401
-    _torchrun_dist_init,
-    reset_gtp_globals,
-)
-
 
 class _Head(torch.nn.Module):
     """A GTP output head with optionally repeated uses."""

@@ -2,7 +2,6 @@
 """Wide ShortcutMoE forward/backward parity with real GTP/EGTP sharding."""
 
 import pytest
-import torch
 
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
@@ -14,7 +13,6 @@ from tests.unit_tests.ssm.test_wide_shortcut_parallel import _run_wide_shortcut_
 
 
 @pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize(
     "compute_symbol", [Symbols.ATTENTION, Symbols.MAMBA], ids=["attention", "mamba"]
 )

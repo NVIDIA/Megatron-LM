@@ -1051,40 +1051,34 @@ Case A is what §1.3's "tail slice" framing describes for the reassembled tensor
 **Whenever you add or change a GTP_remat/EGTP_remat feature, run the GTP_remat unit-test suite below as a sanity check before opening a PR.** These tests exercise the full TE↔Mcore path (weight gather/RS, DDP, distributed optimizer, finalize, grad-norm) and catch silent-correctness regressions that don't surface as crashes.
 
 ```bash
-# 4 GPUs. GTP_remat requires TransformerEngine >= 2.19. -m "not flaky_in_dev" matches CI's
-# dev filter and excludes test_gtp_partial_cg.py's flake under shared-process load
-# (suspected but unconfirmed cuBLASLt algorithm-selection sensitivity).
+# 4 GPUs, as in CI. GTP_remat requires TransformerEngine >= 2.19. -m "not flaky_in_dev" matches
+# CI's dev filter.
 torchrun --nproc-per-node 4 -m pytest tests/unit_tests/generalized_tensor_parallel/ -v -m "not flaky_in_dev"
 ```
 
-Run the sequence-sharding tests on both 4 and 8 GPUs to cover all layouts:
-
-```bash
-for ranks in 4 8; do
-    uv run python -m torch.distributed.run --nproc-per-node "$ranks" -m pytest -q \
-        tests/unit_tests/test_gtp_parallel_layout.py \
-        tests/unit_tests/generalized_tensor_parallel/test_gtp_cp_overlap.py
-done
-```
+CI runs the whole directory in one process on exactly 4 ranks, so every test is written for 4
+ranks. `conftest.py` resets the process-global GTP state after each test; use
+`gtp_test_utils.cached_group` instead of `dist.new_group`, since every communicator otherwise lives
+until the process exits. MXFP8 cases carry `launch_on_gb200`: the GB200 job runs only marked tests,
+and H100 skips MXFP8.
 
 | Test file | What it guards |
 |-----------|----------------|
 | `test_gtp_basics.py` | Core GTP_remat shard/gather, cache ownership, wgrad ring, DDP bucket alignment, the `num_zeros` padding correction (§3.7), and TE's recompute-phase flag (dtype-agnostic, relied on by the readiness gate in §3.2). |
-| `test_attention_gtp.py` | GTP_remat on attention linears, loss parity vs no-GTP_remat. |
-| `test_mamba_gtp.py` | GTP_remat on Mamba projection weights. |
-| `test_tp_gtp.py` | GTP_remat composed with tensor parallelism (`tp_group × gtp_remat_group`). |
+| `test_mamba_gtp.py` | GTP_remat on Mamba projection weights: per-parameter and input gradients vs an unsharded layer through padded shards, BF16 and native MXFP8. |
+| `test_tp_gtp.py` | GTP_remat composed with tensor parallelism (`tp_group × gtp_remat_group`): column- and row-parallel output, dX and `main_grad` values vs an FP32 reference. |
 | `test_gtp_cp_overlap.py` | Sequence sharding with CP, TP/SP, gradient and Adam-update parity, and checkpoint loading after a CP change. |
 | `test_moe_egtp.py` | EGTP_remat on MoE routed-expert weights. |
-| `test_gtp_loss_correctness.py` | End-to-end: GTP_remat per-step loss trajectory matches a no-GTP_remat baseline. |
-| `test_gtp_grad_correctness.py` | Gradient + dist-opt + grad-norm numeric parity vs a DP baseline at replicate (DP) > 1. Also the fp32-accumulation reduce-scatter (§2.6): gtp_remat-axis and DDP-axis parity, plus the size-2 bypass. |
+| `test_gtp_loss_correctness.py` | End-to-end: a multi-step GTP_remat loss trajectory on forward-prefetched weights matches a no-GTP_remat baseline at a tight tolerance. |
+| `test_gtp_grad_correctness.py` | Per-parameter gradient parity vs a DP baseline at replicate (DP) > 1, dense and MoE (GTP/EGTP sizes, per-token loss), dist-opt grad-norm parity. Also the fp32-accumulation reduce-scatter (§2.6): gtp_remat-axis and DDP-axis parity, plus the size-2 bypass. |
 | `test_gtp_cudagraph_grad.py` | Capture-step grad-norm guard (§1.2): `_backup_grads_before_capture`/`_restore_grads_after_capture` keep a graph capture from clobbering finalized `main_grad` (own params + cross-graph `next_w`, incl. routed-expert `weight_list`). |
-| `test_gtp_partial_cg.py` | Four-layer partial-CG loss and eager-vs-replay grad-norm parity with two-slot ring reuse across independently replayed graphs (§3.5). |
+| `test_gtp_partial_cg.py` | Partial-CG (local) loss and grad-norm parity with eager from the first replay after capture, for attention and MoE-router scopes (§3.5). The attention case is `flaky_in_dev`: it differed from eager at the first replay on H100 CI. |
 | `test_gtp_dcp.py` | DCP sharding metadata (§3.3): TP×GTP_remat offsets, pad reshard, `replica_id`, native-FP8 save/load. Also the SSM `in_proj` split: the gated-delta-product mixer's per-shard factory build/merge at MXFP8 alignment (no gather, chunks tiled exactly once), a full DCP save→load roundtrip of that mixer, and loading its `in_proj` across GTP_remat and non-GTP_remat runs in both directions. |
-| `test_gtp_muon.py` | Newton–Schulz per-shard parity for all three GTP_remat modes (§1.6): blockwise/duplicated/distributed at TP1, plus row- and column-parallel cases at `tp_size != gtp_remat_size` in both directions. |
+| `test_gtp_muon.py` | Newton–Schulz per-shard parity for all three GTP_remat modes (§1.6): blockwise/duplicated/distributed at TP1, padded shards, and row- and column-parallel cases at TP2×GTP_remat2. |
 | `test_gtp_muon_dcp.py` | Muon optimizer-state DCP roundtrip (§1.6): `replica_id` fold + native-FP8 backfill matching. |
 | `test_gtp_muon_qkv.py` | Layout-invariant split-QKV (§1.6): the decision uses the across-shards row count (with the production shape that a shard-local test rejected), the split runs after the all-gather so the GTP_remat shard equals TP1's result restricted to this rank's rows, and `blockwise`/`distributed` fall back to whole-matrix Newton–Schulz bitwise, warning once. |
 | `test_gtp_recompute_chain.py` | Recompute-chain buffers (§3.1): adjacent nodes never share a gather buffer, dense and grouped, plus dgrad/wgrad parity vs no-recompute. |
-| `test_gtp_mtp.py` | GTP_remat + MTP shared weights (§3.5), 28 cases over `mtp_use_repeated_layer` × dense/MoE. Guards three silent hazards: a stale gather, a dropped reduce-scatter, and a wrong `output_layer` consume count under pre-RS wgrad accumulation. |
+| `test_gtp_mtp.py` | GTP_remat + MTP shared weights (§3.5), over `mtp_use_repeated_layer` and dense/MoE. Guards three silent hazards: a stale gather, a dropped reduce-scatter, and a wrong `output_layer` consume count under pre-RS wgrad accumulation. |
 | `test_gtp_fp8_param_gather.py` | Native-FP8 GTP_remat (§1.3): fp8-vs-BF16 loss parity (TP1/TP2, MoE), post-save-spike guard. |
 | `test_gtp_ddp_param_sync_race.py` | Parameter-readiness ordering (§3.2): GTP_remat's ahead-of-consume prefetch must not read a bucket DDP has not published. Structural and numerical (stale-value) guards on the default one-weight-ahead chain, the grouped-expert one-block-ahead chain, and the recompute exclusion. |
 | `test_gtp_custom_pgs.py` | `pg_collection` plumbing: a custom `gtp_remat` group (permuted ranks, same size) must give the same fwd/bwd results as the MPU groups — catches modules reading `parallel_state` instead of the collection passed to them. |

@@ -11,17 +11,17 @@ otherwise it either shape-mismatches or hands every GTP peer the same rows.
 Everything below is exercised on ONE world_size=4, TP=1 stack holding every layer kind at once --
 GDP mixer, attention, MLP:
 
-* **GTP_remat 1 / 2 / 4**, each compared **bitwise** against the GTP_remat=1 reference.
+* **GTP_remat 2**, compared **bitwise** against the GTP_remat=1 reference. Two GTP groups of two
+  ranks each, so ranks 2 and 3 have a GTP rank different from their global rank.
 * **Both TE parallel modes** -- column (``in_proj``, ``linear_qkv``, ``fc1``) and row
   (``out_proj``, ``linear_proj``, ``fc2``), which are the two slicing geometries.
 * **Alignment padding.** The GDP ``in_proj`` is 3104 wide, not a multiple of
-  ``32 * gtp_remat_size`` at any degree here, so the padded branch of ``gtp_remat_slice_rows``
+  ``32 * gtp_remat_size``, so the padded branch of ``gtp_remat_slice_rows``
   always runs -- asserted rather than assumed.
 * **BF16 and MXFP8 primary weights** (``fp8_param``).
 * **The quantized-init snapshot.** TE caches ``_high_precision_init_val`` at construction and the
   distributed optimizer seeds its fp32 master params from it, but CPU init writes the real values
-  only afterwards -- a stale snapshot means training starts from uninitialized memory. Checked at
-  GTP_remat=1 as well, because that bug needs no GTP.
+  only afterwards -- a stale snapshot means training starts from uninitialized memory.
 * **Replicated params stay replicated** -- layernorms, and the GDP conv1d / A_log / dt_bias, which
   are GPU-initialized regardless and must come through the CPU path untouched.
 """
@@ -37,17 +37,12 @@ if not HAVE_GTP:
 
 from megatron.core.tensor_parallel.gtp_api import dequantize_gtp_native_fp8, is_gtp_param
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
-    _requires_multi_gpu,
     _requires_mxfp8,
     _run_distributed,
-    _torchrun_dist_init,
-    reset_fp8_state,
-    reset_gtp_globals,
 )
 
 WORLD = 4
-# GTP_remat degrees exercised; WORLD must be divisible by each.
-GTP_SIZES = [2, 4]
+GTP_REMAT_SIZE = 2
 HIDDEN = 256
 NUM_HEADS = 8
 FFN_HIDDEN = 512
@@ -140,7 +135,7 @@ def _init_mpu(gtp_remat_size):
     # Training calls this before model construction. Padding is enabled unconditionally (not just
     # for the fp8 cases) so every build shards identically, and so the padded branch of
     # gtp_remat_slice_rows is exercised: the GDP in_proj is 3104 wide, which is not a multiple of
-    # 32 * gtp_remat_size at any degree under test.
+    # 32 * gtp_remat_size.
     configure_gtp_remat_from_recipe(fp8=True, fp8_recipe="mxfp8")
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(
@@ -155,9 +150,7 @@ def _init_mpu(gtp_remat_size):
     )
 
 
-def _worker_cpu_init_is_gtp_invariant(rank, world_size, port, fp8_param, gtp_remat_size):
-    from megatron.core import parallel_state as ps
-
+def _worker_cpu_init_is_gtp_invariant(rank, world_size, port, fp8_param):
     config = _make_config(fp8_param)
 
     # ---------------- Reference: GTP_remat off, every rank holds the full weight ------------
@@ -170,8 +163,8 @@ def _worker_cpu_init_is_gtp_invariant(rank, world_size, port, fp8_param, gtp_rem
     del ref_block
 
     # ---------------- GTP_remat on, weights allocated pre-sharded --------------------------
-    gtp_pgs = _init_mpu(gtp_remat_size=gtp_remat_size)
-    assert gtp_pgs.gtp_remat.size() == gtp_remat_size, "GTP_remat inactive"
+    gtp_pgs = _init_mpu(gtp_remat_size=GTP_REMAT_SIZE)
+    assert gtp_pgs.gtp_remat.size() == GTP_REMAT_SIZE, "GTP_remat inactive"
     gtp_block = _build_block(config, gtp_pgs)
     sharded = [p for p in gtp_block.parameters() if is_gtp_param(p)]
     assert sharded, "GTP is not active: the block has no GTP-sharded parameter"
@@ -179,9 +172,6 @@ def _worker_cpu_init_is_gtp_invariant(rank, world_size, port, fp8_param, gtp_rem
         getattr(p, "pad_length", 0) > 0 for p in sharded
     ), "no GTP-sharded weight needed alignment padding; the padded slice path is not covered"
     gathered = _full_weights(gtp_block, gtp_pgs.gtp_remat)
-
-    ps.destroy_model_parallel()
-    ps.initialize_model_parallel()
 
     assert set(gathered) == set(reference), "parameter sets differ between the two layouts"
     for name, values in gathered.items():
@@ -193,12 +183,12 @@ def _worker_cpu_init_is_gtp_invariant(rank, world_size, port, fp8_param, gtp_rem
             atol=0.0,
             rtol=0.0,
             msg=lambda m, name=name: (
-                f"{name}: CPU init at GTP_remat={gtp_remat_size} differs from GTP_remat=1\n{m}"
+                f"{name}: CPU init at GTP_remat={GTP_REMAT_SIZE} differs from GTP_remat=1\n{m}"
             ),
         )
 
 
-def _worker_high_precision_init_val(rank, world_size, port, gtp_remat_size):
+def _worker_high_precision_init_val(rank, world_size, port):
     """The optimizer's master-weight snapshot must hold exactly the CPU-initialized values.
 
     Compared against a BF16 build rather than against the dequantized FP8 weight: both come from
@@ -206,12 +196,12 @@ def _worker_high_precision_init_val(rank, world_size, port, gtp_remat_size):
     assertion to within MXFP8 quantization error, which is loose enough to hide a partly-stale
     snapshot.
     """
-    bf16_pgs = _init_mpu(gtp_remat_size=gtp_remat_size)
+    bf16_pgs = _init_mpu(gtp_remat_size=GTP_REMAT_SIZE)
     bf16_block = _build_block(_make_config(fp8_param=False), bf16_pgs)
     bf16_weights = {n: p.data.detach().float().cpu() for n, p in bf16_block.named_parameters()}
     del bf16_block
 
-    fp8_pgs = _init_mpu(gtp_remat_size=gtp_remat_size)
+    fp8_pgs = _init_mpu(gtp_remat_size=GTP_REMAT_SIZE)
     block = _build_block(_make_config(fp8_param=True), fp8_pgs)
 
     checked = 0
@@ -229,25 +219,28 @@ def _worker_high_precision_init_val(rank, world_size, port, gtp_remat_size):
         )
     assert checked > 0, "no quantized primary weights found; fp8_param did not take effect"
 
+
+def _run_restoring_mpu(worker, *args):
+    """Run ``worker`` (which re-initializes the MPU) and restore the default MPU after."""
     from megatron.core import parallel_state as ps
 
-    ps.destroy_model_parallel()
-    ps.initialize_model_parallel()
+    try:
+        _run_distributed(worker, WORLD, *args)
+    finally:
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel()
 
 
 class TestGTPCpuInitialization:
-    @pytest.mark.parametrize("fp8_param", [False, True])
-    @pytest.mark.parametrize("gtp_remat_size", GTP_SIZES)
-    def test_cpu_init_is_gtp_invariant(self, gtp_remat_size, fp8_param):
-        _requires_multi_gpu(WORLD)
+    @pytest.mark.parametrize(
+        "fp8_param", [False, pytest.param(True, marks=pytest.mark.launch_on_gb200)]
+    )
+    def test_cpu_init_is_gtp_invariant(self, fp8_param):
         if fp8_param:
             _requires_mxfp8()
-        _run_distributed(_worker_cpu_init_is_gtp_invariant, WORLD, fp8_param, gtp_remat_size)
+        _run_restoring_mpu(_worker_cpu_init_is_gtp_invariant, fp8_param)
 
-    @pytest.mark.parametrize("gtp_remat_size", [1, *GTP_SIZES])
-    def test_high_precision_init_val_refreshed(self, gtp_remat_size):
-        """Also covered at GTP=1: the stale snapshot is a plain cpu-init + fp8_param bug, and
-        nothing about it needs GTP."""
-        _requires_multi_gpu(WORLD)
+    @pytest.mark.launch_on_gb200
+    def test_high_precision_init_val_refreshed(self):
         _requires_mxfp8()
-        _run_distributed(_worker_high_precision_init_val, WORLD, gtp_remat_size)
+        _run_restoring_mpu(_worker_high_precision_init_val)

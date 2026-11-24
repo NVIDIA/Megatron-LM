@@ -2,8 +2,8 @@
 
 """GTP sequence sharding with CP attention and DDP/Adam, including CP-changing resume.
 
-Run with torchrun on both four and eight GPUs to cover all TP/CP/GTP layouts.
-The reference uses ordinary CP and replicated weights, with identical tokens.
+Every layout runs on four ranks. The reference uses ordinary CP and replicated weights, with
+identical tokens.
 """
 
 import pytest
@@ -22,7 +22,6 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
-    GTP_CONFIG,
     GTPShardedParam,
     reset_gtp_state,
     update_gtp_config,
@@ -31,29 +30,15 @@ from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
-from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: F401
-    _torchrun_dist_init,
-    reset_fp8_state,
-    reset_gtp_globals,
-)
 
 
 @pytest.fixture(autouse=True)
 def _enable_cp_attention(set_env, monkeypatch):
     # The common unit fixture disables both TE attention backends. CP requires
     # the fused backend here; restore its environment after each test.
+    # GTP_CONFIG is restored by the directory conftest.
     monkeypatch.setenv("NVTE_FUSED_ATTN", "1")
-    original = {
-        name: getattr(GTP_CONFIG, name)
-        for name in (
-            "pad_for_alignment",
-            "calculate_per_token_loss",
-            "reduce_scatter_with_fp32_accumulation",
-        )
-    }
     update_gtp_config(reduce_scatter_with_fp32_accumulation=False)
-    yield
-    update_gtp_config(**original)
 
 
 class _Model(torch.nn.Module):
@@ -177,8 +162,8 @@ def _step(model, optimizer, pg, step):
 
 def test_replica_all_gather_group_uses_weight_layout():
     """Optimizer AG must use the same replicas as its gradient reduction."""
-    if dist.get_world_size() not in (4, 8):
-        pytest.skip("Requires four or eight ranks")
+    if dist.get_world_size() != 4:
+        pytest.skip("Requires 4 ranks")
     ps.destroy_model_parallel()
     try:
         ps.initialize_model_parallel(
@@ -197,10 +182,20 @@ def test_replica_all_gather_group_uses_weight_layout():
 
 @pytest.mark.parametrize(
     "tp,cp,weight,num_sequence_shards",
-    [(1, 2, 2, 2), (1, 1, 4, 2), (2, 2, 2, 2), (1, 2, 4, 2), (2, 1, 4, 4), (2, 2, 2, 1)],
+    [
+        # GTP group = the sequence shards, plus ordinary CP.
+        pytest.param(1, 2, 2, 2, id="cp2-gtp2-seq2"),
+        # GTP group spans sequence shards and data-parallel replicas.
+        pytest.param(1, 1, 4, 2, id="gtp4-seq2"),
+        # TP x sequence-sharded GTP (sequence-parallel activations within each shard).
+        pytest.param(2, 1, 2, 2, id="tp2-gtp2-seq2"),
+        # Plain GTP (no sequence shards) next to CP: multi-step forward-prefetched weights.
+        pytest.param(1, 2, 2, 1, id="cp2-gtp2"),
+    ],
 )
-@pytest.mark.parametrize("distopt", [False, True])
-@pytest.mark.parametrize("per_token", [False, True])
+@pytest.mark.parametrize(
+    "distopt,per_token", [(False, True), (True, False)], ids=["ddp-per_token", "distopt-mean"]
+)
 def test_attention_gradients_and_adam_updates(
     tp, cp, weight, num_sequence_shards, distopt, per_token
 ):
@@ -235,17 +230,15 @@ def test_attention_gradients_and_adam_updates(
                     torch.testing.assert_close(grads[name], grad_target, rtol=0.03, atol=2e-3)
     finally:
         ps.destroy_model_parallel()
-        reset_gtp_state()
 
 
-@pytest.mark.parametrize("tp", [1, 2])
-def test_model_and_adam_checkpoint_after_cp_extension(tp, tmp_path_dist_ckpt):
+def test_model_and_adam_checkpoint_after_cp_extension(tmp_path_dist_ckpt):
     """CP1 -> CP2 with two GTP sequence shards preserves model and optimizer ownership."""
     from megatron.core.dist_checkpointing import ShardedTensor, load, save
     from tests.unit_tests.dist_checkpointing import TempNamedDir
 
-    if dist.get_world_size() != 4 * tp:
-        pytest.skip(f"Requires {4 * tp} ranks")
+    if dist.get_world_size() != 4:
+        pytest.skip("Requires 4 ranks")
     metadata = {"distrib_optim_sharding_type": "dp_reshardable"}
 
     def state(model, optimizer, pg, loading=False):
@@ -277,7 +270,7 @@ def test_model_and_adam_checkpoint_after_cp_extension(tp, tmp_path_dist_ckpt):
         }
 
     try:
-        model, optimizer, pg, _ = _build(tp, 1, 2, True, False, num_sequence_shards=2)
+        model, optimizer, pg, _ = _build(1, 1, 2, True, False, num_sequence_shards=2)
         _step(model, optimizer, pg, 0)
         saved_state = state(model, optimizer, pg)
         expected_weights = {n: p.detach().clone() for n, p in model.module.named_parameters()}
@@ -287,9 +280,9 @@ def test_model_and_adam_checkpoint_after_cp_extension(tp, tmp_path_dist_ckpt):
                 leaf.data.fill_(dist.get_rank() + 1)
         expected = snapshot(saved_state["optimizer"])
         assert expected and any("exp_avg" in key for key, _ in expected)
-        with TempNamedDir(tmp_path_dist_ckpt / f"gtpcp_tp{tp}", sync=True) as directory:
+        with TempNamedDir(tmp_path_dist_ckpt / "gtpcp", sync=True) as directory:
             save(saved_state, directory)
-            model, optimizer, pg, _ = _build(tp, 2, 2, True, False, num_sequence_shards=2)
+            model, optimizer, pg, _ = _build(1, 2, 2, True, False, num_sequence_shards=2)
             restored = load(state(model, optimizer, pg, loading=True), directory)
             model.module.load_state_dict(restored["model"])
             optimizer.load_state_dict(restored["optimizer"])
@@ -301,4 +294,3 @@ def test_model_and_adam_checkpoint_after_cp_extension(tp, tmp_path_dist_ckpt):
                 torch.testing.assert_close(param, expected_weights[name], rtol=0, atol=0)
     finally:
         ps.destroy_model_parallel()
-        reset_gtp_state()

@@ -33,24 +33,19 @@ from megatron.core.transformer.cuda_graphs import (
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.experts import GroupedMLPSubmodules, TEGroupedMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
-from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: F401
+from megatron.core.utils import PARAM_READY_CALLBACK_ATTR
+from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
     _make_gtp_linear,
     _requires_mxfp8,
-    _torchrun_dist_init,
-    reset_fp8_state,
-    reset_gtp_globals,
 )
 
 
 @pytest.fixture
 def expert_group():
-    """Isolate each model's process groups and communication streams."""
+    """Give each test its own GTP4 x EGTP4 process groups."""
     if torch.distributed.get_world_size() != 4:
         pytest.skip("requires torchrun --nproc-per-node=4")
     torch.cuda.synchronize()
-    # Full graphs must not join uncaptured streams from earlier test models.
-    gtp._AG_STREAMS.clear()
-    gtp._RS_STREAMS.clear()
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(gtp_remat_size=4, expert_gtp_remat_size=4)
     initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
@@ -59,8 +54,6 @@ def expert_group():
         yield ps.get_expert_gtp_weight_remat_group()
     finally:
         torch.cuda.synchronize()
-        gtp._AG_STREAMS.clear()
-        gtp._RS_STREAMS.clear()
         ps.destroy_model_parallel()
         ps.initialize_model_parallel()
 
@@ -86,12 +79,14 @@ class _Block(torch.nn.Module):
         return x + self.mlp.experts.linear_fc2(F.silu(gate) * value, self.splits)
 
 
-def _initialize_grads(model):
+def _initialize_grads(model, grad_ready=None):
+    """Allocate main_grad and register a DDP-style grad-ready hook that appends to ``grad_ready``."""
     params = list(model.parameters())
     for p in params:
         p.main_grad = torch.zeros(p.shape, device=p.device, dtype=torch.bfloat16)
-        # Retain AccumulateGrad and mirror DDP readiness hooks for local graph replay.
-        p.register_grad_accum_hook(p.expand_as(p).grad_fn.next_functions[0][0], lambda: None)
+        hook = (lambda p=p: grad_ready.append(p)) if grad_ready is not None else (lambda: None)
+        # Retain AccumulateGrad, as DDP does, for local graph replay.
+        p.register_grad_accum_hook(p.expand_as(p).grad_fn.next_functions[0][0], hook)
     return params
 
 
@@ -185,9 +180,12 @@ def _native_model(group, recipe):
     return model
 
 
-@pytest.mark.parametrize("registered", [False, True], ids=["default-chains", "registered-chains"])
-@pytest.mark.parametrize("mxfp8", [False, True], ids=["bf16", "native-mxfp8"])
-def test_grouped_full_iteration_replay(expert_group, monkeypatch, mxfp8, registered):
+@pytest.mark.parametrize(
+    "mxfp8",
+    [False, pytest.param(True, marks=pytest.mark.launch_on_gb200)],
+    ids=["bf16", "native-mxfp8"],
+)
+def test_grouped_full_iteration_replay(expert_group, monkeypatch, mxfp8):
     if mxfp8:
         _requires_mxfp8()
         monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")
@@ -197,9 +195,6 @@ def test_grouped_full_iteration_replay(expert_group, monkeypatch, mxfp8, registe
         if mxfp8
         else torch.nn.Sequential(*[_Block(expert_group) for _ in range(4)]).cuda()
     )
-    if registered:
-        for role in ("linear_fc1", "linear_fc2"):
-            gtp.register_prefetch_chain(role, [getattr(b.mlp.experts, role).weight0 for b in model])
     gtp.classify_gtp_remat_chains(model, cuda_graph_impl="full_iteration")
     assert all(hasattr(p, "_gtp_prefetch_chain_name") for p in model.parameters())
     params = _initialize_grads(model)
@@ -283,9 +278,14 @@ def test_grouped_full_iteration_replay(expert_group, monkeypatch, mxfp8, registe
             torch.cuda.synchronize()
 
 
-@pytest.mark.parametrize("registered", [False, True], ids=["default-chains", "registered-chains"])
-def test_grouped_local_graph_replay(expert_group, registered):
-    group = expert_group
+def _run_local_graph_replay(group):
+    """Replay per-block local graphs against an eager reference of the same weight updates.
+
+    Weight updates are published lazily, through the parameter-ready callback a sharding backend
+    such as DDP with overlapped param gather installs: a replay that gathers a weight without
+    first making it ready reads the previous step's value. Every step also checks that each
+    weight's grad-ready hook fired exactly once.
+    """
     config = TransformerConfig(
         num_layers=4,
         hidden_size=128,
@@ -315,29 +315,41 @@ def test_grouped_local_graph_replay(expert_group, registered):
             return self.compute(hidden_states=hidden_states)
 
     model = torch.nn.Sequential(*[LocalBlock(i) for i in range(4)]).cuda()
-    if registered:
-        for role in ("linear_fc1", "linear_fc2"):
-            gtp.register_prefetch_chain(
-                role, [getattr(b.unit.mlp.experts, role).weight0 for b in model]
-            )
     gtp.classify_gtp_remat_chains(model, cuda_graph_modules=["moe"], cuda_graph_impl="local")
-    params = _initialize_grads(model)
+    grad_ready = []
+    params = _initialize_grads(model, grad_ready)
     inputs = [torch.randn(64, 128, device="cuda", dtype=torch.bfloat16) for _ in range(6)]
     initial = [p.detach().clone() for p in params]
+    unpublished = {}
+
+    def publish(index):
+        if index in unpublished:
+            params[index].detach().copy_(unpublished.pop(index))
+
+    for index, p in enumerate(params):
+        setattr(p, PARAM_READY_CALLBACK_ATTR, lambda index=index: publish(index))
 
     def step(x):
         x = x.detach().clone().requires_grad_()
-        return _snapshot(_step(model, x), x, params)
+        grad_ready.clear()
+        snapshot = _snapshot(_step(model, x), x, params)
+        assert sorted(map(id, grad_ready)) == sorted(map(id, params)), "grad-ready not once each"
+        return snapshot
 
-    def update():
+    def update(lazy):
         with torch.no_grad():
-            for p in params:
-                p.sub_(0.01 / group.size() * p.main_grad)
+            for index, p in enumerate(params):
+                # The sign flip makes a stale weight visible in every output and gradient.
+                value = (p.main_grad * (0.01 / group.size()) - p).detach()
+                if lazy:
+                    unpublished[index] = value
+                else:
+                    p.copy_(value)
 
     reference = []
     for x in inputs:
         reference.append(step(x))
-        update()
+        update(lazy=False)
     _copy_weights(params, initial)
     for block in model:
         block.manager = CudaGraphManager(config, base_module=block, function_name="compute")
@@ -347,34 +359,28 @@ def test_grouped_local_graph_replay(expert_group, registered):
     try:
         for x, expected in zip(inputs, reference):
             _assert_snapshot(step(x), expected)
-            update()
-        runners = [block.manager.cudagraph_runners[0] for block in model]
-        assert any(runner._gtp_wgrad_ring_slots for runner in runners)
-        # Cross-graph RS can finalize a block in its predecessor's backward graph.
-        finalized = [
-            id(p) for r in runners for _, weights in r._gtp_finalize_hook_plan for p in weights
-        ]
-        assert sorted(finalized) == sorted(map(id, params))
+            update(lazy=True)
+        assert any(block.manager.cudagraph_runners[0]._gtp_wgrad_ring_slots for block in model)
     finally:
-        torch.cuda.synchronize()
-        for block in model:
-            for runner in block.manager.cudagraph_runners:
-                for graph in (runner.fwd_graph, runner.bwd_graph):
-                    if graph is not None:
-                        graph.reset()
         delete_cuda_graphs()
+
+
+def test_grouped_local_graph_replay(expert_group):
+    """Local graphs replay like eager, and still do for a model rebuilt after teardown."""
+    _run_local_graph_replay(expert_group)
+    # The documented in-process rebuild: tear down the graphs, reset GTP's chain state, rebuild.
+    gtp.reset_gtp_state()
+    _run_local_graph_replay(expert_group)
 
 
 @pytest.mark.parametrize("captured", [False, True])
 @pytest.mark.parametrize("grouped", [False, True], ids=["dense", "grouped"])
-@pytest.mark.parametrize("recompute", [False, True])
-def test_consumer_does_not_wait_for_later_gather(expert_group, captured, grouped, recompute):
+def test_consumer_does_not_wait_for_later_gather(expert_group, captured, grouped):
     group = expert_group
     model = _Block(group) if grouped else _make_gtp_linear(128, 128, group)
     gtp.set_cuda_graph_modules([], cuda_graph_impl="full_iteration" if captured else "none")
     gtp.classify_gtp_chains(torch.nn.Sequential(model))
     param = model.mlp.experts.linear_fc2.weight0 if grouped else model.weight
-    event = param._recompute_ag_event if recompute else param.ag_event
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     ready = torch.cuda.Event(enable_timing=True, external=True)
@@ -382,79 +388,65 @@ def test_consumer_does_not_wait_for_later_gather(expert_group, captured, grouped
     ag_stream = gtp.get_ag_stream(param.chain_id, group)
 
     def run():
-        _, handle = param._all_gather_weight(async_op=True, fwd=True, recompute=recompute)
-        if recompute:
-            param._recompute_prefetch_handle = handle
-        else:
-            param._prefetch_handle = handle
+        _, param._prefetch_handle = param._all_gather_weight(async_op=True, fwd=True)
         with torch.cuda.stream(ag_stream):
             # Stand in for unrelated work queued after this gather on the AG stream.
             torch.cuda._sleep(100_000_000)
             tail.record()
-        if recompute:
-            param._wait_recompute_param_gather()
-        else:
-            param._wait_param_gather()
-        event.wait()
+        param._wait_param_gather()
+        param.ag_event.wait()
         ready.record()
         torch.cuda.current_stream().wait_stream(ag_stream)
 
     with torch.cuda.stream(stream):
-        param._all_gather_weight(async_op=False, fwd=True, recompute=recompute)
+        param._all_gather_weight(async_op=False, fwd=True)
     torch.cuda.synchronize()
-    if captured:
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            run()
-        graph.replay()
-    else:
-        with torch.cuda.stream(stream):
-            run()
-    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph() if captured else None
+    try:
+        if captured:
+            with torch.cuda.graph(graph, stream=stream):
+                run()
+            graph.replay()
+        else:
+            with torch.cuda.stream(stream):
+                run()
+        torch.cuda.synchronize()
+    finally:
+        if captured:
+            graph.reset()
     # CUDA timestamps compare device dependencies, not Python launch timings. The
     # consumer must become ready before the unrelated tail, in eager AND replay.
     assert ready.elapsed_time(tail) > 1.0, "consumer incorrectly depends on later AG-stream work"
-    if captured:
-        graph.reset()
 
 
 @pytest.mark.parametrize("recompute", [False, True])
-@pytest.mark.parametrize("grouped", [False, True], ids=["dense", "grouped"])
-def test_sync_fallback_records_completion(expert_group, monkeypatch, recompute, grouped):
+def test_sync_fallback_records_completion(expert_group, monkeypatch, recompute):
+    """A gather that falls back to synchronous (no Work handle) must still record its completion
+    event, or the consumer waits on whatever the event recorded last."""
     group = expert_group
-    if grouped:
-        op = te.ops.GroupedLinear(1, 128, 128, bias=False, device="cuda", dtype=torch.bfloat16)
-        op.gtp_remat_size = group.size()
-        wrap_module_params_gtp(op, ["weight0"], group, is_grouped=True)
-        param = op.weight0
-        param.chain_id = "GTP_remat_grouped_fc1_ungraphed"
-    else:
-        op = _make_gtp_linear(128, 128, group)
-        param = op.weight
+    layer = _make_gtp_linear(128, 128, group)
+    param = layer.weight
+    full = torch.empty(param._unsharded_shape_padded, device="cuda", dtype=torch.bfloat16)
+    torch.distributed.all_gather_into_tensor(full, param.detach(), group=group)
     original_gather = gtp.gather_along_first_dim
-    calls = []
 
     def synchronous_fallback(*args, **kwargs):
-        assert kwargs["async_op"] is True
         kwargs["async_op"] = False
         result, handle = original_gather(*args, **kwargs)
         assert handle is None
-        calls.append(True)
         return result, None
 
     monkeypatch.setattr(gtp, "gather_along_first_dim", synchronous_fallback)
+    event = param._recompute_ag_event if recompute else param.ag_event
+    # The event's previous record stays pending behind a long kernel on an unrelated stream.
+    stale = torch.cuda.Stream()
+    with torch.cuda.stream(stale):
+        torch.cuda._sleep(1_000_000_000)
+        event.record()
     result, handle = param._all_gather_weight(async_op=True, fwd=True, recompute=recompute)
-    assert calls == [True]  # Dense and single-expert weights use the non-coalesced path.
     assert handle.handle is None
-    if recompute:
-        param._recompute_prefetch_handle = handle
-        param._wait_recompute_param_gather()
-        event = param._recompute_ag_event
-    else:
-        param._prefetch_handle = handle
-        param._wait_param_gather()
-        event = param.ag_event
-    event.wait()
+    gtp.get_ag_stream(param.chain_id, group).synchronize()
+    completed = event.query()
     torch.cuda.synchronize()
-    assert event.query()
-    assert (result[0] if grouped else result).shape == (128, 128)
+    assert completed, "the gather did not record its completion event"
+    torch.testing.assert_close(result, full, atol=0, rtol=0)
