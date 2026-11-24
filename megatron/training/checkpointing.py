@@ -3850,10 +3850,14 @@ def load_checkpoint(
                     else:
                         print_rank_0('WARNING: RNG state not found for current TP/PP rank')
                         rng_state_list = next(iter(state_dict['rng_state'].values()))
-                    rng_state = _select_rng_state(rng_state_list, load_dp_rng_states, dp_cp_group)
+                    rng_state = _select_rng_state(
+                        rng_state_list, load_dp_rng_states, dp_cp_group, dp_group
+                    )
                 else:
                     rng_state_list = state_dict['rng_state']
-                    rng_state = _select_rng_state(rng_state_list, load_dp_rng_states, dp_cp_group)
+                    rng_state = _select_rng_state(
+                        rng_state_list, load_dp_rng_states, dp_cp_group, dp_group
+                    )
                 random.setstate(rng_state['random_rng_state'])
                 np.random.set_state(rng_state['np_rng_state'])
                 torch.set_rng_state(rng_state['torch_rng_state'])
@@ -3958,17 +3962,26 @@ def _select_rng_state(
     rng_state_list: list[dict[str, Any]],
     per_dp_rank: bool,
     dp_cp_group: Optional[torch.distributed.ProcessGroup],
+    dp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> dict[str, Any]:
     """Select the RNG state matching the saved checkpoint layout.
 
-    ``dp_cp_group`` must be the same group ``get_rng_state`` gathered over (the DP x CP group,
+    ``dp_cp_group`` must be the group ``get_rng_state`` gathers over (the DP x CP group,
     gtp_remat-inclusive when GTP is active), so the index follows the gather order.
+
+    Checkpoints saved before the gather moved to DP x CP hold a list gathered over DP only. The
+    two lengths differ exactly when CP (or GTP) widens the group, so a list whose length is not
+    the DP x CP size is the old layout and is indexed by the plain DP rank.
     """
     if not per_dp_rank:
         return rng_state_list[0]
     if dp_cp_group is None:
         dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
-    return rng_state_list[get_pg_rank(dp_cp_group)]
+    if len(rng_state_list) == get_pg_size(dp_cp_group):
+        return rng_state_list[get_pg_rank(dp_cp_group)]
+    if dp_group is None:
+        dp_group = mpu.get_data_parallel_group()
+    return rng_state_list[get_pg_rank(dp_group)]
 
 
 def _checkpoint_has_per_dp_rng_states(run_config: Optional[dict[str, Any]], default: bool = False) -> bool:
