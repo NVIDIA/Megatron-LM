@@ -32,6 +32,7 @@ from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     init_num_microbatches_calculator,
 )
+from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -2584,10 +2585,11 @@ class TestHybridLayerPairCudaGraph:
         config_kwargs.update(overrides)
         return TransformerConfig(**config_kwargs)
 
-    def _build_models(self, config, pattern, hybrid_layer_config_list=None):
+    def _build_models(self, config, pattern, hybrid_layer_config_list=None, ddp_config=None):
         """Build one DDP-wrapped HybridModel per virtual pipeline stage of this rank.
 
-        The model takes its layers from hybrid_layer_config_list if given, else from pattern.
+        The model takes its layers from hybrid_layer_config_list if given, else from pattern. The
+        DDP config defaults to FP32 gradient reduction without overlap.
         """
         vpp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
         models = []
@@ -2608,7 +2610,8 @@ class TestHybridLayerPairCudaGraph:
                 vp_stage=vp_stage,
                 hybrid_layer_config_list=hybrid_layer_config_list,
             ).cuda()
-            ddp_config = DistributedDataParallelConfig(grad_reduce_in_fp32=True)
+            if ddp_config is None:
+                ddp_config = DistributedDataParallelConfig(grad_reduce_in_fp32=True)
             models.append(DistributedDataParallel(config, ddp_config, model))
         return models
 
@@ -2707,6 +2710,99 @@ class TestHybridLayerPairCudaGraph:
             with torch.no_grad():
                 for _, param in self._named_parameters(models):
                     param.add_(param.main_grad.to(param.dtype), alpha=-1e-2)
+        return helper, record
+
+    def _train_with_param_gather(self, models, config, batches, replays, pair):
+        """Train as _train does, with a distributed optimizer that overlaps its param all-gather.
+
+        The models must overlap the parameter all-gather with forward compute. As in training,
+        the forward pre-hooks that wait for each module's all-gather are off for the eager
+        iteration and the capture; afterwards the graphed modules' hooks run manually, before the
+        graph replays. The record of _train has two more entries: "manual_hooks", per decoder
+        layer, the modules whose hooks the layer runs before it replays, and "hook_calls", per
+        iteration, (graph replays so far, module) for each manual hook call.
+        """
+        config.cuda_graph_pair_hybrid_layers = pair
+        helper = TECudaGraphHelper(
+            model=models,
+            config=config,
+            seq_length=self.seq_length,
+            micro_batch_size=self.micro_batch_size,
+        )
+        self.helpers.append(helper)
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(
+                optimizer="adam",
+                lr=1e-3,
+                bf16=True,
+                use_distributed_optimizer=True,
+                overlap_param_gather=True,
+                clip_grad=0.0,
+                weight_decay=0.0,
+            ),
+            models,
+            use_gloo_process_groups=False,
+        )
+        module_names = {
+            module: f"{chunk}.{name}"
+            for chunk, model in enumerate(models)
+            for name, module in model.module.named_modules()
+        }
+        layers = [
+            layer for model in models for layer in get_attr_wrapped_model(model, "decoder").layers
+        ]
+        hook_calls = []
+
+        def recording_hook_factory(make_hook):
+            def make_recording_hook():
+                hook = make_hook()
+
+                def recording_hook(module, *args):
+                    hook_calls.append((replays[0], module_names[module]))
+                    return hook(module, *args)
+
+                return recording_hook
+
+            return make_recording_hook
+
+        record = {"loss": [], "mtp_loss": [], "grads": [], "replays": [], "hook_calls": []}
+        for model in models:
+            model.disable_forward_pre_hook(param_sync=False)
+        for iteration in range(3):
+            if iteration == config.cuda_graph_warmup_steps:
+                helper.create_cudagraphs()
+                for model in models:
+                    model.enable_forward_pre_hook()
+                with pytest.MonkeyPatch.context() as patch:
+                    for model in models:
+                        patch.setattr(
+                            model,
+                            "_make_forward_pre_hook",
+                            recording_hook_factory(model._make_forward_pre_hook),
+                        )
+                    helper.cuda_graph_set_manual_hooks()
+                record["manual_hooks"] = [
+                    [module_names[module] for _, (module,) in layer.te_cuda_graph_manual_hooks]
+                    for layer in layers
+                ]
+            for model in models:
+                model.zero_grad_buffer()
+            optimizer.zero_grad()
+            replays[0] = 0
+            hook_calls.clear()
+            record["loss"].append(self._forward_backward(models, batches))
+            record["replays"].append(replays[0])
+            record["hook_calls"].append(list(hook_calls))
+            for model in models:
+                model.finish_grad_sync()
+            mtp_loss = MTPLossLoggingHelper.tracker.get("loss_values")
+            record["mtp_loss"].append(None if mtp_loss is None else mtp_loss.clone())
+            MTPLossLoggingHelper.clean_metrics_in_tracker()
+            record["grads"].append(
+                {name: param.main_grad.clone() for name, param in self._named_parameters(models)}
+            )
+            update_successful, _, _ = optimizer.step()
+            assert update_successful
         return helper, record
 
     def _restore(self, models, params):
@@ -3066,6 +3162,69 @@ class TestHybridLayerPairCudaGraph:
                 assert record["replays"] == [0, 2 * num_replayed, 2 * num_replayed]
             self._assert_bitwise_equal(paired, unpaired)
             paired_helper.delete_cuda_graphs()
+        torch.cuda.current_stream().wait_stream(stream)
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("2.10.0")),
+        reason="Partial CUDA graph UT support requires TransformerEngine version >= 2.10.0",
+    )
+    def test_paired_graphs_run_the_param_gather_hooks_of_both_layers(self, monkeypatch):
+        """With the distributed optimizer's overlapped parameter all-gather, the mixer of a pair
+        runs the forward pre-hooks of both layers' graphed modules before it launches the graph,
+        so the pair trains like per-layer graphs."""
+        pattern = "*E*E"
+        replays = self._setup_parallel_state(monkeypatch, num_microbatches=1)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            config = self._config(pattern, _PARTIAL_MOE_GRAPH_MODULES)
+            # One bucket per parameter, so only a module's own hook waits for its all-gather.
+            models = self._build_models(
+                config,
+                pattern,
+                ddp_config=DistributedDataParallelConfig(
+                    grad_reduce_in_fp32=True,
+                    use_distributed_optimizer=True,
+                    overlap_grad_reduce=True,
+                    overlap_param_gather=True,
+                    bucket_size=1,
+                ),
+            )
+            batches = self._batches(num_microbatches=1, padding=False)
+            initial_params = {
+                name: param.detach().clone() for name, param in self._named_parameters(models)
+            }
+            unpaired_helper, unpaired = self._train_with_param_gather(
+                models, config, batches, replays, pair=False
+            )
+            unpaired_helper.delete_cuda_graphs()
+            self._restore(models, initial_params)
+            paired_helper, paired = self._train_with_param_gather(
+                models, config, batches, replays, pair=True
+            )
+
+            callables = paired_helper.flattened_callables
+            assert [isinstance(c, _TECudaGraphLayerPair) for c in callables] == [True, True]
+            # The hooks that each layer runs with per-layer graphs. The MoE layers' router is
+            # graphed, so they have hooks of their own.
+            layer_hooks = unpaired["manual_hooks"]
+            assert all(layer_hooks)
+            assert any(name.endswith("decoder.layers.1.mlp.router") for name in layer_hooks[1])
+            # A pair's mixer runs the hooks of both layers, and its feed-forward layer runs none.
+            pair_hooks = [layer_hooks[0] + layer_hooks[1], layer_hooks[2] + layer_hooks[3]]
+            assert paired["manual_hooks"] == [pair_hooks[0], [], pair_hooks[1], []]
+            # Each graphed iteration calls every hook once, before the forward replay of the graph
+            # that covers its module: the k-th graphed callable's hooks see k replays.
+            for record, callable_hooks in ((unpaired, layer_hooks), (paired, pair_hooks)):
+                calls = [(k, name) for k, names in enumerate(callable_hooks) for name in names]
+                assert record["hook_calls"] == [[], calls, calls]
+            assert unpaired["replays"] == [0, 8, 8]
+            assert paired["replays"] == [0, 4, 4]
+            self._assert_bitwise_equal(paired, unpaired)
+            paired_helper.delete_cuda_graphs()
+            # Deleting the graphs drops the hooks of both layers of each pair.
+            decoder = get_attr_wrapped_model(models[0], "decoder")
+            assert [len(layer.te_cuda_graph_manual_hooks) for layer in decoder.layers] == [0] * 4
         torch.cuda.current_stream().wait_stream(stream)
 
     @pytest.mark.parametrize(
