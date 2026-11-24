@@ -343,15 +343,17 @@ def test_identity_without_image_diagnostics_preserves_usable_cache(
 
 
 @pytest.mark.parametrize(
-    "mode,publication,expected",
+    "mode,publication,merge_group,expected",
     [
-        ("baseline", "failure", "false"),
-        ("baseline", "skipped", "false"),
-        ("baseline", "success", "true"),
-        ("enforce", "skipped", "true"),
+        ("baseline", "failure", "false", "false"),
+        ("baseline", "skipped", "false", "false"),
+        ("baseline", "success", "false", "true"),
+        ("enforce", "skipped", "false", "true"),
+        # Merge groups upload artifacts; the post-merge workflow publishes caches.
+        ("baseline", "skipped", "true", "true"),
     ],
 )
-def test_producer_result_requires_cache_publication(mode, publication, expected):
+def test_producer_result_requires_cache_publication(mode, publication, merge_group, expected):
     script = _action_script("Check result")
     script = script[script.index('EXIT_CODE="${MAIN_EXIT_CODE') :]
     script = script.split('if [[ "$IS_SUCCESS" == "false"', 1)[0]
@@ -363,6 +365,7 @@ def test_producer_result_requires_cache_publication(mode, publication, expected)
             "MAIN_CONCLUSION": "success",
             "TESTMON_MODE": mode,
             "CACHE_PUBLICATION": publication,
+            "IS_MERGE_GROUP": merge_group,
         },
         capture_output=True,
         text=True,
@@ -553,6 +556,22 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
         ({"SOURCE_REPOSITORY": "fork/Megatron-LM"}, False),
         ({"SOURCE_EVENT": "pull_request"}, False),
         ({"REQUESTED_SHA": "c" * 40}, False),
+        (
+            {
+                "SOURCE_EVENT": "merge_group",
+                "SOURCE_REF": "refs/heads/gh-readonly-queue/main/pr-1-" + "d" * 40,
+            },
+            True,
+        ),
+        ({"SOURCE_EVENT": "merge_group"}, False),
+        (
+            {
+                "SOURCE_EVENT": "merge_group",
+                "SOURCE_REF": "refs/heads/gh-readonly-queue/dev/pr-1-" + "d" * 40,
+            },
+            False,
+        ),
+        ({"SOURCE_REF": "refs/heads/gh-readonly-queue/main/pr-1-" + "d" * 40}, False),
     ],
 )
 def test_action_baseline_guard_rejects_untrusted_producers(tmp_path, override, allowed):
