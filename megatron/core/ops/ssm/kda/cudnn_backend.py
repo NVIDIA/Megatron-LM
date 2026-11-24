@@ -12,8 +12,8 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from cudnn.linear_attention.frost.common.piece_chain import build_state_chain, run_state_chain
-from cudnn.linear_attention.ops import kimi_delta_attention as _kimi_delta_attention
 from cudnn.linear_attention.ops import (
+    kimi_delta_attention,
     kimi_delta_attention_summary,
     kimi_delta_attention_summary_bwd,
 )
@@ -21,34 +21,21 @@ from torch.autograd.function import once_differentiable
 
 _MIN_CUDNN_KDA_COMPUTE_CAPABILITY = (10, 0)
 
-# Importing the public operation above registers these explicit custom ops. The
-# distributed autograd wrapper calls them directly so forward does not retain a
-# nested autograd graph solely to invoke the local cuDNN backward.
+# Chunkwise CP supplies the local kernels' boundary state and its adjoint explicitly.
 _KDA_FWD = torch.ops.cudnn.kimi_delta_attention_fwd
 _KDA_BWD = torch.ops.cudnn.kimi_delta_attention_bwd
 _STATE_CHAIN_HAS_REVERSE = "reverse" in inspect.signature(build_state_chain).parameters
 
 
-class _CudnnKdaBackwardResult(NamedTuple):
-    """Gradients matching the positional arguments of ``_CudnnKda.forward``."""
+class _CPBoundary(NamedTuple):
+    """Sequence spans and their peers in one contiguous context-parallel shard."""
 
-    q: Optional[torch.Tensor]
-    k: Optional[torch.Tensor]
-    v: Optional[torch.Tensor]
-    g: Optional[torch.Tensor]
-    beta: Optional[torch.Tensor]
-    cu_seqlens: None
-    first_boundary_end: None
-    last_boundary_start: None
-    a_log: Optional[torch.Tensor]
-    dt_bias: Optional[torch.Tensor]
-    cp_group: None
-    pre_num_ranks: None
-    post_num_ranks: None
-    scale: None
-    use_qk_l2norm_in_kernel: None
-    safe_gate: None
-    lower_bound: None
+    group: dist.ProcessGroup
+    rank: int
+    pre_num_ranks: int
+    post_num_ranks: int
+    first_end: int
+    last_start: int
 
 
 def _require_sm100_or_newer(device: torch.device) -> None:
@@ -148,54 +135,44 @@ def _pack_boundary_summary(h: torch.Tensor, transition: torch.Tensor) -> torch.T
         raise ValueError("KDA boundary summaries must have [H,D,K] layout")
     if h.shape[0] != transition.shape[0] or h.shape[-1] != transition.shape[-1]:
         raise ValueError("KDA H and transition boundary shapes are incompatible")
+    if h.dtype != torch.float32 or transition.dtype != torch.float32:
+        raise ValueError("KDA boundary state and transition must both be FP32")
     return torch.cat((h, transition), dim=-2)
 
 
-def _unpack_boundary_summaries(
-    packed: torch.Tensor, value_dim: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return packed[..., :value_dim, :], packed[..., value_dim:, :]
-
-
-def _merge_boundary_chain(
-    h_all: torch.Tensor,
-    transition_all: torch.Tensor,
+def _exchange_boundary(
+    summary: Optional[tuple[torch.Tensor, torch.Tensor]],
+    value: torch.Tensor,
+    key_dim: int,
+    num_seqs: int,
+    cp: _CPBoundary,
     *,
-    rank: int,
-    num_remote_ranks: int,
     reverse: bool,
 ) -> torch.Tensor:
-    """Return the state entering or leaving this rank's split sequence."""
-    if num_remote_ranks == 0:
-        return torch.zeros_like(h_all[rank])
-    if reverse:
-        start, stop = rank + 1, rank + num_remote_ranks + 1
+    """Exchange one FP32 packet per rank and seed the single crossing sequence."""
+    heads, value_dim = value.shape[-2:]
+    if summary is None:
+        packet = value.new_zeros((heads, value_dim + key_dim, key_dim), dtype=torch.float32)
     else:
-        start, stop = rank - num_remote_ranks, rank
-    # Slicing the packed collective returns strided views. These are the two
-    # intentional D2D materializations required by the FROST state chain.
-    return _run_state_chain(
-        h_all[start:stop].contiguous(), transition_all[start:stop].contiguous(), reverse=reverse
-    )
+        h, transition = summary
+        # summary_bwd returns M^T; the reverse FROST chain applies its own transpose.
+        matrix = transition[0].transpose(-2, -1) if reverse else transition[0]
+        packet = _pack_boundary_summary(h[0], matrix)
 
-
-def _op_kwargs(
-    *,
-    use_qk_l2norm_in_kernel: bool,
-    safe_gate: bool,
-    lower_bound: Optional[float],
-    a_log: Optional[torch.Tensor],
-    dt_bias: Optional[torch.Tensor],
-) -> dict:
-    return {
-        "use_qk_l2norm_in_kernel": use_qk_l2norm_in_kernel,
-        "use_beta_sigmoid_in_kernel": False,
-        "safe_gate": safe_gate,
-        "gate_lower_bound": lower_bound if safe_gate else None,
-        "gate_domain": "log",
-        "a_log": a_log if safe_gate else None,
-        "dt_bias": dt_bias if safe_gate else None,
-    }
+    gathered = _all_gather_boundary_summary(packet, cp.group)
+    state = packet.new_zeros((num_seqs, heads, value_dim, key_dim))
+    count = cp.post_num_ranks if reverse else cp.pre_num_ranks
+    if count:
+        start = cp.rank + 1 if reverse else cp.rank - count
+        peers = gathered[start : start + count]
+        state[-1 if reverse else 0].copy_(
+            _run_state_chain(
+                peers[..., :value_dim, :].contiguous(),
+                peers[..., value_dim:, :].contiguous(),
+                reverse=reverse,
+            )
+        )
+    return state
 
 
 def _flatten_bthd(tensor: torch.Tensor) -> torch.Tensor:
@@ -269,174 +246,31 @@ def _boundary_offsets(
     return int(values[1]), int(values[-2])
 
 
-def _compute_forward_cp_state(
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    *,
-    last_boundary_start: int,
-    a_log: Optional[torch.Tensor],
-    dt_bias: Optional[torch.Tensor],
-    cp_group: dist.ProcessGroup,
-    cp_rank: int,
-    pre_num_ranks: int,
-    use_qk_l2norm_in_kernel: bool,
-    safe_gate: bool,
-    lower_bound: Optional[float],
-) -> torch.Tensor:
-    """Build the recurrent state entering this rank's first local sequence."""
-    last_cu = cu_seqlens[-2:]
-    if last_boundary_start:
-        last_cu = last_cu - last_boundary_start
-    h_local, transition_local = kimi_delta_attention_summary(
-        k[last_boundary_start:],
-        v[last_boundary_start:],
-        g[last_boundary_start:],
-        beta[last_boundary_start:],
-        last_cu,
-        plan_name="kda_summary_frost",
-        **_op_kwargs(
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            safe_gate=safe_gate,
-            lower_bound=lower_bound,
-            a_log=a_log,
-            dt_bias=dt_bias,
-        ),
-    )
-    value_dim = h_local.shape[-2]
-    packed_all = _all_gather_boundary_summary(
-        _pack_boundary_summary(h_local[-1], transition_local[-1]), cp_group
-    )
-    h_all, transition_all = _unpack_boundary_summaries(packed_all, value_dim)
-    incoming_boundary = _merge_boundary_chain(
-        h_all, transition_all, rank=cp_rank, num_remote_ranks=pre_num_ranks, reverse=False
-    )
-    incoming = h_local.new_zeros(
-        cu_seqlens.numel() - 1, h_local.shape[1], h_local.shape[2], h_local.shape[3]
-    )
-    incoming[0].copy_(incoming_boundary)
-    return incoming
+class _ChunkwiseKda(torch.autograd.Function):
+    """Add the cross-rank initial state and final-state gradient to local cuDNN KDA."""
 
-
-def _compute_backward_cp_state_grad(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    grad_output: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    *,
-    first_boundary_end: int,
-    a_log: Optional[torch.Tensor],
-    dt_bias: Optional[torch.Tensor],
-    cp_group: dist.ProcessGroup,
-    cp_rank: int,
-    post_num_ranks: int,
-    scale: float,
-    use_qk_l2norm_in_kernel: bool,
-    safe_gate: bool,
-    lower_bound: Optional[float],
-) -> torch.Tensor:
-    """Build the final-state gradient supplied to the local KDA backward."""
-    g_local, transition_backward = kimi_delta_attention_summary_bwd(
-        q[:first_boundary_end],
-        k[:first_boundary_end],
-        g[:first_boundary_end],
-        beta[:first_boundary_end],
-        grad_output[:first_boundary_end],
-        cu_seqlens[:2],
-        output_transition=True,
-        plan_name="kda_summary_frost",
-        scale=scale,
-        **_op_kwargs(
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            safe_gate=safe_gate,
-            lower_bound=lower_bound,
-            a_log=a_log,
-            dt_bias=dt_bias,
-        ),
-    )
-    # summary_bwd exposes M^T. The reverse FROST merge expects forward M and
-    # applies its own transpose while composing.
-    transition_first = transition_backward[0].transpose(-2, -1)
-    packed_all = _all_gather_boundary_summary(
-        _pack_boundary_summary(g_local[0], transition_first), cp_group
-    )
-    g_all, transition_all = _unpack_boundary_summaries(packed_all, g_local.shape[-2])
-    outgoing_boundary = _merge_boundary_chain(
-        g_all, transition_all, rank=cp_rank, num_remote_ranks=post_num_ranks, reverse=True
-    )
-    grad_final_state = g_local.new_zeros(
-        cu_seqlens.numel() - 1, g_local.shape[1], g_local.shape[2], g_local.shape[3]
-    )
-    grad_final_state[-1].copy_(outgoing_boundary)
-    return grad_final_state
-
-
-class _CudnnKda(torch.autograd.Function):
     @staticmethod
-    def forward(
-        ctx,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        first_boundary_end: Optional[int],
-        last_boundary_start: Optional[int],
-        a_log: Optional[torch.Tensor],
-        dt_bias: Optional[torch.Tensor],
-        cp_group: Optional[dist.ProcessGroup],
-        pre_num_ranks: int,
-        post_num_ranks: int,
-        scale: float,
-        use_qk_l2norm_in_kernel: bool,
-        safe_gate: bool,
-        lower_bound: Optional[float],
-    ) -> torch.Tensor:
-        """Run local cuDNN KDA after composing any state entering this CP rank."""
-        if q.ndim != 3 or any(tensor.ndim != 3 for tensor in (k, v, g)) or beta.ndim != 2:
-            raise ValueError("cuDNN KDA expects compact THD tensors")
-        if cu_seqlens.ndim != 1:
-            raise ValueError("cuDNN KDA expects one-dimensional sequence boundaries")
-
-        ctx.local_only = cp_group is None
-        ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
-        ctx.safe_gate = safe_gate
-        ctx.lower_bound = lower_bound
-        ctx.a_log_present = a_log is not None
-        ctx.dt_bias_present = dt_bias is not None
-
-        if ctx.local_only:
-            incoming = None
-        else:
-            if first_boundary_end is None or last_boundary_start is None:
-                raise RuntimeError("cuDNN KDA CP requires local CPU sequence boundaries")
-            ctx.cp_group = cp_group
-            ctx.cp_rank = dist.get_rank(group=cp_group)
-            ctx.post_num_ranks = post_num_ranks
-            ctx.first_boundary_end = first_boundary_end
-            incoming = _compute_forward_cp_state(
-                k,
-                v,
-                g,
-                beta,
-                cu_seqlens,
-                last_boundary_start=last_boundary_start,
-                a_log=a_log,
-                dt_bias=dt_bias,
-                cp_group=cp_group,
-                cp_rank=ctx.cp_rank,
-                pre_num_ranks=pre_num_ranks,
-                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-                safe_gate=safe_gate,
-                lower_bound=lower_bound,
+    def forward(ctx, q, k, v, g, beta, cu_seqlens, a_log, dt_bias, scale, cp, options):
+        """Only the last local sequence can send a forward state to a later rank."""
+        ops = dict(options, a_log=a_log, dt_bias=dt_bias)
+        summary = None
+        if cp.post_num_ranks:
+            start = cp.last_start
+            last_cu = cu_seqlens[-2:]
+            if start:
+                last_cu = last_cu - start
+            summary = kimi_delta_attention_summary(
+                k[start:],
+                v[start:],
+                g[start:],
+                beta[start:],
+                last_cu,
+                plan_name="kda_summary_frost",
+                **ops,
             )
-
-        ctx.scale = scale
+        incoming = _exchange_boundary(
+            summary, v, k.shape[-1], cu_seqlens.numel() - 1, cp, reverse=False
+        )
         output = _KDA_FWD(
             q,
             k,
@@ -444,67 +278,42 @@ class _CudnnKda(torch.autograd.Function):
             g,
             beta,
             cu_seqlens,
-            ctx.scale,
+            scale,
             initial_state=incoming,
             output_final_state=False,
             plan_name="kda_frost",
-            **_op_kwargs(
-                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-                safe_gate=safe_gate,
-                lower_bound=lower_bound,
-                a_log=a_log,
-                dt_bias=dt_bias,
-            ),
+            **ops,
         )[0]
-
-        ctx.incoming_present = incoming is not None
-        empty = q.new_empty(0)
-        ctx.save_for_backward(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            cu_seqlens,
-            incoming if incoming is not None else empty,
-            a_log if a_log is not None else empty,
-            dt_bias if dt_bias is not None else empty,
-        )
+        ctx.save_for_backward(q, k, v, g, beta, cu_seqlens, a_log, dt_bias, incoming)
+        ctx.scale, ctx.cp, ctx.options = scale, cp, options
         return output
 
     @staticmethod
     @once_differentiable
-    def backward(ctx, grad_output: torch.Tensor):
-        """Run cuDNN KDA backward after composing any state gradient from later CP ranks."""
-        q, k, v, g, beta, cu_seqlens, incoming, a_log, dt_bias = ctx.saved_tensors
-        incoming = incoming if ctx.incoming_present else None
-        a_log = a_log if ctx.a_log_present else None
-        dt_bias = dt_bias if ctx.dt_bias_present else None
-        if not grad_output.is_contiguous():
-            grad_output = grad_output.contiguous()
-
-        if ctx.local_only:
-            grad_final_state = None
-        else:
-            grad_final_state = _compute_backward_cp_state_grad(
-                q,
-                k,
-                g,
-                beta,
-                grad_output,
-                cu_seqlens,
-                first_boundary_end=ctx.first_boundary_end,
-                a_log=a_log,
-                dt_bias=dt_bias,
-                cp_group=ctx.cp_group,
-                cp_rank=ctx.cp_rank,
-                post_num_ranks=ctx.post_num_ranks,
+    def backward(ctx, grad_output):
+        """Only the first local sequence can send a state gradient to an earlier rank."""
+        q, k, v, g, beta, cu_seqlens, a_log, dt_bias, incoming = ctx.saved_tensors
+        cp = ctx.cp
+        ops = dict(ctx.options, a_log=a_log, dt_bias=dt_bias)
+        grad_output = grad_output.contiguous()
+        summary = None
+        if cp.pre_num_ranks:
+            end = cp.first_end
+            summary = kimi_delta_attention_summary_bwd(
+                q[:end],
+                k[:end],
+                g[:end],
+                beta[:end],
+                grad_output[:end],
+                cu_seqlens[:2],
                 scale=ctx.scale,
-                use_qk_l2norm_in_kernel=ctx.use_qk_l2norm_in_kernel,
-                safe_gate=ctx.safe_gate,
-                lower_bound=ctx.lower_bound,
+                output_transition=True,
+                plan_name="kda_summary_frost",
+                **ops,
             )
-
+        grad_final_state = _exchange_boundary(
+            summary, v, k.shape[-1], cu_seqlens.numel() - 1, cp, reverse=True
+        )
         dq, dk, dv, dg, dbeta, _, da_log, ddt_bias = _KDA_BWD(
             grad_output,
             q,
@@ -519,32 +328,20 @@ class _CudnnKda(torch.autograd.Function):
             state_checkpoints=None,
             checkpoint_every_n_tokens=0,
             plan_name="kda_frost",
-            **_op_kwargs(
-                use_qk_l2norm_in_kernel=ctx.use_qk_l2norm_in_kernel,
-                safe_gate=ctx.safe_gate,
-                lower_bound=ctx.lower_bound,
-                a_log=a_log,
-                dt_bias=dt_bias,
-            ),
+            **ops,
         )
-        return _CudnnKdaBackwardResult(
-            q=dq,
-            k=dk,
-            v=dv,
-            g=dg,
-            beta=dbeta,
-            cu_seqlens=None,
-            first_boundary_end=None,
-            last_boundary_start=None,
-            a_log=da_log if ctx.a_log_present else None,
-            dt_bias=ddt_bias if ctx.dt_bias_present else None,
-            cp_group=None,
-            pre_num_ranks=None,
-            post_num_ranks=None,
-            scale=None,
-            use_qk_l2norm_in_kernel=None,
-            safe_gate=None,
-            lower_bound=None,
+        return (
+            dq,
+            dk,
+            dv,
+            dg,
+            dbeta,
+            None,
+            da_log if a_log is not None else None,
+            ddt_bias if dt_bias is not None else None,
+            None,
+            None,
+            None,
         )
 
 
@@ -584,9 +381,7 @@ def cudnn_chunk_kda(
         scale = 1.0 / math.sqrt(q.shape[-1])
 
     if cp_context is None:
-        cp_group = None
-        pre_num_ranks = post_num_ranks = 0
-        first_boundary_end = last_boundary_start = None
+        cp = None
         if cu_seqlens is None:
             cu_seqlens = torch.arange(
                 0, (batch + 1) * tokens, tokens, dtype=torch.int32, device=q.device
@@ -616,6 +411,9 @@ def cudnn_chunk_kda(
         first_boundary_end, last_boundary_start = _boundary_offsets(
             cp_context.cu_seqlens_cpu, tokens, cu_seqlens.numel()
         )
+        cp = _CPBoundary(
+            cp_group, rank, pre_num_ranks, post_num_ranks, first_boundary_end, last_boundary_start
+        )
 
     tensors, beta_thd, a_log, dt_bias = _prepare_inputs(
         q,
@@ -629,22 +427,34 @@ def cudnn_chunk_kda(
         a_log=a_log,
         dt_bias=dt_bias,
     )
-    if not cu_seqlens.is_contiguous():
-        cu_seqlens = cu_seqlens.contiguous()
-    output = _CudnnKda.apply(
-        *tensors,
-        beta_thd,
-        cu_seqlens,
-        first_boundary_end,
-        last_boundary_start,
-        a_log,
-        dt_bias,
-        cp_group,
-        pre_num_ranks,
-        post_num_ranks,
-        scale,
-        use_qk_l2norm_in_kernel,
-        safe_gate and use_gate_in_kernel,
-        lower_bound,
-    )
+    if cu_seqlens.ndim != 1:
+        raise ValueError("cuDNN KDA expects one-dimensional sequence boundaries")
+    cu_seqlens = cu_seqlens.contiguous()
+    bounded_gate = safe_gate and use_gate_in_kernel
+    options = {
+        "use_qk_l2norm_in_kernel": use_qk_l2norm_in_kernel,
+        "use_beta_sigmoid_in_kernel": False,
+        "safe_gate": bounded_gate,
+        "gate_lower_bound": lower_bound if bounded_gate else None,
+        "gate_domain": "log",
+    }
+    if cp is None:
+        output = kimi_delta_attention(
+            *tensors,
+            beta_thd,
+            cu_seqlens,
+            scale=scale,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            plan_name="kda_frost",
+            **options,
+        )[0]
+        if output.requires_grad:
+            # The public backward only compacts zero-stride dO. Sliced gradients also need
+            # compact THD storage for the cuDNN plan.
+            output.register_hook(torch.Tensor.contiguous)
+    else:
+        output = _ChunkwiseKda.apply(
+            *tensors, beta_thd, cu_seqlens, a_log, dt_bias, scale, cp, options
+        )
     return output.reshape(original_output_shape), None

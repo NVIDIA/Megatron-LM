@@ -74,6 +74,78 @@ def test_cudnn_kda_rejects_unknown_keyword_arguments():
         cudnn_chunk_kda(q, k, v, g, beta, unsupported_option=True)
 
 
+@pytest.mark.parametrize("gate_mode", ["precomputed", "softplus", "bounded"])
+def test_cudnn_kda_gate_precision(gate_mode):
+    """Sub-BF16 differences in gate inputs and parameters survive THD preparation."""
+    from megatron.core.ops.ssm.kda.cudnn_backend import _prepare_inputs
+
+    shape = (1, 4, 2, 64)
+    q = torch.zeros(shape, device="cuda", dtype=torch.bfloat16)
+    g = torch.full(shape, 1 + 2**-9, device=q.device, requires_grad=True)
+    beta = torch.full(shape[:3], 0.5 + 2**-10, device=q.device)
+    a_log = torch.full((2,), 0.5 + 2**-10, device=q.device, requires_grad=True)
+    bias = torch.full((128,), -1 + 2**-9, device=q.device, requires_grad=True)
+    tensors, actual_beta, actual_log, actual_bias = _prepare_inputs(
+        q,
+        q,
+        q,
+        g,
+        beta,
+        use_gate_in_kernel=gate_mode != "precomputed",
+        safe_gate=gate_mode == "bounded",
+        lower_bound=-5.0,
+        a_log=a_log,
+        dt_bias=bias,
+    )
+    torch.testing.assert_close(actual_beta, beta.flatten(0, 1), rtol=0, atol=0)
+    if gate_mode == "softplus":
+        # Independent, higher-precision evaluation of the decay and its VJP.
+        rd, ra, rb = (x.detach().double().requires_grad_() for x in (g, a_log, bias))
+        ref = -ra.exp().view(1, 1, 2, 1) * torch.logaddexp(rd + rb.view(2, 64), rd.new_zeros(()))
+        torch.testing.assert_close(tensors[3], ref.float().flatten(0, 1), rtol=2e-6, atol=0)
+        actual_grads = torch.autograd.grad(tensors[3].sum(), (g, a_log, bias))
+        ref_grads = torch.autograd.grad(ref.sum(), (rd, ra, rb))
+        for actual, expected in zip(actual_grads, ref_grads):
+            torch.testing.assert_close(actual, expected.float(), rtol=2e-6, atol=0)
+    else:
+        torch.testing.assert_close(tensors[3], g.flatten(0, 1), rtol=0, atol=0)
+    if gate_mode == "bounded":
+        torch.testing.assert_close(actual_log, a_log, rtol=0, atol=0)
+        torch.testing.assert_close(actual_bias, bias.view(2, 64), rtol=0, atol=0)
+    else:
+        assert actual_log is None and actual_bias is None
+
+
+@pytest.mark.skipif(Utils.world_size < 4, reason="Requires 4 GPUs")
+def test_cudnn_kda_fp32_boundary_exchange():
+    """BF16 activations carry FP32 states and adjoints across multiple FROST pieces."""
+    from megatron.core.ops.ssm.kda.cudnn_backend import _CPBoundary, _exchange_boundary
+
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=4
+    )
+    try:
+        group = parallel_state.get_context_parallel_group()
+        rank = torch.distributed.get_rank(group)
+        value = torch.zeros((128, 2, 64), device="cuda", dtype=torch.bfloat16)
+        # This value and its first three multiples distinguish FP32 from a BF16 round trip.
+        h = torch.full((1, 2, 64, 64), 1 + 2**-9, device=value.device, dtype=torch.float32)
+        matrix = torch.eye(64, device=value.device).expand_as(h).contiguous()
+        # A single sequence across CP4, then two sequences each split across two adjacent ranks.
+        for pre, post in ((rank, 3 - rank), (rank % 2, 1 - rank % 2)):
+            cp = _CPBoundary(group, rank, pre, post, 128, 0)
+            for reverse in (False, True):
+                sends = pre if reverse else post
+                receives = post if reverse else pre
+                summary = (h, matrix) if sends else None
+                state = _exchange_boundary(summary, value, 64, 2, cp, reverse=reverse)
+                expected = torch.zeros((2, 2, 64, 64), device=value.device, dtype=torch.float32)
+                expected[-1 if reverse else 0] = receives * h[0]
+                torch.testing.assert_close(state, expected, rtol=0, atol=0)
+    finally:
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.parametrize(
     "cp_size",
     [1, pytest.param(4, marks=pytest.mark.skipif(Utils.world_size < 4, reason="Requires 4 GPUs"))],
