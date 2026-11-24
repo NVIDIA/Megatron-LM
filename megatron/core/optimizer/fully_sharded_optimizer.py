@@ -324,10 +324,23 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         ``get_data_parallel_group_if_dtensor`` always sees plain tensors, returns None,
         and the layout is gone by the time the norm is taken.
         """
+        return self._get_grad_norm(self.get_parameters())
+
+    @override
+    @torch.no_grad()
+    def get_dsa_split_grad_norms(self) -> tuple[float, float]:
+        """Compute DSA split norms without assuming a shared dense/expert device mesh."""
+        indexer_params, non_indexer_params = self.get_dsa_split_parameters()
+        indexer_norm = self._get_grad_norm(indexer_params)
+        non_indexer_norm = self._get_grad_norm(non_indexer_params)
+        return indexer_norm.item(), non_indexer_norm.item()
+
+    def _get_grad_norm(self, parameters: List[torch.nn.Parameter]) -> torch.Tensor:
+        """Compute the global L2 norm using each gradient's sharding and replication."""
         total_norm_squared = torch.zeros(
             (), dtype=torch.float32, device=torch.cuda.current_device()
         )
-        for parameter in self.get_parameters():
+        for parameter in parameters:
             # MFSDP v2 reduces into parameter.grad; it never populates decoupled_grad,
             # which is a v1 param-and-grad-buffer concept.
             grad = parameter.grad
