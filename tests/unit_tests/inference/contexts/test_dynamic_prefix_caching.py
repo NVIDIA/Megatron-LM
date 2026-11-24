@@ -103,6 +103,8 @@ class PrefixCachingTestBase:
         enable_chunked_prefill=False,
         num_speculative_tokens=0,
         mtp_num_layers=None,
+        disaggregation_role=None,
+        disaggregation_shards=None,
     ):
         DynamicInferenceContext.ROUNDER = rounder
         DynamicInferenceContext.TOKEN_ROUNDER = rounder
@@ -142,6 +144,8 @@ class PrefixCachingTestBase:
             prefix_caching_eviction_policy=prefix_caching_eviction_policy,
             prefix_caching_mamba_gb=prefix_caching_mamba_gb,
             num_speculative_tokens=num_speculative_tokens,
+            disaggregation_role=disaggregation_role,
+            disaggregation_shards=disaggregation_shards,
         )
         return DynamicInferenceContext(
             model_config=transformer_config, inference_config=inference_config
@@ -1090,6 +1094,28 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert ctx.is_hybrid_model
         assert ctx.mamba_slot_allocator is None
         assert "memory-only" in caplog.text
+
+    @pytest.mark.internal
+    def test_decode_engine_skips_the_mamba_prefix_cache(self, caplog):
+        # A decode engine imports each handoff straight into live SSM state, so it
+        # allocates no Mamba cache from a budget shared with prefill, and does not
+        # warn about memory-only mode: the budget was not forgotten.
+        import logging as _logging
+
+        with caplog.at_level(_logging.WARNING):
+            ctx = self._mctx(disaggregation_role="decode")
+        assert ctx.mamba_slot_allocator is None
+        assert ctx.prefix_caching_mamba_gb is None
+        assert ctx.config.prefix_caching_mamba_gb == 0.01  # the shared config is untouched
+        assert "memory-only" not in caplog.text
+        assert self._mctx(disaggregation_role="prefill").mamba_slot_allocator is not None
+
+    @pytest.mark.internal
+    def test_native_disaggregation_requires_a_role(self):
+        # Without the role a decode context would allocate the Mamba cache from the
+        # budget shared with prefill; native shards always have one to resolve.
+        with pytest.raises(AssertionError, match="disaggregation_role"):
+            self._mctx(disaggregation_shards="tp=1,role=prefill+tp=1,role=decode")
 
     @pytest.mark.internal
     def test_mamba_cache_budget_too_small_raises(self, monkeypatch):

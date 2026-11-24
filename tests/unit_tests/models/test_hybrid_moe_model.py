@@ -78,6 +78,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "cpu_offloading_weights": False,
     "cross_entropy_fusion_impl": "native",
     "cross_entropy_loss_fusion": True,
+    "cross_entropy_mxfp8_grad": False,
     "csa2_candidate_block_size": 0,
     "csa2_candidate_source_layer": None,
     "csa2_candidate_topk_blocks": 0,
