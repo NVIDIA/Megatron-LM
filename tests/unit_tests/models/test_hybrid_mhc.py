@@ -5,13 +5,15 @@ from contextlib import nullcontext
 import pytest
 import torch
 
+from megatron.core.context_parallel.utils import get_batches_on_this_cp_rank
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
-from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+from megatron.core.models.hybrid.hybrid_layer_allocation import MTPSplit, Symbols
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.pipeline_parallel.schedules import custom_backward, deallocate_output_tensor
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.hyper_connection import SinglePassMHCState
@@ -215,6 +217,98 @@ class TestHybridStackMHC:
         for stage, original in zip((first, last), whole.layers):
             for param, ref in zip(stage.layers[0].parameters(), original.parameters()):
                 torch.testing.assert_close(param.grad, ref.grad)
+
+    @pytest.mark.parametrize("packed", [False, True], ids=["attention", "packed-attention-to-mlp"])
+    def test_single_pass_mix_follows_cp_tokens(self, packed):
+        """Compare token ownership and its backward with a same-weight unsharded stack."""
+        if Utils.world_size < 2 or Utils.world_size % 2:
+            pytest.skip("requires a two-rank CP group")
+        Utils.initialize_model_parallel(1, 1, context_parallel_size=2)
+        groups = _get_pg_collection()
+        singleton = ProcessGroupCollection(tp=groups.tp, pp=groups.pp, cp=groups.tp)
+        symbols = [Symbols.ATTENTION, Symbols.MLP] if packed else [Symbols.ATTENTION]
+
+        def build(pg):
+            config = _get_config(
+                len(symbols),
+                mhc_single_pass=True,
+                context_parallel_size=pg.cp.size(),
+                attention_cp_layout="zigzag",
+                linear_cp_layout="contiguous",
+            )
+            return HybridStack(
+                config,
+                submodules=_get_dummy_submodules(),
+                post_layer_norm=False,
+                layer_type_list=symbols,
+                pg_collection=pg,
+            ).cuda()
+
+        whole, part = build(singleton), build(groups)
+        with torch.no_grad():
+            for layer in whole.layers:
+                layer.hyper_connection.alpha_pre.fill_(0.5)
+        part.load_state_dict(whole.state_dict())
+        gen = torch.Generator(device="cuda").manual_seed(11)
+        hidden = torch.randn(8, 1, 32, device="cuda", generator=gen, requires_grad=True)
+        upstream = torch.randn(hidden.shape, device="cuda", generator=gen)
+        shard = slice(4 * groups.cp.rank(), 4 * (groups.cp.rank() + 1))
+        local = hidden.detach()[shard].clone().requires_grad_()
+        kwargs = {}
+        if packed:
+            batch = get_batches_on_this_cp_rank(
+                {
+                    "tokens": torch.arange(8, device="cuda").unsqueeze(0),
+                    "cu_seqlens": torch.tensor([[0, 3, 8]], device="cuda", dtype=torch.int32),
+                    "max_seqlen": torch.tensor(5, device="cuda"),
+                },
+                "contiguous",
+                False,
+                groups.cp,
+                additional_layouts=("zigzag",),
+            )
+            assert (
+                batch.thd_plan.zigzag_local_token_count
+                != batch.thd_plan.contiguous_local_token_count
+            )
+            kwargs = dict(
+                packed_seq_params=batch.get_packed_seq_params(),
+                packed_seq_params_by_layout=batch.packed_seq_params_by_layout,
+                cp_layout_plan=batch.thd_plan,
+            )
+        ref_state, state = SinglePassMHCState(), SinglePassMHCState()
+        ref = whole(hidden, attention_mask=None, mhc_state=ref_state)
+        out = part(local, attention_mask=None, mhc_state=state, **kwargs)
+        torch.testing.assert_close(out, ref[shard], rtol=1e-4, atol=2e-5)
+        torch.testing.assert_close(state.pre_mix, ref_state.pre_mix[shard], rtol=1e-4, atol=2e-5)
+        out.backward(upstream[shard])
+        ref.backward(upstream)
+        torch.testing.assert_close(local.grad, hidden.grad[shard], rtol=1e-4, atol=2e-5)
+        for name, param in part.named_parameters():
+            expected = whole.get_parameter(name).grad
+            if expected is None:
+                assert param.grad is None
+            else:
+                torch.distributed.all_reduce(param.grad, group=groups.cp)
+                torch.testing.assert_close(param.grad, expected, rtol=1e-4, atol=2e-5, msg=name)
+
+    @pytest.mark.parametrize("config_list", [False, True], ids=["pattern", "config-list"])
+    def test_single_pass_rejects_inferred_mtp(self, config_list):
+        config = _get_config(num_layers=1, mhc_single_pass=True)
+        assert config.mtp_num_layers is None
+        if config_list:
+            layer = MLPLayerConfig.from_config(config)
+            architecture = {"hybrid_layer_config_list": [layer, MTPSplit, layer]}
+        else:
+            architecture = {"hybrid_layer_pattern": "-/-"}
+        with pytest.raises(NotImplementedError, match="Single-pass mHC does not support MTP"):
+            HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=64,
+                max_sequence_length=8,
+                **architecture,
+            )
 
     def test_empty_pipeline_stage_preserves_input_after_output_deallocation(self):
         config = _get_config(num_layers=2, deallocate_pipeline_outputs=True)

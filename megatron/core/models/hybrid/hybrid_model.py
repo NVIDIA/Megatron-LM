@@ -425,6 +425,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
 
         # Validate the full architecture, including MTP heads on other pipeline stages.
+        if self.mtp_num_depths and self.config.mhc_single_pass:
+            raise NotImplementedError("Single-pass mHC does not support MTP")
         if self.config.mtp_kl_loss_weight > 0 and (
             self.config.mtp_num_layers is None or self.config.mtp_num_layers <= 0
         ):

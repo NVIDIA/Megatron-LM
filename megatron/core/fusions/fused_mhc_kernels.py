@@ -1257,6 +1257,11 @@ if _CUTILE_AVAILABLE:
             orig_tile = ct.load(
                 orig, index=(pid, 0, ct_idx), shape=(TILE_SIZE, N, TILE_C), padding_mode=PAD_ZERO
             )
+            # Preserve FP32 products when the coefficient gradient has FP32 storage.
+            if g_hp.dtype == ct.float32:
+                x_exp = x_exp.astype(ct.float32)
+            if g_hr.dtype == ct.float32:
+                orig_tile = orig_tile.astype(ct.float32)
             acc_g_hp = acc_g_hp + ct.sum(go_tile * x_exp, axis=2, keepdims=True)
             acc_g_hr = acc_g_hr + ct.sum(
                 ct.expand_dims(orig_tile, axis=2) * ct.expand_dims(go_tile, axis=1), axis=3
@@ -1288,6 +1293,11 @@ if _CUTILE_AVAILABLE:
             orig_tile = ct.load(
                 orig, index=(pid, 0, ct_idx), shape=(TILE_SIZE, N, TILE_C), padding_mode=PAD_ZERO
             )
+            # Preserve FP32 products when the coefficient gradient has FP32 storage.
+            if g_hp.dtype == ct.float32:
+                xb_exp = xb_exp.astype(ct.float32)
+            if g_hr.dtype == ct.float32:
+                orig_tile = orig_tile.astype(ct.float32)
             acc_g_hp = acc_g_hp + ct.sum(go_tile * xb_exp, axis=2, keepdims=True)
             acc_g_hr = acc_g_hr + ct.sum(
                 ct.expand_dims(orig_tile, axis=2) * ct.expand_dims(go_tile, axis=1), axis=3
@@ -2911,6 +2921,9 @@ def _get_triton_h_post_bda_bwd(backend: MHCBackend = "auto"):
 
 def _torch_h_aggregate_bwd(grad_output: Tensor, x: Tensor, h_pre: Tensor) -> Tuple[Tensor, Tensor]:
     grad_output_expanded = grad_output.unsqueeze(2)
+    if h_pre.dtype == torch.float32 and grad_output.dtype in (torch.bfloat16, torch.float16):
+        # Promote before the product and reduction for FP32 mixing coefficients.
+        grad_output_expanded = grad_output_expanded.float()
     grad_x = grad_output_expanded * h_pre.unsqueeze(-1)
     grad_h = torch.sum(grad_output_expanded * x, dim=-1)
     return grad_x.to(dtype=x.dtype), grad_h.to(dtype=h_pre.dtype)

@@ -835,6 +835,10 @@ class HybridStack(MegatronModule):
                             hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
                                 physical_layer_idx, hidden_states
                             )
+                            if mhc_state is not None and mhc_state.pre_mix is not None:
+                                mhc_state.pre_mix, _ = cp_layout_state.prepare_layer(
+                                    physical_layer_idx, mhc_state.pre_mix
+                                )
                         # Keep both residuals in the layer's layout, inside the CP conversions.
                         residual_accumulator = hidden_states
                         layer_padding_mask = padding_mask
@@ -936,6 +940,10 @@ class HybridStack(MegatronModule):
                             hidden_states = cp_layout_state.finalize_layer(
                                 physical_layer_idx, hidden_states
                             )
+                            if mhc_state is not None and mhc_state.pre_mix is not None:
+                                mhc_state.pre_mix = cp_layout_state.finalize_layer(
+                                    physical_layer_idx, mhc_state.pre_mix
+                                )
 
                     if residual_stream_recompute_context is not None:
                         residual_stream_recompute_context.finalize(hidden_states)

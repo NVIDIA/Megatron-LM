@@ -641,6 +641,53 @@ def test_single_pass_mhc_replays_bit_exact(backend, dtype):
     )
 
 
+@pytest.mark.parametrize("backend", ["triton", "auto"])
+def test_single_pass_read_fp32_mix_gradient(backend, monkeypatch):
+    """A low-precision activation must not round the predecessor's FP32 gradient."""
+    if not fused_mhc_kernels.is_triton_available():
+        pytest.skip("requires Triton")
+    monkeypatch.setattr(fused_mhc_kernels, "is_cutile_available", lambda: False)
+    x = torch.full((1, 1, 4, 16), 1 / 8192, device="cuda", dtype=torch.bfloat16)
+    x[..., 0] = 1
+    x.requires_grad_()
+    mix = torch.ones(x.shape[:-1], device="cuda", requires_grad=True)
+    out = fused_mhc_kernels.fused_h_aggregate(x, mix, backend=backend)
+    dx, dmix = torch.autograd.grad(out, (x, mix), torch.ones_like(out))
+    torch.testing.assert_close(dmix, x.float().sum(-1), rtol=0, atol=0)
+    torch.testing.assert_close(dx, torch.ones_like(x), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_single_pass_cutile_write_fp32_mix_gradients(with_bias):
+    """BF16 products have FP32 coefficient gradients before the activation store."""
+    if not fused_mhc_kernels.is_cutile_available():
+        pytest.skip("requires cuTile")
+    row = torch.zeros(1, 1, 32, device="cuda", dtype=torch.bfloat16)
+    row[..., :16] = 1.0078125
+    scales = torch.tensor([1, 2, 4, 8], device="cuda").view(1, 1, 4, 1)
+    orig = (row.unsqueeze(-2) * scales).requires_grad_()
+    dy = (row.unsqueeze(-2) / scales).to(torch.bfloat16)
+    x = row.clone().requires_grad_()
+    hr = torch.arange(16, device="cuda", dtype=torch.float32).reshape(1, 1, 4, 4) / 8
+    hr.requires_grad_()
+    hp = scales.flatten(-2).float().requires_grad_()
+    bias = torch.full((32,), 0.125, device="cuda", requires_grad=True) if with_bias else None
+    inputs = (hr, orig, hp, x) if bias is None else (hr, orig, hp, x, bias)
+    out = fused_mhc_kernels.fused_h_post_bda(
+        hr, orig, hp, x if bias is None else x.float(), bias, backend="cutile", output_dtype=x.dtype
+    )
+    branch = x.float() if bias is None else x.float() + bias
+    expected = (
+        (hr.unsqueeze(-1) * orig.float().unsqueeze(-2)).sum(-3)
+        + hp.unsqueeze(-1) * branch.unsqueeze(-2)
+    ).to(x.dtype)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    for actual, ref in zip(
+        torch.autograd.grad(out, inputs, dy), torch.autograd.grad(expected, inputs, dy)
+    ):
+        torch.testing.assert_close(actual, ref, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("backend", _MHC_BACKENDS)
 def test_mhc_h_aggregate_replays_fwd_bwd(backend):
     if backend == "triton" and not fused_mhc_kernels.is_triton_available():
