@@ -79,8 +79,8 @@ def get_shard_ranks(buffer: DBuffer) -> list[int]:
 def get_sorted_rank_ranges(buffer: DBuffer) -> dict[int, Range]:
     """Return sharded buffer ranges keyed by global rank, in buffer offset order.
 
-    They depend only on the buffer's mesh, placements, and layout, so callers that gather or
-    scatter many buffers sharing them can compute the ranges once and pass them as `rank_ranges`.
+    They depend only on the buffer's mesh, placements, and layout, so a caller that gathers or
+    scatters the same buffers every step computes them once and passes them as `rank_ranges`.
     """
     mesh = buffer.mesh
     rank_ranges = [
@@ -95,7 +95,7 @@ def gather(
     destination: dict[int, torch.Tensor],
     *,
     tensor_to_owner: dict[int, int],
-    rank_ranges: dict[int, Range] | None = None,
+    rank_ranges: dict[int, Range],
     transport: Transport | None = None,
 ) -> list[dist.Work]:
     """Gather full tensors from local chunks to their owners via P2P.
@@ -117,7 +117,7 @@ def gather(
             does not own are never written to.
         tensor_to_owner: Participating tensor index to owner global rank. Each owner must
             hold a nonempty shard of its tensor; see `assign_owner_work`.
-        rank_ranges: `get_sorted_rank_ranges(source)`, if the caller already has it.
+        rank_ranges: `get_sorted_rank_ranges(source)`.
         transport: Moves the transfers instead of NCCL P2P.
 
     Returns:
@@ -127,8 +127,6 @@ def gather(
     mesh = source.mesh
     this_rank = mesh.get_rank()
     layout = source.layout
-    if rank_ranges is None:
-        rank_ranges = get_sorted_rank_ranges(source)
 
     # Send non-owned chunks to their owners, receive owned ones.
     transfers: list[Transfer] = []
@@ -171,7 +169,7 @@ def scatter(
     destination: DBuffer,
     *,
     tensor_to_owner: dict[int, int],
-    rank_ranges: dict[int, Range] | None = None,
+    rank_ranges: dict[int, Range],
     transport: Transport | None = None,
 ) -> list[dist.Work]:
     """Scatter full result tensors from the owners to the other ranks via P2P.
@@ -194,7 +192,7 @@ def scatter(
             be a separate scratch DBuffer for updates the caller will apply later.
         tensor_to_owner: Participating tensor index to owner global rank. Each owner must
             hold a nonempty shard of its tensor; see `assign_owner_work`.
-        rank_ranges: `get_sorted_rank_ranges(destination)`, if the caller already has it.
+        rank_ranges: `get_sorted_rank_ranges(destination)`.
         transport: Moves the transfers instead of NCCL P2P.
 
     Returns:
@@ -204,8 +202,6 @@ def scatter(
     mesh = destination.mesh
     this_rank = mesh.get_rank()
     layout = destination.layout
-    if rank_ranges is None:
-        rank_ranges = get_sorted_rank_ranges(destination)
 
     # Send owned result chunks, receive the ones held here.
     transfers: list[Transfer] = []
