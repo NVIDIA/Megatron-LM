@@ -66,10 +66,6 @@ inputs:
     description: "Git ref to check out. Must match the SHA used by the upstream parse step so recipes don't diverge between scheduling and execution."
     required: false
     default: ""
-  checkout:
-    description: "Check out sha. Set to false when the caller already prepared the workspace, e.g. a Testmon checkout."
-    required: false
-    default: "true"
   unit_testmon_mode:
     description: "Unit-test mode: full, enforce, preselected (CPU plan), or baseline (main producer only)."
     required: false
@@ -86,12 +82,16 @@ inputs:
     description: "Artifact containing the CPU-selected plan.json for this bucket."
     required: false
     default: ""
+  unit_testmon_checkout_artifact_id:
+    description: "Optional PR checkout prepared on a shared Testmon baseline."
+    required: false
+    default: ""
   unit_testmon_baseline_sha:
-    description: "Source commit of the pinned Testmon cache when the caller prepared the checkout."
+    description: "Source commit of the pinned Testmon cache for a prepared checkout."
     required: false
     default: ""
   unit_testmon_generation:
-    description: "Pinned Testmon cache generation when the caller prepared the checkout."
+    description: "Pinned Testmon cache generation for a prepared checkout."
     required: false
     default: ""
 runs:
@@ -101,10 +101,8 @@ runs:
       shell: bash -x -e -u -o pipefail {0}
       run: echo "node_name=$NODE_NAME" | tee -a "$GITHUB_OUTPUT"
 
-    # Callers switch the workspace before this action loads; switching it here would
-    # replace this file while it runs and break the runner's post-job cleanup.
     - name: Checkout repository
-      if: inputs.checkout != 'false'
+      if: inputs.unit_testmon_checkout_artifact_id == ''
       uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       with:
         ref: ${{ inputs.sha }}
