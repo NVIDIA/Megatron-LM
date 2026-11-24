@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import enum
+import functools
 import importlib
 import inspect
 import io
@@ -36,7 +37,11 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_world_size,
     model_parallel_is_initialized,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    resolve_gtp_remat_group,
+    warn_global_process_group_fallback,
+)
 from megatron.core.quantization.quant_config import QuantizationConfig
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_observation import suspend_tensor_observations
@@ -2343,6 +2348,11 @@ class TEGatedDeltaNetAttention(torch.nn.Module):
 _te_dpa_supports_softcap = (
     "softcap" in inspect.signature(te.pytorch.DotProductAttention.__init__).parameters
 )
+_te_dpa_supports_no_load_balance = (
+    hasattr(getattr(te.pytorch, "CPLoadBalancingStrategy", None), "NO_LOAD_BALANCE")
+    and "load_balancing_strategy"
+    in inspect.signature(te.pytorch.DotProductAttention.set_context_parallel_group).parameters
+)
 
 
 class TEDotProductAttention(te.pytorch.DotProductAttention):
@@ -2406,22 +2416,23 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             )
 
         if pg_collection is None:
+            warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection(
                 tp=get_tensor_model_parallel_group(check_initialized=False),
                 cp=get_context_parallel_group(check_initialized=False),
                 hcp=get_hierarchical_context_parallel_groups(check_initialized=False),
             )
         else:
-            assert hasattr(
-                pg_collection, "tp"
-            ), "TEDotProductAttention pg_collection must have tp pg"
-            assert hasattr(
-                pg_collection, "cp"
-            ), "TEDotProductAttention pg_collection must have cp pg"
-            if cp_comm_type == "a2a+p2p":
-                assert hasattr(
-                    pg_collection, "hcp"
-                ), "TEDotProductAttention pg_collection must have hierarchical cp pg"
+            # ProcessGroupCollection returns None for a group that was never set, so a hasattr
+            # check cannot detect a missing one. cp is only read when context parallelism is on.
+            groups = vars(pg_collection)
+            if groups.get("tp") is None:
+                raise ValueError("TEDotProductAttention pg_collection must have a tp process group")
+            if groups.get("cp") is None and self.config.context_parallel_size > 1:
+                raise ValueError(
+                    "TEDotProductAttention pg_collection must have a cp process group when "
+                    "context_parallel_size > 1"
+                )
         self._tp_group = pg_collection.tp
 
         if is_te_min_version("0.10.0"):
@@ -2453,9 +2464,14 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                         "hierarchical cp commucation."
                     )
                     extra_kwargs["cp_comm_type"] = "a2a+p2p"
-                    extra_kwargs["cp_group"] = get_hierarchical_context_parallel_groups(
-                        check_initialized=False
-                    )
+                    # The global-group fallbacks and use_mpu_process_groups() carry hcp; a
+                    # collection built for another grid must set it.
+                    if vars(pg_collection).get("hcp") is None:
+                        raise ValueError(
+                            "TEDotProductAttention with cp_comm_type='a2a+p2p' requires "
+                            "pg_collection.hcp (the hierarchical context-parallel groups)"
+                        )
+                    extra_kwargs["cp_group"] = pg_collection.hcp
                 else:
                     extra_kwargs["cp_comm_type"] = cp_comm_type
 
@@ -2558,6 +2574,54 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             **extra_kwargs,
         )
 
+        if self.config.attention_cp_layout == "contiguous":
+            self.fused_attention.register_forward_hook(
+                self._make_fused_cp_grad_contiguous, with_kwargs=True
+            )
+            cp_comm_type = cp_comm_type or self.cp_comm_type
+            cp_groups = self.cp_group if isinstance(self.cp_group, list) else [self.cp_group]
+            if any(get_pg_size(group) > 1 for group in cp_groups):
+                if cp_comm_type != "all_gather":
+                    raise ValueError("Contiguous attention CP requires cp_comm_type='all_gather'.")
+                if not _te_dpa_supports_no_load_balance:
+                    raise RuntimeError(
+                        "Contiguous attention CP requires a Transformer Engine build with "
+                        "CPLoadBalancingStrategy.NO_LOAD_BALANCE support."
+                    )
+                if self.attention_type != "self":
+                    raise ValueError("Contiguous attention CP only supports self-attention.")
+            self.set_context_parallel_group(
+                self.cp_group, self.cp_global_ranks, self.cp_stream, cp_comm_type
+            )
+
+    @staticmethod
+    def _make_fused_cp_grad_contiguous(_module, _inputs, kwargs, output):
+        """Work around TE's fused THD all-gather backward ignoring gradient strides."""
+        if (
+            kwargs.get("qkv_layout", "").startswith("t")
+            and kwargs.get("cp_comm_type") == "all_gather"
+            and get_pg_size(kwargs.get("cp_group")) > 1
+        ):
+            output = output[0] if isinstance(output, tuple) else output
+            if output.requires_grad:
+                output.register_hook(lambda grad: grad.contiguous())
+
+    def set_context_parallel_group(
+        self, cp_group, cp_global_ranks, cp_stream, cp_comm_type="p2p", load_balancing_strategy=None
+    ):
+        """Keep TE's partition strategy consistent when a caller rebinds the CP group."""
+        cp_groups = cp_group if isinstance(cp_group, list) else [cp_group]
+        if self.config.attention_cp_layout == "contiguous" and any(
+            get_pg_size(group) > 1 for group in cp_groups
+        ):
+            load_balancing_strategy = te.pytorch.CPLoadBalancingStrategy.NO_LOAD_BALANCE
+        kwargs = {}
+        if load_balancing_strategy is not None:
+            kwargs["load_balancing_strategy"] = load_balancing_strategy
+        super().set_context_parallel_group(
+            cp_group, cp_global_ranks, cp_stream, cp_comm_type, **kwargs
+        )
+
     @contextmanager
     def _temporary_runtime_context_parallel_group(
         self, packed_seq_params: Optional[PackedSeqParams]
@@ -2576,11 +2640,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             if runtime_cp_group.size() == 1:
                 # Dynamic CP metadata retains the singleton group, while TE
                 # must see CP disabled for this microbatch.
-                super().set_context_parallel_group(None, None, None, self.cp_comm_type)
+                self.set_context_parallel_group(None, None, None, self.cp_comm_type)
             else:
                 if TEDotProductAttention.cp_stream is None:
                     TEDotProductAttention.cp_stream = torch.cuda.Stream()
-                super().set_context_parallel_group(
+                self.set_context_parallel_group(
                     runtime_cp_group,
                     torch.distributed.get_process_group_ranks(runtime_cp_group),
                     TEDotProductAttention.cp_stream,
@@ -2589,9 +2653,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             yield
         finally:
             if original_cp_group is None or original_cp_group.size() == 1:
-                super().set_context_parallel_group(None, None, None, self.cp_comm_type)
+                self.set_context_parallel_group(None, None, None, self.cp_comm_type)
             else:
-                super().set_context_parallel_group(
+                self.set_context_parallel_group(
                     original_cp_group,
                     original_cp_global_ranks,
                     TEDotProductAttention.cp_stream,
@@ -2651,6 +2715,48 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             else {}
         )
         qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
+
+        if self.config.attention_cp_layout == "contiguous" and get_pg_size(self.cp_group) > 1:
+            if attention_bias is not None:
+                raise ValueError("Contiguous attention CP does not support attention bias.")
+            if qkv_format == "sbhd":
+                if attn_mask_type != AttnMaskType.causal:
+                    raise ValueError(
+                        "Padded contiguous attention CP requires THD sequence metadata."
+                    )
+                # Adapt dense inputs to the THD format required by TE's no-load-balance CP.
+                from transformer_engine.pytorch.attention.dot_product_attention.utils import (
+                    get_full_cu_seqlens,
+                )
+
+                seq_length = query.size(0) * self.cp_group.size()
+                cu_seqlens = get_full_cu_seqlens(1, seq_length, query.device)
+                sample_params = PackedSeqParams(
+                    qkv_format="thd",
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_kv=cu_seqlens,
+                    cu_seqlens_q_padded=cu_seqlens,
+                    cu_seqlens_kv_padded=cu_seqlens,
+                    max_seqlen_q=seq_length,
+                    max_seqlen_kv=seq_length,
+                    pad_between_seqs=False,
+                )
+                outputs = [
+                    self._forward(
+                        q.contiguous(),
+                        k.contiguous(),
+                        v.contiguous(),
+                        None,
+                        attn_mask_type,
+                        packed_seq_params=sample_params,
+                        num_splits=num_splits,
+                        bf16_backward=bf16_backward,
+                    )
+                    for q, k, v in zip(query.unbind(1), key.unbind(1), value.unbind(1))
+                ]
+                return outputs[0].unsqueeze(1) if len(outputs) == 1 else torch.stack(outputs, dim=1)
+            if qkv_format != "thd":
+                raise ValueError("Contiguous attention CP requires SBHD or THD input.")
 
         attention_bias_kwargs = {}
         if attention_bias is not None:
@@ -2821,6 +2927,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             # The comms between TP and EP group is explicitly handled by MoE token dispatcher.
             # So we disable comms by making TE agnostic of model parallel.
             if pg_collection is None:
+                warn_global_process_group_fallback(type(self).__name__)
                 pg_collection = ProcessGroupCollection.use_mpu_process_groups()
             self._pg_collection = pg_collection
             assert is_expert, "TEGroupedLinear only supports expert parallelism"
@@ -4100,6 +4207,9 @@ try:
     _TE_FUSED_PARALLEL_CE_RETURN_ARGMAX = (
         "return_argmax" in inspect.signature(parallel_cross_entropy).parameters
     )
+    _TE_FUSED_PARALLEL_CE_GRAD_QUANTIZER = (
+        "grad_quantizer" in inspect.signature(parallel_cross_entropy).parameters
+    )
     current_te_version = get_te_version()
 
     def te_parallel_cross_entropy(
@@ -4109,11 +4219,15 @@ try:
         is_cg_capturable: bool = False,
         overwrite_input: bool = True,
         return_argmax: bool = False,
+        grad_fp8_format: Optional[str] = None,
     ):
         """Wrapper function for TE's Cross Entropy Loss kernel
 
         With ``return_argmax``, returns ``(loss, argmax)``: the argmax of each row over the full
         vocabulary, found by the loss kernel, or None if this TE version cannot return it.
+
+        With ``grad_fp8_format`` ('e4m3' or 'e5m2'), backward returns the gradient of the logits
+        as an MXFP8 tensor in that format, for an MXFP8 LM head.
         """
         parallel_cross_entropy_kwargs = {
             "label_smoothing": 0.0,
@@ -4129,11 +4243,29 @@ try:
             parallel_cross_entropy_kwargs["is_cg_capturable"] = is_cg_capturable
             # According to TE CrossEntropyFunction, ignore_idx defaults to -100
             parallel_cross_entropy_kwargs["ignore_idx"] = -100
+        if grad_fp8_format is not None:
+            parallel_cross_entropy_kwargs["grad_quantizer"] = _mxfp8_grad_quantizer(grad_fp8_format)
         if return_argmax:
             if not _TE_FUSED_PARALLEL_CE_RETURN_ARGMAX:
                 return parallel_cross_entropy(logits, labels, **parallel_cross_entropy_kwargs), None
             parallel_cross_entropy_kwargs["return_argmax"] = True
         return parallel_cross_entropy(logits, labels, **parallel_cross_entropy_kwargs)
+
+    @functools.lru_cache(maxsize=None)
+    def _mxfp8_grad_quantizer(grad_fp8_format: str):
+        """MXFP8 quantizer (row-wise and column-wise) for the gradient of the logits."""
+        if not _TE_FUSED_PARALLEL_CE_GRAD_QUANTIZER:
+            raise RuntimeError(
+                "An MXFP8 cross entropy gradient (cross_entropy_mxfp8_grad) requires a "
+                "Transformer Engine whose parallel_cross_entropy accepts grad_quantizer."
+            )
+        import transformer_engine_torch as tex
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
+        fp8_dtypes = {"e4m3": tex.DType.kFloat8E4M3, "e5m2": tex.DType.kFloat8E5M2}
+        if grad_fp8_format not in fp8_dtypes:
+            raise ValueError(f"grad_fp8_format must be 'e4m3' or 'e5m2', got {grad_fp8_format!r}")
+        return MXFP8Quantizer(fp8_dtypes[grad_fp8_format], rowwise=True, columnwise=True)
 
 except ImportError:
     te_parallel_cross_entropy = None  # type: ignore[assignment, misc]
@@ -4147,10 +4279,13 @@ def te_cross_entropy(
     cuda_graph_capturable: bool = False,
     overwrite_input: bool = True,
     return_argmax: bool = False,
+    grad_fp8_format: str | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
     """Adapt TE cross entropy to the backend target signature and required label stride.
 
     With ``return_argmax``, returns ``(loss, argmax)`` as ``te_parallel_cross_entropy`` does.
+    With ``grad_fp8_format``, backward returns an MXFP8 gradient of the logits, as
+    ``te_parallel_cross_entropy`` does.
     """
     if te_parallel_cross_entropy is None:
         raise RuntimeError("Trying to use a TE block when it's not present.")
@@ -4162,6 +4297,7 @@ def te_cross_entropy(
         cuda_graph_capturable,
         overwrite_input=overwrite_input,
         return_argmax=return_argmax,
+        grad_fp8_format=grad_fp8_format,
     )
 
 

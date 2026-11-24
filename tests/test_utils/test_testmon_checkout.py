@@ -152,8 +152,43 @@ def test_baseline_lookup_excludes_build_only_forks_and_retries(monkeypatch):
         {**candidate, "head_repository": {"full_name": "fork/Megatron-LM"}},
         candidate,
     ]
-    monkeypatch.setattr(checkout, "run", lambda *args: json.dumps({"workflow_runs": candidates}))
+    publishers, published_jobs = [], {}
+
+    def fake_run(*args):
+        url = args[2]
+        if "publish-testmon-cache.yml" in url:
+            return json.dumps({"workflow_runs": publishers})
+        if url.endswith("/jobs?per_page=100"):
+            return json.dumps(published_jobs.get(url.split("/")[-2], []))
+        return json.dumps({"workflow_runs": candidates})
+
+    monkeypatch.setattr(checkout, "run", fake_run)
     assert checkout.latest_baseline() == ("a" * 40, "123-1")
+
+    # Published merge-group baselines win, including manual republishes of older
+    # commits; forks, other events and publishers without baselines are skipped.
+    publisher = {"head_repository": {"full_name": checkout.REPOSITORY}, "event": "push"}
+    publishers.extend(
+        [
+            {**publisher, "id": 454, "event": "schedule"},
+            {**publisher, "id": 455, "head_repository": {"full_name": "fork/Megatron-LM"}},
+            {**publisher, "id": 456},
+            {**publisher, "id": 457, "event": "workflow_dispatch"},
+        ]
+    )
+    published = "Publish unit-testmon-v1-main-dgx_h100-0123456789abcdef-1 from run {} at {}"
+    published_jobs.update(
+        {
+            "454": [published.format(1, "d" * 40)],
+            "455": [published.format(2, "d" * 40)],
+            "456": ["Find merge-group baselines"],
+            "457": ["Find merge-group baselines", published.format(789, "c" * 40)],
+        }
+    )
+    assert checkout.latest_baseline() == ("c" * 40, "789-1")
+    published_jobs.clear()
+    assert checkout.latest_baseline() == ("a" * 40, "123-1")
+
     candidates.pop()
     with pytest.raises(ValueError, match="No successful first-attempt"):
         checkout.latest_baseline()
