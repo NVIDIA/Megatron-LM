@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import os
 from typing import Any
 
@@ -30,7 +30,7 @@ from megatron.energon import (
     get_val_datasets,
 )
 from megatron.energon.errors import log_exception
-from megatron.training import get_args, get_train_state
+from megatron.training import get_args, get_run_config, get_train_state
 from megatron.training.checkpointing import get_checkpoint_name
 
 
@@ -39,16 +39,29 @@ def use_new_dataloader_path():
     return args.packing_buffer_size is not None or getattr(args, "use_new_dataloader_path", False)
 
 
-def datasets_provider(task_encoder, worker_config=None):
+def datasets_provider(
+    task_encoder,
+    worker_config=None,
+    *,
+    sequence_length=None,
+    packing_sequence_length=None,
+    image_token_budget=None,
+):
     """Create multimodal train, validation and test datasets."""
     args = get_args()
 
-    if use_new_dataloader_path():
-        train_task_encoder = MultiModalTaskEncoder()
-        val_task_encoder = MultiModalTaskEncoder(is_val=True)
+    length_inputs = dict(
+        sequence_length=sequence_length, packing_sequence_length=packing_sequence_length
+    )
+    if task_encoder is not None:
+        # MIMO supplies its own Energon encoder, including its sequence limits.
+        train_task_encoder = val_task_encoder = task_encoder
+    elif use_new_dataloader_path():
+        train_task_encoder = MultiModalTaskEncoder(**length_inputs)
+        val_task_encoder = MultiModalTaskEncoder(is_val=True, **length_inputs)
     else:
-        train_task_encoder = TaskEncoder()
-        val_task_encoder = TaskEncoder()
+        train_task_encoder = TaskEncoder(image_token_budget=image_token_budget, **length_inputs)
+        val_task_encoder = TaskEncoder(image_token_budget=image_token_budget, **length_inputs)
 
     dname = args.data_path[0] if type(args.data_path) is list else args.data_path
     train_dataset = get_train_dataset(
@@ -126,8 +139,27 @@ def is_dataloader_rank(
     return is_first_rank
 
 
+def validate_length_inputs(args, *, sequence_length, packing_sequence_length):
+    """Check the encoder length inputs on every rank.
+
+    Only the loader ranks build the task encoders, so an error raised there would leave the other
+    ranks waiting in the first collective; the provider checks before its loader-rank early return.
+    """
+    packing = args.packing_buffer_size is not None and args.packing_buffer_size > 0
+    if packing and not (packing_sequence_length and packing_sequence_length > 0):
+        raise ValueError("--packing-buffer-size needs --packing-seq-length > 0")
+    if sequence_length and packing_sequence_length and sequence_length < packing_sequence_length:
+        raise ValueError("--dataloader-seq-length must be >= --packing-seq-length")
+
+
 def train_valid_test_dataloaders_provider(
-    train_val_test_num_samples, task_encoder=None, *, restore_dataloader_state=True
+    train_val_test_num_samples,
+    task_encoder=None,
+    *,
+    restore_dataloader_state=True,
+    sequence_length=None,
+    packing_sequence_length=None,
+    image_token_budget=None,
 ):
     """Build dataloaders, optionally skipping state restoration for a length-only probe."""
     args = get_args()
@@ -140,7 +172,9 @@ def train_valid_test_dataloaders_provider(
         )
 
     if task_encoder is None:
-        task_encoder = TaskEncoder()
+        validate_length_inputs(
+            args, sequence_length=sequence_length, packing_sequence_length=packing_sequence_length
+        )
 
     # Dataloader is only on specific ranks.
     if not is_dataloader_rank(
@@ -169,7 +203,13 @@ def train_valid_test_dataloaders_provider(
         global_error_handler=compact_sample_error_handler,
         restore_error_handler=compact_sample_error_handler,
     )
-    train_ds, valid_ds1, test_ds = datasets_provider(task_encoder, worker_config)
+    train_ds, valid_ds1, test_ds = datasets_provider(
+        task_encoder,
+        worker_config,
+        sequence_length=sequence_length,
+        packing_sequence_length=packing_sequence_length,
+        image_token_budget=image_token_budget,
+    )
 
     if use_new_dataloader_path():
         prefetch_kwargs = {}
@@ -192,9 +232,11 @@ def train_valid_test_dataloaders_provider(
     # The full-dataset length probe runs before model checkpoint loading. Its
     # temporary loader must not restore state; the real loader below model setup
     # uses the checkpoint's resolved iteration and retains strict restore checks.
-    if restore_dataloader_state and args.load is not None:
+    checkpoint = get_run_config().checkpoint
+    if restore_dataloader_state and checkpoint.load is not None:
         if getattr(args, "dataloader_save", None):
-            iteration = get_train_state().iteration
+            train_state = get_train_state()
+            iteration = train_state.iteration
             dp_rank = parallel_state.get_data_parallel_rank()
             strict_load = should_strictly_load_dataloader_state(args)
             data_save_name = get_checkpoint_name(
@@ -205,7 +247,7 @@ def train_valid_test_dataloaders_provider(
                 basename=f"train_dataloader_dprank{dp_rank:03d}.pt",
             )
             if not os.path.exists(data_save_name):
-                if is_initial_checkpoint_load_without_dataloader_state(args, iteration):
+                if is_initial_checkpoint_load_without_dataloader_state(train_state, checkpoint):
                     if dp_rank == 0:
                         print(
                             f"Dataset state {data_save_name} does not exist for the initial "

@@ -52,7 +52,7 @@ def test_full_iteration_fp32_accumulation_scratch_lifetime(monkeypatch):
     world_size = group.size()
     if world_size <= 2:
         pytest.skip("FP32-accumulation reduce-scatter requires more than two ranks")
-    assert not gtp.is_gtp_symm_pool_registered(group)
+    assert not gtp.uses_gtp_symm_pool(group, collective="rs")
     monkeypatch.setattr(gtp, "_wgrad_buf_pool", {})
     monkeypatch.setattr(gtp, "_FULL_ITERATION", True)
     monkeypatch.setattr(gtp.GTP_CONFIG, "async_reduction", True)

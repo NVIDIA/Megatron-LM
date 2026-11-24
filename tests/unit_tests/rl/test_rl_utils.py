@@ -789,7 +789,7 @@ class TestRLUtils:
         cfg.rl.rl_offload_optimizer_during_inference = True
         cfg.validate()
         assert not cfg.ddp.grad_buffer_offload
-        cfg.rl.finalize_ddp_config(cfg.ddp)
+        cfg.finalize()
         assert cfg.ddp.grad_buffer_offload
 
     def test_rl_optimizer_offload_rejects_mxfp8_grad_buffer_aliasing(self):
@@ -804,7 +804,7 @@ class TestRLUtils:
         )
         cfg = pretrain_cfg_container_from_args(args)
         # Global setup validates the config, so introduce the invalid combination afterward.
-        cfg.ddp.reuse_grad_buf_for_mxfp8_param_ag = True
+        cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag = True
         with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
             cfg.validate()
         assert not cfg.ddp.grad_buffer_offload
@@ -975,7 +975,14 @@ class TestRLUtils:
 
         monkeypatch.setattr(rl_utils, "get_args", lambda: args)
         monkeypatch.setattr(rl_utils, "get_train_state", lambda: train_state)
-        monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=rl_config))
+        monkeypatch.setattr(
+            rl_utils,
+            "get_run_config",
+            lambda: SimpleNamespace(
+                rl=rl_config,
+                model=SimpleNamespace(transformer=SimpleNamespace(max_seq_length_per_sample=SEQ)),
+            ),
+        )
         monkeypatch.setattr(
             rl_utils, "megatron_rl_inference_mode", lambda *_a, **_k: nullcontext(MagicMock())
         )
@@ -1351,7 +1358,7 @@ class TestRLUtils:
         not torch.cuda.is_available(), reason="train_rl.py's loss_func runs on CUDA"
     )
     @pytest.mark.parametrize("packing", [False, True])
-    def test_forward_step_reports_samples_seen(self, monkeypatch, packing):
+    def test_forward_step_reports_samples_seen(self, monkeypatch, run_config, packing):
         """train_rl.py's loss function reports the microbatch's sequence count as _samples_seen:
         the sequences packed into the bin, or the batch size; the loop sums the reports."""
         with patch("logging.basicConfig"):  # train_rl.py reconfigures the root logger on import
@@ -1376,18 +1383,9 @@ class TestRLUtils:
         monkeypatch.setattr(train_rl, "is_pipeline_last_stage", lambda: True)
         monkeypatch.setattr(train_rl, "get_logprobs", lambda *a, **k: values)
         monkeypatch.setattr(train_rl, "calculate_grpo_loss", lambda **k: (values,) * 6)
-        monkeypatch.setattr(
-            train_rl,
-            "get_run_config",
-            lambda: SimpleNamespace(rl=RLConfig(rl_use_sequence_packing=packing)),
-        )
-        monkeypatch.setattr(
-            train_rl,
-            "get_args",
-            lambda: SimpleNamespace(
-                check_for_nan_in_loss_and_grad=False, check_for_spiky_loss=False
-            ),
-        )
+        run_config.rl.rl_use_sequence_packing = packing
+        run_config.rerun_state_machine.check_for_nan_in_loss = False
+        monkeypatch.setattr(train_rl, "get_args", SimpleNamespace)
         if packing:
             seq_indices = [11, 12, 13, 14, 15]
             monkeypatch.setattr(
@@ -2335,7 +2333,6 @@ class TestRLUtils:
                 trajs_batch_size=micro_batch_size,
                 seq_length=sequence_length,
                 logprobs_batch_size=micro_batch_size,
-                decoder_seq_length=sequence_length,
                 dtype=torch.bfloat16,
                 pp_group=gpt_model.pg_collection.pp,
                 is_correction=False,

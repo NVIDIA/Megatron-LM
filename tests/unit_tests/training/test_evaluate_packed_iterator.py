@@ -47,8 +47,20 @@ def test_evaluate_stops_cleanly_when_packed_iterator_runs_out(monkeypatch, compl
         consumed_valid_samples=0,
     )
     cfg = SimpleNamespace(
+        data=SimpleNamespace(dataset=None),
+        get_batch_parallel_size=lambda: 1,
+        model=SimpleNamespace(
+            transformer=SimpleNamespace(
+                cuda_graph_impl="none",
+                moe_expert_rank_capacity_factor=None,
+                max_seq_length_per_sample=8,
+            )
+        ),
         validation=SimpleNamespace(
-            eval_global_batch_size=1, eval_micro_batch_size=1, eval_iters=completed_steps + 2
+            eval_global_batch_size=1,
+            eval_micro_batch_size=1,
+            eval_iters=completed_steps + 2,
+            eval_empty_cuda_cache=False,
         ),
         train=SimpleNamespace(empty_unused_memory_level=0, exit_duration_in_mins=None),
     )
@@ -80,6 +92,9 @@ def test_evaluate_stops_cleanly_when_packed_iterator_runs_out(monkeypatch, compl
 
     assert not exited
     assert forward_backward.call_count == completed_steps
+    for call in forward_backward.call_args_list:
+        assert call.kwargs["seq_length"] == 8
+        assert "decoder_seq_length" not in call.kwargs
     # FT skips the warmup eval step and monitors each later step in a "step" section.
     assert client.closed_sections == ["step"] * max(completed_steps - 1, 0)
     assert not client.open_sections
