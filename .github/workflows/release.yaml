@@ -32,6 +32,14 @@ on:
         required: true
         default: true
         type: boolean
+      publish-target:
+        description: Package index for a real upload; dry-run always disables uploads
+        required: true
+        type: choice
+        default: pypi
+        options:
+          - pypi
+          - testpypi
       create-gh-release:
         description: Create a GitHub release
         required: true
@@ -58,7 +66,6 @@ on:
         default: ""
 
 permissions:
-  id-token: write
   contents: write
   pull-requests: write
 
@@ -77,11 +84,30 @@ jobs:
       - name: Validate release-ref is a commit SHA
         env:
           RELEASE_REF: ${{ inputs.release-ref || github.sha }}
+          IS_PRODUCTION: ${{ github.event_name == 'workflow_dispatch' && !inputs.dry-run && inputs.publish-target == 'pypi' }}
         run: |
           if ! echo "$RELEASE_REF" | grep -qE '^[0-9a-f]{40}$'; then
             echo "::error::release-ref must be a full 40-character commit SHA, not a branch name."
             exit 1
           fi
+          if [[ "$IS_PRODUCTION" == "true" && "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Production publishing must run from main; select the release commit with release-ref."
+            exit 1
+          fi
+
+  release-workflow-tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - run: python -m pip install 'pytest==9.1.1' 'PyYAML==6.0.3' packaging
+      - run: python -m pytest .github/scripts/test_release_workflow.py
 
   pre-flight:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@037094bcc9138c72bc125418e6e3653f9e1c4160 # v1.11.0
@@ -90,7 +116,7 @@ jobs:
     if: github.repository == 'NVIDIA/Megatron-LM' && github.event_name != 'workflow_dispatch'
 
   bump:
-    needs: [pre-flight, validate-inputs]
+    needs: [pre-flight, validate-inputs, release-workflow-tests]
     if: |
       !cancelled() && !failure()
       && github.repository == 'NVIDIA/Megatron-LM'
@@ -101,8 +127,8 @@ jobs:
     with:
       release-branch-pattern: "core_[rv][0-9]*.[0-9]*.[0-9]*"
       release-ref: ${{ inputs.release-ref || github.sha }}
-      validate-only: ${{ github.event_name != 'workflow_dispatch' }}
-      dry-run: ${{ inputs.dry-run || false }}
+      validate-only: ${{ github.event_name != 'workflow_dispatch' || inputs.publish-target == 'testpypi' }}
+      dry-run: ${{ inputs.dry-run || inputs.publish-target == 'testpypi' }}
       version-bump-branch: ${{ inputs.version-bump-branch || github.ref_name }}
       restrict-to-admins: true
       app-id: ${{ vars.BOT_ID }}
@@ -114,7 +140,7 @@ jobs:
         ]
     secrets: inherit  # pragma: allowlist secret
 
-  build-test-publish-wheels:
+  build-test-wheels:
     needs: [pre-flight, bump]
     if: |
       !cancelled() && !failure() && needs.bump.result == 'success'
@@ -124,32 +150,130 @@ jobs:
         || !(needs.pre-flight.outputs.docs_only == 'true'
              || needs.pre-flight.outputs.is_deployment_workflow == 'true')
       )
-    uses: ./.github/workflows/_build_test_publish_wheel.yml
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_build_test_wheel.yml
     with:
       ref: ${{ inputs.release-ref || github.sha }}
-      dry-run: ${{ inputs.dry-run || false }}
-      no-publish: ${{ github.event_name != 'workflow_dispatch' || inputs.dry-run }}
-    secrets: inherit  # pragma: allowlist secret
+      dry-run: ${{ inputs.dry-run || inputs.publish-target == 'testpypi' }}
+
+  publish-wheels:
+    needs: [bump, build-test-wheels]
+    if: >-
+      !cancelled() && !failure()
+      && needs.bump.result == 'success' && needs.build-test-wheels.result == 'success'
+      && github.repository == 'NVIDIA/Megatron-LM'
+      && github.event_name == 'workflow_dispatch' && !inputs.dry-run
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    environment:
+      name: ${{ inputs.publish-target }}
+      url: https://${{ inputs.publish-target == 'testpypi' && 'test.' || '' }}pypi.org/p/${{ matrix.package }}
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [megatron-core, megatron-fsdp]
+    steps:
+      - name: Download tested distributions
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: wheels-${{ matrix.package }}-*-${{ inputs.publish-target == 'testpypi' && 'dry-run' || 'release' }}
+          path: dist/
+          merge-multiple: true
+
+      - name: Publish with a trusted publisher
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          repository-url: ${{ inputs.publish-target == 'testpypi' && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
+          attestations: true
+
+  verify-published-wheels:
+    needs: [publish-wheels]
+    runs-on: ${{ matrix.platform == 'amd64' && 'ubuntu-22.04' || 'ubuntu-22.04-arm' }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: megatron-core
+            platform: amd64
+            module: megatron.core
+          - package: megatron-core
+            platform: arm64
+            module: megatron.core
+          - package: megatron-fsdp
+            platform: amd64
+            module: megatron_fsdp
+    steps:
+      - name: Checkout verification tooling
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Download expected distributions
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: wheels-${{ matrix.package }}-*-${{ inputs.publish-target == 'testpypi' && 'dry-run' || 'release' }}
+          path: dist/
+          merge-multiple: true
+
+      - name: Verify uploaded files and attestations
+        id: verify
+        env:
+          INDEX: ${{ inputs.publish-target }}
+          PACKAGE: ${{ matrix.package }}
+        run: |
+          python -m pip install 'pypi-attestations==0.0.32'
+          python .github/scripts/verify_pypi_release.py --index "$INDEX" --package "$PACKAGE" --dist-dir dist
+
+      - name: Install published wheel and check its version
+        working-directory: ${{ runner.temp }}
+        env:
+          INDEX_URL: https://${{ inputs.publish-target == 'testpypi' && 'test.' || '' }}pypi.org/simple/
+          PACKAGE: ${{ matrix.package }}
+          MODULE: ${{ matrix.module }}
+          VERSION: ${{ steps.verify.outputs.version }}
+        run: |
+          python -m venv published-wheel
+          source published-wheel/bin/activate
+          python -m pip install --index-url https://pypi.org/simple/ --find-links "$GITHUB_WORKSPACE/dist" "$PACKAGE==$VERSION"
+          python -m pip uninstall -y "$PACKAGE"
+          python -m pip install --no-cache-dir --no-deps --only-binary=:all: --index-url "$INDEX_URL" "$PACKAGE==$VERSION"
+          python -c 'import importlib, os; actual = importlib.import_module(os.environ["MODULE"]).__version__; assert actual == os.environ["VERSION"], (actual, os.environ["VERSION"])'
 
   finalize:
-    needs: [bump, build-test-publish-wheels]
+    needs: [bump, build-test-wheels, publish-wheels, verify-published-wheels]
     if: |
       github.repository == 'NVIDIA/Megatron-LM'
-      && (success() || !failure())
-      && !cancelled()
+      && !cancelled() && !failure()
+      && needs.bump.result == 'success'
+      && needs.build-test-wheels.result == 'success'
+      && (github.event_name != 'workflow_dispatch' || inputs.dry-run
+          || needs.verify-published-wheels.result == 'success')
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_finalize.yml@cf5acebace78c7c339bc1f804357a991336f1c4d # v1.8.10
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
       release-version: ${{ needs.bump.outputs.release-version }}
       library-name: Megatron Core
       pypi-name: megatron-core
-      validate-only: ${{ github.event_name != 'workflow_dispatch' }}
-      dry-run: ${{ inputs.dry-run || false }}
-      create-gh-release: ${{ inputs.create-gh-release || true }}
+      validate-only: ${{ github.event_name != 'workflow_dispatch' || inputs.publish-target == 'testpypi' }}
+      dry-run: ${{ inputs.dry-run || inputs.publish-target == 'testpypi' }}
+      create-gh-release: ${{ inputs.create-gh-release }}
       gh-release-tag-prefix: core_
       gh-release-use-changelog-builder: ${{ inputs.generate-changelog || false }}
       gh-release-from-tag: ${{ inputs.gh-release-from-tag || '' }}
-      publish-docs: ${{ github.event_name == 'workflow_dispatch' && inputs.publish-docs }}
+      publish-docs: ${{ github.event_name == 'workflow_dispatch' && inputs.publish-target != 'testpypi' && inputs.publish-docs }}
       docs-target-path: megatron-core/developer-guide
       publish-as-latest: true
       run-on-version-tag-only: ${{ github.ref_name != 'main' }}
@@ -157,9 +281,11 @@ jobs:
     secrets: inherit  # pragma: allowlist secret
 
   release-summary:
-    needs: [pre-flight, bump, build-test-publish-wheels, finalize]
+    needs: [validate-inputs, release-workflow-tests, pre-flight, bump, build-test-wheels, publish-wheels, verify-published-wheels, finalize]
     if: github.repository == 'NVIDIA/Megatron-LM' && !cancelled()
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
     steps:
       - name: Result
         env:
