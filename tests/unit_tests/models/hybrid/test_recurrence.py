@@ -641,24 +641,41 @@ def test_non_recurrent_checkpoint_resumes_optimizer_and_loop_training(
 def test_ddp_accumulates_shared_weight_gradients(model_factory, grad_fusion, pattern):
     model = model_factory(pattern=pattern, grad_fusion=grad_fusion)
     reference = model_factory(pattern=pattern)
-    reference.load_state_dict(model.state_dict())
     ddp = DistributedDataParallel(
         config=model.config,
         ddp_config=DistributedDataParallelConfig(overlap_grad_reduce=True),
         module=model,
         pg_collection=model.pg_collection,
     )
-    ddp.zero_grad_buffer()
-    tokens, positions = _inputs()
-    with ddp.no_sync():
-        ddp(tokens, positions, None, n_loops=1).square().mean().backward()
-    ddp(tokens, positions, None, n_loops=3).square().mean().backward()
-    ddp.finish_grad_sync()
-    reference(tokens, positions, None, n_loops=1).square().mean().backward()
-    reference(tokens, positions, None, n_loops=3).square().mean().backward()
-    for parameter, expected in zip(model.parameters(), reference.parameters(), strict=True):
-        torch.testing.assert_close(parameter.main_grad, expected.grad)
-    assert any(p.main_grad.abs().sum() > 0 for p in model.decoder.layers[1].parameters())
+    ddp.broadcast_params()
+    reference.load_state_dict(model.state_dict())
+    group = model.pg_collection.dp_cp
+    base_tokens, positions = _inputs()
+    for step, count in enumerate((3, 1, 2)):
+        ddp.zero_grad_buffer()
+        reference.zero_grad(set_to_none=True)
+        # Each rank and microbatch sees a different input, while loop depth is
+        # constant throughout the optimizer step and shared across ranks.
+        first = (base_tokens + group.rank() + step) % 32
+        second = (first + 11) % 32
+        with ddp.no_sync():
+            ddp(first, positions, None, n_loops=count).square().mean().backward()
+        ddp(second, positions, None, n_loops=count).square().mean().backward()
+        if step > 0:
+            # The first batch only learns readiness counts. Later batches must
+            # launch communication from the backward hooks, not from finish.
+            assert all(
+                bucket.grad_reduce_handle is not None or bucket.grad_reduce_finished
+                for bucket in ddp.bucket_groups
+            )
+        ddp.finish_grad_sync()
+
+        for tokens in (first, second):
+            reference(tokens, positions, None, n_loops=count).square().mean().backward()
+        for parameter, expected in zip(model.parameters(), reference.parameters(), strict=True):
+            torch.distributed.all_reduce(expected.grad, group=group)
+            torch.testing.assert_close(parameter.main_grad, expected.grad / group.size())
+        assert any(p.main_grad.abs().sum() > 0 for p in model.decoder.layers[1].parameters())
 
 
 @pytest.mark.parametrize(
