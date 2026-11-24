@@ -41,6 +41,54 @@ def _dev_scalar(value, dtype=torch.int32):
 
 
 @pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
+def test_expert_weight_build_protects_source_storage(precision, monkeypatch):
+    """Record source allocations before the builder can rebind their storage."""
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+    from megatron.core.inference.utils import InferenceMode
+    from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+    weight = torch.ones(32, 32, device="cuda", dtype=torch.bfloat16)
+    if precision == "mxfp8":
+        weight = MXFP8Tensor.from_bf16(weight, backend="triton")
+    sources = (weight.data, weight.scale) if precision == "mxfp8" else (weight,)
+    recorded = []
+    record_stream = torch.Tensor.record_stream
+
+    def record(tensor, stream):
+        recorded.append((tensor.data_ptr(), stream))
+        record_stream(tensor, stream)
+
+    monkeypatch.setattr(torch.Tensor, "record_stream", record)
+    side = torch.cuda.Stream()
+
+    def build():
+        assert recorded == [(tensor.data_ptr(), side) for tensor in sources]
+
+    experts = SimpleNamespace(
+        _concatenated_weights_built=False,
+        _EXPERT_WEIGHT_GROUPS=(("linear_fc1", "_fc1_weight"),),
+        num_local_experts=1,
+        linear_fc1=SimpleNamespace(weight0=weight),
+        _unwrap_mxfp8_weight=InferenceGroupedMLP._unwrap_mxfp8_weight,
+        _build_flashinfer_clamp_limit=lambda device: None,
+        _build_concatenated_mxfp8_weights=build,
+        _build_concatenated_weights=build,
+        _nvfp4_recipe=None,
+    )
+    monkeypatch.setattr(
+        InferenceGroupedMLP, "_expert_weights_use_mxfp8", lambda _: precision == "mxfp8"
+    )
+    with pytest.raises(RuntimeError, match="requires InferenceMode"):
+        InferenceGroupedMLP.build_inference_weights(experts)
+    side.wait_stream(torch.cuda.current_stream())
+    with InferenceMode.active(), torch.cuda.stream(side):
+        InferenceGroupedMLP.build_inference_weights(experts)
+        InferenceGroupedMLP.build_inference_weights(experts)
+    torch.cuda.current_stream().wait_stream(side)
+    assert len(recorded) == len(sources)
+
+
+@pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
 @pytest.mark.parametrize("ep_rank", [0, 1])
 def test_flashinfer_clamped_relu2_replays(precision, ep_rank):
     """Replay the MCore adapter, including graph capture and local-EP expert offsets.
@@ -141,9 +189,15 @@ def test_flashinfer_clamped_relu2_replays(precision, ep_rank):
     assert error_l2 <= relative_l2
     assert_replays_bit_exact(run, (x,), backward=False, what=f"clamped_relu2_{precision}")
 
+    # Exercise the shortcut stream fork/join inside the existing graph replay test.
+    side = torch.cuda.Stream()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = run(x)
+        main = torch.cuda.current_stream()
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            captured = run(x)
+        main.wait_stream(side)
 
     def replay():
         graph.replay()
