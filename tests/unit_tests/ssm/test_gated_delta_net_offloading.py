@@ -172,7 +172,9 @@ def test_gdn_packed_offload(gdn_groups, variant, fused, fraction, threshold, mon
 
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
-@pytest.mark.parametrize("variant,mode", [("gdn", "eval"), ("gdn", "no-grad"), ("gdn", "frozen")])
+@pytest.mark.parametrize(
+    "variant,mode", [("gdn", "eval"), ("gdn", "no-grad"), ("gdn", "frozen"), ("gdn2", "eval")]
+)
 def test_gdn_resident_forward(gdn_groups, variant, mode):
     if variant == "gdn2":
         pytest.importorskip("fla.ops.gdn2")
