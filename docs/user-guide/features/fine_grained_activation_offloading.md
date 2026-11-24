@@ -43,7 +43,7 @@ Each scope offloads saved activations to CPU during forward and reloads them bef
 | `moe_act` | Activation function in MoE experts | MoE models only |
 | `fused_group_mlp` | Whole fused grouped MLP | Requires `--use-transformer-engine-op-fuser`; cannot be combined with `expert_fc1` or `moe_act` |
 | `shortcut_post_norm` | Shortcut post-combine normalization | Requires `--moe-shortcut-connection` |
-| `gdn_core_attn` | Tensors saved inside the FLA GDN recurrence | BF16 GDN only. See the recomputation and CUDA graph restrictions below. |
+| `gdn_core_attn` | Tensors saved inside the FLA GDN recurrence | BF16 GDN/GDN2 only. See the recomputation and CUDA graph restrictions below. |
 
 When selective `residual_stream` replay is active, its shared checkpoint manager owns the
 connected ShortcutMoE post-norm. In that case `shortcut_post_norm` offloading is skipped for the
@@ -51,17 +51,18 @@ replay-owned forward so that replay and offloading do not release the same activ
 
 ### GDN Recurrence Offloading
 
-`gdn_core_attn` selects tensors saved by the BF16 FLA GDN recurrence, independently
+`gdn_core_attn` selects tensors saved by the BF16 FLA GDN/GDN2 recurrence, independently
 of standard attention's `core_attn` scope. It commits before output normalization
 and anchors backward prefetch on a differentiable recurrence input. Shared inputs
 are not force-released; evaluation and no-grad execution bypass the scope.
 
 Enable this scope with `--fine-grained-activation-offloading --offload-modules gdn_core_attn`.
-For HybridModel, select GDN with `G` in `--hybrid-layer-pattern`.
+For HybridModel, select GDN layers with `G` in `--hybrid-layer-pattern`.
+Set `--experimental-attention-variant gdn2` to use the GDN2 variant.
 With an explicit layer-config list, enable the scope on the model config and at least one GDN layer.
-Selective `gdn_norm_out` recomputation and native pre-GDR fusion are supported.
+Both variants support selective `gdn_norm_out` recomputation. Pre-GDR fusion is GDN-only.
 Whole-GDN selective recomputation (`--recompute-modules gdn`), full recomputation,
-GDN2, FP8/NVFP4, other recurrence backends, and CUDA graphs are rejected.
+FP8/NVFP4, other recurrence backends, and CUDA graphs are rejected.
 Set `NVTE_CPU_OFFLOAD_V1=1` with Transformer Engine 2.10 or newer.
 
 ### Tuning Parameters

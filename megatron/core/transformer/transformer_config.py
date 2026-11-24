@@ -1780,7 +1780,7 @@ class TransformerConfig(ModelParallelConfig):
     "shortcut_post_norm": offload the input of the shortcut output normalization.
             Requires moe_shortcut_connection=True.
     "gdn_core_attn": offload tensors saved by the FLA GatedDeltaNet recurrence.
-            Requires BF16 GDN and gdn_kernel_backend="fla", with no CUDA graphs,
+            Requires BF16 GDN/GDN2 and gdn_kernel_backend="fla", with no CUDA graphs,
             full recomputation, or selective recomputation of the whole GDN layer.
     """
     min_offloaded_tensor_size: int = 1024 * 1024
@@ -3497,9 +3497,10 @@ class TransformerConfig(ModelParallelConfig):
                 f'Allowed modules are: {allowed_modules}'
             )
             if "gdn_core_attn" in self.offload_modules:
-                variant = self.experimental_attention_variant
-                if variant != "gdn" and (not self.is_hybrid_model or variant == "gdn2"):
-                    raise ValueError("gdn_core_attn offloading only supports GDN (gdn).")
+                if not self.is_hybrid_model and not is_gated_delta_net_variant(
+                    self.experimental_attention_variant
+                ):
+                    raise ValueError("gdn_core_attn offloading only supports GDN (gdn or gdn2).")
                 if not self.bf16 or self.fp8 or self.fp4:
                     raise ValueError("gdn_core_attn offloading requires BF16 without FP8 or FP4.")
                 if self.gdn_kernel_backend != "fla":

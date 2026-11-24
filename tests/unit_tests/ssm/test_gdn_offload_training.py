@@ -61,6 +61,7 @@ def _training_config(
     *,
     fused_pre_gdr: bool = False,
     native_hybrid: bool = False,
+    variant: str = "gdn",
 ) -> TransformerConfig:
     """Configure the reduced-size complete decoder and its parallel topology."""
     return TransformerConfig(
@@ -93,7 +94,7 @@ def _training_config(
         batch_p2p_comm=False,
         attention_backend=AttnBackend.auto if cp > 1 else AttnBackend.unfused,
         is_hybrid_model=native_hybrid,
-        experimental_attention_variant=None if native_hybrid else "gdn",
+        experimental_attention_variant=None if native_hybrid and variant == "gdn" else variant,
         linear_attention_freq=None if native_hybrid else 4,
         linear_conv_kernel_dim=4,
         linear_key_head_dim=64,
@@ -121,7 +122,13 @@ def _build_training_model(
         stack_spec = ModuleSpec(
             module=HybridStack,
             submodules=HybridStackSubmodules(
-                gdn_layer=layer_specs[0], attention_layer=layer_specs[3]
+                gdn_layer=(
+                    layer_specs[0] if config.experimental_attention_variant == "gdn" else None
+                ),
+                gdn2_layer=(
+                    layer_specs[0] if config.experimental_attention_variant == "gdn2" else None
+                ),
+                attention_layer=layer_specs[3],
             ),
         )
     torch.manual_seed(31)
@@ -190,16 +197,18 @@ def _snapshot_leaf(value: Any) -> Any:
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.parametrize(
-    "tp,sp,cp,pp,vp,fraction,recompute_norm,fused_pre_gdr,native_hybrid",
+    "tp,sp,cp,pp,vp,fraction,recompute_norm,fused_pre_gdr,variant,native_hybrid",
     [
-        pytest.param(1, False, 1, 1, None, 1.0, False, False, False, id="decoder"),
-        pytest.param(1, False, 1, 1, None, 1.0, False, False, True, id="hybrid-gdn"),
-        pytest.param(1, False, 1, 1, None, 0.0, False, False, False, id="resident"),
-        pytest.param(1, False, 1, 1, None, 0.5, True, True, False, id="fused-norm"),
-        pytest.param(2, True, 1, 1, None, 1.0, False, False, False, id="tp-sp"),
-        pytest.param(1, False, 2, 1, None, 1.0, False, False, False, id="cp"),
-        pytest.param(1, False, 1, 2, None, 1.0, False, False, False, id="pp"),
-        pytest.param(1, False, 1, 2, 2, 1.0, False, False, False, id="pp-vpp"),
+        pytest.param(1, False, 1, 1, None, 1.0, False, False, "gdn", False, id="decoder"),
+        pytest.param(1, False, 1, 1, None, 1.0, False, False, "gdn", True, id="hybrid-gdn"),
+        pytest.param(1, False, 1, 1, None, 1.0, True, False, "gdn2", False, id="gdn2-decoder"),
+        pytest.param(1, False, 1, 1, None, 1.0, True, False, "gdn2", True, id="hybrid-gdn2"),
+        pytest.param(1, False, 1, 1, None, 0.0, False, False, "gdn", False, id="resident"),
+        pytest.param(1, False, 1, 1, None, 0.5, True, True, "gdn", False, id="fused-norm"),
+        pytest.param(2, True, 1, 1, None, 1.0, False, False, "gdn", False, id="tp-sp"),
+        pytest.param(1, False, 2, 1, None, 1.0, False, False, "gdn", False, id="cp"),
+        pytest.param(1, False, 1, 2, None, 1.0, False, False, "gdn", False, id="pp"),
+        pytest.param(1, False, 1, 2, 2, 1.0, False, False, "gdn", False, id="pp-vpp"),
     ],
 )
 def test_gdn_offload_training(
@@ -211,12 +220,15 @@ def test_gdn_offload_training(
     fraction: float,
     recompute_norm: bool,
     fused_pre_gdr: bool,
+    variant: str,
     native_hybrid: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Match losses, accumulated gradients, updated weights and Adam states on every rank."""
     if Utils.world_size % (tp * cp * pp):
         pytest.skip("This topology requires a world size divisible by TP * CP * PP.")
+    if variant == "gdn2":
+        pytest.importorskip("fla.ops.gdn2")
     if fused_pre_gdr:
         pytest.importorskip("causal_conv1d", minversion="1.6.1")
         monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
@@ -237,6 +249,7 @@ def test_gdn_offload_training(
             recompute_norm,
             fused_pre_gdr=fused_pre_gdr,
             native_hybrid=native_hybrid,
+            variant=variant,
         )
         baseline_config = replace(
             config, fine_grained_activation_offloading=False, offload_modules=[]

@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from dataclasses import replace
+from typing import Any
 
 import pytest
 import torch
@@ -11,12 +12,13 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.layers.utils import create_layer_config
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import ChunkOffloadHandler
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import PipelineOffloadManager
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_net import HAVE_FLA
+from megatron.core.ssm.gated_delta_net import HAVE_FLA, GatedDeltaNet2
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from tests.unit_tests.ssm.test_gdn_offload_training import _training_config
 from tests.unit_tests.test_utilities import Utils
@@ -32,15 +34,15 @@ def _config(**overrides):
     [
         ({"experimental_attention_variant": None}, "only supports GDN"),
         (
-            {
-                "experimental_attention_variant": "gdn2",
-                "is_hybrid_model": True,
-                "linear_attention_freq": None,
-            },
-            "only supports GDN",
+            {"recompute_granularity": "selective", "recompute_modules": ["gdn"]},
+            "whole-GDN recomputation",
         ),
         (
-            {"recompute_granularity": "selective", "recompute_modules": ["gdn"]},
+            {
+                "experimental_attention_variant": "gdn2",
+                "recompute_granularity": "selective",
+                "recompute_modules": ["gdn"],
+            },
             "whole-GDN recomputation",
         ),
         ({"bf16": False}, "BF16"),
@@ -135,6 +137,7 @@ def _run(model, source, packed=None, *, detached=False):
     "variant,fused,fraction,threshold",
     [
         pytest.param("gdn", False, 1.0, 1024, id="gdn-packed"),
+        pytest.param("gdn2", False, 0.5, 1024, id="gdn2-packed-norm"),
         pytest.param("gdn", True, 0.5, 1024, id="gdn-packed-fused-norm"),
         pytest.param("gdn", False, 1.0, 10**9, id="gdn-below-threshold"),
     ],
@@ -186,3 +189,61 @@ def test_gdn_resident_forward(gdn_groups, variant, mode):
         else:
             assert not output.requires_grad
     assert chunk._offloaded_group_index == 0
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.parametrize(
+    "value_heads,frozen_gates",
+    [
+        pytest.param(4, False, id="trainable-unexpanded"),
+        pytest.param(8, False, id="trainable-expanded"),
+        pytest.param(4, True, id="frozen"),
+    ],
+)
+def test_gdn2_offload_retains_live_sigmoid_gates(
+    gdn_groups: ProcessGroupCollection,
+    value_heads: int,
+    frozen_gates: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Skip copies of live sigmoid outputs while allowing expanded or frozen gates."""
+    pytest.importorskip("fla.ops.gdn2")
+    config = _config(experimental_attention_variant="gdn2", linear_num_value_heads=value_heads)
+    baseline, offloaded = _pair(config, gdn_groups)
+    if frozen_gates:
+        for model in (baseline, offloaded):
+            for layer in model:
+                layer.in_proj.requires_grad_(False)
+                layer.conv1d.requires_grad_(False)
+
+    source = torch.randn(128, 1, 256, device="cuda", dtype=torch.bfloat16)
+    reference = _run(baseline, source, detached=frozen_gates)
+    gate_copies: list[tuple[dict[str, int], set[int]]] = []
+    run_core = GatedDeltaNet2._run_gated_delta_rule
+    offload_tensor = ChunkOffloadHandler.offload
+
+    def record_gates(
+        layer: GatedDeltaNet2,
+        kernel_inputs: dict[str, torch.Tensor],
+        cu_seqlens: torch.Tensor | None,
+    ) -> torch.Tensor:
+        gate_copies.append(
+            ({name: kernel_inputs[name].untyped_storage().data_ptr() for name in ("b", "w")}, set())
+        )
+        return run_core(layer, kernel_inputs, cu_seqlens)
+
+    def record_copy(handler: ChunkOffloadHandler, tensor: torch.Tensor, **kwargs: Any) -> Any:
+        _, copied = gate_copies[-1]
+        copied.add(tensor.untyped_storage().data_ptr())
+        return offload_tensor(handler, tensor, **kwargs)
+
+    monkeypatch.setattr(GatedDeltaNet2, "_run_gated_delta_rule", record_gates)
+    monkeypatch.setattr(ChunkOffloadHandler, "offload", record_copy)
+    off_interface.init_chunk_handler(0, None, None, 1024, 0, 1.0)
+    torch.testing.assert_close(
+        _run(offloaded, source, detached=frozen_gates), reference, rtol=0, atol=0
+    )
+    assert len(gate_copies) == config.num_layers
+    for gates, copied in gate_copies:
+        assert (gates["w"] in copied) == frozen_gates
+        assert (gates["b"] in copied) == (frozen_gates or value_heads != 4)
