@@ -219,15 +219,23 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="kda_recurrence",
-        sources=("megatron/core/ssm/gated_delta_net/kda.py",),
-        tests=(K + "test_dev_sync_kernels.py",),
+        sources=(
+            "megatron/core/ssm/gated_delta_net/kda.py",
+            "megatron/core/ssm/gated_delta_net/packed_cp_metadata.py",
+        ),
+        tests=(
+            K + "test_dev_sync_kernels.py",
+            "tests/unit_tests/ssm/gated_delta_net/test_packed_cp_metadata.py",
+        ),
         kind="dispatch",
         notes="KDA gate preparation and the selected FLA chunk_kda forward/backward at CP1, alone "
         "and feeding the fused sigmoid output norm that gdn_gated_output_norm_fusion selects in "
         "_apply_gated_norm, plus a module-level replay of the Kimi-K3 bias-free low-rank "
         "F-decay / output-gate projections (kda_f_lora_rank / kda_gate_lora_rank) with the "
         "TP-replicated beta projection under deterministic_mode. Multi-rank convolution and "
-        "chunkwise CP remain in the existing parity suite.",
+        "chunkwise CP remain in the existing parity suite. "
+        "Packed CP metadata tests compare cached partition boundaries with fresh construction "
+        "and exercise mutation invalidation and forward routing; they do not qualify kernel numerics.",
     ),
     KernelEntry(
         name="balanced_cp_route_metadata",
@@ -764,12 +772,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ssm/gated_delta_net/gdn.py",
             "megatron/core/ssm/gated_delta_net/gdn2.py",
             "megatron/core/ssm/gated_delta_net/kda.py",
+            "megatron/core/ssm/gated_delta_net/packed_cp_metadata.py",
         ),
         tests=(
             K + "test_ssm_kernels.py",
             K + "test_gated_norm.py",
             C + "test_hybrid_model.py",
-            R + 'test_ssm_replay.py',
+            R + "test_ssm_replay.py",
+            "tests/unit_tests/ssm/gated_delta_net/test_packed_cp_metadata.py",
         ),
         kind="torch.compile",
         notes="deterministic_mode selects torch_chunk_gated_delta_rule over FLA (recorded non-deterministic). "
@@ -781,7 +791,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "activation; test_ssm_kernels.py replays a whole GatedDeltaNet built with a GELU "
         "activation_func under deterministic_mode (torch conv1d / L2 norm / chunk rule). The "
         "opt-in fused output norm (gdn_gated_output_norm_fusion; SiLU for GDN, sigmoid for KDA) "
-        "is replayed through both _apply_gated_norm dispatchers in test_gated_norm.py.",
+        "is replayed through both _apply_gated_norm dispatchers in test_gated_norm.py. "
+        "Packed CP metadata tests separately cover exact cached/fresh boundaries, invalidation, "
+        "and cross-layer forward reuse without claiming numerical CP kernel parity.",
     ),
     KernelEntry(
         name="gdn_pre_gated_delta_rule_fusion",
