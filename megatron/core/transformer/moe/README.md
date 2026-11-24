@@ -370,7 +370,7 @@ The router's logical expert selections and probabilities are preserved; remappin
 the selected experts execute. Replica gradients return to the original parameters, which retain
 optimizer and checkpoint ownership. Replicas have no separate optimizer state.
 
-Requirements and limits:
+The following requirements apply to the HybridEP dispatcher. The [MoK backend](#bf16-mok-with-moonep) uses its own physical expert descriptors and CUDA symmetric-memory transport.
 
 - Triton 3.5 or newer is required for launch-scoped descriptor allocation.
 - Use EP sizes 2–64, up to 8,192 experts evenly divided across EP ranks, top-k from 1 to
@@ -661,7 +661,7 @@ structure selects routed-only MOK in `auto` mode. Activation selection is indepe
 | Parallelism | Expert TP=1; TP>1 requires sequence parallelism and native shared execution; EP in {1, 4, 8, 16, 32, 64}; each EP group must fit within one NVLink domain supporting PyTorch symmetric memory and multicast |
 | Shapes | Hidden and expert intermediate sizes divisible by 256; at least 512 local tokens per rank, divisible by 256; identical token, hidden, and top-k shapes across EP ranks |
 | Recomputation | Whole-MoE activation recompute; shared-expert-only recompute when shared execution is native |
-| CUDA Graph | Full-iteration capture |
+| CUDA Graph | Full-iteration capture with owner-only MoK. Virtual expert placement requires eager execution. |
 | Checkpointing | Save/resume with unchanged backend, weight layout, and parallel configuration |
 
 #### BF16 MoK with MoonEP

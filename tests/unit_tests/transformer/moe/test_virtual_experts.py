@@ -1137,7 +1137,9 @@ def test_mok_virtual_expert_plan_preserves_masked_routes():
     try:
         group = ps.get_expert_model_parallel_group()
         device = torch.device("cuda", torch.cuda.current_device())
-        workspace = vt.VirtualExpertPlannerWorkspace(num_experts=8, device=device, group=group)
+        workspace = vt.VirtualExpertPlannerWorkspace(
+            num_experts=8, device=device, group=group, symm_backend="CUDA"
+        )
         # An incomplete final planner tile and an empty row cover both kinds of padding.
         ids = torch.zeros((1025, 2), dtype=torch.int32, device=device)
         ids[:, 1] = -1
