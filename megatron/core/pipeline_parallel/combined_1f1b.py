@@ -38,14 +38,10 @@ def _release_tensor_storage(tensors):
             tensor.untyped_storage().resize_(0)
 
 
-def setup_mfsdp_v2_ep_overlap(model_chunks: Sequence[torch.nn.Module]) -> None:
-    """Install persistent module hooks once after wrapping, before training or evaluation."""
+def setup_mfsdp_v2_ep_overlap(model_chunks: Sequence[FullyShardedDataParallelV2]) -> None:
+    """Install persistent hooks for overlap-enabled MFSDP v2 chunks after wrapping."""
     for chunk in model_chunks:
-        if (
-            isinstance(chunk, FullyShardedDataParallelV2)
-            and chunk.config.overlap_moe_expert_parallel_comm
-        ):
-            register_fsdp_module_hooks(chunk.module)
+        register_fsdp_module_hooks(chunk.module)
 
 
 def combined_1f1b_schedule_for_no_pipelining(

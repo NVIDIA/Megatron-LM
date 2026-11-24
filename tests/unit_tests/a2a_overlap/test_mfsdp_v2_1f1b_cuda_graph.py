@@ -100,7 +100,8 @@ class TestMFSDPv2EPOverlapCudaGraph:
                 module=model,
                 pg_collection=process_group_collection,
             )
-            setup_mfsdp_v2_ep_overlap([model])
+            if config.overlap_moe_expert_parallel_comm:
+                setup_mfsdp_v2_ep_overlap([model])
             # Like MCore training, the schedule finishes gradient synchronization.
             config.no_sync_func = model.no_sync
             config.finalize_model_grads_func = finalize_model_grads

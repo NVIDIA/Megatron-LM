@@ -2160,7 +2160,8 @@ def wrap_model_chunks_with_ddp(
                     **chunk_kwargs,
                 )
             )
-    setup_mfsdp_v2_ep_overlap(wrapped)
+    if is_mfsdp_v2 and config.overlap_moe_expert_parallel_comm:
+        setup_mfsdp_v2_ep_overlap(wrapped)
     return wrapped
 
 

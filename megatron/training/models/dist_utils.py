@@ -445,7 +445,12 @@ def _ddp_wrap(
                     **chunk_kwargs,
                 )
                 wrapped_model.append(wrapped_chunk)
-        setup_mfsdp_v2_ep_overlap(wrapped_model)
+        if is_mfsdp_v2:
+            overlap_chunks = [
+                chunk for chunk in wrapped_model if chunk.config.overlap_moe_expert_parallel_comm
+            ]
+            if overlap_chunks:
+                setup_mfsdp_v2_ep_overlap(overlap_chunks)
         model = wrapped_model
 
     # Ensure side-stream initialization completes before touching params on the current stream.
