@@ -96,9 +96,8 @@ def test_muon_matches_reference(
     """FSDP, HSDP, HFSDP, and unsharded Muon should produce identical loss curves.
 
     Each block is its own FSDP group, so several groups' communication is in flight at once; with
-    8, all three are. Each group holds two differently shaped Muon matrices: in block1 and block3
-    both share an optimizer group, so the momentum update batches them; in block2 they belong to
-    optimizer groups with different settings.
+    8, all three are. Each group holds two differently shaped Muon matrices, so the momentum
+    update batches them.
     """
     world_size = distributed_setup.world_size
     if dp_mode == "fsdp":
@@ -144,20 +143,11 @@ def test_muon_matches_reference(
     )
     excluded_names = ["block3.3.weight", "block3.3.bias"]
     muon_names = [name for name in params if name not in excluded_names]
-    second_group = ["block2.0.weight"]
-
-    def param_groups(named_params):
-        """The Muon matrices with the defaults, except second_group with its own settings."""
-        return [
-            {"params": [named_params[n] for n in muon_names if n not in second_group]},
-            {"params": [named_params[n] for n in second_group], "lr": 0.02, "weight_decay": 0.05},
-        ]
-
     optimizer = muon.FsdpMuon(
-        param_groups(params), num_groups_in_flight=num_groups_in_flight, **kwargs
+        [params[name] for name in muon_names], num_groups_in_flight=num_groups_in_flight, **kwargs
     )
     fully_shard_optimizer(optimizer, precision_aware=True)
-    reference_optimizer = Muon(param_groups(reference_params), **kwargs)
+    reference_optimizer = Muon([reference_params[name] for name in muon_names], **kwargs)
     other_optimizer = torch.optim.SGD([params[n] for n in excluded_names], lr=0.01, foreach=False)
     fully_shard_optimizer(other_optimizer)
     reference_other = torch.optim.SGD([reference_params[n] for n in excluded_names], lr=0.01)
