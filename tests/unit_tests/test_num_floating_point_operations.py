@@ -739,8 +739,12 @@ class TestAccumulatorTopology:
                 )
                 training_module.set_seqlen_stats_in_iteration(real_tokens, squared_lengths)
                 iterators = packed if vpp else [packed]
+            else:
+                # Validation uses the same forward step before training resumes.
+                model = Mock(vp_stage=stages[0], pg_collection=pg, training=False)
+                pretrain_hybrid.forward_step(iter([sample.copy()]), model)
             for stage, iterator in zip(stages, iterators):
-                model = Mock(vp_stage=stage, pg_collection=pg)
+                model = Mock(vp_stage=stage, pg_collection=pg, training=True)
                 for _ in range(count):
                     pretrain_hybrid.forward_step(iterator, model)
 

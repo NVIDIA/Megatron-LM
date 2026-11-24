@@ -352,6 +352,7 @@ def forward_step(data_iterator, model: HybridModel):
             cu_seqlens is not None
             and vp_stage in (None, 0)
             and get_run_config().model.transformer.sequence_packing_scheduler is None
+            and get_attr_wrapped_model(model, "training")
         ):
             update_seqlen_stats_from_cu_seqlens(cu_seqlens.squeeze(0))
 
