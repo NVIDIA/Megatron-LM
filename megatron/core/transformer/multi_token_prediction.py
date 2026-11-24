@@ -15,6 +15,7 @@ from torch import Tensor
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.context_parallel import ContextParallelBatch, convert_cp_layout
 from megatron.core.context_parallel.sequence_roll import roll_contiguous, roll_contiguous_fields
+from megatron.core.determinism.te import bind_layer_trace_context
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
@@ -2135,7 +2136,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             # Pass tensor / ``None`` args positionally and capture the
             # non-tensor objects via the ``custom_forward`` closure.
             return precision_aware_checkpoint(
-                custom_forward,
+                bind_layer_trace_context(custom_forward),
                 self.config,
                 self.tp_group,
                 hidden_states,

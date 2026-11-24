@@ -46,6 +46,7 @@ from megatron.core import mpu, tensor_parallel
 from megatron.core._rank_utils import safe_get_rank
 from megatron.core.datasets.data_schedule import wrap_data_iterator
 from megatron.core.determinism.context import DeterminismContext, determinism_context
+from megatron.core.determinism.te import suspend_layer_trace
 from megatron.core.determinism.trace import (
     TraceConfig,
     close_determinism_trace,
@@ -5944,7 +5945,7 @@ def evaluate(
     if eval_iters is None:
         eval_iters = cfg.validation.eval_iters
 
-    with torch.no_grad():
+    with torch.no_grad(), suspend_layer_trace():
         iteration = 0
         if verbose:
             print_rank_0(f'Evaluating on {eval_iters * eval_batch_size} samples')

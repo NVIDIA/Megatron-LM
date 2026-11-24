@@ -8,6 +8,7 @@ these records cannot certify replay coverage. Value-bearing capture retains the
 recorder's CUDA graph restrictions. No distributed collectives are introduced.
 """
 
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import replace
 from functools import wraps
@@ -18,6 +19,17 @@ from .context import determinism_context, get_determinism_context
 from .trace import get_determinism_trace
 
 _REGISTER_BACKWARD_HOOKS = ContextVar("te_trace_register_backward_hooks", default=True)
+_LAYER_TRACE_ENABLED = ContextVar("te_layer_trace_enabled", default=True)
+
+
+@contextmanager
+def suspend_layer_trace():
+    """Pause L1 observations during evaluation and restore the caller's state."""
+    token = _LAYER_TRACE_ENABLED.set(False)
+    try:
+        yield
+    finally:
+        _LAYER_TRACE_ENABLED.reset(token)
 
 
 def bind_layer_trace_context(function):
@@ -47,7 +59,7 @@ def trace_transformer_layer_forward(forward):
 
     @wraps(forward)
     def wrapped(self, hidden_states, /, *args, **kwargs):
-        if not self.config.determinism_trace_layers:
+        if not self.config.determinism_trace_layers or not _LAYER_TRACE_ENABLED.get():
             return forward(self, hidden_states, *args, **kwargs)
         trace = get_determinism_trace()
         if trace is None:
