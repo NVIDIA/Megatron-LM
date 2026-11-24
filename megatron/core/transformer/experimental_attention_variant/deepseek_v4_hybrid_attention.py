@@ -15,6 +15,7 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedTensor,
     ShardedTensorFactory,
 )
+from megatron.core.env_flags import env_flag
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.models.common.embeddings import (
@@ -58,6 +59,77 @@ def _initialize_grouped_output_projection(
 
 def _skip_initialization(weight: torch.Tensor) -> None:
     """Leave the weight uninitialized when ``perform_initialization`` is disabled."""
+
+
+# MCORE_DSV4_GROUP_PROJ_BMM (read once at import; off by default) runs the grouped output
+# projection (wo_a) as strided-batched GEMMs on the token-major tensors instead of
+# torch.einsum. einsum runs the same per-group BF16 GEMMs over a group-major [g, tokens, *]
+# layout, so its output and, in backward, the [tokens, g, d] input gradient and the weight
+# gradient are copied back to their token-major layouts. Outputs and both gradients matched
+# einsum bit for bit in GB300 testing, but cuBLAS may select another algorithm for the strided
+# operands on other GPUs, shapes or library versions, so the switch is opt-in:
+# MCORE_DSV4_GROUP_PROJ_BMM=1 enables it, and unset or 0 keeps einsum.
+_GROUP_PROJ_BMM = env_flag("MCORE_DSV4_GROUP_PROJ_BMM", False)
+
+
+def _grouped_projection_bmm_eligible(
+    input_: torch.Tensor, weight: torch.Tensor, groups: int
+) -> bool:
+    """Whether ``_GroupedProjectionBMM`` can run the grouped projection of ``input_``.
+
+    It needs a nonempty contiguous CUDA input ``[..., groups, d]`` and a contiguous weight of
+    the input's dtype.
+    """
+    return (
+        input_.is_cuda
+        and input_.numel() > 0
+        and input_.is_contiguous()
+        and weight.is_contiguous()
+        and input_.dtype == weight.dtype
+        and input_.size(-2) == groups
+    )
+
+
+class _GroupedProjectionBMM(torch.autograd.Function):
+    """y[..., j, :] = x[..., j, :] @ w[j].T with w = weight.view(groups, rank, d), copy-free.
+
+    cuBLAS reads and writes the token-major tensors through per-group strided views (leading
+    dimension groups * width, batch stride width), so neither direction materializes a
+    group-major copy of the input, the output, the input gradient or the weight gradient.
+    The output is a new tensor, not a view, so callers may modify it in place, as they may
+    modify the einsum result.
+    """
+
+    @staticmethod
+    def forward(ctx, input_: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        """Project each group of the contiguous [..., groups, d] input to [..., groups, rank]."""
+        groups, width = input_.shape[-2:]
+        x = input_.view(-1, groups, width)
+        w = weight.view(groups, -1, width)
+        out = input_.new_empty((*input_.shape[:-1], w.size(1)))
+        torch.bmm(
+            x.transpose(0, 1),
+            w.transpose(1, 2),
+            out=out.view(-1, groups, w.size(1)).transpose(0, 1),
+        )
+        ctx.save_for_backward(input_, weight)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """Input and weight gradients, again through strided views of the token-major tensors."""
+        input_, weight = ctx.saved_tensors
+        groups, width = input_.shape[-2:]
+        x = input_.view(-1, groups, width)
+        w = weight.view(groups, -1, width)
+        grad = grad_output.contiguous().view(-1, groups, w.size(1)).transpose(0, 1)
+        grad_input = grad_weight = None
+        if ctx.needs_input_grad[0]:
+            grad_input = input_.new_empty(input_.shape)
+            torch.bmm(grad, w, out=grad_input.view(-1, groups, width).transpose(0, 1))
+        if ctx.needs_input_grad[1]:
+            grad_weight = torch.bmm(grad.transpose(1, 2), x.transpose(0, 1)).view(weight.shape)
+        return grad_input, grad_weight
 
 
 def _thd_physical_cu_seqlens(packed_seq_params) -> torch.Tensor:
@@ -256,7 +328,7 @@ class DSv4HybridAttention(Attention):
             warnings.warn(
                 "transformer_engine.pytorch.ops.BatchedLinear is unavailable. Please upgrade "
                 "Transformer Engine to avoid a performance regression; "
-                "DSv4HybridAttention.linear_o_group_proj is falling back to torch.einsum.",
+                "DSv4HybridAttention.linear_o_group_proj is using its PyTorch grouped projection.",
                 stacklevel=2,
             )
             group_proj_out_size = self.config.o_groups * self.config.o_lora_rank
@@ -451,6 +523,8 @@ class DSv4HybridAttention(Attention):
         weight = self._linear_o_group_proj_weight.reshape(
             self.o_local_groups, self.config.o_lora_rank, -1
         )
+        if _GROUP_PROJ_BMM and _grouped_projection_bmm_eligible(input_, weight, self.o_local_groups):
+            return _GroupedProjectionBMM.apply(input_, weight)
         return torch.einsum("...gd,grd->...gr", input_, weight)
 
     def _post_o_group_proj(

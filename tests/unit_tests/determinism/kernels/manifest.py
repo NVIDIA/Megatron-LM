@@ -362,6 +362,23 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "output-discarding recompute path (CheckpointWithoutOutput) re-runs the same kernels and "
         "is covered functionally by tests/unit_tests/transformer/test_attention_residual.py.",
     ),
+    KernelEntry(
+        name="dsv4_grouped_projection_bmm",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/deepseek_v4_hybrid_attention.py",
+        ),
+        tests=(
+            K + "test_dsv4_grouped_projection.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_attention.py",
+        ),
+        kind="torch-op",
+        notes="Grouped output projection as cuBLAS strided-batched GEMMs on the token-major "
+        "tensors (MCORE_DSV4_GROUP_PROJ_BMM, opt-in; torch.einsum by default). The kernel test "
+        "compares the output and the input and weight gradients with the torch.einsum path bit "
+        "for bit (64K CP16 proxy, unaligned and odd shapes), checks the dispatch conditions and "
+        "that no copy kernel runs, and replays forward and backward bit-exactly under contention "
+        "and in a CUDA graph.",
+    ),
     # ---------------------------------------------------------------- Megatron Triton fusions
     KernelEntry(
         name="fused_pad_routing_map",
