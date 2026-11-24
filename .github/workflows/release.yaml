@@ -110,9 +110,9 @@ jobs:
       - run: python -m pytest .github/scripts/test_release_workflow.py
 
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@037094bcc9138c72bc125418e6e3653f9e1c4160 # v1.11.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@2eee849aec3da7b625a798188a0e1ba603e448d8
     with:
-      workflow_ref: 037094bcc9138c72bc125418e6e3653f9e1c4160 # pragma: allowlist secret
+      workflow_ref: 2eee849aec3da7b625a798188a0e1ba603e448d8 # pragma: allowlist secret
     if: github.repository == 'NVIDIA/Megatron-LM' && github.event_name != 'workflow_dispatch'
 
   bump:
@@ -123,7 +123,7 @@ jobs:
       && !(needs.pre-flight.outputs.docs_only == 'true'
            || needs.pre-flight.outputs.is_merge_group == 'true'
            || needs.pre-flight.outputs.is_deployment_workflow == 'true')
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_bump.yml@cf5acebace78c7c339bc1f804357a991336f1c4d # v1.8.10
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_bump.yml@2eee849aec3da7b625a798188a0e1ba603e448d8
     with:
       release-branch-pattern: "core_[rv][0-9]*.[0-9]*.[0-9]*"
       release-ref: ${{ inputs.release-ref || github.sha }}
@@ -262,7 +262,7 @@ jobs:
       contents: write
       pull-requests: write
       id-token: write
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_finalize.yml@cf5acebace78c7c339bc1f804357a991336f1c4d # v1.8.10
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_finalize.yml@2eee849aec3da7b625a798188a0e1ba603e448d8
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
       release-version: ${{ needs.bump.outputs.release-version }}
