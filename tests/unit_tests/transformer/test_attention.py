@@ -9,6 +9,7 @@ from packaging import version
 
 import megatron.core.parallel_state as parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
@@ -164,19 +165,22 @@ class TestParallelAttention:
         sequence_length = 32
         micro_batch_size = 2
 
-        self.parallel_attention.cuda()
+        self.parallel_attention.cuda().float().eval()
 
         # [sequence length, batch size, hidden size]
-        hidden_states = torch.ones(
+        hidden_states = torch.randn(
             (sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size),
-            dtype=torch.bfloat16,
+            device="cuda",
+            requires_grad=True,
         )
-        hidden_states = hidden_states.cuda()
 
-        attention_mask = torch.ones((micro_batch_size, 1, 1, sequence_length), dtype=bool).cuda()
-        rotary_pos_emb = torch.ones(
-            sequence_length, 1, 1, self.parallel_attention.config.kv_channels
-        ).cuda()
+        attention_mask = torch.zeros((micro_batch_size, 1, 1, sequence_length), dtype=bool).cuda()
+        rotary_pos_emb = RotaryEmbedding(
+            config.kv_channels,
+            rotary_percent=1.0,
+            rotary_interleaved=rotary_interleaved,
+            cp_group=self.parallel_attention.pg_collection.cp,
+        )(sequence_length)
         output, bias = self.parallel_attention(
             hidden_states, attention_mask, rotary_pos_emb=rotary_pos_emb
         )
@@ -186,8 +190,32 @@ class TestParallelAttention:
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == config.hidden_size
         assert bias.shape[0] == config.hidden_size
-        self.parallel_attention.config.apply_rope_fusion = False
-        self.parallel_attention.config.rotary_interleaved = False
+
+        upstream = torch.randn_like(output)
+        grad_inputs = (hidden_states, *self.parallel_attention.parameters())
+        grads = torch.autograd.grad(output + bias, grad_inputs, upstream)
+        # Replay the real fused dispatch, including input and parameter gradients.
+        replay, replay_bias = self.parallel_attention(
+            hidden_states, attention_mask, rotary_pos_emb=rotary_pos_emb
+        )
+        replay_grads = torch.autograd.grad(replay + replay_bias, grad_inputs, upstream)
+        for actual, expected in zip((replay, replay_bias, *replay_grads), (output, bias, *grads)):
+            assert torch.equal(
+                actual.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8)
+            )
+
+        config.fused_single_qkv_rope = False
+        config.apply_rope_fusion = False
+        reference, reference_bias = self.parallel_attention(
+            hidden_states, attention_mask, rotary_pos_emb=rotary_pos_emb
+        )
+        reference_grads = torch.autograd.grad(reference + reference_bias, grad_inputs, upstream)
+        torch.testing.assert_close(
+            (output, bias, grads),
+            (reference, reference_bias, reference_grads),
+            rtol=1e-4,
+            atol=1e-4,
+        )
 
     def test_checkpointed_gpu_forward(self):
         transformer_config = self.transformer_config

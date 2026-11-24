@@ -192,13 +192,19 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="attention_kernels_and_dispatch",
         sources=("megatron/core/transformer/attention.py",),
-        tests=(K + "test_fused_activations.py", K + "test_runtime_cp_attention.py"),
+        tests=(
+            K + "test_fused_activations.py",
+            K + "test_runtime_cp_attention.py",
+            "tests/unit_tests/transformer/test_attention.py",
+        ),
         kind="dispatch",
         notes="Attention._apply_output_gate is replayed in test_fused_activations.py. "
         "Packed SelfAttention dispatch through RoPE and TE attention is replayed with runtime "
         "CP1/CP2/CP4, including input/parameter gradients and CP-state restoration, in "
         "test_runtime_cp_attention.py. The dynamic-inference flash_decode_and_prefill "
-        "dispatch (FA2 prefill/decode) is replayed there with a config-driven softmax_scale.",
+        "dispatch (FA2 prefill/decode) is replayed there with a config-driven softmax_scale. "
+        "test_attention.py compares and replays unpacked fused RoPE in both rotary layouts, "
+        "including input and parameter gradients.",
     ),
     KernelEntry(
         name="fused_vocab_parallel_cross_entropy",
