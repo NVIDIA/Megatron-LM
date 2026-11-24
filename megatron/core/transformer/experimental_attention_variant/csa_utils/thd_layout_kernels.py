@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """CuTeDSL kernels for DSv4 packed-THD layout work.
 
 This module contains the context-parallel compressor compaction/metadata kernels

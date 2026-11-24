@@ -86,6 +86,7 @@ class MoKVirtualLayout:
         self.clear()
 
     def clear(self):
+        """Drop views and descriptors tied to the previous owner storage."""
         self.transport.clear()
         self.native_views = None
         self.owner_members = None
@@ -94,6 +95,7 @@ class MoKVirtualLayout:
         self.grad_tables = None
 
     def prepare_weights(self, module, plan, native_views, *, backward):
+        """Publish replica weights and return MoK descriptors in physical slot order."""
         # MoK refreshes its converted scales in place after an optimizer update. A new native
         # view may also change a backing address, e.g. on model reload; rebuild descriptors then.
         if self.native_views is None or any(

@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Packed CSA layout and index metadata using device tensor operations.
 
 All capacities come from input shapes. Real lengths remain device tensors; no

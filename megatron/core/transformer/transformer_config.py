@@ -635,8 +635,9 @@ class TransformerConfig(ModelParallelConfig):
     """Run DSv4 hybrid THD context parallelism on MCore's per-sequence zigzag partition
     (cp_partition_mode='zigzag'): CP rank r holds chunks r and 2*CP-1-r of the sequence, which
     balances causal attention work across ranks. Off (default) keeps the contiguous partition.
-    Supports THD packs with each document padded to a multiple of 2*CP, sliding-window and ratio-128 compressed layers without
-    a CSA indexer (no ratio-4 layers), static CP, delay_wgrad_compute=False and
+    Supports THD packs with each document padded to a multiple of 2*CP, sliding-window and
+    ratio-128 compressed layers without a CSA indexer (no ratio-4 layers), static CP,
+    delay_wgrad_compute=False and
     cuda_graph_impl='none'; unsupported cases raise."""
 
     apply_dsa_kernel_fusion: Optional[bool] = None

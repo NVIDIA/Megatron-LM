@@ -25,7 +25,7 @@ class PackedZigzagLayout:
     d_window: int
 
     def exchange(self, hidden, group):
-        """Gather the left context of each segment. Repeated uses sum at their source in backward."""
+        """Gather left context for each segment and sum its gradients at their source."""
         from megatron.core.tensor_parallel.mappings import all_to_all
 
         sends = hidden.index_select(0, self.send_indices)
@@ -50,7 +50,7 @@ def _transfers(boundaries, chunks, cp_size, src, dst, window):
 
 
 def build_packed_zigzag_layout(boundaries, cp_rank, cp_size, local_rows, ratio, window, device):
-    """Build host-known maps once per microbatch. No hidden or dense attention tensors are gathered."""
+    """Build index maps from the host-known document boundaries for this microbatch."""
     lengths = np.diff(np.asarray(boundaries, dtype=np.int64))
     if (
         not len(lengths)

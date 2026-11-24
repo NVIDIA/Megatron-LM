@@ -456,7 +456,8 @@ def check_dsv4_zigzag_cp_pack(
     if cu_seqlens.ndim != 1 or cu_seqlens.numel() != 2:
         raise NotImplementedError(
             "The two-segment zigzag layout expects one sequence per pack; got cumulative "
-            f"lengths of shape {tuple(cu_seqlens.shape)}. Packed inputs use the per-document layout."
+            f"lengths of shape {tuple(cu_seqlens.shape)}. "
+            "Packed inputs use the per-document layout."
         )
     if int(compress_ratio) == 4:
         raise NotImplementedError(

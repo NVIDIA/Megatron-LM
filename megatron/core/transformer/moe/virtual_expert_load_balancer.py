@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
 """Virtual-expert load balancing, virtual-expert planning, and runtime weight movement.
@@ -173,8 +173,8 @@ class _VirtualExpertStorage:
             self.grad_handle = symm_mem.rendezvous(self.grad_arena, group)
         except RuntimeError as exc:
             raise RuntimeError(
-                f"Virtual-expert weights could not allocate {config.symm_backend} symmetric memory for the EP group; "
-                "the EP group must lie within one NVLink domain."
+                f"Virtual-expert weights could not allocate {config.symm_backend} symmetric memory "
+                "for the EP group; the EP group must lie within one NVLink domain."
             ) from exc
         # The fast TMA reduction uses a descriptor with a constant positive peer stride.
         # CUDA VMM can return irregular addresses; the MoK integration also supports
