@@ -788,6 +788,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             else None
         )
         ctx.bias_gradient_accumulation_fusion = gradient_accumulation_fusion
+        ctx.differentiable_bias_grad = False
         ctx.gradient_accumulation_fusion = gradient_accumulation_fusion
         ctx.allreduce_dgrad = allreduce_dgrad
         ctx.sequence_parallel = sequence_parallel
@@ -971,8 +972,12 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         grad_bias = None
         if use_bias and ctx.needs_input_grad[2]:
             bias = ctx.bias
-            accumulate_bias = ctx.bias_gradient_accumulation_fusion and hasattr(
-                bias, "grad_added_to_main_grad"
+            # Keep later traversals of a higher-order graph differentiable as well.
+            ctx.differentiable_bias_grad |= torch.is_grad_enabled()
+            accumulate_bias = (
+                not ctx.differentiable_bias_grad
+                and ctx.bias_gradient_accumulation_fusion
+                and hasattr(bias, "grad_added_to_main_grad")
             )
             # Only opt in when the owning wrapper provides an FP32 buffer and
             # the fused-accumulation hook protocol. Ordinary autograd and

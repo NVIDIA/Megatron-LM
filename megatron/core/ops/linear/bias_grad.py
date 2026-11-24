@@ -54,6 +54,7 @@ class _BiasWithMainGrad(torch.autograd.Function):
         """Cast and broadcast the bias while preserving its wrapper metadata."""
         ctx.bias = bias
         ctx.main_grad = main_grad
+        ctx.differentiable_bias_grad = False
         # Cast the small vector before expanding. In particular, FP32 residual
         # connections must deliver FP32 per-position gradients to backward.
         return bias.to(dtype).expand(shape)
@@ -61,7 +62,9 @@ class _BiasWithMainGrad(torch.autograd.Function):
     @staticmethod
     def backward(ctx: Any, grad_output: Tensor) -> tuple[Tensor, None, None, None]:
         """Reduce the per-position gradient and hand it to the owning wrapper."""
-        if not torch.is_grad_enabled() and try_accumulate_bias_grad(
+        # Double backward can revisit this node with grad mode disabled.
+        ctx.differentiable_bias_grad |= torch.is_grad_enabled()
+        if not ctx.differentiable_bias_grad and try_accumulate_bias_grad(
             ctx.bias, grad_output, ctx.main_grad
         ):
             # The wrapper still needs an autograd edge and any ordinary .grad.

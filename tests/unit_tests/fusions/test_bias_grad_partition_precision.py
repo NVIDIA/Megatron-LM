@@ -13,6 +13,7 @@ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu, bias_gelu_back, bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
+from megatron.core.ops.linear.bias_grad import bias_with_main_grad
 from megatron.core.transformer import TransformerConfig
 
 
@@ -20,6 +21,28 @@ def _fused_bias_dropout_add(x, bias):
     # Keep the upstream gradient identical across partitions.
     bias_dropout_add = get_bias_dropout_add(training=True, fused=True)
     return bias_dropout_add((x, bias), torch.zeros_like(x), 0.0)
+
+
+def test_broadcast_bias_higher_order_grad():
+    bias = torch.nn.Parameter(torch.full((3,), 2.0, device="cuda"))
+    bias.main_grad = torch.full_like(bias, 17.0)
+    bias.grad_added_to_main_grad = False
+    initial = bias.main_grad.clone()
+    shape = torch.Size((2, 3))
+
+    reference = bias.expand(shape).pow(3).sum()
+    expected_first = torch.autograd.grad(reference, bias, create_graph=True)[0]
+    expected_second = torch.autograd.grad(expected_first.sum(), bias)[0]
+
+    output = bias_with_main_grad(bias, shape).pow(3).sum()
+    first = torch.autograd.grad(output, bias, create_graph=True)[0]
+    assert first.requires_grad
+    torch.testing.assert_close(first, expected_first, rtol=0, atol=0)
+    torch.testing.assert_close(bias.main_grad, initial, rtol=0, atol=0)
+
+    second = torch.autograd.grad(first.sum(), bias)[0]
+    torch.testing.assert_close(second, expected_second, rtol=0, atol=0)
+    torch.testing.assert_close(bias.main_grad, initial, rtol=0, atol=0)
 
 
 def _accumulate_bias_grad(fused_op, grad_output_chunks, expected_input_grad_scale):
@@ -267,6 +290,78 @@ def test_fused_bias_wrapper_accumulation(op, wrapper):
                 dist.all_gather_object(by_rank, local_grad)
                 grad = expected.new_tensor([value for shard in by_rank for value in shard])
             torch.testing.assert_close(grad, expected, rtol=0, atol=0)
+    finally:
+        parallel_state.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("strategy", ["no_shard", "optim_grads_params"])
+@pytest.mark.parametrize(
+    "fused_gradient", [float("nan"), float("inf"), 2.0], ids=["nan", "inf", "finite"]
+)
+def test_mfsdp_checks_fused_bias_buffer(strategy, fused_gradient):
+    from megatron.core.distributed.fsdp.mcore_adapter_v1 import FullyShardedDataParallelV1
+    from megatron.core.utils import is_te_min_version
+
+    if not dist.is_initialized():
+        pytest.skip("Requires the distributed test runner")
+    if not is_te_min_version("2.10"):
+        pytest.skip("Megatron FSDP v1 fused accumulation requires Transformer Engine >= 2.10")
+
+    class BiasOnly(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bias = torch.nn.Parameter(torch.zeros(8, device="cuda", dtype=torch.bfloat16))
+
+        def forward(self, x):
+            return _run_fused_bias("bda", x, self.bias, True), x + self.bias
+
+    parallel_state.initialize_model_parallel()
+    try:
+        model = BiasOnly()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=8,
+            num_attention_heads=1,
+            bf16=True,
+            calculate_per_token_loss=True,
+            gradient_accumulation_fusion=True,
+        )
+        wrapped = FullyShardedDataParallelV1(
+            config,
+            DistributedDataParallelConfig(
+                data_parallel_sharding_strategy=strategy,
+                overlap_grad_reduce=True,
+                overlap_param_gather=True,
+                megatron_fsdp_main_grads_dtype=torch.float32,
+                megatron_fsdp_grad_comm_dtype=torch.float32,
+            ),
+            model,
+            fsdp_unit_modules=[BiasOnly],
+        )
+        wrapped.module.report_nan_in_param_grad = True
+        wrapped.zero_grad_buffer()
+        wrapped.module.is_last_microbatch = True
+        x = torch.zeros((2, 3, 8), device="cuda", dtype=torch.bfloat16)
+        fused, ordinary = wrapped(x)
+        grads = (torch.full_like(fused, fused_gradient), torch.ones_like(ordinary))
+
+        if fused_gradient != 2.0:
+            with pytest.raises(ValueError, match="Detected NaN or Inf"):
+                torch.autograd.backward((fused, ordinary), grads)
+            return
+
+        torch.autograd.backward((fused, ordinary), grads)
+        wrapped.finish_grad_sync()
+        grad = model.bias.grad
+        if hasattr(grad, "to_local"):
+            grad = grad.to_local()
+        expected = 18.0 * dist.get_world_size()
+        count = 0 if grad is None else grad.numel()
+        mismatches = 0 if grad is None else (grad != expected).count_nonzero().item()
+        summary = torch.tensor([count, mismatches], device=x.device)
+        dist.all_reduce(summary)
+        expected_count = 8 * dist.get_world_size() if strategy == "no_shard" else 8
+        assert summary.tolist() == [expected_count, 0]
     finally:
         parallel_state.destroy_model_parallel()
 

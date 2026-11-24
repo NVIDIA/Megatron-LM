@@ -19,8 +19,8 @@ except ImportError:
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
-from megatron.core.fusions.fused_bias_dropout import configure_bias_dropout_add
 from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin
+from megatron.core.fusions.fused_bias_dropout import configure_bias_dropout_add
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.ops.norm.torch_norm import LayerNormBuilder

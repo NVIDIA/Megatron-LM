@@ -707,11 +707,13 @@ class MegatronFSDP(torch.nn.Module):
             if getattr(param, "bias_grad_added_to_main_grad", False):
                 # Native fused bias writes its own contribution directly. Autograd
                 # can still return gradients from other uses of the same parameter.
-                if param.grad is not None:
-                    grad = to_local_if_dtensor(param.grad)
+                if param.grad is not None or self.report_nan_in_param_grad:
+                    main_grad = param.get_main_grad()
+                    if param.grad is not None:
+                        main_grad.add_(to_local_if_dtensor(param.grad))
                     if self.report_nan_in_param_grad:
-                        _check_nan_in_grad(grad)
-                    param.get_main_grad().add_(grad)
+                        _check_nan_in_grad(main_grad)
+                if param.grad is not None:
                     del param.grad
                 param.bias_grad_added_to_main_grad = False
             elif gbuf.is_data_distributed:

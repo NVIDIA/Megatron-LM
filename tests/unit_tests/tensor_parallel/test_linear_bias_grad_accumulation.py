@@ -120,6 +120,30 @@ def test_bias_accumulation_with_deferred_weight_gradient():
     torch.testing.assert_close(bias.main_grad.double(), dy.double().sum((0, 1)), rtol=0, atol=0)
 
 
+def test_native_linear_higher_order_bias_grad():
+    x = torch.zeros(2, 4, device="cuda")
+    weight = torch.eye(4, device="cuda")
+    weight.main_grad = torch.zeros_like(weight)
+    bias = torch.nn.Parameter(torch.full((4,), 2.0, device="cuda"))
+    bias.main_grad = torch.full_like(bias, 17.0)
+    bias.grad_added_to_main_grad = False
+    initial = bias.main_grad.clone()
+
+    reference = _linear(x, weight, bias, fusion=False).pow(3).sum()
+    expected_first = torch.autograd.grad(reference, bias, create_graph=True)[0]
+    expected_second = torch.autograd.grad(expected_first.sum(), bias)[0]
+
+    output = _linear(x, weight, bias, deferred=[]).pow(3).sum()
+    first = torch.autograd.grad(output, bias, create_graph=True)[0]
+    assert first.requires_grad
+    torch.testing.assert_close(first, expected_first, rtol=0, atol=0)
+    torch.testing.assert_close(bias.main_grad, initial, rtol=0, atol=0)
+
+    second = torch.autograd.grad(first.sum(), bias)[0]
+    torch.testing.assert_close(second, expected_second, rtol=0, atol=0)
+    torch.testing.assert_close(bias.main_grad, initial, rtol=0, atol=0)
+
+
 def test_frozen_bias_does_not_acquire_fsdp_gradient_buffer():
     x, dy, weight, bias = _inputs()
     bias.requires_grad_(False)
