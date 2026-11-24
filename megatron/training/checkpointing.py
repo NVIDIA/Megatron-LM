@@ -3125,17 +3125,22 @@ def load_checkpoint(
             sharded_sd_metadata = _build_sharded_state_dict_metadata(
                 dp_cp_group=dp_cp_group, ckpt_format=load_format
             )
-            checkpoint_name = get_checkpoint_name(load_dir, iteration, release)
-            gen_sd_rng_state = _align_rng_state_sharded_metadata(gen_sd_rng_state, checkpoint_name)
-            if gen_sd_rng_state is None:
-                ignore_rng_state = True
-                print_rank_0(
-                    "RNG state cannot be restored for this DP/CP layout; using freshly initialized RNG state"
-                )
         else:
             sharded_sd_metadata = dist_checkpointing.load_content_metadata(
                 preloaded_state_dict=state_dict
             )
+            # Global torch-dist checkpoints: adapt the RNG ShardedObject to the stored layout
+            # (legacy 2-D keys, DP/CP rescale). Local checkpoints have no global .metadata file.
+            if gen_sd_rng_state is not None:
+                gen_sd_rng_state = _align_rng_state_sharded_metadata(
+                    gen_sd_rng_state, checkpoint_name
+                )
+                if gen_sd_rng_state is None:
+                    ignore_rng_state = True
+                    print_rank_0(
+                        'RNG state cannot be restored for this DP/CP layout; '
+                        'using freshly initialized RNG state'
+                    )
         print_rank_0(
             f'sharded_state_dict metadata loaded from the checkpoint: {sharded_sd_metadata}'
         )
