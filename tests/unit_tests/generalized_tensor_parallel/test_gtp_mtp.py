@@ -757,9 +757,7 @@ def _worker_fused_wgrad_returns_none(rank, world_size, port, repeated_layer=Fals
         model = _build_mtp_gpt_model(repeated_layer, moe=False)
         classify_gtp_remat_chains([model])
         for parameter in model.parameters():
-            parameter.main_grad = torch.zeros(
-                parameter.shape, dtype=torch.float32, device='cuda'
-            )
+            parameter.main_grad = torch.zeros(parameter.shape, dtype=torch.float32, device='cuda')
         shared = [
             (name, parameter)
             for name, parameter in model.named_parameters()
