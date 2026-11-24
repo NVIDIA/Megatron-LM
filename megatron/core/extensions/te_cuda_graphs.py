@@ -171,6 +171,12 @@ class TECudaGraphMixin:
             cuda_graph_modules scopes this module covers and which submodules
             are inside the graph.
 
+    Replay and deletion hooks (no-ops by default):
+        _before_te_cuda_graph_replay: eager work that runs after the manual parameter
+            (all-gather) hooks and right before the graph replays, on the same stream.
+        _after_te_cuda_graphs_deleted: releases state that the graphs pinned; called by
+            TECudaGraphHelper.delete_cuda_graphs after it dropped this module's graphs.
+
     Rules for subclasses:
         Graph inputs must be tensors or None; drop anything else (e.g.
         packed_seq_params, inference_context) before replay.
@@ -385,7 +391,16 @@ class TECudaGraphMixin:
 
         for hook, hook_args in self.te_cuda_graph_manual_hooks:
             hook(*hook_args)
+        self._before_te_cuda_graph_replay()
         return self.te_cuda_graphs[cg_index](*cudagraph_args, **cudagraph_kwargs)
+
+    def _before_te_cuda_graph_replay(self):
+        """Run eager work that must follow the manual (parameter all-gather) hooks and precede the
+        graph replay on the current stream. No-op by default."""
+
+    def _after_te_cuda_graphs_deleted(self):
+        """Release state that this module's TE CUDA graphs pinned, after the graphs were deleted.
+        No-op by default."""
 
     def _get_te_cuda_graph_replay_args(self, hidden_states: torch.Tensor, *args, **kwargs):
         """Validate the module's tensor inputs and add TE execution metadata."""

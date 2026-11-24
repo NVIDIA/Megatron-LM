@@ -54,7 +54,6 @@ from megatron.training.global_vars import (
     get_train_state,
     initialize_runtime_services,
 )
-from megatron.training.models import LLaVAModelConfig
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 
 logger = logging.getLogger(__name__)
@@ -251,16 +250,9 @@ def initialize_megatron(
                 tp_comm_overlap_cfg = args.tp_comm_overlap_cfg
             else:
                 tp_comm_overlap_cfg = cfg.model.tp_comm_overlap_cfg
-            # Model seq_length is position capacity, not the actual batch length.
-            # VLM overlap uses the padded text+image decoder length.
-            sequence_length = (
-                args.decoder_seq_length
-                if isinstance(cfg.model, LLaVAModelConfig)
-                else args.seq_length
-            )
             _initialize_tp_communicators(
                 transformer_config,
-                sequence_length=sequence_length,
+                sequence_length=cfg.model.transformer.max_seq_length_per_sample,
                 micro_batch_size=cfg.train.micro_batch_size,
                 tp_comm_overlap_cfg=tp_comm_overlap_cfg,
             )
@@ -390,8 +382,9 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
         print_rank_0("> initializing torch distributed ...")
         # Manually set the device ids.
         if device_count > 0:
-            torch.cuda.set_device(cfg.dist.local_rank)
-            device_id = torch.device(f'cuda:{cfg.dist.local_rank}')
+            device_index = 0 if cfg.dist.external_gpu_device_mapping else cfg.dist.local_rank
+            torch.cuda.set_device(device_index)
+            device_id = torch.device(f'cuda:{device_index}')
         else:
             device_id = None
 

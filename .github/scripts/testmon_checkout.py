@@ -13,6 +13,10 @@ import tempfile
 from pathlib import Path
 
 REPOSITORY = "NVIDIA/Megatron-LM"
+# publish-testmon-cache.yml names each successful publish job after its source.
+PUBLISH_JOB = re.compile(
+    r"Publish unit-testmon-v[0-9]+-main-.+-1 from run ([1-9][0-9]*) at ([0-9a-f]{40})"
+)
 
 
 def run(
@@ -44,14 +48,58 @@ def sha(value: object) -> str:
     return value
 
 
+def published_baseline() -> tuple[str, str] | None:
+    """Find the latest merge-group baseline published on push or by manual dispatch."""
+    try:
+        publishers = json.loads(
+            run(
+                "gh",
+                "api",
+                f"repos/{REPOSITORY}/actions/workflows/publish-testmon-cache.yml/"
+                "runs?branch=main&status=completed&per_page=100",
+            )
+        )
+    except subprocess.CalledProcessError:
+        # The publisher workflow may not exist on main yet.
+        return None
+    for publisher in publishers["workflow_runs"]:
+        if (
+            publisher["event"] not in {"push", "workflow_dispatch"}
+            or publisher["head_repository"]["full_name"] != REPOSITORY
+        ):
+            continue
+        # Commits without merge-group artifacts complete without publishing anything.
+        names = json.loads(
+            run(
+                "gh",
+                "api",
+                f'repos/{REPOSITORY}/actions/runs/{publisher["id"]}/jobs?per_page=100',
+                "--jq",
+                '[.jobs[] | select(.conclusion == "success") | .name]',
+            )
+        )
+        sources = {match.groups() for name in names if (match := PUBLISH_JOB.fullmatch(name))}
+        if len(sources) == 1:
+            # The publisher only accepts first-attempt merge-group artifacts.
+            producer, source = sources.pop()
+            return sha(source), f"{producer}-1"
+    return None
+
+
 def latest_baseline() -> tuple[str, str]:
-    """Find a successful trusted main producer with a common cache generation."""
+    """Prefer published merge-group baselines, then the scheduled main producer."""
+    published = published_baseline()
+    if published:
+        return published
     response = json.loads(
         run(
             "gh",
             "api",
             f"repos/{REPOSITORY}/actions/workflows/populate-build-cache.yml/"
-            "runs?branch=main&status=success&per_page=100",
+            "runs?branch=main&status=completed&per_page=100",
+            "--jq",
+            '{workflow_runs: [.workflow_runs[] | select(.conclusion == "success" or '
+            '.conclusion == "failure")]}',
         )
     )
     for candidate in response["workflow_runs"]:

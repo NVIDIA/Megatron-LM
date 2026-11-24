@@ -23,6 +23,7 @@ def test_evaluate_weights_valid_tokens_across_batches_ranks_and_iterations(
     run_config.validation.eval_micro_batch_size = 1
     run_config.validation.eval_iters = 2
     args = SimpleNamespace(
+        modelopt_enabled=True,
         eval_global_batch_size=4,
         eval_micro_batch_size=1,
         data_parallel_size=2,
@@ -65,6 +66,13 @@ def test_evaluate_weights_valid_tokens_across_batches_ranks_and_iterations(
 
     forward_backward = mock.Mock(side_effect=losses)
     model = mock.Mock()
+
+    def distillation(model, *, seq_length, micro_batch_size, decoder_seq_length):
+        assert seq_length == run_config.model.transformer.max_seq_length_per_sample
+        assert micro_batch_size == 1
+        assert decoder_seq_length is None
+        return None
+
     with (
         mock.patch.object(training_mod, "get_args", return_value=args),
         mock.patch.object(training_mod, "get_train_state", return_value=train_state),
@@ -73,7 +81,11 @@ def test_evaluate_weights_valid_tokens_across_batches_ranks_and_iterations(
         mock.patch.object(training_mod, "get_forward_backward_func", return_value=forward_backward),
         mock.patch.object(training_mod, "get_attr_wrapped_model", return_value=groups),
         mock.patch.object(training_mod, "is_pp_last_stage", return_value=True),
-        mock.patch.object(training_mod, "has_nvidia_modelopt", False),
+        mock.patch.object(training_mod, "has_nvidia_modelopt", True),
+        mock.patch.object(training_mod, "is_distillation_model", return_value=True, create=True),
+        mock.patch.object(
+            training_mod, "get_tensor_shapes_adjust_fn_for_distillation", distillation, create=True
+        ),
         mock.patch.object(training_mod, "ft_integration"),
         mock.patch.object(training_mod, "_otel_managed_span", return_value=mock.MagicMock()),
         mock.patch.object(
