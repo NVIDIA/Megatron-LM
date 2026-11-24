@@ -100,7 +100,8 @@ _DSA_INDEX_KEY_FIELDS = ("index_key_dtype", "head_dim", "tokens_per_block", "ele
 def dsa_index_key_transfer_view(dsa_memory_buffer: Any) -> Any:
     """View a paged DSA index-key cache in the [planes, L, B, T, H, d] KV transfer layout.
 
-    The ``[L, B, T, Di]`` cache becomes one plane of one head.
+    BF16 caches are ``[L, B, T, Di]``; NVFP4 caches are ``[L, B, pages, page_bytes]``, so an
+    NVFP4 "token" is one packed page. Either way the cache becomes one plane of one head.
     """
     if dsa_memory_buffer.dim() != 4:
         raise ValueError(

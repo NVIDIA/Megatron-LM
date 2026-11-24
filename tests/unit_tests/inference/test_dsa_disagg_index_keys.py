@@ -17,7 +17,8 @@ from megatron.core.inference.disaggregation.utils import (
 )
 
 LAYERS, HEADS, TOKENS, HEAD_DIM, POOL = 4, 2, 128, 2, 9
-INDEX_KEYS = {"bf16": (torch.bfloat16, TOKENS, 128)}
+# NVFP4 caches hold 64-key pages of packed keys and scales (here a stand-in page size).
+INDEX_KEYS = {"bf16": (torch.bfloat16, TOKENS, 128), "nvfp4": (torch.uint8, TOKENS // 64, 80)}
 SRC_BLOCKS, DST_BLOCKS = [6, 2, 4], [1, 7, 3]
 CACHED = 1  # The decode already holds the first block (prefix-cache hit), keys included.
 SENTINEL = 11
@@ -44,7 +45,7 @@ def test_index_key_view_is_one_plane_of_one_head():
 
 
 def test_transfer_meta_keeps_nesting_and_trimmed_block_ids():
-    local = {"index_key_dtype": "bf16", "head_dim": 128, "tokens_per_block": 2, "element_size": 2}
+    local = {"index_key_dtype": "nvfp4", "head_dim": 80, "tokens_per_block": 2, "element_size": 1}
     rank = lambda name: {"agent": f"kv-{name}", "dsa": dict(local, agent=f"dsa-{name}")}
     meta = {
         "resume_tokens": [5],
@@ -72,15 +73,15 @@ def test_transfer_meta_keeps_nesting_and_trimmed_block_ids():
     "peer, error",
     [
         ({"agent": "kv"}, "does not export DSA index keys"),
-        ({"dsa": {"index_key_dtype": "bf16", "head_dim": 64}}, "head_dim: peer=64 local=128"),
+        ({"dsa": {"index_key_dtype": "bf16", "head_dim": 128}}, "index_key_dtype: peer=bf16"),
         (
-            {"dsa": {"index_key_dtype": "bf16", "head_dim": 128, "tokens_per_block": 4}},
-            "tokens_per_block: peer=4 local=2",
+            {"dsa": {"index_key_dtype": "nvfp4", "head_dim": 64, "tokens_per_block": 2}},
+            "head_dim: peer=64 local=80",
         ),
     ],
 )
 def test_transfer_meta_rejects_incompatible_peers(peer, error):
-    local = {"index_key_dtype": "bf16", "head_dim": 128, "tokens_per_block": 2, "element_size": 2}
+    local = {"index_key_dtype": "nvfp4", "head_dim": 80, "tokens_per_block": 2, "element_size": 1}
     with pytest.raises(ValueError, match=error):
         dsa_transfer_meta({"tp_metas": [peer]}, local)
 
@@ -93,7 +94,10 @@ def _canonical(device):
     keys = {}
     for dtype, (torch_dtype, tokens, dim) in INDEX_KEYS.items():
         shape = (LAYERS, count, tokens, dim)
-        keys[dtype] = torch.randn(shape, generator=generator).to(torch_dtype)
+        if torch_dtype == torch.uint8:
+            keys[dtype] = torch.randint(0, 256, shape, generator=generator, dtype=torch.uint8)
+        else:
+            keys[dtype] = torch.randn(shape, generator=generator).to(torch_dtype)
     return kv.to(device), {dtype: value.to(device) for dtype, value in keys.items()}
 
 
@@ -191,7 +195,7 @@ def distributed_world():
     ),
     reason="requires torchrun with exactly four CUDA ranks",
 )
-@pytest.mark.parametrize("dtype", ["bf16"])
+@pytest.mark.parametrize("dtype", ["bf16", "nvfp4"])
 @pytest.mark.parametrize("src_topology,dst_topology,src_ranks,dst_ranks", TOPOLOGIES)
 def test_nccl_index_keys_follow_kv_blocks(
     distributed_world, dtype, src_topology, dst_topology, src_ranks, dst_ranks

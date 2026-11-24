@@ -327,8 +327,10 @@ def assert_import_equal(engine, pending, source, prompt_length):
         actual = engine.context.memory_buffer[:, :, block, :count].cpu()
         assert torch.equal(actual, source["kv"][:, :, index, :count])
         if "dsa" in source:
+            # NVFP4 index keys are packed in 64-key pages; compare only complete pages.
             dsa = engine.context.dsa_memory_buffer
-            assert torch.equal(dsa[:, block, :count].cpu(), source["dsa"][:, index, :count])
+            rows = count if dsa.shape[2] == block_size else count // (block_size // dsa.shape[2])
+            assert torch.equal(dsa[:, block, :rows].cpu(), source["dsa"][:, index, :rows])
     if pending.ssm is not None:
         slot = pending.ssm.live_slot
         assert torch.equal(engine.context.mamba_conv_states[:, slot].cpu(), source["conv"])

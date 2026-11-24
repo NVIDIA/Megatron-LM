@@ -57,8 +57,8 @@ FIRST, SECOND = 600, 700
 SHARED = 2 * BLOCK
 # Largest log-prob difference allowed outside batch-invariant mode. Aggregated serving differs
 # from itself (repeat run, other GPU) by up to ~4.4e-3 (BF16, Triton and FlashInfer); the budget
-# is ~5x that.
-LOGPROB_BUDGET = {"bf16": 2e-2}
+# is ~5x that. NVFP4 ties more often at the top-k boundary, so it gets a wider budget.
+LOGPROB_BUDGET = {"bf16": 2e-2, "nvfp4": 5e-2}
 
 pytestmark = [
     pytest.mark.launch_on_gb200,
@@ -145,6 +145,7 @@ def _engine(model, config, dsa_backend, index_key_dtype, role=None):
             kv_transport_backend="nccl",
             disaggregation_role=role,
             dsa_backend=dsa_backend,
+            dsa_indexer_key_dtype=index_key_dtype,
         ),
     )
     controller = TextGenerationController(
@@ -240,6 +241,7 @@ def transport_world():
     [
         pytest.param("flashinfer", "bf16", True, id="flashinfer-bf16-batch_invariant"),
         pytest.param("flashinfer", "bf16", False, id="flashinfer-bf16"),
+        pytest.param("flashinfer", "nvfp4", False, id="flashinfer-nvfp4"),
         pytest.param("triton", "bf16", False, id="triton-bf16"),
     ],
 )
@@ -255,6 +257,8 @@ def test_disaggregated_dsa_matches_aggregated(
             pytest.skip("The Triton DSA kernels need Gluon's tma.async_load")
     if dsa_backend == "flashinfer" and not dsa_gqa_flashinfer.HAVE_FLASHINFER_DSA:
         pytest.skip("FlashInfer's DSA kernels are not installed")
+    if index_key_dtype == "nvfp4" and not dsa_gqa_flashinfer.HAVE_FLASHINFER_DSA_NVFP4:
+        pytest.skip("FlashInfer's NVFP4 indexer kernels are not installed")
 
     with _batch_invariant(batch_invariant):
         model_parallel_cuda_manual_seed(

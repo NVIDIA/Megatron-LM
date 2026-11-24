@@ -1931,7 +1931,7 @@ def test_dsa_push_sends_index_keys_after_kv_for_uncached_blocks():
 
 
 @pytest.mark.parametrize("is_push", [False, True], ids=["pull", "push"])
-@pytest.mark.parametrize("dtype", ["bf16"])
+@pytest.mark.parametrize("dtype", ["bf16", "nvfp4"])
 def test_dsa_handoff_imports_index_keys_for_uncached_blocks(handoff_loop, is_push, dtype):
     engine = _HandoffHarness(handoff_loop)
     engine._kv_transfer_agent.is_push = is_push
@@ -1980,8 +1980,8 @@ def test_dsa_handoff_imports_index_keys_for_uncached_blocks(handoff_loop, is_pus
 def test_dsa_handoff_rejects_mismatched_index_key_cache(handoff_loop):
     engine = _HandoffHarness(handoff_loop)
     engine._dsa_transfer_agent = _TransferAgent()
-    engine._dsa_local_meta = dict(_dsa_meta("decode-dsa"), head_dim=64)
-    meta = {"request_id": 12, "resume_tokens": [99], "dsa": _dsa_meta("prefill-dsa")}
+    engine._dsa_local_meta = _dsa_meta("decode-dsa", "nvfp4")
+    meta = {"request_id": 12, "resume_tokens": [99], "dsa": _dsa_meta("prefill-dsa", "bf16")}
     engine.add_request_with_kv_handoff(
         12, [6] * 8, SamplingParams(num_tokens_to_generate=2), meta, [100, 101]
     )
@@ -1989,7 +1989,7 @@ def test_dsa_handoff_rejects_mismatched_index_key_cache(handoff_loop):
 
     pending = engine._pending_kv_imports[0]
     assert isinstance(pending.local_error, ValueError)
-    assert "head_dim: peer=128 local=64" in str(pending.local_error)
+    assert "index_key_dtype: peer=bf16 local=nvfp4" in str(pending.local_error)
     assert not engine._kv_transfer_agent.calls and not engine._dsa_transfer_agent.calls
 
 
