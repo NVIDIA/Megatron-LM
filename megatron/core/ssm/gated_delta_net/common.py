@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 
 from megatron.core import tensor_parallel
+from megatron.core.context_parallel.groups import get_valid_dynamic_context_parallel_group_sizes
 from megatron.core.fp8_utils import get_fp8_align_size, get_fp8_disabled_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
@@ -280,6 +281,36 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
                 },
             )
             self._validate_runtime_cp_size(self.cp_size)
+
+        # Only KDA implements chunkwise linear CP today. GDN/GDN2 accept
+        # linear_cp_mode="chunkwise" without error but stay on the headwise
+        # path: hybrid_block gates chunkwise metadata on
+        # `type(layer_config) is MambaLayerConfig`, so the request is silently
+        # dropped and the mixer keeps asserting "no chunkwise metadata" below.
+        # The input remains sequence-sharded in headwise CP; the mixer gathers
+        # sequence shards and partitions heads internally.
+        if not isinstance(config, KDALayerConfig) and config.linear_cp_mode == "chunkwise":
+            dynamic_cp_sizes = ()
+            if config.dynamic_context_parallel:
+                dynamic_cp_groups = getattr(self.pg_collection, "dynamic_cp", None)
+                dynamic_cp_sizes = (
+                    dynamic_cp_groups
+                    if dynamic_cp_groups
+                    else get_valid_dynamic_context_parallel_group_sizes(
+                        self.pg_collection.dp_cp.size()
+                    )
+                )
+            if self.cp_size > 1 or any(
+                size >= max(2, config.min_dynamic_context_parallel_size)
+                for size in dynamic_cp_sizes
+            ):
+                raise ValueError(
+                    f"linear_cp_mode='chunkwise' is not implemented for "
+                    f"{type(config).__name__}: only headwise linear CP is "
+                    "supported. Keep sequence-sharded inputs; the mixer gathers "
+                    "sequence shards and partitions heads internally (see #9731). "
+                    "Use linear_cp_mode='headwise', or KDA for chunkwise CP."
+                )
 
         attrs_to_check = (
             "dt_bias_dim",
