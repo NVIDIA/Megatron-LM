@@ -1367,26 +1367,10 @@ class TransformerConfig(ModelParallelConfig):
     the weight-prefetch chain and the second exercises the prefetch path before capture."""
 
     cuda_graph_pair_hybrid_layers: bool = False
-    """With cuda_graph_impl="transformer_engine", capture each Hybrid mixer layer (attention, GDN,
-    ...) together with the MoE or MLP layer that follows it as one CUDA graph, which halves the
-    graph launches per block. The pair runs the same operations as the two per-layer graphs, and
-    parameter names and checkpoints do not change. Layers that cannot be paired keep their own
-    graphs, and so, with a warning, do MoE layers whose graphs contain the MoE megakernel
-    (moe_megakernel_backend). The layers of Hybrid MTP blocks, which per-layer graphs leave
-    eager, are graphed the same way, unless mtp_use_repeated_layer runs a block for several MTP
-    depths, keep_mtp_in_bf16 keeps it out of FP8/FP4 training, its layer configs select another
-    FP8/FP4 recipe than this config, with which TE graphs are captured, or the BF16 graph inputs
-    would round its FP32 residual stream (fp32_residual_connection). Their MoE layers also stay
-    eager, and the mixers before them keep their own graphs, when an MoE layer's own config sets up
-    a graph scope that pairing does not capture: mlp_chunks_for_training > 1 with the moe_router
-    scope, or the moe scope or whole-layer capture with the allgather dispatcher or with neither
-    drop-and-pad MoE nor moe_virtual_expert_load_balance, which the moe scope requires for decoder
-    layers too. Pairing is skipped with a warning when EP communication overlap,
-    delay_wgrad_compute, fine-grained activation offloading, sequence_packing_scheduler, mHC or
-    context parallelism is enabled. Wide residual streams do not support Transformer Engine CUDA
-    graphs; configuration validation rejects that combination. A layer whose own layer config
-    (hybrid_layer_config_list) sets another cuda_graph_impl is not paired and runs as with
-    per-layer graphs. Has no effect with other cuda_graph_impl values."""
+    """With cuda_graph_impl="transformer_engine", capture each Hybrid mixer layer and the MoE or
+    MLP layer that follows it as one CUDA graph instead of two, and also graph the layers of
+    Hybrid MTP blocks. Layers that cannot be paired keep their own graphs, and unsupported
+    configurations fall back with a warning; see docs/user-guide/features/cuda_graph.md."""
 
     external_cuda_graph: bool = False
     """DEPRECATED and replaced by cuda_graph_impl.
