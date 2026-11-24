@@ -624,6 +624,39 @@ class TestPackedSampleAccounting:
         assert count == 3 * 2 * samples
         assert _get_optimizer_param_scheduler_increment(args, count) == 3 * 2 * samples
 
+    def test_samples_seen_without_reports_or_pipeline_stays_on_host(self, monkeypatch, run_config):
+        """With nothing reported and one pipeline stage, no device work and no host sync."""
+        run_config.train = TrainingConfig(micro_batch_size=2, train_samples=10_000)
+        monkeypatch.setattr(training, "get_num_microbatches", lambda: 3)
+        monkeypatch.setattr(training, "get_pg_size", lambda group: 1)
+        monkeypatch.setattr(type(run_config), "get_batch_parallel_size", lambda self: 4)
+
+        def no_device_work(*args, **kwargs):
+            raise AssertionError("the scheduled sample count needs no device work")
+
+        monkeypatch.setattr(torch, "full", no_device_work)
+        monkeypatch.setattr(torch.distributed, "broadcast", no_device_work)
+
+        count = training._get_samples_seen_in_iteration([{}] * 3, None, SimpleNamespace(pp=None))
+
+        assert count == 3 * 2 * 4
+
+    def test_samples_seen_without_reports_falls_back_across_pipeline_stages(
+        self, monkeypatch, run_config
+    ):
+        """A non-last stage hears "nothing reported" from the last stage and uses the schedule."""
+        run_config.train = TrainingConfig(micro_batch_size=2, train_samples=10_000)
+        monkeypatch.setattr(training, "get_num_microbatches", lambda: 3)
+        monkeypatch.setattr(training, "get_pg_size", lambda group: 2)
+        monkeypatch.setattr(training, "is_pp_last_stage", lambda group: False)
+        monkeypatch.setattr(training, "get_pp_last_rank", lambda group: 1)
+        monkeypatch.setattr(type(run_config), "get_batch_parallel_size", lambda self: 4)
+        monkeypatch.setattr(torch.distributed, "broadcast", lambda tensor, src, group: None)
+
+        count = training._get_samples_seen_in_iteration([{}] * 3, None, SimpleNamespace(pp=None))
+
+        assert count == 3 * 2 * 4
+
     def test_pop_samples_seen_sums_and_removes_metadata(self):
         losses = [
             {"lm loss": torch.tensor(1.0), "_samples_seen": torch.tensor(3.0)},
