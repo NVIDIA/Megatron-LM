@@ -25,6 +25,10 @@ def test_batched_linear_gradient_owner_replays(mode, fused):
     import transformer_engine.common.recipe as recipes
     import transformer_engine.pytorch as te
 
+    from megatron.core.transformer.experimental_attention_variant.csa2_module_spec import (
+        csa2_attention_spec,
+    )
+
     recipe = None
     if mode != "bf16":
         available, reason = te.is_mxfp8_available(return_reason=True)
@@ -37,8 +41,10 @@ def test_batched_linear_gradient_owner_replays(mode, fused):
         if mode == "primary_mxfp8"
         else nullcontext()
     )
+    projection = csa2_attention_spec.submodules.linear_o_group_proj
+    assert projection is TEBatchedLinear
     with init:
-        module = TEBatchedLinear(
+        module = projection(
             2,
             64,
             64,

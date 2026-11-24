@@ -22,6 +22,9 @@ from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid
     DSv4HybridSelfAttention,
     DSv4HybridSelfAttentionSubmodules,
 )
+from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention_module_specs import (
+    get_dsv4_o_group_proj_spec,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec
 
 
@@ -43,6 +46,7 @@ def get_csa2_module_spec_for_backend(backend: CSA2BackendSpecProvider) -> Module
             linear_q_down_proj=backend.linear(),
             linear_q_up_proj=backend.column_parallel_linear(),
             linear_kv_proj=backend.column_parallel_linear(),
+            linear_o_group_proj=get_dsv4_o_group_proj_spec(),
             linear_proj=backend.row_parallel_linear(),
             q_layernorm=backend.layer_norm(rms_norm=True, for_qk=True),
             kv_layernorm=backend.layer_norm(rms_norm=True, for_qk=True),
