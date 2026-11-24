@@ -150,9 +150,14 @@ follows it as one graph, which halves the graph launches per block:
   `transformer_engine` is not paired and runs as it does with per-layer graphs; its neighbor keeps
   its own graph.
 - The layers of Hybrid MTP blocks, which per-layer graphs leave eager, are graphed too, paired the
-  same way. They stay eager with `--mtp-use-repeated-layer` and several MTP depths, with
-  `--keep-mtp-in-bf16` in FP8 or FP4 training, and with `--fp32-residual-connection`, because the
-  BF16 graph inputs would round the FP32 residual stream that the eager MTP layers keep.
+  same way. They stay eager, with a warning:
+  - with `--mtp-use-repeated-layer` and several MTP depths;
+  - with `--keep-mtp-in-bf16` in FP8 or FP4 training;
+  - when the MTP layer configs of a `hybrid_layer_config_list` select another FP8 or FP4 recipe
+    than the model (format, recipe, recipe options or amax reduction group), since one capture
+    uses the model's recipe for all layers;
+  - with `--fp32-residual-connection`, because the BF16 graph inputs would round the FP32
+    residual stream that the eager MTP layers keep.
 - The MoE layers of Hybrid MTP blocks also stay eager, with a warning, and the mixers before them
   keep their own graphs, when an MoE layer's own config sets up a graph scope that pairing does
   not capture:

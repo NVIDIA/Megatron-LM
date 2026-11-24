@@ -2590,9 +2590,11 @@ def _hybrid_mtp_graphs_supported(config: TransformerConfig) -> bool:
 
     A graph keeps the activations of one call per microbatch, so a block that runs once per MTP
     depth (mtp_use_repeated_layer) stays eager. TE graphs capture MTP layers with the model's
-    FP8/FP4 setting, so a block kept out of it (keep_mtp_in_bf16) stays eager too. A graph's
-    hidden_states input is BF16, so with fp32_residual_connection graphed layers would round the
-    FP32 residual stream that the block's eager layers keep, and the block stays eager as well.
+    FP8/FP4 setting, so a block kept out of it (keep_mtp_in_bf16) stays eager too, and so does a
+    block whose layer configs select another recipe (see _hybrid_mtp_recipe_differences). A
+    graph's hidden_states input is BF16, so with fp32_residual_connection graphed layers would
+    round the FP32 residual stream that the block's eager layers keep, and the block stays eager
+    as well.
     """
     blocking_features = [
         name
@@ -2663,6 +2665,58 @@ def _hybrid_mtp_moe_blocking_features(config: TransformerConfig) -> list:
         )
         if enabled
     ]
+
+
+# The TransformerConfig fields from which get_fp8_recipe, get_fp4_recipe, get_fp8_context and
+# get_fp4_context build a layer's FP8/FP4 recipe and amax reduction group.
+_QUANTIZATION_RECIPE_FIELDS = (
+    "fp8",
+    "fp8_recipe",
+    "fp8_margin",
+    "fp8_interval",
+    "fp8_amax_history_len",
+    "fp8_amax_compute_algo",
+    "fp8_wgrad",
+    "fp8_dot_product_attention",
+    "fp8_multi_head_attention",
+    "fp8_quantizer_factory",
+    "fp8_recipe_attrs",
+    "fp4",
+    "fp4_recipe",
+    "fp4_quantizer_factory",
+    "fp4_recipe_attrs",
+    "tp_only_amax_red",
+)
+
+
+def _hybrid_mtp_recipe_differences(mtp_block, config: TransformerConfig) -> list:
+    """Return the FP8/FP4 recipe settings in which Hybrid MTP layers differ from the model.
+
+    make_graphed_callables takes one recipe for all callables, the model's. The eager MTP block
+    runs inside the model's FP8/FP4 context and, except with delayed scaling, enters each layer's
+    own context inside it, so a layer whose config selects another recipe can run differently
+    once graphed. Such a block stays eager, as with per-layer graphs. The first/last-layer BF16
+    settings are not compared: inside the model's context they cannot turn FP8/FP4 off for an MTP
+    layer, and TE graphs enable FP8/FP4 for every MTP layer.
+
+    Args:
+        mtp_block (HybridStack): The mtp_model_layer of a Hybrid MTP block.
+        config (TransformerConfig): The model config that TE graphs are captured with.
+
+    Returns:
+        list: The names of the differing settings, sorted. Empty without FP8/FP4 training, in
+        which neither the eager block nor the graphs quantize.
+    """
+    if not (config.fp8 or config.fp4):
+        return []
+    return sorted(
+        {
+            name
+            for layer_config in mtp_block.layer_config_list
+            for name in _QUANTIZATION_RECIPE_FIELDS
+            if getattr(layer_config, name) != getattr(config, name)
+        }
+    )
 
 
 def _te_graph_callables(
@@ -2780,6 +2834,8 @@ class TECudaGraphHelper:
         num_pairs, num_hybrid_mtp_callables = 0, 0
         # The settings that keep MoE layers of Hybrid MTP blocks eager, for one warning.
         mtp_moe_blocking_features = set()
+        # The FP8/FP4 settings that keep Hybrid MTP blocks eager, for one warning.
+        mtp_recipe_differences = set()
         for chunk_number, model_chunk in enumerate(self.model):
             try:
                 chunk_with_decoder = get_attr_wrapped_model(
@@ -2824,6 +2880,12 @@ class TECudaGraphHelper:
                     if _te_cuda_graph_layer_is_graphable(mtp_layer.mtp_model_layer, self.config):
                         mtp_callables = [mtp_layer.mtp_model_layer]
                     elif graph_hybrid_mtp and getattr(mtp_layer, "is_hybrid_mtp", False):
+                        recipe_differences = _hybrid_mtp_recipe_differences(
+                            mtp_layer.mtp_model_layer, self.config
+                        )
+                        if recipe_differences:
+                            mtp_recipe_differences.update(recipe_differences)
+                            continue
                         mtp_block_layers = mtp_layer.mtp_model_layer.layers
                         # An MoE layer is captured with its own config, which a
                         # hybrid_layer_config_list can set apart from the model config.
@@ -2883,6 +2945,16 @@ class TECudaGraphHelper:
                 level=logging.WARNING,
                 msg='MoE layers of Hybrid MTP blocks are not CUDA-graphed with '
                 f'{", ".join(sorted(mtp_moe_blocking_features))}; they run eagerly.',
+            )
+        if mtp_recipe_differences:
+            log_on_each_pipeline_stage(
+                logger=logger,
+                tp_group=self.tp_group,
+                dp_cp_group=self.dp_cp_group,
+                level=logging.WARNING,
+                msg='Hybrid MTP layers are not CUDA-graphed because their layer configs differ '
+                f'from the model in {", ".join(sorted(mtp_recipe_differences))}, and TE graphs '
+                "would capture them with the model's FP8/FP4 recipe; they run eagerly.",
             )
         log_on_each_pipeline_stage(
             logger=logger,

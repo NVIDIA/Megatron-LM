@@ -2460,6 +2460,46 @@ class TestHybridLayerPairCudaGraph:
         else:
             assert len(blocking_features) == 1 and blocking_feature in blocking_features[0]
 
+    @pytest.mark.parametrize(
+        "model_recipe,mtp_layer_recipe,expected_differences",
+        [
+            # Without FP8/FP4 training, neither the eager MTP block nor the graphs quantize.
+            pytest.param({}, {"fp8": "e4m3", "fp8_recipe": "tensorwise"}, [], id="bf16-model"),
+            pytest.param({"fp8": "e4m3", "fp8_recipe": "mxfp8"}, {}, [], id="same-recipe"),
+            pytest.param(
+                {"fp8": "e4m3", "fp8_recipe": "mxfp8"},
+                {"fp8_recipe": "tensorwise"},
+                ["fp8_recipe"],
+                id="tensorwise-mtp-layer",
+            ),
+            # Inside the model's FP8 context, the BF16 rule cannot turn FP8 off for an MTP layer.
+            pytest.param(
+                {"fp8": "e4m3", "fp8_recipe": "mxfp8"},
+                {"first_last_layers_bf16": True},
+                [],
+                id="bf16-first-last-layers",
+            ),
+            pytest.param(
+                {"fp4": "e2m1"}, {"tp_only_amax_red": True}, ["tp_only_amax_red"], id="nvfp4-amax"
+            ),
+        ],
+    )
+    def test_hybrid_mtp_layers_need_the_model_recipe(
+        self, model_recipe, mtp_layer_recipe, expected_differences
+    ):
+        config = _base_cuda_graph_config(cuda_graph_impl="transformer_engine")
+        # Set after construction: FP8/FP4 need more setup to validate, and the rule only reads the
+        # fields.
+        for name, value in model_recipe.items():
+            setattr(config, name, value)
+        # Only the feed-forward layer of the MTP block sets its own recipe.
+        mixer_config, partner_config = (TransformerConfig.from_config(config) for _ in range(2))
+        for name, value in mtp_layer_recipe.items():
+            setattr(partner_config, name, value)
+        mtp_block = SimpleNamespace(layer_config_list=[mixer_config, partner_config])
+        differences = cuda_graphs_module._hybrid_mtp_recipe_differences(mtp_block, config)
+        assert differences == expected_differences
+
     def _setup_parallel_state(self, monkeypatch, num_microbatches, **parallel_sizes):
         """Initialize parallelism and return a counter of CUDA graph replays."""
         # Required by deterministic_mode for TE attention.
@@ -3201,6 +3241,67 @@ class TestHybridLayerPairCudaGraph:
             assert paired["replays"] == [0, 2 * len(callables), 2 * len(callables)]
             assert len(stage_warnings) == 1 and blocking_feature in stage_warnings[0]
             self._assert_bitwise_equal(paired, unpaired)
+            paired_helper.delete_cuda_graphs()
+        torch.cuda.current_stream().wait_stream(stream)
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("2.10.0")),
+        reason="Partial CUDA graph UT support requires TransformerEngine version >= 2.10.0",
+    )
+    @pytest.mark.launch_on_gb200
+    def test_hybrid_mtp_layers_with_another_recipe_stay_eager(self, monkeypatch):
+        """An MXFP8 model whose MTP layer configs select tensorwise FP8 keeps its MTP layers eager.
+
+        The eager MTP block runs each layer in its own FP8 context, and per-layer graphs leave the
+        block eager. One TE capture takes one recipe, the model's, so pairing keeps the block eager
+        too instead of graphing it in MXFP8, and trains bit for bit like per-layer graphs.
+        """
+        if not mxfp8_available:
+            pytest.skip("MXFP8 is not supported on this GPU")
+        pattern = "GE*E/*E"
+        replays = self._setup_parallel_state(monkeypatch, num_microbatches=1)
+        stage_warnings = self._record_stage_warnings(monkeypatch)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            config = self._config(
+                pattern,
+                _PARTIAL_MOE_GRAPH_MODULES,
+                fp8="e4m3",
+                fp8_recipe="mxfp8",
+                # MXFP8 needs GDN projection widths that are multiples of 32.
+                linear_num_value_heads=16,
+            )
+            decoder_pattern, mtp_pattern = pattern.split("/")
+            mtp_configs = validate_segment_layers(mtp_pattern, config)
+            for layer_config in mtp_configs:
+                layer_config.fp8_recipe = "tensorwise"
+            models = self._build_models(
+                config,
+                pattern,
+                hybrid_layer_config_list=[
+                    *validate_segment_layers(decoder_pattern, config),
+                    MTPSplit,
+                    *mtp_configs,
+                ],
+            )
+            batches = self._batches(num_microbatches=1, padding=False)
+            initial_params = {
+                name: param.detach().clone() for name, param in self._named_parameters(models)
+            }
+            unpaired_helper, unpaired = self._train(models, config, batches, replays, pair=False)
+            unpaired_helper.delete_cuda_graphs()
+            self._restore(models, initial_params)
+            paired_helper, paired = self._train(models, config, batches, replays, pair=True)
+
+            # Graphed in MXFP8, the MTP layers would change the MTP loss and the gradients.
+            self._assert_bitwise_equal(paired, unpaired)
+            # Only the two decoder pairs are graphed, and one warning names the setting.
+            callables = paired_helper.flattened_callables
+            assert [isinstance(c, _TECudaGraphLayerPair) for c in callables] == [True, True]
+            assert not any(paired_helper.flattened_callables_is_mtp)
+            assert paired["replays"] == [0, 2 * len(callables), 2 * len(callables)]
+            assert len(stage_warnings) == 1 and "fp8_recipe" in stage_warnings[0]
             paired_helper.delete_cuda_graphs()
         torch.cuda.current_stream().wait_stream(stream)
 
