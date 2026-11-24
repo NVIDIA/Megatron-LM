@@ -5,12 +5,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.bridge.training import vlm_step
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.timers import Timers
+from megatron.training.forward_steps import vlm_step
 from tests.unit_tests.test_utilities import Utils
 
 

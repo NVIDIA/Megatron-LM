@@ -105,7 +105,7 @@ def main(argv: list[str] | None = None) -> None:
     step = options.forward_step
     if step is None:
         if isinstance(config.model, (GPTModelConfig, HybridModelConfig)):
-            step = "megatron.bridge.training.llm_step:forward_step"
+            step = "megatron.training.forward_steps.llm_step:forward_step"
         else:
             raise TypeError("Default forward steps require a GPTModelConfig or HybridModelConfig")
     forward_step = _load_callable(step)

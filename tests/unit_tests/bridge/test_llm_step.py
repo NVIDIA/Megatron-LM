@@ -3,11 +3,11 @@
 import pytest
 import torch
 
-from megatron.bridge.training import llm_step
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.training.config import DataConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDatasetConfig
+from megatron.training.forward_steps import llm_step
 from tests.unit_tests.test_utilities import Utils
 
 

@@ -17,7 +17,7 @@
 # https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/ec0eb0a65c42e7d2b24bf2e6bd015217e99fb4ed/src/megatron/bridge/training/gpt_step.py
 # https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/ec0eb0a65c42e7d2b24bf2e6bd015217e99fb4ed/src/megatron/bridge/training/losses.py
 
-"""Text pretraining step using MLM configs, batching, and runtime services.
+"""Shared text pretraining step using MLM configs, batching, and runtime services.
 
 Unlike Bridge's per-TP-rank loaders, MLM builds datasets on TP rank zero. The
 batch adapter therefore uses Core's existing TP broadcast and CP layout helpers.

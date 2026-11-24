@@ -37,10 +37,10 @@ from typing import Any
 
 import torch
 
-from megatron.bridge.training.llm_step import masked_next_token_loss
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.utils import StragglerDetector, get_attr_wrapped_model
 from megatron.training import get_timers
+from megatron.training.forward_steps.llm_step import masked_next_token_loss
 from megatron.training.global_vars import get_run_config
 from megatron.training.models.hybrid import HybridModelConfig
 

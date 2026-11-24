@@ -40,7 +40,7 @@ public dataclass fields (numbers, booleans, `null`, lists, or strings); repeated
 keys use the last value. Unknown fields are rejected. Define optional config
 sections, dataset classes, and Python callables in the recipe itself.
 
-The runner uses `megatron.bridge.training.llm_step.forward_step` for GPT/Hybrid models.
+The runner uses `megatron.training.forward_steps.llm_step.forward_step` for GPT/Hybrid models.
 This adapts Bridge's text step to MLM runtime services and its TP-rank-zero data
 loaders, without a repository-root script dependency, ModelOpt step, or `GlobalState`.
 Use `--forward-step module:function` for an explicit MLM-compatible step.
@@ -50,7 +50,7 @@ the runner does not supply synthetic image inputs or a default VLM step.
 config, initializing distributed services, building datasets, or training.
 It is not a substitute for runtime validation against the actual GPU topology.
 
-`megatron.bridge.training.vlm_step.forward_step` adapts Bridge's shared VLM step.
+`megatron.training.forward_steps.vlm_step.forward_step` adapts Bridge's shared VLM step.
 The model owns the vision encoder (HF or Megatron), visual embedding insertion,
 multimodal positions, and context-parallel slicing. The step passes visual model
 kwargs and collator-provided packed metadata through, and uses the model's
@@ -81,7 +81,7 @@ Import the factory into a Python launch script and set explicit run overrides:
 ```python
 from megatron.bridge.recipes.llama import llama3_8b_pretrain_config
 from megatron.training.api import pretrain
-from megatron.bridge.training.llm_step import forward_step
+from megatron.training.forward_steps.llm_step import forward_step
 
 cfg = llama3_8b_pretrain_config()
 cfg.model.transformer.context_parallel_size = 1

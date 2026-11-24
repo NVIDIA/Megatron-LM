@@ -263,9 +263,8 @@ def loss_func(
         a dict containing reporting metrics on the loss and number of tokens across
             the data parallel ranks
     """
-    # Optional CLI boundary until offline KD is config-owned by #9635.
     args = get_args()
-    if getattr(args, "logits_load_dir", None) is not None:
+    if args.logits_load_dir is not None:
         # Offline knowledge distillation loss using cached teacher log-probabilities.
         loss_func_cached_logits = _build_cached_logits_loss_func(
             logprobs_dir=args.logits_load_dir,
