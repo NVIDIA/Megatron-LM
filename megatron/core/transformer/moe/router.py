@@ -464,20 +464,40 @@ class TopKRouter(Router):
             accumulate_histogram = (
                 self.training and torch.is_grad_enabled() and not self.frozen_expert_bias
             )
-            return topk_routing_with_score_function(
+            # Match ordinary top-k routing: older TE versions need the unfused path
+            # when the dispatcher requests compact expert IDs.
+            fused = self.config.moe_router_fusion and (
+                not dense_output or fused_topk_with_score_function_supports_topk_indices
+            )
+            topk_indices = (
+                torch.empty(
+                    (logits.shape[0], self.topk),
+                    dtype=self._dense_route_indices_dtype() or torch.int64,
+                    device=logits.device,
+                )
+                if dense_output and fused
+                else None
+            )
+            probs, routing_map = topk_routing_with_score_function(
                 logits,
                 self.topk,
                 use_pre_softmax=self.config.moe_router_pre_softmax,
                 scaling_factor=self.config.moe_router_topk_scaling_factor,
                 score_function=self.score_function,
                 expert_bias=self.expert_bias,
-                fused=self.config.moe_router_fusion,
+                fused=fused,
+                topk_indices=topk_indices,
+                dense_output=dense_output and not fused,
                 qb_histogram=self.qb_histogram if accumulate_histogram else None,
                 qb_bin_bounds=self.qb_bin_bounds if accumulate_histogram else None,
                 # The histogram is only supplied while accumulating, so every pass must
                 # use the reference router to stay bitwise identical across passes.
                 allow_batch_invariant_sigmoid_topk=False,
             )
+            if self.config.moe_virtual_expert_load_balance and fused:
+                # MoonEP consumes compact probabilities as well as compact expert IDs.
+                probs = probs.gather(1, routing_map)
+            return probs, routing_map
 
         assert (
             not self.config.moe_router_fusion
