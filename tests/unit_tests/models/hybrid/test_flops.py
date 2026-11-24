@@ -9,6 +9,8 @@ from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
+from megatron.core.ssm.gated_delta_net.kda import KimiDeltaAttention
+from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import MegatronModule
@@ -103,6 +105,35 @@ def test_mixed_ffn_widths_use_actual_child_configs(include_backward, expected):
     narrow = _bare(MLP, _config(ffn_hidden_size=24))
     wide = _bare(MLP, _config(ffn_hidden_size=48))
     model = _model(config, [narrow, wide, _bare(ExternalGainLayer, config)])
+    assert model.estimate_flops(**BATCH_STATS, include_backward=include_backward) == expected
+
+
+@pytest.mark.parametrize(
+    "two_stage_gates,include_backward,expected",
+    [(False, False, 14_000), (False, True, 42_000), (True, False, 13_104), (True, True, 39_312)],
+)
+def test_kda_gate_projections_in_model_estimate(two_stage_gates, include_backward, expected):
+    config = KDALayerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=2,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        linear_conv_kernel_dim=3,
+        kda_two_stage_gates=two_stage_gates,
+    )
+    layer = _bare(
+        TransformerLayer,
+        config,
+        self_attention=_bare(KimiDeltaAttention, config),
+        cross_attention=IdentityOp(),
+        mlp=IdentityOp(),
+    )
+    model = _model(config, [layer], post_process=False)
+    # MACs per token: QKV 384, beta 32, convolution 72, recurrence 128, output 128.
+    # Direct gates add 256 MACs; the two 16 -> 4 -> 8 gates add 192.
     assert model.estimate_flops(**BATCH_STATS, include_backward=include_backward) == expected
 
 
