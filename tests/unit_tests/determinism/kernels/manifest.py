@@ -200,7 +200,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "test_runtime_cp_attention.py. The dynamic-inference flash_decode_and_prefill "
         "dispatch (FA2 prefill/decode) is replayed there with a config-driven softmax_scale. "
         "YaRN with RoPE fusion (TE fused RoPE, concentration factor squared in the softmax "
-        "scale) is replayed there with and without a learnable softmax sink.",
+        "scale) is replayed there with and without a learnable softmax sink, and with partial "
+        "RoPE, which keeps the factor in the unfused RoPE.",
     ),
     KernelEntry(
         name="fused_vocab_parallel_cross_entropy",

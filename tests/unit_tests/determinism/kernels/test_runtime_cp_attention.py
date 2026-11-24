@@ -444,9 +444,12 @@ def test_flash_decode_dispatch_config_softmax_scale_replays(path):
         Utils.destroy_model_parallel()
 
 
-@pytest.mark.parametrize("softmax_type", ["vanilla", "learnable"])
-def test_yarn_rope_fusion_replays(softmax_type, monkeypatch):
-    """YaRN with RoPE fusion (TE fused RoPE, factor squared in the softmax scale) replays."""
+@pytest.mark.parametrize(
+    ("softmax_type", "rotary_percent"), [("vanilla", 1.0), ("learnable", 1.0), ("vanilla", 0.5)]
+)
+def test_yarn_rope_fusion_replays(softmax_type, rotary_percent, monkeypatch):
+    """YaRN with RoPE fusion (TE fused RoPE, factor squared in the softmax scale) replays. Partial
+    RoPE keeps the factor in the unfused RoPE and takes the square back out of q."""
     import math
     from unittest import mock
 
@@ -523,7 +526,9 @@ def test_yarn_rope_fusion_replays(softmax_type, monkeypatch):
         inputs = dict(
             hidden_states=hidden.requires_grad_(True),
             attention_mask=None,
-            rotary_pos_emb=RotaryEmbedding(kv_channels=head_dim, rotary_percent=1.0)(seq_len),
+            rotary_pos_emb=RotaryEmbedding(kv_channels=head_dim, rotary_percent=rotary_percent)(
+                seq_len
+            ),
         )
         with mock.patch.object(
             rope_utils, "fused_apply_rotary_pos_emb", wraps=rope_utils.fused_apply_rotary_pos_emb
@@ -533,9 +538,12 @@ def test_yarn_rope_fusion_replays(softmax_type, monkeypatch):
                 inputs,
                 replays=3,
                 contention=True,
-                what=f"YaRN RoPE fusion, {softmax_type} softmax",
+                what=f"YaRN RoPE fusion, {softmax_type} softmax, rotary_percent {rotary_percent}",
             )
-        assert fused_rope.call_count >= 2  # q and k use TE's fused RoPE.
+        if rotary_percent == 1.0:
+            assert fused_rope.call_count >= 2  # q and k use TE's fused RoPE.
+        else:
+            assert fused_rope.call_count == 0  # Partial RoPE keeps the factor in the unfused RoPE.
         assert "in.hidden_states" in result[1]
         for tensors in result:
             assert all(torch.isfinite(t).all() for t in tensors.values())

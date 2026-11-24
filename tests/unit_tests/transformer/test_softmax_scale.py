@@ -34,6 +34,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import (
+    HAVE_FUSED_QKV_ROPE,
     CrossAttention,
     CrossAttentionSubmodules,
     SelfAttention,
@@ -463,7 +464,13 @@ class TestMLASoftmaxScale(_GpuTestFixtureBase):
             assert attention.core_attention.softmax_scale == attention.softmax_scale
 
 
-def _yarn_config(apply_rope_fusion, softmax_scale=None, softmax_type="vanilla", no_rope_freq=None):
+def _yarn_config(
+    apply_rope_fusion,
+    softmax_scale=None,
+    softmax_type="vanilla",
+    no_rope_freq=None,
+    fused_single_qkv_rope=False,
+):
     config = TransformerConfig(
         num_layers=2,
         hidden_size=128,
@@ -474,6 +481,7 @@ def _yarn_config(apply_rope_fusion, softmax_scale=None, softmax_type="vanilla", 
         apply_rope_fusion=apply_rope_fusion,
         attention_dropout=0.0,
         no_rope_freq=no_rope_freq,
+        fused_single_qkv_rope=fused_single_qkv_rope,
     )
     # gpt-oss YaRN settings: concentration factor 0.1 * ln(32) + 1.
     config.yarn_rotary_scaling_factor = 32.0
@@ -483,9 +491,15 @@ def _yarn_config(apply_rope_fusion, softmax_scale=None, softmax_type="vanilla", 
 
 
 def _make_yarn_self_attention(
-    apply_rope_fusion, softmax_scale=None, softmax_type="vanilla", no_rope_freq=None
+    apply_rope_fusion,
+    softmax_scale=None,
+    softmax_type="vanilla",
+    no_rope_freq=None,
+    fused_single_qkv_rope=False,
 ):
-    config = _yarn_config(apply_rope_fusion, softmax_scale, softmax_type, no_rope_freq)
+    config = _yarn_config(
+        apply_rope_fusion, softmax_scale, softmax_type, no_rope_freq, fused_single_qkv_rope
+    )
     submodules = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
     attn = SelfAttention(config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal)
     return attn.cuda()
@@ -534,11 +548,13 @@ class TestYarnRopeFusionSoftmaxScale(_GpuTestFixtureBase):
     @pytest.mark.parametrize("softmax_scale", [None, 0.042])
     def test_factor_moves_into_softmax_scale(self, softmax_scale):
         unfused = _make_yarn_self_attention(False, softmax_scale)
+        assert not unfused._yarn_factor_in_softmax_scale
         assert unfused._rope_mscale == pytest.approx(self.FACTOR)
         assert not hasattr(unfused, "softmax_scale")
 
         fused = _make_yarn_self_attention(True, softmax_scale)
         base = softmax_scale if softmax_scale is not None else fused.config.kv_channels**-0.5
+        assert fused._yarn_factor_in_softmax_scale
         assert fused._rope_mscale == 1.0
         assert fused.softmax_scale == pytest.approx(base * self.FACTOR**2)
         core = fused.core_attention
@@ -602,15 +618,43 @@ class TestYarnRopeFusionSoftmaxScale(_GpuTestFixtureBase):
             _run(fused, x, key_value_states=context), _run(unfused, x, key_value_states=context)
         )
 
-    def test_partial_rotary_raises_with_fusion(self):
-        """Partial RoPE scales only the rotated dims, so the softmax-scale form is refused."""
-        seq_len, batch = 8, 2
-        for apply_rope_fusion in [False, True]:
-            attn = _make_yarn_self_attention(apply_rope_fusion)
-            x = torch.randn(seq_len, batch, attn.config.hidden_size, device="cuda")
-            freqs = torch.rand(seq_len, 1, 1, attn.config.kv_channels // 2, device="cuda")
-            if apply_rope_fusion:
-                with pytest.raises(ValueError, match="whole head dim"):
-                    attn(x, None, rotary_pos_emb=freqs)
-            else:
-                attn(x, None, rotary_pos_emb=freqs)
+    @pytest.mark.parametrize("rope", ["q_and_k", "q_only", "k_only"])
+    def test_partial_rotary_matches_unfused(self, rope):
+        """Partial RoPE scales only the rotated dims, which the softmax scale can't express. The
+        factor stays in the unfused RoPE and q takes the folded square back out, so outputs and
+        grads (fp32) match the path without RoPE fusion."""
+        unfused = _make_yarn_self_attention(False)
+        fused = _make_yarn_self_attention(True)
+        fused.load_state_dict(unfused.state_dict())
+        seq_len, batch, head_dim = 32, 2, unfused.config.kv_channels
+        x = torch.randn(seq_len, batch, unfused.config.hidden_size, device="cuda")
+        freqs = torch.rand(seq_len, 1, 1, head_dim // 2, device="cuda") * 8
+        rotary_pos_emb = {"q_and_k": freqs, "q_only": (freqs, None), "k_only": (None, freqs)}[rope]
+
+        ref = _run(unfused, x, rotary_pos_emb=rotary_pos_emb)
+        with patch.object(
+            rope_utils, "fused_apply_rotary_pos_emb", wraps=rope_utils.fused_apply_rotary_pos_emb
+        ) as fused_rope:
+            got = _run(fused, x, rotary_pos_emb=rotary_pos_emb)
+        assert fused_rope.call_count == 0
+        _assert_matches(got, ref)
+
+    @pytest.mark.skipif(not HAVE_FUSED_QKV_ROPE, reason="needs TE's fused QKV RoPE")
+    @pytest.mark.parametrize("partial", [False, True])
+    def test_fused_single_qkv_rope(self, partial):
+        """The fused QKV RoPE takes no scale. Over the whole head, it plus the factor squared in the
+        softmax scale matches the unfused split path. Partial RoPE is refused there."""
+        unfused = _make_yarn_self_attention(False)
+        fused = _make_yarn_self_attention(True, fused_single_qkv_rope=True)
+        fused.load_state_dict(unfused.state_dict())
+        seq_len, batch, head_dim = 32, 2, unfused.config.kv_channels
+        x = torch.randn(seq_len, batch, unfused.config.hidden_size, device="cuda")
+        rot_dim = head_dim // 2 if partial else head_dim
+        freqs = torch.rand(seq_len, 1, 1, rot_dim, device="cuda") * 8
+        if partial:
+            with pytest.raises(ValueError, match="fused_single_qkv_rope=False"):
+                fused(x, None, rotary_pos_emb=freqs)
+        else:
+            _assert_matches(
+                _run(fused, x, rotary_pos_emb=freqs), _run(unfused, x, rotary_pos_emb=freqs)
+            )
