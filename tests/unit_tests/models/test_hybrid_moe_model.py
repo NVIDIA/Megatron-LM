@@ -60,6 +60,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "batch_invariant_backend": "te_native",
     "batch_invariant_collective": "ordered",
     "batch_invariant_mode": False,
+    "batch_invariant_peer_tp_size": None,
     "batch_p2p_comm": True,
     "batch_p2p_sync": True,
     "bf16": True,

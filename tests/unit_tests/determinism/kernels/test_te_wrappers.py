@@ -31,6 +31,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    BatchInvariantTEGemmFn,
     set_batch_invariant_mode,
     te_supports_batch_invariant_grouped_gemm,
 )
@@ -73,6 +74,44 @@ if HAVE_TE:
 
 HIDDEN, FFN, TOKENS = 2048, 8192, 8192
 _IS_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
+
+
+@pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
+def test_te_gemm_batched_operands_match_flattened_replay(layout):
+    """TE flattens sequence and batch before its NT weight-gradient transpose."""
+    seeded()
+    tokens, batch, inputs, outputs = 4, 3, 96, 64
+    if layout == "TN":
+        a_shape, b_shape = (outputs, inputs), (tokens, batch, inputs)
+    elif layout == "NN":
+        a_shape, b_shape = (inputs, outputs), (tokens, batch, inputs)
+    else:
+        a_shape, b_shape = (tokens, batch, inputs), (tokens, batch, outputs)
+    a = torch.randn(a_shape, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    b = torch.randn(b_shape, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    flat_a = a.detach().reshape(-1, a.shape[-1]).requires_grad_()
+    flat_b = b.detach().reshape(-1, b.shape[-1]).requires_grad_()
+
+    def gemm(a, b):
+        return BatchInvariantTEGemmFn.apply(a, b, None, a.dtype, layout)
+
+    with set_batch_invariant_mode(True, backend="triton"):
+        actual = gemm(a, b)
+        expected = gemm(flat_a, flat_b)
+        assert bytes_equal(actual.reshape_as(expected), expected)
+        gradient = torch.randn_like(actual)
+        actual_grads = torch.autograd.grad(actual, (a, b), gradient)
+        expected_grads = torch.autograd.grad(
+            expected, (flat_a, flat_b), gradient.reshape_as(expected)
+        )
+        for got, want in zip(actual_grads, expected_grads):
+            assert bytes_equal(got.reshape_as(want), want)
+        assert_replays_bit_exact(
+            gemm,
+            (a.detach().requires_grad_(), b.detach().requires_grad_()),
+            replays=3,
+            what=f"TE GEMM {layout} with sequence/batch operands",
+        )
 
 
 @pytest.fixture

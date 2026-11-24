@@ -861,30 +861,23 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
         transa = layout[0].upper() == "T"
         transb = layout[1].upper() == "T"
 
-        opA = A.transpose(0, 1) if transa else A  # [K, O] or [I, O]
+        if A.dim() < 2 or B.dim() < 2:
+            raise ValueError(
+                f"TE GEMM operands must have at least two dimensions: {A.shape}, {B.shape}"
+            )
+        # TE's NT weight-gradient GEMM can receive [sequence, batch, hidden].
+        # Its transpose applies to the flattened matrix, not sequence and batch.
+        A_2d = A.reshape(-1, A.shape[-1])
+        B_2d = B.reshape(-1, B.shape[-1])
+        opA = A_2d.transpose(0, 1) if transa else A_2d
         # Triton's persistent GEMM consumes the operand strides directly. A
         # contiguous copy here materializes large TE projection weights on
         # every forward, including each CUDA-graph replay. Non-transposed
         # layouts retain their existing behavior.
         if not transa:
             opA = opA.contiguous()
-        opB = B.transpose(0, 1).contiguous() if transb else B.contiguous()  # [..., K]
-
-        # Flatten opA to 2D if needed (weight tensors should be 2D, but validate)
-        if opA.dim() > 2:
-            opA = opA.reshape(-1, opA.shape[-1])
-        elif opA.dim() < 2:
-            raise ValueError(f"opA has insufficient dimensions: {opA.shape}")
-        assert opA.dim() == 2, f"opA must be 2D, got shape {opA.shape}"
-
-        # Flatten all leading dims of opB except the last feature dim to match TE behavior
-        if opB.dim() >= 2:
-            leading_shape = opB.shape[:-1]
-            K = opB.shape[-1]
-            opB_2d = opB.reshape(-1, K)
-        else:
-            leading_shape = ()
-            opB_2d = opB
+        opB_2d = B_2d.transpose(0, 1).contiguous() if transb else B_2d.contiguous()
+        leading_shape = opB_2d.shape[:-1] if transb else B.shape[:-1]
 
         # Perform GEMM: (N_total, K) @ (K, O) -> (N_total, O)
         base_2d = mm_batch_invariant(opB_2d, opA)
@@ -902,7 +895,6 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
         # Save for backward
         ctx.transa = transa
         ctx.transb = transb
-        ctx.leading_shape = leading_shape
         ctx.bias_present = bias is not None
         ctx.save_for_backward(A, B)
         return out
@@ -917,42 +909,26 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
         A, B = ctx.saved_tensors
         transa = ctx.transa
         transb = ctx.transb
-        leading_shape = ctx.leading_shape
-
-        # Reconstruct opA/opB for gradients
-        opA = A.transpose(0, 1).contiguous() if transa else A  # [K, O]
-        opB = B.transpose(0, 1).contiguous() if transb else B  # [..., K]
-
-        # Flatten grad_output to 2D to mirror forward flatten
-        if grad_output.dim() >= 2 and isinstance(leading_shape, tuple) and len(leading_shape) > 0:
-            N_total = 1
-            for s in leading_shape:
-                N_total *= s
-            grad_out_2d = grad_output.reshape(N_total, grad_output.shape[-1])
-        else:
-            grad_out_2d = grad_output
+        A_2d = A.reshape(-1, A.shape[-1])
+        B_2d = B.reshape(-1, B.shape[-1])
+        opA = A_2d.transpose(0, 1).contiguous() if transa else A_2d
+        opB = B_2d.transpose(0, 1).contiguous() if transb else B_2d
+        grad_out_2d = grad_output.reshape(-1, grad_output.shape[-1])
 
         # Y = B_flat @ A -> dB_flat = dY @ A^T ; dA = B_flat^T @ dY
         d_opB_2d = grad_out_2d.matmul(opA.transpose(0, 1).contiguous())
         d_opA = opB.reshape(-1, opB.shape[-1]).transpose(0, 1).contiguous().matmul(grad_out_2d)
 
-        # Reshape d_opB back to original opB shape
-        d_opB = (
-            d_opB_2d.reshape(*leading_shape, d_opB_2d.shape[-1])
-            if grad_output.dim() >= 2
-            else d_opB_2d
-        )
-
         # Map back to dA, dB based on trans flags
         if transa:
-            dA = d_opA.transpose(0, 1).contiguous()
+            dA = d_opA.transpose(0, 1).contiguous().reshape_as(A)
         else:
-            dA = d_opA
+            dA = d_opA.reshape_as(A)
 
         if transb:
-            dB = d_opB.transpose(0, 1).contiguous()
+            dB = d_opB_2d.transpose(0, 1).contiguous().reshape_as(B)
         else:
-            dB = d_opB
+            dB = d_opB_2d.reshape_as(B)
 
         # Bias grad along last dimension of Y, if bias was added in forward
         if ctx.bias_present:

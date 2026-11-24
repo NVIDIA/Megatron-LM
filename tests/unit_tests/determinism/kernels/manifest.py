@@ -367,7 +367,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="ordered_row_linear",
         sources=("megatron/core/ops/linear/ordered.py",),
-        tests=(K + "test_ordered_reduce_kernels.py", K + "test_te_wrappers.py"),
+        tests=(K + "test_ordered_reduce_kernels.py",),
         kind="external-lib",
         notes="Torch and TE row-parallel GEMMs with operation-owned symmetric scratch and "
         "ordinary TP backward; replayed through shard and TE module paths.",
