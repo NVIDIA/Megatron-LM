@@ -238,7 +238,7 @@ def test_window_teacher_gpu_parity_and_bit_exact_replay():
     rows = torch.arange(32, device="cuda")[:, None]
     ids = rows - torch.arange(8, device="cuda")[None, :]
     ids = ids.clamp_min(-1).int()
-    scale = teacher_dim**-0.5
+    scale = query.size(-1) ** -0.5
     expected = fused_csa_window_lse(query.cpu(), keys.cpu(), sink.cpu(), ids.cpu(), scale)
     actual = fused_csa_window_lse(query, keys, sink, ids, scale)
     torch.testing.assert_close(actual.cpu(), expected, rtol=1e-5, atol=1e-5)
