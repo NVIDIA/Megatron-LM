@@ -4,8 +4,9 @@
 
 The FlashInfer DSA backend (``dsa_gqa_flashinfer``) splits a dynamic-batching step into two paths:
 
-- **decode rows**: the leading single-token requests. Each such request has one row, which
-  scores all of its keys, selects its top-k and attends to them;
+- **decode rows**: the leading requests of at most ``decode_tokens`` rows (1, or ``1 + k`` when
+  speculative decoding verifies ``k`` draft tokens per request). Each of their rows scores all of
+  its causal keys, selects its top-k and attends to them;
 - **prefill tiles**: every other request's rows, cut into ``TILE_ROWS``-row tiles of one request
   each. A tile's rows select their keys through a sampled threshold, and attend in groups of
   ``union_group(heads)`` consecutive rows (the "union core").
@@ -126,12 +127,15 @@ def plan_sizes(
     padded_requests: int,
     decode_only: bool,
     padded_prefill_requests: Optional[int] = None,
+    decode_tokens: int = 1,
 ) -> PlanSizes:
     """Static plan sizes for a padded batch: decode-path rows, prefill tiles and requests.
 
     Only requests that take the tile path can leave a partial tile, so the tiles beyond the
     rows' own are bounded by ``padded_prefill_requests`` (the batch's padded prefill request
-    count; ``padded_requests`` when not given). Leading decode requests take the decode path.
+    count; ``padded_requests`` when not given). Leading decode requests take the decode path,
+    each with up to ``decode_tokens`` rows (``1 + k`` when speculative decoding verifies ``k``
+    draft tokens per request).
 
     Example: 400 rows and 8 requests, not decode-only, give 8 decode rows, ``ceil(400 / 128) +
     8 = 12`` tiles, 8 prefill requests and 400 compact rows.
@@ -140,7 +144,7 @@ def plan_sizes(
         return {"decode_rows": padded_rows, "tiles": 0, "prefill_requests": 0, "compact_rows": 0}
     prefill = padded_requests if padded_prefill_requests is None else padded_prefill_requests
     return {
-        "decode_rows": min(padded_rows, padded_requests),
+        "decode_rows": min(padded_rows, padded_requests * decode_tokens),
         "tiles": ceil_div(padded_rows, TILE_ROWS) + prefill,
         "prefill_requests": prefill,
         # The per-row sample kernels run on the live prefill rows, at most the padded rows,
@@ -198,30 +202,39 @@ class _StepRequests:
         return cls(q_len=q_len, kv_len=kv_len, first_row=_segment_starts(q_len))
 
 
-def _plan_decode_rows(requests: _StepRequests, decode_rows: int, decode_only: bool):
+def _plan_decode_rows(
+    requests: _StepRequests, decode_rows: int, decode_only: bool, decode_tokens: int = 1
+):
     """Which requests take the decode path, and the decode rows' arrays.
 
-    The decode path takes the *leading* single-token requests (the dynamic context orders
-    decode requests first) whose row is among the first ``decode_rows`` rows. A single-token
-    request after the first multi-token one is tiled instead, so the prefill rows stay
-    consecutive for the union core. Example: query lengths ``[1, 1, 300, 1]`` put requests 0
-    and 1 on decode rows 0 and 1, with their KV lengths as the rows' key counts.
+    The decode path takes the *leading* requests of at most ``decode_tokens`` rows (the dynamic
+    context orders decode requests first) whose rows are all among the first ``decode_rows``
+    rows. A short request after the first longer one is tiled instead, so the prefill rows stay
+    consecutive for the union core. Each row of a decode-path request is one decode-path entry:
+    row ``j`` of a request adding ``q`` rows sees its first ``kv_len - q + j + 1`` keys. Example:
+    query lengths ``[1, 1, 300, 1]`` put requests 0 and 1 on decode rows 0 and 1, with their KV
+    lengths as the rows' key counts; with ``decode_tokens = 3``, query lengths ``[3, 300]`` and
+    KV lengths ``[50, 1300]`` put request 0 on decode rows 0 .. 2 with 48, 49 and 50 keys.
 
     Returns:
         (on_decode bool [requests], decode_requests int32 [decode_rows],
         decode_lengths int32 [decode_rows]); unused decode rows have length 0.
     """
     q_len, first_row = requests.q_len, requests.first_row
-    multi_token = np.flatnonzero(q_len > 1)
-    num_leading = multi_token[0] if len(multi_token) else len(q_len)
-    on_decode = (np.arange(len(q_len)) < num_leading) & (first_row < decode_rows)
+    longer = np.flatnonzero(q_len > decode_tokens)
+    num_leading = longer[0] if len(longer) else len(q_len)
+    on_decode = (np.arange(len(q_len)) < num_leading) & (first_row + q_len <= decode_rows)
     decode_requests = np.zeros(decode_rows, np.int32)
     decode_lengths = np.zeros(decode_rows, np.int32)
     decode_ids = np.flatnonzero(on_decode)
-    decode_requests[first_row[decode_ids]] = decode_ids
-    decode_lengths[first_row[decode_ids]] = requests.kv_len[decode_ids]
+    rows_per_request = q_len[decode_ids]
+    row_request = np.repeat(decode_ids, rows_per_request)
+    row_in_request = _index_within_segment(rows_per_request)
+    rows = first_row[row_request] + row_in_request
+    decode_requests[rows] = row_request
+    decode_lengths[rows] = requests.kv_len[row_request] - q_len[row_request] + row_in_request + 1
     if decode_only and on_decode.sum() != len(q_len):
-        raise ValueError("A decode-only step holds single-token requests only.")
+        raise ValueError(f"A decode-only step holds requests of at most {decode_tokens} rows only.")
     return on_decode, decode_requests, decode_lengths
 
 
@@ -370,18 +383,22 @@ def build_step_plan(
     decode_only: bool,
     heads: int,
     padded_prefill_requests: Optional[int] = None,
+    decode_tokens: int = 1,
 ) -> StepPlanArrays:
     """The plan arrays (int32, CPU) of a step whose request ``i`` adds ``query_lengths[i]`` rows,
     in order, the last at key ``kv_lengths[i] - 1``; sizes depend only on the padded batch.
 
-    The leading single-token requests whose rows are among the first ``decode_rows`` rows take
-    the decode path; every other request's rows go into prefill tiles. See the module docstring
-    for a worked example.
+    The leading requests of at most ``decode_tokens`` rows whose rows are among the first
+    ``decode_rows`` rows take the decode path, one entry per row (a speculative-decoding verify
+    step adds ``1 + k`` rows per decode request); every other request's rows go into prefill
+    tiles. See the module docstring for a worked example.
     """
-    sizes = plan_sizes(padded_rows, padded_requests, decode_only, padded_prefill_requests)
+    sizes = plan_sizes(
+        padded_rows, padded_requests, decode_only, padded_prefill_requests, decode_tokens
+    )
     requests = _StepRequests.from_lengths(query_lengths, kv_lengths)
     on_decode, decode_requests, decode_lengths = _plan_decode_rows(
-        requests, sizes["decode_rows"], decode_only
+        requests, sizes["decode_rows"], decode_only, decode_tokens
     )
     tiles = _tile_prefill_requests(requests, on_decode, sizes)
     row_ends, query_rows = _tiled_row_layout(requests, tiles, sizes["tiles"])

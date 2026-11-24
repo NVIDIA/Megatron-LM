@@ -101,6 +101,49 @@ def test_flashinfer_step_plan():
     assert decode_plan["compact_rows"].size == 0
 
 
+def test_flashinfer_step_plan_speculative_rows():
+    """With speculative decoding a decode request adds up to 1 + k rows; each row takes the
+    decode path with its own causal key count, and a longer request goes to the tiles."""
+    plan = build_step_plan(
+        [3, 2, 300, 3],
+        [50, 9000, 1300, 77],
+        padded_rows=400,
+        padded_requests=8,
+        decode_only=False,
+        heads=NUM_HEADS,
+        decode_tokens=3,
+    )
+    assert plan_sizes(400, 8, False, decode_tokens=3)["decode_rows"] == 24
+    assert plan["decode_requests"][:5].tolist() == [0, 0, 0, 1, 1]
+    assert plan["decode_lengths"].tolist() == [48, 49, 50, 8999, 9000] + [0] * 19
+    # The 300-row chunk and the 3-row request after it fill tiles from step row 5.
+    rows = plan["query_rows"][plan["query_rows"] >= 0]
+    assert rows.tolist() == list(range(5, 308))
+    ends = plan["row_ends"][plan["query_rows"] >= 0]
+    assert ends.tolist() == list(range(1001, 1301)) + [75, 76, 77]
+    decode_plan = build_step_plan(
+        [3, 3],
+        [10, 20],
+        padded_rows=9,
+        padded_requests=3,
+        decode_only=True,
+        heads=NUM_HEADS,
+        decode_tokens=3,
+    )
+    assert decode_plan["decode_requests"][:6].tolist() == [0, 0, 0, 1, 1, 1]
+    assert decode_plan["decode_lengths"].tolist() == [8, 9, 10, 18, 19, 20, 0, 0, 0]
+    with pytest.raises(ValueError, match="at most 3 rows"):
+        build_step_plan(
+            [4],
+            [10],
+            padded_rows=9,
+            padded_requests=3,
+            decode_only=True,
+            heads=NUM_HEADS,
+            decode_tokens=3,
+        )
+
+
 def test_flashinfer_compact_rows_are_bounded_by_tokens():
     """Many small prefills tile far more rows than they hold; the per-row sample kernels run on
     at most the padded rows however many requests the batch admits."""
@@ -164,9 +207,12 @@ def _reference_plan(
     decode_only,
     heads,
     padded_prefill_requests=None,
+    decode_tokens=1,
 ):
     """The plan built one request and one row at a time, from its definition."""
-    sizes = plan_sizes(padded_rows, padded_requests, decode_only, padded_prefill_requests)
+    sizes = plan_sizes(
+        padded_rows, padded_requests, decode_only, padded_prefill_requests, decode_tokens
+    )
     group = union_group(heads)
     plan = {
         "decode_requests": [0] * sizes["decode_rows"],
@@ -178,13 +224,15 @@ def _reference_plan(
         "request_rows": [0] * sizes["prefill_requests"],
         "sample_ends": [0] * sizes["prefill_requests"],
     }
-    # 1. Decode rows: leading single-token requests whose row is among the decode rows.
+    # 1. Decode rows: leading requests of at most `decode_tokens` rows whose rows are all among
+    # the decode rows; row j of a request adding q rows sees its first kv_len - q + j + 1 keys.
     prefill, first_row, leading = [], 0, True
     for request, (q_len, kv_len) in enumerate(zip(query_lengths, kv_lengths)):
-        leading = leading and q_len <= 1
-        if leading and first_row < sizes["decode_rows"]:
-            plan["decode_requests"][first_row] = request
-            plan["decode_lengths"][first_row] = kv_len
+        leading = leading and q_len <= decode_tokens
+        if leading and first_row + q_len <= sizes["decode_rows"]:
+            for j in range(q_len):
+                plan["decode_requests"][first_row + j] = request
+                plan["decode_lengths"][first_row + j] = kv_len - q_len + j + 1
         else:
             prefill.append((request, first_row, q_len, kv_len))
         first_row += q_len
@@ -232,22 +280,30 @@ def _reference_plan(
     return {name: np.asarray(values, dtype=np.int32) for name, values in plan.items()}
 
 
-def _random_batch(rng):
-    """Random step arguments: decode-only or mixed batches, with lengths around tile edges."""
+def _random_batch(rng, max_decode_tokens=1):
+    """Random step arguments: decode-only or mixed batches, with lengths around tile edges.
+
+    With ``max_decode_tokens > 1`` some batches are speculative-decoding steps, whose decode
+    requests add up to ``decode_tokens`` rows each."""
     heads = int(rng.choice([8, 16, 32, 64, 128]))
+    decode_tokens = int(rng.integers(1, max_decode_tokens + 1))
+    # Only pass `decode_tokens` when it is not the default, so the batches also suit planners
+    # without it.
+    extra = {"decode_tokens": decode_tokens} if decode_tokens > 1 else {}
     if rng.random() < 0.25:
         n = int(rng.integers(0, 65))
-        q_len = [1] * n
-        kv_len = [int(k) for k in rng.integers(1, 20000, n)]
-        padded_requests = n + int(rng.integers(0, 8))
+        q_len = [int(q) for q in rng.integers(1, decode_tokens + 1, n)]
+        kv_len = [q + int(k) for q, k in zip(q_len, rng.integers(0, 20000, n))]
+        padded_requests = max(n + int(rng.integers(0, 8)), 1)
         return (
             q_len,
             kv_len,
             dict(
-                padded_rows=max(padded_requests, 1),
-                padded_requests=max(padded_requests, 1),
+                padded_rows=padded_requests * decode_tokens,
+                padded_requests=padded_requests,
                 decode_only=True,
                 heads=heads,
+                **extra,
             ),
         )
     num_decode = int(rng.integers(0, 33))
@@ -257,16 +313,18 @@ def _random_batch(rng):
         int(rng.choice(edge)) if rng.random() < 0.5 else int(rng.integers(1, 700))
         for _ in range(num_prefill)
     ]
-    q_len = [1] * num_decode + prefill_q
+    q_len = [int(q) for q in rng.integers(1, decode_tokens + 1, num_decode)] + prefill_q
     kv_len = [q + int(rng.integers(0, 20000)) for q in q_len]
     tokens = sum(q_len)
     padded_rows = max(tokens + int(rng.integers(0, 300)), 1)
     padded_requests = len(q_len) + int(rng.integers(0, 16))
-    # Requests past the decode rows (or after the first multi-token one) take the prefill path.
-    decode_rows = min(padded_rows, padded_requests)
-    first = np.cumsum([0] + q_len[:-1])
-    leading = np.cumprod([q <= 1 for q in q_len]).astype(bool) if q_len else np.zeros(0, bool)
-    prefill_count = int((~(leading & (first < decode_rows))).sum()) if q_len else 0
+    # Requests past the decode rows (or after the first one longer than `decode_tokens`) take
+    # the prefill path.
+    decode_rows = min(padded_rows, padded_requests * decode_tokens)
+    q = np.asarray(q_len, dtype=np.int64)
+    first = np.cumsum(q) - q
+    leading = np.cumprod(q <= decode_tokens).astype(bool)
+    prefill_count = int((~(leading & (first + q <= decode_rows))).sum())
     padded_prefill = None
     if rng.random() < 0.5:
         padded_prefill = prefill_count + int(rng.integers(0, 4))
@@ -279,6 +337,7 @@ def _random_batch(rng):
             decode_only=False,
             heads=heads,
             padded_prefill_requests=padded_prefill,
+            **extra,
         ),
     )
 
@@ -313,10 +372,11 @@ def _assert_plans_equal(actual, expected, context):
 
 @pytest.mark.parametrize("seed", range(4))
 def test_build_step_plan_matches_reference(seed):
-    """The vectorized planner equals the per-row reference on random batches."""
+    """The vectorized planner equals the per-row reference on random batches, speculative
+    decoding steps (decode requests of up to 1 + k rows) included."""
     rng = np.random.default_rng(1000 + seed)
     for _ in range(250):
-        q_len, kv_len, kwargs = _random_batch(rng)
+        q_len, kv_len, kwargs = _random_batch(rng, max_decode_tokens=4)
         _assert_plans_equal(
             build_step_plan(q_len, kv_len, **kwargs),
             _reference_plan(q_len, kv_len, **kwargs),

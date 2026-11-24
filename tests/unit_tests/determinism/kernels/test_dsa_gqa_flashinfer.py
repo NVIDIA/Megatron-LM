@@ -19,7 +19,10 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 HEADS, HEAD_DIM, INDEX_DIM, TOPK, PAGE = 16, 256, 128, 512, 256
 
 
-def test_flashinfer_sparse_attention_replays():
+@pytest.mark.parametrize("decode_tokens", [1, 3], ids=["decode", "speculative-decode"])
+def test_flashinfer_sparse_attention_replays(decode_tokens):
+    """A mixed step replays bit-exactly, including speculative-decoding steps whose decode
+    requests add 1 + k rows, each a decode-path row with its own causal key count."""
     device = torch.device("cuda", torch.cuda.current_device())
     if not (
         dsa_gqa_flashinfer.HAVE_FLASHINFER_DSA
@@ -27,7 +30,8 @@ def test_flashinfer_sparse_attention_replays():
     ):
         pytest.skip("FlashInfer's DSA kernels are not installed or not supported here")
     seeded()
-    query_lengths, kv_lengths = [1, 1, 300, 37], [700, 6000, 3000, 37]
+    d = decode_tokens
+    query_lengths, kv_lengths = [d, d, 300, 37], [700, 6000, 3000, 37]
     padded_rows, padded_requests, bound = 384, 4, 6144
     max_pages = bound // PAGE
     num_pages = padded_requests * max_pages
@@ -44,8 +48,9 @@ def test_flashinfer_sparse_attention_replays():
         padded_requests=padded_requests,
         decode_only=False,
         heads=HEADS,
+        decode_tokens=d,
     )
-    sizes = dsa_gqa_flashinfer.plan_sizes(padded_rows, padded_requests, False)
+    sizes = dsa_gqa_flashinfer.plan_sizes(padded_rows, padded_requests, False, decode_tokens=d)
     page_table = torch.zeros(
         padded_requests,
         dsa_gqa_flashinfer.page_table_columns(max_pages, PAGE, bound, TOPK),
