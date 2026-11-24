@@ -42,7 +42,7 @@ class _FsdpGroupAssignment:
     rank_ranges: dict[int, Range]
 
     @cached_property
-    def has_comm(self) -> bool:
+    def requires_communication(self) -> bool:
         """Whether any of the optimized tensors has shards on several ranks."""
         layout = self.fsdp_group.main_weight.layout
         return any(
@@ -130,7 +130,7 @@ class _GroupPipeline:
         self._momentum_inputs = optimizer._compute_momentum_inputs(group, active)
         buffer = group.main_weight
         owned = [i for i, owner in owners.items() if owner == group.mesh.get_rank()]
-        if self.assignment.has_comm:
+        if self.assignment.requires_communication:
             self._full_inputs = {
                 i: torch.empty(
                     buffer.layout.tensor_shapes[i], dtype=buffer.dtype, device=buffer.device
@@ -170,7 +170,7 @@ class _GroupPipeline:
         A group without communication has nothing to scatter: its owners hold all its updates.
         """
         assert self._stage is _PipelineStage.ORTHO_POSTED
-        if self.assignment.has_comm:
+        if self.assignment.requires_communication:
             buffer = self.assignment.fsdp_group.main_weight
             self._local_updates = DBuffer(
                 buffer.mesh, buffer.placements, buffer.layout, torch.float32, buffer.device
@@ -317,8 +317,10 @@ class FsdpMuon(Muon):
         # Spread the "free" groups, which need no communication, evenly over the "comm" groups,
         # the last one at the end: their Newton-Schulz hides the transfers in flight, which the
         # comm groups' own may be too short for.
-        free = [pipeline for pipeline in pipelines if not pipeline.assignment.has_comm]
-        comm = [pipeline for pipeline in pipelines if pipeline.assignment.has_comm]
+        free = [
+            pipeline for pipeline in pipelines if not pipeline.assignment.requires_communication
+        ]
+        comm = [pipeline for pipeline in pipelines if pipeline.assignment.requires_communication]
         positions = [(k + 1) / len(free) for k in range(len(free))]
         positions += [(i + 0.5) / len(comm) for i in range(len(comm))]
         pipelines = [
@@ -339,14 +341,14 @@ class FsdpMuon(Muon):
                 pipelines[i + self.num_groups_in_flight].gather(self)
             pipeline.orthogonalize(self)
             pipeline.scatter()
-            if not pipeline.assignment.has_comm:
+            if not pipeline.assignment.requires_communication:
                 pipeline.apply_updates(self)
             if i >= self.num_groups_in_flight:
                 previous = pipelines[i - self.num_groups_in_flight]
-                if previous.assignment.has_comm:
+                if previous.assignment.requires_communication:
                     previous.apply_updates(self)
         for pipeline in pipelines[max(0, len(pipelines) - self.num_groups_in_flight) :]:
-            if pipeline.assignment.has_comm:
+            if pipeline.assignment.requires_communication:
                 pipeline.apply_updates(self)
 
     def _compute_momentum_inputs(
