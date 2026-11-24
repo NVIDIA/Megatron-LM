@@ -141,6 +141,8 @@ class SafeDCPUnpickler(SafeUnpickler):
         {
             *SAFE_OBJECTS,
             ("pathlib", "PosixPath"),
+            # Newer torch versions record shard paths as ``PurePosixPath``.
+            ("pathlib", "PurePosixPath"),
             # Multi-Storage Client writers record shard paths as ``MultiStoragePath``
             # (a pathlib-style path) in the ``_StorageInfo`` entries of the metadata.
             ("multistorageclient.pathlib", "MultiStoragePath"),
