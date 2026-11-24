@@ -602,6 +602,8 @@ def test_native_decode_suspend_resume(native_context_factory, cache_mode, static
         torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
 
 
+# Needs Blackwell; the GB200 lane selects only this test from the module.
+@pytest.mark.launch_on_gb200
 @pytest.mark.parametrize("deterministic", [False, True], ids=["native", "deterministic"])
 @pytest.mark.parametrize("decode_only", [True, False])
 def test_native_decode_and_mixed_batches_replay_in_cuda_graph(
