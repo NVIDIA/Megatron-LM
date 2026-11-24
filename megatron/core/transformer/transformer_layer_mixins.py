@@ -75,6 +75,10 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
         # Set the offload module in cuda graph flag.
         self.offload_module_in_cuda_graph = False
         cuda_graph_modules = self.config.cuda_graph_modules or []
+        if (not cuda_graph_modules or CudaGraphModule.attn in cuda_graph_modules) and getattr(
+            self.self_attention, "offload_gdn_core_attention", False
+        ):
+            self.offload_module_in_cuda_graph = True
         if CudaGraphModule.attn in cuda_graph_modules:
             if self.offload_core_attn or self.offload_attn_proj or self.offload_qkv_linear:
                 self.offload_module_in_cuda_graph = True
@@ -285,6 +289,12 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
         cudagraph_args, cudagraph_kwargs = super()._get_te_cuda_graph_replay_args(
             hidden_states, **kwargs
         )
+        if getattr(self.self_attention, "offload_gdn_core_attention", False) and (
+            not self.config.cuda_graph_modules
+            or CudaGraphModule.attn in self.config.cuda_graph_modules
+        ):
+            cudagraph_kwargs.pop("cuda_graph_stream", None)
+            cudagraph_kwargs.pop("cuda_graph_event", None)
 
         try:
             import transformer_engine.pytorch as te  # pylint: disable=unused-import

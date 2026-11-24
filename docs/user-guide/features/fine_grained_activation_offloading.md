@@ -62,8 +62,9 @@ Set `--experimental-attention-variant gdn2` to use the GDN2 variant.
 With an explicit layer-config list, enable the scope on the model config and at least one GDN layer.
 Both variants support selective `gdn_norm_out` recomputation. Pre-GDR fusion is GDN-only.
 Whole-GDN selective recomputation (`--recompute-modules gdn`), full recomputation,
-FP8/NVFP4, other recurrence backends, and CUDA graphs are rejected.
+FP8/NVFP4, other recurrence backends, and non-TE CUDA graphs are rejected.
 Set `NVTE_CPU_OFFLOAD_V1=1` with Transformer Engine 2.10 or newer.
+For TE graphs, use PyTorch 2.9+, TE 2.14+, positive warmup and attention or whole-layer capture.
 
 ### Tuning Parameters
 

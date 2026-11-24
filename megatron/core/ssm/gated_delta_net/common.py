@@ -436,7 +436,9 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             )
         nvtx_range_pop(suffix="gated_delta_rule")
         # Commit before output normalization; its saves can alias recurrence inputs.
-        return manager.group_offload(core_attn_out)
+        return manager.group_offload(
+            core_attn_out, delay_offload=self.config.delay_offload_until_cuda_graph
+        )
 
     def forward_post_core_attn(
         self, norm_out: torch.Tensor

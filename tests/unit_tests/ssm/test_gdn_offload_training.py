@@ -195,6 +195,55 @@ def _snapshot_leaf(value: Any) -> Any:
     return value.detach().clone() if isinstance(value, torch.Tensor) else value
 
 
+def _training_batches(generator, groups, count):
+    positions = torch.arange(128, device="cuda").unsqueeze(0)
+    batches = []
+    for _ in range(count):
+        tokens = torch.randint(0, 512, (1, 129), generator=generator, device="cpu").cuda()
+        batch = {
+            "tokens": tokens[:, :-1].contiguous(),
+            "labels": tokens[:, 1:].contiguous(),
+            "position_ids": positions,
+        }
+        batches.append(get_batch_on_this_cp_rank(batch, False, cp_group=groups.cp))
+    return batches
+
+
+def _run_microbatches(schedule, models, optimizer, groups, batches):
+    optimizer.zero_grad()
+    for model in models:
+        model.zero_grad_buffer()
+    return schedule(
+        forward_step_func=_forward_step,
+        data_iterator=[iter(batches) for _ in models],
+        model=models,
+        num_microbatches=len(batches),
+        seq_length=128,
+        micro_batch_size=1,
+        forward_only=False,
+        p2p_communicator=P2PCommunicator(groups.pp, models[0].config),
+        pg_collection=groups,
+    )
+
+
+def _step_snapshot(models, optimizer, losses):
+    parameters = {
+        f"{stage}.{name}": parameter
+        for stage, model in enumerate(models)
+        for name, parameter in model.named_parameters()
+    }
+    grads = {name: p.main_grad.detach().clone() for name, p in parameters.items()}
+    success, grad_norm, _ = optimizer.step()
+    assert success and grad_norm > 0
+    return {
+        "losses": losses,
+        "grads": grads,
+        "grad_norm": grad_norm,
+        "weights": {name: p.detach().clone() for name, p in parameters.items()},
+        "optimizer": dict_list_map_outplace(_snapshot_leaf, optimizer.state_dict()),
+    }
+
+
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.parametrize(
     "tp,sp,cp,pp,vp,fraction,recompute_norm,fused_pre_gdr,variant,native_hybrid",
@@ -275,38 +324,16 @@ def test_gdn_offload_training(
 
         monkeypatch.setattr(OffloadTensorPool, "reset", record_pool_reset)
         for _ in range(3):
-            batches = []
-            for _ in range(2):
-                tokens = torch.randint(0, 512, (1, 129), generator=generator, device="cpu").cuda()
-                batch = {
-                    "tokens": tokens[:, :-1].contiguous(),
-                    "labels": tokens[:, 1:].contiguous(),
-                    "position_ids": torch.arange(128, device="cuda").unsqueeze(0),
-                }
-                batches.append(get_batch_on_this_cp_rank(batch, False, cp_group=groups.cp))
             # Fixed weights and zero dropout must reproduce each repeated example.
             # This also catches VPP payload mixups in the disabled baseline.
-            batches = batches * 2
+            batches = _training_batches(generator, groups, 2) * 2
             snapshots = []
             for models, optimizer in (
                 (baseline, baseline_optimizer),
                 (offloaded, offload_optimizer),
             ):
                 pool_before_reset.clear()
-                optimizer.zero_grad()
-                for model in models:
-                    model.zero_grad_buffer()
-                losses = schedule(
-                    forward_step_func=_forward_step,
-                    data_iterator=[iter(batches) for _ in models],
-                    model=models,
-                    num_microbatches=4,
-                    seq_length=128,
-                    micro_batch_size=1,
-                    forward_only=False,
-                    p2p_communicator=P2PCommunicator(groups.pp, models[0].config),
-                    pg_collection=groups,
-                )
+                losses = _run_microbatches(schedule, models, optimizer, groups, batches)
                 # Reject a bad baseline on every rank before the next collective.
                 step_valid = torch.tensor(
                     len(losses) == (4 if is_pp_last_stage(groups.pp) else 0)
@@ -319,26 +346,7 @@ def test_gdn_offload_training(
                 assert (
                     step_valid.item()
                 ), "Microbatch losses or pre-reset pinned buffers are invalid."
-                grads = {
-                    f"{stage}.{name}": parameter.main_grad.detach().clone()
-                    for stage, model in enumerate(models)
-                    for name, parameter in model.named_parameters()
-                }
-                success, grad_norm, _ = optimizer.step()
-                assert success and grad_norm > 0
-                snapshots.append(
-                    {
-                        "losses": losses,
-                        "grads": grads,
-                        "grad_norm": grad_norm,
-                        "weights": {
-                            f"{stage}.{name}": parameter.detach().clone()
-                            for stage, model in enumerate(models)
-                            for name, parameter in model.named_parameters()
-                        },
-                        "optimizer": dict_list_map_outplace(_snapshot_leaf, optimizer.state_dict()),
-                    }
-                )
+                snapshots.append(_step_snapshot(models, optimizer, losses))
             torch.cuda.synchronize()
             if fused_pre_gdr:
                 # Native gate backward atomically reduces FP32 parameter gradients.

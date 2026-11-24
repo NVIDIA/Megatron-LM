@@ -47,7 +47,7 @@ def _config(**overrides):
         ),
         ({"bf16": False}, "BF16"),
         ({"gdn_kernel_backend": "torch"}, "FLA"),
-        ({"cuda_graph_impl": "local"}, "CUDA graphs"),
+        ({"cuda_graph_impl": "local"}, "Transformer Engine CUDA graphs"),
         ({"fp8": "e4m3"}, "BF16"),
         ({"fp4": "e2m1"}, "BF16"),
     ],
