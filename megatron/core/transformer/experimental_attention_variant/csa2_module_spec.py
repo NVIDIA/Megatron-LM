@@ -22,10 +22,9 @@ from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid
     DSv4HybridSelfAttention,
     DSv4HybridSelfAttentionSubmodules,
 )
-from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention_module_specs import (
-    get_dsv4_o_group_proj_spec,
-)
 from megatron.core.transformer.spec_utils import ModuleSpec
+
+from .deepseek_v4_hybrid_attention_module_specs import get_dsv4_o_group_proj_spec
 
 
 class CSA2BackendSpecProvider(BackendSpecProvider, Protocol):
