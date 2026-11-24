@@ -146,6 +146,9 @@ follows it as one graph, which halves the graph launches per block:
 - A layer keeps its own graph when it cannot be paired: Mamba layers, layers whose neighbor is not
   graphed, pairs split by a pipeline stage boundary, hash-routed MoE layers, and pairs whose two
   layers differ in their FP8/FP4 first/last-layer BF16 setting.
+- An MoE layer whose graph contains the MoE megakernel (`--moe-megakernel-backend`) keeps its own
+  graph, with a warning: the megakernel's weight views are refreshed eagerly right before that
+  graph replays.
 - A layer whose own config in a `hybrid_layer_config_list` sets a `cuda_graph_impl` other than
   `transformer_engine` is not paired and runs as it does with per-layer graphs; its neighbor keeps
   its own graph.

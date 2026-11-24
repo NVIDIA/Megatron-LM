@@ -2536,6 +2536,10 @@ def _te_cuda_graph_pair_supported(mixer, partner, config) -> bool:
     # Hash routing reads input_ids, which HybridStack passes to the hash-routed layer only.
     if partner.is_moe_layer and getattr(partner.mlp.router, "is_hash_layer", False):
         return False
+    # A graph that contains an MoE megakernel needs the layer's eager weight-view refresh
+    # (_before_te_cuda_graph_replay) before every replay, which only the layer's own graph runs.
+    if partner._cuda_graph_megakernel() is not None:
+        return False
     # One graph runs both layers under one FP8/FP4 setting. All layers of an MTP block run under
     # the block's setting, to which the first/last-layer BF16 rule does not apply.
     if (config.fp8 or config.fp4) and not mixer.is_mtp_layer:
@@ -2955,6 +2959,20 @@ class TECudaGraphHelper:
                 msg='Hybrid MTP layers are not CUDA-graphed because their layer configs differ '
                 f'from the model in {", ".join(sorted(mtp_recipe_differences))}, and TE graphs '
                 "would capture them with the model's FP8/FP4 recipe; they run eagerly.",
+            )
+        # _te_cuda_graph_pair_supported never pairs such a layer, so it is graphed on its own.
+        if pair_hybrid_layers and any(
+            getattr(c, "is_moe_layer", False) and c._cuda_graph_megakernel() is not None
+            for c in self.flattened_callables
+        ):
+            log_on_each_pipeline_stage(
+                logger=logger,
+                tp_group=self.tp_group,
+                dp_cp_group=self.dp_cp_group,
+                level=logging.WARNING,
+                msg='cuda_graph_pair_hybrid_layers does not pair MoE layers whose CUDA graph '
+                'contains the MoE megakernel (moe_megakernel_backend); they keep their own CUDA '
+                'graphs.',
             )
         log_on_each_pipeline_stage(
             logger=logger,
