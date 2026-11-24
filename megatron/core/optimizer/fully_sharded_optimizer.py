@@ -54,6 +54,10 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
     MFSDP-specific storage operations explicit.
     """
 
+    # DTensor replication must be counted by this wrapper even when chained
+    # optimizers share the same final reduction group.
+    requires_individual_grad_stats = True
+
     @override
     def __init__(
         self,
@@ -384,6 +388,8 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         if any(model_chunk.config.cuda_graph_impl != "none" for model_chunk in self.model_chunks):
             set_to_none = False
 
+        # A skipped update never reaches step_with_ready_grads(), so restore the casts here too.
+        self._restore_model_grads()
         if not self.is_stub_optimizer:
             self.optimizer.zero_grad(set_to_none=set_to_none)
 
@@ -415,12 +421,16 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
     def step_with_ready_grads(self) -> bool:
         """Step the optimizer and restore MFSDP gradient dtypes."""
         success = super().step_with_ready_grads()
+        self._restore_model_grads()
+        return success
+
+    def _restore_model_grads(self) -> None:
+        """Undo _copy_model_grads_to_main_grads() and restore the MFSDP gradient dtypes."""
         for parameter, original_grad in self._casted_grads:
             parameter.grad = None
             parameter.grad_dtype = original_grad.dtype
             parameter.grad = original_grad
         self._casted_grads.clear()
-        return success
 
     def _copy_main_params_to_model_params(self) -> None:
         """Refresh MFSDP V2 compute weights after updating optimizer weights."""

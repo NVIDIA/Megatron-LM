@@ -88,6 +88,23 @@ pip install -e /workspace/Model-Optimizer
 
 ### Megatron-Core Checkpoint Prerequisite
 
+ModelOpt's local modules use canonical Transformer Engine keys when saving distributed
+checkpoints. Older ModelOpt checkpoints with separate layernorm names are accepted during
+loading: canonical keys are preferred, with legacy names used only when the requested key
+is absent. This applies to model weights and model-keyed optimizer tensors and does not
+change the model's subsequent save behavior. `--export-te-mcore-model` is deprecated and
+ignored; `--export-default-te-spec` selects full Transformer Engine modules instead of
+ModelOpt's local modules.
+
+Checkpoint settings come from the run container's `checkpoint` section. Distillation loads the
+teacher weights from `distillation.teacher_load`, using `teacher_ckpt_format` when provided
+(otherwise the student's format). The teacher load ignores the student's `ckpt_step`,
+`pretrained_checkpoint`, and `non_persistent_ckpt_type`, and does not change the student's
+checkpoint settings or restore the teacher's optimizer, RNG, or training progress.
+ModelOpt detection and state restoration share the weight loader's persistent checkpoint selection:
+the pretrained fallback when needed, `latest_train_state.pt` before the legacy text tracker,
+and the explicit `ckpt_step` override.
+
 All examples require a Megatron-Core distributed checkpoint. To import a
 Hugging Face model, run the [Megatron-Bridge stable checkpoint conversion
 CLI](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/examples/conversion#2-stable-checkpoint-conversion-cli)
@@ -246,7 +263,7 @@ deployment.
 ```sh
 \
     TP=1 \
-    HF_MODEL_CKPT=<pretrained_model_name_or_path> \
+    MLM_MODEL_CKPT=<megatron_core_checkpoint> \
     MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Eagle3 \
     ./eagle3.sh meta-llama/Llama-3.2-1B-Instruct
 
@@ -268,10 +285,9 @@ Then only the draft model is called during training. AL is no longer reported du
 ```sh
 \
     # Convert to online eagle3 model for base model feature extraction
-    HF_MODEL_CKPT=<pretrained_model_name_or_path> \
+    MLM_MODEL_CKPT=<megatron_core_checkpoint> \
     MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Eagle3 \
-    MLM_EXTRA_ARGS="--algorithm eagle3" \
-    ./convert.sh meta-llama/Llama-3.2-1B-Instruct
+    ./convert_speculative.sh meta-llama/Llama-3.2-1B-Instruct
 
 \
     # Dump base model feature to disk
@@ -281,10 +297,10 @@ Then only the draft model is called during training. AL is no longer reported du
 
 \
     # Convert to offline eagle3 model
-    HF_MODEL_CKPT=<pretrained_model_name_or_path> \
+    MLM_MODEL_CKPT=<megatron_core_checkpoint> \
     MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Eagle3-offline \
-    MLM_EXTRA_ARGS="--algorithm eagle3 --export-offline-model" \
-    ./convert.sh meta-llama/Llama-3.2-1B-Instruct
+    MLM_EXTRA_ARGS="--export-offline-model" \
+    ./convert_speculative.sh meta-llama/Llama-3.2-1B-Instruct
 
 \
     # Train the offline eagle3 model using extracted features
@@ -320,7 +336,7 @@ Example for depth pruning Qwen3-8B from 36 to 24 layers:
 ```sh
 PP=1 \
 MLM_EXTRA_ARGS='--prune-export-config {"num_layers":24}' \
-HF_MODEL_CKPT=<pretrained_model_name_or_path> \
+MLM_MODEL_CKPT=<megatron_core_checkpoint> \
 MLM_MODEL_SAVE=Qwen3-8B-Pruned \
 ./prune.sh Qwen/Qwen3-8B
 ```

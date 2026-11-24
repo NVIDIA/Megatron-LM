@@ -102,11 +102,10 @@ def _assert_layer_config_types(layer_config_list, pattern: str) -> None:
     ]
 
 
-def _assert_config_contents_equal(actual, expected) -> None:
-    actual_vars = vars(actual).copy()
-    if type(actual) is CSALayerConfig:
-        actual_vars.pop("compress_ratio")
-    assert actual_vars.keys() == vars(expected).keys()
+def _assert_source_config_preserved(actual, expected) -> None:
+    actual_vars = vars(actual)
+    # Layer-specific defaults can add fields beyond the copied source config.
+    assert vars(expected).keys() <= actual_vars.keys()
     for field_name, expected_value in vars(expected).items():
         actual_value = actual_vars[field_name]
         if isinstance(expected_value, functools.partial):
@@ -203,7 +202,7 @@ class TestValidateSegmentLayers:
         assert type(layer_config_list[0]) is config_class
         assert isinstance(layer_config_list[0], TransformerConfig)
         assert layer_config_list[0] is not self.config
-        _assert_config_contents_equal(layer_config_list[0], self.config)
+        _assert_source_config_preserved(layer_config_list[0], self.config)
         assert layer_config_list[0].hidden_size == self.config.hidden_size
         if layer_symbol in _DSV4_COMPRESS_RATIOS:
             assert layer_config_list[0].compress_ratio == _DSV4_COMPRESS_RATIOS[layer_symbol]

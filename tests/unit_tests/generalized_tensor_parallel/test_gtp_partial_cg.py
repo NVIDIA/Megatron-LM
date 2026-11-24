@@ -413,8 +413,9 @@ class TestGTPPartialCGCorrectness:
     ):
         """Local-CG loss trajectory and global grad norm must match eager execution.
 
-        Flaky under a busy shared process (eager/replay drift or a rare Inf grad norm); cause
-        is unconfirmed, suspected GEMM algorithm-selection sensitivity to process-wide GPU state.
+        Flaky in the full H100 dev bucket: the attention case's first replay after capture can
+        differ from eager while later replays match. It does not reproduce alone or after the
+        preceding GTP files; cause unconfirmed.
         """
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires at least 4 CUDA devices")

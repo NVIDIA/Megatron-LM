@@ -4,6 +4,7 @@ from collections.abc import Callable, Sequence
 
 from torch import Tensor
 
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
@@ -14,6 +15,7 @@ from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config 
     CSALayerConfig,
 )
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -119,6 +121,46 @@ def get_layer_symbol_from_config(layer_config: TransformerConfig) -> str:
         if type(layer_config) is config_type:
             return symbol
     raise ValueError(f"Unexpected hybrid layer config type: {type(layer_config).__name__}")
+
+
+def get_custom_layer_type(layer_config: object) -> type[MegatronModule] | None:
+    """Resolve a config's direct implementation reference without a registry or imports."""
+    if not isinstance(layer_config, TransformerConfig):
+        return None
+    layer_type = getattr(layer_config, "layer_type", None)
+    if layer_type is None:
+        return None
+    if not isinstance(layer_type, type) or not issubclass(layer_type, MegatronModule):
+        raise TypeError("layer_type must be a MegatronModule subclass.")
+    return layer_type
+
+
+def invoke_custom_layer(
+    layer: MegatronModule,
+    hidden_states: Tensor,
+    *,
+    attention_mask: Tensor | None = None,
+    rotary_pos_emb: Tensor | tuple[Tensor, Tensor] | None = None,
+    packed_seq_params: PackedSeqParams | None = None,
+    padding_mask: Tensor | None = None,
+    input_ids: Tensor | None = None,
+) -> Tensor:
+    """Apply the custom-layer calling convention in eager and recomputed execution.
+
+    ``input_ids`` is optional and may be None, including in HybridModel's MTP stacks.
+    Custom layers must handle missing IDs; token-dependent MTP execution is not supported.
+    """
+    output = layer(
+        hidden_states,
+        attention_mask=attention_mask,
+        rotary_pos_emb=rotary_pos_emb,
+        packed_seq_params=packed_seq_params,
+        padding_mask=padding_mask,
+        input_ids=input_ids,
+    )
+    if not isinstance(output, Tensor) or output.shape != hidden_states.shape:
+        raise ValueError("A custom hybrid layer must return a tensor with the input shape.")
+    return output
 
 
 def validate_shared_rotary_config(

@@ -1,11 +1,11 @@
-<!---
+{/*
    Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
    NVIDIA CORPORATION and its licensors retain all intellectual property
    and proprietary rights in and to this software, related documentation
    and any modifications thereto. Any use, reproduction, disclosure or
    distribution of this software and related documentation without an express
    license agreement from NVIDIA CORPORATION is strictly prohibited.
--->
+*/}
 
 # dist_checkpointing package
 
@@ -47,7 +47,7 @@ torch.serialization.add_safe_globals([argparse.Namespace])
 
 Beginning with **mcore v0.14**, the ``flattened_range`` attribute was removed from ``dist_checkpointing``. As a result:
 
-- Optimizer states saved with mcore versions <= 0.14 can no longer be loaded directly. Loading these legacy optimizer states is not supported because the required sharded metadata is no longer available. If you need to continue training from older checkpoints, refer to the workaround described below.
+- Optimizer states saved with mcore versions &lt;= 0.14 can no longer be loaded directly. Loading these legacy optimizer states is not supported because the required sharded metadata is no longer available. If you need to continue training from older checkpoints, refer to the workaround described below.
 - Model weights from older checkpoints remain fully compatible. No extra steps are needed—model weights from checkpoints created by earlier versions load automatically; simply add the ``--no-load-optim`` flag.
 
 ### Workaround: Loading legacy optimizer states with ToT MCore
@@ -147,9 +147,5 @@ Note that async saving for these formats requires the `nvidia-resiliency-ext` pa
 
 ## Subpackages
 
-```{toctree}
-:maxdepth: 4
-
-dist_checkpointing.strategies
-```
+- [dist_checkpointing.strategies package](dist_checkpointing.strategies.md)
 

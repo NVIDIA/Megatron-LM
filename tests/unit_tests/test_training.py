@@ -26,7 +26,9 @@ from megatron.training.global_vars import (
 )
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 from megatron.training.training import (
+    _add_model_freeze_pre_wrap_hook,
     _consume_embedding_min_norm_metrics,
+    _freeze_all_model_chunks,
     _get_indexer_logging_layer_counts,
     _get_optimizer_param_scheduler_increment,
     _pop_samples_seen,
@@ -108,8 +110,9 @@ def test_straggler_reporting_uses_config_and_logger_cadence(
     ["pretrain_gpt", "pretrain_hybrid", "megatron.elastification.pretrain_hybrid_flex", "train_rl"],
 )
 @pytest.mark.parametrize("nan_check,spiky_check", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize("loss_factor", [None, 3.0])
 def test_entrypoint_loss_checks_read_rerun_config(
-    monkeypatch, run_config, module_name, nan_check, spiky_check
+    monkeypatch, run_config, module_name, nan_check, spiky_check, loss_factor
 ):
     with patch("logging.basicConfig"):
         entrypoint = importlib.import_module(module_name)
@@ -123,6 +126,8 @@ def test_entrypoint_loss_checks_read_rerun_config(
     monkeypatch.setattr(entrypoint, "get_rerun_state_machine", lambda: machine)
     run_config.rerun_state_machine.check_for_nan_in_loss = nan_check
     run_config.rerun_state_machine.check_for_spiky_loss = spiky_check
+    if loss_factor is not None:
+        run_config.rerun_state_machine.spiky_loss_factor = loss_factor
     values = torch.ones(2, device="cuda")
     if module_name == "train_rl":
         result = entrypoint.loss_func(values, values, values, values, values, values, 1, values)
@@ -136,6 +141,11 @@ def test_entrypoint_loss_checks_read_rerun_config(
     for call in machine.validate_result.call_args_list:
         assert call.kwargs["tolerance"] == 0
         assert call.kwargs["fatal"] == (call.kwargs["message"] != "Spiky loss")
+        if call.kwargs["message"] == "Spiky loss":
+            threshold = (
+                0.2 if module_name == "train_rl" else (10.0 if loss_factor is None else loss_factor)
+            )
+            assert call.kwargs["rejection_func"].keywords["threshold"] == threshold
 
 
 class _LenDataloader:
@@ -177,6 +187,14 @@ def create_test_args():
     return args
 
 
+def test_freeze_hook_appended_to_model_config_without_kd():
+    model_config = Mock(pre_wrap_hooks=[])
+    _add_model_freeze_pre_wrap_hook(
+        model_config, freeze_all_layers=True, freeze_base_model_for_mtp=False
+    )
+    assert model_config.pre_wrap_hooks == [_freeze_all_model_chunks]
+
+
 def test_indexer_logging_counts_only_active_legacy_ratios():
     """Unused ratio-tail entries must not dilute the reported indexer loss."""
     args = SimpleNamespace(
@@ -192,6 +210,11 @@ def test_indexer_logging_counts_only_active_legacy_ratios():
     assert _get_indexer_logging_layer_counts(model_config) == (3, 2)
 
 
+def test_no_optimizer_does_not_require_training_wrapper_config(monkeypatch):
+    monkeypatch.setattr(training, "get_run_config", lambda: SimpleNamespace())
+    assert not training.should_disable_forward_pre_hook(SimpleNamespace(), None)
+
+
 @pytest.mark.parametrize("fsdp2", [False, True])
 @pytest.mark.parametrize("megatron_fsdp", [False, True])
 def test_native_builder_uses_dist_and_ddp_configs(monkeypatch, run_config, fsdp2, megatron_fsdp):
@@ -202,7 +225,6 @@ def test_native_builder_uses_dist_and_ddp_configs(monkeypatch, run_config, fsdp2
         use_torch_fsdp2=not fsdp2,
         use_megatron_fsdp=not megatron_fsdp,
     )
-    run_config.dist.use_torch_fsdp2 = fsdp2
     run_config.ddp = (
         training.TorchFullyShardedDataParallelConfig(use_megatron_fsdp=megatron_fsdp)
         if fsdp2
@@ -244,7 +266,7 @@ def test_should_disable_forward_pre_hook_needs_a_live_optimizer(optimizer, layer
     """The pre-hooks belong to the distributed optimizer's overlapped param-gather, so the loop
     toggles them only when an optimizer was built (not under --skip-train or
     --rl-rollout-only --no-load-optim)."""
-    args = SimpleNamespace(use_megatron_fsdp=False)
+    args = SimpleNamespace(use_megatron_fsdp=True)  # The registered config owns this flag.
     run_config.optimizer.use_distributed_optimizer = not layer_wise
     run_config.optimizer.use_layer_wise_distributed_optimizer = layer_wise
     run_config.optimizer.overlap_param_gather = True
@@ -252,7 +274,8 @@ def test_should_disable_forward_pre_hook_needs_a_live_optimizer(optimizer, layer
     run_config.optimizer.overlap_param_gather = False
     assert not training.should_disable_forward_pre_hook(args, optimizer)
     run_config.optimizer.overlap_param_gather = True
-    args.use_megatron_fsdp = True
+    run_config.ddp.use_megatron_fsdp = True
+    args.use_megatron_fsdp = False
     assert not training.should_disable_forward_pre_hook(args, optimizer)
 
 
@@ -306,6 +329,8 @@ class TestTraining:
         run_config.validation = ValidationConfig(
             eval_interval=1, eval_iters=1, eval_global_batch_size=1
         )
+        # These providers return iterators, so use the external loader.
+        run_config.data.dataloader.dataloader_type = "external"
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -436,6 +461,8 @@ class TestTraining:
         }
 
     def test_build_train_valid_test_data_iterators_multi_full_validation(self, run_config):
+        # The provider yields iterators: the external loader type, now read from the section.
+        run_config.data.dataloader.dataloader_type = 'external'
         """multiple_validation_sets + full_validation builds a list of iterators
         (one per validation set) and sets cfg.validation.eval_iters to the per-loader
         lengths MAX-reduced across DP ranks."""
