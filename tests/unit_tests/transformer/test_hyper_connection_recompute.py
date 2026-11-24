@@ -11,7 +11,7 @@ Tests the following functionality:
 5. TransformerConfig 'mhc' in recompute_modules option
 """
 
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 
 import pytest
 import torch
@@ -45,40 +45,33 @@ def _weighted_loss(outputs, weights):
     return sum((output * weight).sum() for output, weight in zip(outputs, weights, strict=True))
 
 
-def _discard_and_check_outputs(
-    manager: CheckpointWithoutOutputManager,
-    boundary: torch.Tensor,
-    *,
-    live_tensors: Iterable[torch.Tensor] = (),
-) -> Callable[[torch.Tensor], torch.Tensor]:
-    """Verify the discard and return a hook that checks the rebuilt values during backward.
+class _ReplaySnapshot:
+    """Observe checkpoint storage and retain the original values for comparison during replay."""
 
-    The manager installs its rebuild hook first, so the caller's check sees the restored outputs.
-    """
-    outputs = [
-        output.detach()
-        for checkpoint in manager.checkpoints
-        for output in checkpoint.outputs
-        if isinstance(output, torch.Tensor)
-    ]
-    assert outputs, "The real mHC path must register replay work"
-    assert all(output.untyped_storage().size() > 0 for output in outputs)
-    expected = [output.clone() for output in outputs]
-    live = [tensor.detach() for tensor in (boundary, *live_tensors)]
+    def __init__(
+        self, manager: CheckpointWithoutOutputManager, *, live_tensors: Iterable[torch.Tensor]
+    ) -> None:
+        # Detached tensors follow the original storage. Clones keep the values across discard.
+        self.outputs = [
+            output.detach()
+            for checkpoint in manager.checkpoints
+            for output in checkpoint.outputs
+            if isinstance(output, torch.Tensor)
+        ]
+        assert self.outputs, "The real mHC path must register replay work"
+        assert all(output.untyped_storage().size() > 0 for output in self.outputs)
+        self.expected = [output.clone() for output in self.outputs]
+        self.live_tensors = [tensor.detach() for tensor in live_tensors]
 
-    manager.discard_all_outputs_and_register_unified_recompute(boundary)
+    def assert_discarded(self) -> None:
+        assert all(output.untyped_storage().size() == 0 for output in self.outputs)
+        assert all(tensor.untyped_storage().size() > 0 for tensor in self.live_tensors)
 
-    assert all(output.untyped_storage().size() == 0 for output in outputs)
-    assert all(tensor.untyped_storage().size() > 0 for tensor in live)
-
-    def check_reconstruction(grad: torch.Tensor) -> torch.Tensor:
-        assert all(output.untyped_storage().size() > 0 for output in outputs)
-        assert all(tensor.untyped_storage().size() > 0 for tensor in live)
-        for output, original in zip(outputs, expected, strict=True):
-            torch.testing.assert_close(output, original)
-        return grad
-
-    return check_reconstruction
+    def check_reconstruction(self, _grad: torch.Tensor) -> None:
+        """Check the restored outputs when backward reaches the boundary."""
+        assert all(output.untyped_storage().size() > 0 for output in self.outputs)
+        assert all(tensor.untyped_storage().size() > 0 for tensor in self.live_tensors)
+        torch.testing.assert_close(self.outputs, self.expected)
 
 
 class TestHyperConnectionModuleCheckpoint:
@@ -179,10 +172,10 @@ class TestHyperConnectionModuleCheckpoint:
             (aggregated_ref, h_res_ref, h_post_ref, residual_ref, mixed_ref),
         )
         loss_ckpt = _weighted_loss((aggregated_ckpt, mixed_ckpt, h_post_ckpt), weights)
-        check_reconstruction = _discard_and_check_outputs(
+        snapshot = _ReplaySnapshot(
             manager,
-            loss_ckpt,
             live_tensors=(
+                loss_ckpt,
                 hidden_states_ckpt,
                 residual_ckpt,
                 residual_ckpt_out,
@@ -190,7 +183,9 @@ class TestHyperConnectionModuleCheckpoint:
                 h_post_ckpt,
             ),
         )
-        loss_ckpt.register_hook(check_reconstruction)
+        manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
+        snapshot.assert_discarded()
+        loss_ckpt.register_hook(snapshot.check_reconstruction)
         loss_ckpt.backward()
         grad_hidden_ckpt = hidden_states_ckpt.grad.clone()
         grad_residual_ckpt = residual_ckpt.grad.clone()
@@ -296,10 +291,12 @@ class TestHyperConnectionModuleCheckpoint:
         )
         loss_ckpt = _weighted_loss((aggregated_ckpt, h_res_ckpt, h_post_ckpt), weights)
 
-        check_reconstruction = _discard_and_check_outputs(
-            manager, loss_ckpt, live_tensors=(hidden_states_ckpt, h_res_ckpt, h_post_ckpt)
+        snapshot = _ReplaySnapshot(
+            manager, live_tensors=(loss_ckpt, hidden_states_ckpt, h_res_ckpt, h_post_ckpt)
         )
-        loss_ckpt.register_hook(check_reconstruction)
+        manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
+        snapshot.assert_discarded()
+        loss_ckpt.register_hook(snapshot.check_reconstruction)
         loss_ckpt.backward()
         grad_hidden_ckpt = hidden_states_ckpt.grad.clone()
 
@@ -395,10 +392,12 @@ class TestMHCBlockRecomputeIntegration:
         output_ckpt, mappings_ckpt = forward(hidden_states_ckpt, residual_ckpt, manager)
         torch.testing.assert_close(output_ckpt, output_ref)
         torch.testing.assert_close(mappings_ckpt, mappings_ref)
-        check_reconstruction = _discard_and_check_outputs(
-            manager, output_ckpt, live_tensors=(hidden_states_ckpt, residual_ckpt, *mappings_ckpt)
+        snapshot = _ReplaySnapshot(
+            manager, live_tensors=(output_ckpt, hidden_states_ckpt, residual_ckpt, *mappings_ckpt)
         )
-        output_ckpt.register_hook(check_reconstruction)
+        manager.discard_all_outputs_and_register_unified_recompute(output_ckpt)
+        snapshot.assert_discarded()
+        output_ckpt.register_hook(snapshot.check_reconstruction)
         # The terminal BDA output must remain usable after earlier outputs are discarded.
         _weighted_loss((output_ckpt,), (weight,)).backward()
 
@@ -486,12 +485,13 @@ class TestMHCBlockRecomputeIntegration:
             (aggregated_ckpt, h_res_ckpt, h_post_ckpt, output_ckpt),
             (aggregated_ref, h_res_ref, h_post_ref, output_ref),
         )
-        check_reconstruction = _discard_and_check_outputs(
+        snapshot = _ReplaySnapshot(
             manager,
-            output_ckpt,
-            live_tensors=(hidden_states_ckpt, residual_ckpt, h_res_ckpt, h_post_ckpt),
+            live_tensors=(output_ckpt, hidden_states_ckpt, residual_ckpt, h_res_ckpt, h_post_ckpt),
         )
-        output_ckpt.register_hook(check_reconstruction)
+        manager.discard_all_outputs_and_register_unified_recompute(output_ckpt)
+        snapshot.assert_discarded()
+        output_ckpt.register_hook(snapshot.check_reconstruction)
         _weighted_loss((output_ckpt,), (weight,)).backward()
         grad_hidden_ckpt = hidden_states_ckpt.grad.clone()
 
