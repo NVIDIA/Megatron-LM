@@ -605,7 +605,12 @@ def get_rng_state(
         get_pg_size(dp_group) if dp_group is not None else mpu.get_data_parallel_world_size()
     )
     rng_state_list = None
-    if cfg.rng.data_parallel_random_init and torch.distributed.is_initialized() and dp_world_size > 1:
+    # One RNG state per DP rank is stored when ranks are seeded differently
+    # (data_parallel_random_init) or when the checkpoint layout asks for it explicitly.
+    per_dp_rank_rng = (
+        cfg.rng.data_parallel_random_init or cfg.checkpoint.save_rng_state_per_dp_rank
+    )
+    if per_dp_rank_rng and torch.distributed.is_initialized() and dp_world_size > 1:
         rng_state_list = [None for i in range(dp_world_size)]
         torch.distributed.all_gather_object(
             rng_state_list,
