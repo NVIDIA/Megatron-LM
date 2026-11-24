@@ -13,6 +13,7 @@ from megatron.core.tensor_parallel.random import (
     convert_cuda_rng_state,
     cudagraph_needs_generator_registration,
     get_cuda_rng_tracker,
+    is_checkpointing,
     model_parallel_cuda_manual_seed,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -235,6 +236,34 @@ def test_checkpoint():
     assert torch.equal(input1.grad, torch.ones((4, 4)).cuda())
 
     Utils.destroy_model_parallel()
+
+
+def test_checkpoint_without_grad_is_a_plain_call():
+    """With grad disabled no backward recomputes the function, so checkpoint() calls it directly.
+
+    The function must not see is_checkpointing(), which callers use to queue state for the
+    recompute, and distribute_saved_activations must not split the caller's input in place.
+    """
+    seen = []
+
+    def forward(x):
+        seen.append(is_checkpointing())
+        return x * 2
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+    try:
+        x = torch.ones((4, 4), device="cuda", requires_grad=True)
+        with torch.no_grad():
+            output = checkpoint(forward, True, x)
+        assert seen == [False]
+        assert x.shape == (4, 4)
+        assert torch.equal(output, torch.full((4, 4), 2.0, device="cuda"))
+
+        checkpoint(forward, False, x).sum().backward()
+        # The forward, then its recompute in backward.
+        assert seen == [False, True, True]
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_checkpoint_without_output():
