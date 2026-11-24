@@ -29,7 +29,9 @@ removed.)
 ``csa_utils.cp_utils.compute_cp_indexer_topk``: it returns the top-k in the same contiguous
 ``[l_local, topk]`` layout, so the downstream index-building and sparse attention are unchanged.
 
-Triage switch: ``MCORE_DSA_CP_BAL_DEBUG=1`` logs the eligibility decision once.
+With ``dsa_cp_balance_indexer="auto"``, the host compares eligible layouts per microbatch
+before preparing the route. Set ``MCORE_DSA_CP_BAL_DEBUG=1`` to log the automatic choice on
+CP rank zero. In forced mode the same switch logs the eligibility probe once.
 
 CUDA-graph contract: static pack compositions at PP=1 are enforced through
 ``prebuild_balanced_layouts`` — under CUDA graphs it MUST be called every microbatch (as
@@ -57,6 +59,9 @@ from functools import lru_cache
 import torch
 import torch.distributed as dist
 
+from megatron.core.transformer.experimental_attention_variant.csa_utils.indexer_layout_cost import (
+    prefer_zigzag,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa import rotate_activation
 from megatron.core.transformer.experimental_attention_variant.dsa_fused_safety import (
     FUSED_INDEXER_MAX_SAFE_ROWS,
@@ -484,6 +489,23 @@ def pack_eligible_for_zigzag(packed_seq_params, cu_seqlens, cp_group, cp_size, l
         cache = {}
         packed_seq_params._dsa_cp_balance_layout_cache = cache
     return _pack_zigzag_verdict(cu_seqlens, cp_group, cp_size, l_local, cache)
+
+
+def auto_use_zigzag(packed_seq_params, cp_group, local_rows, config) -> bool:
+    """Read the microbatch decision, preparing it once for direct eager Core callers."""
+    cache = getattr(packed_seq_params, "_dsa_cp_balance_layout_cache", None) or {}
+    if packed_seq_params.csa_indexer_use_zigzag is None or cache.get("auto_geometry") != (
+        _group_key(cp_group),
+        local_rows,
+    ):
+        prebuild_balanced_layouts(
+            packed_seq_params,
+            cp_group=cp_group,
+            capacity=cp_group.size() * local_rows,
+            auto_config=config,
+        )
+    assert packed_seq_params.csa_indexer_use_zigzag is not None
+    return packed_seq_params.csa_indexer_use_zigzag
 
 
 def _ensure_pack_zigzag_ok(cu_seqlens, cp_group, cp_size, l_local, layout_cache):
@@ -1887,6 +1909,7 @@ def prebuild_balanced_layouts(
     capacity=None,
     graphs_enabled=False,
     graph_dynamic_packs=False,
+    auto_config=None,
 ):
     """Data-prep-time prebuild of the balanced-indexer zigzag plan and multi-seq gate.
 
@@ -1900,10 +1923,15 @@ def prebuild_balanced_layouts(
     that the fused indexer requires (its packed calls allow only one segment per
     sequence per call, so head and tail chunks go into two separate calls). The
     static-shape device-side builder in ``_zigzag_plan`` remains as the
-    capture-safe fallback for callers that do not prebuild.
+    capture-safe fallback for callers that do not prebuild. Passing ``auto_config``
+    resolves the per-microbatch choice before allocating any zigzag route.
     """
     if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
         return
+    if auto_config is not None:
+        if graphs_enabled or graph_dynamic_packs:
+            raise ValueError("Automatic indexer layout selection requires uncaptured attention.")
+        packed_seq_params.csa_indexer_use_zigzag = False
     if cp_group is None:
         cp_group = getattr(packed_seq_params, "cp_group", None)
     if cp_group is None or cp_group.size() <= 1:
@@ -1921,7 +1949,19 @@ def prebuild_balanced_layouts(
         raise ValueError(
             "graph-dynamic balanced CP indexer requires cu_seqlens for at least one sequence."
         )
-    metadata_total = int(cu[-1].item())
+    # Auto needs all boundaries for the cost model. Reuse one host read for both
+    # the physical-capacity calculation and scoring, including on contiguous packs.
+    auto_cu = cu.tolist() if auto_config is not None else None
+    if auto_cu is not None:
+        if not auto_cu or auto_cu[0] != 0 or any(e < s for s, e in zip(auto_cu, auto_cu[1:])):
+            raise ValueError(
+                "Automatic CSA indexer layout requires nondecreasing boundaries starting at zero."
+            )
+        metadata_total = auto_cu[-1]
+        if capacity is not None and metadata_total > capacity:
+            raise ValueError("Packed sequence boundaries exceed the physical CSA indexer capacity.")
+    else:
+        metadata_total = int(cu[-1].item())
     if graph_dynamic_packs:
         if capacity is None:
             raise ValueError(
@@ -1948,6 +1988,9 @@ def prebuild_balanced_layouts(
             capacity = min(capacity, per_rank * N)
         if total < capacity:
             total = capacity
+    if auto_config is not None and metadata_total == 0 and capacity is not None:
+        # A physically padded, entirely empty pack can still have query rows.
+        total = capacity
     if graph_dynamic_packs:
         l_local = _validate_graph_dynamic_capacity(total, N)
     else:
@@ -1988,7 +2031,7 @@ def prebuild_balanced_layouts(
 
     gkey = (_group_key(cp_group), l_local)
 
-    def _stash_verdict(ok):
+    def _stash_verdict(ok, *, use_zigzag=False):
         # Per-pack OK verdict on the microbatch's own cache (consulted first by
         # ``_ensure_pack_zigzag_ok``, so a prebuilt forward never re-probes) plus the
         # module registry (the capture-time fallback, keyed by (group, l_local)).
@@ -1998,6 +2041,18 @@ def prebuild_balanced_layouts(
             packed_seq_params._dsa_cp_balance_layout_cache = cache_
         cache_["zz_pack_ok"] = (l_local, ok)
         _ZZ_PACK_OK[gkey] = ok
+        if auto_config is not None:
+            cache_["auto_geometry"] = gkey
+            packed_seq_params.csa_indexer_use_zigzag = use_zigzag
+            if not use_zigzag:
+                cache_.pop(("zigzag", r), None)
+            if _GATE_DEBUG and r == 0:
+                logger.info(
+                    "CSA auto indexer: zigzag=%s, eligible=%s, local_rows=%d",
+                    use_zigzag,
+                    ok,
+                    l_local,
+                )
 
     # Static-composition observation: recorded UNCONDITIONALLY on every prebuild
     # call, before every early return or invariant raise, so no pack — including
@@ -2006,7 +2061,7 @@ def prebuild_balanced_layouts(
     # graphs still contributes observations. The raise itself only applies when
     # CUDA graphs are enabled (eager varlen is ordinary operation).
     seen_key = _group_key(cp_group)
-    seen_cu = (l_local, [int(v) for v in cu.tolist()])
+    seen_cu = (l_local, auto_cu if auto_cu is not None else [int(v) for v in cu.tolist()])
     seen = _SEEN_CU.get(seen_key)
     if graphs_enabled and seen is not None and seen != seen_cu:
         raise RuntimeError(
@@ -2020,6 +2075,8 @@ def prebuild_balanced_layouts(
 
     if total <= 0:
         # All-empty pack: nothing to score; the forward exits before any fused call.
+        if auto_config is not None:
+            _stash_verdict(False)
         return
     if total % N != 0:
         raise ValueError(
@@ -2031,11 +2088,30 @@ def prebuild_balanced_layouts(
     # Same sequence enumeration as _zigzag_plan: real segments plus the
     # capacity-padding pseudo-sequence [cu[-1], total) (empty for full packs).
     seq_lens_list = [e - s for s, e in zip(cu_list[:-1], cu_list[1:])] + [total - cu_list[-1]]
-    if l_local % 2 != 0 or any(sl % (2 * N) for sl in seq_lens_list):
-        # Not zigzag-representable: record the verdict so the forward routes this
-        # microbatch to the contiguous reference path. The configured alignment is
-        # deliberately not part of this decision: only the physical capacity and
-        # actual sequence boundaries determine whether the zigzag layout is legal.
+    eligible = l_local % 2 == 0 and all(sl % (2 * N) == 0 for sl in seq_lens_list)
+    if auto_config is not None:
+        contiguous_fused = l_local <= FUSED_INDEXER_MAX_SAFE_ROWS
+        zigzag_fused = eligible and l_local // 2 <= FUSED_INDEXER_MAX_SAFE_ROWS
+        no_work = auto_config.dsa_indexer_topk == 0 or not any(sl >= 4 for sl in seq_lens_list[:-1])
+        if (
+            not no_work
+            and not (contiguous_fused or zigzag_fused)
+            and auto_config.dsa_indexer_precision == "mxfp8"
+        ):
+            raise ValueError(
+                "Neither CSA indexer layout supports this MXFP8 pack: reduce the per-rank "
+                "capacity or use sequence lengths divisible by twice the CP size."
+            )
+        # When only the fused halves fit, avoid the unfused BF16 reference path.
+        # Compare compute and routing time only when both fused layouts are legal.
+        if (
+            no_work
+            or not zigzag_fused
+            or (contiguous_fused and not prefer_zigzag(seq_lens_list, N, l_local, auto_config))
+        ):
+            _stash_verdict(eligible)
+            return
+    elif not eligible:
         _stash_verdict(False)
         return
 
@@ -2060,7 +2136,7 @@ def prebuild_balanced_layouts(
             cache = {}
             packed_seq_params._dsa_cp_balance_layout_cache = cache
         cache[("zigzag", r)] = prev
-        _stash_verdict(True)
+        _stash_verdict(True, use_zigzag=True)
         return
 
     # The balanced row-limit applies only when a plan will actually be built: an
@@ -2211,4 +2287,4 @@ def prebuild_balanced_layouts(
         packed_seq_params._dsa_cp_balance_layout_cache = cache
     cache[("zigzag", r)] = plan
     _LAST_PLAN[(_group_key(cp_group), r)] = plan
-    _stash_verdict(True)
+    _stash_verdict(True, use_zigzag=True)

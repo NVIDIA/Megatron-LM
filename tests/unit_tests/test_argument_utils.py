@@ -1342,6 +1342,18 @@ class TestMegatronNetworkArgumentGeneration:
 
         return _add_network_size_args(ArgumentParser(exit_on_error=False))
 
+    @pytest.mark.parametrize(
+        ("argv", "expected"),
+        [
+            ([], False),
+            (["--dsa-cp-balance-indexer"], True),
+            (["--dsa-cp-balance-indexer", "auto"], "auto"),
+        ],
+    )
+    def test_balanced_indexer_policy(self, argv, expected):
+        """The bare flag retains its boolean semantics alongside explicit auto selection."""
+        assert self._parser().parse_args(argv).dsa_cp_balance_indexer == expected
+
     def test_transformer_callback_fields_are_not_registered_as_cli_args(self):
         """Callback fields are runtime hooks, not CLI-provided values."""
         from megatron.training.arguments import _add_network_size_args

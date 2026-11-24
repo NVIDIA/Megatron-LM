@@ -29,6 +29,7 @@ from megatron.core.transformer.experimental_attention_variant.cp_balanced_indexe
     _zigzag_plan,
     add_graph_dynamic_plan_to_kwargs,
     attach_graph_dynamic_plan_buffers,
+    auto_use_zigzag,
     build_graph_dynamic_plan,
     copy_graph_dynamic_plan_,
     get_graph_dynamic_plan,
@@ -1653,6 +1654,66 @@ def _make_balanced_transformer_config(monkeypatch, **overrides):
     )
     kwargs.update(overrides)
     return _make_config(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("boundaries", "eligible", "zigzag"),
+    [
+        ([0, 256], True, True),
+        ([0, 128, 256], True, False),
+        ([0, 5, 256], False, False),
+        ([0, 8], True, False),  # the physical tail travels but has no keys
+    ],
+)
+def test_auto_decision_is_shared_across_ranks_and_layers(monkeypatch, boundaries, eligible, zigzag):
+    """Same capacity, different packs; direct Core callers build at most one route."""
+    from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
+
+    config = _make_balanced_transformer_config(
+        monkeypatch,
+        dsa_cp_balance_indexer="auto",
+        dsa_cp_indexer_auto_compute_tflops=1.0,
+        dsa_cp_indexer_auto_overhead_us=0.0,
+    )
+    for rank in range(2):
+        group = _StubGroup(2, rank)
+        pack = _packed_params(boundaries, boundaries[-1])
+        assert auto_use_zigzag(pack, group, 128, config) is zigzag
+        assert pack.csa_indexer_use_zigzag is zigzag
+        assert pack._dsa_cp_balance_layout_cache["zz_pack_ok"] == (128, eligible)
+        assert (("zigzag", rank) in pack._dsa_cp_balance_layout_cache) is zigzag
+        with monkeypatch.context() as context:
+            context.setattr(
+                cp_balanced_indexer,
+                "prebuild_balanced_layouts",
+                lambda *a, **k: pytest.fail("per-layer rebuild"),
+            )
+            assert auto_use_zigzag(pack, group, 128, config) is zigzag
+
+
+def test_auto_prices_routing_only_when_both_fused_paths_fit(monkeypatch):
+    """Respect the fused row bound and MXFP8's fused-only scoring contract."""
+    from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
+
+    config = _make_balanced_transformer_config(
+        monkeypatch, dsa_cp_balance_indexer="auto", dsa_cp_indexer_auto_overhead_us=1e6
+    )
+    group = _StubGroup(2, 0)
+    assert not auto_use_zigzag(_packed_params([0, 256], 256), group, 128, config)
+    monkeypatch.setattr(cp_balanced_indexer, "FUSED_INDEXER_MAX_SAFE_ROWS", 64)
+    assert auto_use_zigzag(_packed_params([0, 256], 256), group, 128, config)
+    assert not auto_use_zigzag(_packed_params([0, 512], 512), group, 256, config)
+    config.dsa_indexer_precision = "mxfp8"
+    with pytest.raises(ValueError, match="Neither CSA indexer layout"):
+        auto_use_zigzag(_packed_params([0, 5, 256], 256), group, 128, config)
+
+
+def test_auto_rejects_attention_graph_capture(monkeypatch):
+    """A single captured graph cannot switch collective programs on replay."""
+    with pytest.raises(ValueError, match="requires attention outside CUDA graph capture"):
+        _make_balanced_transformer_config(
+            monkeypatch, dsa_cp_balance_indexer="auto", cuda_graph_impl="transformer_engine"
+        )
 
 
 @pytest.mark.parametrize("alignment", [None, "max", 12, 8])

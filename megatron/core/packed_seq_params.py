@@ -49,6 +49,8 @@ class PackedSeqParams:
     tokens_per_sample: int = None
     cp_partition_route: Optional["ThdCpRoute"] = None
     cp_scatter_cache: object = None
+    # Resolved selection-only layout for this microbatch. None until auto mode prepares it.
+    csa_indexer_use_zigzag: bool | None = None
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.

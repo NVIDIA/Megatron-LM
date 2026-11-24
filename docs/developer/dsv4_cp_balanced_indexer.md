@@ -23,6 +23,48 @@ The graph input ABI remains two tensor owners: aligned int32 layout metadata
 and an int64 route. Replay refreshes their values for the current pack without
 changing tensor shapes or communication split sizes.
 
+## Automatic layout selection
+
+Omitting `--dsa-cp-balance-indexer` keeps selection contiguous. The bare flag
+uses zigzag for every representable pack. Passing `--dsa-cp-balance-indexer auto`
+selects once per packed microbatch. All ranks derive the same decision from
+global padded sequence boundaries, the runtime CP size, the physical row
+capacity and the model configuration. Each CSA indexer reads
+`PackedSeqParams.csa_indexer_use_zigzag`. Its query dispatch and inverse
+top-k exchange use the same decision. The model keeps contiguous CP token
+ownership. Direct eager Core callers can resolve the decision on first use.
+
+For a one-based query position `p` within a document, the ratio-4 indexer
+can score `floor(p / 4)` completed compressed keys. The host model sums those
+counts over each rank's contiguous intervals and its mirrored zigzag chunks.
+Padding beyond the last supplied boundary moves with the query rows and
+contributes zero keys. The model converts the difference between the two
+peak rank counts to time using two dot-product FLOPs per head dimension.
+It estimates routing time from the busiest rank's remote rows, local copies
+of the full shard, and a fixed overhead. The row payload includes low-rank Q,
+head weights, int32 top-k IDs and, when configured for sparse-loss training,
+FP32 predictions. Zigzag must save more time than this routing estimate.
+Contiguous decisions skip building the zigzag route.
+
+| Configuration field | Initial value | Cost represented |
+| --- | ---: | --- |
+| `dsa_cp_indexer_auto_compute_tflops` | 500 TFLOP/s | Effective scoring throughput per rank |
+| `dsa_cp_indexer_auto_exchange_gbps` | 200 GB/s | Exposed dispatch and return traffic after overlap |
+| `dsa_cp_indexer_auto_copy_gbps` | 2000 GB/s | Effective throughput for local permutation and packing |
+| `dsa_cp_indexer_auto_overhead_us` | 20 µs | Extra launches, amortized preparation and decision margin per use |
+
+These coefficients are starting estimates. Calibrate them for the model,
+hardware and CP topology before drawing throughput conclusions.
+`MCORE_DSA_CP_BAL_DEBUG=1` logs the choice and pack eligibility on CP rank zero.
+
+Auto requires attention to run eagerly, including when other modules use
+CUDA graphs. Capturing attention fixes its collective sequence across replays.
+The current fused scorer accepts up to 32,768 query rows per call. For a
+representable pack with larger contiguous shards, auto uses the two fused halves
+when each fits. An oversized or unrepresentable zigzag layout falls back to
+contiguous scoring, using the unfused implementation when required for BF16.
+MXFP8 requires a legal fused route for nonempty scoring.
+
 ## Projection and scoring precision
 
 Selection Q normally uses the existing TE projection, including the effective

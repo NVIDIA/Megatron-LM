@@ -603,7 +603,10 @@ class TransformerConfig(ModelParallelConfig):
     backend. The final index scores remain FP32 independently of this option. This option does
     not affect ``CSAIndexer``, which keeps its FP8-disabled BF16 projection."""
 
-    dsa_cp_balance_indexer: bool = False
+    dsa_cp_balance_indexer: bool | Literal["auto"] = field(
+        default=False,
+        metadata={"argparse_meta": {"type": str, "nargs": "?", "const": True, "choices": ["auto"]}},
+    )
     """Enable the load-balanced context-parallel DSA indexer path. The contiguous CP split makes the
     causal indexer's per-query cost grow with rank, so later CP ranks become stragglers. When True,
     each rank instead scores a balanced low-position + high-position chunk pair (two launches of the
@@ -620,8 +623,9 @@ class TransformerConfig(ModelParallelConfig):
     balanced two-half-call path therefore fails closed above per-rank capacities of
     2 * 32768 rows, balanced-run reference fallbacks above 32768 rows take the unfused
     implementation, and pre-existing paths keep their behavior with a once-per-process
-    correctness warning. Whether balancing is worthwhile for a workload is decided once,
-    at recipe level, by this flag.
+    correctness warning. With ``"auto"``, data preparation chooses between the two legal
+    layouts per packed microbatch by comparing critical-rank scoring work with routing cost.
+    Auto requires attention to execute outside CUDA graph capture.
     Selection Q inherits the effective per-layer precision. Only delayed-scaling selection
     uses a stateless nonquantized projection; its canonical local projection still records once
     in eval/no-grad checkpoint forwards so amax and recompute metadata remain consistent.
@@ -640,6 +644,19 @@ class TransformerConfig(ModelParallelConfig):
     instances sized for the largest future schedule entry. Other graph configurations retain the
     static-composition behavior."""
 
+    dsa_cp_indexer_auto_compute_tflops: float = 500.0
+    """Effective indexer dot-product TFLOP/s per rank for automatic layout selection."""
+
+    dsa_cp_indexer_auto_exchange_gbps: float = 200.0
+    """Effective GB/s for exposed remote dispatch and return traffic in auto mode."""
+
+    dsa_cp_indexer_auto_copy_gbps: float = 2000.0
+    """Effective GB/s for packing and restoring all local query rows in auto mode."""
+
+    dsa_cp_indexer_auto_overhead_us: float = 20.0
+    """Extra microseconds per zigzag use for launches, amortized preparation, and headroom.
+    The auto cost parameters are initial estimates that can be calibrated for a deployment."""
+
     @property
     def dsa_cp_balance_indexer_graph_dynamic_packs(self) -> bool:
         """Whether CUDA-graphed balanced DSA routing supports varying pack compositions.
@@ -648,7 +665,7 @@ class TransformerConfig(ModelParallelConfig):
         replay always agree on whether fixed-capacity dynamic route metadata is required.
         """
         return bool(
-            self.dsa_cp_balance_indexer
+            self.dsa_cp_balance_indexer is True
             and self.cuda_graph_impl == "transformer_engine"
             and cuda_graph_captures_attention(self)
             and self.sequence_packing_scheduler == "dp_balanced"
@@ -3016,6 +3033,25 @@ class TransformerConfig(ModelParallelConfig):
                         "cp_partition_mode='contiguous'."
                     )
 
+        if (
+            not isinstance(self.dsa_cp_balance_indexer, bool)
+            and self.dsa_cp_balance_indexer != "auto"
+        ):
+            raise ValueError("dsa_cp_balance_indexer must be False, True, or 'auto'.")
+        if self.dsa_cp_balance_indexer == "auto":
+            for name in (
+                "dsa_cp_indexer_auto_compute_tflops",
+                "dsa_cp_indexer_auto_exchange_gbps",
+                "dsa_cp_indexer_auto_copy_gbps",
+            ):
+                value = getattr(self, name)
+                if not math.isfinite(value) or value <= 0:
+                    raise ValueError(f"{name} must be finite and positive.")
+            if (
+                not math.isfinite(self.dsa_cp_indexer_auto_overhead_us)
+                or self.dsa_cp_indexer_auto_overhead_us < 0
+            ):
+                raise ValueError("dsa_cp_indexer_auto_overhead_us must be finite and nonnegative.")
         if self.dsa_cp_balance_indexer and self.experimental_attention_variant != "dsv4_hybrid":
             # The flag is consumed only by the CSA indexer; on any other model the
             # data-step prebuild would burn per-microbatch host syncs for nothing.
@@ -5839,6 +5875,11 @@ class TransformerConfig(ModelParallelConfig):
                     )
 
         graph_captures_attention = cuda_graph_captures_attention(self)
+        if self.dsa_cp_balance_indexer == "auto" and graph_captures_attention:
+            raise ValueError(
+                "dsa_cp_balance_indexer='auto' requires attention outside CUDA graph capture: "
+                "different microbatches can issue different collectives."
+            )
 
         if self.dsa_cp_balance_indexer_graph_dynamic_packs:
             if self.dynamic_context_parallel or self.context_parallel_size <= 1:
