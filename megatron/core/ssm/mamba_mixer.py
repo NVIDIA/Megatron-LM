@@ -211,9 +211,12 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         """Estimate projection and scan FLOPs using the existing SSD approximation."""
         config = self.config
         tokens = total_real_tokens_in_batch
-        hidden = config.hidden_size
-        inner = 2 * hidden
-        heads = config.mamba_num_heads or inner // config.mamba_head_dim
+        if isinstance(self, MambaMixer):
+            hidden, inner, heads = self.d_model, self.d_inner, self.nheads
+        else:
+            hidden = config.hidden_size
+            heads = config.mamba_num_heads or (2 * hidden // config.mamba_head_dim)
+            inner = heads * config.mamba_head_dim
         forward = (
             2
             * tokens

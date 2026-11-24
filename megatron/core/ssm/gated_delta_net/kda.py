@@ -85,7 +85,7 @@ class KimiDeltaAttention(_GDNBase):
         else:
             gate_macs = 2 * hidden * channels
         delta_macs = self._conv_and_recurrence_macs_per_token(
-            config.linear_conv_kernel_dim, 3 * channels, heads, head_dim
+            config.linear_conv_kernel_dim, 3 * channels, head_dim, channels
         )
         forward = 2 * total_real_tokens_in_batch * (projection_macs + gate_macs + delta_macs)
         return (3 if include_backward else 1) * forward

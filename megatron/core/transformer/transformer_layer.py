@@ -32,7 +32,11 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
-from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
+from megatron.core.transformer.module import (
+    GraphableMegatronModule,
+    TwoStageAttentionLayer,
+    estimate_layer_flops,
+)
 from megatron.core.transformer.moe.router_replay import ChunkedRouterReplay
 from megatron.core.transformer.residual_connection import (
     ResidualBranchOutput,
@@ -363,7 +367,8 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
     ) -> float:
         """Compose the computational sublayers without counting their children twice."""
         return sum(
-            layer.estimate_flops(
+            estimate_layer_flops(
+                layer,
                 total_real_tokens_in_batch=total_real_tokens_in_batch,
                 seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
                 include_backward=include_backward,

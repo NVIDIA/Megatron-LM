@@ -52,7 +52,11 @@ class GainLayer(MegatronModule):
     ) -> float:
         """Count channel scaling, optionally including input and parameter gradients."""
         forward = total_real_tokens_in_batch * self.config.hidden_size
-        return (3 if include_backward else 1) * forward
+        if not include_backward:
+            return forward
+        # Each channel sums its per-token products into one gain gradient.
+        reduction_adds = max(total_real_tokens_in_batch - 1, 0) * self.config.hidden_size
+        return 3 * forward + reduction_adds
 
     def forward(
         self,

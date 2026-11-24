@@ -36,6 +36,9 @@ from megatron.core.transformer.experimental_attention_variant import (
 from megatron.core.transformer.module import MegatronModule, accepts_flops_config, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer.utils import (
+    capped_causal_attention_fraction as _dsa_sparse_core_scale,
+)
 from megatron.core.utils import ensure_params_ready, get_pg_size
 
 logger = logging.getLogger(__name__)
@@ -69,39 +72,6 @@ def _dsa_index_share_carrier_scope(carrier: object) -> Iterator[None]:
         yield
     finally:
         _CURRENT_DSA_INDEX_SHARE_CARRIER.reset(token)
-
-
-def _dsa_sparse_core_scale(total_real_tokens, seqlen_squared_sum, dsa_indexer_topk):
-    """Fraction of dense causal (query, key) pairs that DSA actually attends to.
-
-    A DSA layer scores every past position with the indexer but runs attention
-    only over the ``dsa_indexer_topk`` highest-scoring keys, so its core
-    attention cost is ``sum_i(min(i, topk))`` pairs per sequence instead of the
-    dense causal ``L^2 / 2``. Returns the ratio between the two, i.e. the
-    factor the dense core-attention coefficient must be scaled by.
-
-    The caller only has the batch aggregates ``sum_i(L_i)`` and
-    ``sum_i(L_i ** 2)``, not the individual sequence lengths, so the ratio is
-    evaluated at the length-weighted mean ``sum(L^2) / sum(L)``. For equal-length
-    sequences, this aggregation introduces no additional approximation, but
-    the pair counts still use the continuous approximation described below.
-    For ragged batches, it weights toward the long sequences that dominate
-    attention cost. Collapses to ``1.0`` when the sequences are
-    no longer than ``topk``, where top-k selects everything and attention is
-    dense.
-    """
-    if not dsa_indexer_topk or total_real_tokens <= 0 or seqlen_squared_sum <= 0:
-        return 1.0
-    mean_seqlen = seqlen_squared_sum / total_real_tokens
-    # Average attended KV entries per query: ``min(i, topk)`` averaged over the
-    # sequence, approximated as ``eff * (1 - eff / (2 * L))`` with
-    # ``eff = min(topk, floor(L))``. The exact discrete average has ``eff - 1``
-    # in the correction term; the O(1/L) difference is below the precision of
-    # this estimate.
-    eff = min(dsa_indexer_topk, math.floor(mean_seqlen))
-    attended = eff * (1 - eff / (2 * mean_seqlen))
-    # Dense causal attention averages ~``mean_seqlen / 2`` keys per query.
-    return attended / (mean_seqlen / 2)
 
 
 def _dsa_kpool_pairs(mean_seqlen, pool_size, max_pools=None):

@@ -28,15 +28,32 @@ def accepts_flops_config(estimate):
     """Keep the config-only call used by training reports for built-in layer types."""
 
     @wraps(estimate)
-    def from_module_or_config(config, **batch_stats):
-        if isinstance(config, MegatronModule):
-            return estimate(config, **batch_stats)
+    def from_module_or_config(module_or_config=None, /, config=None, **batch_stats):
+        if config is None:
+            if isinstance(module_or_config, MegatronModule):
+                return estimate(module_or_config, **batch_stats)
+            if module_or_config is None:
+                raise TypeError("estimate_flops requires a layer or config")
+            config = module_or_config
         # A config describes the attention arithmetic but cannot own an indexer.
         # Config-only reports count indexer executions separately.
         layer = SimpleNamespace(config=config, core_attention=None, indexer=None)
         return estimate(layer, **batch_stats)
 
     return from_module_or_config
+
+
+def estimate_layer_flops(layer, *, include_backward=False, **batch_stats) -> float:
+    """Allow custom layers with the original classmethod hook to report forward FLOPs."""
+    estimate = layer.estimate_flops
+    if isinstance(getattr(estimate, "__self__", None), type):
+        if include_backward:
+            raise NotImplementedError(
+                f"{type(layer).__name__} must implement estimate_flops as an instance method "
+                "with include_backward to estimate backward FLOPs."
+            )
+        return estimate(layer.config, **batch_stats)
+    return estimate(include_backward=include_backward, **batch_stats)
 
 
 class TwoStageAttentionLayer:

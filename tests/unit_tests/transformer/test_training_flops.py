@@ -1,13 +1,17 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Forward and backward FLOPs use the sparse core and indexer actually constructed."""
+"""Forward and backward FLOPs reflect the layers constructed for training."""
 
 from types import SimpleNamespace
 
 import pytest
 
+from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
+)
+from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+    DSv4HybridSelfAttention,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexer, DSAttention
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
@@ -77,3 +81,47 @@ def test_mla_composes_its_sparse_core_once(module_type, include_backward, expect
     # Expanded MLA core costs 224 FLOPs; absorbed core costs 320. Both include
     # projections exactly once and the same exceptional indexer training cost.
     assert attention.estimate_flops(**BATCH_STATS, include_backward=include_backward) == expected
+
+
+def test_mamba_flops_use_resolved_mixer_dimensions():
+    config = SimpleNamespace(
+        hidden_size=8, mamba_head_dim=2, mamba_num_heads=3, mamba_state_dim=4, mamba_num_groups=1
+    )
+    # Three heads give inner width 6. Each token costs 368 + 168 + 96 FLOPs.
+    assert MambaMixer.estimate_flops(config, **BATCH_STATS) == 2528
+
+    # A nondefault constructor expansion of 1.5 gives six heads and inner width 12.
+    config.mamba_num_heads = None
+    mixer = make_flops_test_layer(MambaMixer, config, d_model=8, d_inner=12, nheads=6)
+    assert mixer.estimate_flops(**BATCH_STATS) == 4544
+
+
+@pytest.mark.parametrize(
+    "attention_backend,packing_scheduler,loss_coeff,expected_training",
+    [
+        ("auto", None, 0.0, 7664),
+        ("auto", None, 0.1, 7728),
+        ("unfused", None, 0.0, 7728),
+        ("unfused", "dp_balanced", 0.0, 7664),
+    ],
+)
+def test_csa_counts_score_backward_for_the_configured_kernel(
+    attention_backend, packing_scheduler, loss_coeff, expected_training
+):
+    config = _config(loss_coeff)
+    config.output_projection_lora_rank = 2
+    config.output_projection_groups = 1
+    config.csa_window_size = 2
+    config.csa_dense_mode = False
+    config.attention_backend = attention_backend
+    config.dsa_kernel_backend = "cudnn"
+    config.sequence_packing_scheduler = packing_scheduler
+    config.context_parallel_size = 1
+    attention = make_flops_test_layer(DSv4HybridSelfAttention, config, _dsv4_compress_ratio=4)
+
+    # The resolved ratio is sufficient for legacy configs that lack compress_ratio.
+    # Sparse ratio 4 costs 2,544 projection/window/attention FLOPs and 32 indexer score FLOPs.
+    assert attention.estimate_flops(**BATCH_STATS) == 2576
+    config.compress_ratio = 0
+    assert attention.estimate_flops(**BATCH_STATS, include_backward=True) == expected_training
+    assert DSv4HybridSelfAttention.estimate_flops(config, **BATCH_STATS) == 992
