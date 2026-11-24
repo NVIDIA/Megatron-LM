@@ -849,12 +849,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         self.is_stub_optimizer = False
         if self.ddp_config.use_megatron_fsdp:
-            if param_norm_setup is not None:
-                param_norm_setup.ownership(
-                    self.optimizer.param_groups, "Megatron FSDP", supported=False
-                )
-            elif config.embedding_min_norm is not None:
-                raise ValueError("embedding_min_norm is not supported with Megatron FSDP")
+            # FSDP v1 can drop the word-embedding marker when wrapping weights in DTensors.
+            # Check the configured floor even if the recipe found no embeddings.
+            if config.embedding_min_norm is not None:
+                error = "embedding_min_norm is not supported with Megatron FSDP"
+                if param_norm_setup is None:
+                    raise ValueError(error)
+                # The factory gathers setup errors so all participating ranks raise together.
+                param_norm_setup.error = error
             # Megatron-FSDP will manage optimizer weights and gradients.
             return
 

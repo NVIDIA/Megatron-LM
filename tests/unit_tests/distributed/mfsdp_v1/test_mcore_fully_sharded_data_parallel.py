@@ -117,6 +117,17 @@ class TestFullyShardedDataParallel:
         )
         return fsdp_model
 
+    def test_embedding_min_norm_rejected_without_marked_weights(self):
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+
+        fsdp_model = self._build_fsdp_model()
+        config = OptimizerConfig(lr=1e-3, use_distributed_optimizer=True, embedding_min_norm=1.0)
+        with pytest.raises(
+            ValueError, match="embedding_min_norm is not supported with Megatron FSDP"
+        ):
+            get_megatron_optimizer(config, [fsdp_model])
+
     def test_fsdp_mp_policy_with_default_args(self):
         """Test that FullyShardedDataParallel with default dtype args produces the expected policy."""
         if not is_torch_min_version("2.4.0"):
