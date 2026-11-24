@@ -17,6 +17,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_last_stage,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.cuda_graphs import CudaGraphManager
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.multi_token_prediction import tie_word_embeddings_state_dict
@@ -316,6 +317,24 @@ class LanguageModule(MegatronModule):
         if self.config.mup_output_mult != 1.0:
             return logits * self.config.mup_output_mult
         return logits
+
+    def _capture_prompt_hidden_states(self, hidden_states: Tensor, inference_context) -> None:
+        """Copy the final hidden states into the context's `prompt_hidden_states`, if it has one.
+
+        Args:
+            hidden_states (Tensor): The output layer's input, [S, 1, H] in active-token order
+                (this rank's shard of it under sequence parallelism).
+            inference_context: The forward's inference context, or None.
+        """
+        buffer = getattr(inference_context, "prompt_hidden_states", None)
+        if buffer is None:
+            return
+        if self.output_layer.sequence_parallel:
+            hidden_states = gather_from_sequence_parallel_region(
+                hidden_states, group=self.pg_collection.tp
+            )
+        # Copied into the fixed buffer, so CUDA graph replays fill it too.
+        buffer[: hidden_states.shape[0]].copy_(hidden_states.squeeze(1))
 
     def shared_embedding_or_output_weight(self) -> Tensor:
         """Gets the embedding weight or output logit weights when share embedding and output weights set to True

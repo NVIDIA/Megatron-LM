@@ -1024,6 +1024,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     ),
                     main_hidden_states=hidden_states,
                 )
+        if in_inference_mode:
+            self._capture_prompt_hidden_states(hidden_states, inference_context)
+
         # Give callers a post-decoder hook before the default output projection and loss path.
         if output_processor is not None:
             return output_processor(

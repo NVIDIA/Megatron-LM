@@ -96,7 +96,14 @@ class RequestIntakeMixin:
                 request.status == Status.FAILED
             ), f"Request {request.request_id} ended in non-terminal status {request.status}."
             request.add_event_fail()
-        return request_entry.record.merge()
+        merged = request_entry.record.merge()
+        # Attach the mean prompt hidden state to a request that asked for it.
+        params = merged.sampling_params
+        if params.return_prompt_embedding:
+            merged.prompt_embedding = self.controller.pop_prompt_embedding(
+                merged.request_id, len(merged.prompt_tokens) - params.prompt_embedding_skip_tokens
+            )
+        return merged
 
     def _complete_request(
         self,
@@ -355,6 +362,18 @@ class RequestIntakeMixin:
         if seed_error is not None:
             request.status = Status.FAILED
             request.add_event_error_nontransient(ValueError(seed_error))
+
+        # Fail a prompt-embedding request the engine cannot answer correctly.
+        if request.sampling_params.return_prompt_embedding and (
+            self.context.prompt_hidden_states is None or self.context.enable_prefix_caching
+        ):
+            request.status = Status.FAILED
+            request.add_event_error_nontransient(
+                ValueError(
+                    "Prompt embeddings require InferenceConfig.capture_prompt_hidden_states "
+                    "(--inference-dynamic-batching-prompt-hidden-states) and no prefix caching"
+                )
+            )
 
         assert (
             request.sampling_params.num_tokens_to_generate is None

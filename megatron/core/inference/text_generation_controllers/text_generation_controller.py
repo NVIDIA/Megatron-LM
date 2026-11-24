@@ -306,6 +306,8 @@ class TextGenerationController(MTPControllerMixin):
         self.tokenizer = tokenizer
         self.extra_eos_token_id_set = self._build_extra_eos_token_id_set(tokenizer)
         self.num_speculative_tokens = inference_config.num_speculative_tokens
+        # Request ID -> [float64 sum of prompt hidden states on the CPU, rows summed].
+        self._prompt_hidden_sums: Dict[int, list] = {}
 
         pg_collection = inference_config.pg_collection
         if pg_collection is not None:
@@ -1011,6 +1013,16 @@ class TextGenerationController(MTPControllerMixin):
             logits = broadcast_from_last_pipeline_stage(
                 logits_shape, dtype=self._logits_dtype, tensor=logits, pp_group=self.pp_group
             )
+            hidden_states = getattr(context, "prompt_hidden_states", None)
+            if hidden_states is not None:
+                # Only the last stage's model filled the buffer.
+                hidden_states = hidden_states[: input_ids.shape[1]]
+                broadcast_from_last_pipeline_stage(
+                    list(hidden_states.shape),
+                    dtype=hidden_states.dtype,
+                    tensor=hidden_states,
+                    pp_group=self.pp_group,
+                )
 
         if self._enable_cuda_graph:
             # Ensure that the model wrote the logits into the correct buffer.
@@ -1422,6 +1434,59 @@ class TextGenerationController(MTPControllerMixin):
 
         routing_dtype = np.int16 if (self.model_config.num_moe_experts or 0) <= 32768 else np.int32
         return stacked_routing.cpu().numpy().astype(routing_dtype)
+
+    def _accumulate_prompt_hidden_states(self) -> None:
+        """Add the consumed forward's prompt hidden states to their requests' running sums.
+
+        A row takes part when its request is in prefill, asked for an embedding
+        (`return_prompt_embedding`) and did not ask to skip the row's position. Must run while the
+        context layout still describes the forward that filled `context.prompt_hidden_states`:
+        before `update_requests`, and before the next forward is launched.
+        """
+        context = self.inference_wrapped_model.inference_context
+        hidden_states = getattr(context, "prompt_hidden_states", None)
+        if hidden_states is None:
+            return
+        tokens = slice(0, context.active_token_count)
+        requests = context.token_to_request_idx[tokens].long()
+        metadata = context.request_metadata
+        keep = (
+            metadata["return_prompt_embedding"][requests]
+            & (context.request_in_prefill_status_tensor[requests] == 1)
+            & (
+                context.token_to_position_in_request[tokens]
+                >= metadata["prompt_embedding_skip_tokens"][requests]
+            )
+        )
+        if not keep.any():
+            return
+        # A request's rows are contiguous, and each sum reads its own rows only, so a request's
+        # embedding does not depend on the rest of the batch.
+        request_ids, counts = context.request_ids[requests[keep]].unique_consecutive(
+            return_counts=True
+        )
+        counts = counts.tolist()
+        rows = hidden_states[tokens][keep.to(hidden_states.device)].split(counts)
+        sums = torch.stack([chunk.sum(dim=0, dtype=torch.float64) for chunk in rows]).cpu()
+        for request_id, total, count in zip(request_ids.tolist(), sums, counts):
+            entry = self._prompt_hidden_sums.setdefault(request_id, [0, 0])
+            entry[0] += total
+            entry[1] += count
+
+    def pop_prompt_embedding(self, request_id: int, num_positions: int) -> Optional[List[float]]:
+        """Return a finished request's mean prompt hidden state and forget its running sum.
+
+        Args:
+            request_id (int): The engine's ID of the request.
+            num_positions (int): Number of prompt positions the mean must cover.
+
+        Returns:
+            Optional[List[float]]: The mean, or `None` unless exactly `num_positions` (> 0)
+                rows were summed: each position once, none missing (as after a prefix-cache
+                hit) and none repeated (as after a recomputation).
+        """
+        total, count = self._prompt_hidden_sums.pop(request_id, (None, 0))
+        return (total / count).tolist() if 0 < count == num_positions else None
 
     def _dynamic_step_calculate_log_probs(self) -> Optional[Tensor]:
         """Calculate log probs from logits."""
@@ -3188,6 +3253,9 @@ class TextGenerationController(MTPControllerMixin):
 
                 log_probs_gpu_result = self._run_async_sched_log_probs(sample_result)
                 log_probs_transfer = self._copy_async_sched_log_probs_to_cpu(log_probs_gpu_result)
+                # Only this async path consumes prefill forwards; the overlap paths are
+                # decode-only on both sides.
+                self._accumulate_prompt_hidden_states()
                 # The rows arrive after update and admission, so record their
                 # blocks now and pin them until the rows are stored.
                 prompt_logprob_writes = context.capture_prompt_logprob_writes()
@@ -3570,6 +3638,8 @@ class TextGenerationController(MTPControllerMixin):
                             log_probs_tensor
                         )
             range_pop()
+
+            self._accumulate_prompt_hidden_states()
 
             # Cache prompt log-prob rows on their blocks before update_requests
             # changes the layout that locates them.

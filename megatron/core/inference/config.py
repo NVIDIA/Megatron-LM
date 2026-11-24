@@ -857,6 +857,11 @@ class InferenceConfig:
     `freeze_overlap`.
     """
 
+    capture_prompt_hidden_states: bool = False
+    """Keep each forward's final hidden states (the output layer's input) in a context buffer,
+    so a request with `SamplingParams.return_prompt_embedding` can be answered with the mean
+    of its prompt's hidden states. Off by default: no buffer, no copy in the forward."""
+
     logprobs_mode: Literal['raw_logprobs', 'processed_logprobs'] = 'raw_logprobs'
     """Whether log-probs of engine-sampled tokens are modified by the sampling parameters.
 

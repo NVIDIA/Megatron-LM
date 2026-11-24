@@ -67,6 +67,11 @@ class SamplingParams:
     streaming: bool = False  # Emit incremental ENGINE_REPLY_PARTIAL frames.
     streaming_interval: int = 1  # Minimum unsent tokens per ENGINE_REPLY_PARTIAL.
     do_kv_handoff: bool = False  # Pin KV blocks and expose metadata for peer transfer.
+    # Return `prompt_embedding` with the finished request: the mean of the model's final hidden
+    # states over the prompt, leaving out its first `prompt_embedding_skip_tokens` positions
+    # (a start token, say). Needs InferenceConfig.capture_prompt_hidden_states.
+    return_prompt_embedding: bool = False
+    prompt_embedding_skip_tokens: int = 0
 
     # Optional request-local RNG; independent of dynamic batch position.
     seed: Optional[int] = None

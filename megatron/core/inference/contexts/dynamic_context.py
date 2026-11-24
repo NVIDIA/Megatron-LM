@@ -1936,6 +1936,17 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         self._mtp_allocate_buffers()
 
+        # Final hidden states of the latest forward, in active-token order: filled by
+        # `LanguageModule._capture_prompt_hidden_states`, only [:active_token_count] is valid.
+        self.prompt_hidden_states = None
+        if self.config.capture_prompt_hidden_states:
+            self.prompt_hidden_states = torch.empty(
+                self.max_tokens,
+                self.hidden_size,
+                device=torch.cuda.current_device(),
+                dtype=self.params_dtype,
+            )
+
         # Reset tensor-related metadata.
         self.reset_metadata()
 
