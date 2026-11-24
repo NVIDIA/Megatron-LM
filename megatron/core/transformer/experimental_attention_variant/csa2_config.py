@@ -6,6 +6,10 @@ import math
 
 import torch
 
+from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+    use_fused_dsa_kernels,
+)
+
 
 def validate_csa2_config(config) -> None:
     """Reject inconsistent owners, compression ratios and hierarchical candidate pools."""
@@ -54,7 +58,7 @@ def validate_csa2_config(config) -> None:
     if config.moe_shortcut_connection:
         raise NotImplementedError("CSA2 does not yet support shortcut MoE")
     if config.context_parallel_size > 1:
-        if config.dsa_kernel_backend != "cudnn" or config.attention_cp_layout != "contiguous":
+        if not use_fused_dsa_kernels(config) or config.attention_cp_layout != "contiguous":
             raise ValueError("CSA2 CP requires fused kernels and contiguous packed layout")
     if (
         config.overlap_moe_expert_parallel_comm

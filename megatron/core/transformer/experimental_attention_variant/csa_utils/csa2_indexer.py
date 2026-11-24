@@ -33,6 +33,7 @@ from .csa2_candidates import (
     CSA2CandidateBlocks,
     fused_candidate_blocks,
     mxfp8_selection_heads,
+    score_workspace_rows,
     select_compact_positions,
 )
 from .csa2_teacher_lse import fused_csa_window_lse
@@ -274,7 +275,7 @@ def fused_compact_topk(inputs: CSA2IndexerInputs, topk: int, precision: str) -> 
     All layouts use the existing packed rows, including CP-local queries and
     global keys. Dispatch-local scratch and host-known bounds keep capture
     independent of live prefix values without a second workspace/cache API.
-    BF16 retains bounded scoring on devices/frontends without compact support.
+    Large workspaces use the tiled scorer, as does BF16 without compact support.
     THD padding rows get empty key spans (MCORE_CSA2_TOPK_PAD_SEGMENTS). MXFP8
     scores H32 natively unless MCORE_CSA2_MXFP8_NATIVE_H32=0 pads it to H64.
     """
@@ -287,31 +288,32 @@ def fused_compact_topk(inputs: CSA2IndexerInputs, topk: int, precision: str) -> 
         return torch.full(shape, -1, dtype=torch.int32, device=q.device)
     fused_sparse_attention._ensure_dsa_namespace()
     compact = getattr(fused_sparse_attention._DSA, "indexer_forward_top_k_wrapper", None)
-    if not callable(compact) or torch.cuda.get_device_capability(q.device)[0] < 10:
-        if precision == "bf16":
-            indices, _ = fused_candidate_blocks(
-                inputs, topk_blocks=0, block_size=1, precision=precision, token_topk=topk
-            )
-            return indices
+    has_compact = callable(compact) and torch.cuda.get_device_capability(q.device)[0] >= 10
+    if not has_compact and precision == "mxfp8":
         raise RuntimeError("CSA2 MXFP8 selection requires cuDNN compact support and SM100 or later")
+    cu_q, cu_k, max_q, max_k = inputs.packed_metadata
+    # Odd ratio-2 spans can have one more causal candidate than complete K groups.
+    max_k = max(max_k, (max_q + inputs.ratio - 1) // inputs.ratio)
+    if not has_compact or q.shape[0] > score_workspace_rows(max_k):
+        indices, _ = fused_candidate_blocks(
+            inputs, topk_blocks=0, block_size=1, precision=precision, token_topk=topk
+        )
+        return indices
     heads = q.shape[-2]
     weights = (weights.float() * (q.shape[-1] ** -0.5 * heads**-0.5)).to(weights.dtype)
     if precision == "mxfp8" and mxfp8_selection_heads(heads) != heads:
         q = torch.nn.functional.pad(q, (0, 0, 0, 32))
         weights = torch.nn.functional.pad(weights, (0, 32))
     if _COMPACT_TOPK_PAD_SEGMENTS and inputs.thd_layout is not None:
-        cu_q, cu_k, max_q, max_k, offsets = inputs.compact_topk_metadata
+        cu_q, cu_k, _, _, offsets = inputs.compact_topk_metadata
         # max_seqlen_q only sizes cuDNN's stage-1 grid of m-block tiles per segment.
         # Every segment lies within the local rows, so under CP they bound it more
         # tightly than the global max_q, and the padding segments add fewer empty
         # tiles. max_k keeps the global bound because causal offsets reach global keys.
         grid_q = min(max_q, q.shape[0])
     else:
-        cu_q, cu_k, max_q, max_k = inputs.packed_metadata
         offsets = inputs.packed_causal_offsets
         grid_q = max_q
-    # Odd r2 spans can have one more causal candidate than complete K groups.
-    max_k = max(max_k, (max_q + inputs.ratio - 1) // inputs.ratio)
     precision_kwargs = {}
     if precision == "mxfp8":
         quantized = []

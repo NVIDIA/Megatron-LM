@@ -81,6 +81,12 @@ def mxfp8_selection_heads(num_heads: int) -> int:
     return 64 if num_heads == 32 and not _MXFP8_NATIVE_H32 else num_heads
 
 
+def score_workspace_rows(max_keys: int) -> int:
+    """Rows of cuDNN's four-float-aligned scores that fit the budget, at least one."""
+    row_bytes = ((max(max_keys, 1) + 3) // 4 * 4) * 4
+    return max(1, _SCORE_CHUNK_MAX_BYTES // row_bytes)
+
+
 @dataclass(frozen=True)
 class CSA2CandidateBlocks:
     """Sorted sequence-local block IDs and valid counts, both int32.
@@ -373,10 +379,7 @@ def fused_candidate_blocks(
     fused_sparse_attention._ensure_dsa_namespace()
     cu_q, cu_k, max_q, score_max_k = inputs.packed_metadata
     causal_offsets = inputs.packed_causal_offsets
-    # Account for cuDNN's four-float row alignment. Even a single very long
-    # row needs its own score buffer; otherwise cap the chunk at the score budget.
-    row_bytes = ((score_max_k + 3) // 4 * 4) * 4
-    chunk_size = min(_QUERY_CHUNK_SIZE, max(1, _SCORE_CHUNK_MAX_BYTES // row_bytes))
+    chunk_size = min(_QUERY_CHUNK_SIZE, score_workspace_rows(score_max_k))
     kernel_k = k
     precision_kwargs = dict(precision=precision)
     if precision == "mxfp8":

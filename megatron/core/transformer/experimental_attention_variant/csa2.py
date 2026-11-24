@@ -1354,23 +1354,26 @@ class CompressedSparseAttention2(MegatronModule):
         if scores.shape[-1] == 0 or (thd_layout is not None and query.shape[0] == 0):
             # No complete compression group: preserve zero gradients for the indexer.
             return scores.sum() * 0
+        query_valid_rows = None
+        if thd_layout is not None:
+            # The native teacher takes SBHD inputs. Packed documents share one batch row.
+            query = query.unsqueeze(1)
+            local_kv = local_kv.unsqueeze(1)
+            window_indices = window_indices.unsqueeze(0)
+            scores = scores.unsqueeze(0)
+            global_indices = global_indices.unsqueeze(0)
+            query_valid_rows = thd_layout.valid_tokens
         non_compressed_lse = _compute_unfused_csa_non_compressed_lse(
             query, local_kv, self.attn_sink, window_indices, self.softmax_scale
         )
         mask = torch.zeros_like(scores).masked_fill(torch.isneginf(scores), -torch.inf)
-        num_heads = query.shape[1] if thd_layout is not None else query.shape[2]
-        query_valid_rows = None
-        if thd_layout is not None:
-            scores = scores.unsqueeze(0)
-            global_indices = global_indices.unsqueeze(0)
-            query_valid_rows = thd_layout.valid_tokens
         is_cp = thd_layout is not None and thd_layout.cp_size > 1
         loss = compute_dsa_indexer_loss(
             # The shared helper adds masks in place; keep the scoring/selection tensor intact.
             scores.clone(),
             global_indices,
             query.detach(),
-            global_kv.detach().unsqueeze(2).expand(-1, -1, num_heads, -1),
+            global_kv.detach().unsqueeze(2).expand(-1, -1, query.shape[2], -1),
             self.softmax_scale,
             self.config.dsa_indexer_loss_coeff,
             self.config.dsa_indexer_use_sparse_loss,
@@ -1731,6 +1734,8 @@ class CompressedSparseAttention2(MegatronModule):
             cp_group = packed_seq_params.cp_group
         cp_size = get_pg_size(cp_group)
         if cp_size > 1:
+            if not self.use_fused_kernels:
+                raise ValueError("CSA2 CP requires fused kernels")
             if packed_seq_params is None or boundary_hidden is None or boundary_kv is None:
                 raise ValueError("CSA2 CP requires THD metadata and the DSv4 boundary exchange")
         elif boundary_hidden is not None or boundary_kv is not None:

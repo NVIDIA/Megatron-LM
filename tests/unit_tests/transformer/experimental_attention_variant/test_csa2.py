@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa import (
     CompressedSparseAttentionSubmodules,
     CompressorSubmodules,
@@ -138,24 +138,39 @@ def test_ordinary_stack_rejects_shared_csa2_at_construction():
         get_experimental_attention_variant_module_spec(config)
 
 
-def _forward(layers, state):
+def _forward(layers, state, *, packed=False):
     outputs, inputs = [], []
+    batch = 1 if packed else 2
+    params = None
+    if packed:
+        from megatron.core.packed_seq_params import PackedSeqParams
+
+        cu = torch.tensor([0, 8], dtype=torch.int32)
+        params = PackedSeqParams(
+            qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=8, max_seqlen_kv=8
+        )
     for layer in layers:
-        x = torch.randn(8, 2, 16, requires_grad=True)
-        qr = torch.randn(8, 2, 8, requires_grad=True)
-        q = torch.randn(8, 2, 2, 8, requires_grad=True)
-        kv = torch.randn(8, 2, 1, 8, requires_grad=True)
+        x = torch.randn(8, batch, 16, requires_grad=True)
+        qr = torch.randn(8, batch, 8, requires_grad=True)
+        q = torch.randn(8, batch, 2, 8, requires_grad=True)
+        kv = torch.randn(8, batch, 1, 8, requires_grad=True)
+        if packed:
+            q, kv = q.squeeze(1), kv.squeeze(1)
         inputs.append((x, qr, q, kv))
-        outputs.append(layer(q, kv, kv, None, x=x, qr=qr, csa2_state=state))
+        outputs.append(
+            layer(q, kv, kv, None, x=x, qr=qr, csa2_state=state, packed_seq_params=params)
+        )
     return outputs, inputs
 
 
-def test_shared_owners_receive_main_and_auxiliary_gradients(monkeypatch):
+@pytest.mark.parametrize("packed", [False, True], ids=["sbhd", "thd"])
+def test_shared_owners_receive_main_and_auxiliary_gradients(monkeypatch, packed):
     monkeypatch.setattr(DSAIndexerLossLoggingHelper, "save_loss_to_tracker", lambda **kwargs: None)
     DSAIndexerLossAutoScaler.set_loss_scale(torch.tensor(1.0))
     _, layers = _setup()
-    first, first_inputs = _forward(layers, CSA2State())
-    second, _ = _forward(layers, CSA2State())
+    first, first_inputs = _forward(layers, CSA2State(), packed=packed)
+    second, _ = _forward(layers, CSA2State(), packed=packed)
+    assert all(o.isfinite().all() for o in first + second)
     assert layers[2].indexer is None and layers[1].compressor is None
     sum(output.square().mean() for output in first + second).backward()
     assert layers[0].compressor.linear_wkv.weight.grad.abs().sum() > 0
@@ -164,14 +179,34 @@ def test_shared_owners_receive_main_and_auxiliary_gradients(monkeypatch):
     assert torch.isfinite(first_inputs[0][0].grad).all()
 
 
-def test_auxiliary_objective_does_not_train_main_compressor(monkeypatch):
+@pytest.mark.parametrize("packed", [False, True], ids=["sbhd", "thd"])
+def test_auxiliary_objective_does_not_train_main_compressor(monkeypatch, packed):
     monkeypatch.setattr(DSAIndexerLossLoggingHelper, "save_loss_to_tracker", lambda **kwargs: None)
     _, layers = _setup()
     state = CSA2State(defer_indexer_loss=True)
-    _forward(layers[:1], state)
+    _forward(layers[:2], state, packed=packed)
     state.indexer_loss.backward()
     assert layers[0].compressor.linear_wkv.weight.grad is None
     assert layers[0].indexer.linear_wk.weight.grad.abs().sum() > 0
+    assert layers[1].indexer.linear_wq_b.weight.grad.abs().sum() > 0
+
+
+def test_cp_requires_effective_fused_dispatch():
+    from dataclasses import replace
+
+    config, _ = _setup()
+    fused = replace(
+        config,
+        context_parallel_size=2,
+        attention_cp_layout="contiguous",
+        dsa_kernel_backend="cudnn",
+        params_dtype=torch.bfloat16,
+        v_head_dim=512,
+        dsa_indexer_n_heads=32,
+        dsa_indexer_head_dim=128,
+    )
+    with pytest.raises(ValueError, match="CSA2 CP requires fused kernels"):
+        replace(fused, attention_backend=AttnBackend.unfused)
 
 
 @pytest.mark.parametrize("ratio", [1, 2, 4, 128])
@@ -1079,6 +1114,10 @@ def test_packed_selection_matches_scoring_precision(monkeypatch, ratio, heads, c
 
     from megatron.core.ops.attention.csa.indexer_quantization import quantize_indexer_mxfp8_logical
     from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+        csa2_candidates,
+        fused_sparse_attention,
+    )
     from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_candidates import (
         candidate_blocks_from_scores,
         fused_candidate_blocks,
@@ -1172,14 +1211,35 @@ def test_packed_selection_matches_scoring_precision(monkeypatch, ratio, heads, c
     assert_replays_bit_exact(
         select, (q, k, w), backward=False, replays=3, what=f"CSA2 {precision} packed selection"
     )
-    # Compact cuDNN selection has an allocation-free output contract during
-    # capture. The caller must supply slot-local outputs for both precisions.
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = fused_compact_topk(inputs, 7, precision)
-    for _ in range(3):
-        graph.replay()
-        torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+
+    def check_capture():
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = fused_compact_topk(inputs, 7, precision)
+        for _ in range(3):
+            graph.replay()
+            torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+
+    check_capture()
+
+    # Force ordinary selection across tiles on this small pack and inspect the real score buffers.
+    budget = 64 * 1024
+    monkeypatch.setattr(csa2_candidates, "_SCORE_CHUNK_MAX_BYTES", budget)
+    scorer = fused_sparse_attention._DSA.indexer_forward_wrapper
+    tile_rows = []
+
+    def checked_scores(*args, **kwargs):
+        result = scorer(*args, **kwargs)
+        tile = result["scores"]
+        row_bytes = tile.stride(0) * tile.element_size()
+        assert tile.shape[0] * row_bytes <= max(budget, row_bytes)
+        tile_rows.append(tile.shape[0])
+        return result
+
+    monkeypatch.setattr(fused_sparse_attention._DSA, "indexer_forward_wrapper", checked_scores)
+    torch.testing.assert_close(fused_compact_topk(inputs, 7, precision), expected)
+    assert len(tile_rows) > 1 and sum(tile_rows) == q.shape[0]
+    check_capture()
 
 
 def _cp_compressor_tokens(rank, device="cpu"):
