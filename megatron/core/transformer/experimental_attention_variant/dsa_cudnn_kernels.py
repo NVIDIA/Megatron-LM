@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 from typing import TYPE_CHECKING, Optional, Protocol, Tuple
 
 import torch
@@ -143,6 +144,7 @@ class CudnnDsaInterface(Protocol):
 _cudnn_dsa: Optional[CudnnDsaInterface] = None
 _CLIP_PROB_MIN = torch.finfo(torch.float32).tiny
 _TOPK_TIE_BREAK_EPS = 1.0e-12
+_STABLE_INDEXER_TOPK = os.environ.get("MCORE_DSA_STABLE_INDEXER_TOPK") == "1"
 _INDEXER_RATIO = 1
 _INDEXER_SOFTMAX_SCALE = 1.0
 _TOPK_WRAPPER_MAX_SCRATCH_BYTES = 2 * 1024 * 1024 * 1024
@@ -554,7 +556,7 @@ def _use_dense_indexer_topk_tie_break(scores: Tensor, topk_k: int) -> bool:
     rely on exact finite ties for correctness, so keep the expensive full-matrix
     tie-break off the CUDA training path.
     """
-    return topk_k < scores.size(-1) and not scores.is_cuda
+    return topk_k < scores.size(-1) and not scores.is_cuda and not _STABLE_INDEXER_TOPK
 
 
 def _remove_indexer_topk_tie_break(
@@ -568,10 +570,38 @@ def _remove_indexer_topk_tie_break(
     return torch.where(topk_indices >= 0, topk_scores - bias, topk_scores)
 
 
+def _stable_indexer_topk(scores: Tensor, lengths: Tensor, k: int, return_values: bool) -> dict:
+    """Diagnostic, exact score-descending/key-ascending top-k over each valid prefix.
+
+    Equal scores retain the input's ascending key order. Stable sorting raw scores avoids
+    an epsilon tie-break that could round away or reverse two distinct nearby scores.
+    The sort and its int64 indices are bounded to a chunk of rows on long KV axes.
+    """
+    rows, columns = scores.shape
+    ids = torch.empty((rows, k), dtype=torch.int32, device=scores.device)
+    values = scores.new_empty((rows, k)) if return_values else None
+    keys = torch.arange(columns, device=scores.device)
+    # Budget for sort indices, temporary score storage and the per-element mask.
+    chunk_rows = max(1, (128 * 1024 * 1024) // max(1, columns * 32))
+    for start in range(0, rows, chunk_rows):
+        end = min(start + chunk_rows, rows)
+        block = scores[start:end]
+        valid_length = lengths[start:end, None]
+        masked = block.masked_fill(keys >= valid_length, float("-inf"))
+        selected = torch.argsort(masked, dim=-1, descending=True, stable=True)[:, :k]
+        pad = selected >= valid_length
+        ids[start:end] = selected.masked_fill(pad, -1)
+        if values is not None:
+            values[start:end] = block.gather(-1, selected).masked_fill(pad, float("-inf"))
+    return {"indices": ids, "values": values}
+
+
 def _indexer_top_k_wrapper_chunked(
     scores_flat: Tensor, seq_lens: Tensor, topk_k: int, return_topk_scores: bool
 ) -> dict:
     """Run cuDNN top-k in row chunks to bound wrapper scratch allocation."""
+    if _STABLE_INDEXER_TOPK:
+        return _stable_indexer_topk(scores_flat, seq_lens, topk_k, return_topk_scores)
     n_rows, sk = scores_flat.shape
     scratch_bytes_per_row = max(1, sk) * torch.iinfo(torch.int32).bits // 8
     scratch_bytes_per_row *= _TOPK_WRAPPER_SCRATCH_INT32_FACTOR
