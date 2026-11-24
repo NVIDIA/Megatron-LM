@@ -158,7 +158,6 @@ def _uses_dsv4_zigzag_cp(config, packed_seq_params) -> bool:
     )
 
 
-
 @dataclass
 class DSv4HybridSelfAttentionSubmodules:
     """Submodules for the DSv4HybridAttention layer."""
@@ -523,7 +522,9 @@ class DSv4HybridAttention(Attention):
         weight = self._linear_o_group_proj_weight.reshape(
             self.o_local_groups, self.config.o_lora_rank, -1
         )
-        if _GROUP_PROJ_BMM and _grouped_projection_bmm_eligible(input_, weight, self.o_local_groups):
+        if _GROUP_PROJ_BMM and _grouped_projection_bmm_eligible(
+            input_, weight, self.o_local_groups
+        ):
             return _GroupedProjectionBMM.apply(input_, weight)
         return torch.einsum("...gd,grd->...gr", input_, weight)
 

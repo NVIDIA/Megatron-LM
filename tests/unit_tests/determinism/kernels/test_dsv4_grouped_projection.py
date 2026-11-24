@@ -87,7 +87,10 @@ def test_grouped_projection_dispatch(monkeypatch):
         (torch.randn(groups * rank, width, device="cuda") * width**-0.5).bfloat16()
     )
     module = SimpleNamespace(
-        _uses_te_batched_linear=False, _linear_o_group_proj_weight=weight, o_local_groups=groups, config=SimpleNamespace(o_lora_rank=rank)
+        _uses_te_batched_linear=False,
+        _linear_o_group_proj_weight=weight,
+        o_local_groups=groups,
+        config=SimpleNamespace(o_lora_rank=rank),
     )
     calls = []
     apply = dsv4_attention._GroupedProjectionBMM.apply

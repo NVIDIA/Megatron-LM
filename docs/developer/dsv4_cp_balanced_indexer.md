@@ -73,3 +73,17 @@ The E2E comparison uses the standard Hybrid entrypoint with mixed-length THD
 packs, MXFP8, and TE attention partial graphs. Its two arms differ only in
 dsa_cp_balance_indexer. Full recompute is covered at module level because dev
 does not support full recompute inside TE partial graphs.
+
+## Document-local zigzag attention
+
+For `dsv4_cp_zigzag=True`, both attention and linear layers consume the
+same document-local mirrored partition in THD format. Align each document
+to `2 * context_parallel_size` before partitioning it. The attention layer
+constructs RoPE positions, left-window halo rows and compressed-KV ownership
+from the padded per-document boundaries. The causal length of each document
+still uses its actual token count. With CP16 a row may contain several documents
+of different sizes, including a final document with right padding.
+
+The CP16 distributed test runs the fused H layer on two groups with different
+document orders and compares each document's forward and backward to CP1. See
+[`TestPackedDSv4ZigzagCPDistributed`](../../tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_zigzag_cp.py).
