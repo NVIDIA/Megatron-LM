@@ -651,12 +651,22 @@ def test_te_linear_parity(layer_cls, input_shape, fused_wgrad):
                 main_grad += dw_regular.float()
             else:
                 pairs.append(("Weight gradient", dw_bik, dw_regular))
+            # bf16 tolerances: the batch-invariant RMSNorm can round an ln_out element one
+            # ulp away from TE's, which moves a layernorm-linear output by an ulp.
             for label, actual, expected in pairs:
-                max_diff = (actual - expected).abs().max().item()
-                assert max_diff < 1e-3, f"{label} difference too large: {max_diff}"
+                torch.testing.assert_close(
+                    actual,
+                    expected,
+                    **_tols(torch.bfloat16),
+                    msg=lambda m, label=label: f"{label}: {m}",
+                )
         if fused_wgrad:
-            max_diff = (layer_bik.weight.main_grad - main_grad).abs().max().item()
-            assert max_diff < 1e-3, f"main_grad difference too large: {max_diff}"
+            torch.testing.assert_close(
+                layer_bik.weight.main_grad,
+                main_grad,
+                **_tols(torch.bfloat16),
+                msg=lambda m: f"main_grad: {m}",
+            )
     finally:
         Utils.destroy_model_parallel()
 
