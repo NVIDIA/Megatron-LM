@@ -24,11 +24,12 @@ from megatron.training.argument_utils import (
     core_transformer_config_from_args,
     gpt_data_config_from_args,
     hybrid_config_from_args,
+    model_config_from_args,
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import add_megatron_arguments, parse_args, validate_args
 from megatron.training.config import PretrainConfigContainer
-from megatron.training.models import BertModelConfig
+from megatron.training.models import BertModelConfig, HybridModelConfig
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
@@ -112,6 +113,17 @@ def test_uneven_pipeline_split_requires_hybrid_model(monkeypatch, is_hybrid):
     args.is_hybrid_model = is_hybrid
 
     with nullcontext() if is_hybrid else pytest.raises(AssertionError, match="divisible by"):
+        validate_args(args)
+
+    if is_hybrid:
+        assert isinstance(model_config_from_args(args), HybridModelConfig)
+
+
+def test_hybrid_cli_rejects_inferring_virtual_stages_from_layer_count(monkeypatch):
+    args = _minimal_training_args(monkeypatch)
+    args.is_hybrid_model = True
+    args.num_layers_per_virtual_pipeline_stage = 1
+    with pytest.raises(ValueError, match="--num-virtual-stages-per-pipeline-rank"):
         validate_args(args)
 
 

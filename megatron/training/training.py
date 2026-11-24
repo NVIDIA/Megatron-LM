@@ -2593,7 +2593,7 @@ def setup_model_and_optimizer(
                 )
 
             builder = builder_cls(model_config)
-            return builder.build_distributed_models(
+            models = builder.build_distributed_models(
                 pg_collection=pg_collection,
                 ddp_config=cfg.ddp,
                 overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
@@ -2604,6 +2604,10 @@ def setup_model_and_optimizer(
                 use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
                 use_layer_wise_param_layout=cfg.optimizer.use_layer_wise_param_layout,
             )
+            if model_config is not cfg.model:
+                # Keep the resolved transformer config when hooks needed a temporary builder config.
+                cfg.model.transformer = model_config.transformer
+            return models
         else:
             assert model_provider_func is not None, "Must provide a model config via config_container or a model_provider_func."
             return get_model(

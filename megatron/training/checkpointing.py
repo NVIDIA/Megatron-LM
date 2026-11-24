@@ -1844,7 +1844,8 @@ def generate_state_dict(
     checkpoint section: the format shapes the template, and all three are recorded in the
     persisted arguments.
     """
-    checkpoint = get_run_config().checkpoint
+    cfg = get_run_config()
+    checkpoint = cfg.checkpoint
     if ckpt_format is None:
         ckpt_format = checkpoint.ckpt_format
     saved_policy = dict(ckpt_format=ckpt_format, save=save, verify_integrity=verify_integrity)
@@ -1860,7 +1861,7 @@ def generate_state_dict(
     )
     # Preserve the resolved vocabulary for checkpoint-args readers without updating runtime args
     # (#8401); the projection above is already a copy of the namespace.
-    padded_vocab_size = get_run_config().tokenizer.padded_vocab_size
+    padded_vocab_size = cfg.tokenizer.padded_vocab_size
     if getattr(args, 'padded_vocab_size', None) != padded_vocab_size:
         state_dict['args'].padded_vocab_size = padded_vocab_size
     # Persist a scalar model-family marker so a config-list-defined HybridModel
@@ -1869,6 +1870,9 @@ def generate_state_dict(
     state_dict['args'].is_hybrid_model = any(
         _hybrid_model_architecture(m) is not None for m in model
     )
+    if getattr(cfg.model, "hybrid_layer_config_list", None) is not None:
+        # Older readers restore MTP depth from saved args, even when Core inferred it.
+        state_dict['args'].mtp_num_layers = cfg.model.transformer.mtp_num_layers
     state_dict['checkpoint_version'] = 3.1
     if iteration is not None:
         state_dict['iteration'] = iteration
@@ -2802,7 +2806,7 @@ def _hybrid_model_architecture(module):
     return None
 
 
-def _validate_checkpoint_model_family(args, ckpt_args, model, *, checkpoint_model=None):
+def _validate_checkpoint_model_family(ckpt_args, model, *, checkpoint_model=None):
     """Validate HybridModel/GPT families using saved config, with saved args as a fallback.
 
     A pattern-defined HybridModel loading a GPT checkpoint is left for the
@@ -2880,7 +2884,7 @@ def _maybe_setup_gpt_to_hybrid_load(
         # Without explicit source-model metadata, keep the regular loading path.
         return None, False
     runtime_is_hybrid, ckpt_is_hybrid, _ = _validate_checkpoint_model_family(
-        args, ckpt_args, model, checkpoint_model=checkpoint_model
+        ckpt_args, model, checkpoint_model=checkpoint_model
     )
     if runtime_is_hybrid == ckpt_is_hybrid:
         return None, False
@@ -3148,9 +3152,7 @@ def load_checkpoint(
     # torch_dcp loads matching tensors in place. Reject incompatible model families from the
     # metadata-only read before constructing or applying the runtime sharded state dict.
     if ckpt_format == "torch_dcp" and state_dict is not None and (vars(ckpt_args) or checkpoint_model):
-        _validate_checkpoint_model_family(
-            args, ckpt_args, model, checkpoint_model=checkpoint_model
-        )
+        _validate_checkpoint_model_family(ckpt_args, model, checkpoint_model=checkpoint_model)
 
     # Both model-space torch_dist and fsdp_dtensor checkpoints carry model-keyed
     # optimizer state that can be retargeted from GPTModel to HybridModel.
@@ -3568,9 +3570,7 @@ def load_checkpoint(
     if ckpt_format not in ("torch_dist", "torch_dcp", "fsdp_dtensor") and (
         (checkpoint_args is not None and vars(checkpoint_args)) or checkpoint_model
     ):
-        _validate_checkpoint_model_family(
-            args, checkpoint_args, model, checkpoint_model=checkpoint_model
-        )
+        _validate_checkpoint_model_family(checkpoint_args, model, checkpoint_model=checkpoint_model)
 
     # Set checkpoint version.
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))

@@ -235,9 +235,9 @@ def test_external_non_moe_config_does_not_enable_moe_metrics():
 
 
 def test_saved_hybrid_family_preserves_checkpoint_policy_and_runtime_args(run_config):
-    config = _config()
+    config = _config(mtp_num_layers=2)
     model = Mock(spec=HybridModel)
-    model.hybrid_layer_config_list = [config]
+    model.hybrid_layer_config_list = [config, config, config, MTPSplit, config, MTPSplit, config]
     model.state_dict_for_save_checkpoint.return_value = {"weight": 1}
     args = Namespace(
         ckpt_format="torch_dist",
@@ -245,13 +245,14 @@ def test_saved_hybrid_family_preserves_checkpoint_policy_and_runtime_args(run_co
         no_save_optim=False,
         padded_vocab_size=16,
         is_hybrid_model=False,
+        mtp_num_layers=None,
     )
     original_args = vars(args).copy()
     run_config.checkpoint.save = "/configured"
     run_config.checkpoint.save_optim = False
     run_config.tokenizer.padded_vocab_size = 32
     run_config.model = HybridModelConfig(
-        transformer=config, vocab_size=32, hybrid_layer_config_list=[config]
+        transformer=config, vocab_size=32, hybrid_layer_config_list=model.hybrid_layer_config_list
     )
 
     state = checkpointing.generate_state_dict(
@@ -260,6 +261,7 @@ def test_saved_hybrid_family_preserves_checkpoint_policy_and_runtime_args(run_co
 
     saved_args = state["args"]
     assert saved_args.is_hybrid_model is True
+    assert saved_args.mtp_num_layers == 2
     assert saved_args.ckpt_format == "torch"
     assert saved_args.save == "/actual"
     assert saved_args.no_save_optim is True
@@ -267,7 +269,7 @@ def test_saved_hybrid_family_preserves_checkpoint_policy_and_runtime_args(run_co
     assert vars(args) == original_args
     assert state["model"] == {"weight": 1}
     assert checkpointing._validate_checkpoint_model_family(
-        args, Namespace(is_hybrid_model=False), [model], checkpoint_model=run_config.model.as_dict()
+        Namespace(is_hybrid_model=False), [model], checkpoint_model=run_config.model.as_dict()
     ) == (True, True, None)
 
 
@@ -276,7 +278,7 @@ def test_external_layer_keeps_config_list_gpt_conversion_restriction():
     model.hybrid_layer_config_list = [_config()]
     with pytest.raises(RuntimeError, match="config-list-defined hybrid model"):
         checkpointing._validate_checkpoint_model_family(
-            Namespace(), Namespace(hybrid_layer_pattern=None), [model]
+            Namespace(hybrid_layer_pattern=None), [model]
         )
 
 

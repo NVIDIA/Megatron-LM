@@ -232,14 +232,10 @@ class LogitsSaverHooks:
         self._tp_dst_rank_global = parallel_state.get_tensor_model_parallel_src_rank()
         self._cp_dst_rank_global = dist.get_global_rank(self.cp_group, 0)
 
-        # Track number of MTP outputs to ignore
-        args = get_args()
-        self._mtp_num_layers = args.mtp_num_layers or 0
-        self._curr_mtp_passes = 0
-
         # Dataset-identity hash + serialised metadata, written as the
         # first member of every batched tar so the student loader can
         # verify alignment per-tar without an extra tarfile.open.
+        args = get_args()
         self.dataset_hash, self._dataset_identifiers = compute_dataset_hash()
         self.metadata_dict: Dict[str, Any] = {
             "hash": self.dataset_hash,
@@ -380,6 +376,8 @@ class LogitsSaverHooks:
         Args:
             model: Model to instrument. Must own ``output_layer`` (last PP stage).
         """
+        self._mtp_num_layers = model.config.mtp_num_layers or 0
+        self._curr_mtp_passes = 0
         fwd_handle = model.output_layer.register_forward_hook(self._forward_hook)
         self._hook_handles.append(fwd_handle)
         if get_args().freeze_all_layers:

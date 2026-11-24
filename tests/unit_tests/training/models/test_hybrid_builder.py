@@ -457,11 +457,8 @@ class TestHybridModelBuilderBuildModel:
         assert kw["vp_stage"] is None
 
     @pytest.mark.parametrize("with_mtp", [False, True])
-    @patch("megatron.training.models.hybrid.get_args")
     @patch("megatron.training.models.hybrid.HybridModel")
-    def test_config_list_is_forwarded_without_conversion(self, mock_model, mock_args, with_mtp):
-        args = Namespace(mtp_num_layers=None)
-        mock_args.return_value = args
+    def test_config_list_is_forwarded_without_conversion(self, mock_model, with_mtp):
         transformer = AttentionLayerConfig.from_config(_make_transformer())
         source_config_list = [transformer, transformer]
         if with_mtp:
@@ -472,11 +469,17 @@ class TestHybridModelBuilderBuildModel:
         expected_depth = 1 if with_mtp else None
         normalized_transformer = type(transformer).from_config(transformer)
         normalized_transformer.mtp_num_layers = expected_depth
-        mock_model.return_value = Mock(
-            config=normalized_transformer, mtp_num_depths=1 if with_mtp else 0
-        )
+        mock_model.return_value.config = normalized_transformer
 
-        model = HybridModelBuilder(config).build_model(self.pg, pre_process=True, post_process=True)
+        # An embedded builder can run alongside a different CLI-defined model.
+        cli_depth = None if with_mtp else 7
+        cli_args = Namespace(
+            mtp_num_layers=cli_depth, num_layers_per_virtual_pipeline_stage=1, is_hybrid_model=False
+        )
+        with patch("megatron.training.global_vars._GLOBAL_ARGS", cli_args):
+            model = HybridModelBuilder(config).build_model(
+                self.pg, pre_process=True, post_process=True
+            )
 
         forwarded = mock_model.call_args.kwargs["hybrid_layer_config_list"]
         assert forwarded is source_config_list
@@ -484,9 +487,10 @@ class TestHybridModelBuilderBuildModel:
         assert forwarded[1] is transformer
         assert mock_model.call_args.kwargs["config"] is transformer
         assert config.transformer is model.config is normalized_transformer
-        assert args.mtp_num_layers == expected_depth
-        assert args.is_hybrid_model is True
+        assert config.transformer.mtp_num_layers == expected_depth
         assert transformer.mtp_num_layers is None
+        assert cli_args.mtp_num_layers == cli_depth
+        assert cli_args.is_hybrid_model is False
 
 
 class TestHybridModelBuilderBuildDistributedModels:

@@ -24,7 +24,6 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.training.global_vars import get_args
 from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
 from megatron.training.models.dist_utils import unimodal_build_distributed_models
 from megatron.training.models.transforms import ModelTransformConfig
@@ -217,23 +216,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         matching preconfigured virtual-pipeline topology.
         """
         hybrid_layer_config_list = self._model_config.hybrid_layer_config_list
-        try:
-            args = get_args()
-        except AssertionError:
-            args = None
-        args_mtp_num_layers = getattr(args, "mtp_num_layers", None) if args is not None else None
         if hybrid_layer_config_list is not None:
-            # This CLI-only option is not part of TransformerConfig. Core validates the
-            # supplied PP/VPP topology against the list's PipelineSplit markers.
-            if (
-                args is not None
-                and getattr(args, "num_layers_per_virtual_pipeline_stage", None) is not None
-            ):
-                raise ValueError(
-                    "Python-defined HybridModel config lists must configure VPP explicitly with "
-                    "--num-virtual-stages-per-pipeline-rank; "
-                    "--num-layers-per-virtual-pipeline-stage would infer VPP from a layer count."
-                )
             has_deprecated_ratio = self._model_config.hybrid_attention_ratio != 0.0 or (
                 self._model_config.hybrid_mlp_ratio != 0.0
             )
@@ -287,20 +270,6 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         if hybrid_layer_config_list is not None:
             # Core validates the list, detaches any shared root config, and infers MTP depth.
             self._model_config.transformer = model.config
-            if args_mtp_num_layers is not None and args_mtp_num_layers != model.mtp_num_depths:
-                raise ValueError(
-                    "hybrid_layer_config_list defines "
-                    f"{model.mtp_num_depths} MTP depths, but runtime "
-                    f"mtp_num_layers is {args_mtp_num_layers}"
-                )
-        if args is not None:
-            args.is_hybrid_model = True
-            if (
-                hybrid_layer_config_list is not None
-                and args_mtp_num_layers is None
-                and model.mtp_num_depths > 0
-            ):
-                args.mtp_num_layers = model.mtp_num_depths
         return model
 
     def build_distributed_models(

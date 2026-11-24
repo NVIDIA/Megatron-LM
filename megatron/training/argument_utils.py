@@ -63,7 +63,7 @@ from megatron.training.models import (
     ModelConfig,
     T5ModelConfig,
 )
-from megatron.training.utils import warn_rank_0
+from megatron.training.utils import is_hybrid_model, warn_rank_0
 
 # TODO: support arg renames
 
@@ -832,11 +832,7 @@ def model_config_from_args(
     keep the shared field mapping below independent of individual model families.
     """
     if model_config_cls is None:
-        model_config_cls = (
-            HybridModelConfig
-            if getattr(args, "hybrid_layer_pattern", None) is not None
-            else GPTModelConfig
-        )
+        model_config_cls = HybridModelConfig if is_hybrid_model(args) else GPTModelConfig
     if issubclass(model_config_cls, GPTModelConfig):
         return gpt_config_from_args(args, model_config_cls=model_config_cls)
     if issubclass(model_config_cls, HybridModelConfig):
@@ -1293,8 +1289,7 @@ def inference_cfg_container_from_args(
     Args:
         args: Parsed and validated argparse namespace (e.g. from ``parse_and_validate_args``).
         model_cfg: Optional pre-built model config. If None, a model config is constructed from
-            ``args`` (a HybridModelConfig when ``--hybrid-layer-pattern`` is set, otherwise a
-            GPTModelConfig).
+            ``args`` (a HybridModelConfig for a hybrid launch, otherwise a GPTModelConfig).
         build_model_config: If False, leave model_cfg=None until the caller resolves
             its model inputs. Application-specific families pass model_cfg explicitly.
     """
