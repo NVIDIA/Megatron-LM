@@ -156,6 +156,7 @@ from megatron.training.checkpoint_manager import (
     CheckpointSaveContext,
     get_checkpoint_manager,
     manager_reports_checkpointing,
+    set_checkpoint_manager,
 )
 from megatron.training.checkpointing import (
     checkpoint_exists,
@@ -1987,6 +1988,8 @@ def pretrain(
     ft_integration.on_checkpointing_start()
     get_checkpoint_manager().finalize_async_saves(blocking=True, terminate=True)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
+    # The manager is shut down; drop it so a later run in this process builds a fresh one.
+    set_checkpoint_manager(None)
 
     one_logger and one_logger.log_metrics(
         {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}

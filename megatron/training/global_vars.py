@@ -289,6 +289,12 @@ def unset_global_variables():
 
     unset_num_microbatches_calculator()
 
+    # The checkpoint manager is cached per run; a second run reusing the same CheckpointConfig
+    # object must not get back a manager the first run already shut down.
+    from megatron.training.checkpoint_manager import set_checkpoint_manager
+
+    set_checkpoint_manager(None)
+
 
 def set_args(args):
     global _GLOBAL_ARGS

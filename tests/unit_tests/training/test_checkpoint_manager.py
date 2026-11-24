@@ -323,6 +323,18 @@ class TestGetCheckpointManager:
         assert isinstance(default_manager, cm.DefaultCheckpointManager)
         assert isinstance(custom_manager, _GoodManager)
 
+    def test_manager_is_rebuilt_after_teardown_even_with_the_same_config_object(self):
+        from megatron.training.global_vars import unset_global_variables
+
+        config = _config()
+
+        with self._run_config(config):
+            first = cm.get_checkpoint_manager()
+            unset_global_variables()
+            second = cm.get_checkpoint_manager()
+
+        assert first is not second
+
     def test_installed_manager_is_returned_for_the_current_config(self):
         installed = _GoodManager(None)
         config = _config()
