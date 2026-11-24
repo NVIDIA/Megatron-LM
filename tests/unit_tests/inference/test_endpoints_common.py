@@ -489,6 +489,8 @@ _ENGINE_OWNED_FIELDS = {
     "num_tokens_total",
     "streaming",
     "do_kv_handoff",
+    "return_prompt_embedding",  # Set by /v1/embeddings only.
+    "prompt_embedding_skip_tokens",  # Set by /v1/embeddings only.
 }
 _EVERY_FIELD_REQUEST = {
     "seed": 42,
