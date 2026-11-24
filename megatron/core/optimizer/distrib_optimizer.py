@@ -41,7 +41,7 @@ from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 from .. import tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing import ShardedTensor
-from ..dist_checkpointing.dict_utils import nested_values
+from ..dist_checkpointing.dict_utils import dict_list_map_outplace, nested_values
 from ..dist_checkpointing.mapping import (
     LocalNonpersistentObject,
     ShardedObject,
@@ -812,7 +812,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
 
         if has_config_logger_enabled(config):
-            log_config_to_disk(config, locals(), prefix=type(self).__name__)
+            log_args = locals().copy()
+            del log_args["param_norm_setup"]
+            if pg_collection is not None:
+                # The config logger would deep-copy live groups inside this dataclass.
+                log_args["pg_collection"] = dict_list_map_outplace(
+                    lambda group: getattr(group, "group_name", group), vars(pg_collection)
+                )
+            log_config_to_disk(config, log_args, prefix=type(self).__name__)
 
         super().__init__(optimizer, config, grad_scaler, init_state_fn)
         self.model_chunks = model_chunks

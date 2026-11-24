@@ -1,12 +1,14 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import argparse
+import json
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import (
     _get_megatron_optimizer_based_on_param_groups,
@@ -130,7 +132,7 @@ def test_direct_optimizer_warns_and_skips_embedding_floor(ddp_embedding):
 
 @pytest.mark.filterwarnings("error:.*embedding_min_norm.*:UserWarning")
 @pytest.mark.parametrize("threshold", [None, 1.0], ids=["disabled", "enabled"])
-def test_embedding_floor_through_optimizer_builder(threshold, ddp_embedding, monkeypatch):
+def test_embedding_floor_through_optimizer_builder(threshold, ddp_embedding, monkeypatch, tmp_path):
     """An ordinary optimizer step publishes the projected FP32 masters to the BF16 model."""
     model = ddp_embedding.module
 
@@ -150,8 +152,13 @@ def test_embedding_floor_through_optimizer_builder(threshold, ddp_embedding, mon
         weight_decay=0.0,
         clip_grad=0.0,
         embedding_min_norm=threshold,
+        config_logger_dir=str(tmp_path),
     )
     optimizer = get_megatron_optimizer(config, [ddp_embedding])
+    log_path = tmp_path / f"DistributedOptimizer.rank_{parallel_state.get_all_ranks()}.iter0.json"
+    logged = json.loads(log_path.read_text())
+    assert logged["pg_collection"]["dp_cp"] == ddp_embedding.dp_cp_group.group_name
+
     # With zero moments, zero epsilon and gradients of ±1, Adam subtracts exactly lr * grad.
     # Identical inputs on every rank, with distinct rows in each TP and DP shard.
     signs = torch.randint(2, (256, 64), device="cpu", generator=torch.Generator().manual_seed(17))
