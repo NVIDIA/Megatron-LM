@@ -57,7 +57,9 @@ def test_overlap_rejects_unsupported_execution_before_dispatch(monkeypatch, fail
         num_speculative_tokens=0,
     )
     calls = []
-    monkeypatch.setattr(block, "_launch_dispatch", lambda *args, **kwargs: calls.append(1))
+    monkeypatch.setattr(
+        block.moe_layer.mlp, "dispatch", lambda *args, **kwargs: calls.append(1), raising=False
+    )
     with torch.inference_mode(), InferenceMode.active(), pytest.raises(RuntimeError, match=message):
         block(
             hidden_states=torch.ones(4, 1, 8),
@@ -156,17 +158,15 @@ def test_overlap_graph_replay_preserves_inputs_and_updates_live_cache_once(
             shortcut_hidden
         ).masked_fill(mask, 0)
 
-    def dispatch(hidden, probs, *, async_op=False):
-        assert not async_op
+    def dispatch(hidden, probs):
         return hidden * 2, probs
 
-    def combine(output, *, async_op=False):
-        assert not async_op
+    def combine(output):
         return output * 4
 
     monkeypatch.setattr(block, "_moe_router_preprocess", route)
-    monkeypatch.setattr(block, "_launch_dispatch", dispatch)
-    monkeypatch.setattr(block, "_launch_combine", combine)
+    monkeypatch.setattr(block.moe_layer.mlp, "dispatch", dispatch, raising=False)
+    monkeypatch.setattr(block.moe_layer.mlp, "combine", combine, raising=False)
     monkeypatch.setattr(
         block,
         "_moe_shared_experts",
@@ -269,10 +269,10 @@ def test_overlap_keeps_every_collective_on_the_calling_stream(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        block, "_launch_dispatch", lambda h, p, *, async_op=False: record("dispatch", (h, p))
+        block.moe_layer.mlp, "dispatch", lambda h, p: record("dispatch", (h, p)), raising=False
     )
     monkeypatch.setattr(
-        block, "_launch_combine", lambda out, *, async_op=False: record("combine", out)
+        block.moe_layer.mlp, "combine", lambda out: record("combine", out), raising=False
     )
     block.moe_layer.mlp.routed_experts_compute = lambda h, p: record("experts", (h + p, None))
     monkeypatch.setattr(

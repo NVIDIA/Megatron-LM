@@ -525,8 +525,9 @@ class ShortcutMoEBlock(MegatronModule):
                 packed_seq_params=packed_seq_params,
                 recompute_context=None,
             )
-            dispatched_input, dispatched_probs = self._launch_dispatch(
-                route_input, route_probs, async_op=False
+            # Dispatch runs on the calling (main) stream, like every other collective.
+            dispatched_input, dispatched_probs = self.moe_layer.mlp.dispatch(
+                route_input, route_probs
             )
 
         # Fork after the dispatch: only the experts' local compute runs on the shortcut stream.
@@ -558,8 +559,10 @@ class ShortcutMoEBlock(MegatronModule):
                 packed_seq_params=packed_seq_params,
                 recompute_context=None,
             )
-            routed_output = self._wait_combine(routed_output)
-            combined_output = self._launch_combine(routed_output, async_op=False)
+            # Join the routed experts' compute back onto the main stream, then combine there.
+            main_stream.wait_stream(shortcut_stream)
+            routed_output.record_stream(main_stream)
+            combined_output = self.moe_layer.mlp.combine(routed_output)
             return self._postprocess(
                 residual=residual,
                 combined_output=combined_output,
