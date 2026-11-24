@@ -93,7 +93,8 @@ def test_shrinking_the_dp_cp_world_drops_the_rng_state():
 
 
 @pytest.mark.parametrize(
-    ("dp_random", "per_dp_flag", "gathers"), [(False, False, False), (False, True, True), (True, False, True)]
+    ("dp_random", "per_dp_flag", "gathers"),
+    [(False, False, False), (False, True, True), (True, False, True)],
 )
 def test_either_flag_makes_the_save_gather_per_rank_states(
     monkeypatch, run_config, dp_random, per_dp_flag, gathers
@@ -111,7 +112,9 @@ def test_either_flag_makes_the_save_gather_per_rank_states(
     monkeypatch.setattr(checkpointing.torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(checkpointing, "get_pg_size", lambda group: 2)
     monkeypatch.setattr(checkpointing, "get_pg_rank", lambda group: 0)
-    gather = Mock(side_effect=lambda output, state, *, group: output.__setitem__(slice(None), [state, state]))
+    gather = Mock(
+        side_effect=lambda output, state, *, group: output.__setitem__(slice(None), [state, state])
+    )
     monkeypatch.setattr(checkpointing.torch.distributed, "all_gather_object", gather)
     group = object()
     state = checkpointing.get_rng_state("torch", group, group, dp_cp_group=group)
