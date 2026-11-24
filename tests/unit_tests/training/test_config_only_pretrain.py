@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 """Exercise the recipe training path without a legacy argument namespace."""
 
 import math

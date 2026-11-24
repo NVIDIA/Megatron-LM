@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 """Recipe overrides edit native config leaves without replacing Python objects."""
 
 import pytest

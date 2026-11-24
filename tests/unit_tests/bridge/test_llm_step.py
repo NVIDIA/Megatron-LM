@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 """The packaged text step preserves MLM's batch partitioning and masked loss."""
 
 import pytest
