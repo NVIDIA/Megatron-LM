@@ -849,12 +849,16 @@ class TransformerConfig(ModelParallelConfig):
     """Use the kitchen extension for transformer quantization."""
 
     rmsnorm_impl: Literal["native", "liger"] = "native"
-    """Kernel for the RMSNorm modules built by `TENorm`. HybridModel only; GPTModel rejects it.
+    """Norm backend of the HybridModel stack spec. HybridModel only; GPTModel rejects it.
 
-    "liger" uses Liger-Kernel for every such RMSNorm (layer, QK, final and MTP norms); norms
-    fused into a Transformer Engine linear and Mamba's gated norm are unchanged. It is not a
-    speedup: Liger is usually slower than the native norms. Requires `normalization="RMSNorm"`
-    and `transformer_impl="transformer_engine"`; see `__post_init__` for the other restrictions.
+    The Hybrid builders and HybridModel's default spec apply it with `with_norm_backend`, so
+    "liger" builds every norm slot of the spec (layer, QK, MoE pre-MLP, MTP and final norms) with
+    Liger-Kernel; a spec passed to HybridModel directly chooses its own norms. Norms fused into a
+    Transformer Engine linear, Mamba's gated norm and norms built outside the spec (MoE's latent
+    fc2 norm, shortcut-MoE norms) stay Transformer Engine. It is not a speedup: Liger is usually
+    slower than the native norms.
+    Requires `normalization="RMSNorm"` and `transformer_impl="transformer_engine"`; see
+    `__post_init__` for the other restrictions.
     """
 
     use_kitchen_attention: bool = False

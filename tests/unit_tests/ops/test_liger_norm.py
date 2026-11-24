@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Liger RMSNorm selection, configuration checks and tensor contracts."""
+"""Liger RMSNorm as a norm backend, configuration checks and tensor contracts."""
 
 import sys
 from types import SimpleNamespace
@@ -10,7 +10,7 @@ import torch
 
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.ops.norm.backends import select_rms_norm
+from megatron.core.ops.norm.backends import get_norm_module_spec
 from megatron.core.ops.norm.liger_norm import LigerRMSNorm, _normalize_in_weight_dtype
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -32,15 +32,19 @@ def _config(**overrides):
 def test_unselected_paths_do_not_import_liger(monkeypatch):
     for module in ("liger_kernel", "liger_kernel.megatron"):
         monkeypatch.setitem(sys.modules, module, None)  # any import attempt now fails
-    assert select_rms_norm(_config(rmsnorm_impl="native")) is None
-    assert select_rms_norm(SimpleNamespace(normalization="LayerNorm", rmsnorm_impl="liger")) is None
+    assert get_norm_module_spec("native") is TENorm
+    assert get_norm_module_spec("liger") is LigerRMSNorm  # naming it in a spec imports nothing
     with pytest.raises(ImportError, match="Liger RMSNorm requires liger_kernel.megatron"):
-        TENorm(config=_config(), hidden_size=8)
+        LigerRMSNorm(config=_config(), hidden_size=8)
+    with pytest.raises(ValueError, match="Unknown norm backend 'apex'"):
+        get_norm_module_spec("apex")
 
 
-def test_te_norm_builds_the_selected_kernel():
+def test_liger_backend_builds_a_megatron_norm():
     pytest.importorskip("liger_kernel.megatron")
-    norm = TENorm(config=_config(params_dtype=torch.bfloat16), hidden_size=8, eps=1e-6)
+    norm = get_norm_module_spec("liger")(
+        config=_config(params_dtype=torch.bfloat16), hidden_size=8, eps=1e-6
+    )
     assert type(norm).__name__ == "LigerMegatronRMSNorm"
     assert norm.weight.dtype == torch.bfloat16 and norm.weight.device.type == "cpu"
     assert norm.weight.is_rmsnorm_weight and norm.returns_residual is False

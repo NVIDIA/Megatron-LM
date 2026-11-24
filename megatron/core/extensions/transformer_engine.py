@@ -26,7 +26,6 @@ from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedState
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.model_parallel_config import ModelParallelConfig
-from megatron.core.ops.norm.backends import select_rms_norm
 from megatron.core.ops.norm.torch_norm import LayerNormInterface
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
@@ -1259,10 +1258,6 @@ class TENorm:
         eps: float = 1e-5,
         has_residual: bool = False,
     ):
-        selected = select_rms_norm(config)  # e.g. rmsnorm_impl="liger"
-        if selected is not None:
-            return selected(config=config, hidden_size=hidden_size, eps=eps)
-
         if not HAVE_TE:
             raise ImportError(
                 "Transformer Engine is not installed. "

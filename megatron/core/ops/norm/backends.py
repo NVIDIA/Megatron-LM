@@ -1,25 +1,28 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Which RMSNorm kernel a config asks for."""
+"""Which norm module a spec names for a norm backend."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from megatron.core.ops.norm.torch_norm import LayerNormBuilder
-    from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-def select_rms_norm(config: TransformerConfig) -> Optional[LayerNormBuilder]:
-    """Return the RMSNorm ``config.rmsnorm_impl`` selects, or ``None`` for the caller's own.
+def get_norm_module_spec(backend: str = "native") -> LayerNormBuilder:
+    """Return the norm module a spec should name for ``backend`` (a ``rmsnorm_impl`` value).
 
-    ``TENorm`` asks this when it builds an RMSNorm, so the choice follows the config wherever
-    a spec or provider names it, as cross entropy follows ``select_cross_entropy``. Liger is
-    imported only when its norm is built.
+    ``"native"`` is Transformer Engine's ``TENorm``; ``"liger"`` is Liger's RMSNorm, which
+    imports Liger only when a norm is built. Specs choose their norms with this, as they choose
+    every other module.
     """
-    if getattr(config, "rmsnorm_impl", "native") != "liger" or config.normalization != "RMSNorm":
-        return None
-    from megatron.core.ops.norm.liger_norm import LigerRMSNorm
+    if backend == "native":
+        from megatron.core.extensions.transformer_engine import TENorm
 
-    return LigerRMSNorm
+        return TENorm
+    if backend == "liger":
+        from megatron.core.ops.norm.liger_norm import LigerRMSNorm
+
+        return LigerRMSNorm
+    raise ValueError(f"Unknown norm backend {backend!r}; expected 'native' or 'liger'.")

@@ -1,15 +1,37 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""HybridModel with rmsnorm_impl="liger": which norms switch, and forward/backward parity."""
+"""HybridModel with the Liger norm backend: the spec's norm slots, and forward/backward parity."""
 
 import pytest
 import torch
 
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.extensions.transformer_engine import TENorm
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    hybrid_stack_spec,
+    wide_residual_hybrid_stack_spec,
+    with_norm_backend,
+)
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.ops.norm.liger_norm import LigerRMSNorm
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.mark.parametrize("stack_spec", [hybrid_stack_spec, wide_residual_hybrid_stack_spec])
+def test_with_norm_backend_names_liger_in_every_norm_slot(stack_spec):
+    assert with_norm_backend(stack_spec, "native") is stack_spec
+    liger = with_norm_backend(stack_spec, "liger")
+    # Every TENorm slot at any depth (ModuleSpecs, submodule dataclasses, partials, MTP layer
+    # lists) now names Liger; the shared default spec is left as it was.
+    assert "TENorm" in repr(stack_spec) and "TENorm" not in repr(liger)
+    assert stack_spec.submodules.final_norm is TENorm
+    submodules = liger.submodules
+    assert submodules.final_norm is LigerRMSNorm
+    assert submodules.moe_layer.submodules.pre_mlp_layernorm is LigerRMSNorm
+    mtp_layer = submodules.mtp_block_spec.submodules.layer_specs[0].submodules
+    assert mtp_layer.enorm is mtp_layer.hnorm is mtp_layer.layer_norm is LigerRMSNorm
+    assert submodules.attention_layer == stack_spec.submodules.attention_layer  # no norm slots
 
 
 def _rms_norms(model):
@@ -25,6 +47,7 @@ def hybrid_models():
     torch.set_float32_matmul_precision("highest")  # keep TF32 from amplifying norm rounding
     models = {}
     for impl in ("native", "liger"):
+        # The Liger model takes HybridModel's default spec, which follows config.rmsnorm_impl.
         model_parallel_cuda_manual_seed(123)
         config = TransformerConfig(
             num_layers=2,
@@ -40,7 +63,7 @@ def hybrid_models():
         )
         models[impl] = HybridModel(
             config=config,
-            hybrid_stack_spec=hybrid_stack_spec,
+            hybrid_stack_spec=hybrid_stack_spec if impl == "native" else None,
             vocab_size=128,
             max_sequence_length=16,
             hybrid_layer_pattern="*E/*-",  # attention, MoE, and one MTP depth

@@ -636,21 +636,14 @@ class TestTEWrappers:
             what=f"TELayerNormColumnParallelLinear[{normalization}]",
         )
 
-    @pytest.mark.parametrize(
-        "normalization,rmsnorm_impl",
-        [("LayerNorm", "native"), ("RMSNorm", "native"), ("RMSNorm", "liger")],
-    )
-    def test_te_norm_replays(self, normalization, rmsnorm_impl):
-        """Replay the norm TENorm builds, including the Liger RMSNorm rmsnorm_impl selects."""
-        if rmsnorm_impl == "liger":
-            pytest.importorskip("liger_kernel.megatron")
+    @pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
+    def test_te_norm_replays(self, normalization):
         seeded()
-        config = _config(normalization=normalization, rmsnorm_impl=rmsnorm_impl)
-        module = TENorm(config, HIDDEN, eps=1e-5).cuda()
+        module = TENorm(_config(normalization=normalization), HIDDEN, eps=1e-5).cuda()
         assert getattr(module.weight, "is_rmsnorm_weight", False) == (normalization == "RMSNorm")
         x = torch.randn(TOKENS, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         assert_module_replays_bit_exact(
-            module, (x,), replays=3, contention=True, what=f"TENorm[{normalization},{rmsnorm_impl}]"
+            module, (x,), replays=3, contention=True, what=f"TENorm[{normalization}]"
         )
 
     @pytest.mark.skipif(TEFusedMLP is None, reason="TE operation-based MLP is unavailable")

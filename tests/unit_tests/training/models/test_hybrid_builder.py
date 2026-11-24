@@ -5,6 +5,9 @@ from unittest.mock import Mock, call, patch
 import pytest
 import torch
 
+from megatron.core.extensions.transformer_engine import TENorm
+from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
+from megatron.core.ops.norm.liger_norm import LigerRMSNorm
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
@@ -43,6 +46,22 @@ def test_liger_rejects_modelopt_hybrid_specs(modelopt):
     )
     with pytest.raises(ValueError, match="rmsnorm_impl='liger' is not supported by ModelOpt"):
         resolve_hybrid_stack_spec(_make_hybrid_config(transformer=transformer, **modelopt))
+
+
+def test_rmsnorm_impl_chooses_the_resolved_spec_norms():
+    transformer = _make_transformer(
+        rmsnorm_impl="liger", normalization="RMSNorm", transformer_impl="transformer_engine"
+    )
+    spec = resolve_hybrid_stack_spec(_make_hybrid_config(transformer=transformer))
+    assert spec.submodules.final_norm is LigerRMSNorm
+    assert spec.submodules.moe_layer.submodules.pre_mlp_layernorm is LigerRMSNorm
+    # A configured spec gets the same norm backend, without changing the caller's spec.
+    custom = ModuleSpec(module=HybridStack, submodules=HybridStackSubmodules())
+    config = _make_hybrid_config(transformer=transformer, hybrid_stack_spec=custom)
+    assert resolve_hybrid_stack_spec(config).submodules.final_norm is LigerRMSNorm
+    assert custom.submodules.final_norm is TENorm
+    native = resolve_hybrid_stack_spec(_make_hybrid_config(hybrid_stack_spec=custom))
+    assert native is custom
 
 
 # =============================================================================

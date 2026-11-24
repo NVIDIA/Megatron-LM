@@ -257,10 +257,11 @@ below), not by an operation constructor. Say a library `foo` provides both.
 - **Normalization.** Write `norm/foo_norm.py` with a module built as a
   `LayerNormBuilder` (`config=`, `hidden_size=`, `eps=`) and satisfying
   `LayerNormInterface`. Use the parameter names the existing norms use (`weight`,
-  and `bias` for LayerNorm) so a checkpoint loads under either backend. An RMSNorm
-  kernel is a value of `rmsnorm_impl` with a branch in `select_rms_norm`
-  (`norm/backends.py`). `TENorm` asks it when it builds an RMSNorm, so every spec
-  that names it follows the config with no spec change.
+  and `bias` for LayerNorm) so a checkpoint loads under either backend. The
+  provider that offers it returns it from `layer_norm(rms_norm=..., for_qk=...,
+  has_residual=...)`; providers stay in `models/` and `extensions/`. A backend that
+  `rmsnorm_impl` selects is also a branch in `get_norm_module_spec` (`norm/backends.py`),
+  which `with_norm_backend` puts in every norm slot of a HybridModel stack spec.
 - **Tests:** parity against `cross_entropy.vocab_parallel_cross_entropy` or the
   Torch norm, including backward and TP > 1 for cross entropy; a missing library
   is an `ImportError` naming the backend when it is selected; the existing values
@@ -269,9 +270,11 @@ below), not by an operation constructor. Say a library `foo` provides both.
 ## Liger RMSNorm
 
 Install `liger-kernel>=0.8.5` (the dev image has it) and select `--normalization RMSNorm
---rmsnorm-impl liger` for HybridModel; GPTModel rejects it. Every RMSNorm built by `TENorm`
-then uses Liger; norms fused into a Transformer Engine linear and Mamba's gated norm are
-unchanged. It is not a speedup: Liger is usually slower than the native norms.
+--rmsnorm-impl liger` for HybridModel; GPTModel rejects it. The Hybrid builders then build the
+stack spec with `with_norm_backend(spec, "liger")`, whose norm slots (layer, QK, MoE pre-MLP,
+MTP and final norms) name Liger's RMSNorm. Norms fused into a Transformer Engine linear, Mamba's
+gated norm and norms built outside the spec stay Transformer Engine. It is not a speedup: Liger
+is usually slower than the native norms.
 
 ## Dependency checks
 
@@ -322,8 +325,7 @@ directly. This is the pattern used by the new-operation recipe above.
 model-spec components, such as parallel linear layers, normalization, attention,
 and cross entropy. Its cross-entropy slot asks `loss/backends.py`'s
 `select_cross_entropy`, and its `layer_norm` slot returns a `norm` module or
-Transformer Engine's, whose RMSNorm asks `norm/backends.py`'s `select_rms_norm`. It does
-not currently provide SSM or sparse-attention kernel
+Transformer Engine's. It does not currently provide SSM or sparse-attention kernel
 slots. Keep operation-local kernel selection in the family until an extension
 to that provider interface and its callers is implemented together.
 
