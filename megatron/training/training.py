@@ -3487,6 +3487,28 @@ def train_step(
     )
 
 
+def _moe_loss_metric_names(*moe_configs) -> list[str]:
+    """Return the loss metrics enabled by any of the supplied router configs."""
+    routing_types = set()
+    for config in moe_configs:
+        configured_types = config.moe_router_load_balancing_type
+        if isinstance(configured_types, str):
+            routing_types.add(configured_types)
+        else:
+            routing_types.update(configured_types)
+
+    track_names = []
+    if "aux_loss" in routing_types:
+        track_names.append("load_balancing_loss")
+    if "seq_aux_loss" in routing_types:
+        track_names.append("seq_load_balancing_loss")
+    if "global_aux_loss" in routing_types:
+        track_names.append("global_load_balancing_loss")
+    if any(config.moe_z_loss_coeff is not None for config in moe_configs):
+        track_names.append("z_loss")
+    return track_names
+
+
 def _hybrid_config_list_moe_logging_metadata(
     hybrid_layer_config_list, mtp_use_repeated_layer: bool, moe_num_hash_layers: int
 ):
@@ -3516,29 +3538,8 @@ def _hybrid_config_list_moe_logging_metadata(
     )
     num_moe_layers = len(main_moe_configs) + len(mtp_moe_configs) * mtp_repeats
     num_hash_layers = min(len(main_moe_configs), max(moe_num_hash_layers, 0))
-    if num_moe_layers == 0:
-        return [], num_layers, 0, False, 0
-
-    routing_types = set()
-    moe_configs = [*main_moe_configs, *mtp_moe_configs]
-    for moe_config in moe_configs:
-        configured_types = moe_config.moe_router_load_balancing_type
-        routing_types.update([configured_types] if isinstance(configured_types, str) else configured_types)
-
-    metric_to_routing_type = {
-        "load_balancing_loss": "aux_loss",
-        "seq_load_balancing_loss": "seq_aux_loss",
-        "global_load_balancing_loss": "global_aux_loss",
-    }
-    track_names = [
-        metric_name
-        for metric_name, routing_type in metric_to_routing_type.items()
-        if routing_type in routing_types
-    ]
-    if any(config.moe_z_loss_coeff is not None for config in moe_configs):
-        track_names.append("z_loss")
-
-    return track_names, num_layers, num_moe_layers, True, num_hash_layers
+    track_names = _moe_loss_metric_names(*main_moe_configs, *mtp_moe_configs)
+    return track_names, num_layers, num_moe_layers, num_hash_layers
 
 
 def _hybrid_model_chunks_for_runtime_metrics(model, model_config):
@@ -3601,15 +3602,15 @@ def training_log(
     packed_sequence_stats: Optional[Dict[str, float]] = None,
     num_microbatches: int | None = None,
     embedding_min_norm_metrics: Dict[str, float] | None = None,
-    moe_logging_metadata: tuple[list[str], int, int, bool, int] | None = None,
+    moe_logging_metadata: tuple[list[str], int, int, int] | None = None,
     num_floating_point_operations_in_batch: float | None = None,
 ):
     """Log training information such as losses, timing, ....
 
     ``moe_logging_metadata`` contains metric names, tracker size, MoE layer count,
-    whether the model has MoE layers, and the main-stack hash-router count. If
-    omitted, use the model config metadata. Compute batch FLOPs only if no count
-    is supplied. Hybrid training uses the constructed model chunks.
+    and the main-stack hash-router count. If omitted, use the model config
+    metadata. Compute batch FLOPs only if no count is supplied. Hybrid training
+    uses the constructed model chunks.
     """
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
@@ -3781,22 +3782,11 @@ def training_log(
         callback_manager.trigger("on_tensorboard_log")
     # Log MoE metrics.
     moe_log_string = ""
-    has_moe_layers = (
-        moe_logging_metadata[3] if moe_logging_metadata is not None else cfg.model.transformer.num_moe_experts is not None
-    )
-
+    num_moe_layers = 0
     if moe_logging_metadata is not None:
-        track_names, layers, num_moe_layers, _, num_hash_layers = moe_logging_metadata
-    elif has_moe_layers:
-        track_names = []
-        if "aux_loss" in cfg.model.transformer.moe_router_load_balancing_type:
-            track_names.append("load_balancing_loss")
-        if "seq_aux_loss" in cfg.model.transformer.moe_router_load_balancing_type:
-            track_names.append("seq_load_balancing_loss")
-        if "global_aux_loss" in cfg.model.transformer.moe_router_load_balancing_type:
-            track_names.append("global_load_balancing_loss")
-        if cfg.model.transformer.moe_z_loss_coeff is not None:
-            track_names.append("z_loss")
+        track_names, layers, num_moe_layers, num_hash_layers = moe_logging_metadata
+    elif cfg.model.transformer.num_moe_experts is not None:
+        track_names = _moe_loss_metric_names(cfg.model.transformer)
 
         if is_hybrid_model(cfg.model):
             from megatron.core.models.hybrid.hybrid_layer_allocation import (
@@ -3841,7 +3831,7 @@ def training_log(
 
         layers = cfg.model.transformer.num_layers + (cfg.model.transformer.mtp_num_layers or 0)
 
-    if has_moe_layers:
+    if num_moe_layers > 0:
         moe_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         moe_log_string = get_moe_metrics_tracker().report(
             loss_scale=moe_loss_scale,
@@ -3999,8 +3989,7 @@ def training_log(
                     log_string += ' {}: {:.6E} |'.format(key, avg)
                 if should_reset:
                     total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
-        if has_moe_layers and moe_log_string:
-            log_string += moe_log_string
+        log_string += moe_log_string
         log_string += f' loss scale: {loss_scale:.1f} |'
         if grad_norm is not None:
             log_string += f' grad norm: {grad_norm:.3f} |'
@@ -4683,7 +4672,8 @@ def train(
             hybrid_model.config.mtp_use_repeated_layer,
             hybrid_model.config.moe_num_hash_layers,
         )
-        has_moe_layers = moe_logging_metadata[3]
+        _, _, num_moe_layers, _ = moe_logging_metadata
+        has_moe_layers = num_moe_layers > 0
 
     fault_injector_config = cfg.fault_tolerance.fault_injector
 

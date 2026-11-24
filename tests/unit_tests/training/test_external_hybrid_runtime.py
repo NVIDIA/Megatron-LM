@@ -229,31 +229,45 @@ def test_estimation_failures_propagate_across_pipeline_ranks(monkeypatch, local_
 @pytest.mark.parametrize("repeated_mtp", [False, True])
 def test_builtin_moe_metadata_with_external_layers_uses_standard_tracker_conventions(repeated_mtp):
     dense = _config()
-    moe = MoELayerConfig.from_config(_config(num_moe_experts=4, moe_z_loss_coeff=0.01))
-    configs = [dense, moe, PipelineSplit, moe, MTPSplit, moe, MTPSplit, moe]
+    moe = MoELayerConfig.from_config(_config(num_moe_experts=4))
+    mtp_moe = MoELayerConfig.from_config(
+        _config(
+            num_moe_experts=4,
+            moe_router_load_balancing_type=["seq_aux_loss", "global_aux_loss"],
+            moe_aux_loss_coeff=[0.01, 0.01],
+            moe_z_loss_coeff=0.01,
+        )
+    )
+    configs = [dense, moe, PipelineSplit, moe, MTPSplit, mtp_moe, MTPSplit, mtp_moe]
 
     metadata = _hybrid_config_list_moe_logging_metadata(
         configs, mtp_use_repeated_layer=repeated_mtp, moe_num_hash_layers=0
     )
 
-    assert metadata == (["load_balancing_loss", "z_loss"], 5, 3 if repeated_mtp else 4, True, 0)
+    assert metadata == (
+        ["load_balancing_loss", "seq_load_balancing_loss", "global_load_balancing_loss", "z_loss"],
+        5,
+        3 if repeated_mtp else 4,
+        0,
+    )
 
 
 def test_builtin_hash_metadata_with_external_non_moe_layer():
     dense = _config()
-    moe = MoELayerConfig.from_config(_config(num_moe_experts=4))
+    moe = MoELayerConfig.from_config(
+        _config(num_moe_experts=4, moe_router_load_balancing_type="seq_aux_loss")
+    )
     assert _hybrid_config_list_moe_logging_metadata([dense, moe, moe], False, 9) == (
-        ["load_balancing_loss"],
+        ["seq_load_balancing_loss"],
         3,
         2,
-        True,
         2,
     )
 
 
 def test_external_non_moe_config_does_not_enable_moe_metrics():
     config = _config()
-    assert _hybrid_config_list_moe_logging_metadata([config], False, 0) == ([], 1, 0, False, 0)
+    assert _hybrid_config_list_moe_logging_metadata([config], False, 0) == ([], 1, 0, 0)
 
 
 def test_saved_hybrid_family_preserves_checkpoint_policy_and_runtime_args(run_config):
