@@ -48,6 +48,10 @@ class TinyModel(nn.Module):
         """Run both blocks."""
         return self.block2(self.block1(x))
 
+    def fsdp_units(self):
+        """Modules to shard, one FSDP group each: block1 as a whole, each linear layer of block2."""
+        return [self.block1, *(layer for layer in self.block2 if isinstance(layer, nn.Linear))]
+
 
 def _train(
     model: nn.Module, optimizers: tuple[torch.optim.Optimizer, ...], inputs: torch.Tensor
@@ -134,10 +138,8 @@ def test_muon_matches_reference(
     reference = copy.deepcopy(model).float()
     reference_params = dict(reference.named_parameters())
     with fully_shard_context(FsdpContext(device=device)):
-        fully_shard(model.block1, mesh=mesh, placements=placements)
-        for layer in model.block2:
-            if isinstance(layer, nn.Linear):
-                fully_shard(layer, mesh=mesh, placements=placements)
+        for unit in model.fsdp_units():
+            fully_shard(unit, mesh=mesh, placements=placements)
     params = dict(model.named_parameters())
     kwargs = dict(
         lr=0.05,
