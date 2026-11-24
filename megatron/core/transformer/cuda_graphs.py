@@ -250,25 +250,40 @@ except ImportError:
     pass
 
 
+# Whether a capture guard (no_gc_during_capture) has frozen the heap.
+_CAPTURE_FROZE_HEAP = False
+
+
 @contextmanager
-def no_gc_during_capture():
+def no_gc_during_capture(freeze: bool = False):
     """Keep Python's automatic garbage collection out of a CUDA graph capture.
 
     A collection that runs while a stream is capturing can free tensors held by unreachable
     objects, such as a released inference engine's pinned host buffers. Releasing them mid-capture
     can leave PyTorch's pinned host allocator failing its next request with "CUDA error: invalid
     argument". Automatic collection is therefore paused for the capture and resumes afterwards,
-    when it collects what the capture left unreachable. With FREEZE_GC, the existing heap is also
-    frozen for the capture.
+    when it collects what the capture left unreachable.
+
+    With `freeze` and FREEZE_GC, the heap is also frozen for the capture, as the layer and TE
+    captures always did: that makes them faster before PyTorch 2.9, but it also keeps the
+    collection PyTorch 2.8 runs before a capture from freeing unreachable tensors left by warmup.
+    gc.unfreeze() thaws every frozen object, so a guard inside one that froze the heap leaves the
+    freeze to it. A freeze from other code cannot be told apart: since Python 3.12, immortal
+    objects share the frozen generation, so gc.get_freeze_count() is never zero. Set
+    CUDA_GRAPH_CAPTURE_FREEZE_GC=0 to keep such a freeze through captures before PyTorch 2.9.
     """
+    global _CAPTURE_FROZE_HEAP
     gc_was_enabled = gc.isenabled()
+    freeze = freeze and FREEZE_GC and not _CAPTURE_FROZE_HEAP
     gc.disable()
-    if FREEZE_GC:
+    if freeze:
         gc.freeze()
+        _CAPTURE_FROZE_HEAP = True
     try:
         yield
     finally:
-        if FREEZE_GC:
+        if freeze:
+            _CAPTURE_FROZE_HEAP = False
             gc.unfreeze()
         if gc_was_enabled:
             gc.enable()
@@ -1522,7 +1537,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     track_gtp_capture_comms() if self.gtp_remat else nullcontext(None)
                 )
                 with (
-                    no_gc_during_capture(),
+                    no_gc_during_capture(freeze=True),
                     capture_comm_context as capture_comms,
                     capture_constants(self.fwd_graph),
                     torch.cuda.graph(
@@ -1657,7 +1672,7 @@ class _CudaGraphRunner(torch.nn.Module):
 
         capture_comm_context = track_gtp_capture_comms() if self.gtp_remat else nullcontext(None)
         with (
-            no_gc_during_capture(),
+            no_gc_during_capture(freeze=True),
             capture_comm_context as capture_comms,
             _preserve_parameter_grads_during_backward_capture(self),
             capture_constants(self.bwd_graph),
@@ -2999,7 +3014,7 @@ class TECudaGraphHelper:
                 rng_context = get_cuda_rng_tracker().fork()
             else:
                 rng_context = nullcontext()
-            with rng_context, capture_constants(self), no_gc_during_capture():
+            with rng_context, capture_constants(self), no_gc_during_capture(freeze=True):
                 graphs = make_graphed_callables(
                     tuple(self.flattened_callables), sample_args, **kwargs
                 )

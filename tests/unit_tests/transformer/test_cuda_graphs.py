@@ -1,9 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import contextlib
 import gc
 import inspect
 import os
 import sys
+import weakref
 
 import pytest
 import torch
@@ -33,6 +35,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     CheckpointWithoutOutput,
+    _probe_cudagraph_needs_generator_registration,
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
@@ -161,14 +164,16 @@ def test_failed_capture_restores_global_state(monkeypatch, has_te_modules, failu
     assert torch.autograd.function.FunctionCtx.save_for_backward is original_save
 
 
+@pytest.mark.parametrize("freeze", [False, True])
 @pytest.mark.parametrize("freeze_gc", [False, True])
 @pytest.mark.parametrize("gc_enabled", [True, False])
 @pytest.mark.parametrize("capture_fails", [False, True])
 def test_no_gc_during_capture_restores_collection_state(
-    monkeypatch, freeze_gc, gc_enabled, capture_fails
+    monkeypatch, freeze, freeze_gc, gc_enabled, capture_fails
 ):
     """Automatic collection is off inside a capture and returns to its prior state after it,
-    also when the capture raises; FREEZE_GC freezes the heap for the capture only."""
+    also when the capture raises; with freeze and FREEZE_GC, the heap is frozen for the capture
+    only."""
     monkeypatch.setattr(cuda_graphs_module, "FREEZE_GC", freeze_gc)
     freeze_events = []
     monkeypatch.setattr(gc, "freeze", lambda: freeze_events.append("freeze"))
@@ -179,21 +184,40 @@ def test_no_gc_during_capture_restores_collection_state(
     else:
         gc.disable()
     try:
-        capture_error = RuntimeError("injected capture failure")
-        try:
-            with cuda_graphs_module.no_gc_during_capture():
+        failure = pytest.raises(RuntimeError, match="injected capture failure")
+        with failure if capture_fails else contextlib.nullcontext():
+            with cuda_graphs_module.no_gc_during_capture(freeze=freeze):
                 assert not gc.isenabled()
                 if capture_fails:
-                    raise capture_error
-        except RuntimeError as error:
-            assert error is capture_error
+                    raise RuntimeError("injected capture failure")
         assert gc.isenabled() == gc_enabled
-        assert freeze_events == (["freeze", "unfreeze"] if freeze_gc else [])
+        assert freeze_events == (["freeze", "unfreeze"] if freeze and freeze_gc else [])
     finally:
         if was_enabled:
             gc.enable()
         else:
             gc.disable()
+
+
+def test_nested_capture_guard_keeps_the_outer_freeze(monkeypatch):
+    """A freezing guard inside another leaves the outer guard's freeze in place: gc.unfreeze() at
+    its exit would thaw the whole heap while the outer capture still runs."""
+    monkeypatch.setattr(cuda_graphs_module, "FREEZE_GC", True)
+
+    class Cycle:
+        pass
+
+    cycle = Cycle()
+    cycle.self = cycle
+    alive = weakref.ref(cycle)
+    with cuda_graphs_module.no_gc_during_capture(freeze=True):
+        del cycle
+        with cuda_graphs_module.no_gc_during_capture(freeze=True):
+            pass
+        gc.collect()
+        assert alive() is not None
+    gc.collect()
+    assert alive() is None
 
 
 @pytest.mark.parametrize("has_runner", [False, True])
@@ -2633,8 +2657,8 @@ class TestInlineCaptureManager:
     @torch.inference_mode()
     def test_capture_runs_without_automatic_gc(self, monkeypatch):
         """No automatic collection can run while Megatron captures a graph (here the inline
-        capture, and the RNG probe the first capture runs): one could free tensors of
-        unreachable objects, such as a released engine's pinned host buffers, mid-capture."""
+        capture, and the RNG probe the first capture in a process runs): one could free tensors
+        of unreachable objects, such as a released engine's pinned host buffers, mid-capture."""
         config = self._make_config()
         module = _SimpleModule(config).cuda().eval()
         x = torch.randn(4, config.hidden_size, device="cuda")
@@ -2666,6 +2690,13 @@ class TestInlineCaptureManager:
         module.my_op(x)
 
         assert gc_enabled_in_capture and not any(gc_enabled_in_capture)
+        assert gc.isenabled()
+
+        # The probe's result is cached per process, so an earlier capture may have run it
+        # already; run its capture directly.
+        gc_enabled_in_capture.clear()
+        _probe_cudagraph_needs_generator_registration()
+        assert gc_enabled_in_capture == [False, False]
         assert gc.isenabled()
 
     @torch.inference_mode()
