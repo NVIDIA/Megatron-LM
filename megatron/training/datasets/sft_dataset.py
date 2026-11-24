@@ -151,6 +151,7 @@ class SFTDataset(MegatronDataset):
         pack_targets = []
         pack_positions = []
         cu_seqlens = [0]
+        real_tokens = squared_lengths = 0
         eod = tokenizer.eod
         pad = tokenizer.pad
         # TODO(duncan): Track number of convs dropped and/or truncated and amount of end-padding
@@ -163,7 +164,10 @@ class SFTDataset(MegatronDataset):
             tokens_list = tokens.tolist()
             targets_list = targets.tolist()
 
-
+            # Only input positions that survive pack-level truncation contribute FLOPs.
+            length = min(len(tokens_list), pack_length - len(pack_tokens))
+            real_tokens += length
+            squared_lengths += length**2
             pack_tokens.extend(tokens_list)
             pack_targets.extend(targets_list)
 
@@ -242,6 +246,7 @@ class SFTDataset(MegatronDataset):
             'loss_mask': loss_mask,
             'position_ids': position_ids,
             'cu_seqlens': padded_cu_seqlens,
+            'packed_seqlen_stats': torch.tensor([real_tokens, squared_lengths], dtype=torch.int64),
             'max_seqlen': max_seqlen,
         }
 
@@ -391,6 +396,10 @@ class MockSFTDataset(SFTDataset):
             pack_targets.extend([eod, pad])
             pack_positions = pack_positions[:pack_length + 1]
             cu_seqlens[-1] = len(pack_tokens) - 1
+            # The final input position is an explicit EOD, even if alignment caused truncation.
+            real_length = min(len(tokens_list), max_body) + 1
+        else:
+            real_length = len(tokens_list)
 
         # Handle any necessary padding
         if len(pack_tokens) < pack_length + 1:  # +1 here to account for later alignment
@@ -424,5 +433,6 @@ class MockSFTDataset(SFTDataset):
             'loss_mask': loss_mask,
             'position_ids': position_ids,
             'cu_seqlens': cu_seqlens,
+            'packed_seqlen_stats': torch.tensor([real_length, real_length**2], dtype=torch.int64),
             'max_seqlen': max_seqlen,
         }

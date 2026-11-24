@@ -2676,6 +2676,7 @@ def _get_batch_on_this_cp_rank_per_sequence_balancing(
     METADATA_KEYS = (
         'cu_seqlens',
         'cu_seqlens_padded',
+        'packed_seqlen_stats',
         'dataset_id',
         'max_seqlen',
         'local_cp_size',

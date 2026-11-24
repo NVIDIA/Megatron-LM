@@ -736,9 +736,15 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     the all-reduce; BSHD callers that never invoke this function leave the
     flag at ``False`` and pay zero collective cost.
     """
-    global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
     if cu_seqlens is None or cu_seqlens.numel() < 2:
         return
+    lengths = cu_seqlens.diff().to(dtype=torch.float64)
+    accumulate_seqlen_stats(torch.stack((lengths.sum(), lengths.square().sum())))
+
+
+def accumulate_seqlen_stats(stats):
+    """Add a microbatch's real token count and sum of squared document lengths."""
+    global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
     # Pin the accumulator to the current CUDA device when available so the
     # eventual all-reduce can use NCCL even if a caller passed a CPU tensor
     # (e.g. unit tests). Production always supplies a CUDA tensor.
@@ -746,14 +752,10 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
         device = (
             torch.device(f'cuda:{torch.cuda.current_device()}')
             if torch.cuda.is_available()
-            else cu_seqlens.device
+            else stats.device
         )
         _seqlen_stats_in_iteration = torch.zeros(2, dtype=torch.float64, device=device)
-    seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(
-        device=_seqlen_stats_in_iteration.device, dtype=torch.float64
-    )
-    _seqlen_stats_in_iteration[0] += seqlens.sum()
-    _seqlen_stats_in_iteration[1] += (seqlens * seqlens).sum()
+    _seqlen_stats_in_iteration += stats.to(_seqlen_stats_in_iteration)
     _seqlen_stats_active = True
     _seqlen_stats_are_global = False
 

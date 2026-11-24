@@ -24,6 +24,7 @@ from hybrid_builders import hybrid_builder
 from megatron.core import mpu
 from megatron.core.context_parallel import ContextParallelBatch, get_batches_on_this_cp_rank
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
+from megatron.core.datasets.data_schedule_utils import get_local_real_seqlen_stats
 from megatron.core.enums import ModelType
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.package_info import __version__ as mcore_version
@@ -58,7 +59,7 @@ from megatron.training.arguments import parse_and_validate_args
 from megatron.training.datasets.providers import build_gpt_datasets, is_dataset_built_on_rank
 from megatron.training.datasets.utils import get_dataset_input_length
 from megatron.training.global_vars import get_run_config, set_run_config
-from megatron.training.training import update_seqlen_stats_from_cu_seqlens
+from megatron.training.training import accumulate_seqlen_stats
 from megatron.training.utils import is_first_or_last_pipeline_stage
 
 try:
@@ -92,7 +93,13 @@ BATCH_KEYS = [
 ]
 
 
-def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroupCollection] = None):
+def get_batch(
+    data_iterator,
+    vp_stage=None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+    *,
+    collect_seqlen_stats=False,
+):
     """Generate a batch."""
 
     cfg = get_run_config()
@@ -156,7 +163,7 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
     seq_length = get_dataset_input_length(cfg.data.dataset)
     batch = {}
     if tp_rank == 0:
-        batch = next(data_iterator)
+        batch = next(data_iterator).copy()
         for key in BATCH_KEYS:
             batch[key] = (
                 batch[key].cuda(non_blocking=True)
@@ -167,10 +174,12 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
     # Read after the early return above: an intermediate stage without cu_seqlens never looks at
     # the dataset (a loader-only section has none).
     create_attention_mask_in_dataloader = cfg.data.creates_attention_mask()
+    tp_group = mpu.get_tensor_model_parallel_group()
+    tp_src_rank = mpu.get_tensor_model_parallel_src_rank()
     batch = get_batch_on_this_tp_rank(
         batch,
-        broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
-        broadcast_group=mpu.get_tensor_model_parallel_group(),
+        broadcast_src_rank=tp_src_rank,
+        broadcast_group=tp_group,
         has_cu_seqlens=has_cu_seqlens,
         dynamic_cp=False,
         create_attention_mask_in_dataloader=create_attention_mask_in_dataloader,
@@ -185,6 +194,13 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
     )
 
     batch = flatten_batch_for_packed_sequences(batch)
+    if collect_seqlen_stats and batch['cu_seqlens'] is not None:
+        stats = get_local_real_seqlen_stats([batch], batch['cu_seqlens'].device)
+        if tp_group.size() > 1 and cfg.data.is_sft():
+            # Only the dataloader rank has SFT's pre-padding counts.
+            torch.distributed.broadcast(stats, tp_src_rank, group=tp_group)
+        accumulate_seqlen_stats(stats)
+    batch.pop('packed_seqlen_stats', None)
 
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
         assert has_cu_seqlens
@@ -209,7 +225,7 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         additional_layouts=additional_layouts,
         use_per_sequence_balancing=cfg.data.use_per_sequence_balancing(),
         sequence_parallel=cfg.model.transformer.sequence_parallel,
-        tp_group=mpu.get_tensor_model_parallel_group(),
+        tp_group=tp_group,
         tp_cp_group=(
             mpu.get_tensor_and_context_parallel_group()
             if (
@@ -335,7 +351,11 @@ def forward_step(data_iterator, model: HybridModel):
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
         cp_batch = get_batch(
-            data_iterator, vp_stage, pg_collection=get_attr_wrapped_model(model, "pg_collection")
+            data_iterator,
+            vp_stage,
+            pg_collection=get_attr_wrapped_model(model, "pg_collection"),
+            collect_seqlen_stats=vp_stage in (None, 0)
+            and get_attr_wrapped_model(model, "training"),
         )
         batch = cp_batch.get_batch()
         attention_mask = batch.get("attention_mask")
@@ -346,16 +366,6 @@ def forward_step(data_iterator, model: HybridModel):
         tokens = batch.get("tokens")
         packed_seq_params = cp_batch.get_packed_seq_params()
         padding_mask = batch.get("padding_mask")
-        # The packing scheduler already counted the global batch. For ordinary packed
-        # data, count each microbatch on one virtual stage per physical pipeline rank.
-        if (
-            cu_seqlens is not None
-            and vp_stage in (None, 0)
-            and get_run_config().model.transformer.sequence_packing_scheduler is None
-            and get_attr_wrapped_model(model, "training")
-        ):
-            update_seqlen_stats_from_cu_seqlens(cu_seqlens.squeeze(0))
-
         # Offline logits KD: record this microbatch's global (un-CP-sharded)
         # document boundaries so the saver can persist them alongside the
         # logits _forward_hook is about to capture -- required for

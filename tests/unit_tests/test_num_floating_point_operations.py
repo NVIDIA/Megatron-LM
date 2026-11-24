@@ -688,50 +688,53 @@ class TestAccumulatorTopology:
         import pretrain_hybrid
         from megatron.core.datasets.data_schedule import wrap_data_iterator
         from megatron.core.process_groups_config import ProcessGroupCollection
-        from megatron.training.datasets.sft_dataset import SFTDatasetConfig
+        from megatron.training.datasets.sft_dataset import SFTDataset, SFTDatasetConfig
         from tests.unit_tests.test_utilities import Utils
 
         if Utils.world_size != 4:
             pytest.skip("requires four ranks")
         pp = 2 if vpp else 1
         Utils.initialize_model_parallel(
+            tensor_model_parallel_size=2 if cp == 1 else 1,
             pipeline_model_parallel_size=pp,
             virtual_pipeline_model_parallel_size=vpp,
             context_parallel_size=cp,
         )
         pg = ProcessGroupCollection.use_mpu_process_groups()
+        run_config.train.micro_batch_size = 1
         config = run_config.model.transformer
+        config.tensor_model_parallel_size = pg.tp.size()
         config.pipeline_model_parallel_size = pp
         config.microbatch_group_size_per_vp_stage = pp
         config.virtual_pipeline_model_parallel_size = vpp
         config.context_parallel_size = cp
         config.max_seqlen_per_dp_cp_rank = 8
+        documents = [torch.arange(1, 4), torch.arange(1, 5)]
+        tokenizer = Mock(pad=0, eod=99)
+        tokenizer.tokenize_conversation.side_effect = [(doc, doc) for doc in documents]
         run_config.data.dataset = SFTDatasetConfig(
             sequence_length=12,
             random_seed=1,
+            tokenizer=tokenizer,
             reset_position_ids=False,
             reset_attention_mask=False,
             eod_mask_loss=False,
+            create_attention_mask=False,
         )
         monkeypatch.setattr(pretrain_hybrid, "get_timers", Mock())
 
-        tokens = torch.arange(12, device="cuda").unsqueeze(0)
-        cu = torch.tensor([[0, 4, 12]], dtype=torch.int32, device="cuda")
-        sample = dict(
-            tokens=tokens,
-            labels=tokens,
-            position_ids=tokens,
-            loss_mask=torch.ones_like(tokens).float(),
-            cu_seqlens=cu,
-            cu_seqlens_padded=cu,
-            max_seqlen=cu.diff().max().reshape(1),
-        )
+        dataset = object.__new__(SFTDataset)
+        dataset.config = run_config.data.dataset
+        dataset.dataset = [[{"role": "system"}, {"role": "system"}]]
+        dataset.indices = [0]
+        dataset.padding_divisor = 4
+        sample = torch.utils.data.default_collate([dataset[0]])
         stages = range(vpp) if vpp else (None,)
-        # Each DP replica contributes one copy of the two documents.
-        expected = ((4 + 8) * pg.dp.size(), (4**2 + 8**2) * pg.dp.size())
+        # The three- and four-token documents occupy four and eight physical positions.
+        expected = (7 * pg.dp.size(), 25 * pg.dp.size())
         for scheduler in (None, "dp_balanced"):
             config.sequence_packing_scheduler = scheduler
-            iterators = [iter([sample.copy()]) for _ in stages]
+            iterators = [iter([sample.copy()]) if pg.tp.rank() == 0 else None for _ in stages]
             count = 1
             if scheduler is not None:
                 packed, count, real_tokens, squared_lengths = wrap_data_iterator(
