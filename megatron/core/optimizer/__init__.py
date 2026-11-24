@@ -60,6 +60,7 @@ from ..distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
 from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
+from .apply_param_norm_constraints import ParamNormSetup
 from .distrib_optimizer import DistributedOptimizer
 from .emerging_optimizers import (
     _EMERGING_OPTIMIZERS,
@@ -88,6 +89,7 @@ from .optimizer_config import (
     ParamWithNamePredicate,
     SGDOptimizerConfig,
 )
+from .param_norm_constraints import EmbeddingMinNormRecipe
 
 logger = logging.getLogger(__name__)
 
@@ -553,6 +555,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     distributed_optimizer_instance_id: Optional[int] = 0,
     pg_collection: Optional[ProcessGroupCollection] = None,
     skip_megatron_wrapping: bool = False,
+    param_norm_setup: Optional[ParamNormSetup] = None,
 ) -> Union[MegatronOptimizer, Tuple[Optional[torch.optim.Optimizer], Optional[Callable]]]:
     """Get Megatron optimizer based on parameter groups.
 
@@ -588,13 +591,17 @@ def _get_megatron_optimizer_based_on_param_groups(
     if skip_megatron_wrapping and config.optimizer_cpu_offload:
         raise ValueError("skip_megatron_wrapping=True is incompatible with optimizer_cpu_offload.")
 
-    has_word_embedding = any(
-        getattr(param, "is_word_embedding_parameter", False)
-        for param_group in param_groups
-        for param in param_group["params"]
-    )
-    if config.embedding_min_norm is not None and has_word_embedding:
-        if not config.use_distributed_optimizer:
+    if not config.use_distributed_optimizer or skip_megatron_wrapping:
+        if param_norm_setup is not None:
+            wrapper = "layer-wise" if skip_megatron_wrapping else "replicated"
+            param_norm_setup.ownership(
+                param_groups, f"{wrapper} {config.optimizer}", supported=False
+            )
+        elif config.embedding_min_norm is not None and any(
+            getattr(p, "is_word_embedding_parameter", False)
+            for group in param_groups
+            for p in group["params"]
+        ):
             raise ValueError("embedding_min_norm requires the distributed optimizer")
 
     # When freezing sub-models we may have no trainable parameters on a rank and
@@ -772,6 +779,8 @@ def _get_megatron_optimizer_based_on_param_groups(
             data_parallel_group_gloo=data_parallel_group_gloo,
             data_parallel_group_idx=data_parallel_group_idx,
             distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+            param_norm_setup=param_norm_setup,
+            pg_collection=pg_collection,
         )
         # This is needed for case where num_distributed_optimizer_instances > 1. In this case,
         # weight gradients are all-reduced across optimizer instances, so each instance has
@@ -856,6 +865,7 @@ def _get_megatron_emerging_optimizer(
     pg_collection: Optional[ProcessGroupCollection] = None,
     param_group_process_group: Optional[torch.distributed.ProcessGroup] = None,
     use_gloo_process_groups: bool = True,
+    param_norm_setup: Optional[ParamNormSetup] = None,
 ) -> MegatronOptimizer:
     """Build an emerging optimizer (e.g. Muon) for the given model chunks.
 
@@ -1027,6 +1037,9 @@ def _get_megatron_emerging_optimizer(
         # constructed via ``_create_emerging_optimizer``. Scalar optimizers that also appear
         # in ``_EMERGING_OPTIMIZERS`` (e.g., Lion) fall through to the standard fallback path.
         if opt_name == eopt_name and opt_name in _EMERGING_OPTIMIZERS:
+            if param_norm_setup is not None:
+                wrapper = "layer-wise" if use_layer_wise else "replicated"
+                param_norm_setup.ownership(groups, f"{wrapper} {eopt_name}", supported=False)
             optimizer, init_state_fn = _create_emerging_optimizer(
                 config, groups, eopt_name, model_chunks, pg_collection
             )
@@ -1068,6 +1081,7 @@ def _get_megatron_emerging_optimizer(
                     config=fallback_config,
                     model_chunks=model_chunks,
                     param_groups=groups,
+                    param_norm_setup=param_norm_setup,
                     per_model_buffers=distopt_per_model_buffers,
                     model_parallel_group=distopt_process_groups['mp_group'],
                     data_parallel_group=distopt_process_groups['intra_dp_cp_group'],
@@ -1095,6 +1109,7 @@ def _get_megatron_emerging_optimizer(
                     config=fallback_config,
                     model_chunks=model_chunks,
                     param_groups=groups,
+                    param_norm_setup=param_norm_setup,
                     model_parallel_group=model_parallel_group,
                     pg_collection=pg_collection,
                     skip_megatron_wrapping=use_layer_wise,
@@ -1264,6 +1279,12 @@ def get_megatron_optimizer(
         ), "MimoModel does not support virtual pipeline parallelism (multiple model chunks)"
         return get_mimo_optimizer(model_chunks[0], config)
 
+    param_norm_setup = None
+    if config.embedding_min_norm is not None:
+        param_norm_setup = ParamNormSetup(
+            model_chunks, EmbeddingMinNormRecipe(config.embedding_min_norm)
+        )
+
     # None → apply standard defaults. To extend defaults with custom overrides,
     # start from get_standard_config_overrides(config) and merge yours in.
     if config_overrides is None:
@@ -1288,7 +1309,10 @@ def get_megatron_optimizer(
             pg_collection=pg_collection,
             param_group_process_group=param_group_process_group,
             use_gloo_process_groups=use_gloo_process_groups,
+            param_norm_setup=param_norm_setup,
         )
+        if param_norm_setup is not None:
+            param_norm_setup.validate(pg_collection, param_group_process_group)
         _clear_high_precision_initializers(model_chunks)
         return optimizer
 
@@ -1380,6 +1404,7 @@ def get_megatron_optimizer(
                 model_chunks=model_chunk,
                 param_groups=param_groups,
                 per_model_buffers=buffers,
+                param_norm_setup=param_norm_setup,
                 model_parallel_group=mp_group,
                 data_parallel_group=dp_cp_group,
                 data_parallel_group_gloo=intra_dp_cp_group_gloo,
@@ -1406,6 +1431,8 @@ def get_megatron_optimizer(
             optimizers.append(optimizer_part)
             model_chunk_offset += 1
 
+        if param_norm_setup is not None:
+            param_norm_setup.validate(pg_collection, param_group_process_group)
         _clear_high_precision_initializers(model_chunks)
         if len(optimizers) == 1:
             return optimizers[0]
@@ -1445,6 +1472,7 @@ def get_megatron_optimizer(
                 model_chunks=dense_model_chunks,
                 param_groups=param_groups,
                 per_model_buffers=buffers,
+                param_norm_setup=param_norm_setup,
                 model_parallel_group=mp_group,
                 data_parallel_group=intra_dp_cp_group,
                 data_parallel_group_gloo=intra_dp_cp_group_gloo,
@@ -1494,6 +1522,7 @@ def get_megatron_optimizer(
                 model_chunks=model_chunks,
                 param_groups=moe_param_groups,
                 per_model_buffers=moe_buffers,
+                param_norm_setup=param_norm_setup,
                 model_parallel_group=expt_tp_pp_with_egtp_remat_group,
                 data_parallel_group=intra_expt_dp_group,
                 data_parallel_group_gloo=intra_expt_dp_group_gloo,
@@ -1509,5 +1538,7 @@ def get_megatron_optimizer(
             state_dict=param_to_param_group, checkpoint_id=dump_param_to_param_group_map
         )
 
+    if param_norm_setup is not None:
+        param_norm_setup.validate(pg_collection, param_group_process_group)
     _clear_high_precision_initializers(model_chunks)
     return ChainedOptimizer(optimizers)

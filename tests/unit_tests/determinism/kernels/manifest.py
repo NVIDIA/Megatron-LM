@@ -710,6 +710,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "Hybrid CPU/GPU Adam replay also covers overlapped parameter and gradient copies.",
     ),
     KernelEntry(
+        name="param_norm_constraints",
+        sources=("megatron/core/optimizer/apply_param_norm_constraints.py",),
+        tests=(K + "test_optimizer_kernels.py",),
+        kind="torch-op",
+        notes="Embedding row sums of squares and rescaling on flat FP32 optimizer shards.",
+    ),
+    KernelEntry(
         name="tensor_metric_l2",
         sources=("megatron/training/tensor_metrics/definitions.py",),
         tests=(K + "test_optimizer_kernels.py",),

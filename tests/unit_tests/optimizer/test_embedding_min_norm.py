@@ -2,15 +2,31 @@
 
 import argparse
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
-from megatron.core.optimizer import _get_megatron_optimizer_based_on_param_groups
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.optimizer import (
+    _get_megatron_optimizer_based_on_param_groups,
+    get_megatron_optimizer,
+)
+from megatron.core.optimizer.apply_param_norm_constraints import ParamNormSetup
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.optimizer import MixedPrecisionOptimizer, copy_optimizer_param_metadata
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
+from megatron.core.optimizer.param_norm_constraints import EmbeddingMinNorm, EmbeddingMinNormRecipe
+from megatron.core.tensor_parallel.layers import VocabParallelEmbedding
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import _add_regularization_args
+from tests.unit_tests.test_utilities import Utils
+
+
+def _process_group(name, rank=0):
+    return Mock(
+        spec=torch.distributed.ProcessGroup, group_name=name, rank=lambda: rank, size=lambda: 2
+    )
 
 
 def _fake_distributed_optimizer(
@@ -25,22 +41,147 @@ def _fake_distributed_optimizer(
 ):
     if end is None:
         end = embedding.numel()
-    param_range = SimpleNamespace(start=start, end=end)
-    return SimpleNamespace(
-        config=SimpleNamespace(embedding_min_norm=min_norm),
-        _word_embedding_params=[embedding],
-        _embedding_min_norm_stats=None,
-        model_param_gbuf_map={embedding: object()} if owns_shard else {},
-        data_parallel_group=SimpleNamespace(rank=lambda: data_parallel_rank),
+    embedding.is_word_embedding_parameter = True
+    parameters = [embedding]
+    group = _process_group("dp", data_parallel_rank)
+    optimizer = SimpleNamespace(
+        config=OptimizerConfig(embedding_min_norm=min_norm, use_distributed_optimizer=True),
         distributed_optimizer_instance_id=optimizer_instance_id,
-        _get_model_param_range_map=lambda _: {"param": param_range},
+        optimizer=SimpleNamespace(param_groups=[{"params": parameters}]),
+        buffers=[SimpleNamespace(params=parameters)],
+        _local_param_range=lambda _: (start, end) if owns_shard else (0, 0),
+        data_parallel_group=group,
+        _param_norm_plan=None,
+        _embedding_min_norm_stats=None,
     )
+    if min_norm is not None:
+        setup = ParamNormSetup(
+            [torch.nn.ParameterList(parameters)], EmbeddingMinNormRecipe(min_norm)
+        )
+        setup.bind_to_distrib_optimizer(optimizer, data_parallel_group=group, pg_collection=None)
+        assert setup.error is None
+    return optimizer
 
 
-def _initialize_embedding_min_norm(optimizer):
-    optimizer._embedding_min_norm_states = DistributedOptimizer._build_embedding_min_norm_states(
-        optimizer
+def test_embedding_recipe_selects_trainable_input_and_tied_copy():
+    model = torch.nn.ModuleList([torch.nn.Embedding(2, 3) for _ in range(4)])
+    for table in model[:3]:
+        table.weight.is_word_embedding_parameter = True
+    model[1].weight.shared = True
+    model[2].weight.requires_grad_(False)
+    recipe = EmbeddingMinNormRecipe(0.75)
+    selected = recipe(model)
+    assert {c.parameter for c in selected} == {model[0].weight, model[1].weight}
+
+
+@pytest.fixture
+def ddp_embedding():
+    if not torch.cuda.is_available():
+        pytest.skip("requires the CUDA distributed optimizer")
+    # Exercise DP at two ranks and both TP and DP on larger even-sized launches.
+    tp_size = 2 if Utils.world_size >= 4 and Utils.world_size % 2 == 0 else 1
+    Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+    try:
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=2,
+            tensor_model_parallel_size=tp_size,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            perform_initialization=False,
+        )
+        model = VocabParallelEmbedding(256, 64, init_method=torch.nn.init.zeros_, config=config)
+        torch.nn.init.constant_(model.weight, 1 / 32)
+        model.weight.is_word_embedding_parameter = True
+        yield DistributedDataParallel(
+            config, DistributedDataParallelConfig(use_distributed_optimizer=True), model
+        )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_direct_optimizer_warns_and_skips_embedding_floor(ddp_embedding):
+    weight = ddp_embedding.module.weight
+    config = OptimizerConfig(
+        bf16=True, use_distributed_optimizer=True, embedding_min_norm=1.0, clip_grad=0.0
     )
+    with pytest.warns(UserWarning, match=r"embedding_min_norm.*get_megatron_optimizer\(\)"):
+        optimizer = DistributedOptimizer(
+            torch.optim.AdamW([weight], lr=0.0),
+            config,
+            grad_scaler=None,
+            init_state_fn=None,
+            model_chunks=[ddp_embedding],
+            per_model_buffers={0: ddp_embedding.buffers},
+            data_parallel_group=ddp_embedding.intra_dp_cp_group,
+            data_parallel_group_gloo=None,
+            data_parallel_group_idx=0,
+            distributed_optimizer_instance_id=0,
+        )
+    assert optimizer._param_norm_plan is None
+    weight.main_grad.zero_()
+    assert optimizer.step()[0]
+    # With lr=0, each row should keep its initial norm of 1/4.
+    norms = weight.float().norm(dim=1)
+    torch.testing.assert_close(norms, torch.full_like(norms, 0.25))
+    assert optimizer._consume_embedding_min_norm_stats() is None
+
+
+@pytest.mark.filterwarnings("error:.*embedding_min_norm.*:UserWarning")
+@pytest.mark.parametrize("threshold", [None, 1.0], ids=["disabled", "enabled"])
+def test_embedding_floor_through_optimizer_builder(threshold, ddp_embedding, monkeypatch):
+    """An ordinary optimizer step publishes the projected FP32 masters to the BF16 model."""
+    model = ddp_embedding.module
+
+    if threshold is None:
+        monkeypatch.setattr(
+            "megatron.core.optimizer.ParamNormSetup",
+            lambda *args: pytest.fail("disabled factory created a norm plan"),
+        )
+    lr = 1 / 64
+    config = OptimizerConfig(
+        bf16=True,
+        use_distributed_optimizer=True,
+        lr=lr,
+        adam_beta1=0.0,
+        adam_beta2=0.0,
+        adam_eps=0.0,
+        weight_decay=0.0,
+        clip_grad=0.0,
+        embedding_min_norm=threshold,
+    )
+    optimizer = get_megatron_optimizer(config, [ddp_embedding])
+    # With zero moments, zero epsilon and gradients of ±1, Adam subtracts exactly lr * grad.
+    # Identical inputs on every rank, with distinct rows in each TP and DP shard.
+    signs = torch.randint(2, (256, 64), device="cpu", generator=torch.Generator().manual_seed(17))
+    grad = signs.to(device=model.weight.device, dtype=torch.float32) * 2 - 1
+    vocab = slice(model.vocab_start_index, model.vocab_end_index)
+    model.weight.main_grad.copy_(grad[vocab])
+    assert optimizer.step()[0]
+
+    expected = 1 / 32 - lr * grad
+    if threshold is not None:  # Every row is below the threshold after Adam.
+        expected = 2 * threshold * torch.nn.functional.normalize(expected, dim=1)
+    local = expected[vocab]
+    start, end = optimizer.chained_optimizers[0]._local_param_range(model.weight)
+    if start < end:
+        [master] = optimizer.get_parameters()
+        torch.testing.assert_close(master, local.flatten()[start:end])
+    torch.testing.assert_close(model.weight, local.bfloat16(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "matched, error", [(False, "No optimizer owns.*weight"), (True, "weight.*muon")]
+)
+def test_trainable_embedding_requires_a_supported_owner(matched, error):
+    model = torch.nn.Embedding(2, 3)
+    model.weight.is_word_embedding_parameter = True
+    setup = ParamNormSetup([model], EmbeddingMinNormRecipe(1.0))
+    params = [model.weight] if matched else []
+    setup.ownership([{"params": params}], "layer-wise muon", supported=False)
+    with pytest.raises(ValueError, match=error):
+        setup.validate(None)
 
 
 def test_embedding_min_norm_projects_split_master_shard(monkeypatch):
@@ -64,11 +205,6 @@ def test_embedding_min_norm_projects_split_master_shard(monkeypatch):
         row_sums.add_(remote_sums)
 
     monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
-    monkeypatch.setattr(
-        "megatron.core.optimizer.distrib_optimizer.tensor_parallel.gtp_local_pad_zero_count",
-        lambda *_: 0,
-    )
-    _initialize_embedding_min_norm(optimizer)
 
     DistributedOptimizer._post_optimizer_step(optimizer)
 
@@ -90,11 +226,6 @@ def test_embedding_min_norm_leaves_zero_at_and_above_threshold_unchanged(monkeyp
     optimizer = _fake_distributed_optimizer(embedding, min_norm=1.0)
 
     monkeypatch.setattr(torch.distributed, "all_reduce", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        "megatron.core.optimizer.distrib_optimizer.tensor_parallel.gtp_local_pad_zero_count",
-        lambda *_: 0,
-    )
-    _initialize_embedding_min_norm(optimizer)
 
     DistributedOptimizer._post_optimizer_step(optimizer)
     DistributedOptimizer._post_optimizer_step(optimizer)
@@ -109,7 +240,6 @@ def test_embedding_min_norm_leaves_zero_at_and_above_threshold_unchanged(monkeyp
 def test_embedding_min_norm_nonowner_still_enters_collective(monkeypatch):
     embedding = torch.nn.Parameter(torch.zeros(3, 2, dtype=torch.bfloat16))
     embedding.main_param = None
-    optimizer = _fake_distributed_optimizer(embedding, min_norm=1.0, owns_shard=False)
     calls = []
     padding_calls = 0
 
@@ -124,28 +254,33 @@ def test_embedding_min_norm_nonowner_still_enters_collective(monkeypatch):
 
     monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
     monkeypatch.setattr(
-        "megatron.core.optimizer.distrib_optimizer.tensor_parallel.gtp_local_pad_zero_count",
+        "megatron.core.optimizer.apply_param_norm_constraints.tensor_parallel.gtp_local_pad_zero_count",
         fake_padding,
     )
-    _initialize_embedding_min_norm(optimizer)
+    optimizer = _fake_distributed_optimizer(embedding, min_norm=1.0, owns_shard=False)
 
     DistributedOptimizer._post_optimizer_step(optimizer)
     DistributedOptimizer._post_optimizer_step(optimizer)
 
     assert padding_calls == 1
     assert len(calls) == 2
-    assert calls[0][0] is calls[1][0] is optimizer._embedding_min_norm_states[0].row_sums
+    assert calls[0][0].data_ptr() == calls[1][0].data_ptr()
     torch.testing.assert_close(calls[0][1], torch.zeros(3))
     torch.testing.assert_close(calls[1][1], torch.zeros(3))
     assert all(call[2] is optimizer.data_parallel_group for call in calls)
 
 
-@pytest.mark.parametrize(("data_parallel_rank", "optimizer_instance_id"), [(1, 0), (0, 1)])
-def test_embedding_min_norm_stats_recorded_once_per_model_replica(
-    monkeypatch, data_parallel_rank, optimizer_instance_id
+@pytest.mark.parametrize(
+    "data_parallel_rank,optimizer_instance_id,tied",
+    [(1, 0, False), (0, 1, False), (0, 0, True)],
+    ids=["dp-replica", "optimizer-replica", "tied-pipeline-copy"],
+)
+def test_embedding_min_norm_projects_nonreporting_copies(
+    monkeypatch, data_parallel_rank, optimizer_instance_id, tied
 ):
     embedding = torch.nn.Parameter(torch.zeros(1, 2, dtype=torch.bfloat16))
     embedding.main_param = torch.tensor([0.25, 0.0])
+    embedding.shared = tied
     optimizer = _fake_distributed_optimizer(
         embedding,
         min_norm=1.0,
@@ -153,33 +288,7 @@ def test_embedding_min_norm_stats_recorded_once_per_model_replica(
         optimizer_instance_id=optimizer_instance_id,
     )
     monkeypatch.setattr(torch.distributed, "all_reduce", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        "megatron.core.optimizer.distrib_optimizer.tensor_parallel.gtp_local_pad_zero_count",
-        lambda *_: 0,
-    )
-    _initialize_embedding_min_norm(optimizer)
-
     DistributedOptimizer._post_optimizer_step(optimizer)
-
-    torch.testing.assert_close(embedding.main_param, torch.tensor([2.0, 0.0]))
-    assert DistributedOptimizer._consume_embedding_min_norm_stats(optimizer) is None
-
-
-def test_embedding_min_norm_projects_tied_copy_without_recounting_it(monkeypatch):
-    """A tied copy on another pipeline stage is projected, but its rows are not counted twice."""
-    embedding = torch.nn.Parameter(torch.zeros(1, 2, dtype=torch.bfloat16))
-    embedding.main_param = torch.tensor([0.25, 0.0])
-    embedding.shared = True
-    optimizer = _fake_distributed_optimizer(embedding, min_norm=1.0)
-    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        "megatron.core.optimizer.distrib_optimizer.tensor_parallel.gtp_local_pad_zero_count",
-        lambda *_: 0,
-    )
-    _initialize_embedding_min_norm(optimizer)
-
-    DistributedOptimizer._post_optimizer_step(optimizer)
-
     torch.testing.assert_close(embedding.main_param, torch.tensor([2.0, 0.0]))
     assert DistributedOptimizer._consume_embedding_min_norm_stats(optimizer) is None
 
@@ -188,14 +297,12 @@ def test_embedding_min_norm_excludes_complete_gtp_padding_rows(monkeypatch):
     full_master = torch.tensor([[0.25, 0.0], [2.0, 0.0], [0.1, 0.2]], dtype=torch.float32)
     embedding = torch.nn.Parameter(torch.zeros_like(full_master, dtype=torch.bfloat16))
     embedding.main_param = full_master.flatten().clone()
-    optimizer = _fake_distributed_optimizer(embedding, min_norm=1.0)
 
     monkeypatch.setattr(torch.distributed, "all_reduce", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        "megatron.core.optimizer.distrib_optimizer.tensor_parallel.gtp_local_pad_zero_count",
-        lambda *_: embedding.shape[1],
-    )
-    _initialize_embedding_min_norm(optimizer)
+    embedding.group = _process_group("gtp", rank=1)
+    embedding.is_gtp_weight_remat = True
+    embedding.pad_length = 1
+    optimizer = _fake_distributed_optimizer(embedding, min_norm=1.0)
 
     DistributedOptimizer._post_optimizer_step(optimizer)
 
@@ -286,6 +393,8 @@ def test_overflow_skips_optimizer_step_and_post_transform():
 
 @pytest.mark.parametrize("value", [0.0, -1.0, float("inf"), float("nan")])
 def test_embedding_min_norm_rejects_nonpositive_or_nonfinite_values(value):
+    with pytest.raises(ValueError, match="finite positive"):
+        EmbeddingMinNorm(value)
     with pytest.raises(ValueError, match="finite positive"):
         OptimizerConfig(embedding_min_norm=value).validate()
 

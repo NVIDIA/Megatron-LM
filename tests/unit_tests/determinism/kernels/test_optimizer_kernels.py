@@ -17,9 +17,18 @@ from megatron.core.optimizer import (
     _get_param_groups,
     get_standard_config_overrides,
 )
+from megatron.core.optimizer.apply_param_norm_constraints import (
+    ParamNormPlan,
+    bind_param_norm_constraint,
+)
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32, get_grad_norm_fp32
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.param_norm_constraints import (
+    EmbeddingMinNorm,
+    EmbeddingMinNormStats,
+    ParamNormConstraint,
+)
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.training.tensor_metrics.definitions import L2NormMetric, _fused_l2_norm_impl
 from megatron.training.utils.common_utils import _get_param_data
@@ -305,26 +314,20 @@ def test_embedding_min_norm_projection_replays(monkeypatch, end_in_padding):
     end = (full_master.numel() if end_in_padding else valid_numel) - row_width // 5
     shard = full_master.flatten()[start:end].clone()
 
-    embedding = torch.nn.Parameter(
-        torch.zeros_like(full_master, dtype=torch.bfloat16), requires_grad=False
+    embedding = torch.nn.Parameter(torch.zeros_like(full_master, dtype=torch.bfloat16))
+    collector = EmbeddingMinNormStats()
+    # Replay the local shard with an identity reduction across data-parallel ranks.
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *_args, **_kwargs: None)
+    embedding.is_gtp_weight_remat = True
+    embedding.group = SimpleNamespace(rank=lambda: 1, size=lambda: 2)
+    embedding.pad_length = padding_rows
+    entry = bind_param_norm_constraint(
+        ParamNormConstraint.rows(embedding, EmbeddingMinNorm(min_norm, stats=collector)),
+        local_range=lambda _: (start, end),
+        data_parallel_group=SimpleNamespace(rank=lambda: 0),
     )
     optimizer = SimpleNamespace(
-        config=SimpleNamespace(embedding_min_norm=min_norm),
-        _word_embedding_params=[embedding],
-        _embedding_min_norm_stats=None,
-        model_param_gbuf_map={embedding: object()},
-        data_parallel_group=SimpleNamespace(rank=lambda: 0),
-        distributed_optimizer_instance_id=0,
-        _get_model_param_range_map=lambda _: {"param": SimpleNamespace(start=start, end=end)},
-    )
-    # A single data-parallel rank owns the whole shard, so the row-sum all-reduce is identity.
-    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        "megatron.core.optimizer.distrib_optimizer.tensor_parallel.gtp_local_pad_zero_count",
-        lambda *_: padding_rows * row_width,
-    )
-    optimizer._embedding_min_norm_states = DistributedOptimizer._build_embedding_min_norm_states(
-        optimizer
+        _param_norm_plan=ParamNormPlan((entry,)), _embedding_min_norm_stats=collector
     )
 
     def fn(master):
@@ -343,6 +346,8 @@ def test_embedding_min_norm_projection_replays(monkeypatch, end_in_padding):
     )
     projected, stats = fn(shard)
     assert stats[0].item() == num_rows - 4  # Every nonzero row below the threshold.
+    # Row 2 has one positive element, so its projected value equals the target norm.
+    assert projected[2 * row_width + row_width // 2 - start].item() == 2 * min_norm
     unchanged = torch.zeros(num_rows + padding_rows, dtype=torch.bool, device="cuda")
     unchanged[[0, 1, 3, 4]] = True
     unchanged[num_rows:] = True
