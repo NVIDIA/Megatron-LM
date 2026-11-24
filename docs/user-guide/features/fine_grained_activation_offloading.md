@@ -58,8 +58,8 @@ are not force-released; evaluation and no-grad execution bypass the scope.
 
 Selective `gdn_norm_out` recomputation and native pre-GDR fusion are supported.
 GDN2, FP8/NVFP4, other recurrence backends, full recomputation and CUDA graphs are
-rejected. See [GDN recurrence activation offloading](../../developer/gdn_activation_offloading.md)
-for configuration and the scope of validation.
+rejected. Enable this scope with `--fine-grained-activation-offloading --offload-modules gdn_core_attn`.
+Set `NVTE_CPU_OFFLOAD_V1=1` with Transformer Engine 2.10 or newer.
 
 ### Tuning Parameters
 
