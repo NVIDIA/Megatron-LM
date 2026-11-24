@@ -43,6 +43,7 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import unwrap_model
 from megatron.training.checkpointing import preprocess_fsdp_dtensor_state_dict
@@ -495,7 +496,10 @@ def test_metadata_attach_issues_no_collectives(
 
 
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
-def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_size):
+@pytest.mark.parametrize("mixed_precision_wrapper", [False, True], ids=["bare", "bf16-wrapper"])
+def test_ep_fsdp_checkpoint_roundtrip(
+    distributed_setup, tmp_path_dist_ckpt, ep_size, mixed_precision_wrapper
+):
     """MCore checkpoint save/load reproduces uninterrupted BF16 MoE training.
 
     Use MCore's existing global expert names and optimizer checkpoint format.
@@ -544,6 +548,8 @@ def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_
                 hybrid_layer_pattern="*E",
                 pg_collection=groups,
             ).cuda()
+            if mixed_precision_wrapper:
+                model = Float16Module(config, model)
             model = FullyShardedDataParallel(
                 config=config,
                 ddp_config=DistributedDataParallelConfig(
