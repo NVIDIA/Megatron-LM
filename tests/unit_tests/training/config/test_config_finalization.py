@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import TransformerConfig
 from megatron.training import global_vars
@@ -16,6 +17,8 @@ from megatron.training.config import (
     InferenceSetupConfig,
     RLConfig,
 )
+from megatron.training.config.dataset_config import DataConfig
+from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDatasetConfig
 from megatron.training.models import (
     BertModelConfig,
     GPTModelConfig,
@@ -25,6 +28,144 @@ from megatron.training.models import (
     T5ModelConfig,
 )
 from megatron.training.models.base import ModelConfig
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_dataset_content_limit_and_execution_bound_are_distinct(run_config, packed):
+    cfg = run_config
+    cfg.train.micro_batch_size = 1
+    cfg.model.seq_length = 64
+    cfg.model.transformer.max_seq_length_per_sample = 32 if packed else None
+    cfg.data = DataConfig(
+        dataset=(SFTDatasetConfig if packed else GPTDatasetConfig)(
+            random_seed=1234,
+            sequence_length=8,
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
+        ),
+        dataset_type=MockSFTDataset if packed else MockGPTDataset,
+    )
+    before = copy.deepcopy(cfg.to_dict())
+    cfg.validate()
+    assert cfg.to_dict() == before
+    if packed:
+        assert cfg.data.dataset.packed_sequence_length is None
+    else:
+        assert not hasattr(cfg.data.dataset, "packed_sequence_length")
+    cfg.finalize()
+    assert cfg.data.dataset.sequence_length == 8
+    assert cfg.model.transformer.max_seq_length_per_sample == (32 if packed else 8)
+    saved = cfg.to_dict()
+    restored = type(cfg).from_dict(saved)
+    restored.finalize()
+    assert type(restored.data.dataset) is (SFTDatasetConfig if packed else GPTDatasetConfig)
+    assert restored.model.transformer.max_seq_length_per_sample == (32 if packed else 8)
+    assert restored.to_dict() == saved
+
+
+@pytest.mark.parametrize("position_embedding_type", ["learned_absolute", "rope", "relative"])
+def test_t5_input_widths_do_not_follow_position_capacity(position_embedding_type):
+    model = T5ModelConfig(
+        transformer=TransformerConfig(
+            num_layers=2, hidden_size=32, num_attention_heads=4, max_seq_length_per_sample=32
+        ),
+        seq_length=128,
+        encoder_num_layers=2,
+        encoder_seq_length=16,
+        decoder_seq_length=32,
+        position_embedding_type=position_embedding_type,
+    )
+    model.validate()
+    model.finalize()
+    assert model.encoder_seq_length == 16
+    assert model.transformer.max_seq_length_per_sample == 32
+    model.seq_length = 16
+    if position_embedding_type == "learned_absolute":
+        with pytest.raises(ValueError, match="position capacity.*decoder_seq_length"):
+            model.validate()
+        model.encoder_seq_length = None
+        with pytest.raises(ValueError, match="position capacity.*encoder_seq_length"):
+            model.validate()
+        model.encoder_seq_length = 16
+    else:
+        model.validate()
+    model.seq_length = 128
+    model.transformer.max_seq_length_per_sample = 16
+    with pytest.raises(ValueError, match="decoder_seq_length"):
+        model.validate()
+
+
+def test_bert_callback_validates_learned_position_capacity(run_config):
+    run_config.model = BertModelConfig(transformer=run_config.model.transformer, seq_length=32)
+    run_config.model.transformer.max_seq_length_per_sample = 64
+    assert run_config.data.dataset is None
+    with pytest.raises(ValueError, match="BERT position capacity"):
+        run_config.validate()
+    run_config.model.seq_length = 128
+    before = copy.deepcopy(run_config.to_dict())
+    run_config.validate()
+    assert run_config.to_dict() == before
+
+
+def test_llava_requires_the_language_execution_width():
+    """The resolved text + image + padding width is an input; the container never derives it
+    from the text-only dataset length."""
+    transformer = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
+    model = LLaVAModelConfig(transformer=transformer, seq_length=32)
+    with pytest.raises(ValueError, match="requires transformer.max_seq_length_per_sample"):
+        model.validate()
+    transformer.max_seq_length_per_sample = 64
+    with pytest.raises(ValueError, match="LLaVA position capacity"):
+        model.validate()
+    model.position_embedding_type = "rope"
+    model.validate()
+
+
+@pytest.mark.parametrize(
+    "bound,capacity,error", [(33, 64, "alignment"), (64, 32, "position capacity"), (32, 64, None)]
+)
+def test_sft_pack_validates_physical_shape(run_config, bound, capacity, error):
+    cfg = run_config
+    cfg.model.seq_length = capacity
+    cfg.model.position_embedding_type = "learned_absolute"
+    cfg.model.transformer.max_seq_length_per_sample = bound
+    cfg.model.transformer.context_parallel_size = 2
+    cfg.data = DataConfig(
+        dataset=SFTDatasetConfig(
+            random_seed=1234,
+            sequence_length=9,
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
+        ),
+        dataset_type=MockSFTDataset,
+    )
+    if error is None:
+        # Conversation truncation need not align; the emitted pack must.
+        cfg.validate()
+    else:
+        with pytest.raises(ValueError, match=error):
+            cfg.validate()
+
+
+def test_legacy_sft_config_requires_matching_execution_width(run_config):
+    cfg = run_config
+    cfg.model.transformer.max_seq_length_per_sample = 32
+    cfg.data = DataConfig(
+        dataset=GPTDatasetConfig(
+            random_seed=1234,
+            sequence_length=16,
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
+        ),
+        dataset_type=MockSFTDataset,
+    )
+    with pytest.raises(ValueError, match="Use SFTDatasetConfig"):
+        cfg.validate()
+    cfg.model.transformer.max_seq_length_per_sample = 16
+    cfg.validate()
 
 
 @pytest.mark.parametrize("inference", [False, True])
@@ -159,6 +300,7 @@ def test_optimizer_recipe_warning_only_for_conflicts(run_config, caplog, old_rec
 )
 def test_optimizer_validation_uses_model_precision(run_config, model_recipe, optimizer_recipe):
     run_config.train.micro_batch_size = 1
+    run_config.model.transformer.fp8 = "hybrid"
     run_config.model.transformer.fp8_recipe = model_recipe
     run_config.optimizer.fp8_recipe = optimizer_recipe
     run_config.optimizer.optimizer_cpu_offload = True
@@ -194,8 +336,11 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
     run_config.train.global_batch_size = 8
     run_config.rl = RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
     if invalid_policy == "ddp_offload":
+        transformer.fp8 = "hybrid"
         run_config.ddp.fp8_param_gather = True
-        run_config.ddp.reuse_grad_buf_for_mxfp8_param_ag = True
+        # Validate optimizer policy before the DDP mirrors are finalized.
+        run_config.ddp.reuse_grad_buf_for_mxfp8_param_ag = False
+        run_config.optimizer.reuse_grad_buf_for_mxfp8_param_ag = True
         error, message = ValueError, "parameters share the gradient-buffer storage"
     else:
         # Native recipes can edit model layout before startup; validate it before RNG derivation.
@@ -220,6 +365,7 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
     # A rejected configuration remains editable and can be finalized after correction.
     if invalid_policy == "ddp_offload":
         run_config.ddp.reuse_grad_buf_for_mxfp8_param_ag = False
+        run_config.optimizer.reuse_grad_buf_for_mxfp8_param_ag = False
     else:
         transformer.virtual_pipeline_model_parallel_size = 2
     run_config.finalize()
@@ -258,6 +404,7 @@ def test_finalization_resolves_layer_wise_ddp_flag(
     run_config.optimizer.optimizer = optimizer
     run_config.optimizer.use_distributed_optimizer = use_distributed_optimizer
     run_config.optimizer.use_layer_wise_distributed_optimizer = use_layer_wise_distributed_optimizer
+    run_config.optimizer.use_layer_wise_param_layout = use_layer_wise_param_layout
     run_config.ddp.use_distributed_optimizer = use_distributed_optimizer
 
     run_config.finalize()
@@ -265,9 +412,81 @@ def test_finalization_resolves_layer_wise_ddp_flag(
     layer_wise = optimizer in ("muon", "dist_muon")
     assert run_config.optimizer.use_layer_wise_distributed_optimizer is layer_wise
     assert run_config.optimizer.use_distributed_optimizer is (not layer_wise)
-    # Layout-enabled wrapping opts back into DistOpt buffers later; finalization
-    # must preserve the legacy baseline for either layout setting.
-    assert run_config.ddp.use_distributed_optimizer is (not layer_wise)
+    # Resolve the wrapper's reduce-scatter layout before model construction.
+    assert run_config.ddp.use_distributed_optimizer is (
+        not layer_wise or use_layer_wise_param_layout
+    )
+
+
+@pytest.mark.parametrize(
+    "version, disable_symmetric_registration, model_overrides",
+    [(1, False, True), (1, True, True), (2, False, True), (2, False, False)],
+)
+def test_megatron_fsdp_finalization(
+    monkeypatch, run_config, caplog, version, disable_symmetric_registration, model_overrides
+):
+    monkeypatch.delenv("CUDA_DEVICE_MAX_CONNECTIONS", raising=False)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(batch_parallel_size=1))
+    transformer = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
+    transformer.gradient_accumulation_fusion = model_overrides
+    transformer.deallocate_pipeline_outputs = model_overrides
+    run_config.model = GPTModelConfig(transformer=transformer, vocab_size=128, seq_length=16)
+    run_config.train.micro_batch_size = 1
+    run_config.checkpoint.ckpt_format = "fsdp_dtensor"
+    ddp = run_config.ddp
+    ddp.use_megatron_fsdp = True
+    ddp.megatron_fsdp_version = version
+    ddp.nccl_ub = True
+    ddp.disable_symmetric_registration = disable_symmetric_registration
+    ddp.average_in_collective = True
+    ddp.overlap_grad_reduce = True
+    run_config.optimizer.use_distributed_optimizer = True
+    run_config.optimizer.overlap_param_gather = True
+
+    for _ in range(2):
+        before = copy.deepcopy(run_config.to_dict())
+        run_config.validate()
+        assert run_config.to_dict() == before
+        run_config.finalize()
+        assert not ddp.use_custom_fsdp
+        assert ddp.fsdp_manual_registration is (version == 1)
+        assert ddp.fsdp_double_buffer is (version == 1)
+        assert ddp.average_in_collective is (version != 1 or disable_symmetric_registration)
+        assert ddp.use_distributed_optimizer is (version == 1)
+        assert run_config.optimizer.use_distributed_optimizer is (version == 1)
+        assert ddp.overlap_grad_reduce is (version == 1)
+        assert ddp.overlap_param_gather is (version == 1)
+        assert run_config.optimizer.overlap_param_gather is (version == 1)
+        if version == 2:
+            assert not transformer.gradient_accumulation_fusion
+            assert not transformer.deallocate_pipeline_outputs
+            assert not ddp.fsdp_all_gather_in_start_param_sync
+    for field in ("gradient_accumulation_fusion", "deallocate_pipeline_outputs"):
+        warnings = [
+            message
+            for message in caplog.messages
+            if f"Disabling model.transformer.{field}" in message
+        ]
+        assert len(warnings) == int(version == 2 and model_overrides)
+
+
+@pytest.mark.parametrize("expert_override", [None, "no_shard"])
+def test_ddp_finalization_respects_recipe_edits(run_config, expert_override):
+    ddp = run_config.ddp
+    ddp.expert_data_parallel_sharding_strategy = expert_override
+    ddp.data_parallel_sharding_strategy = "optim_grads_params"
+    ddp.outer_dp_sharding_strategy = "optim"
+    ddp.megatron_fsdp_max_pool_double_buffer = True
+    before = copy.deepcopy(run_config.to_dict())
+    ddp.validate()
+    assert run_config.to_dict() == before
+    ddp.finalize()
+    assert ddp.expert_data_parallel_sharding_strategy == (expert_override or "optim_grads_params")
+    assert ddp.expert_outer_dp_sharding_strategy == "optim"
+    assert ddp.fsdp_double_buffer
+    resolved = copy.deepcopy(run_config.to_dict())
+    ddp.finalize()
+    assert run_config.to_dict() == resolved
 
 
 @pytest.mark.parametrize("storage", ["dict", "yaml"])
@@ -293,6 +512,9 @@ def test_serialization_starts_a_new_lifecycle(
     if isinstance(run_config.model, ModelConfig):
         # Preserve builder metadata without treating it as a constructor keyword.
         run_config.model.builder = "megatron.training.models.gpt.GPTModelBuilder"
+    if model_cls is LLaVAModelConfig:
+        # The application resolves the language execution width before building the container.
+        run_config.model.transformer.max_seq_length_per_sample = 16
     run_config.train.micro_batch_size = 1
     run_config.finalize()
     # Training attaches live objects to the transformer; checkpoint metadata must omit them.
@@ -411,3 +633,39 @@ def test_tracker_iterations_are_merged_once_without_mutating_cli(monkeypatch, ru
     restored = type(run_config).from_dict(run_config.to_dict())
     restored.finalize()
     assert restored.train.iterations_to_skip == [1, 3, 5]
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize(
+    "policy,expected", [("automatic", 40000000), ("count", 4096), ("size", 1024)]
+)
+def test_ddp_bucket_resolution_is_idempotent_and_round_trips(
+    run_config, tmp_path, overlap, policy, expected
+):
+    from megatron.core.distributed import DistributedDataParallelConfig
+
+    with pytest.raises(AssertionError, match="Cannot specify both"):
+        DistributedDataParallelConfig(num_buckets=2, bucket_size=1024).validate()
+    run_config.ddp = DistributedDataParallelConfig(
+        overlap_grad_reduce=overlap,
+        num_buckets=2 if policy == "count" else None,
+        bucket_size=1024 if policy == "size" else None,
+    )
+    ddp = run_config.ddp
+    for _ in range(2):
+        ddp.resolve_bucket_size(num_parameters=8192, data_parallel_size=2)
+        ddp.validate()
+        assert ddp._bucket_size_resolved
+        assert ddp.bucket_size == (expected if overlap else None)
+    path = str(tmp_path / "run_config.yaml")
+    run_config.to_yaml(path)
+    restored = type(run_config).from_yaml(path)
+    assert restored.ddp._bucket_size_resolved
+    restored.ddp.validate()
+    restored.ddp.resolve_bucket_size(num_parameters=8192, data_parallel_size=2)
+    assert restored.to_dict()["ddp"] == run_config.to_dict()["ddp"]
+    if policy == "count":
+        # A restored count remains authoritative when rebuilding wrappers for a new run.
+        restored.ddp.num_buckets = 4
+        restored.ddp.resolve_bucket_size(num_parameters=8192, data_parallel_size=2)
+        assert restored.ddp.bucket_size == (2048 if overlap else None)
