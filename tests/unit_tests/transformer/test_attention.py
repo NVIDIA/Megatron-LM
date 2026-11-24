@@ -162,25 +162,22 @@ class TestParallelAttention:
         self.parallel_attention.config.rotary_interleaved = rotary_interleaved
         self.parallel_attention.config.fused_single_qkv_rope = fused_qkv_rope
         config = self.parallel_attention.config
-        sequence_length = 8
-        micro_batch_size = 1
+        sequence_length = 32
+        micro_batch_size = 2
 
-        self.parallel_attention.cuda().float().eval()
+        self.parallel_attention.cuda()
 
         # [sequence length, batch size, hidden size]
-        hidden_states = torch.randn(
+        hidden_states = torch.ones(
             (sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size),
-            device="cuda",
-            requires_grad=True,
+            dtype=torch.bfloat16,
         )
+        hidden_states = hidden_states.cuda()
 
-        attention_mask = torch.zeros((micro_batch_size, 1, 1, sequence_length), dtype=bool).cuda()
-        rotary_pos_emb = RotaryEmbedding(
-            config.kv_channels,
-            rotary_percent=1.0,
-            rotary_interleaved=rotary_interleaved,
-            cp_group=self.parallel_attention.pg_collection.cp,
-        )(sequence_length)
+        attention_mask = torch.ones((micro_batch_size, 1, 1, sequence_length), dtype=bool).cuda()
+        rotary_pos_emb = torch.ones(
+            sequence_length, 1, 1, self.parallel_attention.config.kv_channels
+        ).cuda()
         output, bias = self.parallel_attention(
             hidden_states, attention_mask, rotary_pos_emb=rotary_pos_emb
         )
@@ -191,25 +188,33 @@ class TestParallelAttention:
         assert output.shape[2] == config.hidden_size
         assert bias.shape[0] == config.hidden_size
 
-        if not fused_qkv_rope:
-            return
-        upstream = torch.randn_like(output)
-        grad_inputs = (hidden_states, *self.parallel_attention.parameters())
-        actual = (output, *torch.autograd.grad(output + bias, grad_inputs, upstream))
-        # Replay single-QKV fusion, then compare with split/unfused RoPE.
-        for fused in (True, False):
-            config.fused_single_qkv_rope = config.apply_rope_fusion = fused
-            out, bias = self.parallel_attention(
-                hidden_states, attention_mask, rotary_pos_emb=rotary_pos_emb
-            )
-            expected = (out, *torch.autograd.grad(out + bias, grad_inputs, upstream))
-            if fused:
-                for x, y in zip(actual, expected):
-                    assert torch.equal(
-                        x.contiguous().view(torch.uint8), y.contiguous().view(torch.uint8)
-                    )
-            else:
-                torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+        if fused_qkv_rope:
+            # Nonuniform inputs/frequencies expose the rotary layout in outputs and gradients.
+            self.parallel_attention.float().eval()
+            x = torch.randn_like(hidden_states, dtype=torch.float32).requires_grad_()
+            rope = RotaryEmbedding(
+                config.kv_channels,
+                1.0,
+                rotary_interleaved,
+                cp_group=self.parallel_attention.pg_collection.cp,
+            )(sequence_length)
+            upstream = torch.randn_like(x)
+            grad_inputs = (x, *self.parallel_attention.parameters())
+            results = []
+            for fused in (True, True, False):  # Fused replay, then split/unfused reference.
+                config.fused_single_qkv_rope = config.apply_rope_fusion = fused
+                out, bias = self.parallel_attention(
+                    x, torch.zeros_like(attention_mask), rotary_pos_emb=rope
+                )
+                results.append((out, *torch.autograd.grad(out + bias, grad_inputs, upstream)))
+            for actual, replay in zip(results[0], results[1]):
+                assert torch.equal(
+                    actual.contiguous().view(torch.uint8), replay.contiguous().view(torch.uint8)
+                )
+            torch.testing.assert_close(results[0], results[2], rtol=1e-4, atol=1e-4)
+
+        self.parallel_attention.config.apply_rope_fusion = False
+        self.parallel_attention.config.rotary_interleaved = False
 
     def test_checkpointed_gpu_forward(self):
         transformer_config = self.transformer_config

@@ -202,9 +202,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "Packed SelfAttention dispatch through RoPE and TE attention is replayed with runtime "
         "CP1/CP2/CP4, including input/parameter gradients and CP-state restoration, in "
         "test_runtime_cp_attention.py. The dynamic-inference flash_decode_and_prefill "
-        "dispatch (FA2 prefill/decode) is replayed there with a config-driven softmax_scale. "
-        "test_attention.py compares and replays single-QKV RoPE in both rotary layouts, "
-        "including input and parameter gradients.",
+        "dispatch (FA2 prefill/decode) is replayed there with a config-driven softmax_scale.",
     ),
     KernelEntry(
         name="fused_vocab_parallel_cross_entropy",
