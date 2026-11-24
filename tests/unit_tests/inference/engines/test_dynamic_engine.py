@@ -1803,16 +1803,16 @@ class DynamicInferenceEngineTestBase:
             ).cuda()
         elif test_config.model_provider == "hybrid":
             is_gdn = test_config.ssm_mixer == "gdn"
+            # An explicit test-config value overrides the mixer's own deterministic_mode choice
+            # (e.g. GDN turns it off); merge into one dict to avoid duplicate kwargs.
+            hybrid_kwargs = hybrid_mixer_kwargs(test_config.ssm_mixer)
+            if test_config.deterministic_mode is not None:
+                hybrid_kwargs["deterministic_mode"] = test_config.deterministic_mode
             pp_size = test_config.pipeline_model_parallel_size
             # Transformer config.
             transformer_config = TransformerConfig(
                 params_dtype=torch.bfloat16,
                 flash_attention_version=test_config.flash_attention_version,
-                **(
-                    {}
-                    if test_config.deterministic_mode is None
-                    else {"deterministic_mode": test_config.deterministic_mode}
-                ),
                 num_layers=(
                     3 if pp_size == 1 else 6
                 ),  # 1 Mamba layer, 1 attention layer, 1 MLP layer
@@ -1823,7 +1823,7 @@ class DynamicInferenceEngineTestBase:
                 ),
                 moe_router_dtype=test_config.moe_router_dtype,
                 hidden_size=256,  # The Mamba layer places several constraints on this
-                **hybrid_mixer_kwargs(test_config.ssm_mixer),
+                **hybrid_kwargs,
                 num_attention_heads=16,
                 linear_conv_kernel_dim=4,
                 linear_key_head_dim=32,
