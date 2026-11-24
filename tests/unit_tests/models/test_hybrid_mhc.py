@@ -479,6 +479,7 @@ class TestHybridStackMHC:
         assert output.shape == hidden_states.shape
         assert all(isinstance(layer, HyperConnectionHybridLayer) for layer in stack.layers)
         assert all(isinstance(layer.inner_layer, TransformerLayer) for layer in stack.layers)
+        assert stack.layers[0].inner_layer.attn_norm_manager is None
         output.float().sum().backward()
         assert hidden_states.grad is not None
         assert all(
