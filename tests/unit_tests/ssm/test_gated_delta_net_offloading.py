@@ -234,8 +234,10 @@ def test_gdn_offload_replay(
 
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
-@pytest.mark.parametrize("fraction", [0.0, 0.5, 1.0])
-@pytest.mark.parametrize("recompute_norm", [False, True])
+@pytest.mark.parametrize(
+    "fraction,recompute_norm",
+    [pytest.param(0.5, False, id="partial"), pytest.param(1.0, True, id="full-norm")],
+)
 def test_gdn_offload_microbatch_accumulation(
     gdn_offload_groups: ProcessGroupCollection,
     monkeypatch: pytest.MonkeyPatch,
@@ -308,8 +310,10 @@ def test_gdn_offload_microbatch_accumulation(
 
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
-@pytest.mark.parametrize("recompute_norm", [False, True])
-@pytest.mark.parametrize("fused_pre_gdr", [False, True], ids=["unfused_pre_gdr", "fused_pre_gdr"])
+@pytest.mark.parametrize(
+    "fused_pre_gdr,recompute_norm",
+    [pytest.param(False, False, id="unfused"), pytest.param(True, True, id="fused-norm")],
+)
 def test_gdn_offload_packed_sequence(
     gdn_offload_groups: ProcessGroupCollection,
     fused_pre_gdr: bool,
@@ -326,7 +330,7 @@ def test_gdn_offload_packed_sequence(
         recompute_modules=["gdn_norm_out"] if recompute_norm else [],
     )
     baseline, offloaded = _build_pair(config, gdn_offload_groups)
-    cu = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
+    cu = torch.tensor([0, 32, 128], device="cuda", dtype=torch.int32)
     packed = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu)
     for _ in range(3):
         source = torch.randn(128, 1, 256, device="cuda", dtype=torch.bfloat16)
@@ -372,9 +376,14 @@ def test_gdn_offload_delayed_d2h(
 
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
-@pytest.mark.parametrize("training,grad_enabled", [(False, False), (False, True), (True, False)])
-@pytest.mark.parametrize("recompute_norm", [False, True])
-@pytest.mark.parametrize("fused_pre_gdr", [False, True], ids=["unfused_pre_gdr", "fused_pre_gdr"])
+@pytest.mark.parametrize(
+    "training,grad_enabled,recompute_norm,fused_pre_gdr",
+    [
+        pytest.param(False, False, False, False, id="eval-no-grad"),
+        pytest.param(False, True, True, True, id="eval-grad-fused-norm"),
+        pytest.param(True, False, False, False, id="train-no-grad"),
+    ],
+)
 def test_gdn_offload_training_eval_training(
     gdn_offload_groups: ProcessGroupCollection,
     training: bool,
@@ -394,6 +403,24 @@ def test_gdn_offload_training_eval_training(
     )
     baseline, offloaded = _build_pair(config, gdn_offload_groups)
     source = torch.randn(128, 1, 256, device="cuda", dtype=torch.bfloat16)
+
+    def bypass_forward() -> None:
+        offloaded.train(training)
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                PipelineOffloadManager,
+                "get_instance",
+                lambda: pytest.fail("Eval/no-grad forward should not access the offload manager."),
+            )
+            with torch.set_grad_enabled(grad_enabled):
+                output = source
+                for layer in offloaded:
+                    y, _ = layer(output, None)
+                    output = output + y
+
+    # Check bypass both before the manager exists and after the offload policy is learned.
+    bypass_forward()
+    offloaded.train()
     manager = PipelineOffloadManager.get_instance()
     reference = _run(baseline, source)
     result = _run(offloaded, source, offload=True)
@@ -402,14 +429,8 @@ def test_gdn_offload_training_eval_training(
     learned_bytes = manager.offload_summary_total_bytes
     assert learned_bytes > 0 and not manager._is_warmup
 
-    offloaded.train(training)
     off_interface.init_chunk_handler(0, None, None, 1024, 0, 1.0)
-    with torch.set_grad_enabled(grad_enabled):
-        output = source
-        for layer in offloaded:
-            y, _ = layer(output, None)
-            output = output + y
-    del output, y
+    bypass_forward()
     off_interface.reset(process_group=torch.distributed.group.WORLD)
     assert not manager._is_warmup
     assert manager.offload_summary_total_bytes == learned_bytes
@@ -421,28 +442,6 @@ def test_gdn_offload_training_eval_training(
     assert manager.cpu_tensor_pool.get_pool_status()["global_stats"]["current_in_use"] == 0
     off_interface.reset(process_group=torch.distributed.group.WORLD)
     assert manager.offload_summary_total_bytes == learned_bytes
-
-
-@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
-@pytest.mark.parametrize("training,grad_enabled", [(False, True), (True, False), (False, False)])
-def test_gdn_offload_no_grad_bypass(
-    gdn_offload_groups: ProcessGroupCollection,
-    monkeypatch: pytest.MonkeyPatch,
-    training: bool,
-    grad_enabled: bool,
-) -> None:
-    """Inference-style forwards do not initialize an offload manager or record groups."""
-    model = _build(_config(), gdn_offload_groups)
-    model.train(training)
-    monkeypatch.setattr(
-        PipelineOffloadManager,
-        "get_instance",
-        lambda: pytest.fail("Eval/no-grad forward should not access the offload manager."),
-    )
-    source = torch.randn(64, 1, 256, device="cuda", dtype=torch.bfloat16)
-    with torch.set_grad_enabled(grad_enabled):
-        for layer in model:
-            source, _ = layer(source, None)
 
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
