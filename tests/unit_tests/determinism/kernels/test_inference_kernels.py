@@ -136,6 +136,21 @@ def test_flashinfer_clamped_relu2_replays(precision, ep_rank):
         execution_weights.append(
             prepare_cutlass_mxfp8_weights(weights) if precision == "mxfp8" else weights
         )
+    if precision == "bf16":
+        # Exercise native packing from per-expert IPC views before the real FlashInfer
+        # forward and CUDA graph replay below. The original weight tensors are the oracle.
+        packed = torch.nn.Module()
+        packed.num_local_experts = local_experts
+        for name, stack in zip(("linear_fc1", "linear_fc2"), canonical_weights):
+            linear = torch.nn.Module()
+            for i, view in enumerate(stack.unbind()):
+                linear.register_parameter(f"weight{i}", torch.nn.Parameter(view))
+            packed.add_module(name, linear)
+        InferenceGroupedMLP._build_concatenated_weights(packed)
+        execution_weights = [packed._fc1_weight, packed._fc2_weight]
+        assert all(
+            a.data_ptr() == b.data_ptr() for a, b in zip(execution_weights, canonical_weights)
+        )
     clamp_scale = 0.5
     module = SimpleNamespace(
         _uses_mxfp8_weights=precision == "mxfp8",

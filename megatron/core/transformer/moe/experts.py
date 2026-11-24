@@ -1,4 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Portions adapted from NVIDIA-NeMo/RL under Apache-2.0.
+# https://github.com/NVIDIA-NeMo/RL/tree/34dd6b3b4f8f108554ec0c9312d83ba7e639da9d
 from __future__ import annotations
 
 import functools
@@ -1414,6 +1416,33 @@ class TEGroupedMLP(MegatronModule):
         self.linear_fc1.backward_dw()
 
 
+def _contiguous_expert_stack(weights: list[torch.Tensor]) -> torch.Tensor | None:
+    """Return a view when equally shaped experts already share packed storage."""
+    if not weights:
+        return None
+    first = weights[0]
+    if (
+        type(first) not in (torch.Tensor, torch.nn.Parameter)
+        or first.ndim != 2
+        or first.dtype not in (torch.bfloat16, torch.float16, torch.float32)
+    ):
+        return None
+    storage = first.untyped_storage()
+    for index, weight in enumerate(weights):
+        if (
+            type(weight) not in (torch.Tensor, torch.nn.Parameter)
+            or weight.shape != first.shape
+            or weight.dtype != first.dtype
+            or weight.device != first.device
+            or not weight.is_contiguous()
+            or weight.untyped_storage().data_ptr() != storage.data_ptr()
+            or weight.untyped_storage().nbytes() != storage.nbytes()
+            or weight.storage_offset() != first.storage_offset() + index * first.numel()
+        ):
+            return None
+    return first.as_strided((len(weights), *first.shape), (first.numel(), *first.stride()))
+
+
 class InferenceGroupedMLP(TEGroupedMLP):
     """Inference-optimized GroupedMLP with GPU-resident offsets.
 
@@ -1737,6 +1766,19 @@ class InferenceGroupedMLP(TEGroupedMLP):
         - Training updates to flow through (param.data is a view into the big tensor)
         - torch.nn.functional.grouped_mm / FlashInfer to use the big tensor directly
         """
+        # The refit or DDP buffers can already contain both expert stacks in kernel order.
+        fc1 = _contiguous_expert_stack(
+            [getattr(self.linear_fc1, f'weight{i}') for i in range(self.num_local_experts)]
+        )
+        fc2 = _contiguous_expert_stack(
+            [getattr(self.linear_fc2, f'weight{i}') for i in range(self.num_local_experts)]
+        )
+        if fc1 is not None and fc2 is not None:
+            self.register_buffer('_fc1_weight', fc1.detach(), persistent=False)
+            self.register_buffer('_fc2_weight', fc2.detach(), persistent=False)
+            self._uses_mxfp8_weights = False
+            return
+
         # Get device/dtype from existing TE weights
         device = self.linear_fc1.weight0.device
         dtype = self.linear_fc1.weight0.dtype
