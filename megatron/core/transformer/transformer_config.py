@@ -3254,9 +3254,7 @@ class TransformerConfig(ModelParallelConfig):
             if self.context_parallel_size > 1:
                 expected_layout = "zigzag" if self.dsv4_cp_zigzag else "contiguous"
                 if self.attention_cp_layout != expected_layout:
-                    raise ValueError(
-                        f"DSv4 context parallelism requires attention_cp_layout='{expected_layout}'."
-                    )
+                    raise ValueError(f"DSv4 CP requires attention_cp_layout='{expected_layout}'.")
             if self.dynamic_context_parallel and not self.dsa_cp_balance_indexer:
                 # NOTE(nightly-sync 26_10_2026): main rejects DSv4 + dynamic CP outright
                 # ("not supported yet"), but dev has since implemented it for the balanced
