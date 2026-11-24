@@ -3251,10 +3251,12 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.tensor_model_parallel_size == 1
             ), "DSv4 Hybrid Attention only supports TP size 1."
-            if self.context_parallel_size > 1 and self.attention_cp_layout != "contiguous":
-                raise ValueError(
-                    "DSv4 context parallelism requires attention_cp_layout='contiguous'."
-                )
+            if self.context_parallel_size > 1:
+                expected_layout = "zigzag" if self.dsv4_cp_zigzag else "contiguous"
+                if self.attention_cp_layout != expected_layout:
+                    raise ValueError(
+                        f"DSv4 context parallelism requires attention_cp_layout='{expected_layout}'."
+                    )
             if self.dynamic_context_parallel and not self.dsa_cp_balance_indexer:
                 # NOTE(nightly-sync 26_10_2026): main rejects DSv4 + dynamic CP outright
                 # ("not supported yet"), but dev has since implemented it for the balanced
