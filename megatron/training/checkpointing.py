@@ -1043,17 +1043,18 @@ def save_checkpoint(
                 save_strategy = TorchDistSaveShardedStrategy(
                     cpu_shm_mode=checkpoint.async_ckpt_use_cpu_shm
                 )
+                # Writers per rank. Independent of ckpt_assume_constant_structure.
+                if checkpoint.async_save:
+                    save_strategy.thread_count = checkpoint.dist_ckpt_workers
+                elif checkpoint.dist_ckpt_workers != 1:
+                    # We don't allow per-rank parallel save for sync save
+                    logger.warning(
+                        'Per-rank parallel save is not supported for sync save. '
+                        'Setting checkpoint.dist_ckpt_workers to 1'
+                    )
+                    save_strategy.thread_count = 1
                 if checkpoint.ckpt_assume_constant_structure and save_format == 'torch_dist':
                     save_strategy.use_cached_ckpt_structure = checkpoint.ckpt_assume_constant_structure
-                    if checkpoint.async_save:
-                        save_strategy.thread_count = checkpoint.dist_ckpt_workers
-                    else:
-                        # We don't allow per-rank parallel save for sync save
-                        logger.warning(
-                            'Per-rank parallel save is not supported for sync save. '
-                            'Setting checkpoint.dist_ckpt_workers to 1'
-                        )
-                        save_strategy.thread_count = 1
                     if (
                         checkpointing_context is not None
                         and 'load_strategy' in checkpointing_context

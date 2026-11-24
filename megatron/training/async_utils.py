@@ -184,7 +184,7 @@ def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
             "Installed nvidia-resiliency-ext does not support "
             "get_write_results_queue(mp_mode=...). Update nvidia-resiliency-ext."
         )
-    get_write_results_queue(mp_mode="fork")
+    get_write_results_queue(mp_mode=checkpoint.async_write_results_mp_mode)
     if rank == 0:
         print(f"init_persistent_async_worker: rank {rank}, Async Caller Started in {time.time() - time_start} seconds", flush=True)
 
