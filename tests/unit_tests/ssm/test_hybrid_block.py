@@ -183,7 +183,7 @@ def test_layers_keep_residual_layout_and_declare_compute_requirements(monkeypatc
     )
 
     assert stack.required_cp_layouts == {"contiguous", "zigzag"}
-    assert all(layer.config.residual_state_layout == "contiguous" for layer in stack.layers)
+    assert all(layer.config.global_cp_layout == "contiguous" for layer in stack.layers)
 
 
 def test_hybrid_stack_rejects_layer_config_subclasses(monkeypatch):

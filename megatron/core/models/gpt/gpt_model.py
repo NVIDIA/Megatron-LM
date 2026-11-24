@@ -138,7 +138,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         if (
             config.mtp_num_layers
             and (config.context_parallel_size > 1 or config.dynamic_context_parallel)
-            and config.residual_state_layout != config.attention_cp_layout
+            and config.global_cp_layout != config.attention_cp_layout
         ):
             raise ValueError(
                 "GPTModel MTP requires its residual layout to match attention_cp_layout; "

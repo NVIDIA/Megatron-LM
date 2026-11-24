@@ -103,7 +103,7 @@ Transformer Engine.
 The low-level `get_batch_on_this_cp_rank` dispatcher accepts
 `cp_partition_mode` as a spelling of its existing contiguous/zigzag selection.
 It validates conflicts with `use_contiguous_cp`; it does not merely annotate
-the returned tokens. `auto` is a conversion policy, not a physical ordering,
+the returned tokens. `auto` selects a configuration default, not a physical ordering,
 and is rejected by these tensor and batch APIs.
 
 ### Configuration-time layout resolution
@@ -115,7 +115,7 @@ The user-facing controls are:
 | `linear_cp_mode` / `--linear-cp-mode` | `headwise`, `chunkwise` | `headwise`; no `auto` algorithm |
 | `linear_attention_cp_layout` / `--linear-attention-cp-layout` | `auto`, `contiguous`, `zigzag` | Headwise -> zigzag; chunkwise -> contiguous |
 | `attention_cp_layout` / `--attention-cp-layout` | `auto`, `contiguous`, `zigzag` | Zigzag, or contiguous for the configured DSv4 hybrid variant |
-| `residual_state_layout` / `--residual-state-layout` | `auto`, `contiguous`, `zigzag` | The resolved linear layout |
+| `global_cp_layout` / `--global-cp-layout` | `auto`, `contiguous`, `zigzag` | The resolved linear layout |
 
 All three layout defaults are resolved in `TransformerConfig.__post_init__`,
 before module construction. An explicit concrete value is never overwritten.
@@ -123,17 +123,28 @@ The resulting configuration, including its serialized representation, contains
 concrete layouts. Modules read these values; they do not resolve defaults during
 forward. The selected kernel checks its supported layouts during construction.
 
+`global_cp_layout` is the default CP layout for parts without a separate layout
+policy. It determines input partitioning and the backbone residual boundary,
+including token alignment for MLP/MoE. A module's compute-layout `auto` uses its
+own resolution rule, rather than inheriting the global layout. For example,
+global contiguous with ordinary attention auto keeps the residual in contiguous
+layout while the attention branch uses zigzag and restores contiguous before
+the residual write. A separate policy need not be an explicit CLI value.
+
 This first-stage rule does not inspect the actual layer pattern or optimize a
 cost model. In particular, an unused linear-layout setting can still determine
-the residual layout of a full-attention-only model. Set `residual_state_layout`
+the residual layout of a full-attention-only model. Set `global_cp_layout`
 explicitly when that default is unsuitable. Architecture-aware default selection
 and finer optimization policies are separate work.
 
 `linear_cp_layout` remains an input compatibility alias for
 `linear_attention_cp_layout`; concrete `cp_partition_mode` values alias
-`residual_state_layout`. Conflicting aliases are rejected. The former
+`global_cp_layout`. Conflicting aliases are rejected. The former
 `cp_partition_mode=auto` layer-run policy is rejected rather than silently
 reinterpreted as the new configuration-time default.
+
+Update the previous draft's `residual_state_layout` field and
+`--residual-state-layout` flag to `global_cp_layout` and `--global-cp-layout`.
 
 ### Computation branches own conversion
 

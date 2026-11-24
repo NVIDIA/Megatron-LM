@@ -13,10 +13,10 @@ from .layout import CPLayout, THDCPLayoutPlan, convert_cp_partition_mode
 
 
 def get_cp_boundary_layout(config) -> CPLayout:
-    """Read the residual layout already resolved during configuration."""
-    layout = config.residual_state_layout
+    """Read the global CP layout already resolved during configuration."""
+    layout = config.global_cp_layout
     if layout not in ("contiguous", "zigzag"):
-        raise ValueError("Resolve residual_state_layout before constructing the model")
+        raise ValueError("Resolve global_cp_layout before constructing the model")
     return layout
 
 

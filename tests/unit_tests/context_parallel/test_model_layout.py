@@ -116,10 +116,10 @@ def test_model_residual_layout_forward_backward(tp, cp, packed, pattern):
             )
         elif pattern == "wide":
             config_kwargs.update(wide_residual=WideResidualConfig(num_streams=2))
-        config = TransformerConfig(**config_kwargs, residual_state_layout="zigzag")
+        config = TransformerConfig(**config_kwargs, global_cp_layout="zigzag")
         fixed_config = TransformerConfig(
             **config_kwargs,
-            residual_state_layout="contiguous",
+            global_cp_layout="contiguous",
             linear_cp_mode="chunkwise" if pattern == "chunkwise" else "headwise",
             linear_attention_cp_layout="contiguous" if pattern == "M-*" else "auto",
         )

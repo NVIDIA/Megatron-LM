@@ -27,7 +27,7 @@ def test_runtime_cp_layout_uses_microbatch_groups_without_mutating_module(monkey
     module = SimpleNamespace(
         pg_collection=groups,
         config=SimpleNamespace(
-            residual_state_layout="contiguous", sequence_parallel=True, cuda_graph_impl="none"
+            global_cp_layout="contiguous", sequence_parallel=True, cuda_graph_impl="none"
         ),
     )
     calls = []

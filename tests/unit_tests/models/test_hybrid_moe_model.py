@@ -196,7 +196,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "linear_attention_freq": None,
     "linear_attention_cp_layout": "zigzag",
     "linear_cp_layout": "zigzag",
-    "residual_state_layout": "zigzag",
+    "global_cp_layout": "zigzag",
     "cp_partition_mode": "zigzag",
     "linear_cp_mode": "headwise",
     "linear_conv_kernel_dim": 4,

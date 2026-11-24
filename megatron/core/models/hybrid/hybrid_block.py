@@ -214,7 +214,7 @@ class HybridStack(MegatronModule):
         # The root residual layout is already resolved; pipeline stages do not infer it.
         self.layer_config_list = [copy(layer_config) for layer_config in self.layer_config_list]
         for layer_config in self.layer_config_list:
-            layer_config.residual_state_layout = self.boundary_layout
+            layer_config.global_cp_layout = self.boundary_layout
             layer_config.cp_partition_mode = self.boundary_layout
         required_cp_layouts = {self.boundary_layout}
         # Build layers from the pre-selected segment

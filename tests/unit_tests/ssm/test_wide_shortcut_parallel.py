@@ -122,7 +122,7 @@ def _build_stack(
         .to(dtype=config.params_dtype)
     )
     assert model._residual_stream_atomic_layer_pairs == ((0, 1),)
-    assert model.boundary_layout == config.residual_state_layout
+    assert model.boundary_layout == config.global_cp_layout
     return model
 
 

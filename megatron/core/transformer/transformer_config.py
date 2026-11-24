@@ -1331,14 +1331,18 @@ class TransformerConfig(ModelParallelConfig):
     attention_cp_layout: Literal["auto", "contiguous", "zigzag"] = "auto"
     """Attention compute layout. Auto uses the selected attention variant's default."""
 
-    residual_state_layout: Literal["auto", "contiguous", "zigzag"] = "auto"
-    """Residual-stream layout. Auto follows the resolved linear layout, without scanning layers."""
+    global_cp_layout: Literal["auto", "contiguous", "zigzag"] = "auto"
+    """Default CP layout for parts without a separate layout policy.
+
+    Auto follows the resolved linear layout, without scanning layers. Compute-layout auto
+    values resolve from their own rules; they do not inherit this field.
+    """
 
     linear_cp_layout: CPLayout | None = None
     """Compatibility alias for linear_attention_cp_layout; not an independent setting."""
 
     cp_partition_mode: CPLayout | None = None
-    """Compatibility alias for a concrete residual_state_layout. Layer-run auto is removed."""
+    """Compatibility alias for a concrete global_cp_layout. Layer-run auto is removed."""
 
     ##################
     # Cuda Graphs
@@ -1891,7 +1895,7 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(f"Unsupported linear_cp_mode: {self.linear_cp_mode!r}")
         for alias, target in (
             ("linear_cp_layout", "linear_attention_cp_layout"),
-            ("cp_partition_mode", "residual_state_layout"),
+            ("cp_partition_mode", "global_cp_layout"),
         ):
             value = getattr(self, alias)
             if value is not None:
@@ -1908,7 +1912,7 @@ class TransformerConfig(ModelParallelConfig):
                 "contiguous" if self.experimental_attention_variant == "dsv4_hybrid" else "zigzag"
             ),
         }
-        for name in (*defaults, "residual_state_layout"):
+        for name in (*defaults, "global_cp_layout"):
             value = getattr(self, name)
             if value == "auto":
                 value = defaults.get(name, self.linear_attention_cp_layout)
@@ -1917,11 +1921,11 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(f"Unsupported {name}: {value!r}")
         # Normalize aliases too, so serialization/reconstruction retains concrete values.
         self.linear_cp_layout = cast(CPLayout, self.linear_attention_cp_layout)
-        self.cp_partition_mode = cast(CPLayout, self.residual_state_layout)
+        self.cp_partition_mode = cast(CPLayout, self.global_cp_layout)
         if (
             self.context_parallel_size > 1
             and any(
-                layout != self.residual_state_layout
+                layout != self.global_cp_layout
                 for layout in (self.linear_attention_cp_layout, self.attention_cp_layout)
             )
             and self.sequence_parallel

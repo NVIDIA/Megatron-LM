@@ -96,7 +96,7 @@ def _layer():
     layer = TransformerLayer.__new__(TransformerLayer)
     torch.nn.Module.__init__(layer)
     layer.config = SimpleNamespace(
-        residual_state_layout="contiguous",
+        global_cp_layout="contiguous",
         attention_cp_layout="zigzag",
         sequence_parallel=False,
         cuda_graph_impl="none",
@@ -220,7 +220,7 @@ def test_metadata_only_mtp_checks_the_actual_source_layout(
     """Missing batch views must not silently skip required MTP redistribution."""
     block = SimpleNamespace(
         config=SimpleNamespace(
-            residual_state_layout=mode or linear_layout, attention_cp_layout="zigzag"
+            global_cp_layout=mode or linear_layout, attention_cp_layout="zigzag"
         ),
         cp_group=_group(cp_size),
         tp_group=_group(1),
@@ -269,7 +269,7 @@ def test_pretrain_entry_prebuilds_module_views(monkeypatch, script_name, mode):
         num_layers=1,
         hidden_size=32,
         num_attention_heads=2,
-        residual_state_layout=mode,
+        global_cp_layout=mode,
         linear_attention_cp_layout=("zigzag" if script_name == "pretrain_hybrid" else "contiguous"),
         attention_cp_layout="zigzag",
         sequence_packing_scheduler=None,
@@ -332,7 +332,7 @@ def test_pretrain_entry_prebuilds_module_views(monkeypatch, script_name, mode):
     [
         ({}, "zigzag"),
         ({"linear_cp_mode": "chunkwise"}, "contiguous"),
-        ({"linear_cp_mode": "chunkwise", "residual_state_layout": "zigzag"}, "zigzag"),
+        ({"linear_cp_mode": "chunkwise", "global_cp_layout": "zigzag"}, "zigzag"),
         ({"linear_attention_cp_layout": "contiguous"}, "contiguous"),
         ({"linear_cp_layout": "contiguous"}, "contiguous"),
         ({"linear_cp_mode": "chunkwise", "linear_attention_cp_layout": "zigzag"}, "zigzag"),
@@ -352,7 +352,7 @@ def test_config_resolution_drives_real_batch_partition(monkeypatch, options, exp
         [[0, 1, 2, 3]] if expected_layout == "contiguous" else [[0, 1, 6, 7]]
     )
     assert config.linear_cp_layout == config.linear_attention_cp_layout
-    assert config.cp_partition_mode == config.residual_state_layout
+    assert config.cp_partition_mode == config.global_cp_layout
 
 
 def test_conflicting_aliases_and_legacy_run_policy_fail_at_configuration():
