@@ -16,7 +16,7 @@ import torch
 import yaml
 from config import EvaluationConfig
 from evaluation.evaluation_datasets import get_evaluation_dataset
-from model import model_provider
+from model import model_provider, resolve_multimodal_sequence_lengths
 from multimodal_args import add_multimodal_extra_args
 
 from megatron.core import parallel_state
@@ -230,7 +230,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
         conv = get_conversation(config.task, question, metadata)
 
         if not args.use_mcore_inference:
-            forward_step = partial(VLMForwardStep, num_img_embeddings_per_tile, imgs, num_tiles, args.decoder_seq_length)
+            forward_step = partial(VLMForwardStep, num_img_embeddings_per_tile, imgs, num_tiles, cfg.model.transformer.max_seq_length_per_sample)
 
         inference_context = StaticInferenceContext(max_batch_size=1, max_sequence_length=args.inference_max_seq_length)
         if is_first_rank():
@@ -244,7 +244,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                    num_img_embeddings_per_tile=num_img_embeddings_per_tile,
                    imgs=imgs,
                    num_tiles=num_tiles,
-                   decoder_seq_length=args.decoder_seq_length,
+                   decoder_seq_length=cfg.model.transformer.max_seq_length_per_sample,
                 )
                 results: List[InferenceRequest] = inference_engine.generate(
                     inference_requests=[inference_request]
@@ -361,7 +361,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                    num_img_embeddings_per_tile=num_img_embeddings_per_tile,
                    imgs=imgs,
                    num_tiles=num_tiles,
-                   decoder_seq_length=args.decoder_seq_length,
+                   decoder_seq_length=cfg.model.transformer.max_seq_length_per_sample,
                 )
                 inference_engine.generate(
                     inference_requests=[inference_request]
@@ -857,6 +857,7 @@ def eval_tasks():
     from megatron.training.argument_utils import model_config_from_args
 
     args = parse_and_validate_args(extra_args_provider=add_text_generation_args)
+    resolve_multimodal_sequence_lengths(args)
     model_cfg = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
     set_run_config(inference_cfg_container_from_args(args, model_cfg))
     initialize_megatron(training=False)

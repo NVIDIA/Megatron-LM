@@ -29,6 +29,7 @@ from megatron.core.utils import get_torch_version, is_torch_min_version
 from megatron.training.argument_utils import (
     _mfsdp_v2_disables_pipeline_output_dealloc,
     _model_rng_config,
+    warn_rank_0,
 )
 
 # Taken from https://stackoverflow.com/questions/65414773/parse-environment-variable-from-yaml-with-pyyaml
@@ -274,10 +275,23 @@ def validate_yaml(args, defaults={}):
         assert args.encoder_seq_length is not None
         args.seq_length = args.encoder_seq_length
 
-    if args.seq_length is not None:
-        assert args.max_position_embeddings >= args.seq_length
-    if args.decoder_seq_length is not None:
-        assert args.max_position_embeddings >= args.decoder_seq_length
+    # max_position_embeddings sizes learned position tables, not RoPE inputs.
+    if getattr(args, 'position_embedding_type', 'learned_absolute') == 'learned_absolute':
+        if args.seq_length is not None:
+            assert args.max_position_embeddings >= args.seq_length
+        if args.decoder_seq_length is not None:
+            assert args.max_position_embeddings >= args.decoder_seq_length
+    elif args.max_position_embeddings < max(
+        args.seq_length or 0,
+        args.decoder_seq_length or 0,
+        getattr(args.model_parallel, "max_seq_length_per_sample", None) or 0,
+        getattr(args.language_model, "max_seq_length_per_sample", None) or 0,
+    ):
+        warn_rank_0(
+            "max_position_embeddings is smaller than the run sequence length. RoPE/YaRN "
+            "does not require a learned position table, but checkpoint/export context-length "
+            "metadata retains max_position_embeddings; set it explicitly for the intended export."
+        )
     if args.lr is not None:
         assert args.min_lr <= args.lr
     # Mixed precision checks.
@@ -412,10 +426,16 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
     rng = _model_rng_config(args)
     # Read the distributed-init args before the rebind below hides them.
     disable_pipeline_output_dealloc = _mfsdp_v2_disables_pipeline_output_dealloc(args)
+    execution_bound = getattr(args.model_parallel, "max_seq_length_per_sample", None)
+    if execution_bound is None:
+        execution_bound = getattr(getattr(args, transfomer_key), "max_seq_length_per_sample", None)
+    if execution_bound is None:
+        execution_bound = getattr(args, "seq_length", None)
     # Combine transfomer config with model parallel args
     args = SimpleNamespace(**vars(getattr(args, transfomer_key)), **vars(args.model_parallel))
     # Translate args to core transformer configuration
     kw_args = core_config_from_args(args, TransformerConfig)    
+    kw_args['max_seq_length_per_sample'] = execution_bound
     
     # Hardcoded 
     kw_args['deallocate_pipeline_outputs'] = not disable_pipeline_output_dealloc
