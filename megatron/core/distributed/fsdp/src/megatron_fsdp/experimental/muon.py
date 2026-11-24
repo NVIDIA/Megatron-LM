@@ -157,10 +157,7 @@ class _GroupPipeline:
                 rank_ranges=self.assignment.rank_ranges,
             )
         else:
-            self._full_inputs = {
-                i: self._momentum_inputs.get_tensor_view(i).view(buffer.layout.tensor_shapes[i])
-                for i in owned
-            }
+            self._full_inputs = {i: self._momentum_inputs.get_tensor_view(i) for i in owned}
         self._stage = _PipelineStage.GATHER_POSTED
 
     def wait_for_gather(self) -> None:
