@@ -196,6 +196,41 @@ def test_no_gc_during_capture_restores_collection_state(
             gc.disable()
 
 
+@pytest.mark.parametrize("has_runner", [False, True])
+def test_delete_cuda_graphs_collects_only_after_resetting_graphs(monkeypatch, has_runner):
+    """Teardown runs a full collection (~0.4 s on a large heap) only after it reset graphs; it
+    empties the CUDA cache either way."""
+    events = []
+
+    class Graph:
+        def reset(self):
+            events.append("reset")
+
+    runner = object.__new__(_CudaGraphRunner)
+    runner.fwd_graph, runner.bwd_graph = Graph(), Graph()
+    monkeypatch.setattr(
+        _CudagraphGlobalRecord, "captured_runners", {runner} if has_runner else set()
+    )
+    monkeypatch.setattr(_CudagraphGlobalRecord, "cudagraph_record", [])
+    monkeypatch.setattr(_CudagraphGlobalRecord, "cudagraph_inference_record", [])
+    monkeypatch.setattr(_CudagraphGlobalRecord, "cudagraph_created", True)
+    monkeypatch.setattr(cuda_graphs_module, "_GTP_RUNNER_STREAMS", {})
+    monkeypatch.setattr(CudaGraphManager, "global_mempool", CudaGraphManager.global_mempool)
+    monkeypatch.setattr(
+        cuda_graphs_module, "release_capture_constants", lambda graph: events.append("release")
+    )
+    monkeypatch.setattr(gc, "collect", lambda *args: events.append("collect") or 0)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty_cache"))
+
+    delete_cuda_graphs()
+
+    deleted = ["reset", "release", "reset", "release", "collect"] if has_runner else []
+    assert events == deleted + ["empty_cache"]
+    assert not _CudagraphGlobalRecord.captured_runners
+    if has_runner:
+        assert runner.fwd_graph is None and runner.bwd_graph is None
+
+
 class TestCudaGraphSavedTensorObserver:
     @pytest.fixture
     def record(self):
