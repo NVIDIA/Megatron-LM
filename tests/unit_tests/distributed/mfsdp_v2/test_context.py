@@ -27,6 +27,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
+    ExecutionAction,
     ExecutionEvent,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
@@ -123,7 +124,7 @@ def test_recorded_execution_order(distributed_setup):
     with context.finalize_gradients(mode=GradientFinalizationMode.SKIP_OUTER):
         model(inputs).sum().backward()
     assert not context.is_recording_execution_order
-    assert list(context.execution_order) == [
+    assert list(context.execution_order.view(action=ExecutionAction.UNSHARD)) == [
         ExecutionEvent(module, Phase.FORWARD) for module in [model, model.first, model.second]
     ] + [ExecutionEvent(module, Phase.BACKWARD) for module in [model, model.second, model.first]]
 
@@ -140,7 +141,7 @@ def test_recorded_execution_order(distributed_setup):
 
 
 def test_recorded_evaluation_order(distributed_setup):
-    """An evaluation-only execution can be recorded and replayed."""
+    """Evaluation preserves pending recording and the completed training trace."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = (
@@ -158,14 +159,19 @@ def test_recorded_evaluation_order(distributed_setup):
     inputs = torch.ones(2, 4, device=device)
     with torch.no_grad():
         expected = model(inputs)
-        assert list(context.execution_order) == [
-            ExecutionEvent(module, Phase.FORWARD) for module in [model, *model.children()]
-        ]
-        # Evaluation has no autograd callback; explicitly complete the recorded execution.
+        assert list(context.execution_order) == []
         context.post_backward()
+        assert context._recording_execution_order
+    model.train()
+    model(inputs).sum().backward()
+    recorded = tuple(context.execution_order)
+    view = context.execution_order_view
+    model.eval()
+    with torch.no_grad():
         for _ in range(2):
             torch.testing.assert_close(model(inputs), expected)
-            assert context.execution_order.position == 0
+            assert context.execution_order_view is view and view.position == 0
+            assert tuple(context.execution_order) == recorded
 
 
 def test_registration_order_rejects_reordered_execution(distributed_setup):

@@ -26,6 +26,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     PrefetchOrder,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
+    ExecutionAction,
     ExecutionEvent,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard import (
@@ -147,8 +148,10 @@ class TestMfsdpV2PipelineSharedContext:
                 # in finalize_model_grads cannot be hidden by calling it directly in the test.
                 finalize_model_grads(wrapped_chunks, pg_collection=self.pg_collection)
                 assert not context.is_recording_execution_order
-                assert list(context.execution_order) == expected
-                assert context.execution_order.position == 0
+                assert (
+                    list(context.execution_order.view(action=ExecutionAction.UNSHARD)) == expected
+                )
+                assert context.execution_order_view.position == 0
                 # Each of two microbatches contributes two to every weight gradient.
                 for chunk in wrapped_chunks:
                     for parameter in chunk.parameters():

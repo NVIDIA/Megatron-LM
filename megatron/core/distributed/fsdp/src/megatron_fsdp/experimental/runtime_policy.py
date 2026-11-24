@@ -45,8 +45,10 @@ class RuntimePolicy:
     prefetch_order: PrefetchOrder = PrefetchOrder.REGISTRATION
     """Use registration order, or record execution until context.post_backward().
 
-    Schedules call post_backward() once after all microbatch backwards. Subsequent
-    schedules must repeat the trace consistently across data-parallel ranks.
+    Schedules call post_backward() once after all microbatch backwards and delayed
+    weight gradients. Subsequent schedules must repeat the complete U/R trace,
+    including its interleaving, consistently across data-parallel ranks. Recording
+    requires ordinary module hooks; combined EP-overlap scheduling is unsupported.
     Discard the context if recording fails.
     """
 
