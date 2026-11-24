@@ -46,6 +46,7 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.attention import (
     Attention,
     LinearProjBuilder,
+    prepare_flashinfer_mla_decode,
     resolve_absorbed_mla_decode_kernel,
 )
 from megatron.core.transformer.enums import AttnMaskType
@@ -389,9 +390,15 @@ class MultiLatentAttention(Attention):
         # none covers this layer (see _absorbs_cached_latents).
         self.absorbed_decode_kernel = None
         if self.cache_mla_latents:
-            self.absorbed_decode_kernel, reason = resolve_absorbed_mla_decode_kernel(self.config)
+            self.absorbed_decode_kernel, reason = resolve_absorbed_mla_decode_kernel(
+                self.config, self.num_attention_heads_per_partition
+            )
             if self.absorbed_decode_kernel is None and not self.batch_invariant_mode:
                 _warn_unabsorbed_decode(reason)
+        if self.absorbed_decode_kernel == "flashinfer":
+            # Before the KV cache and any CUDA-graph capture, so a failure shows here and not
+            # at the first decode step.
+            prepare_flashinfer_mla_decode(torch.cuda.current_device())
 
         if self.config.rope_type == "rope":
             self.rotary_pos_emb = RotaryEmbedding(
@@ -514,11 +521,11 @@ class MultiLatentAttention(Attention):
         """Whether this step attends over the cached latents with absorbed attention.
 
         Only decode-only steps absorb, and only where a decode kernel covers this layer
-        (``absorbed_decode_kernel``: FlashMLA, on SM90). Every other step up-projects the cached
-        latents and runs unabsorbed attention, the math training uses. Batch-invariant mode never
-        absorbs: FlashMLA derives its split-KV schedule from the whole batch, and absorbed and
-        unabsorbed attention round differently, so a request's output would depend on its
-        co-batch.
+        (``absorbed_decode_kernel``: FlashMLA on SM90, FlashInfer on SM100 and SM103). Every
+        other step up-projects the cached latents and runs unabsorbed attention, the math
+        training uses. Batch-invariant mode never absorbs: the decode kernels derive their
+        split-KV schedule from the whole batch, and absorbed and unabsorbed attention round
+        differently, so a request's output would depend on its co-batch.
         """
         return (
             self.cache_mla_latents
@@ -661,8 +668,8 @@ class MultiLatentAttention(Attention):
                 q, k, v = (query, key, value)
                 cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
                 cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
-                # Absorbed steps run the FlashMLA decode kernel over the latents; all others run
-                # the varlen kernel over the up-projected keys and values.
+                # Absorbed steps run the device's MLA decode kernel over the latents; all others
+                # run the varlen kernel over the up-projected keys and values.
                 absorbed = self._absorbs_cached_latents(inference_context)
 
                 core_attn_out = self.flash_decode_and_prefill(

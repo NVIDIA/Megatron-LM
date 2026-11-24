@@ -17,6 +17,12 @@ try:
 except PackageNotFoundError:
     FLASHINFER_JIT_CACHE_VERSION = None
 
+# FlashInfer's prebuilt TRTLLM-GEN cubins, which its MLA decode on Blackwell runs.
+try:
+    FLASHINFER_CUBIN_VERSION = version("flashinfer-cubin")
+except PackageNotFoundError:
+    FLASHINFER_CUBIN_VERSION = None
+
 
 def detokenize_tokens(
     tokenizer: Any, tokens: list[int], remove_EOD: bool = True, skip_special_tokens: bool = True
