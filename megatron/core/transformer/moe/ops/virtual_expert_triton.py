@@ -472,7 +472,11 @@ class VirtualExpertPlannerWorkspace:
     :func:`_scratch_layout`; :meth:`field` views one field for inspection."""
 
     def __init__(
-        self, *, num_experts: int, device: torch.device, group: dist.ProcessGroup,
+        self,
+        *,
+        num_experts: int,
+        device: torch.device,
+        group: dist.ProcessGroup,
         symm_backend: str = "NCCL",
     ) -> None:
         _check_triton_version()

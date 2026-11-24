@@ -181,9 +181,8 @@ class _VirtualExpertStorage:
         # direct peer reads through the window pointer table.
         bases = self.grad_handle.buffer_ptrs
         stride = bases[1] - bases[0] if len(bases) > 1 else 0
-        self.uniform_grad_stride = (
-            0 < stride < 2**40
-            and all(base == bases[0] + peer * stride for peer, base in enumerate(bases))
+        self.uniform_grad_stride = 0 < stride < 2**40 and all(
+            base == bases[0] + peer * stride for peer, base in enumerate(bases)
         )
         if config.symm_backend == "NCCL" and not self.uniform_grad_stride:
             raise RuntimeError(

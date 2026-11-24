@@ -77,10 +77,7 @@ def _module(groups, replicas):
         for param in model.parameters():
             param.copy_(torch.randn(param.shape, generator=generator, device="cuda") / 16)
     return DistributedDataParallel(
-        config,
-        DistributedDataParallelConfig(grad_reduce_in_fp32=True),
-        model,
-        pg_collection=groups,
+        config, DistributedDataParallelConfig(grad_reduce_in_fp32=True), model, pg_collection=groups
     )
 
 

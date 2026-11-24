@@ -330,7 +330,8 @@ class TEGroupedMLP(MegatronModule):
 
         num_virtual_experts = (
             self.num_local_experts
-            if self.config.moe_virtual_expert_load_balance and self.config.moe_megakernel_backend is None
+            if self.config.moe_virtual_expert_load_balance
+            and self.config.moe_megakernel_backend is None
             else 0
         )
         self.linear_fc1 = submodules.linear_fc1(

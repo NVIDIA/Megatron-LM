@@ -656,13 +656,65 @@ structure selects routed-only MOK in `auto` mode. Activation selection is indepe
 | Routed precision | BF16, or MXFP8 with `fp8_param=True` and native TE rowwise/columnwise payloads and scales |
 | Router precision | `moe_router_dtype=None` or `"fp32"`; FP64 routing/weighted averaging is unsupported |
 | Shared experts | Optional; fused shared experts use BF16 and the routed intermediate size, with optional sigmoid output gate via `moe_shared_expert_gate`; native shared experts retain MCore's precision and structure |
-| Activation | SwiGLU or SiTU-GLU, without a linear offset or tanh clamp |
+| Activation | SwiGLU or SiTU-GLU. Gated SiLU with both gate and up tanh scales represents SiTU-GLU. |
 | Routed weight layout | Per-expert non-single weights, or single-grouped weights with `moe_use_grouped_tensor=True` and Transformer Engine 2.14+ |
 | Parallelism | Expert TP=1; TP>1 requires sequence parallelism and native shared execution; EP in {1, 4, 8, 16, 32, 64}; each EP group must fit within one NVLink domain supporting PyTorch symmetric memory and multicast |
 | Shapes | Hidden and expert intermediate sizes divisible by 256; at least 512 local tokens per rank, divisible by 256; identical token, hidden, and top-k shapes across EP ranks |
 | Recomputation | Whole-MoE activation recompute; shared-expert-only recompute when shared execution is native |
 | CUDA Graph | Full-iteration capture |
 | Checkpointing | Save/resume with unchanged backend, weight layout, and parallel configuration |
+
+#### BF16 MoK with MoonEP
+
+MoonEP maps a logical expert to one or more physical MoK slots across the EP group. The router still selects the logical experts and their gate weights. Before each grouped operation MCore publishes the selected expert weights and combines replica weight gradients on their logical owners. The optimizer and distributed checkpoint continue to refer to the owner parameters. Use a single NVLink domain with CUDA symmetric memory and multicast for every EP group.
+
+For the routed-only SiTU-GLU path, build the [tested public MoK source](https://github.com/QiZhangNV/mixture-of-kittens/tree/ee7bdaba515fd3d557105d71809ec74cd523d5a1) in a CUDA development environment. The helper needs Git, uv, a CUDA toolkit with nvcc and cuobjdump, and an active Python environment with PyTorch and the wheel build prerequisites. It prepares the pinned ThunderKittens submodule.
+
+```bash
+# From the Megatron-LM checkout, with a Python virtual environment active.
+export UV_PROJECT_ENVIRONMENT="$VIRTUAL_ENV"
+MOK_ARCH=SM103 bash docker/common/install_mok.sh \
+  ee7bdaba515fd3d557105d71809ec74cd523d5a1 "$(mktemp -d)"
+```
+
+On a GB300 NVL72, run the following two checks with four GPUs per node. The first exercises the physical placement of masked routes. The second compares real kernel output, input and gate gradients, and every routed expert's owner gradient through checkpoint replay.
+
+```bash
+torchrun --standalone --nproc-per-node=4 -m pytest -q \
+  tests/unit_tests/transformer/moe/test_virtual_experts.py::test_mok_virtual_expert_plan_preserves_masked_routes \
+  tests/unit_tests/transformer/moe/test_mok_virtual_experts.py
+```
+
+The following MCore model settings specify the BF16 ERNIE 5.5 geometry for the [companion Megatron-Bridge recipe](https://github.com/NVIDIA-NeMo/Megatron-Bridge/pull/7000). On 64 GPUs, TP1/PP1 and CP16 give four independent data replicas. With one packed row per replica per microbatch and GBS32, each optimizer update accumulates eight microbatches. Supply a 262,144-token packed row and set the Bridge data configuration to the same sequence length. For multi-document zigzag, pad each document to a multiple of 32 tokens (twice the CP size) and set the packed-document limit to the actual number of documents.
+
+```yaml
+bf16: true
+seq_length: 262144
+tensor_model_parallel_size: 1
+pipeline_model_parallel_size: 1
+context_parallel_size: 16
+expert_model_parallel_size: 64
+expert_tensor_parallel_size: 1
+cp_partition_mode: zigzag
+dsv4_cp_zigzag: true
+cuda_graph_impl: none
+moe_router_dtype: fp32
+moe_grouped_gemm: true
+gradient_accumulation_fusion: true
+moe_token_dispatcher_type: flex
+moe_flex_dispatcher_backend: hybridep
+moe_megakernel_backend: mok
+moe_megakernel_backend_config:
+  macrobatch_size: 16384
+  schedule_capacity_multiplier: 0.5
+moe_virtual_expert_load_balance: true
+recompute_granularity: full
+recompute_method: uniform
+recompute_num_layers: 2
+```
+
+Set `moe_virtual_expert_load_balance: false` for owner-only MoK. Both modes support the two-symbol full checkpoint in this eager BF16 configuration. In a split hybrid stack, an attention symbol and the next FFN symbol then share one saved checkpoint input. The attention branch releases its normalization manager as soon as the offload group has committed the branch output.
+
 
 Wgrad GEMMs accumulate in FP32. The destination `main_grad` dtype selects the reduction-store
 precision: FP32 retains FP32 contributions, while BF16 rounds each contribution before adding it
