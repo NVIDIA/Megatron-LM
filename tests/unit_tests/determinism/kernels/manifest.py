@@ -223,7 +223,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(K + "test_te_batched_linear.py",),
         kind="external-lib",
-        notes="TE batched GEMM with a 2D optimizer owner; BF16/MXFP8 and fused main-grad replay.",
+        notes="TE batched GEMM with a 2D optimizer owner; BF16/MXFP8 and fused main-grad replay. "
+        "Also replays the batched-GEMM fallback used when TE lacks BatchedLinear.",
     ),
     KernelEntry(
         name="jit_fuser",
