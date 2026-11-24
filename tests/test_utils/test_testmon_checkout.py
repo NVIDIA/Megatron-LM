@@ -100,14 +100,17 @@ def test_complete_pr_delta_excludes_newer_main_and_restores_bundle(
     assert git(consumer, "rev-parse", "HEAD") == head
     github_output = tmp_path / "github-output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(github_output))
-    # Exercise the consumer action against the same combined artifact layout as CI.
+    # Exercise the workflow restore step against the same combined artifact layout as CI.
     shutil.copytree(args.pr_files_dir, tmp_path / "testmon-pr-files")
     monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
     monkeypatch.setenv("ORIGINAL_SHA", head)
-    action = yaml.safe_load((SCRIPT.parents[1] / "actions/testmon-checkout/action.yml").read_text())
-    restore = action["runs"]["steps"][-1]["run"].replace(
-        str(SCRIPT.relative_to(SCRIPT.parents[2])), str(SCRIPT)
-    )
+    workflow = yaml.safe_load((SCRIPT.parents[1] / "workflows/_unit-tests.yml").read_text())
+    (step,) = [
+        step
+        for step in workflow["jobs"]["run"]["steps"]
+        if step.get("name") == "Restore prepared unit-test checkout"
+    ]
+    restore = step["run"].replace(str(SCRIPT.relative_to(SCRIPT.parents[2])), str(SCRIPT))
     subprocess.run(["bash", "-euo", "pipefail", "-c", restore], check=True)
     assert git(consumer, "rev-parse", "HEAD") == tested
     assert git(consumer, "rev-parse", "HEAD^") == baseline
