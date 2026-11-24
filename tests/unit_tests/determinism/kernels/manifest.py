@@ -1049,9 +1049,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         name="te_tp_collectives",
         sources=("megatron/core/tensor_parallel/generalized_tensor_parallelism.py",),
         kind="dispatch",
-        exempt_reason="TE gather_along_first_dim / reduce_scatter_along_first_dim of weights and "
-        "wgrads in generalized tensor parallelism; multi-rank NCCL collectives pinned by "
-        "NCCL_ALGO=Ring under --deterministic-mode, not exercised by the determinism model tests.",
+        tests=("tests/unit_tests/determinism/kernels/test_gtp_capture_collectives.py",),
+        notes="Multi-rank bit-exact CUDA graph replay of repeated single/grouped TE weight "
+        "gathers and gradient reduce-scatters, including automatic full-iteration GTP-stream dispatch.",
     ),
     KernelEntry(
         name="te_thd_partitioned_indices",
