@@ -392,7 +392,7 @@ def _get_ffn_gemm_shapes():
     tp = cfg.model.transformer.tensor_model_parallel_size
     gated = cfg.model.transformer.gated_linear_unit
 
-    tokens = cfg.train.micro_batch_size * args.seq_length
+    tokens = cfg.train.micro_batch_size * cfg.model.transformer.max_seq_length_per_sample
     glu_mult = 2 if gated else 1
 
     # fc1 / up-proj: (tokens, ffn_hidden_size * glu_mult / TP) with K = hidden_size
