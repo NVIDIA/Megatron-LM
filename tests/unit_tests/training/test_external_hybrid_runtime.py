@@ -54,6 +54,12 @@ def _model(config, layers, *, post_process=True, pp_group=None):
         mtp_process=False,
         post_process=post_process,
         vocab_size=32,
+        share_embeddings_and_output_weights=False,
+        output_layer=(
+            torch.nn.Linear(config.hidden_size, 32, bias=False, device="meta")
+            if post_process
+            else None
+        ),
         pg_collection=SimpleNamespace(pp=pp_group),
     )
 
@@ -203,7 +209,8 @@ def test_missing_hybrid_chunk_requires_an_estimator_only_for_hybrid_runs():
     assert _hybrid_model_chunks_for_runtime_metrics(chunks, SimpleNamespace()) is None
 
 
-@pytest.mark.parametrize("with_layers,expected_local", [(False, 0), (True, 672)])
+# Each of the two gain layers counts 336 multiplications and 96 gradient-reduction additions.
+@pytest.mark.parametrize("with_layers,expected_local", [(False, 0), (True, 864)])
 def test_virtual_chunks_are_summed_before_reducing_only_the_pipeline_group(
     monkeypatch, with_layers, expected_local
 ):

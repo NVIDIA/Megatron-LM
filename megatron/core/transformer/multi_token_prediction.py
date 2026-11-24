@@ -46,7 +46,7 @@ from megatron.core.tensor_parallel.inference_layers import (
 )
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.hyper_connection import learned_output_contract
-from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
+from megatron.core.transformer.module import MegatronModule, estimate_layer_flops, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -1818,12 +1818,18 @@ class MultiTokenPredictionLayer(MegatronModule):
     ) -> float:
         """Count the inner layer and this depth's norms and embedding projection."""
         hidden_size = self.config.hidden_size
-        return self.mtp_model_layer.estimate_flops(
+        streams = self.config.mhc_num_residual_streams if self.config.enable_mhc_connections else 1
+        # Embed and normalize the token once, process each hidden stream, then normalize
+        # the contracted output once before the vocabulary head.
+        norm_width = (2 + streams) * hidden_size
+        projection_width = (1 + streams) * hidden_size**2
+        return estimate_layer_flops(
+            self.mtp_model_layer,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             include_backward=include_backward,
         ) + (6 if include_backward else 2) * total_real_tokens_in_batch * (
-            3 * hidden_size + 2 * hidden_size**2
+            norm_width + projection_width
         )
 
     def get_inner_quantization_context(self) -> AbstractContextManager:

@@ -619,25 +619,49 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         total_real_tokens_in_batch: float,
         seqlen_squared_sum_in_batch: float,
         include_backward: bool = False,
+        compute_mtp_loss: bool = True,
     ) -> float:
-        """Estimate this pipeline chunk's work for a global batch, without collectives."""
-        kwargs = dict(
+        """Estimate this chunk's work for a global batch using the same MTP flag as forward."""
+        batch_stats = dict(
             total_real_tokens_in_batch=total_real_tokens_in_batch,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
-            include_backward=include_backward,
         )
-        flops = self.decoder.estimate_flops(**kwargs)
-        if self.mtp_process:
-            flops += self.mtp.estimate_flops(**kwargs)
-        if self.post_process:
-            output_heads = 1 + (self.config.mtp_num_layers if self.mtp_process else 0)
-            flops += (
-                (6 if include_backward else 2)
-                * total_real_tokens_in_batch
-                * self.config.hidden_size
-                * self.vocab_size
-                * output_heads
+        decoder_backward = include_backward and not (
+            self.training and self.config.freeze_base_model_for_mtp
+        )
+        flops = self.decoder.estimate_flops(**batch_stats, include_backward=decoder_backward)
+        run_mtp = self.mtp_process and compute_mtp_loss and not InferenceMode.is_active()
+        if run_mtp:
+            # Training keeps a zero gradient connection even when both objectives are disabled.
+            mtp_backward = include_backward and (
+                self.training or self.config.mtp_ce_loss_weight > 0 or not self.post_process
             )
+            flops += self.mtp.estimate_flops(**batch_stats, include_backward=mtp_backward)
+        if self.post_process:
+            # Each projection has a forward matmul and up to two gradient matmuls.
+            head_matmuls = 1
+            weight_backward = False
+            if include_backward:
+                weight = (
+                    self.shared_embedding_or_output_weight()
+                    if self.share_embeddings_and_output_weights
+                    else self.output_layer.weight
+                )
+                weight_backward = weight.requires_grad
+                # process_mtp_loss attaches the MTP losses to the main hidden states.
+                head_matmuls += int(decoder_backward or run_mtp) + int(weight_backward)
+            if run_mtp:
+                teacher = self.training and self.config.mtp_kl_loss_weight > 0
+                if teacher:
+                    head_matmuls += 1  # Teacher logits are computed under no_grad.
+                if teacher or self.config.mtp_ce_loss_weight > 0:
+                    student_matmuls = 1 + int(include_backward)
+                    student_matmuls += int(weight_backward and not self.config.mtp_detach_heads)
+                    head_matmuls += self.config.mtp_num_layers * student_matmuls
+            projection_flops = (
+                2 * total_real_tokens_in_batch * self.config.hidden_size * self.vocab_size
+            )
+            flops += projection_flops * head_matmuls
         return flops
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:

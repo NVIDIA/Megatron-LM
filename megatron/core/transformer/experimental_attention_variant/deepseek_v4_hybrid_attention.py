@@ -28,6 +28,9 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     CompressedSparseAttentionBuilder,
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
+from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+    use_fused_dsa_kernels,
+)
 from megatron.core.transformer.module import accepts_flops_config
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -688,11 +691,17 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         """Estimate W/C/H attention, including projections, compression and indexing.
 
         Packed top-k saturation uses the token-weighted mean sequence length, as the
-        batch aggregates do not retain individual document lengths. Includes FMA x2.
+        batch aggregates do not retain individual document lengths. At CP=1 without a
+        packing scheduler, the indexer backward estimate assumes SBHD. Includes FMA x2.
         """
         config = self.config
-        if config.compress_ratio not in (0, 4, 128):
-            raise ValueError(f"Unsupported CSA compression ratio: {config.compress_ratio}")
+        ratio = (
+            self._dsv4_compress_ratio
+            if isinstance(self, DSv4HybridSelfAttention)
+            else config.compress_ratio
+        )
+        if ratio not in (0, 4, 128):
+            raise ValueError(f"Unsupported CSA compression ratio: {ratio}")
         if total_real_tokens_in_batch == 0:
             return 0
         hidden = config.hidden_size
@@ -712,10 +721,11 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             + heads * config.csa_window_size * head_dim * 2
         )
         core_term = 0
-        if config.compress_ratio == 128:
+        score_flops = 0
+        if ratio == 128:
             token_term += hidden * head_dim * 2
             core_term += heads * head_dim / 128
-        elif config.compress_ratio == 4:
+        elif ratio == 4:
             # Ratio-4 compression overlaps two windows.
             token_term += hidden * (2 * head_dim) * 2
             if config.csa_dense_mode:
@@ -731,11 +741,22 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     + q_rank * indexer_heads * indexer_dim
                     + hidden * indexer_heads
                 )
-                core_term += indexer_heads * indexer_dim / 4
+                score_flops = 2 * indexer_heads * indexer_dim * seqlen_squared_sum_in_batch / 4
+                # Native SBHD computes score gradients even with a zero loss coefficient.
+                # The fused SBHD and packed kernels skip those matmuls.
+                if include_backward and (
+                    (config.dsa_indexer_loss_coeff or 0.0) > 0
+                    or (
+                        config.sequence_packing_scheduler is None
+                        and config.context_parallel_size == 1
+                        and not use_fused_dsa_kernels(config)
+                    )
+                ):
+                    score_flops *= 3
         forward = 2 * (
             token_term * total_real_tokens_in_batch + core_term * seqlen_squared_sum_in_batch
         )
-        return (3 if include_backward else 1) * forward
+        return (3 if include_backward else 1) * forward + score_flops
 
     def __init__(
         self,

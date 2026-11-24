@@ -45,7 +45,11 @@ class ExternalGainLayer(MegatronModule):
     ) -> float:
         """Count one multiply per element, plus input and parameter gradients if requested."""
         forward = total_real_tokens_in_batch * self.config.hidden_size
-        return forward * (3 if include_backward else 1)
+        if not include_backward:
+            return forward
+        # Each channel sums its per-token products into one gain gradient.
+        reduction_adds = max(total_real_tokens_in_batch - 1, 0) * self.config.hidden_size
+        return 3 * forward + reduction_adds
 
     def forward(
         self,
