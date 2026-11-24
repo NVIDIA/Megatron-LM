@@ -135,13 +135,11 @@ jobs:
             test '${{ steps.build-wheel.outputs.expected-release-number }}' == \"\$RELEASE_NUMBER\" \
           "
 
-      - name: Keep one source distribution per package
-        if: matrix.PLATFORM == 'arm64'
-        run: rm dist/*.tar.gz
-
       - name: Upload wheels
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: wheels-${{ matrix.PACKAGE }}-${{ matrix.PLATFORM }}-${{ inputs.dry-run && 'dry-run' || 'release' }}
-          path: dist/
+          path: |
+            dist/*.whl
+            ${{ matrix.PLATFORM == 'amd64' && 'dist/*.tar.gz' || '' }}
           if-no-files-found: error
