@@ -81,6 +81,12 @@ class BertModel(LanguageModule):
         output_layer_bias: bool = True,
     ):
         super(BertModel, self).__init__(config=config, pg_collection=pg_collection)
+        if self.config.cross_entropy_mxfp8_grad:
+            # Only GPTModel builds the MXFP8 LM head that takes an MXFP8 logits gradient.
+            raise ValueError(
+                "cross_entropy_mxfp8_grad requires GPTModel's MXFP8 LM head; "
+                "BertModel builds a BF16 LM head."
+            )
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
