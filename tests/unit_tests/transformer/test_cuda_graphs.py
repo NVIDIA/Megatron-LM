@@ -1641,6 +1641,45 @@ class TestTECudaGraphHelper:
             if helper.graphs_created():
                 helper.delete_cuda_graphs()
 
+    def test_packed_mrope_capture_keeps_global_positions(self):
+        """Capture and replay must agree on the rotary input shape for THD with CP."""
+        if Utils.world_size % 2:
+            pytest.skip("This context-parallel case requires two GPUs.")
+        Utils.initialize_model_parallel(context_parallel_size=2)
+        init_num_microbatches_calculator(
+            rank=0, global_batch_size=1, micro_batch_size=1, data_parallel_size=1
+        )
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            bf16=True,
+            use_cpu_initialization=True,
+            context_parallel_size=2,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            cuda_graph_thd_max_packed_sequences=4,
+            sequence_packing_scheduler="dp_balanced",
+            max_seqlen_per_dp_cp_rank=16,
+            pad_packed_seq_alignment="max",
+            use_te_rng_tracker=True,
+            mrope_section=[2, 3, 3],
+        )
+        model_parallel_cuda_manual_seed(321)
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=128,
+            max_sequence_length=32,
+            position_embedding_type="mrope",
+        ).cuda()
+        positions = torch.arange(32, device="cuda").expand(3, 1, -1)
+        rotary = model.rotary_pos_emb(positions, config.mrope_section, packed_seq=True)
+        helper = TECudaGraphHelper([model], config, 32, 1, optimizers=[])
+        _, capture_kwargs = helper._get_cuda_graph_input_data()
+        for inputs in capture_kwargs["sample_kwargs"]:
+            assert inputs["rotary_pos_emb"].shape == rotary.shape
+
     @pytest.mark.parametrize("num_microbatches", [16, 64, 256])
     @pytest.mark.parametrize("pp_size", [1, 2, 4])
     @pytest.mark.parametrize("vpp_size", [None, 2])

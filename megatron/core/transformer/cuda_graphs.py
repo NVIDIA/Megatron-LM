@@ -2547,6 +2547,7 @@ class TECudaGraphHelper:
 
             def get_rotary_pos_emb(transformer_module, transformer_input):
                 uses_mla = self.config.multi_latent_attention
+                packed_seq = getattr(self.config, "sequence_packing_scheduler", None) is not None
                 if getattr(transformer_module, "hybrid_layer_config_list", None) is not None:
                     # Config types select the layer implementation; copied flags may differ.
                     config_type = type(layer.config)
@@ -2562,7 +2563,7 @@ class TECudaGraphHelper:
                         dtype=torch.long,
                     )
                     return transformer_module.rotary_pos_emb(
-                        position_ids, transformer_module.mrope_section
+                        position_ids, transformer_module.mrope_section, packed_seq=packed_seq
                     )
                 if transformer_module.position_embedding_type == 'rope' and not uses_mla:
                     rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(
@@ -2570,9 +2571,7 @@ class TECudaGraphHelper:
                     )
                     if rotary_seq_len not in rotary_pos_emb_cache:
                         rotary_pos_emb_cache[rotary_seq_len] = transformer_module.rotary_pos_emb(
-                            rotary_seq_len,
-                            packed_seq=getattr(self.config, "sequence_packing_scheduler", None)
-                            is not None,
+                            rotary_seq_len, packed_seq=packed_seq
                         )
                     return rotary_pos_emb_cache[rotary_seq_len]
                 else:
