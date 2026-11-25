@@ -35,6 +35,5 @@ MODEL_ARGS=" \
     --tokenizer-type HuggingFaceTokenizer \
     --make-vocab-size-divisible-by 1 \
     --use-mcore-models \
-    --export-model-type HybridModel \
     --padded-vocab-size 131072 \
 "

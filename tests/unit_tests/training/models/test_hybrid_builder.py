@@ -9,6 +9,7 @@ from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
+from megatron.training.models.transforms import ModelTransformConfig
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -216,12 +217,29 @@ class TestHybridModelBuilderBuildModel:
     @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
     @patch("megatron.training.models.hybrid.HybridModel")
     def test_spec_none_uses_default_te_spec(self, mock_model, *_):
-        # Default config: hybrid_stack_spec=None, restore_modelopt_state=False,
-        # transformer_impl != "inference_optimized" → falls through to default TE spec.
+        # Default config: hybrid_stack_spec=None and transformer_impl !=
+        # "inference_optimized" → falls through to the default TE spec.
         with patch("megatron.training.models.hybrid.default_hybrid_stack_spec") as mock_default:
             self.builder.build_model(self.pg, pre_process=True, post_process=True)
         call_kwargs = mock_model.call_args.kwargs
         assert call_kwargs["hybrid_stack_spec"] is mock_default
+
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
+    def test_transform_config_selects_modelopt_spec(self, mock_model, *_):
+        self.config.transformations = ModelTransformConfig(
+            default_te_spec=True, moe_grouped_gemm=False
+        )
+        with patch(
+            "megatron.training.models.hybrid.get_hybrid_stack_modelopt_spec"
+        ) as mock_modelopt:
+            self.builder.build_model(self.pg, pre_process=True, post_process=True)
+        mock_modelopt.assert_called_once_with(
+            remap_te_layernorm=False, use_default_te_spec=True, moe_grouped_gemm=False
+        )
+        assert mock_model.call_args.kwargs["hybrid_stack_spec"] is mock_modelopt.return_value
 
     @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
     @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
@@ -288,6 +306,16 @@ class TestHybridModelBuilderBuildModel:
         call_kwargs = mock_model.call_args.kwargs
         assert call_kwargs["hybrid_stack_spec"] is mock_inf
         mock_modelopt.assert_not_called()
+
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
+    def test_wide_residual_rejects_transform_config_spec(self, _mock_model, *_):
+        self.config.transformer.wide_residual = WideResidualConfig(num_streams=2)
+        self.config.transformations = ModelTransformConfig()
+        with pytest.raises(NotImplementedError, match="ModelOpt HybridStack"):
+            self.builder.build_model(self.pg, pre_process=True, post_process=True)
 
     @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
     @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
@@ -414,39 +442,25 @@ class TestHybridModelBuilderBuildDistributedModels:
 
         assert result is model_list
 
-    @patch("megatron.training.models.hybrid.compose_hooks")
     @patch("megatron.training.models.hybrid.unimodal_build_distributed_models")
-    def test_pre_wrap_hooks_composed_and_passed(self, mock_unimodal, mock_compose):
-        model_list = [Mock()]
-        mock_unimodal.return_value = model_list
-        composed_pre = Mock()
-        composed_post = Mock(return_value=None)
-        mock_compose.side_effect = [composed_pre, composed_post]
-
-        hook1 = Mock()
-        self.config.pre_wrap_hooks = [hook1]
+    def test_pre_wrap_hooks_composed_and_passed(self, mock_unimodal):
+        stages = [Mock()]
+        mock_unimodal.return_value = stages
+        hook = Mock(return_value=stages)
+        self.config.pre_wrap_hooks = [hook]
         self.builder.build_distributed_models(self.pg)
+        composed = mock_unimodal.call_args.args[10]
+        assert composed(stages) is stages
+        hook.assert_called_once_with(stages)
 
-        # First compose_hooks call must be with the pre_wrap_hooks list
-        assert mock_compose.call_args_list[0] == call([hook1])
-        # The composed pre-wrap hook is the 11th positional arg (index 10)
-        unimodal_args = mock_unimodal.call_args.args
-        assert unimodal_args[10] is composed_pre
-
-    @patch("megatron.training.models.hybrid.compose_hooks")
     @patch("megatron.training.models.hybrid.unimodal_build_distributed_models")
-    def test_post_wrap_hook_applied_to_results(self, mock_unimodal, mock_compose):
-        model_list = [Mock()]
-        wrapped_list = [Mock(), Mock()]
-        mock_unimodal.return_value = model_list
-        composed_pre = Mock()
-        composed_post = Mock(return_value=wrapped_list)
-        mock_compose.side_effect = [composed_pre, composed_post]
-
-        result = self.builder.build_distributed_models(self.pg)
-
-        composed_post.assert_called_once_with(model_list)
-        assert result is wrapped_list
+    def test_post_wrap_hook_applied_to_results(self, mock_unimodal):
+        stages, wrapped = [Mock()], [Mock(), Mock()]
+        mock_unimodal.return_value = stages
+        hook = Mock(return_value=wrapped)
+        self.config.post_wrap_hooks = [hook]
+        assert self.builder.build_distributed_models(self.pg) is wrapped
+        hook.assert_called_once_with(stages)
 
     @patch("megatron.training.models.hybrid.compose_hooks")
     @patch("megatron.training.models.hybrid.unimodal_build_distributed_models")
