@@ -1089,6 +1089,26 @@ def validate_loaded_state_dict(state_dict, checkpoint_path):
             ), f"key: {key}; {value} {load_item_dict[key]}"
 
 
+def handle_pipeline_layers_in_state_dict(model, model_state_dict):
+    """Rename this pipeline stage's transformer layers to their global layer indices.
+
+    Every stage numbers its layers from zero, so without this the stages' layers would share
+    names in one checkpoint. The optimizer state already uses the global names; see
+    :func:`get_global_unique_param_name`.
+    """
+    prefixes = {}
+    for name, module in model.named_modules():
+        name = _strip_wrapper_prefixes(name)
+        match = re.fullmatch(r"(.*layers)\.(\d+)", name)
+        if match and isinstance(module, TransformerLayer) and "mtp" not in name:
+            prefixes[f"{name}."] = f"{match.group(1)}.{module.layer_number - 1}."
+    renamed = {}
+    for key, value in model_state_dict.items():
+        prefix = next((p for p in prefixes if key.startswith(p)), None)
+        renamed[key if prefix is None else prefixes[prefix] + key[len(prefix) :]] = value
+    return renamed
+
+
 def get_global_unique_param_name(model_chunks, param):
     """
     Get the global unique parameter name for a given model and parameter.
