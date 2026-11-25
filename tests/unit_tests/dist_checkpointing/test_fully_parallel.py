@@ -89,14 +89,14 @@ class MockLoadStrategy(TorchDistLoadShardedStrategy):
 
 
 def test_distribute_shards_to_ranks_greedy():
-    shard_to_ranks = {'a': [0, 1, 2], 'b': [0, 1, 2], 'c': [1], 'd': [0, 2], 'e': [2]}
-    shard_to_size = {'a': 4, 'b': 3, 'c': 5, 'd': 2, 'e': 1}
-    assert distribute_shards_to_ranks(shard_to_ranks, shard_to_size, 3, {'e'}) == {
-        'a': 2,
-        'b': 0,
-        'c': 1,
-        'd': 0,
-        'e': 2,
+    shard_to_ranks = {"a": [0, 1, 2], "b": [0, 1, 2], "c": [1], "d": [0, 2], "e": [2]}
+    shard_to_size = {"a": 4, "b": 3, "c": 5, "d": 2, "e": 1}
+    assert distribute_shards_to_ranks(shard_to_ranks, shard_to_size, 3, {"e"}) == {
+        "a": 2,
+        "b": 0,
+        "c": 1,
+        "d": 0,
+        "e": 2,
     }
 
 
