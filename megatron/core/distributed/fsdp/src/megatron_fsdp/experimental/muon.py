@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import cached_property
+from importlib.metadata import version as _pkg_version
 from typing import Any, cast
 
 import torch
@@ -29,6 +30,9 @@ from .gather_scatter import gather, get_sorted_rank_ranges, scatter
 from .owner_planning import assign_owner_work
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 from .range import Range, intersect_ranges
+
+# Emerging-Optimizers runs a batched (3-D) Newton-Schulz from 0.3 on.
+_EO_BATCHED_NS = tuple(int(x) for x in _pkg_version('emerging-optimizers').split('.')[:2]) >= (0, 3)
 
 # Newton-Schulz temporaries grow with the batch, so a batch holds at most this much FP32 input.
 _MAX_BATCH_BYTES = 1 << 30
@@ -290,8 +294,10 @@ class FsdpMuon(Muon):
         self.num_groups_in_flight = num_groups_in_flight
         # Same-shape tensors share one Newton-Schulz unless a subclass orthogonalizes differently
         # or SYRK is on, whose kernel takes 2-D inputs only.
-        self._batch_same_shape = type(self).orthogonalize is Muon.orthogonalize and not kwargs.get(
-            "use_syrk", False
+        self._batch_same_shape = (
+            _EO_BATCHED_NS
+            and type(self).orthogonalize is Muon.orthogonalize
+            and not kwargs.get("use_syrk", False)
         )
 
         # Preserve discovery order: communication must be posted identically on every rank.
