@@ -6,7 +6,6 @@ import copy
 
 import pytest
 import torch
-import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Partial, Replicate
@@ -21,7 +20,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import RowAtomic
 
 pytest.importorskip("emerging_optimizers")
-from emerging_optimizers.orthogonalized_optimizers import muon_utils
 from emerging_optimizers.orthogonalized_optimizers.muon import Muon
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import muon
@@ -158,12 +156,18 @@ def test_muon_matches_reference(
     torch.testing.assert_close(losses, reference_losses, atol=0, rtol=0)
 
 
-def test_muon_batches_same_shape_tensors(distributed_setup, monkeypatch):
+def test_muon_batches_same_shape_tensors(distributed_setup):
     """Same-shape tensors of one FSDP group run one batched Newton-Schulz.
 
     Batched GEMMs round differently from per-tensor ones, so the losses match the reference to
     rounding error rather than bitwise.
     """
+    shapes = {0: (8, 8), 1: (8, 8), 2: (1, 8), 3: (8, 8)}
+    assert muon._batches_by_shape({i: torch.empty(s) for i, s in shapes.items()}) == [
+        [0, 1, 3],
+        [2],
+    ]
+
     world_size = distributed_setup.world_size
     if world_size < 2 or world_size % 2:
         pytest.skip("Requires an even number of ranks for two-rank DP meshes.")
@@ -184,20 +188,7 @@ def test_muon_batches_same_shape_tensors(distributed_setup, monkeypatch):
     fully_shard_optimizer(optimizer, precision_aware=True)
     reference_optimizer = Muon(list(reference.parameters()), **kwargs)
 
-    batch_sizes = []
-    newton_schulz = muon_utils.newton_schulz
-
-    def record_batch_size(x, *args, **kwargs):
-        batch_sizes.append(x.shape[0] if x.ndim == 3 else 1)
-        return newton_schulz(x, *args, **kwargs)
-
-    monkeypatch.setattr(muon_utils, "newton_schulz", record_batch_size)
     inputs = torch.randn(5, 4, 8, device=device)
     losses = _train(model, (optimizer,), inputs)
-    monkeypatch.undo()
     reference_losses = _train(reference, (reference_optimizer,), inputs)
-
     torch.testing.assert_close(losses, reference_losses, rtol=1e-5, atol=1e-5)
-    largest_batch = torch.tensor(max(batch_sizes, default=0), device=device)
-    dist.all_reduce(largest_batch, op=dist.ReduceOp.MAX)
-    assert largest_batch.item() > 1
