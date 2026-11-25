@@ -1477,7 +1477,7 @@ wheels = [
 
 [[package]]
 name = "flash-attn-4"
-version = "4.0.0b27"
+version = "4.0.0b33"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apache-tvm-ffi" },
@@ -1488,9 +1488,9 @@ dependencies = [
     { name = "torch-c-dlpack-ext" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d9/95/2550a2f165a90ca5d3f56be464391a0a6475b5a1a3cf7324cc93902f1e31/flash_attn_4-4.0.0b27.tar.gz", hash = "sha256:da72905c435eb30c0cb319c9b2eca20e67791355f347e47130d7c9586e84e5ad", size = 377736, upload-time = "2026-08-19T08:13:33.706Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/0c/d8/f5f957549afcb25890519e7423df697b17e4f8f90df41fc721552558f6fe/flash_attn_4-4.0.0b33.tar.gz", hash = "sha256:fcd43af2f4bde45b19f4f601002d9250cc93f1908a74345a056479f1f0e1c9ac", size = 493675, upload-time = "2026-09-30T08:22:22.672Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/73/b3/85de5e9e393f5fc8a83c27258ba21c683c396c5ad79f15713283a801407b/flash_attn_4-4.0.0b27-py3-none-any.whl", hash = "sha256:c84fedab172419f87bd1daf019ecd268595f512a5967ff90b74a0a601f578e07", size = 402719, upload-time = "2026-08-19T08:13:32.171Z" },
+    { url = "https://files.pythonhosted.org/packages/f0/07/0dffc2de0357396f077b909f10d2f25a25e177c3f881ba345b95d5fd183c/flash_attn_4-4.0.0b33-py3-none-any.whl", hash = "sha256:7ffbb0c2e2a03ee0ba7f00997d5dbcfcd0ab22cbcbccbe2c9195527583ce14e4", size = 522100, upload-time = "2026-09-30T08:22:20.844Z" },
 ]
 
 [package.optional-dependencies]
@@ -2829,7 +2829,7 @@ requires-dist = [
     { name = "emerging-optimizers", marker = "extra == 'dev'", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.3.0" },
     { name = "fast-hadamard-transform", marker = "extra == 'dev'", git = "https://github.com/Dao-AILab/fast-hadamard-transform.git?rev=f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" },
     { name = "fastapi", marker = "extra == 'dev'", specifier = "~=0.50" },
-    { name = "flash-attn-4", extras = ["cu13"], marker = "extra == 'dev'", specifier = "==4.0.0b27" },
+    { name = "flash-attn-4", extras = ["cu13"], marker = "extra == 'dev'", specifier = "==4.0.0b33" },
     { name = "flash-linear-attention", marker = "extra == 'ssm'", specifier = "==0.5.1" },
     { name = "flashinfer-jit-cache", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
     { name = "flashinfer-jit-cache-sm100a", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
