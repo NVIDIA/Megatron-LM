@@ -25,6 +25,11 @@ from typing import Any, cast
 import torch
 from torch.distributed.tensor import DTensor
 
+from megatron.core.fusions.fused_angular_muown import (
+    fused_angular_muown_apply_update,
+    fused_angular_muown_momentum_inputs,
+)
+
 from .dbuffer import DBuffer
 from .muon import FsdpMuon, _FsdpGroupAssignment
 from .parameter_group import FsdpParameterGroup
@@ -189,7 +194,6 @@ class FsdpAngularMuOwn(FsdpMuon):
         momentum_inputs: DBuffer = DBuffer(
             buffer.mesh, buffer.placements, buffer.layout, buffer.dtype, buffer.device
         )
-        beta1, beta2 = self.row_scale_betas
         for i, group_index in tensor_to_optimizer_group_index.items():
             self._active_group_indices.add(group_index)
             group: dict[str, Any] = self.param_groups[group_index]
@@ -202,38 +206,20 @@ class FsdpAngularMuOwn(FsdpMuon):
             if momentum.numel() == 0:
                 # This rank holds no rows of the tensor.
                 continue
-            beta: float = group["momentum"]
-            # Local rows: W and G are (k, n); g and Adam's moments of g are (k, 1).
-            weight: torch.Tensor = param.to_local()
-            grad: torch.Tensor = param.grad.to_local().to(momentum.dtype).reshape(momentum.shape)
-            row_scale: torch.Tensor = state["row_scale"].to_local()
-            row_scale_exp_avg: torch.Tensor = state["row_scale_exp_avg"].to_local()
-            row_scale_exp_avg_sq: torch.Tensor = state["row_scale_exp_avg_sq"].to_local()
-            # This rank's rows of the Newton-Schulz input, filled in place below.
-            ns_input: torch.Tensor = momentum_inputs.get_tensor_view(i).view_as(momentum)
-
-            # U = W / g, with |g| floored at norm_eps. copysign keeps g's sign and maps +0 to +eps.
-            direction = weight / torch.copysign(row_scale.abs().clamp_min(self.norm_eps), row_scale)
-            # d_i = <G_i, U_i>: the radial gradient, which is dL/dg_i.
-            radial_grad = (grad * direction).sum(dim=1, keepdim=True)
-            # dL/dU_i = g_i * (G_i - d_i * U_i): the direction gradient, tangent to the unit sphere.
-            torch.addcmul(grad, direction, radial_grad, value=-1.0, out=ns_input)
-            ns_input.mul_(row_scale)
-
-            # Adam moments of g:  m_g <- beta1 * m_g + (1 - beta1) * d,
-            #                     v_g <- beta2 * v_g + (1 - beta2) * d^2.
-            row_scale_exp_avg.lerp_(radial_grad, 1 - beta1)
-            row_scale_exp_avg_sq.mul_(beta2).addcmul_(radial_grad, radial_grad, value=1 - beta2)
-
-            # Raw-sum momentum:  M <- beta * M + dL/dU.
-            # Newton-Schulz normalizes its input, so this matches Muon's EMA momentum up to the
-            # positive factor 1 / (1 - beta).
-            momentum.mul_(beta).add_(ns_input)
-            # Newton-Schulz input:  M~ = dL/dU + beta * M with Nesterov, otherwise M~ = M.
-            if self.nesterov:
-                ns_input.add_(momentum, alpha=beta)
-            else:
-                ns_input.copy_(momentum)
+            # Local rows: W, G, and M are (k, n); g and Adam's moments of g are (k, 1).
+            fused_angular_muown_momentum_inputs(
+                param.to_local(),
+                param.grad.to_local().reshape(momentum.shape),
+                momentum,
+                momentum_inputs.get_tensor_view(i).view_as(momentum),
+                state["row_scale"].to_local(),
+                state["row_scale_exp_avg"].to_local(),
+                state["row_scale_exp_avg_sq"].to_local(),
+                beta=group["momentum"],
+                betas=self.row_scale_betas,
+                norm_eps=self.norm_eps,
+                nesterov=self.nesterov,
+            )
         return momentum_inputs
 
     def _apply_local_updates(
@@ -282,35 +268,18 @@ class FsdpAngularMuOwn(FsdpMuon):
                 update: torch.Tensor = full_updates[i].view(-1).narrow(0, offset, weight.numel())
             else:
                 update = local_updates.get_tensor_view(i)
-            update = update.reshape(weight.shape).to(weight.dtype)
             state: dict[str, Any] = self.state[param]
-            row_scale: torch.Tensor = state["row_scale"].to_local()
-            row_scale_exp_avg: torch.Tensor = state["row_scale_exp_avg"].to_local()
-            row_scale_exp_avg_sq: torch.Tensor = state["row_scale_exp_avg_sq"].to_local()
-
-            # U = W / g. g is not updated yet, so this is the U that split the gradient.
-            direction = weight / torch.copysign(row_scale.abs().clamp_min(self.norm_eps), row_scale)
-            # U+ = U - lr * kappa_t * O
-            direction.add_(update, alpha=-lr * kappa)
-            # Retraction denominators:  rho_i = ||U+_i||,  rho_den_i = max(rho_i, norm_eps).
-            row_norm = torch.linalg.vector_norm(direction, dim=1, keepdim=True)
-            denominator = row_norm.clamp_min(self.norm_eps)
-
-            # Adam on g with decoupled decay:
-            #   g <- (1 - lr * lambda') * g - lr * m_hat / (sqrt(v_hat) + eps),
-            #   m_hat = m_g / (1 - beta1^t),  v_hat = v_g / (1 - beta2^t),
-            #   lambda' = weight_decay * weight_decay_mult.
             weight_decay: float = group["weight_decay"] * self.weight_decay_mult
-            if weight_decay != 0:
-                row_scale.mul_(1 - lr * weight_decay)
-            row_scale.sub_(
-                (row_scale_exp_avg / (1 - beta1**step))
-                / ((row_scale_exp_avg_sq / (1 - beta2**step)).sqrt() + self.row_scale_eps),
-                alpha=lr,
+            fused_angular_muown_apply_update(
+                weight,
+                update.view(weight.shape),
+                state["row_scale"].to_local(),
+                state["row_scale_exp_avg"].to_local(),
+                state["row_scale_exp_avg_sq"].to_local(),
+                direction_lr=lr * kappa,
+                lr=lr,
+                decay=1 - lr * weight_decay,
+                bias_corrections=(1 - beta1**step, 1 - beta2**step),
+                adam_eps=self.row_scale_eps,
+                norm_eps=self.norm_eps,
             )
-
-            # W = g * U_new with the retracted unit rows U_new = U+ / rho_den.
-            torch.mul(direction, row_scale / denominator, out=weight)
-            # g <- g * rho / rho_den: a no-op unless the clamp fired, where it keeps
-            # |g_i| = ||W_i||.
-            row_scale.mul_(row_norm / denominator)

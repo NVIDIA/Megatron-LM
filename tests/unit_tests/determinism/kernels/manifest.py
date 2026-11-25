@@ -1080,6 +1080,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "GEMM path; the SYRK paths are exercised only where the stack supports them.",
     ),
     KernelEntry(
+        name="fused_angular_muown",
+        sources=("megatron/core/fusions/fused_angular_muown.py",),
+        tests=(K + "test_angular_muown_kernels.py",),
+        kind="triton",
+        notes="One program per row: each row's column sums run in a fixed order and every "
+        "element and row state is written by one program, so replays are bit-identical.",
+    ),
+    KernelEntry(
         name="mfsdp_muon_dispatch",
         sources=("megatron/core/distributed/fsdp/src/megatron_fsdp/experimental/muon.py",),
         tests=("tests/unit_tests/distributed/mfsdp_v2/test_muon.py",),
