@@ -282,16 +282,26 @@ class FsdpModule:
             context.allgather_stream.wait_stream(context.current_stream())
 
         if context.is_recording_execution_order:
-            # Recomputation is recorded as a forward event too, so later passes prefetch
-            # the planes it needs.
+            # The first iteration is training. Include recomputation so replay
+            # prefetches its forward weight planes.
             context.execution_order.append(ExecutionEvent(cast(nn.Module, self), Phase.FORWARD))
-            prefetch = False
-        elif context.prefetch_order is PrefetchOrder.RECORDED:
-            prefetch = True
-        else:
+
+        def should_prefetch() -> bool:
+            """Whether this call can prefetch using the established training trace."""
+            if context.is_recording_execution_order:
+                return False
+            # Evaluation usually runs forward only, so it needs a different execution
+            # order from the training trace, which includes backward events.
+            # Disabling prefetch may slow evaluation by losing all-gather/compute overlap.
+            # TODO: Use a separate forward-only execution order to restore that overlap.
+            if not cast(nn.Module, self).training:
+                return False
+            if context.prefetch_order is PrefetchOrder.RECORDED:
+                return True
             # A REGISTRATION order has no recomputation events.
-            prefetch = not is_recomputing
-        self.unshard(Phase.FORWARD, prefetch=prefetch)
+            return not is_recomputing
+
+        self.unshard(Phase.FORWARD, prefetch=should_prefetch())
 
     def unshard(self, phase: Phase | None = None, prefetch: bool = False) -> None:
         """Unshard this FsdpModule's parameter groups immediately.
