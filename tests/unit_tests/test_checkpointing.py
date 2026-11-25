@@ -469,9 +469,16 @@ class MockOptimizer(MockState):
         state_dict["param_groups"] = [param_group.copy() for param_group in self.param_groups]
         return state_dict
 
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict, *, override_lr=False):
         super().load_state_dict(state_dict)
-        self.param_groups = [param_group.copy() for param_group in state_dict["param_groups"]]
+        if override_lr:
+            from megatron.core.optimizer.optimizer import match_param_groups
+
+            self.param_groups = match_param_groups(
+                self.param_groups, state_dict["param_groups"], override_lr=True
+            )
+        else:
+            self.param_groups = [param_group.copy() for param_group in state_dict["param_groups"]]
 
 
 @pytest.mark.parametrize(
@@ -1323,13 +1330,20 @@ def test_load_checkpoint_stream_ckpt_dequant_refuses_optimizer(create_ckpt_load_
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])
+@pytest.mark.parametrize("distributed", [False, True])
 def test_load_checkpoint_override_opt_param_scheduler(
-    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format, run_config
+    init_model_parallel,
+    create_ckpt_load_args,
+    tmp_path_dist_ckpt,
+    ckpt_format,
+    run_config,
+    distributed,
 ):
     """Test override_opt_param_scheduler behavior during checkpoint load."""
     args = create_ckpt_load_args
     args.ckpt_format = ckpt_format
-    args.use_distributed_optimizer = False
+    args.use_distributed_optimizer = distributed
+    run_config.optimizer.use_distributed_optimizer = distributed
     args.use_dist_ckpt = ckpt_format != "torch"
     run_config.scheduler.override_opt_param_scheduler = True
     run_config.optimizer.lr = 1.0
@@ -1362,6 +1376,10 @@ def test_load_checkpoint_override_opt_param_scheduler(
             {"is_decoupled_lr": True, "max_lr": -1.0, "min_lr": -1.0},
             {"default_config": False, "wd_mult": 0.5, "max_lr": 16.0, "min_lr": 1.6},
         ]
+        if distributed:
+            optimizer.param_groups.append(
+                {"default_config": False, "wd_mult": 0.5, "max_lr": 16.0, "min_lr": 1.6}
+            )
         opt_param_scheduler = MockOptParamScheduler(
             {"opt_param_scheduler": "scheduler_state", "num_steps": 3}
         )
@@ -1380,6 +1398,12 @@ def test_load_checkpoint_override_opt_param_scheduler(
             {"is_decoupled_lr": True, "max_lr": -2.0, "min_lr": -2.0},
             {"default_config": False, "wd_mult": 0.5, "max_lr": 32.0, "min_lr": 3.2},
         ]
+        if distributed:
+            new_optimizer.param_groups[0].update(max_lr=1.0, min_lr=0.1)
+            new_optimizer.param_groups[1].update(max_lr=0.5, min_lr=0.05)
+            new_optimizer.param_groups.append(
+                {"default_config": False, "wd_mult": 0.5, "max_lr": 32.0, "min_lr": 3.2}
+            )
         new_opt_param_scheduler = MockOptParamScheduler(
             {"opt_param_scheduler": "dummy2", "num_steps": 0}
         )

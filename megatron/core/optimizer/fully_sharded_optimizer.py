@@ -247,7 +247,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         return param_groups
 
     @override
-    def load_state_dict(self, state_dict: ShardedStateDict) -> None:
+    def load_state_dict(self, state_dict: ShardedStateDict, *, override_lr: bool = False) -> None:
         """Load optimizer state produced by :meth:`sharded_state_dict`.
 
         By the time this runs DCP has already written the checkpoint's tensors into the
@@ -257,6 +257,8 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         to the current parameters, mirroring the Megatron-FSDP branch of
         :meth:`DistributedOptimizer.load_state_dict`.
         """
+        if override_lr:
+            raise NotImplementedError("Group LR reconciliation is not supported with FSDP.")
         param_groups = self._param_groups_from_group_meta(state_dict["param_to_group_meta"])
         state = state_dict["state"]
         if not is_te_min_version("2.18.0"):

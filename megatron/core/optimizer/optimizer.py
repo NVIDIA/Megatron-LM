@@ -269,6 +269,106 @@ def find_saved_param_group(identifier: tuple, saved_groups: Dict[tuple, Dict]) -
     return None
 
 
+def _group_metadata_equal(left, right) -> bool:
+    """Compare retained optimizer metadata, including tensor-valued counters."""
+    if isinstance(left, torch.Tensor) or isinstance(right, torch.Tensor):
+        return (
+            isinstance(left, torch.Tensor)
+            and isinstance(right, torch.Tensor)
+            and left.dtype == right.dtype
+            and torch.equal(left, right)
+        )
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(
+            _group_metadata_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        return len(left) == len(right) and all(
+            _group_metadata_equal(a, b) for a, b in zip(left, right)
+        )
+    return left == right
+
+
+def match_param_groups(
+    current_groups: List[Dict], saved_groups: List[Dict], *, override_lr: bool = False
+) -> List[Dict]:
+    """Reconcile distributed optimizer metadata without changing the checkpoint format.
+
+    Ordinary resume retains exact matching, including legacy duplicate identifiers and
+    the pre-DSA split. An explicit LR override keeps runtime lr/max_lr/min_lr and the
+    runtime LR logging classification (default_config). Saved groups may then be
+    interchangeable, but only if *all* retained metadata agrees, including counters and
+    backend-specific fields. Parameter tensors are loaded separately by DistributedOptimizer;
+    this reconciliation must not be used to reorder a flat, positional optimizer state.
+    """
+    runtime_keys = ("lr", "max_lr", "min_lr", "default_config")
+    excluded = {"params", *runtime_keys, *(f"pre_{key}" for key in runtime_keys)}
+
+    def lookup_key(group: Dict) -> tuple:
+        # Keep the tuple positions so the existing DSA lookup also works here.
+        return tuple(
+            None if override_lr and name in ("max_lr", "min_lr") else value
+            for name, value in zip(
+                param_group_identifier_keys, get_param_group_identifier_tuple(group)
+            )
+        )
+
+    def retained_metadata(group: Dict) -> Dict:
+        result = {key: value for key, value in group.items() if key not in excluded}
+        # Normalize existing NeMo aliases and missing legacy structural fields only.
+        # Unknown fields remain in the comparison; they may affect optimizer behavior.
+        for key in param_group_identifier_keys:
+            if key not in ("max_lr", "min_lr"):
+                result.pop(f"pre_{key}", None)
+                result[key] = get_param_group_identifier_value(group, key)
+        return result
+
+    saved_map: Dict[tuple, Dict] = {}
+    ambiguous_keys: set[tuple] = set()
+    for saved_group in saved_groups:
+        key = lookup_key(saved_group)
+        if override_lr and key in saved_map:
+            if key not in ambiguous_keys and not _group_metadata_equal(
+                retained_metadata(saved_map[key]), retained_metadata(saved_group)
+            ):
+                ambiguous_keys.add(key)
+        else:
+            # Ordinary resume retains the legacy last-duplicate-wins behavior.
+            saved_map[key] = saved_group
+
+    has_saved_indexer = any(_is_dsa_indexer_identifier(key) for key in saved_map)
+    matched = []
+    for current in current_groups:
+        key = lookup_key(current)
+        # During an override, an explicit saved indexer group rules out the
+        # pre-DSA fallback. Ordinary resume keeps the existing lookup unchanged.
+        group = (
+            saved_map.get(key)
+            if override_lr and has_saved_indexer
+            else find_saved_param_group(key, saved_map)
+        )
+        if group is None:
+            raise ValueError(_missing_param_group_message(key, saved_map))
+        if not override_lr:
+            matched.append(group)
+            continue
+        # Unused saved groups need not be compatible with this rank's groups.
+        if lookup_key(group) in ambiguous_keys:
+            raise ValueError(
+                "Ambiguous parameter group match during LR override: saved groups have "
+                "different retained optimizer metadata (for example betas, epsilon or step). "
+                "Resume with the original configuration without LR override, or explicitly "
+                "start with fresh optimizer state. Group position and old LR values cannot "
+                "disambiguate an LR override."
+            )
+        group = {key: value for key, value in group.items() if key not in excluded}
+        group.update({key: current[key] for key in runtime_keys if key in current})
+        # Preserve the runtime half of the supported pre-DSA group split.
+        group["is_dsa_indexer"] = get_param_group_identifier_value(current, "is_dsa_indexer")
+        matched.append(group)
+    return matched
+
+
 MTP_GRAD_NORM_GROUP = 'mtp'
 GRAD_NORM_GROUP_ATTR = 'grad_norm_group'
 SEPARATE_GRAD_NORM_GROUPS = (MTP_GRAD_NORM_GROUP,)
@@ -707,8 +807,8 @@ class MegatronOptimizer(ABC):
         pass
 
     @abstractmethod
-    def load_state_dict(self, state_dict):
-        """Load pass-in `state_dict`."""
+    def load_state_dict(self, state_dict, *, override_lr: bool = False):
+        """Load state, optionally preserving runtime LR settings on supported backends."""
         pass
 
     # Promote state so it can be retrieved or set via
@@ -1503,7 +1603,9 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             state_dict['optimizer']['state']['common_step'] = step
         return state_dict
 
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict, *, override_lr: bool = False):
+        if override_lr:
+            raise NotImplementedError("LR reconciliation requires the distributed optimizer.")
         # Optimizer.
         optimizer_key = 'optimizer'
         if optimizer_key not in state_dict:
@@ -1719,7 +1821,9 @@ class FP32Optimizer(MegatronOptimizer):
     def state_dict(self):
         return self.optimizer.state_dict()
 
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict, *, override_lr: bool = False):
+        if override_lr:
+            raise NotImplementedError("LR reconciliation requires the distributed optimizer.")
         if 'common_step' in state_dict['state']:
             common_step = state_dict['state'].pop('common_step')
             self._restore_common_per_param_step(state_dict, common_step)
@@ -1988,10 +2092,12 @@ class ChainedOptimizer(MegatronOptimizer):
                 sharded_state_dict[optimizer_idx] = optim_state_dict
             return sharded_state_dict
 
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict, *, override_lr: bool = False):
+        # Avoid passing new keywords to existing custom optimizers during ordinary resume.
+        load_kwargs = {"override_lr": True} if override_lr else {}
         # If there is only one optimizer, we read the state dict as a single optimizer.
         if len(self.chained_optimizers) == 1:
-            self.chained_optimizers[0].load_state_dict(state_dict)
+            self.chained_optimizers[0].load_state_dict(state_dict, **load_kwargs)
             return
         if len(self.chained_optimizers) != len(state_dict):
             raise RuntimeError(
@@ -2001,7 +2107,7 @@ class ChainedOptimizer(MegatronOptimizer):
         if isinstance(state_dict, dict):
             state_dict = (v for k, v in sorted(state_dict.items()))
         for optimizer, state in zip(self.chained_optimizers, state_dict):
-            optimizer.load_state_dict(state)
+            optimizer.load_state_dict(state, **load_kwargs)
         self._synchronize_steps()
 
     @override
