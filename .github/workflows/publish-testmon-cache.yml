@@ -1,0 +1,166 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+name: Publish Testmon caches
+run-name: Publish Testmon caches for ${{ inputs.head_sha || github.sha }}
+
+# Merge groups targeting main record Testmon baselines as artifacts. Their caches
+# would be scoped to the temporary merge-queue ref, so publish them from main once
+# the merge-group commit has landed. Only landed commits become PR baselines.
+on:
+  push:
+    branches:
+      - main
+  # Republish a landed merge group's caches, e.g. to make an older commit the PR baseline.
+  workflow_dispatch:
+    inputs:
+      head_sha:
+        description: Commit on main whose merge-group Testmon caches PRs should use (full or short SHA)
+        type: string
+        required: true
+
+concurrency:
+  group: publish-testmon-cache-${{ inputs.head_sha || github.sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  find:
+    name: Find merge-group baselines
+    if: github.repository == 'NVIDIA/Megatron-LM'
+    runs-on: ubuntu-latest
+    outputs:
+      run_id: ${{ steps.find.outputs.run_id }}
+      source_sha: ${{ steps.find.outputs.source_sha }}
+      matrix: ${{ steps.find.outputs.matrix }}
+    steps:
+      - name: Find the merge-group baselines to publish
+        id: find
+        shell: bash -e -u -o pipefail {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          REQUESTED_SHA: ${{ inputs.head_sha }}
+        run: |
+          SOURCE_SHA=$GITHUB_SHA
+          if [[ -n "$REQUESTED_SHA" ]]; then
+            # Caches saved from other refs are invisible to PRs.
+            if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+              echo "::error::Dispatch this workflow from main."
+              exit 1
+            fi
+            if [[ ! "$REQUESTED_SHA" =~ ^[0-9a-f]{7,40}$ ]]; then
+              echo "::error::head_sha must be a commit SHA (7 to 40 lowercase hex characters)."
+              exit 1
+            fi
+            SOURCE_SHA=$(gh api "repos/$REPOSITORY/commits/$REQUESTED_SHA" --jq .sha)
+            # Only landed commits may become PR baselines.
+            STATUS=$(gh api "repos/$REPOSITORY/compare/$SOURCE_SHA...main" --jq .status)
+            if [[ "$STATUS" != "identical" && "$STATUS" != "ahead" ]]; then
+              echo "::error::$SOURCE_SHA is not on main."
+              exit 1
+            fi
+          fi
+          # A landed merge-group commit is the main commit, so match it exactly.
+          RUN_ID=$(gh api "repos/$REPOSITORY/actions/workflows/cicd-main.yml/runs?event=merge_group&head_sha=$SOURCE_SHA&per_page=100" \
+            --jq "[.workflow_runs[] | select(.head_repository.full_name == \"$REPOSITORY\" and (.head_branch | startswith(\"gh-readonly-queue/main/\")))] | first | .id // empty")
+          MATRIX='[]'
+          if [[ -n "$RUN_ID" ]]; then
+            # Generations must come from the first attempt, as PR checkouts require.
+            MATRIX=$(gh api --paginate "repos/$REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" \
+              --jq '.artifacts[] | select(.expired | not) | select(.name | test("^unit-testmon-v[0-9]+-main-.+-1$")) | .name' \
+              | jq -R -s -c 'split("\n") | map(select(length > 0)) | map({artifact: .})')
+          fi
+          echo "run_id=$RUN_ID" | tee -a "$GITHUB_OUTPUT"
+          echo "source_sha=$SOURCE_SHA" | tee -a "$GITHUB_OUTPUT"
+          echo "matrix=$MATRIX" | tee -a "$GITHUB_OUTPUT"
+          if [[ "$MATRIX" == "[]" ]]; then
+            # A requested commit must publish; pushes without baselines are routine.
+            if [[ -n "$REQUESTED_SHA" && -z "$RUN_ID" ]]; then
+              echo "::error::No merge group targeting main tested $SOURCE_SHA; it was merged outside the queue."
+              exit 1
+            elif [[ -n "$REQUESTED_SHA" ]]; then
+              echo "::error::Merge-group run $RUN_ID for $SOURCE_SHA has no unexpired first-attempt Testmon baselines."
+              exit 1
+            fi
+            echo "::notice::No merge-group Testmon baselines for $SOURCE_SHA; nothing to publish."
+          fi
+
+  publish:
+    # PR checkouts read the baseline commit and generation from this name.
+    name: Publish ${{ matrix.artifact }} from run ${{ needs.find.outputs.run_id }} at ${{ needs.find.outputs.source_sha }}
+    needs: find
+    if: needs.find.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.find.outputs.matrix) }}
+    steps:
+      - name: Checkout the landed commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.find.outputs.source_sha }}
+
+      - name: Download the merge-group baseline
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: assets_dir/testmon
+          run-id: ${{ needs.find.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Validate the baseline for this commit
+        id: validate
+        shell: bash -e -u -o pipefail {0}
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          SOURCE_SHA: ${{ needs.find.outputs.source_sha }}
+          GENERATION: ${{ needs.find.outputs.run_id }}-1
+        run: |
+          MANIFEST=assets_dir/testmon/manifest.json
+          jq -e --arg sha "$SOURCE_SHA" --arg generation "$GENERATION" \
+            '.source_ref == "refs/heads/main" and .source_sha == $sha and .generation == $generation' "$MANIFEST"
+          # Recompute the identity from the landed commit instead of trusting the artifact.
+          python3 tests/unit_tests/testmon_cache.py identity \
+            --bucket "$(jq -r .identity.bucket "$MANIFEST")" \
+            --platform "$(jq -r .identity.platform "$MANIFEST")" \
+            --output "$RUNNER_TEMP/unit-testmon-identity.json" | tee -a "$GITHUB_OUTPUT"
+          PREFIX=$(jq -r .cache_prefix "$RUNNER_TEMP/unit-testmon-identity.json")
+          [[ "$ARTIFACT" == "${PREFIX}1" ]]
+          python3 tests/unit_tests/testmon_cache.py validate \
+            --cache-dir assets_dir/testmon --identity "$RUNNER_TEMP/unit-testmon-identity.json" \
+            --matched-key "$PREFIX$GENERATION" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "key=$PREFIX$GENERATION" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Match the baseline cache compression
+        id: cache-compression
+        shell: bash -e -u -o pipefail {0}
+        run: |
+          # GPU runners publish gzip caches. actions/cache includes compression
+          # in its version and otherwise chooses ubuntu-latest's installed zstd.
+          TESTMON_CACHE_BIN=$(mktemp -d "$RUNNER_TEMP/unit-testmon-gzip.XXXXXX")
+          printf '#!/bin/sh\nexit 1\n' > "$TESTMON_CACHE_BIN/zstd"
+          chmod +x "$TESTMON_CACHE_BIN/zstd"
+          printf 'path=%s:%s\n' "$TESTMON_CACHE_BIN" "$PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Save the main Testmon cache
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        env:
+          PATH: ${{ steps.cache-compression.outputs.path }}
+        with:
+          path: assets_dir/testmon
+          key: ${{ steps.validate.outputs.key }}
+
+      # cache/save warns on upload failures, so verify publication explicitly.
+      - name: Verify the main Testmon cache
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        env:
+          PATH: ${{ steps.cache-compression.outputs.path }}
+        with:
+          path: assets_dir/testmon
+          key: ${{ steps.validate.outputs.key }}
+          lookup-only: true
+          fail-on-cache-miss: true

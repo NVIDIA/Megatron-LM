@@ -407,6 +407,22 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.enable_prefix_caching = inference_config.enable_prefix_caching
         self.prefix_caching_eviction_policy = inference_config.prefix_caching_eviction_policy
         self.prefix_caching_coordinator_policy = inference_config.prefix_caching_coordinator_policy
+        # An external router (Dynamo) splits work without shards, so only native
+        # disaggregation can be checked here; its factory sets the role first.
+        assert (
+            inference_config.disaggregation_shards is None
+            or inference_config.disaggregation_role is not None
+        ), (
+            "disaggregation_shards is set but disaggregation_role is not; build the engine "
+            "with build_dynamic_inference_engine or set the role before the context"
+        )
+        # Decode imports each handoff straight into live SSM state and never
+        # restores a cached one, so it holds no Mamba prefix cache.
+        self.prefix_caching_mamba_gb = (
+            None
+            if inference_config.disaggregation_role == "decode"
+            else inference_config.prefix_caching_mamba_gb
+        )
 
         # Hyperparameter for choosing to prioritize prefix hit matches vs minimizing idle load
         self.prefix_caching_routing_alpha = inference_config.prefix_caching_routing_alpha
@@ -856,8 +872,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             # stage (see `_compute_prefix_match`), so it stays available.
             mamba_prefix_cache_requested = (
                 self.enable_prefix_caching
-                and inference_config.prefix_caching_mamba_gb is not None
-                and inference_config.prefix_caching_mamba_gb > 0
+                and self.prefix_caching_mamba_gb is not None
+                and self.prefix_caching_mamba_gb > 0
             )
             if (
                 mamba_prefix_cache_requested
@@ -981,9 +997,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             ), "Router recording/replay requested but no MoE experts specified!"
             self.moe_routing_metadata = RoutingMetadata(self, model_config.moe_router_topk)
 
+        # MoE layers cannot be built without num_moe_experts, so a model without it is dense
+        # and must not set up dispatcher state: the NVLS buffers need a symmetric-memory
+        # rendezvous over the tp_ep group, which equals the TP group for a dense model.
+        has_moe_layers = model_config.num_moe_experts is not None
+
         # are we using the inference_optimized nccl ep dispatcher for MoEs?
         self._nccl_ep_dispatcher = (
-            get_pg_size(self.expert_model_parallel_group) > 1
+            has_moe_layers
+            and get_pg_size(self.expert_model_parallel_group) > 1
             and model_config.inference_moe_token_dispatcher_type == 'nccl'
         )
 
@@ -991,7 +1013,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # The NVLS dispatcher gathers over the tp_ep group, so it is also active
         # for EP == 1 with expert tensor parallelism (ETP > 1).
         self._nvls_dispatcher = (
-            get_pg_size(self.expert_tensor_and_model_parallel_group) > 1
+            has_moe_layers
+            and get_pg_size(self.expert_tensor_and_model_parallel_group) > 1
             and model_config.inference_moe_token_dispatcher_type == 'nvls'
         )
 
@@ -1211,7 +1234,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     f"{get_mem_size_str(spec_total_bytes)}",
                 ]
 
-            prefix_caching_mamba_gb = inference_config.prefix_caching_mamba_gb
+            prefix_caching_mamba_gb = self.prefix_caching_mamba_gb
             if (
                 inference_config.enable_prefix_caching
                 and prefix_caching_mamba_gb is not None
@@ -1304,8 +1327,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             # The prefix-cached subclass carries the intermediate-state extraction machinery.
             use_prefix_cached = (
                 self.config.enable_prefix_caching
-                and self.config.prefix_caching_mamba_gb is not None
-                and self.config.prefix_caching_mamba_gb > 0
+                and self.prefix_caching_mamba_gb is not None
+                and self.prefix_caching_mamba_gb > 0
             )
             if use_prefix_cached:
                 self.mamba_metadata = PrefixCachedMambaMetadata(
@@ -1890,12 +1913,17 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.mamba_slot_allocator: Optional[MambaSlotAllocator] = None
         if (
             self.is_hybrid_model
-            and self.config.prefix_caching_mamba_gb is not None
-            and self.config.prefix_caching_mamba_gb > 0
+            and self.prefix_caching_mamba_gb is not None
+            and self.prefix_caching_mamba_gb > 0
             and self.config.enable_prefix_caching
         ):
-            self._allocate_mamba_cache(self.config.prefix_caching_mamba_gb)
-        elif self.is_hybrid_model and self.config.enable_prefix_caching:
+            self._allocate_mamba_cache(self.prefix_caching_mamba_gb)
+        elif (
+            self.is_hybrid_model
+            and self.config.enable_prefix_caching
+            # Decode skips the cache by design; the warning is for a forgotten budget.
+            and self.config.disaggregation_role != "decode"
+        ):
             # Memory-only mode: prefix caching on a hybrid model without a Mamba
             # cache budget deduplicates identical KV prefixes for memory savings,
             # but does NOT cache Mamba recurrent state. Prefill skipping is
@@ -1910,7 +1938,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 "memory savings, but Mamba state caching and prefill skipping are "
                 "disabled (every token is recomputed). Set prefix_caching_mamba_gb "
                 "> 0 to enable full prefix caching.",
-                self.config.prefix_caching_mamba_gb,
+                self.prefix_caching_mamba_gb,
             )
 
         self._mtp_allocate_buffers()

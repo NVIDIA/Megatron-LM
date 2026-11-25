@@ -87,6 +87,19 @@ def test_external_launch_accepts_deployment_managed_engine():
     assert config.parent_event_port == 5556
 
 
+def test_streaming_interval_defaults_to_every_token_and_must_be_positive():
+    assert parse_args(_argv()).streaming_interval == 1
+
+    argv = _argv()
+    split = argv.index("--")
+    argv[split:split] = ["--streaming-interval", "32"]
+    assert parse_args(argv).streaming_interval == 32
+
+    argv[split + 1] = "0"
+    with pytest.raises(SystemExit):
+        parse_args(argv)
+
+
 def test_disaggregated_role_requires_coordinator_address():
     argv = _argv()
     argv[1] = "prefill"
@@ -160,8 +173,10 @@ def test_engine_service_initializes_config_before_megatron(monkeypatch):
 async def test_engine_service_validates_handoff_before_construction(monkeypatch, role, backend):
     args = SimpleNamespace(role=role, disagg_kv_transport_backend=backend)
 
-    def build_engine(*, engine_class):
+    def build_engine(*, engine_class, disaggregation_role):
         assert engine_class is not None
+        # The role reaches the config before the context sizes role-specific buffers.
+        assert disaggregation_role == (None if role == "aggregated" else role)
         raise RuntimeError("configuration observed")
 
     monkeypatch.setattr(engine_service, "get_args", lambda: args)

@@ -49,7 +49,7 @@ from megatron.core import parallel_state
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.num_microbatches_calculator import get_num_microbatches
-from megatron.training import get_args, get_tensorboard_writer
+from megatron.training import get_tensorboard_writer
 from megatron.training.distillation.utils import (
     CACHED_LOGITS_INDEX_SENTINEL,
     CACHED_LOGITS_LOGPROB_SENTINEL,
@@ -72,6 +72,7 @@ from megatron.training.distillation.utils import (
     v2_batched_tar_filename,
     v2_pack_indices,
 )
+from megatron.training.global_vars import get_run_config
 from megatron.training.utils import print_rank_last
 
 logger = logging.getLogger(__name__)
@@ -233,14 +234,16 @@ class LogitsSaverHooks:
         self._cp_dst_rank_global = dist.get_global_rank(self.cp_group, 0)
 
         # Track number of MTP outputs to ignore
-        args = get_args()
-        self._mtp_num_layers = args.mtp_num_layers or 0
+        cfg = get_run_config()
+        self._micro_batch_size = int(cfg.train.micro_batch_size)
+        self._freeze_all_layers = cfg.train.freeze_all_layers
+        self._mtp_num_layers = cfg.model.transformer.mtp_num_layers or 0
         self._curr_mtp_passes = 0
 
         # Dataset-identity hash + serialised metadata, written as the
         # first member of every batched tar so the student loader can
         # verify alignment per-tar without an extra tarfile.open.
-        self.dataset_hash, self._dataset_identifiers = compute_dataset_hash()
+        self.dataset_hash, self._dataset_identifiers = compute_dataset_hash(cfg)
         self.metadata_dict: Dict[str, Any] = {
             "hash": self.dataset_hash,
             "identifiers": self._dataset_identifiers,
@@ -252,9 +255,9 @@ class LogitsSaverHooks:
                 # Recorded so the loader can build a LogprobsReshardPlan and
                 # support changing MBS / DP / GBS at student-side load time.
                 "format_version": LOGPROBS_FORMAT_VERSION,
-                "mbs_save": int(args.micro_batch_size),
+                "mbs_save": self._micro_batch_size,
                 "dp_size_save": int(self.dp_size),
-                "gbs_save": int(args.global_batch_size),
+                "gbs_save": int(cfg.train.global_batch_size),
                 # Recorded so the loader can tell whether this tar was
                 # written by a CP-aware (cu_seqlens-persisting) saver.
                 "cp_size_save": int(self.cp_size),
@@ -270,7 +273,7 @@ class LogitsSaverHooks:
         # Surface the resulting load-time CP constraint up front rather than
         # only when a student's TeacherTarDataset construction later raises
         # or warns about it (see the cp_size_save checks there).
-        if is_packed_sequence_run() and self.cp_size > 1:
+        if is_packed_sequence_run(cfg.data) and self.cp_size > 1:
             print_rank_last(
                 f"Cached-logits saver: writing packed (--sft) sequences with "
                 f"context-parallel size {self.cp_size}. Document padding is "
@@ -382,7 +385,7 @@ class LogitsSaverHooks:
         """
         fwd_handle = model.output_layer.register_forward_hook(self._forward_hook)
         self._hook_handles.append(fwd_handle)
-        if get_args().freeze_all_layers:
+        if self._freeze_all_layers:
             self._override_language_model_loss(model)
 
     def _override_language_model_loss(self, model: LanguageModule) -> None:
@@ -759,7 +762,7 @@ class LogitsSaverHooks:
 
         Keyed by the global sample range ``(start_sample, end_sample)``
         this iteration covers, rather than the training-iteration number.
-        ``training.py`` only updates ``args.consumed_train_samples`` after
+        ``training.py`` only updates ``TrainState.consumed_train_samples`` after
         ``train_step()`` returns, so at this point (inside the forward
         hook, within ``train_step``) it still holds exactly the sample
         count *before* this iteration's batch -- ``start_sample``, for
@@ -776,7 +779,7 @@ class LogitsSaverHooks:
         }, buffer)
         data = buffer.getvalue()
         start_sample = get_consumed_train_samples()
-        end_sample = start_sample + get_num_microbatches() * self.dp_size * get_args().micro_batch_size
+        end_sample = start_sample + get_num_microbatches() * self.dp_size * self._micro_batch_size
         self._pending_writes[(start_sample, end_sample)] = data
 
     # ------------------------------------------------------------------
