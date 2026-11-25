@@ -152,6 +152,8 @@ class SafeDCPUnpickler(SafeUnpickler):
             ("torch.distributed.checkpoint.metadata", "MetadataIndex"),
             ("torch.distributed.checkpoint.metadata", "StorageMeta"),
             ("torch.distributed.checkpoint.metadata", "TensorProperties"),
+            # Older checkpoints pickled TensorProperties from its legacy location.
+            ("torch.distributed._shard.sharded_tensor.metadata", "TensorProperties"),
             ("torch.distributed.checkpoint.metadata", "TensorStorageMetadata"),
             ("torch.distributed.checkpoint.metadata", "ChunkStorageMetadata"),
             ("torch.distributed.checkpoint.metadata", "BytesStorageMetadata"),
@@ -162,6 +164,13 @@ class SafeDCPUnpickler(SafeUnpickler):
             ("torch.distributed.checkpoint.planner", "WriteItem"),
             ("torch.distributed.checkpoint.planner", "WriteItemType"),
             ("torch.distributed.checkpoint.planner", "TensorWriteData"),
+            # NumPy scalars (``scalar(dtype, bytes)``) stored in metadata; the legacy
+            # ``numpy.core`` path is what NumPy 1.x checkpoints reference.
+            ("numpy.core.multiarray", "scalar"),
+            ("numpy._core.multiarray", "scalar"),
+            # Empty placeholder classes used to read old MCore checkpoints' metadata.
+            ("megatron.core.dist_checkpointing.strategies.torch", "MCoreSavePlan"),
+            ("megatron.core.dist_checkpointing.strategies.torch", "MCoreMetadata"),
         }
     )
 
