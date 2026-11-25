@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Replay dev CSA layout kernels, aligned HCA backward, and compressor forward.
+"""Replay dev CSA layout kernels, aligned HCA, compressor forward, and attention-score recompute.
 
 The external compressor dAPE backward uses atomics and is not claimed bit-exact;
 the existing strict-determinism dispatch guard is checked explicitly instead.
@@ -76,6 +76,48 @@ def test_dev_flat_sparse_indices_replay():
         backward=False,
         contention=True,
         what="dev CSA compact flat indices",
+    )
+
+
+def test_dev_strided_attn_target_score_recompute_replays():
+    """Replay the indexer-loss attention target on the strided views the sparse loss passes."""
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+        fused_sparse_attention,
+    )
+
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("cuDNN DSA requires SM90+")
+    try:
+        from cudnn import DSA  # noqa: F401
+    except ImportError:
+        pytest.skip("cuDNN DSA is unavailable")
+    seeded()
+    # 64 heads so q is not head-padded, K sliced from a larger buffer like
+    # ``kv_full[kv_offset:]``, and batch * seqlen_q = 4096 query rows so many CTAs run at once.
+    seqlen_q, batch, heads, dim, seqlen_k, topk, kv_offset = 2048, 2, 64, 512, 256, 128, 32
+    query = torch.randn(seqlen_q, batch, heads, dim, device="cuda", dtype=torch.bfloat16)
+    kv_full = torch.randn(kv_offset + seqlen_k, batch, dim, device="cuda", dtype=torch.bfloat16)
+    lse = torch.rand(batch, seqlen_q, heads, device="cuda") * 4 + 8
+    indices = torch.rand(batch, seqlen_q, seqlen_k, device="cuda").argsort(-1)[..., :topk]
+    indices = indices.to(torch.int32)
+    indices[:, :, -5:] = -1
+
+    def run(query, kv_full, lse, indices):
+        # Build the views inside the replayed function so each run sees the production
+        # strides and the non-zero K storage offset.
+        q_view = query.permute(1, 0, 2, 3)
+        k_view = kv_full[kv_offset:].permute(1, 0, 2)
+        assert not q_view.is_contiguous() and not k_view.is_contiguous()
+        return fused_sparse_attention._compute_attn_target(
+            q_view, k_view, lse, indices, dim**-0.5, qhead_per_kv_head=heads
+        )
+
+    assert_replays_bit_exact(
+        run,
+        (query, kv_full, lse, indices),
+        backward=False,
+        contention=True,
+        what="strided CSA indexer-loss attention target",
     )
 
 

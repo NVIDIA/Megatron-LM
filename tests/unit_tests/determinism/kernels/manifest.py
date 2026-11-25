@@ -129,9 +129,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(K + "test_dsv4_dev_replay.py",),
         kind="triton",
-        notes="Real CuTe compaction forward/unique-store backward and Triton/compiled integer "
-        "routing metadata replay. Stock sparse-attention backward is not certified here; "
-        "numerical CP/indexer parity remains in the dev CSA tests.",
+        notes="Real CuTe compaction forward/unique-store backward, Triton/compiled integer "
+        "routing metadata, and the cuDNN ``sparse_attn_score_recompute_wrapper`` indexer-loss "
+        "target on strided SBHD->BSHD views (64 heads, no head padding; THD not covered) "
+        "replay. Stock sparse-attention backward is not certified here; numerical "
+        "CP/indexer parity remains in the dev CSA tests.",
     ),
     KernelEntry(
         name="aligned_hca_backward",
