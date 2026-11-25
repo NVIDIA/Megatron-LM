@@ -7,7 +7,9 @@ two inductor gather/normalize kernels) with one launch. Expert selection and
 ordering match ``torch.topk(..., sorted=False)``. Probabilities match the
 compiled left-fold normalization bitwise for top-k below eight; for larger top-k
 the normalization sum is reduced in a different order, so a probability can
-differ in its last bit. Batch-invariant routing does not use this kernel.
+differ in its last bit. With ``batch_invariant=True`` the launch configuration does
+not depend on the number of tokens, so every row's result is independent of the
+batch; batch-invariant routing uses the kernel this way in training and inference.
 """
 
 from typing import Optional
@@ -20,6 +22,8 @@ from megatron.core.utils import null_decorator
 try:
     import triton
     import triton.language as tl
+
+    from megatron.core.inference.triton_pdl import gdc_wait, pdl_kwargs
 
     HAVE_TRITON = True
 except ImportError:
@@ -52,6 +56,7 @@ def _sigmoid_topk_kernel(
     USE_TL_TOPK: tl.constexpr,
     APPLY_SCALING: tl.constexpr,
     BLOCK_T: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
     """Top-k of sigmoid(logits) + bias, probabilities from sigmoid(logits).
 
@@ -64,6 +69,8 @@ def _sigmoid_topk_kernel(
         generates it, so probabilities match bit for bit. Larger top-k uses a tree
         reduction, which can differ from the compiled sum in the last bit.
     """
+    if USE_PDL:
+        gdc_wait()
     rows = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
     cols = tl.arange(0, EXPERTS_POW2)
     row_mask = rows < num_tokens
@@ -145,6 +152,7 @@ def sigmoid_topk_routing(
     topk: int,
     scaling_factor: Optional[float] = None,
     block_tokens: Optional[int] = None,
+    batch_invariant: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Dense sigmoid top-k routing with an expert bias.
 
@@ -155,8 +163,7 @@ def sigmoid_topk_routing(
     the shape range covered by ``is_sigmoid_topk_supported``. Indices always match
     bitwise. Probabilities match bitwise for top-k below eight; for larger top-k the
     compiled reduction order depends on autotuning and prior batch shapes, so a
-    probability can differ in its last bit. This kernel is not used in batch-invariant
-    mode.
+    probability can differ in its last bit.
 
     Args:
         logits: [num_tokens, num_experts] fp32 router logits.
@@ -166,6 +173,8 @@ def sigmoid_topk_routing(
         scaling_factor: optional multiplier applied to the normalized probabilities.
         block_tokens: optional rows per CTA; defaults to one for top-k of eight or
             more or up to 128 experts, and four otherwise.
+        batch_invariant: keep the launch configuration independent of the number of
+            tokens, so each row's probabilities and indices do not depend on the batch.
 
     Returns:
         probs [num_tokens, topk] fp32 and top_indices [num_tokens, topk] int64.
@@ -182,7 +191,7 @@ def sigmoid_topk_routing(
             # One row per CTA. Four warps hide the top-k latency on decode batches;
             # one warp exposes more independent CTAs once prefill batches are wide.
             block_tokens = 1
-            num_warps = 1 if num_tokens >= 1024 else 4
+            num_warps = 1 if num_tokens >= 1024 and not batch_invariant else 4
         else:
             # One warp per short row avoids idle rows on decode batches and exposes
             # more independent CTAs on prefill. Wider rows retain the existing layout.
@@ -209,5 +218,6 @@ def sigmoid_topk_routing(
         APPLY_SCALING=bool(scaling_factor),
         BLOCK_T=block_tokens,
         num_warps=num_warps,
+        **pdl_kwargs(),
     )
     return probs, indices

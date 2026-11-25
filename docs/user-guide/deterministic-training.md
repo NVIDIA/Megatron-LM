@@ -1,11 +1,11 @@
-<!---
+{/*
    Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
    NVIDIA CORPORATION and its licensors retain all intellectual property
    and proprietary rights in and to this software, related documentation
    and any modifications thereto. Any use, reproduction, disclosure or
    distribution of this software and related documentation without an express
    license agreement from NVIDIA CORPORATION is strictly prohibited.
--->
+*/}
 
 # Deterministic Training
 
@@ -60,7 +60,7 @@ Checked against the parsed `args` Namespace in `apply_determinism_to_args`. Inco
 |---|---|
 | `--cross-entropy-loss-fusion` | Must be off — asserted (fused CE is non-deterministic); drop the flag yourself |
 | `--tp-comm-overlap` | Must be off — asserted (the overlap path is not bit-exact); drop the flag yourself |
-| `moe_router_aux_loss_fusion` | Must be off — asserted (TE's fused aux-loss kernel is non-deterministic); follows `moe_router_fusion` when unset |
+| `moe_router_aux_loss_fusion` | Supported when TE's `fused_moe_aux_loss` API accepts `deterministic`; Megatron selects its deterministic kernel. Older TE requires `--no-moe-router-aux-loss-fusion`. Follows `moe_router_fusion` when unset |
 | `torch.use_deterministic_algorithms` | Set to `True` |
 | `torch.utils.deterministic.fill_uninitialized_memory` | Set to `False` — see below |
 

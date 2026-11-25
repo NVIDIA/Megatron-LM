@@ -33,6 +33,8 @@ from megatron.energon import stateless
 from megatron.energon.av import AVDecoder
 from megatron.energon.edataclass import edataclass
 from megatron.training import get_args, get_tokenizer
+from megatron.training.global_vars import get_run_config
+from megatron.training.models import LLaVAModelConfig, MimoBuildConfig
 
 from .conversation_sample import ConversationSample, ImageMedia, Media, VideoFrameMedia, VideoMedia
 from .cookers.conversation import (
@@ -325,19 +327,36 @@ class MultiModalTaskEncoder(
         ),
     ]
 
-    def __init__(self, is_val: bool = False, tiling_augment_prob: float = 0.4):
+    def __init__(
+        self,
+        is_val: bool = False,
+        tiling_augment_prob: float = 0.4,
+        *,
+        sequence_length,
+        packing_sequence_length,
+    ):
         super().__init__()
         self.is_val = is_val
         self.args = get_args()
+        cfg = get_run_config()
+        if not isinstance(cfg.model, (LLaVAModelConfig, MimoBuildConfig)):
+            raise TypeError(
+                "Expected cfg.model to be LLaVAModelConfig or MimoBuildConfig, "
+                f"got {type(cfg.model).__name__}"
+            )
+        # Copy the model's preprocessing inputs for workers.
+        self.img_h = cfg.model.img_h
+        self.img_w = cfg.model.img_w
+        self.patch_dim = cfg.model.patch_dim
+        self.drop_vision_class_token = cfg.model.drop_vision_class_token
         self.tokenizer = get_tokenizer()
+        self.cfg = cfg
         with open(self.args.prompt_path, "r") as f:
             self.manual_prompts = json.load(f)
-        # TODO: There is four seq lengths now: seq_length, decoder_seq_length, dataloader_seq_length, packing_seq_length
-        # Why do we need all of these? Can we simplify?
-        # The docs are not clear.
-        self.dataloader_seq_length = self.args.dataloader_seq_length
-        # TODO: It's unclear why we need this separately. This should be the same as dataloader_seq_length which should be decoder_seq_length?
-        self.packing_seq_length = self.args.packing_seq_length
+        # Dataset limits are supplied by the application before entering pretrain.
+        # The model execution bound includes modality expansion and padding.
+        self.dataloader_seq_length = sequence_length
+        self.packing_seq_length = packing_sequence_length
         self.is_packing_enabled = (
             self.args.packing_buffer_size is not None
             and self.args.packing_buffer_size > 0
@@ -353,7 +372,6 @@ class MultiModalTaskEncoder(
 
         self.txt_to_token_dict = {}
 
-        self.img_h, self.img_w = self.args.img_h, self.args.img_w
         self.img_token_id = self.tokenizer.image_token_index
         # This map is used to reduce the number of tiles used per image if the number of tokens is
         # larger than the decoder_seq_length.
@@ -362,7 +380,7 @@ class MultiModalTaskEncoder(
         self.tiling_augment_prob = tiling_augment_prob
 
         # Create the image tiling strategy using the refactored function
-        self.image_tiling_strategy = create_image_tiling_strategy(self.args)
+        self.image_tiling_strategy = create_image_tiling_strategy(self.args, self.cfg)
 
         # Validate temporal compression settings
         temporal_patch_size = getattr(self.args, 'video_temporal_patch_size', 1)
@@ -805,7 +823,7 @@ class MultiModalTaskEncoder(
             if self.args.only_keep_samples_with_img and len(image_media) == 0:
                 raise ValueError(f"Sample has no image: {sample.__key__}")
 
-            prompt_format = self.args.tokenizer_prompt_format
+            prompt_format = self.cfg.tokenizer.tokenizer_prompt_format
 
             if (
                 not skip_chat_template
@@ -872,7 +890,9 @@ class MultiModalTaskEncoder(
                 + "".join([f"{m.sender}: {m.fragments}\n" for m in sample.conversation])
             )
 
-        max_image_token_allowed = self.args.decoder_seq_length - len(input_ids) - 4
+        max_image_token_allowed = (
+            self.cfg.model.transformer.max_seq_length_per_sample - len(input_ids) - 4
+        )
         image_media_params = self.image_tiling_strategy.compute_params(
             image_media,
             max_image_token_allowed,
@@ -982,7 +1002,7 @@ class MultiModalTaskEncoder(
             "do not pass --packing-buffer-size with this cooker."
         )
 
-        pack_length = self.args.decoder_seq_length
+        pack_length = self.cfg.model.transformer.max_seq_length_per_sample
         pad = self.tokenizer.pad
 
         pack_tokens: list[int] = []
@@ -1363,8 +1383,8 @@ class MultiModalTaskEncoder(
         if has_fp8 and self.args.dynamic_resolution and no_cp:
             img_seq_len = 0
             for img in imgs:
-                img_seq_len += (img.shape[1] // self.args.patch_dim) * (
-                    img.shape[2] // self.args.patch_dim
+                img_seq_len += (img.shape[1] // self.patch_dim) * (
+                    img.shape[2] // self.patch_dim
                 )
             padding_needed = get_padding(
                 img_seq_len,
@@ -1372,12 +1392,12 @@ class MultiModalTaskEncoder(
                 self.args.tensor_model_parallel_size,
                 self.args.sequence_parallel,
                 self.args.tp_comm_overlap,
-                self.args.decoder_seq_length,
+                self.cfg.model.transformer.max_seq_length_per_sample,
                 fp8_enabled=has_fp8,
             )
             if padding_needed > 0:
                 pad_img = torch.zeros(
-                    [3, self.args.patch_dim, padding_needed * self.args.patch_dim]
+                    [3, self.patch_dim, padding_needed * self.patch_dim]
                 )
                 imgs.append(pad_img)
                 has_pad_img = torch.tensor(True)
@@ -1452,7 +1472,7 @@ class MultiModalTaskEncoder(
                 self.args.tensor_model_parallel_size,
                 self.args.sequence_parallel,
                 self.args.tp_comm_overlap,
-                self.args.decoder_seq_length,
+                self.cfg.model.transformer.max_seq_length_per_sample,
                 fp8_enabled=has_fp8,
             )
             if padding_needed > 0:
@@ -1725,7 +1745,7 @@ class MultiModalTaskEncoder(
             True if the target has trainable tokens, False otherwise.
         """
         # Compute the loss mask based on extending the image tags with the proper
-        # number of image tokens, extracting the first self.args.decoder_seq_length tokens, and
+        # number of image tokens, extracting the first self.cfg.model.transformer.max_seq_length_per_sample tokens, and
         # ensuring that some of these tokens have a loss mask > 0.
         # Note that this is a bit hacky because we reproduce here parts of the logics which are in
         # the model itself. Ideally, the data sampler would return the already processed inputs
@@ -1742,7 +1762,7 @@ class MultiModalTaskEncoder(
         loss_mask[expanded_target == self.tokenizer.pad] = 0.0  # mask paddings
         loss_mask[expanded_target == IGNORE_INDEX] = 0.0  # mask prompts
         loss_mask = torch.cat((loss_mask[1:], torch.zeros((1,))))
-        loss_mask = loss_mask[: self.args.decoder_seq_length]
+        loss_mask = loss_mask[: self.cfg.model.transformer.max_seq_length_per_sample]
         return torch.sum(loss_mask) > 0
 
     def _replace_value_with_repetition(
@@ -1797,7 +1817,7 @@ class MultiModalTaskEncoder(
                 self.args.tensor_model_parallel_size,
                 self.args.sequence_parallel,
                 self.args.tp_comm_overlap,
-                self.args.decoder_seq_length,
+                self.cfg.model.transformer.max_seq_length_per_sample,
                 fp8_enabled=False,
             )
             # Build padding directly on the token/label tensors' dtype and device;
@@ -1849,9 +1869,9 @@ class MultiModalTaskEncoder(
         total_img_embeddings_len = sum(media.num_embeddings for media in image_tiling_params)
         total_num_images = len(image_tiling_params)
         packing_seq_length = (
-            self.args.packing_seq_length
-            if self.args.packing_seq_length > 0
-            else self.args.decoder_seq_length
+            self.packing_seq_length
+            if self.packing_seq_length > 0
+            else self.cfg.model.transformer.max_seq_length_per_sample
         )
         max_text_tokens = packing_seq_length - total_img_embeddings_len + total_num_images
 

@@ -27,14 +27,18 @@ DeepEP), and torch ops with a non-deterministic accumulation (``scatter_add_``,
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Tuple
 
 # PR label that lets a kernel change merge without touching its determinism test
 # (refactors, comment-only edits). Maintainers create it once in the repository.
 EXEMPT_LABEL = "determinism-exempt"
 
-# Directories whose every ``.py`` file (``__init__.py`` excluded) must be registered.
+# Directories whose every ``.py`` file must be registered, except ``__init__.py`` and a deprecated
+# import path left by a move, which only forwards to the module that now holds the kernel.
+# ``megatron/core/ops`` is not one: its families keep operation modules (such as the norm
+# modules) beside their kernels. Its kernel files are registered below by path, and new ones are
+# found by ``KERNEL_CONTENT_PATTERNS``.
 KERNEL_DIRECTORIES: Tuple[str, ...] = ("megatron/core/fusions", "megatron/core/ssm/ops")
 
 # Regular expressions (``re.MULTILINE``) that mark a source file as kernel-bearing wherever
@@ -101,8 +105,16 @@ class KernelEntry:
 # Test-file prefixes used below.
 K = "tests/unit_tests/determinism/kernels/"
 C = "tests/unit_tests/determinism/correctness/"
+R = "tests/unit_tests/context_parallel/runtime/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
+    KernelEntry(
+        name="mtp_kl_loss",
+        sources=("megatron/core/ops/mtp_kl_loss.py",),
+        tests=(K + "test_mtp_kl_loss.py",),
+        kind="torch.compile",
+        notes="MTP KD local sum-exp/KL reductions and recomputed student gradient; no teacher gradient.",
+    ),
     KernelEntry(
         name="csa_output_rope_reconstruction",
         sources=("megatron/core/ops/attention/csa/output_rope.py",),
@@ -114,23 +126,37 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="fused_bias_swiglu",
         sources=("megatron/core/fusions/fused_bias_swiglu.py",),
-        tests=(K + "test_fused_activations.py",),
+        tests=(K + "test_fused_activations.py", R + 'test_activation_replay.py'),
         kind="torch.compile",
         notes="Elementwise; weighted variants reduce the per-token weight grad over ffn (Inductor tree reduction).",
     ),
     KernelEntry(
+        name="fused_swiglu_triton",
+        sources=("megatron/core/fusions/fused_swiglu_triton.py",),
+        tests=(K + "test_fused_activations.py",),
+        kind="triton",
+        notes="Bias-free plain, clamped and router-weighted SwiGLU behind bias_swiglu_impl and "
+        "weighted_bias_swiglu_impl; one row per program or several short rows per program. The "
+        "weighted d_w is a per-row tl.sum over a fixed tile order; no atomics.",
+    ),
+    KernelEntry(
         name="fused_bias_geglu",
         sources=("megatron/core/fusions/fused_bias_geglu.py",),
-        tests=(K + "test_fused_activations.py",),
+        tests=(K + "test_fused_activations.py", R + 'test_activation_replay.py'),
         kind="torch.compile",
     ),
     KernelEntry(
         name="paged_stash_marker_propagation",
         sources=("megatron/core/extensions/transformer_engine.py",),
-        tests=(K + "test_fused_activations.py",),
+        tests=(
+            K + "test_fused_activations.py",
+            R + 'test_activation_replay.py',
+            K + "test_te_wrappers.py",
+        ),
         kind="dispatch",
         notes="Propagates TE's grouped-tensor marker across fused-activation views and casts; "
-        "the marked SwiGLU and QuickGeGLU replay test covers values and gradients.",
+        "the marked SwiGLU and QuickGeGLU replay test covers values and gradients. "
+        "Direct marker calls replay values and gradients in test_te_wrappers.py.",
     ),
     KernelEntry(
         name="fused_bias_gelu",
@@ -156,12 +182,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=(
             "megatron/core/activations.py",
             "megatron/core/transformer/utils.py",
-            "megatron/core/transformer/torch_norm.py",
+            "megatron/core/ops/norm/torch_norm.py",
         ),
         tests=(K + "test_fused_activations.py",),
         kind="torch.compile",
         notes="squared_relu/quick_gelu/fast_gelu/tanh_soft_clamp/situ/situ_glu, openai/erf GELU, "
-        "L2Norm._norm (row reduction).",
+        "L2Norm._norm (row reduction), and eager unfused_fast_gelu for variable-length projections.",
     ),
     KernelEntry(
         name="attention_kernels_and_dispatch",
@@ -176,7 +202,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="fused_vocab_parallel_cross_entropy",
-        sources=("megatron/core/fusions/fused_cross_entropy.py",),
+        sources=("megatron/core/ops/loss/fused_cross_entropy.py",),
         tests=(K + "test_fused_activations.py",),
         kind="torch.compile",
         notes="Rejected by --deterministic-mode (op catalog); the replay test records its status as xfail(strict=False).",
@@ -186,7 +212,19 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/extensions/transformer_engine.py",),
         tests=(K + "test_te_wrappers.py",),
         kind="external-lib",
-        notes="Replays TE's overwrite_input path when supported.",
+        notes="Replays TE's overwrite_input path when supported, and the MXFP8 gradient "
+        "output (cross_entropy_mxfp8_grad) when TE supports grad_quantizer.",
+    ),
+    KernelEntry(
+        name="te_batched_linear_matrix_parameter",
+        sources=(
+            "megatron/core/extensions/te_batched_linear.py",
+            "megatron/core/transformer/experimental_attention_variant/deepseek_v4_hybrid_attention.py",
+        ),
+        tests=(K + "test_te_batched_linear.py",),
+        kind="external-lib",
+        notes="TE batched GEMM with a 2D optimizer owner; BF16/MXFP8 and fused main-grad replay. "
+        "Also replays the batched-GEMM fallback used when TE lacks BatchedLinear.",
     ),
     KernelEntry(
         name="jit_fuser",
@@ -256,14 +294,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/fusions/fused_mhc_kernels.py",
             "megatron/core/transformer/hyper_connection.py",
         ),
-        tests=(K + "test_fused_triton_kernels.py",),
+        tests=(
+            K + "test_fused_triton_kernels.py",
+            "tests/unit_tests/fusions/test_fused_mhc_kernels.py",
+        ),
         kind="triton",
         notes="Sinkhorn / h_aggregate / h_post_bda / proj_rms_compute_h on the triton, native (torch.compile) and cuTile backends.",
     ),
     KernelEntry(
         name="streamwise_residual_ops",
         sources=("megatron/core/transformer/streamwise_residual_ops.py",),
-        tests=(K + "test_streamwise_residual_ops.py",),
+        tests=(K + "test_streamwise_residual_ops.py", K + "test_inference_triton_pdl.py"),
         kind="triton",
         notes="Fused streamwise read/write with fixed-order controller-gradient reductions; "
         "replay covers identity carry and learned retention.",
@@ -271,7 +312,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     # ---------------------------------------------------------------- apex CUDA extensions and local TP layers
     KernelEntry(
         name="fused_layer_norm",
-        sources=("megatron/core/fusions/fused_layer_norm.py",),
+        sources=("megatron/core/ops/norm/fused_layer_norm.py",),
         tests=(K + "test_tensor_parallel_kernels.py",),
         kind="cuda-ext",
         notes="apex FastLayerNormFN / FusedLayerNormAffineFunction; dgamma/dbeta cross-row reduction.",
@@ -300,7 +341,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="vocab_parallel_cross_entropy",
-        sources=("megatron/core/tensor_parallel/cross_entropy.py",),
+        sources=("megatron/core/ops/loss/cross_entropy.py",),
         tests=(K + "test_tensor_parallel_kernels.py",),
         kind="torch-op",
     ),
@@ -317,7 +358,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="tensor_parallel_random_share_storage",
-        sources=("megatron/core/tensor_parallel/random.py",),
+        sources=("megatron/core/activation_policy/recompute/checkpointing.py",),
         kind="cuda-ext",
         exempt_reason="load_inline extension aliases tensor storage on the host; no GPU compute.",
     ),
@@ -330,6 +371,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_te_wrappers.py",
             C + "test_fp8_determinism.py",
             K + "test_runtime_cp_attention.py",
+            R + 'test_te_replay.py',
         ),
         kind="te-wrapper",
         notes="TE Linear / LayerNormLinear / Norm / GroupedLinear / DotProductAttention / fused RoPE replayed standalone; "
@@ -362,13 +404,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
         name="moe_utils",
         sources=("megatron/core/transformer/moe/moe_utils.py",),
         tests=(
+            "tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",
             K + "test_moe_kernels.py",
             "tests/unit_tests/inference/test_batch_invariant_nvls.py",
         ),
         kind="torch-op",
         notes="permute/unpermute (index_add_ vs scatter_add_), routing (index_put_ vs scatter), sort_chunks, aux loss, "
         "router gating GEMM, TE fused permutation/router kernels, global-batch quantile "
-        "histogram accumulation and bias updates.",
+        "histogram accumulation and bias updates. Fused aux loss uses TE's "
+        "fixed-order reduction when explicitly requested, with torch deterministic algorithms on or off; "
+        "the default atomic branch is a negative control.",
     ),
     KernelEntry(
         name="mok_route_adapter",
@@ -376,7 +421,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_mok_kernels.py",),
         kind="triton",
         notes="Dense routing-map compaction and router-gradient scatter use one CTA per token "
-        "and unique expert indices; replayed with missing routes and side-stream contention.",
+        "and unique expert indices; replayed with missing routes, a strided padding mask and "
+        "side-stream contention. test_moe_kernels.py also replays it with MoELayer's padding mask, "
+        "through a megakernel stand-in, in eager and CUDA-graph replay.",
     ),
     KernelEntry(
         name="mok_runtime",
@@ -396,27 +443,45 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_moe_kernels.py",
             "tests/unit_tests/transformer/moe/test_virtual_experts.py",
+            "tests/unit_tests/transformer/moe/test_aux_loss.py",
         ),
         kind="torch.compile",
-        notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing.",
+        notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing. "
+        "Global-batch QB also compares histograms and the compact-output compatibility fallback. "
+        "Fused aux_loss, seq_aux_loss and global_aux_loss replay their logged scalar, "
+        "input and router-weight gradients with fused TopK routing, and compare to the unfused reference.",
     ),
     KernelEntry(
         name="moe_token_dispatchers",
         sources=(
             "megatron/core/transformer/moe/token_dispatcher.py",
             "megatron/core/transformer/moe/moe_layer.py",
+            "megatron/core/transformer/moe/training_matches_inference.py",
         ),
-        tests=(K + "test_moe_kernels.py",),
+        tests=(
+            "tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",
+            K + "test_moe_kernels.py",
+        ),
         kind="torch-op",
         notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available; "
-        "virtual-expert routing metadata and probability gradients replay under stream contention.",
+        "virtual-expert routing metadata and probability gradients replay under stream contention; "
+        "the FlashInfer per-token NVFP4 value pass (moe_training_matches_inference) with recompute "
+        "backward, and its MXFP8 training-stack quantization. The megakernel branch passes the "
+        "padding mask to a stand-in backend that runs MOK route compaction: replayed under stream "
+        "contention against the reference semantics, and in a CUDA graph whose static mask "
+        "changes between replays.",
     ),
     KernelEntry(
         name="moe_experts",
         sources=("megatron/core/transformer/moe/experts.py",),
-        tests=(K + "test_moe_kernels.py",),
+        tests=(
+            "tests/unit_tests/inference/test_moe_dispatching_and_routing.py",
+            K + "test_moe_kernels.py",
+            K + "test_inference_kernels.py",
+        ),
         kind="te-wrapper",
-        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert.",
+        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert. "
+        "FlashInfer MXFP8/BF16 experts: top-k=1 side-stream graph replay matches serial.",
     ),
     KernelEntry(
         name="moe_fused_a2a",
@@ -440,9 +505,25 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Activation page copy kernels (no arithmetic); functional round-trip coverage.",
     ),
     KernelEntry(
+        name="moe_ep_invariant_combine",
+        sources=("megatron/core/transformer/moe/ep_invariant_combine.py",),
+        tests=(
+            "tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",
+            "tests/unit_tests/inference/test_ep_invariant_ordered_rsv.py",
+            K + "test_moe_kernels.py",
+            K + "test_inference_kernels.py",
+        ),
+        kind="triton",
+        notes="Fixed expert-order leaves and pairwise FP32 tree; parity across EP sizes and "
+        "training/inference paths. Bit-exact replay of the training tree (forward, row and "
+        "probability gradients) in test_ep_invariant_tree_replays and of the dense-map and "
+        "top-k inference combines in test_ep_invariant_{dense_map,topk}_replays.",
+    ),
+    KernelEntry(
         name="moe_batch_invariant_unpermute",
         sources=("megatron/core/transformer/moe/batch_invariant.py",),
         tests=(
+            "tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",
             "tests/unit_tests/transformer/moe/test_moe_batch_invariant.py",
             "tests/unit_tests/transformer/moe/test_moe_batch_invariant_unpermute.py",
             K + "test_moe_kernels.py",
@@ -454,7 +535,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="inference_routing_mask_kernel",
         sources=("megatron/core/transformer/moe/inference_routing_mask_kernel.py",),
-        tests=(K + "test_inference_kernels.py",),
+        tests=(K + "test_inference_kernels.py", K + "test_inference_triton_pdl.py"),
         kind="triton",
         training_path=False,
     ),
@@ -473,6 +554,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "JSON-table choices; every candidate of each config-invariant kernel must give "
         "bit-identical outputs; SSM replay runs the real SSM autotuners through runtime "
         "pinning, with autotune caching on and off.",
+    ),
+    KernelEntry(
+        name="triton_block_pointer_compat",
+        sources=("docker/common/triton_block_ptr_compat.py",),
+        tests=(K + "test_triton_block_ptr_compat.py",),
+        kind="dispatch",
+        notes="CI-installed tl.make_block_ptr/advance/load/store adapter. The image's actual "
+        "lowering is exercised by strided, boundary-masked, transposed and 3-D copy replay, "
+        "including FP8 padding, and by H100/Blackwell offline compilation.",
     ),
     # ---------------------------------------------------------------- SSM
     KernelEntry(
@@ -508,6 +598,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
         training_path=False,
     ),
     KernelEntry(
+        name="ssm_mamba2_replayssm_spec",
+        sources=("megatron/core/ssm/ops/mamba2/mamba_ssm_replay.py",),
+        tests=(K + "test_ssm_kernels.py",),
+        kind="triton",
+        training_path=False,
+        notes="ReplaySSM speculative decode: fused scatter + B.C precompute, verify, flush and "
+        "cursor-commit kernels. Fixed launch configs (no autotuning) and no atomics; one step "
+        "with verify, flush and padding rows is replayed and its output, SSM checkpoint, ring "
+        "caches and cursors compared.",
+    ),
+    KernelEntry(
         name="ssm_common_kernels",
         sources=(
             "megatron/core/ssm/ops/common/causal_conv1d_triton.py",
@@ -515,7 +616,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ssm/ops/common/intermediate_extraction.py",
             "megatron/core/ssm/ops/common/determinism.py",
         ),
-        tests=(K + "test_ssm_kernels.py",),
+        tests=(K + "test_ssm_kernels.py", K + "test_inference_triton_pdl.py"),
         kind="triton",
         notes="determinism.py provides ordered workspaces and re-exports the shared tuning "
         "policy; SSM replay checks that runtime pinning covers the module-level autotuners, "
@@ -537,7 +638,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ssm/ops/gdp/wy_fast.py",
             "megatron/core/ssm/context_parallel/gdp.py",
         ),
-        tests=(K + "test_ssm_kernels.py",),
+        tests=(K + "test_ssm_kernels.py", K + "test_inference_triton_pdl.py"),
         kind="triton",
         notes="Gated Delta Product varlen chunk scan (drives cumsum/l2norm/kkt/solve_tril/wy_fast/chunk_h/chunk_o), "
         "fused recurrent decode, and the decode- and prefill-prepare kernels. The decode kernels are "
@@ -553,7 +654,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ssm/gated_delta_net/gdn2.py",
             "megatron/core/ssm/gated_delta_net/kda.py",
         ),
-        tests=(K + "test_ssm_kernels.py", K + "test_gated_norm.py", C + "test_hybrid_model.py"),
+        tests=(
+            K + "test_ssm_kernels.py",
+            K + "test_gated_norm.py",
+            C + "test_hybrid_model.py",
+            R + 'test_ssm_replay.py',
+        ),
         kind="torch.compile",
         notes="deterministic_mode selects torch_chunk_gated_delta_rule over FLA (recorded non-deterministic). "
         "Dynamic-inference decode runs the Megatron forks causal_conv1d_update and "
@@ -590,16 +696,19 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/optimizer/clip_grads.py",
             "megatron/core/optimizer/__init__.py",
             "megatron/core/optimizer/optimizer.py",
+            "megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py",
             "megatron/training/utils/common_utils.py",
         ),
         tests=(
             K + "test_optimizer_kernels.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
+            "tests/unit_tests/distributed/mfsdp_v2/test_mcore_muon.py",
         ),
         kind="external-lib",
         notes="multi_tensor l2norm / scale (TE, apex or local fallback) and fused Adam; "
         "optimizer.py (gradient unscaling) and training/utils/common_utils.py (param / grad norm "
-        "logging) launch the same multi_tensor kernels through multi_tensor_applier.",
+        "logging) launch the same multi_tensor kernels through multi_tensor_applier. "
+        "Hybrid CPU/GPU Adam replay also covers overlapped parameter and gradient copies.",
     ),
     KernelEntry(
         name="tensor_metric_l2",
@@ -649,16 +758,36 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/contexts/attention_context/triton/tensor_ops.py",
             "megatron/core/inference/contexts/fused_kv_append_kernel.py",
         ),
-        tests=(K + "test_inference_kernels.py",),
+        tests=(K + "test_inference_kernels.py", K + "test_inference_triton_pdl.py"),
         kind="triton",
         training_path=False,
     ),
     KernelEntry(
         name="inference_zero_padding_rows",
         sources=("megatron/core/inference/contexts/zero_padding_rows_kernel.py",),
-        tests=(K + "test_inference_kernels.py",),
+        tests=(K + "test_inference_kernels.py", K + "test_inference_triton_pdl.py"),
         kind="triton",
         training_path=False,
+    ),
+    KernelEntry(
+        name="inference_triton_pdl",
+        sources=("megatron/core/inference/triton_pdl.py",),
+        kind="triton",
+        training_path=False,
+        exempt_reason="Launch helper only (griddepcontrol.wait and the PDL launch option of the "
+        "registered inference Triton kernels); its no-op fallback is never compiled.",
+    ),
+    KernelEntry(
+        name="sigmoid_topk_router",
+        sources=("megatron/core/inference/moe/sigmoid_topk.py",),
+        tests=(
+            K + "test_inference_kernels.py",
+            K + "test_inference_triton_pdl.py",
+            "tests/unit_tests/transformer/moe/test_moe_batch_invariant_router.py",
+        ),
+        kind="triton",
+        notes="Inference router (inference_moe_router_backend='triton'); batch-invariant mode also "
+        "runs it in training with a launch configuration independent of the token count.",
     ),
     KernelEntry(
         name="inference_moe_kernels",
@@ -666,16 +795,24 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/moe/activations.py",
             "megatron/core/inference/moe/batch_invariant.py",
             "megatron/core/inference/moe/permute.py",
-            "megatron/core/inference/moe/sigmoid_topk.py",
             "megatron/core/inference/moe/vllm_fused_moe.py",
             "megatron/core/inference/moe/fused_moe.py",
             "megatron/core/inference/quantization/mxfp8_quantize.py",
         ),
-        tests=(K + "test_inference_kernels.py",),
+        tests=(
+            "tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",
+            "tests/unit_tests/inference/test_ep_invariant_ordered_rsv.py",
+            "tests/unit_tests/inference/test_moe_dispatching_and_routing.py",
+            K + "test_inference_kernels.py",
+            K + "test_inference_triton_pdl.py",
+            "tests/unit_tests/transformer/moe/test_moe_batch_invariant.py",
+        ),
         kind="triton",
         training_path=False,
         notes="Batch-invariant paths replay bit-exactly; the atomic default unpermute is the negative control. "
-        "ordered_reduce_scatter_v (multi-rank) is not replayed here.",
+        "Ordinary vLLM MoE also covers parallel alignment, tiled slot reduction, and decode/prefill hints. "
+        "ordered_reduce_scatter_v (multi-rank) is not replayed here. The BF16 expert GEMM "
+        "(torch grouped_mm) is checked row-invariant in test_moe_batch_invariant.py.",
     ),
     KernelEntry(
         name="batch_invariant_kernels",
@@ -684,7 +821,6 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_inference_kernels.py",
             K + "test_te_wrappers.py",
             "tests/unit_tests/transformer/test_te_layers_batch_invariant.py",
-            "tests/unit_tests/inference/test_batch_invariant_deepgemm_stride.py",
         ),
         kind="triton",
     ),
@@ -701,6 +837,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=(
             "megatron/core/inference/contexts/dynamic_context.py",
             "megatron/core/inference/contexts/kv_block_allocator.py",
+            "megatron/core/inference/contexts/prefix_cache_block_state.py",
             "megatron/core/context_parallel/layout.py",
         ),
         kind="torch-op",
@@ -738,6 +875,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
         training_path=False,
         exempt_reason="Byte copy for refit; needs NVSHMEM and a multi-GPU RL environment.",
     ),
+    KernelEntry(
+        name="nccl_m2n_expert_refit",
+        sources=("megatron/core/resharding/copy_services/nccl_m2n_copy_service.py",),
+        tests=(
+            K + "test_refit_expert_staging.py",
+            "tests/unit_tests/resharding/test_nccl_m2n_copy_service.py",
+        ),
+        kind="external-lib",
+        training_path=False,
+        notes="Expert stack views, staging, and foreach writeback replay bit-exactly under "
+        "contention. Native M2N/MXFP8 parity runs in the dedicated GB200 integration bucket.",
+    ),
     # ---------------------------------------------------------------- external-library dispatch sites
     # Modules that choose between / call external GPU kernels. Covered by the replay tests of
     # the kernels they call (and by module-level tests where they exist); ``notes`` say which.
@@ -748,18 +897,32 @@ KERNELS: Tuple[KernelEntry, ...] = (
             C + "test_ssm_conv1d.py",
             K + "test_ssm_kernels.py",
             "tests/unit_tests/inference/engines/test_batch_invariant_mamba_prefix_caching.py",
+            R + 'test_ssm_replay.py',
         ),
         kind="dispatch",
         notes="Selects the pip causal_conv1d / mamba_ssm kernels (causal_conv1d_fn, "
         "mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined, causal_conv1d_update_cuda) or "
         "the Megatron forks (ops/common, ops/mamba2: varlen scan, causal_conv1d_update, "
-        "selective_state_update). Module-level replay: test_ssm_conv1d.py::TestMambaMixerDeterminism; "
-        "kernels replayed piecewise in test_ssm_kernels.py.",
+        "selective_state_update, ReplaySSM spec decode). Module-level replay: "
+        "test_ssm_conv1d.py::TestMambaMixerDeterminism; "
+        "kernels replayed piecewise in test_ssm_kernels.py. Runtime helper projections, "
+        "convolution and CP collectives are replayed in runtime/test_ssm_replay.py.",
+    ),
+    KernelEntry(
+        name="ssm_runtime_cp_collectives",
+        sources=(
+            "megatron/core/ssm/mamba_context_parallel.py",
+            "megatron/core/ssm/gdp_context_parallel.py",
+        ),
+        tests=(R + "test_ssm_replay.py",),
+        kind="dispatch",
+        notes="Runtime CP1/2/4/1 helper views replay the actual head-exchange collectives, "
+        "parameter-sliced convolution and backward without mutating the build-time helper.",
     ),
     KernelEntry(
         name="ssm_gated_delta_product",
         sources=("megatron/core/ssm/gated_delta_product.py",),
-        tests=(K + "test_ssm_kernels.py",),
+        tests=(K + "test_ssm_kernels.py", R + 'test_ssm_replay.py'),
         kind="dispatch",
         notes="Dispatches FLA chunk_gated_delta_product / l2_norm, the CuTeDSL gdp_attn kernel "
         "(gdp_cutedsl_kernel; not in the CI container, uncovered), causal_conv1d and the Megatron "
@@ -767,12 +930,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "replayed in test_ssm_kernels.py. ssm_decode also drives the speculative-decoding path, "
         "where causal_conv1d_update and the fused recurrence take several draft tokens per step and "
         "fill the conv / SSM rollback snapshot buffers; both are replayed there with the snapshots "
-        "as outputs. No module-level replay yet (HYBRID_CONFIGS has no GDP cell).",
+        "as outputs. Runtime chunkwise full-head gating and headwise helper convolution/collectives "
+        "are replayed in runtime/test_ssm_replay.py.",
     ),
     KernelEntry(
         name="rope_dispatch",
         sources=("megatron/core/models/common/embeddings/rope_utils.py",),
-        tests=(K + "test_te_wrappers.py",),
+        tests=(K + "test_te_wrappers.py", R + 'test_mla_replay.py', R + 'test_indexer_replay.py'),
         kind="dispatch",
         notes="apply_rotary_pos_emb selects TE fused RoPE (replayed in test_te_wrappers.py), "
         "flash-attn apply_rotary_emb (not in the CI container) or the unfused torch path.",
@@ -783,7 +947,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/multi_latent_attention.py",
             "megatron/core/transformer/experimental_attention_variant/absorbed_mla.py",
         ),
-        tests=(K + "test_fused_triton_kernels.py", K + "test_te_wrappers.py"),
+        tests=(
+            K + "test_fused_triton_kernels.py",
+            K + "test_te_wrappers.py",
+            R + 'test_mla_replay.py',
+        ),
         kind="dispatch",
         notes="Calls the Triton MLA YaRN RoPE kernels (fused_apply_mla_rope_for_q / _kv, replayed in "
         "test_fused_triton_kernels.py), TE fused RoPE and TE's fused MLA key/value RoPE + MXFP8 "
@@ -888,6 +1056,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "NCCL_ALGO=Ring under --deterministic-mode, not exercised by the determinism model tests.",
     ),
     KernelEntry(
+        name="gtp_fp8_checkpoint_casts",
+        sources=("megatron/core/tensor_parallel/generalized_tensor_parallelism.py",),
+        tests=("tests/unit_tests/generalized_tensor_parallel/test_gtp_dcp.py",),
+        kind="dispatch",
+        notes="Native-FP8 checkpoint copy/dequantization, with legacy TE class compatibility.",
+    ),
+    KernelEntry(
         name="te_thd_partitioned_indices",
         sources=(
             "megatron/core/datasets/data_schedule.py",
@@ -936,6 +1111,22 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "against unsharded Muon across multiple steps, including an optimizer-state reload. "
         "Tests exercise the default GEMM path with FP32 and BF16 model weights.",
     ),
+    KernelEntry(
+        name="csa_deterministic_attention_and_indexer",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py",
+        ),
+        tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa_deterministic_indexer.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa_fused_sparse_attention.py",
+        ),
+        kind="dispatch",
+        notes="Stable TopK and fixed-order sparse indexer dK/dW, with batch-local reference/replay; "
+        "real non-CP attention replay exercises deterministic cuDNN backward independently. "
+        "Deterministic learned-indexer SBHD forwards preserve key order and output bits across "
+        "no-grad and training dispatch, including zero and positive sparse indexer loss.",
+    ),
     # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
     KernelEntry(
         name="csa_teacher_lse",
@@ -966,10 +1157,27 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="dsa_dispatch",
         sources=("megatron/core/transformer/experimental_attention_variant/dsa.py",),
-        tests=(K + "test_fused_triton_kernels.py",),
+        tests=(K + "test_fused_triton_kernels.py", R + 'test_indexer_replay.py'),
         kind="dispatch",
         notes="DSA weights projection dispatches Transformer Engine general_gemm when available; "
         "replay covers the selected GEMM, deterministic torch fallback, and chunked KPool top-k.",
+    ),
+    KernelEntry(
+        name="dsa_triton_inference",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/dsa_gqa.py",
+            "megatron/core/transformer/experimental_attention_variant/dsa_gqa_inference.py",
+            "megatron/core/transformer/experimental_attention_variant/dsa_gqa_inference_kernels.py",
+        ),
+        kind="triton",
+        training_path=False,
+        exempt_reason="FlashInfer GVR2 top-k can vary tied indices and output ordering. "
+        "Native DSA decode does not support deterministic mode and rejects it before top-k "
+        "execution; this path has no bit-exact replay guarantee.",
+        notes="Paged Triton prefill and Gluon/Triton decode have exact top-k and training/decode "
+        "numerical parity coverage in "
+        "tests/unit_tests/transformer/experimental_attention_variant/test_dsa_gqa_inference.py, "
+        "including empty/ragged requests, causal masks, and graph page-table refresh.",
     ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(

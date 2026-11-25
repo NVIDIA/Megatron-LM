@@ -29,7 +29,7 @@ from megatron.core.ssm.mamba_context_parallel import (
     _redo_attention_load_balancing,
     _undo_attention_load_balancing,
 )
-from megatron.core.ssm.utils import _split_tensor_factory
+from megatron.core.ssm.utils import _split_tensor_factory, _validate_dynamic_cp_head_geometry
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
@@ -40,7 +40,7 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import get_pg_size, nvtx_range_pop, nvtx_range_push
 
 try:
     from fla.modules.convolution import causal_conv1d
@@ -164,6 +164,29 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
 
     gated_delta_rule: GatedDeltaRuleInterface
 
+    @classmethod
+    def _estimate_flops(
+        cls, config: TransformerConfig, total_real_tokens_in_batch: float, *, use_gdn2: bool
+    ) -> float:
+        """Share the GDN/GDN2 forward estimate without enabling it for other variants."""
+        qk_dim = (config.linear_key_head_dim or 128) * (config.linear_num_key_heads or 16)
+        value_head_dim = config.linear_value_head_dim or 128
+        value_heads = config.linear_num_value_heads or 32
+        value_dim = value_head_dim * value_heads
+        input_dim = (
+            4 * qk_dim + 3 * value_dim if use_gdn2 else 2 * qk_dim + 2 * value_dim + 2 * value_heads
+        )
+        return (
+            2
+            * total_real_tokens_in_batch
+            * (
+                config.hidden_size * input_dim
+                + (config.linear_conv_kernel_dim or 4) * (2 * qk_dim + value_dim)
+                + value_heads * value_head_dim**2 * 4  # KK^T, VK^T, S(a(I-bKK^T)), and SQ.
+                + config.hidden_size * value_dim
+            )
+        )
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -244,6 +267,19 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
 
         self.num_v_heads_local_tp = self.num_value_heads // self.tp_size
         self.num_k_heads_local_tp = self.num_key_heads // self.tp_size
+
+        # Chunkwise KDA partitions tokens and keeps all TP-local heads, so only
+        # headwise variants require divisibility by the selected CP group size.
+        if not (isinstance(config, KDALayerConfig) and config.linear_cp_mode == "chunkwise"):
+            _validate_dynamic_cp_head_geometry(
+                config,
+                self.pg_collection,
+                head_counts={
+                    "GDN key heads": self.num_k_heads_local_tp,
+                    "GDN value heads": self.num_v_heads_local_tp,
+                },
+            )
+            self._validate_runtime_cp_size(self.cp_size)
 
         attrs_to_check = (
             "dt_bias_dim",
@@ -332,6 +368,12 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             hidden_size=self.value_head_dim,
             eps=self.config.layernorm_epsilon,
         )
+
+        # out_norm's parameters are shared by all heads, but TP splits the heads, so each
+        # rank's gradient is a partial sum. Tag them so finalize_model_grads sums them.
+        for param in self.out_norm.parameters():
+            setattr(param, "sum_gradients_across_tp_domain", True)
+
         self.recompute_norm_out = False
         self.norm_out_checkpoint = None
         self.recompute_gdn = False
@@ -376,6 +418,18 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             self.norm_out_checkpoint.discard_output_and_register_recompute(out)
 
         return out, out_bias
+
+    def _validate_runtime_cp_size(self, cp_size: int) -> None:
+        """Require a nonempty integer key/value head shard for the runtime topology."""
+        for name, count in (
+            ("key", self.num_k_heads_local_tp),
+            ("value", self.num_v_heads_local_tp),
+        ):
+            if count < 1 or count % cp_size:
+                raise ValueError(
+                    f"GDN TP-local {name} head count {count} must be positive and "
+                    f"divisible by runtime CP size {cp_size}"
+                )
 
     def _setup_variant_attrs(self):
         """Set variant specifics on the module. Called once from ``__init__``.
@@ -477,6 +531,8 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         thd_cp_a2a_inv: torch.Tensor | None,
         batch: int,
         seq_len: int,
+        cp_size: int,
+        cp_group: Optional[torch.distributed.ProcessGroup],
         packed_seq_params: PackedSeqParams | None = None,
     ) -> torch.Tensor:
         # RMSNorm
@@ -489,9 +545,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         norm_out_hp = norm_out_hp.reshape(batch, seq_len, -1)
         norm_out_hp = norm_out_hp.transpose(0, 1).contiguous()
 
-        return a2a_hp_to_cp(
-            norm_out_hp, self.cp_size, self.pg_collection.cp, packed_seq_params, thd_cp_a2a_inv
-        )
+        return a2a_hp_to_cp(norm_out_hp, cp_size, cp_group, packed_seq_params, thd_cp_a2a_inv)
 
     @jit_fuser
     def _apply_gated_norm(self, x, gate):
@@ -959,7 +1013,7 @@ def a2a_cp_to_hp(
     qkvzba: torch.Tensor,
     in_proj_split_sections: tuple[int, ...],
     cp_size: int,
-    cp_group: torch.distributed.ProcessGroup,
+    cp_group: Optional[torch.distributed.ProcessGroup],
     cu_seqlens_q: torch.Tensor | None,
     seq_len: int,
     packed_seq_params: PackedSeqParams | None,
@@ -1008,7 +1062,7 @@ def a2a_cp_to_hp(
 def a2a_hp_to_cp(
     norm_out: torch.Tensor,
     cp_size: int,
-    cp_group: torch.distributed.ProcessGroup,
+    cp_group: Optional[torch.distributed.ProcessGroup],
     packed_seq_params: PackedSeqParams | None,
     thd_cp_a2a_inv: torch.Tensor | None,
 ) -> torch.Tensor:

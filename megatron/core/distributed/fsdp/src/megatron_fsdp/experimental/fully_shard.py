@@ -104,7 +104,9 @@ def fully_shard(
 
     Args:
         module: Module whose currently unowned parameters are managed by FSDP.
-        mesh: Parent device mesh containing the data-parallel axes.
+        mesh: Parent device mesh containing the data-parallel axes. With symmetric memory,
+            the mesh provider must initialize each data-parallel NCCL communicator before
+            construction, for example with a barrier on each mesh-axis group.
         placements: Parameter, gradient, and optimizer placements.
         mixed_precision_policy: Optional precision policy. Defaults to FP32 main weights
             and parameter-dtype main gradients.
@@ -191,28 +193,6 @@ def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
     if dim_names is None or axis not in dim_names:
         raise ValueError(f"Mesh axis {axis!r} is not present in mesh dim names {dim_names}.")
     return dim_names.index(axis)
-
-
-@contextmanager
-def microbatch(context: FsdpContext, is_last: bool) -> Iterator[None]:
-    """Mark an FSDP microbatch as the last accumulation microbatch.
-
-    Non-final microbatches still release unsharded weights, but defer automatic
-    gradient synchronization. HSDP/HFSDP also defer DP-outer gradient reduction
-    until the last microbatch. Wrap both forward and backward in this scope.
-
-    Args:
-        context: FSDP context whose roots should use this microbatch state.
-        is_last: Whether this scope contains the last accumulation microbatch.
-    """
-    context.ensure_finalized()
-    previous_state = context.is_last_microbatch
-    context.is_last_microbatch = is_last
-
-    try:
-        yield
-    finally:
-        context.is_last_microbatch = previous_state
 
 
 def _attach_mixin(module: nn.Module) -> None:

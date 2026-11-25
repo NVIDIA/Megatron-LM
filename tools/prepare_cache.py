@@ -7,17 +7,21 @@ Unsupported configurations:
 """
 
 import argparse
+from copy import copy
 from typing import Any, Dict, Optional
 
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig as MCoreGPTDatasetConfig
 from megatron.core.datasets.utils import compile_helpers
-from megatron.training import argument_utils, get_train_valid_test_num_samples
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+from megatron.training import argument_utils
+from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.arguments import parse_args, validate_args
+from megatron.training.config import TrainingConfig, ValidationConfig
 from megatron.training.config.container import update_train_iters
-from megatron.training.global_vars import set_args, set_run_config, unset_global_variables
+from megatron.training.global_vars import set_args, unset_global_variables
+from megatron.training.training import calculate_train_valid_test_num_samples
 
 try:
     from megatron.post_training.arguments import add_modelopt_args
@@ -125,15 +129,28 @@ def _print_effective_configuration(
 def core_gpt_dataset_config_from_args(args: Any) -> MCoreGPTDatasetConfig:
     """Build the Megatron Core GPTDatasetConfig used for offline cache preparation.
 
-    The shared ``argument_utils.core_gpt_dataset_config_from_args`` (a standalone section from the
-    legacy arguments, the layout and validation fields and the seed from ``args``, a tokenizer built
-    from ``args``) with the
-    dataset class pinned to the plain ``GPTDataset`` this tool builds, after rejecting the modes it
-    does not build (``--mock-data``, ``--sft``, ``--fim-data``); the section is validated there, so
-    a missing data source is reported before the builder runs.
+    There is no model or training container here. Use the target training topology resolved
+    by validate_args, which may differ from the process running this tool, and bind a local
+    tokenizer before building the cache.
     """
     _reject_unsupported_modes(args)
-    return argument_utils.core_gpt_dataset_config_from_args(args, dataset_type=GPTDataset)
+    # This tool has always built indexed GPT caches, even for a command line carrying
+    # the Varlen flag. Select the matching config without changing the caller's args.
+    args = copy(args)
+    args.use_varlen_dataset = False
+    data = argument_utils.gpt_data_config_from_args(args)
+    data.dataset_type = GPTDataset
+    config = data.dataset
+    config.data_parallel_size = args.data_parallel_size
+    config.context_parallel_size = args.context_parallel_size
+    config.sequence_parallel_size = args.tensor_model_parallel_size * int(bool(args.sequence_parallel))
+    config.dynamic_context_parallel = args.dynamic_context_parallel
+    config.full_validation = args.full_validation
+    config.multiple_validation_sets = args.multiple_validation_sets
+    data.validate()
+    data.finalize()
+    data.bind_tokenizer(build_tokenizer(args))
+    return config
 
 
 def build_dataset_caches(args: Any) -> Dict[str, Any]:
@@ -146,12 +163,16 @@ def build_dataset_caches(args: Any) -> Dict[str, Any]:
     set_args(args)
 
     try:
-        cfg = pretrain_cfg_container_from_args(args)
-        cfg.finalize()
-        set_run_config(cfg)
+        train = _default_config_from_args(TrainingConfig, args)
+        validation = _default_config_from_args(ValidationConfig, args)
         # Derive train_iters from --train-samples when needed (pretrain() does the same).
-        update_train_iters(cfg.train)
-        train_valid_test_num_samples = get_train_valid_test_num_samples()
+        update_train_iters(train)
+        train_valid_test_num_samples = calculate_train_valid_test_num_samples(
+            train,
+            validation,
+            phase_transition_iterations=args.phase_transition_iterations,
+            iteration=0,
+        )
         _print_effective_configuration(args, train_valid_test_num_samples, ignored_flags)
 
         compile_helpers()

@@ -6,6 +6,7 @@ Tests asserting memory usage or storage release belong here, including during
 CUDA graph capture and replay.
 """
 
+import gc
 import logging
 
 import pytest
@@ -18,6 +19,7 @@ from torch.distributed.tensor import Partial, Replicate, Shard
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
+    PrefetchOrder,
     RuntimePolicy,
     fully_shard,
     fully_shard_context,
@@ -75,6 +77,42 @@ def _zero2_placements() -> Placements:
 
 def _mb(num_bytes: int) -> str:
     return f"{num_bytes / 1024**2:.2f} MB"
+
+
+def test_shared_layer_releases_storage(distributed_setup):
+    """Release weights per invocation while accumulating gradients from both uses."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    layer = nn.Linear(4, 4, bias=False, device=device)
+    nn.init.ones_(layer.weight)
+    model = nn.Sequential(layer, layer)
+    with fully_shard_context(
+        FsdpContext(
+            device=device, runtime_policy=RuntimePolicy(prefetch_order=PrefetchOrder.RECORDED)
+        )
+    ):
+        fully_shard(layer, mesh, _default_placements())
+
+    completions = []
+
+    def check_data_and_grad(module, _grad_input, _grad_output):
+        # Each invocation releases its weight storage when its backward finishes.
+        assert module.weight.untyped_storage().nbytes() == 0
+        if not completions:
+            # The shared weight's gradient still awaits the other use's contribution.
+            assert module.weight.grad is None
+        completions.append(module)
+
+    # Observe PyTorch's completion independently of MFSDP's hook wrapper.
+    layer.register_full_backward_hook(check_data_and_grad)
+    x = torch.ones(2, 4, device=device, requires_grad=True)
+    model(x).sum().backward()
+    assert len(completions) == 2
+    # Each use contributes 8 to every weight gradient.
+    torch.testing.assert_close(
+        layer.weight.grad.full_tensor(), torch.full((4, 4), 16.0, device=device)
+    )
+    torch.testing.assert_close(x.grad, torch.full_like(x, 16.0))
 
 
 @pytest.mark.parametrize("main_params_dtype", [torch.bfloat16, torch.float32])
@@ -148,7 +186,10 @@ def test_training_step_peak_memory_bounds_full_size_buffers(
     mesh = init_device_mesh(device.type, (world_size,))
     dim = 4096
     dtype = torch.bfloat16
-    model = MultiChildModel(dim=dim, num_children=8).to(dtype=dtype)
+    # Keep full-sized weights/gradients without cuBLAS's version-dependent scratch.
+    model = MultiChildModel(dim=dim, num_children=0)
+    model.layers.extend(ElementwiseModel(dim) for _ in range(8))
+    model = model.to(dtype=dtype)
     placements = _default_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
     with fully_shard_context(
@@ -170,23 +211,23 @@ def test_training_step_peak_memory_bounds_full_size_buffers(
         model(x).float().sum().backward()
         optimizer.step()
 
-    # Warm up so cuBLAS's workspaces land in resting_allocated rather than in peak_delta,
-    # which would otherwise depend on whether an earlier test already allocated them.
+    # Materialize gradient state and record the traversal before measuring prefetch.
     train_step()
 
+    gc.collect()
+    torch.cuda.synchronize(device)
     resting_allocated = torch.cuda.memory_allocated(device)
     torch.cuda.reset_peak_memory_stats(device)
     train_step()
     peak_delta = torch.cuda.max_memory_allocated(device) - resting_allocated
 
-    # Backward keeps the current child and one prefetched child unsharded. The current
-    # child also has a full wgrad until it is copied into a full reduce-scatter input.
-    # With separate streams, their allocation cannot reuse the released full-weight
-    # storage, for a four-buffer peak. With a unified stream, the release precedes the
-    # allocation on that stream, reducing the peak to three. The slack on top covers
+    # Backward keeps the current child and one prefetched child unsharded. Gradient
+    # readiness can precede module completion, so the full wgrad and packed reduce-scatter
+    # input may also coexist before resharding. Both stream configurations therefore
+    # allow four full buffers. The slack on top covers
     # allocator granularity and small temporaries, measured at ~169 KiB.
     child_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
-    full_buffer_bound = 4 if overlap_allgather_reduction else 3
+    full_buffer_bound = 4
     bound_nbytes = full_buffer_bound * child_weight_nbytes + 1024**2
 
     assert peak_delta < bound_nbytes, (
@@ -207,6 +248,11 @@ def test_zero1_memory_uses_sharded_optimizer_and_replicated_weight(distributed_s
     num_tokens = 256
     dtype = torch.bfloat16
     x = torch.ones(num_tokens, dim, device=device, dtype=dtype)
+    # Clear process-global caches before the baseline so releasing a previous
+    # test's workspace cannot hide this model's allocations.
+    torch._C._cuda_clearCublasWorkspaces()
+    gc.collect()
+    torch.cuda.synchronize(device)
     allocated_before_setup = torch.cuda.memory_allocated(device)
     model = ElementwiseModel(dim).to(device=device, dtype=dtype)
     mesh = init_device_mesh(device.type, (world_size,))
@@ -222,7 +268,6 @@ def test_zero1_memory_uses_sharded_optimizer_and_replicated_weight(distributed_s
     sharded_fp32_weight_nbytes = (
         dim * dim // world_size * torch.empty((), dtype=torch.float32).element_size()
     )
-    torch._C._cuda_clearCublasWorkspaces()
     torch.cuda.reset_peak_memory_stats(device)
 
     def train_step() -> None:
@@ -240,14 +285,28 @@ def test_zero1_memory_uses_sharded_optimizer_and_replicated_weight(distributed_s
         state["exp_avg"].to_local().nbytes + state["exp_avg_sq"].to_local().nbytes
         for state in optimizer.state.values()
     )
-    # Resting memory holds one replicated BF16 model weight, one sharded BF16
-    # main gradient, and three sharded FP32 buffers: main weight and two Adam states.
+    # The Partial main gradient retains a full buffer; its optimizer-layout view is
+    # sharded and aliases that storage. Model weights are replicated; FP32 main
+    # weights and the two Adam states are sharded.
+    full_bf16_grad_nbytes = full_bf16_weight_nbytes
+    assert parameter_group.main_grad.placements == (Partial("avg"),)
+    assert parameter_group.main_grad.local_buffer.nbytes == full_bf16_grad_nbytes
+    assert parameter_group.pre_optimizer_main_grad.local_buffer.nbytes == sharded_bf16_weight_nbytes
     expected_resting_nbytes = (
-        full_bf16_weight_nbytes + sharded_bf16_weight_nbytes + 3 * sharded_fp32_weight_nbytes
+        full_bf16_weight_nbytes + full_bf16_grad_nbytes + 3 * sharded_fp32_weight_nbytes
     )
-    # Peak memory additionally holds the casted gradient and the sqrt and division
+    # On the first backward, unpacked wgrad and packed collective input coexist
+    # with persistent weights/gradients, before Adam's two states are created.
+    backward_peak_nbytes = (
+        full_bf16_weight_nbytes
+        + full_bf16_grad_nbytes
+        + sharded_fp32_weight_nbytes
+        + 2 * full_bf16_grad_nbytes
+    )
+    # Adam additionally holds the casted gradient and the sqrt and division
     # intermediates in ``denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)``.
-    expected_peak_nbytes = expected_resting_nbytes + 3 * sharded_fp32_weight_nbytes
+    optimizer_peak_nbytes = expected_resting_nbytes + 3 * sharded_fp32_weight_nbytes
+    expected_peak_nbytes = max(backward_peak_nbytes, optimizer_peak_nbytes)
     assert optimizer_state_nbytes == 2 * sharded_fp32_weight_nbytes
     assert resting_nbytes < expected_resting_nbytes + 1024**2
     assert peak_nbytes < expected_peak_nbytes + 1024**2

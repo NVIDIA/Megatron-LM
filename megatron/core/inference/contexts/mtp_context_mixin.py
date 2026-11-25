@@ -188,7 +188,9 @@ class MTPContextMixin:
                         if next_token_idx < len(req.prompt_tokens)
                         else -1
                     )
-                    producer_next = int(self.kv_block_allocator.block_mtp_next_token[block_id])
+                    producer_next = int(
+                        self.kv_block_allocator.pc_state.block_mtp_next_token[block_id]
+                    )
                     # -1 on either side means the slot holds no draft KV (the producer's
                     # successor had not arrived) or that we have no successor to match it
                     # against, so equality there is not agreement -- neither is inheritable.
@@ -391,29 +393,13 @@ class MTPContextMixin:
         n = mtp.active_request_count
         padded = mtp.padded_count
 
-        positions = mtp.active_offsets  # [n] int, MTP write position P_r for this depth
+        # Token write maps (one token per active request at its MTP write position P_r, padded
+        # rows sent to the dummy block) and MHA read metadata (query_length=1 per request,
+        # kv_length = P_r + 1, write-then-attend), in one sync-free launch.
+        kv_len = mtp.write_draft_step_metadata(self.gpu_view)
 
-        # Token write maps (one token per active request), padded rows sent to the dummy block.
-        mtp.write_token_maps(
-            gpu_view=self.gpu_view,
-            rows=mtp.row_ids[:n],
-            positions=positions,
-            block_table=mtp.active_block_table,
-            padded_token_count=padded,
-        )
-
-        # MHA read metadata: query_length=1 per request, kv_length = P_r + 1 (write-then-attend).
-        query_lengths, kv_len = mtp.stage_decode_lengths()
-        mtp.write_mha_metadata(
-            gpu_view=self.gpu_view,
-            query_lengths=query_lengths,
-            kv_lengths=kv_len,
-            block_table=mtp.active_block_table,
-            padded_request_count=padded,
-        )
-
-        # The staged buffers above are read only by these writes; the graph reads `gpu_view`
-        # alone, whose addresses are fixed, so replaying against them is graph-safe.
+        # Outside the eager max below, the graph reads `gpu_view` alone, whose addresses are
+        # fixed, so replaying against them is graph-safe.
         if mtp.graphed:
             # Graphed: route to the graph metadata and use the FIXED capture-time sequence-length
             # bound (baked into the flash-attn kernel launch at capture) rather than a per-step

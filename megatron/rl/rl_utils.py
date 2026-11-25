@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
 import gc
@@ -248,6 +248,7 @@ def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool
 def verify_model_weights_swap(
     train_model: LanguageModule,
     inference_model: LanguageModule,
+    padded_vocab_size: int = 128256,
     seq_len: int = 8,
     batch_size: int = 2,
     atol: float = 1e-4,
@@ -263,6 +264,7 @@ def verify_model_weights_swap(
     Args:
         train_model: The training model (source of weights).
         inference_model: The inference model (target of weights).
+        padded_vocab_size: Vocabulary size used to generate verification tokens.
         seq_len: Sequence length for test input.
         batch_size: Batch size for test input.
         atol: Absolute tolerance for comparing outputs.
@@ -280,14 +282,13 @@ def verify_model_weights_swap(
     train_core = unwrap_model(train_lm)
     inf_core = unwrap_model(inf_lm)
 
-    actual_vocab_size = getattr(args, 'padded_vocab_size', 128256)
-    actual_seq_len = min(seq_len, getattr(args, 'seq_length', seq_len))
+    actual_seq_len = min(seq_len, get_run_config().model.transformer.max_seq_length_per_sample)
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
     # Generate deterministic test input - same across ALL ranks
     torch.manual_seed(1234)
     test_tokens = torch.randint(
-        low=0, high=actual_vocab_size, size=(batch_size, actual_seq_len),
+        low=0, high=padded_vocab_size, size=(batch_size, actual_seq_len),
         device=device, dtype=torch.long
     )
     test_position_ids = (
@@ -459,8 +460,8 @@ def log_rl_throughput_metrics(args, batch_size, elapsed_time_per_iteration, iter
     actual_tokens_per_sec_per_gpu = None
     packing_efficiency = None
 
-    if args.seq_length > 0:
-        tokens_per_iteration = batch_size * args.seq_length
+    if cfg.model.transformer.max_seq_length_per_sample > 0:
+        tokens_per_iteration = batch_size * cfg.model.transformer.max_seq_length_per_sample
         tokens_per_sec = tokens_per_iteration / elapsed_time_per_iteration
         tokens_per_sec_per_gpu = tokens_per_sec / args.world_size
 
@@ -531,7 +532,7 @@ def log_rl_throughput_metrics(args, batch_size, elapsed_time_per_iteration, iter
         if wandb_writer is not None:
             wandb_writer.log({'throughput/avg_seq_length': avg_seq_length}, iteration)
     elif cfg.logger.log_throughput:
-        log_string += f' avg_seq_len: {args.seq_length} |'
+        log_string += f' avg_seq_len: {cfg.model.transformer.max_seq_length_per_sample} |'
 
     return log_string
 
@@ -721,7 +722,9 @@ def maybe_get_rollout_bank(args):
     if _ROLLOUT_BANK is None:
         from megatron.rl.rollout_bank import RolloutBank
 
-        bank_dir = cfg.rl.rl_rollout_bank_dir or os.path.join(args.save or ".", "rollout_bank")
+        bank_dir = cfg.rl.rl_rollout_bank_dir or os.path.join(
+            cfg.checkpoint.save or ".", "rollout_bank"
+        )
         _ROLLOUT_BANK = RolloutBank(bank_dir, max_bytes=cfg.rl.rl_rollout_bank_max_bytes)
         get_rl_runtime_state().rollout_bank = _ROLLOUT_BANK
         log_single_rank(logger, logging.INFO, f"Durable rollout bank enabled at {bank_dir}")
@@ -855,6 +858,7 @@ def colocated_inference(
             verify_model_weights_swap(
                 train_model=model,
                 inference_model=inference_model,
+                padded_vocab_size=cfg.tokenizer.padded_vocab_size,
                 atol=.1,
                 rtol=5e-4,
             )
@@ -2477,7 +2481,6 @@ def compute_logprobs_batch(
     trajs_batch_size, # n_bins for seq packing, and batch_size for non seq packing
     seq_length,
     logprobs_batch_size,
-    decoder_seq_length,
     dtype,
     pp_group,
     is_correction,
@@ -2494,7 +2497,6 @@ def compute_logprobs_batch(
             num_microbatches=1,
             seq_length=seq_length,
             micro_batch_size=logprobs_batch_size,
-            decoder_seq_length=decoder_seq_length,
             forward_only=True,
             adjust_tensor_shapes_fn=None,
             collect_non_loss_data=collect_non_loss_data,
@@ -2558,7 +2560,7 @@ def prepare_data_for_update(
 
     with nvtx_range("rl/prepare-data-for-update", time=True):
         with nvtx_range("rl/compute-group-stats", time=True):
-            group_stats = compute_group_stats(rollouts, tokenizer, args.seq_length, request_ledger)
+            group_stats = compute_group_stats(rollouts, tokenizer, cfg.model.transformer.max_seq_length_per_sample, request_ledger)
 
         # Now split the rollouts across the data parallel ranks for training
         # This needs to be done at this point because we are about to calculate logprobs
@@ -2628,14 +2630,14 @@ def prepare_data_for_update(
 
         with nvtx_range("rl/prepare-trajectories", time=True):
             trajs, generation_masks, inference_logprobs = prepare_trajectories(
-                rows, tokenizer, args.seq_length, cfg.rl.rl_skip_bos_token,
+                rows, tokenizer, cfg.model.transformer.max_seq_length_per_sample, cfg.rl.rl_skip_bos_token,
             )
         if not has_inference_logprobs:
             inference_logprobs = None
         elif sequence_packing:
             # Pad each row to seq_length and stack; an all-PAD (all-None) local slice becomes an
             # all-zero [num_rows, seq_length] tensor so this rank still joins the all_gather.
-            inference_logprobs = _pad_nonnull_with_zeros(inference_logprobs, args.seq_length)
+            inference_logprobs = _pad_nonnull_with_zeros(inference_logprobs, cfg.model.transformer.max_seq_length_per_sample)
 
         packing_context = None
         # Build trajectories based on sequence packing or standard processing
@@ -2646,7 +2648,7 @@ def prepare_data_for_update(
                     generation_masks,
                     inference_logprobs,
                     global_advantages,
-                    args.seq_length,
+                    cfg.model.transformer.max_seq_length_per_sample,
                     cfg.rl.rl_sequence_packing_max_sequences_per_bin,
                     cfg.rl.rl_sequence_packing_algo
                     )
@@ -2711,9 +2713,8 @@ def prepare_data_for_update(
                     forward_backward_func=forward_backward_func,
                     packing_context=packing_context,
                     trajs_batch_size=len(compute_trajs),
-                    seq_length=args.seq_length,
+                    seq_length=cfg.model.transformer.max_seq_length_per_sample,
                     logprobs_batch_size=logprobs_batch_size,
-                    decoder_seq_length=args.decoder_seq_length,
                     dtype=dtype,
                     pp_group=pp_group,
                     is_correction=cfg.rl.rl_inference_logprobs_is_correction,
@@ -2731,9 +2732,8 @@ def prepare_data_for_update(
                     forward_backward_func=forward_backward_func,
                     packing_context=packing_context,
                     trajs_batch_size=len(compute_trajs),
-                    seq_length=args.seq_length,
+                    seq_length=cfg.model.transformer.max_seq_length_per_sample,
                     logprobs_batch_size=logprobs_batch_size,
-                    decoder_seq_length=args.decoder_seq_length,
                     dtype=dtype,
                     pp_group=pp_group,
                     is_correction=cfg.rl.rl_inference_logprobs_is_correction,
@@ -2763,7 +2763,7 @@ def prepare_data_for_update(
                             inference_logprobs=packing_context.original_inference_logprobs,
                             packing_info=packing_context.packing_info,
                             generation_masks=packing_context.original_generation_masks,
-                            bin_size=args.seq_length,
+                            bin_size=cfg.model.transformer.max_seq_length_per_sample,
                         )
                     )
 
@@ -2979,7 +2979,7 @@ def evaluate_and_print_results_rl(
                     rank_info=None,
                     generation_args={
                         'temperature': cfg.rl.rl_default_temperature,
-                        'max_tokens': args.seq_length,
+                        'max_tokens': cfg.model.transformer.max_seq_length_per_sample,
                         'top_p': cfg.rl.rl_default_top_p,
                         'top_k': cfg.rl.rl_default_top_k,
                     },
