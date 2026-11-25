@@ -162,7 +162,9 @@ class MTPControllerMixin:
         Requires a graphed, decode-only main step. Under the NVLS dispatcher each rank decides
         locally (its all-gather-v / reduce-scatter-v accept per-rank token counts); under the NCCL
         and training dispatchers the EP batch-dimension sync makes every graphed step decode-only
-        on all ranks, so the decision is uniform there.
+        on all ranks, so the decision is uniform there. Idle EP ranks evaluate the same decision in
+        `_run_dummy_serial_mtp_forward` and then run `_mtp_dummy_commit_graphed_forward`, which
+        issues the commit pass's MoE collectives with the same token count.
         """
         return (
             self._mtp_resolved_padded_count is not None
@@ -800,6 +802,35 @@ class MTPControllerMixin:
         # depth overwrites it. The main verifier reads a separate KV plane.
 
     @torch.inference_mode()
+    def _mtp_dummy_commit_graphed_forward(
+        self, context, unwrapped_model, padded_count: int
+    ) -> None:
+        """EP-dummy counterpart of `_mtp_commit_pass_graphed`, with every row on the dummy block.
+
+        Real ranks on a graphed decode-only step run the fixed-shape commit pass over
+        `padded_count * num_speculative_tokens` rows; the dummy rank must issue the same MoE
+        collectives with the same token count, not the single-row `_mtp_dummy_prefill_forward`.
+        """
+        num_rows = padded_count * self.num_speculative_tokens
+        dummy_hidden = torch.zeros(
+            (num_rows, 1, self.model_config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=self.model_config.params_dtype,
+        )
+        if self._sp_enabled:
+            dummy_hidden = scatter_to_sequence_parallel_region(
+                dummy_hidden, group=self.inference_wrapped_model.tp_group
+            )
+        dummy_tokens = torch.zeros((1, num_rows), device=dummy_hidden.device, dtype=torch.long)
+        context._mtp_setup_commit_graphed(padded_count, padded_count)
+        unwrapped_model.compute_mtp_kv_write(
+            hidden_states=dummy_hidden,
+            next_token_ids=dummy_tokens,
+            position_ids=torch.zeros_like(dummy_tokens),
+            mtp_inference_context=context,
+        )
+        context.mtp_metadata.end_forward()
+
     def _run_dummy_serial_mtp_forward(self) -> None:
         """Run dummy MTP forward passes to participate in EP collectives.
 
@@ -855,8 +886,9 @@ class MTPControllerMixin:
         context = self.inference_wrapped_model.inference_context
 
         # When the MTP KV cache is active, real ranks run one commit-pass forward before the
-        # depth loop. The dummy EP rank must mirror both the count (D+1 forwards) and the
-        # graph/eager mode, else the shared MoE all-to-all count/shape
+        # depth loop. The dummy EP rank must mirror the count (D+1 forwards), the commit pass's
+        # layout (fixed-shape on graphed decode-only steps, else the one-row prefill-style pass)
+        # and the graph/eager mode, else the shared MoE all-to-all count/shape
         # mismatches and the collective hangs. Mirror the real path's mode via the EP-synced
         # `_mtp_resolved_padded_count` (None iff the main step was eager) -- NOT the local live
         # `using_cuda_graph_this_step()`, which the commit pass clobbers on the real ranks.
@@ -875,7 +907,10 @@ class MTPControllerMixin:
         mtp_context_kwarg = {"mtp_inference_context": context} if mtp_cache_active else {}
         with context._mtp_forward_phase(preserve_step_bookkeeping=mtp_cache_active):
             if mtp_cache_active:
-                self._mtp_dummy_prefill_forward(context, unwrapped_model)
+                if self._mtp_commit_graphed_this_step(context):
+                    self._mtp_dummy_commit_graphed_forward(context, unwrapped_model, padded_count)
+                else:
+                    self._mtp_dummy_prefill_forward(context, unwrapped_model)
                 context.mtp_metadata.begin_decode_for_capture(padded_count, graphed=main_graphed)
             for depth in range(self.num_mtp_depths):
                 nvtx_range_push(f"mtp-spec-decoding/dummy-depth-{depth}")
