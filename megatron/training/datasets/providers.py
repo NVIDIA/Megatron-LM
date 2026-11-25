@@ -28,25 +28,20 @@ def is_dataset_built_on_rank_explicit(
     sequence_packing_scheduler: Optional[str],
     pipeline_model_parallel_layout: Any,
     mtp_num_layers: Optional[int],
-    needs_batch_on_all_pipeline_stages: bool = False,
 ) -> bool:
     """Whether the dataset should be built on the current rank: the GPT and hybrid rule, with the
     run's inputs given explicitly (``is_dataset_built_on_rank`` reads them from the model config).
 
     Only tensor-parallel rank 0 builds. A sequence-packing scheduler or packed dataset builds
-    on every pipeline stage, as do callers requesting masks on all stages. The
-    others build on the first and last stages and multi-token-prediction ranks.
+    on every pipeline stage; the others on the first and last stages and on the
+    multi-token-prediction ranks.
     """
     from megatron.training.utils import is_first_or_last_pipeline_stage
 
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
-    if (
-        is_packed_sequence
-        or sequence_packing_scheduler is not None
-        or needs_batch_on_all_pipeline_stages
-    ):
-        # Packed metadata and explicit masks are inputs to every decoder stage.
+    if is_packed_sequence or sequence_packing_scheduler is not None:
+        # The sequence-packing scheduler runs on every PP stage and reads its input there.
         return True
     return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank(
         layout=pipeline_model_parallel_layout,
@@ -58,10 +53,7 @@ def is_dataset_built_on_rank_explicit(
 
 
 def is_dataset_built_on_rank(
-    vp_stage: Optional[int] = None,
-    is_packed_sequence: bool = False,
-    *,
-    needs_batch_on_all_pipeline_stages: bool = False,
+    vp_stage: Optional[int] = None, is_packed_sequence: bool = False
 ) -> bool:
     """``is_dataset_built_on_rank_explicit`` applied to the registered model config: the predicate
     ``pretrain_gpt.py`` and ``pretrain_hybrid.py`` pass, and the default of ``build_gpt_datasets``.
@@ -76,7 +68,6 @@ def is_dataset_built_on_rank(
         sequence_packing_scheduler=config.sequence_packing_scheduler,
         pipeline_model_parallel_layout=config.pipeline_model_parallel_layout,
         mtp_num_layers=config.mtp_num_layers,
-        needs_batch_on_all_pipeline_stages=needs_batch_on_all_pipeline_stages,
     )
 
 

@@ -64,7 +64,6 @@ _BATCH_KEYS = (
     "local_cp_size",
     "loss_mask",
     "max_seqlen",
-    "padding_mask",
     "position_ids",
     "tokens",
 )
@@ -101,8 +100,7 @@ def get_batch(
     is_first = is_pp_first_stage(pg_collection.pp) and is_vp_first_stage(vp_stage, vp_size)
     is_last = is_pp_last_stage(pg_collection.pp) and is_vp_last_stage(vp_stage, vp_size)
     has_cu_seqlens = cfg.data.has_cu_seqlens()
-    needs_masks = cfg.data.creates_attention_mask() or config.num_moe_experts is not None
-    if not is_first and not is_last and not use_mtp and not has_cu_seqlens and not needs_masks:
+    if not is_first and not is_last and not use_mtp and not has_cu_seqlens:
         return ContextParallelBatch.from_single_layout(
             config.linear_cp_layout, dict.fromkeys(_BATCH_KEYS), None
         )
@@ -135,7 +133,6 @@ def get_batch(
         pipeline_model_parallel_size=pg_collection.pp.size(),
         is_pipeline_first_stage=is_first,
         is_pipeline_last_stage=is_last,
-        broadcast_padding_mask=True,
     )
     batch = flatten_batch_for_packed_sequences(batch)
     # mRoPE positions are [3, batch, sequence], not [batch, sequence]. The model

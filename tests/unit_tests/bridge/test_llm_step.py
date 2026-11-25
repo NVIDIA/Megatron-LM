@@ -2,7 +2,6 @@
 
 """The packaged text step preserves MLM's batch partitioning and masked loss."""
 
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -138,67 +137,6 @@ def test_masked_loss_preserves_token_count_and_gradients(run_config):
     torch.testing.assert_close(losses.grad, mask)
 
 
-@pytest.mark.parametrize("cp", [1, 2])
-@pytest.mark.parametrize("middle_stage", [False, True])
-def test_optional_masks_survive_tp_cp_and_middle_pipeline_stages(
-    run_config, monkeypatch, cp, middle_stage
-):
-    Utils.initialize_model_parallel(2 // cp, 1, context_parallel_size=cp)
-    try:
-        groups = ProcessGroupCollection.use_mpu_process_groups()
-        if middle_stage:
-            # Emulate the middle stage of PP=3 while using two real GPUs for TP/CP.
-            groups.pp = SimpleNamespace(size=lambda: 3, rank=lambda: 1)
-            monkeypatch.setattr(llm_step, "mtp_on_this_rank", lambda **kwargs: False)
-        run_config.train.micro_batch_size = 1
-        run_config.data = DataConfig(
-            dataset=GPTDatasetConfig(
-                random_seed=1234,
-                sequence_length=16,
-                reset_position_ids=False,
-                reset_attention_mask=True,
-                eod_mask_loss=False,
-                create_attention_mask=True,
-            ),
-            dataset_type=MockGPTDataset,
-        )
-        attention = torch.ones(1, 1, 16, 16, dtype=torch.bool).triu(1)
-        attention[:, :, 8:, :8] = True  # The second document cannot see the first.
-        padding = torch.arange(16).reshape(1, 16) >= 12
-        for padding_mask in (padding, None):
-            sample = dict(
-                tokens=torch.arange(16).reshape(1, 16),
-                labels=torch.arange(16).reshape(1, 16),
-                position_ids=torch.arange(16).reshape(1, 16),
-                loss_mask=torch.ones(1, 16),
-                attention_mask=attention,
-                padding_mask=padding_mask,
-            )
-            batch = llm_step.get_batch(
-                iter([sample]) if groups.tp.rank() == 0 else None,
-                pg_collection=groups,
-                vp_stage=None,
-            ).get_batch()
-            indices = torch.arange(16)
-            if cp == 2:
-                rank = groups.cp.rank()
-                indices = torch.cat(
-                    [
-                        torch.arange(rank * 4, (rank + 1) * 4),
-                        torch.arange((3 - rank) * 4, (4 - rank) * 4),
-                    ]
-                )
-            torch.testing.assert_close(batch["attention_mask"], attention[:, :, indices].cuda())
-            if padding_mask is None:
-                assert batch.get("padding_mask") is None
-            else:
-                torch.testing.assert_close(batch["padding_mask"], padding[:, indices].cuda())
-            if middle_stage:
-                assert batch["tokens"] is None and batch["labels"] is None
-    finally:
-        Utils.destroy_model_parallel()
-
-
 @pytest.mark.parametrize("pre_process,hybrid", [(True, False), (False, False), (False, True)])
 def test_forward_step_scatter_is_only_for_later_gpt_stages(
     run_config, monkeypatch, pre_process, hybrid
@@ -254,23 +192,3 @@ def test_packed_flops_count_once_across_virtual_chunks(run_config, monkeypatch, 
     expected = [32, 256] if scheduled else [16, 128]
     assert training._seqlen_stats_in_iteration.tolist() == expected
     assert training._seqlen_stats_are_global is scheduled
-
-
-def test_dataset_provider_builds_middle_stage_for_masks(monkeypatch):
-    from megatron.training.datasets import providers
-
-    monkeypatch.setattr(providers.mpu, "get_tensor_model_parallel_rank", lambda: 0)
-    monkeypatch.setattr("megatron.training.utils.is_first_or_last_pipeline_stage", lambda _: False)
-    monkeypatch.setattr(providers, "mtp_on_this_rank", lambda **kwargs: False)
-    monkeypatch.setattr(providers.mpu, "get_pipeline_model_parallel_group", lambda: None)
-    kwargs = dict(
-        sequence_packing_scheduler=None, pipeline_model_parallel_layout=None, mtp_num_layers=None
-    )
-    assert not providers.is_dataset_built_on_rank_explicit(None, False, **kwargs)
-    assert providers.is_dataset_built_on_rank_explicit(
-        None, False, needs_batch_on_all_pipeline_stages=True, **kwargs
-    )
-    monkeypatch.setattr(providers.mpu, "get_tensor_model_parallel_rank", lambda: 1)
-    assert not providers.is_dataset_built_on_rank_explicit(
-        None, False, needs_batch_on_all_pipeline_stages=True, **kwargs
-    )

@@ -2310,7 +2310,6 @@ def get_batch_on_this_tp_rank(
     pipeline_model_parallel_size: int = 1,
     is_pipeline_first_stage: bool = False,
     is_pipeline_last_stage: bool = False,
-    broadcast_padding_mask: bool = False,
 ):
     """Broadcast batch tensors from TP rank 0 to all other ranks in the TP group.
 
@@ -2351,9 +2350,6 @@ def get_batch_on_this_tp_rank(
         pipeline_model_parallel_size (int): Number of pipeline-parallel stages.
         is_pipeline_first_stage (bool): Whether this rank is on the first PP stage.
         is_pipeline_last_stage (bool): Whether this rank is on the last PP stage.
-        broadcast_padding_mask (bool): Carry an optional boolean padding mask on
-            all stages. All TP ranks must agree on this flag. When enabled, a
-            presence flag precedes the mask so batches without a mask retain None.
 
     Returns:
         dict[str, torch.Tensor]: The batch dict with all tensors populated on
@@ -2432,21 +2428,18 @@ def get_batch_on_this_tp_rank(
             if create_attention_mask_in_dataloader:
                 _broadcast(batch['attention_mask'])
 
-        else:
+        elif has_cu_seqlens:
             # NOTE(asolergi-nv): Broadcast required THD metadata to intermediate stages.
             batch["tokens"] = None
             batch["labels"] = None
             batch["loss_mask"] = None
             batch["position_ids"] = None
-            if has_cu_seqlens:
-                _broadcast_cu_seqlens(batch['cu_seqlens'])
-                _broadcast(batch['max_seqlen'])
-                if cp_size > 1:
-                    _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
-            if create_attention_mask_in_dataloader:
-                _broadcast(batch['attention_mask'])
-            else:
-                batch["attention_mask"] = None
+            batch["attention_mask"] = None
+
+            _broadcast_cu_seqlens(batch['cu_seqlens'])
+            _broadcast(batch['max_seqlen'])
+            if cp_size > 1:
+                _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
 
     else:
         if dynamic_cp:
@@ -2556,20 +2549,17 @@ def get_batch_on_this_tp_rank(
             if create_attention_mask_in_dataloader:
                 _broadcast(attention_mask)
 
-        else:
+        elif has_cu_seqlens:
             # NOTE(asolergi-nv): Broadcast required THD metadata to intermediate stages.
             tokens = None
             labels = None
             loss_mask = None
             position_ids = None
 
-            if has_cu_seqlens:
-                cu_seqlens = _broadcast_cu_seqlens()
-                _broadcast(max_seqlen)
-                if cp_size > 1:
-                    cu_seqlens_padded = _broadcast_cu_seqlens()
-            if create_attention_mask_in_dataloader:
-                _broadcast(attention_mask)
+            cu_seqlens = _broadcast_cu_seqlens()
+            _broadcast(max_seqlen)
+            if cp_size > 1:
+                cu_seqlens_padded = _broadcast_cu_seqlens()
 
         batch = {
             'tokens': tokens,
@@ -2583,25 +2573,6 @@ def get_batch_on_this_tp_rank(
             'local_cp_size': local_cp_size,
             'dynamic_cp_group': None,
         }
-
-    if broadcast_padding_mask and torch.distributed.get_world_size(broadcast_group) > 1:
-        padding_mask = batch.get('padding_mask') if tp_rank == 0 else None
-        present = torch.tensor(
-            padding_mask is not None, dtype=torch.bool, device=torch.cuda.current_device()
-        )
-        _broadcast(present)
-        if present.item():
-            length = dynamic_cp_seq_length.item() if dynamic_cp else seq_length
-            if tp_rank == 0:
-                assert padding_mask.dtype == torch.bool
-                assert padding_mask.shape == (micro_batch_size, length)
-                padding_mask = padding_mask.contiguous()
-            else:
-                padding_mask = torch.empty(
-                    (micro_batch_size, length), dtype=torch.bool, device=torch.cuda.current_device()
-                )
-            _broadcast(padding_mask)
-        batch['padding_mask'] = padding_mask
 
     return batch
 
