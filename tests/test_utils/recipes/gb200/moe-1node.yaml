@@ -10,6 +10,7 @@ spec:
   gpus: 4
   n_repeat: 5
   platforms: dgx_gb200
+  golden_platform: dgx_gb200
   script_setup: |
     set -euo pipefail
     unset https_proxy
@@ -57,7 +58,7 @@ spec:
         "CHECKPOINT_LOAD_PATH=/mnt/artifacts"
         "TRAINING_SCRIPT_PATH=pretrain_gpt.py"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
-        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
+        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{golden_platform}.json"
         "N_REPEAT={n_repeat}"
         "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE:-}}"
         "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS:-}}"
@@ -70,8 +71,13 @@ products:
   - test_case: [deepseek_proxy_mfsdp_v2_ep2_mb4_per_token_loss_1node]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_gb200]
+      # GitHub runners are GB300 hardware, so they share the GB300 baseline.
+      - environment: [dev]
+        scope: [mr-github]
+        platforms: [dgx_gb200]
+        golden_platform: [dgx_gb300]
   - test_case: [deepseek_proxy_mfsdp_v1_ep2_1node]
     products:
       - environment: [dev]
