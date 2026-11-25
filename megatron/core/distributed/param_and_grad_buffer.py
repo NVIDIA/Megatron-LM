@@ -10,7 +10,6 @@ from functools import partial
 from typing import Dict, List, Optional, Tuple
 
 import torch
-from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from torch.distributed import _coalescing_manager
 
 import megatron.core.allocator.vmm_symm_allocator as vmm_symm_allocator
@@ -38,11 +37,15 @@ from ..fp8_utils import (
     modify_grouped_tensor_rowwise_storage,
     modify_underlying_storage,
     post_all_gather_processing,
-    requantize_whole_params_from_high_precision,
 )
 from ..optimizer.param_layout import pad_bucket_end, pad_param_start
 from ..utils import is_torch_min_version
 from .distributed_data_parallel_config import DistributedDataParallelConfig
+from .param_gather import (
+    _compact_param_gather_uses_grad_buffer,
+    _copy_back_layerwise_gather,
+    start_layerwise_param_gather,
+)
 from .reduce_scatter_with_fp32_accumulation import reduce_scatter_with_fp32_accumulation
 
 logger = logging.getLogger(__name__)
@@ -206,65 +209,6 @@ class _ParamAndGradBucket:
         self.layerwise_param_flat_sizes = [
             sum([p.numel() for p in param_list]) for param_list in layerwise_params_list
         ]
-
-
-# DDP bucket groups and the optimizer-owned compact gather share these staging and copy-back
-# rules so that all ranks publish the same parameter values with either dispatch path.
-def _compact_param_gather_uses_grad_buffer(config) -> bool:
-    """Whether a compact LayerWise all-gather receives into ``bucket.grad_data``.
-
-    Configuring overlap selects gradient storage for all supported dtypes, even when the
-    call is forced synchronous. With overlap off, only the MXFP8 setting selects it.
-    """
-    return config.overlap_param_gather or config.reuse_grad_buf_for_mxfp8_param_ag
-
-
-def _layerwise_gather_sources(
-    params: List[torch.nn.Parameter], quantized: bool
-) -> List[torch.Tensor]:
-    """The tensors an owner contributes to a variable-size LayerWise all-gather.
-
-    Quantized params can't be flattened (MXFP8 has no view(-1)), so they travel as BF16 cast
-    from the owner's FP32 master; the copy-back requantizes them on every rank.
-    """
-    if not quantized:
-        return params
-    for param in params:
-        assert getattr(param, 'main_param', None) is not None, (
-            "LayerWise quantized param gather needs the owner's FP32 main_param to stage the "
-            "all-gather source."
-        )
-    return [param.main_param.to(torch.bfloat16) for param in params]
-
-
-@torch.no_grad()
-def _copy_back_layerwise_gather(
-    params_list: List[List[torch.nn.Parameter]],
-    gather_list: List[torch.Tensor],
-    local_rank: int,
-    quantized: bool,
-) -> None:
-    """Publish a variable-size LayerWise all-gather into the model params.
-
-    Plain params of the other ranks are copied from their gather slots; the local rank's
-    params already hold their update. Quantized params were gathered as BF16 staged from the
-    owners' FP32 masters and are requantized on every rank, owner included, so that all
-    replicas hold identical quantized values.
-    """
-    quantized_params, quantized_values = [], []
-    for rank, params in enumerate(params_list):
-        if not params:
-            continue
-        if quantized:
-            templates = [torch.empty(p.shape, device="meta", dtype=torch.bfloat16) for p in params]
-            quantized_params.extend(params)
-            quantized_values.extend(_unflatten_dense_tensors(gather_list[rank], templates))
-        elif rank != local_rank:
-            values = _unflatten_dense_tensors(gather_list[rank], params)
-            for model_param, value in zip(params, values):
-                model_param.data.copy_(value)
-    if quantized_params:
-        requantize_whole_params_from_high_precision(quantized_params, quantized_values)
 
 
 class _LayerwiseAllGatherHandle:
@@ -569,52 +513,16 @@ class _ParamAndGradBucketGroup:
                 # Single-rank group (e.g., expt_dp_size == 1): no all-gather needed.
                 self.param_gather_dispatched = True
                 return
-            local_rank = self.intra_distributed_optimizer_instance_rank
             group = self.intra_distributed_optimizer_instance_group
             layerwise_work_handles = []
             for bucket in self.buckets:
-                # Use param dtype (e.g., bf16), NOT grad dtype (which may be
-                # fp32 when grad_reduce_in_fp32 is enabled). Quantized params travel as
-                # BF16 staged from their FP32 masters.
-                param_dtype = (
-                    torch.bfloat16
-                    if bucket.layerwise_gather_quantized
-                    else bucket.params_list[0].dtype
-                )
-
-                if max(bucket.layerwise_param_flat_sizes) == 0:
-                    bucket.layerwise_gather_list = None
-                    continue
-
-                local_size = bucket.layerwise_param_flat_sizes[local_rank]
-                total_gather_size = sum(bucket.layerwise_param_flat_sizes)
-
-                # Reuse grad_data as the all_gather receive buffer; it is idle
-                # during forward and grad_dtype.element_size >= param_dtype.
-                reuse_buf = bucket.grad_data.view(param_dtype)
-                assert reuse_buf.numel() >= total_gather_size
-
-                # Partition reuse_buf into contiguous per-rank receive slices.
-                gather_list = []
-                offset = 0
-                for i in range(dp_size):
-                    size = bucket.layerwise_param_flat_sizes[i]
-                    gather_list.append(reuse_buf[offset : offset + size])
-                    offset += size
-                local_slot_view = gather_list[local_rank]
-
-                # Flatten local params and copy into the local rank's slot.
-                # Detach from autograd since start_param_sync may be called
-                # during the forward pass where autograd is active.
-                if local_size > 0:
-                    sources = _layerwise_gather_sources(
-                        bucket.layerwise_params_list[local_rank], bucket.layerwise_gather_quantized
-                    )
-                    local_slot_view.copy_(_flatten_dense_tensors(sources).detach())
-                bucket.layerwise_gather_list = gather_list
-
-                work = torch.distributed.all_gather(
-                    gather_list, local_slot_view, group=group, async_op=async_op
+                bucket.layerwise_gather_list, work = start_layerwise_param_gather(
+                    bucket.layerwise_params_list,
+                    bucket.layerwise_param_flat_sizes,
+                    group,
+                    bucket.layerwise_gather_quantized,
+                    grad_buffer=bucket.grad_data,
+                    async_op=async_op,
                 )
                 if async_op and work is not None:
                     layerwise_work_handles.append(work)

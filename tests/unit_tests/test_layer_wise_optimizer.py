@@ -11,6 +11,7 @@ from packaging.version import Version
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.distributed.param_gather import all_gather_v
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
@@ -616,6 +617,31 @@ class TestLayerWiseOptimizer:
         layer_wise = _layer_wise(optimizer)
         assert layer_wise.ddp_config is model.ddp_config
         assert layer_wise.overlap_param_gather == ddp_overlap_param_gather
+
+    @pytest.mark.parametrize("borrow_buffer", [False, True])
+    @pytest.mark.parametrize("async_op", [False, True])
+    def test_all_gather_v_with_empty_owner(self, borrow_buffer, async_op):
+        """Gather unequal payloads, including an empty rank, without touching extra storage."""
+        group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        rank = group.rank()
+        sizes = list(range(group.size()))
+        local = torch.full((sizes[rank],), rank, dtype=torch.bfloat16, device="cuda")
+        out = local.new_full((sum(sizes) + 1,), -1) if borrow_buffer else None
+
+        slots, work = all_gather_v(local, sizes, group, out=out, async_op=async_op)
+        if async_op:
+            work.wait()
+        else:
+            assert work is None
+
+        assert len(slots) == len(sizes)
+        for owner, slot in enumerate(slots):
+            assert torch.equal(slot, local.new_full((sizes[owner],), owner))
+        if out is None:
+            assert slots[rank].data_ptr() == local.data_ptr()
+        else:
+            assert all(slot.untyped_storage().data_ptr() == out.data_ptr() for slot in slots)
+            assert out[-1].item() == -1
 
     def test_overlap_param_gather_bucket_lw_params(self):
         """Every compact LayerWise bucket lists each rank's whole params and their sizes."""

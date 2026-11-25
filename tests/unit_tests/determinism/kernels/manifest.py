@@ -708,7 +708,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="ddp_grad_buffer_reductions",
-        sources=("megatron/core/distributed/param_and_grad_buffer.py",),
+        sources=(
+            "megatron/core/distributed/param_and_grad_buffer.py",
+            "megatron/core/distributed/param_gather.py",
+        ),
         tests=(
             C + "test_gpt_model.py",
             "tests/unit_tests/distributed/test_param_storage_copyback.py",

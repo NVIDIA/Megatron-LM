@@ -8,17 +8,18 @@ from itertools import chain
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
-from torch._utils import _flatten_dense_tensors
 
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedStateDict
 from megatron.core.distributed.param_and_grad_buffer import (
-    _compact_param_gather_uses_grad_buffer,
     _compute_default_per_buffer_param_layout,
-    _copy_back_layerwise_gather,
-    _layerwise_gather_sources,
     _param_uses_quantized_storage,
     group_params_for_buffers,
+)
+from megatron.core.distributed.param_gather import (
+    _compact_param_gather_uses_grad_buffer,
+    _copy_back_layerwise_gather,
+    start_layerwise_param_gather,
 )
 from megatron.core.full_cuda_graph import FullIterationGradCopy
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -1259,41 +1260,6 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         identical quantized values.
         """
 
-        # helper function to flatten local params, all-gather,
-        # unflatten and copy to model params
-        def _allgather_helper(params_list, group, quantized):
-            # Any rank, including rank 0, may own no param of this domain.
-            first_param = next((params[0] for params in params_list if params), None)
-            if first_param is None:
-                return
-            device = first_param.device
-            dtype = torch.bfloat16 if quantized else first_param.dtype
-            rank = get_pg_rank(group)
-            dp_size = get_pg_size(group)
-            # Flatten this rank's params.
-            local_sources = _layerwise_gather_sources(params_list[rank], quantized)
-            src = (
-                _flatten_dense_tensors(local_sources)
-                if len(local_sources) > 0
-                else torch.empty(0, device=device, dtype=dtype)
-            )
-            flat_sizes = [sum(p.numel() for p in params) for params in params_list]
-            if max(flat_sizes) == 0:
-                return
-
-            # Allocate per-rank receive buffers with actual sizes (no padding).
-            # PyTorch's NCCL backend handles uneven sizes in all_gather via
-            # grouped send/recv internally. Reuse src for local rank's slot.
-            gather_list = []
-            for i in range(dp_size):
-                if i == rank:
-                    gather_list.append(src)
-                else:
-                    gather_list.append(torch.empty(flat_sizes[i], device=device, dtype=dtype))
-
-            torch.distributed.all_gather(gather_list, src, group=group)
-            _copy_back_layerwise_gather(params_list, gather_list, rank, quantized)
-
         def _allgather_by_transport(params_list, group):
             # Flattening needs one dtype; keep e.g. FP32 params out of a BF16 transport, and
             # quantized params apart from plain ones. The transport order follows the owner
@@ -1303,8 +1269,14 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 for param in params:
                     key = (_param_uses_quantized_storage(param), param.dtype)
                     transports.setdefault(key, [[] for _ in params_list])[rank].append(param)
+            rank = get_pg_rank(group)
             for (quantized, _), transport_params_list in transports.items():
-                _allgather_helper(transport_params_list, group, quantized)
+                sizes = [sum(param.numel() for param in params) for params in transport_params_list]
+                slots, _ = start_layerwise_param_gather(
+                    transport_params_list, sizes, group, quantized
+                )
+                if slots is not None:
+                    _copy_back_layerwise_gather(transport_params_list, slots, rank, quantized)
 
         if self.pg_collection is None:
             return
