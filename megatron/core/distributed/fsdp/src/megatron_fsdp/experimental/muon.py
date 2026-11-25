@@ -28,27 +28,27 @@ from .dbuffer import DBuffer
 from .gather_scatter import gather, get_sorted_rank_ranges, scatter
 from .owner_planning import assign_owner_work
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
-from .range import Range, intersect_ranges
+from .range import intersect_ranges
 
 
 @dataclass(frozen=True)
 class _FsdpGroupAssignment:
-    """An FSDP group and its cached optimizer-group and owner-rank assignments and rank ranges."""
+    """An FSDP group and its cached optimizer-group and owner-rank assignments."""
 
     fsdp_group: FsdpParameterGroup
     tensor_to_optimizer_group_index: dict[int, int]
     tensor_to_owner_rank: dict[int, int]
-    # The layout is fixed, so the ranges are computed once instead of on every gather and scatter.
-    rank_ranges: dict[int, Range]
 
     @cached_property
     def requires_communication(self) -> bool:
         """Whether any of the optimized tensors has shards on several ranks."""
-        layout = self.fsdp_group.main_weight.layout
+        buffer = self.fsdp_group.main_weight
+        layout = buffer.layout
+        rank_ranges = get_sorted_rank_ranges(layout, buffer.mesh, buffer.placements)
         return any(
             sum(
                 intersect_ranges(layout.get_tensor_range(i), rank_range).numel > 0
-                for rank_range in self.rank_ranges.values()
+                for rank_range in rank_ranges.values()
             )
             > 1
             for i in self.tensor_to_optimizer_group_index
@@ -151,10 +151,7 @@ class _GroupPipeline:
                 for i in owned
             }
             self._gather_works = gather(
-                self._momentum_inputs,
-                self._full_inputs,
-                tensor_to_owner=owners,
-                rank_ranges=self.assignment.rank_ranges,
+                self._momentum_inputs, self._full_inputs, tensor_to_owner=owners
             )
         else:
             self._full_inputs = {i: self._momentum_inputs.get_tensor_view(i) for i in owned}
@@ -186,10 +183,7 @@ class _GroupPipeline:
                 buffer.mesh, buffer.placements, buffer.layout, torch.float32, buffer.device
             )
             self._scatter_works = scatter(
-                self._full_updates,
-                self._local_updates,
-                tensor_to_owner=self._active_owners(),
-                rank_ranges=self.assignment.rank_ranges,
+                self._full_updates, self._local_updates, tensor_to_owner=self._active_owners()
             )
         self._stage = _PipelineStage.SCATTER_POSTED
 
@@ -300,7 +294,6 @@ class FsdpMuon(Muon):
                         if fp.sharded in param_to_optimizer_group_index
                     },
                     tensor_to_owner_rank=tensor_to_owner_rank,
-                    rank_ranges=get_sorted_rank_ranges(fsdp_group.main_weight),
                 )
             )
         self._validate_parameter_groups()
