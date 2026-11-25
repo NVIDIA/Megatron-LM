@@ -25,14 +25,18 @@ from typing import Any, cast
 import torch
 from torch.distributed.tensor import DTensor
 
-from megatron.core.fusions.fused_angular_muown import (
-    fused_angular_muown_apply_update,
-    fused_angular_muown_momentum_inputs,
-)
-
 from .dbuffer import DBuffer
 from .muon import FsdpMuon, _FsdpGroupAssignment
 from .parameter_group import FsdpParameterGroup
+
+try:
+    from megatron.core.fusions.fused_angular_muown import (
+        fused_angular_muown_apply_update,
+        fused_angular_muown_momentum_inputs,
+    )
+except ImportError:
+    # Standalone Megatron-FSDP has only the torch path.
+    fused_angular_muown_apply_update = fused_angular_muown_momentum_inputs = None
 
 __all__ = ["FsdpAngularMuOwn"]
 
@@ -139,6 +143,8 @@ class FsdpAngularMuOwn(FsdpMuon):
         self.norm_eps = norm_eps
         # mult in lambda' = weight_decay * mult, used in g <- (1 - lr * lambda') * g.
         self.weight_decay_mult = weight_decay_mult
+        if use_fused_kernels and fused_angular_muown_apply_update is None:
+            raise ImportError("use_fused_kernels needs Megatron-Core's fused AngularMuOwn kernels.")
         self.use_fused_kernels = use_fused_kernels
         # kappa_t of the most recent step, for logging only; no formula reads it.
         self.last_angular_multiplier = 1.0
