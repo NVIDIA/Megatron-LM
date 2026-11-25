@@ -22,8 +22,10 @@ def test_pretrain_updates_and_evaluates_without_args(run_config, monkeypatch):
 
     Keep get_args() real and its backing global None: patching only one imported
     alias would miss readers in other modules. Optional getattr(None, ..., default)
-    fallbacks remain supported during migration. This covers the ordinary GPT
-    path, not every optional training feature.
+    fallbacks remain supported during migration, but new settings should belong
+    to a config object in ConfigContainer: legacy args access will eventually be
+    removed from the training loop. This covers the ordinary GPT path, not every
+    optional training feature.
     """
     # Isolate training services from neighboring tests; monkeypatch restores them.
     for name in vars(global_vars):
@@ -104,5 +106,17 @@ def test_pretrain_updates_and_evaluates_without_args(run_config, monkeypatch):
                 initial_weights, callbacks.callback_context.model[0].parameters(), strict=True
             )
         )
+    except AttributeError as error:
+        if error.obj is None:
+            # Preserve the original traceback while explaining this test's args=None contract.
+            error.add_note(
+                "This test runs training with get_args() returning None. If the failing "
+                "access is args.<field>, put the setting in a config object in "
+                "ConfigContainer and read it from cfg instead. Legacy args access will "
+                "eventually be removed from the Megatron-LM training loop. For an "
+                "unmigrated optional setting only, use getattr(args, '<field>', default) "
+                "with an appropriate default instead of args.<field>."
+            )
+        raise
     finally:
         Utils.destroy_model_parallel()
