@@ -31,9 +31,7 @@ class TrainingConfig:
     data-parallel-size. If this value is None, then use micro-batch-size * data-parallel-size
     as the global batch size. This choice will result in 1 for number of micro-batches."""
 
-    rampup_batch_size: list[int] | None = field(
-        default=None, metadata={"argparse_meta": {"nargs": 3}}
-    )
+    rampup_batch_size: list[int] | None = field(default=None, metadata={"argparse_meta": {"nargs": 3}})
     """Batch size ramp up with the following values: <start batch size>, <batch size increment>,
     <ramp-up samples>
     For example:
@@ -53,6 +51,7 @@ class TrainingConfig:
         step_batch_size_schedule = "0:768 250B:1536 500B:3072 750B:6144"
     Cannot be used together with decrease_batch_size_if_needed.
     """
+
 
     decrease_batch_size_if_needed: bool = False
     """If set, decrease batch size if microbatch_size * dp_size does not 
@@ -251,29 +250,12 @@ class SchedulerConfig:
     lr_warmup_fraction, lr_warmup_iters, or lr_warmup_samples.
     """
 
-    override_opt_param_scheduler: bool = field(
-        default=False,
-        metadata={
-            "argparse_meta": {
-                "arg_names": ["--override-opt_param-scheduler", "--override-opt-param-scheduler"]
-            }
-        },
-    )
+    override_opt_param_scheduler: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--override-opt_param-scheduler", "--override-opt-param-scheduler"]}})
     """Reset the values of the scheduler (learning rate, warmup iterations, minimum learning rate,
     maximum number of iterations, and decay style) from input arguments and ignore values from
     checkpoints. Note that all the above values will be reset."""
 
-    use_checkpoint_opt_param_scheduler: bool = field(
-        default=False,
-        metadata={
-            "argparse_meta": {
-                "arg_names": [
-                    "--use-checkpoint-opt_param-scheduler",
-                    "--use-checkpoint-opt-param-scheduler",
-                ]
-            }
-        },
-    )
+    use_checkpoint_opt_param_scheduler: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--use-checkpoint-opt_param-scheduler", "--use-checkpoint-opt-param-scheduler"]}})
     """Use checkpoint to set the values of the scheduler (learning rate, warmup iterations,
     minimum learning rate, maximum number of iterations, and decay style) from checkpoint
     and ignore input arguments."""
@@ -314,25 +296,30 @@ class SchedulerConfig:
         if train_iters and not skip_train:
             # If we use iteration-based training, make sure the
             # sample-based options are off.
-            assert train_samples is None, 'expected iteration-based training'
-            assert self.lr_decay_samples is None, 'expected iteration-based learning rate decay'
-            assert self.lr_warmup_samples == 0, 'expected iteration-based learning rate warmup'
+            assert train_samples is None, \
+                'expected iteration-based training'
+            assert self.lr_decay_samples is None, \
+                'expected iteration-based learning rate decay'
+            assert self.lr_warmup_samples == 0, \
+                'expected iteration-based learning rate warmup'
             if self.lr_warmup_fraction is not None:
-                assert (
-                    self.lr_warmup_iters == 0
-                ), 'can only specify one of lr-warmup-fraction and lr-warmup-iters'
+                assert self.lr_warmup_iters == 0, \
+                    'can only specify one of lr-warmup-fraction and lr-warmup-iters'
 
         # Sample-based training.
         if train_samples and not skip_train:
             # If we use sample-based training, make sure the
             # iteration-based options are off.
-            assert train_iters is None, 'expected sample-based training'
-            assert self.lr_decay_iters is None, 'expected sample-based learning rate decay'
-            assert self.lr_warmup_iters == 0, 'expected sample-based learning rate warmup'
+            assert train_iters is None, \
+                'expected sample-based training'
+            assert self.lr_decay_iters is None, \
+                'expected sample-based learning rate decay'
+            assert self.lr_warmup_iters == 0, \
+                'expected sample-based learning rate warmup'
             if self.lr_warmup_fraction is not None:
-                assert self.lr_warmup_samples == 0, (
-                    'can only specify one of lr-warmup-fraction ' 'and lr-warmup-samples'
-                )
+                assert self.lr_warmup_samples == 0, \
+                    'can only specify one of lr-warmup-fraction ' \
+                    'and lr-warmup-samples'
 
         if self.weight_decay_incr_style == "constant":
             for w in (self.start_weight_decay, self.end_weight_decay):
@@ -496,7 +483,8 @@ class LoggerConfig:
     """Save router weight tensors to a .pt sidecar file."""
 
     enable_one_logger: bool = field(
-        default=True, metadata={"argparse_meta": {"arg_names": ["--no-one-logger"]}}
+        default=True,
+        metadata={"argparse_meta": {"arg_names": ["--no-one-logger"]}},
     )
     """Enable/disable using one_logger to track E2E metrics.
     Note that one_logger is an internal tool and not available externally.
@@ -549,12 +537,7 @@ class CheckpointConfig:
     save: str | None = None
     """Output directory to save checkpoints to."""
 
-    save_interval: int | None = field(
-        default=None,
-        metadata={
-            "argparse_meta": {"arg_names": ["--save-interval", "--persistent-save-interval"]}
-        },
-    )
+    save_interval: int | None = field(default=None, metadata={"argparse_meta": {"arg_names": ["--save-interval", "--persistent-save-interval"]}})
     """Number of iterations between persistent checkpoint saves."""
 
     save_params_interval: int | None = None
@@ -667,15 +650,7 @@ class CheckpointConfig:
     The legacy format was deprecated on Feb 13, 2024.
     """
 
-    fully_parallel_save: bool = field(
-        default=True,
-        metadata={
-            "argparse_meta": {
-                "arg_names": ["--no-ckpt-fully-parallel-save"],
-                "dest": "ckpt_fully_parallel_save",
-            }
-        },
-    )
+    fully_parallel_save: bool = field(default=True, metadata={"argparse_meta": {"arg_names": ["--no-ckpt-fully-parallel-save"], "dest": "ckpt_fully_parallel_save"}})
     """Disable applying full save parallelization across DP for distributed checkpoints.
     Depending on ckpt format might decrease the number of files in the checkpoint.
     Makes DistributedOptimizer checkpoint non-reshardable."""
@@ -711,20 +686,10 @@ class CheckpointConfig:
     subprocess. Useful on MNNVL systems where fabric resources are exhausted.
     Only applies with the nvrx async strategy."""
 
-    fully_parallel_load: bool = field(
-        default=False,
-        metadata={
-            "argparse_meta": {
-                "arg_names": ["--ckpt-fully-parallel-load"],
-                "dest": "ckpt_fully_parallel_load",
-            }
-        },
-    )
+    fully_parallel_load: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--ckpt-fully-parallel-load"], "dest": "ckpt_fully_parallel_load"}})
     """Apply full load parallelization across DP for distributed checkpoints."""
 
-    ckpt_fully_parallel_load_exchange_algo: Literal[
-        "broadcast", "gather_rounds", "gather_object"
-    ] = "broadcast"
+    ckpt_fully_parallel_load_exchange_algo: Literal["broadcast", "gather_rounds", "gather_object"] = "broadcast"
     """Algorithm for fully parallel load of distributed checkpoints.
     "broadcast"(default): Broadcast the checkpoint from rank 0 to all other ranks.
     "gather_rounds": Gather the checkpoint from all ranks in rounds.
@@ -888,9 +853,8 @@ class CheckpointConfig:
         """
         from megatron.training.utils import has_nvrx_checkpointing_async_support
 
-        assert self.async_strategy in [
-            "nvrx"
-        ], f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx."
+        assert self.async_strategy in ["nvrx"], \
+            f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx."
 
         if self.custom_manager_class is not None:
             from megatron.training.config.instantiate_utils import target_allowlist
@@ -920,49 +884,38 @@ class CheckpointConfig:
                 )
 
         if self.verify_integrity:
-            assert (
-                self.ckpt_format == "torch_dist"
-            ), f"`verify_integrity` is only supported with torch_dist checkpoint format."
+            assert self.ckpt_format == "torch_dist", \
+                f"`verify_integrity` is only supported with torch_dist checkpoint format."
 
         if self.ckpt_convert_format is not None:
             assert self.ckpt_convert_save is not None
             assert self.load is not None
 
-        assert self.non_persistent_ckpt_type in [
-            'global',
-            'local',
-            None,
-        ], 'Currently only global and local checkpoints are supported'
+        assert self.non_persistent_ckpt_type in ['global', 'local', None], \
+            'Currently only global and local checkpoints are supported'
         if self.non_persistent_ckpt_type == 'local':
             try:
                 from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
                     LocalCheckpointManager,
                 )
             except ModuleNotFoundError as e:
-                raise RuntimeError(
-                    'nvidia_resiliency_ext is required for local checkpointing'
-                ) from e
-            assert (
-                self.non_persistent_local_ckpt_dir is not None
-            ), "Tried to use local checkpointing without specifying --local-ckpt-dir!"
+                raise RuntimeError('nvidia_resiliency_ext is required for local checkpointing') from e
+            assert self.non_persistent_local_ckpt_dir is not None, \
+                "Tried to use local checkpointing without specifying --local-ckpt-dir!"
 
         # A save directory without a periodic interval (None or 0) saves at the end of training and
         # on the exit paths only; the same rule for both frameworks (Megatron-Bridge's loops read
         # it this way, Megatron-LM used to require an interval).
         if self.save_interval is not None:
-            assert (
-                self.save_interval >= 0
-            ), "save_interval must be non-negative (None or 0 disables the periodic saves)"
+            assert self.save_interval >= 0, \
+                "save_interval must be non-negative (None or 0 disables the periodic saves)"
         if self.save_retain_interval is not None:
             assert self.save_interval, "save_retain_interval requires a positive save_interval"
             assert self.save_retain_interval > 0, "save_retain_interval must be positive"
-            assert (
-                self.save_retain_interval % self.save_interval == 0
-            ), "save_retain_interval must be divisible by save_interval"
-            assert self.most_recent_k in (
-                None,
-                -1,
-            ), "save_retain_interval and most_recent_k cannot be enabled together"
+            assert self.save_retain_interval % self.save_interval == 0, \
+                "save_retain_interval must be divisible by save_interval"
+            assert self.most_recent_k in (None, -1), \
+                "save_retain_interval and most_recent_k cannot be enabled together"
 
         # The PG-distribution cache stores one file per parallelization group, keyed by that
         # group's ordered global ranks, and each file holds both the save and the load
@@ -1011,9 +964,8 @@ class CheckpointConfig:
             )
 
         if self.override_ckpt_iteration is not None:
-            assert (
-                not self.finetune
-            ), "Cannot override checkpoint iteration together with finetune flag."
+            assert not self.finetune, \
+                "Cannot override checkpoint iteration together with finetune flag."
 
         if self.replication_jump and not self.replication:
             raise AssertionError(
@@ -1021,9 +973,8 @@ class CheckpointConfig:
                 "drop the jump (Megatron-LM used to ignore it)."
             )
         if self.replication:
-            assert (
-                self.replication_jump is not None
-            ), "--replication requires the value of --replication-jump!"
+            assert self.replication_jump is not None, \
+                "--replication requires the value of --replication-jump!"
             assert self.non_persistent_ckpt_type == "local", (
                 "--replication requires args.non_persistent_ckpt_type == 'local', but got: "
                 f"{self.non_persistent_ckpt_type}"
@@ -1064,44 +1015,43 @@ class TokenizerConfig:
         "TikTokenizer",
         "NullTokenizer",
         "SFTTokenizer",
-    ] = field(
-        default=None,
-        metadata={
-            "argparse_meta": {
-                "choices": [
-                    "BertWordPieceLowerCase",
-                    "BertWordPieceCase",
-                    "GPT2BPETokenizer",
-                    "SentencePieceTokenizer",
-                    "GPTSentencePieceTokenizer",
-                    "HuggingFaceTokenizer",
-                    "Llama2Tokenizer",
-                    "TikTokenizer",
-                    "MultimodalTokenizer",
-                    "NullTokenizer",
-                    "NullMultimodalTokenizer",
-                    "SFTTokenizer",
-                ]
-            }
-        },
-    )
+        ] = field(
+                default=None,
+                metadata={
+                    "argparse_meta": {
+                        "choices": [
+                            "BertWordPieceLowerCase",
+                            "BertWordPieceCase",
+                            "GPT2BPETokenizer",
+                            "SentencePieceTokenizer",
+                            "GPTSentencePieceTokenizer",
+                            "HuggingFaceTokenizer",
+                            "Llama2Tokenizer",
+                            "TikTokenizer",
+                            "MultimodalTokenizer",
+                            "NullTokenizer",
+                            "NullMultimodalTokenizer",
+                            "SFTTokenizer",
+                        ]
+                    }
+                }
+            )
     """What type of tokenizer to use."""
 
     tokenizer_model: str = None
     """Path to the tokenizer model."""
 
-    metadata_path: str | None = field(
-        default=None, metadata={"argparse_meta": {"arg_names": ["--tokenizer-metadata"]}}
-    )
+    metadata_path: str | None = field(default=None, metadata={"argparse_meta": {"arg_names": ["--tokenizer-metadata"]}})
     """Path to the tokenizer metadata file in json format."""
 
-    special_tokens: Optional[list[str]] = field(
-        default=None, metadata={"argparse_meta": {"arg_names": ["--tokenizer-special-tokens"]}}
-    )
+    special_tokens: Optional[list[str]] = field(default=None, metadata={"argparse_meta": {"arg_names": ["--tokenizer-special-tokens"]}})
     """List of special tokens. For TikTokenizer needs to have 
     ["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]"""
 
-    tiktoken_pattern: Literal["v1", "v2"] = None
+    tiktoken_pattern: Literal[
+        "v1",
+        "v2",
+    ] = None
     """Which tiktoken pattern to use. Options: [v1, v2]"""
 
     tiktoken_num_special_tokens: int = 1000
@@ -1138,30 +1088,17 @@ class TokenizerConfig:
     sft_tokenizer_prompt_format: str = "nemotron-h-aligned"
     """SFT prompt format."""
 
-
 @dataclass(kw_only=True)
 class MultiModalTokenizerConfig(TokenizerConfig):
     """Extended tokenizer config with additional settings for multimodal-model tokenizers."""
 
-    tokenizer_type: Literal["MultimodalTokenizer", "NullMultimodalTokenizer"] = None
+    tokenizer_type: Literal[
+        "MultimodalTokenizer",
+        "NullMultimodalTokenizer",
+    ] = None
     """What type of tokenizer to use."""
 
-    tokenizer_prompt_format: (
-        Literal[
-            "mistral",
-            "llama3",
-            "chatml",
-            "nvlm-yi-34b",
-            "qwen2p0",
-            "qwen2p5",
-            "llama3p1",
-            "nemotron5",
-            "nemotron5-aligned",
-            "llama_nemotron_8b",
-            "nemotron6-moe",
-        ]
-        | None
-    ) = None
+    tokenizer_prompt_format: Literal["mistral", "llama3", "chatml", "nvlm-yi-34b", "qwen2p0", "qwen2p5", "llama3p1", "nemotron5", "nemotron5-aligned", "llama_nemotron_8b", "nemotron6-moe"] | None = None
     """Prompt format to use with the tokenizer."""
 
     image_tag_type: Literal["nvlm", "internvl", ""] | None = None
