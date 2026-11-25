@@ -13,18 +13,14 @@ import importlib
 import logging
 import sys
 from collections.abc import Callable
-from dataclasses import fields, is_dataclass
 from pathlib import Path
 from pprint import pformat
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from megatron.training.config import PretrainConfigContainer
 
 logger = logging.getLogger(__name__)
 
 
 def _load_callable(path: str) -> Callable:
+    """Load trusted Python selected explicitly on the command line, not a YAML target."""
     module, separator, name = path.partition(":")
     if not separator or not module or not name:
         raise ValueError(f"Expected module:function, got {path!r}")
@@ -32,42 +28,6 @@ def _load_callable(path: str) -> Callable:
     if not callable(function):
         raise TypeError(f"{path!r} is not callable")
     return function
-
-
-def _apply_overrides(config: "PretrainConfigContainer", overrides: list[str]) -> None:
-    """Update existing public fields without reconstructing configs or losing callbacks."""
-    from omegaconf import OmegaConf
-
-    for override in overrides:
-        path, separator, literal = override.partition("=")
-        if not separator:
-            raise ValueError(f"Expected KEY=VALUE, got {override!r}")
-        names = path.split(".")
-        owner = config
-        for index, name in enumerate(names):
-            if (
-                not name
-                or name.startswith("_")
-                or not is_dataclass(owner)
-                or isinstance(owner, type)
-                or name not in {field.name for field in fields(owner) if field.init}
-            ):
-                raise ValueError(f"Not an editable config field: {path!r}")
-            if index < len(names) - 1:
-                owner = getattr(owner, name)
-        if names[-1] == "pipeline_model_parallel_layout":
-            # TransformerConfig normalizes the layout and derives VPP settings
-            # during construction; a leaf assignment cannot safely repeat that.
-            raise ValueError(f"Define {path!r} in the recipe factory, not as an override")
-        current = getattr(owner, names[-1])
-        if is_dataclass(current):
-            raise ValueError(f"Override a field within {path!r}, not the entire config section")
-        if callable(current):
-            raise ValueError(f"Define the Python callable or class {path!r} in the recipe")
-        value = OmegaConf.to_container(OmegaConf.from_dotlist([f"value={literal}"]), resolve=True)[
-            "value"
-        ]
-        setattr(owner, names[-1], value)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -96,13 +56,14 @@ def main(argv: list[str] | None = None) -> None:
     from megatron.core._rank_utils import safe_get_rank
     from megatron.training.api import pretrain
     from megatron.training.config import PretrainConfigContainer
+    from megatron.training.config.utils import apply_config_overrides
     from megatron.training.models.gpt import GPTModelConfig
     from megatron.training.models.hybrid import HybridModelConfig
 
     config = _load_callable(options.recipe)()
     if not isinstance(config, PretrainConfigContainer):
         raise TypeError("Recipe must return an MLM PretrainConfigContainer")
-    _apply_overrides(config, options.overrides)
+    apply_config_overrides(config, options.overrides)
     is_vlm = isinstance(config.model, (Nemotron35SuperVLModelConfig, Qwen35VLModelConfig))
     if is_vlm and options.forward_step is None:
         raise ValueError("VLM recipes require an explicit --forward-step")

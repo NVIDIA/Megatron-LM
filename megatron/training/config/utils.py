@@ -7,10 +7,13 @@ import logging
 from dataclasses import fields as dataclass_fields
 from dataclasses import is_dataclass
 from functools import lru_cache
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import ModuleSpec
+
+if TYPE_CHECKING:
+    from megatron.training.config.container import ConfigContainerBase
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +25,54 @@ _TRANSFORMER_RUNTIME_FIELDS = frozenset(
         "experimental_attention_variant_loss_scale_func",
     }
 )
+
+
+def apply_config_overrides(config: "ConfigContainerBase", overrides: list[str]) -> None:
+    """Apply dotted KEY=VALUE overrides to existing public dataclass fields in place.
+
+    Preserve native objects and callbacks; framework startup still owns finalization.
+    Config sections, callables, and constructor-normalized pipeline layouts must be
+    specified in the Python recipe rather than replaced by a CLI leaf assignment.
+
+    Args:
+        config: Native configuration to update.
+        overrides: Ordered KEY=VALUE strings; repeated keys use the last value.
+
+    Raises:
+        ValueError: An override is malformed or does not name an editable field.
+    """
+    from omegaconf import OmegaConf
+
+    for override in overrides:
+        path, separator, literal = override.partition("=")
+        if not separator:
+            raise ValueError(f"Expected KEY=VALUE, got {override!r}")
+        names = path.split(".")
+        owner = config
+        for index, name in enumerate(names):
+            if (
+                not name
+                or name.startswith("_")
+                or not is_dataclass(owner)
+                or isinstance(owner, type)
+                or name not in {field.name for field in dataclass_fields(owner) if field.init}
+            ):
+                raise ValueError(f"Not an editable config field: {path!r}")
+            if index < len(names) - 1:
+                owner = getattr(owner, name)
+        if names[-1] == "pipeline_model_parallel_layout":
+            # TransformerConfig normalizes the layout and derives VPP settings
+            # during construction; a leaf assignment cannot safely repeat that.
+            raise ValueError(f"Define {path!r} in the recipe factory, not as an override")
+        current = getattr(owner, names[-1])
+        if is_dataclass(current):
+            raise ValueError(f"Override a field within {path!r}, not the entire config section")
+        if callable(current):
+            raise ValueError(f"Define the Python callable or class {path!r} in the recipe")
+        value = OmegaConf.to_container(OmegaConf.from_dotlist([f"value={literal}"]), resolve=True)[
+            "value"
+        ]
+        setattr(owner, names[-1], value)
 
 
 def serialize_dataclass(

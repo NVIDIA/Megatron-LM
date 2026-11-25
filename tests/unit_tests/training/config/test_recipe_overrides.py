@@ -5,7 +5,7 @@
 import pytest
 
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
-from scripts.run_recipe import _apply_overrides
+from megatron.training.config.utils import apply_config_overrides
 
 
 def test_overrides_preserve_native_objects_and_leave_finalization_to_startup(run_config):
@@ -13,7 +13,7 @@ def test_overrides_preserve_native_objects_and_leave_finalization_to_startup(run
     activation = transformer.activation_func
     layout = PipelineParallelLayerLayout.from_str("Et*2L", pipeline_model_parallel_size=1)
     transformer.pipeline_model_parallel_layout = layout
-    _apply_overrides(
+    apply_config_overrides(
         run_config,
         [
             "train.train_iters=4",
@@ -40,7 +40,9 @@ def test_pipeline_layout_override_requires_recipe_construction(run_config, layou
     transformer = run_config.model.transformer
     original = transformer.pipeline_model_parallel_layout
     with pytest.raises(ValueError, match="recipe factory"):
-        _apply_overrides(run_config, [f"model.transformer.pipeline_model_parallel_layout={layout}"])
+        apply_config_overrides(
+            run_config, [f"model.transformer.pipeline_model_parallel_layout={layout}"]
+        )
     assert transformer.pipeline_model_parallel_layout is original
     assert not run_config._finalized
 
@@ -58,7 +60,7 @@ def test_pipeline_layout_override_requires_recipe_construction(run_config, layou
 )
 def test_invalid_override_cannot_create_phantom_fields(run_config, override):
     with pytest.raises(ValueError):
-        _apply_overrides(run_config, [override])
+        apply_config_overrides(run_config, [override])
     assert not hasattr(run_config.train, "typo")
     assert not run_config._finalized
 

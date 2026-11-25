@@ -1878,8 +1878,6 @@ def pretrain(
             print_rank_0('training ...')
 
         iteration = 0
-        if args is not None:
-            args.curr_iteration = iteration
         # Mirrors train()'s own loop-entry condition, so the "misaligned save_interval"
         # fallback below can skip when there was nothing left to train this invocation
         # (e.g. resubmitting an already-finished job) instead of redoing a redundant save.

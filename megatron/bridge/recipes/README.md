@@ -16,29 +16,15 @@ recipes should not call `finalize()` themselves. Recipes must specify their
 dataset and dataloader through `cfg.data`; there is no dataset-provider override.
 Custom model providers still use the lower-level training entrypoint.
 
-## Llama 3 example
-
-Use the generic recipe runner from the repository root:
-
-```bash
-CUDA_DEVICE_MAX_CONNECTIONS=1 uv run python -m torch.distributed.run \
-    --nproc-per-node=4 scripts/run_recipe.py \
-    --recipe megatron.bridge.recipes.llama:llama3_8b_pretrain_config \
-    model.transformer.context_parallel_size=1 \
-    model.transformer.tensor_model_parallel_size=2 \
-    model.transformer.max_seq_length_per_sample=512 \
-    data.dataset.sequence_length=512 \
-    train.global_batch_size=4 train.train_iters=20 \
-    scheduler.lr_warmup_iters=1 scheduler.lr_decay_iters=20 \
-    validation.eval_iters=1 validation.eval_interval=5 \
-    data.dataloader.num_workers=0 logger.log_interval=1
-```
+## Recipe runner
 
 The recipe is a trusted, importable zero-argument Python factory returning an
 MLM `PretrainConfigContainer`. Trailing `KEY=VALUE` overrides edit existing
 public dataclass fields (numbers, booleans, `null`, lists, or strings); repeated
 keys use the last value. Unknown fields are rejected. Define optional config
 sections, dataset classes, and Python callables in the recipe itself.
+Both `--recipe` and `--forward-step` import and execute Python code. Only use
+trusted modules; this runner is not a sandbox for untrusted recipe names or YAML.
 
 The runner uses `megatron.training.forward_steps.llm_step.forward_step` for GPT/Hybrid models.
 This adapts Bridge's text step to MLM runtime services and its TP-rank-zero data
@@ -69,47 +55,6 @@ lengths nor finalizes the config: both remain under the existing framework
 ownership rules. It calls `megatron.training.api.pretrain`, which delegates to
 the existing training loop.
 
-The independently expressed settings follow the
-[Bridge Llama 3 8B BF16 recipe](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/eea53e431a8b0b4e9c4f47a76784c6f3200c9a1f/src/megatron/bridge/recipes/llama/h100/llama3.py).
-It uses mock data and a NullTokenizer, not pretrained weights or the original
-Llama tokenizer. Unlike the reference's 32K mock vocabulary, this recipe retains
-Llama 3's 128256-token architecture vocabulary. This is scratch training, not a
-model-quality benchmark. Replace the dataset and tokenizer together for real data.
-
-Import the factory into a Python launch script and set explicit run overrides:
-
-```python
-from megatron.bridge.recipes.llama import llama3_8b_pretrain_config
-from megatron.training.api import pretrain
-from megatron.training.forward_steps.llm_step import forward_step
-
-cfg = llama3_8b_pretrain_config()
-cfg.model.transformer.context_parallel_size = 1
-cfg.model.transformer.tensor_model_parallel_size = 2
-cfg.model.transformer.max_seq_length_per_sample = 512
-cfg.data.dataset.sequence_length = 512
-cfg.train.global_batch_size = 4
-cfg.train.train_iters = 20
-cfg.scheduler.lr_warmup_iters = 1
-cfg.scheduler.lr_decay_iters = 20
-cfg.validation.eval_iters = 1
-cfg.validation.eval_interval = 5
-cfg.data.dataloader.num_workers = 0
-cfg.logger.log_interval = 1
-pretrain(cfg, forward_step)
-```
-
-Run that script from the repository root in an MLM training environment:
-
-```bash
-CUDA_DEVICE_MAX_CONNECTIONS=1 uv run python -m torch.distributed.run \
-    --nproc-per-node=4 your_recipe.py
-```
-
-The command uses TP=2 and DP=2. Select topology and batch size for your hardware.
-Reduce model dimensions explicitly for a small smoke test. Dataset length and model execution length remain separate config
-owners; this fixed-length pretraining example sets both to the same value.
-
 For checkpointing, set `cfg.checkpoint.save` and `save_interval`. For resumption,
 also set `cfg.checkpoint.load`, keeping the intended scheduler horizon unchanged
 across launches. Config-only save/resume currently supports `torch_dist`. Saved
@@ -117,14 +62,52 @@ configuration and runtime topology replace optional CLI metadata; checkpoints
 from native runs do not contain fabricated `args`. Older tools that require
 checkpoint `args` are not yet supported. Config-only MoE upcycling is also deferred.
 
-Offline cached-logit distillation remains on its CLI path until
-[#9635](https://github.com/NVIDIA/Megatron-LM/pull/9635) supplies
-`cfg.offline_distillation`. This entrypoint does not add a competing cached-logit
-config or fabricate args to enable that feature. Ordinary pretraining needs no
-legacy argument namespace.
+Offline cached-logit distillation is owned by `cfg.offline_distillation`, but
+the packaged forward steps do not yet select its student loss. Use the existing
+offline-distillation entrypoints for that workflow. Ordinary pretraining needs
+no legacy argument namespace.
 
-This example uses the dataset/config implementation already on `main`. It does
+The runner uses the dataset/config implementation already on `main`. It does
 not introduce data-schema changes. Phase boundaries are owned by
 `cfg.train.phase_transition_iterations`, and optimizer mapping diagnostics by
 `cfg.logger.dump_param_to_param_group_map`. Other optional CLI-only features,
 including full-dataset training and upcycling, are not migrated here.
+
+## Remaining legacy runtime reads
+
+The following `getattr(args, ...)` reads remain in shared training/startup and
+checkpoint code. Their defaults let ordinary config-only pretraining run, but
+do not make these optional features config-owned. This is a follow-up inventory,
+not a proposal to migrate them all in this PR.
+
+| Location under `megatron/training/` | Fields | Purpose |
+| --- | --- | --- |
+| `training.py`: `pretrain`, `_get_train_full_dataset_sample_count` | `train_full_dataset`, `deduplicate_dataloader_across_context_parallel` | Determine the full-dataset training horizon. |
+| `training.py`: `setup_model_and_optimizer` | `moe_use_upcycling` (two reads) | Select the legacy upcycling path, which also mutates model args. |
+| `training.py`: `train` | `log_packed_sequence_stats` | Enable packed-sequence statistics logging. |
+| `global_vars.py`: `initialize_runtime_services` | `enable_experimental` | Enable experimental Core features. |
+| `global_vars.py`: `_build_tokenizer` | `moe_num_hash_layers`, `hash_moe_vocab_size`, `yaml_cfg` | Backfill hash-MoE vocabulary into legacy arguments. |
+| `initialize.py`: `finish_mpu_init` | `mimo_llm_offset` | Include the first non-colocated MIMO language-model rank in logging. |
+| `checkpointing.py`: `save_checkpoint` | `dataloader_save` | Save external dataloader state. |
+| `checkpointing.py`: `load_checkpoint` | `wide_residual_num_streams`, `allow_llm_only_checkpoint` | Legacy wide-residual fallback and language-only pretrained checkpoint loading. |
+
+Separate compatibility/boundary reads should not be confused with missing
+training config ownership:
+
+- `checkpointing.py`: `inference_shards` is an inference/legacy-format guard;
+  `_gtp_pad_for_alignment_from_args` reads `fp4`, `fp8_recipe`, and `fp8` for
+  legacy checkpoint metadata and argument-based loaders. `load_args_from_checkpoint`
+  also reads the selected load argument, `use_megatron_fsdp`, and dynamic field names.
+- `global_vars.py`: inference telemetry still reads `data_parallel_size` and
+  `seq_length`. Training telemetry already uses config owners.
+- `initialize.py`: `write_args_to_tensorboard` enumerates CLI metadata only when
+  args exists; changing logging formats is separate from ownership migration.
+- CLI adapters/validation (`arguments.py`, `argument_utils.py`, `yaml_arguments.py`,
+  `determinism.py`, and the DeepSeek V4 argument normalizer) intentionally read args.
+- `utils/common_utils.py`: `is_gtp_remat_active(args)` has a misleading parameter
+  name, but its training and conversion callers pass a `TransformerConfig`, not
+  the legacy namespace.
+
+`freeze_all_layers` is already owned by `cfg.train`; its runtime reads no longer
+use args. Saved checkpoint argument readers remain necessary for backward
+compatibility and are not part of this live-argument cleanup.
