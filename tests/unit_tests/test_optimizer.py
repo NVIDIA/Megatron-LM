@@ -29,6 +29,7 @@ from megatron.core.optimizer import (
     _get_megatron_emerging_optimizer,
     _get_megatron_optimizer_based_on_param_groups,
     _get_param_groups,
+    _ParamNormConstraintFlags,
     check_config_overrides_consistency,
     get_megatron_optimizer,
     get_standard_config_overrides,
@@ -115,8 +116,9 @@ def test_copy_optimizer_param_metadata_preserves_allreduce():
     assert destination.allreduce is False
 
 
-def test_get_param_groups_scopes_alignment_to_explicit_process_group(mocker):
-    """Disjoint module domains must not import each other's optimizer-group keys."""
+@pytest.mark.parametrize("has_local_recipe", [False, True])
+def test_get_param_groups_scopes_alignment_to_explicit_process_group(mocker, has_local_recipe):
+    """Align optimizer keys and decide whether this construction group needs norm validation."""
     module_group = object()
     foreign_key = ((('lr_mult', 2.0),), False)
     get_world_size = mocker.patch("torch.distributed.get_world_size")
@@ -125,17 +127,22 @@ def test_get_param_groups_scopes_alignment_to_explicit_process_group(mocker):
     def world_size(*, group=None):
         return 1 if group is module_group else 2
 
-    def gather(output, local_keys, *, group=None):
-        output[0] = local_keys
+    def gather(output, local_report, *, group=None):
+        output[0] = local_report
         if group is None:
-            output[1] = [foreign_key]
+            output[1] = ([foreign_key], True)
 
     get_world_size.side_effect = world_size
     all_gather_object.side_effect = gather
     net = Net()
-    config = OptimizerConfig(optimizer='adam', lr=0.01)
+    config = OptimizerConfig(optimizer='adam', lr=0.01, embedding_min_norm=None)
 
-    module_groups = _get_param_groups([net], config, {}, process_group=module_group)
+    # A rank can have a norm recipe even when the embedding floor is disabled.
+    norm_constraint_flags = _ParamNormConstraintFlags(has_local_recipe=has_local_recipe)
+    module_groups = _get_param_groups(
+        [net], config, {}, process_group=module_group, norm_constraint_flags=norm_constraint_flags
+    )
+    assert norm_constraint_flags.group_needs_validation == has_local_recipe
 
     assert len(module_groups) == 1
     assert module_groups[0]['params'] == list(net.parameters())
@@ -145,7 +152,8 @@ def test_get_param_groups_scopes_alignment_to_explicit_process_group(mocker):
 
     get_world_size.reset_mock()
     all_gather_object.reset_mock()
-    world_groups = _get_param_groups([net], config, {})
+    world_groups = _get_param_groups([net], config, {}, norm_constraint_flags=norm_constraint_flags)
+    assert norm_constraint_flags.group_needs_validation
 
     assert len(world_groups) == 2
     assert any(not group['params'] and group['lr_mult'] == 2.0 for group in world_groups)

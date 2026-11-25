@@ -3,7 +3,7 @@ import copy
 import logging
 import warnings
 from collections import defaultdict
-from dataclasses import astuple
+from dataclasses import astuple, dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -320,11 +320,20 @@ def get_mup_config_overrides(
     return mup_overrides
 
 
+@dataclass
+class _ParamNormConstraintFlags:
+    """Track whether this rank has a recipe and whether the group must validate its constraints."""
+
+    has_local_recipe: bool
+    group_needs_validation: bool = False
+
+
 def _get_param_groups(
     model_chunks: List[MegatronModule],
     config: OptimizerConfig,
     config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]],
     process_group: Optional[torch.distributed.ProcessGroup] = None,
+    norm_constraint_flags: Optional[_ParamNormConstraintFlags] = None,
 ) -> List[Dict]:
     """Create parameter groups for optimizer.
 
@@ -345,6 +354,8 @@ def _get_param_groups(
             empty dictionary rather than the default value of None.
         process_group (Optional[torch.distributed.ProcessGroup]): group whose ranks must construct
             aligned parameter groups. ``None`` preserves the WORLD-group behavior.
+        norm_constraint_flags: Records whether this rank has a parameter-norm recipe and
+            whether any rank in the construction group requires setup validation.
     Returns:
         List of parameter groups.
     """
@@ -393,9 +404,14 @@ def _get_param_groups(
     # so we need to align the param groups across ranks, otherwise we may have
     # runtime error when loading the checkpoint or numerical error when resuming training.
     params_key = list(params_map.keys())
-    gathered_params_key = [None] * torch.distributed.get_world_size(group=process_group)
-    torch.distributed.all_gather_object(gathered_params_key, params_key, group=process_group)
-    for keys in gathered_params_key:
+    reports = [None] * torch.distributed.get_world_size(group=process_group)
+    has_local_recipe = norm_constraint_flags is not None and norm_constraint_flags.has_local_recipe
+    torch.distributed.all_gather_object(
+        reports, (params_key, has_local_recipe), group=process_group
+    )
+    if norm_constraint_flags is not None:
+        norm_constraint_flags.group_needs_validation = any(has_recipe for _, has_recipe in reports)
+    for keys, _ in reports:
         for key in keys:
             if key not in params_key:
                 params_key.append(key)
@@ -503,6 +519,7 @@ def _get_param_groups_and_buffers(
     filter_fn: Callable,
     buffer_name: str,
     process_group: Optional[torch.distributed.ProcessGroup] = None,
+    norm_constraint_flags: Optional[_ParamNormConstraintFlags] = None,
 ) -> Tuple[List[Dict], Dict[int, List[_ParamAndGradBuffer]]]:
     """Returns parameter groups and buffer for optimizer.
 
@@ -523,7 +540,9 @@ def _get_param_groups_and_buffers(
     Returns:
         List of parameter groups and dictionary of model chunk IDs to buffers.
     """
-    param_groups = _get_param_groups(model_chunks, config, config_overrides, process_group)
+    param_groups = _get_param_groups(
+        model_chunks, config, config_overrides, process_group, norm_constraint_flags
+    )
     param_groups = list(filter(filter_fn, param_groups))
     buffers = {}
     for model_chunk_idx, model_chunk in enumerate(model_chunks):
@@ -866,6 +885,7 @@ def _get_megatron_emerging_optimizer(
     param_group_process_group: Optional[torch.distributed.ProcessGroup] = None,
     use_gloo_process_groups: bool = True,
     param_norm_setup: Optional[ParamNormSetup] = None,
+    norm_constraint_flags: Optional[_ParamNormConstraintFlags] = None,
 ) -> MegatronOptimizer:
     """Build an emerging optimizer (e.g. Muon) for the given model chunks.
 
@@ -896,7 +916,13 @@ def _get_megatron_emerging_optimizer(
         if not all(isinstance(chunk, FullyShardedDataParallelV2) for chunk in model_chunks):
             raise ValueError("MFSDP v2 requires every model chunk to be wrapped with MFSDP v2.")
         return _get_megatron_fsdp_emerging_optimizer(
-            config, model_chunks, config_overrides, pg_collection, param_group_process_group
+            config,
+            model_chunks,
+            config_overrides,
+            pg_collection,
+            param_group_process_group,
+            param_norm_setup,
+            norm_constraint_flags,
         )
 
     if not HAVE_EMERGING_OPTIMIZERS:
@@ -957,7 +983,7 @@ def _get_megatron_emerging_optimizer(
     # Build param groups and bucket by (optimizer_name, is_expert_parallel).
     # Layer-wise distributed optimizer handles expert params internally so we skip that split.
     all_param_groups = _get_param_groups(
-        model_chunks, config, config_overrides, param_group_process_group
+        model_chunks, config, config_overrides, param_group_process_group, norm_constraint_flags
     )
     grouped_param_groups = defaultdict(list)
     for group in all_param_groups:
@@ -1150,6 +1176,8 @@ def _get_megatron_fsdp_emerging_optimizer(
     config_overrides: Dict[ParamKey, Any],
     pg_collection: Optional[ProcessGroupCollection],
     param_group_process_group: Optional[torch.distributed.ProcessGroup],
+    param_norm_setup: Optional[ParamNormSetup] = None,
+    norm_constraint_flags: Optional[_ParamNormConstraintFlags] = None,
 ) -> MegatronOptimizer:
     """Build Muon and Adam optimizers for MFSDP v2 model chunks.
 
@@ -1182,7 +1210,7 @@ def _get_megatron_fsdp_emerging_optimizer(
     config_overrides.update(_get_default_param_overrides(config, 'muon'))
     groups_by_optimizer = defaultdict(list)
     for group in _get_param_groups(
-        model_chunks, config, config_overrides, param_group_process_group
+        model_chunks, config, config_overrides, param_group_process_group, norm_constraint_flags
     ):
         groups_by_optimizer[group.get('optimizer', 'muon')].append(group)
 
@@ -1211,6 +1239,7 @@ def _get_megatron_fsdp_emerging_optimizer(
                 config=fallback_config,
                 model_chunks=model_chunks,
                 param_groups=adam_groups,
+                param_norm_setup=param_norm_setup,
                 pg_collection=pg_collection,
             )
             # ChainedOptimizer asserts that all sub-optimizers share the top-level config.
@@ -1285,6 +1314,14 @@ def get_megatron_optimizer(
             model_chunks, EmbeddingMinNormRecipe(config.embedding_min_norm)
         )
 
+    # Reuse the parameter-group exchange to decide whether all construction peers must validate.
+    norm_constraint_flags = _ParamNormConstraintFlags(has_local_recipe=param_norm_setup is not None)
+
+    def validate_param_norm_constraints() -> None:
+        if norm_constraint_flags.group_needs_validation:
+            setup = param_norm_setup or ParamNormSetup(model_chunks, recipe=None)
+            setup.validate(pg_collection, param_group_process_group)
+
     # None → apply standard defaults. To extend defaults with custom overrides,
     # start from get_standard_config_overrides(config) and merge yours in.
     if config_overrides is None:
@@ -1308,11 +1345,11 @@ def get_megatron_optimizer(
             config_overrides=config_overrides,
             pg_collection=pg_collection,
             param_group_process_group=param_group_process_group,
+            norm_constraint_flags=norm_constraint_flags,
             use_gloo_process_groups=use_gloo_process_groups,
             param_norm_setup=param_norm_setup,
         )
-        if param_norm_setup is not None:
-            param_norm_setup.validate(pg_collection, param_group_process_group)
+        validate_param_norm_constraints()
         _clear_high_precision_initializers(model_chunks)
         return optimizer
 
@@ -1378,7 +1415,11 @@ def get_megatron_optimizer(
         ):
             if is_mfsdp_v2:
                 param_groups = _get_param_groups(
-                    model_chunk, config, config_overrides, param_group_process_group
+                    model_chunk,
+                    config,
+                    config_overrides,
+                    param_group_process_group,
+                    norm_constraint_flags,
                 )
                 if not is_te_min_version("2.18.0"):
                     # TE FusedAdam can skip pending updates when a group ends in an empty tensor:
@@ -1397,6 +1438,7 @@ def get_megatron_optimizer(
                     filter_fn=lambda g: True,
                     buffer_name='buffers',
                     process_group=param_group_process_group,
+                    norm_constraint_flags=norm_constraint_flags,
                 )
 
             optimizer_part = _get_megatron_optimizer_based_on_param_groups(
@@ -1431,8 +1473,7 @@ def get_megatron_optimizer(
             optimizers.append(optimizer_part)
             model_chunk_offset += 1
 
-        if param_norm_setup is not None:
-            param_norm_setup.validate(pg_collection, param_group_process_group)
+        validate_param_norm_constraints()
         _clear_high_precision_initializers(model_chunks)
         if len(optimizers) == 1:
             return optimizers[0]
@@ -1453,6 +1494,7 @@ def get_megatron_optimizer(
             filter_fn=lambda g: not g['is_expert_parallel'],
             buffer_name='buffers',
             process_group=param_group_process_group,
+            norm_constraint_flags=norm_constraint_flags,
         )
         for model_chunk in dense_model_chunks:
             model_chunk.overlap_param_gather_with_optimizer_step = (
@@ -1492,6 +1534,7 @@ def get_megatron_optimizer(
         filter_fn=lambda g: g['is_expert_parallel'],
         buffer_name='expert_parallel_buffers',
         process_group=param_group_process_group,
+        norm_constraint_flags=norm_constraint_flags,
     )
     if dump_param_to_param_group_map is not None:
         for param_group in moe_param_groups:
@@ -1538,7 +1581,6 @@ def get_megatron_optimizer(
             state_dict=param_to_param_group, checkpoint_id=dump_param_to_param_group_map
         )
 
-    if param_norm_setup is not None:
-        param_norm_setup.validate(pg_collection, param_group_process_group)
+    validate_param_norm_constraints()
     _clear_high_precision_initializers(model_chunks)
     return ChainedOptimizer(optimizers)

@@ -183,17 +183,19 @@ class ParamNormSetup:
 
     Once all optimizers are built, ``validate`` checks ownership, agreement on DP
     reductions, and consistent rules for tied pipeline copies. Setup saves local errors
-    until this check so peers can reach the same validation step.
+    until this check so peers can reach the same validation step. A stage with no local
+    recipe participates if a peer requested validation and reports any tied copy as unconstrained.
     """
 
-    def __init__(self, model_chunks, recipe: ParamNormRecipe) -> None:
+    def __init__(self, model_chunks, recipe: ParamNormRecipe | None) -> None:
         self.constraints = []
         self.owners = {}
         self.agreement = ParamNormAgreement()
         self.tied_rules = set()
         self.error = None
         try:
-            self.constraints = collect_param_norm_constraints(model_chunks, recipe)
+            if recipe is not None:
+                self.constraints = collect_param_norm_constraints(model_chunks, recipe)
             rules = {c.parameter: c.rule.validation_key() for c in self.constraints}
             # A frozen physical copy must participate in the pipeline consistency check too.
             self.tied_rules = {

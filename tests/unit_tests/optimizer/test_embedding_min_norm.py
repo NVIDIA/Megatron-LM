@@ -2,6 +2,7 @@
 
 import argparse
 import json
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -77,18 +78,25 @@ def test_embedding_recipe_selects_trainable_input_and_tied_copy():
 
 
 @pytest.fixture
-def ddp_embedding():
+def ddp_embedding(request):
     if not torch.cuda.is_available():
         pytest.skip("requires the CUDA distributed optimizer")
+    pp_size = getattr(request, "param", 1)
+    if Utils.world_size % pp_size:
+        pytest.skip(f"requires a world size divisible by {pp_size} pipeline stages")
     # Exercise DP at two ranks and both TP and DP on larger even-sized launches.
-    tp_size = 2 if Utils.world_size >= 4 and Utils.world_size % 2 == 0 else 1
-    Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+    tp_size = 2 if pp_size == 1 and Utils.world_size >= 4 and Utils.world_size % 2 == 0 else 1
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tp_size, pipeline_model_parallel_size=pp_size
+    )
     try:
         config = TransformerConfig(
-            num_layers=1,
+            num_layers=pp_size,
             hidden_size=64,
             num_attention_heads=2,
             tensor_model_parallel_size=tp_size,
+            pipeline_model_parallel_size=pp_size,
+            pipeline_dtype=torch.bfloat16,
             bf16=True,
             params_dtype=torch.bfloat16,
             perform_initialization=False,
@@ -176,6 +184,74 @@ def test_embedding_floor_through_optimizer_builder(threshold, ddp_embedding, mon
         [master] = optimizer.get_parameters()
         torch.testing.assert_close(master, local.flatten()[start:end])
     torch.testing.assert_close(model.weight, local.bfloat16(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("ddp_embedding", [2], indirect=True, ids=["pp2"])
+@pytest.mark.parametrize("tied", [False, True], ids=["untied", "tied"])
+def test_embedding_floor_enabled_only_on_input_stage(ddp_embedding, tied):
+    input_stage = parallel_state.is_pipeline_first_stage()
+    weight = ddp_embedding.module.weight
+    weight.is_word_embedding_parameter = input_stage or tied
+    weight.shared_embedding = tied
+    config = OptimizerConfig(
+        bf16=True,
+        use_distributed_optimizer=True,
+        lr=0.0,
+        clip_grad=0.0,
+        embedding_min_norm=1.0 if input_stage else None,
+    )
+
+    # Bound the wait if one stage skips the optimizer setup collective.
+    peers = torch.distributed.new_group(backend="gloo", timeout=timedelta(seconds=30))
+    try:
+        if tied:
+            with pytest.raises(ValueError, match=r"shared word embedding .* mismatch: rank"):
+                get_megatron_optimizer(config, [ddp_embedding], param_group_process_group=peers)
+            return
+        optimizer = get_megatron_optimizer(config, [ddp_embedding], param_group_process_group=peers)
+        # Both stages must finish setup before either enters optimizer-step collectives.
+        torch.distributed.barrier(group=peers)
+    finally:
+        torch.distributed.destroy_process_group(peers)
+
+    weight.main_grad.zero_()
+    assert optimizer.step()[0]
+    norms = weight.float().norm(dim=1)
+    torch.testing.assert_close(norms, torch.full_like(norms, 2.0 if input_stage else 0.25))
+
+
+@pytest.mark.skipif(Utils.world_size < 4, reason="requires two multi-rank construction groups")
+@pytest.mark.parametrize("ddp_embedding", [Utils.world_size], indirect=True)
+def test_embedding_floor_validation_stays_in_construction_group(ddp_embedding, mocker):
+    # One pipeline stage per rank keeps each weight's DP group inside its construction group.
+    rank = torch.distributed.get_rank()
+    size = torch.distributed.get_world_size()
+    groups = [list(range(i, size, 2)) for i in (0, 1)]
+    members = groups[rank % 2]
+    peers, _ = torch.distributed.new_subgroups_by_enumeration(
+        groups, backend="gloo", timeout=timedelta(seconds=30)
+    )
+    try:
+        ddp_embedding.module.weight.is_word_embedding_parameter = rank == members[0]
+        config = OptimizerConfig(
+            bf16=True,
+            use_distributed_optimizer=True,
+            lr=0.0,
+            embedding_min_norm=1.0 if rank == 0 else None,
+        )
+        gather = torch.distributed.all_gather_object
+
+        def gather_within_group(object_list, obj, group=None):
+            # Catch a WORLD fallback before the active ranks wait for the all-off group.
+            assert group is peers
+            return gather(object_list, obj, group=group)
+
+        mocker.patch.object(torch.distributed, "all_gather_object", new=gather_within_group)
+        validate = mocker.spy(ParamNormSetup, "validate")
+        get_megatron_optimizer(config, [ddp_embedding], param_group_process_group=peers)
+        assert validate.call_count == (1 if 0 in members else 0)
+    finally:
+        torch.distributed.destroy_process_group(peers)
 
 
 @pytest.mark.parametrize(
