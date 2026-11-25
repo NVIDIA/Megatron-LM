@@ -13,7 +13,6 @@ from megatron.rl.config import (
     ROLLOUT_MODEL_LAYOUT_FIELDS,
     add_rl_args,
     rollout_inference_container_from_args,
-    rollout_model_is_separate,
 )
 from megatron.training.argument_utils import (
     _default_config_from_args,
@@ -28,6 +27,7 @@ from megatron.training.config import (
     RootConfigContainer,
     TokenizerConfig,
 )
+from megatron.training.config.container import rollout_model_is_separate
 
 # The unit-test lanes run under torchrun; the training layout is TP 1, so the global batch must
 # be a multiple of the launch's data-parallel size (validate_args checks the eval batch against it).

@@ -6,7 +6,11 @@ from argparse import ArgumentParser, Namespace
 from megatron.core.inference.shards_spec import spec_declares_disaggregation
 from megatron.training.argument_utils import ArgumentGroupFactory, _default_config_from_args
 from megatron.training.config import CheckpointConfig, RLConfig, RootConfigContainer
-from megatron.training.config.container import InferenceConfigContainer, PretrainConfigContainer
+from megatron.training.config.container import (
+    ROLLOUT_LAYOUT_FIELDS,
+    InferenceConfigContainer,
+    PretrainConfigContainer,
+)
 from megatron.training.config.inference_config import InferenceSetupConfig
 from megatron.training.global_vars import (
     get_root_config_container,
@@ -15,15 +19,14 @@ from megatron.training.global_vars import (
 )
 from megatron.training.models.base import ModelConfig
 
+# The flag that overrides each rollout layout field. CP has none: context-parallel training
+# forces the rollout's to 1.
 _DEPLOYMENT_ARGS = {
     "tensor_model_parallel_size": "rl_inference_tensor_model_parallel_size",
     "pipeline_model_parallel_size": "rl_inference_pipeline_model_parallel_size",
     "expert_model_parallel_size": "rl_inference_expert_model_parallel_size",
     "expert_tensor_parallel_size": "rl_inference_expert_tensor_model_parallel_size",
 }
-# Transformer fields in which a rollout deployment's layout can differ from training's:
-# the overridable parallelism, plus the CP that context-parallel training forces to 1.
-ROLLOUT_LAYOUT_FIELDS = (*_DEPLOYMENT_ARGS, "context_parallel_size")
 # What a separately built rollout model takes from its deployment:
 # the layout, plus the fields `rollout_inference_container_from_args` derives with it.
 ROLLOUT_MODEL_LAYOUT_FIELDS = (
@@ -33,26 +36,6 @@ ROLLOUT_MODEL_LAYOUT_FIELDS = (
     "tensor_parallel_num_weight_shards",
     "expert_tensor_parallel_num_weight_shards",
 )
-
-
-def rollout_model_is_separate(
-    inference_container: InferenceConfigContainer, training_model_cfg: ModelConfig | None
-) -> bool:
-    """Whether rollouts need their own model instead of the training model.
-
-    True for disaggregated shards, or for a deployment layout that differs from the training
-    model's in TP, PP, EP, expert TP or CP. When either side has no transformer section, a
-    distinct model config object counts as separate.
-    """
-    if spec_declares_disaggregation(inference_container.inference.inference_shards):
-        return True
-    deployment, training = inference_container.model, training_model_cfg
-    layouts = (getattr(deployment, "transformer", None), getattr(training, "transformer", None))
-    if None in layouts:
-        return deployment is not training
-    return any(
-        getattr(layouts[0], name) != getattr(layouts[1], name) for name in ROLLOUT_LAYOUT_FIELDS
-    )
 
 
 def rollout_inference_container_from_args(
@@ -125,62 +108,6 @@ def rollout_inference_container_from_args(
         logger=pretrain.logger,
         profiling=pretrain.profiling,
     )
-
-
-def validate_run(root: RootConfigContainer, *, global_batch_size: int | None = None) -> None:
-    """The RL section's rules against the run's training container and rollout deployment
-    (`RLConfig.run_rules`; the root container calls this before validating its members)."""
-    training, inference, rl = root.training, root.inference, root.algorithm.rl
-    if global_batch_size is None:
-        global_batch_size = training.train.global_batch_size
-    # The offload `finalize_run` will request, checked like the offload the DDP section
-    # requests (`PretrainConfigContainer._validate_ddp_config`).
-    if (
-        rl.requires_grad_buffer_offload
-        and training.optimizer.reuse_grad_buf_for_mxfp8_param_ag
-        and not training.ddp.use_megatron_fsdp
-    ):
-        raise ValueError(
-            "Gradient-buffer offload is incompatible with "
-            "--reuse-grad-buf-for-mxfp8-param-ag: "
-            "parameters share the gradient-buffer storage that offload releases."
-        )
-    transformer = getattr(training.model, "transformer", None)
-    cuda_graph_impl = None if transformer is None else transformer.cuda_graph_impl
-    rl.validate_run(
-        cuda_graph_impl=cuda_graph_impl,
-        micro_batch_size=training.train.micro_batch_size,
-        global_batch_size=global_batch_size,
-        train_iters=training.train.train_iters,
-        train_samples=training.train.train_samples,
-        skip_train=training.validation.skip_train,
-        load_optim=training.checkpoint.load_optim,
-        save_interval=training.checkpoint.save_interval,
-        exit_interval=training.train.exit_interval,
-    )
-    if rl.rl_offload_inference_model_weights and not rollout_model_is_separate(
-        inference, training.model
-    ):
-        raise ValueError(
-            "--rl-offload-inference-model-weights requires a separate inference model. "
-            "This flag is only useful when doing refit since the weights are shared with "
-            "the training model."
-        )
-
-
-def finalize_run(root: RootConfigContainer) -> None:
-    """Apply the RL section to the run's training container (`RLConfig.run_rules`; the root
-    container calls this before finalizing its members)."""
-    training = root.training
-    global_batch_size = training.train.global_batch_size
-    if global_batch_size is None:
-        # The training container derives an unset global batch size when it finalizes,
-        # after this call; check the RL rules against the size it will derive.
-        global_batch_size, _, _ = training._resolve_batch_sizes(training.get_batch_parallel_size())
-    validate_run(root, global_batch_size=global_batch_size)
-    if root.algorithm.rl.requires_grad_buffer_offload:
-        # Applied before the training container finalizes its DDP section.
-        training.ddp.grad_buffer_offload = True
 
 
 def add_rl_args(parser: ArgumentParser) -> ArgumentParser:

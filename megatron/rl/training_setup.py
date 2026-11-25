@@ -20,12 +20,13 @@ from megatron.core.num_microbatches_calculator import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_model_config
-from megatron.rl.config import ROLLOUT_MODEL_LAYOUT_FIELDS, get_rl_config, rollout_model_is_separate
+from megatron.rl.config import ROLLOUT_MODEL_LAYOUT_FIELDS, get_rl_config
 from megatron.rl.inference.disagg import build_disagg_inference_model
 from megatron.rl.rl_utils import inference_model_alloc_context
 from megatron.training.callbacks import Callback, CallbackContext
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.config import InferenceConfigContainer
+from megatron.training.config.container import rollout_model_is_separate
 from megatron.training.global_vars import get_args, get_run_config, get_train_state
 from megatron.training.training import get_model
 from megatron.training.utils import print_rank_0

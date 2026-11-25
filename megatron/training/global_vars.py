@@ -205,6 +205,8 @@ def initialize_runtime_services(
     args: Namespace, *, build_tokenizer: bool = True, training: bool = False
 ) -> None:
     """Build services from finalized config; normally called by initialize_megatron."""
+    from megatron.training.argument_utils import resolve_tokenizer_vocab_size
+
     cfg = get_run_config()
     if build_tokenizer:
         _build_tokenizer(cfg, args)
@@ -213,7 +215,11 @@ def initialize_runtime_services(
     if build_tokenizer or cfg.tokenizer.padded_vocab_size is not None:
         # Every container of the run that carries a model (an RL rollout deployment may hold its
         # own copy of the model config).
-        get_root_config_container().resolve_tokenizer_vocab_size()
+        root = get_root_config_container()
+        if root.training is not None:
+            resolve_tokenizer_vocab_size(root.training)
+        if root.inference is not None:
+            resolve_tokenizer_vocab_size(root.inference)
     _bind_dataset_tokenizer(cfg)
     _set_wandb_writer(args)
     _set_telemetry(args, include_training=training)

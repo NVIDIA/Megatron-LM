@@ -1,6 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
-import importlib
 import logging
 import os
 from dataclasses import dataclass, field
@@ -20,6 +19,7 @@ from megatron.core.distributed.distributed_data_parallel_config import Distribut
 from megatron.core.distributed.torch_fully_sharded_data_parallel_config import (
     TorchFullyShardedDataParallelConfig,
 )
+from megatron.core.inference.shards_spec import spec_declares_disaggregation
 from megatron.core.msc_utils import maybe_msc
 from megatron.core.num_microbatches_calculator import (
     get_current_global_batch_size,
@@ -119,13 +119,6 @@ class ConfigContainerBase:
         finalize_model = getattr(getattr(self, "model", None), "finalize", None)
         if callable(finalize_model):
             finalize_model()
-
-    def resolve_tokenizer_vocab_size(self) -> None:
-        """Bind tokenizer-derived vocabulary on every member container."""
-        for config_field in dataclass_fields(self):
-            member = getattr(self, config_field.name)
-            if isinstance(member, ConfigContainerBase):
-                member.resolve_tokenizer_vocab_size()
 
     @classmethod
     def from_dict(
@@ -1113,13 +1106,6 @@ class PretrainConfigContainer(ConfigContainerBase):
         self.data.finalize()
         self.ddp.finalize()
 
-    def resolve_tokenizer_vocab_size(self) -> None:
-        """Bind the model's vocabulary from this container's tokenizer section."""
-        # Imported lazily: megatron.training.argument_utils imports megatron.training.config.
-        from megatron.training.argument_utils import resolve_tokenizer_vocab_size
-
-        resolve_tokenizer_vocab_size(self)
-
 
 def update_train_iters(train: TrainingConfig) -> None:
     """Resolve the sample-based training horizon on the supplied training config."""
@@ -1187,39 +1173,47 @@ class InferenceConfigContainer(ConfigContainerBase):
             # instead of loading random weights, as validate_args derives it.
             self.checkpoint.exit_on_missing_checkpoint = True
 
-    def resolve_tokenizer_vocab_size(self) -> None:
-        """Bind the model's vocabulary from this container's tokenizer section."""
-        # Imported lazily: megatron.training.argument_utils imports megatron.training.config.
-        from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 
-        resolve_tokenizer_vocab_size(self)
+# Transformer fields in which an RL rollout deployment's layout can differ from training's:
+# the overridable parallelism, plus the CP that context-parallel training forces to 1.
+ROLLOUT_LAYOUT_FIELDS = (
+    "tensor_model_parallel_size",
+    "pipeline_model_parallel_size",
+    "expert_model_parallel_size",
+    "expert_tensor_parallel_size",
+    "context_parallel_size",
+)
+
+
+def rollout_model_is_separate(
+    inference_container: InferenceConfigContainer, training_model_cfg: ModelConfig | None
+) -> bool:
+    """Whether rollouts need their own model instead of the training model.
+
+    True for disaggregated shards, or for a deployment layout that differs from the training
+    model's in TP, PP, EP, expert TP or CP. When either side has no transformer section, a
+    distinct model config object counts as separate.
+    """
+    if spec_declares_disaggregation(inference_container.inference.inference_shards):
+        return True
+    deployment, training = inference_container.model, training_model_cfg
+    layouts = (getattr(deployment, "transformer", None), getattr(training, "transformer", None))
+    if None in layouts:
+        return deployment is not training
+    return any(
+        getattr(layouts[0], name) != getattr(layouts[1], name) for name in ROLLOUT_LAYOUT_FIELDS
+    )
 
 
 @dataclass(kw_only=True)
 class AlgorithmConfigContainer(ConfigContainerBase):
     """Container for the algorithm sections a run adds on top of `training`.
 
-    Each section names the module holding its rules against the run's other containers
-    (`run_rules`); the root container applies them when it validates and finalizes.
+    The root container holds each section's rules against the run's other containers.
     """
 
     rl: RLConfig | None = None
     """The RL loop's section; `None` for a run without RL."""
-
-    def _run_rules(self) -> list:
-        """The rules modules of the sections this run has."""
-        sections = (getattr(self, f.name) for f in dataclass_fields(self) if f.init)
-        return [importlib.import_module(s.run_rules) for s in sections if s is not None]
-
-    def validate_run(self, root: "RootConfigContainer") -> None:
-        """Check each section's rules against the run's other containers."""
-        for rules in self._run_rules():
-            rules.validate_run(root)
-
-    def finalize_run(self, root: "RootConfigContainer") -> None:
-        """Apply each section's derivations to the run's other containers."""
-        for rules in self._run_rules():
-            rules.finalize_run(root)
 
 
 @dataclass(kw_only=True)
@@ -1244,15 +1238,13 @@ class RootConfigContainer(ConfigContainerBase):
     """The algorithm sections a run adds on top of `training` (the RL section)."""
 
     def validate(self) -> None:
-        """Check the algorithm sections' rules against the run, then validate every member."""
-        if self.algorithm is not None:
-            self.algorithm.validate_run(self)
+        """Check the rules between the members, then validate every member."""
+        self._validate_rl()
         super().validate()
 
     def _finalize(self) -> None:
-        """Apply the algorithm sections' rules, then finalize the members."""
-        if self.algorithm is not None:
-            self.algorithm.finalize_run(self)
+        """Apply the derivations between the members, then finalize the members."""
+        self._finalize_rl()
         # The run config last: an RL run finalizes its rollout deployment before training.
         run_config = self.run_config
         for config_field in dataclass_fields(self):
@@ -1261,6 +1253,61 @@ class RootConfigContainer(ConfigContainerBase):
                 member.finalize()
         if run_config is not None:
             run_config.finalize()
+
+    def _validate_rl(self, global_batch_size: int | None = None) -> None:
+        """Check the RL section against the training container and the rollout deployment,
+        with the supplied or the configured training batch size."""
+        rl = None if self.algorithm is None else self.algorithm.rl
+        if rl is None:
+            return
+        training, inference = self.training, self.inference
+        if global_batch_size is None:
+            global_batch_size = training.train.global_batch_size
+        # The offload `_finalize_rl` will request, checked like the offload the DDP section
+        # requests (`PretrainConfigContainer._validate_ddp_config`).
+        if (
+            rl.requires_grad_buffer_offload
+            and training.optimizer.reuse_grad_buf_for_mxfp8_param_ag
+            and not training.ddp.use_megatron_fsdp
+        ):
+            raise ValueError(
+                "Gradient-buffer offload is incompatible with "
+                "--reuse-grad-buf-for-mxfp8-param-ag: "
+                "parameters share the gradient-buffer storage that offload releases."
+            )
+        transformer = getattr(training.model, "transformer", None)
+        cuda_graph_impl = None if transformer is None else transformer.cuda_graph_impl
+        rl.validate_run(
+            cuda_graph_impl=cuda_graph_impl,
+            micro_batch_size=training.train.micro_batch_size,
+            global_batch_size=global_batch_size,
+            train_iters=training.train.train_iters,
+            train_samples=training.train.train_samples,
+            skip_train=training.validation.skip_train,
+            load_optim=training.checkpoint.load_optim,
+            save_interval=training.checkpoint.save_interval,
+            exit_interval=training.train.exit_interval,
+        )
+        if rl.rl_offload_inference_model_weights and not rollout_model_is_separate(
+            inference, training.model
+        ):
+            raise ValueError(
+                "--rl-offload-inference-model-weights requires a separate inference model. "
+                "This flag is only useful when doing refit since the weights are shared with "
+                "the training model."
+            )
+
+    def _finalize_rl(self) -> None:
+        """Apply the RL section to the training container, before the members finalize."""
+        rl = None if self.algorithm is None else self.algorithm.rl
+        if rl is None:
+            return
+        training = self.training
+        global_batch_size, _, _ = training._resolve_batch_sizes(training.get_batch_parallel_size())
+        self._validate_rl(global_batch_size)
+        if rl.requires_grad_buffer_offload:
+            # Applied before the training container finalizes its DDP section.
+            training.ddp.grad_buffer_offload = True
 
     @classmethod
     def wrap(cls, run_config: ConfigContainerBase) -> "RootConfigContainer":

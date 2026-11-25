@@ -18,7 +18,6 @@ from megatron.rl.config import (
     add_rl_args,
     get_rl_run_config,
     rollout_inference_container_from_args,
-    rollout_model_is_separate,
     set_rl_run_config,
 )
 from megatron.training.argument_utils import (
@@ -36,6 +35,7 @@ from megatron.training.config import (
     RootConfigContainer,
     rl_config,
 )
+from megatron.training.config.container import rollout_model_is_separate
 from megatron.training.config.utils import sanitize_dataclass_config, serialize_value
 
 INIT_FIELDS = [f for f in fields(RLConfig) if f.init]
@@ -379,7 +379,9 @@ def test_validate_run_from_the_container_and_the_entry_point():
     pretrain.model.transformer.cuda_graph_impl = "local"
     cuda_graph_run.validate()
     assert not pretrain.ddp.grad_buffer_offload
-    cuda_graph_run.finalize()
+    # Pinned to one rank: under a multi-rank launch 12 is not a multiple of 4 x the ranks.
+    with patch("megatron.training.config.container.safe_get_world_size", lambda: 1):
+        cuda_graph_run.finalize()
     assert not pretrain.ddp.grad_buffer_offload
     pretrain = _pretrain_container()
     pretrain.ddp.grad_buffer_offload = True
