@@ -46,6 +46,8 @@ def test_attention_key_slot_order_keeps_invalid_suffix(monkeypatch, preserve_ord
     ids = torch.tensor([[6, 1, 4, 7], [3, 2, 7, 7]], dtype=torch.int32)
     lengths = torch.tensor([3, 2], dtype=torch.int32)
     result = dsa_cudnn_kernels._sort_valid_topk_indices_by_index(ids, lengths, sk=8)
-    expected = [[6, 1, 4, -1], [3, 2, -1, -1]] if preserve_order else [[1, 4, 6, -1], [2, 3, -1, -1]]
+    expected = (
+        [[6, 1, 4, -1], [3, 2, -1, -1]] if preserve_order else [[1, 4, 6, -1], [2, 3, -1, -1]]
+    )
     expected = torch.tensor(expected, dtype=torch.int32)
     assert torch.equal(result, expected)
