@@ -15,6 +15,8 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class _FusedLinearFunction(torch.autograd.Function):
+    """Write one microbatch's wgrad into MFSDP's initially uninitialized scratch buffer."""
+
     @staticmethod
     def forward(ctx, x, weight):
         ctx.save_for_backward(x, weight)
@@ -23,7 +25,7 @@ class _FusedLinearFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         x, weight = ctx.saved_tensors
-        weight.get_main_grad().add_(grad_output.t() @ x)
+        weight.get_main_grad().copy_(grad_output.t() @ x)
         weight.grad_added_to_main_grad = True
         return grad_output @ weight, None
 
@@ -52,6 +54,8 @@ class TestMFSDPNoneGradHook:
             "megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp"
         )
         is_torch_min_version = fsdp_module.is_torch_min_version
+        if use_tensor_hook and not is_torch_min_version("2.8.0"):
+            pytest.skip("None-gradient tensor post-accumulate hooks require PyTorch >= 2.8")
         monkeypatch.setattr(
             fsdp_module,
             "is_torch_min_version",
@@ -78,6 +82,7 @@ class TestMFSDPNoneGradHook:
             lambda *args: seen.append(weight not in model._params_require_handle_grad)
         )
         try:
+            model.zero_grad_buffer()
             model(x).sum().backward()
             model.finish_grad_sync()
         finally:
