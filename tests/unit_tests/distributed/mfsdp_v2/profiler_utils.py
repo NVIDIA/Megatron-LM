@@ -85,22 +85,30 @@ def collect_linked_event_groups(
     Each group contains the CUDA events linked to one matching CPU event, including kernels
     and memcpys.
     """
-    # A correlation id is shared by a device event and the leaf runtime op that issued it,
-    # not the enclosing matched op, so walk cpu_parent up from each correlated leaf. Id 0
-    # is the "no device correlation" sentinel and is skipped.
+    # A CPU operation can issue several correlated runtime calls (including event
+    # recording calls with no device event). Group by the enclosing operation,
+    # not by each leaf correlation, or those calls inflate the collective count.
     events = prof.events()
     linked_correlation_ids = _linked_correlation_ids(prof, events)
+    groups_by_operation: dict[int, EventGroup] = {}
     groups_by_correlation: dict[int, EventGroup] = {}
     for event in events:
         correlation_id = linked_correlation_ids[id(event)]
         if event.device_type != DeviceType.CPU or not correlation_id:
             continue
         node = event
+        operation = None
         while node is not None:
             if cpu_event_name_substring in node.name:
-                groups_by_correlation[correlation_id] = EventGroup()
-                break
+                operation = node
             node = node.cpu_parent
+        if operation is None:
+            continue
+        group = groups_by_operation.setdefault(operation.id, EventGroup())
+        # Correlated runtime calls can have no device event (for example an
+        # event record). Preserve those groups, but ignore uncorrelated async
+        # backend annotations that would otherwise count the operation twice.
+        groups_by_correlation[correlation_id] = group
 
     for event in events:
         if not _is_device_kernel(event):
@@ -114,7 +122,7 @@ def collect_linked_event_groups(
             continue
         group.append(event)
 
-    return list(groups_by_correlation.values())
+    return list(groups_by_operation.values())
 
 
 def event_groups_overlap(first: EventGroup, second: EventGroup) -> bool:

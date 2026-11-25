@@ -84,6 +84,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "cross_entropy_fusion_impl": "native",
     "cross_entropy_loss_fusion": True,
     "create_attention_mask_in_dataloader": True,
+    "cross_entropy_mxfp8_grad": False,
     "csa_compress_ratios": None,
     "csa_compress_rotary_base": 40000.0,
     "csa_dense_mode": False,

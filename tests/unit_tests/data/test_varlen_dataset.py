@@ -22,6 +22,8 @@ import torch
 # Import via the public module path so this test gets discovered through the
 # regular pytest entry point. The functions under test are pure Python and do
 # not require torch.distributed.
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
+from megatron.training.config import DataConfig, DataloaderConfig
 from megatron.training.datasets.sft_dataset import (
     IGNORE_INDEX,
     MockSFTDataset,
@@ -1528,6 +1530,9 @@ def _build_varlen_for_loader(items, config, num_samples):
 
 
 def _loader_args(*, use_varlen, sbhd, scheduler, mbs, dynamic_cp=False, gbs=None, num_workers=0):
+    """The legacy namespace these tests register (the runtime still expects one); the loader reads
+    none of it: the loader-owned values come from the data section, the model-parallel values
+    from the run config's model section."""
     return SimpleNamespace(
         dataloader_type='single',
         micro_batch_size=mbs,
@@ -1535,9 +1540,31 @@ def _loader_args(*, use_varlen, sbhd, scheduler, mbs, dynamic_cp=False, gbs=None
         full_validation=False,
         dynamic_context_parallel=dynamic_cp,
         num_workers=num_workers,
+        context_parallel_size=1,
+        pipeline_model_parallel_size=1,
         use_varlen_dataset=use_varlen,
         varlen_sbhd_validation=sbhd,
         sequence_packing_scheduler=scheduler,
+    )
+
+
+def _loader_section(run_config, *, seq_length, sbhd):
+    """The data section the loader reads: a varlen dataset config (a source, so the resolver
+    accepts the real class) with the SBHD flag of the run, the single loader, no workers."""
+    dataset = GPTDatasetConfig(
+        sequence_length=seq_length,
+        random_seed=1,
+        blend=(["prefix"], None),
+        split="9,1,0",
+        varlen_sbhd_validation=sbhd,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+    )
+    run_config.data = DataConfig(
+        dataset=dataset,
+        dataset_type=VarlenDataset,
+        dataloader=DataloaderConfig(dataloader_type="single", num_workers=0),
     )
 
 
@@ -1572,6 +1599,7 @@ def test_sbhd_validation_dataloader_uses_default_collate(run_config, loader_mode
         n = mbs * dp * 4
         cfg = _make_config(tok, seq_length=seq_len, sbhd=True)
         ds = _build_varlen_for_loader(["hello world"] * n, cfg, num_samples=n)
+        _loader_section(run_config, seq_length=seq_len, sbhd=True)
         set_args(_loader_args(use_varlen=True, sbhd=True, scheduler=None, mbs=mbs))
         loader = build_pretraining_data_loader(ds, consumed_samples=0)
         batch = next(iter(loader))
@@ -1607,6 +1635,7 @@ def test_thd_dataloader_uses_identity_collate(run_config, loader_model_config):
         variable = ["a", "abcdef", "xy", "qwerty"]
         items = [variable[i % len(variable)] for i in range(n)]
         ds = _build_varlen_for_loader(items, cfg, num_samples=n)
+        _loader_section(run_config, seq_length=64, sbhd=False)
         set_args(_loader_args(use_varlen=True, sbhd=False, scheduler="dp_balanced", mbs=mbs))
         loader = build_pretraining_data_loader(ds, consumed_samples=0)
         batch = next(iter(loader))
@@ -1687,6 +1716,7 @@ def test_packing_scheduler_dataloader_yields_microbatches(run_config, loader_mod
         variable = ["a", "abcdef", "xy", "qwerty"]
         items = [variable[i % len(variable)] for i in range(n)]
         ds = _build_varlen_for_loader(items, cfg, num_samples=n)
+        _loader_section(run_config, seq_length=64, sbhd=False)
         set_args(
             _loader_args(use_varlen=True, sbhd=False, scheduler="dp_balanced", mbs=mbs, gbs=gbs)
         )

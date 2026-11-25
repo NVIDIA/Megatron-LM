@@ -1,4 +1,4 @@
-<!---
+{/*
    Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
    NVIDIA CORPORATION and its licensors retain all intellectual property
@@ -6,7 +6,7 @@
    and any modifications thereto. Any use, reproduction, disclosure or
    distribution of this software and related documentation without an express
    license agreement from NVIDIA CORPORATION is strictly prohibited.
--->
+*/}
 
 # Combined 1F1B: Expert-Parallel All-to-All Overlap
 
@@ -166,6 +166,77 @@ The flag is optional for correctness. Enable it when profiling shows that forwar
 computation alone is too short to cover backward A2A communication. It introduces
 Transformer Engine version and feature-combination requirements, so establish a
 working overlap baseline before adding it.
+
+### Backward pipeline receive wait
+
+With PP>1, each steady-state 1F1B step pairs the forward pass of one model chunk
+with the backward pass of another. The backward chunk needs the output gradient
+received from the next pipeline stage; the paired forward layers do not. If the
+gradient arrives late, for example because the next stage is slower (stage
+imbalance), any computation queued behind the receive wait is delayed.
+
+With `--overlap-moe-expert-parallel-comm`, the scheduler issues this receive wait
+(`pre_backward`) on the communication stream. The communication stream waits
+for the backward chunk's CUDA event, waits for the receive, and records the
+event again. Every backward node of the chunk waits on this event on its own
+stream, so everything that reads the gradient stays ordered after the receive.
+The forward chunk has its own event, so its computation is not queued behind
+the receive. Previously the wait was issued on the compute stream before any
+layer ran, so the paired forward computation waited for a late gradient too.
+
+For the first paired layer, with a late gradient:
+
+```text
+Previous behavior (wait on the compute stream)
+  compute: [wait recv ..........] F.pre_dispatch  B.expert dgrad  F.expert ...
+  comm:                            B.combine       F.dispatch      B.dispatch ...
+
+Current behavior (wait on the communication stream)
+  compute: F.pre_dispatch [idle .........] B.expert dgrad  F.expert ...
+  comm:    [wait recv ..........] B.combine  F.dispatch     B.dispatch ...
+```
+
+What this does and does not change:
+
+- The paired forward layer's pre-dispatch computation (attention, router)
+  runs while the gradient is in flight. This is the whole overlap window.
+- `F.dispatch` still waits for the receive: it is queued on the communication
+  stream after `B.combine`, which needs the gradient. The first backward
+  compute node (normally the expert dgrad) also waits, through the chunk event.
+- Only where the receive is waited for differs from the previous behavior. The
+  kernels and their order on each stream are the same, so results are bitwise
+  identical. It hides receive latency; it does not shorten the receive.
+
+Where it applies: only where the scheduler passes a backward receive wait to the
+model chunk, that is the steady-state 1F1B phase of the interleaved (VPP)
+schedule with P2P overlap. P2P overlap is on by default with VPP. With
+`--no-overlap-p2p-communication`, without pipeline parallelism, or on the last
+pipeline stage (which receives no gradient), there is no receive to hide.
+
+Limitations. In these cases a compute-stream node waits for the chunk event
+before the paired forward pre-dispatch computation is issued, so most or all of
+the benefit is lost:
+
+- Output-layer backward (`post_process`), which runs before the layer loop. It
+  only exists on the last pipeline stage, where there is no receive to hide.
+- MTP post-processing backward, which runs on the compute stream before the MTP
+  layer's combine backward, when the MTP layer is in a chunk that receives a
+  gradient (standalone MTP placement on an earlier pipeline rank).
+- Full activation recompute, when the backward chunk's last layer ends a
+  recompute segment: the replay runs before that layer's backward, and its
+  first node waits for the chunk event on the compute stream.
+
+Dense layers are not excluded: their dispatch and combine are no-ops, and the
+paired forward pre-dispatch computation is still issued before the dense MLP
+backward, which then waits for the gradient on the compute stream.
+
+Profiling: the benefit depends on how often and how late the backward receive
+is, which depends on scale and stage balance. In a profile, check whether
+forward computation runs during the backward PP receive at the start of 1F1B
+chunks. Example: DeepSeek-V3 671B with NVFP4 on 64 VR200 nodes (PP4, EP32, VPP)
+ran at 17.87 s/step with the wait on the compute stream and 17.57 s/step with
+it on the communication stream (-0.30 s/step). A 4-node proxy did not show the
+gain, because its backward pipeline receives are rarely late.
 
 ### Tensor lifetime management
 

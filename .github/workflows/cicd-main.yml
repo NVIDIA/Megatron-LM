@@ -272,6 +272,9 @@ jobs:
           FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
           ENABLE_SELECTIVE_UNIT_TESTS: ${{ vars.ENABLE_SELECTIVE_UNIT_TESTS }}
           H100_TRAFFIC_MODE: ${{ env.H100_RUNNER_TRAFFIC_MODE }}
+          # Each cloud accepts a login or a list of logins, e.g. {"gcp":["alice"],"aws":"bob"}.
+          H100_RUNNER_USER_OVERRIDES: ${{ vars.H100_RUNNER_USER_OVERRIDES }}
+          PR_AUTHOR: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').user.login }}
           PREFLIGHT_IS_MEMBER: ${{ needs.pre-flight.outputs.is_member }}
           IS_PR: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/pull-request/') }}
           IS_MAINTAINER: ${{ needs.is-not-external-contributor.outputs.is_maintainer }}
@@ -339,6 +342,16 @@ jobs:
 
           if [ "$IS_PR" == "true" ] && [ "$MERGE_QUEUE_JOBS" != "true" ]; then
             if [ "$PREFLIGHT_IS_MEMBER" == "true" ]; then
+              # Use the repository traffic mode when both or neither cloud matches.
+              if [[ -n "${H100_RUNNER_USER_OVERRIDES:-}" ]]; then
+                H100_TRAFFIC_MODE=$(jq -r --arg author "${PR_AUTHOR,,}" --arg fallback "$H100_TRAFFIC_MODE" '
+                  def matches_author:
+                    (if type == "string" then [.] else . // [] end)
+                    | any(.[]; ascii_downcase == $author);
+                  . as $users | ["aws", "gcp"] | map(select($users[.] | matches_author))
+                  | if length == 1 then .[0] else $fallback end
+                ' <<< "$H100_RUNNER_USER_OVERRIDES")
+              fi
               case "$H100_TRAFFIC_MODE" in
                 aws)
                   ;;
@@ -1022,7 +1035,7 @@ jobs:
       - name: Parse unit tests
         id: parse-unit-tests
         run: |
-          cat tests/test_utils/recipes/h100/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests.json
+          cat tests/test_utils/recipes/h100/unit-tests.yaml | yq -o json '[.products[] | select(.testmon != false) | .test_case[] | { "bucket": .}] + [.products[] | select(.testmon == false) | .test_case[] | { "bucket": ., "mode": "testmon-disabled"}] | sort_by(.model, .test_case)' | jq -c > unit-tests.json
           echo "unit-tests=$(cat unit-tests.json)" | tee -a $GITHUB_OUTPUT
 
   cicd-unit-tests-latest:
@@ -1054,8 +1067,9 @@ jobs:
       runner: ${{ needs.configure.outputs.h100_gpu_runs_on }}
       container-image: ${{ format('{0}/megatron-lm:{1}-{2}', needs.configure.outputs.h100_registry, needs.configure.outputs.sha, needs.configure.outputs.h100_cloud) }}
       sha: ${{ needs.configure.outputs.sha }}
-      unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
-      unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
+      # Merge groups targeting main record Testmon baselines for the post-merge publisher.
+      unit_testmon_mode: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_ref == 'refs/heads/main' && 'baseline' || (needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full') }}
+      unit_testmon_target_branch: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_ref == 'refs/heads/main' && 'main' || needs.configure.outputs.target_branch }}
       unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
       unit_testmon_checkout_artifact_id: ${{ needs.configure.outputs.unit_testmon_checkout_artifact_id }}
 
@@ -1098,7 +1112,7 @@ jobs:
       - name: Parse unit tests
         id: parse-unit-tests
         run: |
-          cat tests/test_utils/recipes/gb200/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests-gb200.json
+          cat tests/test_utils/recipes/gb200/unit-tests.yaml | yq -o json '[.products[] | select(.testmon != false) | .test_case[] | { "bucket": .}] + [.products[] | select(.testmon == false) | .test_case[] | { "bucket": ., "mode": "testmon-disabled"}] | sort_by(.model, .test_case)' | jq -c > unit-tests-gb200.json
           echo "unit-tests-gb200=$(cat unit-tests-gb200.json)" | tee -a $GITHUB_OUTPUT
 
   cicd-unit-tests-latest-gb200:
@@ -1133,8 +1147,9 @@ jobs:
       container-image: ${{ needs.cicd-parse-unit-tests-gb200.outputs.container-image }}
       platform: dgx_gb200
       sha: ${{ needs.configure.outputs.sha }}
-      unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
-      unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
+      # Merge groups targeting main record Testmon baselines for the post-merge publisher.
+      unit_testmon_mode: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_ref == 'refs/heads/main' && 'baseline' || (needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full') }}
+      unit_testmon_target_branch: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_ref == 'refs/heads/main' && 'main' || needs.configure.outputs.target_branch }}
       unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
       unit_testmon_checkout_artifact_id: ${{ needs.configure.outputs.unit_testmon_checkout_artifact_id }}
 

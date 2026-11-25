@@ -258,10 +258,17 @@ run_baseline_tests() {
     rm -f -- "$cache_root/summary.md"
     mkdir -p "$cache_root"
 
+    # Testmon pauses an outer `coverage run` tracer, so collect production
+    # coverage through pytest-cov, which Testmon forwards recorded lines to.
     run_testmon_phase baseline prod \
+        --cov=megatron/core --cov-config=pyproject.toml --cov-report= \
         -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target"
     run_testmon_phase baseline experimental \
         -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "$target"
+    # Platforms may collect no production tests for a bucket.
+    if compgen -G '.coverage.unit_tests*' > /dev/null; then
+        coverage combine -q
+    fi
     write_testmon_summary "baseline produced"
 }
 
