@@ -62,6 +62,18 @@ def _strip_wrapper_prefixes(path):
     return '.'.join(parts)
 
 
+# Optimizer states shaped along the rows of their parameter, which split with it: Adam's moments,
+# Muon's momentum, and AngularMuOwn's (rows, 1) row scales and their Adam moments.
+_FUSED_PARAM_STATE_KEYS = (
+    "exp_avg",
+    "exp_avg_sq",
+    "momentum_buffer",
+    "row_scale",
+    "row_scale_exp_avg",
+    "row_scale_exp_avg_sq",
+)
+
+
 def _is_mfsdp_v2_param(param):
     """Whether ``param`` is managed by MFSDP v2."""
     return get_containing_parameter_group(param) is not None
@@ -396,7 +408,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
                     continue
                 new_opt_state_dict[f"{key}_w"] = opt_state_dict[key].copy()
                 new_opt_state_dict[f"{key}_v"] = opt_state_dict[key].copy()
-                for subkey in ("exp_avg", "exp_avg_sq", "momentum_buffer"):
+                for subkey in _FUSED_PARAM_STATE_KEYS:
                     if subkey not in opt_state_dict[key]:
                         continue
                     local_key = expert_param_local_key(key, num_experts)
@@ -566,7 +578,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
                 sizes, names, dim = match
                 for sub_name in names:
                     new_opt_state[f"{key}.{sub_name}"] = opt_state[key].copy()
-                for subkey in ("exp_avg", "exp_avg_sq", "momentum_buffer"):
+                for subkey in _FUSED_PARAM_STATE_KEYS:
                     if subkey not in opt_state[key]:
                         continue
                     dist_param = parameters[_strip_wrapper_prefixes(key)]
@@ -797,7 +809,7 @@ def handle_mla_down_proj_in_state_dict(model, model_state_dict, optimizer_state_
             for new_key in new_keys:
                 new_optimizer_state[new_key] = optimizer_state[key].copy()
             dist_param = parameters[_strip_wrapper_prefixes(key)]
-            for subkey in ("exp_avg", "exp_avg_sq", "momentum_buffer"):
+            for subkey in _FUSED_PARAM_STATE_KEYS:
                 if subkey not in optimizer_state[key]:
                     continue
                 sections = split_fused_fsdp_param(

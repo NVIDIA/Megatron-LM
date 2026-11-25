@@ -498,7 +498,10 @@ def test_metadata_attach_issues_no_collectives(
 
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
 @pytest.mark.parametrize("activation", ["gelu", "swiglu"])
-@pytest.mark.parametrize(("optimizer_name", "layer_pattern"), [("adam", "*E"), ("muon", "*-*E")])
+@pytest.mark.parametrize(
+    ("optimizer_name", "layer_pattern"),
+    [("adam", "*E"), ("muon", "*-*E"), ("angular_muown", "*-*E")],
+)
 def test_ep_fsdp_checkpoint_roundtrip(
     distributed_setup, tmp_path_dist_ckpt, ep_size, optimizer_name, layer_pattern, activation
 ):
@@ -510,7 +513,7 @@ def test_ep_fsdp_checkpoint_roundtrip(
     world_size, rank = Utils.world_size, Utils.rank
     if world_size % ep_size:
         pytest.skip(f"world_size {world_size} is incompatible with EP={ep_size}.")
-    if optimizer_name == "muon":
+    if optimizer_name in ("muon", "angular_muown"):
         pytest.importorskip("emerging_optimizers")
 
     Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=ep_size)
@@ -578,9 +581,21 @@ def test_ep_fsdp_checkpoint_roundtrip(
                 if optimizer_name == "adam"
                 else {}
             )
+            # The angular decay starts within the run, so the resumed step count matters.
+            muown_options = (
+                dict(
+                    muon_use_muown=True,
+                    muown_use_angular=True,
+                    muon_scale_mode="shape_scaling",
+                    muown_angular_warmup_iters=2,
+                    muown_angular_horizon_iters=10,
+                )
+                if optimizer_name == "angular_muown"
+                else {}
+            )
             optimizer = get_megatron_optimizer(
                 OptimizerConfig(
-                    optimizer=optimizer_name,
+                    optimizer="adam" if optimizer_name == "adam" else "muon",
                     lr=0.001,
                     weight_decay=0.1,
                     bf16=True,
@@ -589,6 +604,7 @@ def test_ep_fsdp_checkpoint_roundtrip(
                     clip_grad=0.0,
                     muon_split_qkv=False,
                     **adam_state,
+                    **muown_options,
                 ),
                 [model],
                 use_gloo_process_groups=False,
