@@ -24,10 +24,29 @@ the same checkpoint identity as other trainable base weights.
 
 MLM setup rejects unequal A/B bounds selected by the standard adapter name globs
 with a nonzero initial warmup LR, including hand-written mappings using those
-globs. Arbitrary layer-specific selectors require validation by their provider.
-The check does not depend on rank-local adapter presence. The callable serializes through the existing recipe target mechanism
-and can also be supplied to Bridge's shared mapping/callable interface.
+globs. Arbitrary layer-specific selectors require validation by their policy.
+The check does not depend on rank-local adapter presence. The callable serializes through the existing recipe target mechanism. Its ratio
+can be changed through recipe CLI/YAML overrides. Bridge accepts this same
+callable through its mapping/callable interface.
 
 This configures optimizer groups only; adapter construction, freezing and adapter
 checkpoint filtering remain the responsibility of the PEFT integration. Runtime
 LR overrides on resume additionally require the corresponding Core/MLM resume fixes.
+
+## Existing Bridge callers and checkpoints
+
+`get_lora_plus_lr_overrides(config, ratio)` exposes the shared LR calculation as
+explicit A and B entries. It does not add standard WD/decoupled-LR rules; callers
+compose those with `merge_config_overrides`. An unset `min_lr` is interpreted as
+zero, preserving the existing Bridge helper's behavior.
+
+Bridge retains `get_lora_plus_config_overrides` as a thin wrapper around that
+helper and the standard rules. This preserves its existing parameter groups,
+including the explicit A and B entries at ratio one, so existing checkpoints
+keep their group membership and parameter order. Bridge also delegates the
+warmup check to `validate_lora_plus_warmup`.
+
+Use the original policy when resuming an existing run. Switching from the legacy
+helper to the new callable can change group structure even when the effective
+learning rates are identical. This change does not convert checkpoint groups or
+introduce a checkpoint format version.

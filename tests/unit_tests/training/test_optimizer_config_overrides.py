@@ -21,6 +21,7 @@ from megatron.training.config import PretrainConfigContainer, target_allowlist
 from megatron.training.config.optimizer_config import (
     LoRAPlusOptimizerOverrides,
     build_optimizer_config_overrides,
+    get_lora_plus_lr_overrides,
     validate_lora_plus_warmup,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -335,3 +336,27 @@ def test_lora_plus_does_not_silently_change_ratio_under_mup():
         build_optimizer_config_overrides(
             OptimizerConfig(lr=1e-3), _model(use_mup=True), LoRAPlusOptimizerOverrides(0.5)
         )
+
+
+@pytest.mark.parametrize(
+    "lr,minimum",
+    [(None, 0.0), (float("inf"), 0.0), (0.001, -0.1), (0.001, 0.01), (0.001, float("nan"))],
+)
+def test_lora_plus_shared_builder_rejects_invalid_bounds(lr, minimum):
+    with pytest.raises(ValueError, match="finite base LR bounds"):
+        get_lora_plus_lr_overrides(OptimizerConfig(lr=lr, min_lr=minimum), 16.0)
+
+
+def test_lora_plus_shared_builder_preserves_explicit_legacy_groups():
+    overrides = get_lora_plus_lr_overrides(OptimizerConfig(lr=0.001, min_lr=None), 1.0)
+    assert overrides == {
+        ParamKey(name="*.linear_in.weight"): {"max_lr": 0.001, "min_lr": 0.0},
+        ParamKey(name="*.linear_out.weight"): {"max_lr": 0.001, "min_lr": 0.0},
+    }
+    with pytest.raises(ValueError, match="scaled learning rate must be finite"):
+        get_lora_plus_lr_overrides(OptimizerConfig(lr=1e308), 16.0)
+
+
+@pytest.mark.parametrize("overrides", [None, {}])
+def test_lora_plus_warmup_accepts_absent_policies(overrides):
+    validate_lora_plus_warmup(overrides, OptimizerConfig(lr=0.001), 0.0001)

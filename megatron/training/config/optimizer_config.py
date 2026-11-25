@@ -26,7 +26,30 @@ OptimizerConfigOverrides = dict[ParamKey, ParamGroupOverride]
 OptimizerConfigOverrideHook = Callable[..., OptimizerConfigOverrides]
 
 
-@dataclass(frozen=True)
+def get_lora_plus_lr_overrides(
+    optimizer_config: OptimizerConfig, ratio: float
+) -> OptimizerConfigOverrides:
+    """Build explicit A/B learning-rate bounds, without composing standard rules.
+
+    Keeping both entries preserves the parameter-group structure of existing LoRA+
+    callers. New recipe callables may omit A's redundant contribution. ``None`` for
+    the base minimum LR is interpreted as zero, matching the legacy Bridge helper.
+    """
+    if not math.isfinite(ratio) or ratio <= 0:
+        raise ValueError("LoRA+ ratio must be finite and positive.")
+    lr = optimizer_config.lr
+    minimum = optimizer_config.min_lr if optimizer_config.min_lr is not None else 0.0
+    if lr is None or not math.isfinite(lr) or not 0 <= minimum <= lr:
+        raise ValueError("LoRA+ requires finite base LR bounds with 0 <= min_lr <= lr.")
+    if not math.isfinite(lr * ratio):
+        raise ValueError("LoRA+ scaled learning rate must be finite.")
+    return {
+        ParamKey(name="*.linear_in.weight"): {"max_lr": lr, "min_lr": minimum},
+        ParamKey(name="*.linear_out.weight"): {"max_lr": lr * ratio, "min_lr": minimum * ratio},
+    }
+
+
+@dataclass
 class LoRAPlusOptimizerOverrides:
     """Scale adapter B's entire LR schedule relative to A through the recipe hook.
 
@@ -43,14 +66,7 @@ class LoRAPlusOptimizerOverrides:
         self, *, optimizer_config: OptimizerConfig, model: list[MegatronModule]
     ) -> OptimizerConfigOverrides:
         """Return only the contribution that differs from the base optimizer policy."""
-        if not math.isfinite(self.ratio) or self.ratio <= 0:
-            raise ValueError("LoRA+ ratio must be finite and positive.")
-        lr = optimizer_config.lr
-        minimum = optimizer_config.min_lr if optimizer_config.min_lr is not None else 0.0
-        if lr is None or not math.isfinite(lr) or not 0 <= minimum <= lr:
-            raise ValueError("LoRA+ requires finite base LR bounds with 0 <= min_lr <= lr.")
-        if not math.isfinite(lr * self.ratio):
-            raise ValueError("LoRA+ scaled learning rate must be finite.")
+        overrides = get_lora_plus_lr_overrides(optimizer_config, self.ratio)
         if any(
             getattr(getattr(chunk, "config", None), "use_mup", False)
             for chunk in unwrap_model(model)
@@ -58,23 +74,19 @@ class LoRAPlusOptimizerOverrides:
             raise ValueError("LoRA+ with muP requires an explicit combined optimizer mapping.")
         if self.ratio == 1.0:
             return {}
-        return {
-            ParamKey(name="*.linear_out.weight"): {
-                "max_lr": lr * self.ratio,
-                "min_lr": minimum * self.ratio,
-            }
-        }
+        key = ParamKey(name="*.linear_out.weight")
+        return {key: overrides[key]}
 
 
 def validate_lora_plus_warmup(
-    overrides: OptimizerConfigOverrides, optimizer_config: OptimizerConfig, initial_lr: float
+    overrides: OptimizerConfigOverrides | None, optimizer_config: OptimizerConfig, initial_lr: float
 ) -> None:
     """Reject unequal named A/B bounds with a shared nonzero initial warmup LR.
 
     Check the policy rather than local parameter presence so pipeline ranks agree.
     This covers hand-written mappings and callables using standard adapter globs.
     """
-    if initial_lr == 0:
+    if not overrides or initial_lr == 0:
         return
     bounds = []
     for parameter in ("adapter.linear_in.weight", "adapter.linear_out.weight"):
