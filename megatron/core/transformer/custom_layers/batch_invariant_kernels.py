@@ -861,9 +861,10 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
         transa = layout[0].upper() == "T"
         transb = layout[1].upper() == "T"
         # TE flattens both operands to 2D before applying the layout's transposes, and its
-        # output keeps B's leading dims unless B is transposed (getGemmOutputShape).
+        # output keeps B's leading dims, or B's last dim when B is transposed
+        # (getGemmOutputShape).
         ctx.a_shape, ctx.b_shape = A.shape, B.shape
-        out_leading_shape = None if transb else B.shape[:-1]
+        leading_shape = B.shape[-1:] if transb else B.shape[:-1]
         A, B = A.reshape(-1, A.shape[-1]), B.reshape(-1, B.shape[-1])
 
         opA = A.transpose(0, 1) if transa else A  # [K, O] or [I, O]
@@ -873,23 +874,7 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
         # layouts retain their existing behavior.
         if not transa:
             opA = opA.contiguous()
-        opB = B.transpose(0, 1).contiguous() if transb else B.contiguous()  # [..., K]
-
-        # Flatten opA to 2D if needed (weight tensors should be 2D, but validate)
-        if opA.dim() > 2:
-            opA = opA.reshape(-1, opA.shape[-1])
-        elif opA.dim() < 2:
-            raise ValueError(f"opA has insufficient dimensions: {opA.shape}")
-        assert opA.dim() == 2, f"opA must be 2D, got shape {opA.shape}"
-
-        # Flatten all leading dims of opB except the last feature dim to match TE behavior
-        if opB.dim() >= 2:
-            leading_shape = opB.shape[:-1] if out_leading_shape is None else out_leading_shape
-            K = opB.shape[-1]
-            opB_2d = opB.reshape(-1, K)
-        else:
-            leading_shape = ()
-            opB_2d = opB
+        opB_2d = B.transpose(0, 1).contiguous() if transb else B.contiguous()  # [N, K]
 
         # Perform GEMM: (N_total, K) @ (K, O) -> (N_total, O)
         base_2d = mm_batch_invariant(opB_2d, opA)
@@ -1088,12 +1073,21 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
     else:
         # The product of a call without alpha or accumulate, in the operands' dtype.
         product = BatchInvariantTEGemmFn.apply(A, B, None, None, layout)
-        if accumulate and out.dtype == torch.float32:
-            # Into fp32 out (a weight gradient into main_grad) in place, with no fp32
-            # temporaries.
+        if accumulate and (
+            out.dtype == torch.float32
+            or (
+                out.dtype == product.dtype
+                and alpha == 1.0
+                and beta == 1.0
+                and epilogue_bias is None
+            )
+        ):
+            # In place, with no fp32 temporaries: into fp32 out (a weight gradient into
+            # main_grad), or a plain sum into out of the product's dtype (a bf16 main_grad).
+            # add_ computes that sum in fp32 and rounds it once, as the branch below does.
             if beta != 1.0:
                 out.mul_(beta)
-            out.add_(product.reshape(out.shape), alpha=alpha)
+            out.add_(product, alpha=alpha)
             if epilogue_bias is not None:
                 out.add_(epilogue_bias)
             result = out
@@ -1103,7 +1097,7 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
             if epilogue_bias is not None:
                 result = result + epilogue_bias.float()
             if accumulate:
-                result = result + beta * out.float().reshape(result.shape)
+                result = result + beta * out.float()
             result = result.to(out.dtype if out is not None else (out_dtype or product.dtype))
 
     bias_grad = None
@@ -1114,7 +1108,7 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
 
     if out is not None:
         if result is not out:
-            out.copy_(result.reshape(out.shape))
+            out.copy_(result)
         # TE expects (gemm_out, bias_grad, gelu_input, extra_output)
         return (out, bias_grad, None, extra_output)
     return (result, bias_grad, None, extra_output)

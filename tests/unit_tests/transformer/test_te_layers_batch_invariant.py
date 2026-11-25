@@ -168,6 +168,13 @@ _GEMM_CASES = {
         ((96, 128), _FP32),
         [dict(layout="NT", grad=True), dict(accumulate=True, layout="NT", grad=True)],
     ),
+    # A weight gradient into a bf16 main_grad (--grad-reduce-in-bf16), added in place.
+    "wgrad-bf16": (
+        (64, 128),
+        (64, 96),
+        ((96, 128), _BF16),
+        [dict(accumulate=True, layout="NT", grad=True)],
+    ),
     # A scaled linear plus bias, added into a scaled bf16 residual.
     "alpha-beta-bias": (
         (96, 128),
@@ -182,8 +189,8 @@ _GEMM_CASES = {
 @pytest.mark.parametrize("case", list(_GEMM_CASES))
 def test_bik_te_general_gemm_honors_accumulate_alpha_beta(case):
     """The batch-invariant general_gemm computes TE's alpha * op(A) @ op(B) + bias + beta * out,
-    adding into out instead of overwriting it. Into fp32 it adds exactly the bf16 product that
-    the same call without accumulate returns."""
+    adding into out instead of overwriting it. Into fp32 or a bf16 main_grad it adds exactly the
+    bf16 product that the same call without accumulate returns, rounded once."""
     import transformer_engine.pytorch.cpp_extensions as te_cpp
 
     torch.manual_seed(5)
@@ -211,11 +218,11 @@ def test_bik_te_general_gemm_honors_accumulate_alpha_beta(case):
     # bf16 before it is scaled and added, TE's is not.
     scale = reference.float().abs().max().item()
     torch.testing.assert_close(actual.float(), reference.float(), rtol=0, atol=2**-6 * scale)
-    if out_dtype == _FP32:
+    if out_dtype == _FP32 or case == "wgrad-bf16":
         expected = out0
         for product, kwargs in zip(products, calls):
-            kept = expected if kwargs.get("accumulate") else 0.0
-            expected = kept + product.float().reshape(out_shape)
+            kept = expected.float() if kwargs.get("accumulate") else 0.0
+            expected = (kept + product.float().reshape(out_shape)).to(out_dtype)
         assert torch.equal(actual, expected)
 
 
