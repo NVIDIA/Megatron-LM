@@ -43,12 +43,9 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
-from megatron.core.transformer.fsdp_dtensor_checkpoint import (
-    handle_experts_in_state_dict,
-    handle_pipeline_layers_in_state_dict,
-    handle_swiglu_in_state_dict,
-)
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.checkpointing import preprocess_fsdp_dtensor_state_dict
+from megatron.training.training import wrap_model_chunks_with_ddp
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
     run_forward_backward_on_microbatches,
@@ -497,7 +494,7 @@ def test_metadata_attach_issues_no_collectives(
     assert model_state_dict.keys() == dict(model.named_parameters()).keys()
 
 
-@pytest.mark.parametrize("topology", ["fsdp", "hsdp", "hfsdp", "pp2"])
+@pytest.mark.parametrize("topology", ["fsdp", "hsdp", "hfsdp", "pp2", "vpp2"])
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
 @pytest.mark.parametrize("activation", ["gelu", "swiglu"])
 @pytest.mark.parametrize(("optimizer_name", "layer_pattern"), [("adam", "*E"), ("muon", "*-*E")])
@@ -514,32 +511,34 @@ def test_ep_fsdp_checkpoint_roundtrip(
 
     Use MCore's existing global expert names and optimizer checkpoint format.
     EP=1 is the positive control; EP>1 exercises separate dense and expert-DP meshes.
-    HSDP and HFSDP add a dense outer DP axis that replicates or shards the optimizer state; PP=2
-    gives each stage its own layers, which the checkpoint must name globally.
+    HSDP and HFSDP add a dense outer DP axis that replicates or shards the optimizer state. PP=2
+    gives each stage its own layers, which the checkpoint must name globally; VPP=2 also gives
+    each rank two model chunks.
     """
     world_size, rank = Utils.world_size, Utils.rank
     outer_size = 2 if topology in ("hsdp", "hfsdp") else 1
-    pp_size = 2 if topology == "pp2" else 1
+    pp_size = 2 if topology in ("pp2", "vpp2") else 1
+    vpp_size = 2 if topology == "vpp2" else 1
     if topology != "fsdp" and ep_size == 4:
         pytest.skip("HSDP, HFSDP, and PP are covered with EP=1 and EP=2.")
     if world_size % (ep_size * outer_size * pp_size):
         pytest.skip(f"world_size {world_size} is incompatible with {topology} and EP={ep_size}.")
     if optimizer_name == "muon":
         pytest.importorskip("emerging_optimizers")
-    # Each PP stage holds one copy of the layer pattern.
-    layer_pattern = "|".join([layer_pattern] * pp_size)
+    # Each (virtual) pipeline stage holds one copy of the layer pattern.
+    layer_pattern = "|".join([layer_pattern] * pp_size * vpp_size)
 
     Utils.initialize_model_parallel(
         1,
         pp_size,
+        2 if vpp_size > 1 else None,
         expert_model_parallel_size=ep_size,
         num_distributed_optimizer_instances=outer_size,
     )
     try:
         device = torch.device("cuda", torch.cuda.current_device())
         groups = ProcessGroupCollection.use_mpu_process_groups()
-        is_first_stage = groups.pp.rank() == 0
-        is_last_stage = groups.pp.rank() == pp_size - 1
+        pp_rank = groups.pp.rank()
 
         def build(seed):
             torch.manual_seed(seed)
@@ -547,6 +546,7 @@ def test_ep_fsdp_checkpoint_roundtrip(
             config = TransformerConfig(
                 num_layers=len(layer_pattern.replace("|", "")),
                 pipeline_model_parallel_size=pp_size,
+                virtual_pipeline_model_parallel_size=vpp_size if vpp_size > 1 else None,
                 pipeline_dtype=torch.bfloat16,
                 hidden_size=64,
                 num_attention_heads=4,
@@ -571,19 +571,25 @@ def test_ep_fsdp_checkpoint_roundtrip(
                 attention_dropout=0.0,
                 attention_backend=AttnBackend.unfused,
             )
-            model = HybridModel(
-                config=config,
-                hybrid_stack_spec=hybrid_stack_spec,
-                vocab_size=128,
-                max_sequence_length=8,
-                hybrid_layer_pattern=layer_pattern,
-                pre_process=is_first_stage,
-                post_process=is_last_stage,
-                pg_collection=groups,
-            ).cuda()
-            model = FullyShardedDataParallel(
-                config=config,
-                ddp_config=DistributedDataParallelConfig(
+            chunks = [
+                HybridModel(
+                    config=config,
+                    hybrid_stack_spec=hybrid_stack_spec,
+                    vocab_size=128,
+                    max_sequence_length=8,
+                    hybrid_layer_pattern=layer_pattern,
+                    pre_process=pp_rank == 0 and vp_stage == 0,
+                    post_process=pp_rank == pp_size - 1 and vp_stage == vpp_size - 1,
+                    pg_collection=groups,
+                    vp_stage=vp_stage if vpp_size > 1 else None,
+                ).cuda()
+                for vp_stage in range(vpp_size)
+            ]
+            # Chunks share one FSDP context, as in training.
+            chunks = wrap_model_chunks_with_ddp(
+                chunks,
+                config,
+                DistributedDataParallelConfig(
                     use_megatron_fsdp=True,
                     megatron_fsdp_version=2,
                     use_distributed_optimizer=True,
@@ -594,7 +600,7 @@ def test_ep_fsdp_checkpoint_roundtrip(
                     num_distributed_optimizer_instances=outer_size,
                     outer_dp_sharding_strategy="optim" if topology == "hfsdp" else "no_shard",
                 ),
-                module=model,
+                DP=FullyShardedDataParallel,
                 pg_collection=groups,
             )
             # Adam keeps BF16 precision-aware moments; Muon uses the config defaults.
@@ -619,50 +625,46 @@ def test_ep_fsdp_checkpoint_roundtrip(
                     muon_split_qkv=False,
                     **adam_state,
                 ),
-                [model],
+                chunks,
                 use_gloo_process_groups=False,
             )
-            return model, optimizer
+            return chunks, optimizer
 
         source, source_optimizer = build(seed=123)
         torch.manual_seed(4321 + rank)
         ids = torch.randint(0, 128, (2, 8), device=device)
         pos = torch.arange(8, device=device).repeat(2, 1)
         target = torch.randn(2, 8, 128, device=device)
-        # Later PP stages train on their own input and target, so every stage trains alone.
-        stage_input = torch.randn(8, 2, 64, device=device, dtype=torch.bfloat16)
+        # Chunks after the first train on their own input, so every chunk trains alone.
+        chunk_input = torch.randn(8, 2, 64, device=device, dtype=torch.bfloat16)
 
-        def train(model, optimizer):
+        def train(chunks, optimizer):
             def forward():
-                if not is_first_stage:
-                    model.module.set_input_tensor(stage_input)
-                output = model(input_ids=ids, position_ids=pos, attention_mask=None)
-                expected = target if is_last_stage else torch.zeros_like(output)
-                return torch.nn.functional.mse_loss(output.float(), expected.float())
+                loss = 0
+                for chunk in chunks:
+                    if not chunk.module.pre_process:
+                        chunk.module.set_input_tensor(chunk_input)
+                    output = chunk(input_ids=ids, position_ids=pos, attention_mask=None)
+                    expected = target if chunk.module.post_process else torch.zeros_like(output)
+                    loss = loss + torch.nn.functional.mse_loss(output.float(), expected.float())
+                return loss
 
             losses = []
             for _ in range(5):
-                model.zero_grad_buffer()
+                for chunk in chunks:
+                    chunk.zero_grad_buffer()
                 optimizer.zero_grad()
-                (loss,) = run_forward_backward_on_microbatches(model, forward)
+                (loss,) = run_forward_backward_on_microbatches(chunks[0], forward)
                 success, _, _ = optimizer.step()
                 assert success
                 dist.all_reduce(loss, op=dist.ReduceOp.AVG)
                 losses.append(loss)
             return losses
 
-        def checkpoint_state(model, optimizer_state):
-            state = {"model": model.state_dict_for_save_checkpoint(), "optimizer": optimizer_state}
-            if model.config.gated_linear_unit:
-                state["model"], state["optimizer"] = handle_swiglu_in_state_dict(
-                    model.module, state["model"], state["optimizer"]
-                )
-            state["model"] = handle_experts_in_state_dict(
-                state["model"], model.config.num_moe_experts
-            )
-            state["model"] = handle_pipeline_layers_in_state_dict(model.module, state["model"])
-            preprocess_state_dict_for_uneven_dtensor(state)
-            return state
+        def checkpoint_state(chunks, model_states, optimizer_state):
+            sections = ["model"] if len(chunks) == 1 else [f"model{i}" for i in range(len(chunks))]
+            state = dict(zip(sections, model_states), optimizer=optimizer_state)
+            return preprocess_fsdp_dtensor_state_dict(chunks[0].config, state, chunks)
 
         train(source, source_optimizer)
         with TempNamedDir(
@@ -670,16 +672,20 @@ def test_ep_fsdp_checkpoint_roundtrip(
             / f"{topology}_ep{ep_size}_{optimizer_name}_{activation}_mcore_roundtrip",
             sync=True,
         ) as path:
+            source_states = [chunk.state_dict_for_save_checkpoint() for chunk in source]
             dcp.save(
-                checkpoint_state(source, source_optimizer.sharded_state_dict({})),
+                checkpoint_state(source, source_states, source_optimizer.sharded_state_dict({})),
                 checkpoint_id=path,
             )
             destination, destination_optimizer = build(seed=987)
-            raw_model_state = destination.state_dict_for_save_checkpoint()
+            raw_model_states = [chunk.state_dict_for_save_checkpoint() for chunk in destination]
             raw_optimizer_state = destination_optimizer.sharded_state_dict({}, is_loading=True)
-            state = checkpoint_state(destination, raw_optimizer_state)
-            dcp.load(state, checkpoint_id=path)
-            destination.load_state_dict(raw_model_state)
+            dcp.load(
+                checkpoint_state(destination, raw_model_states, raw_optimizer_state),
+                checkpoint_id=path,
+            )
+            for chunk, raw_model_state in zip(destination, raw_model_states):
+                chunk.load_state_dict(raw_model_state)
             destination_optimizer.load_state_dict(raw_optimizer_state)
 
         expected_losses = train(source, source_optimizer)
