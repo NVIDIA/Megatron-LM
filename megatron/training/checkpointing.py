@@ -3403,7 +3403,7 @@ def load_checkpoint(
             sharded_state_dict['opt_param_scheduler'] = opt_param_scheduler.state_dict()
         load_kwargs['sharded_state_dict'] = sharded_state_dict
     elif load_format == 'fsdp_dtensor':
-        reader = FileSystemReader(_get_load_checkpoint_path(load_dir, checkpoint))
+        reader = FileSystemReader(get_load_checkpoint_path(load_dir, checkpoint))
         # Layout comes from the checkpoint's saved run config; checkpoints without one fall back
         # to the active run's policy.
         load_dp_rng_states = _checkpoint_has_per_dp_rng_states(
@@ -3513,6 +3513,11 @@ def load_checkpoint(
     # --load-main-params-from-ckpt observes the same rows as model.load_state_dict.
     if not checkpoint_config_read:
         checkpoint_config = _read_checkpoint_run_config(state_dict, checkpoint_name, ckpt_type)
+    # Legacy ('torch') loads skip the torch_dist/fsdp_dtensor branches that set this earlier.
+    load_dp_rng_states = _checkpoint_has_per_dp_rng_states(
+        checkpoint_config,
+        default=cfg.checkpoint.save_rng_state_per_dp_rank or cfg.rng.data_parallel_random_init,
+    )
     validate_glu_layout(state_dict, release)
     state_dict = prepare_glu_checkpoint_for_load(state_dict, args)
 
