@@ -2023,21 +2023,18 @@ def _localize_redundant_extra_states(state_dict):
 
 
 def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
-    """Map ``raw_state_dict`` of the model chunks ``model`` to the fsdp_dtensor format on disk.
-
-    Each chunk's section (``model``, or ``model0``, ``model1``, ... with virtual pipeline stages)
-    is handled with that chunk. Pipeline layers take their global names, as in torch_dist.
-    """
     state_dict = raw_state_dict.copy()
-    sections = ['model'] if len(model) == 1 else [f'model{i}' for i in range(len(model))]
-    for section, chunk in zip(sections, model):
+    # Each model chunk has its own section: model, or model0, model1, ... with virtual pipeline
+    # stages. Pipeline layers get their global names, as in torch_dist.
+    for i, chunk in enumerate(model):
+        section = 'model' if len(model) == 1 else f'model{i}'
         if section not in state_dict:
             continue
-        handle_fp8_extra_state_case(state_dict[section])
         state_dict[section] = handle_pipeline_layers_in_state_dict(chunk, state_dict[section])
+        handle_fp8_extra_state_case(state_dict[section])
 
         def apply(handler):
-            """Run a state dict handler over the section and, when present, the optimizer state."""
+            """Run a state dict handler over the model and, when present, the optimizer state."""
             model_state_dict, optimizer_state_dict = handler(
                 chunk, state_dict[section], state_dict.get('optimizer')
             )
@@ -2571,7 +2568,6 @@ def _load_base_checkpoint(
         if raw_optimizer_state_dict is not None:
             state_dict['optimizer'] = raw_optimizer_state_dict
 
-        # Hand back each chunk's section under the names the chunk loads.
         state_dict.update(raw_model_state_dicts)
     else:
         raise NotImplementedError(f'checkpoint format {ckpt_format} not supported')
