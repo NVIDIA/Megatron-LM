@@ -132,7 +132,7 @@ class TestCreateCheckpointManager:
         with (
             patch.object(target_allowlist, "is_allowed", return_value=True),
             patch("importlib.import_module") as import_module,
-        ) as import_module:
+        ):
             with pytest.raises(ValueError, match="not allowed"):
                 cm.create_checkpoint_manager(_config("torch.hub.load"))
 
