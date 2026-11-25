@@ -67,6 +67,7 @@ def test_sft_preserves_pack_level_truncation():
     assert sample["tokens"].tolist() == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 1, 2]
     assert sample["labels"].tolist() == [2, 3, 4, 5, 6, 7, 8, 9, 10, 1, 2, 0]
     assert sample["cu_seqlens"][:3].tolist() == [0, 10, 12]
+    assert sample["packed_seqlen_stats"].tolist() == [12, 10**2 + 2**2]
     assert sample["loss_mask"].tolist() == [1] * 11 + [0]
 
     # Mock samples also retain tokens beyond sequence_length when the pack fits them.
@@ -78,6 +79,7 @@ def test_sft_preserves_pack_level_truncation():
     sample = mock_dataset[0]
     assert sample["tokens"].tolist() == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 99, 0]
     assert sample["labels"].tolist() == [2, 3, 4, 5, 6, 7, 8, 9, 10, 99, 0, 0]
+    assert sample["packed_seqlen_stats"].tolist() == [11, 11**2]
 
 
 MODEL_ARGV = (

@@ -24,11 +24,12 @@ from megatron.training.argument_utils import (
     core_transformer_config_from_args,
     gpt_data_config_from_args,
     hybrid_config_from_args,
+    model_config_from_args,
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import add_megatron_arguments, parse_args, validate_args
 from megatron.training.config import PretrainConfigContainer
-from megatron.training.models import BertModelConfig
+from megatron.training.models import BertModelConfig, HybridModelConfig
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
@@ -100,6 +101,30 @@ def test_sft_context_parallel_checks_pack_width_not_truncation_limit(monkeypatch
     cfg.validate()
     assert cfg.data.dataset.sequence_length == 33
     assert cfg.model.transformer.max_seq_length_per_sample == 64
+
+
+@pytest.mark.parametrize("is_hybrid", [False, True], ids=["uniform", "hybrid-config-list"])
+def test_uneven_pipeline_split_requires_hybrid_model(monkeypatch, is_hybrid):
+    args = _minimal_training_args(monkeypatch)
+    args.world_size = 2
+    args.rank = 0
+    args.pipeline_model_parallel_size = 2
+    args.num_layers = 3
+    args.is_hybrid_model = is_hybrid
+
+    with nullcontext() if is_hybrid else pytest.raises(AssertionError, match="divisible by"):
+        validate_args(args)
+
+    if is_hybrid:
+        assert isinstance(model_config_from_args(args), HybridModelConfig)
+
+
+def test_hybrid_cli_rejects_inferring_virtual_stages_from_layer_count(monkeypatch):
+    args = _minimal_training_args(monkeypatch)
+    args.is_hybrid_model = True
+    args.num_layers_per_virtual_pipeline_stage = 1
+    with pytest.raises(ValueError, match="--num-virtual-stages-per-pipeline-rank"):
+        validate_args(args)
 
 
 @pytest.mark.parametrize("version", [1, 2])

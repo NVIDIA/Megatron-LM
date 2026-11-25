@@ -36,15 +36,20 @@ class ExternalGainLayer(MegatronModule):
         )
         self.last_forward_inputs = None
 
-    @classmethod
     def estimate_flops(
-        cls,
-        config: TransformerConfig,
+        self,
         *,
         total_real_tokens_in_batch: float,
         seqlen_squared_sum_in_batch: float,
+        include_backward: bool = False,
     ) -> float:
-        return total_real_tokens_in_batch * config.hidden_size
+        """Count one multiply per element, plus input and parameter gradients if requested."""
+        forward = total_real_tokens_in_batch * self.config.hidden_size
+        if not include_backward:
+            return forward
+        # Each channel sums its per-token products into one gain gradient.
+        reduction_adds = max(total_real_tokens_in_batch - 1, 0) * self.config.hidden_size
+        return 3 * forward + reduction_adds
 
     def forward(
         self,

@@ -660,7 +660,7 @@ _TOPOLOGY_8GPU_PARAMS = [
 
 
 class TestAccumulatorTopology:
-    """End-to-end correctness across the (TP, CP, PP, DP) matrix on 8 GPUs.
+    """End-to-end correctness across model- and data-parallel topologies.
 
     Production invariant: within one DP group all ranks (TP * CP * PP of them)
     see the SAME ``cu_seqlens`` because it is broadcast across the
@@ -669,8 +669,6 @@ class TestAccumulatorTopology:
     rank, and asserts the deduplicated global sum matches the closed-form
     expectation. Catches regressions where any of TP/CP/PP is dropped from the
     dedup factor.
-
-    Skipped unless launched with ``torchrun --nproc_per_node 8``.
     """
 
     def setup_method(self):
@@ -681,6 +679,79 @@ class TestAccumulatorTopology:
 
         _reset_seqlen_accumulator()
         Utils.destroy_model_parallel()
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.parametrize("vpp,cp", [(2, 1), (None, 2), (2, 2)], ids=["vpp", "cp", "vpp-cp"])
+    def test_hybrid_packed_flops_stats(self, vpp, cp, run_config, monkeypatch):
+        from unittest.mock import Mock
+
+        import pretrain_hybrid
+        from megatron.core.datasets.data_schedule import wrap_data_iterator
+        from megatron.core.process_groups_config import ProcessGroupCollection
+        from megatron.training.datasets.sft_dataset import SFTDataset, SFTDatasetConfig
+        from tests.unit_tests.test_utilities import Utils
+
+        if Utils.world_size != 4:
+            pytest.skip("requires four ranks")
+        pp = 2 if vpp else 1
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=2 if cp == 1 else 1,
+            pipeline_model_parallel_size=pp,
+            virtual_pipeline_model_parallel_size=vpp,
+            context_parallel_size=cp,
+        )
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        run_config.train.micro_batch_size = 1
+        config = run_config.model.transformer
+        config.tensor_model_parallel_size = pg.tp.size()
+        config.pipeline_model_parallel_size = pp
+        config.microbatch_group_size_per_vp_stage = pp
+        config.virtual_pipeline_model_parallel_size = vpp
+        config.context_parallel_size = cp
+        config.max_seqlen_per_dp_cp_rank = 8
+        documents = [torch.arange(1, 4), torch.arange(1, 5)]
+        tokenizer = Mock(pad=0, eod=99)
+        tokenizer.tokenize_conversation.side_effect = [(doc, doc) for doc in documents]
+        run_config.data.dataset = SFTDatasetConfig(
+            sequence_length=12,
+            random_seed=1,
+            tokenizer=tokenizer,
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
+            create_attention_mask=False,
+        )
+        monkeypatch.setattr(pretrain_hybrid, "get_timers", Mock())
+
+        dataset = object.__new__(SFTDataset)
+        dataset.config = run_config.data.dataset
+        dataset.dataset = [[{"role": "system"}, {"role": "system"}]]
+        dataset.indices = [0]
+        dataset.padding_divisor = 4
+        sample = torch.utils.data.default_collate([dataset[0]])
+        stages = range(vpp) if vpp else (None,)
+        # The three- and four-token documents occupy four and eight physical positions.
+        expected = (7 * pg.dp.size(), 25 * pg.dp.size())
+        for scheduler in (None, "dp_balanced"):
+            config.sequence_packing_scheduler = scheduler
+            iterators = [iter([sample.copy()]) if pg.tp.rank() == 0 else None for _ in stages]
+            count = 1
+            if scheduler is not None:
+                packed, count, real_tokens, squared_lengths = wrap_data_iterator(
+                    iterators if vpp else iterators[0], config, count, pg
+                )
+                training_module.set_seqlen_stats_in_iteration(real_tokens, squared_lengths)
+                iterators = packed if vpp else [packed]
+            else:
+                # Validation uses the same forward step before training resumes.
+                model = Mock(vp_stage=stages[0], pg_collection=pg, training=False)
+                pretrain_hybrid.forward_step(iter([sample.copy()]), model)
+            for stage, iterator in zip(stages, iterators):
+                model = Mock(vp_stage=stage, pg_collection=pg, training=True)
+                for _ in range(count):
+                    pretrain_hybrid.forward_step(iterator, model)
+
+            assert consume_seqlen_stats_in_iteration() == expected, scheduler
 
     @pytest.mark.parametrize("tp,cp,pp", _TOPOLOGY_8GPU_PARAMS)
     def test_dedup_across_topology(self, tp, cp, pp):
@@ -1124,6 +1195,8 @@ class TestDSAHelperEdgeCases:
 
         assert _dsa_sparse_core_scale(0, 0, 2048) == 1.0
         assert _dsa_sparse_core_scale(512, 512 * 4096, None) == 1.0
+        # Packed lengths 1 and 2 both fit inside a 128-key window.
+        assert _dsa_sparse_core_scale(3, 5, 128) == 1.0
 
     def test_hybrid_dsa_variant_attribute_ignored(self):
         """Hybrid DSA accounting keys off the 'D' symbols in the layer

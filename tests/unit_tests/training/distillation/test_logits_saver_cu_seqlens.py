@@ -243,3 +243,21 @@ def test_init_no_note_when_not_packed(tmp_path, monkeypatch):
     LogitsSaverHooks(save_dir=str(tmp_path), k=4)
 
     assert not any("context-parallel" in m for m in messages)
+
+
+def test_hook_skips_mtp_outputs_using_model_depth(tmp_path, monkeypatch):
+    _patch_init_deps(monkeypatch, cp_size=1, sft=False)
+    saver = LogitsSaverHooks(save_dir=str(tmp_path), k=4)
+    model = SimpleNamespace(
+        config=SimpleNamespace(mtp_num_layers=2), output_layer=torch.nn.Identity()
+    )
+    captured = []
+    monkeypatch.setattr(saver, "_process_single_microbatch", captured.append)
+    monkeypatch.setattr(logits_saver, "get_num_microbatches", lambda: 1)
+
+    saver.attach_hooks(model)
+    for value in range(6):
+        model.output_layer(torch.tensor(value))
+    saver.remove_hooks()
+
+    assert [logit.item() for logit in captured] == [2, 5]

@@ -45,7 +45,7 @@ from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
     learned_output_contract,
 )
-from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
+from megatron.core.transformer.module import MegatronModule, estimate_layer_flops, mark_keep_in_fp32
 from megatron.core.transformer.residual_recompute import (
     build_recompute_block_end_plan,
     build_recompute_layer_managers,
@@ -544,6 +544,10 @@ class HybridStack(MegatronModule):
         used by internal code to bypass the input provided by the
         forward_step_func"""
         self.input_tensor = input_tensor
+
+    def estimate_flops(self, **kwargs) -> float:
+        """Sum the layers executed on this pipeline chunk, including shortcut pairs."""
+        return sum(estimate_layer_flops(layer, **kwargs) for layer in self.physical_layers())
 
     def physical_layers(self) -> tuple[nn.Module, ...]:
         """Return one layer per layer_type_list entry, in execution order.

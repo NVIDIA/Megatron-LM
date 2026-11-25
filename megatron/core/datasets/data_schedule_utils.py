@@ -207,9 +207,7 @@ def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.
                 continue
             for key in ["tokens", "labels", "loss_mask", "position_ids"]:
                 sub_sample_dict[key] = sample[key][start_idx:end_idx]
-            # Since sft_dataset.py does not provide cu_seqlens_original,
-            # we assume original_seq_len equals padded_seq_len here.
-            # Ideally the dataset should define the pre-padding seq_len.
+            # Preserve the pre-packed sample's physical document layout when rerouting it.
             seq_len = (end_idx - start_idx).item()
             original_seq_lens.append(seq_len)
             padded_seq_lens.append(seq_len)
@@ -647,11 +645,38 @@ def get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
     return batch, global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered
 
 
+def get_local_real_seqlen_stats(batch, dev):
+    """Sum real lengths and their squares across input samples before repacking."""
+    lengths = []
+    packed_stats = []
+    for sample in batch:
+        if "packed_seqlen_stats" in sample:
+            packed_stats.append(sample["packed_seqlen_stats"].reshape(-1, 2))
+        elif "cu_seqlens" in sample:
+            lengths.append(sample["cu_seqlens"].diff(dim=-1).reshape(-1))
+        else:
+            length = sample.get("original_seq_len", sample.get("padded_seq_len"))
+            lengths.append(length.reshape(-1))
+
+    if packed_stats:
+        stats = (
+            torch.cat(packed_stats)
+            .sum(dim=0)
+            .to(device=dev, dtype=torch.float64, non_blocking=True)
+        )
+    else:
+        stats = torch.zeros(2, dtype=torch.float64, device=dev)
+    if lengths:
+        seqlens = torch.cat(lengths).to(device=dev, dtype=torch.float64, non_blocking=True)
+        stats += torch.stack((seqlens.sum(), seqlens.square().sum()))
+    return stats
+
+
 def get_global_real_seqlen_stats(batch, dp_group, dev) -> Tuple[float, float]:
     """Sum the real (unpadded) sub-sample lengths of the global batch and their squares.
 
     Args:
-        batch: This DP rank's sub-samples as returned by :func:`get_batch_and_global_seqlens`.
+        batch: This DP rank's input samples, before packing or unpacking.
         dp_group: The DP group whose padded lengths were gathered for scheduling.
         dev: Device for the reduction.
 
@@ -659,11 +684,7 @@ def get_global_real_seqlen_stats(batch, dp_group, dev) -> Tuple[float, float]:
         ``(sum_i L_i, sum_i L_i**2)`` over the real lengths ``L_i`` of every sub-sample in
         ``dp_group``, as expected by ``num_floating_point_operations``.
     """
-    seqlens = [sample["original_seq_len"].reshape(-1) for sample in batch]
-    seqlens = (torch.cat(seqlens) if seqlens else torch.zeros(0)).to(
-        device=dev, dtype=torch.float64
-    )
-    stats = torch.stack((seqlens.sum(), seqlens.square().sum()))
+    stats = get_local_real_seqlen_stats(batch, dev)
     if dp_group.size() > 1:
         torch.distributed.all_reduce(stats, group=dp_group)
     seqlen_sum, seqlen_squared_sum = stats.tolist()

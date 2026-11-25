@@ -70,6 +70,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     is_gated_delta_net_variant,
     is_linear_attention_variant,
 )
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.msc_utils import maybe_msc
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
@@ -174,7 +175,7 @@ from megatron.training.logging.packed_sequence_stats import (
     consume_packed_sequence_stats_in_iteration,
     update_packed_sequence_stats,
 )
-from megatron.training.models import ModelConfig, T5ModelConfig
+from megatron.training.models import HybridModelConfig, ModelConfig, T5ModelConfig
 from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
 
 # Local.
@@ -735,9 +736,15 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     the all-reduce; BSHD callers that never invoke this function leave the
     flag at ``False`` and pay zero collective cost.
     """
-    global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
     if cu_seqlens is None or cu_seqlens.numel() < 2:
         return
+    lengths = cu_seqlens.diff().to(dtype=torch.float64)
+    accumulate_seqlen_stats(torch.stack((lengths.sum(), lengths.square().sum())))
+
+
+def accumulate_seqlen_stats(stats):
+    """Add a microbatch's real token count and sum of squared document lengths."""
+    global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
     # Pin the accumulator to the current CUDA device when available so the
     # eventual all-reduce can use NCCL even if a caller passed a CPU tensor
     # (e.g. unit tests). Production always supplies a CUDA tensor.
@@ -745,14 +752,10 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
         device = (
             torch.device(f'cuda:{torch.cuda.current_device()}')
             if torch.cuda.is_available()
-            else cu_seqlens.device
+            else stats.device
         )
         _seqlen_stats_in_iteration = torch.zeros(2, dtype=torch.float64, device=device)
-    seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(
-        device=_seqlen_stats_in_iteration.device, dtype=torch.float64
-    )
-    _seqlen_stats_in_iteration[0] += seqlens.sum()
-    _seqlen_stats_in_iteration[1] += (seqlens * seqlens).sum()
+    _seqlen_stats_in_iteration += stats.to(_seqlen_stats_in_iteration)
     _seqlen_stats_active = True
     _seqlen_stats_are_global = False
 
@@ -844,6 +847,36 @@ def _dsv4_attention_flops(transformer_cfg, layer_counts, total_tokens, seqlen_sq
     return 3 * forward
 
 
+def _hybrid_model_flops(hybrid_models, **kwargs):
+    """Combine local chunk estimates across PP, without counting TP/DP replicas."""
+    error = None
+    try:
+        flops = float(
+            sum(model.estimate_flops(include_backward=True, **kwargs) for model in hybrid_models)
+        )
+        if not math.isfinite(flops) or flops < 0:
+            raise ValueError("The local model returned an invalid FLOP estimate.")
+    except Exception as exc:
+        # Every PP rank must enter the collective even if a local layer cannot estimate.
+        error = exc
+        flops = float("nan")
+    pp_group = hybrid_models[0].pg_collection.pp
+    if pp_group is not None and torch.distributed.get_world_size(pp_group) > 1:
+        device = (
+            torch.cuda.current_device()
+            if torch.distributed.get_backend(pp_group) == "nccl"
+            else "cpu"
+        )
+        total = torch.tensor(flops, dtype=torch.float64, device=device)
+        torch.distributed.all_reduce(total, group=pp_group)
+        flops = total.item()
+    if error is not None:
+        raise error
+    if not math.isfinite(flops) or flops < 0:
+        raise ValueError("A pipeline stage returned an invalid FLOP estimate or could not estimate.")
+    return flops
+
+
 def num_floating_point_operations(
     model_config,
     batch_size,
@@ -851,6 +884,7 @@ def num_floating_point_operations(
     sequence_length,
     seqlen_squared_sum_in_batch=None,
     total_real_tokens_in_batch=None,
+    hybrid_models=None,
 ):
     """Compute the number of floating-point operations for one global batch.
 
@@ -877,7 +911,34 @@ def num_floating_point_operations(
             than ``batch_size * llm_seq_length`` whenever the dataloader added
             CP-alignment padding or end-of-sequence padding, so neither kind of
             padding shows up in the reported FLOPs.
+        hybrid_models: All local, unwrapped HybridModel chunks. Hybrid training and
+            config-list estimates require the constructed chunks. Standalone callers
+            can estimate a legacy pattern from its config alone.
     """
+    llm_seq_length = sequence_length
+    if isinstance(model_config, T5ModelConfig) and model_config.decoder_seq_length is not None:
+        # Preserve T5's decoder-based estimate without exposing it to pipeline sizing.
+        llm_seq_length = model_config.decoder_seq_length
+    # Defaults: BSHD layout assumption (full causal mask, every sample length =
+    # llm_seq_length, no padding). For BSHD ``total_real_tokens = batch * s`` and
+    # ``seqlen_squared_sum = batch * s^2`` recover the original closed-form.
+    if seqlen_squared_sum_in_batch is None:
+        seqlen_squared_sum_in_batch = batch_size * llm_seq_length * llm_seq_length
+    if total_real_tokens_in_batch is None:
+        total_real_tokens_in_batch = batch_size * llm_seq_length
+
+    if hybrid_models:
+        return _hybrid_model_flops(
+            hybrid_models,
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+        )
+    if (
+        hybrid_models is not None
+        or getattr(model_config, "hybrid_layer_config_list", None) is not None
+    ):
+        raise ValueError("Hybrid layer FLOP accounting requires constructed HybridModel chunks.")
+
     from megatron.core.transformer.attention import SelfAttention
     from megatron.core.transformer.mlp import MLP
     from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -885,10 +946,6 @@ def num_floating_point_operations(
     from megatron.training.vocab_utils import model_vocab_size
 
     transformer_cfg = model_config.transformer
-    llm_seq_length = sequence_length
-    if isinstance(model_config, T5ModelConfig) and model_config.decoder_seq_length is not None:
-        # Preserve T5's decoder-based estimate without exposing it to pipeline sizing.
-        llm_seq_length = model_config.decoder_seq_length
     group_query_attention = transformer_cfg.num_query_groups != transformer_cfg.num_attention_heads
     swiglu = (
         transformer_cfg.gated_linear_unit
@@ -900,14 +957,6 @@ def num_floating_point_operations(
         make_vocab_size_divisible_by=model_config.make_vocab_size_divisible_by,
         tensor_model_parallel_size=transformer_cfg.tensor_model_parallel_size,
     )
-
-    # Defaults: BSHD layout assumption (full causal mask, every sample length =
-    # llm_seq_length, no padding). For BSHD ``total_real_tokens = batch * s`` and
-    # ``seqlen_squared_sum = batch * s^2`` recover the original closed-form.
-    if seqlen_squared_sum_in_batch is None:
-        seqlen_squared_sum_in_batch = batch_size * llm_seq_length * llm_seq_length
-    if total_real_tokens_in_batch is None:
-        total_real_tokens_in_batch = batch_size * llm_seq_length
 
     def estimate(layer_type, config=None):
         return layer_type.estimate_flops(
@@ -2603,6 +2652,10 @@ def setup_model_and_optimizer(
 
     model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
+    primary_chunk = unwrapped_model[0]
+    if isinstance(primary_chunk, HybridModel) and primary_chunk.hybrid_layer_config_list is not None:
+        # Core can detach a shared root config before resolving MTP depth.
+        cfg.model.transformer = primary_chunk.config
 
     # Register default GTP prefetch chains and finalize capture scopes after DDP wrap, before the
     # first forward. Placed here (not in get_model) so it also covers the config-container
@@ -3437,6 +3490,61 @@ def train_step(
     )
 
 
+def _moe_loss_metric_names(*moe_configs) -> list[str]:
+    """Return the loss metrics enabled by any of the supplied router configs."""
+    routing_types = set()
+    for config in moe_configs:
+        configured_types = config.moe_router_load_balancing_type
+        if isinstance(configured_types, str):
+            routing_types.add(configured_types)
+        else:
+            routing_types.update(configured_types)
+
+    track_names = []
+    if "aux_loss" in routing_types:
+        track_names.append("load_balancing_loss")
+    if "seq_aux_loss" in routing_types:
+        track_names.append("seq_load_balancing_loss")
+    if "global_aux_loss" in routing_types:
+        track_names.append("global_load_balancing_loss")
+    if any(config.moe_z_loss_coeff is not None for config in moe_configs):
+        track_names.append("z_loss")
+    return track_names
+
+
+def _hybrid_config_list_moe_logging_metadata(model):
+    """Count built-in routers across the full config-list architecture on every PP rank."""
+    if not isinstance(model, HybridModel) or model.hybrid_layer_config_list is None:
+        return None
+
+    from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
+
+    moe_configs = [
+        entry for entry in model.hybrid_layer_config_list if type(entry) is MoELayerConfig
+    ]
+    num_moe_layers = len(moe_configs)
+    if model.config.mtp_use_repeated_layer and model.mtp_num_depths > 1:
+        # The source list includes every depth, but shared routers contribute only once.
+        routers_per_depth = sum(
+            type(entry) is MoELayerConfig for entry in model.mtp_layer_config_list
+        )
+        num_moe_layers -= (model.mtp_num_depths - 1) * routers_per_depth
+    layers = model.config.num_layers + model.mtp_num_depths
+    num_hash_layers = max(model.config.moe_num_hash_layers, 0)
+    return _moe_loss_metric_names(*moe_configs), layers, num_moe_layers, num_hash_layers
+
+
+def _hybrid_model_chunks_for_runtime_metrics(model, model_config):
+    """Return the local chunks when training a HybridModel."""
+    if model:
+        chunks = unwrap_model(model)
+        if isinstance(chunks[0], HybridModel):
+            return chunks
+    if isinstance(model_config, HybridModelConfig):
+        raise ValueError("Hybrid training requires constructed HybridModel chunks to estimate FLOPs.")
+    return None
+
+
 def _get_indexer_logging_layer_counts(model_config) -> tuple[int, int | None]:
     """Return tracker slots and active CSA indexer modules for loss logging."""
     transformer_cfg = model_config.transformer
@@ -3484,8 +3592,16 @@ def training_log(
     packed_sequence_stats: Optional[Dict[str, float]] = None,
     num_microbatches: int | None = None,
     embedding_min_norm_metrics: Dict[str, float] | None = None,
+    moe_logging_metadata: tuple[list[str], int, int, int] | None = None,
+    num_floating_point_operations_in_batch: float | None = None,
 ):
-    """Log training information such as losses, timing, ...."""
+    """Log training information such as losses, timing, ....
+
+    ``moe_logging_metadata`` contains metric names, tracker size, MoE layer count,
+    and the main-stack hash-router count. If omitted, use the model config
+    metadata. Compute batch FLOPs only if no count is supplied. Hybrid training
+    uses the constructed model chunks.
+    """
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     train_state = get_train_state()
@@ -3656,17 +3772,13 @@ def training_log(
         callback_manager.trigger("on_tensorboard_log")
     # Log MoE metrics.
     moe_log_string = ""
-    if cfg.model.transformer.num_moe_experts is not None:
-        moe_loss_scale = 1 / (num_microbatches or get_num_microbatches())
-        track_names = []
-        if "aux_loss" in cfg.model.transformer.moe_router_load_balancing_type:
-            track_names.append("load_balancing_loss")
-        if "seq_aux_loss" in cfg.model.transformer.moe_router_load_balancing_type:
-            track_names.append("seq_load_balancing_loss")
-        if "global_aux_loss" in cfg.model.transformer.moe_router_load_balancing_type:
-            track_names.append("global_load_balancing_loss")
-        if cfg.model.transformer.moe_z_loss_coeff is not None:
-            track_names.append("z_loss")
+    num_moe_layers = 0
+    if moe_logging_metadata is None and model:
+        moe_logging_metadata = _hybrid_config_list_moe_logging_metadata(unwrap_model(model[0]))
+    if moe_logging_metadata is not None:
+        track_names, layers, num_moe_layers, num_hash_layers = moe_logging_metadata
+    elif cfg.model.transformer.num_moe_experts is not None:
+        track_names = _moe_loss_metric_names(cfg.model.transformer)
 
         if is_hybrid_model(cfg.model):
             from megatron.core.models.hybrid.hybrid_layer_allocation import (
@@ -3711,6 +3823,8 @@ def training_log(
 
         layers = cfg.model.transformer.num_layers + (cfg.model.transformer.mtp_num_layers or 0)
 
+    if num_moe_layers > 0:
+        moe_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         moe_log_string = get_moe_metrics_tracker().report(
             loss_scale=moe_loss_scale,
             iteration=iteration,
@@ -3721,7 +3835,6 @@ def training_log(
             track_names=track_names,
             num_layers=layers,
             num_moe_layers=num_moe_layers,
-            moe_layer_freq=cfg.model.transformer.moe_layer_freq,
             num_hash_layers=num_hash_layers,
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
@@ -3777,13 +3890,18 @@ def training_log(
         elapsed_time_per_iteration = elapsed_time / total_iterations
         llm_world_size = cfg.get_model_world_size()
 
-        throughput = num_floating_point_operations(
-            cfg.model,
-            batch_size,
-            sequence_length=sequence_length,
-            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
-            total_real_tokens_in_batch=total_real_tokens_in_batch,
-        ) / (elapsed_time_per_iteration * 10**12 * llm_world_size)
+        if num_floating_point_operations_in_batch is None:
+            num_floating_point_operations_in_batch = num_floating_point_operations(
+                cfg.model,
+                batch_size,
+                sequence_length=sequence_length,
+                seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+                total_real_tokens_in_batch=total_real_tokens_in_batch,
+                hybrid_models=_hybrid_model_chunks_for_runtime_metrics(model, cfg.model),
+            )
+        throughput = num_floating_point_operations_in_batch / (
+            elapsed_time_per_iteration * 10**12 * llm_world_size
+        )
 
         one_logger_utils.track_e2e_metrics(cfg.logger.log_throughput, throughput)
 
@@ -3862,8 +3980,7 @@ def training_log(
                     log_string += ' {}: {:.6E} |'.format(key, avg)
                 if should_reset:
                     total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
-        if cfg.model.transformer.num_moe_experts is not None and moe_log_string:
-            log_string += moe_log_string
+        log_string += moe_log_string
         log_string += f' loss scale: {loss_scale:.1f} |'
         if grad_norm is not None:
             log_string += f' grad norm: {grad_norm:.3f} |'
@@ -4536,6 +4653,10 @@ def train(
     sequence_length = cfg.model.transformer.max_seq_length_per_sample
     timers = get_timers()
     train_state = get_train_state()
+    hybrid_models = _hybrid_model_chunks_for_runtime_metrics(model, cfg.model)
+    moe_logging_metadata = _hybrid_config_list_moe_logging_metadata(
+        hybrid_models[0] if hybrid_models else None
+    )
 
     fault_injector_config = cfg.fault_tolerance.fault_injector
 
@@ -5177,6 +5298,7 @@ def train(
             sequence_length=sequence_length,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
+            hybrid_models=hybrid_models,
         )
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
         train_state.num_floating_point_operations_so_far += num_floating_point_operations_in_batch
@@ -5250,13 +5372,13 @@ def train(
                     max_attention_logit,
                     pg_collection=model_pg_collection,
                     is_first_iteration=is_first_iteration,
-                    seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
-                    total_real_tokens_in_batch=total_real_tokens_in_batch,
                     model=model,
                     callback_manager=callback_manager,
                     packed_sequence_stats=packed_sequence_stats,
                     num_microbatches=scheduled_num_microbatches,
                     embedding_min_norm_metrics=embedding_min_norm_metrics,
+                    moe_logging_metadata=moe_logging_metadata,
+                    num_floating_point_operations_in_batch=num_floating_point_operations_in_batch,
                 )
             # OTel: close the iteration-report super-span (parents params_norm + log;
             # its own uninstrumented time is the loss_scale sync + FLOPs bookkeeping).
@@ -5297,8 +5419,7 @@ def train(
             timers('interval-time', log_level=0).start(barrier=True)
             if cfg.logger.log_energy:
                 energy_monitor.resume()
-            if cfg.model.transformer.num_moe_experts is not None:
-                get_moe_metrics_tracker().clear()
+            get_moe_metrics_tracker().clear()
 
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).
         # Some of these only happen at specific iterations. Capture updated FLOPs accumulator

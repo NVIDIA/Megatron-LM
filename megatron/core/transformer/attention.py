@@ -30,8 +30,17 @@ from megatron.core.process_groups_config import (
 )
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
-from megatron.core.transformer.utils import is_layer_window_attention
+from megatron.core.transformer.module import (
+    MegatronModule,
+    TwoStageAttentionLayer,
+    accepts_flops_config,
+    estimate_layer_flops,
+)
+from megatron.core.transformer.utils import (
+    capped_causal_attention_fraction,
+    causal_window_max_keys,
+    is_layer_window_attention,
+)
 from megatron.core.typed_torch import apply_module, copy_signature, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -1868,28 +1877,44 @@ class SelfAttention(Attention):
     and returns output of the same size.
     """
 
-    @classmethod
+    @accepts_flops_config
     def estimate_flops(
-        cls,
-        config: TransformerConfig,
+        self,
         *,
         total_real_tokens_in_batch: float,
         seqlen_squared_sum_in_batch: float,
+        include_backward: bool = False,
     ) -> float:
-        """Estimate forward QKV/output projections and causal attention, including FMA x2."""
+        """Estimate QKV/output projections and causal attention, including FMA x2."""
+        config = self.config
         hidden = config.hidden_size
         heads = config.num_attention_heads
         projection_size = config.kv_channels * heads
-        flops = (
+        projection_flops = (
             4
             * total_real_tokens_in_batch
             * projection_size
             * (hidden + hidden * config.num_query_groups / heads)
-            + 2 * seqlen_squared_sum_in_batch * projection_size
         )
         if config.attention_output_gate:
-            flops += 2 * total_real_tokens_in_batch * hidden * projection_size
-        return flops
+            projection_flops += 2 * total_real_tokens_in_batch * hidden * projection_size
+        multiplier = 3 if include_backward else 1
+        core = getattr(self, "core_attention", None)
+        core_estimate = getattr(type(core), "estimate_flops", MegatronModule.estimate_flops)
+        if core_estimate is not MegatronModule.estimate_flops:
+            return multiplier * projection_flops + estimate_layer_flops(
+                core,
+                total_real_tokens_in_batch=total_real_tokens_in_batch,
+                seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+                include_backward=include_backward,
+            )
+
+        window_keys = causal_window_max_keys(config, getattr(self, "layer_number", None))
+        support = capped_causal_attention_fraction(
+            total_real_tokens_in_batch, seqlen_squared_sum_in_batch, window_keys
+        )
+        core_flops = 2 * seqlen_squared_sum_in_batch * projection_size * support
+        return multiplier * (projection_flops + core_flops)
 
     def __init__(
         self,

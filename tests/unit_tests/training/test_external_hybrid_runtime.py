@@ -1,0 +1,412 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""Runtime integration for layers implemented outside Megatron Core."""
+
+from argparse import Namespace
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+import torch
+
+from megatron.core.models.hybrid import MTPSplit, PipelineSplit
+from megatron.core.models.hybrid.hybrid_block import HybridStack
+from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.hybrid.layers.utils import create_layer_config
+from megatron.core.ssm.gated_delta_net.kda import KimiDeltaAttention
+from megatron.core.transformer.module import Float16Module, MegatronModule
+from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
+from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
+from megatron.training import checkpointing
+from megatron.training.models.hybrid import HybridModelConfig
+from megatron.training.training import (
+    _hybrid_config_list_moe_logging_metadata,
+    _hybrid_model_chunks_for_runtime_metrics,
+    num_floating_point_operations,
+)
+from megatron.training.utils.checkpoint_utils import read_run_config
+from tests.unit_tests.models.hybrid.external_layer import ExternalGainConfig, ExternalGainLayer
+
+
+def _config(config_type=ExternalGainConfig, **kwargs):
+    return config_type(num_layers=3, hidden_size=16, num_attention_heads=2, **kwargs)
+
+
+def _bare(module_type, config, **attributes):
+    """Build only the module hierarchy; constructors would allocate CUDA model state."""
+    module = module_type.__new__(module_type)
+    MegatronModule.__init__(module, config)
+    for name, value in attributes.items():
+        setattr(module, name, value)
+    return module
+
+
+def _stack(config, layers):
+    return _bare(HybridStack, config, layers=torch.nn.ModuleList(layers))
+
+
+def _model(config, layers, *, post_process=True, pp_group=None):
+    return _bare(
+        HybridModel,
+        config,
+        decoder=_stack(config, layers),
+        mtp_process=False,
+        post_process=post_process,
+        vocab_size=32,
+        share_embeddings_and_output_weights=False,
+        output_layer=(
+            torch.nn.Linear(config.hidden_size, 32, bias=False, device="meta")
+            if post_process
+            else None
+        ),
+        pg_collection=SimpleNamespace(pp=pp_group),
+    )
+
+
+def _flops(*models, model_config=None):
+    return num_floating_point_operations(
+        model_config or HybridModelConfig(transformer=models[0].config, vocab_size=32),
+        batch_size=2,
+        sequence_length=128,
+        total_real_tokens_in_batch=7,
+        seqlen_squared_sum_in_batch=25,
+        hybrid_models=list(models),
+    )
+
+
+def test_explicit_provider_uses_resolved_hybrid_config_for_training(run_config, monkeypatch):
+    from megatron.training import training
+
+    source = _config()
+    run_config.model.transformer = source
+    chunk = _model(_config(mtp_num_layers=1), [])
+    chunk.hybrid_layer_config_list = (source, source, source, MTPSplit, source)
+    wrapped = _bare(Float16Module, chunk.config, module=chunk)
+    monkeypatch.setattr(training, "get_model", lambda provider, *args, **kwargs: [provider()])
+    args = Namespace(logits_save_dir=None, logits_load_dir=None)
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "get_timers", Mock())
+    monkeypatch.setattr(training, "get_one_logger", lambda: None)
+
+    class ReachedOptimizerSetup(Exception):
+        pass
+
+    monkeypatch.setattr(
+        training, "get_standard_config_overrides", Mock(side_effect=ReachedOptimizerSetup)
+    )
+    with pytest.raises(ReachedOptimizerSetup):
+        training.setup_model_and_optimizer(
+            training.ModelType.encoder_or_decoder, lambda: wrapped, cfg_container=run_config
+        )
+
+    assert run_config.model.transformer is chunk.config
+    assert source.mtp_num_layers is None
+
+
+@pytest.mark.parametrize("layer_flops", [0, 123, 123.5])
+def test_training_forwards_packed_sequence_counts_to_external_estimator(monkeypatch, layer_flops):
+    config = _config()
+    estimate_layer = Mock(return_value=layer_flops)
+    layer = _bare(ExternalGainLayer, config)
+    monkeypatch.setattr(layer, "estimate_flops", estimate_layer)
+    model = _model(config, [layer])
+    stale_config = HybridModelConfig(
+        transformer=TransformerConfig(num_layers=3, hidden_size=32, num_attention_heads=2),
+        vocab_size=None,
+    )
+
+    result = _flops(model, model_config=stale_config)
+
+    estimate_layer.assert_called_once_with(
+        total_real_tokens_in_batch=7, seqlen_squared_sum_in_batch=25, include_backward=True
+    )
+    assert result == layer_flops + 21_504
+
+
+@pytest.mark.parametrize("pattern", ["-", None], ids=["pattern", "config-list"])
+def test_training_propagates_missing_layer_estimator(pattern):
+    config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=2)
+    layer_config = create_layer_config(config, "-")
+    model_config = HybridModelConfig(
+        transformer=config,
+        vocab_size=32,
+        hybrid_layer_pattern=pattern,
+        hybrid_layer_config_list=[layer_config] if pattern is None else None,
+    )
+    model = _model(config, [MegatronModule(layer_config)])
+    model.hybrid_layer_pattern = pattern
+    model.hybrid_layer_config_list = model_config.hybrid_layer_config_list
+    chunks = _hybrid_model_chunks_for_runtime_metrics([model], model_config)
+
+    with pytest.raises(NotImplementedError, match="MegatronModule must implement estimate_flops"):
+        _flops(*chunks, model_config=model_config)
+
+
+@pytest.mark.parametrize("chunks", [None, []], ids=["omitted", "empty"])
+def test_config_list_flops_requires_constructed_hybrid_model(chunks):
+    config = _config()
+    model_config = HybridModelConfig(
+        transformer=config, hybrid_layer_config_list=[config] * config.num_layers, vocab_size=32
+    )
+    with pytest.raises(ValueError, match="constructed HybridModel"):
+        num_floating_point_operations(
+            model_config, batch_size=2, sequence_length=128, hybrid_models=chunks
+        )
+
+
+def test_pattern_model_counts_kda_and_mla_from_wrapped_chunk():
+    config = MLATransformerConfig(
+        num_layers=2,
+        hidden_size=16,
+        num_attention_heads=2,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        linear_conv_kernel_dim=3,
+        q_lora_rank=None,
+        kv_lora_rank=4,
+        qk_head_dim=2,
+        qk_pos_emb_head_dim=2,
+        v_head_dim=3,
+        apply_rope_fusion=False,
+    )
+    pattern = "K+"
+    kda_config, mla_config = (create_layer_config(config, symbol) for symbol in pattern)
+    model = _model(
+        config,
+        [
+            _bare(KimiDeltaAttention, kda_config),
+            _bare(MLASelfAttention, mla_config, core_attention=None),
+        ],
+        post_process=False,
+    )
+    model.hybrid_layer_pattern = pattern
+    model.hybrid_layer_config_list = None
+    wrapped = _bare(Float16Module, config, module=model)
+    model_config = HybridModelConfig(
+        transformer=config, vocab_size=32, hybrid_layer_pattern=pattern
+    )
+    chunks = _hybrid_model_chunks_for_runtime_metrics([wrapped], model_config)
+    assert chunks == [model]
+    # Seven tokens and sum(length²)=25: KDA contributes 42,000 training FLOPs, MLA 16,338.
+    assert _flops(*chunks, model_config=model_config) == 58_338
+
+
+def _mock_pipeline(monkeypatch):
+    pp_group = object()
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(torch.distributed, "get_backend", lambda group: "gloo")
+    return pp_group
+
+
+def test_missing_hybrid_chunk_requires_an_estimator_only_for_hybrid_runs():
+    chunks = [torch.nn.Identity()]
+    config = HybridModelConfig(transformer=_config(), vocab_size=32)
+    with pytest.raises(ValueError, match="constructed HybridModel"):
+        _hybrid_model_chunks_for_runtime_metrics(chunks, config)
+    assert _hybrid_model_chunks_for_runtime_metrics(chunks, SimpleNamespace()) is None
+
+
+# Each of the two gain layers counts 336 multiplications and 96 gradient-reduction additions.
+@pytest.mark.parametrize("with_layers,expected_local", [(False, 0), (True, 864)])
+def test_virtual_chunks_are_summed_before_reducing_only_the_pipeline_group(
+    monkeypatch, with_layers, expected_local
+):
+    pp_group = _mock_pipeline(monkeypatch)
+    reductions = []
+
+    def reduce_peer(value, *, group):
+        assert group is pp_group
+        reductions.append(value.item())
+        value.add_(1000)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce_peer)
+    config = _config()
+    chunks = [
+        _model(
+            config,
+            [_bare(ExternalGainLayer, config)] if with_layers else [],
+            post_process=False,
+            pp_group=pp_group,
+        )
+        for _ in range(2)
+    ]
+    assert _flops(*chunks) == expected_local + 1000
+    assert reductions == [expected_local]
+
+
+@pytest.mark.parametrize("local_estimate", [None, float("nan"), -1, 1j])
+def test_estimation_failures_propagate_across_pipeline_ranks(monkeypatch, local_estimate):
+    pp_group = _mock_pipeline(monkeypatch)
+    reductions = []
+
+    def reduce_failure(value, *, group):
+        assert group is pp_group
+        if local_estimate is not None:
+            assert torch.isnan(value).item()
+        reductions.append(value.item())
+        value.fill_(float("nan"))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce_failure)
+    config = _config()
+    model = _model(
+        config, [_bare(ExternalGainLayer, config)], post_process=False, pp_group=pp_group
+    )
+    if local_estimate is not None:
+        # Composite overrides must also be validated before entering the collective.
+        monkeypatch.setattr(model, "estimate_flops", Mock(return_value=local_estimate))
+    with pytest.raises((ValueError, TypeError)):
+        _flops(model)
+    assert len(reductions) == 1  # A local error must still reach the shared collective.
+
+
+def _moe_metadata(root, entries, *, mtp_template=None, mtp_depths=0):
+    model = _bare(
+        HybridModel,
+        root,
+        hybrid_layer_config_list=tuple(entries),
+        mtp_layer_config_list=mtp_template,
+        mtp_num_depths=mtp_depths,
+    )
+    return _hybrid_config_list_moe_logging_metadata(model)
+
+
+@pytest.mark.parametrize("repeated_mtp", [False, True])
+def test_builtin_moe_metadata_with_external_layers_uses_standard_tracker_conventions(repeated_mtp):
+    dense = _config(mtp_num_layers=2, mtp_use_repeated_layer=repeated_mtp)
+    moe = MoELayerConfig.from_config(_config(num_moe_experts=4))
+    mtp_moe = MoELayerConfig.from_config(
+        _config(
+            num_moe_experts=4,
+            moe_router_load_balancing_type=["seq_aux_loss", "global_aux_loss"],
+            moe_aux_loss_coeff=[0.01, 0.01],
+            moe_z_loss_coeff=0.01,
+        )
+    )
+    configs = [dense, moe, PipelineSplit, moe, MTPSplit, mtp_moe, MTPSplit, mtp_moe]
+
+    metadata = _moe_metadata(dense, configs, mtp_template=(mtp_moe,), mtp_depths=2)
+
+    assert metadata == (
+        ["load_balancing_loss", "seq_load_balancing_loss", "global_load_balancing_loss", "z_loss"],
+        5,
+        3 if repeated_mtp else 4,
+        0,
+    )
+
+
+def test_builtin_hash_metadata_with_external_non_moe_layer():
+    dense = _config(num_moe_experts=4, hash_moe_vocab_size=32, moe_num_hash_layers=2)
+    moe = MoELayerConfig.from_config(
+        _config(num_moe_experts=4, moe_router_load_balancing_type="seq_aux_loss")
+    )
+    assert _moe_metadata(dense, [dense, moe, moe]) == (["seq_load_balancing_loss"], 3, 2, 2)
+
+
+def test_external_non_moe_config_does_not_enable_moe_metrics():
+    config = _config()
+    assert _moe_metadata(config, [config] * config.num_layers) == ([], 3, 0, 0)
+
+
+def test_saved_hybrid_family_preserves_checkpoint_policy_and_runtime_args(run_config):
+    config = _config(mtp_num_layers=2)
+    model = Mock(spec=HybridModel)
+    model.config = config
+    model.hybrid_layer_config_list = [config, config, config, MTPSplit, config, MTPSplit, config]
+    model.state_dict_for_save_checkpoint.return_value = {"weight": 1}
+    args = Namespace(
+        ckpt_format="torch_dist",
+        save="/old",
+        no_save_optim=False,
+        padded_vocab_size=16,
+        is_hybrid_model=False,
+        mtp_num_layers=None,
+    )
+    original_args = vars(args).copy()
+    run_config.checkpoint.save = "/configured"
+    run_config.checkpoint.save_optim = False
+    run_config.tokenizer.padded_vocab_size = 32
+
+    state = checkpointing.generate_state_dict(
+        args, [model], None, None, None, iteration=3, ckpt_format="torch", save="/actual"
+    )
+
+    saved_args = state["args"]
+    assert saved_args.uses_hybrid_layer_config_list is True
+    assert saved_args.mtp_num_layers == 2
+    assert saved_args.ckpt_format == "torch"
+    assert saved_args.save == "/actual"
+    assert saved_args.no_save_optim is True
+    assert saved_args.padded_vocab_size == 32
+    assert vars(args) == original_args
+    assert state["model"] == {"weight": 1}
+    # A Python provider can supply the model even when the saved launcher config describes GPT.
+    assert checkpointing._maybe_setup_gpt_to_hybrid_load(
+        args,
+        saved_args,
+        [model],
+        load_optim=True,
+        saved_save_optim=False,
+        checkpoint_model=run_config.model.as_dict(),
+    ) == (None, False)
+
+
+def test_checkpoint_layer_list_selects_native_load_without_saved_args():
+    config = _config()
+    saved = HybridModelConfig(transformer=config, hybrid_layer_config_list=[config] * 3).as_dict()
+    options = dict(load_optim=False, saved_save_optim=False, checkpoint_model=saved)
+    assert checkpointing._maybe_setup_gpt_to_hybrid_load(
+        Namespace(), None, [Mock(spec=HybridModel)], **options
+    ) == (None, False)
+    with pytest.raises(RuntimeError, match="non-hybrid model"):
+        checkpointing._maybe_setup_gpt_to_hybrid_load(Namespace(), None, [object()], **options)
+
+
+def test_pattern_checkpoint_can_be_loaded_after_conversion_to_gpt(run_config):
+    model = Mock(spec=HybridModel)
+    model.hybrid_layer_config_list = None
+    args = Namespace(hybrid_layer_pattern="*-", is_hybrid_model=True)
+    state = checkpointing.generate_state_dict(args, [model], None, None, None, ckpt_format="torch")
+    # The offline converter clears the pattern when it writes the target GPT checkpoint.
+    state["args"].hybrid_layer_pattern = None
+    assert checkpointing._maybe_setup_gpt_to_hybrid_load(
+        args, state["args"], [object()], load_optim=False, saved_save_optim=False
+    ) == (None, False)
+
+
+def test_external_layer_keeps_config_list_gpt_conversion_restriction(run_config):
+    config = _config()
+    run_config.model = HybridModelConfig(transformer=config, hybrid_layer_pattern="*-")
+    model = Mock(spec=HybridModel)
+    model.hybrid_layer_pattern = None
+    model.hybrid_layer_config_list = [config] * config.num_layers
+    with pytest.raises(RuntimeError, match="requires --hybrid-layer-pattern"):
+        checkpointing._maybe_setup_gpt_to_hybrid_load(
+            Namespace(),
+            Namespace(hybrid_layer_pattern=None),
+            [model],
+            load_optim=False,
+            saved_save_optim=False,
+        )
+
+
+def test_external_layer_fields_are_recorded_in_run_config(run_config, tmp_path):
+    root = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
+    custom = ExternalGainConfig.from_config(root)
+    custom.gain_init = 0.5
+    custom.notes.append("architecture-specific")
+    run_config.model = HybridModelConfig(
+        transformer=root, hybrid_layer_config_list=[custom, custom], vocab_size=64
+    )
+    path = tmp_path / "run_config.yaml"
+    run_config.to_yaml(path)
+    for saved in (run_config.to_dict(), read_run_config(str(path))):
+        layers = saved["model"]["hybrid_layer_config_list"]
+        assert layers[0]["_target_"] == (
+            "tests.unit_tests.models.hybrid.external_layer.ExternalGainConfig"
+        )
+        assert layers[0]["gain_init"] == 0.5
+        assert layers[0]["notes"] == ["external", "architecture-specific"]
+        assert layers[0] == layers[1]

@@ -45,6 +45,7 @@ from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistLoadShardedStrategy,
     TorchDistSaveShardedStrategy,
 )
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.optimizer.distrib_optimizer import get_legacy_grad_dtypes
@@ -1863,6 +1864,10 @@ def generate_state_dict(
     padded_vocab_size = get_run_config().tokenizer.padded_vocab_size
     if getattr(args, 'padded_vocab_size', None) != padded_vocab_size:
         state_dict['args'].padded_vocab_size = padded_vocab_size
+    if model and isinstance(model[0], HybridModel) and model[0].hybrid_layer_config_list is not None:
+        # Args-only readers need the architecture kind and the MTP depth inferred by Core.
+        state_dict['args'].uses_hybrid_layer_config_list = True
+        state_dict['args'].mtp_num_layers = model[0].config.mtp_num_layers
     state_dict['checkpoint_version'] = 3.1
     if iteration is not None:
         state_dict['iteration'] = iteration
@@ -2777,7 +2782,6 @@ def _maybe_setup_gpt_to_hybrid_load(
     RuntimeError for combinations that cannot be loaded.
     """
     from megatron.core.dist_checkpointing.gpt_checkpoint_interop import gpt_compatible_layer_maps
-    from megatron.core.models.hybrid.hybrid_model import HybridModel
     from megatron.core.models.mimo.model.base import MimoModel
 
     def _contains_hybrid_model(module):
@@ -2810,26 +2814,34 @@ def _maybe_setup_gpt_to_hybrid_load(
         ckpt_pattern = getattr(ckpt_args, 'hybrid_layer_pattern', None) or getattr(
             ckpt_args, 'hybrid_override_pattern', None
         )
-    if runtime_is_hybrid == bool(ckpt_pattern):
+    ckpt_uses_config_list = (
+        (checkpoint_model or {}).get('hybrid_layer_config_list') is not None
+        or getattr(ckpt_args, 'uses_hybrid_layer_config_list', False)
+    )
+    if runtime_is_hybrid == bool(ckpt_pattern or ckpt_uses_config_list):
         return None, False
     if not runtime_is_hybrid:
+        architecture = f'hybrid layer pattern {ckpt_pattern!r}' if ckpt_pattern else 'layer list'
         raise RuntimeError(
-            f'The checkpoint was saved by a hybrid model run (hybrid layer pattern '
-            f'{ckpt_pattern!r}) but the current run builds a non-hybrid model. Load it '
-            f'with the hybrid training entrypoint instead.'
+            f'The checkpoint was saved by a hybrid model run ({architecture}) but the current '
+            f'run builds a non-hybrid model. Load it with the hybrid training entrypoint instead.'
         )
 
     # GPT checkpoint feeding a HybridModel run: translate the sharded state
     # dict at load time instead of converting the checkpoint on disk.
-    cfg = get_run_config()
-    if not cfg.model.hybrid_layer_pattern:
+    runtime_pattern = (
+        model[0].hybrid_layer_pattern
+        if isinstance(model[0], HybridModel)
+        else getattr(get_run_config().model, 'hybrid_layer_pattern', None)
+    )
+    if not runtime_pattern:
         raise RuntimeError(
             'Loading a GPT checkpoint into a hybrid model requires '
             '--hybrid-layer-pattern so checkpoint layers can be paired with '
             'hybrid layer positions.'
         )
     try:
-        layer_maps = gpt_compatible_layer_maps(cfg.model.hybrid_layer_pattern)
+        layer_maps = gpt_compatible_layer_maps(runtime_pattern)
     except ValueError as exc:
         raise RuntimeError(f'Cannot load a GPT checkpoint into this hybrid model: {exc}') from exc
 
@@ -2838,7 +2850,7 @@ def _maybe_setup_gpt_to_hybrid_load(
         ckpt_num_layers = getattr(ckpt_args, 'num_layers', None)
     if ckpt_num_layers is not None and ckpt_num_layers != layer_maps.num_gpt_layers:
         raise RuntimeError(
-            f'Hybrid layer pattern {cfg.model.hybrid_layer_pattern!r} pairs with a GPT '
+            f'Hybrid layer pattern {runtime_pattern!r} pairs with a GPT '
             f'checkpoint of {layer_maps.num_gpt_layers} layers, but the checkpoint '
             f'has num_layers={ckpt_num_layers}.'
         )

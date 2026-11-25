@@ -32,6 +32,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory imp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import capped_causal_attention_fraction, causal_window_max_keys
 
 # pylint: disable=line-too-long,missing-class-docstring,missing-function-docstring
 
@@ -556,6 +557,56 @@ def _simplified_qk_topk_naive(
 
 class DSGQACoreAttention(MegatronModule):
     """Token-level DSA core attention for grouped-query attention."""
+
+    def estimate_flops(
+        self,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+        include_backward: bool = False,
+    ) -> float:
+        """Count attention, indexer and auxiliary-loss matmuls, excluding kernel recomputation."""
+        config = self.config
+        reference = config.dsa_kernel_backend == "reference"
+        warmup = not reference and config.dsa_fwd_use_dense_attn
+        # Reference BMMs compute the full square before masking. The min-memory
+        # kernels route over the causal triangle and attend only to selected keys.
+        pairs = seqlen_squared_sum_in_batch if reference else seqlen_squared_sum_in_batch / 2
+        support = 1.0
+        if not reference:
+            support = capped_causal_attention_fraction(
+                total_real_tokens_in_batch,
+                seqlen_squared_sum_in_batch,
+                (
+                    causal_window_max_keys(config, self.layer_number)
+                    if warmup
+                    else self.indexer.index_topk
+                ),
+            )
+        head_width = config.num_attention_heads * config.kv_channels
+        attention = 4 * pairs * head_width * support
+        flops = (3 if include_backward else 1) * attention
+        # A frozen MTP backbone stays in training mode but skips the indexer loss.
+        grad_enabled = include_backward or torch.is_grad_enabled()
+        train_indexer = self.training and grad_enabled and (config.dsa_indexer_loss_coeff or 0) > 0
+        if warmup and not train_indexer:
+            return flops
+
+        width = self.indexer.index_head_dim
+        projections = 4 * total_real_tokens_in_batch * config.hidden_size * width
+        if not warmup:
+            flops += projections + 2 * pairs * width  # Top-k routing.
+        if train_indexer:
+            loss_pairs = pairs * support
+            if not reference and not config.dsa_indexer_use_sparse_loss:
+                # Dense KL projects its own indexer Q/K and scores the full square before masking.
+                loss_pairs = seqlen_squared_sum_in_batch
+                flops += projections + 2 * loss_pairs * width
+            flops += 2 * loss_pairs * head_width  # Detached teacher's QK scores.
+            if include_backward:
+                # Detached indexer input needs weight gradients only; scores need dQ and dK.
+                flops += projections + 4 * loss_pairs * width
+        return flops
 
     def __init__(
         self,

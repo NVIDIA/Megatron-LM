@@ -14,6 +14,7 @@ from megatron.core.inference import utils as inference_utils
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.tensor_parallel import random as tp_random
 from megatron.core.transformer import cuda_graphs, multi_token_prediction
+from megatron.core.transformer.module import MegatronModule
 from megatron.training.argument_utils import (
     gpt_config_from_args,
     hybrid_config_from_args,
@@ -33,6 +34,15 @@ _NVTE_ATTN_ENV_VARS = (
     'NVTE_FLASH_ATTN_V3',
     'NVTE_FLASH_ATTN_V4',
 )
+
+
+def make_flops_test_layer(module_type, config, **children):
+    """Build a layer for FLOP accounting without allocating parameters or process groups."""
+    module = module_type.__new__(module_type)
+    MegatronModule.__init__(module, config)
+    for name, child in children.items():
+        setattr(module, name, child)
+    return module
 
 
 class TestModel(torch.nn.Module):

@@ -321,6 +321,15 @@ class DpBalancedScheduler(BasePackingScheduler):
         if data_iterator is not None:
             assert tp_group.rank() == 0, "Only TP rank 0 should have a packed data iterator"
 
+            # Read FLOPs metadata before unpacking discards the original SFT pack.
+            samples = (
+                sample
+                for item in batch_list
+                for sample in (item if isinstance(item, list) else [item])
+            )
+            seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch = (
+                get_global_real_seqlen_stats(samples, dp_group, dev)
+            )
             # Step 1: Gather global sequence lengths for the fetched batches
             batch, global_id_seqlens, global_ids_this_rank, offsets, _ = (
                 get_batch_and_global_seqlens(iter(batch_list), num_microbatches, dp_group)
@@ -380,11 +389,6 @@ class DpBalancedScheduler(BasePackingScheduler):
                 is_dynamic_cp=self.is_dynamic_cp,
             )
 
-            # Step 6: Calculate FLOPs info from real tokens. Padded lengths only size
-            # the schedule and the packed buffers.
-            seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch = (
-                get_global_real_seqlen_stats(batch, dp_group, dev)
-            )
         else:
             (
                 new_samples,

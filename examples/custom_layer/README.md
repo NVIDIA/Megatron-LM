@@ -53,11 +53,14 @@ Success: HybridModel ran forward/backward and updated the custom layer.
    ]
    ```
 
-5. **Estimate forward FLOPs.** `GainLayer.estimate_flops` counts one
-   multiplication per token and hidden channel:
-   `total_real_tokens_in_batch * config.hidden_size`. This pure class method
-   performs no computation on tensors and does not include backward FLOPs.
-   The example does not print FLOP estimates.
+5. **Estimate FLOPs.** Implement the instance method `estimate_flops` with an
+   `include_backward=False` keyword. `GainLayer` counts one forward multiplication
+   per token and hidden channel. Backward adds two multiplications per element
+   and one sum across tokens per channel for the gain gradient. For seven tokens
+   and 16 channels, that gives 336 multiplications and 96 additions in total.
+   A custom layer with the original config-taking classmethod can still report
+   forward FLOPs. Implement the instance method to report backward FLOPs. Return
+   the estimate directly without running tensor operations or collectives.
 
 `from_config` copies the normalized root settings and supplies defaults for new
 fields. HybridModel creates independent config copies and modules for physical

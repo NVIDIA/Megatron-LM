@@ -40,7 +40,11 @@ from megatron.core.ssm.utils import _split_tensor_factory, _validate_dynamic_cp_
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
+from megatron.core.transformer.module import (
+    MegatronModule,
+    TwoStageAttentionLayer,
+    accepts_flops_config,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -196,20 +200,24 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             parallel.
     """
 
-    @classmethod
+    @accepts_flops_config
     def estimate_flops(
-        cls,
-        config: TransformerConfig,
+        self,
         *,
         total_real_tokens_in_batch: float,
         seqlen_squared_sum_in_batch: float,
+        include_backward: bool = False,
     ) -> float:
-        """Estimate forward projection and scan FLOPs using the existing SSD approximation."""
+        """Estimate projection and scan FLOPs using the existing SSD approximation."""
+        config = self.config
         tokens = total_real_tokens_in_batch
-        hidden = config.hidden_size
-        inner = 2 * hidden
-        heads = config.mamba_num_heads or inner // config.mamba_head_dim
-        return (
+        if isinstance(self, MambaMixer):
+            hidden, inner, heads = self.d_model, self.d_inner, self.nheads
+        else:
+            hidden = config.hidden_size
+            heads = config.mamba_num_heads or (2 * hidden // config.mamba_head_dim)
+            inner = heads * config.mamba_head_dim
+        forward = (
             2
             * tokens
             * hidden
@@ -217,6 +225,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             + 7 * tokens * inner * config.mamba_state_dim  # Approximate scan cost.
             + 2 * tokens * inner * hidden
         )
+        return (3 if include_backward else 1) * forward
 
     def __init__(
         self,

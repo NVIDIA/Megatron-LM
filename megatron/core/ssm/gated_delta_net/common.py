@@ -164,12 +164,21 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
 
     gated_delta_rule: GatedDeltaRuleInterface
 
+    @staticmethod
+    def _conv_and_recurrence_macs_per_token(
+        kernel_size: int, qkv_dim: int, key_head_dim: int, value_dim: int
+    ) -> int:
+        """Count depthwise QKV convolution and approximate the recurrent state updates."""
+        # Each value head maintains a key_head_dim by value_head_dim state.
+        return kernel_size * qkv_dim + 4 * key_head_dim * value_dim
+
     @classmethod
     def _estimate_flops(
         cls, config: TransformerConfig, total_real_tokens_in_batch: float, *, use_gdn2: bool
     ) -> float:
         """Share the GDN/GDN2 forward estimate without enabling it for other variants."""
-        qk_dim = (config.linear_key_head_dim or 128) * (config.linear_num_key_heads or 16)
+        key_head_dim = config.linear_key_head_dim or 128
+        qk_dim = key_head_dim * (config.linear_num_key_heads or 16)
         value_head_dim = config.linear_value_head_dim or 128
         value_heads = config.linear_num_value_heads or 32
         value_dim = value_head_dim * value_heads
@@ -181,8 +190,12 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             * total_real_tokens_in_batch
             * (
                 config.hidden_size * input_dim
-                + (config.linear_conv_kernel_dim or 4) * (2 * qk_dim + value_dim)
-                + value_heads * value_head_dim**2 * 4  # KK^T, VK^T, S(a(I-bKK^T)), and SQ.
+                + cls._conv_and_recurrence_macs_per_token(
+                    config.linear_conv_kernel_dim or 4,
+                    2 * qk_dim + value_dim,
+                    key_head_dim,
+                    value_dim,
+                )
                 + config.hidden_size * value_dim
             )
         )

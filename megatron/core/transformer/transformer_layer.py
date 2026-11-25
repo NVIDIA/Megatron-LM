@@ -32,7 +32,11 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
-from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
+from megatron.core.transformer.module import (
+    GraphableMegatronModule,
+    TwoStageAttentionLayer,
+    estimate_layer_flops,
+)
 from megatron.core.transformer.moe.router_replay import ChunkedRouterReplay
 from megatron.core.transformer.residual_connection import (
     ResidualBranchOutput,
@@ -231,6 +235,16 @@ def get_transformer_layer_offset(
 class MlpInterface(Protocol):
     """Interface for MLP implementations in the transformer layer."""
 
+    def estimate_flops(
+        self,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+        include_backward: bool = False,
+    ) -> float:
+        """Estimate forward and backward work for a global batch."""
+        ...
+
     def forward(
         self,
         hidden_states: Tensor,
@@ -343,6 +357,24 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
     Transformer layer takes input with size [s, b, h] and returns an
     output of the same size.
     """
+
+    def estimate_flops(
+        self,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+        include_backward: bool = False,
+    ) -> float:
+        """Compose the computational sublayers without counting their children twice."""
+        return sum(
+            estimate_layer_flops(
+                layer,
+                total_real_tokens_in_batch=total_real_tokens_in_batch,
+                seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+                include_backward=include_backward,
+            )
+            for layer in (self.self_attention, self.cross_attention, self.mlp)
+        )
 
     def __init__(
         self,

@@ -2,6 +2,8 @@
 
 """Megatron Module."""
 
+from functools import wraps
+from types import SimpleNamespace
 from typing import Any, Optional, Tuple
 
 import torch
@@ -20,6 +22,38 @@ from megatron.core.transformer.utils import (
 _FLOAT_TYPES = (torch.FloatTensor, torch.cuda.FloatTensor)
 _HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
 _BF16_TYPES = (torch.BFloat16Tensor, torch.cuda.BFloat16Tensor)
+
+
+def accepts_flops_config(estimate):
+    """Keep the config-only call used by training reports for built-in layer types."""
+
+    @wraps(estimate)
+    def from_module_or_config(module_or_config=None, /, config=None, **batch_stats):
+        if config is None:
+            if isinstance(module_or_config, MegatronModule):
+                return estimate(module_or_config, **batch_stats)
+            if module_or_config is None:
+                raise TypeError("estimate_flops requires a layer or config")
+            config = module_or_config
+        # A config describes the attention arithmetic but cannot own an indexer.
+        # Config-only reports count indexer executions separately.
+        layer = SimpleNamespace(config=config, core_attention=None, indexer=None)
+        return estimate(layer, **batch_stats)
+
+    return from_module_or_config
+
+
+def estimate_layer_flops(layer, *, include_backward=False, **batch_stats) -> float:
+    """Allow custom layers with the original classmethod hook to report forward FLOPs."""
+    estimate = layer.estimate_flops
+    if isinstance(getattr(estimate, "__self__", None), type):
+        if include_backward:
+            raise NotImplementedError(
+                f"{type(layer).__name__} must implement estimate_flops as an instance method "
+                "with include_backward to estimate backward FLOPs."
+            )
+        return estimate(layer.config, **batch_stats)
+    return estimate(include_backward=include_backward, **batch_stats)
 
 
 class TwoStageAttentionLayer:
@@ -77,25 +111,24 @@ class MegatronModule(torch.nn.Module):
         super().__init__()
         self.config = config
 
-    @classmethod
     def estimate_flops(
-        cls,
-        config: TransformerConfig,
+        self,
         *,
         total_real_tokens_in_batch: float,
         seqlen_squared_sum_in_batch: float,
+        include_backward: bool = False,
     ) -> float:
-        """Estimate this module's forward FLOPs for one global batch from its config.
+        """Estimate this module's work for one global batch.
 
-        Built-in and custom layers share this optional hook. It must be pure:
-        do not mutate the config, construct modules, or run collectives.
-        Return a finite nonnegative real number. Training accounts for repeated
-        layer executions and applies the forward/backward multiplier separately.
+        Return forward FLOPs by default, or forward plus backward when requested.
+        Each concrete layer implements its own estimate; composites sum their children.
+        Custom layers implement this method directly; no registration is required.
 
-        Include multiply/add operations, but exclude model-level work such as logits.
+        Estimates must be pure, finite, nonnegative real numbers. Do not construct
+        modules, mutate state, or run collectives. Count each child execution once.
         """
         raise NotImplementedError(
-            f"{cls.__name__} must implement estimate_flops for layer FLOP accounting."
+            f"{type(self).__name__} must implement estimate_flops for layer FLOP accounting."
         )
 
     def refresh_cache(self) -> None:
