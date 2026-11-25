@@ -344,44 +344,6 @@ class OptimizerConfig:
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
     One of 'adam' or 'lion'. Defaults to 'adam'."""
 
-    # MuOwn.
-    muon_use_muown: bool = False
-    """Replace Muon on the Muon matrices with MuOwn, which updates row scales with Adam and row
-    directions with Muon. Only the AngularMuOwn variant (muown_use_angular) on Megatron-FSDP v2
-    is implemented. Defaults to False."""
-
-    muown_use_angular: bool = False
-    """Use AngularMuOwn: keep the row directions at unit norm and scale their Muon step by the
-    angular multiplier kappa_t. Requires muon_use_muown and muon_scale_mode='shape_scaling'.
-    Defaults to False."""
-
-    muown_angular_decay_scale: float = 8.9
-    """Dimensionless scale C of kappa_t = (1 + C * u**r) ** (-p / r), where u is the progress
-    after the angular warmup normalized by muown_angular_horizon_iters. Defaults to 8.9."""
-
-    muown_angular_decay_degree: float = 1.0
-    """Decay degree p of kappa_t. Zero disables the decay after warmup. Defaults to 1.0."""
-
-    muown_angular_plateau_degree: float = 1.0
-    """Plateau degree r >= 1 of kappa_t. r > 1 flattens the start of the decay.
-    Defaults to 1.0."""
-
-    muown_angular_warmup_iters: Optional[int] = None
-    """Iterations that keep kappa_t = 1. None reuses the learning-rate warmup.
-    Defaults to None."""
-
-    muown_angular_horizon_iters: Optional[int] = None
-    """Iterations T that normalize the progress of kappa_t. None uses the number of training
-    iterations. Defaults to None."""
-
-    muown_norm_eps: float = 1e-12
-    """Floor for the absolute row scale and for the row-normalization denominator.
-    Defaults to 1e-12."""
-
-    muown_weight_decay_mult: float = 1.0
-    """Multiplier of weight_decay for the decoupled decay of MuOwn row scales. The row directions
-    are never decayed. Zero disables the decay. Defaults to 1.0."""
-
     # Lion.
     lion_beta1: float = 0.95
     """First beta coefficient for Lion optimizer (used in sign update). Defaults to 0.95."""
@@ -550,32 +512,6 @@ class OptimizerConfig:
             self.optimizer not in ('sgd', 'adam')
             and (self.use_distributed_optimizer or self.optimizer == 'dist_muon')
         )
-
-        if self.muown_use_angular and not self.muon_use_muown:
-            raise ValueError("muown_use_angular requires muon_use_muown.")
-        if self.muon_use_muown:
-            if self.optimizer != 'muon':
-                raise ValueError(
-                    f"muon_use_muown requires optimizer='muon', got {self.optimizer!r}."
-                )
-            if not self.muown_use_angular:
-                raise NotImplementedError(
-                    "Only the AngularMuOwn variant of MuOwn is implemented; set muown_use_angular."
-                )
-            if self.muon_scale_mode != 'shape_scaling':
-                raise ValueError(
-                    "AngularMuOwn requires muon_scale_mode='shape_scaling', got "
-                    f"{self.muon_scale_mode!r}."
-                )
-            if self.muown_angular_plateau_degree < 1:
-                raise ValueError("muown_angular_plateau_degree must be >= 1.")
-            if self.muown_angular_decay_scale < 0 or self.muown_angular_decay_degree < 0:
-                raise ValueError(
-                    "muown_angular_decay_scale and muown_angular_decay_degree must be "
-                    "non-negative."
-                )
-            if self.muown_norm_eps <= 0:
-                raise ValueError("muown_norm_eps must be positive.")
 
         if self.muon_tp_mode == 'layer_sharded':
             # 'dist_muon' is the deprecated alias for muon + the layer-wise path.

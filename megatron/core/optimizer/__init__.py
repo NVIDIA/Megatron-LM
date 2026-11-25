@@ -888,8 +888,6 @@ def _get_megatron_emerging_optimizer(
         return _get_megatron_fsdp_emerging_optimizer(
             config, model_chunks, config_overrides, pg_collection, param_group_process_group
         )
-    if config.muon_use_muown:
-        raise NotImplementedError("MuOwn is implemented only for Megatron-FSDP v2.")
 
     if not HAVE_EMERGING_OPTIMIZERS:
         raise ImportError(

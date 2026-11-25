@@ -41,9 +41,6 @@ try:
     from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
     from emerging_optimizers.soap import SOAP  # pylint: disable=unused-import
 
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.angular_muown import (
-        FsdpAngularMuOwn,
-    )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.muon import FsdpMuon
 
     HAVE_EMERGING_OPTIMIZERS = True
@@ -148,25 +145,10 @@ def _create_emerging_optimizer(config, param_groups, eopt_name, model_chunks, pg
 def _create_fsdp_emerging_optimizer(
     config: OptimizerConfig, param_groups: list[dict[str, Any]]
 ) -> torch.optim.Optimizer:
-    """Build FsdpMuon, or FsdpAngularMuOwn when ``config.muon_use_muown`` is set."""
+    """Build FsdpMuon."""
     kwargs = _kwargs_from_config(Muon, "muon", config)
     kwargs["weight_decay_method"] = "decoupled" if config.decoupled_weight_decay else "l2"
-    if not config.muon_use_muown:
-        return FsdpMuon(param_groups, **kwargs)
-    # OptimizerConfig.validate() has checked the MuOwn variant and scale mode.
-    return FsdpAngularMuOwn(
-        param_groups,
-        angular_decay_scale=config.muown_angular_decay_scale,
-        angular_decay_degree=config.muown_angular_decay_degree,
-        angular_plateau_degree=config.muown_angular_plateau_degree,
-        angular_warmup_steps=config.muown_angular_warmup_iters or 0,
-        angular_horizon_steps=config.muown_angular_horizon_iters or 0,
-        row_scale_betas=(config.adam_beta1, config.adam_beta2),
-        row_scale_eps=config.adam_eps,
-        norm_eps=config.muown_norm_eps,
-        weight_decay_mult=config.muown_weight_decay_mult,
-        **kwargs,
-    )
+    return FsdpMuon(param_groups, **kwargs)
 
 
 # ===========================================================================
